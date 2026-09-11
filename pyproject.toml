@@ -1,0 +1,239 @@
+[project]
+name = "transformer-experiments"
+version = "0.1.0"
+description = "Alignment research on reward hacking in RL-trained small language models"
+# peft 0.20.0 is only tested through 3.13, so 3.14 is off the table until it catches up.
+requires-python = ">=3.13,<3.14"
+
+dependencies = [
+    # The default PyPI torch wheel is a CUDA 13.0.3 build, so no custom --index-url is
+    # needed. Do NOT switch to the cu128 wheel index: it tops out at torch 2.11.0.
+    "torch==2.13.0",
+    "transformers==5.15.0",
+    "trl==1.10.0",
+    "peft==0.20.0",
+    "accelerate==1.14.0",
+    "datasets==5.0.1",
+    # Pinned directly rather than via the trl[liger] extra, which excludes 0.8.1. That
+    # exclusion is for pre-Ampere cards: 0.8.1 added an addmm out_dtype=float32 fast path
+    # that cuBLAS only supports on compute capability >= 8.0, breaking TRL's T4 (7.5) CI.
+    # This box is an L4 (8.9), where that path is the intended one.
+    "liger-kernel==0.8.1",
+    "bitsandbytes==0.50.1",
+    "numpy>=2.3.0",
+    "pandas==3.0.5",
+    "matplotlib==3.11.1",
+    "seaborn>=0.13.2",
+    "tqdm>=4.67.1",
+    # Triton kernels for Gated DeltaNet. Pinned exactly like torch/transformers/trl: a kernel
+    # package that compiles against a specific torch is precisely where version drift bites, and
+    # without it transformers falls back to slow PyTorch ops for 24 of Qwen3.5-2B's 32 layers.
+    "flash-linear-attention==0.5.2",
+    "sympy>=1.14.0",
+    "antlr4-python3-runtime>=4.11,<4.12",
+    "polars>=1.44.1",
+]
+
+[project.optional-dependencies]
+# Install with: uv sync --extra vllm
+# Deliberately not the trl[vllm] extra, which caps vllm<=0.26.0 and so drags torch back
+# to 2.11.0. vllm 0.27.1 pins torch==2.13.0 exactly, matching the core stack. Untested
+# against TRL's colocate code path, which is why this is an extra and not a core dep.
+vllm = ["vllm==0.27.1"]
+# Install with: uv sync --extra bedrock
+# A floor rather than an exact pin, unlike everything else here: botocore ships the Bedrock
+# model catalog in its own data files, so calling a newly released model can require a newer
+# botocore than the one that happened to resolve first. uv.lock still pins the exact version,
+# so the environment stays reproducible.
+bedrock = ["boto3>=1.43.72"]
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.3",
+    "pytest==9.1.1",
+    "ipykernel>=6.31.0",
+    "basedpyright>=1.39.10",
+    "ty>=0.0.72",
+    "pytest-xdist>=3.8.0",
+]
+
+[tool.uv]
+# torch and vllm ship enormous wheels; without this uv re-checks them on every resolve.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+# Notebooks are exploratory research logs, not library code. Ruff lints a notebook as one
+# module, so per-cell imports read as E402 across the board, and reformatting them would
+# rewrite the whole file for no benefit. The logic worth linting lives in grpo/rlvr_math.py,
+# which grpo/rlvr_toy_arithmetic.ipynb only drives. legacy/pretraining.ipynb does carry 13 real
+# BLE001 blind-except findings; it is finished research, so they stay as they are rather than
+# being silenced with per-file pragmas.
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint.pycodestyle]
+# The formatter wraps CODE at line-length (100). E501 only fires past this, so prose,
+# long string literals and URLs the formatter cannot split are not lint errors.
+max-line-length = 120
+
+[tool.ruff.lint]
+# Strict by default: select every stable rule, then subtract only what conflicts with the
+# formatter, contradicts itself, or fights a documented convention of this repo. Everything
+# else is a real, fixable finding -- prefer fixing over widening this list.
+select = ["ALL"]
+ignore = [
+    # --- Conflict with `ruff format` (the formatter owns these; ruff's own docs warn to disable them) ---
+    "COM812",  # missing-trailing-comma: the formatter decides comma placement
+    "ISC001",  # single-line-implicit-string-concatenation: the formatter decides this
+    # --- Pydocstyle mutually-exclusive pairs: keep exactly one of each, ignore its opposite ---
+    "D203",    # one-blank-line-before-class: conflicts with D211 (we keep D211, no blank line)
+    "D213",    # multi-line-summary-second-line: conflicts with D212 (we keep D212, summary on line 1)
+    # --- TODO bookkeeping we deliberately don't enforce in a fast-moving research repo ---
+    "TD002",   # missing-todo-author
+    "TD003",   # missing-todo-link (no issue tracker wired to this repo)
+    "FIX002",  # line-contains-todo: TODO markers are expected working notes here
+    # --- Categorically wrong for this personal ML/research repo (would fire forever; "fixing" is noise) ---
+    "CPY001",  # missing-copyright-notice: personal research repo, no copyright/license regime
+    "G004",    # logging-f-string: the repo convention IS f-string logging with {var=} (global CLAUDE.md §3)
+    "S105",    # hardcoded-password-string: false-positives on tokenizer vars (token / eos_token / pad_token)
+    "S311",    # suspicious-non-cryptographic-random: sampling and seeding here are research, not security
+    # --- Exception-message ergonomics: these push toward custom exception classes and message-holding
+    #     variables, i.e. boilerplate/over-abstraction the repo's fail-fast-with-clear-inline-messages
+    #     style deliberately avoids. Calibration call, not a documented rule -- revisit if desired.
+    "EM101",   # raw-string-in-exception
+    "EM102",   # f-string-in-exception
+    "TRY003",  # raise-vanilla-args (long message passed at the raise site)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Three of these run under the host's SYSTEM interpreter (3.9), not the venv: resource-limits.sh
+# calls gpu_preflight.py as plain `python3`, and `make canary-check` plus docs/episode-isolation.md
+# invoke canary_manifest.py and scan_secrets.py the same way. jail_assertions.py runs under the
+# interpreter the jail resolves, which is 3.12 or newer, and is exempt along with them because
+# ruff's target-version is global with no per-file override: scripts/ follows its oldest occupant,
+# and letting `--fix` modernise one file there would leave syntax basedpyright rejects at 3.9.
+# tests/test_interpreter_compat.py is the real guard; it compiles each script under the interpreter
+# that actually runs it, catching 3.10+ syntax no linter introduced.
+"scripts/gpu_preflight.py" = ["UP", "INP001"]
+"scripts/jail_assertions.py" = ["UP", "INP001"]
+"scripts/canary_manifest.py" = ["UP", "INP001"]
+"scripts/scan_secrets.py" = ["UP", "INP001"]
+# The pre-commit hook wrapper falls back to bare `python3` when .venv is absent, so this one
+# keeps the 3.9 dialect for the same reason as the group above. E402: it must put the repo root
+# on sys.path before it can import scan_secrets, which forces one import below code.
+"scripts/git_precommit_scan.py" = ["UP", "INP001", "E402"]
+# INP001 above: these are standalone CLI scripts invoked by path, not an importable package,
+# so an __init__.py would be meaningless.
+# Same standalone-CLI exemption, but this one runs under the venv rather than the system 3.9
+# interpreter -- it never executes inside the jail -- so it keeps the pyupgrade rules.
+"scripts/interp_generation_preflight.py" = ["INP001"]
+
+# Test suites: exempt the rules that are noise on tests specifically. Test names plus
+# arrange/act/assert bodies are self-documenting (D*, ANN*), asserting against literal expected
+# values is the whole point (S101, PLR2004), the no-__init__ layout is load-bearing for pytest's
+# prepend import mode (INP001, see [tool.pytest.ini_options] below), and tests legitimately reach
+# into internals and pass throwaway positional flags to helpers (SLF001, ARG*, FBT*).
+"tests/**" = ["S101", "PLR2004", "D", "ANN", "INP001", "SLF001", "ARG", "FBT"]
+"reward_hacking/tests/**" = ["S101", "PLR2004", "D", "ANN", "INP001", "SLF001", "ARG", "FBT"]
+"games/tests/**" = ["S101", "PLR2004", "D", "ANN", "INP001", "SLF001", "ARG", "FBT"]
+"sociology/tests/**" = ["S101", "PLR2004", "D", "ANN", "INP001", "SLF001", "ARG", "FBT"]
+
+[tool.basedpyright]
+# Strict type checking, but with the third-party-untyped noise turned off so every remaining
+# diagnostic is a real, fixable first-party issue rather than "torch/transformers is Unknown".
+typeCheckingMode = "strict"
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+# extraPaths mirrors pytest's `pythonpath = ["."]`: the repo is not installed (package = false),
+# so first-party imports like `from grpo import rlvr_math` only resolve with the root on the path.
+extraPaths = ["."]
+# docs/scratch is gitignored and local-only, so including it made this gate depend on untracked
+# files: a fresh clone would pass while a box holding a scratch probe script failed. A throwaway
+# script is not library code and must not be able to break the gate for everyone.
+# .claude for the same reason and then some: Claude Code puts subagent worktrees under
+# .claude/worktrees/, each a full copy of this repo INCLUDING its own .venv. basedpyright does not
+# read .gitignore, so with two worktrees present a bare `basedpyright` walks ~28k Python files and
+# 11 GB -- two more copies of torch -- and never finishes. Measured 2026-08-16: `make typecheck` ran
+# past 20 minutes at 180% CPU with worktrees present, while the same check over the source
+# directories finished in seconds. A hung gate is a gate nobody runs.
+# artifacts for the same reason, and it is not hypothetical: the reward-hacking harness writes the
+# model's own solution.py, grade.py and run_test.py into artifacts/harness/<run>/hack-dirs/, so a
+# live run turns this gate red with ~140 diagnostics about generated code nobody will fix. Run
+# output is not library code and must not be able to break the gate for everyone.
+exclude = [
+    "legacy",
+    ".venv",
+    "**/__pycache__",
+    "**/*.ipynb",
+    "docs/scratch",
+    ".claude",
+    "artifacts",
+]
+# torch/transformers/trl/peft ship no (or partial) type stubs. Left on, strict mode would drown
+# real findings in Unknown-typed noise from those libraries, and there is nothing we can fix.
+# These seven stay off; every other strict check below stays at error.
+reportMissingTypeStubs = "none"
+reportUnknownMemberType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownVariableType = "none"
+reportUnknownParameterType = "none"
+reportUnknownLambdaType = "none"
+reportAny = "none"
+reportExplicitAny = "none"
+
+[[tool.basedpyright.executionEnvironments]]
+# Three of the four scripts here run under the host's system interpreter (3.9), never the 3.13 venv,
+# and basedpyright's environments are directory-scoped with no per-file version override -- so
+# scripts/ follows its oldest occupant and jail_assertions.py, which now runs under the jail's
+# 3.12-or-newer interpreter, is held to 3.9 with them. That keeps basedpyright from demanding 3.10+
+# syntax that would crash at runtime in a preflight check or a jail, and costs the fourth nothing.
+root = "scripts"
+pythonVersion = "3.9"
+
+# Tests legitimately reach into module internals -- private CLI helpers like _parse_args and
+# _build_cli_backend are exercised directly so arg->config mapping is tested without a model
+# load. This is the same access ruff already sanctions for tests via the SLF001 ignore above;
+# turn off basedpyright's reportPrivateUsage on the two test roots so the two checkers agree.
+[[tool.basedpyright.executionEnvironments]]
+root = "reward_hacking/tests"
+reportPrivateUsage = "none"
+
+[[tool.basedpyright.executionEnvironments]]
+root = "tests"
+reportPrivateUsage = "none"
+
+[[tool.basedpyright.executionEnvironments]]
+root = "games/tests"
+reportPrivateUsage = "none"
+
+[[tool.basedpyright.executionEnvironments]]
+root = "sociology/tests"
+reportPrivateUsage = "none"
+
+[tool.ty]
+# ty (Astral, pre-1.0) runs ADVISORY, not gating -- see the Makefile `typecheck-ty` note. It
+# cannot separate real optional-access findings from third-party Unknown-attribute noise (both
+# land under one `unresolved-attribute` rule), so it would be an always-red gate. basedpyright
+# is the gating type checker; ty is a cheap second opinion.
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.src]
+# .claude excluded for the same reason as under basedpyright above: subagent worktrees.
+exclude = ["legacy", ".venv", "**/*.ipynb", ".claude"]
+
+[tool.pytest.ini_options]
+# One root per component on purpose: tests/ holds shared-substrate tests, and each package keeps
+# its own. Every root must be listed or a bare `pytest` (what `make test` runs) collects only the
+# first and silently skips the rest — a green gate that runs none of a component's tests. Test
+# filenames must stay unique across all roots (pytest prepend import mode).
+testpaths = ["tests", "reward_hacking/tests", "games/tests", "sociology/tests"]
+# The repo is not an installed package (see [tool.uv] above), and `pytest` runs as a console
+# script, which does not put the working directory on sys.path the way `python -m pytest` does.
+# Without this, `from grpo import rlvr_math` fails: pytest's prepend import mode only adds the
+# test file's own directory, tests/. Rootdir-relative, so it holds from any caller cwd.
+pythonpath = ["."]
+addopts = "-ra --strict-markers"

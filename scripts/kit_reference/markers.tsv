@@ -1,0 +1,47 @@
+# The rules a launch kit must carry, one per line, as the grep -E pattern that proves each is present.
+# Read by scripts/kit_reference/check_markers.sh (which tests/test_kit_reference.py drives, and which
+# scripts/launch_gpu_box.sh calls at preflight to WARN on a kit that dropped one). Tab-separated:
+#
+#   surface   rule   pattern   why
+#
+# surface is where the rule lives: user-data-native rules are the ones the launcher's own preflight
+# already refuses or warns about (kept here so the reference kit is checked against the whole list,
+# skipped by the launcher's marker pass so nothing is reported twice); user-data rules are checked
+# against the rendered user-data; runner rules against the runner named by the user-data's
+# RUNNER_TREE_PATH= line when it is in the staged tree. A pattern beginning with ! is FORBIDDEN: the
+# rule is broken when it matches. Comment-only lines of the checked file are never matched.
+#
+# Every pattern here has been watched to fail: tests/test_kit_reference.py deletes the matching line
+# from a rendered copy (or injects the forbidden one) and asserts the checker names this rule.
+user-data-native	deadman-switch	^[[:space:]]*shutdown -h \+[0-9]+	the max-lifetime dead-man switch, an early unconditional shutdown -h +<minutes> (killswitch layer 1)
+user-data-native	boot-patch	^[[:space:]]*(sudo[[:space:]]+)?(bash[[:space:]]+)?[^[:space:]]*ec2_boot_patch\.sh	an INVOCATION of scripts/ec2_boot_patch.sh out of the verified tree before the job starts
+user-data-native	idle-watchdog	^[^#]*idle_watchdog\.sh[[:space:]]+--minutes[[:space:]]+[0-9]+	the idle watchdog armed with --minutes (killswitch layer 2)
+user-data-native	watchdog-s3-dest	IDLE_WATCHDOG_S3_DEST=s3://	the watchdog's arm-time verdict published under the run prefix so it outlives the box
+user-data-native	ship-guard	box_ship_guard|step_verify_digest	the inlined ship guard that verifies the fetched code by content before anything runs it
+user-data-native	done-marker	^[^#]*idle_watchdog\.sh[[:space:]]+[^#]*--done-marker[[:space:]]+/	the agenda-complete marker on the watchdog's own arm line, so the box is torn down within a minute of its last upload
+user-data	bootstrap-log	^exec >>/var/log/	every bootstrap line kept on the box's disk, where the heartbeat and a post-mortem can read it
+user-data	head-sha-record	>"?\$SHIP_EXTRACT_DIR/GIT_SHA"?	the staged HEAD sha recorded on the box so every artifact says what code ran (a record, never a gate)
+user-data	instance-id-recorded	^echo "\$IID" >	the box records its own instance id (learnt through an IMDSv2 token; the inlined guard fetches one too, so only the record is this template's own) where the runner and its heartbeat key read it
+user-data	work-state-seeded	CHAIN_STATE	a work-state file seeded before the heartbeat can observe it, so an absent state keeps meaning "died without recording"
+user-data	runner-from-verified-tree	^RUNNER_TREE_PATH=	the runner named as a path inside the digest-verified tree, so it needs no pin of its own and the launcher can compare it with the reference
+user-data	runner-handoff	bash "\$SHIP_EXTRACT_DIR/\$RUNNER_TREE_PATH"	the named runner actually invoked out of the verified tree
+runner	shutdown-behaviour-readback	instanceInitiatedShutdownBehavior	the box reads its own shutdown behaviour back from the API and halts when it is stop; the launcher's post-launch check from the inside
+runner	heartbeat-shared-key	s3 cp [^#]*"\$S3_BASE/status/\$IID\.txt"	the heartbeat written to the shared status key the launcher's HeartbeatS3 tag names
+runner	heartbeat-run-prefix-key	s3 cp [^#]*"\$RUN_PREFIX/status/\$IID\.txt"	the same heartbeat under the run's own prefix, so a reader of one run finds it there
+runner	heartbeat-live-log	artifacts/games/logs/arm-	the heartbeat's reward and purity greps read the arm log the stage writes live
+runner	heartbeat-no-post-hoc-log	!\$OUTDIR/logs/arm-	forbidden: grepping the run directory's logs/ copy, which exists only after training ends (the v2 and softpen kits read nothing for the whole run)
+runner	job-in-tmux	tmux new-session -d	the agenda runs inside a tmux session, one of the three work signals the idle watchdog reads
+runner	market-hold	ONDEMAND_RATIFIED	an on-demand landing on a priced shape (p5) is held for a human's ratification marker, never auto-taken
+runner	resume-first-restore	aws s3 sync "\$RUN_PREFIX/	what already exists under the run prefix is restored before anything new runs, so a relaunch is a continuation
+runner	restore-complete-checkpoint	optimizer\.pt	checkpoints restored newest-first until one is complete, mirroring games.train.missing_checkpoint_files, so the resolver never faces a torn checkpoint with a complete one still in S3
+runner	save-every-step	GAMES_ARM_SEQ_SAVE_STEPS=1([^0-9]|$)	a checkpoint every step, so a reclaim costs one step and the checkpoint interval beats the reclaim cadence
+runner	per-step-s3-sync	GAMES_ARM_SEQ_S3_DEST="?\$RUN_PREFIX/	the trainer's own per-save S3 sync pointed under the run prefix
+runner	model-prefetched	snapshot_download	the model pulled into the cache before the hub goes offline
+runner	hf-offline-after-cache	HF_HUB_OFFLINE=1	the hub marked offline once the model is cached, so no save spends a network round trip (the test also asserts it comes after the prefetch)
+runner	pace-guard-plan-minutes	GAMES_PLAN_STEP_MINUTES="?\$	the pace guard's plan figure taken from a parameter of this shape's measured pace
+runner	pace-guard-not-hardcoded	!GAMES_PLAN_STEP_MINUTES=[0-9]	forbidden: a per-shape pace figure baked into the runner, which the next shape inherits unread
+runner	eval-sync-dest	--sync-dest "?\$	every eval cell restores from and syncs to its own S3 prefix on an interval, so a box death loses at most one interval
+runner	eval-summarise-only	--summarise-only	the closing pass that summarises a cell which died between its last generate call and its summary write, and refuses an unfinished one
+runner	no-rm-partial-trace	!rm -f[^#]*\.jsonl	forbidden: deleting a partial trace, which throws away paid-for records the cell would have resumed
+runner	work-state-exit	exited rc=	the work-state file records the exit code and reason, so the heartbeat says why the box stopped
+runner	done-marker-touch	touch "\$DONE_MARKER"	the agenda-complete marker touched as the runner's LAST act, after the final upload has returned (the test also asserts the order)

@@ -1,0 +1,1487 @@
+{
+  "cells": {
+    "arm-x|cell-y|framing-sweep::twin-pd::unstated::temptation-2@0": {
+      "examined": 10,
+      "skipped_empty": 1,
+      "not_judged": 1,
+      "errored": 1,
+      "coupling_clause_in_prompt": false,
+      "judged": 7,
+      "basis": {
+        "mirror": 3,
+        "convergence": 1,
+        "prosocial-other-regarding": 1,
+        "joint-pie-arithmetic": 0,
+        "ev-arithmetic": 0,
+        "risk-uncertainty": 0,
+        "dominance": 1,
+        "label-position-or-coin-flip": 0,
+        "story-or-label-semantics": 0,
+        "instruction-compliance": 1,
+        "benchmark-known-answer": 0,
+        "asserted-safety-without-arithmetic": 0,
+        "other": 0,
+        "unattributable": 0
+      },
+      "secondary_basis": {
+        "mirror": 0,
+        "convergence": 0,
+        "prosocial-other-regarding": 0,
+        "joint-pie-arithmetic": 0,
+        "ev-arithmetic": 0,
+        "risk-uncertainty": 0,
+        "dominance": 0,
+        "label-position-or-coin-flip": 0,
+        "story-or-label-semantics": 0,
+        "instruction-compliance": 0,
+        "benchmark-known-answer": 1,
+        "asserted-safety-without-arithmetic": 0,
+        "other": 0,
+        "unattributable": 0,
+        "null": 6
+      },
+      "counterpart_assumption": {
+        "copies-me": 3,
+        "correlated": 1,
+        "independent": 1,
+        "disclosed-and-matched": 1,
+        "disclosed-and-exploited": 0,
+        "not-discussed": 1
+      },
+      "diagonal_comparison": {
+        "none": 2,
+        "supporting": 1,
+        "only": 4
+      },
+      "evidence_not_found": 0,
+      "n_prompts": 3,
+      "keyword_agreement": {
+        "agree": 3,
+        "n": 7,
+        "rate": 0.42857142857142855
+      },
+      "keyword_disagreements": [
+        {
+          "key": "arm-x|cell-y|0|p0|1|canonical",
+          "judge": "dominance",
+          "judge_coarse": "none-matched",
+          "keyword": "mirror"
+        },
+        {
+          "key": "arm-x|cell-y|0|p1|0|canonical",
+          "judge": "prosocial-other-regarding",
+          "judge_coarse": "prosocial",
+          "keyword": "mirror"
+        },
+        {
+          "key": "arm-x|cell-y|0|p1|1|canonical",
+          "judge": "convergence",
+          "judge_coarse": "convergence",
+          "keyword": "mirror"
+        },
+        {
+          "key": "arm-x|cell-y|0|p2|1|canonical",
+          "judge": "instruction-compliance",
+          "judge_coarse": "none-matched",
+          "keyword": "mirror"
+        }
+      ],
+      "coupling_story": {
+        "k": 4,
+        "n": 7,
+        "share": 0.5714285714285714,
+        "ci95_lower": 0.18405156764008251,
+        "ci95_upper": 0.9010117215574922,
+        "upper_95_one_sided": 0.8712436071957572
+      },
+      "diagonal_comparison:only": {
+        "k": 4,
+        "n": 7,
+        "share": 0.5714285714285714,
+        "ci95_lower": 0.18405156764008251,
+        "ci95_upper": 0.9010117215574922,
+        "upper_95_one_sided": 0.8712436071957572
+      },
+      "diagonal_comparison:supporting": {
+        "k": 1,
+        "n": 7,
+        "share": 0.14285714285714285,
+        "ci95_lower": 0.0036102968619005785,
+        "ci95_upper": 0.5787231970431952,
+        "upper_95_one_sided": 0.5207029735913069
+      },
+      "dominance_raised": {
+        "k": 6,
+        "n": 7,
+        "share": 0.8571428571428571,
+        "ci95_lower": 0.42127680295680436,
+        "ci95_upper": 0.9963897031380995,
+        "upper_95_one_sided": 0.9926991680209853
+      },
+      "dominance_rejected": {
+        "k": 5,
+        "n": 7,
+        "share": 0.7142857142857143,
+        "ci95_lower": 0.2904208637373421,
+        "ci95_upper": 0.9633074338239145,
+        "upper_95_one_sided": 0.9466244995297628
+      },
+      "payoff_reasoning_present": {
+        "k": 6,
+        "n": 7,
+        "share": 0.8571428571428571,
+        "ci95_lower": 0.42127680295680436,
+        "ci95_upper": 0.9963897031380995,
+        "upper_95_one_sided": 0.9926991680209853
+      },
+      "prompt_mean": {
+        "coupling_story": 0.5555555555555556,
+        "diagonal_comparison:only": 0.5555555555555556,
+        "diagonal_comparison:supporting": 0.16666666666666666,
+        "dominance_raised": 0.8333333333333334,
+        "dominance_rejected": 0.7222222222222222,
+        "payoff_reasoning_present": 0.8333333333333334,
+        "basis:mirror": 0.3888888888888889,
+        "basis:convergence": 0.16666666666666666,
+        "basis:prosocial-other-regarding": 0.16666666666666666,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.1111111111111111,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.16666666666666666,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "clustered_2se": {
+        "coupling_story": 0.12244897959183675,
+        "diagonal_comparison:only": 0.12244897959183675,
+        "diagonal_comparison:supporting": 0.3081565075620714,
+        "dominance_raised": 0.3081565075620714,
+        "dominance_rejected": 0.2548978774856489,
+        "payoff_reasoning_present": 0.3081565075620714,
+        "basis:mirror": 0.3936183984078757,
+        "basis:convergence": 0.3081565075620714,
+        "basis:prosocial-other-regarding": 0.3081565075620714,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.2448979591836735,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.3081565075620714,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "drawn": {
+        "judged": 2,
+        "basis": {
+          "mirror": 1,
+          "convergence": 0,
+          "prosocial-other-regarding": 0,
+          "joint-pie-arithmetic": 0,
+          "ev-arithmetic": 0,
+          "risk-uncertainty": 0,
+          "dominance": 1,
+          "label-position-or-coin-flip": 0,
+          "story-or-label-semantics": 0,
+          "instruction-compliance": 0,
+          "benchmark-known-answer": 0,
+          "asserted-safety-without-arithmetic": 0,
+          "other": 0,
+          "unattributable": 0
+        },
+        "secondary_basis": {
+          "mirror": 0,
+          "convergence": 0,
+          "prosocial-other-regarding": 0,
+          "joint-pie-arithmetic": 0,
+          "ev-arithmetic": 0,
+          "risk-uncertainty": 0,
+          "dominance": 0,
+          "label-position-or-coin-flip": 0,
+          "story-or-label-semantics": 0,
+          "instruction-compliance": 0,
+          "benchmark-known-answer": 0,
+          "asserted-safety-without-arithmetic": 0,
+          "other": 0,
+          "unattributable": 0,
+          "null": 2
+        },
+        "counterpart_assumption": {
+          "copies-me": 1,
+          "correlated": 0,
+          "independent": 1,
+          "disclosed-and-matched": 0,
+          "disclosed-and-exploited": 0,
+          "not-discussed": 0
+        },
+        "diagonal_comparison": {
+          "none": 1,
+          "supporting": 0,
+          "only": 1
+        },
+        "evidence_not_found": 0,
+        "n_prompts": 1,
+        "keyword_agreement": {
+          "agree": 1,
+          "n": 2,
+          "rate": 0.5
+        },
+        "keyword_disagreements": [
+          {
+            "key": "arm-x|cell-y|0|p0|1|canonical",
+            "judge": "dominance",
+            "judge_coarse": "none-matched",
+            "keyword": "mirror"
+          }
+        ],
+        "coupling_story": {
+          "k": 1,
+          "n": 2,
+          "share": 0.5,
+          "ci95_lower": 0.012579117093425032,
+          "ci95_upper": 0.9874208829065749,
+          "upper_95_one_sided": 0.9746794344808964
+        },
+        "diagonal_comparison:only": {
+          "k": 1,
+          "n": 2,
+          "share": 0.5,
+          "ci95_lower": 0.012579117093425032,
+          "ci95_upper": 0.9874208829065749,
+          "upper_95_one_sided": 0.9746794344808964
+        },
+        "diagonal_comparison:supporting": {
+          "k": 0,
+          "n": 2,
+          "share": 0.0,
+          "ci95_lower": 0.0,
+          "ci95_upper": 0.841886116991581,
+          "upper_95_one_sided": 0.7763932022500208
+        },
+        "dominance_raised": {
+          "k": 2,
+          "n": 2,
+          "share": 1.0,
+          "ci95_lower": 0.15811388300841855,
+          "ci95_upper": 1.0,
+          "upper_95_one_sided": 1.0
+        },
+        "dominance_rejected": {
+          "k": 1,
+          "n": 2,
+          "share": 0.5,
+          "ci95_lower": 0.012579117093425032,
+          "ci95_upper": 0.9874208829065749,
+          "upper_95_one_sided": 0.9746794344808964
+        },
+        "payoff_reasoning_present": {
+          "k": 2,
+          "n": 2,
+          "share": 1.0,
+          "ci95_lower": 0.15811388300841855,
+          "ci95_upper": 1.0,
+          "upper_95_one_sided": 1.0
+        },
+        "prompt_mean": {
+          "coupling_story": 0.5,
+          "diagonal_comparison:only": 0.5,
+          "diagonal_comparison:supporting": 0.0,
+          "dominance_raised": 1.0,
+          "dominance_rejected": 0.5,
+          "payoff_reasoning_present": 1.0,
+          "basis:mirror": 0.5,
+          "basis:convergence": 0.0,
+          "basis:prosocial-other-regarding": 0.0,
+          "basis:joint-pie-arithmetic": 0.0,
+          "basis:ev-arithmetic": 0.0,
+          "basis:risk-uncertainty": 0.0,
+          "basis:dominance": 0.5,
+          "basis:label-position-or-coin-flip": 0.0,
+          "basis:story-or-label-semantics": 0.0,
+          "basis:instruction-compliance": 0.0,
+          "basis:benchmark-known-answer": 0.0,
+          "basis:asserted-safety-without-arithmetic": 0.0,
+          "basis:other": 0.0,
+          "basis:unattributable": 0.0
+        },
+        "clustered_2se": {
+          "coupling_story": null,
+          "diagonal_comparison:only": null,
+          "diagonal_comparison:supporting": null,
+          "dominance_raised": null,
+          "dominance_rejected": null,
+          "payoff_reasoning_present": null,
+          "basis:mirror": null,
+          "basis:convergence": null,
+          "basis:prosocial-other-regarding": null,
+          "basis:joint-pie-arithmetic": null,
+          "basis:ev-arithmetic": null,
+          "basis:risk-uncertainty": null,
+          "basis:dominance": null,
+          "basis:label-position-or-coin-flip": null,
+          "basis:story-or-label-semantics": null,
+          "basis:instruction-compliance": null,
+          "basis:benchmark-known-answer": null,
+          "basis:asserted-safety-without-arithmetic": null,
+          "basis:other": null,
+          "basis:unattributable": null
+        }
+      }
+    },
+    "arm-x|cell-y|framing-sweep::twin-pd::unstated::temptation-2@70": {
+      "examined": 6,
+      "skipped_empty": 0,
+      "not_judged": 0,
+      "errored": 0,
+      "coupling_clause_in_prompt": false,
+      "judged": 6,
+      "basis": {
+        "mirror": 6,
+        "convergence": 0,
+        "prosocial-other-regarding": 0,
+        "joint-pie-arithmetic": 0,
+        "ev-arithmetic": 0,
+        "risk-uncertainty": 0,
+        "dominance": 0,
+        "label-position-or-coin-flip": 0,
+        "story-or-label-semantics": 0,
+        "instruction-compliance": 0,
+        "benchmark-known-answer": 0,
+        "asserted-safety-without-arithmetic": 0,
+        "other": 0,
+        "unattributable": 0
+      },
+      "secondary_basis": {
+        "mirror": 0,
+        "convergence": 0,
+        "prosocial-other-regarding": 0,
+        "joint-pie-arithmetic": 0,
+        "ev-arithmetic": 0,
+        "risk-uncertainty": 0,
+        "dominance": 0,
+        "label-position-or-coin-flip": 0,
+        "story-or-label-semantics": 0,
+        "instruction-compliance": 0,
+        "benchmark-known-answer": 0,
+        "asserted-safety-without-arithmetic": 0,
+        "other": 0,
+        "unattributable": 0,
+        "null": 6
+      },
+      "counterpart_assumption": {
+        "copies-me": 2,
+        "correlated": 1,
+        "independent": 3,
+        "disclosed-and-matched": 0,
+        "disclosed-and-exploited": 0,
+        "not-discussed": 0
+      },
+      "diagonal_comparison": {
+        "none": 0,
+        "supporting": 0,
+        "only": 6
+      },
+      "evidence_not_found": 0,
+      "n_prompts": 3,
+      "keyword_agreement": {
+        "agree": 6,
+        "n": 6,
+        "rate": 1.0
+      },
+      "keyword_disagreements": [],
+      "coupling_story": {
+        "k": 3,
+        "n": 6,
+        "share": 0.5,
+        "ci95_lower": 0.11811724875702634,
+        "ci95_upper": 0.8818827512429748,
+        "upper_95_one_sided": 0.8468388820247768
+      },
+      "diagonal_comparison:only": {
+        "k": 6,
+        "n": 6,
+        "share": 1.0,
+        "ci95_lower": 0.540741873560104,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "diagonal_comparison:supporting": {
+        "k": 0,
+        "n": 6,
+        "share": 0.0,
+        "ci95_lower": 0.0,
+        "ci95_upper": 0.4592581264399004,
+        "upper_95_one_sided": 0.39303776899708265
+      },
+      "dominance_raised": {
+        "k": 6,
+        "n": 6,
+        "share": 1.0,
+        "ci95_lower": 0.540741873560104,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "dominance_rejected": {
+        "k": 6,
+        "n": 6,
+        "share": 1.0,
+        "ci95_lower": 0.540741873560104,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "payoff_reasoning_present": {
+        "k": 6,
+        "n": 6,
+        "share": 1.0,
+        "ci95_lower": 0.540741873560104,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "prompt_mean": {
+        "coupling_story": 0.5,
+        "diagonal_comparison:only": 1.0,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 1.0,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 1.0,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "clustered_2se": {
+        "coupling_story": 0.5773502691896257,
+        "diagonal_comparison:only": 0.0,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 0.0,
+        "dominance_rejected": 0.0,
+        "payoff_reasoning_present": 0.0,
+        "basis:mirror": 0.0,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "drawn": {
+        "judged": 0,
+        "basis": {
+          "mirror": 0,
+          "convergence": 0,
+          "prosocial-other-regarding": 0,
+          "joint-pie-arithmetic": 0,
+          "ev-arithmetic": 0,
+          "risk-uncertainty": 0,
+          "dominance": 0,
+          "label-position-or-coin-flip": 0,
+          "story-or-label-semantics": 0,
+          "instruction-compliance": 0,
+          "benchmark-known-answer": 0,
+          "asserted-safety-without-arithmetic": 0,
+          "other": 0,
+          "unattributable": 0
+        },
+        "secondary_basis": {
+          "mirror": 0,
+          "convergence": 0,
+          "prosocial-other-regarding": 0,
+          "joint-pie-arithmetic": 0,
+          "ev-arithmetic": 0,
+          "risk-uncertainty": 0,
+          "dominance": 0,
+          "label-position-or-coin-flip": 0,
+          "story-or-label-semantics": 0,
+          "instruction-compliance": 0,
+          "benchmark-known-answer": 0,
+          "asserted-safety-without-arithmetic": 0,
+          "other": 0,
+          "unattributable": 0,
+          "null": 0
+        },
+        "counterpart_assumption": {
+          "copies-me": 0,
+          "correlated": 0,
+          "independent": 0,
+          "disclosed-and-matched": 0,
+          "disclosed-and-exploited": 0,
+          "not-discussed": 0
+        },
+        "diagonal_comparison": {
+          "none": 0,
+          "supporting": 0,
+          "only": 0
+        },
+        "evidence_not_found": 0,
+        "n_prompts": 0,
+        "keyword_agreement": {
+          "agree": 0,
+          "n": 0,
+          "rate": null
+        },
+        "keyword_disagreements": [],
+        "coupling_story": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "diagonal_comparison:only": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "diagonal_comparison:supporting": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "dominance_raised": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "dominance_rejected": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "payoff_reasoning_present": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "prompt_mean": {
+          "coupling_story": null,
+          "diagonal_comparison:only": null,
+          "diagonal_comparison:supporting": null,
+          "dominance_raised": null,
+          "dominance_rejected": null,
+          "payoff_reasoning_present": null,
+          "basis:mirror": null,
+          "basis:convergence": null,
+          "basis:prosocial-other-regarding": null,
+          "basis:joint-pie-arithmetic": null,
+          "basis:ev-arithmetic": null,
+          "basis:risk-uncertainty": null,
+          "basis:dominance": null,
+          "basis:label-position-or-coin-flip": null,
+          "basis:story-or-label-semantics": null,
+          "basis:instruction-compliance": null,
+          "basis:benchmark-known-answer": null,
+          "basis:asserted-safety-without-arithmetic": null,
+          "basis:other": null,
+          "basis:unattributable": null
+        },
+        "clustered_2se": {
+          "coupling_story": null,
+          "diagonal_comparison:only": null,
+          "diagonal_comparison:supporting": null,
+          "dominance_raised": null,
+          "dominance_rejected": null,
+          "payoff_reasoning_present": null,
+          "basis:mirror": null,
+          "basis:convergence": null,
+          "basis:prosocial-other-regarding": null,
+          "basis:joint-pie-arithmetic": null,
+          "basis:ev-arithmetic": null,
+          "basis:risk-uncertainty": null,
+          "basis:dominance": null,
+          "basis:label-position-or-coin-flip": null,
+          "basis:story-or-label-semantics": null,
+          "basis:instruction-compliance": null,
+          "basis:benchmark-known-answer": null,
+          "basis:asserted-safety-without-arithmetic": null,
+          "basis:other": null,
+          "basis:unattributable": null
+        }
+      }
+    },
+    "arm-x|cell-y|game-behavior::pd-reskin::no-framing::temptation-2@0": {
+      "examined": 1,
+      "skipped_empty": 0,
+      "not_judged": 0,
+      "errored": 0,
+      "coupling_clause_in_prompt": false,
+      "judged": 1,
+      "basis": {
+        "mirror": 1,
+        "convergence": 0,
+        "prosocial-other-regarding": 0,
+        "joint-pie-arithmetic": 0,
+        "ev-arithmetic": 0,
+        "risk-uncertainty": 0,
+        "dominance": 0,
+        "label-position-or-coin-flip": 0,
+        "story-or-label-semantics": 0,
+        "instruction-compliance": 0,
+        "benchmark-known-answer": 0,
+        "asserted-safety-without-arithmetic": 0,
+        "other": 0,
+        "unattributable": 0
+      },
+      "secondary_basis": {
+        "mirror": 0,
+        "convergence": 0,
+        "prosocial-other-regarding": 0,
+        "joint-pie-arithmetic": 0,
+        "ev-arithmetic": 0,
+        "risk-uncertainty": 0,
+        "dominance": 0,
+        "label-position-or-coin-flip": 0,
+        "story-or-label-semantics": 0,
+        "instruction-compliance": 0,
+        "benchmark-known-answer": 0,
+        "asserted-safety-without-arithmetic": 0,
+        "other": 0,
+        "unattributable": 0,
+        "null": 1
+      },
+      "counterpart_assumption": {
+        "copies-me": 1,
+        "correlated": 0,
+        "independent": 0,
+        "disclosed-and-matched": 0,
+        "disclosed-and-exploited": 0,
+        "not-discussed": 0
+      },
+      "diagonal_comparison": {
+        "none": 0,
+        "supporting": 0,
+        "only": 1
+      },
+      "evidence_not_found": 0,
+      "n_prompts": 1,
+      "keyword_agreement": {
+        "agree": 1,
+        "n": 1,
+        "rate": 1.0
+      },
+      "keyword_disagreements": [],
+      "coupling_story": {
+        "k": 1,
+        "n": 1,
+        "share": 1.0,
+        "ci95_lower": 0.024999999999999967,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "diagonal_comparison:only": {
+        "k": 1,
+        "n": 1,
+        "share": 1.0,
+        "ci95_lower": 0.024999999999999967,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "diagonal_comparison:supporting": {
+        "k": 0,
+        "n": 1,
+        "share": 0.0,
+        "ci95_lower": 0.0,
+        "ci95_upper": 0.9749999999999999,
+        "upper_95_one_sided": 0.95
+      },
+      "dominance_raised": {
+        "k": 1,
+        "n": 1,
+        "share": 1.0,
+        "ci95_lower": 0.024999999999999967,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "dominance_rejected": {
+        "k": 1,
+        "n": 1,
+        "share": 1.0,
+        "ci95_lower": 0.024999999999999967,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "payoff_reasoning_present": {
+        "k": 1,
+        "n": 1,
+        "share": 1.0,
+        "ci95_lower": 0.024999999999999967,
+        "ci95_upper": 1.0,
+        "upper_95_one_sided": 1.0
+      },
+      "prompt_mean": {
+        "coupling_story": 1.0,
+        "diagonal_comparison:only": 1.0,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 1.0,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 1.0,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "clustered_2se": {
+        "coupling_story": null,
+        "diagonal_comparison:only": null,
+        "diagonal_comparison:supporting": null,
+        "dominance_raised": null,
+        "dominance_rejected": null,
+        "payoff_reasoning_present": null,
+        "basis:mirror": null,
+        "basis:convergence": null,
+        "basis:prosocial-other-regarding": null,
+        "basis:joint-pie-arithmetic": null,
+        "basis:ev-arithmetic": null,
+        "basis:risk-uncertainty": null,
+        "basis:dominance": null,
+        "basis:label-position-or-coin-flip": null,
+        "basis:story-or-label-semantics": null,
+        "basis:instruction-compliance": null,
+        "basis:benchmark-known-answer": null,
+        "basis:asserted-safety-without-arithmetic": null,
+        "basis:other": null,
+        "basis:unattributable": null
+      },
+      "drawn": {
+        "judged": 0,
+        "basis": {
+          "mirror": 0,
+          "convergence": 0,
+          "prosocial-other-regarding": 0,
+          "joint-pie-arithmetic": 0,
+          "ev-arithmetic": 0,
+          "risk-uncertainty": 0,
+          "dominance": 0,
+          "label-position-or-coin-flip": 0,
+          "story-or-label-semantics": 0,
+          "instruction-compliance": 0,
+          "benchmark-known-answer": 0,
+          "asserted-safety-without-arithmetic": 0,
+          "other": 0,
+          "unattributable": 0
+        },
+        "secondary_basis": {
+          "mirror": 0,
+          "convergence": 0,
+          "prosocial-other-regarding": 0,
+          "joint-pie-arithmetic": 0,
+          "ev-arithmetic": 0,
+          "risk-uncertainty": 0,
+          "dominance": 0,
+          "label-position-or-coin-flip": 0,
+          "story-or-label-semantics": 0,
+          "instruction-compliance": 0,
+          "benchmark-known-answer": 0,
+          "asserted-safety-without-arithmetic": 0,
+          "other": 0,
+          "unattributable": 0,
+          "null": 0
+        },
+        "counterpart_assumption": {
+          "copies-me": 0,
+          "correlated": 0,
+          "independent": 0,
+          "disclosed-and-matched": 0,
+          "disclosed-and-exploited": 0,
+          "not-discussed": 0
+        },
+        "diagonal_comparison": {
+          "none": 0,
+          "supporting": 0,
+          "only": 0
+        },
+        "evidence_not_found": 0,
+        "n_prompts": 0,
+        "keyword_agreement": {
+          "agree": 0,
+          "n": 0,
+          "rate": null
+        },
+        "keyword_disagreements": [],
+        "coupling_story": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "diagonal_comparison:only": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "diagonal_comparison:supporting": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "dominance_raised": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "dominance_rejected": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "payoff_reasoning_present": {
+          "k": 0,
+          "n": 0,
+          "share": null,
+          "ci95_lower": null,
+          "ci95_upper": null,
+          "upper_95_one_sided": null
+        },
+        "prompt_mean": {
+          "coupling_story": null,
+          "diagonal_comparison:only": null,
+          "diagonal_comparison:supporting": null,
+          "dominance_raised": null,
+          "dominance_rejected": null,
+          "payoff_reasoning_present": null,
+          "basis:mirror": null,
+          "basis:convergence": null,
+          "basis:prosocial-other-regarding": null,
+          "basis:joint-pie-arithmetic": null,
+          "basis:ev-arithmetic": null,
+          "basis:risk-uncertainty": null,
+          "basis:dominance": null,
+          "basis:label-position-or-coin-flip": null,
+          "basis:story-or-label-semantics": null,
+          "basis:instruction-compliance": null,
+          "basis:benchmark-known-answer": null,
+          "basis:asserted-safety-without-arithmetic": null,
+          "basis:other": null,
+          "basis:unattributable": null
+        },
+        "clustered_2se": {
+          "coupling_story": null,
+          "diagonal_comparison:only": null,
+          "diagonal_comparison:supporting": null,
+          "dominance_raised": null,
+          "dominance_rejected": null,
+          "payoff_reasoning_present": null,
+          "basis:mirror": null,
+          "basis:convergence": null,
+          "basis:prosocial-other-regarding": null,
+          "basis:joint-pie-arithmetic": null,
+          "basis:ev-arithmetic": null,
+          "basis:risk-uncertainty": null,
+          "basis:dominance": null,
+          "basis:label-position-or-coin-flip": null,
+          "basis:story-or-label-semantics": null,
+          "basis:instruction-compliance": null,
+          "basis:benchmark-known-answer": null,
+          "basis:asserted-safety-without-arithmetic": null,
+          "basis:other": null,
+          "basis:unattributable": null
+        }
+      }
+    }
+  },
+  "prompts": {
+    "arm-x|cell-y|framing-sweep::twin-pd::unstated::temptation-2@0": {
+      "p0": {
+        "n": 3,
+        "coupling_story": 0.6666666666666666,
+        "diagonal_comparison:only": 0.6666666666666666,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 0.6666666666666666,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 0.6666666666666666,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.3333333333333333,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "p1": {
+        "n": 2,
+        "coupling_story": 0.5,
+        "diagonal_comparison:only": 0.5,
+        "diagonal_comparison:supporting": 0.5,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 1.0,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 0.0,
+        "basis:convergence": 0.5,
+        "basis:prosocial-other-regarding": 0.5,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "p2": {
+        "n": 2,
+        "coupling_story": 0.5,
+        "diagonal_comparison:only": 0.5,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 0.5,
+        "dominance_rejected": 0.5,
+        "payoff_reasoning_present": 0.5,
+        "basis:mirror": 0.5,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.5,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      }
+    },
+    "arm-x|cell-y|framing-sweep::twin-pd::unstated::temptation-2@70": {
+      "p0": {
+        "n": 2,
+        "coupling_story": 1.0,
+        "diagonal_comparison:only": 1.0,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 1.0,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 1.0,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "p1": {
+        "n": 2,
+        "coupling_story": 0.5,
+        "diagonal_comparison:only": 1.0,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 1.0,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 1.0,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      },
+      "p2": {
+        "n": 2,
+        "coupling_story": 0.0,
+        "diagonal_comparison:only": 1.0,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 1.0,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 1.0,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      }
+    },
+    "arm-x|cell-y|game-behavior::pd-reskin::no-framing::temptation-2@0": {
+      "pd-reskin--other-frame--temptation-2--coop0": {
+        "n": 1,
+        "coupling_story": 1.0,
+        "diagonal_comparison:only": 1.0,
+        "diagonal_comparison:supporting": 0.0,
+        "dominance_raised": 1.0,
+        "dominance_rejected": 1.0,
+        "payoff_reasoning_present": 1.0,
+        "basis:mirror": 1.0,
+        "basis:convergence": 0.0,
+        "basis:prosocial-other-regarding": 0.0,
+        "basis:joint-pie-arithmetic": 0.0,
+        "basis:ev-arithmetic": 0.0,
+        "basis:risk-uncertainty": 0.0,
+        "basis:dominance": 0.0,
+        "basis:label-position-or-coin-flip": 0.0,
+        "basis:story-or-label-semantics": 0.0,
+        "basis:instruction-compliance": 0.0,
+        "basis:benchmark-known-answer": 0.0,
+        "basis:asserted-safety-without-arithmetic": 0.0,
+        "basis:other": 0.0,
+        "basis:unattributable": 0.0
+      }
+    }
+  },
+  "deltas": {
+    "arm-x|cell-y|framing-sweep::twin-pd::unstated::temptation-2": {
+      "steps": [
+        0,
+        70
+      ],
+      "dimensions": {
+        "coupling_story": {
+          "delta": -0.055555555555555546,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.48432210483785265,
+          "quadrature_2se": 0.5879447357921314,
+          "clustered_2se": 0.5901924143331693,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.5555555555555556,
+            "70": 0.5
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "diagonal_comparison:only": {
+          "delta": 0.4444444444444445,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.11111111111111109,
+          "quadrature_2se": 0.11111111111111109,
+          "clustered_2se": 0.12244897959183675,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.5555555555555556,
+            "70": 1.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "diagonal_comparison:supporting": {
+          "delta": -0.16666666666666666,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.3333333333333333,
+          "quadrature_2se": 0.3333333333333333,
+          "clustered_2se": 0.3081565075620714,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.16666666666666666,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "dominance_raised": {
+          "delta": 0.16666666666666666,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.3333333333333333,
+          "quadrature_2se": 0.3333333333333333,
+          "clustered_2se": 0.3081565075620714,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.8333333333333334,
+            "70": 1.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "dominance_rejected": {
+          "delta": 0.2777777777777778,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.2939723678960657,
+          "quadrature_2se": 0.2939723678960657,
+          "clustered_2se": 0.2548978774856489,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.7222222222222222,
+            "70": 1.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "payoff_reasoning_present": {
+          "delta": 0.16666666666666666,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.3333333333333333,
+          "quadrature_2se": 0.3333333333333333,
+          "clustered_2se": 0.3081565075620714,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.8333333333333334,
+            "70": 1.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:mirror": {
+          "delta": 0.6111111111111112,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.40061680838488767,
+          "quadrature_2se": 0.40061680838488767,
+          "clustered_2se": 0.3936183984078757,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.3888888888888889,
+            "70": 1.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:convergence": {
+          "delta": -0.16666666666666666,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.3333333333333333,
+          "quadrature_2se": 0.3333333333333333,
+          "clustered_2se": 0.3081565075620714,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.16666666666666666,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:prosocial-other-regarding": {
+          "delta": -0.16666666666666666,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.3333333333333333,
+          "quadrature_2se": 0.3333333333333333,
+          "clustered_2se": 0.3081565075620714,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.16666666666666666,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:joint-pie-arithmetic": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:ev-arithmetic": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:risk-uncertainty": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:dominance": {
+          "delta": -0.1111111111111111,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.2222222222222222,
+          "quadrature_2se": 0.2222222222222222,
+          "clustered_2se": 0.2448979591836735,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.1111111111111111,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:label-position-or-coin-flip": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:story-or-label-semantics": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:instruction-compliance": {
+          "delta": -0.16666666666666666,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.3333333333333333,
+          "quadrature_2se": 0.3333333333333333,
+          "clustered_2se": 0.3081565075620714,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.16666666666666666,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:benchmark-known-answer": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:asserted-safety-without-arithmetic": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:other": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        },
+        "basis:unattributable": {
+          "delta": 0.0,
+          "band_method": "paired-between-prompt",
+          "paired_2se": 0.0,
+          "quadrature_2se": 0.0,
+          "clustered_2se": 0.0,
+          "n_paired": 3,
+          "n_unpaired": 0,
+          "level": {
+            "0": 0.0,
+            "70": 0.0
+          },
+          "n_prompts": {
+            "0": 3,
+            "70": 3
+          }
+        }
+      }
+    }
+  },
+  "dimensions": [
+    "coupling_story",
+    "diagonal_comparison:only",
+    "diagonal_comparison:supporting",
+    "dominance_raised",
+    "dominance_rejected",
+    "payoff_reasoning_present",
+    "basis:mirror",
+    "basis:convergence",
+    "basis:prosocial-other-regarding",
+    "basis:joint-pie-arithmetic",
+    "basis:ev-arithmetic",
+    "basis:risk-uncertainty",
+    "basis:dominance",
+    "basis:label-position-or-coin-flip",
+    "basis:story-or-label-semantics",
+    "basis:instruction-compliance",
+    "basis:benchmark-known-answer",
+    "basis:asserted-safety-without-arithmetic",
+    "basis:other",
+    "basis:unattributable"
+  ],
+  "drawn_rows_unmatched": 1
+}

@@ -1,0 +1,511 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "Planted adversarial completions for the self-report battery's parsers, with the parse each",
+    "one must produce. Every string here was written for this file: none of it is instrument text,",
+    "none of it is benchmark material, so this file is tracked while games/data/survey/ is not.",
+    "",
+    "Cases marked known_unparsed are unparseable ON PURPOSE. They are the documented floor of the",
+    "section's parse-failure rate: a model that answers only in prose, or spells its anchor out",
+    "instead of writing the letter, is a measurement gap rather than a bug, and the alternative --",
+    "guessing which option 'I would say Agree' meant -- is the judgement that must never touch a",
+    "scored number. A future change that starts parsing one of these has to edit this file and say",
+    "so, which is the whole reason the expectation is written down rather than merely observed.",
+    "",
+    "expected is the PRESENTED index for a lettered case (what parse_final_answer returns, before",
+    "the caller maps it back through the presentation order), the integer for a numeric case, and",
+    "the vocabulary word for a tagged one. null means no usable answer.",
+    "",
+    "Every value below was produced by running the real parsers, not predicted from reading them."
+  ],
+  "cases": [
+    {
+      "name": "lettered-plain",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: C",
+      "expected": 2,
+      "known_unparsed": false,
+      "why": "The format the instruction asks for."
+    },
+    {
+      "name": "lettered-lowercase",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>final answer: c",
+      "expected": 2,
+      "known_unparsed": false,
+      "why": "Case-insensitive: a model that lowercases the line still answered."
+    },
+    {
+      "name": "lettered-parenthesised",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: (D)",
+      "expected": 3,
+      "known_unparsed": false,
+      "why": "Wrapping the letter in the parenthesis the option list uses is still one letter."
+    },
+    {
+      "name": "lettered-trailing-period",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: B.",
+      "expected": 1,
+      "known_unparsed": false,
+      "why": "Sentence punctuation after the letter does not make it two letters."
+    },
+    {
+      "name": "lettered-markdown-bold",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>**FINAL ANSWER: E**",
+      "expected": 4,
+      "known_unparsed": false,
+      "why": "Models emphasise the final line; the asterisks are not part of the answer."
+    },
+    {
+      "name": "lettered-extra-whitespace",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL  ANSWER:   A",
+      "expected": 0,
+      "known_unparsed": false,
+      "why": "Whitespace inside the marker and after the colon is tolerated."
+    },
+    {
+      "name": "lettered-no-space-after-colon",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER:A",
+      "expected": 0,
+      "known_unparsed": false,
+      "why": "Same answer, one character shorter."
+    },
+    {
+      "name": "lettered-last-answer-wins",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: A\nOn reflection, FINAL ANSWER: D",
+      "expected": 3,
+      "known_unparsed": false,
+      "why": "A model that revises its answer meant the revision, so the last match wins."
+    },
+    {
+      "name": "lettered-other-option-mentioned-after",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: A\nThough B is defensible.",
+      "expected": 0,
+      "known_unparsed": false,
+      "why": "Only a FINAL ANSWER line counts, so hedging prose after it cannot move the answer."
+    },
+    {
+      "name": "lettered-spelled-out-anchor-agree",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>I would say Agree.",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A completion that abandons the answer format entirely and names its anchor in prose. Corrected 2026-08-22: this case does NOT reach the standalone-letter lookahead, because there is no FINAL ANSWER line for the pattern to anchor on at all, so deleting the lookahead leaves it unparsed exactly as it is here. The lookahead's own case is lettered-anchor-word-on-the-answer-line-agree below."
+    },
+    {
+      "name": "lettered-spelled-out-anchor-almost",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>Almost always true.",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The frequency-ladder form of the case above: prose, no answer line, and so also not a test of the lookahead."
+    },
+    {
+      "name": "lettered-anchor-word-on-the-answer-line-agree",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: Agree",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "THE load-bearing case, and the only fixture that reaches the standalone-letter lookahead in FINAL_ANSWER_PATTERN: the model uses the requested format and writes its anchor word where the letter goes. This is the medical-newcomb 'Avoid'-read-as-'A' bug in its Likert form -- without the lookahead the leading 'A' parses as option A, a confident answer at the opposite end of the scale from the one the model wrote. Deleting the lookahead is the sabotage this case goes red under."
+    },
+    {
+      "name": "lettered-anchor-word-on-the-answer-line-almost",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: Almost always",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The frequency-ladder form of the load-bearing case, one anchor over: the ladders begin with 'Almost', which is the same leading 'A' on the answer line."
+    },
+    {
+      "name": "lettered-negated-number-prose",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>not 4 but 2",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "Contrastive prose. Reading it needs a judge, and a judge would be reading a negation, which is where judges are worst."
+    },
+    {
+      "name": "lettered-letter-past-option-count",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: F",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A 5-point scale has no option F; clamping it to E would invent an extreme answer."
+    },
+    {
+      "name": "lettered-digit-instead-of-letter",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: 3",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "Numbering a Likert ladder is natural and the instruction asks for a letter, so this is an honest failure rather than a silent off-by-one between the two conventions."
+    },
+    {
+      "name": "lettered-two-letters",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER: BB",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The lookahead requires the letter to stand alone, so a doubled letter is not a B."
+    },
+    {
+      "name": "lettered-full-width-colon",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>FINAL ANSWER：C",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A full-width colon is a real and repeatable failure mode on a multilingual model, and it is recorded as a floor rather than fixed here: widening the pattern is a change to a parser shared with the decision-theory battery, whose published comparability rests on it."
+    },
+    {
+      "name": "lettered-answer-only-inside-thinking",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "prefilled_think": false,
+      "completion": "<think>The best option is FINAL ANSWER: C</think>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A choice mentioned inside the thinking block is reasoning, not an answer. strip_thinking cuts to the last closing tag first, so this is empty by the time a parser sees it -- which is what stops a model's own deliberation from being scored as its answer."
+    },
+    {
+      "name": "lettered-thinking-never-closed",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "prefilled_think": true,
+      "completion": "still weighing the options and FINAL ANSWER: C",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "With a prefilled opening tag, a completion showing no closing tag ran into the token budget. It reports as truncated rather than parsed, so a rising generation cap cannot read as a preference shift."
+    },
+    {
+      "name": "lettered-refusal",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>I do not have personal preferences, so I cannot answer this.",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A refusal is not a datum. It belongs in the parse-failure rate with its denominator, never averaged in as a midpoint."
+    },
+    {
+      "name": "lettered-empty",
+      "answer_shape": "lettered",
+      "n_options": 5,
+      "completion": "reasoning</think>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "An empty visible answer is the degenerate case and must not resolve to option A."
+    },
+    {
+      "name": "lettered-nine-option-slider",
+      "answer_shape": "lettered",
+      "n_options": 9,
+      "completion": "reasoning</think>FINAL ANSWER: I",
+      "expected": 8,
+      "known_unparsed": false,
+      "why": "The allocation slider offers nine options, so the ninth letter is in range there and out of range on a Likert item -- the option count is per item, never global."
+    },
+    {
+      "name": "lettered-three-option-triple",
+      "answer_shape": "lettered",
+      "n_options": 3,
+      "completion": "reasoning</think>FINAL ANSWER: D",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The same letter that is valid on a nine-option slider is out of range on a three-option triple."
+    },
+    {
+      "name": "numeric-plain",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think>I would cooperate most of the time: <keep>73</keep>",
+      "expected": 73,
+      "known_unparsed": false,
+      "why": "The format the numeric instruction asks for."
+    },
+    {
+      "name": "numeric-zero",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep> 0 </keep>",
+      "expected": 0,
+      "known_unparsed": false,
+      "why": "Zero is a real answer, and padding it with spaces does not change that. A parser that treated an unparsed answer as 0 would be indistinguishable from this case, which is why the two are separate fixtures."
+    },
+    {
+      "name": "numeric-upper-bound",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>100</keep>",
+      "expected": 100,
+      "known_unparsed": false,
+      "why": "The bound is inclusive; an always-cooperate prediction has to be expressible."
+    },
+    {
+      "name": "numeric-above-bound",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>101</keep>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "Out of range is a parse failure rather than a clamp: clamping rewards a model for writing an impossible number and hides it from the parse-rate metrics."
+    },
+    {
+      "name": "numeric-negative",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>-5</keep>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "Same reason as above, at the other end."
+    },
+    {
+      "name": "numeric-decimal",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>73.5</keep>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A fraction is refused rather than truncated, because truncating silently biases every prediction downward."
+    },
+    {
+      "name": "numeric-spelled-out",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>seventy</keep>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "Words in the tag are a failure; number-word parsing is a second parser to get wrong."
+    },
+    {
+      "name": "numeric-last-tag-wins",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think>First I thought <keep>20</keep>, but <keep>80</keep>",
+      "expected": 80,
+      "known_unparsed": false,
+      "why": "A revised answer is the revision, matching every other tag parser here."
+    },
+    {
+      "name": "numeric-percent-prose-no-tag",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think>About 73% of the time.",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The right answer in the wrong format. Reading it means picking a number out of prose, which would also pick one out of 'about 3 in 4'."
+    },
+    {
+      "name": "numeric-unclosed-tag",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>73",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "An unclosed tag is often a truncated completion, and treating it as an answer would score the generation cap."
+    },
+    {
+      "name": "numeric-uppercase-tag",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><KEEP>42</KEEP>",
+      "expected": 42,
+      "known_unparsed": false,
+      "why": "Tag matching is case-insensitive, so shouting the tag still answers."
+    },
+    {
+      "name": "numeric-leading-zeros",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>0073</keep>",
+      "expected": 73,
+      "known_unparsed": false,
+      "why": "Zero-padding is cosmetic."
+    },
+    {
+      "name": "numeric-explicit-plus-sign",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>+50</keep>",
+      "expected": 50,
+      "known_unparsed": false,
+      "why": "A signed positive integer is accepted, which is worth pinning because the same regex is what refuses the negative case."
+    },
+    {
+      "name": "numeric-full-width-digits",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>７３</keep>",
+      "expected": 73,
+      "known_unparsed": false,
+      "why": "SURPRISING AND PINNED DELIBERATELY. Python's regex digit class and int() are both Unicode-aware, so full-width digits parse as 73 rather than failing. Nobody designed that; it is recorded here so a later 'tighten the integer pattern to ASCII' change has to notice it is dropping answers a multilingual model really produces."
+    },
+    {
+      "name": "tagged-plain",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think>I try to find the joint gain. <stance>cooperative</stance>",
+      "expected": "cooperative",
+      "known_unparsed": false,
+      "why": "The format the tagged instruction asks for. Only the tag is ever counted; the free text beside it is archived for a human read and as interpretability stimuli, and no rate in the battery is computed from it."
+    },
+    {
+      "name": "tagged-case-and-whitespace",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think><stance> Competitive </stance>",
+      "expected": "competitive",
+      "known_unparsed": false,
+      "why": "Stripped and case-folded before matching, then matched exactly."
+    },
+    {
+      "name": "tagged-outside-vocabulary",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think><stance>selfish</stance>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A forced tag offers a closed menu, so a word outside it means the instruction did not land. Deliberately unlike parse_theory, which classifies unknown contents as 'other' because its answer space is genuinely open."
+    },
+    {
+      "name": "tagged-last-tag-wins",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think><stance>neither</stance> — actually, <stance>competitive</stance>",
+      "expected": "competitive",
+      "known_unparsed": false,
+      "why": "Consistent with every other tag parser in the repo."
+    },
+    {
+      "name": "tagged-prose-only",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think>I would describe myself as cooperative.",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The word is present and the tag is not. Matching the bare word would also match it inside 'not especially cooperative'."
+    },
+    {
+      "name": "tagged-two-words-in-one-tag",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think><stance>cooperative and competitive</stance>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "A tag naming two menu items is not one answer, and picking the first would let declaration order choose the model's stance for it."
+    },
+    {
+      "name": "tagged-empty-tag",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think><stance></stance>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "An emitted but empty tag is the format landing and the answer not."
+    },
+    {
+      "name": "tagged-placeholder-echoed-verbatim",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think><stance>LABEL</stance>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The instruction's example uses the placeholder word LABEL so no real option is primed (repair R4); a model that echoes the placeholder instead of substituting its word has not answered, and reading it as one would score the instruction template."
+    },
+    {
+      "name": "tagged-placeholder-echo-then-real-answer",
+      "answer_shape": "tagged",
+      "vocabulary": [
+        "cooperative",
+        "competitive",
+        "neither"
+      ],
+      "completion": "reasoning</think>I weigh both sides. <stance>LABEL</stance>\nOn reflection: <stance>neither</stance>",
+      "expected": "neither",
+      "known_unparsed": false,
+      "why": "A model that first parrots the placeholder example and then answers for real meant the real answer; the last tag wins, matching every other tag parser here."
+    },
+    {
+      "name": "numeric-number-as-tag",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think>In every one of the hundred I would pick it. <100>",
+      "expected": null,
+      "known_unparsed": true,
+      "why": "The live failure shape from the 2026-08-22 L4 smoke that armed the rotated-example fallback: without a worked example, a 2B writes the number AS the tag. It must stay a parse failure -- reading it would mean guessing which bare bracketed number was meant as an answer."
+    },
+    {
+      "name": "numeric-example-echo-then-real-answer",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think>The format is <keep>60</keep>, and my own figure is <keep>85</keep>",
+      "expected": 85,
+      "known_unparsed": false,
+      "why": "The rotated worked example echoed verbatim must not shadow the real answer; the last keep tag wins."
+    },
+    {
+      "name": "numeric-example-echo-only",
+      "answer_shape": "numeric",
+      "numeric_max": 100,
+      "completion": "reasoning</think><keep>60</keep>",
+      "expected": 60,
+      "known_unparsed": false,
+      "why": "An echoed example alone is structurally indistinguishable from a genuine answer of the same value -- any in-range example is a legal answer. This is the anchoring hazard the rotation exists to bound: the record carries numeric_example, so the answer-equals-example rate is readable off the trace instead of invisible."
+    }
+  ]
+}
