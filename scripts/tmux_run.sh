@@ -181,7 +181,11 @@ quoted_log="$(printf '%q' "$log")"
 # `status`, which is a read-only parameter in zsh, the login shell tmux runs this under.
 session_command="set -o pipefail;${quoted_command} 2>&1 | tee ${quoted_log}; rc=\$?; [ -s ${quoted_log} ] && [ -n \"\$(tail -c1 ${quoted_log})\" ] && echo >> ${quoted_log}; echo EXITCODE=\$rc >> ${quoted_log}"
 
-if ! tmux new-session -d -s "$name" -c "$PWD" -e "PATH=$PATH" "$session_command"; then
+# PATH rides inside the command string rather than through `new-session -e`, which tmux only grew in
+# 3.2 (Ubuntu 20.04 ships 3.0a); a literal argument reaches the session on every version.
+session_command="export PATH=$(printf '%q' "$PATH"); $session_command"
+
+if ! tmux new-session -d -s "$name" -c "$PWD" "$session_command"; then
   echo "tmux_run: tmux refused to create session $name; nothing is running." >&2
   exit "$TMUX_EXIT"
 fi

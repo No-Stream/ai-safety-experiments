@@ -76,7 +76,9 @@ readonly OOM_EXIT=137
 cpus=$((TOTAL_CPUS * 3 / 4))
 chdir="$PWD"
 mem_high=""
-mem_max="$(numfmt --to=iec $((TOTAL_MEM_KIB * 1024 * 5 / 8)))"
+# Spelled in whole MiB rather than through `numfmt --to=iec`, which keeps three significant digits and
+# on a 31 GiB host rounded 19.56G up to 20G, a 2.25% overshoot of the intended cap.
+mem_max="$((TOTAL_MEM_KIB * 5 / 8 / 1024))M"
 timeout=""
 tasks_max=4096
 nice=10

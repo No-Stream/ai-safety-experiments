@@ -204,7 +204,8 @@ class TestTmuxRunLaunch:
         result = run_helper(stubs, "cell-run", "--log", str(log), "--", "echo", "hi")
         assert result.returncode == 0, result.stderr
         session_command = new_session_call(stubs.calls)[-1]
-        assert session_command.startswith("set -o pipefail;")
+        assert session_command.startswith("export PATH=")
+        assert "; set -o pipefail;" in session_command
         assert f"| tee {log}" in session_command
         # A bare $? under pipefail (zsh lacks ${PIPESTATUS[0]}), captured before the newline check runs.
         assert f"| tee {log}; rc=$?;" in session_command
@@ -240,8 +241,10 @@ class TestTmuxRunLaunch:
         call = new_session_call(stubs.calls)
         assert "-d" in call
         assert call[call.index("-c") + 1] == str(work_dir)
-        assert call[call.index("-e") + 1].startswith("PATH=")
-        assert str(stubs.bin_dir) in call[call.index("-e") + 1]
+        # Inside the command string, not `new-session -e`: that flag needs tmux 3.2 and the box has 3.0a.
+        assert "-e" not in call
+        assert call[-1].startswith("export PATH=")
+        assert str(stubs.bin_dir) in call[-1]
 
     def test_an_existing_session_is_checked_for_by_exact_name(self, stubs: GateStubs) -> None:
         """Without the '=' prefix has-session matches by prefix, so `ci` would look taken by `ci-2`."""
