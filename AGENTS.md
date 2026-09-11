@@ -76,6 +76,14 @@ backwards. The game is maximising ideas tested per unit of GPU time, not minimis
 - **The characteristic failure is a run repeated because a metric was missing** (the `Trainer.log`
   bug below). Instrument generously, keep artifacts, so a gap is a re-analysis, not a re-run.
 
+**One card, no cloud spend, so cheap beats complete** (the owner, 2026-09-10). Every GPU hour is now
+an hour of the only card there is, which sharpens the minimum-viable-run rule rather than changing
+it: run the smallest thing that gets a vibe on the idea, read it, then follow up with the next probe.
+Trim long rollouts before reaching for more compute — 8K-12K completion caps, repetition and presence
+penalties, and a lower reasoning budget are the first moves, and a 32K cap is a deliberate choice made
+after a shorter one has shown it is not enough. Cheap inference is the same lever: batched offline
+generation beats another RL arm whenever the question can be asked of samples.
+
 **The hot paths have been audited once, and the ranked backlog lives in `docs/scratch`**
 (2026-09-02). Six read-only audits of where the compute and the waiting actually went, covering the
 GRPO training step, the eval cells, the interp legs, hosted inference, box bootstrap and the
@@ -143,11 +151,12 @@ is the honest ledger of which gates have teeth and which are merely green.
 Same instinct for reading: do not assert a file path, column name, or API signature you have not
 opened this session. "I'm assuming X, unverified" is complete and welcome; a confident guess is not.
 
-## Smoke test end to end before every Batch run
+## Smoke test end to end before every expensive run
 
-**A Batch run you have never watched complete locally is a check you have never watched fail.** Run
-quick couple-minute end-to-end smoke tests locally, then go to Batch with confidence. Firing Batch
-runs without local testing is a cycle of never-ending paper cuts that wastes days.
+**A run you have never watched complete at smoke scale is a check you have never watched fail.** Run
+quick couple-minute end-to-end smoke tests at the 0.8B tier, then launch the multi-hour run with
+confidence. Firing an expensive run, local or cloud, without a smoke first is a cycle of
+never-ending paper cuts that wastes days.
 
 **End-to-end beats unit-level** — the paper cuts live in the seams (config keys renamed upstream,
 checkpoint paths, artifact upload, container env vars, what got baked into the image), not the
@@ -156,28 +165,45 @@ components. The question is "does the whole path execute," not "does it learn." 
 keys, a silently-ignored `torch_dtype`, a Liger segfault in TRL eval, and the unrecorded-accuracy
 bug; four of the five were silent.)
 
-**The local L4 is not a training machine** — a 4B run of any length is days of wall clock and the
-reference batch does not fit. It is genuinely good for smoke tests, offline batched inference (~10x
-the episode rate of an RL loop), activation capture for interpretability, and 0.6B training. Two
-Batch prerequisites, both silent on failure: push `:latest` and `:<sha>` together but only ever
-*resolve* `:latest`; re-register a fresh job definition at every submit — Batch binds a tag to a
-digest at registration time, so reusing an old revision runs old code without saying so.
+**The local 5090 is the training machine now** (the owner, 2026-09-10), so a long run belongs here
+rather than on a rented box; what fits in its 32 GB is the subject of "Machines and models" below.
+It is also where smoke tests, offline batched inference (~10x the episode rate of an RL loop) and
+activation capture for interpretability run. Two Batch prerequisites still hold wherever the cloud
+path is used, both silent on failure: push `:latest` and `:<sha>` together but only ever *resolve*
+`:latest`; re-register a fresh job definition at every submit — Batch binds a tag to a digest at
+registration time, so reusing an old revision runs old code without saying so.
 
 ## Machines and models
 
-Machines exist; the constraint is getting hold of one — **be flexible on GPU type and bias toward
-the larger card.**
+**Compute is local now** (the owner, 2026-09-10). The work moved off a shared dev box plus rented
+AWS GPUs onto the owner's own machine, and a run happens here unless it cannot: an RTX 5090 with
+32 GB of VRAM and a Ryzen 5950X, under WSL2. The 32 GB card is what every sizing decision starts
+from. WSL2 currently reports 31 GiB of system RAM, which is the default half-of-host cap on a host
+that most likely has 64 GB, so a job that wants more host RAM — CPU offload above all — wants
+`.wslconfig`'s `memory=` raised before it wants a smaller model. Several agent sessions may still
+share this one GPU, so `scripts/gpu_preflight.py` still applies and a long holder still blocks the
+others; what changed is that a long local run is now the expected thing rather than something to
+move off the box.
 
 - **Never hardcode a memory budget.** Derive batch size, group size, and context length from the
-  VRAM present at startup, and log the device the run landed on. A config that assumes 21.5 GiB
-  cannot take whatever machine happens to be free.
+  VRAM present at startup, and log the device the run landed on. The 5090's 32 GB is what this box
+  has today, not a constant to bake into a config, and a run that assumes it will not move to a
+  rented card or a later machine.
+- **Say the wall-clock estimate before launching**, and run anything past a few minutes under the
+  resource limiter in a named tmux session with a teed log (see "Running expensive things").
+
+### When renting cloud GPUs (secondary path, kept for when a job outgrows the 5090)
+
+Everything below still holds when a job genuinely does not fit locally; only its priority changed.
+The killswitch and boot-patch rules for rented boxes are under "Running expensive things", and the
+AWS Batch surface is `cloud/`.
+
 - **Match instance shape to the job.** A single-GPU job requests a single-GPU instance. An 8-GPU
   node to use one of them is waste; multi-GPU instances are for code that uses them, which we have
   not written yet.
 - **Prefer the larger card, stay portable.** `g6e.xlarge` (L40S, 48 GB) is ~26% cheaper per unit of
-  work and 3.7x faster in wall-clock than `g6.xlarge` (L4, 24 GB). Training a 4B on an L4 is never
-  right. The 24 GB figure is nominal (`nvidia-smi` reports 23,034 MiB), describes this dev box
-  only, and must not propagate into cloud job configs.
+  work and 3.7x faster in wall-clock than `g6.xlarge` (L4, 24 GB). A local VRAM figure describes
+  this box only and must not propagate into cloud job configs.
 - **Rented boxes are single-GPU `g7e` or `p5` shapes, on demand, and spot only once on-demand
   capacity is genuinely exhausted** (the owner, 2026-08-24, restated and strengthened 2026-08-27
   after every box in the fleet had drifted to spot-first walks anyway). `g7e.2xlarge` and
@@ -223,7 +249,10 @@ the larger card.**
   The pattern is anchored on the CLI's error code now, so a NotFound of any kind, a stale subnet row
   included, stops the walk as misconfiguration instead of being stepped past.
 
-Model ladder for the new work. The Qwen3.5 family has a **Small** tier (0.8B, 2B, 4B, 9B — no 1B)
+Model ladder for the new work, two working sizes since 2026-09-10: the 0.8B for plumbing and the
+9B for anything where behaviour is the measurement.
+
+The Qwen3.5 family has a **Small** tier (0.8B, 2B, 4B, 9B — no 1B)
 and a **Medium** tier (**27B dense**, plus MoE 35B-A3B / 122B-A10B / 397B-A17B) — earlier docs
 listed only Small. Two newer same-architecture 27B dense drop-ins load with the same classes:
 `Qwen/Qwen3.6-27B` and `Qwen/Qwen3.8-27B`. **Nothing newer than 3.5 was published below 27B** — 3.6
@@ -239,11 +268,11 @@ size a card from a text-only figure rather than from the repo total.
 
 | Model | Use |
 |---|---|
-| `Qwen/Qwen3.5-0.8B` | Plumbing only: does the code execute end to end. Do not read behaviour off it. |
+| `Qwen/Qwen3.5-0.8B` | **The smoke tier.** Plumbing only: does the code execute end to end. Do not read behaviour off it, ever. Anything smaller is equally acceptable for this purpose. |
 | `Qwen/Qwen3.5-2B` | Smoke runs where you also want reward to move. ~5 GB bf16 LoRA. |
-| `Qwen/Qwen3.5-4B` | The working size whenever behaviour is the measurement. ~10 GB bf16 LoRA, ~7.8 GiB of text-only weights. The newest 4B Qwen there is — no 3.6 or 3.8 was ever published at this size. |
-| `Qwen/Qwen3.5-9B` | Capability-ceiling arm, and the **interp cross-validation arm**. Also the newest 9B Qwen there is, for the same reason as the 4B. `Qwen3.5-9B-Base` is the only ~9B Qwen with a pretrained sparse autoencoder (`Qwen/SAE-Res-Qwen3.5-9B-Base-W64K-L0_{50,100}`, all 32 layers). Needs a 48 GB card. Note the checkpoint split: the SAE is on `-Base`, while the TMAX RL'd models descend from the instruct `Qwen/Qwen3.5-9B` — measure that transfer, do not assume it (base→instruct SAE transfer has documented quality hits; see `docs/scratch/tiny-model-selection-2026-08-17.md`). |
-| `Qwen/Qwen3.8-27B` | The **observable-model tier** for the RL + interp work: ~52 GiB download against ~50.1 GiB of text-only bf16 weights in VRAM once the family's vision tower and MTP head drop out; no text-only/base sibling exists at 27B (see `docs/scratch/qwen38-27b-load-check-2026-08-17.md`). bf16 needs a rented ≥80 GB card; the `Qwen3.8-27B-FP8` variant (~27 GiB text-only) fits a 48 GB L40S and is owner-approved for interp probing (2026-08-18) — **probing and inference only, because an FP8 checkpoint cannot be trained on at all** (see below). The only local GPU is the 24 GB L4, so nothing at this size runs here. `Qwen3.5-27B` (identical load path) carries first-party *instruct* SAEs. See `docs/scratch/observable-model-rl-feasibility-2026-08-16.md` and `jlens-sae-feasibility-2026-08-16.md`. |
+| `Qwen/Qwen3.5-4B` | **The working size until 2026-09-10**, and still the right checkpoint for re-analysis of the artifacts already measured at this size and for comparison against them. New behavioural measurement goes to the 9B instead. ~10 GB bf16 LoRA, ~7.8 GiB of text-only weights. The newest 4B Qwen there is — no 3.6 or 3.8 was ever published at this size. |
+| `Qwen/Qwen3.5-9B` | **The working size whenever behaviour is the measurement** (the owner, 2026-09-10), and the **interp cross-validation arm**. Also the newest 9B Qwen there is, for the same reason as the 4B. Fitting bf16 LoRA training into the 5090's 32 GB is tight and buys its room from the rollout budget rather than from a smaller model; size it from the VRAM the run actually sees, and read `docs/scratch/single-5090-grpo-notes-2026-09-10.md` for the sizing work (gitignored, so a plain-text pointer rather than a link). `Qwen3.5-9B-Base` is the only ~9B Qwen with a pretrained sparse autoencoder (`Qwen/SAE-Res-Qwen3.5-9B-Base-W64K-L0_{50,100}`, all 32 layers). Note the checkpoint split: the SAE is on `-Base`, while the TMAX RL'd models descend from the instruct `Qwen/Qwen3.5-9B` — measure that transfer, do not assume it (base→instruct SAE transfer has documented quality hits; see `docs/scratch/tiny-model-selection-2026-08-17.md`). |
+| `Qwen/Qwen3.8-27B` | The **stretch tier**, and a target that needs creativity rather than a bigger config: ~52 GiB download against ~50.1 GiB of text-only bf16 weights in VRAM once the family's vision tower and MTP head drop out, against 32 GB of card, so bf16 LoRA does not fit locally by any straightforward route. What might: QLoRA (knowingly against the family guidance below), CPU-offloaded checkpoints, chunked loss. The sizing note is `docs/scratch/single-5090-grpo-notes-2026-09-10.md` (gitignored, plain-text pointer). The `Qwen3.8-27B-FP8` variant (~27 GiB text-only) fits 32 GB with little to spare and is owner-approved for interp probing (2026-08-18) — **probing and inference only, because an FP8 checkpoint cannot be trained on at all** (see below). No text-only/base sibling exists at 27B (see `docs/scratch/qwen38-27b-load-check-2026-08-17.md`); `Qwen3.5-27B` (identical load path) carries first-party *instruct* SAEs. See `docs/scratch/observable-model-rl-feasibility-2026-08-16.md` and `jlens-sae-feasibility-2026-08-16.md`. **For inference-only probes the owner expects the Q4_K_XL quant to run on the 5090 under vLLM at 50+ tok/s** (the owner, 2026-09-10; an expectation, not yet measured here), and rates the model as roughly late-2025 frontier quality, so it is the default hosted-model substitute for cheap local probing. Training stays bf16 LoRA and does not fit. |
 
 **Jacobian-lens rule (owner, 2026-08-18): never spend effort checking whether a pre-fitted lens
 exists for a checkpoint — we fit our own, cheaply** (a closed-form accumulation, not a training
@@ -251,11 +280,12 @@ run; source `anthropics/jacobian-lens`). Past sessions burned time on lens-exist
 got them wrong in both directions. SAEs are the opposite case: genuinely expensive to fit, so a
 pretrained one is a real (but non-blocking) asset — without one, run non-SAE techniques.
 
-**4B is the default for real measurement** — the floor at which "chose not to do the task" is
-distinguishable from "could not" (Terminal-Bench Lite: 31.8±3.8 vs 2B's 5.7 — from Ai2's TMAX
-paper, arXiv:2606.23321 Table 3, so harness-specific numbers rather than a neutral property; the
-gap also survives on the harder TB 2.1, 14.2 vs 1.9), which is the whole
-distinction this research rests on. Two family facts: **4-bit
+**9B is the default for real measurement** (the owner, 2026-09-10), comfortably clear of the floor
+at which "chose not to do the task" is distinguishable from "could not", which is the whole
+distinction this research rests on. That floor was measured at 4B (Terminal-Bench Lite: 31.8±3.8 vs
+2B's 5.7 — from Ai2's TMAX paper, arXiv:2606.23321 Table 3, so harness-specific numbers rather than
+a neutral property; the gap also survives on the harder TB 2.1, 14.2 vs 1.9), and the argument for
+being above it applies a fortiori at 9B. Two family facts: **4-bit
 QLoRA is not recommended for Qwen3.5** — this is Unsloth's fine-tuning guidance, *not* the Qwen
 model card, and the reason they give is only "higher than normal quantization differences"; the
 `attn_output_gate` mechanism is our own conjecture rather than theirs, though Qwen's own GPTQ-Int4
@@ -265,17 +295,18 @@ saves memory on this family (GPTQ-Int4 ~30.3 GB vs FP8 ~30.9 GB at 27B), so **FP
 escape hatch for inference and interp probing — and for training there is no escape hatch, because
 an FP8 checkpoint cannot be trained on at all, LoRA included** (transformers'
 `FineGrainedFP8HfQuantizer` declares `is_trainable = False`, and `Trainer` refuses even with an
-adapter attached). Training is bf16 LoRA at every rung, which is what puts the 27B on an ≥80 GB
-card, and QLoRA is not recommended anywhere on the ladder. And these are hybrid-attention models
-(`Qwen3_5Config`, whose text sub-config is `Qwen3_5TextConfig` — *not* `Qwen3NextConfig`, a
-different and older family — with three Gated DeltaNet linear-attention layers per full attention
+adapter attached). Training is bf16 LoRA at every rung, which is what makes the 27B a stretch
+target here, and QLoRA is not recommended anywhere on the ladder. And these are hybrid-attention
+models (`Qwen3_5Config`, whose text sub-config is `Qwen3_5TextConfig` — *not* `Qwen3NextConfig`,
+a different and older family — with three Gated DeltaNet linear-attention layers per full attention
 layer), so LoRA must target the linear-attention projections too: take the target modules from
 `discover_lora_targets` in `grpo/throughput.py`, never a hand-written `q/k/v/o` list, which reaches
 attention in a quarter of the layers and silently leaves every DeltaNet block frozen. Any interp
 tooling assuming standard attention needs checking.
 
 Interp tooling (sparse autoencoders, a pre-fitted Jacobian lens, a TransformerLens adapter) exists
-and was verified for `Qwen/Qwen3.5-4B` on 2026-08-15 — **not a reason to work at a different size.**
+and was verified for `Qwen/Qwen3.5-4B` on 2026-08-15 — **not a reason to keep measurement at 4B now
+that 9B is the working size**; re-verify the recipes at 9B before building on them.
 Recipes, silent-failure gotchas, and version pins: `docs/scratch/interp-tooling-verified.md` (read
 before building on any of them).
 
@@ -333,11 +364,11 @@ Every top-level entry, so nothing has to be guessed at:
 - `grpo/` — shared training substrate: a working GRPO harness on TRL 1.10, verified end to end on
   GPU. The `grpo/rlvr_math.py` arithmetic task is a toy; the RL plumbing is live and `games/`
   builds directly on it (sizing, throughput, callbacks). See `grpo/README.md`.
-- `cloud/` — the AWS Batch surface for training arms: the container (`Dockerfile`,
-  `entrypoint.sh`, whose S3-sync EXIT trap means a spot-reclaimed job still ships its
-  checkpoints), `push_ecr.sh`, and `submit_job.py`, which registers a fresh job definition at
-  every submit because Batch pins a tag to a digest at registration time (the stale-code trap in
-  the Batch section above).
+- `cloud/` — the AWS Batch surface for training arms, a secondary path since compute moved local
+  on 2026-09-10: the container (`Dockerfile`, `entrypoint.sh`, whose S3-sync EXIT trap means a
+  spot-reclaimed job still ships its checkpoints), `push_ecr.sh`, and `submit_job.py`, which
+  registers a fresh job definition at every submit because Batch pins a tag to a digest at
+  registration time (the stale-code trap in the Batch section above).
 - `scripts/` — operational tooling: resource limiter, episode jail + red-team suite, canary
   tripwire, secret scanner, GPU preflight.
 - `tests/` — the repo-level pytest suite behind `make test`: cost model, throughput, doc links,
@@ -383,6 +414,16 @@ these are plain-text pointers rather than links on purpose.
 
 `make setup` builds `.venv` from the pinned `uv.lock`. Python 3.13, managed by uv. **Never
 `pip install`** — the lockfile is the environment.
+
+**On the 5090 box, `make setup` alone leaves the tree red** (2026-09-10). `games.train` refuses to
+construct without vLLM and `cloud/submit_job.py` imports boto3, so a bare `uv sync` (which removes
+extras it was not asked for) fails about 200 games tests and the type check. Use
+`uv sync --frozen --extra vllm --extra bedrock` (or `make setup-gpu` plus the bedrock extra) here.
+Two more facts of this box: Ubuntu 20.04 has no packaged Python 3.12+, so the jail interpreter is
+the uv CPython staged under `/var/tmp/cpython-runtime` by `scripts/stage_jail_python.sh` (with
+numpy installed into it) and does not survive a `/var/tmp` wipe; and its tmux is 3.0a, which
+`scripts/tmux_run.sh` now tolerates. `bwrap` is not installed, so the jail runs its `unshare`
+fallback until bubblewrap is added.
 
 Five gates, all expected green before "done", plus one advisory check:
 
@@ -492,13 +533,16 @@ environment is the tmux server's rather than the launching shell's — the helpe
 nothing else.
 
 Before any GPU work, `scripts/gpu_preflight.py` refuses to start when another process already holds
-VRAM on the single shared L4. Assume someone else may be using it.
+VRAM on the single shared GPU. Assume someone else may be using it.
 
-**The local GPU is for smokes of ~5-10 minutes or less — nothing longer, ever** (the owner,
-2026-08-18). Estimate wall clock before launching; anything past that budget runs on a rented EC2
-GPU or AWS Batch, and a local job discovered pacing past ~10 minutes gets killed and moved rather
-than finished. Many concurrent sessions share this one card, and a single long holder starves all
-of them. Rented capacity is cheap; local minutes are the contended resource.
+**The local 5090 is the training machine, and long local runs are expected** (the owner,
+2026-09-10), which reverses the ~5-10 minute local ceiling that held while the only card was a
+shared 24 GB L4. Three things still hold for anything past a few minutes, and they are what make a
+long run safe to leave alone: state the wall-clock estimate before launching, run it through
+`scripts/resource-limits.sh` with a `-t` budget so a runaway cannot take the box down, and start it
+in a named tmux session with a teed log rather than the foreground or a background shell. Several
+agent sessions may still be waiting on the same card, so `gpu_preflight` remains the check that you
+are not stepping on a run in progress, and a multi-hour hold is worth announcing.
 
 **Every rented instance arms its own killswitch at launch — no box may depend on a human
 remembering to terminate it** (the owner, 2026-08-18). Two layers, both armed in user-data before
@@ -581,14 +625,17 @@ check has teeth. The audit's estimate is 1.9-2.7x per step.
 
 ## Shared-machine hygiene (files, /tmp, CPU)
 
-This box runs three to five or more concurrent agent sessions, so filling the disk, `/tmp`, or the
-CPU does not slow one session down, it stalls all of them. On 2026-08-21 `/tmp` ran out of inodes —
+This box runs several concurrent agent sessions, so filling the disk, `/tmp`, or the CPU does not
+slow one session down, it stalls all of them. On 2026-08-21 `/tmp` ran out of inodes —
 file slots, not bytes — and every session's shell failed box-wide until the leftover scratch was
 reaped by hand.
 
 `/tmp` here is a RAM-backed tmpfs with a hard inode cap separate from its byte space, so a tree of
 small files can exhaust the file slots while `df -h` still shows room, and everything in it costs
-RAM. `make tmp-check` prints both figures plus the directories holding the most files.
+RAM. `make tmp-check` prints both figures plus the directories holding the most files. (Both facts
+were measured on the previous dev box; WSL2 may lay `/tmp` out differently, so re-check with
+`make tmp-check` before relying on the numbers. The rule to keep scratch out of `/tmp` holds either
+way.)
 
 **Committing a subset of a dirty tree: gate the composed tree, never your files in isolation.**
 Several sessions edit this tree at once, so the normal commit carries some paths and leaves others

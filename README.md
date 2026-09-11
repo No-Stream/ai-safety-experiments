@@ -20,7 +20,7 @@ rules, which matter more than the layout.
 | `games/` | The game-theory GRPO project: matrix-game RL arms that differ only in grading rule, an eval battery, a decision-theory probe battery, and the stage runner that sequences GPU stages. |
 | `sociology/` | The analysis-model observer study: bundles of banked agent episodes that provably could not have communicated, fed to hosted models under varied framings. |
 | [`grpo/`](grpo/README.md) | Shared RL training substrate — a working GRPO harness on TRL 1.10. |
-| `cloud/` | The AWS Batch surface for training arms: container, ECR push, job submission. |
+| `cloud/` | The AWS Batch surface for training arms: container, ECR push, job submission. A secondary path since compute moved onto the local machine. |
 | [`legacy/`](legacy/README.md) | Finished research. Closed records; do not extend. |
 | `scripts/` | Resource limiter, episode jail and its red-team suite, canary tripwire, secret scanner, GPU preflight. |
 | `tests/` | The repo-level suite behind `make test`; each project keeps its own under `games/tests/`, `reward_hacking/tests/` and `sociology/tests/`. |
@@ -79,8 +79,10 @@ worker start-up costs more than it saves on a narrow selection.
 
 ## Running things on the dev box
 
-Everything local runs on one NVIDIA L4 (24 GB) shared by every session, and only for smokes of
-about ten minutes or less. Real runs belong on a rented GPU, EC2 or AWS Batch, not here.
+Compute is local: one NVIDIA RTX 5090 (32 GB) on a Ryzen 5950X under WSL2, shared by whatever
+sessions are running. Real runs belong here, not on a rented GPU — long jobs are expected, through
+the resource limiter and in a tmux session with a teed log. Rented EC2 and AWS Batch are the
+secondary path for a job that outgrows 32 GB.
 
 Run anything expensive through the resource-limit wrapper, which caps CPU, memory, tasks and
 wall-clock via cgroup v2 so a runaway job cannot make the box unresponsive. It limits resource
@@ -91,7 +93,7 @@ scripts/resource-limits.sh --gpu -t 15m -- python train.py
 ```
 
 `scripts/gpu_preflight.py` refuses to start when another process already holds VRAM on the
-single shared L4. Resource conventions, the measured basis for the thread caps, and which
+single shared GPU. Resource conventions, the measured basis for the thread caps, and which
 limits are enforced versus advisory are in [docs/resource-limits.md](docs/resource-limits.md).
 
 For isolation rather than resource capping — running untrusted or scope-violating code in a

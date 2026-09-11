@@ -1,9 +1,9 @@
 # grpo — shared RL training substrate
 
 This is the repo's working GRPO harness. It is the one thing here that has been verified end
-to end recently: modernised to TRL 1.10, smoke-run on the L4 with Qwen3-0.6B for 30 steps,
-mean reward moving from 0.375 to 0.867. Treat it as live substrate, not as a finished
-experiment.
+to end recently: modernised to TRL 1.10, smoke-run with Qwen3-0.6B for 30 steps, mean reward
+moving from 0.375 to 0.867 (on the L4 that used to be the local card; training now runs on the
+local RTX 5090, 32 GB). Treat it as live substrate, not as a finished experiment.
 
 ```bash
 make smoke                                   # 30-step GPU run, through the resource limiter
@@ -34,7 +34,9 @@ Results and the corrections they forced on the budget note are in
 `docs/scratch/measured-throughput.md`. The short version, so nobody re-derives it: the note's
 reference profile of 64 concurrent episodes at 2048+2048 does **not** fit on a 24 GB L4, what
 runs out is a float32 upcast in the Gated DeltaNet chunked-prefill path rather than the KV cache,
-and the training micro-batch is a second and often tighter ceiling than the episode count.
+and the training micro-batch is a second and often tighter ceiling than the episode count. Those
+figures were taken on the old local L4 and on rented cards; re-measure on the 32 GB 5090, which is
+where runs land now, rather than scaling them by hand.
 
 Three things in `throughput.py` are worth lifting if you write another measurement harness.
 Completions are forced to exactly `max_completion_length` with
