@@ -8,6 +8,7 @@ which catches a renamed flag before an expensive stage starts.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -215,6 +216,25 @@ class TestGeneratedCommands:
                 json.dumps({"all_endpoints_measured": True, "endpoints": incomplete}).encode(),
             )
             assert not plan.measured_budget_is_complete(path), missing
+
+        for endpoint in plan.REQUIRED_ENDPOINTS:
+            for value in (0.0, -1.0, math.nan, True):
+                invalid = dict(endpoints)
+                invalid[endpoint] = value
+                path = _write(
+                    tmp_path / f"invalid-{endpoint}-{str(value).replace('.', '_')}.json",
+                    json.dumps(
+                        {"all_endpoints_measured": True, "endpoints": invalid},
+                        allow_nan=True,
+                    ).encode(),
+                )
+                assert not plan.measured_budget_is_complete(path), (endpoint, value)
+
+        incomplete = _write(
+            tmp_path / "flag-not-set.json",
+            json.dumps({"all_endpoints_measured": False, "endpoints": endpoints}).encode(),
+        )
+        assert not plan.measured_budget_is_complete(incomplete)
 
 
 class TestPhaseResume:
