@@ -1491,7 +1491,7 @@ rungs audited by LLM judge, 40/40 agreement with the deterministic parse. Prereg
 
 Arc: capture (15 cells, un-merged, fp32) + direction fits + forced-choice sweeps + activation
 patching (3 states x L14-16) + lead-axis steering on both arms (7 conditions each, n=32/cond,
-cap 65,536, seed-matched placebos) + three 100-prompt Jacobian lenses; ~$107 across 6 box
+cap 65,536, seed-matched placebos) + three 100-prompt Jacobian lenses; run across 6 box
 incarnations, 4 spot reclaims, one full g7e capacity drought. Analysis:
 `docs/scratch/interp-ninep-analysis-2026-08-26/` (all numbers recomputed from records).
 
@@ -1544,7 +1544,7 @@ eval rows rendered under all 7 counterpart framings × both print orders (224 st
 at base + both step-70 arms and projected onto the arc's lead (correlated-counterpart) direction
 at prompt-end pooling, every contrast against 100 matched-norm-placebo floors; (Leg B) steering
 that direction (L15 α2.0, seed 400, seed-matched placebo, merged step-70 exports, n=32/condition,
-budget 65,536, both print orders) under human and another-ai framings on both arms. ~$41.5, three
+budget 65,536, both print orders) under human and another-ai framings on both arms. Three
 spot boxes, two reclaims, zero measurement loss; every box merge licensed by a bit-identity
 determinism gate against the arc's banked records (32/32 full text, three boxes). Prereg:
 `docs/scratch/framing-interp-cross-dispatch-2026-08-26.md`; analysis:
@@ -1613,7 +1613,7 @@ from records; twin references quoted from the arc at identical seeds, never re-r
   relative L2) while every Leg A reading replicates (≤0.008).
 - **Coverage limits:** one direction, one norm (α2.0), one placebo draw shared across cells
   (active-placebo vs live-single-draw unseparated — fresh-placebo-seeds cell parked on the
-  owner's menu); group×another-ai placebo missing (pre-authorized ~$10-13 gap-fill);
+  owner's menu); group×another-ai placebo missing (pre-authorized gap-fill);
   up-steer only (the arc's down-steer/ablation were already placebo-unreadable at this norm);
   n=32/condition; prompt-end pooling only in Leg A (mid-generation projection unprobed); twin
   reference cells quoted from the arc, not re-run.
@@ -2254,9 +2254,8 @@ prompt listed the two option labels in authored order rather than the order the 
 wrong for the swapped-print-order half of the records, and that a resume did not check the prompt
 scaffold's digest. Both were fixed the same night (judge commit 3aab5f8, scaffold digest
 0cf373cf0f81531c, rubric version kept at v2 because the digest now covers the scaffold text) and all
-2,745 records were re-judged under the fixed scaffold (a second pass at the same list price as the first,
-about $19, so the census cost about $38 against a plan of $12 to $20; the pause that would have stopped
-the first pass arrived after it had finished). The second pass's rows and rates are under
+2,745 records were re-judged under the fixed scaffold (a second pass over the same records as the first;
+the pause that would have stopped the first pass arrived after it had finished). The second pass's rows and rates are under
 `artifacts/games/trace_judge/census-2026-09-03-fixed-scaffold/`; the first pass's stay under
 `artifacts/games/trace_judge/census-2026-09-02/`. Row by row across the two passes, decision basis agrees on 0.88 of
 records, the derived coupling story on 0.97, payoff reasoning present on 0.96; decision-basis agreement
@@ -2380,7 +2379,7 @@ argument wins.
 ladder when a size fails the check. Before an arm is registered at a size, judge a census of the
 base model's traces on the cells the arm will be read on: decision basis, counterpart assumption and
 the first-position split. Require decisions that rest on the game at the rate the 9B shows. The
-census costs a fraction of a training run: the 9B one read 2,324 records for about 23 dollars in
+census costs a fraction of a training run: the 9B one read 2,324 records in
 about ten minutes of wall clock, with the agreement figures above as its calibration. From here on
 behaviour is measured at 9B and up, and the 2B is plumbing, a check that the code runs end to end.
 The 4B rung is skipped for this thread (the owner's call: a scale jump from 2B to 9B to 27B, because

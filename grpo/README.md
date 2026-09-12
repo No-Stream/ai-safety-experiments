@@ -138,15 +138,15 @@ to re-check whenever the model or the task changes.
 
 ## Measured throughput configs (2026-08-29)
 
-> **Measured GRPO throughput configs (g7e / RTX PRO 6000 96 GiB, spot ~$1.35/h, 2026-08-29).**
+> **Measured GRPO throughput configs (g7e / RTX PRO 6000 96 GiB, 2026-08-29).**
 > All configs: vLLM colocate util 0.35, importance-sampling correction off (forced at 32k caps),
 > LoRA 16/32 on discovered targets, micro-batch 1, thinking on, caps at measured floors.
 > Micro-batch >1 measured dead at 2B (≤2.7% for +13-40 GiB peak) and OOM at 9B — mb=1 is the
 > config in BOTH estimator regimes (the dapo/batch-pinned replication arms and dr_grpo/none
 > defaults). Engine util >0.35 buys nothing (zero preemption to 128 episodes). Generation is only
-> 17-42% of a step; cost tracks the batch's max completion length (padding), so batch shape moves
-> $/episode weakly: 2B 8x8 = 12.8 min/step ($20/70-step run), 16x8 +9%/ep, 4x8 nominally +69%/ep
-> but variance-dominated; 9B 8x8 = 34 min/step early-run (realized whole-run 24 min ≈ $38/arm),
+> 17-42% of a step; step time tracks the batch's max completion length (padding), so batch shape
+> moves per-episode wall-clock weakly: 2B 8x8 = 12.8 min/step, 16x8 +9%/ep, 4x8 nominally +69%/ep
+> but variance-dominated; 9B 8x8 = 34 min/step early-run (realized whole-run 24 min),
 > 16x8@0.50 +13%/ep at a 91.6 GiB peak. Two arms per box: 8x8 pairs OOM; simultaneous launches
 > die at init (port 29500 + vLLM profiling race — stagger mandatory); a fitting 4x8@0.30 pair
 > runs but contention makes one-arm-per-box the doctrine. 27B colocate cannot fit one 96 GiB
