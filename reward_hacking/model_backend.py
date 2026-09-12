@@ -38,7 +38,7 @@ from bisect import bisect_right
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypedDict, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, runtime_checkable
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -51,9 +51,16 @@ if TYPE_CHECKING:
         Sequence,
     )
 
+    from peft import PeftModel
+
 import torch
 import urllib3.exceptions
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizerBase,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -200,13 +207,16 @@ def _pick_dtype() -> torch.dtype:
     return torch.float32
 
 
-def _as_single_user_turn(tokenizer: AutoTokenizer, prompt: str, *, thinking: bool) -> str:
+def _as_single_user_turn(tokenizer: PreTrainedTokenizerBase, prompt: str, *, thinking: bool) -> str:
     """Wrap a plain prompt as one user turn via the model's chat template, ready for generation."""
-    return tokenizer.apply_chat_template(  # pyright: ignore[reportAttributeAccessIssue]
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=thinking,
+    return cast(
+        "str",
+        tokenizer.apply_chat_template(  # pyright: ignore[reportAttributeAccessIssue]
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=thinking,
+        ),
     )
 
 
@@ -356,7 +366,7 @@ compare it.
 """
 
 
-def end_of_turn_token_ids(tokenizer: AutoTokenizer) -> tuple[int, ...]:
+def end_of_turn_token_ids(tokenizer: PreTrainedTokenizerBase) -> tuple[int, ...]:
     """Resolve :data:`END_OF_TURN_TOKENS` through a tokenizer, refusing one that lacks either.
 
     Refused rather than partially applied: a tokenizer that maps one of the names to nothing (or to
@@ -376,7 +386,7 @@ def end_of_turn_token_ids(tokenizer: AutoTokenizer) -> tuple[int, ...]:
     return tuple(sorted(set(ids)))
 
 
-def _terminator_ids(tokenizer: AutoTokenizer) -> frozenset[int]:
+def _terminator_ids(tokenizer: PreTrainedTokenizerBase) -> frozenset[int]:
     """Collect the token ids that end a generated row: end-of-sequence, and the padding id.
 
     ``eos_token_id`` is a scalar on most checkpoints and a list on some (Qwen3.5 ships several
@@ -435,6 +445,7 @@ class HFBackend:
         sampling: SamplingConfig | None = None,
         model_path: str | Path | None = None,
         stop_token_ids: Sequence[int] | None = None,
+        model: PreTrainedModel | PeftModel | None = None,
     ) -> None:
         """Initialize the device-aware HuggingFace model and tokenizer.
 
@@ -458,12 +469,18 @@ class HFBackend:
         load_from = self.model_path or model_id
 
         # No trust_remote_code: see TRUST_REMOTE_CODE_WITHHELD_REASON.
-        self._tokenizer = AutoTokenizer.from_pretrained(load_from, padding_side="left")
+        self._tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+            load_from, padding_side="left"
+        )
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
         self._terminator_ids = _terminator_ids(self._tokenizer) | frozenset(self.stop_token_ids)
-        self._model = AutoModelForCausalLM.from_pretrained(
-            load_from, dtype=resolved_dtype, device_map=device_map
+        self._model: PreTrainedModel = (
+            AutoModelForCausalLM.from_pretrained(
+                load_from, dtype=resolved_dtype, device_map=device_map
+            )
+            if model is None
+            else cast("PreTrainedModel", model)
         )
         self._model.eval()
         logger.info(
@@ -474,6 +491,16 @@ class HFBackend:
             self._model.device,
             thinking,
         )
+
+    @property
+    def model(self) -> PreTrainedModel:
+        """The live model used for generation and residual-stream interventions."""
+        return self._model
+
+    @property
+    def tokenizer(self) -> PreTrainedTokenizerBase:
+        """The tokenizer used to render this backend's prompts."""
+        return self._tokenizer
 
     def assert_serves_weights(self, snapshot_dir: Path) -> None:
         """Raise unless the loaded model's config says it was read from ``snapshot_dir``.
@@ -537,16 +564,15 @@ class HFBackend:
         """
         chats = [_as_single_user_turn(self._tokenizer, p, thinking=self.thinking) for p in prompts]
         inputs = self._tokenizer(chats, return_tensors="pt", padding=True).to(self._model.device)
-        outputs = self._model.generate(  # pyright: ignore[reportAttributeAccessIssue]
-            **inputs, **self._generation_kwargs()
-        )
+        generate = cast("Callable[..., torch.Tensor]", self._model.generate)  # pyright: ignore[reportAttributeAccessIssue]
+        outputs = generate(**inputs, **self._generation_kwargs())
         prompt_len = int(inputs["input_ids"].shape[1])
         prompt_tokens: list[int] = inputs["attention_mask"].sum(dim=1).tolist()
         completions: list[BedrockCompletion] = []
         for output, input_tokens in zip(outputs, prompt_tokens, strict=True):
             generated: list[int] = output[prompt_len:].tolist()
             output_tokens, stop_reason = _generated_span(generated, self._terminator_ids)
-            text = self._tokenizer.decode(generated, skip_special_tokens=True)
+            text = cast("str", self._tokenizer.decode(generated, skip_special_tokens=True))
             # A stop-string halt leaves no terminator token, so the span would mislabel it above.
             if self.sampling.stop and any(stop in text for stop in self.sampling.stop):
                 stop_reason = STOP_REASON_STOP_SEQUENCE
@@ -952,7 +978,7 @@ class VLLMBackend:
         )
 
     @property
-    def tokenizer(self) -> AutoTokenizer:
+    def tokenizer(self) -> PreTrainedTokenizerBase:
         """The tokenizer this engine's prompts are rendered with.
 
         Public because the interpretability capture needs the SAME tokenizer the engine generated

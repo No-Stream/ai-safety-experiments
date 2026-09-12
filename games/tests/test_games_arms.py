@@ -218,6 +218,7 @@ class TestArmsRegistry:
             # asks for it.
             "prosocial-breadth-care1",
             "prosocial-breadth-self",
+            "cooperation-generalization-care-alpha-1",
         }
 
     def test_no_two_arms_are_the_same_experiment(self):
@@ -270,8 +271,8 @@ class TestArmsRegistry:
             softpen.corpus_partition,
         )
 
-    def test_exactly_three_arms_price_a_parse_failure_against_the_row(self):
-        """Every other arm keeps its reward byte for byte, and these three say why they do not.
+    def test_row_relative_arms_price_a_parse_failure_against_the_row(self):
+        """Every other arm keeps its reward byte for byte, and these four say why they do not.
 
         The softpen arm is where the row-relative price was introduced (2026-09-02) and the two
         prosocial-breadth arms are where the 2026-09-03 audit's generalisation of it is used: the
@@ -286,6 +287,7 @@ class TestArmsRegistry:
             "pd-track-record-v2-softpen",
             "prosocial-breadth-care1",
             "prosocial-breadth-self",
+            "cooperation-generalization-care-alpha-1",
         }
         assert {ARMS[name].grading for name in row_relative} == {
             GRADING_VS_STATED_MATCH,

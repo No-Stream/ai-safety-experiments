@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -40,15 +41,20 @@ from games.interp_cells import (
     BASE_ARM,
     BASE_STEP,
     CELL_MANIFEST_FILENAME,
+    NATURAL_PREFIX_ACTIVATIONS_FILENAME,
+    PREFIX_ACTIVATIONS_FILENAME,
     CellFormatError,
     CellIdentity,
     Stimulus,
     StimulusFileError,
     assert_adapter_moved_activations,
+    assert_capture_provenance,
     assert_ladder_identity,
+    assert_prefix_rows_align,
     assert_rows_align,
     assert_stimuli_match,
     concept_activations,
+    digest_of_strings,
     load_ladder,
     load_stimuli,
     pair_layout,
@@ -57,6 +63,7 @@ from games.interp_cells import (
     step_dir,
     stimuli_digest,
     write_cell,
+    write_natural_prefix_capture,
 )
 
 N_LAYERS = 3
@@ -135,7 +142,7 @@ class TestStimuliDigestGuard:
 
         assert_stimuli_match(cells, digest)
 
-        edited = [*stimuli[:-1], Stimulus(**{**vars(stimuli[-1]), "text": "a different rendering"})]
+        edited = [*stimuli[:-1], replace(stimuli[-1], text="a different rendering")]
         with pytest.raises(CellFormatError, match="different stimulus corpus"):
             assert_stimuli_match(cells, stimuli_digest(edited))
 
@@ -149,7 +156,7 @@ class TestStimuliDigestGuard:
 
     def test_the_digest_moves_with_the_text(self) -> None:
         stimuli = make_stimuli()
-        edited = [*stimuli[:-1], Stimulus(**{**vars(stimuli[-1]), "text": "changed"})]
+        edited = [*stimuli[:-1], replace(stimuli[-1], text="changed")]
         assert stimuli_digest(stimuli) != stimuli_digest(edited)
 
     def test_the_digest_moves_with_the_order(self) -> None:
@@ -281,7 +288,7 @@ class TestRowAlignment:
         digest = stimuli_digest(stimuli)
         identity = make_identity(digest)
         first = read_cell(write_test_cell(tmp_path, BASE_ARM, BASE_STEP, stimuli, identity))
-        flipped = [Stimulus(**{**vars(stimuli[0]), "side": "B"}), *stimuli[1:]]
+        flipped = [replace(stimuli[0], side="B"), *stimuli[1:]]
         second = read_cell(write_test_cell(tmp_path, "arm", 10, flipped, identity, offset=0.5))
         with pytest.raises(CellFormatError, match="not on their sides"):
             assert_rows_align([first, second])
@@ -381,6 +388,133 @@ class TestCellRoundTrip:
         cell = read_cell(write_test_cell(tmp_path, BASE_ARM, BASE_STEP, stimuli, identity))
         with pytest.raises(CellFormatError, match="outside this 3-layer capture"):
             cell.layer("axis-a", "mean", N_LAYERS)
+
+
+class TestAuxiliaryCaptureRoundTrip:
+    def test_prefix_and_natural_subset_round_trip_with_explicit_row_order(
+        self, tmp_path: Path
+    ) -> None:
+        stimuli = make_stimuli()
+        digest = stimuli_digest(stimuli)
+        identity = make_identity(
+            digest,
+            capture_prefix_states=True,
+            prompt_end_rendered_sha256="prompt-end",
+            teacher_forced_rendered_sha256="teacher-forced",
+            natural_prefix_layers=(0, 2),
+        )
+        rows = {"axis-a": row_index_for(stimuli, [11] * len(stimuli))}
+        prefix = {
+            ("prompt_end", "last"): torch.ones(len(stimuli), N_LAYERS, HIDDEN),
+            ("teacher_forced", "last"): torch.full((len(stimuli), N_LAYERS, HIDDEN), 2.0),
+        }
+        natural = {stimulus.stimulus_id: torch.ones(2, 2, HIDDEN) for stimulus in stimuli}
+        cell_dir = write_cell(
+            step_dir(tmp_path, BASE_ARM, BASE_STEP),
+            arm=BASE_ARM,
+            step=BASE_STEP,
+            identity=identity,
+            rows=rows,
+            activations={("axis-a", "mean"): torch.zeros(len(stimuli), N_LAYERS, HIDDEN)},
+            applied_adapter_weights=None,
+            adapter_weights_sha256=None,
+            provenance={},
+            prefix_activations=prefix,
+            prefix_stimulus_ids=[stimulus.stimulus_id for stimulus in stimuli],
+            natural_prefix_activations=natural,
+        ).parent
+        cell = read_cell(cell_dir)
+        assert cell.prefix_stimulus_ids == tuple(stimulus.stimulus_id for stimulus in stimuli)
+        assert cell.prefix_activations[("prompt_end", "last")].shape == (
+            len(stimuli),
+            N_LAYERS,
+            HIDDEN,
+        )
+        assert cell.natural_prefix_activations[stimuli[0].stimulus_id].shape == (2, 2, HIDDEN)
+        assert (cell_dir / PREFIX_ACTIVATIONS_FILENAME).is_file()
+        assert (cell_dir / NATURAL_PREFIX_ACTIVATIONS_FILENAME).is_file()
+
+        with pytest.raises(CellFormatError, match="shuffled prefix rows"):
+            assert_prefix_rows_align(
+                cell,
+                [stimulus.stimulus_id for stimulus in reversed(stimuli)],
+            )
+
+    def test_natural_subset_requires_layer_identity(self, tmp_path: Path) -> None:
+        stimuli = make_stimuli()
+        identity = make_identity(stimuli_digest(stimuli))
+        with pytest.raises(CellFormatError, match="explicit natural_prefix_layers"):
+            write_cell(
+                step_dir(tmp_path, BASE_ARM, BASE_STEP),
+                arm=BASE_ARM,
+                step=BASE_STEP,
+                identity=identity,
+                rows={"axis-a": row_index_for(stimuli, [11] * len(stimuli))},
+                activations={("axis-a", "mean"): torch.zeros(len(stimuli), N_LAYERS, HIDDEN)},
+                applied_adapter_weights=None,
+                adapter_weights_sha256=None,
+                provenance={},
+                natural_prefix_activations={stimuli[0].stimulus_id: torch.zeros(2, 2, HIDDEN)},
+            )
+
+    def test_metadata_empty_digest_keeps_legacy_algorithm(self) -> None:
+        stimuli = make_stimuli()
+        expected = digest_of_strings(
+            value
+            for stimulus in stimuli
+            for value in (stimulus.stimulus_id, stimulus.text, stimulus.assistant_prefix or "")
+        )
+        assert stimuli_digest(stimuli) == expected
+
+    def test_strict_cooperation_provenance_rejects_legacy_cells(self, tmp_path: Path) -> None:
+        stimuli = make_stimuli()
+        write_test_cell(
+            tmp_path, BASE_ARM, BASE_STEP, stimuli, make_identity(stimuli_digest(stimuli))
+        )
+        cell = read_cell(step_dir(tmp_path, BASE_ARM, BASE_STEP))
+        with pytest.raises(CellFormatError, match="lack concrete tokenizer/kernel provenance"):
+            assert_capture_provenance([cell])
+
+    def test_standalone_natural_capture_persists_selected_rows(self, tmp_path: Path) -> None:
+        stimuli = [
+            replace(
+                stimulus,
+                stimulus_set="natural-prefix",
+                metadata={"natural_state": "base", "rollout_id": "base-rollout"},
+            )
+            for stimulus in make_stimuli(n_pairs=1)
+        ]
+        identity = make_identity(
+            stimuli_digest(stimuli),
+            natural_prefix_layers=(0, 2),
+            natural_selection_manifest_sha256="m",
+        )
+        manifest = write_natural_prefix_capture(
+            tmp_path / "natural",
+            identity=identity,
+            stimuli=stimuli,
+            activations={stimulus.stimulus_id: torch.zeros(2, 2, HIDDEN) for stimulus in stimuli},
+            selection_records=[
+                {
+                    "stimulus_id": stimulus.stimulus_id,
+                    "positions": [0, 2],
+                    "selection_rule": "fixed",
+                    "natural_state": "base",
+                }
+                for stimulus in stimuli
+            ],
+            selection_manifest={
+                "version": 1,
+                "rollout_ids_by_state": {"base": "base-rollout", "final": "final-rollout"},
+                "selection_rule": "fixed",
+                "layers": [0, 2],
+                "sha256": "m",
+            },
+            rendered_sha256="rendered-natural",
+            natural_state="base",
+        )
+        assert manifest.is_file()
+        assert json.loads(manifest.read_text())["rendered_sha256"] == "rendered-natural"
 
 
 class TestStorage:

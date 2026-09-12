@@ -290,7 +290,10 @@ def seed_checkpoint(output_dir: Path, step: int, *, omit: tuple[str, ...] = ()) 
     (checkpoint / gt.TRAINER_STATE_FILENAME).write_text(json.dumps({"global_step": step}))
     for name in (*gt.REQUIRED_CHECKPOINT_FILES, gt.INIT_ADAPTER_WEIGHTS_FILENAME):
         if name not in omit and name != gt.TRAINER_STATE_FILENAME:
-            (checkpoint / name).write_bytes(b"")
+            if name == gt.ADAPTER_CONFIG_FILENAME:
+                (checkpoint / name).write_text(json.dumps({"peft_type": "LORA"}))
+            else:
+                (checkpoint / name).write_bytes(b"state")
     return checkpoint
 
 
@@ -450,6 +453,33 @@ class TestTrainGameArmWiring:
         shipped_names = {type(c).__name__ for c in shipped.trainer.build_kwargs["callbacks"]}
         assert "S3SyncCallback" not in names
         assert "S3SyncCallback" in shipped_names
+
+    def test_retention_manifest_callback_is_opt_in_for_experiment_presets(
+        self, tmp_path: Path, stubbed_run: object
+    ):
+        del stubbed_run
+        plain = run_arm(tmp_path, output_dir=str(tmp_path / "plain"))
+        retained = run_arm(
+            tmp_path,
+            output_dir=str(tmp_path / "retained"),
+            record_retention_manifest=True,
+            save_steps=1,
+            save_total_limit=0,
+        )
+        plain_names = {
+            type(callback).__name__ for callback in plain.trainer.build_kwargs["callbacks"]
+        }
+        retained_callbacks = retained.trainer.build_kwargs["callbacks"]
+        retained_names = {type(callback).__name__ for callback in retained_callbacks}
+        assert "CheckpointRetentionCallback" not in plain_names
+        assert "CheckpointRetentionCallback" in retained_names
+        retention_callback = next(
+            callback
+            for callback in retained_callbacks
+            if isinstance(callback, gt.CheckpointRetentionCallback)
+        )
+        assert retention_callback.run_root == retained.output_dir
+        assert retained.run_config["config"]["record_retention_manifest"] is True
 
     def test_every_built_trainer_carries_the_pace_guard(self, tmp_path: Path, stubbed_run: object):
         """The guard that kills a silently-slow run rides along unconditionally, s3 or not."""

@@ -607,6 +607,7 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
     *,
     checkpoint: Path | None,
     base_model: str,
+    base_model_source: str | None = None,
     backend_kind: str,
     merge_root: Path,
     merge_label: str,
@@ -625,6 +626,7 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
     A mock backend loads nothing at all, so it is answered before any capability question and its
     mode says so; branding the model id as mock stays with the caller that writes the trace.
     """
+    load_source = base_model_source or base_model
     if checkpoint is not None and full_weights is not None:
         raise ValueError(
             f"a run serves a LoRA checkpoint ({checkpoint}) OR full weights ({full_weights.label}), "
@@ -634,7 +636,12 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
     if full_weights is not None:
         return _resolve_full_weights_serving(full_weights, backend_kind)
     if checkpoint is None:
-        return ServedModel(model_id=base_model, load_mode=LOAD_MODE_BASE, adapter_dir=None)
+        return ServedModel(
+            model_id=base_model,
+            load_mode=LOAD_MODE_BASE,
+            adapter_dir=None,
+            backend_kwargs=({"model_path": load_source} if load_source != base_model else {}),
+        )
     if backend_kind == MOCK_BACKEND_KIND:
         logger.warning(
             f"mock backend: neither merging nor serving the adapter at {checkpoint}; no model runs"
@@ -661,6 +668,7 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
                 # Naming the adapter's own targets is what makes a module the engine cannot wrap
                 # raise instead of being skipped with a DEBUG line nobody reads.
                 "lora_target_modules": list(facts.target_modules),
+                **({"model_path": load_source} if load_source != base_model else {}),
             },
         )
 
@@ -685,7 +693,7 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
             f"out-of-memory here is that cost, not a bug: rent a larger card rather than dropping "
             f"to bfloat16, which would quietly attenuate every effect size the eval measures."
         )
-    export_merged_checkpoint(checkpoint, base_model, merged_dir, dtype=dtype)
+    export_merged_checkpoint(checkpoint, load_source, merged_dir, dtype=dtype)
     backend_kwargs: dict[str, object] = {}
     if mode == LOAD_MODE_MERGED_FP32:
         # Load-bearing rather than decorative: the backend otherwise picks its own dtype and would

@@ -30,6 +30,7 @@ the input to the causal tier and to the lens ladder, so its shape is a contract.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -501,7 +502,7 @@ class TestReportArtifacts:
         stimuli = make_stimuli()
         capture_root = tmp_path / "capture"
         plant_ladder(capture_root, stimuli)
-        edited = [*stimuli[:-1], Stimulus(**{**vars(stimuli[-1]), "text": "an edited rendering"})]
+        edited = [*stimuli[:-1], replace(stimuli[-1], text="an edited rendering")]
         corpus = self.write_corpus(tmp_path, edited)
         args = build_parser().parse_args(
             [

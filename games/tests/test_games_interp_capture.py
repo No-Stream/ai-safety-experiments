@@ -27,8 +27,9 @@ identity records and the thing that must not silently become `output_hidden_stat
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -37,12 +38,18 @@ from torch import nn
 from games import interp_capture
 from games.interp_capture import (
     LadderCell,
+    assert_contrast_survives_window,
     assert_no_added_special_tokens,
     assert_render_convention,
     build_identity,
+    build_natural_prefix_stimuli,
     capture_cell,
     capture_pooled_matrix,
+    capture_selected_natural_activations,
+    contrast_boundaries,
+    natural_prefix_source_for_cell,
     parse_arm_spec,
+    parse_natural_prefix_sources,
     parse_steps,
     render_stimuli,
     resolve_arm_cells,
@@ -70,9 +77,6 @@ from reward_hacking.interp.directions import (
     last_token_pool,
     mean_pool,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 N_LAYERS = 3
 HIDDEN = 8
@@ -159,6 +163,13 @@ class TinyTokenizer:
     eos_token = "<eos>"
     padding_side: str = "right"
     added_special_tokens: int = 0
+
+    def get_vocab(self) -> dict[str, int]:
+        """Expose the loaded token mapping used by the capture identity."""
+        return {chr(code): code for code in range(VOCAB)}
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {}
 
     def get_chat_template(self) -> str:
         """A template with no `reasoning_effort` knob, so nothing is pinned for it."""
@@ -417,6 +428,356 @@ def stash_then_pool_reference(
             ]
             rows[pooling].append(torch.stack(per_layer, dim=1))
     return {pooling: torch.cat(blocks, dim=0) for pooling, blocks in rows.items()}
+
+
+class TestContrastAndNaturalCapture:
+    def test_contrast_boundary_and_cropped_window_guard(self) -> None:
+        stimuli = make_stimuli(n_pairs=1)
+        tokenizer = TinyTokenizer()
+        rendered_texts = render_stimuli(
+            cast("Any", tokenizer),
+            stimuli,
+            convention=STIMULUS_RENDER_TEMPLATED,
+            enable_thinking=True,
+        )
+        boundaries = contrast_boundaries(cast("Any", tokenizer), stimuli, rendered_texts)
+        assert len(boundaries) == 1
+        boundary = boundaries[0]
+        assert boundary.first_differing_position < min(boundary.left_length, boundary.right_length)
+        assert_contrast_survives_window(
+            cast("Any", tokenizer),
+            stimuli,
+            rendered_texts,
+            window_end=boundary.first_differing_position + 1,
+        )
+        with pytest.raises(ValueError, match="removes the contrast"):
+            assert_contrast_survives_window(
+                cast("Any", tokenizer),
+                stimuli,
+                rendered_texts,
+                window_end=boundary.first_differing_position,
+            )
+
+    def test_natural_capture_selects_positions_in_small_batches(self) -> None:
+        base = make_stimuli(n_pairs=2)
+        stimuli = [
+            Stimulus(
+                stimulus_id=stimulus.stimulus_id,
+                stimulus_set=stimulus.stimulus_set,
+                side=stimulus.side,
+                pair_id=stimulus.pair_id,
+                text=stimulus.text,
+                assistant_prefix=stimulus.assistant_prefix,
+                metadata={
+                    "selected_positions": [0, 2],
+                    "selection_rule": "fixed smoke positions",
+                },
+            )
+            for stimulus in base
+        ]
+        tokenizer = TinyTokenizer()
+        rendered_texts = render_stimuli(
+            cast("Any", tokenizer),
+            stimuli,
+            convention=STIMULUS_RENDER_TEMPLATED,
+            enable_thinking=True,
+        )
+        model = TinyModel()
+        selected, selections = capture_selected_natural_activations(
+            cast("Any", model),
+            cast("Any", tokenizer),
+            stimuli,
+            rendered_texts,
+            layers=[0, 2],
+            batch_size=1,
+        )
+        assert tuple(selection.stimulus_id for selection in selections) == tuple(
+            stimulus.stimulus_id for stimulus in stimuli
+        )
+        assert all(tensor.shape == (2, 2, HIDDEN) for tensor in selected.values())
+        assert model.model.forward_calls == len(stimuli)
+
+        with pytest.raises(ValueError, match="over the exact 1-token capture budget"):
+            capture_selected_natural_activations(
+                cast("Any", TinyModel()),
+                cast("Any", tokenizer),
+                stimuli[:1],
+                rendered_texts,
+                layers=[0],
+                max_prompt_tokens=1,
+            )
+
+    def test_natural_prefix_builder_uses_exact_requests_and_predeclared_positions(self) -> None:
+        manifest = {
+            "version": 1,
+            "rollout_ids_by_state": {
+                "base": "base-eval-2026-09-12",
+                "final": "final-eval-2026-09-12",
+            },
+            "request_ids": ["game-behavior::pair-7::sample-0"],
+            "scenario_groups": ["natural-scenario-7"],
+            "selection_rule": "fixed first, middle, and final pre-action positions",
+            "layers": [0, 2],
+        }
+        records = [
+            {
+                "request_id": "game-behavior::pair-7::sample-0",
+                "rollout_id": "base-eval-2026-09-12",
+                "scenario_group": "natural-scenario-7",
+                "prompt": "Choose one label after considering the situation.",
+                "pre_action_prefix": "The situation has several consequences to weigh.",
+            }
+        ]
+        stimuli = build_natural_prefix_stimuli(
+            records,
+            cast("Any", TinyTokenizer()),
+            manifest,
+            natural_state="base",
+            convention=STIMULUS_RENDER_TEMPLATED,
+            enable_thinking=True,
+        )
+        assert len(stimuli) == 1
+        assert stimuli[0].metadata["request_id"] == records[0]["request_id"]
+        assert stimuli[0].metadata["selected_positions"] == [105, 130, 153]
+        assert stimuli[0].metadata["action_commitment_present"] is False
+        rendered = render_stimuli(
+            cast("Any", TinyTokenizer()),
+            stimuli,
+            convention=STIMULUS_RENDER_TEMPLATED,
+            enable_thinking=True,
+        )
+        _, selections = capture_selected_natural_activations(
+            cast("Any", TinyModel()),
+            cast("Any", TinyTokenizer()),
+            stimuli,
+            rendered,
+            layers=[0, 2],
+        )
+        assert selections[0].request_id == records[0]["request_id"]
+        assert selections[0].rollout_id == records[0]["rollout_id"]
+        assert selections[0].scenario_group == records[0]["scenario_group"]
+
+    def test_natural_prefix_builder_refuses_unlisted_request(self) -> None:
+        manifest = {
+            "version": 1,
+            "rollout_ids_by_state": {
+                "base": "base-eval-2026-09-12",
+                "final": "final-eval-2026-09-12",
+            },
+            "request_ids": ["required"],
+            "scenario_groups": ["natural-scenario-7"],
+            "selection_rule": "fixed positions",
+            "layers": [0],
+        }
+        with pytest.raises(ValueError, match="absent from retained records"):
+            build_natural_prefix_stimuli(
+                [],
+                cast("Any", TinyTokenizer()),
+                manifest,
+                natural_state="base",
+                convention=STIMULUS_RENDER_TEMPLATED,
+                enable_thinking=True,
+            )
+
+    def test_natural_prefix_ids_join_base_and_final_rollouts_by_request(self) -> None:
+        manifest = {
+            "version": 1,
+            "rollout_ids_by_state": {
+                "base": "base/step-0",
+                "final": "final/step-20",
+            },
+            "request_ids": ["request-1"],
+            "scenario_groups": ["eval-group-1"],
+            "selection_rule": "fixed first, middle, and final pre-action positions",
+            "layers": [0, 2],
+        }
+        tokenizer = cast("Any", TinyTokenizer())
+        base = build_natural_prefix_stimuli(
+            [
+                {
+                    "request_id": "request-1",
+                    "rollout_id": "base/step-0",
+                    "scenario_group": "eval-group-1",
+                    "prompt": "Choose one label.",
+                    "pre_action_prefix": "Base considered the consequences before acting.",
+                }
+            ],
+            tokenizer,
+            manifest,
+            natural_state="base",
+            convention=STIMULUS_RENDER_TEMPLATED,
+            enable_thinking=True,
+        )
+        final = build_natural_prefix_stimuli(
+            [
+                {
+                    "request_id": "request-1",
+                    "rollout_id": "final/step-20",
+                    "scenario_group": "eval-group-1",
+                    "prompt": "Choose one label.",
+                    "pre_action_prefix": "Final considered the consequences before acting.",
+                }
+            ],
+            tokenizer,
+            manifest,
+            natural_state="final",
+            convention=STIMULUS_RENDER_TEMPLATED,
+            enable_thinking=True,
+        )
+        assert base[0].stimulus_id == final[0].stimulus_id == "natural-prefix--request-1"
+        assert base[0].metadata["rollout_id"] != final[0].metadata["rollout_id"]
+        assert base[0].metadata["request_id"] == final[0].metadata["request_id"]
+        with pytest.raises(ValueError, match="state 'base' requires"):
+            build_natural_prefix_stimuli(
+                [
+                    {
+                        "request_id": "request-1",
+                        "rollout_id": "final/step-20",
+                        "scenario_group": "eval-group-1",
+                        "prompt": "Choose one label.",
+                        "pre_action_prefix": "Final considered the consequences before acting.",
+                    }
+                ],
+                tokenizer,
+                manifest,
+                natural_state="base",
+                convention=STIMULUS_RENDER_TEMPLATED,
+                enable_thinking=True,
+            )
+
+    def test_capture_source_state_binding_rejects_swapped_state_before_forward(self) -> None:
+        manifest = {"rollout_ids_by_state": {"base": "base/step-0", "final": "final/step-20"}}
+        swapped = Stimulus(
+            stimulus_id="natural-prefix--request-1",
+            stimulus_set="natural-prefix",
+            side="N",
+            pair_id="request-1",
+            text="prompt",
+            metadata={"natural_state": "final", "rollout_id": "final/step-20"},
+        )
+        with pytest.raises(ValueError, match="expected state='base'"):
+            interp_capture._validate_natural_stimuli_state([swapped], manifest, "base")
+
+    def test_natural_prefix_builder_filters_non_behavior_trace_sections(self) -> None:
+        manifest = {
+            "version": 1,
+            "rollout_ids_by_state": {
+                "base": "trace-base-1",
+                "final": "trace-final-1",
+            },
+            "request_ids": ["request-1"],
+            "scenario_groups": ["natural-group-1"],
+            "selection_rule": "fixed first, middle, and final pre-action positions",
+            "layers": [0, 2],
+        }
+        records = [
+            {"record": "forecast", "prompt": "unrelated forecast"},
+            {
+                "record": "game-behavior",
+                "request_id": "request-1",
+                "rollout_id": "trace-base-1",
+                "scenario_group": "natural-group-1",
+                "prompt": "Choose one label.",
+                "pre_action_prefix": "The consequences should be compared before acting.",
+            },
+        ]
+        stimuli = build_natural_prefix_stimuli(
+            records,
+            cast("Any", TinyTokenizer()),
+            manifest,
+            natural_state="base",
+            convention=STIMULUS_RENDER_TEMPLATED,
+            enable_thinking=True,
+        )
+        assert [stimulus.pair_id for stimulus in stimuli] == ["request-1"]
+        malformed = [
+            {"record": "forecast", "prompt": "unrelated forecast"},
+            {key: value for key, value in records[1].items() if key != "pre_action_prefix"},
+        ]
+        with pytest.raises(ValueError, match="pre_action_prefix"):
+            build_natural_prefix_stimuli(
+                malformed,
+                cast("Any", TinyTokenizer()),
+                manifest,
+                natural_state="base",
+                convention=STIMULUS_RENDER_TEMPLATED,
+                enable_thinking=True,
+            )
+
+    def test_natural_prefix_sources_require_per_state_bindings_for_a_ladder(self) -> None:
+        base_source = Path("base.jsonl")
+        final_source = Path("final.jsonl")
+        checkpoint = Path("checkpoint-20")
+        sources = parse_natural_prefix_sources([f"base={base_source}", f"final={final_source}"])
+        assert sources == {"base": base_source, "final": final_source}
+        base = LadderCell(arm="base", step=0, adapter_dir=None)
+        final = LadderCell(arm="trained", step=20, adapter_dir=checkpoint)
+        assert natural_prefix_source_for_cell(base, sources, n_non_base_cells=1) == base_source
+        assert natural_prefix_source_for_cell(final, sources, n_non_base_cells=1) == final_source
+        with pytest.raises(ValueError, match="multiple natural-prefix sources"):
+            parse_natural_prefix_sources([str(base_source), str(final_source)])
+
+    def test_natural_prefix_builder_cli_writes_private_jsonl_and_identity_sidecar(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        records_path = tmp_path / "retained.jsonl"
+        records_path.write_text(
+            json.dumps(
+                {
+                    "request_id": "request-1",
+                    "rollout_id": "trace-base-1",
+                    "scenario_group": "natural-group-1",
+                    "prompt": "Choose one label.",
+                    "pre_action_prefix": "The consequences should be compared before acting.",
+                }
+            )
+            + "\n"
+        )
+        selection_path = tmp_path / "selection.json"
+        selection_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "rollout_ids_by_state": {
+                        "base": "trace-base-1",
+                        "final": "trace-final-1",
+                    },
+                    "request_ids": ["request-1"],
+                    "scenario_groups": ["natural-group-1"],
+                    "selection_rule": "fixed first, middle, and final pre-action positions",
+                    "layers": [0, 2],
+                }
+            )
+        )
+        monkeypatch.setattr(interp_capture, "PRIVATE_SELECTION_MANIFEST_ROOTS", (tmp_path,))
+        monkeypatch.setattr(
+            interp_capture,
+            "AutoTokenizer",
+            SimpleNamespace(from_pretrained=lambda *args, **kwargs: TinyTokenizer()),
+        )
+        output_path = tmp_path / "natural.jsonl"
+        assert (
+            interp_capture.main(
+                [
+                    "--build-natural-prefix-stimuli",
+                    "--records",
+                    str(records_path),
+                    "--natural-selection-manifest",
+                    str(selection_path),
+                    "--natural-prefix-out",
+                    str(output_path),
+                    "--natural-state",
+                    "base",
+                    "--base-model",
+                    "tiny/base",
+                ]
+            )
+            == 0
+        )
+        assert output_path.is_file()
+        sidecar = output_path.with_suffix(".jsonl.manifest.json")
+        assert sidecar.is_file()
+        assert json.loads(sidecar.read_text())["stimulus_ids"] == ["natural-prefix--request-1"]
 
 
 class TestPooledMatrixPoolings:

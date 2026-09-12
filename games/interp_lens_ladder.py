@@ -477,6 +477,7 @@ class LadderLensModels:
     lens_model: str
     merge_root: Path
     base_weights_identity: str
+    base_revision: str | None = None
     _base: object | None = None
     _tokenizer: object | None = None
     _adapted: object | None = None
@@ -502,8 +503,12 @@ class LadderLensModels:
             )
         if self._base is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self._base = load_adapter_base(self.base_model, dtype=self.dtype, device=device)
-            self._tokenizer = AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True)
+            self._base = load_adapter_base(
+                self.base_model, dtype=self.dtype, device=device, revision=self.base_revision
+            )
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.base_model, revision=self.base_revision, trust_remote_code=True
+            )
             logger.info(f"lens ladder base resident for the un-merged path, {self.base_model=}")
         served: object = self._base
         if cell.adapter_dir is None and self._adapted is not None:

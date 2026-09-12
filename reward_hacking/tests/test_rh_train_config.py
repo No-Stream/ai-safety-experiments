@@ -445,7 +445,10 @@ class TestTheLaunchResumesThroughTheCompletenessGate:
             game_train.INIT_ADAPTER_WEIGHTS_FILENAME,
         ):
             if name not in omit and name != game_train.TRAINER_STATE_FILENAME:
-                (checkpoint / name).write_bytes(b"")
+                if name == game_train.ADAPTER_CONFIG_FILENAME:
+                    (checkpoint / name).write_text(json.dumps({"peft_type": "LORA"}))
+                else:
+                    (checkpoint / name).write_bytes(b"state")
         return checkpoint
 
     def launch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:

@@ -216,7 +216,9 @@ class TestABreadthArmsMixedCorpus:
 
     The gate's arm derivation used to read row 0's game, which on a mixed file picks an arm by
     whichever game the concatenation happened to put first, or finds none and refuses a corpus that is
-    perfectly good. It now asks for an arm whose whole game set covers the file.
+    perfectly good. It now asks for an arm whose whole game set covers the file. The later
+    cooperation-generalization treatment overlaps this arm's game set, so shared subsets must name
+    the arm explicitly and remain ambiguous when they do not.
     """
 
     BREADTH_ARM = "prosocial-breadth-care1"
@@ -233,13 +235,18 @@ class TestABreadthArmsMixedCorpus:
         merged.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
         return merged
 
-    def test_a_mixed_corpus_derives_the_breadth_arm_and_passes(self, tmp_path: Path):
+    def test_a_mixed_corpus_passes_when_the_breadth_arm_is_explicit(self, tmp_path: Path):
         corpus = self.mixed(tmp_path, "twin-pd", "stag-hunt", "trust-vs-stated-return")
-        report = corpus_preflight.preflight_corpus(corpus)
+        report = corpus_preflight.preflight_corpus(corpus, arm_name=self.BREADTH_ARM)
         assert report.arm_name == self.BREADTH_ARM
         assert report.game_id == "twin-pd"
         assert report.corpus_game_ids == ("stag-hunt", "trust-vs-stated-return", "twin-pd")
         assert report.n_rows_after_arm_pins == report.n_rows
+
+    def test_a_mixed_subset_shared_with_cooperation_arm_stays_ambiguous(self, tmp_path: Path):
+        corpus = self.mixed(tmp_path, "twin-pd", "stag-hunt", "trust-vs-stated-return")
+        with pytest.raises(ValueError, match="cooperation-generalization-care-alpha-1"):
+            corpus_preflight.preflight_corpus(corpus)
 
     def test_the_report_names_every_game_the_file_holds(self, tmp_path: Path):
         # A report naming the arm's lead game alone would read as a single-game corpus, which is what
@@ -260,11 +267,15 @@ class TestABreadthArmsMixedCorpus:
         with pytest.raises(ValueError, match="no registered arm"):
             corpus_preflight.preflight_corpus(corpus)
 
-    def test_a_single_game_file_of_the_arms_grading_still_derives_it(self, tmp_path: Path):
-        # A breadth corpus with one game's rows is not ambiguous today, because the pair's two arms
-        # differ in grading: the care weight is in the name the corpus rows carry.
+    def test_a_single_game_file_passes_when_the_breadth_arm_is_explicit(self, tmp_path: Path):
         corpus = render(tmp_path, game_id="twin-pd", grading=self.BREADTH_GRADING)
-        assert corpus_preflight.preflight_corpus(corpus).arm_name == self.BREADTH_ARM
+        report = corpus_preflight.preflight_corpus(corpus, arm_name=self.BREADTH_ARM)
+        assert report.arm_name == self.BREADTH_ARM
+
+    def test_a_single_game_file_shared_with_cooperation_arm_stays_ambiguous(self, tmp_path: Path):
+        corpus = render(tmp_path, game_id="twin-pd", grading=self.BREADTH_GRADING)
+        with pytest.raises(ValueError, match="cooperation-generalization-care-alpha-1"):
+            corpus_preflight.preflight_corpus(corpus)
 
     def test_the_control_arms_grading_derives_the_control(self, tmp_path: Path):
         corpus = self.mixed(tmp_path, "twin-pd", "chicken", grading="care-alpha-0")
