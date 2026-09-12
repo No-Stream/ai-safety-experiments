@@ -41,6 +41,18 @@ def isolated_plan_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     monkeypatch.setenv("GAMES_COOP_MAX_STEPS", "1")
     monkeypatch.setenv("GAMES_COOP_COMPLETION_TOKENS", "32768")
 
+    endpoints = dict.fromkeys(plan.REQUIRED_ENDPOINTS, 1.0)
+    _write(
+        runtime / "measurements.json",
+        json.dumps({"all_endpoints_measured": True, "endpoints": endpoints}).encode(),
+    )
+    monkeypatch.setenv("GAMES_COOP_MEASUREMENTS", str(runtime / "measurements.json"))
+    _write(
+        run / "budget.json",
+        json.dumps({"all_endpoints_measured": True, "endpoints": endpoints}).encode(),
+    )
+    monkeypatch.setenv("GAMES_COOP_BUDGET", str(run / "budget.json"))
+
     _write(runtime / "training.jsonl", b'{"id":"training-row"}\n')
     _write(
         runtime / "training-manifest.json",
