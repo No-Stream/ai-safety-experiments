@@ -487,7 +487,7 @@ def real_tokenizer() -> PreTrainedTokenizerBase:
     from transformers import AutoTokenizer  # noqa: PLC0415 - imported only when the smoke runs
 
     try:
-        return cast(
+        tokenizer = cast(
             "PreTrainedTokenizerBase",
             AutoTokenizer.from_pretrained(  # pyright: ignore[reportUnknownMemberType]
                 corpus_module.DEFAULT_BASE_MODEL,
@@ -497,6 +497,15 @@ def real_tokenizer() -> PreTrainedTokenizerBase:
         )
     except OSError as error:
         pytest.skip(f"the base tokenizer is not in the local cache: {error}")
+    # A snapshot holding only config.json (a download that stopped after the config) does not raise:
+    # transformers 5 builds a Qwen3_5Tokenizer with a one-entry vocab and no chat template from it,
+    # and the corpus build then dies inside apply_chat_template with an error that names neither.
+    if not tokenizer.chat_template or len(tokenizer) < 1000:
+        pytest.skip(
+            f"the cached {corpus_module.DEFAULT_BASE_MODEL} snapshot has no tokenizer files "
+            f"(vocab {len(tokenizer)}, chat template {bool(tokenizer.chat_template)}); fetch them first"
+        )
+    return tokenizer
 
 
 @pytest.fixture(scope="module")
