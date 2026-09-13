@@ -51,10 +51,12 @@ if TYPE_CHECKING:
         Sequence,
     )
 
+    from openai.types.chat import ChatCompletion
     from peft import PeftModel
 
 import torch
 import urllib3.exceptions
+from openai import APIStatusError, OpenAI
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -1207,6 +1209,19 @@ class VLLMBackend:
 
 DEFAULT_BEDROCK_REGION = "us-west-2"
 DEFAULT_BEDROCK_CONCURRENCY = 16
+
+OPENROUTER_MODEL_PREFIX = "openrouter:"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = 1_500.0
+DEFAULT_OPENROUTER_CONCURRENCY = 8
+DEFAULT_OPENROUTER_MAX_TOKENS = 120_000
+DEFAULT_OPENROUTER_MAX_ATTEMPTS = 4
+DEFAULT_OPENROUTER_RETRY_BASE_SECONDS = 1.0
+DEFAULT_OPENROUTER_RETRY_MAX_SECONDS = 30.0
+OPENROUTER_RATE_LIMIT_STATUS = 429
+OPENROUTER_SERVER_ERROR_MIN_STATUS = 500
+OPENROUTER_SERVER_ERROR_MAX_STATUS = 599
 
 BEDROCK_PROFILE_ENV = "REWARD_HACKING_BEDROCK_PROFILE"
 
@@ -2750,6 +2765,257 @@ class BedrockBackend:
         return [completion.text for completion in self.generate_detailed(prompts)]
 
 
+class OpenAICompatBackend:
+    """Non-streaming OpenAI-compatible backend for OpenRouter receiver models.
+
+    OpenRouter documents this endpoint as ``POST /api/v1/chat/completions`` with bearer
+    authentication, ``messages``/``model`` request fields, ``message.content`` plus
+    ``finish_reason`` in each choice, and ``prompt_tokens``/``completion_tokens`` in ``usage``.
+    Its unified reasoning option is the nested ``{"reasoning": {"effort": "..."}}`` body field;
+    readable reasoning is returned as ``message.reasoning`` when the selected model/provider emits
+    it. A model-specific unsupported reasoning setting therefore remains in the request and the
+    resulting HTTP 400 is raised rather than being dropped. Sources: OpenRouter's chat-completions
+    API reference and reasoning-token guide, retrieved 2026-09-12.
+
+    The OpenAI SDK is used only as the OpenAI-compatible HTTP client. Its built-in retry policy is
+    disabled so this backend can retry exactly HTTP 429 and 5xx responses, with a bounded exponential
+    delay, while all other HTTP and transport errors raise immediately.
+    """
+
+    transport = "openai-compatible"
+
+    def __init__(  # noqa: PLR0913 - flat request and retry knobs are independently run-shaping
+        self,
+        model_id: str,
+        *,
+        base_url: str = DEFAULT_OPENROUTER_BASE_URL,
+        timeout: float = DEFAULT_OPENROUTER_TIMEOUT_SECONDS,
+        concurrency: int = DEFAULT_OPENROUTER_CONCURRENCY,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        reasoning_effort: str | None = None,
+        max_attempts: int = DEFAULT_OPENROUTER_MAX_ATTEMPTS,
+        retry_base_seconds: float = DEFAULT_OPENROUTER_RETRY_BASE_SECONDS,
+        retry_max_seconds: float = DEFAULT_OPENROUTER_RETRY_MAX_SECONDS,
+    ) -> None:
+        """Construct a client, resolving the API key before any request can be made."""
+        api_key = os.environ.get(OPENROUTER_API_KEY_ENV, "").strip()
+        if not api_key:
+            raise RuntimeError(
+                f"{OPENROUTER_API_KEY_ENV} is not set; export it before constructing "
+                "OpenAICompatBackend"
+            )
+        if not model_id.removeprefix(OPENROUTER_MODEL_PREFIX):
+            raise ValueError("model_id must contain a model name after the openrouter: prefix")
+        if timeout <= 0:
+            raise ValueError(f"timeout must be positive, got {timeout}")
+        if concurrency < 1:
+            raise ValueError(f"concurrency must be at least 1, got {concurrency}")
+        if max_tokens is not None and max_tokens < 1:
+            raise ValueError(f"max_tokens must be positive when set, got {max_tokens}")
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
+        if retry_base_seconds < 0:
+            raise ValueError(f"retry_base_seconds must be non-negative, got {retry_base_seconds}")
+        if retry_max_seconds < retry_base_seconds:
+            raise ValueError(
+                "retry_max_seconds must be at least retry_base_seconds; "
+                f"got {retry_max_seconds} < {retry_base_seconds}"
+            )
+
+        self.model_id = model_id.removeprefix(OPENROUTER_MODEL_PREFIX)
+        self.concurrency = concurrency
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.reasoning_effort = reasoning_effort
+        self.max_attempts = max_attempts
+        self.retry_base_seconds = retry_base_seconds
+        self.retry_max_seconds = retry_max_seconds
+        self.usage = TokenUsage()
+        self._usage_lock = threading.Lock()
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=base_url.rstrip("/"),
+            timeout=timeout,
+            max_retries=0,
+        )
+
+    def _request_kwargs(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None,
+        extra_body: Mapping[str, object] | None,
+    ) -> dict[str, Any]:
+        """Build one chat request without allowing extra fields to overwrite core fields."""
+        effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+        if effective_max_tokens is not None and effective_max_tokens < 1:
+            raise ValueError(f"max_tokens must be positive when set, got {effective_max_tokens}")
+
+        request_kwargs: dict[str, Any] = {
+            "messages": messages,
+            "model": self.model_id,
+        }
+        if effective_max_tokens is not None:
+            request_kwargs["max_tokens"] = effective_max_tokens
+        if self.temperature is not None:
+            request_kwargs["temperature"] = self.temperature
+        if self.top_p is not None:
+            request_kwargs["top_p"] = self.top_p
+
+        request_extra_body = dict(extra_body) if extra_body is not None else {}
+        core_fields = {"messages", "model", "max_tokens", "temperature", "top_p"}
+        conflicts = core_fields.intersection(request_extra_body)
+        if conflicts:
+            raise ValueError(f"extra_body cannot override core request fields: {sorted(conflicts)}")
+        if self.reasoning_effort is not None:
+            if "reasoning" in request_extra_body or "reasoning_effort" in request_extra_body:
+                raise ValueError(
+                    "extra_body already specifies reasoning while reasoning_effort is configured"
+                )
+            request_extra_body["reasoning"] = {"effort": self.reasoning_effort}
+        if request_extra_body:
+            request_kwargs["extra_body"] = request_extra_body
+        return request_kwargs
+
+    @staticmethod
+    def _reasoning_text(message: Mapping[str, Any]) -> str:
+        """Read OpenRouter's readable reasoning field, including text in reasoning details."""
+        reasoning = message.get("reasoning", message.get("reasoning_content"))
+        if reasoning is not None:
+            if not isinstance(reasoning, str):
+                raise TypeError(
+                    f"OpenRouter reasoning must be a string, got {type(reasoning).__name__}"
+                )
+            return reasoning
+
+        details = message.get("reasoning_details")
+        if details is None:
+            return ""
+        if not isinstance(details, list):
+            raise TypeError(
+                f"OpenRouter reasoning_details must be a list, got {type(details).__name__}"
+            )
+        text_parts: list[str] = []
+        for detail in details:
+            if not isinstance(detail, dict):
+                raise TypeError(
+                    f"OpenRouter reasoning detail must be an object, got {type(detail).__name__}"
+                )
+            text = detail.get("text")
+            if text is not None:
+                if not isinstance(text, str):
+                    raise TypeError(
+                        f"OpenRouter reasoning detail text must be a string, got {type(text).__name__}"
+                    )
+                text_parts.append(text)
+        return "".join(text_parts)
+
+    @classmethod
+    def _parse_response(
+        cls, response: ChatCompletion, *, attempts: int, elapsed_seconds: float
+    ) -> BedrockCompletion:
+        """Map an OpenAI SDK response into the shared detailed-completion record."""
+        choice = response.choices[0]
+        message = cast("Mapping[str, Any]", choice.message.model_dump())
+        content = message.get("content")
+        if content is None:
+            text = ""
+        elif isinstance(content, str):
+            text = content
+        else:
+            raise TypeError(
+                f"OpenRouter message content must be a string, got {type(content).__name__}"
+            )
+
+        if response.usage is None:
+            raise RuntimeError("OpenRouter response omitted the required usage object")
+        usage = cast("Mapping[str, Any]", response.usage.model_dump())
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        if not isinstance(prompt_details, dict):
+            raise TypeError(
+                "OpenRouter prompt_tokens_details must be an object when present, "
+                f"got {type(prompt_details).__name__}"
+            )
+        return BedrockCompletion(
+            text=text,
+            reasoning=cls._reasoning_text(message),
+            usage=TokenUsage(
+                input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+                output_tokens=int(usage.get("completion_tokens", 0) or 0),
+                cache_read_input_tokens=int(prompt_details.get("cached_tokens", 0) or 0),
+            ),
+            stop_reason=choice.finish_reason,
+            elapsed_seconds=elapsed_seconds,
+            first_event_seconds=None,
+            attempts=attempts,
+        )
+
+    def complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        extra_body: Mapping[str, object] | None = None,
+    ) -> BedrockCompletion:
+        """Complete one OpenAI-format chat and add its usage to the run total."""
+        request_kwargs = self._request_kwargs(
+            messages, max_tokens=max_tokens, extra_body=extra_body
+        )
+        started = time.monotonic()
+        create = cast("Any", self._client.chat.completions.create)
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                response = create(**request_kwargs)
+            except APIStatusError as error:
+                status_code = error.status_code
+                retryable = status_code == OPENROUTER_RATE_LIMIT_STATUS or (
+                    OPENROUTER_SERVER_ERROR_MIN_STATUS
+                    <= status_code
+                    <= OPENROUTER_SERVER_ERROR_MAX_STATUS
+                )
+                if not retryable or attempt == self.max_attempts:
+                    raise
+                delay = min(
+                    self.retry_max_seconds,
+                    self.retry_base_seconds * (2 ** (attempt - 1)),
+                )
+                logger.warning(
+                    "OpenAICompatBackend %s received HTTP %d; retrying attempt %d/%d in %.1fs",
+                    self.model_id,
+                    status_code,
+                    attempt + 1,
+                    self.max_attempts,
+                    delay,
+                )
+                time.sleep(delay)
+            else:
+                completion = self._parse_response(
+                    response,
+                    attempts=attempt,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                with self._usage_lock:
+                    self.usage += completion.usage
+                return completion
+        raise RuntimeError("OpenRouter request loop exited without a response")
+
+    def _complete_prompt(self, prompt: str) -> BedrockCompletion:
+        """Wrap one plain prompt as the single user message used by ``generate_detailed``."""
+        return self.complete([{"role": "user", "content": prompt}])
+
+    def generate_detailed(self, prompts: list[str]) -> list[BedrockCompletion]:
+        """Generate one detailed completion per prompt in request order."""
+        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
+            return list(pool.map(self._complete_prompt, prompts))
+
+    def generate(self, prompts: list[str]) -> list[str]:
+        """Generate one answer per prompt, discarding the detailed telemetry."""
+        return [completion.text for completion in self.generate_detailed(prompts)]
+
+
 class MockBackend:
     """Offline stand-in for a policy: no model, no torch load, deterministic completions.
 
@@ -2940,10 +3206,16 @@ def build_backend(kind: str, model_id: str, **kwargs: object) -> Backend:
     """Build the backend selected by ``kind``.
 
     Supported kinds are ``hf`` (transformers), ``mock`` (offline), ``vllm`` (lazy), ``bedrock``
-    (hosted Converse API, lazy), and ``codex`` (shells the codex CLI for GPT-5.x). ``bedrock`` takes
-    a ``BedrockSamplingConfig`` rather than the ``SamplingConfig`` the local backends take; see
-    ``BedrockSamplingConfig`` for why.
+    (hosted Converse API, lazy), ``openrouter`` (OpenAI-compatible hosted API), and ``codex``
+    (shells the codex CLI for GPT-5.x). A model id beginning with ``openrouter:`` routes here even
+    when a legacy caller still supplies ``kind="bedrock"``; the prefix is stripped only from the
+    provider request, while the detailed record keeps the backend's normalized model id.
+
+    ``bedrock`` takes a ``BedrockSamplingConfig`` rather than the ``SamplingConfig`` the local
+    backends take; see ``BedrockSamplingConfig`` for why.
     """
+    if kind == "openrouter" or model_id.startswith(OPENROUTER_MODEL_PREFIX):
+        return OpenAICompatBackend(model_id, **kwargs)  # pyright: ignore[reportArgumentType]
     if kind == "hf":
         return HFBackend(model_id, **kwargs)  # pyright: ignore[reportArgumentType]
     if kind == "mock":
@@ -2955,7 +3227,7 @@ def build_backend(kind: str, model_id: str, **kwargs: object) -> Backend:
     if kind == "codex":
         return CodexBackend(model_id, **kwargs)  # pyright: ignore[reportArgumentType]
     raise ValueError(
-        f"unknown backend kind {kind!r}; expected 'hf', 'mock', 'vllm', 'bedrock', or 'codex'"
+        f"unknown backend kind {kind!r}; expected 'hf', 'mock', 'vllm', 'bedrock', 'openrouter', or 'codex'"
     )
 
 
