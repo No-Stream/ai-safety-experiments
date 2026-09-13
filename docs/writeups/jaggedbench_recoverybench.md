@@ -16,29 +16,32 @@ We tested how often models repeated errors handed to them, both ones we manually
 
 ## Methods and Results
 
-In our initial pass, we tested GPT-OSS-120B and Minimax m2.5 on LiveCodeBench items and found that they deferred more to manually-generated errors than those extracted from actual failed model reasoning traces (9/45 vs 39/42, Fisher p 1.7e-12). We found that wrong methods transferred far better than simple arithmetic errors, which were nearly always caught. (DETAILS, #s TODO)
+In our initial pass, we tested GPT-OSS-120B and Minimax m2.5 on LiveCodeBench items and found that they deferred more to manually-generated errors than those extracted from actual failed model reasoning traces (9/45 vs 39/42, Fisher p 1.7e-12). We found that wrong methods transferred far better than simple arithmetic errors, which were nearly always caught. 
 
-In another experiment, we assembled 80 coding and 34 math problems from USACO 2026, Codeforces 2026, LiveCodeBench v6 Hard, and MathArena hard and harvested 279 model errors from 77 problems. We measured what we termed the "mean net inheritance," meaning the increase in failing the same targeted test cases as the source solution. 
 
-| Receiver | Mean net inheritance  on coding problems (abs %) | Problems |
-|---|---:|---:|
-| GPT-5.6 Luna | +43% | 30 |
-| GPT-OSS-120B | +40% | 18 |
-| GPT-5.6 Sol | +38% | 23 |
-| GPT-5.6 Sol, easy items | +4% | 48 |
-(TODO P VAL, N, ETC)
+│ Flaw Type, GPT-5.6 Luna │
+│ Wrong method │ +49% │
+│ (Right method), wrong execution │ −12% │
+│ Arithmetic error or similar │ −18% │
 
-Each model received faulty reasoning from a variety of models' failures. We found that GPT-5.6 Sol only displayed +4.2% inheritance on problems with a >90% base solve rate, suggesting it was less misled by incorrect traces on these; however, there may be some ceiling effect here. We found that GPT-OSS-120B carried its own errors more than other models', but Minimax m2.5 the reverse.
+In another experiment, we assembled 80 coding and 34 math problems from USACO 2026, Codeforces 2026, LiveCodeBench v6 Hard, and MathArena hard and harvested 279 model errors from 77 problems. We measured what we termed the "mean net error inheritance," meaning the increase in _failing_ the same targeted test cases as the source solution. 
 
-We found that models rarely inherited mistakes on questions comfortably within their capabilities. (TODO details, #s)
+| Model | Net error inheritance on coding problems (abs %) | 95% CI (bootstrap) | N | N with + / - / 0 net inheritance | Sign test p |
+|---|---:|---:|---:|---:|---:|
+| GPT-5.6 Luna | 43% | 33%-55% | 30 | 25 / 4 / 1 | 1e-4 |
+| GPT-OSS-120B | 42% | 27%-57% | 17 | 15 / 1 / 1 | 5e-4 |
+| GPT-5.6 Sol | 38% | 22%-55% | 22 | 16 / 3 / 3 | 0.004 |
+| GPT-5.6 Sol, easy items | 4% | 2%-7% | 48 | 10 / 0 / 38 | 0.002 |
 
-(TODO we should discuss whether the faulty solutions were helpful or harmful, when, patterns, speculation...)
+Each model received faulty reasoning from a variety of models' failures. We found that 
 
-We found at least some heterogeneity by problem; on one problem Sol 5.6 repeated one failure pattern 85% of the time and another 10% of the time (P VALUE HERE). One interesting case was on a suboptimal solution that was too slow to pass some test cases; here models adopted the slow pattern 85-100% of the time, dropping their solve rate from 40-80% to 0-15%. (The models were told that time restrictions exist.) (TODO detail on the time restriction, did we clearly comm it?)
+We found some model-specific differences in inheriting hard problem vs easy problem errors. GPT-5.6 Sol only displayed +4.2% inheritance on problems with a >90% base solve rate, suggesting it was less misled by incorrect traces on these (comparison to non-easy problems stat sig, Mann-Whitney U p = 7e-4). Luna, on the other hand, still had a 35% inheritance on its easy problems. In general, wrong drafts dropped solve rate by 30% for moderate difficulty problems (defined by their problem-specific solve rate), although in a few cases incorrect drafts helped models by providing an approach. Models also differed on whether they tended to inherit their own or other models' errors, with GPT-OSS-120B shipping its own errors more than other models', but Minimax m2.5 the reverse (+0.27 vs -0.33, both p < 1e-4).
 
-We found that higher reasoning effort reduced error inheritance; the obvious explanation would be that at higher effort levels models were willing to complete their own reasoning, but this could also simply be improved model performance / test time compute scaling. 
+We found at least some heterogeneity by problem; on one problem Sol 5.6 repeated a failure pattern 85% of the time and another 10% of the time (17/20 vs 2/20, Fisher p 3.4e-6). On a suboptimal solution that was too slow to pass some test cases, models adopted the slow pattern 85-100% of the time, dropping their solve rate from 40-80% to 0-15%. (The models were told that time restrictions exist.)
 
-_We think that these results suggest that solving problems and checking solutions are somewhat different capabilites_, and models can vary along these correlated dimensions. For example, on one item GPT-5.6 Sol had an 89% solve rate unaided and 0/20 when handed a failure. (TODO SUPPORT THIS!)
+We found that higher reasoning effort reduced error inheritance; the obvious explanation would be that at higher effort levels models were willing to complete their own reasoning, but this could also simply be improved model performance / test time compute scaling. For GPT-OSS, reducing effort from default to low increased inheritance without reducing solve rate, supporting the first mechanism, but this is only suggestive given a single model.
+
+_We think that these results suggest that solving problems and checking solutions are somewhat different capabilites_, and models can vary along these correlated dimensions. For example, on one item GPT-5.6 Sol had an 89% solve rate unaided and 0/20 when handed a failure. In another instance, we found GPT-OSS-120B detected an error 25/25 times but still submitted the error 19/25 times. 
 
 ## Limitations and Next Steps
 
