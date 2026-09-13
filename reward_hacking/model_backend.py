@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
+import email.utils
 import importlib
 import logging
+import math
 import os
 import shutil
 import signal
@@ -1218,13 +1221,13 @@ OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = 1_500.0
 DEFAULT_OPENROUTER_CONCURRENCY = 8
 DEFAULT_OPENROUTER_MAX_TOKENS = 120_000
-DEFAULT_OPENROUTER_MAX_ATTEMPTS = 4
+DEFAULT_OPENROUTER_MAX_ATTEMPTS = 8
 DEFAULT_OPENROUTER_REASONING_EFFORT = "medium"
 """The owner's default rung for every hosted receiver (2026-09-12): enough reasoning that a model is
 not lazy, without buying its full test-time-compute scaling, which the bench does not depend on.
 Pass ``reasoning_effort=None`` to send no reasoning field and take the provider default."""
 DEFAULT_OPENROUTER_RETRY_BASE_SECONDS = 1.0
-DEFAULT_OPENROUTER_RETRY_MAX_SECONDS = 30.0
+DEFAULT_OPENROUTER_RETRY_MAX_SECONDS = 120.0
 DEFAULT_OPENROUTER_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 OPENROUTER_RATE_LIMIT_STATUS = 429
 OPENROUTER_SERVER_ERROR_MIN_STATUS = 500
@@ -2776,6 +2779,10 @@ class _OpenRouterGenerationError(RuntimeError):
     """A completed stream cannot be treated as a model answer and may be retried."""
 
 
+class OpenRouterRetryExhaustedError(RuntimeError):
+    """All configured attempts for one OpenRouter generation failed."""
+
+
 class OpenRouterChunkStream(Protocol):
     """The OpenAI SDK stream methods used by :class:`OpenAICompatBackend`."""
 
@@ -3086,21 +3093,85 @@ class OpenAICompatBackend:
             attempts=attempts,
         )
 
+    @staticmethod
+    def _parse_retry_after(value: object) -> float | None:
+        """Parse a provider retry hint expressed as seconds or an HTTP date."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            delay = float(value)
+        elif isinstance(value, str):
+            try:
+                delay = float(value.strip())
+            except ValueError:
+                try:
+                    retry_at = email.utils.parsedate_to_datetime(value)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=datetime.UTC)
+                delay = (retry_at - datetime.datetime.now(datetime.UTC)).total_seconds()
+        else:
+            return None
+        return delay if math.isfinite(delay) and delay >= 0 else None
+
+    @classmethod
+    def _collect_retry_after_hints(cls, value: object, source: str) -> list[tuple[float, str]]:
+        """Collect retry hints from nested provider metadata."""
+        if not isinstance(value, dict):
+            return []
+        hints: list[tuple[float, str]] = []
+        for key, nested in value.items():
+            if key == "retry_after_seconds":
+                parsed = cls._parse_retry_after(nested)
+                if parsed is not None:
+                    hints.append((parsed, f"{source}.retry_after_seconds"))
+            elif isinstance(key, str) and key.lower() == "retry-after":
+                parsed = cls._parse_retry_after(nested)
+                if parsed is not None:
+                    hints.append((parsed, f"{source}.Retry-After"))
+            elif isinstance(nested, dict):
+                hints.extend(cls._collect_retry_after_hints(nested, f"{source}.{key}"))
+        return hints
+
+    @classmethod
+    def _retry_after_hint(cls, error: BaseException) -> tuple[float, str] | None:
+        """Return the largest provider retry hint carried by an OpenRouter status error."""
+        if not isinstance(error, APIStatusError):
+            return None
+
+        hints = cls._collect_retry_after_hints(error.body, "response body")
+
+        header_value = error.response.headers.get("retry-after")
+        parsed_header = cls._parse_retry_after(header_value)
+        if parsed_header is not None:
+            hints.append((parsed_header, "response header Retry-After"))
+        return max(hints, key=lambda hint: hint[0]) if hints else None
+
     def _retry_after(self, error: BaseException, attempt: int) -> None:
         """Sleep before a retry or raise a bounded error naming the final failure."""
         if attempt == self.max_attempts:
-            raise RuntimeError(
+            raise OpenRouterRetryExhaustedError(
                 f"OpenRouter generation failed after {attempt} attempts; last failure: "
                 f"{type(error).__name__}: {error}"
             ) from error
         delay = min(self.retry_max_seconds, self.retry_base_seconds * (2 ** (attempt - 1)))
+        retry_hint = self._retry_after_hint(error)
+        if retry_hint is not None:
+            hint_seconds, hint_source = retry_hint
+            delay = max(delay, hint_seconds)
+            reason = (
+                f"{type(error).__name__}: {error}; provider retry hint "
+                f"{hint_seconds:.1f}s ({hint_source})"
+            )
+        else:
+            reason = f"{type(error).__name__}: {error}"
         logger.warning(
-            "OpenAICompatBackend %s failed on attempt %d/%d (%s: %s); retrying in %.1fs",
+            "OpenAICompatBackend %s failed on attempt %d/%d (%s); retrying in %.1fs",
             self.model_id,
             attempt,
             self.max_attempts,
-            type(error).__name__,
-            error,
+            reason,
             delay,
         )
         time.sleep(delay)

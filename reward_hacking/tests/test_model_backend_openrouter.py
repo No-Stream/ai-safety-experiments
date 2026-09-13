@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import httpx2
 import openai
@@ -12,6 +12,8 @@ import pytest
 from reward_hacking import model_backend
 from reward_hacking.model_backend import (
     DEFAULT_OPENROUTER_BASE_URL,
+    DEFAULT_OPENROUTER_MAX_ATTEMPTS,
+    DEFAULT_OPENROUTER_RETRY_MAX_SECONDS,
     OPENROUTER_MODEL_PREFIX,
     OpenAICompatBackend,
     TokenUsage,
@@ -20,7 +22,7 @@ from reward_hacking.model_backend import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 
 MODEL_ID = "meta/muse-spark-1.3-contributor"
@@ -406,6 +408,92 @@ class TestOpenAICompatBackend:
         assert completion.text == "answer"
         assert completion.attempts == 2
         assert len(requests) == 2
+
+    def test_retryable_503_honors_provider_retry_after_seconds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend, requests = _backend_with_http_responses(
+            monkeypatch,
+            [
+                (
+                    503,
+                    {
+                        "message": "service overloaded",
+                        "code": 503,
+                        "metadata": {
+                            "provider_error_code": "service_overloaded",
+                            "retry_after_seconds": 60,
+                        },
+                    },
+                ),
+                (200, _completion_body()),
+            ],
+            max_attempts=2,
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(model_backend.time, "sleep", sleeps.append)
+
+        completion = backend.generate_detailed(["prompt"])[0]
+
+        assert completion.attempts == 2
+        assert len(requests) == 2
+        assert sleeps == [60.0]
+
+    def test_retryable_503_honors_retry_after_header(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        backend, requests = _backend_with_http_responses(
+            monkeypatch,
+            [(503, {"error": {"message": "service overloaded"}}), (200, _completion_body())],
+        )
+        # HTTP Retry-After is a response header, so use the transport seam directly for this case.
+        original_send = cast("Callable[..., httpx2.Response]", backend._client._client.send)
+
+        def send_with_retry_after_header(
+            request: httpx2.Request, **kwargs: object
+        ) -> httpx2.Response:
+            response = original_send(request, **kwargs)
+            if response.status_code == 503:
+                response.headers["Retry-After"] = "7"
+            return response
+
+        monkeypatch.setattr(backend._client._client, "send", send_with_retry_after_header)
+        sleeps: list[float] = []
+        monkeypatch.setattr(model_backend.time, "sleep", sleeps.append)
+
+        completion = backend.generate_detailed(["prompt"])[0]
+
+        assert completion.attempts == 2
+        assert len(requests) == 2
+        assert sleeps == [7.0]
+
+    def test_retry_defaults_are_sized_for_provider_outages(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend, _ = _backend_with_http_responses(monkeypatch, [(200, _completion_body())])
+
+        assert DEFAULT_OPENROUTER_MAX_ATTEMPTS == 8
+        assert DEFAULT_OPENROUTER_RETRY_MAX_SECONDS == 120.0
+        assert backend.max_attempts == DEFAULT_OPENROUTER_MAX_ATTEMPTS
+        assert backend.retry_max_seconds == DEFAULT_OPENROUTER_RETRY_MAX_SECONDS
+
+    def test_retry_wait_keeps_each_stream_idle_timeout_per_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stream_idle_timeout = 17.0
+        backend, requests = _backend_with_http_responses(
+            monkeypatch,
+            [(503, {"error": {"message": "service overloaded"}}), (200, _completion_body())],
+            stream_idle_timeout=stream_idle_timeout,
+            max_attempts=2,
+        )
+        sleeps: list[float] = []
+        monkeypatch.setattr(model_backend.time, "sleep", sleeps.append)
+
+        completion = backend.generate_detailed(["prompt"])[0]
+
+        assert completion.attempts == 2
+        assert len(requests) == 2
+        assert sleeps == [1.0]
+        assert backend._client._client.timeout.read == stream_idle_timeout
 
     def test_bad_request_raises_without_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         backend, requests = _backend_with_http_responses(
