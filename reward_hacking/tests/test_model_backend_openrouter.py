@@ -166,6 +166,7 @@ class TestOpenAICompatBackend:
             "messages": [{"role": "user", "content": "solve this"}],
             "model": MODEL_ID,
             "max_tokens": 321,
+            "reasoning": {"effort": "medium"},
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -448,3 +449,19 @@ class TestOpenRouterFactoryRouting:
         body = json.loads(requests[0].content)
         assert body["reasoning"] == {"effort": "high"}
         assert DEFAULT_OPENROUTER_BASE_URL == "https://openrouter.ai/api/v1"
+
+
+class TestDefaultReasoningEffort:
+    def test_default_sends_medium_effort_and_none_sends_no_reasoning_field(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend, requests = _backend_with_http_responses(monkeypatch, [(200, _completion_body())])
+        backend.generate_detailed(["p"])
+        default_body = json.loads(requests[0].content)
+        assert default_body["reasoning"] == {"effort": "medium"}
+
+        backend, requests = _backend_with_http_responses(
+            monkeypatch, [(200, _completion_body())], reasoning_effort=None
+        )
+        backend.generate_detailed(["p"])
+        assert "reasoning" not in json.loads(requests[0].content)

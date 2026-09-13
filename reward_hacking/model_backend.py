@@ -1219,6 +1219,10 @@ DEFAULT_OPENROUTER_TIMEOUT_SECONDS = 1_500.0
 DEFAULT_OPENROUTER_CONCURRENCY = 8
 DEFAULT_OPENROUTER_MAX_TOKENS = 120_000
 DEFAULT_OPENROUTER_MAX_ATTEMPTS = 4
+DEFAULT_OPENROUTER_REASONING_EFFORT = "medium"
+"""The owner's default rung for every hosted receiver (2026-09-12): enough reasoning that a model is
+not lazy, without buying its full test-time-compute scaling, which the bench does not depend on.
+Pass ``reasoning_effort=None`` to send no reasoning field and take the provider default."""
 DEFAULT_OPENROUTER_RETRY_BASE_SECONDS = 1.0
 DEFAULT_OPENROUTER_RETRY_MAX_SECONDS = 30.0
 DEFAULT_OPENROUTER_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
@@ -2820,7 +2824,7 @@ class OpenAICompatBackend:
         max_tokens: int | None = None,
         temperature: float | None = None,
         top_p: float | None = None,
-        reasoning_effort: str | None = None,
+        reasoning_effort: str | None = DEFAULT_OPENROUTER_REASONING_EFFORT,
         max_attempts: int = DEFAULT_OPENROUTER_MAX_ATTEMPTS,
         retry_base_seconds: float = DEFAULT_OPENROUTER_RETRY_BASE_SECONDS,
         retry_max_seconds: float = DEFAULT_OPENROUTER_RETRY_MAX_SECONDS,
