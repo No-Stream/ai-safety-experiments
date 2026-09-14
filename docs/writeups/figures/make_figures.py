@@ -7,12 +7,15 @@ tables of the hunt26 reanalysis, whose only derived quantities are per-band mean
 
     .venv/bin/python docs/writeups/figures/make_figures.py --data <path-to-figure_data.json>
 
-Writes ``fig{1,2,3,4,5}_*.svg`` and 2x ``.png`` next to this file.
+Figure 6 comes from the Muse planted-vs-natural summary table and its stage-A records.
+
+Writes ``fig{1,2,3,4,5,6}_*.svg`` and 2x ``.png`` next to this file.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import math
@@ -891,6 +894,312 @@ def make_fig5(bimodality: dict[str, Any]) -> pathlib.Path:
     return save(fig, "fig5_bimodality")
 
 
+# --- figure 6: the Muse planted-vs-natural draft arms --------------------------
+DRAFT_ARMS = ("natural", "clean_natural", "planted")
+ARM_LABELS = {
+    "natural": "natural\n(a wrong solution\nanother model produced)",
+    "clean_natural": "clean rewrite\n(the same wrong algorithm,\nwritten cleanly)",
+    "planted": "planted\n(a freshly authored\nwrong method)",
+}
+MUSE_JITTER_HALF_WIDTH = 0.013  # per-item values tie exactly; lines would hide each other.
+MUSE_JITTER_SEED = 20260913
+
+
+def parse_muse_per_item(path: pathlib.Path) -> dict[str, dict[str, dict[str, float]]]:
+    """Read the ``Per-item`` table of the Muse summary into item -> arm -> metrics.
+
+    The only parsed columns are the strict ``carry all raw/net`` pair and the solve rate.
+    """
+    per_item: dict[str, dict[str, dict[str, float]]] = {}
+    in_table = False
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if line.startswith("## Per-item"):
+            in_table = True
+            continue
+        if in_table and line.startswith("## "):
+            break
+        if not in_table or not line.startswith("|") or line.startswith("|---"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if cells[0] in {"item", ""}:
+            continue
+        item, arm = cells[0], cells[1]
+        raw_all, net_all = (v.strip() for v in cells[4].split(" / "))  # "N/A" itself holds a slash
+        metrics = {"solve": float(cells[5])}
+        if net_all != "N/A":
+            metrics["raw_all"] = float(raw_all)
+            metrics["net_all"] = float(net_all)
+        per_item.setdefault(item, {})[arm] = metrics
+    if not per_item:
+        raise ValueError(f"no per-item rows parsed from {path}")
+    return per_item
+
+
+def parse_muse_bare_solve(path: pathlib.Path) -> dict[str, float]:
+    """Unaided solve rate per item from the stage-A records."""
+    passed: dict[str, list[bool]] = {}
+    for raw_line in path.read_text().splitlines():
+        if not raw_line.strip():
+            continue
+        record = json.loads(raw_line)
+        passed.setdefault(record["task_id"], []).append(bool(record["grade"]["passed_all"]))
+    return {item: sum(flags) / len(flags) for item, flags in passed.items()}
+
+
+def draw_item_lines(
+    ax: Axes, xs: list[float], series: list[list[float]], rng: random.Random
+) -> None:
+    """One thin jittered line per item over the panel's x positions."""
+    for values in series:
+        jitter = rng.uniform(-MUSE_JITTER_HALF_WIDTH, MUSE_JITTER_HALF_WIDTH)
+        ax.plot(
+            xs,
+            [v + jitter for v in values],
+            color=INK_MUTED,
+            lw=1.0,
+            alpha=0.75,
+            solid_capstyle="round",
+            zorder=3,
+        )
+        for x, value in zip(xs, values, strict=True):
+            ax.plot([x], [value + jitter], marker="o", ms=3.0, ls="none", color=INK_MUTED, zorder=4)
+
+
+def draw_mean_marker(ax: Axes, x: float, mean: float, color: str, *, below: bool) -> None:
+    """Draw a bold pooled-mean marker with its value label, on an opaque patch."""
+    ax.plot([x], [mean], marker="o", ms=11.0, color=color, mec=BG, mew=2.0, zorder=7)
+    ax.annotate(
+        f"{mean:+.2f}" if color == RED else f"{mean:.2f}",
+        (x, mean),
+        textcoords="offset points",
+        xytext=(0, -20 if below else 15),
+        ha="center",
+        va="top" if below else "bottom",
+        fontsize=9.4,
+        color=INK,
+        zorder=8,
+        bbox={"facecolor": BG, "edgecolor": "none", "pad": 1.8, "alpha": 0.9},
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class MusePanelAxis:
+    """Everything that differs between the two figure-6 panels' axes."""
+
+    xlim: tuple[float, float]
+    ylim: tuple[float, float]
+    xticks: list[float]
+    xticklabels: list[str]
+    yticks: list[float]
+    yticklabels: list[str]
+    ylabel: str
+
+
+def style_muse_axis(ax: Axes, spec: MusePanelAxis) -> None:
+    """Apply the house panel cosmetics: recessive gridlines at every y tick, no spines."""
+    ax.set_xlim(*spec.xlim)
+    ax.set_ylim(*spec.ylim)
+    ax.set_xticks(spec.xticks)
+    ax.set_xticklabels(spec.xticklabels, fontsize=7.8, linespacing=1.6)
+    ax.set_yticks(spec.yticks)
+    ax.set_yticklabels(spec.yticklabels, fontsize=8.0)
+    for y in spec.yticks:
+        ax.axhline(y, color=GRID, lw=0.7, zorder=0)
+    ax.set_ylabel(spec.ylabel, fontsize=8.6, labelpad=8)
+    ax.tick_params(axis="y", length=3, pad=4)
+    ax.tick_params(axis="x", length=0, pad=9)
+    strip_spines(ax, keep=())
+
+
+def make_fig6(per_item_path: pathlib.Path, stage_a_path: pathlib.Path) -> pathlib.Path:
+    """Per-item net strict inheritance across the three wrong-draft arms, plus the correct-draft lift."""
+    per_item = parse_muse_per_item(per_item_path)
+    bare_solve = parse_muse_bare_solve(stage_a_path)
+    items = sorted(per_item)
+    missing = [item for item in items if item not in bare_solve]
+    if missing:
+        raise ValueError(f"no stage-A floor for {missing}")
+
+    rng = random.Random(MUSE_JITTER_SEED)
+    fig = plt.figure(figsize=(8.0, 6.6), dpi=BASE_DPI)
+    ax_arms = fig.add_axes((0.093, 0.345, 0.455, 0.335))
+    ax_solve = fig.add_axes((0.745, 0.345, 0.185, 0.335))
+
+    printed: list[str] = []
+
+    # --- left panel: one thin line per item over the three wrong-draft arms ---
+    xs = [0.0, 1.0, 2.0]
+    draw_item_lines(
+        ax_arms,
+        xs,
+        [[per_item[item][arm]["net_all"] for arm in DRAFT_ARMS] for item in items],
+        rng,
+    )
+
+    arm_means = {
+        arm: sum(per_item[item][arm]["net_all"] for item in items) / len(items)
+        for arm in DRAFT_ARMS
+    }
+    ax_arms.plot(
+        xs, [arm_means[arm] for arm in DRAFT_ARMS], color=RED, lw=2.6, zorder=6, alpha=0.85
+    )
+    for x, arm in zip(xs, DRAFT_ARMS, strict=True):
+        mean = arm_means[arm]
+        draw_mean_marker(ax_arms, x, mean, RED, below=False)
+        printed.append(f"{arm}: mean net strict inheritance {mean:+.3f} (n={len(items)} items)")
+
+    style_muse_axis(
+        ax_arms,
+        MusePanelAxis(
+            xlim=(-0.42, 2.42),
+            ylim=(-0.42, 1.02),
+            xticks=xs,
+            xticklabels=[ARM_LABELS[arm] for arm in DRAFT_ARMS],
+            yticks=[-0.25, 0.0, 0.25, 0.5, 0.75, 1.0],
+            yticklabels=["-0.25", "0", "+0.25", "+0.50", "+0.75", "+1.00"],
+            ylabel="Net strict inheritance, in rate points",
+        ),
+    )
+    ax_arms.axhline(0.0, color=RULE, lw=1.1, zorder=1)
+
+    # --- right panel: unaided solve against solve with a correct draft ---
+    solve_xs = [0.0, 1.0]
+    draw_item_lines(
+        ax_solve,
+        solve_xs,
+        [[bare_solve[item], per_item[item]["correct"]["solve"]] for item in items],
+        rng,
+    )
+
+    mean_bare = sum(bare_solve[item] for item in items) / len(items)
+    mean_correct = sum(per_item[item]["correct"]["solve"] for item in items) / len(items)
+    ax_solve.plot(solve_xs, [mean_bare, mean_correct], color=BLUE, lw=2.6, zorder=6, alpha=0.85)
+    for x, mean, below in ((0.0, mean_bare, True), (1.0, mean_correct, False)):
+        draw_mean_marker(ax_solve, x, mean, BLUE, below=below)
+    printed.append(f"correct draft: mean solve {mean_correct:.3f} vs unaided {mean_bare:.3f}")
+
+    style_muse_axis(
+        ax_solve,
+        MusePanelAxis(
+            xlim=(-0.55, 1.55),
+            ylim=(-0.06, 1.20),
+            xticks=solve_xs,
+            xticklabels=["no draft\n(unaided)", "correct draft\n(clean, right)"],
+            yticks=[0.0, 0.25, 0.5, 0.75, 1.0],
+            yticklabels=["0", "0.25", "0.50", "0.75", "1.00"],
+            ylabel="Solve rate",
+        ),
+    )
+
+    fig.text(
+        0.093,
+        0.715,
+        "Wrong drafts: what the receiver inherits",
+        ha="left",
+        va="bottom",
+        fontsize=9.6,
+        color=INK,
+    )
+    fig.text(
+        0.745,
+        0.715,
+        "Correct draft",
+        ha="left",
+        va="bottom",
+        fontsize=9.6,
+        color=INK,
+    )
+    # The uplift, set off by a mustard rule in the header line rather than a coloured number.
+    fig.add_artist(
+        Line2D([0.856, 0.856], [0.712, 0.742], color=MUSTARD, lw=2.4, transform=fig.transFigure)
+    )
+    fig.text(
+        0.868,
+        0.716,
+        f"mean uplift {mean_correct - mean_bare:+.2f}",
+        ha="left",
+        va="bottom",
+        fontsize=8.2,
+        color=INK_SECONDARY,
+    )
+
+    legend_handles = [
+        Line2D([], [], color=INK_MUTED, lw=1.0, marker="o", ms=3.6, label="One problem"),
+        Line2D(
+            [],
+            [],
+            color=RED,
+            lw=2.6,
+            marker="o",
+            ms=9.0,
+            mec=BG,
+            mew=1.6,
+            label="Mean over the 12 problems (inheritance)",
+        ),
+        Line2D(
+            [],
+            [],
+            color=BLUE,
+            lw=2.6,
+            marker="o",
+            ms=9.0,
+            mec=BG,
+            mew=1.6,
+            label="Mean over the 12 problems (solve rate)",
+        ),
+    ]
+    legend = fig.legend(
+        handles=legend_handles,
+        loc="upper left",
+        bbox_to_anchor=(0.089, 0.252),
+        frameon=False,
+        fontsize=8.0,
+        ncol=3,
+        columnspacing=1.8,
+        handletextpad=0.6,
+    )
+    for text in legend.get_texts():
+        text.set_color(INK_SECONDARY)
+
+    add_title(
+        fig,
+        "On Luna, a tidy rewrite of the same wrong method is inherited twice as often as the "
+        "original, and a freshly planted flaw less than either",
+        "Net strict inheritance = the share of rollouts failing every test the supplied wrong draft "
+        "failed, minus the same model's rate of failing those same tests with no draft. 12 problems "
+        "in Luna's 40% to 90% unaided-solve range; 10 rollouts per cell.",
+        title_wrap=70,
+        subtitle_wrap=112,
+    )
+    add_footer(
+        fig,
+        [
+            (
+                "Fisher exact on the pooled strict carry counts: the clean rewrite against the natural "
+                "original p = 0.012; the planted flaw against the natural original p = 0.015, in the "
+                "opposite direction from an earlier two-problem result on other models. The planted flaws "
+                "here were authored by a different process from that study, so this planted arm is not "
+                "comparable across studies."
+            ),
+            (
+                "Per problem, the clean rewrite carries more than the natural original on 9 of 12, and the "
+                "planted flaw carries less than the natural original on 6 of 12."
+            ),
+            (
+                "Solve rate with a correct draft is 0.83 against 0.66 unaided (8 unaided rollouts per "
+                "problem). Thin lines are jittered vertically by up to +/-0.013 because many problems share "
+                "identical values."
+            ),
+        ],
+        wrap=134,
+        y=0.205,
+    )
+    for line in printed:
+        logger.info("fig6 -- %s", line)
+    return save(fig, "fig6_draft_arms")
+
+
 def save(fig: Figure, stem: str) -> pathlib.Path:
     """Write the figure as SVG and as a 2x PNG, and return the PNG path."""
     svg_path = FIGURE_DIR / f"{stem}.svg"
@@ -905,6 +1214,8 @@ def save(fig: Figure, stem: str) -> pathlib.Path:
 REPO_ROOT = FIGURE_DIR.parents[2]
 DEFAULT_PER_ITEM = REPO_ROOT / "docs/scratch/mechanism-scoping/hunt26_reanalysis_per_item.json"
 DEFAULT_BIMODALITY = REPO_ROOT / "docs/scratch/mechanism-scoping/hunt26_reanalysis_bimodality.json"
+DEFAULT_MUSE_SUMMARY = REPO_ROOT / "docs/scratch/mechanism-scoping/muse_pvn_summary.luna.md"
+DEFAULT_MUSE_STAGE_A = REPO_ROOT / "docs/scratch/mechanism-scoping/muse_pvn_stagea.luna.jsonl"
 
 
 def main() -> None:
@@ -927,6 +1238,18 @@ def main() -> None:
         default=DEFAULT_BIMODALITY,
         help="path to hunt26_reanalysis_bimodality.json (figure 5)",
     )
+    parser.add_argument(
+        "--muse-summary",
+        type=pathlib.Path,
+        default=DEFAULT_MUSE_SUMMARY,
+        help="path to muse_pvn_summary.luna.md (figure 6)",
+    )
+    parser.add_argument(
+        "--muse-stage-a",
+        type=pathlib.Path,
+        default=DEFAULT_MUSE_STAGE_A,
+        help="path to muse_pvn_stagea.luna.jsonl (figure 6)",
+    )
     args = parser.parse_args()
 
     per_item = json.loads(args.per_item.read_text())
@@ -944,6 +1267,7 @@ def main() -> None:
         make_fig3(data)
     make_fig4(per_item)
     make_fig5(bimodality)
+    make_fig6(args.muse_summary, args.muse_stage_a)
 
 
 if __name__ == "__main__":
