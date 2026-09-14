@@ -1,25 +1,24 @@
-> This description is LLM-written. The original code here was written by hand; later work has
-> used LLMs.
+> This description is largely LLM-written. The original code here was written by hand; later work has
+> used LLMs. _Note that writeups live in docs/writeups and are human-generated._
+> Benchmark text is not publicly exposed; please contact me if you're interested, and I'm happy to share it.
 
 # Transformer Experiments
 
-Personal AI-alignment research repo. The current direction is **reward hacking**: what heavy
-reinforcement learning against verifiable rewards teaches a model beyond the tasks it was
-trained on, and in particular whether training across many loosely-checked environments
-instils a general prior that the reachable action space is wider than the task description
-implies, plus a habit of reading what dimension a situation is being graded on.
+I focus on a few directions:
+- HuggingFace incident inspired agent motivations: why do agents cooperate or not cooperate with other agents? early directions suggest game theoretical or self-interested motivations as primary with a variety of other model-specific motivations. (e.g. Claude Sonnet 5 seems to display cooperative or altruistic tendencies in some toy-ish evals.)
+- RLVR/GRPO on cooperative and competitive games: how does RLVR affect models' behaviors, self-image, and beliefs, and how much does altruistic or competitive game training, and eventually more complex env training, affect deployment.
+- JaggedBench and its first facet, RecoveryBench: investigating gaps in the jagged frontier. One direction is model recovery: models often proceed along a given path and have trouble taking a step back and finding a better route. This benchmark attempts to measure and document that. It also begins to measure agents' trustworthiness and cooperation: do models trust information packets given to them blindly? This has speculative implications regarding memetic and agent swarm behaviors, which is a future line of work. 
 
-If you are an agent working here, read [AGENTS.md](AGENTS.md) first — it has the operating
-rules, which matter more than the layout.
+If you are an agent working here, read [AGENTS.md](AGENTS.md) first. This document is primarily for humans.
 
 ## Layout
 
 | Directory | What it is |
 |---|---|
-| [`reward_hacking/`](reward_hacking/README.md) | The live project: chasing reward-hacking leads on an off-the-shelf Qwen3.5-4B, plus the TMAX checkpoint tooling. Also houses the RecoveryBench and JaggedBench corpora, which belong to a separate line of work (capacities current models lack) and only live here physically. |
+| [`reward_hacking/`](reward_hacking/README.md) | The live project: chasing reward-hacking leads. Also houses the RecoveryBench and JaggedBench corpora. |
 | `games/` | The game-theory GRPO project: matrix-game RL arms that differ only in grading rule, an eval battery, a decision-theory probe battery, and the stage runner that sequences GPU stages. |
 | `sociology/` | The analysis-model observer study: bundles of banked agent episodes that provably could not have communicated, fed to hosted models under varied framings. |
-| [`grpo/`](grpo/README.md) | Shared RL training substrate — a working GRPO harness on TRL 1.10. |
+| [`grpo/`](grpo/README.md) | Shared RL training substrate: a working GRPO harness on TRL 1.10. |
 | `cloud/` | The AWS Batch surface for training arms: container, ECR push, job submission. |
 | [`legacy/`](legacy/README.md) | Finished research. Closed records; do not extend. |
 | `scripts/` | Resource limiter, episode jail and its red-team suite, canary tripwire, secret scanner, GPU preflight. |
@@ -30,7 +29,7 @@ rules, which matter more than the layout.
 
 ## Setup
 
-One command. It builds `.venv` from the pinned `uv.lock`:
+To build `.venv` from the pinned `uv.lock`:
 
 ```bash
 make setup
@@ -38,8 +37,7 @@ make setup
 
 Python 3.13, managed by [uv](https://docs.astral.sh/uv/). `pyproject.toml` pins the stack
 (torch 2.13, transformers 5.15, TRL 1.10, PEFT, Liger) and `uv.lock` fixes every transitive
-version, so the environment is reproducible. Never `pip install`. vLLM is an optional extra
-and is not needed for anything below:
+version, so the environment is reproducible. Never `pip install`. vLLM is recommended dep for inference speed:
 
 ```bash
 uv sync --extra vllm
@@ -79,8 +77,10 @@ worker start-up costs more than it saves on a narrow selection.
 
 ## Running things on the dev box
 
-Everything local runs on one NVIDIA L4 (24 GB) shared by every session, and only for smokes of
-about ten minutes or less. Real runs belong on a rented GPU, EC2 or AWS Batch, not here.
+Compute is local: one NVIDIA RTX 5090 (32 GB) on a Ryzen 5950X under WSL2, shared by whatever
+sessions are running. Real runs belong here, not on a rented GPU; long jobs are expected, through
+the resource limiter and in a tmux session with a teed log. Rented EC2 and AWS Batch are the
+secondary path for a job that outgrows 32 GB.
 
 Run anything expensive through the resource-limit wrapper, which caps CPU, memory, tasks and
 wall-clock via cgroup v2 so a runaway job cannot make the box unresponsive. It limits resource
@@ -91,11 +91,11 @@ scripts/resource-limits.sh --gpu -t 15m -- python train.py
 ```
 
 `scripts/gpu_preflight.py` refuses to start when another process already holds VRAM on the
-single shared L4. Resource conventions, the measured basis for the thread caps, and which
+single shared GPU. Resource conventions, the measured basis for the thread caps, and which
 limits are enforced versus advisory are in [docs/resource-limits.md](docs/resource-limits.md).
 
-For isolation rather than resource capping — running untrusted or scope-violating code in a
-filesystem/network-isolated jail — use `scripts/episode_jail.sh`, gated on
+For isolation rather than resource capping, running untrusted or scope-violating code in a
+filesystem/network-isolated jail, use `scripts/episode_jail.sh`, gated on
 `scripts/run_jail_tests.sh`, which proves containment holds *and* that the assertion suite has
 teeth. See [docs/episode-isolation.md](docs/episode-isolation.md). Compose them limits
 outside, isolation inside, never the reverse:

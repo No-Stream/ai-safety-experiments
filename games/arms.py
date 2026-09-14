@@ -848,6 +848,21 @@ ARMS: dict[str, GameArm] = {
             "these prompts does, which is the confound the wave-3 grading ladder was built to avoid."
         ),
     ),
+    # The 2026-09-12 cooperation-generalization treatment: a deliberately small frozen corpus over
+    # PD, stag hunt and the announced-rule trust sender. It has its own name and game set so its
+    # manifest cannot be confused with the earlier five-game breadth treatment.
+    "cooperation-generalization-care-alpha-1": GameArm(
+        game_id="twin-pd",
+        game_ids=("stag-hunt", "trust-vs-stated-return"),
+        grading=care_grading(1),
+        parse_penalty_mode=PARSE_PENALTY_MARGIN_BELOW_WORSE,
+        notes=(
+            "Small three-family cooperation-generalization treatment: care-alpha-1 over explicitly "
+            "frozen PD and stag-hunt matrix cells plus a small announced-rule trust subset. Matrix "
+            "rows preserve complete label mappings at both printed positions; trust retains both "
+            "disclosed return regimes. Its private manifest records the selected scenario groups."
+        ),
+    ),
 }
 
 

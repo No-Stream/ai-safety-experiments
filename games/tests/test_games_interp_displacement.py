@@ -36,6 +36,7 @@ refusal reached through the CLI.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -796,7 +797,7 @@ class TestReportArtifacts:
         stimuli = make_stimuli()
         digest = stimuli_digest(stimuli)
         capture_root = plant_ladder(tmp_path / "capture", stimuli, digest)
-        edited = [*stimuli[:-1], Stimulus(**{**vars(stimuli[-1]), "text": "an edited rendering"})]
+        edited = [*stimuli[:-1], replace(stimuli[-1], text="an edited rendering")]
         stimuli_path, provenance_path = write_corpus(tmp_path, edited)
         args = build_parser().parse_args(
             [

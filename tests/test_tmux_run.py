@@ -134,6 +134,21 @@ def new_session_call(calls: list[list[str]]) -> list[str]:
     return matching[0]
 
 
+def environment_without_the_outer_make() -> dict[str, str]:
+    """The current environment minus everything the make that launched this suite would forward.
+
+    An outer `make test GATE_TMUX=1` hands its command-line variables to every sub-make through
+    MAKEFLAGS, and the suite's own GATE_TMUX reaches here through the environment too, so the make
+    invocations under test saw a GATE_TMUX=1 nobody passed them and six tests went red with the
+    Makefile correct. Every test here asserts on what ITS OWN invocation passes.
+    """
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"MAKEFLAGS", "MFLAGS", "MAKELEVEL"} and not name.startswith("GATE_TMUX")
+    }
+
+
 class GateStubs:
     """A stub `tmux` and a stub `uv` first on PATH, plus the environment that steers them."""
 
@@ -149,7 +164,7 @@ class GateStubs:
         self.uv_log = root / "uv-calls.log"
 
     def env(self, **overrides: str) -> dict[str, str]:
-        env = dict(os.environ)
+        env = environment_without_the_outer_make()
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
         env["TMUX_STUB_LOG"] = str(self.log)
         env["UV_STUB_LOG"] = str(self.uv_log)
@@ -204,7 +219,8 @@ class TestTmuxRunLaunch:
         result = run_helper(stubs, "cell-run", "--log", str(log), "--", "echo", "hi")
         assert result.returncode == 0, result.stderr
         session_command = new_session_call(stubs.calls)[-1]
-        assert session_command.startswith("set -o pipefail;")
+        assert session_command.startswith("export PATH=")
+        assert "; set -o pipefail;" in session_command
         assert f"| tee {log}" in session_command
         # A bare $? under pipefail (zsh lacks ${PIPESTATUS[0]}), captured before the newline check runs.
         assert f"| tee {log}; rc=$?;" in session_command
@@ -240,8 +256,10 @@ class TestTmuxRunLaunch:
         call = new_session_call(stubs.calls)
         assert "-d" in call
         assert call[call.index("-c") + 1] == str(work_dir)
-        assert call[call.index("-e") + 1].startswith("PATH=")
-        assert str(stubs.bin_dir) in call[call.index("-e") + 1]
+        # Inside the command string, not `new-session -e`: that flag needs tmux 3.2 and the box has 3.0a.
+        assert "-e" not in call
+        assert call[-1].startswith("export PATH=")
+        assert str(stubs.bin_dir) in call[-1]
 
     def test_an_existing_session_is_checked_for_by_exact_name(self, stubs: GateStubs) -> None:
         """Without the '=' prefix has-session matches by prefix, so `ci` would look taken by `ci-2`."""
@@ -648,6 +666,7 @@ class TestMakeCiConcurrencyAndStatus:
                 f"TYPECHECK_RC={typecheck}",
                 f"TEST_RC={test}",
             ],
+            env=environment_without_the_outer_make(),
             capture_output=True,
             text=True,
             check=False,

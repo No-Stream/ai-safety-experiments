@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -43,6 +46,10 @@ from games.interp_steering import (
     CONDITION_PLACEBO_UP,
     CONDITION_STEER_DOWN,
     CONDITION_STEER_UP,
+    CUSTOM_ALLOCATION_DIAGNOSTIC_ROW_COLUMNS,
+    CUSTOM_ROW_COLUMNS,
+    DIAGNOSTIC_FAMILY_COSTLY_HELPING,
+    DIAGNOSTIC_FAMILY_PAYOFF_CONTROL,
     STEERING_CONDITIONS,
     GenerationCondition,
     condition_key,
@@ -50,15 +57,20 @@ from games.interp_steering import (
     generation_rows,
     hook_for,
     label_first_tokens,
+    load_custom_diagnostic_rows,
+    load_custom_row_manifest,
     load_direction_file,
     parse_named_layers,
     parse_named_specs,
     plan_generation_cells,
+    render_binary_allocation_prompt,
+    reward_optimal_outcome,
     run_fit_direction,
     run_generate,
     select_intervention,
     steering_rows,
     summarise_records,
+    validate_custom_diagnostic_rows,
 )
 from games.prompts import FRAMING_HUMAN, FRAMING_TWIN
 from reward_hacking.interp.directions import (
@@ -72,6 +84,8 @@ from reward_hacking.interp.steering import residual_intervention, steering_hook
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from transformers import PreTrainedTokenizerBase
 
 STIMULUS_SET = "causal-vs-functional-decision"
 N_LAYERS = 2
@@ -449,7 +463,73 @@ class TestSummaries:
         assert summary["n_truncated_thinking"] == 1
         assert summary["cooperate_k"] == 2
         assert summary["cooperate_rate"] == pytest.approx(2 / 3)
+        assert summary["cooperate_rate_lower_bound"] == pytest.approx(2 / 4)
+        assert summary["cooperate_rate_upper_bound"] == pytest.approx(3 / 4)
         assert summary["by_print_order"]["swapped"]["n_parsed"] == 1
+        assert summary["by_print_order"]["swapped"]["n_completions"] == 2
+        assert summary["by_print_order"]["swapped"]["n_parse_failures"] == 1
+        assert summary["by_print_order"]["swapped"]["cooperate_rate_lower_bound"] == pytest.approx(
+            1 / 2
+        )
+        assert summary["by_print_order"]["swapped"]["cooperate_rate_upper_bound"] == pytest.approx(
+            1.0
+        )
+
+    def test_unresolved_outputs_stay_in_the_rate_bounds(self) -> None:
+        records = [
+            {
+                "condition_key": condition,
+                "cooperate": cooperate,
+                "truncated_thinking": False,
+                "label_print_order": "canonical",
+            }
+            for condition, cooperate in [
+                ("real", True),
+                ("real", None),
+                ("placebo", True),
+                ("placebo", False),
+            ]
+        ]
+        summary = summarise_records(records)
+
+        assert summary["real"]["cooperate_rate"] == pytest.approx(1.0)
+        assert summary["real"]["cooperate_rate_lower_bound"] == pytest.approx(0.5)
+        assert summary["real"]["cooperate_rate_upper_bound"] == pytest.approx(1.0)
+        assert summary["placebo"]["cooperate_rate"] == pytest.approx(0.5)
+        assert summary["placebo"]["cooperate_rate_lower_bound"] == pytest.approx(0.5)
+        assert summary["placebo"]["cooperate_rate_upper_bound"] == pytest.approx(0.5)
+
+    def test_allocation_payoffs_keep_unresolved_denominators(self) -> None:
+        records = [
+            {
+                "condition_key": "diagnostic",
+                "cooperate": True,
+                "truncated_thinking": False,
+                "label_print_order": "canonical",
+                "row_kind": "binary-allocation",
+                "selected_own_payoff": 2.0,
+                "selected_counterpart_payoff": 8.0,
+                "selected_total_welfare": 10.0,
+            },
+            {
+                "condition_key": "diagnostic",
+                "cooperate": None,
+                "truncated_thinking": True,
+                "label_print_order": "canonical",
+                "row_kind": "binary-allocation",
+                "selected_own_payoff": None,
+                "selected_counterpart_payoff": None,
+                "selected_total_welfare": None,
+            },
+        ]
+
+        entry = summarise_records(records)["diagnostic"]
+
+        assert entry["n_allocation_completions"] == 2
+        assert entry["n_allocation_payoff_resolved"] == 1
+        assert entry["n_allocation_payoff_unresolved"] == 1
+        assert entry["selected_total_welfare_mean"] == pytest.approx(10.0)
+        assert entry["by_print_order"]["canonical"]["n_allocation_payoff_unresolved"] == 1
 
 
 class TestRows:
@@ -460,39 +540,304 @@ class TestRows:
         assert orders == {"canonical", "swapped"}
 
 
+def custom_diagnostic_rows() -> list[dict[str, Any]]:
+    """Synthetic structural rows; no benchmark prompt text belongs in this test file."""
+    rows: list[dict[str, Any]] = []
+    for index in range(8):
+        is_allocation = index < 4
+        family = (
+            DIAGNOSTIC_FAMILY_COSTLY_HELPING if is_allocation else DIAGNOSTIC_FAMILY_PAYOFF_CONTROL
+        )
+        order = "canonical" if index % 2 == 0 else "swapped"
+        row: dict[str, Any] = {
+            "prompt": f"synthetic diagnostic placeholder {index}",
+            "prompt_id": f"synthetic-diagnostic-{index}",
+            "game_id": "synthetic-game",
+            "grading": "self",
+            "label_a": "LEFT",
+            "label_b": "RIGHT",
+            "coop_label": "LEFT",
+            "reskin_id": f"synthetic-frame-{index}",
+            "payoff_variant": "synthetic-variant",
+            "label_print_order": order,
+            "payoff_cc": 3.0,
+            "payoff_cd": 0.0,
+            "payoff_dc": 5.0,
+            "payoff_dd": 1.0,
+            "endowment": 0.0,
+            "windfall": 0.0,
+            "team_size": 0,
+            "contribution_threshold": 0,
+            "prize": 0.0,
+            "opp_coop_prob": -1.0,
+            "opponent_rule": "",
+            "n_rounds": 0,
+            "transfer_multiplier": 0.0,
+            "stated_return_fraction": -1.0,
+            "stated_match_prob": -1.0,
+            "n_levels": 0,
+            "benefit_per_level": 0.0,
+            "cost_per_level": 0.0,
+            "diagnostic_family": family,
+        }
+        if is_allocation:
+            row.update(
+                {
+                    "row_kind": "binary-allocation",
+                    "allocation_context": f"synthetic allocation context {index}",
+                    "allocation_action_a_description": "synthetic action left",
+                    "allocation_action_b_description": "synthetic action right",
+                    "allocation_prompt_template": (
+                        "context={context};first={first_label}:{first_description}:"
+                        "{first_own_payoff}:{first_counterpart_payoff};second={second_label}:"
+                        "{second_description}:{second_own_payoff}:{second_counterpart_payoff}"
+                    ),
+                    "allocation_action_a_own_payoff": 2.0,
+                    "allocation_action_a_counterpart_payoff": 6.0,
+                    "allocation_action_b_own_payoff": 5.0,
+                    "allocation_action_b_counterpart_payoff": 0.0,
+                }
+            )
+            row["prompt"] = render_binary_allocation_prompt(row)
+        rows.append(row)
+    return rows
+
+
+def unbalance_custom_family_orders(rows: list[dict[str, Any]]) -> None:
+    rows[1]["label_print_order"] = "canonical"
+    rows[1]["prompt"] = render_binary_allocation_prompt(rows[1])
+    rows[4]["label_print_order"] = "swapped"
+
+
+class TestCustomDiagnosticRows:
+    def test_the_fixed_manifest_has_eight_rows_and_balances_each_stratum(self) -> None:
+        rows = validate_custom_diagnostic_rows(custom_diagnostic_rows())
+        assert len(rows) == 8
+        assert frozenset(rows[0]) == CUSTOM_ALLOCATION_DIAGNOSTIC_ROW_COLUMNS
+        assert frozenset(rows[4]) == CUSTOM_ROW_COLUMNS
+        for family in (DIAGNOSTIC_FAMILY_COSTLY_HELPING, DIAGNOSTIC_FAMILY_PAYOFF_CONTROL):
+            assert sum(row["diagnostic_family"] == family for row in rows) == 4
+            assert (
+                sum(
+                    row["diagnostic_family"] == family and row["label_print_order"] == "canonical"
+                    for row in rows
+                )
+                == 2
+            )
+            assert (
+                sum(
+                    row["diagnostic_family"] == family and row["label_print_order"] == "swapped"
+                    for row in rows
+                )
+                == 2
+            )
+
+    def test_reward_optimum_comes_from_the_matrix_not_the_cooperation_label(self) -> None:
+        row = custom_diagnostic_rows()[4]
+        outcome = reward_optimal_outcome(row)
+        assert outcome["reward_optimal"] == "RIGHT"
+        assert outcome["payoff_sensitive"] == 1.0
+
+    def test_unknown_opponent_probability_does_not_invent_a_matrix_optimum(self) -> None:
+        row = custom_diagnostic_rows()[4]
+        row.update({"payoff_cc": 2.0, "payoff_cd": 0.0, "payoff_dc": 1.0, "payoff_dd": 3.0})
+        outcome = reward_optimal_outcome(row)
+        assert outcome["reward_optimal"] is None
+        assert outcome["own_payoff_optimal"] is None
+
+    @pytest.mark.parametrize(
+        ("mutation", "message"),
+        [
+            (lambda rows: rows.pop(), "exactly 8"),
+            (lambda rows: rows[0].pop("prompt"), "missing"),
+            (lambda rows: rows.__setitem__(1, dict(rows[0])), "duplicate"),
+            (
+                lambda rows: rows.__setitem__(0, {**rows[0], "diagnostic_family": "other"}),
+                "diagnostic_family",
+            ),
+            (
+                unbalance_custom_family_orders,
+                "print order within",
+            ),
+            (
+                lambda rows: rows[0].__setitem__("allocation_action_a_own_payoff", 99.0),
+                "prompt does not match",
+            ),
+            (
+                lambda rows: rows[0].__setitem__(
+                    "allocation_prompt_template", "{context} {first_label}"
+                ),
+                "exact placeholder",
+            ),
+        ],
+    )
+    def test_manifest_sabotage_is_refused(self, mutation: Any, message: str) -> None:
+        rows = custom_diagnostic_rows()
+        mutation(rows)
+        with pytest.raises(ValueError, match=message):
+            validate_custom_diagnostic_rows(rows)
+
+    def test_a_manifest_file_is_loaded_at_runtime(self, tmp_path: Path) -> None:
+        path = tmp_path / "diagnostic-rows.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": "cooperation-generalization-diagnostic-rows/v1",
+                    "rows": custom_diagnostic_rows(),
+                }
+            )
+            + "\n"
+        )
+        rows = load_custom_diagnostic_rows(path)
+        assert [row["prompt_id"] for row in rows] == [
+            f"synthetic-diagnostic-{index}" for index in range(8)
+        ]
+
+    def test_generic_manifest_profile_does_not_require_diagnostic_families(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "generic-rows.json"
+        generic_rows = [
+            {key: value for key, value in row.items() if key != "diagnostic_family"}
+            for row in custom_diagnostic_rows()
+        ]
+        path.write_text(json.dumps({"rows": generic_rows}))
+        rows = load_custom_row_manifest(path)
+        assert len(rows) == 8
+        with pytest.raises(ValueError, match="diagnostic_family"):
+            validate_custom_diagnostic_rows(generic_rows)
+
+    def test_a_wrong_manifest_schema_is_refused(self, tmp_path: Path) -> None:
+        path = tmp_path / "diagnostic-rows.json"
+        path.write_text(json.dumps({"schema": "future", "rows": custom_diagnostic_rows()}))
+        with pytest.raises(ValueError, match="expected"):
+            load_custom_diagnostic_rows(path)
+
+
 class _FakeBackend:
     """Stands in for HFBackend: carries a tiny trunk for the hooks, never generates."""
 
     transport = "hf"
 
-    def __init__(self, model_id: str, *, thinking: bool, sampling: Any) -> None:
+    def __init__(
+        self, model_id: str, *, thinking: bool, sampling: Any, model: Any | None = None
+    ) -> None:
         self.model_id = model_id
         self.thinking = thinking
         self.sampling = sampling
-        self._model = TinyLM(24, torch.randn(HIDDEN))
+        self._model = TinyLM(24, torch.randn(HIDDEN)) if model is None else model
+        self._tokenizer = _TinyTokenizer()
 
     def generate(self, prompts: list[str]) -> list[str]:
         raise AssertionError("the fake decode path should be used instead")
+
+    @property
+    def model(self) -> Any:
+        return self._model
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+
+class _TinyTokenBatch(dict[str, torch.Tensor]):
+    def to(self, device: torch.device) -> _TinyTokenBatch:
+        return _TinyTokenBatch({key: value.to(device) for key, value in self.items()})
+
+
+class _TinyTokenizer:
+    def apply_chat_template(self, messages: object, **_: object) -> str:
+        return str(messages)
+
+    def __call__(self, chats: list[str], **_: object) -> _TinyTokenBatch:
+        return _TinyTokenBatch(
+            {
+                "input_ids": torch.ones(len(chats), 3, dtype=torch.long),
+                "attention_mask": torch.ones(len(chats), 3, dtype=torch.long),
+            }
+        )
+
+
+class _TinyAdapterLM(torch.nn.Module):
+    def __init__(self, delta: float) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(()))
+        self.delta = delta
+        self.enabled = True
+
+    @property
+    def device(self) -> torch.device:
+        return self.anchor.device
+
+    @contextmanager
+    def disable_adapter(self) -> Any:
+        was_enabled = self.enabled
+        self.enabled = False
+        try:
+            yield
+        finally:
+            self.enabled = was_enabled
+
+    def forward(self, input_ids: torch.Tensor, **_: object) -> SimpleNamespace:
+        logits = torch.zeros(*input_ids.shape, 2, device=input_ids.device)
+        if self.enabled:
+            logits[..., 0] += self.delta
+        return SimpleNamespace(logits=logits)
 
 
 def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> argparse.Namespace:
     defaults: dict[str, Any] = {
         "model": "tiny/base",
+        "adapter": None,
         "direction": [f"decision={directions_path}"],
         "cells": ["decision:18:1.0"],
         "from_sweep": None,
+        "selected_target": None,
         "n_cells": 3,
         "n_samples": 1,
         "batch_size": 4,
         "max_new_tokens": 64,
         "seed": 0,
+        "placebo_seed": None,
         "deadline": None,
         "conditions": None,
         "counterpart_framing": None,
+        "row_manifest": None,
+        "diagnostic_profile": None,
         "out_dir": tmp_path / "steering",
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+def write_selected_target(
+    path: Path, directions_path: Path, *, extra: dict[str, Any] | None = None
+) -> Path:
+    direction = torch.load(directions_path, map_location="cpu", weights_only=True)[18]
+    report_path = path.parent / "cooperation_interp.json"
+    report_path.write_text('{"synthetic_report": true}\n')
+    payload: dict[str, Any] = {
+        "schema": "cooperation-generalization-selected-target/v1",
+        "version": 1,
+        "target_construct": "decision",
+        "direction": "decision",
+        "direction_path": str(directions_path.resolve()),
+        "direction_sha256": hashlib.sha256(directions_path.read_bytes()).hexdigest(),
+        "layer": 18,
+        "magnitude": 0.5 * float(direction.norm()),
+        "alpha_multiplier": 0.5,
+        "calibration_metric": 0.25,
+        "calibration_rationale": "synthetic fit-only calibration fixture",
+        "expected_effect": "synthetic pre-intervention expectation",
+        "expectation_recorded_before_intervention": True,
+        "geometry_report_path": str(report_path.resolve()),
+        "geometry_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        "exploratory": True,
+    }
+    if extra:
+        payload.update(extra)
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n")
+    return path
 
 
 @pytest.fixture
@@ -647,6 +992,179 @@ class TestGenerateOffline:
         args = generate_args(tmp_path, directions_path, cells=None, from_sweep=None)
         with pytest.raises(ValueError, match="exactly one"):
             run_generate(args)
+
+
+class TestCustomDiagnosticGeneration:
+    def _patch(self, monkeypatch: pytest.MonkeyPatch, completions_for: Any) -> None:
+        monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
+        monkeypatch.setattr(interp_steering, "decode_in_chunks", completions_for)
+
+    def test_generate_uses_all_eight_rows_while_conditions_filter_interventions(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = custom_diagnostic_rows()
+        manifest_path = tmp_path / "private-diagnostic-rows.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "cooperation-generalization-diagnostic-rows/v1",
+                    "rows": rows,
+                }
+            )
+            + "\n"
+        )
+        decoded_widths: list[int] = []
+
+        def fake_decode(backend: Any, prompts: Any, *, chunk_size: int) -> list[str]:
+            del backend, chunk_size
+            decoded_widths.append(len(prompts))
+            return ["deliberation</think>\n<action>LEFT</action>" for _ in prompts]
+
+        self._patch(monkeypatch, fake_decode)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            row_manifest=manifest_path,
+            diagnostic_profile="cooperation-generalization",
+            n_samples=2,
+            conditions="placebo:+",
+            placebo_seed=7919,
+        )
+        summary = run_generate(args)
+
+        assert decoded_widths == [16]
+        assert set(summary["conditions"]) == {"decision:L18:x1.0:placebo:+"}
+        assert summary["n_rows"] == 8
+        assert summary["placebo_seed"] == 7919
+        records = [
+            json.loads(line)
+            for line in (args.out_dir / "steering_records.jsonl").read_text().splitlines()
+        ]
+        assert len(records) == 16
+        assert {record["diagnostic_family"] for record in records} == {
+            DIAGNOSTIC_FAMILY_COSTLY_HELPING,
+            DIAGNOSTIC_FAMILY_PAYOFF_CONTROL,
+        }
+        assert {record["sample_index"] for record in records} == {0, 1}
+        assert all(record["placebo_seed"] == 7919 for record in records)
+        allocation_records = [
+            record for record in records if record["row_kind"] == "binary-allocation"
+        ]
+        assert len(allocation_records) == 8
+        assert all(record["selected_allocation_label"] == "LEFT" for record in allocation_records)
+        assert all(record["selected_own_payoff"] == 2.0 for record in allocation_records)
+        assert all(record["selected_counterpart_payoff"] == 6.0 for record in allocation_records)
+        assert all(record["selected_total_welfare"] == 8.0 for record in allocation_records)
+        condition_summary = summary["conditions"]["decision:L18:x1.0:placebo:+"]
+        assert condition_summary["n_first_position_resolved"] == 16
+        assert condition_summary["first_position_choice_k"] == 8
+        assert condition_summary["first_position_choice_rate"] == pytest.approx(0.5)
+        assert condition_summary["n_allocation_payoff_resolved"] == 8
+        assert condition_summary["n_allocation_payoff_unresolved"] == 0
+        assert condition_summary["selected_total_welfare_mean"] == pytest.approx(8.0)
+        assert set(condition_summary["by_diagnostic_family"]) == {
+            DIAGNOSTIC_FAMILY_COSTLY_HELPING,
+            DIAGNOSTIC_FAMILY_PAYOFF_CONTROL,
+        }
+        payoff_summary = condition_summary["by_diagnostic_family"][DIAGNOSTIC_FAMILY_PAYOFF_CONTROL]
+        assert payoff_summary["n_reward_optimal_resolved"] == 8
+        assert payoff_summary["reward_optimal_match_k"] == 0
+        assert payoff_summary["n_payoff_sensitive"] == 8
+        assert payoff_summary["n_total_welfare_optimal_resolved"] == 0
+        assert payoff_summary["by_print_order"]["canonical"]["n_completions"] == 4
+        costly_summary = condition_summary["by_diagnostic_family"][DIAGNOSTIC_FAMILY_COSTLY_HELPING]
+        assert costly_summary["n_own_payoff_optimal_resolved"] == 8
+        assert costly_summary["own_payoff_optimal_match_k"] == 0
+        assert costly_summary["n_total_welfare_optimal_resolved"] == 8
+        assert costly_summary["total_welfare_optimal_match_k"] == 8
+        identity = json.loads(ledger_path_for(args.out_dir / "steering_records.jsonl").read_text())[
+            "identity"
+        ]
+        assert identity["rendered_rows_sha256"] == summary["rendered_rows_sha256"]
+        assert identity["sample_indices"] == [sample for _ in rows for sample in (0, 1)]
+        assert identity["condition_keys"] == [
+            "none",
+            "decision:L18:x1.0:steer:+",
+            "decision:L18:x1.0:steer:-",
+            "decision:L18:x1.0:placebo:+",
+            "decision:L18:x1.0:placebo:-",
+            "decision:L18:ablate:real",
+            "decision:L18:ablate:placebo",
+        ]
+
+    def test_a_changed_rendered_custom_row_refuses_resume(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = custom_diagnostic_rows()
+        manifest_path = tmp_path / "private-diagnostic-rows.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "cooperation-generalization-diagnostic-rows/v1",
+                    "rows": rows,
+                }
+            )
+            + "\n"
+        )
+        self._patch(monkeypatch, _neutral_completions)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            row_manifest=manifest_path,
+            diagnostic_profile="cooperation-generalization",
+            conditions="none",
+        )
+        run_generate(args)
+        changed = [dict(row) for row in rows]
+        changed[0]["allocation_context"] = "synthetic allocation context changed"
+        changed[0]["prompt"] = render_binary_allocation_prompt(changed[0])
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "cooperation-generalization-diagnostic-rows/v1",
+                    "rows": changed,
+                }
+            )
+            + "\n"
+        )
+        with pytest.raises(ResumeMismatchError, match="rendered_rows_sha256"):
+            run_generate(args)
+
+    def test_a_changed_placebo_seed_refuses_resume(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rows = custom_diagnostic_rows()
+        manifest_path = tmp_path / "private-diagnostic-rows.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "cooperation-generalization-diagnostic-rows/v1",
+                    "rows": rows,
+                }
+            )
+            + "\n"
+        )
+        self._patch(monkeypatch, _neutral_completions)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            row_manifest=manifest_path,
+            diagnostic_profile="cooperation-generalization",
+            conditions="none",
+            placebo_seed=100,
+        )
+        run_generate(args)
+        with pytest.raises(ResumeMismatchError, match="placebo_seed"):
+            run_generate(
+                generate_args(
+                    tmp_path,
+                    directions_path,
+                    row_manifest=args.row_manifest,
+                    diagnostic_profile="cooperation-generalization",
+                    conditions="none",
+                    placebo_seed=101,
+                )
+            )
 
 
 class TestConditionFilter:
@@ -854,6 +1372,220 @@ class TestCounterpartFraming:
             "decision:L18:ablate:real",
             "decision:L18:ablate:placebo",
         }
+
+
+class TestSelectedCalibrationTarget:
+    def test_selected_target_translates_to_one_generation_cell_and_is_recorded(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
+        monkeypatch.setattr(interp_steering, "decode_in_chunks", _neutral_completions)
+        target_path = write_selected_target(tmp_path / "selected-target.json", directions_path)
+        manifest_path = tmp_path / "diagnostic-rows.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema": "cooperation-generalization-diagnostic-rows/v1",
+                    "rows": custom_diagnostic_rows(),
+                }
+            )
+            + "\n"
+        )
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            cells=None,
+            selected_target=target_path,
+            row_manifest=manifest_path,
+            diagnostic_profile="cooperation-generalization",
+            n_samples=2,
+        )
+
+        summary = run_generate(args)
+
+        assert summary["cells"] == [{"direction": "decision", "layer": 18, "alpha_multiplier": 0.5}]
+        assert set(summary["conditions"]) == {
+            "none",
+            "decision:L18:x0.5:steer:+",
+            "decision:L18:x0.5:placebo:+",
+        }
+        assert summary["conditions"]["none"]["n_completions"] == 16
+        assert summary["conditions"]["decision:L18:x0.5:steer:+"]["n_completions"] == 16
+        assert summary["conditions"]["decision:L18:x0.5:placebo:+"]["n_completions"] == 16
+        assert summary["elapsed_seconds"] >= 0.0
+        assert set(summary["condition_seconds"]) == set(summary["conditions"])
+        assert summary["selected_target"]["path"] == str(target_path.resolve())
+        assert summary["selected_target"]["payload"]["exploratory"] is True
+        assert (
+            summary["selected_target"]["sha256"]
+            == hashlib.sha256(target_path.read_bytes()).hexdigest()
+        )
+        assert len((args.out_dir / "steering_records.jsonl").read_text().splitlines()) == 48
+        ledger = json.loads(ledger_path_for(args.out_dir / "steering_records.jsonl").read_text())
+        assert ledger["identity"]["selected_target"] == summary["selected_target"]
+
+    def test_selected_target_rejects_heldout_fields_before_model_load(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target_path = write_selected_target(
+            tmp_path / "selected-target.json",
+            directions_path,
+            extra={"heldout_intervention_outputs_used": False},
+        )
+        monkeypatch.setattr(
+            interp_steering,
+            "HFBackend",
+            lambda *_args, **_kwargs: pytest.fail("invalid target reached model load"),
+        )
+
+        with pytest.raises(ValueError, match="unsupported fields"):
+            run_generate(
+                generate_args(
+                    tmp_path,
+                    directions_path,
+                    cells=None,
+                    selected_target=target_path,
+                    conditions="none",
+                )
+            )
+
+    def test_selected_target_requires_direction_file_digest_and_magnitude(
+        self, tmp_path: Path, directions_path: Path
+    ) -> None:
+        target_path = write_selected_target(
+            tmp_path / "selected-target.json",
+            directions_path,
+            extra={"direction_sha256": "b" * 64},
+        )
+        with pytest.raises(ValueError, match="direction_sha256"):
+            interp_steering.load_selected_target(
+                target_path, {"decision": {18: torch.ones(HIDDEN)}}
+            )
+
+    def test_selected_target_requires_declared_construct_to_match_direction(
+        self, tmp_path: Path, directions_path: Path
+    ) -> None:
+        target_path = write_selected_target(
+            tmp_path / "selected-target.json",
+            directions_path,
+            extra={"target_construct": "costly-other-regard"},
+        )
+        with pytest.raises(ValueError, match="does not match direction"):
+            interp_steering.load_selected_target(
+                target_path, {"decision": torch.load(directions_path, weights_only=True)}
+            )
+
+    def test_selected_target_rejects_stale_geometry_report_before_model_load(
+        self,
+        tmp_path: Path,
+        directions_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        target_path = write_selected_target(tmp_path / "selected-target.json", directions_path)
+        report_path = tmp_path / "cooperation_interp.json"
+        report_path.write_text('{"synthetic_report": false}\n')
+        monkeypatch.setattr(
+            interp_steering,
+            "HFBackend",
+            lambda *_args, **_kwargs: pytest.fail("stale target reached model load"),
+        )
+
+        with pytest.raises(ValueError, match="geometry_report_sha256"):
+            run_generate(
+                generate_args(
+                    tmp_path,
+                    directions_path,
+                    cells=None,
+                    selected_target=target_path,
+                    conditions="none",
+                )
+            )
+
+    def test_selected_target_rejects_missing_geometry_report_before_model_load(
+        self,
+        tmp_path: Path,
+        directions_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        target_path = write_selected_target(
+            tmp_path / "selected-target.json",
+            directions_path,
+            extra={"geometry_report_path": str(tmp_path / "missing-report.json")},
+        )
+        monkeypatch.setattr(
+            interp_steering,
+            "HFBackend",
+            lambda *_args, **_kwargs: pytest.fail("missing report reached model load"),
+        )
+
+        with pytest.raises(FileNotFoundError, match="geometry_report_path"):
+            run_generate(
+                generate_args(
+                    tmp_path,
+                    directions_path,
+                    cells=None,
+                    selected_target=target_path,
+                    conditions="none",
+                )
+            )
+
+    def test_selected_target_is_mutually_exclusive_with_cells_and_sweep(
+        self, tmp_path: Path, directions_path: Path
+    ) -> None:
+        target_path = write_selected_target(tmp_path / "selected-target.json", directions_path)
+        with pytest.raises(ValueError, match="exactly one"):
+            run_generate(generate_args(tmp_path, directions_path, selected_target=target_path))
+
+
+class TestAdapterBackedGeneration:
+    def test_positive_control_proves_the_hooked_tiny_model_is_adapted(self) -> None:
+        interp_steering.assert_adapter_changes_forward(
+            cast("interp_steering.AdapterCapableModel", _TinyAdapterLM(delta=1.0)),
+            cast("PreTrainedTokenizerBase", _TinyTokenizer()),
+            ["synthetic control"],
+        )
+
+    def test_a_noop_adapter_is_refused_before_generation(self) -> None:
+        with pytest.raises(RuntimeError, match="changed no forward logits"):
+            interp_steering.assert_adapter_changes_forward(
+                cast("interp_steering.AdapterCapableModel", _TinyAdapterLM(delta=0.0)),
+                cast("PreTrainedTokenizerBase", _TinyTokenizer()),
+                ["synthetic control"],
+            )
+
+    def test_backend_uses_the_attached_adapter_and_records_its_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text("{}")
+        (adapter_dir / "adapter_model.safetensors").write_bytes(b"synthetic adapter")
+        adapted_model = _TinyAdapterLM(delta=1.0)
+        monkeypatch.setattr(
+            interp_steering,
+            "load_adapter_base",
+            lambda *args, **kwargs: _TinyAdapterLM(delta=0.0),
+        )
+        monkeypatch.setattr(
+            interp_steering,
+            "attach_adapter",
+            lambda *args, **kwargs: SimpleNamespace(
+                peft_model=adapted_model, applied_adapter_weights=7
+            ),
+        )
+        monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
+        sampling = interp_steering.eval_sampling(
+            interp_steering.SAMPLER_TRAINING_DISTRIBUTION, thinking=True
+        )
+        args = argparse.Namespace(model="tiny/base", adapter=adapter_dir)
+
+        backend, model, identity = interp_steering._build_generation_backend(args, sampling)
+
+        assert backend._model is adapted_model
+        assert model is adapted_model
+        assert identity is not None
+        assert identity["applied_adapter_weights"] == 7
+        assert identity["weights_sha256"] == hashlib.sha256(b"synthetic adapter").hexdigest()
 
 
 class TestDecoderLayerContract:

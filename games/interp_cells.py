@@ -43,7 +43,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import asdict, dataclass
+import subprocess
+from dataclasses import MISSING, asdict, dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -54,18 +56,24 @@ from reward_hacking.interp.linear_probe import ConceptActivations
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
-    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 CELL_MANIFEST_FILENAME = "manifest.json"
 ACTIVATIONS_FILENAME = "activations.safetensors"
+PREFIX_ACTIVATIONS_FILENAME = "prefix-activations.safetensors"
+NATURAL_PREFIX_ACTIVATIONS_FILENAME = "natural-prefix-activations.safetensors"
+NATURAL_PREFIX_MANIFEST_FILENAME = "natural-prefix-manifest.json"
 LADDER_MANIFEST_FILENAME = "ladder-manifest.json"
 
 REQUIRED_STIMULUS_FIELDS: frozenset[str] = frozenset({"id", "set", "side", "pair_id", "text"})
 # A partial chain of thought to teacher-force after the template's opening `<think>`. Optional because
 # the decision-theory sets carry one and a bare-stem corpus need not.
-OPTIONAL_STIMULUS_FIELDS: frozenset[str] = frozenset({"assistant_prefix"})
+# Capture metadata is separate from model-facing prompt fields. It records construct and
+# scenario/template-group membership, plus natural-prefix selection details, without putting
+# authored stimulus prose in tracked code.
+STIMULUS_METADATA_FIELD = "metadata"
+OPTIONAL_STIMULUS_FIELDS: frozenset[str] = frozenset({"assistant_prefix", STIMULUS_METADATA_FIELD})
 
 # Key `i` is the output of decoder block `i`. See the module docstring for the off-by-one this names.
 LAYER_CONVENTION_POST_BLOCK = "post_block"
@@ -120,6 +128,7 @@ class Stimulus:
     pair_id: str
     text: str
     assistant_prefix: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -140,6 +149,15 @@ class CellIdentity:
     compute_dtype: str
     store_dtype: str
     stimulus_render: str
+    tokenizer_identity: str = "unspecified"
+    kernel_identity: str = "unspecified"
+    capture_prefix_states: bool = False
+    prompt_end_rendered_sha256: str = "unspecified"
+    teacher_forced_rendered_sha256: str = "unspecified"
+    natural_prefix_layers: tuple[int, ...] = ()
+    natural_selection_manifest_sha256: str = ""
+    natural_prefix_stimuli_sha256: str = ""
+    natural_prefix_rendered_sha256: str = ""
 
     def __post_init__(self) -> None:
         """Reject a render convention nothing knows how to reproduce."""
@@ -156,14 +174,24 @@ class CellIdentity:
     @classmethod
     def from_payload(cls, payload: dict[str, Any], *, source: Path) -> CellIdentity:
         """Read an identity back, naming the file when a field is missing rather than KeyError-ing."""
-        missing = sorted(set(cls.__dataclass_fields__) - set(payload))
+        required_fields = {
+            name
+            for name, definition in cls.__dataclass_fields__.items()
+            if definition.default is MISSING and definition.default_factory is MISSING
+        }
+        missing = sorted(required_fields - set(payload))
         if missing:
             raise CellFormatError(
                 f"{source} records no {missing} in its identity block, so it cannot be checked for "
                 f"comparability against another cell. Re-capture it: a cell that cannot say what it "
                 f"measured is not usable in a before/after read."
             )
-        return cls(**{field: payload[field] for field in cls.__dataclass_fields__})
+        values = {name: payload[name] for name in cls.__dataclass_fields__ if name in payload}
+        if "natural_prefix_layers" in values:
+            values["natural_prefix_layers"] = tuple(
+                int(layer) for layer in values["natural_prefix_layers"]
+            )
+        return cls(**values)
 
 
 @dataclass(frozen=True)
@@ -205,6 +233,11 @@ class CapturedCell:
     adapter_weights_sha256: str | None
     provenance: dict[str, Any]
     source: Path
+    stimulus_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    prefix_activations: dict[tuple[str, str], torch.Tensor] = field(default_factory=dict)
+    prefix_stimulus_ids: tuple[str, ...] = ()
+    natural_prefix_activations: dict[str, torch.Tensor] = field(default_factory=dict)
+    natural_prefix_selection_manifest: dict[str, Any] | None = None
 
     @property
     def label(self) -> str:
@@ -239,6 +272,25 @@ class CapturedCell:
                 f"({self.identity.layer_convention} convention)."
             )
         return self.matrix(stimulus_set, pooling)[:, layer, :]
+
+    @property
+    def metadata(self) -> dict[str, dict[str, Any]]:
+        """Metadata keyed by stimulus id, including natural-prefix selection records."""
+        return self.stimulus_metadata
+
+
+@dataclass(frozen=True)
+class NaturalPrefixCapture:
+    """A reduced natural-prefix artifact stored beside, rather than inside, a construct cell."""
+
+    arm: str | None
+    step: int | None
+    identity: CellIdentity
+    stimulus_ids: tuple[str, ...]
+    activations: dict[str, torch.Tensor]
+    selection_manifest: dict[str, Any]
+    selection_records: tuple[dict[str, Any], ...]
+    source: Path
 
 
 @dataclass(frozen=True)
@@ -304,11 +356,16 @@ def stimuli_digest(stimuli: Sequence[Stimulus]) -> str:
     the source file is what makes a truncated smoke run visibly a different corpus instead of a thin
     version of the same one.
     """
-    return digest_of_strings(
-        field
-        for stimulus in stimuli
-        for field in (stimulus.stimulus_id, stimulus.text, stimulus.assistant_prefix or "")
-    )
+    values: list[str] = []
+    for stimulus in stimuli:
+        values.extend((stimulus.stimulus_id, stimulus.text, stimulus.assistant_prefix or ""))
+        if stimulus.metadata:
+            values.append(
+                json.dumps(
+                    stimulus.metadata, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+                )
+            )
+    return digest_of_strings(values)
 
 
 def load_stimuli(path: Path) -> list[Stimulus]:
@@ -352,6 +409,12 @@ def load_stimuli(path: Path) -> list[Stimulus]:
             )
         seen[stimulus_id] = line_number
         prefix = row.get("assistant_prefix")
+        metadata = row.get(STIMULUS_METADATA_FIELD, {})
+        if not isinstance(metadata, dict) or not all(isinstance(key, str) for key in metadata):
+            raise StimulusFileError(
+                f"{path}:{line_number} has non-object {STIMULUS_METADATA_FIELD!r}; capture "
+                "metadata must be a JSON object keyed by strings."
+            )
         stimuli.append(
             Stimulus(
                 stimulus_id=stimulus_id,
@@ -360,6 +423,7 @@ def load_stimuli(path: Path) -> list[Stimulus]:
                 pair_id=str(row["pair_id"]),
                 text=str(row["text"]),
                 assistant_prefix=None if prefix is None else str(prefix),
+                metadata=metadata,
             )
         )
     if not stimuli:
@@ -377,6 +441,287 @@ def group_by_set(stimuli: Sequence[Stimulus]) -> dict[str, list[Stimulus]]:
     for stimulus in stimuli:
         grouped.setdefault(stimulus.stimulus_set, []).append(stimulus)
     return grouped
+
+
+# These names are metadata labels only. The scenario wording is supplied at runtime from the
+# gitignored cooperation-generalization corpus; no authored stimulus appears in this module.
+COSTLY_OTHER_REGARD_CONSTRUCT = "costly-other-regard"
+DECISION_DEPENDENCE_CONSTRUCT = "decision-dependence"
+CONSTRUCT_NAMES: tuple[str, str] = (
+    COSTLY_OTHER_REGARD_CONSTRUCT,
+    DECISION_DEPENDENCE_CONSTRUCT,
+)
+DECISION_DEPENDENCE_STOCHASTICITY_CONTROLS = frozenset(
+    {
+        "shared-randomness",
+        "independent-randomness",
+        "shared-deterministic-procedure",
+        "independent-deterministic-procedure",
+    }
+)
+DECISION_DEPENDENCE_PROCEDURE_REGIMES = frozenset({"stochastic", "deterministic"})
+DEFAULT_CONSTRUCT_PAIRS = 12
+PAIR_MEMBER_COUNT = 2
+PAIR_SIDES = ("A", "B")
+CONSTRUCT_SPLITS = frozenset({"fit", "heldout"})
+TENSOR_RANK = 3
+PRIVATE_CONSTRUCT_ROOT = Path("docs/scratch/cooperation-generalization")
+PRIVATE_ARTIFACT_ROOT = Path("artifacts")
+
+
+def _private_construct_path(path: Path) -> Path:
+    """Return ``path`` after requiring a location that is private in this checkout.
+
+    The default scratch and artifact roots are stable, but callers may put an exact manifest copy
+    under a configurable run root. Such copies are accepted only when Git itself reports the path
+    ignored, so this loader does not turn a convenient absolute path into a privacy bypass.
+    """
+    resolved = path.resolve()
+    allowed_roots = (PRIVATE_CONSTRUCT_ROOT.resolve(), PRIVATE_ARTIFACT_ROOT.resolve())
+    under_known_private_root = any(resolved.is_relative_to(root) for root in allowed_roots)
+    git_ignored = False
+    if not under_known_private_root:
+        ignored = subprocess.run(  # noqa: S603 - fixed git command; path is one argv value
+            ["git", "check-ignore", "--no-index", "--quiet", str(resolved)],  # noqa: S607 - trusted literal command
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        git_ignored = ignored.returncode == 0
+    if not under_known_private_root and not git_ignored:
+        raise StimulusFileError(
+            f"construct stimulus text must live under {PRIVATE_CONSTRUCT_ROOT} or "
+            f"{PRIVATE_ARTIFACT_ROOT}, or be gitignored; got {path}. The corpus is private "
+            "authored material and must remain gitignored."
+        )
+    return resolved
+
+
+def construct_group(stimulus: Stimulus) -> str:
+    """Read a scenario/template group from one stimulus's metadata.
+
+    ``scenario_group`` is the only accepted key. Using a missing or aliased group would allow a
+    scenario's two sides to cross a split while appearing to have valid metadata.
+    """
+    value = stimulus.metadata.get("scenario_group")
+    if value is not None and str(value).strip():
+        return str(value)
+    raise StimulusFileError(
+        f"stimulus {stimulus.stimulus_id!r} has no scenario/template group metadata; "
+        "construct fit/held-out splits require a whole-scenario group."
+    )
+
+
+def _validate_construct_pair(
+    construct: str,
+    pair_id: str,
+    members: Sequence[Stimulus],
+    reserved_groups: set[str],
+    external_pair_ids: set[str],
+) -> str:
+    """Validate one matched construct pair and return its scenario group."""
+    if pair_id in external_pair_ids:
+        raise StimulusFileError(
+            f"construct pair {pair_id!r} overlaps a reserved training/evaluation identity."
+        )
+    sides = [member.side for member in members]
+    if sorted(sides) != list(PAIR_SIDES) or len(members) != PAIR_MEMBER_COUNT:
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} must contain exactly one A and "
+            f"one B row, got sides {sides}."
+        )
+    declared_constructs = {
+        str(member.metadata.get("construct"))
+        for member in members
+        if member.metadata.get("construct") is not None
+    }
+    if declared_constructs != {construct}:
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} declares metadata constructs "
+            f"{sorted(declared_constructs)}; every row must name its construct explicitly."
+        )
+    declared_splits = [member.metadata.get("split") for member in members]
+    if (
+        len(declared_splits) != PAIR_MEMBER_COUNT
+        or not all(isinstance(split, str) for split in declared_splits)
+        or len(set(declared_splits)) != 1
+        or declared_splits[0] not in CONSTRUCT_SPLITS
+    ):
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} must declare one shared metadata "
+            f"split of 'fit' or 'heldout', got {declared_splits}."
+        )
+    if any(member.metadata.get("measurement_boundary") != "pre_action" for member in members):
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} must declare the pre_action "
+            "measurement boundary on both rows."
+        )
+    if any(member.metadata.get("action_commitment_present") is not False for member in members):
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} includes an action commitment; "
+            "construct captures must end before action commitment."
+        )
+    groups = {construct_group(member) for member in members}
+    if len(groups) != 1:
+        raise StimulusFileError(
+            f"pair {pair_id!r} straddles scenario/template groups {sorted(groups)}; "
+            "both sides must stay in one fit or held-out split."
+        )
+    group = groups.pop()
+    if group in reserved_groups:
+        raise StimulusFileError(
+            f"construct group {group!r} for pair {pair_id!r} overlaps a reserved "
+            "training/evaluation group."
+        )
+    return group
+
+
+def _validate_decision_control(construct: str, pair_id: str, members: Sequence[Stimulus]) -> None:
+    """Validate pair-constant procedure regime and side-specific procedure controls."""
+    controls = {member.side: member.metadata.get("dependence_mechanism") for member in members}
+    if any(
+        control not in DECISION_DEPENDENCE_STOCHASTICITY_CONTROLS for control in controls.values()
+    ):
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} must declare a supported "
+            f"dependence_mechanism on both rows, got {controls}."
+        )
+    regimes = {member.metadata.get("procedure_regime") for member in members}
+    if len(regimes) != 1 or regimes - DECISION_DEPENDENCE_PROCEDURE_REGIMES:
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} must declare one supported "
+            f"procedure_regime on both rows, got {sorted(regimes, key=str)}."
+        )
+    control_a = controls["A"]
+    control_b = controls["B"]
+    if not isinstance(control_a, str) or not isinstance(control_b, str):
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} must declare string "
+            f"dependence mechanisms, got {controls}."
+        )
+    if control_a.startswith("independent-") or not control_b.startswith("independent-"):
+        raise StimulusFileError(
+            f"pair {pair_id!r} in construct {construct!r} must put the coupled "
+            f"control on side A and the independent control on side B, got {controls}."
+        )
+
+
+def validate_construct_stimuli(  # noqa: PLR0913 - callers provide independent corpus isolation controls
+    stimuli: Sequence[Stimulus],
+    *,
+    pairs_per_construct: int = DEFAULT_CONSTRUCT_PAIRS,
+    required_constructs: Sequence[str] = CONSTRUCT_NAMES,
+    reserved_groups: Sequence[str] = (),
+    external_pair_ids: Sequence[str] = (),
+    require_decision_control: bool = False,
+) -> dict[str, dict[str, str]]:
+    """Validate the private two-construct corpus and return pair-to-group mappings.
+
+    This is deliberately pure and accepts in-memory stimuli so CPU tests do not depend on the
+    gitignored runtime file existing. ``reserved_groups`` and ``external_pair_ids`` are the global
+    isolation check: interp calibration/construct scenarios cannot overlap training or evaluation
+    identities merely because each local split is internally disjoint.
+    """
+    if pairs_per_construct < PAIR_MEMBER_COUNT:
+        raise ValueError(f"pairs_per_construct must be at least 2, got {pairs_per_construct}")
+    required = tuple(required_constructs)
+    if len(set(required)) != len(required) or not required:
+        raise ValueError(f"required_constructs must be unique and non-empty, got {required}")
+    by_construct: dict[str, dict[str, list[Stimulus]]] = {}
+    for stimulus in stimuli:
+        if stimulus.stimulus_set not in required:
+            raise StimulusFileError(
+                f"stimulus {stimulus.stimulus_id!r} has construct/set {stimulus.stimulus_set!r}; "
+                f"expected exactly {list(required)}."
+            )
+        by_construct.setdefault(stimulus.stimulus_set, {}).setdefault(stimulus.pair_id, []).append(
+            stimulus
+        )
+    missing_constructs = [name for name in required if name not in by_construct]
+    if missing_constructs:
+        raise StimulusFileError(f"construct corpus is missing {missing_constructs}.")
+    reserved = set(reserved_groups)
+    external_pairs = set(external_pair_ids)
+    result: dict[str, dict[str, str]] = {}
+    for construct in required:
+        pairs = by_construct[construct]
+        if len(pairs) != pairs_per_construct:
+            raise StimulusFileError(
+                f"construct {construct!r} has {len(pairs)} matched pairs; expected "
+                f"{pairs_per_construct}."
+            )
+        mapping: dict[str, str] = {}
+        for pair_id, members in pairs.items():
+            mapping[pair_id] = _validate_construct_pair(
+                construct, pair_id, members, reserved, external_pairs
+            )
+            if construct == DECISION_DEPENDENCE_CONSTRUCT and require_decision_control:
+                _validate_decision_control(construct, pair_id, members)
+        result[construct] = mapping
+    return result
+
+
+def load_private_construct_stimuli(
+    path: Path | None = None,
+    *,
+    pairs_per_construct: int = DEFAULT_CONSTRUCT_PAIRS,
+    reserved_groups: Sequence[str] = (),
+    external_pair_ids: Sequence[str] = (),
+) -> list[Stimulus]:
+    """Load and validate the runtime private two-construct capture corpus.
+
+    The path check is intentional: a tracked path would make future capture text public and
+    invalidate the measurement. Tests should call :func:`validate_construct_stimuli` with synthetic
+    rows instead of bypassing this runtime boundary.
+    """
+    corpus_path = _private_construct_path(
+        PRIVATE_CONSTRUCT_ROOT / "construct-stimuli.jsonl" if path is None else path
+    )
+    stimuli = load_stimuli(corpus_path)
+    validate_construct_stimuli(
+        stimuli,
+        pairs_per_construct=pairs_per_construct,
+        reserved_groups=reserved_groups,
+        external_pair_ids=external_pair_ids,
+        require_decision_control=True,
+    )
+    return stimuli
+
+
+def construct_split_payload(stimuli: Sequence[Stimulus]) -> dict[str, dict[str, Any]]:
+    """Return the authored fit/held-out membership for a validated construct corpus."""
+    pair_groups = validate_construct_stimuli(stimuli)
+    result: dict[str, dict[str, Any]] = {}
+    for construct, mapping in pair_groups.items():
+        split_by_group: dict[str, str] = {}
+        split_by_pair: dict[str, str] = {}
+        for stimulus in stimuli:
+            if stimulus.stimulus_set != construct:
+                continue
+            group = construct_group(stimulus)
+            split = str(stimulus.metadata["split"])
+            prior = split_by_group.setdefault(group, split)
+            if prior != split:
+                raise StimulusFileError(
+                    f"scenario group {group!r} declares both {prior!r} and {split!r}"
+                )
+            split_by_pair[stimulus.pair_id] = split
+        result[construct] = {
+            "fit_pair_ids": sorted(
+                pair_id for pair_id, split in split_by_pair.items() if split == "fit"
+            ),
+            "heldout_pair_ids": sorted(
+                pair_id for pair_id, split in split_by_pair.items() if split == "heldout"
+            ),
+            "fit_groups": sorted(
+                group for group, split in split_by_group.items() if split == "fit"
+            ),
+            "heldout_groups": sorted(
+                group for group, split in split_by_group.items() if split == "heldout"
+            ),
+            "group_by_pair": dict(sorted(mapping.items())),
+        }
+    return result
 
 
 def tensor_key(stimulus_set: str, pooling: str) -> str:
@@ -397,23 +742,43 @@ def step_dir(root: Path, arm: str, step: int) -> Path:
     return root / arm / f"{STEP_DIR_PREFIX}{step}"
 
 
-def write_cell(  # noqa: PLR0913 - a cell is its identity, its rows, its tensors and its provenance
-    cell_dir: Path,
-    *,
-    arm: str,
-    step: int,
-    identity: CellIdentity,
+def _validate_cell_metadata(
     rows: dict[str, RowIndex],
-    activations: dict[tuple[str, str], torch.Tensor],
-    applied_adapter_weights: int | None,
-    adapter_weights_sha256: str | None,
-    provenance: dict[str, Any],
-) -> Path:
-    """Write one cell's tensors and manifest, and return the manifest path.
+    stimulus_metadata: dict[str, dict[str, Any]] | None,
+    prefix_activations: dict[tuple[str, str], torch.Tensor] | None,
+    prefix_stimulus_ids: Sequence[str] | None,
+) -> tuple[
+    dict[str, dict[str, Any]], dict[tuple[str, str], torch.Tensor], tuple[str, ...], set[str]
+]:
+    """Validate metadata and the optional prefix row order before any file mutation."""
+    metadata = dict(stimulus_metadata or {})
+    row_ids = {stimulus_id for row in rows.values() for stimulus_id in row.stimulus_ids}
+    unknown_metadata = sorted(set(metadata) - row_ids)
+    if unknown_metadata:
+        raise CellFormatError(
+            f"stimulus metadata names rows absent from the cell {unknown_metadata[:ERROR_EXAMPLE_COUNT]}; "
+            "metadata must describe only captured stimuli."
+        )
+    try:
+        json.dumps(metadata, sort_keys=True, ensure_ascii=False)
+    except TypeError as error:
+        raise CellFormatError(f"stimulus metadata is not JSON serialisable: {error}") from error
+    prefix = dict(prefix_activations or {})
+    prefix_ids = tuple(prefix_stimulus_ids or ())
+    if prefix and set(prefix_ids) != row_ids:
+        raise CellFormatError(
+            f"prefix_stimulus_ids must cover exactly the cell rows, got {len(prefix_ids)} ids for "
+            f"{len(row_ids)} rows"
+        )
+    if len(set(prefix_ids)) != len(prefix_ids):
+        raise CellFormatError("prefix_stimulus_ids repeats a stimulus id")
+    return metadata, prefix, prefix_ids, row_ids
 
-    The manifest is written last, so a cell interrupted mid-write is not mistaken for a finished one
-    by a resumed run: the marker of "done" is the file that describes the work, not the work.
-    """
+
+def _store_main_activations(
+    activations: dict[tuple[str, str], torch.Tensor], identity: CellIdentity
+) -> dict[str, torch.Tensor]:
+    """Cast ordinary activation blocks and refuse overflow before writing."""
     store_dtype = STORE_DTYPES[identity.store_dtype]
     stored: dict[str, torch.Tensor] = {}
     for (stimulus_set, pooling), tensor in sorted(activations.items()):
@@ -426,8 +791,99 @@ def write_cell(  # noqa: PLR0913 - a cell is its identity, its rows, its tensors
                 f"and poisons every direction computed from it. Store float32 instead."
             )
         stored[tensor_key(stimulus_set, pooling)] = cast_tensor
+    return stored
+
+
+def _store_supplied_prefix_activations(
+    prefix: dict[tuple[str, str], torch.Tensor],
+    row_count: int,
+    identity: CellIdentity,
+) -> dict[str, torch.Tensor]:
+    """Validate and cast prompt-end and teacher-forced activation blocks."""
+    stored: dict[str, torch.Tensor] = {}
+    expected = (row_count, identity.n_layers, identity.hidden_size)
+    for (state, pooling), tensor in sorted(prefix.items()):
+        if tuple(tensor.shape) != expected:
+            raise CellFormatError(
+                f"prefix state {state!r}/{pooling!r} has shape {tuple(tensor.shape)}, expected "
+                f"{expected} for this cell"
+            )
+        cast_tensor = tensor.to(STORE_DTYPES[identity.store_dtype])
+        if not bool(torch.isfinite(cast_tensor).all()):
+            raise CellFormatError(
+                f"casting prefix state {state!r}/{pooling!r} to {identity.store_dtype} produced "
+                "non-finite values"
+            )
+        stored[f"{state}/{pooling}"] = cast_tensor
+    return stored
+
+
+def _store_natural_prefix_activations(
+    natural: dict[str, torch.Tensor], row_ids: set[str], identity: CellIdentity
+) -> dict[str, torch.Tensor]:
+    """Validate and cast reduced natural-prefix activation blocks."""
+    if natural and not identity.natural_prefix_layers:
+        raise CellFormatError(
+            "natural-prefix activations require an explicit natural_prefix_layers identity"
+        )
+    stored: dict[str, torch.Tensor] = {}
+    expected_tail = (len(identity.natural_prefix_layers), identity.hidden_size)
+    for stimulus_id, tensor in sorted(natural.items()):
+        if stimulus_id not in row_ids:
+            raise CellFormatError(
+                f"natural-prefix activation {stimulus_id!r} names a row absent from the cell"
+            )
+        if tensor.ndim != TENSOR_RANK or tuple(tensor.shape[1:]) != expected_tail:
+            raise CellFormatError(
+                f"natural-prefix activation {stimulus_id!r} has shape {tuple(tensor.shape)}; "
+                f"expected [selected_positions, {len(identity.natural_prefix_layers)}, "
+                f"{identity.hidden_size}]"
+            )
+        cast_tensor = tensor.to(STORE_DTYPES[identity.store_dtype])
+        if not bool(torch.isfinite(cast_tensor).all()):
+            raise CellFormatError(
+                f"casting natural-prefix activation {stimulus_id!r} to {identity.store_dtype} "
+                "produced non-finite values"
+            )
+        stored[stimulus_id] = cast_tensor
+    return stored
+
+
+def write_cell(  # noqa: PLR0913 - a cell is its identity, its rows, its tensors and its provenance
+    cell_dir: Path,
+    *,
+    arm: str,
+    step: int,
+    identity: CellIdentity,
+    rows: dict[str, RowIndex],
+    activations: dict[tuple[str, str], torch.Tensor],
+    applied_adapter_weights: int | None,
+    adapter_weights_sha256: str | None,
+    provenance: dict[str, Any],
+    stimulus_metadata: dict[str, dict[str, Any]] | None = None,
+    prefix_activations: dict[tuple[str, str], torch.Tensor] | None = None,
+    prefix_stimulus_ids: Sequence[str] | None = None,
+    natural_prefix_activations: dict[str, torch.Tensor] | None = None,
+    natural_prefix_selection_manifest: dict[str, Any] | None = None,
+) -> Path:
+    """Write one cell's tensors and manifest, and return the manifest path.
+
+    The manifest is written last, so a cell interrupted mid-write is not mistaken for a finished one
+    by a resumed run: the marker of "done" is the file that describes the work, not the work.
+    """
+    metadata, prefix, prefix_ids, row_ids = _validate_cell_metadata(
+        rows, stimulus_metadata, prefix_activations, prefix_stimulus_ids
+    )
+    natural = dict(natural_prefix_activations or {})
+    stored = _store_main_activations(activations, identity)
     cell_dir.mkdir(parents=True, exist_ok=True)
     save_file(stored, str(cell_dir / ACTIVATIONS_FILENAME))
+    prefix_stored = _store_supplied_prefix_activations(prefix, len(row_ids), identity)
+    if prefix_stored:
+        save_file(prefix_stored, str(cell_dir / PREFIX_ACTIVATIONS_FILENAME))
+    natural_stored = _store_natural_prefix_activations(natural, row_ids, identity)
+    if natural_stored:
+        save_file(natural_stored, str(cell_dir / NATURAL_PREFIX_ACTIVATIONS_FILENAME))
     manifest: dict[str, Any] = {
         "arm": arm,
         "step": step,
@@ -450,27 +906,139 @@ def write_cell(  # noqa: PLR0913 - a cell is its identity, its rows, its tensors
         "applied_adapter_weights": applied_adapter_weights,
         "adapter_weights_sha256": adapter_weights_sha256,
         "provenance": provenance,
+        "stimulus_metadata": metadata,
+        "prefix_states": {
+            state: {
+                pooling: list(prefix[state, pooling].shape)
+                for held_state, pooling in sorted(prefix)
+                if held_state == state
+            }
+            for state in sorted({state for state, _ in prefix})
+        },
+        "prefix_stimulus_ids": list(prefix_ids),
+        "natural_prefix_states": {
+            stimulus_id: list(tensor.shape) for stimulus_id, tensor in sorted(natural.items())
+        },
+        "natural_prefix_selection_manifest": natural_prefix_selection_manifest,
     }
     manifest_path = cell_dir / CELL_MANIFEST_FILENAME
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     return manifest_path
 
 
-def read_cell(cell_dir: Path) -> CapturedCell:
-    """Read one cell back, checking the tensors on disk against what the manifest claims.
+def write_natural_prefix_capture(  # noqa: C901, PLR0912, PLR0913 - linear durable artifact boundary
+    capture_dir: Path,
+    *,
+    identity: CellIdentity,
+    stimuli: Sequence[Stimulus],
+    activations: dict[str, torch.Tensor],
+    selection_records: Sequence[dict[str, Any]],
+    selection_manifest: dict[str, Any],
+    rendered_sha256: str,
+    natural_state: str,
+    arm: str | None = None,
+    step: int | None = None,
+    applied_adapter_weights: int | None = None,
+    adapter_weights_sha256: str | None = None,
+) -> Path:
+    """Persist a reduced natural-prefix capture outside the matched construct cell.
 
-    Shapes are re-read rather than trusted because the manifest and the tensors are two files: a
-    cell whose activations were written by one run and whose manifest was written by another would
-    otherwise read as coherent, and every number downstream would be keyed to the wrong rows.
+    Natural rollout rows are a separate corpus: they do not have A/B construct pairs and therefore
+    cannot be inserted into the construct cell's row index. Only selected positions and their
+    metadata are retained; full rollout text remains in its own private source artifact.
     """
-    manifest_path = cell_dir / CELL_MANIFEST_FILENAME
-    if not manifest_path.is_file():
-        raise CellFormatError(f"{manifest_path} not found, so {cell_dir} is not a finished cell.")
-    manifest = cast("dict[str, Any]", json.loads(manifest_path.read_text()))
-    identity = CellIdentity.from_payload(
-        cast("dict[str, Any]", manifest.get("identity", {})), source=manifest_path
-    )
-    rows = {
+    if not identity.natural_prefix_layers:
+        raise CellFormatError("natural-prefix capture identity has no explicit layer subset")
+    if not rendered_sha256.strip():
+        raise CellFormatError("natural-prefix capture requires a non-empty rendered corpus digest")
+    if not identity.natural_selection_manifest_sha256:
+        raise CellFormatError(
+            "natural-prefix capture identity must record the predeclared selection manifest digest"
+        )
+    selection_digest = selection_manifest.get("sha256")
+    if selection_digest != identity.natural_selection_manifest_sha256:
+        raise CellFormatError(
+            "natural-prefix selection manifest digest does not match the capture identity"
+        )
+    if tuple(selection_manifest.get("layers", ())) != identity.natural_prefix_layers:
+        raise CellFormatError(
+            "natural-prefix selection manifest layers do not match the capture identity"
+        )
+    if natural_state not in {"base", "final"}:
+        raise CellFormatError(f"natural-prefix capture has unknown natural_state {natural_state!r}")
+    expected_rollout_id = selection_manifest["rollout_ids_by_state"][natural_state]
+    stimulus_ids = tuple(stimulus.stimulus_id for stimulus in stimuli)
+    if set(activations) != set(stimulus_ids):
+        raise CellFormatError("natural-prefix activations must cover exactly the supplied stimuli")
+    if len(set(stimulus_ids)) != len(stimulus_ids):
+        raise CellFormatError("natural-prefix stimuli repeat an id")
+    records_by_id = {str(record["stimulus_id"]): record for record in selection_records}
+    if set(records_by_id) != set(stimulus_ids):
+        raise CellFormatError(
+            "natural-prefix selection records must cover exactly the supplied stimuli"
+        )
+    for stimulus in stimuli:
+        if stimulus.metadata.get("natural_state") != natural_state:
+            raise CellFormatError(
+                f"natural-prefix stimulus {stimulus.stimulus_id!r} has state "
+                f"{stimulus.metadata.get('natural_state')!r}, expected {natural_state!r}"
+            )
+        if stimulus.metadata.get("rollout_id") != expected_rollout_id:
+            raise CellFormatError(
+                f"natural-prefix stimulus {stimulus.stimulus_id!r} has rollout "
+                f"{stimulus.metadata.get('rollout_id')!r}, expected {expected_rollout_id!r}"
+            )
+    if any(record.get("natural_state") != natural_state for record in selection_records):
+        raise CellFormatError("natural-prefix selection records do not share the capture state")
+    try:
+        json.dumps(selection_manifest, sort_keys=True, ensure_ascii=False)
+        json.dumps(selection_records, sort_keys=True, ensure_ascii=False)
+    except TypeError as error:
+        raise CellFormatError(
+            f"natural-prefix selection metadata is not JSON serialisable: {error}"
+        ) from error
+    stored: dict[str, torch.Tensor] = {}
+    for stimulus_id in stimulus_ids:
+        tensor = activations[stimulus_id]
+        expected_tail = (len(identity.natural_prefix_layers), identity.hidden_size)
+        if tensor.ndim != TENSOR_RANK or tuple(tensor.shape[1:]) != expected_tail:
+            raise CellFormatError(
+                f"natural-prefix activation {stimulus_id!r} has shape {tuple(tensor.shape)}, "
+                f"expected [selected_positions, {len(identity.natural_prefix_layers)}, "
+                f"{identity.hidden_size}]"
+            )
+        cast_tensor = tensor.to(STORE_DTYPES[identity.store_dtype])
+        if not bool(torch.isfinite(cast_tensor).all()):
+            raise CellFormatError(
+                f"natural-prefix activation {stimulus_id!r} contains non-finite values"
+            )
+        stored[stimulus_id] = cast_tensor
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    save_file(stored, str(capture_dir / NATURAL_PREFIX_ACTIVATIONS_FILENAME))
+    manifest = {
+        "arm": arm,
+        "step": step,
+        "applied_adapter_weights": applied_adapter_weights,
+        "adapter_weights_sha256": adapter_weights_sha256,
+        "identity": identity.to_payload(),
+        "stimulus_ids": list(stimulus_ids),
+        "stimuli_sha256": stimuli_digest(stimuli),
+        "rendered_sha256": rendered_sha256,
+        "natural_state": natural_state,
+        "selection_manifest": selection_manifest,
+        "selection_records": list(selection_records),
+        "states": {
+            stimulus_id: list(tensor.shape) for stimulus_id, tensor in sorted(stored.items())
+        },
+    }
+    manifest_path = capture_dir / NATURAL_PREFIX_MANIFEST_FILENAME
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    return manifest_path
+
+
+def _load_rows(manifest: dict[str, Any]) -> dict[str, RowIndex]:
+    """Decode row identity metadata from a cell manifest."""
+    return {
         stimulus_set: RowIndex(
             stimulus_ids=tuple(entry["stimulus_ids"]),
             sides=tuple(entry["sides"]),
@@ -479,29 +1047,145 @@ def read_cell(cell_dir: Path) -> CapturedCell:
         )
         for stimulus_set, entry in cast("dict[str, Any]", manifest["sets"]).items()
     }
-    raw = load_file(str(cell_dir / ACTIVATIONS_FILENAME))
+
+
+def _load_main_activations(
+    cell_dir: Path, rows: dict[str, RowIndex], identity: CellIdentity
+) -> dict[tuple[str, str], torch.Tensor]:
+    """Load ordinary activations and verify every stored block shape."""
     activations: dict[tuple[str, str], torch.Tensor] = {}
-    for key, tensor in raw.items():
+    activation_path = cell_dir / ACTIVATIONS_FILENAME
+    for key, tensor in load_file(str(activation_path)).items():
         parsed = parse_tensor_key(key)
         if parsed is None:
             raise CellFormatError(
-                f"{cell_dir / ACTIVATIONS_FILENAME} holds key {key!r}, which names no known "
-                f"pooling; expected '<set>/<pooling>' with pooling in {sorted(POOLERS)}."
+                f"{activation_path} holds key {key!r}, which names no known pooling; expected "
+                f"'<set>/<pooling>' with pooling in {sorted(POOLERS)}."
             )
-        activations[parsed] = tensor
-    for (stimulus_set, pooling), tensor in sorted(activations.items()):
+        stimulus_set, pooling = parsed
         if stimulus_set not in rows:
             raise CellFormatError(
                 f"{cell_dir} holds activations for set {stimulus_set!r} that its manifest does not "
-                f"describe, so their rows cannot be identified."
+                "describe, so their rows cannot be identified."
             )
         expected = (rows[stimulus_set].n_rows, identity.n_layers, identity.hidden_size)
         if tuple(tensor.shape) != expected:
             raise CellFormatError(
                 f"{cell_dir} set {stimulus_set!r} pooling {pooling!r} is {tuple(tensor.shape)} on "
                 f"disk but its manifest describes {expected}. The manifest and the tensors were "
-                f"written by different runs."
+                "written by different runs."
             )
+        activations[parsed] = tensor
+    return activations
+
+
+def _load_prefix_activations(
+    cell_dir: Path, rows: dict[str, RowIndex], identity: CellIdentity
+) -> dict[tuple[str, str], torch.Tensor]:
+    """Load optional supplied-prefix states and verify their shared row order and shape."""
+    prefix_path = cell_dir / PREFIX_ACTIVATIONS_FILENAME
+    if not prefix_path.is_file():
+        return {}
+    expected = (sum(row.n_rows for row in rows.values()), identity.n_layers, identity.hidden_size)
+    prefix_activations: dict[tuple[str, str], torch.Tensor] = {}
+    for key, tensor in load_file(str(prefix_path)).items():
+        state, separator, pooling = key.partition("/")
+        if not separator or not state or pooling not in POOLERS:
+            raise CellFormatError(
+                f"{prefix_path} holds key {key!r}, expected '<state>/<pooling>' with a known pooling"
+            )
+        if tuple(tensor.shape) != expected:
+            raise CellFormatError(
+                f"{prefix_path} state {state!r}/{pooling!r} has shape {tuple(tensor.shape)}, "
+                f"expected {expected}"
+            )
+        prefix_activations[state, pooling] = tensor
+    return prefix_activations
+
+
+def _load_natural_prefix_activations(
+    cell_dir: Path, rows: dict[str, RowIndex], identity: CellIdentity
+) -> dict[str, torch.Tensor]:
+    """Load reduced natural-prefix states and verify their selected-position axis."""
+    natural_path = cell_dir / NATURAL_PREFIX_ACTIVATIONS_FILENAME
+    if not natural_path.is_file():
+        return {}
+    if not identity.natural_prefix_layers:
+        raise CellFormatError(
+            f"{natural_path} contains natural activations but identity records no layer subset"
+        )
+    row_ids = {stimulus_id for row in rows.values() for stimulus_id in row.stimulus_ids}
+    expected_tail = (len(identity.natural_prefix_layers), identity.hidden_size)
+    natural_prefix_activations: dict[str, torch.Tensor] = {}
+    for stimulus_id, tensor in load_file(str(natural_path)).items():
+        if stimulus_id not in row_ids:
+            raise CellFormatError(
+                f"{natural_path} holds {stimulus_id!r}, which names no cell stimulus"
+            )
+        if tensor.ndim != TENSOR_RANK or tuple(tensor.shape[1:]) != expected_tail:
+            raise CellFormatError(
+                f"{natural_path} stimulus {stimulus_id!r} has shape {tuple(tensor.shape)}, "
+                f"expected [selected_positions, {len(identity.natural_prefix_layers)}, "
+                f"{identity.hidden_size}]"
+            )
+        natural_prefix_activations[stimulus_id] = tensor
+    return natural_prefix_activations
+
+
+def _validate_auxiliary_capture_files(
+    cell_dir: Path,
+    identity: CellIdentity,
+    prefix_activations: dict[tuple[str, str], torch.Tensor],
+    natural_prefix_activations: dict[str, torch.Tensor],
+) -> None:
+    """Require auxiliary files promised by the identity and validate their required states."""
+    prefix_path = cell_dir / PREFIX_ACTIVATIONS_FILENAME
+    if identity.capture_prefix_states:
+        required_prefix_states = {"prompt_end", "teacher_forced"}
+        found_prefix_states = {state for state, _ in prefix_activations}
+        if not prefix_path.is_file():
+            raise CellFormatError(
+                f"{cell_dir} identity requires supplied-prefix states, but {prefix_path} is missing"
+            )
+        if not required_prefix_states <= found_prefix_states:
+            raise CellFormatError(
+                f"{cell_dir} supplied-prefix capture lacks states "
+                f"{sorted(required_prefix_states - found_prefix_states)}"
+            )
+    natural_path = cell_dir / NATURAL_PREFIX_ACTIVATIONS_FILENAME
+    if identity.natural_prefix_layers and not natural_prefix_activations:
+        separate_manifest = cell_dir / "natural-prefix" / NATURAL_PREFIX_MANIFEST_FILENAME
+        if not natural_path.is_file() and not separate_manifest.is_file():
+            raise CellFormatError(
+                f"{cell_dir} identity requires natural-prefix capture, but no natural prefix "
+                f"artifact was found at {natural_path} or {separate_manifest}"
+            )
+
+
+def read_cell(cell_dir: Path) -> CapturedCell:
+    """Read one cell back, checking the tensors on disk against what the manifest claims."""
+    manifest_path = cell_dir / CELL_MANIFEST_FILENAME
+    if not manifest_path.is_file():
+        raise CellFormatError(f"{manifest_path} not found, so {cell_dir} is not a finished cell.")
+    manifest = cast("dict[str, Any]", json.loads(manifest_path.read_text()))
+    identity = CellIdentity.from_payload(
+        cast("dict[str, Any]", manifest.get("identity", {})), source=manifest_path
+    )
+    rows = _load_rows(manifest)
+    activations = _load_main_activations(cell_dir, rows, identity)
+    prefix_activations = _load_prefix_activations(cell_dir, rows, identity)
+    prefix_stimulus_ids = tuple(cast("list[str]", manifest.get("prefix_stimulus_ids", [])))
+    row_ids = tuple(stimulus_id for row in rows.values() for stimulus_id in row.stimulus_ids)
+    if prefix_stimulus_ids and len(set(prefix_stimulus_ids)) != len(prefix_stimulus_ids):
+        raise CellFormatError(f"{manifest_path} repeats ids in prefix_stimulus_ids")
+    if prefix_stimulus_ids and set(prefix_stimulus_ids) != set(row_ids):
+        raise CellFormatError(
+            f"{manifest_path} prefix_stimulus_ids do not cover exactly the cell rows"
+        )
+    natural_prefix_activations = _load_natural_prefix_activations(cell_dir, rows, identity)
+    _validate_auxiliary_capture_files(
+        cell_dir, identity, prefix_activations, natural_prefix_activations
+    )
     return CapturedCell(
         arm=str(manifest["arm"]),
         step=int(manifest["step"]),
@@ -512,6 +1196,13 @@ def read_cell(cell_dir: Path) -> CapturedCell:
         adapter_weights_sha256=cast("str | None", manifest.get("adapter_weights_sha256")),
         provenance=cast("dict[str, Any]", manifest.get("provenance", {})),
         source=cell_dir,
+        stimulus_metadata=cast("dict[str, dict[str, Any]]", manifest.get("stimulus_metadata", {})),
+        prefix_activations=prefix_activations,
+        prefix_stimulus_ids=prefix_stimulus_ids,
+        natural_prefix_activations=natural_prefix_activations,
+        natural_prefix_selection_manifest=cast(
+            "dict[str, Any] | None", manifest.get("natural_prefix_selection_manifest")
+        ),
     )
 
 
@@ -584,16 +1275,31 @@ def assert_ladder_identity(cells: Sequence[CapturedCell]) -> None:
     reference = cells[0]
     differing: dict[str, dict[str, Any]] = {}
     for cell in cells[1:]:
-        for field in CellIdentity.__dataclass_fields__:
-            mine = getattr(cell.identity, field)
-            theirs = getattr(reference.identity, field)
+        for identity_field in CellIdentity.__dataclass_fields__:
+            mine = getattr(cell.identity, identity_field)
+            theirs = getattr(reference.identity, identity_field)
             if mine != theirs:
-                differing.setdefault(field, {reference.label: theirs})[cell.label] = mine
+                differing.setdefault(identity_field, {reference.label: theirs})[cell.label] = mine
     if differing:
         raise CellFormatError(
             f"these cells did not measure the same thing, so comparing them would read a change in "
             f"the apparatus as a change in the model: {json.dumps(differing, sort_keys=True)}. "
             f"Every field here moves the activations by at least as much as a trained delta does."
+        )
+
+
+def assert_capture_provenance(cells: Sequence[CapturedCell]) -> None:
+    """Require concrete tokenizer and kernel identities for a cooperation experiment read."""
+    unspecified = [
+        f"{cell.label}:{field}"
+        for cell in cells
+        for field in ("tokenizer_identity", "kernel_identity")
+        if getattr(cell.identity, field) == "unspecified"
+    ]
+    if unspecified:
+        raise CellFormatError(
+            f"capture cells lack concrete tokenizer/kernel provenance ({unspecified[:ERROR_EXAMPLE_COUNT]}). "
+            "The cooperation capture path must record both identities before its activations are read."
         )
 
 
@@ -662,6 +1368,17 @@ def assert_rows_align(cells: Sequence[CapturedCell]) -> None:
                 )
 
 
+def assert_prefix_rows_align(cell: CapturedCell, stimulus_ids: Sequence[str]) -> None:
+    """Refuse supplied-prefix tensors whose recorded row order differs from the source corpus."""
+    expected = tuple(stimulus_ids)
+    if cell.prefix_stimulus_ids != expected:
+        raise CellFormatError(
+            f"{cell.label} prefix activations record row order {cell.prefix_stimulus_ids}, "
+            f"but the supplied corpus requires {expected}; shuffled prefix rows would pair the "
+            "wrong activation with a construct stimulus."
+        )
+
+
 def assert_adapter_moved_activations(cells: Sequence[CapturedCell]) -> None:
     """Raise if an adapted cell's activations are bit-identical to the base cell's.
 
@@ -706,6 +1423,7 @@ def load_ladder(
     arms: Sequence[str] | None = None,
     steps: Sequence[int] | None = None,
     stimuli_sha256: str | None = None,
+    require_capture_provenance: bool = False,
 ) -> Ladder:
     """Read every cell under `root` that the filters keep, and refuse an incomparable set.
 
@@ -738,6 +1456,8 @@ def load_ladder(
         cells = [cell for cell in cells if cell.step in wanted_steps]
     ordered = tuple(sorted(cells, key=lambda cell: (cell.arm, cell.step)))
     assert_ladder_identity(ordered)
+    if require_capture_provenance:
+        assert_capture_provenance(ordered)
     assert_rows_align(ordered)
     if stimuli_sha256 is not None:
         assert_stimuli_match(ordered, stimuli_sha256)

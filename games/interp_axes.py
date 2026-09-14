@@ -46,21 +46,24 @@ import argparse
 import json
 import logging
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
 from games.interp_cells import (
+    CONSTRUCT_NAMES,
     CapturedCell,
     PairLayout,
     Stimulus,
     concept_activations,
+    construct_group,
     load_ladder,
     load_stimuli,
     pair_layout,
     stimuli_digest,
+    validate_construct_stimuli,
 )
 from reward_hacking.interp.directions import cosine, matched_norm_random_direction
 from reward_hacking.interp.eval_awareness_probe import (
@@ -92,6 +95,7 @@ DIRECTIONS_DIRNAME = "directions"
 
 # How many offending ids an error quotes; the counts beside them carry the magnitude.
 ERROR_EXAMPLE_COUNT = 5
+PAIR_MEMBER_COUNT = 2
 
 # Constraint (b) from the stimuli verification pass, carried in every payload.
 KNOWN_SURFACE_RESIDUALS: tuple[str, ...] = (
@@ -126,6 +130,147 @@ class StimulusStrata:
         for index, pair_id in enumerate(layout.pair_ids):
             by_stratum.setdefault(self.stratum_by_pair[pair_id], []).append(index)
         return {stratum: torch.tensor(indices) for stratum, indices in sorted(by_stratum.items())}
+
+
+@dataclass(frozen=True)
+class ConstructSplit:
+    """A whole-scenario fit/held-out split for one private construct."""
+
+    construct: str
+    group_by_pair: dict[str, str]
+    fit_pair_ids: tuple[str, ...]
+    heldout_pair_ids: tuple[str, ...]
+    procedure_regime_by_pair: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def fit_groups(self) -> tuple[str, ...]:
+        """Scenario/template groups assigned to direction fitting."""
+        return tuple(sorted({self.group_by_pair[pair_id] for pair_id in self.fit_pair_ids}))
+
+    @property
+    def heldout_groups(self) -> tuple[str, ...]:
+        """Scenario/template groups assigned to held-out readout."""
+        return tuple(sorted({self.group_by_pair[pair_id] for pair_id in self.heldout_pair_ids}))
+
+
+def assert_no_pair_crosses_split(
+    stimuli: Sequence[Stimulus],
+    fit_pair_ids: Sequence[str],
+    heldout_pair_ids: Sequence[str],
+) -> None:
+    """Refuse a split that puts either side of a matched pair in different partitions."""
+    fit = set(fit_pair_ids)
+    heldout = set(heldout_pair_ids)
+    overlap = sorted(fit & heldout)
+    if overlap:
+        raise ProvenanceError(f"pair ids occur in both fit and held-out splits: {overlap[:5]}")
+    corpus_pairs = {stimulus.pair_id for stimulus in stimuli}
+    missing = sorted(corpus_pairs - fit - heldout)
+    extra = sorted((fit | heldout) - corpus_pairs)
+    if missing or extra:
+        raise ProvenanceError(
+            f"fit/held-out split does not cover exactly the corpus pairs: missing {missing[:5]}, "
+            f"unknown {extra[:5]}"
+        )
+    by_pair: dict[str, list[Stimulus]] = {}
+    for stimulus in stimuli:
+        by_pair.setdefault(stimulus.pair_id, []).append(stimulus)
+    malformed = sorted(
+        pair_id
+        for pair_id, members in by_pair.items()
+        if len(members) != PAIR_MEMBER_COUNT
+        or sorted(member.side for member in members) != ["A", "B"]
+    )
+    if malformed:
+        raise ProvenanceError(
+            f"fit/held-out split contains malformed matched pairs {malformed[:5]}; expected one A "
+            "and one B row per pair"
+        )
+
+
+def build_construct_splits(  # noqa: PLR0913 - independent split and corpus identity guards
+    stimuli: Sequence[Stimulus],
+    *,
+    pairs_per_construct: int = 12,
+    required_constructs: Sequence[str] = CONSTRUCT_NAMES,
+    reserved_groups: Sequence[str] = (),
+    external_pair_ids: Sequence[str] = (),
+    require_decision_control: bool = False,
+) -> dict[str, ConstructSplit]:
+    """Read an explicitly authored whole-scenario fit/held-out split.
+
+    The private corpus records ``metadata.split`` on both sides of every pair. Splits are never
+    inferred from row order or lexical group names: authored ordering can correlate with scenario
+    content and turn a nominal held-out read into a template extrapolation claim it cannot support.
+    """
+    pair_groups = validate_construct_stimuli(
+        stimuli,
+        pairs_per_construct=pairs_per_construct,
+        required_constructs=required_constructs,
+        reserved_groups=reserved_groups,
+        external_pair_ids=external_pair_ids,
+        require_decision_control=require_decision_control,
+    )
+    group_owner: dict[str, str] = {}
+    for construct, mapping in pair_groups.items():
+        for group in mapping.values():
+            owner = group_owner.setdefault(group, construct)
+            if owner != construct:
+                raise ProvenanceError(
+                    f"scenario group {group!r} appears in constructs {owner!r} and {construct!r}; "
+                    "a shared group could cross the construct split"
+                )
+    result: dict[str, ConstructSplit] = {}
+    for construct in required_constructs:
+        mapping = pair_groups[construct]
+        split_by_group: dict[str, str] = {}
+        for stimulus in stimuli:
+            if stimulus.stimulus_set != construct:
+                continue
+            group = construct_group(stimulus)
+            split = str(stimulus.metadata["split"])
+            prior = split_by_group.setdefault(group, split)
+            if prior != split:
+                raise ProvenanceError(
+                    f"scenario group {group!r} in construct {construct!r} declares both {prior!r} "
+                    f"and {split!r}; a whole group must have one split."
+                )
+        if set(split_by_group) != set(mapping.values()):
+            raise ProvenanceError(
+                f"construct {construct!r} split metadata does not cover exactly its scenario groups"
+            )
+        if set(split_by_group.values()) != {"fit", "heldout"}:
+            raise ProvenanceError(
+                f"construct {construct!r} needs both explicit fit and heldout scenario groups, "
+                f"got {sorted(set(split_by_group.values()))}"
+            )
+        fit_pairs = tuple(
+            sorted(pair_id for pair_id, group in mapping.items() if split_by_group[group] == "fit")
+        )
+        heldout_pairs = tuple(
+            sorted(
+                pair_id for pair_id, group in mapping.items() if split_by_group[group] == "heldout"
+            )
+        )
+        construct_stimuli = [stimulus for stimulus in stimuli if stimulus.stimulus_set == construct]
+        assert_no_pair_crosses_split(construct_stimuli, fit_pairs, heldout_pairs)
+        result[construct] = ConstructSplit(
+            construct=construct,
+            group_by_pair=dict(mapping),
+            fit_pair_ids=fit_pairs,
+            heldout_pair_ids=heldout_pairs,
+            procedure_regime_by_pair={
+                pair_id: str(
+                    next(
+                        stimulus.metadata.get("procedure_regime", "unspecified")
+                        for stimulus in stimuli
+                        if stimulus.stimulus_set == construct and stimulus.pair_id == pair_id
+                    )
+                )
+                for pair_id in mapping
+            },
+        )
+    return result
 
 
 def _stratum_of_row(row: dict[str, Any], *, path: Path, line_number: int) -> str:
@@ -652,6 +797,11 @@ def build_parser() -> argparse.ArgumentParser:
         "this corpus (both sides cite the same cells), so it is the primary comparison per "
         "docs/scratch/interp-capture-2026-08-20/CONFOUNDS-read-me-2026-08-20.md.",
     )
+    parser.add_argument(
+        "--require-capture-provenance",
+        action="store_true",
+        help="Refuse legacy cells without concrete tokenizer and kernel identities.",
+    )
     return parser
 
 
@@ -669,7 +819,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     strata = load_strata(args.provenance, stimuli)
     arms = _split(args.arms)
     steps = None if args.steps is None else [int(part) for part in _split(args.steps) or []]
-    ladder = load_ladder(args.capture_root, arms=arms, steps=steps, stimuli_sha256=digest)
+    ladder = load_ladder(
+        args.capture_root,
+        arms=arms,
+        steps=steps,
+        stimuli_sha256=digest,
+        require_capture_provenance=args.require_capture_provenance,
+    )
     wanted_sets = _split(args.sets) or list(ladder.stimulus_sets)
     wanted_poolings = _split(args.poolings) or list(ladder.poolings)
     layers = (

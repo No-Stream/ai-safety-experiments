@@ -84,6 +84,14 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match="unknown arm"):
             gt.GameTrainConfig(arm="not-an-arm", generate_fresh=True)
 
+    def test_an_empty_model_id_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="model_id must be non-empty"):
+            make_config(model_id="")
+
+    def test_an_empty_explicit_model_source_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="model_source must be non-empty"):
+            make_config(model_source="")
+
     def test_a_corpus_and_a_fresh_generation_are_different_experiments(self):
         with pytest.raises(ValueError, match="not both"):
             gt.GameTrainConfig(arm="dictator", corpus_path="corpus.jsonl", generate_fresh=True)
@@ -223,6 +231,41 @@ class TestParseArgs:
         assert config.autosize is False
         assert config.smoke is False
         assert config.vllm_importance_sampling_correction is False
+
+    def test_logical_model_identity_is_separate_from_the_immutable_load_source(
+        self, tmp_path: Path
+    ):
+        snapshot = str(tmp_path / "qwen3.5-9b-exact-snapshot")
+        config = gt._parse_args(
+            [
+                "--arm",
+                "twin-pd-group",
+                "--model",
+                "Qwen/Qwen3.5-9B",
+                "--model-source",
+                snapshot,
+                "--generate-fresh",
+                "--no-vllm-importance-sampling-correction",
+            ]
+        )
+
+        assert config.model_id == "Qwen/Qwen3.5-9B"
+        assert config.model_source == snapshot
+        assert config.load_source == snapshot
+        assert config.max_completion_tokens == 32768
+
+    def test_resume_identity_refuses_a_different_immutable_snapshot(self) -> None:
+        recorded = make_config(model_source="/snapshots/first")
+        current = make_config(model_source="/snapshots/second")
+
+        with pytest.raises(RuntimeError, match="model_source"):
+            gt.assert_resume_matches(
+                recorded={**gt.RESUME_IDENTITY_DEFAULTS, **asdict(recorded)},
+                current=asdict(current),
+                fields=gt.RESUME_IDENTITY_FIELDS,
+                checkpoint="checkpoint-1",
+                consequence="weights changed under one run identity.",
+            )
 
     def test_an_unregistered_arm_is_refused_by_the_parser(self):
         with pytest.raises(SystemExit):

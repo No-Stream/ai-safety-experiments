@@ -18,16 +18,20 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from games.throughput_probe import (
+    _find_phase_timer,
     apply_plan_step_minutes,
     parse_args,
+    summarize_phase_timings,
     summarize_probe,
 )
 from games.train import GameTrainConfig
+from grpo.throughput import STEP_PHASES, StepPhaseTimer, timing_metric
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -225,3 +229,95 @@ class TestSummarizeProbe:
         path = tmp_path / "probe.json"
         path.write_text(json.dumps(summary, default=str))
         assert json.loads(path.read_text())["median_step_seconds"] == 600.0
+
+
+def phase_history(*, steps: int = 3) -> list[dict[str, float]]:
+    """Return complete timer log rows with distinct values for every phase and step."""
+    return [
+        {
+            timing_metric(phase): float(step + phase_index + 1)
+            for phase_index, phase in enumerate(STEP_PHASES)
+        }
+        for step in range(steps)
+    ]
+
+
+class TestSummarizePhaseTimings:
+    def test_warmup_is_excluded_and_budget_aliases_use_phase_medians(self) -> None:
+        history = phase_history()
+
+        summary = summarize_phase_timings(
+            history=history,
+            warmup_steps=1,
+            expected_steps=len(history),
+            memory_peaks={
+                "peak_allocated_gib": 11.0,
+                "peak_reserved_gib": 12.0,
+                "peak_device_used_gib": 13.0,
+            },
+        )
+
+        phase_seconds_all = cast("dict[str, list[float]]", summary["phase_seconds_all"])
+        phase_seconds_measured = cast("dict[str, list[float]]", summary["phase_seconds_measured"])
+        phase_medians_seconds = cast("dict[str, float]", summary["phase_medians_seconds"])
+        assert phase_seconds_all["backward"] == [8.0, 9.0, 10.0]
+        assert phase_seconds_measured["backward"] == [9.0, 10.0]
+        assert phase_medians_seconds["backward"] == 9.5
+        assert summary["throughput"] == {
+            "generation": 4.5,
+            "backward": 9.5,
+            "optimizer": 11.5,
+            "phase_medians_seconds": phase_medians_seconds,
+        }
+        assert summary["memory"] == {
+            "peak_allocated_gib": 11.0,
+            "peak_reserved_gib": 12.0,
+            "peak_device_used_gib": 13.0,
+        }
+
+    def test_missing_phase_metric_is_a_hard_failure(self) -> None:
+        history = phase_history(steps=2)
+        del history[1][timing_metric("backward")]
+
+        with pytest.raises(ValueError, match="backward"):
+            summarize_phase_timings(
+                history=history,
+                warmup_steps=0,
+                expected_steps=len(history),
+                memory_peaks={
+                    "peak_allocated_gib": 1.0,
+                    "peak_reserved_gib": 1.0,
+                    "peak_device_used_gib": 1.0,
+                },
+            )
+
+    def test_phase_summary_survives_json_round_trip(self, tmp_path: Path) -> None:
+        history = phase_history(steps=2)
+        summary = summarize_phase_timings(
+            history=history,
+            warmup_steps=0,
+            expected_steps=len(history),
+            memory_peaks={
+                "peak_allocated_gib": 1.0,
+                "peak_reserved_gib": 2.0,
+                "peak_device_used_gib": 3.0,
+            },
+        )
+        path = tmp_path / "probe.json"
+        path.write_text(json.dumps(summary))
+
+        payload = json.loads(path.read_text())
+        assert payload["throughput"]["optimizer"] == 10.5
+        assert payload["memory"]["peak_device_used_gib"] == 3.0
+
+
+def test_probe_reuses_the_single_timer_attached_by_games_train() -> None:
+    timer = StepPhaseTimer()
+    trainer = SimpleNamespace(callback_handler=SimpleNamespace(callbacks=[timer]))
+
+    assert _find_phase_timer(trainer) is timer
+
+    for callbacks in ([], [timer, StepPhaseTimer()]):
+        trainer.callback_handler.callbacks = callbacks
+        with pytest.raises(RuntimeError, match="exactly one"):
+            _find_phase_timer(trainer)

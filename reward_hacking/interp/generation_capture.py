@@ -66,7 +66,7 @@ from reward_hacking.model_backend import (
 )
 
 if TYPE_CHECKING:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
@@ -418,7 +418,7 @@ def _generation_kwargs(tokenizer: AutoTokenizer, sampling: SamplingConfig) -> di
 
 
 def record_from_token_ids(  # noqa: PLR0913 - a record is its ids, its boundary, its cap and its sampler
-    tokenizer: AutoTokenizer,
+    tokenizer: AutoTokenizer | PreTrainedTokenizerBase,
     prompt: str,
     *,
     prompt_token_ids: Sequence[int],
@@ -448,12 +448,15 @@ def record_from_token_ids(  # noqa: PLR0913 - a record is its ids, its boundary,
     full_ids = torch.tensor([*prompt_token_ids, *response_token_ids], dtype=torch.long)
     prompt_len = len(prompt_token_ids)
     seq_len = int(full_ids.shape[0])
+    response_text = tokenizer.decode(  # pyright: ignore[reportAttributeAccessIssue]
+        list(response_token_ids), skip_special_tokens=True
+    )
+    if not isinstance(response_text, str):
+        raise TypeError("tokenizer.decode must return one string for one response")
     return GenerationRecord(
         prompt_text=prompt,
         prompt_len=prompt_len,
-        response_text=tokenizer.decode(  # pyright: ignore[reportAttributeAccessIssue]
-            list(response_token_ids), skip_special_tokens=True
-        ),
+        response_text=response_text,
         full_ids=full_ids,
         token_strings=list(
             tokenizer.convert_ids_to_tokens(full_ids.tolist())  # pyright: ignore[reportAttributeAccessIssue]

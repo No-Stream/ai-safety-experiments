@@ -175,6 +175,20 @@ class TestResolveServedModel:
         assert served.backend_kwargs == {}
         assert merge.calls == []
 
+    def test_immutable_source_loads_under_the_canonical_base_identity(self, tmp_path: Path) -> None:
+        snapshot = str(tmp_path / "immutable-snapshot")
+        served = resolve_served_model(
+            checkpoint=None,
+            base_model=BASE_MODEL,
+            base_model_source=snapshot,
+            backend_kind="vllm",
+            merge_root=tmp_path / "merges",
+            merge_label="base-",
+        )
+
+        assert served.model_id == BASE_MODEL
+        assert served.backend_kwargs == {"model_path": snapshot}
+
     def test_vllm_passes_the_adapter_through_without_merging(
         self, tmp_path: Path, merge: RecordingMerge
     ) -> None:
@@ -198,6 +212,25 @@ class TestResolveServedModel:
             "max_lora_rank": 16,
             "lora_target_modules": list(TRAINED_TARGETS),
         }
+
+    def test_runtime_adapter_keeps_the_immutable_base_load_source(
+        self, tmp_path: Path, merge: RecordingMerge
+    ) -> None:
+        checkpoint = make_adapter_dir(tmp_path / "checkpoint-70")
+        snapshot = str(tmp_path / "immutable-snapshot")
+        served = resolve_served_model(
+            checkpoint=checkpoint,
+            base_model=BASE_MODEL,
+            base_model_source=snapshot,
+            backend_kind="vllm",
+            merge_root=tmp_path / "merges",
+            merge_label="arm-step-70-",
+        )
+
+        assert served.model_id == BASE_MODEL
+        assert served.backend_kwargs["model_path"] == snapshot
+        assert served.backend_kwargs["lora_adapter"] == str(checkpoint)
+        assert merge.calls == []
 
     def test_the_deltanet_projections_reach_the_engine(self, tmp_path: Path) -> None:
         """A target list missing these adapts a quarter of the stack and says nothing.
