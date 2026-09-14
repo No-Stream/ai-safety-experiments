@@ -29,23 +29,23 @@ What is here:
   hidden-check pass, because each of those mechanisms can produce one.
 - `model_backend.py` — the shared inference seam. One `Backend` protocol over local HuggingFace
   and vLLM, a `MockBackend` for the offline tests, and `BedrockBackend` for hosted models we
-  cannot run here, which is what makes cross-model measurement possible. Bedrock needs the
-  optional extra (`uv sync --extra bedrock`); `make bedrock-smoke` makes one live call to check
+  cannot run here, which is what makes cross-model measurement possible. The hosted backend needs
+  the optional extra (`uv sync --extra bedrock`); `make bedrock-smoke` makes one live call to check
   the credential path without putting the network anywhere near `make test`.
-- `bedrock_batch.py` — the same hosted models by a second route: Bedrock's batch inference service,
-  for sweeping an item corpus across a wide roster. Half the token price, no rate limits to fight, and
+- `bedrock_batch.py` — the same hosted models by a second route: the hosted batch inference service,
+  for sweeping an item corpus across a wide roster. No rate limits to fight, and
   every model's job runs concurrently, which is the actual win — one model's 145 records finish
-  faster on the live Converse path than batch's ~5-minute queueing floor, but eight models submitted
+  faster on the live path than batch's ~5-minute queueing floor, but eight models submitted
   at once still land inside 25 minutes. `submit` and `collect` are separate calls so an interrupted
-  session resumes from a saved handle rather than re-paying for the inference; `jagged/sweep.py` is
+  session resumes from a saved handle rather than re-running the inference; `jagged/sweep.py` is
   the CLI over them, taking the corpus to sweep as a `--items module:attribute` reference. The records are `modelInvocationType="Converse"`, so prompt construction and
   response parsing are literally the live path's functions and there is no second copy to drift.
   Two things it will refuse: fewer than 100 records per job (a hard, non-adjustable quota — small
-  and calibration runs belong on Converse), and a model id outside the verified roster table.
+  and calibration runs belong on the live endpoint), and a model id outside the verified roster table.
 - `backend_cli.py` — the shared `--backend` plumbing behind the `episodes` and `channel` CLIs and
   the `interp` probe: one flag set, one place that builds the right sampling
-  config per backend, and refusals for the combinations that cannot work (`--top-k` at Bedrock
-  Converse, which has no `topK` field; an activation probe pointed at a hosted endpoint). Both
+  config per backend, and refusals for the combinations that cannot work (`--top-k` at the hosted
+  endpoint, which has no `topK` field; an activation probe pointed at a hosted endpoint). Both
   sampling CLIs also take `--backend mock`, which runs the whole path on canned completions
   for free. The real-execution harness keeps its own backend selection, because a jailed run that
   really executes what the policy emits has no free canned version.

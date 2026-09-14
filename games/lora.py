@@ -247,6 +247,7 @@ def load_adapter_base(
     *,
     dtype: torch.dtype = DEFAULT_MERGE_DTYPE,
     device: torch.device | None = None,
+    revision: str | None = None,
 ) -> PreTrainedModel:
     """Build the base model the way training built it, ready for adapters to be attached.
 
@@ -257,7 +258,11 @@ def load_adapter_base(
     done here instead, so a single-GPU capture stays on a single GPU.
     """
     built: PreTrainedModel = create_model_from_path(
-        base_model_id, dtype=dtype, device_map=None, trust_remote_code=True
+        base_model_id,
+        dtype=dtype,
+        device_map=None,
+        trust_remote_code=True,
+        revision=revision,
     )
     # transformers 5.x wraps `.to`, which pyright reads as an unbound __call__ wanting `self`.
     placed = built if device is None else built.to(device)  # pyright: ignore[reportArgumentType]

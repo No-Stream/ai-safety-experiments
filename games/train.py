@@ -78,6 +78,18 @@ from games.arms import (
     GameArm,
     arm_game_ids,
 )
+from games.checkpoint_retention import (
+    ADAPTER_WEIGHT_FILENAMES as RETENTION_ADAPTER_WEIGHT_FILENAMES,
+)
+from games.checkpoint_retention import (
+    REQUIRED_CHECKPOINT_FILES as RETENTION_REQUIRED_CHECKPOINT_FILES,
+)
+from games.checkpoint_retention import (
+    CheckpointRetentionCallback,
+    missing_checkpoint_files,
+    validate_retention_settings,
+    write_retention_manifest,
+)
 from games.dataset import build_game_dataset
 from games.deltanet_kernels import assert_bridged_kernel_matches_call_site, bridge_decode_kernel
 from games.generation import (
@@ -503,6 +515,7 @@ RESUMED_RUN_CONFIG_TEMPLATE = "run_config.resume-from-{checkpoint}.json"
 RESUME_IDENTITY_FIELDS = (
     "arm",
     "model_id",
+    "model_source",
     "corpus_path",
     "generate_fresh",
     "thinking",
@@ -549,6 +562,7 @@ RESUME_IDENTITY_FIELDS = (
 # existed means THIS value, not a mismatch -- and not the current default, which would let a resume
 # silently relabel what the checkpoint's steps were trained under.
 RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
+    "model_source": None,
     "loss_type": "dapo",
     "scale_rewards": "batch",
     "init_adapter": "",
@@ -641,6 +655,9 @@ class GameTrainConfig:
 
     arm: str
     model_id: str = DEFAULT_MODEL_ID
+    # Optional immutable snapshot to load. ``model_id`` remains the canonical checkpoint identity
+    # used for measured sampler floors, corpus compatibility, run naming, and cost metadata.
+    model_source: str | None = None
     # A corpus from `games.select_prompts` holds only prompts whose action distribution was
     # mixed at training temperature, which is where GRPO's within-group disagreement comes from.
     corpus_path: str | None = None
@@ -766,6 +783,9 @@ class GameTrainConfig:
     # by `TestTheFp32HeadMovesTheOldLogpsPassTowardTheLigerLoss`).
     cast_lm_head_to_fp32: bool = False
     output_dir: str | None = None
+    # New experiment presets opt into a per-save inventory. Existing games arms retain their
+    # historical persistence behavior unless they explicitly request this artifact.
+    record_retention_manifest: bool = False
     # Thinking ON is the plan's requirement, because the decision-theory reasoning these arms
     # measure lives in the chain of thought. It is a flag only because every Qwen3.5 tier measured
     # (0.8B, 2B, 4B) and openbmb/MiniCPM5-1B fail to terminate their thinking on a game prompt at
@@ -801,6 +821,7 @@ class GameTrainConfig:
         assert_vllm_rollouts()
         if self.arm not in ARMS:
             raise ValueError(f"unknown arm {self.arm!r}; known arms: {sorted(ARMS)}")
+        self._validate_model_identity()
         assert_resume_is_addressable(self.resume_from_checkpoint, self.output_dir)
         assert_init_adapter_is_loadable(self.init_adapter)
         if self.corpus_path is not None and self.generate_fresh:
@@ -846,7 +867,25 @@ class GameTrainConfig:
             )
         self._validate_completion_budget()
         self._validate_instruments()
+        self._validate_retention()
         self._validate_memory_plan()
+
+    def _validate_model_identity(self) -> None:
+        """Require both the logical model identity and any explicit load source to be non-empty."""
+        if not self.model_id:
+            raise ValueError("model_id must be non-empty")
+        if self.model_source is not None and not self.model_source:
+            raise ValueError("model_source must be non-empty when supplied")
+
+    def _validate_retention(self) -> None:
+        """Apply the per-step no-rotation policy only to explicitly instrumented runs."""
+        if not self.record_retention_manifest:
+            return
+        validate_retention_settings(
+            max_steps=cast("int", SMOKE_OVERRIDES["max_steps"]) if self.smoke else self.max_steps,
+            save_steps=1 if self.smoke else self.save_steps,
+            save_total_limit=0 if self.smoke else self.save_total_limit,
+        )
 
     def _validate_penalty_epsilon_and_dropout(self) -> None:
         """Refuse the three knobs whose value is what makes the arithmetic downstream mean anything.
@@ -976,6 +1015,11 @@ class GameTrainConfig:
             f"format-dominated and the chain of thought stops being what the arm measures. Pass "
             f"--allow-short-completions for a timing probe, or --no-thinking for a plumbing run."
         )
+
+    @property
+    def load_source(self) -> str:
+        """Return the hub id or immutable local snapshot from which weights are loaded."""
+        return self.model_source or self.model_id
 
     def _validate_memory_plan(self) -> None:
         """Reject a division of the card leaving the trainer nothing, or an engine we cannot build.
@@ -1270,7 +1314,10 @@ def shrink_for_smoke(config: GameTrainConfig) -> GameTrainConfig:
     A separate smoke script would exercise a separate code path, which is the one thing a smoke
     run must not do.
     """
-    return replace(config, smoke=True, corpus_path=None, **SMOKE_OVERRIDES)  # pyright: ignore[reportArgumentType]
+    smoke_overrides = dict(SMOKE_OVERRIDES)
+    if config.record_retention_manifest:
+        smoke_overrides.update(save_steps=1, save_total_limit=0)
+    return replace(config, smoke=True, corpus_path=None, **smoke_overrides)  # pyright: ignore[reportArgumentType]
 
 
 def path_safe_model_id(model_id: str) -> str:
@@ -1331,28 +1378,11 @@ def resolve_resume_checkpoint(requested: str, output_dir: str) -> str | None:
 
 
 # What `transformers.Trainer` must find in a checkpoint for a resume to restore what it claims to.
-# `optimizer.pt` and `scheduler.pt` are the load-bearing pair: `_load_optimizer_and_scheduler` loads
-# both only when BOTH exist and otherwise continues, silently, with a freshly constructed optimizer
-# and a scheduler at step 0. `rng_state.pth` missing is an info-level log and a different sampling
-# stream. The single-process name is exact because `_announce_launch` refuses a multi-process launch.
-REQUIRED_CHECKPOINT_FILES: tuple[str, ...] = (
-    TRAINER_STATE_FILENAME,
-    "optimizer.pt",
-    "scheduler.pt",
-    "rng_state.pth",
-)
-# PEFT writes the safetensors name by default; the `.bin` name is the legacy serialization it and
-# transformers still read, so a checkpoint carrying either has its adapter.
-ADAPTER_WEIGHT_FILENAMES: tuple[str, ...] = (INIT_ADAPTER_WEIGHTS_FILENAME, "adapter_model.bin")
+# The shared predicate also requires PEFT's adapter config, and checks direct children only, so the
+# resolver and retention inventory cannot disagree about a nested or adapter-only directory.
+REQUIRED_CHECKPOINT_FILES: tuple[str, ...] = RETENTION_REQUIRED_CHECKPOINT_FILES
+ADAPTER_WEIGHT_FILENAMES: tuple[str, ...] = RETENTION_ADAPTER_WEIGHT_FILENAMES
 INCOMPLETE_CHECKPOINTS_DIRNAME = "incomplete-checkpoints"
-
-
-def missing_checkpoint_files(checkpoint: Path) -> list[str]:
-    """Name every file a resume needs that this checkpoint directory does not have."""
-    missing = [name for name in REQUIRED_CHECKPOINT_FILES if not (checkpoint / name).is_file()]
-    if not any((checkpoint / name).is_file() for name in ADAPTER_WEIGHT_FILENAMES):
-        missing.append(" or ".join(ADAPTER_WEIGHT_FILENAMES))
-    return missing
 
 
 @dataclass(frozen=True)
@@ -1477,7 +1507,7 @@ def describe_init_adapter(
     if not config.init_adapter:
         return None
     adapter_dir = Path(config.init_adapter)
-    assert_adapter_matches_base(adapter_dir, config.model_id)
+    assert_adapter_matches_base(adapter_dir, config.load_source)
     identity = adapter_config_identity(adapter_dir)
     expected: dict[str, object] = {
         "r": config.lora_rank,
@@ -2382,6 +2412,7 @@ def _trl_arguments(config: GameTrainConfig, plan: SizingPlan, *, dtype: torch.dt
         save_strategy="steps",
         save_steps=config.save_steps,
         save_total_limit=config.save_total_limit,
+        save_only_model=False,
         # TRL evaluates by computing the GRPO surrogate loss over eval prompts, which segfaults
         # inside Liger's fused loss. The eval battery reads checkpoints instead.
         eval_strategy="no",
@@ -2480,13 +2511,14 @@ def _announce_launch(config: GameTrainConfig) -> int:
     crash it replaces happens inside `GRPOTrainer.__init__` on a rented card.
     """
     assert_cast_lm_head_is_supported(
-        config.model_id, cast_lm_head_to_fp32=config.cast_lm_head_to_fp32
+        config.load_source, cast_lm_head_to_fp32=config.cast_lm_head_to_fp32
     )
     arm = config.game_arm
     logger.info(
         "training arm, %s",
         f"{config.arm=} game_id={arm.game_id!r} grading={arm.grading!r} "
-        f"model_id={config.model_id!r} output_dir={config.output_dir!r}",
+        f"model_id={config.model_id!r} model_source={config.load_source!r} "
+        f"output_dir={config.output_dir!r}",
     )
     logger.info("arm rationale: %s", arm.notes)
     # The spread table is part of every launch record rather than an on-demand check: under the
@@ -2731,7 +2763,7 @@ def _prepare_run(
         f"{dtype=}",
     )
 
-    tokenizer, template_facts = resolve_tokenizer(config.model_id, thinking=config.thinking)
+    tokenizer, template_facts = resolve_tokenizer(config.load_source, thinking=config.thinking)
     rows = prepare_rows(config)
     dataset = build_game_dataset(
         rows,
@@ -2744,7 +2776,7 @@ def _prepare_run(
     )
     logger.info("dataset built, %s", f"n_prompts={len(dataset)} n_rows_in={len(rows)}")
 
-    lora_targets = discover_lora_targets(config.model_id)
+    lora_targets = discover_lora_targets(config.load_source)
     logger.info("LoRA targets: %s", lora_targets["module_counts"])
     init_adapter_facts = describe_init_adapter(config, lora_targets=lora_targets)
     kernel_paths = log_deltanet_kernel_paths(
@@ -2752,7 +2784,7 @@ def _prepare_run(
             "int", lora_targets["expected_linear_attention_layers"]
         )
     )
-    param_count = count_meta_parameters(config.model_id)
+    param_count = count_meta_parameters(config.load_source)
     plan, cost = _derive_plan(config, device=device, dtype=dtype, param_count=param_count)
     assert_dataset_fills_a_step(
         len(dataset), plan, dynamic_sampling_oversample=config.dynamic_sampling_oversample
@@ -3612,6 +3644,16 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
     # and steps_per_generation on this object, and those derived values are what decide whether
     # the rollout trace is complete.
     grpo_args = _build_grpo_config(config, prepared.plan, dtype=prepared.dtype)
+    callbacks = build_callbacks(
+        logging_steps=config.logging_steps,
+        output_dir=cast("str", config.output_dir),
+        s3_dest=config.s3_dest,
+    )
+    if config.record_retention_manifest:
+        # Write before S3SyncCallback so each save ships the matching inventory with its checkpoint.
+        callbacks.insert(
+            0, CheckpointRetentionCallback(run_root=Path(cast("str", config.output_dir)))
+        )
     # Registered as a callback here and attached to the built trainer below: the callback half
     # needs the optimizer-step hooks, the attach half needs the trainer's seams to exist.
     phase_timer = StepPhaseTimer()
@@ -3619,7 +3661,7 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
         old_logps_chunk_tokens=config.old_logps_chunk_tokens,
         importance_sampling_log_only=config.vllm_importance_sampling_log_only,
         dynamic_sampling_oversample=config.dynamic_sampling_oversample,
-        model=config.model_id,
+        model=config.load_source,
         reward_funcs=reward,  # pyright: ignore[reportArgumentType]
         args=grpo_args,
         train_dataset=prepared.dataset,
@@ -3635,11 +3677,7 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
             target_modules=cast("list[str]", prepared.lora_targets["target_modules"]),
         ),
         callbacks=[
-            *build_callbacks(
-                logging_steps=config.logging_steps,
-                output_dir=cast("str", config.output_dir),
-                s3_dest=config.s3_dest,
-            ),
+            *callbacks,
             # Appended here rather than inside build_callbacks: the reward-hacking trainer shares
             # that builder and keeps a deliberate slow path behind --allow-hf-generation, which
             # this guard would kill at step 3.
@@ -3869,6 +3907,7 @@ def _summarize_run(
         "game_id": arm.game_id,
         "grading": arm.grading,
         "model_id": config.model_id,
+        "model_source": config.load_source,
         "output_dir": prepared.output_dir,
         **git_provenance(),
         "smoke": config.smoke,
@@ -3959,6 +3998,14 @@ def train_game_arm(
     _, missing, trace_files = _summarize_run(
         prepared, trainer, wall_seconds=wall_seconds, checks=checks
     )
+    if config.record_retention_manifest:
+        manifest = write_retention_manifest(Path(prepared.output_dir))
+        logger.info(
+            "retention manifest written, checkpoints=%d incomplete=%d bytes=%d",
+            len(manifest.retained),
+            len(manifest.incomplete),
+            manifest.checkpoint_bytes_after,
+        )
     if config.s3_dest:
         # The callback's on_train_end fires inside trainer.train(), BEFORE save_model, save_state
         # and the summary write above, so without this the bucket's copy of every finished run is
@@ -4090,6 +4137,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     parser.add_argument("--arm", required=True, choices=sorted(ARMS))
     # None so that --smoke can default the model without overriding an explicit choice.
     parser.add_argument("--model", dest="model_id", default=None)
+    parser.add_argument(
+        "--model-source",
+        default=None,
+        help=(
+            "Immutable local snapshot to load while --model remains the canonical model identity "
+            "used for sampler and provenance decisions."
+        ),
+    )
     parser.add_argument("--corpus", dest="corpus_path", default=None)
     parser.add_argument("--generate-fresh", action="store_true")
     parser.add_argument("--smoke", action="store_true")
@@ -4225,6 +4280,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     )
     _add_sampler_mismatch_arguments(parser)
     parser.add_argument("--output-dir", dest="output_dir", default=None)
+    parser.add_argument(
+        "--record-retention-manifest",
+        action="store_true",
+        help="write a hashed run-owned checkpoint inventory after each save",
+    )
     parser.add_argument(
         "--resume-from-checkpoint",
         dest="resume_from_checkpoint",

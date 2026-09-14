@@ -16,16 +16,22 @@ plausible number.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from games.interp_axes import (
     KNOWN_SURFACE_RESIDUALS,
     POOLED_STRATUM,
     SCENARIO_STRATUM,
     ProvenanceError,
+    assert_no_pair_crosses_split,
+    build_construct_splits,
     build_parser,
     load_strata,
     run,
@@ -42,9 +48,6 @@ from games.interp_cells import (
     stimuli_digest,
     write_cell,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 N_LAYERS = 3
 HIDDEN = 64
@@ -73,6 +76,50 @@ def make_set(stimulus_set: str, n_pairs: int) -> list[Stimulus]:
     ]
 
 
+def make_construct_set(construct: str, n_pairs: int = 4) -> list[Stimulus]:
+    """Small explicit grouped construct corpus used only for split validation."""
+    rows: list[Stimulus] = []
+    for pair_index in range(n_pairs):
+        split = "fit" if pair_index % 2 == 0 else "heldout"
+        group = f"{construct}-scenario-{pair_index}"
+        rows.extend(
+            Stimulus(
+                stimulus_id=f"{construct}--p{pair_index}--{side}",
+                stimulus_set=construct,
+                side=side,
+                pair_id=f"{construct}--p{pair_index}",
+                text=f"fixed mechanics premise {construct} pair {pair_index} side {side}",
+                metadata={
+                    "construct": construct,
+                    "scenario_group": group,
+                    "split": split,
+                    "measurement_boundary": "pre_action",
+                    "action_commitment_present": False,
+                    **(
+                        {
+                            "procedure_regime": (
+                                "stochastic" if pair_index in (0, 1) else "deterministic"
+                            ),
+                            "dependence_mechanism": (
+                                "shared-randomness"
+                                if pair_index in (0, 1) and side == "A"
+                                else "independent-randomness"
+                                if pair_index in (0, 1)
+                                else "shared-deterministic-procedure"
+                                if side == "A"
+                                else "independent-deterministic-procedure"
+                            ),
+                        }
+                        if construct == "decision-dependence"
+                        else {}
+                    ),
+                },
+            )
+            for side in ("A", "B")
+        )
+    return rows
+
+
 def coarse_stratum_of(pair_index: int) -> str:
     """The planted stratum split for the coarse set: first half matched, second half split."""
     return MATCHED if pair_index < 4 else SPLIT
@@ -96,6 +143,103 @@ def provenance_row(stimulus: Stimulus) -> dict[str, Any]:
         coarse_stratum_of(pair_index) if stimulus.stimulus_set == COARSE_SET else SPLIT
     )
     return row
+
+
+class TestConstructSplits:
+    def test_authored_group_split_is_used_and_pairs_stay_whole(self) -> None:
+        stimuli = make_construct_set("costly-other-regard") + make_construct_set(
+            "decision-dependence"
+        )
+        splits = build_construct_splits(stimuli, pairs_per_construct=4)
+        for construct, split in splits.items():
+            assert split.fit_groups == tuple(f"{construct}-scenario-{index}" for index in (0, 2))
+            assert split.heldout_groups == tuple(
+                f"{construct}-scenario-{index}" for index in (1, 3)
+            )
+            assert set(split.fit_pair_ids) | set(split.heldout_pair_ids) == {
+                f"{construct}--p{index}" for index in range(4)
+            }
+            if construct == "decision-dependence":
+                assert set(split.procedure_regime_by_pair.values()) == {
+                    "stochastic",
+                    "deterministic",
+                }
+            assert_no_pair_crosses_split(
+                [stimulus for stimulus in stimuli if stimulus.stimulus_set == construct],
+                split.fit_pair_ids,
+                split.heldout_pair_ids,
+            )
+
+    def test_group_crossing_and_reserved_identity_are_refused(self) -> None:
+        stimuli = make_construct_set("costly-other-regard") + make_construct_set(
+            "decision-dependence"
+        )
+        crossed = [
+            replace(
+                stimulus,
+                metadata={
+                    **stimulus.metadata,
+                    "scenario_group": "costly-other-regard-scenario-0",
+                },
+            )
+            if stimulus.stimulus_id == "costly-other-regard--p1--B"
+            else stimulus
+            for stimulus in stimuli
+        ]
+        with pytest.raises(ValueError, match="straddles scenario/template groups"):
+            build_construct_splits(crossed, pairs_per_construct=4)
+        with pytest.raises(ValueError, match="reserved training/evaluation group"):
+            build_construct_splits(
+                stimuli,
+                pairs_per_construct=4,
+                reserved_groups=("decision-dependence-scenario-1",),
+            )
+        with pytest.raises(ValueError, match="reserved training/evaluation identity"):
+            build_construct_splits(
+                stimuli,
+                pairs_per_construct=4,
+                external_pair_ids=("decision-dependence--p1",),
+            )
+
+    def test_missing_or_mixed_explicit_split_is_refused(self) -> None:
+        stimuli = make_construct_set("costly-other-regard") + make_construct_set(
+            "decision-dependence"
+        )
+        missing = [
+            replace(
+                stimulus,
+                metadata={key: value for key, value in stimulus.metadata.items() if key != "split"},
+            )
+            if stimulus.stimulus_id == "costly-other-regard--p0--A"
+            else stimulus
+            for stimulus in stimuli
+        ]
+        with pytest.raises(ValueError, match="must declare one shared metadata split"):
+            build_construct_splits(missing, pairs_per_construct=4)
+
+    def test_strict_decision_control_metadata_is_required_for_cooperation_path(self) -> None:
+        stimuli = make_construct_set("costly-other-regard") + make_construct_set(
+            "decision-dependence"
+        )
+        missing = [
+            replace(
+                stimulus,
+                metadata={
+                    key: value
+                    for key, value in stimulus.metadata.items()
+                    if key not in {"procedure_regime", "dependence_mechanism"}
+                },
+            )
+            if stimulus.stimulus_set == "decision-dependence"
+            else stimulus
+            for stimulus in stimuli
+        ]
+        with pytest.raises(ValueError, match="dependence_mechanism"):
+            build_construct_splits(
+                missing,
+                pairs_per_construct=4,
+                require_decision_control=True,
+            )
 
 
 def write_corpus(

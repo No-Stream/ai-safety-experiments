@@ -73,7 +73,12 @@ def write_checkpoint(run_dir: Path, step: int, *, omit: tuple[str, ...] = ()) ->
     checkpoint.mkdir(parents=True)
     for name in COMPLETE_FILES:
         if name not in omit:
-            (checkpoint / name).write_bytes(b"")
+            if name == TRAINER_STATE_FILENAME:
+                (checkpoint / name).write_text(json.dumps({"global_step": step}))
+            elif name == "adapter_config.json":
+                (checkpoint / name).write_text(json.dumps({"peft_type": "LORA"}))
+            else:
+                (checkpoint / name).write_bytes(b"state")
     return checkpoint
 
 
@@ -132,7 +137,7 @@ class TestMissingCheckpointFiles:
 
     def test_the_legacy_bin_adapter_name_also_counts(self, tmp_path: Path) -> None:
         checkpoint = write_checkpoint(tmp_path, 1, omit=("adapter_model.safetensors",))
-        (checkpoint / "adapter_model.bin").write_bytes(b"")
+        (checkpoint / "adapter_model.bin").write_bytes(b"state")
         assert missing_checkpoint_files(checkpoint) == []
 
     def test_every_missing_file_is_named(self, tmp_path: Path) -> None:

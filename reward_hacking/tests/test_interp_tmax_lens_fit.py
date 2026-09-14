@@ -796,6 +796,27 @@ class ToyHF(nn.Module):
         )
 
 
+class ToyTokenizer:
+    """A loaded-tokenizer-shaped fixture for the provenance payload."""
+
+    def __init__(self) -> None:
+        self.vocabulary = {f"token_{index}": index for index in range(TOY_VOCAB)}
+        self.padding_side = "right"
+        self.truncation_side = "right"
+        self.model_max_length = 512
+        self.clean_up_tokenization_spaces = False
+        self.split_special_tokens = False
+        self.chat_template = "{{ messages }}"
+        self.special_tokens_map = {"eos_token": "<eos>"}
+        self.init_kwargs = {"model_max_length": 512, "_commit_hash": "toy-commit"}
+
+    def get_vocab(self) -> dict[str, int]:
+        return self.vocabulary
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {}
+
+
 class ToyLensModel:
     """The slice of ``jlens.hf.HFLensModel`` the driver uses, over a :class:`ToyHF`."""
 
@@ -963,7 +984,7 @@ def toy_handle(hf: ToyHF, *, fingerprint: str = FINGERPRINT_A) -> LensModelHandl
     return LensModelHandle(
         model=ToyLensModel(hf),
         hf_model=cast("Any", hf),
-        tokenizer=None,
+        tokenizer=ToyTokenizer(),
         facts=facts,
         loading_report=LoadingReport(0, 0, 0),
         layer_types=("full_attention",) * TOY_LAYERS,

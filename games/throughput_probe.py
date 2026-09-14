@@ -32,13 +32,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import statistics
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from games.deltanet_kernels import assert_bridged_kernel_matches_call_site, bridge_decode_kernel
 from games.generation import (
@@ -65,7 +66,7 @@ from games.train import (
     required_metrics_for,
     write_json,
 )
-from grpo.throughput import StepTimingCallback, instrument_generation
+from grpo.throughput import STEP_PHASES, StepPhaseTimer, instrument_generation, timing_metric
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -171,6 +172,78 @@ def summarize_probe(
     }
 
 
+def summarize_phase_timings(
+    *,
+    history: Sequence[Mapping[str, object]],
+    warmup_steps: int,
+    expected_steps: int,
+    memory_peaks: Mapping[str, float],
+) -> dict[str, object]:
+    """Persist the existing phase timer's readings in the probe's native JSON artifact.
+
+    ``StepPhaseTimer`` writes one ``timing/<phase>_s`` value per optimizer step into TRL's log
+    history.  The probe has a one-step logging cadence, but this function still checks that every
+    phase has exactly one value per timed step before taking medians.  A partial or aggregated
+    series would make a persisted price look complete while omitting part of the training pass.
+    """
+    if warmup_steps < 0:
+        raise ValueError(f"warmup cannot be negative, {warmup_steps=}")
+    if expected_steps <= warmup_steps:
+        raise ValueError(
+            f"nothing would be measured: {expected_steps=} is not past {warmup_steps=}, "
+            "so phase medians would report warmup"
+        )
+
+    phase_seconds_all: dict[str, list[float]] = {}
+    for phase in STEP_PHASES:
+        metric = timing_metric(phase)
+        values = [float(cast("float", record[metric])) for record in history if metric in record]
+        if len(values) != expected_steps:
+            raise ValueError(
+                f"phase {phase!r} logged {len(values)} value(s), expected {expected_steps}; "
+                "phase timing requires one native log value per optimizer step"
+            )
+        if any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ValueError(f"phase {phase!r} contains a non-finite or negative timing")
+        phase_seconds_all[phase] = values
+
+    phase_seconds_measured = {
+        phase: values[warmup_steps:] for phase, values in phase_seconds_all.items()
+    }
+    phase_medians_seconds = {
+        phase: statistics.median(values) for phase, values in phase_seconds_measured.items()
+    }
+    required_memory = ("peak_allocated_gib", "peak_reserved_gib", "peak_device_used_gib")
+    if any(key not in memory_peaks for key in required_memory):
+        missing = [key for key in required_memory if key not in memory_peaks]
+        raise ValueError(f"phase timing summary is missing memory peaks: {missing}")
+    memory = {key: float(memory_peaks[key]) for key in required_memory}
+    return {
+        "phase_seconds_all": phase_seconds_all,
+        "phase_seconds_measured": phase_seconds_measured,
+        "phase_medians_seconds": phase_medians_seconds,
+        # These three short names are the stable contract consumed by cooperation_budget.
+        "throughput": {
+            "generation": phase_medians_seconds["generate"],
+            "backward": phase_medians_seconds["backward"],
+            "optimizer": phase_medians_seconds["optimizer_step"],
+            "phase_medians_seconds": phase_medians_seconds,
+        },
+        "memory": memory,
+    }
+
+
+def _find_phase_timer(trainer: object) -> StepPhaseTimer:
+    """Find the one phase timer that ``games.train`` attached to the built trainer."""
+    callbacks = cast("Any", trainer).callback_handler.callbacks
+    matches = [callback for callback in callbacks if isinstance(callback, StepPhaseTimer)]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"games.train must attach exactly one StepPhaseTimer, found {len(matches)}"
+        )
+    return matches[0]
+
+
 def run_probe(spec: ProbeSpec, *, kernel_bridge: dict[str, object] | None) -> dict[str, object]:
     """Execute one probe end to end and persist its artifact.
 
@@ -199,8 +272,7 @@ def run_probe(spec: ProbeSpec, *, kernel_bridge: dict[str, object] | None) -> di
         episodes_per_step=prepared.plan.episodes_per_step,
         gradient_accumulation_steps=prepared.plan.gradient_accumulation_steps,
     )
-    timing = StepTimingCallback()
-    trainer.add_callback(timing)
+    timing = _find_phase_timer(trainer)
     generation_timings = instrument_generation(trainer)
 
     wall_start = time.perf_counter()
@@ -220,6 +292,15 @@ def run_probe(spec: ProbeSpec, *, kernel_bridge: dict[str, object] | None) -> di
         warmup_steps=spec.warmup_steps,
         episodes_per_step=prepared.plan.episodes_per_step,
     )
+    phase_summary = summarize_phase_timings(
+        history=cast("Sequence[Mapping[str, object]]", trainer.state.log_history),
+        warmup_steps=spec.warmup_steps,
+        expected_steps=len(timing.step_records),
+        memory_peaks={
+            key: cast("float", summary[key])
+            for key in ("peak_allocated_gib", "peak_reserved_gib", "peak_device_used_gib")
+        },
+    )
     result: dict[str, object] = {
         "probe": {"warmup_steps": spec.warmup_steps, "wall_seconds_train": wall_seconds},
         "config": asdict(spec.config),
@@ -233,6 +314,7 @@ def run_probe(spec: ProbeSpec, *, kernel_bridge: dict[str, object] | None) -> di
         "metrics": metrics,
         "missing_metrics": missing,
         **summary,
+        **phase_summary,
         "finished_at": datetime.now(tz=UTC).isoformat(),
     }
     write_json(Path(spec.json_out), result)
@@ -250,6 +332,11 @@ def parse_args(argv: Sequence[str] | None = None) -> ProbeSpec:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--arm", required=True)
     parser.add_argument("--model", dest="model_id", default=None)
+    parser.add_argument(
+        "--model-source",
+        default=None,
+        help="Immutable local snapshot loaded while --model retains sampler semantics.",
+    )
     parser.add_argument("--corpus", dest="corpus_path", default=None)
     parser.add_argument("--generate-fresh", action="store_true")
     parser.add_argument("--num-generations", type=int, default=8)
@@ -316,6 +403,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ProbeSpec:
     config = GameTrainConfig(
         arm=args.arm,
         model_id=model_id,
+        model_source=args.model_source,
         corpus_path=args.corpus_path,
         generate_fresh=args.generate_fresh,
         num_generations=args.num_generations,

@@ -80,7 +80,10 @@ def seed_checkpoint(output_dir: Path, step: int) -> Path:
     )
     for name in (*game_train.REQUIRED_CHECKPOINT_FILES, game_train.INIT_ADAPTER_WEIGHTS_FILENAME):
         if name != game_train.TRAINER_STATE_FILENAME:
-            (checkpoint / name).write_bytes(b"")
+            if name == game_train.ADAPTER_CONFIG_FILENAME:
+                (checkpoint / name).write_text(json.dumps({"peft_type": "LORA"}))
+            else:
+                (checkpoint / name).write_bytes(b"state")
     return checkpoint
 
 

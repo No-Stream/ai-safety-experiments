@@ -20,8 +20,10 @@ gates and exits non-zero with a JSON report naming the failures:
 The report is written after every gate, so a crash mid-way leaves the evidence of the gates that
 ran. ``jlens`` runs from a PYTHONPATH clone pinned at
 :data:`reward_hacking.interp.jacobian.JLENS_COMMIT`; the report records the clone's commit and the
-run refuses another. Prompts come from a ``reward_hacking.interp.tmax_lens_corpus`` directory when
-one is given (the GPU gates run at its derived fit window), else from a benign built-in text.
+run refuses another. Prompts come from either a ``reward_hacking.interp.tmax_lens_corpus`` directory
+or the private cooperation ``--fit-stimuli`` JSONL. The cooperation path uses the capture renderer,
+records its exact corpus/render identities and derives the gate window from those rendered prompts.
+Without either corpus input the gates use benign built-in text.
 
 The checkpoint is resolved and loaded by :func:`load_lens_model`, the loader the lens fit
 (``reward_hacking.interp.tmax_lens_fit``) shares: ``games.eval_model.resolve_full_weights`` pins the
@@ -52,7 +54,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from transformers import AutoTokenizer
 
+from games.cooperation_lens import prepare_fit_prompts
 from games.deltanet_kernels import (
     DELTANET_KERNEL_FIELD,
     QWEN3_5_MODELING_MODULE,
@@ -60,11 +64,13 @@ from games.deltanet_kernels import (
     prefill_deltanet_kernels,
 )
 from games.eval_model import FullWeightsFacts, FullWeightsSource, resolve_full_weights
+from games.tokenizer_identity import tokenizer_content_sha256
 from reward_hacking.interp.jacobian import (
     JLENS_COMMIT,
     JacobianConfig,
     _require_jlens,  # pyright: ignore[reportPrivateUsage]  # the shared PYTHONPATH jlens loader
     fit_skip_first,
+    resolve_weights_identity,
 )
 from reward_hacking.interp.lens_deltanet_gates import (
     DEFAULT_POSITION_GAP,
@@ -217,6 +223,11 @@ class LensModelHandle:
             "model_label": self.facts.label,
             "snapshot_dir": str(self.facts.snapshot_dir),
             "weights_identity": self.weights_identity,
+            "resolved_weights_identity": (
+                self.weights_identity
+                if self.facts.commit_sha is not None
+                else resolve_weights_identity(str(self.facts.snapshot_dir))
+            ),
             "weights_fingerprint": self.facts.fingerprint,
             "declares_vision_config": self.facts.declares_vision_config,
             "chat_template_sha256": self.facts.chat_template_sha256,
@@ -224,6 +235,7 @@ class LensModelHandle:
             "load_path": LENS_LOAD_PATH,
             "hf_class": type(self.hf_model).__name__,
             "tokenizer_source": self.tokenizer_source,
+            "tokenizer_content_sha256": tokenizer_content_sha256(self.tokenizer),
             "load_seconds": round(self.load_seconds, 1),
             "n_layers": int(self.model.n_layers),
             "d_model": int(self.model.d_model),
@@ -447,17 +459,48 @@ def run_gates(args: argparse.Namespace) -> int:
     jl = _require_jlens()
     gates = cast("list[str]", args.gates)
     corpus = None if args.corpus_dir is None else load_lens_corpus(cast("Path", args.corpus_dir))
-    max_seq_len = (
-        cast("int", args.max_seq_len)
-        if corpus is None
-        else corpus.plan(ROLE_FIT, ceiling=cast("int", args.max_seq_len)).max_seq_len
-    )
+    cooperation_fit = None
+    if args.fit_stimuli is not None:
+        tokenizer_source = cast("str | None", args.tokenizer) or cast("str", args.model_id)
+        tokenizer_revision = (
+            cast("str | None", args.tokenizer_revision)
+            if args.tokenizer is not None
+            else cast("str | None", args.revision)
+        )
+        fit_tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            revision=tokenizer_revision,
+            trust_remote_code=True,
+        )
+        cooperation_fit = prepare_fit_prompts(
+            cast("Path", args.fit_stimuli),
+            fit_tokenizer,
+            convention=cast("str", args.stimulus_render),
+            enable_thinking=not cast("bool", args.no_thinking),
+            max_seq_len_ceiling=cast("int", args.max_seq_len),
+        )
+        max_seq_len = cooperation_fit.max_seq_len
+        texts = list(cooperation_fit.prompts)
+        cooperation_binding = cooperation_fit.binding_payload(
+            convention=cast("str", args.stimulus_render),
+            enable_thinking=not cast("bool", args.no_thinking),
+            tokenizer_content_identity=tokenizer_content_sha256(fit_tokenizer),
+        )
+    else:
+        max_seq_len = (
+            cast("int", args.max_seq_len)
+            if corpus is None
+            else corpus.plan(ROLE_FIT, ceiling=cast("int", args.max_seq_len)).max_seq_len
+        )
+        texts = gate_prompts(corpus, fallback_tokens=max_seq_len)
+        cooperation_binding = None
     run = GateRun(
         report={
             "invocation": " ".join(sys.argv),
             "jlens": jlens_provenance(jl),
             "corpus_dir": None if args.corpus_dir is None else str(args.corpus_dir),
             "corpus_digests": None if corpus is None else corpus.sidecar["digests"],
+            "cooperation_fit_corpus": cooperation_binding,
             "max_seq_len": max_seq_len,
             "gates_requested": gates,
             "gates": {},
@@ -465,7 +508,6 @@ def run_gates(args: argparse.Namespace) -> int:
         },
         out_path=cast("Path", args.out),
     )
-    texts = gate_prompts(corpus, fallback_tokens=max_seq_len)
     if GATE_TOKENS in gates:
         run_token_gate(run, texts)
     if any(gate != GATE_TOKENS for gate in gates):
@@ -507,9 +549,22 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--tokenizer-revision",
     )
     parser.add_argument("--tokenizer-revision", default=None)
-    parser.add_argument(
+    corpus = parser.add_mutually_exclusive_group()
+    corpus.add_argument(
         "--corpus-dir", type=Path, default=None, help="a tmax_lens_corpus directory"
     )
+    corpus.add_argument(
+        "--fit-stimuli",
+        type=Path,
+        default=None,
+        help="private cooperation lens fit JSONL rendered before any model load",
+    )
+    parser.add_argument(
+        "--stimulus-render",
+        choices=("templated_here", "verbatim"),
+        default="templated_here",
+    )
+    parser.add_argument("--no-thinking", action="store_true")
     parser.add_argument(
         "--max-seq-len",
         type=int,

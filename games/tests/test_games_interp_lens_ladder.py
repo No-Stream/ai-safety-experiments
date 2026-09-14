@@ -373,9 +373,10 @@ def stubs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     attaches: list[_AttachCall] = []
     base = object()
 
-    def load_base(model_id: str, *, dtype: Any, device: Any) -> object:
+    def load_base(model_id: str, *, dtype: Any, device: Any, revision: str | None = None) -> object:
         del dtype, device
         loads.append(model_id)
+        assert revision is None
         return base
 
     def attach(
@@ -448,6 +449,45 @@ class TestLadderLensModels:
             merge_root=tmp_path / "merged",
             base_weights_identity="hf:abc",
         )
+
+    def test_base_revision_is_threaded_to_weights_and_tokenizer_loaders(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        load_calls: list[tuple[str, str | None]] = []
+        tokenizer_calls: list[tuple[str, str | None]] = []
+        base = object()
+
+        def load_base(
+            model_id: str, *, dtype: Any, device: Any, revision: str | None = None
+        ) -> object:
+            del dtype, device
+            load_calls.append((model_id, revision))
+            return base
+
+        def load_tokenizer(model_id: str, **kwargs: object) -> str:
+            tokenizer_calls.append((model_id, cast("str | None", kwargs["revision"])))
+            return "tokenizer"
+
+        monkeypatch.setattr(interp_lens_ladder, "load_adapter_base", load_base)
+        monkeypatch.setattr(
+            interp_lens_ladder,
+            "AutoTokenizer",
+            SimpleNamespace(from_pretrained=load_tokenizer),
+        )
+        models = interp_lens_ladder.LadderLensModels(
+            base_model="Qwen/Qwen3.5-9B",
+            dtype=torch.bfloat16,
+            jl=cast("Any", _StubJlensModule()),
+            lens_model=LENS_MODEL_UNMERGED,
+            merge_root=tmp_path / "merged",
+            base_weights_identity="hf:base-commit",
+            base_revision="base-commit",
+        )
+
+        models.target_for(LadderCell(BASE_ARM, BASE_STEP, None))
+
+        assert load_calls == [("Qwen/Qwen3.5-9B", "base-commit")]
+        assert tokenizer_calls == [("Qwen/Qwen3.5-9B", "base-commit")]
 
     def test_the_base_loads_once_and_every_cell_is_wrapped_after_its_attach(
         self, tmp_path: Path, stubs: dict[str, Any]

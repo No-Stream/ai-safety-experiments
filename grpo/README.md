@@ -1,9 +1,9 @@
 # grpo — shared RL training substrate
 
 This is the repo's working GRPO harness. It is the one thing here that has been verified end
-to end recently: modernised to TRL 1.10, smoke-run on the L4 with Qwen3-0.6B for 30 steps,
-mean reward moving from 0.375 to 0.867. Treat it as live substrate, not as a finished
-experiment.
+to end recently: modernised to TRL 1.10, smoke-run with Qwen3-0.6B for 30 steps, mean reward
+moving from 0.375 to 0.867 (on the L4 that used to be the local card; training now runs on the
+local RTX 5090, 32 GB). Treat it as live substrate, not as a finished experiment.
 
 ```bash
 make smoke                                   # 30-step GPU run, through the resource limiter
@@ -34,7 +34,9 @@ Results and the corrections they forced on the budget note are in
 `docs/scratch/measured-throughput.md`. The short version, so nobody re-derives it: the note's
 reference profile of 64 concurrent episodes at 2048+2048 does **not** fit on a 24 GB L4, what
 runs out is a float32 upcast in the Gated DeltaNet chunked-prefill path rather than the KV cache,
-and the training micro-batch is a second and often tighter ceiling than the episode count.
+and the training micro-batch is a second and often tighter ceiling than the episode count. Those
+figures were taken on the old local L4 and on rented cards; re-measure on the 32 GB 5090, which is
+where runs land now, rather than scaling them by hand.
 
 Three things in `throughput.py` are worth lifting if you write another measurement harness.
 Completions are forced to exactly `max_completion_length` with
@@ -136,15 +138,15 @@ to re-check whenever the model or the task changes.
 
 ## Measured throughput configs (2026-08-29)
 
-> **Measured GRPO throughput configs (g7e / RTX PRO 6000 96 GiB, spot ~$1.35/h, 2026-08-29).**
+> **Measured GRPO throughput configs (g7e / RTX PRO 6000 96 GiB, 2026-08-29).**
 > All configs: vLLM colocate util 0.35, importance-sampling correction off (forced at 32k caps),
 > LoRA 16/32 on discovered targets, micro-batch 1, thinking on, caps at measured floors.
 > Micro-batch >1 measured dead at 2B (≤2.7% for +13-40 GiB peak) and OOM at 9B — mb=1 is the
 > config in BOTH estimator regimes (the dapo/batch-pinned replication arms and dr_grpo/none
 > defaults). Engine util >0.35 buys nothing (zero preemption to 128 episodes). Generation is only
-> 17-42% of a step; cost tracks the batch's max completion length (padding), so batch shape moves
-> $/episode weakly: 2B 8x8 = 12.8 min/step ($20/70-step run), 16x8 +9%/ep, 4x8 nominally +69%/ep
-> but variance-dominated; 9B 8x8 = 34 min/step early-run (realized whole-run 24 min ≈ $38/arm),
+> 17-42% of a step; step time tracks the batch's max completion length (padding), so batch shape
+> moves per-episode wall-clock weakly: 2B 8x8 = 12.8 min/step, 16x8 +9%/ep, 4x8 nominally +69%/ep
+> but variance-dominated; 9B 8x8 = 34 min/step early-run (realized whole-run 24 min),
 > 16x8@0.50 +13%/ep at a 91.6 GiB peak. Two arms per box: 8x8 pairs OOM; simultaneous launches
 > die at init (port 29500 + vLLM profiling race — stagger mandatory); a fitting 4x8@0.30 pair
 > runs but contention makes one-arm-per-box the doctrine. 27B colocate cannot fit one 96 GiB

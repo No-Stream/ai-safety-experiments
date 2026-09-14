@@ -16,12 +16,15 @@ import subprocess
 import types
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
 from torch import nn
 
+from games.eval_model import FullWeightsFacts
+from games.tokenizer_identity import tokenizer_content_sha256
 from reward_hacking.interp import lens_deltanet_gates, lens_fit_gate
 from reward_hacking.interp.jacobian import JacobianConfig, fit_lens
 from reward_hacking.interp.lens_deltanet_gates import (
@@ -43,6 +46,7 @@ from reward_hacking.interp.lens_deltanet_gates import (
 from reward_hacking.interp.lens_fit_gate import (
     FALLBACK_PROMPT,
     GateRun,
+    LensModelHandle,
     gate_prompts,
     jlens_provenance,
 )
@@ -55,15 +59,91 @@ from reward_hacking.interp.lens_schedule_gates import (
     resume_equality,
     token_identity,
 )
+from reward_hacking.interp.tmax_full_weights import LoadingReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+    from transformers import PreTrainedModel
 
 D_MODEL = 8
 VOCAB = 32
 SEQ_LEN = 24
 GAP = 8
 CONV_KERNEL = 4
+
+
+class ReportTokenizer:
+    def __init__(self) -> None:
+        self.padding_side = "right"
+        self.truncation_side = "right"
+        self.model_max_length = 128
+        self.clean_up_tokenization_spaces = False
+        self.split_special_tokens = False
+        self.chat_template = "{{ messages }}"
+        self.special_tokens_map = {"eos_token": "<eos>"}
+        self.init_kwargs = {"legacy": False, "_commit_hash": "test-source"}
+
+    def get_vocab(self) -> dict[str, int]:
+        return {"alpha": 0, "beta": 1}
+
+    def get_added_vocab(self) -> dict[str, int]:
+        return {}
+
+
+def test_model_report_persists_loaded_tokenizer_content_fingerprint(tmp_path: Path) -> None:
+    tokenizer = ReportTokenizer()
+    handle = LensModelHandle(
+        model=SimpleNamespace(n_layers=2, d_model=8),
+        hf_model=cast("PreTrainedModel", SimpleNamespace()),
+        tokenizer=tokenizer,
+        facts=FullWeightsFacts(
+            label="base",
+            snapshot_dir=tmp_path,
+            commit_sha="commit-a",
+            weights_sha256=(("model.safetensors", "weights-hash"),),
+            chat_template_sha256="template-hash",
+            declares_vision_config=True,
+        ),
+        loading_report=LoadingReport(
+            n_language_model_loaded=1, n_missing_tower=0, n_unexpected_tower=0
+        ),
+        layer_types=("linear_attention", "full_attention"),
+        conv_reach=4,
+        tokenizer_source="base-tokenizer",
+        load_seconds=0.1,
+        device_facts={},
+    )
+    assert handle.as_payload()["tokenizer_content_sha256"] == tokenizer_content_sha256(tokenizer)
+
+
+def test_model_report_persists_canonical_local_weights_identity(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    handle = LensModelHandle(
+        model=SimpleNamespace(n_layers=1, d_model=8),
+        hf_model=cast("PreTrainedModel", SimpleNamespace()),
+        tokenizer=ReportTokenizer(),
+        facts=FullWeightsFacts(
+            label="local",
+            snapshot_dir=tmp_path,
+            commit_sha=None,
+            weights_sha256=(("model.safetensors", "weights-hash"),),
+            chat_template_sha256=None,
+            declares_vision_config=True,
+        ),
+        loading_report=LoadingReport(
+            n_language_model_loaded=1, n_missing_tower=0, n_unexpected_tower=0
+        ),
+        layer_types=("linear_attention",),
+        conv_reach=4,
+        tokenizer_source=str(tmp_path),
+        load_seconds=0.1,
+        device_facts={},
+    )
+    expected = lens_fit_gate.resolve_weights_identity(str(tmp_path))
+    assert handle.as_payload()["resolved_weights_identity"] == expected
+
 
 FAKE_MODELING = types.ModuleType("fake_modeling")
 """Stands in for transformers' modeling module: the toy mixer looks its kernel up here by name."""

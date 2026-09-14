@@ -230,7 +230,10 @@ run_pivot_stage() {
   mount -t tmpfs tmpfs "$new_root"
   mkdir -p "$new_root"/{usr,proc,dev,tmp,work,etc,oldroot}
 
-  mount --bind /usr "$new_root/usr"
+  # --rbind, not --bind: inside a user namespace the kernel refuses a non-recursive bind of a directory
+  # that has locked child mounts (EINVAL, "wrong fs type"), and WSL2 mounts /usr/lib/modules and
+  # /usr/lib/wsl/* under /usr. bwrap binds recursively too, so the two backends stay equivalent.
+  mount --rbind /usr "$new_root/usr"
   mount -o remount,bind,ro "$new_root/usr"
   ln -s usr/bin "$new_root/bin"
   ln -s usr/sbin "$new_root/sbin"
@@ -265,7 +268,7 @@ run_pivot_stage() {
       mkdir -p "$(dirname -- "$new_root$path")"
       touch "$new_root$path"
     fi
-    mount --bind "$path" "$new_root$path"
+    mount --rbind "$path" "$new_root$path"
     mount -o remount,bind,ro "$new_root$path"
   done
 

@@ -561,8 +561,16 @@ class TestAStopRequestUnwindsARunMidGeneration:
         assert signal.getsignal(signal.SIGTERM) is previous
 
 
-_DEAF_CHILD = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)"
-"""A child that ignores SIGTERM, so "terminated" and "force-killed" are distinguishable deaths."""
+_DEAF_CHILD = (
+    "import signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "sys.stdout.write('deaf\\n'); sys.stdout.flush(); time.sleep(300)"
+)
+"""A child that ignores SIGTERM, so "terminated" and "force-killed" are distinguishable deaths.
+
+It reports on stdout once the handler is installed, and the probe waits for that line before reaping:
+a SIGTERM that lands while the child interpreter is still starting up kills it (exit -15, observed
+once on a loaded eight-worker box), which reads as the reaper skipping the grace when it did not.
+"""
 
 _REAPER_PROBE = """
 import json, subprocess, sys, time
@@ -574,7 +582,9 @@ child = None
 if scenario == "sleep":
     child = subprocess.Popen(["sleep", "300"])
 elif scenario == "deaf":
-    child = subprocess.Popen([sys.executable, "-c", deaf_child])
+    child = subprocess.Popen([sys.executable, "-c", deaf_child], stdout=subprocess.PIPE, text=True)
+    assert child.stdout is not None
+    assert child.stdout.readline().rstrip() == "deaf", "the deaf child never reported its handler installed"
 if child is not None:
     report["pid"] = child.pid
     report["listed_before"] = child.pid in live_child_pids()
