@@ -1,0 +1,428 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="648pt" height="460.8pt" viewBox="0 0 648 460.8" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-09-22T10:03:11.799592</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.11.1, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 460.8 
+L 648 460.8 
+L 648 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 58.32 359.424 
+L 544.32 359.424 
+L 544.32 78.336 
+L 58.32 78.336 
+z
+" style="fill: #ffffff"/>
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1"/>
+     <g id="text_1">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="80.410909" y="372.704273" transform="rotate(-0 80.410909 372.704273)">0</text>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_2"/>
+     <g id="text_2">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="124.592727" y="372.704273" transform="rotate(-0 124.592727 372.704273)">1</text>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_3"/>
+     <g id="text_3">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="168.774545" y="372.704273" transform="rotate(-0 168.774545 372.704273)">2</text>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_4"/>
+     <g id="text_4">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="212.956364" y="372.704273" transform="rotate(-0 212.956364 372.704273)">3</text>
+     </g>
+    </g>
+    <g id="xtick_5">
+     <g id="line2d_5"/>
+     <g id="text_5">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="301.32" y="372.704273" transform="rotate(-0 301.32 372.704273)">5</text>
+     </g>
+    </g>
+    <g id="xtick_6">
+     <g id="line2d_6"/>
+     <g id="text_6">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="389.683636" y="372.704273" transform="rotate(-0 389.683636 372.704273)">7</text>
+     </g>
+    </g>
+    <g id="xtick_7">
+     <g id="line2d_7"/>
+     <g id="text_7">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="478.047273" y="372.704273" transform="rotate(-0 478.047273 372.704273)">9</text>
+     </g>
+    </g>
+    <g id="xtick_8">
+     <g id="line2d_8"/>
+     <g id="text_8">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="522.229091" y="372.704273" transform="rotate(-0 522.229091 372.704273)">10</text>
+     </g>
+    </g>
+    <g id="text_9">
+     <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="301.32" y="386.089039" transform="rotate(-0 301.32 386.089039)">Past rounds (of 10) the unrelated model was said to have matched the actor's choice</text>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="line2d_9">
+      <path d="M 58.32 351.616 
+L 544.32 351.616 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #e1e0d9; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_10"/>
+     <g id="text_10">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: end; fill: #52514e" x="52.32" y="355.256137" transform="rotate(-0 52.32 355.256137)">0%</text>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="line2d_11">
+      <path d="M 58.32 299.562667 
+L 544.32 299.562667 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #e1e0d9; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_12"/>
+     <g id="text_11">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: end; fill: #52514e" x="52.32" y="303.202803" transform="rotate(-0 52.32 303.202803)">20%</text>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="line2d_13">
+      <path d="M 58.32 247.509333 
+L 544.32 247.509333 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #e1e0d9; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_14"/>
+     <g id="text_12">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: end; fill: #52514e" x="52.32" y="251.14947" transform="rotate(-0 52.32 251.14947)">40%</text>
+     </g>
+    </g>
+    <g id="ytick_4">
+     <g id="line2d_15">
+      <path d="M 58.32 195.456 
+L 544.32 195.456 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #e1e0d9; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_16"/>
+     <g id="text_13">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: end; fill: #52514e" x="52.32" y="199.096137" transform="rotate(-0 52.32 199.096137)">60%</text>
+     </g>
+    </g>
+    <g id="ytick_5">
+     <g id="line2d_17">
+      <path d="M 58.32 143.402667 
+L 544.32 143.402667 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #e1e0d9; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_18"/>
+     <g id="text_14">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: end; fill: #52514e" x="52.32" y="147.042803" transform="rotate(-0 52.32 147.042803)">80%</text>
+     </g>
+    </g>
+    <g id="ytick_6">
+     <g id="line2d_19">
+      <path d="M 58.32 91.349333 
+L 544.32 91.349333 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #e1e0d9; stroke-width: 0.8; stroke-linecap: square"/>
+     </g>
+     <g id="line2d_20"/>
+     <g id="text_15">
+      <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: end; fill: #52514e" x="52.32" y="94.98947" transform="rotate(-0 52.32 94.98947)">100%</text>
+     </g>
+    </g>
+    <g id="text_16">
+     <text style="font-size: 10px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="20.640508" y="218.88" transform="rotate(-90 20.640508 218.88)">Mean share of endowment given</text>
+    </g>
+   </g>
+   <g id="FillBetweenPolyCollection_1">
+    <defs>
+     <path id="m2402e16f6c" d="M 80.410909 -140.676267 
+L 80.410909 -109.9648 
+L 124.592727 -124.0192 
+L 168.774545 -244.782933 
+L 212.956364 -281.7408 
+L 301.32 -348.8896 
+L 389.683636 -350.4512 
+L 478.047273 -361.642667 
+L 522.229091 -364.245333 
+L 522.229091 -369.450667 
+L 522.229091 -369.450667 
+L 478.047273 -369.450667 
+L 389.683636 -369.450667 
+L 301.32 -365.546667 
+L 212.956364 -317.6576 
+L 168.774545 -294.754133 
+L 124.592727 -147.4432 
+L 80.410909 -140.676267 
+z
+"/>
+    </defs>
+    <g clip-path="url(#p24244cba98)">
+     <use xlink:href="#m2402e16f6c" x="0" y="460.8" style="fill: #eb6834; fill-opacity: 0.12"/>
+    </g>
+   </g>
+   <g id="FillBetweenPolyCollection_2">
+    <defs>
+     <path id="m887d936917" d="M 80.410909 -109.184 
+L 80.410909 -109.184 
+L 124.592727 -109.184 
+L 168.774545 -128.704 
+L 212.956364 -137.2928 
+L 301.32 -146.922667 
+L 389.683636 -202.88 
+L 478.047273 -229.166933 
+L 522.229091 -227.345067 
+L 522.229091 -300.219733 
+L 522.229091 -300.219733 
+L 478.047273 -285.905067 
+L 389.683636 -255.453867 
+L 301.32 -197.934933 
+L 212.956364 -170.606933 
+L 168.774545 -158.894933 
+L 124.592727 -109.184 
+L 80.410909 -109.184 
+z
+"/>
+    </defs>
+    <g clip-path="url(#p24244cba98)">
+     <use xlink:href="#m887d936917" x="0" y="460.8" style="fill: #4a3aa7; fill-opacity: 0.12"/>
+    </g>
+   </g>
+   <g id="line2d_21">
+    <path d="M 58.32 347.712 
+L 544.32 347.712 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke-dasharray: 4.8,3.6; stroke-dashoffset: 0; stroke: #eb6834; stroke-opacity: 0.8; stroke-width: 1.2"/>
+   </g>
+   <g id="line2d_22">
+    <path d="M 58.32 351.616 
+L 544.32 351.616 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke-dasharray: 4.8,3.6; stroke-dashoffset: 0; stroke: #4a3aa7; stroke-opacity: 0.8; stroke-width: 1.2"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 58.32 359.424 
+L 58.32 78.336 
+" style="fill: none; stroke: #c3c2b7; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 58.32 359.424 
+L 544.32 359.424 
+" style="fill: none; stroke: #c3c2b7; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_23">
+    <path d="M 80.410909 335.479467 
+L 124.592727 325.0688 
+L 168.774545 191.031467 
+L 212.956364 161.1008 
+L 301.32 103.581867 
+L 389.683636 100.458667 
+L 478.047273 92.3904 
+L 522.229091 91.349333 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #eb6834; stroke-width: 2; stroke-linecap: round"/>
+   </g>
+   <g id="text_17">
+    <text style="font-weight: 700; font-size: 10.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #0b0b0b" x="530.229091" y="94.066618" transform="rotate(-0 530.229091 94.066618)">Qwen3-235B</text>
+   </g>
+   <g id="line2d_24">
+    <path d="M 80.410909 351.616 
+L 124.592727 351.616 
+L 168.774545 317.000533 
+L 212.956364 306.850133 
+L 301.32 288.3712 
+L 389.683636 231.633067 
+L 478.047273 203.264 
+L 522.229091 197.0176 
+" clip-path="url(#p24244cba98)" style="fill: none; stroke: #4a3aa7; stroke-width: 2; stroke-linecap: round"/>
+   </g>
+   <g id="text_18">
+    <text style="font-weight: 700; font-size: 10.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #0b0b0b" x="530.229091" y="199.734885" transform="rotate(-0 530.229091 199.734885)">GPT-5.6 Luna</text>
+   </g>
+   <g id="text_19">
+    <text style="font-size: 9.5px; font-family: 'Liberation Sans'; fill: #52514e" transform="translate(104.710909 98.977629)">Copy, said to have matched</text>
+    <text style="font-size: 9.5px; font-family: 'Liberation Sans'; fill: #52514e" transform="translate(104.710909 109.317229)">on 0 of 10 rounds: still gives (94%)</text>
+   </g>
+   <g id="text_20">
+    <text style="font-size: 9px; font-family: 'Liberation Sans'; text-anchor: middle; fill: #52514e" x="345.501818" y="338.817957" transform="rotate(-0 345.501818 338.817957)">No track record: 2% (Qwen), 0% (Luna)</text>
+   </g>
+   <g id="line2d_25">
+    <defs>
+     <path id="m847dfb76b2" d="M 0 3.5 
+C 0.928211 3.5 1.81853 3.131218 2.474874 2.474874 
+C 3.131218 1.81853 3.5 0.928211 3.5 0 
+C 3.5 -0.928211 3.131218 -1.81853 2.474874 -2.474874 
+C 1.81853 -3.131218 0.928211 -3.5 0 -3.5 
+C -0.928211 -3.5 -1.81853 -3.131218 -2.474874 -2.474874 
+C -3.131218 -1.81853 -3.5 -0.928211 -3.5 0 
+C -3.5 0.928211 -3.131218 1.81853 -2.474874 2.474874 
+C -1.81853 3.131218 -0.928211 3.5 0 3.5 
+z
+" style="stroke: #ffffff; stroke-width: 1.5"/>
+    </defs>
+    <g clip-path="url(#p24244cba98)">
+     <use xlink:href="#m847dfb76b2" x="80.410909" y="335.479467" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m847dfb76b2" x="124.592727" y="325.0688" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m847dfb76b2" x="168.774545" y="191.031467" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m847dfb76b2" x="212.956364" y="161.1008" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m847dfb76b2" x="301.32" y="103.581867" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m847dfb76b2" x="389.683636" y="100.458667" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m847dfb76b2" x="478.047273" y="92.3904" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m847dfb76b2" x="522.229091" y="91.349333" style="fill: #eb6834; stroke: #ffffff; stroke-width: 1.5"/>
+    </g>
+   </g>
+   <g id="line2d_26">
+    <defs>
+     <path id="m827916b0f2" d="M 0 3.5 
+C 0.928211 3.5 1.81853 3.131218 2.474874 2.474874 
+C 3.131218 1.81853 3.5 0.928211 3.5 0 
+C 3.5 -0.928211 3.131218 -1.81853 2.474874 -2.474874 
+C 1.81853 -3.131218 0.928211 -3.5 0 -3.5 
+C -0.928211 -3.5 -1.81853 -3.131218 -2.474874 -2.474874 
+C -3.131218 -1.81853 -3.5 -0.928211 -3.5 0 
+C -3.5 0.928211 -3.131218 1.81853 -2.474874 2.474874 
+C -1.81853 3.131218 -0.928211 3.5 0 3.5 
+z
+" style="stroke: #ffffff; stroke-width: 1.5"/>
+    </defs>
+    <g clip-path="url(#p24244cba98)">
+     <use xlink:href="#m827916b0f2" x="80.410909" y="351.616" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m827916b0f2" x="124.592727" y="351.616" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m827916b0f2" x="168.774545" y="317.000533" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m827916b0f2" x="212.956364" y="306.850133" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m827916b0f2" x="301.32" y="288.3712" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m827916b0f2" x="389.683636" y="231.633067" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m827916b0f2" x="478.047273" y="203.264" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+     <use xlink:href="#m827916b0f2" x="522.229091" y="197.0176" style="fill: #4a3aa7; stroke: #ffffff; stroke-width: 1.5"/>
+    </g>
+   </g>
+   <g id="line2d_27">
+    <defs>
+     <path id="m5979b13d92" d="M -0 6.363961 
+L 6.363961 0 
+L 0 -6.363961 
+L -6.363961 -0 
+z
+" style="stroke: #eb6834; stroke-width: 2; stroke-linejoin: miter"/>
+    </defs>
+    <g clip-path="url(#p24244cba98)">
+     <use xlink:href="#m5979b13d92" x="80.410909" y="106.705067" style="fill: #ffffff; stroke: #eb6834; stroke-width: 2; stroke-linejoin: miter"/>
+    </g>
+   </g>
+   <g id="line2d_28">
+    <defs>
+     <path id="m550db85b06" d="M -0 6.363961 
+L 6.363961 0 
+L 0 -6.363961 
+L -6.363961 -0 
+z
+" style="stroke: #4a3aa7; stroke-width: 2; stroke-linejoin: miter"/>
+    </defs>
+    <g clip-path="url(#p24244cba98)">
+     <use xlink:href="#m550db85b06" x="80.410909" y="351.616" style="fill: #ffffff; stroke: #4a3aa7; stroke-width: 2; stroke-linejoin: miter"/>
+    </g>
+   </g>
+  </g>
+  <g id="text_21">
+   <text style="font-weight: 700; font-size: 14px; font-family: 'Liberation Sans'; text-anchor: start; fill: #0b0b0b" x="12.96" y="26.320383" transform="rotate(-0 12.96 26.320383)">Giving rises with claimed past matches, even for an unrelated model</text>
+  </g>
+  <g id="text_22">
+   <text style="font-size: 10.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #52514e" x="12.96" y="49.116287" transform="rotate(-0 12.96 49.116287)">Mean fraction of a 20-unit endowment given, by how many of 10 past rounds the unrelated model was said to have matched</text>
+  </g>
+  <g id="text_23">
+   <text style="font-size: 8.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #898781" x="12.96" y="451.485659" transform="rotate(-0 12.96 451.485659)">128 replies per point. Colour marks the giving model.</text>
+  </g>
+  <g id="legend_1">
+   <g id="line2d_29">
+    <path d="M 21.51 417.132205 
+L 32.91 417.132205 
+L 44.31 417.132205 
+" style="fill: none; stroke: #52514e; stroke-width: 2; stroke-linecap: square"/>
+    <defs>
+     <path id="m752b1cc9c5" d="M 0 3.5 
+C 0.928211 3.5 1.81853 3.131218 2.474874 2.474874 
+C 3.131218 1.81853 3.5 0.928211 3.5 0 
+C 3.5 -0.928211 3.131218 -1.81853 2.474874 -2.474874 
+C 1.81853 -3.131218 0.928211 -3.5 0 -3.5 
+C -0.928211 -3.5 -1.81853 -3.131218 -2.474874 -2.474874 
+C -3.131218 -1.81853 -3.5 -0.928211 -3.5 0 
+C -3.5 0.928211 -3.131218 1.81853 -2.474874 2.474874 
+C -1.81853 3.131218 -0.928211 3.5 0 3.5 
+z
+" style="stroke: #ffffff"/>
+    </defs>
+    <g>
+     <use xlink:href="#m752b1cc9c5" x="32.91" y="417.132205" style="fill: #52514e; stroke: #ffffff"/>
+    </g>
+   </g>
+   <g id="text_24">
+    <text style="font-size: 9.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #52514e" x="51.91" y="420.457205" transform="rotate(-0 51.91 420.457205)">Unrelated model with a track record</text>
+   </g>
+   <g id="patch_5">
+    <path d="M 21.51 434.122732 
+L 44.31 434.122732 
+L 44.31 427.472732 
+L 21.51 427.472732 
+z
+" style="fill: #dddcd6"/>
+   </g>
+   <g id="text_25">
+    <text style="font-size: 9.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #52514e" x="51.91" y="434.122732" transform="rotate(-0 51.91 434.122732)">± band vs the no-record baseline</text>
+   </g>
+   <g id="line2d_30">
+    <path d="M 220.854141 417.132205 
+L 232.254141 417.132205 
+L 243.654141 417.132205 
+" style="fill: none; stroke-dasharray: 4.8,3.6; stroke-dashoffset: 0; stroke: #52514e; stroke-width: 1.2"/>
+   </g>
+   <g id="text_26">
+    <text style="font-size: 9.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #52514e" x="251.254141" y="420.457205" transform="rotate(-0 251.254141 420.457205)">Same unrelated model, no track record given</text>
+   </g>
+   <g id="line2d_31">
+    <defs>
+     <path id="m65ba8188f9" d="M -0 5.656854 
+L 5.656854 0 
+L 0 -5.656854 
+L -5.656854 -0 
+z
+" style="stroke: #52514e; stroke-width: 2; stroke-linejoin: miter"/>
+    </defs>
+    <g>
+     <use xlink:href="#m65ba8188f9" x="232.254141" y="430.797732" style="fill: #ffffff; stroke: #52514e; stroke-width: 2; stroke-linejoin: miter"/>
+    </g>
+   </g>
+   <g id="text_27">
+    <text style="font-size: 9.5px; font-family: 'Liberation Sans'; text-anchor: start; fill: #52514e" x="251.254141" y="434.122732" transform="rotate(-0 251.254141 434.122732)">Copy of itself, said to have matched 0 of 10</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p24244cba98">
+   <rect x="58.32" y="78.336" width="486" height="281.088"/>
+  </clipPath>
+ </defs>
+</svg>
