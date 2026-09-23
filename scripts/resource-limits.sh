@@ -197,10 +197,13 @@ if ((advisory)); then
     ulimit -v $(($(numfmt --from=iec "$mem_max") / 1024)) || true
   fi
   cd -- "$chdir" || die "could not enter $chdir"
-  # coreutils timeout signals the job's whole process group and exits 124, the same contract as the
-  # cgroup path's RuntimeMaxSec; without it advisory mode silently had no wall-clock limit.
+  # coreutils timeout exits 124 like the cgroup path's RuntimeMaxSec; without it advisory mode had no
+  # wall-clock limit at all. --foreground keeps the job in the terminal's process group, so killing
+  # its tmux session still hangs it up; without it timeout's own group survived a kill-session
+  # (observed 2026-09-23, a 9B vLLM job kept the GPU). The cost: on expiry only the command itself
+  # is signalled, so a child that ignores its parent's death can outlive it.
   timeout_cmd=()
-  [[ -n "$timeout" ]] && timeout_cmd=(timeout --kill-after=60s "$timeout")
+  [[ -n "$timeout" ]] && timeout_cmd=(timeout --foreground --kill-after=60s "$timeout")
   exec "${timeout_cmd[@]}" env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 \
     taskset -c "0-$((cpus - 1))" "$@"
 fi
