@@ -2,6 +2,11 @@
 > used LLMs. _Note that writeups live in docs/writeups and are human-generated._
 > Benchmark text is not publicly exposed; please contact me if you're interested, and I'm happy to share it.
 
+__writeups__:
+- JaggedBench: measuring the jagged frontier - https://nostream.substack.com/p/jaggedbench-and-recoverybench-measuring  
+- Studying model cooperation + motivations - https://nostream.substack.com/p/an-experiment-on-ai-cooperation-motivations  
+- Studying RL effects on model cooperation, motivations, and self-image - LINK TODO  
+
 # Transformer Experiments
 
 I focus on a few directions:
