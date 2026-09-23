@@ -95,3 +95,6 @@ canary/*
 # archive (scripts/ship_tree.sh lists with --exclude-standard), so a kit's runner and checks travel
 # to the box as sha256-pinned --data objects; see the reference kit's README, customisation step 2.
 scripts/kits/
+
+# Hand-carried model/record exports between machines; they hold benchmark item text, never commit.
+/model-export-*
