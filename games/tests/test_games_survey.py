@@ -1613,7 +1613,7 @@ class TestCalibration:
             {"game_id": "twin-pd", "coop_fraction": 1.0},
             {"game_id": "twin-pd", "coop_fraction": 0.0},
         ]
-        calibration = calibration_gaps(survey_records, behaviour)[item.item_id]
+        calibration = calibration_gaps(survey_records, behaviour)["twin-pd"]
         assert calibration.predicted == pytest.approx(0.8)
         assert calibration.measured == pytest.approx(0.5)
         assert calibration.gap == pytest.approx(0.3)
@@ -1628,7 +1628,7 @@ class TestCalibration:
             if item.family == FAMILY_SELF_PREDICTION and item.predicts_game == "twin-pd"
         )
         answer = parse_survey_answer(item, "<keep>80</keep>")
-        calibration = calibration_gaps([survey_record_fields(item, answer)], [])[item.item_id]
+        calibration = calibration_gaps([survey_record_fields(item, answer)], [])["twin-pd"]
         assert calibration.predicted == pytest.approx(0.8)
         assert calibration.measured is None
         assert calibration.gap is None
@@ -1646,7 +1646,7 @@ class TestCalibration:
         answer = parse_survey_answer(item, "I would rather not say.")
         calibration = calibration_gaps(
             [survey_record_fields(item, answer)], [{"game_id": "twin-pd", "coop_fraction": 0.5}]
-        )[item.item_id]
+        )["twin-pd"]
         assert calibration.predicted is None
         assert calibration.n_predictions == 0
         assert calibration.measured == pytest.approx(0.5)
@@ -1660,6 +1660,7 @@ class TestCalibration:
             families=[FAMILY_SELF_PREDICTION],
             data_dir=data_dir,
             instruments=[SYNTHETIC_INSTRUMENT],
+            include_counterpart_variants=True,
         )
         predictions = {item.item_id: item for item in items if item.predicts_game == "twin-pd"}
         parent = predictions["self-prediction-twin-pd"]
@@ -1669,11 +1670,11 @@ class TestCalibration:
             survey_record_fields(variant, parse_survey_answer(variant, "<keep>80</keep>")),
         ]
         gaps = calibration_gaps(records, [{"game_id": "twin-pd", "coop_fraction": 0.5}])
-        assert set(gaps) == {parent.item_id, variant.item_id}
-        assert gaps[parent.item_id].predicted == pytest.approx(0.2)
-        assert gaps[variant.item_id].predicted == pytest.approx(0.8)
-        assert gaps[parent.item_id].measured == pytest.approx(0.5)
-        assert gaps[variant.item_id].measured == pytest.approx(0.5)
+        assert set(gaps) == {"twin-pd", "twin-pd::with-counterpart"}
+        assert gaps["twin-pd"].predicted == pytest.approx(0.2)
+        assert gaps["twin-pd::with-counterpart"].predicted == pytest.approx(0.8)
+        assert gaps["twin-pd"].measured == pytest.approx(0.5)
+        assert gaps["twin-pd::with-counterpart"].measured == pytest.approx(0.5)
 
 
 class TestTheRecordContract:
@@ -2047,6 +2048,7 @@ class TestTheBatteryEntryPoint:
             families=[FAMILY_SELF_PREDICTION],
             data_dir=data_dir,
             instruments=[SYNTHETIC_INSTRUMENT],
+            include_counterpart_variants=True,
         )
         by_id = {item.item_id: item for item in items}
         parent = by_id["self-prediction-twin-pd"]
@@ -2068,6 +2070,18 @@ class TestTheBatteryEntryPoint:
         )
         assert variant.stem.endswith(SYNTHETIC_ELICITATION)
         assert variant.stem_swapped.endswith(SYNTHETIC_ELICITATION)
+
+    def test_self_prediction_battery_excludes_the_variant_by_default(self, tmp_path: Path) -> None:
+        data_dir = synthetic_authored_file(tmp_path / "survey")
+        synthetic_published_file(data_dir)
+        items = survey_battery(
+            families=[FAMILY_SELF_PREDICTION],
+            data_dir=data_dir,
+            instruments=[SYNTHETIC_INSTRUMENT],
+        )
+        assert SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID not in {
+            item.item_id for item in items
+        }
 
     def test_an_unknown_tier_raises(self) -> None:
         with pytest.raises(ValueError, match="unknown survey tier"):
@@ -2112,9 +2126,7 @@ class TestTheBatteryEntryPoint:
         assert_every_reverse_key_has_a_sibling(items)
         assert (
             len(items)
-            == len(AUTHORED_ITEM_SPECS)
-            + 1  # The twin counterpart item is derived at runtime, not registered as authored text.
-            + PUBLISHED_INSTRUMENTS[SYNTHETIC_INSTRUMENT].n_items
+            == len(AUTHORED_ITEM_SPECS) + PUBLISHED_INSTRUMENTS[SYNTHETIC_INSTRUMENT].n_items
         )
 
     def test_a_duplicate_id_raises(self) -> None:

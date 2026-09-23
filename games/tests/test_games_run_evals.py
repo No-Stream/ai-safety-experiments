@@ -43,6 +43,7 @@ from games.survey import (
     FAMILIES_WITH_SHARED_ELICITATION,
     PUBLISHED_INSTRUMENTS,
     SCHEMA_VERSION,
+    SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID,
     SURVEY_ALLOCATION,
     SURVEY_CHEAP_TALK,
     SURVEY_CHOICE,
@@ -497,6 +498,39 @@ class TestCliEndToEnd:
         assert records[0]["eval_config"]["survey_data_dir"] == str(data_dir)
         assert records[0]["eval_config"]["survey_samples"] == 1
         assert {record["family"] for record in records[1:]} <= set(FAMILIES)
+
+    def test_the_counterpart_variant_flag_is_opt_in_and_recorded_in_cell_config(
+        self, tmp_path: Path
+    ) -> None:
+        out_dir = tmp_path / "out"
+        data_dir = synthetic_survey_data_dir(tmp_path / "survey-data")
+        exit_code = run_evals.main(
+            [
+                "--model",
+                "fake-base",
+                "--arm",
+                "plumbing-arm",
+                "--backend",
+                "mock",
+                "--out-dir",
+                str(out_dir),
+                "--sections",
+                SECTION_SELF_REPORT,
+                "--survey-samples",
+                "1",
+                "--survey-data-dir",
+                str(data_dir),
+                "--survey-counterpart-variants",
+                "--no-report",
+            ]
+        )
+        assert exit_code == 0
+        records = read_eval_records(out_dir / "step-0.jsonl")
+        assert records[0]["eval_config"]["survey_counterpart_variants"] is True
+        assert any(
+            record.get("item_id") == SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID
+            for record in records[1:]
+        )
 
     def test_the_self_report_section_without_item_data_is_refused_up_front(
         self, tmp_path: Path

@@ -2320,7 +2320,7 @@ def orientation_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 @dataclass(frozen=True, slots=True)
 class Calibration:
-    """One item's predicted cooperation rate against the rate measured in the same cell."""
+    """One game's predicted cooperation rate against the rate measured in the same cell."""
 
     game_id: str
     predicted: float | None
@@ -2339,50 +2339,58 @@ class Calibration:
 def calibration_gaps(
     survey_records: Sequence[Mapping[str, Any]], behaviour_records: Sequence[Mapping[str, Any]]
 ) -> dict[str, Calibration]:
-    """Return the self-prediction gap per item: what the model says it does minus what it did.
+    """Return the self-prediction gap per calibration key: what it says it does minus what it did.
 
     The one place this battery scores the artifact instead of the report, and the answer to the
     over-reporting caveat that qualifies everything else here. Both sides come from the *same* eval
     cell, so the comparison is within one checkpoint under one sampler rather than across passes.
 
-    The predicted side is a percentage, the measured side the mean `coop_fraction` of that item's
-    predicted game; both are put on the 0-1 scale before subtracting. A game with no behaviour
-    records in the cell keeps each item's prediction and reports a missing measured side, because
-    that is a coverage fact about the run (the game-behavior section was not requested, or was
-    restricted with `--games`) rather than a reason to drop the prediction on the floor.
+    The predicted side is a percentage, the measured side the mean `coop_fraction` of that key's
+    predicted game; both are put on the 0-1 scale before subtracting. Existing items retain their
+    game key, so their historical rows keep their pooled meaning. The counterpart-framed variant
+    gets its own suffix so it cannot pool with its parent. A game with no behaviour records in the
+    cell keeps each prediction and reports a missing measured side, because that is a coverage fact
+    about the run (the game-behavior section was not requested, or was restricted with `--games`)
+    rather than a reason to drop the prediction on the floor.
     """
-    predicted_by_item: dict[str, list[float]] = {}
-    game_by_item: dict[str, str] = {}
+    predicted_by_key: dict[str, list[float]] = {}
+    game_by_key: dict[str, str] = {}
     for record in survey_records:
         game_id = record.get("predicts_game")
         numeric = record.get("numeric")
         if game_id is None:
             continue
         game_key = str(game_id)
-        item_key = str(record.get("item_id", game_key))
-        previous_game = game_by_item.setdefault(item_key, game_key)
+        item_id = record.get("item_id")
+        calibration_key = (
+            f"{game_key}::with-counterpart"
+            if item_id == SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID
+            else game_key
+        )
+        previous_game = game_by_key.setdefault(calibration_key, game_key)
         if previous_game != game_key:
             raise ValueError(
-                f"survey item {item_key!r} predicts both {previous_game!r} and {game_key!r}; "
+                f"calibration key {calibration_key!r} predicts both {previous_game!r} and "
+                f"{game_key!r}; "
                 f"one item cannot open calibration rows for two measured games."
             )
-        predicted_by_item.setdefault(item_key, [])
+        predicted_by_key.setdefault(calibration_key, [])
         if numeric is not None:
-            predicted_by_item[item_key].append(float(numeric) / PERCENT)
+            predicted_by_key[calibration_key].append(float(numeric) / PERCENT)
     measured_by_game: dict[str, list[float]] = {}
     for record in behaviour_records:
         fraction = record.get("coop_fraction")
         if fraction is not None:
             measured_by_game.setdefault(str(record["game_id"]), []).append(float(fraction))
     return {
-        item_id: Calibration(
-            game_id=game_by_item[item_id],
+        calibration_key: Calibration(
+            game_id=game_by_key[calibration_key],
             predicted=_mean(predictions),
-            measured=_mean(measured_by_game.get(game_by_item[item_id], [])),
+            measured=_mean(measured_by_game.get(game_by_key[calibration_key], [])),
             n_predictions=len(predictions),
-            n_measured_records=len(measured_by_game.get(game_by_item[item_id], [])),
+            n_measured_records=len(measured_by_game.get(game_by_key[calibration_key], [])),
         )
-        for item_id, predictions in sorted(predicted_by_item.items())
+        for calibration_key, predictions in sorted(predicted_by_key.items())
     }
 
 
@@ -5562,6 +5570,7 @@ def survey_battery(
     data_dir: Path | None = None,
     instruments: Sequence[str] = (),
     tier: str = "",
+    include_counterpart_variants: bool = False,
 ) -> list[SurveyItem]:
     """Return the battery one eval cell asks: the authored items plus the published instruments.
 
@@ -5579,9 +5588,9 @@ def survey_battery(
     `tier` empty means both tiers. Core is position-level within instruments (the CI-R enjoyment
     subscale is core while its contentiousness sibling is breadth), so neither `families` nor
     `instruments` can select it -- this filter is the only way to run the deliberated leg's core
-    battery without paying thinking-on completions for every breadth item. Selecting the core
-    self-prediction family also derives its counterpart-framed twin-pd item here; that item stays
-    out of the authored registry because its text is inherited at runtime from the parent.
+    battery without paying thinking-on completions for every breadth item. The optional
+    counterpart-framed twin-pd item is derived only when explicitly requested; it stays out of the
+    authored registry because its text is inherited at runtime from the parent.
     """
     if tier and tier not in TIERS:
         raise ValueError(f"unknown survey tier {tier!r}; known tiers: {list(TIERS)}.")
@@ -5609,7 +5618,7 @@ def survey_battery(
     ]
     selects_self_prediction = not families or FAMILY_SELF_PREDICTION in families
     selects_core = not tier or tier == TIER_CORE
-    if items and selects_self_prediction and selects_core:
+    if items and include_counterpart_variants and selects_self_prediction and selects_core:
         # This is a runtime framing variant, so it deliberately does not change the authored
         # registry or its planned family count.
         items.append(_self_prediction_twin_pd_variant(items))

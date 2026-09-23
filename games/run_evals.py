@@ -679,6 +679,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--survey-counterpart-variants",
+        action=argparse.BooleanOptionalAction,
+        default=EVAL_DEFAULTS.survey_counterpart_variants,
+        help=(
+            "Include the opt-in counterpart-framed variant of the self-prediction twin-pd item. "
+            "The default keeps the historical survey battery unchanged."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=EVAL_DEFAULTS.batch_size,
@@ -2593,6 +2602,7 @@ def _resolve_eval_config(
         survey_instruments=_parse_id_list(args.survey_instruments),
         survey_families=_parse_id_list(args.survey_families),
         survey_tier=args.survey_tier,
+        survey_counterpart_variants=args.survey_counterpart_variants,
         prefilled_think=template.prefilled_think,
         batch_size=args.batch_size,
         dtbench_dir=args.dtbench_dir,

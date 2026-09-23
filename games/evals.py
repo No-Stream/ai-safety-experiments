@@ -528,6 +528,10 @@ class EvalConfig:
     # reachable through this knob -- the deliberated leg runs tier="core" so breadth items never
     # bill thinking-on completions.
     survey_tier: str = ""
+    # Optional runtime framing variant for the self-prediction twin-pd item. Off preserves the
+    # original survey battery and its frozen core membership; when on, the planner asks the extra
+    # counterpart-framed item and records the switch in the cell identity.
+    survey_counterpart_variants: bool = False
     prefilled_think: bool = True
     dtbench_dir: Path | None = None
     games: tuple[str, ...] = ()
@@ -773,6 +777,7 @@ class EvalConfig:
             # asked items that do not exist.
             "survey_families": list(self.survey_families) or sorted(families_with_items()),
             "survey_tier": self.survey_tier or list(TIERS),
+            "survey_counterpart_variants": self.survey_counterpart_variants,
             "prefilled_think": self.prefilled_think,
             "batch_size": self.batch_size,
             "dtbench_dir": str(self.dtbench_dir) if self.dtbench_dir is not None else None,
@@ -1883,6 +1888,7 @@ def _survey_renderings(config: EvalConfig) -> list[tuple[_SurveyRendering, str]]
         data_dir=config.survey_data_dir,
         instruments=config.survey_instruments,
         tier=config.survey_tier,
+        include_counterpart_variants=config.survey_counterpart_variants,
     )
     for item in battery:
         orders = battery_orders(item) or ((ORDER_NOT_APPLICABLE, ()),)
@@ -2366,15 +2372,14 @@ def _summarise_self_report(
             for item_id, reading in numeric_item_readings(records).items()
         },
         "calibration_gaps": {
-            item_id: {
-                "game_id": reading.game_id,
+            calibration_key: {
                 "predicted": reading.predicted,
                 "measured": reading.measured,
                 "gap": reading.gap,
                 "n_predictions": reading.n_predictions,
                 "n_measured_records": reading.n_measured_records,
             }
-            for item_id, reading in calibration_gaps(records, behaviour_records).items()
+            for calibration_key, reading in calibration_gaps(records, behaviour_records).items()
         },
     }
     return reductions

@@ -317,20 +317,27 @@ class TestATraceWithoutASummaryIsResumed:
         # Every cell before the block existed ran the serial call sequence; the reconstruction says so.
         assert meta["resume"]["sessions"][0]["submission"] == SUBMISSION_SERIAL
 
+    @pytest.mark.parametrize(
+        "other_config",
+        [
+            EvalConfig(
+                games=("twin-pd", "chicken"),
+                include_never_trained=False,
+                capability_items=4,
+                open_ended_samples=1,
+                multiple_choice_samples=1,
+            ),
+            dataclasses.replace(CONFIG, survey_counterpart_variants=True),
+        ],
+        ids=["different-games", "counterpart-variants-switched-on"],
+    )
     def test_a_trace_from_another_configuration_is_refused_and_left_intact(
-        self, tmp_path: Path
+        self, tmp_path: Path, other_config: EvalConfig
     ) -> None:
         out_path = tmp_path / "step-5.jsonl"
         with pytest.raises(SimulatedDeathError):
             run_serial(DiesAtCall(scripted_backend(), at_call=2), out_path)
         before = out_path.read_bytes()
-        other_config = EvalConfig(
-            games=("twin-pd", "chicken"),
-            include_never_trained=False,
-            capability_items=4,
-            open_ended_samples=1,
-            multiple_choice_samples=1,
-        )
         with pytest.raises(ValueError, match="refusing to resume") as refusal:
             run_eval_battery(
                 scripted_backend(),
