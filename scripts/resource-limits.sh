@@ -167,7 +167,9 @@ if ((gpu)); then
   [[ -n "$timeout" ]] || timeout=15m
   python_bin="${GPU_PREFLIGHT_PYTHON:-python3}"
   command -v "$python_bin" >/dev/null || die "--gpu needs a python3 on PATH (or set GPU_PREFLIGHT_PYTHON)"
-  "$python_bin" "$script_dir/gpu_preflight.py"
+  # WSL2's nvidia-smi attributes no VRAM to any process, so the desktop's idle few GiB read as an
+  # unnamed peer; GPU_PREFLIGHT_THRESHOLD_MIB raises the bar above that baseline on such a host.
+  "$python_bin" "$script_dir/gpu_preflight.py" ${GPU_PREFLIGHT_THRESHOLD_MIB:+--threshold-mib "$GPU_PREFLIGHT_THRESHOLD_MIB"}
 fi
 
 # Thread caps for the job itself. These are per-process and multiply across

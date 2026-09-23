@@ -278,6 +278,14 @@ the process list, and it is worth believing over the process list. `tests/test_g
 pins both grounds and the three cases that must stay allowed (idle card, small attributed context,
 our own allocation).
 
+Under WSL2, nvidia-smi attributes VRAM to no process at all, so the Windows desktop's idle few GiB
+(about 3.9 GiB on the 5090 box, 2026-09-23) always trip the second ground. Set
+`GPU_PREFLIGHT_THRESHOLD_MIB` above that measured idle baseline (6000 there) and
+`resource-limits.sh --gpu` passes it through as `--threshold-mib`. A real peer run still trips it,
+because a model job holds far more than the margin. Re-measure the baseline with `nvidia-smi` on an
+idle card before choosing the number, and never raise it to get past a refusal you haven't
+explained.
+
 `--gpu` also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which lets the
 caching allocator grow segments in place instead of fragmenting into unusable blocks.
 On 23 GB with variable sequence lengths, fragmentation is a more likely cause of a
