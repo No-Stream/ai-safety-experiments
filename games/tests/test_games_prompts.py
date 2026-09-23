@@ -85,6 +85,7 @@ from games.prompts import (
     render_game_prompt,
     render_iterated_prompt,
     render_responder_prompt,
+    twin_counterpart_paragraph,
 )
 from games.rewards import (
     GRADING_GROUP_MIX,
@@ -910,6 +911,12 @@ class TestGeneratePromptRows:
         for game_id in ("twin-pd", "fixed-pie-pd", "stag-hunt", "hi-lo", "harmony", "chicken"):
             for row in generate_prompt_rows(game_id, GRADING_GROUP_MIX, split=SPLIT_TRAIN):
                 assert "another instance of this same model" in str(row["prompt"])
+
+    def test_the_twin_counterpart_helper_is_in_every_twin_pd_eval_prompt(self) -> None:
+        paragraph = twin_counterpart_paragraph()
+        rows = generate_prompt_rows("twin-pd", GRADING_GROUP_MIX, split=SPLIT_EVAL)
+        assert rows
+        assert all(paragraph in str(row["prompt"]) for row in rows)
 
     def test_generation_is_deterministic(self) -> None:
         for game_id in GAME_IDS:

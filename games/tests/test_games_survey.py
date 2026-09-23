@@ -31,7 +31,10 @@ import pytest
 
 from games.parsing import parse_split, parse_tag, strip_thinking
 from games.probes import ORDER_AS_AUTHORED, ORDER_REVERSED, parse_final_answer
-from games.prompts import assert_no_loaded_vocabulary
+from games.prompts import (
+    assert_counterpart_paragraph_is_the_only_insertion,
+    assert_no_loaded_vocabulary,
+)
 from games.survey import (
     ACQUIESCENCE_NO_POSITIVE_KEYED,
     ACQUIESCENCE_NO_REVERSE_KEYED,
@@ -57,6 +60,7 @@ from games.survey import (
     ORIENTATION_PROSOCIAL,
     PUBLISHED_INSTRUMENTS,
     SCHEMA_VERSION,
+    SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID,
     SUBSCALE_INERT_FACT,
     SUBSCALE_INERT_LIKERT,
     SUBSCALE_INERT_NUMERIC,
@@ -1609,7 +1613,7 @@ class TestCalibration:
             {"game_id": "twin-pd", "coop_fraction": 1.0},
             {"game_id": "twin-pd", "coop_fraction": 0.0},
         ]
-        calibration = calibration_gaps(survey_records, behaviour)["twin-pd"]
+        calibration = calibration_gaps(survey_records, behaviour)[item.item_id]
         assert calibration.predicted == pytest.approx(0.8)
         assert calibration.measured == pytest.approx(0.5)
         assert calibration.gap == pytest.approx(0.3)
@@ -1624,7 +1628,7 @@ class TestCalibration:
             if item.family == FAMILY_SELF_PREDICTION and item.predicts_game == "twin-pd"
         )
         answer = parse_survey_answer(item, "<keep>80</keep>")
-        calibration = calibration_gaps([survey_record_fields(item, answer)], [])["twin-pd"]
+        calibration = calibration_gaps([survey_record_fields(item, answer)], [])[item.item_id]
         assert calibration.predicted == pytest.approx(0.8)
         assert calibration.measured is None
         assert calibration.gap is None
@@ -1642,10 +1646,34 @@ class TestCalibration:
         answer = parse_survey_answer(item, "I would rather not say.")
         calibration = calibration_gaps(
             [survey_record_fields(item, answer)], [{"game_id": "twin-pd", "coop_fraction": 0.5}]
-        )["twin-pd"]
+        )[item.item_id]
         assert calibration.predicted is None
         assert calibration.n_predictions == 0
         assert calibration.measured == pytest.approx(0.5)
+
+    def test_parent_and_counterpart_variant_have_separate_calibration_rows(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = synthetic_authored_file(tmp_path / "survey")
+        synthetic_published_file(data_dir)
+        items = survey_battery(
+            families=[FAMILY_SELF_PREDICTION],
+            data_dir=data_dir,
+            instruments=[SYNTHETIC_INSTRUMENT],
+        )
+        predictions = {item.item_id: item for item in items if item.predicts_game == "twin-pd"}
+        parent = predictions["self-prediction-twin-pd"]
+        variant = predictions[SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID]
+        records = [
+            survey_record_fields(parent, parse_survey_answer(parent, "<keep>20</keep>")),
+            survey_record_fields(variant, parse_survey_answer(variant, "<keep>80</keep>")),
+        ]
+        gaps = calibration_gaps(records, [{"game_id": "twin-pd", "coop_fraction": 0.5}])
+        assert set(gaps) == {parent.item_id, variant.item_id}
+        assert gaps[parent.item_id].predicted == pytest.approx(0.2)
+        assert gaps[variant.item_id].predicted == pytest.approx(0.8)
+        assert gaps[parent.item_id].measured == pytest.approx(0.5)
+        assert gaps[variant.item_id].measured == pytest.approx(0.5)
 
 
 class TestTheRecordContract:
@@ -2010,6 +2038,37 @@ class TestTheBatteryEntryPoint:
         assert {item.family for item in items} == {FAMILY_NEGATIVE_CONTROL}
         assert len(items) == 15
 
+    def test_self_prediction_battery_includes_the_twin_counterpart_variant(
+        self, tmp_path: Path
+    ) -> None:
+        data_dir = synthetic_authored_file(tmp_path / "survey")
+        synthetic_published_file(data_dir)
+        items = survey_battery(
+            families=[FAMILY_SELF_PREDICTION],
+            data_dir=data_dir,
+            instruments=[SYNTHETIC_INSTRUMENT],
+        )
+        by_id = {item.item_id: item for item in items}
+        parent = by_id["self-prediction-twin-pd"]
+        variant = by_id[SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID]
+        assert variant.kind == SURVEY_NUMERIC
+        assert variant.numeric_max == parent.numeric_max
+        assert variant.stem_swapped is not None
+        assert parent.stem_swapped is not None
+        assert variant.counterbalanced == parent.counterbalanced
+        assert (
+            parse_survey_answer(parent, "<keep>37</keep>").numeric
+            == parse_survey_answer(variant, "<keep>37</keep>").numeric
+        )
+        assert_counterpart_paragraph_is_the_only_insertion(
+            stem=parent.stem, rendered=variant.stem, prompt_id=variant.item_id
+        )
+        assert_counterpart_paragraph_is_the_only_insertion(
+            stem=parent.stem_swapped, rendered=variant.stem_swapped, prompt_id=variant.item_id
+        )
+        assert variant.stem.endswith(SYNTHETIC_ELICITATION)
+        assert variant.stem_swapped.endswith(SYNTHETIC_ELICITATION)
+
     def test_an_unknown_tier_raises(self) -> None:
         with pytest.raises(ValueError, match="unknown survey tier"):
             survey_battery(tier="not-a-tier")
@@ -2053,7 +2112,9 @@ class TestTheBatteryEntryPoint:
         assert_every_reverse_key_has_a_sibling(items)
         assert (
             len(items)
-            == len(AUTHORED_ITEM_SPECS) + PUBLISHED_INSTRUMENTS[SYNTHETIC_INSTRUMENT].n_items
+            == len(AUTHORED_ITEM_SPECS)
+            + 1  # The twin counterpart item is derived at runtime, not registered as authored text.
+            + PUBLISHED_INSTRUMENTS[SYNTHETIC_INSTRUMENT].n_items
         )
 
     def test_a_duplicate_id_raises(self) -> None:

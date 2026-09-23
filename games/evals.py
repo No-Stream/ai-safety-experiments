@@ -2366,14 +2366,15 @@ def _summarise_self_report(
             for item_id, reading in numeric_item_readings(records).items()
         },
         "calibration_gaps": {
-            game_id: {
+            item_id: {
+                "game_id": reading.game_id,
                 "predicted": reading.predicted,
                 "measured": reading.measured,
                 "gap": reading.gap,
                 "n_predictions": reading.n_predictions,
                 "n_measured_records": reading.n_measured_records,
             }
-            for game_id, reading in calibration_gaps(records, behaviour_records).items()
+            for item_id, reading in calibration_gaps(records, behaviour_records).items()
         },
     }
     return reductions

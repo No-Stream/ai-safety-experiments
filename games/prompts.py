@@ -4496,7 +4496,9 @@ def _counterpart_paragraph(*, twin_framing: bool, opponent_framing: str | None) 
         raise ValueError(
             "twin_framing and opponent_framing describe the same counterpart two different ways; pass at most one."
         )
-    clause = TWIN_COUNTERPART_CLAUSE if twin_framing else opponent_framing
+    if twin_framing:
+        return twin_counterpart_paragraph()
+    clause = opponent_framing
     if clause is None:
         return None
     return about_the_other_side(clause)
@@ -4510,6 +4512,11 @@ def about_the_other_side(clause: str) -> str:
     and silently drop out of that check.
     """
     return f"About the other side: {clause}"
+
+
+def twin_counterpart_paragraph() -> str:
+    """Return the complete counterpart paragraph used by twin-framed play prompts."""
+    return about_the_other_side(TWIN_COUNTERPART_CLAUSE)
 
 
 def render_game_prompt(  # noqa: PLR0913

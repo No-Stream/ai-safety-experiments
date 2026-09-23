@@ -1205,7 +1205,7 @@ def self_report_instrument_rows(traces: Sequence[EvalTrace]) -> list[dict[str, A
 
 
 def self_report_calibration_rows(traces: Sequence[EvalTrace]) -> list[dict[str, Any]]:
-    """Return the self-prediction gap per step and game: what it says it does minus what it did.
+    """Return the self-prediction gap per step and item: what it says it does minus what it did.
 
     The one table in this section that scores the artifact rather than the report, and the answer to
     the over-reporting caveat that qualifies everything else here. Both sides come from the SAME cell,
@@ -1224,7 +1224,8 @@ def self_report_calibration_rows(traces: Sequence[EvalTrace]) -> list[dict[str, 
         rows.extend(
             {
                 STEP_COLUMN: trace.step,
-                GAME_COLUMN: game_id,
+                GAME_COLUMN: reading.game_id,
+                "item": item_id,
                 "predicted": _optional_cell(reading.predicted),
                 "measured": _optional_cell(reading.measured),
                 "gap (predicted - measured)": _optional_cell(reading.gap, signed=True),
@@ -1232,7 +1233,7 @@ def self_report_calibration_rows(traces: Sequence[EvalTrace]) -> list[dict[str, 
                     f"{reading.n_predictions}/{reading.n_measured_records}"
                 ),
             }
-            for game_id, reading in sorted(gaps.items())
+            for item_id, reading in sorted(gaps.items())
         )
     return rows
 

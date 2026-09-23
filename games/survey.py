@@ -70,7 +70,7 @@ import json
 import logging
 import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from games.parsing import parse_split, parse_tag
@@ -82,7 +82,7 @@ from games.probes import (
     counterbalanced_option_orders,
     parse_final_answer,
 )
-from games.prompts import ALL_GAME_IDS
+from games.prompts import ALL_GAME_IDS, twin_counterpart_paragraph
 from games.survey_expectations import (
     AMBIGUITY_CHIP_BAG_NONZERO_FLOOR_EXPECTATION,
     AMBIGUITY_CHIP_BAG_PRIZE_OR_NOTHING_EXPECTATION,
@@ -2320,7 +2320,7 @@ def orientation_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 @dataclass(frozen=True, slots=True)
 class Calibration:
-    """One game's predicted cooperation rate against the rate measured in the same cell."""
+    """One item's predicted cooperation rate against the rate measured in the same cell."""
 
     game_id: str
     predicted: float | None
@@ -2339,41 +2339,50 @@ class Calibration:
 def calibration_gaps(
     survey_records: Sequence[Mapping[str, Any]], behaviour_records: Sequence[Mapping[str, Any]]
 ) -> dict[str, Calibration]:
-    """Return the self-prediction gap per game: what the model says it does minus what it did.
+    """Return the self-prediction gap per item: what the model says it does minus what it did.
 
     The one place this battery scores the artifact instead of the report, and the answer to the
     over-reporting caveat that qualifies everything else here. Both sides come from the *same* eval
     cell, so the comparison is within one checkpoint under one sampler rather than across passes.
 
-    The predicted side is a percentage, the measured side the mean `coop_fraction` of that game's
-    behaviour records; both are put on the 0-1 scale before subtracting. A game with no behaviour
-    records in the cell keeps its prediction and reports a missing measured side, because that is a
-    coverage fact about the run (the game-behavior section was not requested, or was restricted with
-    `--games`) rather than a reason to drop the prediction on the floor.
+    The predicted side is a percentage, the measured side the mean `coop_fraction` of that item's
+    predicted game; both are put on the 0-1 scale before subtracting. A game with no behaviour
+    records in the cell keeps each item's prediction and reports a missing measured side, because
+    that is a coverage fact about the run (the game-behavior section was not requested, or was
+    restricted with `--games`) rather than a reason to drop the prediction on the floor.
     """
-    predicted_by_game: dict[str, list[float]] = {}
+    predicted_by_item: dict[str, list[float]] = {}
+    game_by_item: dict[str, str] = {}
     for record in survey_records:
         game_id = record.get("predicts_game")
         numeric = record.get("numeric")
         if game_id is None:
             continue
-        predicted_by_game.setdefault(str(game_id), [])
+        game_key = str(game_id)
+        item_key = str(record.get("item_id", game_key))
+        previous_game = game_by_item.setdefault(item_key, game_key)
+        if previous_game != game_key:
+            raise ValueError(
+                f"survey item {item_key!r} predicts both {previous_game!r} and {game_key!r}; "
+                f"one item cannot open calibration rows for two measured games."
+            )
+        predicted_by_item.setdefault(item_key, [])
         if numeric is not None:
-            predicted_by_game[str(game_id)].append(float(numeric) / PERCENT)
+            predicted_by_item[item_key].append(float(numeric) / PERCENT)
     measured_by_game: dict[str, list[float]] = {}
     for record in behaviour_records:
         fraction = record.get("coop_fraction")
         if fraction is not None:
             measured_by_game.setdefault(str(record["game_id"]), []).append(float(fraction))
     return {
-        game_id: Calibration(
-            game_id=game_id,
+        item_id: Calibration(
+            game_id=game_by_item[item_id],
             predicted=_mean(predictions),
-            measured=_mean(measured_by_game.get(game_id, [])),
+            measured=_mean(measured_by_game.get(game_by_item[item_id], [])),
             n_predictions=len(predictions),
-            n_measured_records=len(measured_by_game.get(game_id, [])),
+            n_measured_records=len(measured_by_game.get(game_by_item[item_id], [])),
         )
-        for game_id, predictions in sorted(predicted_by_game.items())
+        for item_id, predictions in sorted(predicted_by_item.items())
     }
 
 
@@ -2388,6 +2397,7 @@ def calibration_gaps(
 INSTRUMENT_NEGATIVE_CONTROL = "negative-control"
 INSTRUMENT_SELF_PREDICTION = "self-prediction"
 INSTRUMENT_SELF_CHARACTERISATION = "self-characterisation"
+SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID = "self-prediction-twin-pd-with-counterpart"
 
 # The 2026-08-22 families' instruments. An instrument groups the items that share an answer format
 # and a scoring unit, which is what `assert_scored_subscales_share_a_unit` and the acquiescence guard
@@ -4543,6 +4553,56 @@ def _append_shared_elicitation(
         text[key] = f"{stem.rstrip()}{ELICITATION_SEPARATOR}{block.strip()}"
 
 
+def _insert_before_shared_elicitation(
+    stem: str, stem_swapped: str, *, item_id: str
+) -> tuple[str, str]:
+    """Insert the twin counterpart paragraph before the suffix shared by both stems."""
+    stem_sections = stem.split(ELICITATION_SEPARATOR)
+    swapped_sections = stem_swapped.split(ELICITATION_SEPARATOR)
+    shared_suffix_sections = 0
+    for left, right in zip(reversed(stem_sections), reversed(swapped_sections), strict=False):
+        if left != right:
+            break
+        shared_suffix_sections += 1
+    if not shared_suffix_sections:
+        raise ValueError(
+            f"{item_id} has no shared trailing elicitation block in its counterbalanced stems; "
+            f"the counterpart variant cannot preserve the family's closing question."
+        )
+    paragraph = twin_counterpart_paragraph()
+
+    def insert(sections: list[str]) -> str:
+        split_at = len(sections) - shared_suffix_sections
+        return ELICITATION_SEPARATOR.join((*sections[:split_at], paragraph, *sections[split_at:]))
+
+    return insert(stem_sections), insert(swapped_sections)
+
+
+def _self_prediction_twin_pd_variant(items: Sequence[SurveyItem]) -> SurveyItem:
+    """Derive the twin-pd counterpart-framed item from the local parent item."""
+    parent_id = f"{INSTRUMENT_SELF_PREDICTION}-twin-pd"
+    parent = next((item for item in items if item.item_id == parent_id), None)
+    if parent is None:
+        raise ValueError(
+            f"the authored battery has no {parent_id!r}, so the runtime counterpart variant cannot "
+            f"be derived. The authored loader should have refused that incomplete file earlier."
+        )
+    if parent.stem_swapped is None:
+        raise ValueError(
+            f"{parent_id} has no swapped stem, so its runtime counterpart variant could not be "
+            f"counterbalanced."
+        )
+    stem, stem_swapped = _insert_before_shared_elicitation(
+        parent.stem, parent.stem_swapped, item_id=parent_id
+    )
+    return replace(
+        parent,
+        item_id=SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID,
+        stem=stem,
+        stem_swapped=stem_swapped,
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # The published instruments. Metadata only -- counts, subscale membership, keying, scoring, licence.
 # Not one word of item text, by design; see the module docstring and games/data/survey/README.md.
@@ -5519,7 +5579,9 @@ def survey_battery(
     `tier` empty means both tiers. Core is position-level within instruments (the CI-R enjoyment
     subscale is core while its contentiousness sibling is breadth), so neither `families` nor
     `instruments` can select it -- this filter is the only way to run the deliberated leg's core
-    battery without paying thinking-on completions for every breadth item.
+    battery without paying thinking-on completions for every breadth item. Selecting the core
+    self-prediction family also derives its counterpart-framed twin-pd item here; that item stays
+    out of the authored registry because its text is inherited at runtime from the parent.
     """
     if tier and tier not in TIERS:
         raise ValueError(f"unknown survey tier {tier!r}; known tiers: {list(TIERS)}.")
@@ -5545,6 +5607,12 @@ def survey_battery(
         *load_authored_items(data_dir),
         *load_published_instruments(data_dir, instruments=instruments),
     ]
+    selects_self_prediction = not families or FAMILY_SELF_PREDICTION in families
+    selects_core = not tier or tier == TIER_CORE
+    if items and selects_self_prediction and selects_core:
+        # This is a runtime framing variant, so it deliberately does not change the authored
+        # registry or its planned family count.
+        items.append(_self_prediction_twin_pd_variant(items))
     if families:
         items = [item for item in items if item.family in set(families)]
     if tier:
