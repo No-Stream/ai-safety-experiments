@@ -188,10 +188,20 @@ job_env=(
 if ((advisory)); then
   echo "resource-limits: WARNING advisory mode - limits are NOT enforced; the job can exceed them" >&2
   # ulimit -v caps address space, which is a poor proxy for RSS and is ignored by
-  # anything using its own allocator, hence "advisory".
-  ulimit -v $(($(numfmt --from=iec "$mem_max") / 1024)) || true
+  # anything using its own allocator, hence "advisory". A CUDA process reserves far more
+  # address space than it touches, so under the cap its thread stacks fail to map and
+  # pthread_create returns EAGAIN (observed: vLLM dying at import, 2026-09-23); GPU jobs skip it.
+  if ((gpu)); then
+    echo "resource-limits: --gpu with --advisory skips ulimit -v; memory is not capped at all" >&2
+  else
+    ulimit -v $(($(numfmt --from=iec "$mem_max") / 1024)) || true
+  fi
   cd -- "$chdir" || die "could not enter $chdir"
-  exec env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 \
+  # coreutils timeout signals the job's whole process group and exits 124, the same contract as the
+  # cgroup path's RuntimeMaxSec; without it advisory mode silently had no wall-clock limit.
+  timeout_cmd=()
+  [[ -n "$timeout" ]] && timeout_cmd=(timeout --kill-after=60s "$timeout")
+  exec "${timeout_cmd[@]}" env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 \
     taskset -c "0-$((cpus - 1))" "$@"
 fi
 
