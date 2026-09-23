@@ -197,15 +197,37 @@ if ((advisory)); then
     ulimit -v $(($(numfmt --from=iec "$mem_max") / 1024)) || true
   fi
   cd -- "$chdir" || die "could not enter $chdir"
-  # coreutils timeout exits 124 like the cgroup path's RuntimeMaxSec; without it advisory mode had no
-  # wall-clock limit at all. --foreground keeps the job in the terminal's process group, so killing
-  # its tmux session still hangs it up; without it timeout's own group survived a kill-session
-  # (observed 2026-09-23, a 9B vLLM job kept the GPU). The cost: on expiry only the command itself
-  # is signalled, so a child that ignores its parent's death can outlive it.
-  timeout_cmd=()
-  [[ -n "$timeout" ]] && timeout_cmd=(timeout --foreground --kill-after=60s "$timeout")
-  exec "${timeout_cmd[@]}" env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 \
-    taskset -c "0-$((cpus - 1))" "$@"
+  if [[ -z "$timeout" ]]; then
+    exec env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 taskset -c "0-$((cpus - 1))" "$@"
+  fi
+  # coreutils timeout (no --foreground) puts the job in its own process group and on expiry signals
+  # that whole group, exiting 124 like the cgroup path's RuntimeMaxSec. A separate group no longer
+  # hears a tmux kill-session's hangup, so this shell forwards it. Both halves were watched failing
+  # on 2026-09-23 with a 9B vLLM job: --foreground left the orphaned EngineCore holding 29 GiB after
+  # a timeout, and the group without the forward survived a kill-session.
+  timeout --kill-after=60s "$timeout" env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 \
+    taskset -c "0-$((cpus - 1))" "$@" &
+  job_pid=$!
+  # TERM the job's group, then KILL whatever is left after 30s, matching timeout's --kill-after.
+  stop_job_group() {
+    kill -TERM -- "-$job_pid" 2>/dev/null || true
+    for _ in {1..30}; do
+      kill -0 -- "-$job_pid" 2>/dev/null || return 0
+      sleep 1
+    done
+    kill -KILL -- "-$job_pid" 2>/dev/null || true
+  }
+  trap stop_job_group HUP INT TERM
+  # `|| status=$?` because under set -e a bare failing `wait` (124 on timeout) exits before the sweep.
+  status=0
+  while :; do
+    wait "$job_pid" && status=0 || status=$?
+    kill -0 "$job_pid" 2>/dev/null || break
+  done
+  # timeout exits as soon as its direct child does, so --kill-after never reaches a grandchild that
+  # ignored TERM (a vLLM EngineCore, say); sweep whatever is still in the group before reporting.
+  stop_job_group
+  exit "$status"
 fi
 
 # Clear our own spent units before asking the manager how it is doing. The cleanup at the end
