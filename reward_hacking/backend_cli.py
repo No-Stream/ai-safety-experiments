@@ -195,6 +195,16 @@ _KNOBS: tuple[_Knob, ...] = (
         ),
     ),
     _Knob(
+        dest="vllm_max_num_seqs",
+        flag="--vllm-max-num-seqs",
+        kinds=frozenset({"vllm"}),
+        why=(
+            "It caps the vLLM engine's concurrent sequences, and with them its CUDA-graph "
+            "captures. The hf backend batches per call and the hosted kinds schedule their own, "
+            "so anywhere else the flag would be silently meaningless."
+        ),
+    ),
+    _Knob(
         dest="min_p",
         flag="--min-p",
         kinds=LOCAL_KINDS,
@@ -391,6 +401,17 @@ def add_backend_args(parser: argparse.ArgumentParser, *, default: str = "hf") ->
             "sized to its prompts. The legibility probe derives the same number from its prompt "
             "and completion budgets; the harness's transcript grows per turn, so here it is "
             "explicit. vllm only."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-max-num-seqs",
+        type=int,
+        default=None,
+        help=(
+            "Most sequences the vLLM engine runs at once; vLLM also sizes its CUDA-graph captures "
+            "from it. Unset keeps vLLM's default, whose graph-memory estimate for Qwen3.5-9B "
+            "(~9 GiB) left no KV cache on a 32 GB card at 0.80 utilization. Long-thinking cells "
+            "fit only ~5-12 full-length sequences anyway, so 64 loses nothing. vllm only."
         ),
     )
 
@@ -630,6 +651,8 @@ def backend_from_args(  # noqa: PLR0913 - keyword-only per-CLI overrides, not wo
             engine_kwargs["gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
         if kind == "vllm" and args.vllm_max_model_len is not None:
             engine_kwargs["max_model_len"] = args.vllm_max_model_len
+        if kind == "vllm" and args.vllm_max_num_seqs is not None:
+            engine_kwargs["max_num_seqs"] = args.vllm_max_num_seqs
         return build_backend(
             kind,
             model_id,

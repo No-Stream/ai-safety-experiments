@@ -551,6 +551,35 @@ class TestVllmGpuMemoryUtilizationKnob:
             backend_cli.backend_from_args(args, LOCAL_MODEL)
 
 
+class TestVllmMaxNumSeqsKnob:
+    """``--vllm-max-num-seqs`` reaches the engine on vllm and is refused everywhere else.
+
+    vLLM sizes its CUDA-graph captures from this cap, and at its default the 9B's graph estimate
+    (~9 GiB) left no KV cache on a 32 GB card. Unset must leave the engine construction unchanged.
+    """
+
+    def _args(self, *argv: str) -> argparse.Namespace:
+        parser = argparse.ArgumentParser()
+        backend_cli.add_backend_args(parser)
+        return parser.parse_args(list(argv))
+
+    def test_the_cap_reaches_the_engine_kwargs(self, recorded: list[_RecordedBuild]) -> None:
+        args = self._args("--backend", "vllm", "--vllm-max-num-seqs", "64")
+        backend_cli.backend_from_args(args, LOCAL_MODEL, local_sampling=_sampling_base())
+        assert recorded[-1].kwargs["max_num_seqs"] == 64
+
+    def test_unset_means_no_engine_kwarg_at_all(self, recorded: list[_RecordedBuild]) -> None:
+        args = self._args("--backend", "vllm")
+        backend_cli.backend_from_args(args, LOCAL_MODEL, local_sampling=_sampling_base())
+        assert "max_num_seqs" not in recorded[-1].kwargs
+
+    @pytest.mark.parametrize("kind", ["hf", "bedrock", "codex"])
+    def test_it_is_refused_on_backends_without_an_engine(self, kind: str) -> None:
+        args = self._args("--backend", kind, "--vllm-max-num-seqs", "64")
+        with pytest.raises(ValueError, match="--vllm-max-num-seqs"):
+            backend_cli.backend_from_args(args, LOCAL_MODEL)
+
+
 class TestVllmMaxModelLenKnob:
     """``--vllm-max-model-len`` reaches the engine on vllm and is refused everywhere else.
 
