@@ -328,8 +328,9 @@ class TestATraceWithoutASummaryIsResumed:
                 multiple_choice_samples=1,
             ),
             dataclasses.replace(CONFIG, survey_counterpart_variants=True),
+            dataclasses.replace(CONFIG, survey_items=("self-prediction-twin-pd",)),
         ],
-        ids=["different-games", "counterpart-variants-switched-on"],
+        ids=["different-games", "counterpart-variants-switched-on", "survey-items-filter"],
     )
     def test_a_trace_from_another_configuration_is_refused_and_left_intact(
         self, tmp_path: Path, other_config: EvalConfig
@@ -360,6 +361,32 @@ class TestATraceWithoutASummaryIsResumed:
                 submission=SUBMISSION_SERIAL,
                 resume=True,
             )
+        assert out_path.read_bytes() == before
+
+    def test_a_filtered_trace_refuses_resume_without_the_filter(self, tmp_path: Path) -> None:
+        out_path = tmp_path / "step-5.jsonl"
+        filtered = dataclasses.replace(CONFIG, survey_items=("self-prediction-twin-pd",))
+        with pytest.raises(SimulatedDeathError):
+            run_eval_battery(
+                DiesAtCall(scripted_backend(), at_call=2),
+                sections=SECTIONS_UNDER_TEST,
+                out_path=out_path,
+                meta=META,
+                config=filtered,
+                submission=SUBMISSION_SERIAL,
+            )
+        before = out_path.read_bytes()
+        with pytest.raises(ValueError, match="refusing to resume") as refusal:
+            run_eval_battery(
+                scripted_backend(),
+                sections=SECTIONS_UNDER_TEST,
+                out_path=out_path,
+                meta=META,
+                config=CONFIG,
+                submission=SUBMISSION_SERIAL,
+                resume=True,
+            )
+        assert "survey_items" in str(refusal.value)
         assert out_path.read_bytes() == before
 
     def test_the_item_data_paths_are_not_part_of_the_identity(self, tmp_path: Path) -> None:

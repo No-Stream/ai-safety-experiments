@@ -670,6 +670,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--survey-items",
+        default="",
+        help=(
+            "Comma-separated survey item ids to administer; empty means every item selected by "
+            "--survey-instruments, --survey-families, and --survey-tier. Selecting the parent "
+            "self-prediction-twin-pd item also selects its runtime counterpart variant when "
+            "--survey-counterpart-variants is enabled."
+        ),
+    )
+    parser.add_argument(
         "--survey-tier",
         default=EVAL_DEFAULTS.survey_tier,
         help=(
@@ -755,7 +765,7 @@ def _refuse_orphan_trap_cells_file(args: argparse.Namespace, sections: Sequence[
 def _parse_id_list(raw: str) -> tuple[str, ...]:
     """Split a comma-separated id list; empty means "every registered one", which EvalConfig reads.
 
-    Shared by --games, --trained-games and --survey-instruments rather than written three times:
+    Shared by the game, training-game, and survey id flags rather than written once per flag:
     `EvalConfig` validates each list against its own registry, so the splitter has no registry of
     its own and does not need one per flag.
     """
@@ -1677,11 +1687,26 @@ def bank_key(identity: Mapping[str, Any]) -> str:
 
 def _identity_drift(stored: Mapping[str, Any], expected: Mapping[str, Any]) -> list[str]:
     """Name every field of ``expected`` that ``stored`` disagrees with, compared through JSON types."""
-    return [
-        f"{name}: {_drift_text(stored.get(name, '<absent>'))} banked, {_drift_text(value)} asked"
-        for name, value in expected.items()
-        if _json_native(stored.get(name)) != _json_native(value)
-    ]
+    drifted: list[str] = []
+    for name, value in expected.items():
+        if name == "eval_config":
+            stored_config = stored.get(name, {})
+            config_names = sorted(set(stored_config) | set(value))
+            for config_name in config_names:
+                stored_config_value = stored_config.get(config_name, "<absent>")
+                expected_config_value = value.get(config_name, "<absent>")
+                if _json_native(stored_config_value) != _json_native(expected_config_value):
+                    drifted.append(
+                        f"eval_config.{config_name}: {_drift_text(stored_config_value)} banked, "
+                        f"{_drift_text(expected_config_value)} asked"
+                    )
+            continue
+        if _json_native(stored.get(name)) != _json_native(value):
+            drifted.append(
+                f"{name}: {_drift_text(stored.get(name, '<absent>'))} banked, "
+                f"{_drift_text(value)} asked"
+            )
+    return drifted
 
 
 def _drift_text(value: Any) -> str:  # noqa: ANN401 - any identity value, rendered for a refusal
@@ -2601,6 +2626,7 @@ def _resolve_eval_config(
         survey_data_dir=args.survey_data_dir,
         survey_instruments=_parse_id_list(args.survey_instruments),
         survey_families=_parse_id_list(args.survey_families),
+        survey_items=_parse_id_list(args.survey_items),
         survey_tier=args.survey_tier,
         survey_counterpart_variants=args.survey_counterpart_variants,
         prefilled_think=template.prefilled_think,

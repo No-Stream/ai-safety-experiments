@@ -118,9 +118,11 @@ from games.prompts import (
 )
 from games.provenance import git_sha
 from games.survey import (
+    AUTHORED_ITEM_SPECS,
     FAMILIES,
     NON_SOCIAL_LABEL_PREFIX,
     PUBLISHED_INSTRUMENTS,
+    SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID,
     SURVEY_NUMERIC,
     TIERS,
     SurveyItem,
@@ -162,6 +164,18 @@ if TYPE_CHECKING:
     from reward_hacking.model_backend import Backend
 
 logger = logging.getLogger(__name__)
+
+_REGISTERED_SURVEY_ITEM_IDS: frozenset[str] = frozenset(
+    {
+        *(spec.item_id for spec in AUTHORED_ITEM_SPECS),
+        *(
+            f"{instrument}-{position:02d}"
+            for instrument, spec in PUBLISHED_INSTRUMENTS.items()
+            for position in range(1, spec.n_items + 1)
+        ),
+        SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID,
+    }
+)
 
 SECTION_GAME_BEHAVIOR = "game-behavior"
 SECTION_DT_PROBES = "dt-probes"
@@ -524,6 +538,9 @@ class EvalConfig:
     # Empty means every family that has items. Naming a subset is how the breadth tier or the
     # negative-control family gets run on its own.
     survey_families: tuple[str, ...] = ()
+    # Empty means every item selected by the instrument/family/tier filters. A named subset is how
+    # an expensive self-report cell asks only the items needed for its hypothesis.
+    survey_items: tuple[str, ...] = ()
     # Empty means both tiers. The core set is position-level within instruments, so it is only
     # reachable through this knob -- the deliberated leg runs tier="core" so breadth items never
     # bill thinking-on completions.
@@ -730,7 +747,7 @@ class EvalConfig:
             )
 
     def _validate_survey_instruments(self) -> None:
-        """Reject a survey instrument or family list that names something other than it means.
+        """Reject a survey instrument, family, or item list that names something other than it means.
 
         `games.survey.survey_battery` refuses the same two shapes, so this is deliberately the
         earlier of two checks rather than the only one: it fires where the config is built, which is
@@ -756,10 +773,24 @@ class EvalConfig:
                     f"{name} names {repeated} more than once, which asks those items twice under "
                     f"one sample index and double-weights them in every composite."
                 )
+        unknown_items = sorted(set(self.survey_items) - _REGISTERED_SURVEY_ITEM_IDS)
+        if unknown_items:
+            raise ValueError(
+                f"Unknown survey_items {unknown_items}; known item ids: "
+                f"{sorted(_REGISTERED_SURVEY_ITEM_IDS)}."
+            )
+        repeated_items = sorted(
+            {item_id for item_id in self.survey_items if list(self.survey_items).count(item_id) > 1}
+        )
+        if repeated_items:
+            raise ValueError(
+                f"survey_items names {repeated_items} more than once, which asks those items twice "
+                f"under one sample index and double-weights them in every composite."
+            )
 
     def as_record(self) -> dict[str, Any]:
         """Return the config as JSON-safe values for the meta record."""
-        return {
+        record = {
             "open_ended_samples": self.open_ended_samples,
             "open_ended_samples_by_item": dict(self.open_ended_samples_by_item),
             "multiple_choice_samples": self.multiple_choice_samples,
@@ -801,6 +832,11 @@ class EvalConfig:
                 None if self.held_out_extension is None else self.held_out_extension.as_record()
             ),
         }
+        # Omit the unused filter so traces and bank identities from before this knob remain byte
+        # stable; a non-empty selection is explicit and therefore must be part of the identity.
+        if self.survey_items:
+            record["survey_items"] = list(self.survey_items)
+        return record
 
 
 def _decode_token_budget(backend: Backend) -> int:
@@ -1839,6 +1875,33 @@ class _SurveyRendering:
     numeric_example: int | None
 
 
+def _select_survey_items(
+    items: Sequence[SurveyItem],
+    requested: tuple[str, ...],
+    *,
+    include_counterpart_variants: bool,
+) -> list[SurveyItem]:
+    """Apply the optional item filter after the loader has derived runtime variants."""
+    if not requested:
+        return list(items)
+    known_ids = {item.item_id for item in items}
+    unknown = sorted(set(requested) - known_ids)
+    if unknown:
+        raise ValueError(
+            f"Unknown survey_items {unknown}; known item ids: {sorted(known_ids)}. "
+            f"The requested ids must be present in the selected survey data, instrument, family, "
+            f"and tier filters."
+        )
+    selected = set(requested)
+    if (
+        include_counterpart_variants
+        and "self-prediction-twin-pd" in selected
+        and SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID in known_ids
+    ):
+        selected.add(SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID)
+    return [item for item in items if item.item_id in selected]
+
+
 def _self_report_record(
     rendering: _SurveyRendering, completion: str, *, prefilled_think: bool
 ) -> dict[str, Any]:
@@ -1888,6 +1951,11 @@ def _survey_renderings(config: EvalConfig) -> list[tuple[_SurveyRendering, str]]
         data_dir=config.survey_data_dir,
         instruments=config.survey_instruments,
         tier=config.survey_tier,
+        include_counterpart_variants=config.survey_counterpart_variants,
+    )
+    battery = _select_survey_items(
+        battery,
+        config.survey_items,
         include_counterpart_variants=config.survey_counterpart_variants,
     )
     for item in battery:
@@ -2584,6 +2652,16 @@ def _refuse_changed_cell(
         if name == "eval_config":
             expected_value = _without_local_paths(expected_value)
             stored_value = _without_local_paths(stored_value)
+            config_names = sorted(set(stored_value) | set(expected_value))
+            for config_name in config_names:
+                stored_config_value = stored_value.get(config_name, "<absent>")
+                expected_config_value = expected_value.get(config_name, "<absent>")
+                if _json_native(stored_config_value) != _json_native(expected_config_value):
+                    drifted.append(
+                        f"eval_config.{config_name}: {_drift_repr(stored_config_value)} on disk, "
+                        f"{_drift_repr(expected_config_value)} now"
+                    )
+            continue
         if _json_native(stored_value) != _json_native(expected_value):
             drifted.append(
                 f"{name}: {_drift_repr(stored_value)} on disk, {_drift_repr(expected_value)} now"

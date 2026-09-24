@@ -60,6 +60,7 @@ from games.survey import (
     INSTRUMENT_TRIPLE_DOMINANCE,
     PUBLISHED_INSTRUMENTS,
     SCHEMA_VERSION,
+    SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID,
     SURVEY_ALLOCATION,
     SURVEY_CHEAP_TALK,
     SURVEY_CHOICE,
@@ -721,6 +722,11 @@ class TestTheConfigRefusesWhatWouldMisfireLater:
         with pytest.raises(ValueError, match="Unknown survey_families"):
             EvalConfig(survey_families=("negative-controls",))
 
+    def test_a_typoed_item_is_refused_with_the_known_ids(self) -> None:
+        with pytest.raises(ValueError, match="Unknown survey_items") as refusal:
+            EvalConfig(survey_items=("self-prediction-does-not-exist",))
+        assert "self-prediction-twin-pd" in str(refusal.value)
+
     def test_a_repeated_instrument_is_refused(self) -> None:
         """It would ask those items twice under one sample index and double-weight the composite."""
         with pytest.raises(ValueError, match="more than once"):
@@ -761,6 +767,7 @@ class TestTheConfigRefusesWhatWouldMisfireLater:
             survey_data_dir=data_dir,
             survey_instruments=(INSTRUMENT_TRIPLE_DOMINANCE,),
             survey_families=("triple-dominance-allocation",),
+            survey_items=("self-prediction-twin-pd",),
             survey_tier=TIER_CORE,
         )
         record = config.as_record()
@@ -768,7 +775,45 @@ class TestTheConfigRefusesWhatWouldMisfireLater:
         assert record["survey_data_dir"] == str(data_dir)
         assert record["survey_instruments"] == [INSTRUMENT_TRIPLE_DOMINANCE]
         assert record["survey_families"] == ["triple-dominance-allocation"]
+        assert record["survey_items"] == ["self-prediction-twin-pd"]
         assert record["survey_tier"] == TIER_CORE
+
+    def test_an_unused_item_filter_does_not_change_the_legacy_config_identity(self) -> None:
+        assert "survey_items" not in EvalConfig().as_record()
+
+    def test_an_item_filter_selects_the_parent_and_its_enabled_counterpart_variant(
+        self, tmp_path: Path
+    ) -> None:
+        _, records, _ = run_section(
+            tmp_path,
+            config=EvalConfig(
+                survey_samples=1,
+                batch_size=64,
+                survey_items=("self-prediction-twin-pd",),
+                survey_counterpart_variants=True,
+            ),
+        )
+        selected = survey_records(records)
+        assert {record["item_id"] for record in selected} == {
+            "self-prediction-twin-pd",
+            SELF_PREDICTION_TWIN_PD_WITH_COUNTERPART_ITEM_ID,
+        }
+        assert len(selected) == 4
+
+    def test_an_item_filter_without_variants_selects_only_the_named_item(
+        self, tmp_path: Path
+    ) -> None:
+        _, records, _ = run_section(
+            tmp_path,
+            config=EvalConfig(
+                survey_samples=1,
+                batch_size=64,
+                survey_items=("self-prediction-twin-pd",),
+            ),
+        )
+        selected = survey_records(records)
+        assert {record["item_id"] for record in selected} == {"self-prediction-twin-pd"}
+        assert len(selected) == 2
 
     def test_an_empty_instrument_list_records_every_registered_instrument(self) -> None:
         assert EvalConfig().as_record()["survey_instruments"] == sorted(PUBLISHED_INSTRUMENTS)
