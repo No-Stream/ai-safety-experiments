@@ -92,6 +92,16 @@ def make_adapter_dir(
     return path
 
 
+def make_model_snapshot(path: Path, *, vision_config: bool = True) -> Path:
+    """Write the config seam used to decide whether vLLM must skip the vision tower."""
+    path.mkdir(parents=True, exist_ok=True)
+    config: dict[str, object] = {"architectures": ["Qwen3_5ForConditionalGeneration"]}
+    if vision_config:
+        config["vision_config"] = {"depth": 1}
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return path
+
+
 class RecordingMerge:
     """Stand-in for `export_merged_checkpoint`, so a merge rung is testable without weights."""
 
@@ -176,7 +186,7 @@ class TestResolveServedModel:
         assert merge.calls == []
 
     def test_immutable_source_loads_under_the_canonical_base_identity(self, tmp_path: Path) -> None:
-        snapshot = str(tmp_path / "immutable-snapshot")
+        snapshot = str(make_model_snapshot(tmp_path / "immutable-snapshot"))
         served = resolve_served_model(
             checkpoint=None,
             base_model=BASE_MODEL,
@@ -187,6 +197,34 @@ class TestResolveServedModel:
         )
 
         assert served.model_id == BASE_MODEL
+        assert served.backend_kwargs == {"model_path": snapshot, "language_model_only": True}
+
+    def test_a_local_base_model_path_gets_the_vision_tower_flag(self, tmp_path: Path) -> None:
+        snapshot = make_model_snapshot(tmp_path / "model-path-snapshot")
+        served = resolve_served_model(
+            checkpoint=None,
+            base_model=str(snapshot),
+            backend_kind="vllm",
+            merge_root=tmp_path / "merges",
+            merge_label="base-",
+        )
+
+        assert served.model_id == str(snapshot)
+        assert served.backend_kwargs == {"language_model_only": True}
+
+    def test_a_local_base_without_a_vision_config_needs_no_engine_flag(
+        self, tmp_path: Path
+    ) -> None:
+        snapshot = str(make_model_snapshot(tmp_path / "text-only-snapshot", vision_config=False))
+        served = resolve_served_model(
+            checkpoint=None,
+            base_model=BASE_MODEL,
+            base_model_source=snapshot,
+            backend_kind="vllm",
+            merge_root=tmp_path / "merges",
+            merge_label="base-",
+        )
+
         assert served.backend_kwargs == {"model_path": snapshot}
 
     def test_vllm_passes_the_adapter_through_without_merging(
@@ -217,7 +255,7 @@ class TestResolveServedModel:
         self, tmp_path: Path, merge: RecordingMerge
     ) -> None:
         checkpoint = make_adapter_dir(tmp_path / "checkpoint-70")
-        snapshot = str(tmp_path / "immutable-snapshot")
+        snapshot = str(make_model_snapshot(tmp_path / "immutable-snapshot"))
         served = resolve_served_model(
             checkpoint=checkpoint,
             base_model=BASE_MODEL,
@@ -229,8 +267,26 @@ class TestResolveServedModel:
 
         assert served.model_id == BASE_MODEL
         assert served.backend_kwargs["model_path"] == snapshot
+        assert served.backend_kwargs["language_model_only"] is True
         assert served.backend_kwargs["lora_adapter"] == str(checkpoint)
         assert merge.calls == []
+
+    def test_transformers_keeps_the_local_base_path_without_the_vllm_flag(
+        self, tmp_path: Path, merge: RecordingMerge
+    ) -> None:
+        checkpoint = make_adapter_dir(tmp_path / "checkpoint-70")
+        snapshot = str(make_model_snapshot(tmp_path / "immutable-snapshot"))
+        served = resolve_served_model(
+            checkpoint=checkpoint,
+            base_model=BASE_MODEL,
+            base_model_source=snapshot,
+            backend_kind="hf",
+            merge_root=tmp_path / "merges",
+            merge_label="arm-step-70-",
+        )
+
+        assert served.backend_kwargs == {"dtype": torch.float32}
+        assert merge.calls
 
     def test_the_deltanet_projections_reach_the_engine(self, tmp_path: Path) -> None:
         """A target list missing these adapts a quarter of the stack and says nothing.

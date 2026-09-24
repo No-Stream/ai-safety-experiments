@@ -377,6 +377,16 @@ def _declares_vision_config(snapshot_dir: Path) -> bool:
     return "vision_config" in config
 
 
+def _vllm_language_model_only_kwargs(backend_kind: str, model_source: str) -> dict[str, object]:
+    """Skip a local checkpoint's vision tower on vLLM when its config declares one."""
+    if backend_kind != "vllm":
+        return {}
+    source_path = Path(model_source)
+    if not source_path.is_dir() or not _declares_vision_config(source_path):
+        return {}
+    return {"language_model_only": True}
+
+
 def _local_weights_digests(snapshot_dir: Path) -> tuple[tuple[str, str], ...]:
     """Hash every tensor file in the directory, refusing a directory that carries none."""
     files = sorted(path for path in snapshot_dir.iterdir() if path.suffix == SAFETENSORS_SUFFIX)
@@ -636,11 +646,14 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
     if full_weights is not None:
         return _resolve_full_weights_serving(full_weights, backend_kind)
     if checkpoint is None:
+        backend_kwargs = _vllm_language_model_only_kwargs(backend_kind, load_source)
+        if load_source != base_model:
+            backend_kwargs = {"model_path": load_source, **backend_kwargs}
         return ServedModel(
             model_id=base_model,
             load_mode=LOAD_MODE_BASE,
             adapter_dir=None,
-            backend_kwargs=({"model_path": load_source} if load_source != base_model else {}),
+            backend_kwargs=backend_kwargs,
         )
     if backend_kind == MOCK_BACKEND_KIND:
         logger.warning(
@@ -668,6 +681,7 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
                 # Naming the adapter's own targets is what makes a module the engine cannot wrap
                 # raise instead of being skipped with a DEBUG line nobody reads.
                 "lora_target_modules": list(facts.target_modules),
+                **_vllm_language_model_only_kwargs(backend_kind, load_source),
                 **({"model_path": load_source} if load_source != base_model else {}),
             },
         )

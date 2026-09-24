@@ -663,6 +663,16 @@ class _FakeVllmModule:
     class LLM:
         def __init__(self, **kwargs: object) -> None:
             self.kwargs = dict(kwargs)
+            self.llm_engine = SimpleNamespace(
+                vllm_config=SimpleNamespace(
+                    cache_config=SimpleNamespace(
+                        num_gpu_blocks=123,
+                        kv_cache_size_tokens=456789,
+                        kv_cache_max_concurrency=13.5,
+                    ),
+                    model_config=SimpleNamespace(max_model_len=32768),
+                )
+            )
 
 
 def _patch_fake_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -736,6 +746,20 @@ class TestTheVllmBackendPassesTheStopAndTheSeedItWasConfiguredWith:
         params = _vllm_sampling_params(monkeypatch, SamplingConfig(max_new_tokens=64, seed=seed))
 
         assert params.kwargs["seed"] == seed
+
+    def test_construction_logs_the_engine_kv_cache_capacity(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _patch_loaders(monkeypatch)
+        _patch_fake_vllm(monkeypatch)
+
+        with caplog.at_level("INFO", logger="reward_hacking.model_backend"):
+            VLLMBackend("Qwen/Qwen3.5-4B", sampling=_sampling_base())
+
+        assert (
+            "vLLM KV cache capacity: num_gpu_blocks=123 kv_cache_tokens=456789 "
+            "max_concurrency_at_max_model_len=13.5 max_model_len=32768"
+        ) in caplog.text
 
 
 class TestTheGenerationSeedFieldIsHonestPerBackend:
@@ -1164,6 +1188,16 @@ class TestServingFromASnapshotDirectory:
         class FakeLLM:
             def __init__(self, **kwargs: object) -> None:
                 built.append(kwargs)
+                self.llm_engine = SimpleNamespace(
+                    vllm_config=SimpleNamespace(
+                        cache_config=SimpleNamespace(
+                            num_gpu_blocks=123,
+                            kv_cache_size_tokens=456789,
+                            kv_cache_max_concurrency=13.5,
+                        ),
+                        model_config=SimpleNamespace(max_model_len=32768),
+                    )
+                )
 
         class FakeSamplingParams:
             def __init__(self, **kwargs: object) -> None:

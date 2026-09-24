@@ -860,6 +860,16 @@ class VLLMBackend:
         # No trust_remote_code: see TRUST_REMOTE_CODE_WITHHELD_REASON.
         self._tokenizer = AutoTokenizer.from_pretrained(load_from)
         self._llm = vllm.LLM(model=load_from, **engine_kwargs)
+        engine_config = self._llm.llm_engine.vllm_config
+        cache_config = engine_config.cache_config
+        logger.info(
+            "vLLM KV cache capacity: num_gpu_blocks=%s kv_cache_tokens=%s "
+            "max_concurrency_at_max_model_len=%s max_model_len=%s",
+            cache_config.num_gpu_blocks,
+            cache_config.kv_cache_size_tokens,
+            cache_config.kv_cache_max_concurrency,
+            engine_config.model_config.max_model_len,
+        )
         self.lora_adapter = None if lora_adapter is None else str(lora_adapter)
         self._lora_request = (
             None
