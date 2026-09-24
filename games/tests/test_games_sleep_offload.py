@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -100,7 +101,7 @@ def test_sleep_offload_round_trip_preserves_policy_and_optimizer_state(
     assert generation.events == ["sync", "generate"]
     assert empty_cache_calls == [None]
     assert timer.phases == ["policy_to_cpu", "policy_to_cuda"]
-    assert model.devices == ["cpu", torch.device("cpu")]
+    assert model.devices == []
     assert [id(parameter) for parameter in model.parameters()] == parameter_ids
     assert [
         id(parameter) for group in optimizer.param_groups for parameter in group["params"]
@@ -112,6 +113,32 @@ def test_sleep_offload_round_trip_preserves_policy_and_optimizer_state(
         }
         for parameter, state in optimizer.state.items()
     } == optimizer_state_devices
+
+
+def test_cpu_policy_round_trip_preserves_identity_and_measures_copy_seconds() -> None:
+    """The small CPU analogue keeps the policy objects while exercising both copies."""
+    model = torch.nn.Sequential(torch.nn.Linear(2, 3), torch.nn.BatchNorm1d(3))
+    parameter_ids = tuple(id(parameter) for parameter in model.parameters())
+    buffer_ids = tuple(id(buffer) for buffer in model.buffers())
+    original_parameters = [parameter.detach().clone() for parameter in model.parameters()]
+    original_buffers = [buffer.detach().clone() for buffer in model.buffers()]
+
+    start = time.perf_counter()
+    cpu_staging = gt.move_policy_to_cpu_staging(model)
+    gt.restore_policy_from_cpu_staging(model, cpu_staging, torch.device("cpu"))
+    round_trip_seconds = time.perf_counter() - start
+
+    assert round_trip_seconds >= 0.0
+    assert tuple(id(parameter) for parameter in model.parameters()) == parameter_ids
+    assert tuple(id(buffer) for buffer in model.buffers()) == buffer_ids
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(model.parameters(), original_parameters, strict=True)
+    )
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(model.buffers(), original_buffers, strict=True)
+    )
 
 
 def test_sleep_offload_refuses_a_non_colocated_vllm_trainer() -> None:

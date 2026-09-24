@@ -191,6 +191,7 @@ from grpo.estimator_defaults import (
     assert_liger_faithful_estimator,
     executed_estimator,
 )
+from grpo.liger_frozen_head import FrozenHeadLigerGRPOLoss
 from grpo.rlvr_math import (
     MemoryMonitorCallback,
     NonFiniteMetricCallback,
@@ -744,6 +745,10 @@ class GameTrainConfig:
     vllm_gpu_memory_utilization: float = VLLM_COLOCATE_GPU_FRACTION
     # Opt-in handoff: sleep the engine during training and move the policy out while it wakes.
     colocate_sleep_offload: bool = False
+    # Opt-in: skip Liger's full-vocabulary gradient buffers for the frozen lm_head (~6 GiB at 9B).
+    # Same loss and gradients (games/tests/test_liger_frozen_head.py), so off by default only to
+    # keep existing runs byte-for-byte reproducible.
+    liger_frozen_head: bool = False
     # TRL's own default, and deliberately left at it: switching it off changes the gradient
     # estimator, which is a science decision needing a recorded caveat rather than a default. What
     # each setting costs at the production shape is in `log_colocate_settings`.
@@ -850,6 +855,7 @@ class GameTrainConfig:
                 f"groups than the optimizer step needs and the batch handed to TRL would be short."
             )
         self._validate_penalty_epsilon_and_dropout()
+        self._validate_liger_frozen_head()
         assert_known_estimator(self.loss_type, self.scale_rewards)
         assert_liger_faithful_estimator(
             self.loss_type,
@@ -888,6 +894,12 @@ class GameTrainConfig:
             save_steps=1 if self.smoke else self.save_steps,
             save_total_limit=0 if self.smoke else self.save_total_limit,
         )
+
+    def _validate_liger_frozen_head(self) -> None:
+        if self.liger_frozen_head and not self.use_liger_kernel:
+            raise ValueError(
+                "liger_frozen_head patches the Liger loss, so it needs use_liger_kernel"
+            )
 
     def _validate_penalty_epsilon_and_dropout(self) -> None:
         """Refuse the three knobs whose value is what makes the arithmetic downstream mean anything.
@@ -3640,6 +3652,54 @@ class DynamicSampledGRPOTrainer(PaddingTrimmedGRPOTrainer):
         )
 
 
+@dataclass(frozen=True)
+class PolicyCpuStaging:
+    """The policy tensors' original devices, retained while vLLM owns the card."""
+
+    tensors: tuple[torch.Tensor, ...]
+    devices: tuple[torch.device, ...]
+    tensor_ids: tuple[int, ...]
+
+
+def _policy_tensors(model: torch.nn.Module) -> tuple[torch.Tensor, ...]:
+    """Return every tensor whose storage must follow a policy across the vLLM interval."""
+    return (*model.parameters(), *model.buffers())
+
+
+def move_policy_to_cpu_staging(model: torch.nn.Module) -> PolicyCpuStaging:
+    """Move policy storage into pinned host buffers without replacing Parameter objects."""
+    tensors = _policy_tensors(model)
+    devices = tuple(tensor.device for tensor in tensors)
+    use_pinned_memory = any(device.type == "cuda" for device in devices)
+    for tensor in tensors:
+        cpu_copy = torch.empty_like(tensor, device="cpu", pin_memory=use_pinned_memory)
+        cpu_copy.copy_(tensor.detach(), non_blocking=use_pinned_memory)
+        tensor.data = cpu_copy
+    if use_pinned_memory:
+        torch.cuda.synchronize()
+    return PolicyCpuStaging(
+        tensors=tensors,
+        devices=devices,
+        tensor_ids=tuple(id(tensor) for tensor in tensors),
+    )
+
+
+def restore_policy_from_cpu_staging(
+    model: torch.nn.Module, staging: PolicyCpuStaging, training_device: torch.device
+) -> None:
+    """Restore policy storage after vLLM has released its allocation."""
+    tensors = _policy_tensors(model)
+    if tuple(id(tensor) for tensor in tensors) != staging.tensor_ids:
+        raise RuntimeError("policy tensor identity changed during colocated sleep offload")
+    if any(device != training_device for device in staging.devices):
+        raise RuntimeError(
+            "colocated sleep offload needs every policy tensor on one training device, "
+            f"got {staging.devices=}"
+        )
+    for tensor in tensors:
+        tensor.data = tensor.detach().to(training_device, non_blocking=True, copy=True)
+
+
 def install_colocated_sleep_offload(  # noqa: C901 - two wrapped seams share one placement invariant
     trainer: GRPOTrainer, phase_timer: StepPhaseTimer
 ) -> None:
@@ -3660,7 +3720,7 @@ def install_colocated_sleep_offload(  # noqa: C901 - two wrapped seams share one
             f"colocate sleep offload needs one policy device, got {training_devices=}"
         )
     training_device = training_devices[0]
-    placement_before_sync: tuple[tuple[int, ...], dict[int, dict[str, torch.device]]] | None = None
+    placement_before_sync: tuple[PolicyCpuStaging, dict[int, dict[str, torch.device]]] | None = None
 
     def optimizer_state_devices() -> dict[int, dict[str, torch.device]]:
         optimizer = trainer_internals.optimizer
@@ -3677,9 +3737,8 @@ def install_colocated_sleep_offload(  # noqa: C901 - two wrapped seams share one
 
     def offloaded_sync_weights(*args: object, **kwargs: object) -> object:
         nonlocal placement_before_sync
-        placement_before_sync = (parameter_ids, optimizer_state_devices())
         with cast("Any", phase_timer).phase("policy_to_cpu"):
-            model.to("cpu")
+            placement_before_sync = (move_policy_to_cpu_staging(model), optimizer_state_devices())
             torch.cuda.empty_cache()
         return original_sync_weights(*args, **kwargs)
 
@@ -3688,11 +3747,12 @@ def install_colocated_sleep_offload(  # noqa: C901 - two wrapped seams share one
         result = original_generate(*args, **kwargs)
         if not generation._llm_weights_sleeping:  # noqa: SLF001 - TRL's sleep completion state
             raise RuntimeError("vLLM generation returned before the sleep-mode engine slept")
-        with cast("Any", phase_timer).phase("policy_to_cuda"):
-            model.to(training_device)
         if placement_before_sync is None:
             raise RuntimeError("vLLM generated without a preceding policy offload")
-        expected_parameter_ids, expected_optimizer_devices = placement_before_sync
+        staging, expected_optimizer_devices = placement_before_sync
+        with cast("Any", phase_timer).phase("policy_to_cuda"):
+            restore_policy_from_cpu_staging(model, staging, training_device)
+        expected_parameter_ids = parameter_ids
         if tuple(id(parameter) for parameter in model.parameters()) != expected_parameter_ids:
             raise RuntimeError("policy parameter identity changed across colocated sleep offload")
         if tuple(parameter.device for parameter in model.parameters()) != training_devices:
@@ -3778,6 +3838,8 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
             phase_timer,
         ],
     )
+    if config.liger_frozen_head:
+        cast("Any", trainer).liger_loss = FrozenHeadLigerGRPOLoss(trainer.liger_loss)
     phase_timer.attach(trainer)
     if config.colocate_sleep_offload:
         prepare_colocated_sleep_offload(trainer, phase_timer)
@@ -4380,6 +4442,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             "OPT-IN: sleep the colocated vLLM engine between rollouts and offload the policy to "
             "CPU while it wakes, allowing the engine's awake allocation to exceed the training "
             "allocation. Adds host-device transfer time per generation."
+        ),
+    )
+    parser.add_argument(
+        "--liger-frozen-head",
+        action="store_true",
+        help=(
+            "OPT-IN: use a Liger GRPO loss that allocates no gradient buffers for the frozen "
+            "lm_head (about 6 GiB at 9B). Same loss and gradients; needs the Liger kernel."
         ),
     )
     _add_sampler_mismatch_arguments(parser)

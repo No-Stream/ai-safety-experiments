@@ -200,6 +200,16 @@ class TestParseArgs:
         assert default.colocate_sleep_offload is False
         assert requested.colocate_sleep_offload is True
 
+    def test_liger_frozen_head_is_explicit_and_needs_liger(self):
+        default = gt._parse_args(["--arm", "dictator", "--generate-fresh"])
+        requested = gt._parse_args(["--arm", "dictator", "--generate-fresh", "--liger-frozen-head"])
+        assert default.liger_frozen_head is False
+        assert requested.liger_frozen_head is True
+        with pytest.raises(ValueError, match="needs use_liger_kernel"):
+            gt._parse_args(
+                ["--arm", "dictator", "--generate-fresh", "--liger-frozen-head", "--no-liger"]
+            )
+
     def test_flags_map_onto_config_fields(self):
         config = gt._parse_args(
             [

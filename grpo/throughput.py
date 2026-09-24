@@ -468,10 +468,8 @@ def instrument_generation(trainer: GRPOTrainer) -> list[float]:
 
 STEP_PHASES: tuple[str, ...] = (
     "rollout_score",
-    "policy_to_cpu",
     "sync_weights",
     "generate",
-    "policy_to_cuda",
     "decode",
     "rewards",
     "logps_forward",
@@ -479,6 +477,9 @@ STEP_PHASES: tuple[str, ...] = (
     "backward",
     "grad_clip",
     "optimizer_step",
+    # Only nonzero under --colocate-sleep-offload; appended so earlier phases keep their positions.
+    "policy_to_cpu",
+    "policy_to_cuda",
 )
 TIMING_METRIC_PREFIX = "timing/"
 STEP_INTERVAL_METRIC = f"{TIMING_METRIC_PREFIX}step_interval_s"
