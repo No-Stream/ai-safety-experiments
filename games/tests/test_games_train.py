@@ -192,6 +192,14 @@ class TestOutputDirNaming:
 
 
 class TestParseArgs:
+    def test_colocate_sleep_offload_is_explicit(self):
+        default = gt._parse_args(["--arm", "dictator", "--generate-fresh"])
+        requested = gt._parse_args(
+            ["--arm", "dictator", "--generate-fresh", "--colocate-sleep-offload"]
+        )
+        assert default.colocate_sleep_offload is False
+        assert requested.colocate_sleep_offload is True
+
     def test_flags_map_onto_config_fields(self):
         config = gt._parse_args(
             [
@@ -1775,6 +1783,16 @@ class TestVllmColocateIsTheOnlyGeneration:
         assert args.vllm_gpu_memory_utilization == pytest.approx(gt.VLLM_COLOCATE_GPU_FRACTION)
         assert args.vllm_gpu_memory_utilization == pytest.approx(0.35)
 
+    def test_sleep_offload_is_opt_in_and_stops_trainer_placement_before_engine_build(self):
+        default = self.build()
+        sleep_offload = self.build(colocate_sleep_offload=True)
+        assert default.vllm_enable_sleep_mode is False
+        assert default.place_model_on_device is None
+        assert sleep_offload.vllm_enable_sleep_mode is True
+        assert sleep_offload.place_model_on_device is False
+        assert isinstance(sleep_offload.model_init_kwargs, dict)
+        assert sleep_offload.model_init_kwargs["device_map"] is None
+
     def test_the_incident_export_is_refused_at_config_construction(
         self, monkeypatch: pytest.MonkeyPatch
     ):
@@ -1818,7 +1836,9 @@ class TestVllmColocateIsTheOnlyGeneration:
         assert make_config().vllm_importance_sampling_correction is True
         assert (
             self.build().vllm_importance_sampling_correction
-            is GRPOConfig(output_dir=self.OUTPUT_DIR).vllm_importance_sampling_correction
+            is GRPOConfig(
+                output_dir=self.OUTPUT_DIR, bf16=False
+            ).vllm_importance_sampling_correction
         )
 
     def test_dropping_the_estimator_correction_reaches_trl(self):
@@ -1829,7 +1849,7 @@ class TestVllmColocateIsTheOnlyGeneration:
         """The mode decides what the correction DOES with the log-probability difference, so it is
         passed rather than left implicit: a run whose record names token_truncate while TRL kept its
         sequence-level default would report a treatment it never ran."""
-        default = GRPOConfig(output_dir=self.OUTPUT_DIR).vllm_importance_sampling_mode
+        default = GRPOConfig(output_dir=self.OUTPUT_DIR, bf16=False).vllm_importance_sampling_mode
         assert self.build().vllm_importance_sampling_mode == default
         assert (
             self.build(vllm_importance_sampling_mode="token_truncate").vllm_importance_sampling_mode

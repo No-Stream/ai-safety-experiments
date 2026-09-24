@@ -742,6 +742,8 @@ class GameTrainConfig:
     # no backend field because there is no backend choice (games.generation.VLLM_ONLY_RATIONALE).
     # These two knobs tune the engine; nothing turns it off.
     vllm_gpu_memory_utilization: float = VLLM_COLOCATE_GPU_FRACTION
+    # Opt-in handoff: sleep the engine during training and move the policy out while it wakes.
+    colocate_sleep_offload: bool = False
     # TRL's own default, and deliberately left at it: switching it off changes the gradient
     # estimator, which is a science decision needing a recorded caveat rather than a default. What
     # each setting costs at the production shape is in `log_colocate_settings`.
@@ -1094,6 +1096,7 @@ def _vllm_arguments(config: GameTrainConfig) -> dict[str, Any]:
         "use_vllm": True,
         "vllm_mode": "colocate",
         "vllm_gpu_memory_utilization": config.vllm_gpu_memory_utilization,
+        "vllm_enable_sleep_mode": config.colocate_sleep_offload,
         "vllm_max_model_length": config.vllm_max_model_length,
         "vllm_importance_sampling_correction": config.vllm_importance_sampling_correction,
         # Passed even with the correction off, where TRL reads it nowhere: `training_args.bin` then
@@ -2369,9 +2372,19 @@ def _build_grpo_config(
     )
 
 
+class SleepOffloadGRPOConfig(GRPOConfig):
+    """Tell transformers to leave the policy on CPU until the sleeping engine has been built."""
+
+    @property
+    def place_model_on_device(self) -> bool:
+        """Keep the policy on CPU until the colocated engine is asleep."""
+        return False
+
+
 def _trl_arguments(config: GameTrainConfig, plan: SizingPlan, *, dtype: torch.dtype) -> GRPOConfig:
     """Build the arguments TRL derives its own batch shape from, before any widening."""
-    return GRPOConfig(
+    config_class = SleepOffloadGRPOConfig if config.colocate_sleep_offload else GRPOConfig
+    return config_class(
         output_dir=cast("str", config.output_dir),
         run_name=f"{config.arm}-{path_safe_model_id(config.model_id)}",
         seed=config.seed,
@@ -2436,8 +2449,9 @@ def _trl_arguments(config: GameTrainConfig, plan: SizingPlan, *, dtype: torch.dt
             # `dtype`, not `torch_dtype`: TRL ignores the latter in favour of its own key and the
             # model would load in float32 while bf16=True told the trainer to autocast.
             "dtype": dtype,
-            # No device_map: "auto" shards across every visible card, which collides with the
-            # two-GPU topology that puts a vLLM server on GPU1.
+            # TRL otherwise injects device_map="auto" on CUDA. Sleep/offload must keep the policy
+            # on CPU until the engine has been constructed and slept.
+            **({"device_map": None} if config.colocate_sleep_offload else {}),
             "trust_remote_code": True,
         },
         **_vllm_arguments(config),
@@ -2562,6 +2576,7 @@ def _derive_plan(
     engine_reserved_gib = colocate_reserved_gib(
         total_vram_gib=cast("float", device["total_vram_gib"]),
         gpu_memory_utilization=config.vllm_gpu_memory_utilization,
+        sleep_mode=config.colocate_sleep_offload,
     )
     plan = plan_sizing(
         num_generations=config.num_generations,
@@ -3625,6 +3640,84 @@ class DynamicSampledGRPOTrainer(PaddingTrimmedGRPOTrainer):
         )
 
 
+def install_colocated_sleep_offload(  # noqa: C901 - two wrapped seams share one placement invariant
+    trainer: GRPOTrainer, phase_timer: StepPhaseTimer
+) -> None:
+    """Offload the policy for the engine's awake interval, preserving its optimizer objects."""
+    trainer_internals = cast("Any", trainer)
+    if not (trainer_internals.use_vllm and trainer_internals.vllm_mode == "colocate"):
+        raise ValueError("colocate sleep offload requires a trainer built with colocated vLLM")
+    model = cast("torch.nn.Module", trainer_internals.model)
+    generation = trainer_internals.vllm_generation
+    original_sync_weights = generation.sync_weights
+    original_generate = generation.generate
+    training_devices = tuple(parameter.device for parameter in model.parameters())
+    parameter_ids = tuple(id(parameter) for parameter in model.parameters())
+    if not training_devices:
+        raise RuntimeError("cannot offload a policy with no parameters")
+    if len(set(training_devices)) != 1:
+        raise RuntimeError(
+            f"colocate sleep offload needs one policy device, got {training_devices=}"
+        )
+    training_device = training_devices[0]
+    placement_before_sync: tuple[tuple[int, ...], dict[int, dict[str, torch.device]]] | None = None
+
+    def optimizer_state_devices() -> dict[int, dict[str, torch.device]]:
+        optimizer = trainer_internals.optimizer
+        if optimizer is None:
+            return {}
+        return {
+            id(parameter): {
+                name: value.device
+                for name, value in state.items()
+                if isinstance(value, torch.Tensor)
+            }
+            for parameter, state in optimizer.state.items()
+        }
+
+    def offloaded_sync_weights(*args: object, **kwargs: object) -> object:
+        nonlocal placement_before_sync
+        placement_before_sync = (parameter_ids, optimizer_state_devices())
+        with cast("Any", phase_timer).phase("policy_to_cpu"):
+            model.to("cpu")
+            torch.cuda.empty_cache()
+        return original_sync_weights(*args, **kwargs)
+
+    def restored_generate(*args: object, **kwargs: object) -> object:
+        nonlocal placement_before_sync
+        result = original_generate(*args, **kwargs)
+        if not generation._llm_weights_sleeping:  # noqa: SLF001 - TRL's sleep completion state
+            raise RuntimeError("vLLM generation returned before the sleep-mode engine slept")
+        with cast("Any", phase_timer).phase("policy_to_cuda"):
+            model.to(training_device)
+        if placement_before_sync is None:
+            raise RuntimeError("vLLM generated without a preceding policy offload")
+        expected_parameter_ids, expected_optimizer_devices = placement_before_sync
+        if tuple(id(parameter) for parameter in model.parameters()) != expected_parameter_ids:
+            raise RuntimeError("policy parameter identity changed across colocated sleep offload")
+        if tuple(parameter.device for parameter in model.parameters()) != training_devices:
+            raise RuntimeError(
+                "policy parameters did not return to their training device after generation"
+            )
+        if optimizer_state_devices() != expected_optimizer_devices:
+            raise RuntimeError("optimizer state moved during colocated sleep offload")
+        placement_before_sync = None
+        return result
+
+    generation.sync_weights = offloaded_sync_weights
+    generation.generate = restored_generate
+
+
+def prepare_colocated_sleep_offload(trainer: GRPOTrainer, phase_timer: StepPhaseTimer) -> None:
+    """Put the policy on CUDA only after TRL has constructed and slept the vLLM engine."""
+    trainer_internals = cast("Any", trainer)
+    generation = trainer_internals.vllm_generation
+    if not generation._llm_weights_sleeping:  # noqa: SLF001 - TRL's post-construction sleep state
+        raise RuntimeError("vLLM engine was not asleep after sleep-mode construction")
+    trainer_internals.model.to(trainer_internals.accelerator.device)
+    install_colocated_sleep_offload(trainer, phase_timer)
+
+
 def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
     """Construct the trainer this plan calls for, and stamp the tokenizer's ids onto the model."""
     config = prepared.config
@@ -3686,6 +3779,8 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
         ],
     )
     phase_timer.attach(trainer)
+    if config.colocate_sleep_offload:
+        prepare_colocated_sleep_offload(trainer, phase_timer)
     # Not what generation reads -- TRL passes `generate()` its own GenerationConfig and overrides
     # the model's -- but what `save_model` writes, which is what every downstream eval load reads.
     model = trainer.model
@@ -4276,6 +4371,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             f"the colocated engine's share of TOTAL card VRAM, held for the whole run and "
             f"subtracted from what the sizing plan may spend. Defaults from "
             f"{VLLM_GPU_FRACTION_ENV}, else the measured {VLLM_COLOCATE_GPU_FRACTION}."
+        ),
+    )
+    parser.add_argument(
+        "--colocate-sleep-offload",
+        action="store_true",
+        help=(
+            "OPT-IN: sleep the colocated vLLM engine between rollouts and offload the policy to "
+            "CPU while it wakes, allowing the engine's awake allocation to exceed the training "
+            "allocation. Adds host-device transfer time per generation."
         ),
     )
     _add_sampler_mismatch_arguments(parser)

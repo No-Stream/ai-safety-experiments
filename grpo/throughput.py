@@ -468,8 +468,10 @@ def instrument_generation(trainer: GRPOTrainer) -> list[float]:
 
 STEP_PHASES: tuple[str, ...] = (
     "rollout_score",
+    "policy_to_cpu",
     "sync_weights",
     "generate",
+    "policy_to_cuda",
     "decode",
     "rewards",
     "logps_forward",

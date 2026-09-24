@@ -201,7 +201,9 @@ class SizingPlan:
     engine_reserved_gib: float = 0.0
 
 
-def colocate_reserved_gib(*, total_vram_gib: float, gpu_memory_utilization: float) -> float:
+def colocate_reserved_gib(
+    *, total_vram_gib: float, gpu_memory_utilization: float, sleep_mode: bool = False
+) -> float:
     """Return the VRAM a colocated vLLM engine takes out of the card before the trainer allocates.
 
     vLLM reads `gpu_memory_utilization` as a fraction of the card's TOTAL memory rather than of
@@ -223,6 +225,9 @@ def colocate_reserved_gib(*, total_vram_gib: float, gpu_memory_utilization: floa
             f"gpu_memory_utilization must be in (0, 1), {gpu_memory_utilization=}: the engine "
             f"holds that share of the card for the whole run, so the trainer needs the rest"
         )
+    # Level-2 sleep releases the engine's weights and KV cache while the trainer is active.
+    if sleep_mode:
+        return 0.0
     return total_vram_gib * gpu_memory_utilization
 
 
