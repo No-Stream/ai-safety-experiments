@@ -19,6 +19,7 @@ from games.argument_prior_map import (
     _summarize_openers,
     donor_cooperation_rates,
     load_openers,
+    spread_across_scenarios,
 )
 from games.inference_utils import adapter_digest, append_jsonl, content_key, load_completed_keys
 from games.kl_footprint import derive_kl_row_group_size, matched_norm_random_lora
@@ -235,3 +236,21 @@ def test_donor_cooperation_counts_the_canonical_cooperate_action() -> None:
     ]
     rates = donor_cooperation_rates(records)
     assert rates["twin|cut-0|base"] == {"records": 4, "parsed": 3, "cooperate": 2, "rate": 2 / 3}
+
+
+def test_context_rows_spread_across_scenarios_before_label_arrangements() -> None:
+    """Four rows once meant one scenario in four label arrangements (2026-09-25 first cut)."""
+    rows = [
+        {
+            "reskin_id": f"scenario-{scenario}",
+            "prompt_id": f"s{scenario}-a{arrangement}",
+            "label_print_order": "x",
+        }
+        for scenario in range(5)
+        for arrangement in range(4)
+    ]
+    picked = spread_across_scenarios(rows, 8)
+    assert len(picked) == 8
+    assert len({row["reskin_id"] for row in picked[:5]}) == 5
+    assert len({row["prompt_id"] for row in picked}) == 8
+    assert len({row["prompt_id"].split("-a")[1] for row in picked[:5]}) > 1

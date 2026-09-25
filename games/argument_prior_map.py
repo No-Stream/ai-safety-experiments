@@ -328,6 +328,32 @@ def load_openers(path: Path) -> tuple[Opener, ...]:
     return openers
 
 
+def spread_across_scenarios(
+    rendered_rows: Sequence[dict[str, Any]], count: int
+) -> list[dict[str, Any]]:
+    """Pick `count` rows round-robin across scenarios, rotating through each one's label arrangements.
+
+    Sorting by prompt id and taking the first rows once gave every cell a single scenario in four
+    label arrangements, so the spread measured label order rather than scenario variation.
+    """
+    by_scenario: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rendered_rows:
+        by_scenario[str(row["reskin_id"])].append(row)
+    scenarios = [
+        sorted(rows, key=lambda item: (str(item["prompt_id"]), str(item["label_print_order"])))
+        for _scenario, rows in sorted(by_scenario.items())
+    ]
+    picked: list[dict[str, Any]] = []
+    round_index = 0
+    while len(picked) < count and any(round_index < len(rows) for rows in scenarios):
+        for scenario_index, rows in enumerate(scenarios):
+            arrangement = (round_index + scenario_index) % len(rows)
+            if round_index < len(rows) and len(picked) < count:
+                picked.append(rows[arrangement])
+        round_index += 1
+    return picked
+
+
 def context_rows(
     tokenizer: TeacherForcingTokenizer,
     *,
@@ -353,11 +379,7 @@ def context_rows(
                     label_print_order=label_print_order,
                 )
             ]
-            ordered_rows = sorted(
-                rendered_rows,
-                key=lambda item: (str(item["prompt_id"]), str(item["label_print_order"])),
-            )
-            for row in ordered_rows[:rows_per_cell]:
+            for row in spread_across_scenarios(rendered_rows, rows_per_cell):
                 prompt = str(row["prompt"])
                 selected.append(
                     ContextRow(
