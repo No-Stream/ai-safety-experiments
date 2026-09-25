@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
-from games import arm_sequence
+from games import arm_sequence, rewards
 from games import arms as games_arms
 from games.arms import (
     GameArm,
@@ -176,6 +176,90 @@ class Recorder:
 
     def log_extra(self, column: str, values: list[Any]) -> None:
         self.extra[column] = list(values)
+
+
+class TestTailLengthPenalty:
+    """The opt-in tail term uses the same generated-token count TRL logs."""
+
+    def test_the_penalty_is_zero_through_the_start_then_ramps_to_the_cap(self) -> None:
+        assert rewards.tail_length_penalties(
+            [4, 8, 10, 12, 16], start=8, cap=12, max_penalty=0.2
+        ) == pytest.approx([0.0, 0.0, 0.1, 0.2, 0.2])
+
+    def test_prefilled_thinking_counts_generated_tokens_before_the_close_marker(self) -> None:
+        assert rewards.thinking_token_lengths(
+            ["reasoning</think><action>C</action>"],
+            [[7, 8, 91, 4, 5]],
+            prefilled_think=True,
+            open_marker=[90],
+            close_marker=[91],
+        ) == [2]
+
+    def test_the_default_reward_has_no_tail_penalty(self, recorder: Recorder) -> None:
+        rows = [make_row(framing_id="plain"), make_row(framing_id="plain")]
+        completion_ids = [[1] * 9, [1] * 12]
+        ordinary = make_game_reward(2, prefilled_think=False)
+        explicit_off = make_game_reward(
+            2,
+            prefilled_think=False,
+            tail_length_penalty_start=None,
+            tail_length_penalty_max=0.0,
+            completion_cap=12,
+        )
+        kwargs = {
+            "completions": [COOPERATE_COMPLETION, DEFECT_COMPLETION],
+            "completion_ids": completion_ids,
+            "framing_id": ["plain", "plain"],
+            "log_metric": recorder.log_metric,
+            "log_extra": recorder.log_extra,
+            **as_columns(rows),
+        }
+        assert ordinary(**kwargs) == pytest.approx(explicit_off(**kwargs))
+
+    def test_per_framing_thinking_length_is_logged_in_tokens(self, recorder: Recorder) -> None:
+        reward = make_game_reward(
+            2,
+            prefilled_think=False,
+            tail_length_penalty_start=8,
+            tail_length_penalty_max=0.2,
+            completion_cap=12,
+            think_open_token_ids=[90],
+            think_close_token_ids=[91],
+        )
+        rows = [
+            make_row(framing_id="short-frame"),
+            make_row(framing_id="short-frame"),
+            make_row(prompt_id="prompt-1", framing_id="long-frame"),
+            make_row(prompt_id="prompt-1", framing_id="long-frame"),
+        ]
+        rewards_out = reward(
+            completions=[
+                f"<think>short</think>{COOPERATE_COMPLETION}",
+                f"<think>short</think>{DEFECT_COMPLETION}",
+                f"<think>long</think>{COOPERATE_COMPLETION}",
+                f"<think>long</think>{DEFECT_COMPLETION}",
+            ],
+            completion_ids=[
+                [90, 1, 1, 91, 2, 2],
+                [90, 1, 1, 1, 1, 91, 2, 2],
+                [90, 1, 1, 1, 1, 1, 1, 91, 2, 2],
+                [90, 1, 1, 1, 1, 1, 1, 1, 1, 91, 2, 2],
+            ],
+            framing_id=["short-frame", "short-frame", "long-frame", "long-frame"],
+            log_metric=recorder.log_metric,
+            log_extra=recorder.log_extra,
+            **as_columns(rows),
+        )
+        assert recorder.metrics["thinking/mean_length_tokens/framing/short-frame"] == pytest.approx(
+            3.0
+        )
+        assert recorder.metrics["thinking/mean_length_tokens/framing/long-frame"] == pytest.approx(
+            7.0
+        )
+        unpenalized = [PAYOFF_CC / 2 + PAYOFF_CD / 2, PAYOFF_DC / 2 + PAYOFF_DD / 2] * 2
+        assert rewards_out == pytest.approx(
+            [unpenalized[0], unpenalized[1], unpenalized[2] - 0.1, unpenalized[3] - 0.2]
+        )
 
 
 @pytest.fixture

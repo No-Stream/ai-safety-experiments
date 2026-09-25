@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import time
+from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
+from peft import LoraConfig, PeftModel, get_peft_model
 
 from games import sizing
 from games import train as gt
@@ -168,3 +170,69 @@ def test_swap_metrics_reach_the_existing_mem_log_column_set() -> None:
     assert {"policy_to_cpu", "policy_to_cuda"} <= set(STEP_PHASES)
     assert {"timing/policy_to_cpu_s", "timing/policy_to_cuda_s"} <= set(TIMING_METRIC_KEYS)
     assert {"timing/policy_to_cpu_s", "timing/policy_to_cuda_s"} <= set(gt.MEM_LOG_EXTRA_COLUMNS)
+
+
+class TinyPolicy(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(3, 4, bias=False)
+        self.norm = torch.nn.LayerNorm(4)
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.proj(values))
+
+
+class RecordingWeightSink:
+    def __init__(self) -> None:
+        self.pushed: dict[str, torch.Tensor] = {}
+
+    @staticmethod
+    def _fix_param_name_to_vllm(name: str, extra_prefixes: list[str] | None = None) -> str:
+        for prefix in ["_checkpoint_wrapped_module.", *(extra_prefixes or [])]:
+            name = name.replace(prefix, "")
+        return name
+
+    def _push_param_to_vllm(self, name: str, parameter: torch.Tensor) -> None:
+        self.pushed[name] = parameter.detach().cpu().clone()
+
+
+def test_nonmutating_lora_sync_matches_peft_merge_and_preserves_policy_bits() -> None:
+    torch.manual_seed(17)
+    policy = cast(
+        "PeftModel",
+        get_peft_model(
+            cast("Any", TinyPolicy()),
+            LoraConfig(r=2, lora_alpha=4, lora_dropout=0.0, target_modules=["proj"]),
+        ).to(torch.bfloat16),
+    )
+    with torch.no_grad():
+        for name, parameter in policy.named_parameters():
+            if "lora_B" in name:
+                parameter.normal_()
+    reference = deepcopy(policy)
+    before = {name: parameter.detach().clone() for name, parameter in policy.named_parameters()}
+    parameter_ids = {name: id(parameter) for name, parameter in policy.named_parameters()}
+    sink = RecordingWeightSink()
+
+    gt.sync_peft_weights_to_vllm_nonmutating(
+        policy,
+        fix_param_name=sink._fix_param_name_to_vllm,
+        push_param=sink._push_param_to_vllm,
+        merge_device=torch.device("cpu"),
+    )
+    reference_internals = cast("Any", reference)
+    reference_internals.merge_adapter()
+    expected = {
+        name.removeprefix("base_model.model.").replace(".base_layer", ""): parameter.detach()
+        for name, parameter in reference.named_parameters()
+        if cast("str", reference_internals.prefix) not in name and "original_module" not in name
+    }
+
+    assert sink.pushed.keys() == expected.keys()
+    for name, parameter in expected.items():
+        assert torch.equal(sink.pushed[name], parameter), name
+        assert not sink.pushed[name].requires_grad
+    assert before.keys() == dict(policy.named_parameters()).keys()
+    for name, parameter in policy.named_parameters():
+        assert id(parameter) == parameter_ids[name]
+        assert torch.equal(parameter, before[name]), name

@@ -21,6 +21,7 @@ import pytest
 import torch
 from datasets import Dataset
 from transformers import AutoConfig
+from transformers.trainer_utils import SchedulerType
 from trl import GRPOConfig  # pyright: ignore[reportPrivateImportUsage]
 
 from games import corpus_partition, generation, preflight, sizing
@@ -83,6 +84,121 @@ def make_plan(**overrides: object) -> sizing.SizingPlan:
         "weights_gib": 8.0,
     }
     return sizing.plan_sizing(**(kwargs | overrides))  # pyright: ignore[reportArgumentType]
+
+
+class TestTailLengthPenaltyConfig:
+    def test_the_term_is_off_by_default(self) -> None:
+        config = make_config()
+        assert config.tail_length_penalty_start is None
+        assert config.tail_length_penalty_max == pytest.approx(0.0)
+
+    def test_the_flags_are_recorded_and_resume_identity(self, tmp_path: Path) -> None:
+        config = gt._parse_args(
+            [
+                "--arm",
+                "twin-pd-group",
+                "--generate-fresh",
+                "--tail-length-penalty-start",
+                "8192",
+                "--tail-length-penalty-max",
+                "0.2",
+                "--max-completion-tokens",
+                "12288",
+                "--allow-short-completions",
+            ]
+        )
+        assert config.tail_length_penalty_start == 8192
+        assert config.tail_length_penalty_max == pytest.approx(0.2)
+        payload = gt.run_config_payload(
+            replace(config, output_dir=str(tmp_path / "run")),
+            plan=make_plan(),
+            device={"device_name": "cpu"},
+            derived={},
+        )
+        recorded = cast("dict[str, object]", payload["config"])
+        assert recorded["tail_length_penalty_start"] == 8192
+        assert recorded["tail_length_penalty_max"] == pytest.approx(0.2)
+        assert {"tail_length_penalty_start", "tail_length_penalty_max"} <= set(
+            gt.RESUME_IDENTITY_FIELDS
+        )
+
+    @pytest.mark.parametrize(
+        ("start", "maximum"), [(None, 0.2), (12288, 0.2), (8192, 0.0), (8192, -0.1)]
+    )
+    def test_incomplete_or_empty_treatments_are_refused(
+        self, start: int | None, maximum: float
+    ) -> None:
+        with pytest.raises(ValueError, match="tail_length_penalty"):
+            make_config(
+                max_completion_tokens=12288,
+                tail_length_penalty_start=start,
+                tail_length_penalty_max=maximum,
+            )
+
+
+class TestLearningRateScheduleConfig:
+    @pytest.mark.parametrize("scheduler", ["cosine", "constant_with_warmup"])
+    def test_the_scheduler_and_ratio_reach_trl(self, scheduler: str) -> None:
+        config = make_config(lr_scheduler=scheduler, warmup_ratio=0.125)
+        args = gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
+        assert args.lr_scheduler_type == SchedulerType(scheduler)
+        assert args.warmup_steps == pytest.approx(0.125)
+
+    def test_explicit_warmup_steps_override_the_ratio_at_the_cli(self) -> None:
+        config = gt._parse_args(
+            [
+                "--arm",
+                "twin-pd-group",
+                "--generate-fresh",
+                "--lr-scheduler",
+                "constant_with_warmup",
+                "--warmup-steps",
+                "7",
+            ]
+        )
+        assert config.lr_scheduler == "constant_with_warmup"
+        assert config.warmup_ratio is None
+        assert config.warmup_steps == 7
+        args = gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
+        assert args.warmup_steps == 7
+
+    def test_schedule_fields_are_resume_identity(self) -> None:
+        assert {"learning_rate", "lr_scheduler", "warmup_ratio", "warmup_steps"} <= set(
+            gt.RESUME_IDENTITY_FIELDS
+        )
+
+
+class TestSingleForwardVllmImportanceSamplingConfig:
+    def test_equivalent_path_is_on_by_default_and_recorded(self, tmp_path: Path) -> None:
+        config = make_config(liger_frozen_head=True)
+        assert config.single_forward_vllm_importance_sampling is True
+        payload = gt.run_config_payload(
+            replace(config, output_dir=str(tmp_path / "run")),
+            plan=make_plan(),
+            device={"device_name": "cpu"},
+            derived={},
+        )
+        assert (
+            cast("dict[str, object]", payload["config"])["single_forward_vllm_importance_sampling"]
+            is True
+        )
+        assert "single_forward_vllm_importance_sampling" in gt.RESUME_IDENTITY_FIELDS
+
+    def test_the_reference_two_pass_path_can_be_requested(self) -> None:
+        config = gt._parse_args(
+            [
+                "--arm",
+                "twin-pd-group",
+                "--generate-fresh",
+                "--liger-frozen-head",
+                "--two-pass-vllm-importance-sampling",
+            ]
+        )
+        assert config.single_forward_vllm_importance_sampling is False
+
+    def test_single_forward_requires_the_fused_frozen_head_path(self) -> None:
+        with pytest.raises(ValueError, match="single_forward_vllm_importance_sampling"):
+            make_config(liger_frozen_head=False, single_forward_vllm_importance_sampling=True)
 
 
 class TestConfigValidation:
@@ -2329,10 +2445,10 @@ class TestTheColocateEnvironmentIsTheSingleSourceOfTruth:
                 "dictator",
                 "--generate-fresh",
                 "--vllm-gpu-memory-utilization",
-                "0.5",
+                "0.88",
             ]
         )
-        assert config.vllm_gpu_memory_utilization == pytest.approx(0.5)
+        assert config.vllm_gpu_memory_utilization == pytest.approx(0.88)
 
 
 def announce_colocate(config: gt.GameTrainConfig, *, rows: int = 1) -> None:

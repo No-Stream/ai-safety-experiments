@@ -162,11 +162,19 @@ class FrozenHeadLigerGRPOLoss(torch.nn.Module):
                     bias=kwargs.get("ref_bias"),
                     temperature=self.stock_loss.temperature,
                 )
+        vllm_is_ratio = kwargs.get("vllm_is_ratio")
+        vllm_is_ratio_fn = kwargs.get("vllm_is_ratio_fn")
+        if vllm_is_ratio is not None and vllm_is_ratio_fn is not None:
+            raise ValueError("pass either vllm_is_ratio or vllm_is_ratio_fn, not both")
+        if vllm_is_ratio_fn is not None:
+            vllm_is_ratio = vllm_is_ratio_fn(logps)
+        elif callable(vllm_is_ratio):
+            vllm_is_ratio = vllm_is_ratio(logps)
         return compute_loss(
             logps,
             attention_mask,
             advantages,
             ref_per_token_logps_chunk=ref_per_token_logps,
             old_per_token_logps_chunk=kwargs.get("old_per_token_logps"),
-            vllm_is_ratio_chunk=kwargs.get("vllm_is_ratio"),
+            vllm_is_ratio_chunk=vllm_is_ratio,
         )

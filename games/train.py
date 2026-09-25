@@ -57,13 +57,15 @@ import math
 import os
 import random
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
-from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
+from peft import LoraConfig, PeftModel, get_peft_model_state_dict, set_peft_model_state_dict
+from peft.tuners.lora.layer import Linear as LoraLinear
 from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend
 from transformers import AutoConfig, TrainerCallback
@@ -112,6 +114,7 @@ from games.lora import (
     iter_checkpoints,
 )
 from games.pace_guard import StepPaceGuardCallback
+from games.parsing import THINK_CLOSE, THINK_OPEN
 from games.payoffs import (
     STATED_MATCH_PROB_UNSET,
     MatrixGameSpec,
@@ -553,6 +556,10 @@ RESUME_IDENTITY_FIELDS = (
     # they are here rather than left to a reader of the log.
     "adam_epsilon",
     "lora_dropout",
+    "learning_rate",
+    "lr_scheduler",
+    "warmup_ratio",
+    "warmup_steps",
     # The sampler-mismatch instruments, which decide WHICH ESTIMATOR TRL computes exactly as
     # `loss_type` and `scale_rewards` do. With the correction on and log-only off, the surrogate
     # loss is weighted by TRL's ratio (grpo_trainer.py:2896 into liger grpo_loss.py:205-206); with
@@ -566,6 +573,7 @@ RESUME_IDENTITY_FIELDS = (
     "vllm_importance_sampling_log_only",
     "vllm_importance_sampling_mode",
     "cast_lm_head_to_fp32",
+    "single_forward_vllm_importance_sampling",
     # Dynamic sampling decides WHICH PROMPTS an optimizer step trains on: at 1 the step trains the
     # sampler's own draw, above it the live subset of a wider draw. A resume that moved it would put
     # steps trained on two different selections under one step history, and the wider draw also
@@ -575,6 +583,8 @@ RESUME_IDENTITY_FIELDS = (
     # Whether a completion cut off at the cap carries its parse penalty into the gradient or carries
     # nothing, so steps under the two settings train different estimators.
     "mask_truncated_completions",
+    "tail_length_penalty_start",
+    "tail_length_penalty_max",
 )
 # Identity fields added after the first recorded runs, mapped to the value in force when those runs
 # launched -- the then-hardcoded GRPOConfig line for the estimator pair, transformers' own untouched
@@ -591,12 +601,19 @@ RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
     "init_adapter": "",
     "adam_epsilon": 1e-8,
     "lora_dropout": 0.05,
+    "learning_rate": 1e-5,
+    "lr_scheduler": "cosine",
+    "warmup_ratio": 0.1,
+    "warmup_steps": None,
     "vllm_importance_sampling_correction": True,
     "vllm_importance_sampling_log_only": False,
     "vllm_importance_sampling_mode": VLLM_IMPORTANCE_SAMPLING_MODE,
     "cast_lm_head_to_fp32": False,
+    "single_forward_vllm_importance_sampling": False,
     "dynamic_sampling_oversample": 1,
     "mask_truncated_completions": False,
+    "tail_length_penalty_start": None,
+    "tail_length_penalty_max": 0.0,
     "temperature": TRAINING_TEMPERATURE,
     "top_p": TRAINING_TOP_P,
     "top_k": TRAINING_TOP_K,
@@ -697,7 +714,8 @@ class GameTrainConfig:
     micro_batch_size: int | None = None
     learning_rate: float = 1e-5
     lr_scheduler: str = "cosine"
-    warmup_ratio: float = 0.1
+    warmup_ratio: float | None = 0.1
+    warmup_steps: int | None = None
     max_steps: int = 70
     max_prompt_tokens: int = 1024
     # Named, versioned text appended to every user turn before chat templating. This is part of the
@@ -755,6 +773,8 @@ class GameTrainConfig:
     seed: int = 0
     leave_one_out: bool = False
     parse_penalty: float = -1.0
+    tail_length_penalty_start: int | None = None
+    tail_length_penalty_max: float = 0.0
     # Generate this many times the optimizer step's prompt groups and train on the ones that carry a
     # gradient (`DynamicSampledGRPOTrainer`). 1 is off, and off is today's behaviour. A treatment
     # rather than a throughput knob: which prompts an optimizer step trains on stops being the
@@ -785,6 +805,10 @@ class GameTrainConfig:
     # Same loss and gradients (games/tests/test_liger_frozen_head.py), so off by default only to
     # keep existing runs byte-for-byte reproducible.
     liger_frozen_head: bool = False
+    # None selects the single-forward equivalent exactly when the frozen-head fused path can expose
+    # its own per-token log probabilities. Explicit True refuses any shape where that proof does not
+    # apply; False retains TRL's reference two-pass implementation.
+    single_forward_vllm_importance_sampling: bool | None = None
     # TRL's own default, and deliberately left at it: switching it off changes the gradient
     # estimator, which is a science decision needing a recorded caveat rather than a default. What
     # each setting costs at the production shape is in `log_colocate_settings`.
@@ -893,6 +917,9 @@ class GameTrainConfig:
             )
         self._validate_penalty_epsilon_and_dropout()
         self._validate_liger_frozen_head()
+        self._resolve_and_validate_single_forward_importance_sampling()
+        self._validate_learning_rate_schedule()
+        self._validate_tail_length_penalty()
         assert_known_estimator(self.loss_type, self.scale_rewards)
         assert_liger_faithful_estimator(
             self.loss_type,
@@ -944,6 +971,49 @@ class GameTrainConfig:
         if self.liger_frozen_head and not self.use_liger_kernel:
             raise ValueError(
                 "liger_frozen_head patches the Liger loss, so it needs use_liger_kernel"
+            )
+
+    def _resolve_and_validate_single_forward_importance_sampling(self) -> None:
+        requested = self.single_forward_vllm_importance_sampling
+        if requested is None:
+            requested = self.liger_frozen_head and self.vllm_importance_sampling_correction
+            object.__setattr__(self, "single_forward_vllm_importance_sampling", requested)
+        if requested and not self.liger_frozen_head:
+            raise ValueError(
+                "single_forward_vllm_importance_sampling needs --liger-frozen-head: that fused "
+                "loss seam is what exposes the loss forward's detached per-token log probabilities"
+            )
+        if requested and not self.vllm_importance_sampling_correction:
+            raise ValueError(
+                "single_forward_vllm_importance_sampling needs the vLLM correction enabled"
+            )
+
+    def _validate_learning_rate_schedule(self) -> None:
+        if self.lr_scheduler not in {"cosine", "constant_with_warmup"}:
+            raise ValueError(
+                "lr_scheduler must be one of ('cosine', 'constant_with_warmup'), got "
+                f"{self.lr_scheduler!r}"
+            )
+        if (self.warmup_ratio is None) == (self.warmup_steps is None):
+            raise ValueError("set exactly one of warmup_ratio and warmup_steps")
+        if self.warmup_ratio is not None and not 0.0 <= self.warmup_ratio < 1.0:
+            raise ValueError(f"warmup_ratio must be in [0, 1), got {self.warmup_ratio}")
+        if self.warmup_steps is not None and self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be non-negative, got {self.warmup_steps}")
+
+    def _validate_tail_length_penalty(self) -> None:
+        enabled = self.tail_length_penalty_start is not None or self.tail_length_penalty_max != 0.0
+        if not enabled:
+            return
+        if self.tail_length_penalty_start is None:
+            raise ValueError(
+                "tail_length_penalty_start is required when tail_length_penalty_max is nonzero"
+            )
+        if not math.isfinite(self.tail_length_penalty_max) or self.tail_length_penalty_max <= 0.0:
+            raise ValueError("tail_length_penalty_max must be a finite positive number")
+        if not 0 <= self.tail_length_penalty_start < self.max_completion_tokens:
+            raise ValueError(
+                "tail_length_penalty_start must be non-negative and below max_completion_tokens"
             )
 
     def _validate_penalty_epsilon_and_dropout(self) -> None:
@@ -2531,11 +2601,17 @@ def _trl_arguments(config: GameTrainConfig, plan: SizingPlan, *, dtype: torch.dt
         per_device_train_batch_size=plan.micro_batch_size,
         gradient_accumulation_steps=plan.gradient_accumulation_steps,
         num_generations=plan.num_generations,
+        num_iterations=1,
         max_completion_length=config.max_completion_tokens,
         learning_rate=config.learning_rate,
         lr_scheduler_type=config.lr_scheduler,
-        # warmup_ratio was removed; warmup_steps now reads a float in [0, 1) as a ratio.
-        warmup_steps=config.warmup_ratio,
+        # Transformers 5.15 removed warmup_ratio: warmup_steps accepts either an integer count or
+        # a float in [0, 1), interpreted as a ratio.
+        warmup_steps=(
+            config.warmup_steps
+            if config.warmup_steps is not None
+            else cast("float", config.warmup_ratio)
+        ),
         # Passed rather than left to transformers' default because on LoRA the default is not
         # neutral: the A matrices' second moments sit below 1e-8 (GameTrainConfig.adam_epsilon
         # carries the measurement), so the floor and not the gradient sets their step size.
@@ -3388,6 +3464,66 @@ def _tempered_logits(head_output: torch.Tensor, temperature: float) -> torch.Ten
     return head_output.div_(temperature)
 
 
+def compute_vllm_importance_sampling(  # noqa: PLR0913 - mirrors TRL's six inputs explicitly
+    trainer_per_token_logps: torch.Tensor,
+    sampling_per_token_logps: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    mode: str,
+    clip_min: float | None,
+    clip_max: float | None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Reproduce TRL 1.10's vLLM correction from the loss forward's detached logps."""
+    if trainer_per_token_logps.shape != sampling_per_token_logps.shape:
+        raise RuntimeError(
+            "trainer and vLLM log probabilities must have the same shape, got "
+            f"{tuple(trainer_per_token_logps.shape)} and {tuple(sampling_per_token_logps.shape)}"
+        )
+    if mask.shape != trainer_per_token_logps.shape:
+        raise RuntimeError(
+            f"importance-sampling mask {tuple(mask.shape)} does not match logps "
+            f"{tuple(trainer_per_token_logps.shape)}"
+        )
+    per_token_difference = (trainer_per_token_logps - sampling_per_token_logps) * mask
+    sequence_level = mode in {"sequence_mask", "sequence_truncate"}
+    logps_difference = (
+        per_token_difference.sum(dim=-1, keepdim=True) if sequence_level else per_token_difference
+    )
+    ratio = torch.exp(logps_difference)
+    if mode in {"sequence_truncate", "token_truncate"}:
+        ratio = torch.clamp(ratio, min=clip_min, max=clip_max)
+    elif mode in {"sequence_mask", "token_mask"}:
+        minimum = clip_min if clip_min is not None else -math.inf
+        maximum = clip_max if clip_max is not None else math.inf
+        ratio = ratio.masked_fill((ratio < minimum) | (ratio > maximum), 0.0)
+    else:
+        raise ValueError(f"unknown vLLM importance sampling mode {mode!r}")
+
+    live = mask.bool()
+    flat_ratio = ratio.flatten() if sequence_level else ratio[live]
+    live_difference = torch.abs(trainer_per_token_logps - sampling_per_token_logps)[live]
+    zeroed_sequences = ratio.eq(0).squeeze(1) if sequence_level else (ratio.eq(0) & live).any(dim=1)
+
+    def value_or_zero(values: torch.Tensor, reduction: str) -> float:
+        if values.numel() == 0:
+            return 0.0
+        return float(getattr(torch, reduction)(values))
+
+    return ratio, {
+        "sampling/importance_sampling_ratio/min": value_or_zero(flat_ratio, "min"),
+        "sampling/importance_sampling_ratio/mean": value_or_zero(flat_ratio, "mean"),
+        "sampling/importance_sampling_ratio/max": value_or_zero(flat_ratio, "max"),
+        "sampling/sampling_logp_difference/mean": value_or_zero(live_difference, "mean"),
+        "sampling/sampling_logp_difference/max": value_or_zero(live_difference, "max"),
+        IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC: float(zeroed_sequences.float().mean()),
+    }
+
+
+def importance_sampling_ratio_for_loss(ratio: torch.Tensor, *, log_only: bool) -> torch.Tensor:
+    """Keep measured ratios intact while making log-only loss weights exactly one."""
+    return torch.ones_like(ratio) if log_only else ratio
+
+
 class InstrumentedGRPOTrainer(GRPOTrainer):
     """GRPOTrainer with two instruments that leave every default behaviour where it was.
 
@@ -3424,6 +3560,7 @@ class InstrumentedGRPOTrainer(GRPOTrainer):
     # class without either keyword, both get today's behaviour.
     old_logps_chunk_tokens: int = OLD_LOGPS_CHUNK_TOKENS
     importance_sampling_log_only: bool = False
+    single_forward_vllm_importance_sampling: bool = False
     _said_the_surprisal_is_absent: bool = False
     _said_the_logps_pass_is_unchunked: bool = False
 
@@ -3432,12 +3569,25 @@ class InstrumentedGRPOTrainer(GRPOTrainer):
         *args: Any,  # noqa: ANN401 - GRPOTrainer's own untyped constructor, passed through
         old_logps_chunk_tokens: int = OLD_LOGPS_CHUNK_TOKENS,
         importance_sampling_log_only: bool = False,
+        single_forward_vllm_importance_sampling: bool = False,
         **kwargs: Any,  # noqa: ANN401 - GRPOTrainer's own untyped constructor, passed through
     ) -> None:
         """Take the two instrument knobs, then build the trainer TRL would have built."""
         self.old_logps_chunk_tokens = old_logps_chunk_tokens
         self.importance_sampling_log_only = importance_sampling_log_only
+        self.single_forward_vllm_importance_sampling = single_forward_vllm_importance_sampling
+        self._single_forward_metric_parts: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
         super().__init__(*args, **kwargs)
+        if self.single_forward_vllm_importance_sampling and (
+            self.num_iterations != 1 or not self._old_logps_exist_only_for_the_correction
+        ):
+            raise ValueError(
+                "single-forward vLLM importance sampling needs num_iterations=1 and generation "
+                "aligned to optimizer steps; otherwise old_per_token_logps carries policy-version "
+                "drift in addition to the vLLM sampling correction"
+            )
 
     def _generate_and_score_completions(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, generation_batch: dict[str, torch.Tensor | Any]
@@ -3446,14 +3596,106 @@ class InstrumentedGRPOTrainer(GRPOTrainer):
         # TRL annotates this parameter `list[dict[...]]` (grpo_trainer.py:2331) while its only caller
         # hands it the dict-of-columns generation batch (`:1607`), so the cast names the runtime type
         # rather than widening ours to the stale one.
-        batch = super()._generate_and_score_completions(
-            cast("list[dict[str, torch.Tensor | Any]]", generation_batch)
-        )
+        if self.single_forward_vllm_importance_sampling:
+            correction_enabled = self.vllm_importance_sampling_correction
+            self.vllm_importance_sampling_correction = False
+            try:
+                batch = super()._generate_and_score_completions(
+                    cast("list[dict[str, torch.Tensor | Any]]", generation_batch)
+                )
+            finally:
+                self.vllm_importance_sampling_correction = correction_enabled
+        else:
+            batch = super()._generate_and_score_completions(
+                cast("list[dict[str, torch.Tensor | Any]]", generation_batch)
+            )
         self._record_sampled_surprisal(batch)
-        self._record_importance_sampling_zero_fraction(batch)
-        if self.importance_sampling_log_only:
-            self._neutralise_importance_sampling(batch)
+        if not self.single_forward_vllm_importance_sampling:
+            self._record_importance_sampling_zero_fraction(batch)
+            if self.importance_sampling_log_only:
+                self._neutralise_importance_sampling(batch)
         return batch
+
+    def _single_forward_importance_sampling_ratio(
+        self,
+        per_token_logps: torch.Tensor,
+        sampling_per_token_logps: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the correction inside the fused loss and retain TRL-equivalent metrics."""
+        ratio, _ = compute_vllm_importance_sampling(
+            per_token_logps.detach(),
+            sampling_per_token_logps,
+            mask,
+            mode=self.vllm_importance_sampling_mode,
+            clip_min=self.vllm_importance_sampling_clip_min,
+            clip_max=self.vllm_importance_sampling_clip_max,
+        )
+        sequence_level = self.vllm_importance_sampling_mode in {
+            "sequence_mask",
+            "sequence_truncate",
+        }
+        live = mask.bool()
+        flat_ratio = ratio.flatten() if sequence_level else ratio[live]
+        live_difference = torch.abs(per_token_logps.detach() - sampling_per_token_logps)[live]
+        zeroed_sequences = (
+            ratio.eq(0).squeeze(1) if sequence_level else (ratio.eq(0) & live).any(dim=1)
+        )
+        self._single_forward_metric_parts.append(
+            (flat_ratio.detach(), live_difference.detach(), zeroed_sequences.detach())
+        )
+        steps_per_generation = cast("int", cast("GRPOConfig", self.args).steps_per_generation)
+        if (
+            not self.model.training  # pyright: ignore[reportOptionalMemberAccess]
+            or self._step % steps_per_generation == steps_per_generation - 1
+        ):
+            self._flush_single_forward_importance_sampling_metrics()
+        return importance_sampling_ratio_for_loss(ratio, log_only=self.importance_sampling_log_only)
+
+    def _flush_single_forward_importance_sampling_metrics(self) -> None:
+        """Aggregate one generation batch exactly where TRL records its two-pass metrics."""
+        ratios = torch.cat([part[0] for part in self._single_forward_metric_parts])
+        differences = torch.cat([part[1] for part in self._single_forward_metric_parts])
+        zeroed = torch.cat([part[2] for part in self._single_forward_metric_parts])
+        device = ratios.device
+
+        def local_or_zero(values: torch.Tensor, reduction: str) -> torch.Tensor:
+            if values.numel() == 0:
+                return torch.tensor(0.0, device=device)
+            return cast("torch.Tensor", getattr(torch, reduction)(values))
+
+        local_values = {
+            "sampling/importance_sampling_ratio/min": local_or_zero(ratios, "min"),
+            "sampling/importance_sampling_ratio/mean": local_or_zero(ratios, "mean"),
+            "sampling/importance_sampling_ratio/max": local_or_zero(ratios, "max"),
+            "sampling/sampling_logp_difference/mean": local_or_zero(differences, "mean"),
+            "sampling/sampling_logp_difference/max": local_or_zero(differences, "max"),
+        }
+        gathered = {name: self.accelerator.gather(value) for name, value in local_values.items()}
+
+        def gathered_tensor(name: str) -> torch.Tensor:
+            return cast("torch.Tensor", gathered[name])
+
+        mode = "train" if self.model.training else "eval"  # pyright: ignore[reportOptionalMemberAccess]
+        self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
+            float(gathered_tensor("sampling/importance_sampling_ratio/min").min())
+        )
+        self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
+            float(gathered_tensor("sampling/importance_sampling_ratio/mean").nanmean())
+        )
+        self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
+            float(gathered_tensor("sampling/importance_sampling_ratio/max").max())
+        )
+        self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
+            float(gathered_tensor("sampling/sampling_logp_difference/mean").mean())
+        )
+        self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
+            float(gathered_tensor("sampling/sampling_logp_difference/max").max())
+        )
+        self._metrics[mode][IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC].append(
+            float(zeroed.float().mean())
+        )
+        self._single_forward_metric_parts.clear()
 
     def _record_sampled_surprisal(self, batch: dict[str, torch.Tensor | Any]) -> None:
         """Append this generation batch's surprisal readings, or say once why there are none."""
@@ -3674,6 +3916,23 @@ class PaddingTrimmedGRPOTrainer(InstrumentedGRPOTrainer):
             )
             self._trim_padded_tokens_this_step = 0
             self._trim_trimmed_tokens_this_step = 0
+        if self.single_forward_vllm_importance_sampling:
+            sampling_per_token_logps = cast("torch.Tensor", trimmed["sampling_per_token_logps"])
+            completion_mask = cast("torch.Tensor", trimmed["completion_mask"])
+            tool_mask = trimmed.get("tool_mask")
+            loss_mask = (
+                completion_mask
+                if tool_mask is None
+                else completion_mask * cast("torch.Tensor", tool_mask)
+            )
+
+            def ratio_from_loss_logps(per_token_logps: torch.Tensor) -> torch.Tensor:
+                return self._single_forward_importance_sampling_ratio(
+                    per_token_logps, sampling_per_token_logps, loss_mask
+                )
+
+            trimmed.pop("old_per_token_logps", None)
+            trimmed["importance_sampling_ratio"] = ratio_from_loss_logps
         return trimmed
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
@@ -3867,7 +4126,76 @@ def restore_policy_from_cpu_staging(
         tensor.data = tensor.detach().to(training_device, non_blocking=True, copy=True)
 
 
-def install_colocated_sleep_offload(  # noqa: C901 - two wrapped seams share one placement invariant
+@torch.no_grad()
+def _merged_lora_weight_nonmutating(
+    layer: LoraLinear, *, merge_device: torch.device
+) -> torch.Tensor:
+    """Materialize one vanilla LoRA weight on the engine device without touching the policy."""
+    active_adapters = layer.active_adapters
+    if len(active_adapters) != 1:
+        raise RuntimeError(
+            f"nonmutating vLLM sync supports exactly one active LoRA adapter, got {active_adapters}"
+        )
+    adapter = active_adapters[0]
+    if layer.merged:
+        raise RuntimeError("nonmutating vLLM sync requires an unmerged LoRA policy")
+    if adapter not in layer.lora_A:
+        raise RuntimeError(f"active adapter {adapter!r} has no LoRA A matrix")
+    if adapter in layer.lora_variant:
+        raise RuntimeError(
+            f"nonmutating vLLM sync supports vanilla LoRA only, got variant {adapter!r}"
+        )
+    if layer.lora_bias[adapter]:
+        raise RuntimeError("nonmutating vLLM sync does not support LoRA bias")
+    base_layer = cast("torch.nn.Linear", layer.get_base_layer())
+    base_weight = base_layer.weight
+    lora_a_weight = cast("torch.nn.Linear", layer.lora_A[adapter]).weight
+    lora_b_weight = cast("torch.nn.Linear", layer.lora_B[adapter]).weight
+    adapter_dtype = lora_b_weight.dtype
+    lora_a = lora_a_weight.to(merge_device, dtype=torch.float32)
+    lora_b = lora_b_weight.to(merge_device, dtype=torch.float32)
+    delta = (lora_b @ lora_a) * layer.scaling[adapter]
+    if layer.fan_in_fan_out:
+        delta = delta.transpose(0, 1)
+    # Match PEFT's CPU merge exactly: its fp32 B@A is rounded to the adapter dtype before an
+    # in-place base-dtype addition. One fp32 sum followed by one cast differs by a bf16 ulp.
+    merged = base_weight.detach().to(merge_device, copy=True)
+    merged.add_(delta.to(adapter_dtype))
+    return merged
+
+
+def sync_peft_weights_to_vllm_nonmutating(
+    model: PeftModel,
+    *,
+    fix_param_name: Callable[[str, list[str] | None], str],
+    push_param: Callable[[str, torch.Tensor], None],
+    merge_device: torch.device,
+) -> None:
+    """Stream base and temporarily merged LoRA weights to vLLM without merge/unmerge drift."""
+    lora_layers = {
+        name: module for name, module in model.named_modules() if isinstance(module, LoraLinear)
+    }
+    for name, parameter in model.named_parameters():
+        merged_weight: torch.Tensor | None = None
+        if name.endswith(".base_layer.weight"):
+            module_name = name.removesuffix(".base_layer.weight")
+            layer = lora_layers.get(module_name)
+            if layer is None:
+                raise RuntimeError(f"LoRA base weight {name!r} has no matching Linear module")
+            merged_weight = _merged_lora_weight_nonmutating(layer, merge_device=merge_device)
+        vllm_name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+        if cast("str", model.prefix) in vllm_name or "original_module" in vllm_name:
+            continue
+        vllm_name = fix_param_name(vllm_name, ["modules_to_save.default."])
+        pushed = (
+            merged_weight
+            if merged_weight is not None
+            else parameter.detach().to(merge_device, non_blocking=True)
+        )
+        push_param(vllm_name, pushed)
+
+
+def install_colocated_sleep_offload(  # noqa: C901, PLR0915 - wrapped seams share one placement invariant
     trainer: GRPOTrainer, phase_timer: StepPhaseTimer
 ) -> None:
     """Offload the policy for the engine's awake interval, preserving its optimizer objects."""
@@ -3907,6 +4235,20 @@ def install_colocated_sleep_offload(  # noqa: C901 - two wrapped seams share one
         with cast("Any", phase_timer).phase("policy_to_cpu"):
             placement_before_sync = (move_policy_to_cpu_staging(model), optimizer_state_devices())
             torch.cuda.empty_cache()
+        if isinstance(model, PeftModel):
+            if args or kwargs:
+                raise RuntimeError("TRL's colocated sync_weights unexpectedly received arguments")
+            with cast("Any", phase_timer).phase("sync_weights"):
+                generation.llm.wake_up(tags=["weights"])
+                generation._llm_weights_sleeping = False  # noqa: SLF001 - mirror TRL's state seam
+                sync_peft_weights_to_vllm_nonmutating(
+                    model,
+                    fix_param_name=generation._fix_param_name_to_vllm,  # noqa: SLF001
+                    push_param=generation._push_param_to_vllm,  # noqa: SLF001
+                    merge_device=cast("torch.device", generation.accelerator.device),
+                )
+                generation.llm.reset_prefix_cache()
+            return None
         return original_sync_weights(*args, **kwargs)
 
     def restored_generate(*args: object, **kwargs: object) -> object:
@@ -3959,6 +4301,13 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
         # The arm's, not a run knob: the mode is part of the grading, and a checkpoint's arm is
         # already a resume-identity field, so steps priced one way cannot continue under another.
         parse_penalty_mode=config.game_arm.parse_penalty_mode,
+        tail_length_penalty_start=config.tail_length_penalty_start,
+        tail_length_penalty_max=config.tail_length_penalty_max,
+        completion_cap=config.max_completion_tokens,
+        think_open_token_ids=prepared.tokenizer(THINK_OPEN, add_special_tokens=False)["input_ids"],
+        think_close_token_ids=prepared.tokenizer(THINK_CLOSE, add_special_tokens=False)[
+            "input_ids"
+        ],
     )
     # Bound rather than passed inline: GRPOConfig.__post_init__ derives generation_batch_size
     # and steps_per_generation on this object, and those derived values are what decide whether
@@ -3980,6 +4329,9 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
     trainer = DynamicSampledGRPOTrainer(
         old_logps_chunk_tokens=config.old_logps_chunk_tokens,
         importance_sampling_log_only=config.vllm_importance_sampling_log_only,
+        single_forward_vllm_importance_sampling=cast(
+            "bool", config.single_forward_vllm_importance_sampling
+        ),
         dynamic_sampling_oversample=config.dynamic_sampling_oversample,
         model=config.load_source,
         reward_funcs=reward,  # pyright: ignore[reportArgumentType]
@@ -4366,6 +4718,8 @@ def _config_from_namespace(args: argparse.Namespace) -> GameTrainConfig:
     model_id = values.pop("model_id") or (SMOKE_MODEL_ID if smoke else DEFAULT_MODEL_ID)
     if values["max_completion_tokens"] is None:
         values["max_completion_tokens"] = required_completion_budget(model_id)
+    if values["warmup_steps"] is not None:
+        values["warmup_ratio"] = None
     values["generate_fresh"] = bool(values["generate_fresh"]) or smoke
     # `smoke` goes into the FIRST construction, not only the shrunk one: validation runs in
     # __post_init__, and the pre-shrink intermediate still carries the full completion budget the
@@ -4451,6 +4805,23 @@ def _add_sampler_mismatch_arguments(parser: argparse.ArgumentParser) -> None:
             f"Default {OLD_LOGPS_CHUNK_TOKENS}."
         ),
     )
+    single_forward = parser.add_mutually_exclusive_group()
+    single_forward.add_argument(
+        "--single-forward-vllm-importance-sampling",
+        dest="single_forward_vllm_importance_sampling",
+        action="store_true",
+        default=None,
+        help=(
+            "derive the vLLM correction from the fused loss forward's detached log probabilities, "
+            "skipping TRL's separate old-policy pass; requires --liger-frozen-head"
+        ),
+    )
+    single_forward.add_argument(
+        "--two-pass-vllm-importance-sampling",
+        dest="single_forward_vllm_importance_sampling",
+        action="store_false",
+        help="retain TRL's reference separate old-log-probability forward pass",
+    )
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: PLR0915  -- one statement per flag
@@ -4474,8 +4845,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     parser.add_argument("--prompts-per-step", type=int, default=8)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--lr-scheduler", default="cosine")
-    parser.add_argument("--warmup-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--lr-scheduler", choices=("cosine", "constant_with_warmup"), default="cosine"
+    )
+    warmup = parser.add_mutually_exclusive_group()
+    warmup.add_argument("--warmup-ratio", type=float, default=0.1)
+    warmup.add_argument("--warmup-steps", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=70)
     parser.add_argument("--max-prompt-tokens", type=int, default=1024)
     parser.add_argument(
@@ -4596,6 +4971,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
         ),
     )
     parser.add_argument("--parse-penalty", type=float, default=-1.0)
+    parser.add_argument("--tail-length-penalty-start", type=int, default=None)
+    parser.add_argument("--tail-length-penalty-max", type=float, default=0.0)
     parser.add_argument("--max-prompts", type=int, default=None)
     parser.add_argument("--no-autosize", dest="autosize", action="store_false")
     parser.add_argument("--vram-usable-fraction", type=float, default=DEFAULT_VRAM_USABLE_FRACTION)

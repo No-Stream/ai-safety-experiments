@@ -38,11 +38,13 @@ import math
 import re
 from dataclasses import dataclass
 from functools import cache, partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from games.format_rubric import COMPONENT_NAMES, format_component_scores, format_reward
 from games.parsing import (
     RETURN_PERCENTAGE_MAX,
+    THINK_CLOSE,
+    THINK_OPEN,
     parse_action,
     parse_action_sequence,
     parse_claim,
@@ -2702,13 +2704,18 @@ def _log_batch_metrics(  # noqa: PLR0913 - one step's whole metric surface, call
     log_extra("stated_match_ev_margin", [item.ev_margin for item in scored])
 
 
-def make_game_reward(
+def make_game_reward(  # noqa: C901, PLR0913, PLR0915 - one closure owns the reward contract
     num_generations: int,
     *,
     prefilled_think: bool,
     leave_one_out: bool = False,
     parse_penalty: float = DEFAULT_PARSE_PENALTY,
     parse_penalty_mode: str = PARSE_PENALTY_CONSTANT,
+    tail_length_penalty_start: int | None = None,
+    tail_length_penalty_max: float = 0.0,
+    completion_cap: int | None = None,
+    think_open_token_ids: Sequence[int] | None = None,
+    think_close_token_ids: Sequence[int] | None = None,
 ) -> Callable[..., list[float]]:
     """Build the single reward callable TRL calls, closed over the group size and parse policy.
 
@@ -2745,10 +2752,29 @@ def make_game_reward(
         raise ValueError(
             f"parse_penalty_mode must be one of {PARSE_PENALTY_MODES}, got {parse_penalty_mode!r}."
         )
+    tail_penalty_enabled = tail_length_penalty_start is not None or tail_length_penalty_max != 0.0
+    if tail_penalty_enabled:
+        if tail_length_penalty_start is None or completion_cap is None:
+            raise ValueError(
+                "tail length penalty needs both tail_length_penalty_start and completion_cap"
+            )
+        if not math.isfinite(tail_length_penalty_max) or tail_length_penalty_max <= 0.0:
+            raise ValueError("tail_length_penalty_max must be a finite positive number")
+        if not 0 <= tail_length_penalty_start < completion_cap:
+            raise ValueError(
+                "tail_length_penalty_start must be non-negative and below completion_cap"
+            )
+    if (think_open_token_ids is None) != (think_close_token_ids is None):
+        raise ValueError("thinking length metrics need both opening and closing marker token ids")
+    if think_open_token_ids is not None and (
+        not think_open_token_ids or not cast("Sequence[int]", think_close_token_ids)
+    ):
+        raise ValueError("thinking marker token id sequences must be nonempty")
 
     def game_reward(
         *,
         completions: list[str],
+        completion_ids: list[list[int]] | None = None,
         log_metric: Callable[[str, float], None],
         log_extra: Callable[[str, list[Any]], None],
         **columns: object,
@@ -2765,6 +2791,32 @@ def make_game_reward(
         rows = _rows_from_columns(columns, len(completions))
         _assert_contiguous_groups(rows, num_generations)
         framing_ids = _optional_column(columns, FRAMING_ID_COLUMN, len(completions))
+        completion_lengths = (
+            [len(token_ids) for token_ids in completion_ids] if completion_ids is not None else None
+        )
+        if (
+            completion_ids is not None
+            and framing_ids is not None
+            and think_open_token_ids is not None
+            and think_close_token_ids is not None
+        ):
+            thinking_lengths = thinking_token_lengths(
+                completions,
+                completion_ids,
+                prefilled_think=prefilled_think,
+                open_marker=think_open_token_ids,
+                close_marker=think_close_token_ids,
+            )
+            for framing_id in sorted({value for value in framing_ids if value}):
+                selected = [
+                    length
+                    for length, value in zip(thinking_lengths, framing_ids, strict=True)
+                    if value == framing_id
+                ]
+                log_metric(
+                    f"thinking/mean_length_tokens/framing/{framing_id}",
+                    sum(selected) / len(selected),
+                )
 
         stripped = [strip_thinking(text, prefilled_think=prefilled_think) for text in completions]
         visibles = [visible for visible, _ in stripped]
@@ -2813,6 +2865,84 @@ def make_game_reward(
             log_extra=log_extra,
         )
         log_extra("truncated_thinking", list(truncated))
-        return [item.reward for item in scored]
+        rewards = [item.reward for item in scored]
+        if not tail_penalty_enabled:
+            return rewards
+        if completion_lengths is None:
+            raise RuntimeError(
+                "tail length penalty is enabled but TRL supplied no completion_ids to count"
+            )
+        penalties = tail_length_penalties(
+            completion_lengths,
+            start=cast("int", tail_length_penalty_start),
+            cap=cast("int", completion_cap),
+            max_penalty=tail_length_penalty_max,
+        )
+        log_metric("tail_length_penalty/mean", sum(penalties) / len(penalties))
+        log_extra("tail_length_penalty", penalties)
+        return [reward - penalty for reward, penalty in zip(rewards, penalties, strict=True)]
 
     return game_reward
+
+
+def tail_length_penalties(
+    completion_lengths: Sequence[int], *, start: int, cap: int, max_penalty: float
+) -> list[float]:
+    """Return the DAPO-style linear penalty in the completion cap's tail."""
+    if not 0 <= start < cap:
+        raise ValueError(f"tail length penalty needs 0 <= start < cap, got {start=} {cap=}")
+    if not math.isfinite(max_penalty) or max_penalty <= 0.0:
+        raise ValueError(f"max_penalty must be finite and positive, got {max_penalty=}")
+    tail_width = cap - start
+    return [
+        max_penalty * min(max(length - start, 0), tail_width) / tail_width
+        for length in completion_lengths
+    ]
+
+
+def _find_token_marker(tokens: Sequence[int], marker: Sequence[int], *, last: bool) -> int | None:
+    matches = [
+        index
+        for index in range(len(tokens) - len(marker) + 1)
+        if list(tokens[index : index + len(marker)]) == list(marker)
+    ]
+    if not matches:
+        return None
+    return matches[-1] if last else matches[0]
+
+
+def thinking_token_lengths(
+    completions: Sequence[str],
+    completion_ids: Sequence[Sequence[int]],
+    *,
+    prefilled_think: bool,
+    open_marker: Sequence[int],
+    close_marker: Sequence[int],
+) -> list[int]:
+    """Count original generated tokens inside the thinking block, excluding its markers."""
+    if len(completions) != len(completion_ids):
+        raise ValueError("completions and completion_ids must have the same length")
+
+    lengths: list[int] = []
+    for completion, token_ids in zip(completions, completion_ids, strict=True):
+        if prefilled_think:
+            start = 0
+        elif THINK_OPEN in completion:
+            open_index = _find_token_marker(token_ids, open_marker, last=False)
+            if open_index is None:
+                raise RuntimeError("decoded completion contains <think> but its token ids do not")
+            start = open_index + len(open_marker)
+        else:
+            lengths.append(0)
+            continue
+        if THINK_CLOSE in completion:
+            close_index = _find_token_marker(token_ids, close_marker, last=True)
+            if close_index is None:
+                raise RuntimeError("decoded completion contains </think> but its token ids do not")
+            stop = close_index
+        else:
+            stop = len(token_ids)
+        if stop < start:
+            raise RuntimeError("thinking close marker precedes its open marker")
+        lengths.append(stop - start)
+    return lengths
