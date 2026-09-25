@@ -863,6 +863,19 @@ ARMS: dict[str, GameArm] = {
             "disclosed return regimes. Its private manifest records the selected scenario groups."
         ),
     ),
+    "cooperation-generalization-care-alpha-0": GameArm(
+        game_id="twin-pd",
+        game_ids=("stag-hunt", "trust-vs-stated-return"),
+        grading=care_grading(0),
+        parse_penalty_mode=PARSE_PENALTY_MARGIN_BELOW_WORSE,
+        notes=(
+            "The queued own-payoff control for cooperation-generalization-care-alpha-1, run only after "
+            "the treatment's readout: the same frozen corpus regraded at care weight zero, so the pair "
+            "differs in the reward's recipient and nothing else, the row-relative parse price "
+            "included. Without it a cooperation rise cannot be told from what any RL on these prompts "
+            "does."
+        ),
+    ),
 }
 
 

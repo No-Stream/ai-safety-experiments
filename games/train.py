@@ -554,6 +554,9 @@ RESUME_IDENTITY_FIELDS = (
     # consumes the corpus faster, so the resumed steps would not even see the prompts the earlier
     # ones would have reached next.
     "dynamic_sampling_oversample",
+    # Whether a completion cut off at the cap carries its parse penalty into the gradient or carries
+    # nothing, so steps under the two settings train different estimators.
+    "mask_truncated_completions",
 )
 # Identity fields added after the first recorded runs, mapped to the value in force when those runs
 # launched -- the then-hardcoded GRPOConfig line for the estimator pair, transformers' own untouched
@@ -574,6 +577,7 @@ RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
     "vllm_importance_sampling_mode": VLLM_IMPORTANCE_SAMPLING_MODE,
     "cast_lm_head_to_fp32": False,
     "dynamic_sampling_oversample": 1,
+    "mask_truncated_completions": False,
 }
 # Identity fields that are REGISTRY state rather than launch config, compared the same way and kept
 # apart only because the record carries them at its top level while `RESUME_IDENTITY_FIELDS` names
@@ -733,6 +737,12 @@ class GameTrainConfig:
     # training cost does not, which is the trade: on the banked 9B pair a fifth of groups were pure,
     # a third of them late, and on a breadth corpus's far framings most groups are expected to be.
     dynamic_sampling_oversample: int = 1
+    # Off keeps what every banked arm trained under: a completion cut off at the cap earns the parse
+    # penalty and keeps its gradient, and the pressure toward shorter reasoning that produces is
+    # itself something to watch. On (TRL's own knob), a capped completion contributes no gradient,
+    # so the cap stops teaching brevity through the reward; the 16K series asks for this so the cap
+    # censors rather than shapes, with a brevity prompt variant doing the asking instead.
+    mask_truncated_completions: bool = False
     # Smoke and debugging only: it changes what corpus the arm trained on, so it is never a
     # performance knob for a real run.
     max_prompts: int | None = None
@@ -2448,10 +2458,7 @@ def _trl_arguments(config: GameTrainConfig, plan: SizingPlan, *, dtype: torch.dt
         epsilon=config.epsilon,
         scale_rewards=config.scale_rewards,
         loss_type=config.loss_type,
-        # A completion that ran out of tokens mid-thought earns the parse penalty and keeps its
-        # gradient. That pressure toward shorter reasoning is itself something to watch, and
-        # masking it away would hide it.
-        mask_truncated_completions=False,
+        mask_truncated_completions=config.mask_truncated_completions,
         use_liger_kernel=config.use_liger_kernel,
         cast_lm_head_to_fp32=config.cast_lm_head_to_fp32,
         gradient_checkpointing=config.gradient_checkpointing,
@@ -4414,6 +4421,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             "counts land in log_history and mem_log.csv under dynamic_sampling/*. A treatment, "
             "recorded in run_config.json and checked on resume like the arm itself, and the corpus "
             "must hold oversample x prompts-per-step prompts or TRL's sampler yields nothing."
+        ),
+    )
+    parser.add_argument(
+        "--mask-truncated-completions",
+        action="store_true",
+        help=(
+            "OPT-IN: a completion cut off at --max-completion-tokens contributes no gradient, "
+            "instead of earning the parse penalty and keeping it. A resume-identity field."
         ),
     )
     parser.add_argument("--parse-penalty", type=float, default=-1.0)

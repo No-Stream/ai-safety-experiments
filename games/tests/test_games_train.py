@@ -200,6 +200,14 @@ class TestParseArgs:
         assert default.colocate_sleep_offload is False
         assert requested.colocate_sleep_offload is True
 
+    def test_mask_truncated_completions_is_explicit(self):
+        default = gt._parse_args(["--arm", "dictator", "--generate-fresh"])
+        requested = gt._parse_args(
+            ["--arm", "dictator", "--generate-fresh", "--mask-truncated-completions"]
+        )
+        assert default.mask_truncated_completions is False
+        assert requested.mask_truncated_completions is True
+
     def test_liger_frozen_head_is_explicit_and_needs_liger(self):
         default = gt._parse_args(["--arm", "dictator", "--generate-fresh"])
         requested = gt._parse_args(["--arm", "dictator", "--generate-fresh", "--liger-frozen-head"])
@@ -1695,9 +1703,11 @@ class TestRunConfigArtifact:
 class TestGrpoConfigGotchas:
     """The house gotchas, locked down: each of these has cost a run somewhere in this repo."""
 
-    @staticmethod
-    def build() -> GRPOConfig:
-        config = make_config(use_liger_kernel=False, output_dir="artifacts/games/runs/test")
+    OUTPUT_DIR: ClassVar[str] = "artifacts/games/runs/test"
+
+    @classmethod
+    def build(cls) -> GRPOConfig:
+        config = make_config(use_liger_kernel=False, output_dir=cls.OUTPUT_DIR)
         return gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
 
     def test_the_dtype_key_is_dtype_and_never_torch_dtype(self):
@@ -1751,8 +1761,39 @@ class TestGrpoConfigGotchas:
         assert args.log_completions is True
         assert args.logging_steps == 1
 
-    def test_truncated_completions_keep_their_gradient(self):
+    def test_truncated_completions_keep_their_gradient_by_default(self):
         assert self.build().mask_truncated_completions is False
+
+    def test_masking_truncated_completions_is_opt_in_and_reaches_trl(self):
+        config = make_config(
+            use_liger_kernel=False, output_dir=self.OUTPUT_DIR, mask_truncated_completions=True
+        )
+        args = gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
+        assert args.mask_truncated_completions is True
+
+    def test_masking_truncated_completions_is_a_resume_identity_field(self):
+        """Masked and unmasked steps train different estimators: a capped answer either carries
+        its parse penalty into the gradient or carries nothing."""
+        assert "mask_truncated_completions" in gt.RESUME_IDENTITY_FIELDS
+        assert gt.RESUME_IDENTITY_DEFAULTS["mask_truncated_completions"] is False
+        recorded = cast(
+            "dict[str, object]",
+            gt.run_config_payload(
+                make_config(mask_truncated_completions=True, output_dir=self.OUTPUT_DIR),
+                plan=make_plan(),
+                device={"device_name": "NVIDIA RTX 5090"},
+                derived={},
+            )["config"],
+        )
+        assert recorded["mask_truncated_completions"] is True
+        with pytest.raises(RuntimeError, match="mask_truncated_completions"):
+            gt.assert_resume_matches(
+                recorded={**gt.RESUME_IDENTITY_DEFAULTS, **recorded},
+                current=asdict(make_config(output_dir=self.OUTPUT_DIR)),
+                fields=gt.RESUME_IDENTITY_FIELDS,
+                checkpoint="checkpoint-10",
+                consequence="two estimators under one set of step numbers.",
+            )
 
     def test_the_sizing_plan_reaches_trl(self):
         args = self.build()

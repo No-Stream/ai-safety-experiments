@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -219,6 +220,8 @@ class TestArmsRegistry:
             "prosocial-breadth-care1",
             "prosocial-breadth-self",
             "cooperation-generalization-care-alpha-1",
+            # Its own-payoff control, registered 2026-09-24 and queued until the treatment's readout.
+            "cooperation-generalization-care-alpha-0",
         }
 
     def test_no_two_arms_are_the_same_experiment(self):
@@ -288,6 +291,7 @@ class TestArmsRegistry:
             "prosocial-breadth-care1",
             "prosocial-breadth-self",
             "cooperation-generalization-care-alpha-1",
+            "cooperation-generalization-care-alpha-0",
         }
         assert {ARMS[name].grading for name in row_relative} == {
             GRADING_VS_STATED_MATCH,
@@ -595,6 +599,15 @@ class TestTheCorpusMayCarrySeveralGames:
         assert arm_game_ids(control) == arm_game_ids(care)
         assert control.grading == care_grading(0)
         assert care.grading == care_grading(1)
+
+    def test_the_cooperation_control_differs_from_its_treatment_only_in_the_care_weight(
+        self,
+    ) -> None:
+        treatment = ARMS["cooperation-generalization-care-alpha-1"]
+        control = ARMS["cooperation-generalization-care-alpha-0"]
+        assert treatment.grading == care_grading(1)
+        assert control.grading == care_grading(0)
+        assert replace(control, grading=treatment.grading, notes=treatment.notes) == treatment
 
     def test_a_game_nothing_renders_or_builds_is_refused(self) -> None:
         with pytest.raises(ValueError, match="also carry"):
