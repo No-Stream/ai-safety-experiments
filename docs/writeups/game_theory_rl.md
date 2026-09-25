@@ -58,8 +58,6 @@ Cooperation rate in the twin prisoner's dilemma, with the above 32 prompts. n~=2
 
 [figures/rl_reasoning_shift.svg]
 
-### Decision theory + self-report
-
 We also asked the models a variety of decision theory questions, with no significant difference.  (EDT/FDT +0.03 and −0.01 on a −1 to +1 scale; FDT-only increased slightly in both arms, 43→50 and 39→54 of 432.) We also tested DTBench, used in the referenced oaku LessWrong post, where scores were within +-.03 on a [-1,1] scale, and models did not move toward CDT after training. We also found no obvious differences in self-report competitiveness, admiration, or social value orientation. We speculate that perhaps the more capable model in the LW post was able to generalize more, whereas our smaller 9B model learned narrower behaviors.
 
 Asked whether it would cooperate with a copy of itself, the model's forecast did track the behavior change, but it consistently overstimated how often it would cooperate. *Unlike in the self-report batteries above, RL changes did partially generalize to behavior prediction, and model interior knowledge was imperfect directionally correct.* We suspect investigating RL's effects on behavior vs self-image could be interesting; for example, why did the models consistently underestimate their cooperation rates? Likewise it could be interesting to study how pretraining/midtraining vs SFT vs RL affect behavior and self-image, and how strongly and robustly each generalizes. For example, in real-world AI hacking incidents, models have often stated that their behaviors are against spec or unethical but then proceed anyway under various justifications, such as pretending the env is a sandbox.
@@ -77,8 +75,6 @@ Asked whether it would cooperate with a copy of itself, the model's forecast did
 n forecasts, not described / copy: n=108/174, 115/174, 107/110. n actual: n=127, 126, 125. Copy forecast vs actual: p=.05, p<.001, p<.001.
 Perhaps since we used no length, repetition penalties, or top_p, some reasoning traces hit the max generation length (32k) and were excluded.
 
-### Mech interp
-
 We also investigated using mechanistic interpretability. Using linear probes (98-100% accurate in the middle layers), we found a direction in the untrained model that separates "the other player's choice being linked" from "the other player is independent," so it existed before any RL. Steering using this, it creates cooperation, even with the other player described as a human (0% -> 69% cooperation in the pro-cooperation arm and -> 52% in the anti-cooperation arm; a random direction placebo raised it to 25% and 23% respectively simply by "destabilizing" the model.) But upweighting this isn't the causal mechanism of RL; removing this direction barely changed either arm (see table below). (If training simply upweighted this steering vector, removing it should have made the arms comparable.) We also tried giving each trained model identical reasoning text and comparing their final choice to that of the donor transcript; 0 of 160 pairs changed their decision. So RL changed the reasoning generated rather than how that reasoning translates into an action; given a line of reasoning, the action is obvious.
 
 [figures/rl_steering.svg]
@@ -91,44 +87,6 @@ We also investigated using mechanistic interpretability. Using linear probes (98
 
 
 n ~= 32/cell.
-
-#### Which argument does the model reach for? (draft stub, Opus 5.5)
-
-The mirroring and dominance arguments both exist in the untrained model, so we asked whether RL changed how likely the model is to start down each one. We wrote short opening sentences for the model's reasoning, some making the mirroring argument and some the dominance argument, worded so they never name the partner. That way the same sentence fits every partner description. We then measured how probable the model found each opening after reading the prompt (the log-probability of the sentence, with no sampling). The number below is how much more probable the mirroring opening is than the dominance opening, in nats; positive favors mirroring.
-
-| Other player description                                     | Untrained | Change, pro-cooperation arm | Change, anti-cooperation arm |
-| ------------------------------------------------------------ | --------- | --------------------------- | ---------------------------- |
-| A copy of the model, deciding the same way (trained)          | +2.2      | +0.47                       | −0.35                        |
-| A different AI whose past choices always matched its partner's | +2.9      | +0.13                       | −0.10                        |
-| Same weights, deciding independently                          | +0.7      | +0.30                       | −0.16                        |
-| A different AI "deciding the same way you are"                | +1.1      | +0.13                       | −0.34                        |
-| A different AI, deciding independently                        | +0.3      | 0.00                        | −0.32                        |
-| A human                                                       | −1.1      | +0.24                       | −0.07                        |
-| Not described                                                 | −5.7      | −0.08                       | +0.03                        |
-
-Twin prisoner's dilemma, 4 prompts per row; standard errors of the changes are 0.03-0.11. The public goods game shows the same pattern.
-
-The untrained model already matches the argument to the partner: mirroring is much more likely for a copy than for a human. Pro-cooperation training raised the mirroring opening most for the description it was trained on, and about half as much for a human partner, even though cooperation with humans barely moved (under 2% before and after). So the preference for the argument partly generalized, and something later in the reasoning overrides it for a human. It did not generalize to a different AI deciding independently, or to an undescribed partner.
-
-We also took the untrained model's own reasoning for one prompt, cut it before it committed to an answer, and let each model continue from the cut (8 samples per cell). With no reasoning given, the pro-cooperation arm cooperated 100% of the time against 57% for the untrained model. Given the first two thirds of the untrained model's reasoning, both cooperated at similar rates (100% vs 88%). The anti-cooperation arm cooperated less at every cut (29-57%). So the pro-cooperation change sits mostly in which argument the model starts with, while the anti-cooperation change also acts later in the reasoning. With a human partner, every model defected from every cut.
-
-#### Did training change anything else? (draft stub, Opus 5.5)
-
-To look for side effects without guessing which eval to run, we sampled the untrained model on 60 prompts across six everyday categories plus 6 game prompts, then measured how differently each trained model would predict the same text, token by token (the KL divergence from the untrained model). As a baseline for "any change of this size", we compared against a random adapter of the same size as each trained one.
-
-| Prompt category                 | Pro-cooperation arm, relative to random adapter | Anti-cooperation arm, relative to random adapter |
-| ------------------------------- | ----------------------------------------------- | ------------------------------------------------ |
-| Game prompts (what we trained on) | 1.6x                                            | 1.9x                                             |
-| Negotiation and bargaining      | 1.2x                                            | 1.3x                                             |
-| Ethics dilemmas                 | 1.2x                                            | 1.2x                                             |
-| Describing its own values       | 1.2x                                            | 1.2x                                             |
-| Agentic and tool use            | 1.2x                                            | 1.2x                                             |
-| General chat and advice         | 1.2x                                            | 1.2x                                             |
-| Factual questions and coding    | 1.2x                                            | 1.2x                                             |
-
-Mean per-token KL divergence divided by the random adapter's; about 10 prompts per category, one sample each.
-
-The change is concentrated on game prompts. On everything else, including prompts asking the model to describe its values, both trained models differ from the untrained one barely more than a random change of the same size does. On game prompts, the largest shifts are on the words we would expect: "differently" overtakes a word beginning "ir-", a word beginning "cooper-" replaces one beginning "altru-", and "Nash" drops out of the likely next words. This fits the self-report results above: the training left a narrow footprint that general evals would not pick up.
 
 ## Limitations and Next Steps
 
