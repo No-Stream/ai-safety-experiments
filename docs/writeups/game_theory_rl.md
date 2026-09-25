@@ -60,11 +60,11 @@ The model did not reliably predict its own cooperation; in the pro-cooperation a
 
 | Model | Forecast, other player not described | Forecast, other player described as a copy (95% CI) | Actual cooperation with a copy |
 |---|---:|---:|---:|
-| Untrained | 2% | 29% | 43% |
-| Anti-cooperation arm | 2% | 27% | 8% |
-| Pro-cooperation arm | 2% | 71% | 68% |
+| Untrained | 2% | 55% (47-62%) | 43% |
+| Anti-cooperation arm | 1% | 26% (20-32%) | 8% |
+| Pro-cooperation arm | 1% | 89% (83-95%) | 68% |
 
-Forecasts: n=32/cell. Actual: n~=125/cell
+Forecasts, not described / copy: n=108/174, 115/174, 107/110. Actual: n=127, 126, 125. Copy forecast vs actual: p=.05, p<.001, p<.001.
 
 We also investigated using mechanistic interpretability. Using linear probes (98-100% accurate in the middle layers), we found a direction in the untrained model that separates "the other player's choice being linked" from "the other player is independent," so it existed before any RL. Steering using this, it creates cooperation, even with the other player described as a human (0% -> 69% cooperation in the pro-cooperation arm and -> 52% in the anti-cooperation arm; a random direction placebo raised it to 25% and 23% respectively simply by "destabilizing" the model.) But upweighting this isn't the causal mechanism of RL; removing this direction barely changed either arm (see table below). (If training simply upweighted this steering vector, removing it should have made the arms comparable.) We also tried giving each trained model identical reasoning text and comparing their final choice to that of the donor transcript; 0 of 160 pairs changed their decision. So RL changed the reasoning generated rather than how that reasoning translates into an action; given a line of reasoning, the action is obvious.
 
