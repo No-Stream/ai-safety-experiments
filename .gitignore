@@ -98,3 +98,6 @@ scripts/kits/
 
 # Hand-carried model/record exports between machines; they hold benchmark item text, never commit.
 /model-export-*
+
+# Backlog.md config (local task tool; its tasks live under docs/scratch/backlog)
+backlog.config.yml
