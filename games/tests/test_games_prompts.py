@@ -2235,6 +2235,25 @@ class TestRenderMatrixRowsUnderClause:
         assert self.rows(prompts.FRAMING_TWIN, SPLIT_TRAIN)
         assert self.rows(prompts.FRAMING_DIFFERENT_AI_COUPLED, SPLIT_EVAL)
 
+    @pytest.mark.parametrize(
+        "framing",
+        [prompts.FRAMING_STATED_TRACK_RECORD, prompts.FRAMING_DIFFERENT_AI_COUPLED],
+    )
+    def test_a_coupling_clause_trains_under_self_grading(self, framing: str) -> None:
+        """Self grading plays the completion's own action back, so the counterpart the reward pays
+        against IS coupled: a clause asserting coupling is closer to the reward than the human or
+        unstated clauses the guard already lets through. The partner-premise curriculum trains its
+        track-record rungs this way."""
+        rows = prompts.render_matrix_rows_under_clause(
+            "twin-pd",
+            GRADING_SELF,
+            clause=prompts.COUNTERPART_FRAMINGS[framing],
+            framing_label=framing,
+            split=SPLIT_TRAIN,
+        )
+        assert rows
+        assert {row["grading"] for row in rows} == {GRADING_SELF}
+
     def test_a_scenario_subset_renders_only_those_frames(self) -> None:
         frames = prompts.matrix_frames_for_split("twin-pd", SPLIT_TRAIN)[:2]
         rows = prompts.render_matrix_rows_under_clause(

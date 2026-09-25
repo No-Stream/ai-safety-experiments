@@ -113,6 +113,7 @@ from games.payoffs import (
 from games.rewards import (
     FRAMING_ID_COLUMN,
     GRADING_FORMAT_ONLY,
+    GRADING_SELF,
     is_grading,
     unknown_grading_message,
 )
@@ -6780,7 +6781,7 @@ def _clause_frames_for_split(
 
 
 def _refuse_a_coupling_clause_in_training(
-    clause: str | None, framing_label: str, split: str
+    clause: str | None, framing_label: str, split: str, grading: str
 ) -> None:
     """Refuse a training row whose counterpart paragraph asserts the counterpart decides as you do.
 
@@ -6790,8 +6791,12 @@ def _refuse_a_coupling_clause_in_training(
     state one counterpart and pay another, so the arm would learn from a stated correlation the reward
     never honoured. The twin clause is the one standing exception, which is the convention the
     reskin arm and `COUPLING_ASSERTION_PHRASES` already record.
+
+    Self grading is exempt: it pays the completion's own action played back, so the counterpart the
+    reward honours is coupled, and a coupling clause is closer to it than the human or unstated
+    clauses that were never refused. The partner-premise curriculum trains its track-record rungs so.
     """
-    if split != SPLIT_TRAIN or framing_label == FRAMING_TWIN:
+    if split != SPLIT_TRAIN or framing_label == FRAMING_TWIN or grading == GRADING_SELF:
         return
     if _clause_states_coupling(clause):
         stated = [
@@ -6861,7 +6866,7 @@ def render_matrix_rows_under_clause(  # noqa: PLR0913 - one keyword per renderin
             f"hyphenated spelling every registered framing id already uses."
         )
     _assert_generatable(game_id, grading, split, label_print_order)
-    _refuse_a_coupling_clause_in_training(clause, framing_label, split)
+    _refuse_a_coupling_clause_in_training(clause, framing_label, split, grading)
     arm = _matrix_arm_for(game_id)
     contexts = [
         _RowContext(
