@@ -58,7 +58,7 @@ The model did not reliably predict its own cooperation; in the pro-cooperation a
 
 [figures/rl_stated_vs_revealed.svg]
 
-| Model | Forecast, other player not described | Forecast, other player described as a copy | Actual cooperation with a copy |
+| Model | Forecast, other player not described | Forecast, other player described as a copy (95% CI) | Actual cooperation with a copy |
 |---|---:|---:|---:|
 | Untrained | 2% | 29% | 43% |
 | Anti-cooperation arm | 2% | 27% | 8% |

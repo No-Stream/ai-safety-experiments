@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import to_rgb
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter
@@ -442,72 +443,133 @@ def figure_reasoning_shift() -> None:
 # Figure 4: what the model says it would do versus what it does
 # --------------------------------------------------------------------------------------
 
-# Self-prediction item: every parsed answer in all four cells was 0 (127 parsed of 128).
-STATED_VS_REVEALED: dict[str, BeforeAfter] = {
-    "Defection-trained": BeforeAfter(0.358, 0.109),
-    "Cooperation-trained": BeforeAfter(0.397, 0.693),
+
+@dataclass(frozen=True)
+class Forecast:
+    """Mean self-forecast of cooperation with its bootstrap 95% interval and parsed-answer count."""
+
+    mean: float
+    low: float
+    high: float
+    n: int
+
+
+@dataclass(frozen=True)
+class SelfPrediction:
+    """One checkpoint's forecasts (partner undescribed, partner described as a copy) and actual cooperation."""
+
+    no_description: Forecast
+    copy_description: Forecast
+    actual: float
+
+
+# Pooled self-prediction runs (pool_self_prediction.py); actual is the game-behaviour rate with a copy.
+SELF_PREDICTION: dict[str, SelfPrediction] = {
+    "Untrained": SelfPrediction(
+        no_description=Forecast(0.019, 0.002, 0.044, 108),
+        copy_description=Forecast(0.546, 0.471, 0.618, 174),
+        actual=0.433,
+    ),
+    "Anti-cooperation": SelfPrediction(
+        no_description=Forecast(0.014, 0.0, 0.037, 115),
+        copy_description=Forecast(0.259, 0.195, 0.322, 174),
+        actual=0.079,
+    ),
+    "Pro-cooperation": SelfPrediction(
+        no_description=Forecast(0.009, 0.0, 0.023, 107),
+        copy_description=Forecast(0.891, 0.827, 0.945, 110),
+        actual=0.68,
+    ),
+}
+CHECKPOINT_COLOR: dict[str, str] = {
+    "Untrained": UNTRAINED,
+    "Anti-cooperation": DEFECTION_TRAINED,
+    "Pro-cooperation": COOPERATION_TRAINED,
 }
 
 
+def tint(color: str, strength: float) -> tuple[float, float, float]:
+    """Blend ``color`` toward the white surface; an opaque stand-in for alpha that hides gridlines."""
+    red, green, blue = (strength * channel + (1 - strength) for channel in to_rgb(color))
+    return red, green, blue
+
+
 def figure_stated_vs_revealed() -> None:
-    """Plot measured cooperation next to the model's own predicted cooperation (always zero)."""
-    fig, ax = plt.subplots(figsize=(9, 5))
-    fig.subplots_adjust(left=0.09, right=0.96, top=0.74, bottom=0.2)
+    """Plot each checkpoint's two self-forecasts (with 95% intervals) next to its actual cooperation."""
+    fig, ax = plt.subplots(figsize=(9, 5.2))
+    fig.subplots_adjust(left=0.09, right=0.96, top=0.76, bottom=0.2)
     title_block(
         fig,
-        "The model predicts it will never cooperate, whatever it actually does",
-        "Measured cooperation versus the model's own estimate of how often it cooperates in this game",
+        "Told the partner is a copy, the forecast tracks training, but runs high",
+        "The model's forecast of its own cooperation versus how often it actually cooperates with a copy",
         top=0.965,
     )
 
-    bar_width = 0.34
-    positions: list[float] = []
-    labels: list[str] = []
-    for arm_index, (arm, rates) in enumerate(STATED_VS_REVEALED.items()):
-        for step_index, (step_label, measured) in enumerate(
-            (("before", rates.before), ("after", rates.after))
-        ):
-            x = arm_index * 2.6 + step_index * 1.0
-            positions.append(x)
-            labels.append(f"{arm}\n{step_label}")
+    bar_width = 0.26
+    bar_offsets = (-bar_width, 0.0, bar_width)
+    group_spacing = 1.2
+    for group_index, (checkpoint, prediction) in enumerate(SELF_PREDICTION.items()):
+        center = group_index * group_spacing
+        color = CHECKPOINT_COLOR[checkpoint]
+        bars = (
+            (
+                prediction.no_description.mean,
+                prediction.no_description,
+                tint(color, 0.3),
+            ),
+            (
+                prediction.copy_description.mean,
+                prediction.copy_description,
+                tint(color, 0.6),
+            ),
+            (prediction.actual, None, to_rgb(color)),
+        )
+        for offset, (height, forecast, fill_color) in zip(bar_offsets, bars, strict=True):
+            x = center + offset
             ax.bar(
-                x - bar_width / 2,
-                measured,
+                x,
+                max(height, 0.004),
                 width=bar_width,
-                color=ARM_COLOR[arm] if step_label == "after" else UNTRAINED,
                 edgecolor=SURFACE,
-                linewidth=2,
+                linewidth=1.5,
+                color=fill_color,
             )
-            ax.text(
-                x - bar_width / 2,
-                measured + 0.015,
-                f"{measured * 100:.0f}%",
-                ha="center",
-                fontsize=9.5,
-            )
-            ax.bar(x + bar_width / 2, 0.004, width=bar_width, color=INK_SECONDARY)
-            ax.text(x + bar_width / 2, 0.02, "0%", ha="center", fontsize=9.5, color=INK_SECONDARY)
+            label_height = height + 0.015
+            if forecast is not None:
+                ax.errorbar(
+                    x,
+                    height,
+                    yerr=[[height - forecast.low], [forecast.high - height]],
+                    fmt="none",
+                    ecolor=INK_SECONDARY,
+                    elinewidth=1,
+                    capsize=3,
+                )
+                label_height = forecast.high + 0.015
+            ax.text(x, label_height, f"{height * 100:.0f}%", ha="center", fontsize=9.5)
 
-    ax.set_xticks(positions)
-    ax.set_xticklabels(labels, fontsize=9.5, color=INK)
-    ax.set_ylim(0, 0.8)
+    ax.set_xticks([index * group_spacing for index in range(len(SELF_PREDICTION))])
+    ax.set_xticklabels(list(SELF_PREDICTION), fontsize=10, color=INK)
+    ax.set_ylim(0, 1.05)
     percent_axis(ax, "y")
     strip_axes(ax, keep=("bottom",))
 
     legend_handles = [
-        Patch(color=UNTRAINED, label="Before training"),
-        Patch(color=DEFECTION_TRAINED, label="After defection training"),
-        Patch(color=COOPERATION_TRAINED, label="After cooperation training"),
-        Patch(color=INK_SECONDARY, label="Model's own prediction"),
+        Patch(color=tint(INK_SECONDARY, 0.3), label="Forecast, partner not described"),
+        Patch(color=tint(INK_SECONDARY, 0.6), label="Forecast, partner described as a copy"),
+        Patch(color=INK_SECONDARY, label="Actual cooperation with a copy"),
     ]
     fig.legend(
-        handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.84), ncol=4, fontsize=9
+        handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.84), ncol=3, fontsize=9
+    )
+    n_text = "; ".join(
+        f"{checkpoint} n={prediction.no_description.n}/{prediction.copy_description.n}"
+        for checkpoint, prediction in SELF_PREDICTION.items()
     )
     footnote(
         fig,
-        "Qwen3.5-9B. Prediction: 127 parsed answers across the four cells, every one 0. "
-        "Measured: 16 prompts x 8 samples per cell.\n"
-        "The prediction question did not repeat the 'partner is a copy of you' description used in play.",
+        "Qwen3.5-9B. Whiskers: bootstrap 95% intervals. Actual: 16 prompts x 8 samples per checkpoint.\n"
+        f"Parsed forecasts (not described / copy): {n_text}.",
     )
     save(fig, "rl_stated_vs_revealed")
 
