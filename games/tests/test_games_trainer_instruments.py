@@ -726,6 +726,23 @@ class TestTheConfigRefusesAnImpossibleInstrument:
         config = make_config(vllm_importance_sampling_log_only=True)
         assert config.vllm_importance_sampling_correction is True
 
+    @pytest.mark.parametrize("sampler_override", [{"top_p": 0.95}, {"top_k": 20}])
+    @pytest.mark.parametrize("mode", ["sequence_mask", "token_truncate"])
+    def test_a_truncating_sampler_under_the_correction_is_refused(
+        self, sampler_override: dict[str, float], mode: str
+    ) -> None:
+        """TRL's colocated engine reports post-truncation log-probs (`processed_logprobs`) while the
+        trainer scores the full distribution, so every sampled token looks more likely to vLLM and the
+        ratio is biased below one. The 9B probe (2026-09-24, top_p 0.95, ~8K-token completions) put
+        every sequence ratio at 1e-13 or below, zeroing the whole gradient with every signal green.
+        """
+        with pytest.raises(ValueError, match="post-truncation"):
+            make_config(vllm_importance_sampling_mode=mode, **sampler_override)
+
+    def test_a_truncating_sampler_is_allowed_when_the_correction_only_logs(self) -> None:
+        config = make_config(top_p=0.95, vllm_importance_sampling_log_only=True)
+        assert config.top_p == 0.95
+
 
 class TestTheImportanceSamplingModeIsSelectable:
     """Which of TRL's four correction modes a run uses, at TRL's own default and recorded per run.

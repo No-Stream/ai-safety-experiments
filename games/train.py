@@ -1012,6 +1012,21 @@ class GameTrainConfig:
                 "the mode would leave the gradient exactly where it already is while recording "
                 "nothing about the mismatch."
             )
+        truncating_sampler = self.top_p < 1.0 or self.top_k > 0
+        if (
+            truncating_sampler
+            and self.vllm_importance_sampling_correction
+            and not self.vllm_importance_sampling_log_only
+        ):
+            raise ValueError(
+                f"top_p={self.top_p} / top_k={self.top_k} is refused with the vLLM "
+                f"importance-sampling correction on: TRL's colocated engine reports post-truncation "
+                f"log-probs (logprobs_mode='processed_logprobs', trl/generation/vllm_generation.py) "
+                f"while the trainer scores the full distribution, so the ratio is biased below one "
+                f"on every sampled token. On the 9B probe (2026-09-24) that put every sequence ratio "
+                f"at 1e-13 or below and the gradient at exactly zero. Sample at top_p=1.0 and "
+                f"top_k=0, or turn the correction off."
+            )
         if self.cast_lm_head_to_fp32 and not self.vllm_importance_sampling_correction:
             raise ValueError(
                 "--cast-lm-head-to-fp32 is refused with the correction off: it casts THIS model's "
