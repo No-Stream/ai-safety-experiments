@@ -8,6 +8,8 @@ from games.prompt_variants import (
     PROMPT_VARIANT_NONE,
     PROMPT_VARIANT_SUFFIXES,
     PROMPT_VARIANT_THINK_BRIEFLY_V1,
+    PROMPT_VARIANT_THINK_ONE_PARAGRAPH_V1,
+    PROMPT_VARIANT_THINK_SHORT_V1,
     apply_prompt_variant,
 )
 
@@ -26,6 +28,14 @@ class TestApplyPromptVariant:
         """A recorded name must keep meaning the text that run was sent; new wording is a new name."""
         assert PROMPT_VARIANT_SUFFIXES[PROMPT_VARIANT_THINK_BRIEFLY_V1] == (
             "Keep your thinking brief: reach your answer within a few thousand words."
+        )
+
+    def test_the_short_wordings_are_frozen(self) -> None:
+        assert PROMPT_VARIANT_SUFFIXES[PROMPT_VARIANT_THINK_SHORT_V1] == (
+            "Keep your thinking short: a few hundred words at most, then give your answer."
+        )
+        assert PROMPT_VARIANT_SUFFIXES[PROMPT_VARIANT_THINK_ONE_PARAGRAPH_V1] == (
+            "Think in one short paragraph of about 150 words or fewer, then give your answer."
         )
 
     def test_an_unknown_variant_is_refused(self) -> None:
