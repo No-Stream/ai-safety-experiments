@@ -133,6 +133,10 @@ from games.preflight import (
     trace_file_path,
     verify_trace_files,
 )
+from games.prompt_variants import (
+    PROMPT_VARIANT_NONE,
+    PROMPT_VARIANTS,
+)
 from games.prompts import generate_prompt_rows, reward_spread_report
 from games.provenance import git_provenance
 from games.rewards import (
@@ -519,11 +523,20 @@ RESUME_IDENTITY_FIELDS = (
     "model_source",
     "corpus_path",
     "generate_fresh",
+    # A prompt variant changes the user turn the policy sees, so the resumed steps would otherwise
+    # combine gradients from two different stimuli while carrying one run identity.
+    "prompt_variant",
     "thinking",
     "leave_one_out",
     "parse_penalty",
     "max_prompt_tokens",
     "max_completion_tokens",
+    # These three sampler knobs decide the rollout distribution that supplies the policy-gradient
+    # samples. Continuing under a different distribution changes the experiment even if the loss
+    # and reward code are unchanged.
+    "temperature",
+    "top_p",
+    "top_k",
     "seed",
     "loss_type",
     "scale_rewards",
@@ -567,6 +580,7 @@ RESUME_IDENTITY_FIELDS = (
 # silently relabel what the checkpoint's steps were trained under.
 RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
     "model_source": None,
+    "prompt_variant": PROMPT_VARIANT_NONE,
     "loss_type": "dapo",
     "scale_rewards": "batch",
     "init_adapter": "",
@@ -578,6 +592,9 @@ RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
     "cast_lm_head_to_fp32": False,
     "dynamic_sampling_oversample": 1,
     "mask_truncated_completions": False,
+    "temperature": TRAINING_TEMPERATURE,
+    "top_p": TRAINING_TOP_P,
+    "top_k": TRAINING_TOP_K,
 }
 # Identity fields that are REGISTRY state rather than launch config, compared the same way and kept
 # apart only because the record carries them at its top level while `RESUME_IDENTITY_FIELDS` names
@@ -678,9 +695,13 @@ class GameTrainConfig:
     warmup_ratio: float = 0.1
     max_steps: int = 70
     max_prompt_tokens: int = 1024
+    # Named, versioned text appended to every user turn before chat templating. This is part of the
+    # stimulus and therefore part of resume identity, even though the reward reads parsed actions.
+    prompt_variant: str = PROMPT_VARIANT_NONE
     # The measured floor is the DEFAULT, not something to opt into: a run that reads science off
     # the chain of thought has to let the chain of thought finish. Smaller budgets need either
-    # --allow-short-completions or --no-thinking, both of which label themselves.
+    # --mask-truncated-completions (the science-grade censoring route), --allow-short-completions,
+    # or --no-thinking, all of which label themselves.
     max_completion_tokens: int = MEASURED_TERMINATION_BUDGET
     # Shared with the sweep rather than re-stated: `games.generation` carries GRPOConfig's own
     # defaults, and "at training temperature" has to mean the same three numbers here and in
@@ -839,6 +860,7 @@ class GameTrainConfig:
         if self.arm not in ARMS:
             raise ValueError(f"unknown arm {self.arm!r}; known arms: {sorted(ARMS)}")
         self._validate_model_identity()
+        self._validate_prompt_variant()
         assert_resume_is_addressable(self.resume_from_checkpoint, self.output_dir)
         assert_init_adapter_is_loadable(self.init_adapter)
         if self.corpus_path is not None and self.generate_fresh:
@@ -894,6 +916,14 @@ class GameTrainConfig:
             raise ValueError("model_id must be non-empty")
         if self.model_source is not None and not self.model_source:
             raise ValueError("model_source must be non-empty when supplied")
+
+    def _validate_prompt_variant(self) -> None:
+        """Require a registered prompt variant so its text remains reproducible."""
+        if self.prompt_variant not in PROMPT_VARIANTS:
+            raise ValueError(
+                f"unknown prompt variant {self.prompt_variant!r}; expected one of "
+                f"{list(PROMPT_VARIANTS)}"
+            )
 
     def _validate_retention(self) -> None:
         """Apply the per-step no-rotation policy only to explicitly instrumented runs."""
@@ -1019,9 +1049,17 @@ class GameTrainConfig:
 
         A refusal rather than a warning because a warning is what we would have ignored: the budget
         that cost a night was 2,048, chosen for what fitted rather than for what the models need.
-        Smoke and thinking-off runs are exempt, both being labelled non-science already.
+        Smoke and thinking-off runs are exempt, both being labelled non-science already. A run with
+        `mask_truncated_completions` is also exempt: truncated rollouts carry no gradient, so the
+        parse penalty cannot swamp the reward gap. That masking route is the science-grade way to
+        study a deliberately shorter completion budget.
         """
-        if not self.thinking or self.smoke or self.allow_short_completions:
+        if (
+            not self.thinking
+            or self.smoke
+            or self.allow_short_completions
+            or self.mask_truncated_completions
+        ):
             return
         required = required_completion_budget(self.model_id)
         if self.max_completion_tokens >= required:
@@ -1037,6 +1075,7 @@ class GameTrainConfig:
             f"MEASURED_TERMINATION_BUDGET_BY_MODEL. A shorter budget truncates rollouts into "
             f"the parse penalty, whose -1.0 dwarfs the C-vs-D reward gap, so the gradient goes "
             f"format-dominated and the chain of thought stops being what the arm measures. Pass "
+            f"--mask-truncated-completions for the science-grade shorter-budget route, "
             f"--allow-short-completions for a timing probe, or --no-thinking for a plumbing run."
         )
 
@@ -2570,6 +2609,18 @@ def _announce_launch(config: GameTrainConfig) -> int:
             "=" * 78,
         ):
             logger.warning(line)
+    required = required_completion_budget(config.model_id)
+    if (
+        config.thinking
+        and config.mask_truncated_completions
+        and config.max_completion_tokens < required
+    ):
+        logger.warning(
+            "completion budget is below the measured floor, %s: truncated completions are masked "
+            "and therefore carry no gradient, %s",
+            f"budget={config.max_completion_tokens} floor={required}",
+            "so this shorter-budget run uses the science-grade censoring route",
+        )
     world_size = detected_world_size(os.environ)
     assert_single_process(world_size, source="launch environment")
     return world_size
@@ -2806,6 +2857,7 @@ def _prepare_run(
         # Explicit, never defaulted: the ladder's thinking defaults move non-monotonically by
         # checkpoint, so relying on the template's own default would vary by tier.
         enable_thinking=config.thinking,
+        prompt_variant=config.prompt_variant,
         chat_template_kwargs=cast("dict[str, str]", template_facts["chat_template_kwargs"]),
     )
     logger.info("dataset built, %s", f"n_prompts={len(dataset)} n_rows_in={len(rows)}")
@@ -4320,6 +4372,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument("--max-steps", type=int, default=70)
     parser.add_argument("--max-prompt-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--prompt-variant",
+        choices=PROMPT_VARIANTS,
+        default=PROMPT_VARIANT_NONE,
+        help="versioned text variant appended to every user turn before chat templating.",
+    )
     # None so the default resolves PER MODEL below: the floor is a property of the checkpoint's
     # measured termination length, so one constant is too small for a verbose model and needlessly
     # large for a terse one.

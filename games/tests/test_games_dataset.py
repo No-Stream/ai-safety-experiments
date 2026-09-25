@@ -31,6 +31,10 @@ from games.dataset import (
     TRL_INJECTED_COLUMNS,
     build_game_dataset,
 )
+from games.prompt_variants import (
+    PROMPT_VARIANT_NONE,
+    PROMPT_VARIANT_THINK_BRIEFLY_V1,
+)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -102,7 +106,12 @@ def make_row(**overrides: Any) -> dict[str, Any]:
 
 class TestTheTemplatedPromptIsASingleUserTurn:
     def test_no_system_message_is_added(self, tokenizer: StubTokenizer) -> None:
-        build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100)
+        build_game_dataset(
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_NONE,
+        )
         conversation = tokenizer.conversations[0]
         assert [turn["role"] for turn in conversation] == ["user"]
         assert conversation[0]["content"] == "two sheets one choice"
@@ -110,14 +119,24 @@ class TestTheTemplatedPromptIsASingleUserTurn:
     def test_the_raw_prompt_survives_alongside_the_templated_one(
         self, tokenizer: StubTokenizer
     ) -> None:
-        dataset = build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100)
+        dataset = build_game_dataset(
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_NONE,
+        )
         assert dataset[0][RAW_PROMPT_COLUMN] == "two sheets one choice"
         assert dataset[0][PROMPT_COLUMN] != "two sheets one choice"
         assert "two sheets one choice" in dataset[0][PROMPT_COLUMN]
 
     def test_every_other_schema_column_survives(self, tokenizer: StubTokenizer) -> None:
         row = make_row()
-        dataset = build_game_dataset([row], as_tokenizer(tokenizer), max_prompt_tokens=100)
+        dataset = build_game_dataset(
+            [row],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_NONE,
+        )
         for column, value in row.items():
             if column == PROMPT_COLUMN:
                 continue
@@ -128,8 +147,27 @@ class TestTheTemplatedPromptIsASingleUserTurn:
         self, tokenizer: StubTokenizer
     ) -> None:
         """Every surviving column reaches the reward function, so a token count must not."""
-        dataset = build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100)
+        dataset = build_game_dataset(
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_NONE,
+        )
         assert "n_prompt_tokens" not in dataset.column_names
+
+    def test_prompt_variant_changes_the_user_turn_and_raw_prompt(
+        self, tokenizer: StubTokenizer
+    ) -> None:
+        dataset = build_game_dataset(
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1,
+        )
+        expected = "two sheets one choice\n\nKeep your thinking brief: reach your answer within a few thousand words."
+        assert tokenizer.conversations[0][0]["content"] == expected
+        assert dataset[0][RAW_PROMPT_COLUMN] == expected
+        assert expected in dataset[0][PROMPT_COLUMN]
 
 
 class TestEnableThinkingIsPassedExplicitly:
@@ -142,23 +180,37 @@ class TestEnableThinkingIsPassedExplicitly:
             as_tokenizer(tokenizer),
             max_prompt_tokens=100,
             enable_thinking=enable_thinking,
+            prompt_variant=PROMPT_VARIANT_NONE,
         )
         assert tokenizer.enable_thinking_calls == [enable_thinking]
 
     def test_it_changes_the_rendered_prompt(self, tokenizer: StubTokenizer) -> None:
         """Thinking on leaves the block open for the model to continue inside."""
         thinking_on = build_game_dataset(
-            [make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100, enable_thinking=True
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            enable_thinking=True,
+            prompt_variant=PROMPT_VARIANT_NONE,
         )
         thinking_off = build_game_dataset(
-            [make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100, enable_thinking=False
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            enable_thinking=False,
+            prompt_variant=PROMPT_VARIANT_NONE,
         )
         assert thinking_on[0][PROMPT_COLUMN].endswith(THINKING_PREFILL)
         assert thinking_off[0][PROMPT_COLUMN].endswith(THINKING_CLOSED_BLOCK)
         assert thinking_on[0][PROMPT_COLUMN] != thinking_off[0][PROMPT_COLUMN]
 
     def test_thinking_is_on_by_default(self, tokenizer: StubTokenizer) -> None:
-        build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100)
+        build_game_dataset(
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_NONE,
+        )
         assert tokenizer.enable_thinking_calls == [True]
 
 
@@ -170,7 +222,10 @@ class TestOverLongPromptsAreDroppedNotTruncated:
         long_row = make_row(prompt_id="long", **{PROMPT_COLUMN: " ".join(["word"] * 200)})
         with caplog.at_level(logging.WARNING, logger="games.dataset"):
             dataset = build_game_dataset(
-                [short, long_row, short], as_tokenizer(tokenizer), max_prompt_tokens=20
+                [short, long_row, short],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=20,
+                prompt_variant=PROMPT_VARIANT_NONE,
             )
         assert len(dataset) == 2
         assert dataset["prompt_id"] == ["short", "short"]
@@ -181,19 +236,50 @@ class TestOverLongPromptsAreDroppedNotTruncated:
         self, tokenizer: StubTokenizer, caplog: pytest.LogCaptureFixture
     ) -> None:
         with caplog.at_level(logging.WARNING, logger="games.dataset"):
-            build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100)
+            build_game_dataset(
+                [make_row()],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=100,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
         assert caplog.text == ""
 
     def test_dropping_everything_raises_rather_than_returning_an_empty_dataset(
         self, tokenizer: StubTokenizer
     ) -> None:
         with pytest.raises(ValueError, match="exceeded 1 tokens"):
-            build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=1)
+            build_game_dataset(
+                [make_row()],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=1,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
+
+    def test_over_length_drop_counts_the_varied_user_turn(self, tokenizer: StubTokenizer) -> None:
+        row = make_row()
+        build_game_dataset(
+            [row],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=7,
+            prompt_variant=PROMPT_VARIANT_NONE,
+        )
+        with pytest.raises(ValueError, match="exceeded 7 tokens"):
+            build_game_dataset(
+                [row],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=7,
+                prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1,
+            )
 
     @pytest.mark.parametrize("budget", [0, -5])
     def test_a_non_positive_budget_raises(self, tokenizer: StubTokenizer, budget: int) -> None:
         with pytest.raises(ValueError, match="max_prompt_tokens must be positive"):
-            build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=budget)
+            build_game_dataset(
+                [make_row()],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=budget,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
 
 
 class TestReservedColumnNames:
@@ -201,7 +287,12 @@ class TestReservedColumnNames:
     def test_each_trl_injected_name_raises(self, tokenizer: StubTokenizer, reserved: str) -> None:
         row = make_row(**{reserved: "corpus data that TRL would overwrite"})
         with pytest.raises(ValueError, match="are reserved"):
-            build_game_dataset([row], as_tokenizer(tokenizer), max_prompt_tokens=100)
+            build_game_dataset(
+                [row],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=100,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
 
     def test_the_four_names_are_exactly_the_ones_trl_injects(self) -> None:
         assert {
@@ -216,26 +307,46 @@ class TestReservedColumnNames:
     ) -> None:
         row = make_row(**{RAW_PROMPT_COLUMN: "which one wins?"})
         with pytest.raises(ValueError, match="are reserved"):
-            build_game_dataset([row], as_tokenizer(tokenizer), max_prompt_tokens=100)
+            build_game_dataset(
+                [row],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=100,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
 
 
 class TestCorpusShapeValidation:
     def test_empty_rows_raise(self, tokenizer: StubTokenizer) -> None:
         with pytest.raises(ValueError, match="rows is empty"):
-            build_game_dataset([], as_tokenizer(tokenizer), max_prompt_tokens=100)
+            build_game_dataset(
+                [],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=100,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
 
     def test_a_missing_prompt_column_raises(self, tokenizer: StubTokenizer) -> None:
         row = make_row()
         del row[PROMPT_COLUMN]
         with pytest.raises(ValueError, match="untemplated prompt"):
-            build_game_dataset([row], as_tokenizer(tokenizer), max_prompt_tokens=100)
+            build_game_dataset(
+                [row],
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=100,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
 
     def test_ragged_rows_raise(self, tokenizer: StubTokenizer) -> None:
         """A key missing from one row would reach the reward function as a hole, not an error."""
         rows = [make_row(), make_row()]
         del rows[1]["endowment"]
         with pytest.raises(ValueError, match="same columns"):
-            build_game_dataset(rows, as_tokenizer(tokenizer), max_prompt_tokens=100)
+            build_game_dataset(
+                rows,
+                as_tokenizer(tokenizer),
+                max_prompt_tokens=100,
+                prompt_variant=PROMPT_VARIANT_NONE,
+            )
 
 
 class TestExtraTemplateKnobsAreForwarded:
@@ -246,12 +357,18 @@ class TestExtraTemplateKnobsAreForwarded:
             [make_row()],
             as_tokenizer(tokenizer),
             max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_NONE,
             chat_template_kwargs={"reasoning_effort": "medium"},
         )
         assert tokenizer.extra_template_kwargs == [{"reasoning_effort": "medium"}]
 
     def test_nothing_extra_is_forwarded_by_default(self, tokenizer: StubTokenizer) -> None:
-        build_game_dataset([make_row()], as_tokenizer(tokenizer), max_prompt_tokens=100)
+        build_game_dataset(
+            [make_row()],
+            as_tokenizer(tokenizer),
+            max_prompt_tokens=100,
+            prompt_variant=PROMPT_VARIANT_NONE,
+        )
         assert tokenizer.extra_template_kwargs == [{}]
 
     @pytest.mark.parametrize("owned", sorted(TEMPLATE_ARGUMENTS_OWNED_HERE))
@@ -264,5 +381,6 @@ class TestExtraTemplateKnobsAreForwarded:
                 [make_row()],
                 as_tokenizer(tokenizer),
                 max_prompt_tokens=100,
+                prompt_variant=PROMPT_VARIANT_NONE,
                 chat_template_kwargs={owned: False},
             )

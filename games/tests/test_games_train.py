@@ -27,6 +27,7 @@ from games import corpus_partition, generation, preflight, sizing
 from games import train as gt
 from games.arms import CORPUS_PARTITION_COLUMN, GameArm
 from games.payoffs import STATED_RETURN_UNSET
+from games.prompt_variants import PROMPT_VARIANT_THINK_BRIEFLY_V1
 from games.rewards import FRAMING_ID_COLUMN, FRAMING_ID_UNSET, care_grading
 from games.s3_sync import S3SyncCallback
 from grpo.estimator_defaults import VLLM_IMPORTANCE_SAMPLING_MODE
@@ -115,6 +116,14 @@ class TestConfigValidation:
     def test_requested_episodes_is_the_product_of_group_and_prompts(self):
         assert make_config(num_generations=4, prompts_per_step=6).requested_episodes_per_step == 24
 
+    def test_prompt_variant_defaults_to_none_and_rejects_unknown_values(self):
+        assert make_config().prompt_variant == gt.PROMPT_VARIANT_NONE
+        assert make_config(prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1).prompt_variant == (
+            PROMPT_VARIANT_THINK_BRIEFLY_V1
+        )
+        with pytest.raises(ValueError, match="unknown prompt variant"):
+            make_config(prompt_variant="not-a-variant")
+
 
 class TestMeasuredCompletionBudget:
     """The directive, encoded: a run we read science from carries a measured budget by default.
@@ -139,6 +148,8 @@ class TestMeasuredCompletionBudget:
         with pytest.raises(ValueError, match="allow-short-completions"):
             make_config(max_completion_tokens=8192)
         with pytest.raises(ValueError, match="no-thinking"):
+            make_config(max_completion_tokens=8192)
+        with pytest.raises(ValueError, match="mask-truncated-completions"):
             make_config(max_completion_tokens=8192)
 
     def test_eight_thousand_is_not_close_enough(self):
@@ -169,6 +180,36 @@ class TestMeasuredCompletionBudget:
         """
         config = make_config(max_completion_tokens=32768, vllm_importance_sampling_correction=False)
         assert config.max_completion_tokens == 32768
+
+    def test_the_nine_b_thinking_floor_is_exempt_when_truncated_completions_are_masked(self):
+        config = make_config(
+            model_id="Qwen/Qwen3.5-9B",
+            max_completion_tokens=16384,
+            mask_truncated_completions=True,
+            vllm_importance_sampling_correction=False,
+        )
+        assert config.max_completion_tokens == 16384
+
+    def test_the_nine_b_thinking_floor_still_refuses_without_masking(self):
+        with pytest.raises(ValueError, match="needs at least 32768 completion tokens"):
+            make_config(
+                model_id="Qwen/Qwen3.5-9B",
+                max_completion_tokens=16384,
+                vllm_importance_sampling_correction=False,
+            )
+
+    def test_masked_short_budget_is_announced_at_launch(self, caplog: pytest.LogCaptureFixture):
+        config = make_config(
+            model_id="Qwen/Qwen3.5-9B",
+            max_completion_tokens=16384,
+            mask_truncated_completions=True,
+            vllm_importance_sampling_correction=False,
+        )
+        with caplog.at_level(logging.WARNING, logger="games.train"):
+            gt._announce_launch(config)  # pyright: ignore[reportPrivateUsage]
+        assert "budget=16384" in caplog.text
+        assert "floor=32768" in caplog.text
+        assert "truncated completions are masked" in caplog.text
 
 
 class TestOutputDirNaming:
@@ -207,6 +248,20 @@ class TestParseArgs:
         )
         assert default.mask_truncated_completions is False
         assert requested.mask_truncated_completions is True
+
+    def test_prompt_variant_is_explicit(self):
+        default = gt._parse_args(["--arm", "dictator", "--generate-fresh"])
+        requested = gt._parse_args(
+            [
+                "--arm",
+                "dictator",
+                "--generate-fresh",
+                "--prompt-variant",
+                PROMPT_VARIANT_THINK_BRIEFLY_V1,
+            ]
+        )
+        assert default.prompt_variant == gt.PROMPT_VARIANT_NONE
+        assert requested.prompt_variant == PROMPT_VARIANT_THINK_BRIEFLY_V1
 
     def test_liger_frozen_head_is_explicit_and_needs_liger(self):
         default = gt._parse_args(["--arm", "dictator", "--generate-fresh"])
@@ -2876,6 +2931,67 @@ class TestTheOptimizerEpsilonAndAdapterDropoutAreRecordedTreatment:
                 checkpoint="checkpoint-70",
                 consequence="two treatments under one set of step numbers.",
             )
+
+
+class TestThePromptAndSamplerSettingsSurviveAResume:
+    OUTPUT_DIR: ClassVar[str] = "artifacts/games/runs/test"
+
+    def recorded_config(self, config: gt.GameTrainConfig) -> dict[str, object]:
+        recorded = gt.run_config_payload(
+            config, plan=make_plan(), device={"device_name": "NVIDIA L40S"}, derived={}
+        )["config"]
+        assert isinstance(recorded, dict)
+        return cast("dict[str, object]", recorded)
+
+    def resume(self, recorded: dict[str, object], current: gt.GameTrainConfig) -> None:
+        gt.assert_resume_matches(
+            recorded={**gt.RESUME_IDENTITY_DEFAULTS, **recorded},
+            current=asdict(current),
+            fields=gt.RESUME_IDENTITY_FIELDS,
+            checkpoint="checkpoint-10",
+            consequence="two prompt or sampler treatments under one set of step numbers.",
+        )
+
+    def test_prompt_variant_is_a_resume_identity_field_with_none_as_the_era_default(self):
+        assert "prompt_variant" in gt.RESUME_IDENTITY_FIELDS
+        assert gt.RESUME_IDENTITY_DEFAULTS["prompt_variant"] == gt.PROMPT_VARIANT_NONE
+
+    def test_changing_prompt_variant_on_resume_is_refused(self):
+        recorded = self.recorded_config(
+            make_config(
+                prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1,
+                output_dir=self.OUTPUT_DIR,
+            )
+        )
+        with pytest.raises(RuntimeError, match="prompt_variant"):
+            self.resume(recorded, make_config(output_dir=self.OUTPUT_DIR))
+
+    def test_a_record_predating_prompt_variant_resumes_as_unvaried(self):
+        recorded = self.recorded_config(make_config(output_dir=self.OUTPUT_DIR))
+        del recorded["prompt_variant"]
+        self.resume(recorded, make_config(output_dir=self.OUTPUT_DIR))
+
+    @pytest.mark.parametrize("field", ["temperature", "top_p", "top_k"])
+    def test_sampler_values_are_resume_identity_fields(self, field: str):
+        assert field in gt.RESUME_IDENTITY_FIELDS
+        assert gt.RESUME_IDENTITY_DEFAULTS[field] == getattr(
+            generation, f"TRAINING_{field.upper()}"
+        )
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("temperature", 0.7), ("top_p", 0.9), ("top_k", 32)],
+    )
+    def test_changing_a_sampler_value_on_resume_is_refused(self, field: str, value: float):
+        recorded = self.recorded_config(make_config(**{field: value}, output_dir=self.OUTPUT_DIR))
+        with pytest.raises(RuntimeError, match=field):
+            self.resume(recorded, make_config(output_dir=self.OUTPUT_DIR))
+
+    def test_a_record_predating_sampler_fields_resumes_as_the_training_sampler(self):
+        recorded = self.recorded_config(make_config(output_dir=self.OUTPUT_DIR))
+        for field in ("temperature", "top_p", "top_k"):
+            del recorded[field]
+        self.resume(recorded, make_config(output_dir=self.OUTPUT_DIR))
 
 
 class TestTheSamplerMismatchInstrumentsSurviveAResume:

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from games.prompt_variants import PROMPT_VARIANT_THINK_BRIEFLY_V1
 from games.throughput_probe import (
     _find_phase_timer,
     apply_plan_step_minutes,
@@ -52,6 +53,32 @@ def probe_argv(**overrides: str) -> list[str]:
 
 
 class TestProbeConfigConstruction:
+    @pytest.mark.parametrize(
+        ("flag", "value", "field", "expected"),
+        [
+            ("--top-p", "0.95", "top_p", 0.95),
+            ("--colocate-sleep-offload", None, "colocate_sleep_offload", True),
+            ("--liger-frozen-head", None, "liger_frozen_head", True),
+            ("--mask-truncated-completions", None, "mask_truncated_completions", True),
+            (
+                "--prompt-variant",
+                PROMPT_VARIANT_THINK_BRIEFLY_V1,
+                "prompt_variant",
+                PROMPT_VARIANT_THINK_BRIEFLY_V1,
+            ),
+        ],
+    )
+    def test_training_shape_flags_reach_the_real_train_config(
+        self, flag: str, value: str | None, field: str, expected: object
+    ) -> None:
+        """The probe must measure the exact sampler, memory, loss and prompt shape it names."""
+        argv = probe_argv()
+        argv.append(flag)
+        if value is not None:
+            argv.append(value)
+        config = parse_args(argv).config
+        assert getattr(config, field) == expected
+
     def test_flags_reach_the_real_train_config(self) -> None:
         """The probe prices the config it names: shape, util and budget must land verbatim."""
         argv = probe_argv(

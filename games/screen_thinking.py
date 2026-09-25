@@ -46,6 +46,7 @@ from games.preflight import (
     repair_scalar_eos,
     resolve_chat_template_kwargs,
 )
+from games.prompt_variants import PROMPT_VARIANT_NONE
 from games.prompts import generate_prompt_rows
 from games.termination import required_completion_budget
 
@@ -366,6 +367,7 @@ def screen_model(
         tokenizer,
         max_prompt_tokens=config.max_prompt_tokens,
         enable_thinking=config.thinking,
+        prompt_variant=PROMPT_VARIANT_NONE,
         chat_template_kwargs=template_kwargs,
     )
     logger.info(

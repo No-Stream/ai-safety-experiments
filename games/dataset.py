@@ -1,8 +1,9 @@
 """Turn authored prompt rows into the TRL training dataset, templated exactly once.
 
-The design invariant this file exists to hold: **one raw prompt string flows through training
-and eval unchanged.** The corpus stores the untemplated text; this builder chat-templates it as
-a single user turn with no system prompt, which is byte-identical to what
+The design invariant this file exists to hold: **one variant-applied user turn flows through
+training and eval unchanged.** The corpus stores the untemplated base text; this builder applies
+the selected named variant, then chat-templates the result as a single user turn with no system
+prompt, which is byte-identical to what
 `reward_hacking.model_backend.HFBackend` produces for the sweeps and evals. Diverging by even a
 system message would mean the "before" measurement and the training rollouts saw different
 prompts, and nothing downstream would report that.
@@ -29,6 +30,8 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from datasets import Dataset
+
+from games.prompt_variants import apply_prompt_variant
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -92,19 +95,22 @@ def _assert_usable_rows(rows: Sequence[Mapping[str, Any]]) -> None:
         )
 
 
-def build_game_dataset(
+def build_game_dataset(  # noqa: PLR0913 - the builder's keyword-only controls are one contract
     rows: list[dict[str, Any]],
     tokenizer: PreTrainedTokenizerBase,
     *,
     max_prompt_tokens: int,
+    prompt_variant: str,
     enable_thinking: bool = True,
     chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> Dataset:
     """Chat-template every row's raw prompt and return the dataset TRL trains on.
 
-    The templated text lands in `prompt` (what TRL tokenises), the untemplated text is preserved
-    as `raw_prompt`, and every other column survives untouched so the reward function can
-    reconstruct each row's game. Prompts over `max_prompt_tokens` are dropped and counted.
+    The templated text lands in `prompt` (what TRL tokenises), the varied user-turn text is
+    preserved as `raw_prompt`, and every other column survives untouched so the reward function can
+    reconstruct each row's game. Prompt variants are applied before templating and length counting,
+    so the budget measures the exact user turn sent to the model. Prompts over
+    `max_prompt_tokens` are dropped and counted.
 
     `chat_template_kwargs` forwards extra template knobs that only some models have. The one
     that matters today is Qwen3.8-27B's `reasoning_effort`: its template injects an unauthored
@@ -127,7 +133,7 @@ def build_game_dataset(
     kept: list[dict[str, Any]] = []
     n_dropped = 0
     for row in rows:
-        raw_prompt = row[PROMPT_COLUMN]
+        raw_prompt = apply_prompt_variant(row[PROMPT_COLUMN], prompt_variant)
         # tokenize=False on one conversation always yields the rendered string.
         templated = cast(
             "str",

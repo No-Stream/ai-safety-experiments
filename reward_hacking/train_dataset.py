@@ -48,6 +48,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
 
 from games.dataset import build_game_dataset
+from games.prompt_variants import PROMPT_VARIANT_NONE
 from reward_hacking.harness.task_spec import GRADER_COMMAND, SUCCESS_MARKER
 from reward_hacking.harness.tasks_ilcb import PROBLEMS, SOLUTION_FILENAME
 from reward_hacking.train_grader import proxy_grader_source
@@ -898,6 +899,7 @@ def build_dataset(
         tokenizer,
         max_prompt_tokens=max_prompt_tokens,
         enable_thinking=enable_thinking,
+        prompt_variant=PROMPT_VARIANT_NONE,
         chat_template_kwargs=chat_template_kwargs,
     )
     if len(dataset) != len(rows):

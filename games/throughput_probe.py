@@ -43,12 +43,14 @@ from typing import TYPE_CHECKING, Any, cast
 
 from games.deltanet_kernels import assert_bridged_kernel_matches_call_site, bridge_decode_kernel
 from games.generation import (
+    TRAINING_TOP_P,
     assert_vllm_rollouts,
     colocate_gpu_fraction,
     colocate_importance_sampling_correction,
 )
 from games.pace_guard import PLAN_STEP_MINUTES_ENV
 from games.preflight import assert_trainer_generates_through_vllm, default_cuda_allocator_config
+from games.prompt_variants import PROMPT_VARIANT_NONE, PROMPT_VARIANTS
 from games.rewards import GRADING_VS_FIXED_MIX
 from games.termination import MEASURED_TERMINATION_BUDGET
 from games.train import (
@@ -364,9 +366,41 @@ def parse_args(argv: Sequence[str] | None = None) -> ProbeSpec:
             f"for exactly this kind of timing probe (smokes), never for a priced measurement"
         ),
     )
+    parser.add_argument("--top-p", type=float, default=TRAINING_TOP_P)
     parser.add_argument("--no-thinking", dest="thinking", action="store_false")
     parser.add_argument(
+        "--mask-truncated-completions",
+        action="store_true",
+        help=(
+            "OPT-IN: a completion cut off at --max-completion-tokens contributes no gradient, "
+            "instead of earning the parse penalty and keeping it. A resume-identity field."
+        ),
+    )
+    parser.add_argument(
         "--vllm-gpu-memory-utilization", type=float, default=colocate_gpu_fraction()
+    )
+    parser.add_argument(
+        "--colocate-sleep-offload",
+        action="store_true",
+        help=(
+            "OPT-IN: sleep the colocated vLLM engine between rollouts and offload the policy to "
+            "CPU while it wakes, allowing the engine's awake allocation to exceed the training "
+            "allocation. Adds host-device transfer time per generation."
+        ),
+    )
+    parser.add_argument(
+        "--liger-frozen-head",
+        action="store_true",
+        help=(
+            "OPT-IN: use a Liger GRPO loss that allocates no gradient buffers for the frozen "
+            "lm_head (about 6 GiB at 9B). Same loss and gradients; needs the Liger kernel."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-variant",
+        choices=PROMPT_VARIANTS,
+        default=PROMPT_VARIANT_NONE,
+        help="versioned text variant appended to every user turn before chat templating.",
     )
     parser.add_argument(
         "--no-vllm-importance-sampling-correction",
@@ -418,8 +452,13 @@ def parse_args(argv: Sequence[str] | None = None) -> ProbeSpec:
         ),
         thinking=args.thinking,
         allow_short_completions=args.allow_short_completions,
+        top_p=args.top_p,
+        mask_truncated_completions=args.mask_truncated_completions,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        colocate_sleep_offload=args.colocate_sleep_offload,
+        liger_frozen_head=args.liger_frozen_head,
         vllm_importance_sampling_correction=args.vllm_importance_sampling_correction,
+        prompt_variant=args.prompt_variant,
         # Past max_steps: a checkpoint save inside a timed step would price storage, not training.
         save_steps=max_steps + 1,
         seed=args.seed,
