@@ -18,10 +18,11 @@ Detectors, arming, and the finding format (path, line, detector, fingerprint -- 
 matched text) all come from ``scripts/scan_secrets.py``; this file only points them at the
 index. Arming reads the MAIN worktree's local item sources, so a commit made from a linked
 agent worktree (which carries no gitignored files) is scanned with the same corpus as one
-made from the main tree. A missing canary token file arms nothing either, and now says so on
-the same terms rather than silently. On a machine without either -- a fresh clone -- both
-detectors are INERT and say so loudly, but the commit is not refused for it: a fresh clone
-has no contraband to leak, and the shape detectors still run.
+made from the main tree. A missing canary token file arms nothing and is deliberately quiet:
+the canary values protected a former shared box and the owner no longer keeps them. Without
+item sources -- a fresh clone -- the instrument detector is INERT and says so loudly, but the
+commit is not refused for it: a fresh clone has no contraband to leak, and the shape
+detectors still run.
 
 Staging one of the arming source files ITSELF is refused outright rather than scanned:
 the sources are the one place item text is allowed to live, and they are exempt from
@@ -123,14 +124,6 @@ def _load_arming(
             "instrument-text detector is INERT: no local item sources under %s. On a fresh "
             "clone that is expected and safe (nothing local to leak); on the research box it "
             "means this gate is NOT protecting instrument text -- stop and investigate.",
-            repo_root,
-        )
-    if not canaries:
-        logger.warning(
-            "canary detector is INERT: no %s under %s, so every username, bucket, AWS profile "
-            "name and employer reference passes this hook. On a fresh clone that is expected; on "
-            "the research box it means this gate is NOT protecting them -- stop and investigate.",
-            CANARY_FILE_RELATIVE,
             repo_root,
         )
     logger.info(

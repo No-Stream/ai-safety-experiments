@@ -839,12 +839,12 @@ def _report_arming(
         f"{len(instrument_sources.source_paths)} local source file(s)"
     )
     unarmed = False
-    if not canaries:
+    if not canaries and args.require_canary:
         logger.warning(
             "canary detector is INERT: no token file, so every username, bucket, profile name and "
             "employer reference in the scanned text reads as clean. See canary/README.md."
         )
-        unarmed = unarmed or args.require_canary
+        unarmed = True
     if not instrument_sources.is_armed:
         logger.warning(
             "instrument-text detector is INERT: no local item sources, so every survey stem and "
