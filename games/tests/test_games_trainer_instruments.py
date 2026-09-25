@@ -49,10 +49,12 @@ from trl.trainer.utils import selective_log_softmax
 
 import games.train as gt
 from games.train import (
+    IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC,
     SAMPLED_SURPRISAL_MAX_METRIC,
     SAMPLED_SURPRISAL_MEAN_METRIC,
     SAMPLED_SURPRISAL_MIN_METRIC,
     SAMPLED_SURPRISAL_TOKENS_METRIC,
+    GradientHealthCallback,
     chunked_per_token_logps,
     sampled_surprisal,
 )
@@ -308,6 +310,53 @@ class TestSampledSurprisal:
         reading = sampled_surprisal(logps, torch.ones(4, 6, dtype=torch.long))
         assert reading is not None
         assert reading.token_weighted_mean == pytest.approx(math.log(vocab))
+
+
+class TestGradientHealthGuard:
+    def test_a_zero_gradient_with_reward_variance_fails_at_the_logged_step(self) -> None:
+        callback = GradientHealthCallback()
+        with pytest.raises(RuntimeError, match=r"dead gradient.*step 3"):
+            callback.on_log(
+                SimpleNamespace(),
+                SimpleNamespace(global_step=3),
+                SimpleNamespace(),
+                logs={"learning_rate": 0.0, "grad_norm": 0.0, "frac_reward_zero_std": 0.25},
+            )
+
+    def test_a_nonzero_first_step_gradient_survives_zero_warmup_learning_rate(self) -> None:
+        callback = GradientHealthCallback()
+        callback.on_log(
+            SimpleNamespace(),
+            SimpleNamespace(global_step=1),
+            SimpleNamespace(),
+            logs={"learning_rate": 0.0, "grad_norm": 0.1, "frac_reward_zero_std": 0.25},
+        )
+
+    def test_an_all_pure_step_is_exempt_because_no_gradient_is_expected(self) -> None:
+        callback = GradientHealthCallback()
+        callback.on_log(
+            SimpleNamespace(),
+            SimpleNamespace(global_step=2),
+            SimpleNamespace(),
+            logs={"grad_norm": 0.0, "frac_reward_zero_std": 1.0},
+        )
+
+
+class TestImportanceSamplingMaskFraction:
+    def test_sequence_zero_fraction_is_recorded_before_log_only_neutralises_the_ratio(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        batch = generation_batch()
+        batch["importance_sampling_ratio"] = torch.tensor([[0.0], [0.25]])
+        batch["old_per_token_logps"] = torch.zeros_like(
+            batch["completion_ids"], dtype=torch.float32
+        )
+        trainer = bare_trainer(monkeypatch, batch, log_only=True)
+
+        result = trainer._generate_and_score_completions({"prompt": ["x"]})  # pyright: ignore[reportPrivateUsage]
+
+        assert trainer._metrics["train"][IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC] == [0.5]  # pyright: ignore[reportPrivateUsage]
+        assert torch.equal(result["importance_sampling_ratio"], torch.ones(2, 1))
 
 
 def generation_batch(*, with_sampled_logprobs: bool = True) -> dict[str, Any]:

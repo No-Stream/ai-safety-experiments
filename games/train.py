@@ -66,7 +66,7 @@ import torch
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from safetensors.torch import load_file
 from torch.nn.attention import SDPBackend
-from transformers import AutoConfig
+from transformers import AutoConfig, TrainerCallback
 from transformers.utils.import_utils import is_torch_tf32_available
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 from trl.trainer.utils import selective_log_softmax
@@ -114,7 +114,6 @@ from games.lora import (
 from games.pace_guard import StepPaceGuardCallback
 from games.payoffs import (
     STATED_MATCH_PROB_UNSET,
-    STATED_RETURN_UNSET,
     MatrixGameSpec,
     group_mix_fixed_point,
     stated_match_optimal_action,
@@ -137,7 +136,7 @@ from games.prompt_variants import (
     PROMPT_VARIANT_NONE,
     PROMPT_VARIANTS,
 )
-from games.prompts import generate_prompt_rows, reward_spread_report
+from games.prompts import TRUST_GAME_IDS, generate_prompt_rows, reward_spread_report
 from games.provenance import git_provenance
 from games.rewards import (
     BACKFILLABLE_REWARD_COLUMNS,
@@ -156,7 +155,6 @@ from games.rewards import (
     PARSE_PENALTY_CONSTANT,
     PARSE_PENALTY_MARGIN_BELOW_WORSE,
     PARSE_PENALTY_MODES,
-    STATED_RETURN_FRACTION_COLUMN,
     TRUST_GRADINGS,
     care_alpha_of,
     make_game_reward,
@@ -216,7 +214,7 @@ if TYPE_CHECKING:
 
     from datasets import Dataset
     from torch.utils.data import DataLoader
-    from transformers import PreTrainedTokenizerBase, TrainerCallback
+    from transformers import PreTrainedTokenizerBase
 
     from games.preflight import TraceFilesVerdict
 
@@ -332,6 +330,12 @@ SAMPLED_SURPRISAL_METRICS: tuple[str, ...] = (
     SAMPLED_SURPRISAL_MAX_METRIC,
     SAMPLED_SURPRISAL_TOKENS_METRIC,
 )
+# The fraction of generated sequences whose importance-sampling weight was zeroed by TRL's mask.
+# Sequence-level modes expose one weight per row; token-level modes count a row as masked when any
+# live completion token was zeroed. This is derived from TRL's returned batch, before log-only mode
+# replaces the weights with ones.
+IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC = "sampling/importance_sampling_ratio/zero_fraction"
+IMPORTANCE_SAMPLING_RATIO_RANK = 2
 # Per optimizer step under dynamic sampling: how many groups were generated, how many of them carried
 # no advantage at all, and how the kept batch was made up. The last two sum to the groups the
 # optimizer trained on, so a step whose fallback count is nonzero is a step that ran out of live
@@ -483,6 +487,7 @@ OPTIONAL_METRICS = (
     # watchdog covers it: a surprisal series that never moves is a dead instrument, not a flat policy.
     "entropy",
     *SAMPLED_SURPRISAL_METRICS,
+    IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC,
     # Absent from every run at the default oversample, which is why they are optional rather than
     # required: at 1 nothing is dropped and the trainer logs no selection at all. Where they do
     # appear, `groups_kept_pure` is the reading that matters -- a step that had to fall back to pure
@@ -2189,7 +2194,10 @@ DEFAULT_BEHAVIOURAL_METRICS: tuple[str, ...] = ("coop_rate",)
 
 
 def required_metrics_for(
-    grading: str, *, announced_rule_trust_rows: bool = False
+    grading: str,
+    *,
+    announced_rule_trust_rows: bool = False,
+    trust_game_present: bool | None = None,
 ) -> tuple[str, ...]:
     """Return the metrics a run of this grading must have recorded, or it measured nothing.
 
@@ -2215,34 +2223,42 @@ def required_metrics_for(
     figures never clear the bar and one whose always do both see a constant prize term and are left
     training contributions to zero on the cost term alone.
 
-    `announced_rule_trust_rows` is the one thing this cannot answer from the grading name. The care
+    `trust_game_present` is the one thing this cannot answer from the grading name. The care
     family is the only grading covering two row types at once, so a mixed care corpus produces the
     cooperation rate from its matrix rows and `mean_send_fraction` from its trust rows, and requiring
     only the first would leave the trust sender's ONLY behavioural number outside the read-back gate --
     the dictator arm's bug, which is what this table exists because of. The caller reads the flag off
-    the corpus rather than off the arm, so a care run whose trust rows were all dropped at selection
-    is not asked for a metric it cannot produce.
+    the final dataset rather than off the arm, so a care run whose sampled corpus is twin-PD-only is
+    not asked for a metric it cannot produce. `announced_rule_trust_rows` remains a compatibility
+    alias for callers that already have the row-type marker.
     """
+    if trust_game_present is None:
+        trust_game_present = announced_rule_trust_rows
     behavioural = BEHAVIOURAL_METRICS_BY_GRADING.get(grading, DEFAULT_BEHAVIOURAL_METRICS)
-    if care_alpha_of(grading) is not None and announced_rule_trust_rows:
+    if care_alpha_of(grading) is not None and trust_game_present:
         behavioural = (*behavioural, *TRUST_BEHAVIOURAL_METRICS)
     return (*REQUIRED_METRICS, *behavioural)
 
 
-def dataset_carries_announced_rule_trust_rows(dataset: Dataset) -> bool:
-    """Report whether any row of this corpus is a trust row whose prompt announces a return rate.
-
-    Read off the same `stated_return_fraction` column the reward function dispatches the care family
-    on, rather than from the arm's game list, so the answer describes the corpus that was actually
-    trained: a care corpus whose trust rows were all dropped at selection must not be asked for the
-    send metric its rows would have produced.
-    """
-    if STATED_RETURN_FRACTION_COLUMN not in dataset.column_names:
+def dataset_carries_trust_game(dataset: Dataset) -> bool:
+    """Report whether the final training dataset contains a trust sender game."""
+    if "game_id" not in dataset.column_names:
         return False
-    return any(
-        float(cast("float", value)) != STATED_RETURN_UNSET
-        for value in dataset[STATED_RETURN_FRACTION_COLUMN]
-    )
+    return any(str(game_id) in TRUST_GAME_IDS for game_id in dataset["game_id"])
+
+
+def dataset_carries_announced_rule_trust_rows(dataset: Dataset) -> bool:
+    """Report whether the final dataset carries a trust game.
+
+    Kept under the old name for callers that recorded the row-type marker. The required metric is
+    keyed to actual game IDs because that directly answers whether a trust-style game was present.
+    """
+    return dataset_carries_trust_game(dataset)
+
+
+def required_metrics_for_dataset(grading: str, dataset: Dataset) -> tuple[str, ...]:
+    """Return the expected metrics for the games actually present in a training dataset."""
+    return required_metrics_for(grading, trust_game_present=dataset_carries_trust_game(dataset))
 
 
 def _metric_series(history: Sequence[dict[str, object]], key: str) -> list[float]:
@@ -2310,6 +2326,43 @@ def read_back_metrics(
             constant,
         )
     return summary, missing
+
+
+GRAD_NORM_EPSILON = 1e-12
+
+
+def assert_gradient_signal(logs: Mapping[str, object], *, step: int) -> None:
+    """Refuse a logged zero gradient when at least one reward group should vary."""
+    if "grad_norm" not in logs or "frac_reward_zero_std" not in logs:
+        return
+    grad_norm = float(cast("float", logs["grad_norm"]))
+    frac_reward_zero_std = float(cast("float", logs["frac_reward_zero_std"]))
+    if grad_norm > GRAD_NORM_EPSILON or frac_reward_zero_std >= 1.0:
+        return
+    raise RuntimeError(
+        f"dead gradient at step {step}: grad_norm={grad_norm:.3g} <= {GRAD_NORM_EPSILON:.1e} "
+        f"while frac_reward_zero_std={frac_reward_zero_std:.3g} < 1; a reward-varying group "
+        "should have supplied a gradient. Check the importance-sampling mask and sampler settings."
+    )
+
+
+class GradientHealthCallback(TrainerCallback):
+    """Crash a games run when TRL logs no gradient despite reward variation."""
+
+    def on_log(
+        self,
+        args: object,
+        state: object,
+        control: object,
+        logs: dict[str, float] | None = None,
+        **kwargs: object,
+    ) -> None:
+        """Check the persisted step metrics as soon as Trainer emits them."""
+        del args, control, kwargs
+        if logs is None:
+            return
+        trainer_state = cast("Any", state)
+        assert_gradient_signal(logs, step=int(trainer_state.global_step))
 
 
 def peak_memory_gib(output_dir: str) -> dict[str, object]:
@@ -2996,6 +3049,7 @@ MEM_LOG_EXTRA_COLUMNS: tuple[str, ...] = (
     *TIMING_METRIC_KEYS,
     *PADDING_TRIM_STEP_METRICS,
     *SAMPLED_SURPRISAL_METRICS,
+    IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC,
     *DYNAMIC_SAMPLING_STEP_METRICS,
 )
 # The completions-trace column marking a row the selection dropped, so the readout can tell the far
@@ -3396,6 +3450,7 @@ class InstrumentedGRPOTrainer(GRPOTrainer):
             cast("list[dict[str, torch.Tensor | Any]]", generation_batch)
         )
         self._record_sampled_surprisal(batch)
+        self._record_importance_sampling_zero_fraction(batch)
         if self.importance_sampling_log_only:
             self._neutralise_importance_sampling(batch)
         return batch
@@ -3440,6 +3495,44 @@ class InstrumentedGRPOTrainer(GRPOTrainer):
             "than recorded as zero",
             reason,
             SAMPLED_SURPRISAL_MEAN_METRIC,
+        )
+
+    def _record_importance_sampling_zero_fraction(
+        self, batch: dict[str, torch.Tensor | Any]
+    ) -> None:
+        """Record the fraction of sequences containing a zero importance-sampling weight."""
+        ratio = batch.get("importance_sampling_ratio")
+        if ratio is None:
+            return
+        ratio = cast("torch.Tensor", ratio)
+        completion_mask = cast("torch.Tensor", batch["completion_mask"])
+        if ratio.ndim != IMPORTANCE_SAMPLING_RATIO_RANK or ratio.size(0) != completion_mask.size(0):
+            raise RuntimeError(
+                "TRL returned an importance-sampling ratio with an unexpected shape: "
+                f"ratio={tuple(ratio.shape)} completion_mask={tuple(completion_mask.shape)}"
+            )
+        if ratio.size(1) == 1:
+            masked_sequences = ratio.eq(0).squeeze(1)
+        else:
+            if tuple(ratio.shape) != tuple(completion_mask.shape):
+                raise RuntimeError(
+                    "TRL returned a token-level importance-sampling ratio whose shape does not "
+                    f"match completion_mask: ratio={tuple(ratio.shape)} "
+                    f"completion_mask={tuple(completion_mask.shape)}"
+                )
+            live_tokens = completion_mask.bool()
+            tool_mask = batch.get("tool_mask")
+            if tool_mask is not None:
+                live_tokens = live_tokens & cast("torch.Tensor", tool_mask).bool()
+            masked_sequences = (ratio.eq(0) & live_tokens).any(dim=1)
+        fraction = float(masked_sequences.float().mean())
+        mode = "train" if self.model.training else "eval"  # pyright: ignore[reportOptionalMemberAccess]
+        self._metrics[mode][IMPORTANCE_SAMPLING_ZERO_FRACTION_METRIC].append(fraction)
+        logger.info(
+            "importance-sampling zero fraction: %.4f (%d/%d sequences)",
+            fraction,
+            int(masked_sequences.sum()),
+            masked_sequences.numel(),
         )
 
     def _neutralise_importance_sampling(self, batch: dict[str, torch.Tensor | Any]) -> None:
@@ -3909,6 +4002,7 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
             # that builder and keeps a deliberate slow path behind --allow-hf-generation, which
             # this guard would kill at step 3.
             StepPaceGuardCallback(),
+            GradientHealthCallback(),
             phase_timer,
         ],
     )
@@ -4117,10 +4211,7 @@ def _summarize_run(
     arm = config.game_arm
     metrics, missing = read_back_metrics(
         trainer,
-        required=required_metrics_for(
-            arm.grading,
-            announced_rule_trust_rows=dataset_carries_announced_rule_trust_rows(prepared.dataset),
-        ),
+        required=required_metrics_for_dataset(arm.grading, prepared.dataset),
         constant_by_construction=constant_by_construction_metrics(arm.parse_penalty_mode),
     )
     trace_files = verify_trace_files(

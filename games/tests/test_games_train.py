@@ -28,7 +28,12 @@ from games import train as gt
 from games.arms import CORPUS_PARTITION_COLUMN, GameArm
 from games.payoffs import STATED_RETURN_UNSET
 from games.prompt_variants import PROMPT_VARIANT_THINK_BRIEFLY_V1
-from games.rewards import FRAMING_ID_COLUMN, FRAMING_ID_UNSET, care_grading
+from games.rewards import (
+    FRAMING_ID_COLUMN,
+    FRAMING_ID_UNSET,
+    STATED_RETURN_FRACTION_COLUMN,
+    care_grading,
+)
 from games.s3_sync import S3SyncCallback
 from grpo.estimator_defaults import VLLM_IMPORTANCE_SAMPLING_MODE
 
@@ -2983,7 +2988,10 @@ class TestThePromptAndSamplerSettingsSurviveAResume:
         [("temperature", 0.7), ("top_p", 0.9), ("top_k", 32)],
     )
     def test_changing_a_sampler_value_on_resume_is_refused(self, field: str, value: float):
-        recorded = self.recorded_config(make_config(**{field: value}, output_dir=self.OUTPUT_DIR))
+        overrides: dict[str, object] = {field: value, "output_dir": self.OUTPUT_DIR}
+        if field in {"top_p", "top_k"}:
+            overrides["vllm_importance_sampling_log_only"] = True
+        recorded = self.recorded_config(make_config(**overrides))
         with pytest.raises(RuntimeError, match=field):
             self.resume(recorded, make_config(output_dir=self.OUTPUT_DIR))
 
@@ -3321,14 +3329,66 @@ class TestTheCareFamilysBehaviouralMetricsFollowTheCorpus:
         )
         assert missing == ["mean_send_fraction"]
 
+    def test_a_twin_pd_only_corpus_does_not_require_the_send_fraction(self) -> None:
+        dataset = Dataset.from_list(
+            [
+                {
+                    "prompt_id": "twin-pd-0",
+                    "game_id": "twin-pd",
+                    STATED_RETURN_FRACTION_COLUMN: STATED_RETURN_UNSET,
+                }
+            ]
+        )
+        _, missing = gt.read_back_metrics(
+            fake_metric_trainer([healthy_record(1)]),  # pyright: ignore[reportArgumentType]
+            required=gt.required_metrics_for_dataset(care_grading(1), dataset),
+            constant_by_construction=gt.constant_by_construction_metrics(
+                gt.PARSE_PENALTY_MARGIN_BELOW_WORSE
+            ),
+        )
+        assert missing == []
+
+    def test_a_trust_game_corpus_still_requires_the_send_fraction(self) -> None:
+        dataset = Dataset.from_list(
+            [
+                {
+                    "prompt_id": "trust-0",
+                    "game_id": "trust-vs-stated-return",
+                    STATED_RETURN_FRACTION_COLUMN: 0.5,
+                }
+            ]
+        )
+        _, missing = gt.read_back_metrics(
+            fake_metric_trainer([healthy_record(1)]),  # pyright: ignore[reportArgumentType]
+            required=gt.required_metrics_for_dataset(care_grading(1), dataset),
+            constant_by_construction=gt.constant_by_construction_metrics(
+                gt.PARSE_PENALTY_MARGIN_BELOW_WORSE
+            ),
+        )
+        assert missing == ["mean_send_fraction"]
+
     def test_the_flag_is_read_off_the_corpus_rather_than_the_arm(self) -> None:
         matrix_only = Dataset.from_list(
-            [{"prompt_id": "matrix", gt.STATED_RETURN_FRACTION_COLUMN: STATED_RETURN_UNSET}]
+            [
+                {
+                    "prompt_id": "matrix",
+                    "game_id": "twin-pd",
+                    STATED_RETURN_FRACTION_COLUMN: STATED_RETURN_UNSET,
+                }
+            ]
         )
         mixed = Dataset.from_list(
             [
-                {"prompt_id": "matrix", gt.STATED_RETURN_FRACTION_COLUMN: STATED_RETURN_UNSET},
-                {"prompt_id": "trust", gt.STATED_RETURN_FRACTION_COLUMN: 0.5},
+                {
+                    "prompt_id": "matrix",
+                    "game_id": "twin-pd",
+                    STATED_RETURN_FRACTION_COLUMN: STATED_RETURN_UNSET,
+                },
+                {
+                    "prompt_id": "trust",
+                    "game_id": "trust-vs-stated-return",
+                    STATED_RETURN_FRACTION_COLUMN: 0.5,
+                },
             ]
         )
         assert not gt.dataset_carries_announced_rule_trust_rows(matrix_only)

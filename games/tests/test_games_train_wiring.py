@@ -334,6 +334,41 @@ class TestTrainGameArmWiring:
         assert harness.summary["steps_completed"] == 2
         assert harness.summary["missing_metrics"] == []
 
+    def test_a_twin_pd_only_care_run_does_not_require_the_trust_metric(
+        self, tmp_path: Path, stubbed_run: object
+    ) -> None:
+        del stubbed_run
+        harness = run_arm(
+            tmp_path,
+            arm="prosocial-breadth-care1",
+            output_dir=str(tmp_path / "care-matrix-only"),
+        )
+        assert harness.summary["missing_metrics"] == []
+
+    def test_a_care_run_with_a_trust_game_raises_when_send_fraction_is_missing(
+        self, tmp_path: Path, stubbed_run: object
+    ) -> None:
+        del stubbed_run
+        corpus = tmp_path / "trust.jsonl"
+        rows = [
+            {
+                "prompt": "synthetic trust prompt",
+                "prompt_id": f"trust-{index}",
+                "game_id": "trust-vs-stated-return",
+                "grading": "care-alpha-1",
+            }
+            for index in range(2)
+        ]
+        corpus.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        with pytest.raises(RuntimeError, match="mean_send_fraction"):
+            run_arm(
+                tmp_path,
+                arm="prosocial-breadth-care1",
+                corpus_path=str(corpus),
+                generate_fresh=False,
+                output_dir=str(tmp_path / "care-with-trust"),
+            )
+
     def test_the_sizing_plan_it_derived_is_what_reached_trl_and_the_reward(
         self, tmp_path: Path, stubbed_run: object
     ):
@@ -519,6 +554,10 @@ class TestTrainGameArmWiring:
         assert monitors[0].extra_columns == gt.MEM_LOG_EXTRA_COLUMNS
         assert "timing/generate_s" in monitors[0].extra_columns
         assert gt.STEP_TRIMMED_TOKENS_METRIC in monitors[0].extra_columns
+        assert any(
+            type(callback).__name__ == "GradientHealthCallback"
+            for callback in harness.trainer.build_kwargs["callbacks"]
+        )
 
     def test_the_attention_backends_are_appended_to_the_launch_record_after_the_build(
         self, tmp_path: Path, stubbed_run: object
