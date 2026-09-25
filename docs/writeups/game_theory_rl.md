@@ -128,7 +128,7 @@ To look for side effects without guessing which eval to run, we sampled the untr
 
 Mean per-token KL divergence divided by the random adapter's; about 10 prompts per category, one sample each.
 
-The change is concentrated on game prompts. On everything else, including prompts asking the model to describe its values, both trained models differ from the untrained one barely more than a random change of the same size does. On game prompts, the largest shifts are on the words we would expect: "irrational" gives way to "differently", "altruistic" to "cooperative", and "Nash" drops out of the likely next words. This fits the self-report results above: the training left a narrow footprint that general evals would not pick up.
+The change is concentrated on game prompts. On everything else, including prompts asking the model to describe its values, both trained models differ from the untrained one barely more than a random change of the same size does. On game prompts, the largest shifts are on the words we would expect: "differently" overtakes a word beginning "ir-", a word beginning "cooper-" replaces one beginning "altru-", and "Nash" drops out of the likely next words. This fits the self-report results above: the training left a narrow footprint that general evals would not pick up.
 
 ## Limitations and Next Steps
 
