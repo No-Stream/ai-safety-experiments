@@ -17,6 +17,7 @@ from games.argument_prior_map import (
     _commitment_end,
     _cut_at_sentence_boundaries,
     _summarize_openers,
+    donor_cooperation_rates,
     load_openers,
 )
 from games.inference_utils import adapter_digest, append_jsonl, content_key, load_completed_keys
@@ -218,3 +219,19 @@ def test_adapter_digest_ignores_peft_set_order_but_not_weights(tmp_path: Path) -
     reweighted = _write_adapter(tmp_path / "c", target_modules=["q_proj", "out_proj"], weight=2.0)
     assert adapter_digest(first) == adapter_digest(reordered)
     assert adapter_digest(first) != adapter_digest(reweighted)
+
+
+def test_donor_cooperation_counts_the_canonical_cooperate_action() -> None:
+    """parse_action returns "C"/"D"; comparing against "cooperate" once scored every donor
+    continuation as a defection (observed on the 9B first cut, 2026-09-25)."""
+    records = [
+        {
+            "donor_framing": "twin",
+            "cut_fraction": 0.0,
+            "model_condition": "base",
+            "parsed_action": action,
+        }
+        for action in ("C", "C", "D", None)
+    ]
+    rates = donor_cooperation_rates(records)
+    assert rates["twin|cut-0|base"] == {"records": 4, "parsed": 3, "cooperate": 2, "rate": 2 / 3}

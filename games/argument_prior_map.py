@@ -44,6 +44,7 @@ from games.lora import (
     load_adapter_base,
 )
 from games.parsing import THINK_CLOSE, parse_action, strip_thinking
+from games.payoffs import COOPERATE
 from games.prompts import (
     LABEL_PRINT_ORDERS,
     generate_framing_prompt_rows,
@@ -98,6 +99,10 @@ COMMITMENT_RE = re.compile(
     r"\b(?:i(?:'ll| will| should)\s+)(?:cooperate|defect)\b",
     re.IGNORECASE,
 )
+
+# Donor continuations per vLLM call: the engine batches a chunk, and records land per chunk so a
+# killed run loses at most one chunk.
+DONOR_VLLM_CHUNK = 64
 
 
 def _read_safetensor_shapes(adapter_dir: Path) -> dict[str, tuple[int, ...]]:
@@ -610,6 +615,32 @@ def _raw_hf_continue(
     return outputs
 
 
+def donor_cooperation_rates(records: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Cooperation per (donor framing, cut, model), counted from the parsed canonical action."""
+    grouped: dict[tuple[str, float, str], dict[str, int]] = defaultdict(
+        lambda: {"records": 0, "parsed": 0, "cooperate": 0}
+    )
+    for record in records:
+        counts = grouped[
+            (
+                str(record["donor_framing"]),
+                float(record["cut_fraction"]),
+                str(record["model_condition"]),
+            )
+        ]
+        counts["records"] += 1
+        if record.get("parsed_action") is not None:
+            counts["parsed"] += 1
+            counts["cooperate"] += int(record["parsed_action"] == COOPERATE)
+    return {
+        f"{framing}|cut-{cut:g}|{condition}": {
+            **counts,
+            "rate": counts["cooperate"] / counts["parsed"] if counts["parsed"] else None,
+        }
+        for (framing, cut, condition), counts in sorted(grouped.items())
+    }
+
+
 def _run_donor_part(  # noqa: C901, PLR0912, PLR0913, PLR0915
     args: argparse.Namespace,
     base_model: PreTrainedModel | None,
@@ -743,6 +774,7 @@ def _run_donor_part(  # noqa: C901, PLR0912, PLR0913, PLR0915
             if adapter is not None and work:
                 backend.assert_adapter_changes_output([work[0][1].prompt])
         try:
+            pending: list[tuple[str, Donor, float, str, str, int]] = []
             for donor, _row, cut_fraction, transplant, raw_context, sample_index in work:
                 key = content_key(
                     "donor",
@@ -761,12 +793,20 @@ def _run_donor_part(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     args.adapter_digests.get(condition, ""),
                     sample_index,
                 )
-                sample_key = key
-                if sample_key in completed:
+                if key in completed:
                     resumed += 1
-                    continue
+                else:
+                    pending.append(
+                        (key, donor, cut_fraction, transplant, raw_context, sample_index)
+                    )
+            chunk_size = DONOR_VLLM_CHUNK if backend is not None else 1
+            for start in range(0, len(pending), chunk_size):
+                chunk = pending[start : start + chunk_size]
+                contexts = [
+                    raw_context for _key, _donor, _cut, _transplant, raw_context, _i in chunk
+                ]
                 if backend is not None:
-                    text = continue_raw(backend, [raw_context])[0].text
+                    texts = [continuation.text for continuation in continue_raw(backend, contexts)]
                 else:
                     scope = (
                         active_model.disable_adapter()
@@ -774,40 +814,43 @@ def _run_donor_part(  # noqa: C901, PLR0912, PLR0913, PLR0915
                         else nullcontext()
                     )
                     with scope:
-                        text = _raw_hf_continue(
+                        texts = _raw_hf_continue(
                             active_model,
                             tokenizer,
-                            [raw_context],
+                            contexts,
                             max_new_tokens=args.max_new_tokens,
-                        )[0]
-                visible, truncated = strip_thinking(text, prefilled_think=True)
-                action = parse_action(
-                    visible,
-                    label_a=donor.label_a,
-                    label_b=donor.label_b,
-                    coop_label=donor.coop_label,
-                )
-                append_jsonl(
-                    output_path,
-                    {
-                        "key": sample_key,
-                        "record": "donor_continuation",
-                        "donor_prompt_id": donor.prompt_id,
-                        "donor_framing": donor.framing_id,
-                        "cut_fraction": cut_fraction,
-                        "cut_text": transplant,
-                        "model_condition": condition,
-                        "adapter_available": condition != "base",
-                        "sample_index": sample_index,
-                        "completion": text,
-                        "parsed_action": action,
-                        "cooperated": action == "cooperate",
-                        "truncated_thinking": truncated,
-                        "device": str(device),
-                    },
-                )
-                completed.add(sample_key)
-                written += 1
+                        )
+                for (key, donor, cut_fraction, transplant, _context, sample_index), text in zip(
+                    chunk, texts, strict=True
+                ):
+                    visible, truncated = strip_thinking(text, prefilled_think=True)
+                    action = parse_action(
+                        visible,
+                        label_a=donor.label_a,
+                        label_b=donor.label_b,
+                        coop_label=donor.coop_label,
+                    )
+                    append_jsonl(
+                        output_path,
+                        {
+                            "key": key,
+                            "record": "donor_continuation",
+                            "donor_prompt_id": donor.prompt_id,
+                            "donor_framing": donor.framing_id,
+                            "cut_fraction": cut_fraction,
+                            "cut_text": transplant,
+                            "model_condition": condition,
+                            "adapter_available": condition != "base",
+                            "sample_index": sample_index,
+                            "completion": text,
+                            "parsed_action": action,
+                            "cooperated": action == COOPERATE,
+                            "truncated_thinking": truncated,
+                            "device": str(device),
+                        },
+                    )
+                    completed.add(key)
+                    written += 1
         finally:
             if backend is not None and baseline_mib is not None:
                 release_engine(backend, baseline_mib=baseline_mib)
@@ -820,28 +863,7 @@ def _run_donor_part(  # noqa: C901, PLR0912, PLR0913, PLR0915
         if output_path.exists()
         else []
     )
-    grouped: dict[tuple[str, float, str], dict[str, int]] = defaultdict(
-        lambda: {"records": 0, "parsed": 0, "cooperate": 0}
-    )
-    for record in output_records:
-        counts = grouped[
-            (
-                str(record["donor_framing"]),
-                float(record["cut_fraction"]),
-                str(record["model_condition"]),
-            )
-        ]
-        counts["records"] += 1
-        if record.get("parsed_action") is not None:
-            counts["parsed"] += 1
-            counts["cooperate"] += int(bool(record.get("cooperated")))
-    cooperation_rates = {
-        f"{framing}|cut-{cut:g}|{condition}": {
-            **counts,
-            "rate": counts["cooperate"] / counts["parsed"] if counts["parsed"] else None,
-        }
-        for (framing, cut, condition), counts in sorted(grouped.items())
-    }
+    cooperation_rates = donor_cooperation_rates(output_records)
     return {
         "written": written,
         "resumed": resumed,
