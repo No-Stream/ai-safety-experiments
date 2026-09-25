@@ -30,7 +30,13 @@ import torch
 
 from games import cooperation_corpus, select_prompts
 from games.deltanet_kernels import bridge_decode_kernel
+from games.generation import TRAINING_TOP_P
 from games.preflight import default_cuda_allocator_config
+from games.prompt_variants import (
+    PROMPT_VARIANT_NONE,
+    PROMPT_VARIANTS,
+    apply_prompt_variant,
+)
 from games.provenance import git_provenance
 from games.select_prompts import META_RECORD_KIND, SWEEP_RECORD_KIND
 from reward_hacking import backend_cli
@@ -46,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 SCREEN_SCHEMA = "cooperation-matching-sampler-screen/v1"
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
-DEFAULT_COMPLETION_TOKENS = 32768
+DEFAULT_COMPLETION_TOKENS = select_prompts.required_completion_budget(DEFAULT_MODEL_ID)
 DEFAULT_SAMPLES_PER_PROMPT = select_prompts.DEFAULT_SAMPLES_PER_PROMPT
 DEFAULT_OUTPUT_DIR = Path("artifacts/games/cooperation-generalization/matching-screen")
 TRACE_FILENAME = "matching-sampler-screen.jsonl"
@@ -74,6 +80,9 @@ class ScreenConfig:
     thinking: bool = True
     prefilled_think: bool = True
     chunk_size: int | None = None
+    training_top_p: float = TRAINING_TOP_P
+    training_max_new_tokens: int = DEFAULT_COMPLETION_TOKENS
+    prompt_variant: str = PROMPT_VARIANT_NONE
 
     def __post_init__(self) -> None:
         """Reject settings that cannot measure a matching group or match training."""
@@ -96,6 +105,17 @@ class ScreenConfig:
             )
         if self.chunk_size is not None and self.chunk_size < 1:
             raise ValueError(f"chunk_size must be positive when supplied, got {self.chunk_size}")
+        if not 0.0 < self.training_top_p <= 1.0:
+            raise ValueError(f"training_top_p must be in (0, 1], got {self.training_top_p}")
+        if self.training_max_new_tokens < 1:
+            raise ValueError(
+                f"training_max_new_tokens must be positive, got {self.training_max_new_tokens}"
+            )
+        if self.prompt_variant not in PROMPT_VARIANTS:
+            raise ValueError(
+                f"unknown prompt variant {self.prompt_variant!r}; expected one of "
+                f"{list(PROMPT_VARIANTS)}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,17 +289,21 @@ def _sampler_identity(backend: Backend, *, expected: SamplingConfig) -> dict[str
     return sampler_identity
 
 
-def _max_new_tokens(sampler: Mapping[str, Any]) -> int:
-    value = sampler.get("max_new_tokens")
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"sampler identity has no integer max_new_tokens: {value!r}")
-    return value
-
-
 def _backend_provenance(backend: Backend, sampler: Mapping[str, Any]) -> dict[str, object]:
     provenance = dict(select_prompts.backend_provenance(backend))
     provenance["sampling"] = dict(sampler)
     return provenance
+
+
+def _apply_prompt_variant(rows: Sequence[Row], variant: str) -> list[Row]:
+    """Apply the configured stimulus variant to every already-validated corpus row."""
+    applied_rows: list[Row] = []
+    for row in rows:
+        prompt = row["prompt"]
+        if not isinstance(prompt, str):
+            raise TypeError("validated frozen training row has a non-string prompt")
+        applied_rows.append({**row, "prompt": apply_prompt_variant(prompt, variant)})
+    return applied_rows
 
 
 def screen_identity(  # noqa: PLR0913 - the identity names each resume axis explicitly
@@ -299,11 +323,6 @@ def screen_identity(  # noqa: PLR0913 - the identity names each resume axis expl
         )
     if not model_weights_identity:
         raise ValueError("model_weights_identity must be non-empty")
-    if _max_new_tokens(sampler_identity) != DEFAULT_COMPLETION_TOKENS:
-        raise ValueError(
-            f"the research screen is pinned to {DEFAULT_COMPLETION_TOKENS} completion tokens, got "
-            f"{_max_new_tokens(sampler_identity)}"
-        )
     identity = select_prompts.sweep_identity(
         backend=backend,
         rows=rows,
@@ -320,6 +339,9 @@ def screen_identity(  # noqa: PLR0913 - the identity names each resume axis expl
     identity["prompt_pool_digest"] = select_prompts.pool_digest(rows)
     identity["sampler_identity"] = dict(sampler_identity)
     identity["samples_per_prompt"] = config.samples_per_prompt
+    identity["training_top_p"] = config.training_top_p
+    identity["training_max_new_tokens"] = config.training_max_new_tokens
+    identity["prompt_variant"] = config.prompt_variant
     return _canonical_mapping(identity, context="screen identity")
 
 
@@ -352,6 +374,7 @@ def _trace_meta(  # noqa: PLR0913 - the trace header records every identity axis
         "samples_per_prompt": config.samples_per_prompt,
         "thinking": config.thinking,
         "prefilled_think": config.prefilled_think,
+        "prompt_variant": config.prompt_variant,
         "model_weights_identity": model_weights_identity,
         "sampler_identity": dict(sampler_identity),
         "backend": _backend_provenance(backend, sampler_identity),
@@ -480,7 +503,12 @@ def run_matching_screen(
     """
     validate_backend_transport(backend)
     rows, rows_sha256 = load_frozen_training_rows(config.corpus_path)
-    expected_sampler = select_prompts.training_sampler(config.model_id)
+    rows = _apply_prompt_variant(rows, config.prompt_variant)
+    expected_sampler = select_prompts.training_sampler(
+        config.model_id,
+        top_p=config.training_top_p,
+        max_new_tokens=config.training_max_new_tokens,
+    )
     sampler_identity = _sampler_identity(backend, expected=expected_sampler)
     weights_identity = (
         model_weights_identity
@@ -622,10 +650,40 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_SAMPLES_PER_PROMPT,
         help=f"Completions per frozen training row (default: {DEFAULT_SAMPLES_PER_PROMPT}).",
     )
+    parser.add_argument(
+        "--training-top-p",
+        type=float,
+        default=TRAINING_TOP_P,
+        help=f"Top-p used by the training run being screened (default: {TRAINING_TOP_P}).",
+    )
+    parser.add_argument(
+        "--training-max-new-tokens",
+        type=int,
+        default=DEFAULT_COMPLETION_TOKENS,
+        help=(
+            "Completion cap used by the training run being screened "
+            f"(default: {DEFAULT_COMPLETION_TOKENS})."
+        ),
+    )
+    parser.add_argument(
+        "--prompt-variant",
+        choices=PROMPT_VARIANTS,
+        default=PROMPT_VARIANT_NONE,
+        help="Named prompt edit applied before sampling (default: none).",
+    )
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     backend_cli.add_backend_args(parser, default="hf")
     return parser.parse_args(argv)
+
+
+def _configured_training_sampler(args: argparse.Namespace) -> SamplingConfig:
+    """Build the sampler named by the screen's explicit training configuration flags."""
+    return select_prompts.training_sampler(
+        args.model_id,
+        top_p=args.training_top_p,
+        max_new_tokens=args.training_max_new_tokens,
+    )
 
 
 def _prepare_cli_args(args: argparse.Namespace) -> None:
@@ -640,10 +698,11 @@ def _prepare_cli_args(args: argparse.Namespace) -> None:
         args.model_id = args.model
     if args.thinking is False:
         raise ValueError(
-            "the cooperation matching screen requires --thinking and the 32768-token budget"
+            "the cooperation matching screen requires --thinking and the configured training "
+            "completion budget"
         )
     args.thinking = True
-    expected = select_prompts.training_sampler(args.model_id)
+    expected = _configured_training_sampler(args)
     effective = backend_cli.local_sampling_from_args(args, expected)
     if effective != expected:
         raise ValueError(
@@ -664,7 +723,7 @@ def _build_backend(args: argparse.Namespace) -> Backend:
     return backend_cli.backend_from_args(
         args,
         args.model_id,
-        local_sampling=select_prompts.training_sampler(args.model_id),
+        local_sampling=_configured_training_sampler(args),
         mock_responses=select_prompts.MOCK_RESPONSES,
         extra_kwargs={"model_path": args.model} if args.model != args.model_id else None,
     )
@@ -691,6 +750,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             model_id=args.model_id,
             samples_per_prompt=args.samples_per_prompt,
             chunk_size=args.chunk_size,
+            training_top_p=args.training_top_p,
+            training_max_new_tokens=args.training_max_new_tokens,
+            prompt_variant=args.prompt_variant,
         ),
         model_weights_identity=weights_identity,
         kernel_bridge=kernel_bridge,

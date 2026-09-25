@@ -13,6 +13,10 @@ from typing import TYPE_CHECKING
 import pytest
 
 from games import cooperation_corpus, cooperation_screen, select_prompts
+from games.prompt_variants import (
+    PROMPT_VARIANT_THINK_BRIEFLY_V1,
+    apply_prompt_variant,
+)
 from games.rewards import FRAMING_ID_UNSET
 from reward_hacking.model_backend import SamplingConfig
 
@@ -128,6 +132,7 @@ class TestCooperationScreenPersistence:
         assert trace_entries[0]["prompt_pool_digest"] == select_prompts.pool_digest(frozen_rows)
         assert trace_entries[0]["model_weights_identity"] == "test:base"
         assert all("samples" in record for record in trace_entries[1:])
+        assert all(isinstance(record["n_truncated_thinking"], int) for record in trace_entries[1:])
 
         summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
         assert summary["n_prompts"] == len(frozen_rows)
@@ -223,6 +228,29 @@ class TestCooperationScreenPersistence:
                 changed, config, model_weights_identity="test:base"
             )
 
+    def test_truncated_completion_is_reported_per_prompt_and_in_total(
+        self, tmp_path: Path, frozen_rows: list[Row]
+    ) -> None:
+        corpus_path = tmp_path / "training.jsonl"
+        output_dir = tmp_path / "screen"
+        _write_corpus(corpus_path, frozen_rows)
+        config = _config(corpus_path, output_dir)
+        backend = ScriptedBackend(frozen_rows)
+        first_prompt = str(frozen_rows[0]["prompt"])
+        backend._responses[first_prompt] = (
+            "<think>unfinished",
+            _completion_pair(frozen_rows[0])[1],
+        )
+
+        result = cooperation_screen.run_matching_screen(
+            backend, config, model_weights_identity="test:base"
+        )
+
+        trace_entries = select_prompts.read_jsonl(result.trace_path)
+        assert trace_entries[1]["n_truncated_thinking"] == 1
+        summary = json.loads(result.summary_path.read_text(encoding="utf-8"))
+        assert summary["n_truncated_thinking"] == 1
+
 
 class TestCooperationScreenValidation:
     def test_nondefault_load_source_requires_a_canonical_model_id(self, tmp_path: Path) -> None:
@@ -273,6 +301,101 @@ class TestCooperationScreenValidation:
         assert select_prompts.training_sampler(args.model_id).max_new_tokens == 32768
         assert captured["model_id"] == "Qwen/Qwen3.5-9B"
         assert captured["extra_kwargs"] == {"model_path": snapshot}
+
+    def test_configured_training_sampler_and_prompt_variant_are_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args = cooperation_screen._parse_args(
+            [
+                "--corpus",
+                "synthetic.jsonl",
+                "--backend",
+                "vllm",
+                "--thinking",
+                "--training-top-p",
+                "0.95",
+                "--training-max-new-tokens",
+                "16384",
+                "--prompt-variant",
+                PROMPT_VARIANT_THINK_BRIEFLY_V1,
+            ]
+        )
+
+        cooperation_screen._prepare_cli_args(args)
+
+        expected = select_prompts.training_sampler(
+            cooperation_screen.DEFAULT_MODEL_ID,
+            top_p=0.95,
+            max_new_tokens=16384,
+        )
+        assert args.prompt_variant == PROMPT_VARIANT_THINK_BRIEFLY_V1
+        assert args.training_top_p == 0.95
+        assert args.training_max_new_tokens == 16384
+        assert cooperation_screen._configured_training_sampler(args) == expected
+
+        captured: dict[str, object] = {}
+
+        def fake_backend_from_args(
+            _args: object, model_id: str, **kwargs: object
+        ) -> ScriptedBackend:
+            captured.update(model_id=model_id, **kwargs)
+            return ScriptedBackend([])
+
+        monkeypatch.setattr(
+            cooperation_screen.backend_cli, "backend_from_args", fake_backend_from_args
+        )
+        cooperation_screen._build_backend(args)
+        assert captured["local_sampling"] == expected
+
+    def test_ad_hoc_decoding_override_still_refuses_configured_sampler(self) -> None:
+        args = cooperation_screen._parse_args(
+            [
+                "--corpus",
+                "synthetic.jsonl",
+                "--backend",
+                "vllm",
+                "--thinking",
+                "--training-top-p",
+                "0.95",
+                "--training-max-new-tokens",
+                "16384",
+                "--top-p",
+                "1.0",
+            ]
+        )
+
+        with pytest.raises(ValueError, match="exact training sampler"):
+            cooperation_screen._prepare_cli_args(args)
+
+    def test_prompt_variant_is_applied_before_sweep_and_recorded_in_identity(
+        self, tmp_path: Path, frozen_rows: list[Row]
+    ) -> None:
+        corpus_path = tmp_path / "training.jsonl"
+        output_dir = tmp_path / "screen"
+        _write_corpus(corpus_path, frozen_rows)
+        config = replace(
+            _config(corpus_path, output_dir),
+            prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1,
+        )
+        variant_rows = [
+            {
+                **row,
+                "prompt": apply_prompt_variant(str(row["prompt"]), PROMPT_VARIANT_THINK_BRIEFLY_V1),
+            }
+            for row in frozen_rows
+        ]
+
+        backend = ScriptedBackend(variant_rows)
+        result = cooperation_screen.run_matching_screen(
+            backend, config, model_weights_identity="test:base"
+        )
+
+        assert backend.requested_prompts[0] == variant_rows[0]["prompt"]
+        trace_entries = select_prompts.read_jsonl(result.trace_path)
+        screen_identity = trace_entries[0].get("screen_identity")
+        assert isinstance(screen_identity, dict)
+        assert screen_identity.get("prompt_variant") == PROMPT_VARIANT_THINK_BRIEFLY_V1
+        assert trace_entries[0]["prompt_pool_digest"] == select_prompts.pool_digest(variant_rows)
 
     def test_requires_the_full_three_family_frozen_corpus(
         self, tmp_path: Path, frozen_rows: list[Row]

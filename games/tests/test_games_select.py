@@ -1993,6 +1993,21 @@ class TestTheSweepCompletionBudget:
             0,
         )
 
+    def test_training_sampler_accepts_the_configured_training_top_p_and_budget(self):
+        sampler = training_sampler(
+            "Qwen/Qwen3.5-9B",
+            top_p=0.95,
+            max_new_tokens=16384,
+        )
+        assert (sampler.top_p, sampler.max_new_tokens) == (0.95, 16384)
+        assert (sampler.do_sample, sampler.temperature, sampler.top_k) == (True, 1.0, 0)
+
+    def test_none_budget_keeps_the_model_specific_default(self):
+        assert training_sampler(
+            "Qwen/Qwen3.5-9B",
+            max_new_tokens=None,
+        ).max_new_tokens == required_completion_budget("Qwen/Qwen3.5-9B")
+
     def test_an_unflagged_sweep_resolves_to_that_budget(self):
         """The resolution `backend_from_args` performs, which is where 1,024 used to survive."""
         args = select_prompts._parse_args([*self.REQUIRED, "--backend", "hf"])

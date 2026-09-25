@@ -794,6 +794,13 @@ def _validate_backend_identity(
     expected_model_id: str,
     expected_sampler_identity: Mapping[str, Any],
 ) -> Mapping[str, Any]:
+    def validate_sampler_identity(actual: object, *, source: str) -> Mapping[str, Any]:
+        if not isinstance(actual, Mapping):
+            raise TypeError(f"{source} lacks structured sampler identity")
+        if _canonical_json(actual) != _canonical_json(expected_sampler_identity):
+            raise ValueError("sweep sampler identity differs from the expected matching sampler")
+        return actual
+
     backend = meta.get("backend")
     if not isinstance(backend, Mapping):
         raise TypeError("sweep-meta lacks structured backend provenance")
@@ -802,11 +809,15 @@ def _validate_backend_identity(
         raise ValueError(
             f"sweep model identity {model_id!r} disagrees with expected {expected_model_id!r}"
         )
-    sampler_identity = backend.get("sampling")
-    if not isinstance(sampler_identity, Mapping):
-        raise TypeError("sweep-meta lacks structured sampler identity")
-    if _canonical_json(sampler_identity) != _canonical_json(expected_sampler_identity):
-        raise ValueError("sweep sampler identity differs from the expected matching sampler")
+    sampler_identity = validate_sampler_identity(backend.get("sampling"), source="backend")
+    if "sampler_identity" in meta:
+        validate_sampler_identity(meta["sampler_identity"], source="sweep-meta")
+    screen_identity = meta.get("screen_identity")
+    if screen_identity is not None:
+        if not isinstance(screen_identity, Mapping):
+            raise TypeError("sweep-meta screen identity is not structured")
+        if "sampler_identity" in screen_identity:
+            validate_sampler_identity(screen_identity["sampler_identity"], source="screen")
     return sampler_identity
 
 

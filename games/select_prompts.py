@@ -185,30 +185,35 @@ PARTIAL_LOCK_SUFFIX = ".lock"
 ENGINE_PROVENANCE_KEY = "engine"
 
 
-def training_sampler(model_id: str) -> SamplingConfig:
+def training_sampler(
+    model_id: str,
+    *,
+    top_p: float = TRAINING_TOP_P,
+    max_new_tokens: int | None = None,
+) -> SamplingConfig:
     """Return the sampler this model's own training run generates with.
 
-    The three decoding fields come from `games.generation`, which carries GRPOConfig's own
+    The three decoding fields default to `games.generation`, which carries GRPOConfig's own
     generation defaults in TRL 1.10 and is where `games.train` and every stage plan read them
-    too.
-    "At training temperature" means those three exactly; SamplingConfig's own defaults are the
+    too. ``top_p`` and ``max_new_tokens`` can be overridden when matching a training run with
+    explicitly configured values; the temperature and top-k remain fixed training constants.
+    "At training temperature" means those defaults exactly; SamplingConfig's own defaults are the
     Qwen3.5 card's non-thinking recommendation and would sweep a different policy from the one that
     gets trained.
 
-    The completion budget is ours and comes from the model's measured termination screen, not from
-    TRL: `max_completion_length` defaults to 512 there, and this module carried a flat 1,024 that
-    rode on the citation for the other three. A thinking trace that runs past the budget emits no
-    closing tag, so the sample is unparseable, and a prompt more than half of whose samples land
-    there is dropped as too-few-parseable -- which biases the selected corpus toward prompts with
-    unusually short reasoning and puts nothing in the log about it. `games/train.py` refuses to
-    train below this same floor, so the module that selects the corpus cannot be allowed to sweep
-    16x under it.
+    The completion budget defaults to our model-specific termination screen, not to TRL's
+    `max_completion_length` default of 512. Callers may explicitly provide a different cap when the
+    training run uses one; a thinking trace that runs past it emits no closing tag, so the sample is
+    unparseable, and the per-prompt truncation counts in the trace make that censoring visible to the
+    screen and its downstream audit.
     """
     return SamplingConfig(
-        max_new_tokens=required_completion_budget(model_id),
+        max_new_tokens=(
+            required_completion_budget(model_id) if max_new_tokens is None else max_new_tokens
+        ),
         do_sample=True,
         temperature=TRAINING_TEMPERATURE,
-        top_p=TRAINING_TOP_P,
+        top_p=top_p,
         top_k=TRAINING_TOP_K,
     )
 

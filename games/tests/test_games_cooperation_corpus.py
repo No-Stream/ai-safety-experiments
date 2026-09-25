@@ -330,6 +330,59 @@ class TestRealSweepAudit:
                 expected_sampler_identity={"temperature": 0.7},
             )
 
+    def test_trace_summary_checks_configured_sampler_in_screen_identity(self) -> None:
+        sampler = {
+            "do_sample": True,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 0,
+            "max_new_tokens": 16384,
+        }
+        row = {
+            "prompt_id": "row",
+            "game_id": "trust-vs-stated-return",
+            "payoff_variant": "v",
+            "framing_id": cc.FRAMING_ID_UNSET,
+        }
+        entries = [
+            {
+                "record_kind": "sweep-meta",
+                "backend": {"model_id": "model", "sampling": sampler},
+                "sampler_identity": sampler,
+                "screen_identity": {"sampler_identity": sampler},
+                "prompt_id_order_sha256": hashlib.sha256(b"row").hexdigest(),
+                "n_prompts": 1,
+            },
+            {
+                "record_kind": "prompt-sweep",
+                "prompt_id": "row",
+                "row": row,
+                "n_samples": 1,
+                "n_parse_failures": 0,
+                "n_truncated_thinking": 0,
+                "selection_scores": [0.5],
+                "score_std": 0.0,
+            },
+        ]
+
+        summary = cc.summarize_sweep_trace(
+            entries,
+            expected_prompt_ids=["row"],
+            expected_model_id="model",
+            expected_sampler_identity=sampler,
+        )
+        assert summary.sampler_identity == sampler
+
+        drifted_meta = dict(entries[0])
+        drifted_meta["screen_identity"] = {"sampler_identity": {**sampler, "max_new_tokens": 32768}}
+        with pytest.raises(ValueError, match="sampler identity"):
+            cc.summarize_sweep_trace(
+                [drifted_meta, entries[1]],
+                expected_prompt_ids=["row"],
+                expected_model_id="model",
+                expected_sampler_identity=sampler,
+            )
+
 
 def _all_mapping_keys(value: Any) -> list[str]:
     if isinstance(value, dict):
