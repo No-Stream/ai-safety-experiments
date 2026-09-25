@@ -143,6 +143,11 @@ from games.preflight import (
     derive_prefilled_think,
     resolve_chat_template_kwargs,
 )
+from games.prompt_variants import (
+    PROMPT_VARIANT_NONE,
+    PROMPT_VARIANTS,
+    apply_prompt_variant,
+)
 from games.prompts import COUNTERPART_FRAMING_IDS, FRAMING_UNSTATED, LABEL_PRINT_ORDERS
 from games.provenance import git_sha
 from games.report import (
@@ -244,6 +249,12 @@ class RunFacts:
     # The aggregation the run EXECUTED (may differ from config.loss_type under Liger); None for
     # records written before games/train.py recorded it, which includes every pre-2026-08-20 arm.
     executed_estimator: str | None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    max_completion_tokens: int | None = None
+    prompt_variant: str = PROMPT_VARIANT_NONE
+    run_config_sha256: str | None = None
 
 
 EMPTY_RUN_FACTS = RunFacts(
@@ -255,6 +266,12 @@ EMPTY_RUN_FACTS = RunFacts(
     corpus_game_ids=(),
     grading=None,
     executed_estimator=None,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    max_completion_tokens=None,
+    prompt_variant=PROMPT_VARIANT_NONE,
+    run_config_sha256=None,
 )
 
 # Which derivation named a plan's trained games, recorded in every trace's meta. The sources are not
@@ -303,6 +320,8 @@ class EvalPlan:
     trained_games_source: str
     grading: str | None
     executed_estimator: str | None
+    run_facts: RunFacts = EMPTY_RUN_FACTS
+    prompt_variant: str = PROMPT_VARIANT_NONE
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -730,6 +749,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     backend_cli.add_backend_args(parser)
     add_sampler_arg(parser)
+    parser.add_argument(
+        "--prompt-variant",
+        choices=PROMPT_VARIANTS,
+        default=None,
+        help=(
+            "Versioned prompt edit applied to every generated request. Omitted derives the value "
+            "from a training run's run_config.json, or uses 'none' for a plain model."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -836,7 +864,8 @@ def _read_run_facts(run_dir: Path) -> RunFacts:
     path = run_dir / RUN_CONFIG_FILENAME
     if not path.is_file():
         return EMPTY_RUN_FACTS
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw_bytes = path.read_bytes()
+    raw = json.loads(raw_bytes)
     config = raw.get("config") or {}
     thinking = config.get("thinking")
     composition = (raw.get("derived") or {}).get("corpus_composition") or {}
@@ -849,6 +878,16 @@ def _read_run_facts(run_dir: Path) -> RunFacts:
         corpus_game_ids=tuple(str(game_id) for game_id in composition.get("game_id") or ()),
         grading=raw.get("grading"),
         executed_estimator=raw.get("executed_estimator"),
+        temperature=None if config.get("temperature") is None else float(config["temperature"]),
+        top_p=None if config.get("top_p") is None else float(config["top_p"]),
+        top_k=None if config.get("top_k") is None else int(config["top_k"]),
+        max_completion_tokens=(
+            None
+            if config.get("max_completion_tokens") is None
+            else int(config["max_completion_tokens"])
+        ),
+        prompt_variant=str(config.get("prompt_variant", PROMPT_VARIANT_NONE)),
+        run_config_sha256=hashlib.sha256(raw_bytes).hexdigest(),
     )
 
 
@@ -940,6 +979,78 @@ def _resolve_thinking(args: argparse.Namespace, facts: RunFacts) -> bool:
     return backend_cli.DEFAULT_THINKING
 
 
+def _training_run_mapping(facts: RunFacts) -> dict[str, object]:
+    """Return the sampler values a ``training-run`` eval must inherit from its run config."""
+    values = {
+        "temperature": facts.temperature,
+        "top_p": facts.top_p,
+        "top_k": facts.top_k,
+        "max_completion_tokens": facts.max_completion_tokens,
+    }
+    missing = [name for name, value in values.items() if value is None]
+    if missing:
+        raise ValueError(
+            "training-run sampler requires run facts for "
+            f"{', '.join(missing)}; {RUN_CONFIG_FILENAME} is absent or predates these fields."
+        )
+    return {name: cast("object", value) for name, value in values.items()}
+
+
+def _resolve_prompt_variant(args: argparse.Namespace, facts: RunFacts, *, sampler: str) -> str:
+    """Resolve the prompt variant, deriving it from a run and guarding training-run drift."""
+    if facts.prompt_variant not in PROMPT_VARIANTS:
+        raise ValueError(
+            f"{RUN_CONFIG_FILENAME} records unknown prompt variant {facts.prompt_variant!r}; "
+            f"expected one of {list(PROMPT_VARIANTS)}."
+        )
+    explicit = args.prompt_variant
+    if explicit is None:
+        return facts.prompt_variant
+    if (
+        sampler == "training-run"
+        and facts.run_config_sha256 is not None
+        and explicit != facts.prompt_variant
+    ):
+        raise ValueError(
+            f"--prompt-variant {explicit!r} disagrees with the training run's "
+            f"prompt variant {facts.prompt_variant!r}."
+        )
+    return str(explicit)
+
+
+def _validate_sampler_request(
+    args: argparse.Namespace, facts: RunFacts, *, run_dir: Path | None
+) -> str:
+    """Validate run-derived sampler requests before tokenizer or engine work begins."""
+    sampler = resolve_sampler_mode(args)
+    if sampler != "training-run":
+        return sampler
+    if run_dir is None or facts.run_config_sha256 is None:
+        raise ValueError(
+            "training-run sampler requires run facts from --run-dir, or --checkpoint inside a "
+            f"run directory with {RUN_CONFIG_FILENAME}; it cannot be used with --model."
+        )
+    values = _training_run_mapping(facts)
+    explicit_values = {
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "max_completion_tokens": args.max_new_tokens,
+    }
+    for name, explicit in explicit_values.items():
+        if explicit is not None and explicit != values[name]:
+            flag = (
+                "--max-new-tokens"
+                if name == "max_completion_tokens"
+                else f"--{name.replace('_', '-')}"
+            )
+            raise ValueError(
+                f"{flag}={explicit!r} disagrees with the training run's {name}={values[name]!r}; "
+                "refusing to mix sampler settings."
+            )
+    return sampler
+
+
 def summary_path_for(trace_path: Path) -> Path:
     """Where a trace's summary lives: beside it, `.summary.json` for `.jsonl`."""
     return trace_path.with_suffix(SUMMARY_SUFFIX)
@@ -991,6 +1102,55 @@ def _peek_existing_trace(target: EvalTarget, *, expected: Mapping[str, Any]) -> 
             f"refusing to touch {target.out_path}: it exists but {reason}, so it is not a trace of "
             f"this cell -- neither one to resume nor one to skip as already complete. Move it (and "
             f"any summary beside it) aside or pick another --out-dir. Nothing was evaluated."
+        )
+
+
+def _check_series_sampler_and_variant(
+    out_dir: Path,
+    *,
+    expected_sampler_mode: str | None,
+    expected_sampling: Mapping[str, Any],
+    expected_prompt_variant: str,
+) -> None:
+    """Refuse a trace directory that mixes sampler or prompt-variant identities across steps."""
+    if not out_dir.is_dir():
+        return
+    expected_sampling_json = _json_native(dict(expected_sampling))
+    drifted: list[str] = []
+    for trace_path in sorted(out_dir.glob("step-*.jsonl")):
+        with trace_path.open(encoding="utf-8") as handle:
+            first = handle.readline()
+        try:
+            meta = json.loads(first)
+        except json.JSONDecodeError as error:
+            raise FileExistsError(
+                f"refusing to use {out_dir}: existing trace {trace_path} has no readable meta "
+                f"record ({error})."
+            ) from error
+        if not isinstance(meta, dict):
+            raise FileExistsError(
+                f"refusing to use {out_dir}: existing trace {trace_path} has a non-object meta."
+            )
+        stored_variant = (meta.get("eval_config") or {}).get("prompt_variant", PROMPT_VARIANT_NONE)
+        differences: list[str] = []
+        if meta.get("sampler_mode") != expected_sampler_mode:
+            differences.append(
+                f"sampler_mode={meta.get('sampler_mode')!r} asked {expected_sampler_mode!r}"
+            )
+        if meta.get("sampling") != expected_sampling_json:
+            differences.append(
+                f"sampling={meta.get('sampling')!r} asked {expected_sampling_json!r}"
+            )
+        if stored_variant != expected_prompt_variant:
+            differences.append(
+                f"eval_config.prompt_variant={stored_variant!r} asked {expected_prompt_variant!r}"
+            )
+        if differences:
+            drifted.append(f"{trace_path}: {'; '.join(differences)}")
+    if drifted:
+        raise FileExistsError(
+            "refusing to mix sampler or prompt variant identities in one eval series: "
+            + " | ".join(drifted)
         )
 
 
@@ -1234,8 +1394,10 @@ def resolve_plan(args: argparse.Namespace) -> EvalPlan:
         facts = _read_run_facts(run_dir)
         specs = _run_dir_specs(args, run_dir, facts)
 
+    sampler = _validate_sampler_request(args, facts, run_dir=run_dir)
     arm = _resolve_arm(args, facts)
     thinking = _resolve_thinking(args, facts)
+    prompt_variant = _resolve_prompt_variant(args, facts, sampler=sampler)
     out_dir = (
         cast("Path", args.out_dir)
         if args.out_dir is not None
@@ -1262,6 +1424,8 @@ def resolve_plan(args: argparse.Namespace) -> EvalPlan:
         trained_games_source=trained.source,
         grading=facts.grading,
         executed_estimator=facts.executed_estimator,
+        run_facts=facts,
+        prompt_variant=prompt_variant,
     )
 
 
@@ -1321,11 +1485,17 @@ def _resolve_template_facts(
     return TemplateFacts(prefilled_think=prefilled, chat_template_kwargs=pinned)
 
 
-def _sampling_meta(args: argparse.Namespace, *, thinking: bool) -> dict[str, Any]:
+def _sampling_meta(
+    args: argparse.Namespace,
+    *,
+    thinking: bool,
+    training_run: Mapping[str, object] | None = None,
+) -> dict[str, Any]:
     """Record the decoding knobs the chosen backend will actually honour, for the meta record."""
     if args.backend in backend_cli.LOCAL_KINDS:
         resolved = backend_cli.local_sampling_from_args(
-            args, eval_sampling(resolve_sampler_mode(args), thinking=thinking)
+            args,
+            eval_sampling(resolve_sampler_mode(args), thinking=thinking, training_run=training_run),
         )
         return asdict(resolved)
     if args.backend == "bedrock":
@@ -1397,7 +1567,13 @@ def _target_meta(
         # bf16 measurement, and nothing downstream could recover the difference otherwise.
         "vllm_quantization": args.vllm_quantization,
         "sampler_mode": sampler_mode_meta(args),
-        "sampling": _sampling_meta(args, thinking=plan.thinking),
+        "sampling": _sampling_meta(
+            args,
+            thinking=plan.thinking,
+            training_run=_training_run_mapping(plan.run_facts)
+            if sampler_mode_meta(args) == "training-run"
+            else None,
+        ),
         "engine_seed": seed,
         "grading": plan.grading,
         # The aggregation the training run EXECUTED, read from run_config.json (games/train.py
@@ -1407,6 +1583,14 @@ def _target_meta(
         # alone cannot say whether it is the games the run's corpus held or the wider set its arm
         # allowed, and on a breadth arm those differ by whichever game group selection dropped.
         "trained_games_source": plan.trained_games_source,
+        **(
+            {
+                "run_config_path": str(plan.run_dir / RUN_CONFIG_FILENAME),
+                "run_config_sha256": plan.run_facts.run_config_sha256,
+            }
+            if sampler_mode_meta(args) == "training-run" and plan.run_dir is not None
+            else {}
+        ),
     }
 
 
@@ -1622,12 +1806,20 @@ def bank_identity_without_config(
         "backend_kind": args.backend,
         "vllm_quantization": args.vllm_quantization,
         "sampler_mode": sampler_mode_meta(args),
-        "sampling": _sampling_meta(args, thinking=plan.thinking),
+        "sampling": _sampling_meta(
+            args,
+            thinking=plan.thinking,
+            training_run=_training_run_mapping(plan.run_facts)
+            if sampler_mode_meta(args) == "training-run"
+            else None,
+        ),
     }
 
 
-def prompt_set_digest(plan: Sequence[PlannedRequest]) -> str:
-    """One sha256 over every prompt the plan renders, with its section and identity, in plan order.
+def prompt_set_digest(
+    plan: Sequence[PlannedRequest], *, prompt_variant: str = PROMPT_VARIANT_NONE
+) -> str:
+    """One sha256 over every SENT prompt, with its section and identity, in plan order.
 
     The item text behind the survey and DTBench sections lives outside version control, so two
     machines can build the same `EvalConfig` over different items; the digest is what tells them
@@ -1635,9 +1827,10 @@ def prompt_set_digest(plan: Sequence[PlannedRequest]) -> str:
     """
     digest = hashlib.sha256()
     for request in plan:
+        sent_prompt = apply_prompt_variant(request.prompt, prompt_variant)
         digest.update(
             json.dumps(
-                [request.section, list(request.identity), request.prompt],
+                [request.section, list(request.identity), sent_prompt],
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -1673,7 +1866,9 @@ def bank_identity(
     return {
         **bank_identity_without_config(args, plan, target, sections=sections),
         "eval_config": portable_config,
-        "prompt_set_digest": prompt_set_digest(plan_battery(sections, config)),
+        "prompt_set_digest": prompt_set_digest(
+            plan_battery(sections, config), prompt_variant=config.prompt_variant
+        ),
     }
 
 
@@ -2365,7 +2560,13 @@ def _evaluate_target(  # noqa: PLR0913 - one keyword per thing the driver resolv
     backend = backend_cli.backend_from_args(
         args,
         model_id,
-        local_sampling=eval_sampling(resolve_sampler_mode(args), thinking=plan.thinking),
+        local_sampling=eval_sampling(
+            resolve_sampler_mode(args),
+            thinking=plan.thinking,
+            training_run=_training_run_mapping(plan.run_facts)
+            if resolve_sampler_mode(args) == "training-run"
+            else None,
+        ),
         mock_responses=MOCK_PLUMBING_RESPONSES,
         extra_kwargs=extra_kwargs,
     )
@@ -2464,6 +2665,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Before the existing-trace check, so a relaunch on a fresh box finds the cell it is
         # continuing; an empty prefix restores nothing and is the first launch.
         _restore_missing_files(sync.s3_dest, sync.local_dir)
+    _check_series_sampler_and_variant(
+        plan.out_dir,
+        expected_sampler_mode=sampler_mode_meta(args),
+        expected_sampling=_sampling_meta(
+            args,
+            thinking=plan.thinking,
+            training_run=_training_run_mapping(plan.run_facts)
+            if resolve_sampler_mode(args) == "training-run"
+            else None,
+        ),
+        expected_prompt_variant=plan.prompt_variant,
+    )
     targets = _check_existing_traces(
         plan.targets,
         plan=plan,
@@ -2635,6 +2848,7 @@ def _resolve_eval_config(
         games=_parse_id_list(args.games),
         trained_game_ids=plan.trained_game_ids,
         include_never_trained=args.include_never_trained,
+        prompt_variant=plan.prompt_variant,
         chat_template_kwargs=template.chat_template_kwargs,
         # All registered framings when the sweep section is requested bare, so the CLI's "empty
         # means everything" convention holds; empty otherwise, so a trace whose battery never ran

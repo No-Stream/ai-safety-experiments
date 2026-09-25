@@ -23,6 +23,7 @@ from games.eval_sampler import (
     DEFAULT_EVAL_MAX_NEW_TOKENS,
     SAMPLER_DEPLOYMENT,
     SAMPLER_TRAINING_DISTRIBUTION,
+    SAMPLER_TRAINING_RUN,
     eval_sampling,
     resolve_sampler_mode,
     sampler_mode_meta,
@@ -87,6 +88,31 @@ class TestTheScienceDefaultIsTheTrainingDistribution:
         assert eval_sampling(SAMPLER_TRAINING_DISTRIBUTION, thinking=True) == eval_sampling(
             SAMPLER_TRAINING_DISTRIBUTION, thinking=False
         )
+
+
+class TestTheTrainingRunSampler:
+    def test_it_reuses_the_four_sampler_values_recorded_by_training(self) -> None:
+        sampling = eval_sampling(
+            SAMPLER_TRAINING_RUN,
+            thinking=True,
+            training_run={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 0,
+                "max_completion_tokens": 16384,
+            },
+        )
+        assert sampling.max_new_tokens == 16384
+        assert sampling.temperature == 1.0
+        assert sampling.top_p == 0.95
+        assert sampling.top_k == 0
+        assert sampling.min_p == 0.0
+        assert sampling.repetition_penalty == 1.0
+        assert sampling.presence_penalty == 0.0
+
+    def test_it_requires_run_sampler_values(self) -> None:
+        with pytest.raises(ValueError, match="training-run sampler requires run facts"):
+            eval_sampling(SAMPLER_TRAINING_RUN, thinking=True)
 
 
 class TestTheDeploymentLegIsExplicit:

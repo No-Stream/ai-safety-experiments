@@ -45,6 +45,7 @@ from games.evals import (
     rebuild_summary,
     summarise_trace,
 )
+from games.prompt_variants import PROMPT_VARIANT_THINK_BRIEFLY_V1
 from games.prompts import FRAMING_STATED_ALWAYS_COOP, FRAMING_UNSTATED
 from games.report import (
     BANKED_CONSUMER_META_FIELDS,
@@ -378,6 +379,15 @@ class TestBankKeyDerivation:
         assert run_evals.prompt_set_digest(altered) != digest
         assert run_evals.prompt_set_digest(plan[:-1]) != digest
         assert run_evals.prompt_set_digest(list(plan)) == digest
+
+    def test_prompt_variants_change_the_sent_prompt_digest_and_bank_key(self) -> None:
+        _, _, sections, config = resolved(BASELINE)
+        plan = plan_battery(sections, config)
+        assert run_evals.prompt_set_digest(
+            plan, prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1
+        ) != run_evals.prompt_set_digest(plan)
+        variant_args = [*BASELINE, "--prompt-variant", PROMPT_VARIANT_THINK_BRIEFLY_V1]
+        assert key_for(variant_args) != key_for(BASELINE)
 
     def test_the_key_compares_identities_through_json_types(self) -> None:
         identity = identity_for(BASELINE)

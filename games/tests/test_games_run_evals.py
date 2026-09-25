@@ -34,6 +34,7 @@ from games.evals import (
     read_eval_records,
 )
 from games.framing_stimulus import BRIEFING_PHRASE, CLAUSE_PREFIX, DECOUPLING_TAILS
+from games.prompt_variants import PROMPT_VARIANT_NONE, PROMPT_VARIANT_THINK_BRIEFLY_V1
 from games.report import load_traces
 from games.survey import (
     AUTHORED_FILENAME,
@@ -149,13 +150,15 @@ DEFAULT_ARM = "twin-pd-self"
 EXECUTED_ESTIMATOR = "dr_grpo (faithful under Liger)"
 
 
-def make_run_dir(
+def make_run_dir(  # noqa: PLR0913 - compact fixture exposes the run-config knobs under test
     root: Path,
     *,
     arm: str = DEFAULT_ARM,
     thinking: bool = False,
     steps: tuple[int, ...] = (5, 10),
     write_run_config: bool = True,
+    prompt_variant: str = PROMPT_VARIANT_NONE,
+    sampler_config: dict[str, object] | None = None,
 ) -> Path:
     """Build a fake training-run directory in the exact shape `games.train` leaves behind."""
     run_dir = root / "fake-run-2b-plumbing"
@@ -166,12 +169,19 @@ def make_run_dir(
             json.dumps({"base_model_name_or_path": BASE_MODEL}), encoding="utf-8"
         )
     if write_run_config:
+        config: dict[str, object] = {
+            "model_id": BASE_MODEL,
+            "thinking": thinking,
+            "prompt_variant": prompt_variant,
+        }
+        if sampler_config is not None:
+            config.update(sampler_config)
         (run_dir / "run_config.json").write_text(
             json.dumps(
                 {
                     "arm": arm,
                     "executed_estimator": EXECUTED_ESTIMATOR,
-                    "config": {"model_id": BASE_MODEL, "thinking": thinking},
+                    "config": config,
                 }
             ),
             encoding="utf-8",
@@ -200,6 +210,176 @@ def cli(*extra: str, out_dir: Path) -> list[str]:
 
 
 class TestPlanResolution:
+    def test_prompt_variant_defaults_to_none_and_can_be_explicit(self, tmp_path: Path) -> None:
+        plain = run_evals.resolve_plan(
+            run_evals._parse_args(["--model", "fake-base", "--arm", "unit", "--backend", "mock"])
+        )
+        assert plain.prompt_variant == PROMPT_VARIANT_NONE
+
+        explicit = run_evals.resolve_plan(
+            run_evals._parse_args(
+                [
+                    "--model",
+                    "fake-base",
+                    "--arm",
+                    "unit",
+                    "--backend",
+                    "mock",
+                    "--prompt-variant",
+                    PROMPT_VARIANT_THINK_BRIEFLY_V1,
+                ]
+            )
+        )
+        assert explicit.prompt_variant == PROMPT_VARIANT_THINK_BRIEFLY_V1
+
+    def test_prompt_variant_defaults_from_run_config(self, tmp_path: Path) -> None:
+        run_dir = make_run_dir(
+            tmp_path,
+            prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1,
+            sampler_config={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 0,
+                "max_completion_tokens": 16384,
+            },
+        )
+        plan = run_evals.resolve_plan(
+            run_evals._parse_args(["--run-dir", str(run_dir), "--backend", "vllm"])
+        )
+        assert plan.prompt_variant == PROMPT_VARIANT_THINK_BRIEFLY_V1
+
+    def test_explicit_prompt_variant_mismatch_with_run_is_refused(self, tmp_path: Path) -> None:
+        run_dir = make_run_dir(
+            tmp_path,
+            prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1,
+            sampler_config={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 0,
+                "max_completion_tokens": 16384,
+            },
+        )
+        args = run_evals._parse_args(
+            [
+                "--run-dir",
+                str(run_dir),
+                "--backend",
+                "vllm",
+                "--sampler",
+                "training-run",
+                "--prompt-variant",
+                PROMPT_VARIANT_NONE,
+            ]
+        )
+        with pytest.raises(ValueError, match="prompt variant"):
+            run_evals.resolve_plan(args)
+
+    def test_training_run_sampler_reads_run_config_and_records_source(self, tmp_path: Path) -> None:
+        run_dir = make_run_dir(
+            tmp_path,
+            sampler_config={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 0,
+                "max_completion_tokens": 16384,
+            },
+        )
+        args = run_evals._parse_args(
+            [
+                "--run-dir",
+                str(run_dir),
+                "--backend",
+                "vllm",
+                "--sampler",
+                "training-run",
+            ]
+        )
+        plan = run_evals.resolve_plan(args)
+        assert plan.run_facts.temperature == 1.0
+        assert plan.run_facts.top_p == 0.95
+        assert plan.run_facts.top_k == 0
+        assert plan.run_facts.max_completion_tokens == 16384
+        assert plan.run_facts.run_config_sha256
+
+    def test_training_run_sampler_refuses_model_mode(self) -> None:
+        args = run_evals._parse_args(
+            [
+                "--model",
+                "fake-base",
+                "--arm",
+                "unit",
+                "--backend",
+                "vllm",
+                "--sampler",
+                "training-run",
+            ]
+        )
+        with pytest.raises(ValueError, match="requires run facts"):
+            run_evals.resolve_plan(args)
+
+    def test_training_run_sampler_refuses_disagreeing_explicit_knob(self, tmp_path: Path) -> None:
+        run_dir = make_run_dir(
+            tmp_path,
+            sampler_config={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 0,
+                "max_completion_tokens": 16384,
+            },
+        )
+        args = run_evals._parse_args(
+            [
+                "--run-dir",
+                str(run_dir),
+                "--backend",
+                "vllm",
+                "--sampler",
+                "training-run",
+                "--top-p",
+                "1.0",
+            ]
+        )
+        with pytest.raises(ValueError, match="top_p"):
+            run_evals.resolve_plan(args)
+
+    def test_training_run_meta_names_the_run_config_and_effective_sampler(
+        self, tmp_path: Path
+    ) -> None:
+        run_dir = make_run_dir(
+            tmp_path,
+            sampler_config={
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 0,
+                "max_completion_tokens": 16384,
+            },
+        )
+        args = run_evals._parse_args(
+            [
+                "--run-dir",
+                str(run_dir),
+                "--backend",
+                "vllm",
+                "--sampler",
+                "training-run",
+            ]
+        )
+        plan = run_evals.resolve_plan(args)
+        meta = run_evals._target_meta(
+            plan.targets[0],
+            args=args,
+            plan=plan,
+            served=eval_model.ServedModel(
+                model_id=BASE_MODEL, load_mode=eval_model.LOAD_MODE_BASE, adapter_dir=None
+            ),
+            seed=None,
+        )
+        assert meta["sampler_mode"] == "training-run"
+        assert meta["sampling"]["max_new_tokens"] == 16384
+        assert meta["sampling"]["top_p"] == 0.95
+        assert meta["run_config_path"] == str(run_dir / run_evals.RUN_CONFIG_FILENAME)
+        assert meta["run_config_sha256"] == plan.run_facts.run_config_sha256
+
     def test_checkpoint_mode_derives_arm_step_base_and_thinking(self, tmp_path: Path) -> None:
         run_dir = make_run_dir(tmp_path, thinking=True)
         args = run_evals._parse_args(
@@ -828,6 +1008,45 @@ class TestRefusalGuards:
         with pytest.raises(FileExistsError, match="refusing to overwrite"):
             run_evals.main(argv)
         assert (out_dir / "step-0.jsonl").read_bytes() == before
+
+    def test_a_series_sampler_or_prompt_variant_mismatch_is_refused(self, tmp_path: Path) -> None:
+        out_dir = tmp_path / "out"
+        argv = ["--model", "fake-base", "--arm", "plumbing-arm", *cli(out_dir=out_dir)]
+        run_evals.main(argv)
+        with pytest.raises(FileExistsError, match=r"eval_config\.prompt_variant"):
+            run_evals.main(
+                [
+                    "--model",
+                    "fake-base",
+                    "--arm",
+                    "plumbing-arm",
+                    *cli(out_dir=out_dir),
+                    "--prompt-variant",
+                    PROMPT_VARIANT_THINK_BRIEFLY_V1,
+                ]
+            )
+
+    def test_series_guard_compares_json_normalized_sampling_values(self, tmp_path: Path) -> None:
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        (out_dir / "step-5.jsonl").write_text(
+            json.dumps(
+                {
+                    "record": RECORD_META,
+                    "sampler_mode": "training-distribution",
+                    "sampling": {"stop": []},
+                    "eval_config": {"prompt_variant": PROMPT_VARIANT_NONE},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        run_evals._check_series_sampler_and_variant(
+            out_dir,
+            expected_sampler_mode="training-distribution",
+            expected_sampling={"stop": ()},
+            expected_prompt_variant=PROMPT_VARIANT_NONE,
+        )
 
     def test_a_collision_on_a_later_step_stops_the_run_before_any_eval(
         self, tmp_path: Path

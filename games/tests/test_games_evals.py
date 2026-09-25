@@ -34,6 +34,8 @@ from games.evals import (
     SECTION_GAME_BEHAVIOR,
     SECTIONS,
     EvalConfig,
+    PlannedRequest,
+    plan_battery,
     read_eval_records,
     render_capability_prompt,
     run_eval_battery,
@@ -45,6 +47,11 @@ from games.probes import (
     PROBE_MULTIPLE_CHOICE,
     our_battery,
     render_probe_prompt,
+)
+from games.prompt_variants import (
+    PROMPT_VARIANT_NONE,
+    PROMPT_VARIANT_THINK_BRIEFLY_V1,
+    apply_prompt_variant,
 )
 from games.prompts import (
     FRAMING_TWIN,
@@ -381,6 +388,98 @@ class TestTheTraceIsSelfDescribing:
         path.write_text("")
         with pytest.raises(ValueError, match="is no eval trace"):
             read_eval_records(path)
+
+
+class TestPromptVariants:
+    def test_none_variant_preserves_plans_and_record_bodies_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        """The default and explicit no-op variant must leave generated prompts and records unchanged."""
+        default_config = EvalConfig(capability_items=3, batch_size=8)
+        explicit_none_config = dataclasses.replace(
+            default_config, prompt_variant=PROMPT_VARIANT_NONE
+        )
+        default_plan = plan_battery([SECTION_CAPABILITIES], default_config)
+        explicit_none_plan = plan_battery([SECTION_CAPABILITIES], explicit_none_config)
+        assert [request.prompt for request in default_plan] == [
+            request.prompt for request in explicit_none_plan
+        ]
+
+        def run(config: EvalConfig, name: str) -> list[str]:
+            path = tmp_path / f"{name}.jsonl"
+            run_eval_battery(
+                MockBackend(responses=lambda prompt: "0", model_id="prompt-variant-test"),
+                sections=[SECTION_CAPABILITIES],
+                out_path=path,
+                meta=BASE_META,
+                config=config,
+            )
+            return path.read_text(encoding="utf-8").splitlines()[1:]
+
+        assert run(default_config, "default") == run(explicit_none_config, "explicit-none")
+
+    def test_think_briefly_variant_is_sent_and_recorded(self, tmp_path: Path) -> None:
+        config = EvalConfig(
+            capability_items=3,
+            batch_size=8,
+            prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1,
+        )
+        base_prompts = [request.prompt for request in plan_battery([SECTION_CAPABILITIES], config)]
+        sent_prompts: list[str] = []
+        backend = MockBackend(
+            responses=lambda prompt: sent_prompts.append(prompt) or "0",
+            model_id="prompt-variant-test",
+        )
+        out_path = tmp_path / "think-briefly.jsonl"
+        run_eval_battery(
+            backend,
+            sections=[SECTION_CAPABILITIES],
+            out_path=out_path,
+            meta=BASE_META,
+            config=config,
+        )
+
+        expected_prompts = [
+            apply_prompt_variant(prompt, PROMPT_VARIANT_THINK_BRIEFLY_V1) for prompt in base_prompts
+        ]
+        assert sent_prompts == expected_prompts
+        records = [
+            record
+            for record in read_eval_records(out_path)
+            if record["record"] == SECTION_CAPABILITIES
+        ]
+        assert [record["prompt"] for record in records] == expected_prompts
+        assert read_eval_records(out_path)[0]["eval_config"]["prompt_variant"] == (
+            PROMPT_VARIANT_THINK_BRIEFLY_V1
+        )
+
+    @pytest.mark.parametrize("variant", ["unknown", "think-briefly-v0"])
+    def test_unknown_prompt_variant_is_rejected(self, variant: str) -> None:
+        with pytest.raises(ValueError, match="unknown prompt variant"):
+            EvalConfig(prompt_variant=variant)
+
+    def test_prompt_variant_is_part_of_the_serialized_config(self) -> None:
+        config = EvalConfig(prompt_variant=PROMPT_VARIANT_THINK_BRIEFLY_V1)
+        assert config.as_record()["prompt_variant"] == PROMPT_VARIANT_THINK_BRIEFLY_V1
+
+    def test_variant_rejects_a_parser_that_returns_an_unexpected_prompt(self) -> None:
+        request = PlannedRequest(
+            section=SECTION_CAPABILITIES,
+            identity=(SECTION_CAPABILITIES, 0),
+            prompt="base prompt",
+            call_group=SECTION_CAPABILITIES,
+            parse=lambda _completion: {
+                "record": SECTION_CAPABILITIES,
+                "item_index": 0,
+                "prompt": "different prompt",
+            },
+        )
+        variant_request = dataclasses.replace(
+            request,
+            prompt=apply_prompt_variant(request.prompt, PROMPT_VARIANT_THINK_BRIEFLY_V1),
+        )
+        with pytest.raises(RuntimeError, match="unexpected record shape"):
+            variant_request.record("ignored")
 
 
 class TestAScriptedBackendComesBackAsItself:

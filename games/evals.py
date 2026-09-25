@@ -38,7 +38,7 @@ import logging
 import os
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import IO, TYPE_CHECKING, Any, cast
 
@@ -81,6 +81,11 @@ from games.probes import (
     parse_final_answer,
     probe_battery,
     render_probe_prompt,
+)
+from games.prompt_variants import (
+    PROMPT_VARIANT_NONE,
+    PROMPT_VARIANTS,
+    apply_prompt_variant,
 )
 from games.prompts import (
     ALL_GAME_IDS,
@@ -559,6 +564,8 @@ class EvalConfig:
     # What training pinned on the chat template, as pairs so the config stays hashable. Non-empty
     # only where the template has such a knob at all, which today is Qwen3.8-27B's reasoning_effort.
     chat_template_kwargs: tuple[tuple[str, str], ...] = ()
+    # A named, versioned edit to every user turn. ``none`` preserves the historical prompts.
+    prompt_variant: str = PROMPT_VARIANT_NONE
     # Sequences per generation call. None derives it from the VRAM actually present; an explicit
     # width is an assertion about the hardware and is refused past the measured throughput knee.
     batch_size: int | None = None
@@ -597,6 +604,11 @@ class EvalConfig:
 
     def __post_init__(self) -> None:
         """Reject counts and widths that would silently produce an empty or unsizable section."""
+        if self.prompt_variant not in PROMPT_VARIANTS:
+            raise ValueError(
+                f"unknown prompt variant {self.prompt_variant!r}; expected one of "
+                f"{list(PROMPT_VARIANTS)}."
+            )
         for name in (
             "open_ended_samples",
             "multiple_choice_samples",
@@ -816,6 +828,7 @@ class EvalConfig:
             "include_never_trained": self.include_never_trained,
             "trained_game_ids": list(self.trained_game_ids),
             "chat_template_kwargs": dict(self.chat_template_kwargs),
+            "prompt_variant": self.prompt_variant,
             "counterpart_framings": list(self.counterpart_framings),
             "framing_sweep_games": list(self.framing_sweep_games),
             "trap_cells_file": (
@@ -1335,6 +1348,14 @@ class PlannedRequest:
     prompt: str
     call_group: str
     parse: Callable[[str], dict[str, Any]]
+    # Parser closures retain this unmodified text. Keep it alongside the request so a variant can
+    # change ``prompt`` without losing the value used to validate prompt-bearing records.
+    base_prompt: str | None = None
+
+    def __post_init__(self) -> None:
+        """Remember the original prompt when a caller did not provide one explicitly."""
+        if self.base_prompt is None:
+            object.__setattr__(self, "base_prompt", self.prompt)
 
     def record(self, completion: str) -> dict[str, Any]:
         """Parse one completion into this request's record, refusing a plan that disagrees with itself.
@@ -1360,6 +1381,14 @@ class PlannedRequest:
                 f"its parser produced a record carrying {identity}. A resume keyed on the planned "
                 f"identity would skip the wrong prompts, so nothing was written."
             )
+        if "prompt" in record:
+            if self.base_prompt is None or record["prompt"] != self.base_prompt:
+                raise RuntimeError(
+                    f"the plan's parser returned prompt {record.get('prompt')!r}, but this request "
+                    f"was planned from base prompt {self.base_prompt!r}; refusing to restamp an "
+                    f"unexpected record shape."
+                )
+            record["prompt"] = self.prompt
         return record
 
 
@@ -2043,6 +2072,24 @@ def plan_battery(sections: Sequence[str], config: EvalConfig) -> list[PlannedReq
         plan.extend(SECTION_PLANNERS[section](config))
     _refuse_repeated_identities(plan)
     return plan
+
+
+def apply_prompt_variant_to_plan(
+    plan: Sequence[PlannedRequest], variant: str
+) -> list[PlannedRequest]:
+    """Return a plan whose requests carry the exact prompts sent for ``variant``.
+
+    ``PlannedRequest.base_prompt`` remains the unmodified text used by each parser closure. This
+    helper is also used by bank-key construction, so a bank digest and a battery generation see the
+    same final request prompts.
+    """
+    if variant not in PROMPT_VARIANTS:
+        raise ValueError(
+            f"unknown prompt variant {variant!r}; expected one of {list(PROMPT_VARIANTS)}."
+        )
+    return [
+        replace(request, prompt=apply_prompt_variant(request.prompt, variant)) for request in plan
+    ]
 
 
 def _refuse_repeated_identities(plan: Sequence[PlannedRequest]) -> None:
@@ -3207,6 +3254,7 @@ def run_eval_battery(  # noqa: PLR0913 - keyword-only knobs, each a recorded dec
         plan = plan_battery(sections, resolved)
     else:
         _validate_supplied_plan(plan, sections, submission=submission, admission=admission)
+    plan = apply_prompt_variant_to_plan(plan, resolved.prompt_variant)
     _refuse_template_kwargs_the_backend_would_drop(backend, resolved)
     effective_submission = _effective_submission(backend, submission)
     effective_admission = admission if effective_submission == SUBMISSION_POOLED else None
