@@ -37,7 +37,11 @@ from games.prompts import (
     COUNTERPART_FRAMING_IDS,
     COUNTERPART_FRAMINGS,
     DIFFERENT_AI_COUNTERPART_CLAUSE,
+    FRAMING_ANOTHER_AI,
+    FRAMING_ANOTHER_AI_NO_SHARED_BRIEFING,
     FRAMING_DIFFERENT_AI,
+    FRAMING_HUMAN,
+    FRAMING_HUMAN_NO_SHARED_BRIEFING,
     FRAMING_HUMAN_TRACK_RECORD,
     FRAMING_HUMAN_TRACK_RECORD_NOISY,
     FRAMING_HUMAN_TRACK_RECORD_PERCENT,
@@ -54,6 +58,7 @@ from games.prompts import (
     HUMAN_TRACK_RECORD_PERCENT_CLAUSE,
     LABEL_PRINT_ORDERS,
     SAME_WEIGHTS_UNCORRELATED_COUNTERPART_CLAUSE,
+    SHARED_BRIEFING_PHRASE,
     SPLIT_EVAL,
     SPLIT_TRAIN,
     STATED_MATCHER_CLAUSE,
@@ -198,6 +203,36 @@ class TestFramingRowsRenderCleanAndDistinct:
         assert STATED_TRACK_RECORD_NOISY_CLAUSE.replace("In almost every", "In every") == (
             STATED_TRACK_RECORD_CLAUSE
         )
+
+    @pytest.mark.parametrize(
+        ("framing_id", "floor_framing_id"),
+        [
+            (FRAMING_HUMAN_NO_SHARED_BRIEFING, FRAMING_HUMAN),
+            (FRAMING_ANOTHER_AI_NO_SHARED_BRIEFING, FRAMING_ANOTHER_AI),
+        ],
+    )
+    def test_no_shared_briefing_clauses_drop_only_the_briefing_phrase(
+        self, framing_id: str, floor_framing_id: str
+    ) -> None:
+        """The ablation isolates the shared-briefing cue: the clause keeps its partner identity and
+        loses the briefing phrase, and nothing else about the prompt changes."""
+        clause = COUNTERPART_FRAMINGS[framing_id]
+        floor_clause = COUNTERPART_FRAMINGS[floor_framing_id]
+        assert clause is not None
+        assert floor_clause is not None
+        assert SHARED_BRIEFING_PHRASE in floor_clause
+        assert SHARED_BRIEFING_PHRASE not in clause
+        assert "briefing" not in clause
+        assert clause.split(",")[0].rstrip(".") == floor_clause.split(",")[0]
+        rows = generate_framing_prompt_rows(
+            "twin-pd", SWEEP_GRADING, framing_id=framing_id, split=SPLIT_EVAL
+        )
+        floor_rows = generate_framing_prompt_rows(
+            "twin-pd", SWEEP_GRADING, framing_id=floor_framing_id, split=SPLIT_EVAL
+        )
+        assert len(rows) == len(floor_rows)
+        for row, floor_row in zip(rows, floor_rows, strict=True):
+            assert str(row["prompt"]) == str(floor_row["prompt"]).replace(floor_clause, clause)
 
     @pytest.mark.parametrize(
         ("framing_id", "clause", "appended_sentence"),

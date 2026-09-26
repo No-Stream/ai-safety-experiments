@@ -874,6 +874,8 @@ FRAMING_STATED_TRACK_RECORD = "stated-track-record"
 FRAMING_STATED_TRACK_RECORD_NOISY = "stated-track-record-noisy"
 FRAMING_HUMAN_TRACK_RECORD = "human-track-record"
 FRAMING_HUMAN_TRACK_RECORD_NOISY = "human-track-record-noisy"
+FRAMING_HUMAN_NO_SHARED_BRIEFING = "human-no-shared-briefing"
+FRAMING_ANOTHER_AI_NO_SHARED_BRIEFING = "another-ai-no-shared-briefing"
 FRAMING_UNSTATED = "unstated"
 
 # Twin asserts shared weights AND a shared decision route in one sentence, so a movement under it
@@ -975,6 +977,35 @@ HUMAN_TRACK_RECORD_TRAINING_PERCENT = 75
 FRAMING_HUMAN_TRACK_RECORD_PERCENT = f"human-track-record-p{HUMAN_TRACK_RECORD_TRAINING_PERCENT}"
 HUMAN_TRACK_RECORD_PERCENT_CLAUSE = HUMAN_TRACK_RECORD_PERCENT_CLAUSE_TEMPLATE.format(
     match_percent=HUMAN_TRACK_RECORD_TRAINING_PERCENT
+)
+
+# The phrase every framing that carried partner-curriculum cooperation shares. The two ablations
+# below drop it and keep the partner's identity, to test whether the learned cue is "reading the same
+# text at the same time" rather than who the partner is. Eval-only.
+SHARED_BRIEFING_PHRASE = "reading a copy of this same briefing at this same moment"
+
+
+def _without_shared_briefing(clause: str, briefing_fragment: str, replacement: str) -> str:
+    """Drop the shared-briefing fragment from one clause, refusing if it is not there exactly once."""
+    if SHARED_BRIEFING_PHRASE not in briefing_fragment:
+        raise ValueError(f"{briefing_fragment!r} does not contain {SHARED_BRIEFING_PHRASE!r}.")
+    occurrences = clause.count(briefing_fragment)
+    if occurrences != 1:
+        raise ValueError(
+            f"{briefing_fragment!r} occurs {occurrences} times in {clause!r}, expected once."
+        )
+    return clause.replace(briefing_fragment, replacement)
+
+
+HUMAN_NO_SHARED_BRIEFING_CLAUSE = _without_shared_briefing(
+    HUMAN_COUNTERPART_CLAUSE,
+    ", who is reading a copy of this same briefing at this same moment, and deciding on it in their own way.",
+    ", who is deciding in their own way.",
+)
+ANOTHER_AI_NO_SHARED_BRIEFING_CLAUSE = _without_shared_briefing(
+    ANOTHER_AI_COUNTERPART_CLAUSE,
+    ", reading a copy of this same briefing at this same moment.",
+    ".",
 )
 
 # The frozen clause plus one disclosure sentence naming the row's cooperative label: a guaranteed
@@ -1082,6 +1113,8 @@ COUNTERPART_FRAMINGS: dict[str, str | None] = {
         )
         for percent in STATED_TRACK_RECORD_EVAL_PERCENTS
     },
+    FRAMING_HUMAN_NO_SHARED_BRIEFING: HUMAN_NO_SHARED_BRIEFING_CLAUSE,
+    FRAMING_ANOTHER_AI_NO_SHARED_BRIEFING: ANOTHER_AI_NO_SHARED_BRIEFING_CLAUSE,
     FRAMING_UNSTATED: None,
 }
 COUNTERPART_FRAMING_IDS: tuple[str, ...] = tuple(COUNTERPART_FRAMINGS)
