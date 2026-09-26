@@ -56,7 +56,6 @@ class TestProbeConfigConstruction:
     @pytest.mark.parametrize(
         ("flag", "value", "field", "expected"),
         [
-            ("--top-p", "0.95", "top_p", 0.95),
             ("--colocate-sleep-offload", None, "colocate_sleep_offload", True),
             ("--liger-frozen-head", None, "liger_frozen_head", True),
             ("--mask-truncated-completions", None, "mask_truncated_completions", True),
@@ -78,6 +77,18 @@ class TestProbeConfigConstruction:
             argv.append(value)
         config = parse_args(argv).config
         assert getattr(config, field) == expected
+
+    def test_a_truncating_top_p_reaches_the_config_with_the_correction_off(self) -> None:
+        """A top_p below one is a legitimate probe shape once the IS correction is off."""
+        argv = [*probe_argv(**{"--top-p": "0.95"}), "--no-vllm-importance-sampling-correction"]
+        assert parse_args(argv).config.top_p == 0.95
+
+    def test_a_truncating_top_p_is_refused_with_the_correction_on(self) -> None:
+        """The probe must inherit games.train's refusal: truncated sampling zeroes the 9B gradient."""
+        with pytest.raises(
+            ValueError, match="is refused with the vLLM importance-sampling correction"
+        ):
+            parse_args(probe_argv(**{"--top-p": "0.95"}))
 
     def test_flags_reach_the_real_train_config(self) -> None:
         """The probe prices the config it names: shape, util and budget must land verbatim."""
