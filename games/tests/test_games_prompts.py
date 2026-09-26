@@ -2237,7 +2237,14 @@ class TestRenderMatrixRowsUnderClause:
 
     @pytest.mark.parametrize(
         "framing",
-        [prompts.FRAMING_STATED_TRACK_RECORD, prompts.FRAMING_DIFFERENT_AI_COUPLED],
+        [
+            prompts.FRAMING_STATED_TRACK_RECORD,
+            prompts.FRAMING_STATED_TRACK_RECORD_NOISY,
+            prompts.FRAMING_HUMAN_TRACK_RECORD,
+            prompts.FRAMING_HUMAN_TRACK_RECORD_NOISY,
+            prompts.FRAMING_HUMAN_TRACK_RECORD_PERCENT,
+            prompts.FRAMING_DIFFERENT_AI_COUPLED,
+        ],
     )
     def test_a_coupling_clause_trains_under_self_grading(self, framing: str) -> None:
         """Self grading plays the completion's own action back, so the counterpart the reward pays

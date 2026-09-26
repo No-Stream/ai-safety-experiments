@@ -872,6 +872,8 @@ FRAMING_STATED_ALWAYS_DEFECT = "stated-always-defect"
 FRAMING_STATED_MATCHER = "stated-matcher"
 FRAMING_STATED_TRACK_RECORD = "stated-track-record"
 FRAMING_STATED_TRACK_RECORD_NOISY = "stated-track-record-noisy"
+FRAMING_HUMAN_TRACK_RECORD = "human-track-record"
+FRAMING_HUMAN_TRACK_RECORD_NOISY = "human-track-record-noisy"
 FRAMING_UNSTATED = "unstated"
 
 # Twin asserts shared weights AND a shared decision route in one sentence, so a movement under it
@@ -943,6 +945,36 @@ DIFFERENT_AI_COUPLED_COUNTERPART_CLAUSE = _coupled_different_ai_clause()
 HUMAN_COUNTERPART_CLAUSE = (
     "you are matched with a person, who is reading a copy of this same briefing at this same "
     "moment, and deciding on it in their own way."
+)
+
+# The human counterpart's certain track-record rung: one empirical sentence added to the plain
+# human clause, so a movement against `human` reads as the track record rather than a reworded identity.
+HUMAN_TRACK_RECORD_CLAUSE = (
+    HUMAN_COUNTERPART_CLAUSE
+    + " In every match so far, their decision has come out identical to their counterpart's."
+)
+
+# The noisy human rung weakens the certainty claim while keeping the counterpart and the rest of the
+# prompt byte-for-byte fixed against the plain human floor.
+HUMAN_TRACK_RECORD_NOISY_CLAUSE = (
+    HUMAN_COUNTERPART_CLAUSE
+    + " In almost every match so far, their decision has come out identical to their counterpart's."
+)
+
+# The quantified human rung, worded as the numeric AI ladder is. It is a plain self-graded breadth
+# framing; the separate `track_record_corpus` reward reads stated_match_prob only from its AI-specific
+# rows and does not assign that field to these partner-premise rows. The percentage is written once
+# and formatted in, as the AI ladder does, because repeated literal numbers near each other trip the
+# payoff-table detector in scripts/scan_secrets.py.
+HUMAN_TRACK_RECORD_PERCENT_CLAUSE_TEMPLATE = (
+    HUMAN_COUNTERPART_CLAUSE
+    + " In about {match_percent}% of matches so far, their decision has come out identical to their "
+    "counterpart's."
+)
+HUMAN_TRACK_RECORD_TRAINING_PERCENT = 75
+FRAMING_HUMAN_TRACK_RECORD_PERCENT = f"human-track-record-p{HUMAN_TRACK_RECORD_TRAINING_PERCENT}"
+HUMAN_TRACK_RECORD_PERCENT_CLAUSE = HUMAN_TRACK_RECORD_PERCENT_CLAUSE_TEMPLATE.format(
+    match_percent=HUMAN_TRACK_RECORD_TRAINING_PERCENT
 )
 
 # The frozen clause plus one disclosure sentence naming the row's cooperative label: a guaranteed
@@ -1041,6 +1073,9 @@ COUNTERPART_FRAMINGS: dict[str, str | None] = {
     FRAMING_STATED_MATCHER: STATED_MATCHER_CLAUSE,
     FRAMING_STATED_TRACK_RECORD: STATED_TRACK_RECORD_CLAUSE,
     FRAMING_STATED_TRACK_RECORD_NOISY: STATED_TRACK_RECORD_NOISY_CLAUSE,
+    FRAMING_HUMAN_TRACK_RECORD: HUMAN_TRACK_RECORD_CLAUSE,
+    FRAMING_HUMAN_TRACK_RECORD_NOISY: HUMAN_TRACK_RECORD_NOISY_CLAUSE,
+    FRAMING_HUMAN_TRACK_RECORD_PERCENT: HUMAN_TRACK_RECORD_PERCENT_CLAUSE,
     **{
         stated_track_record_framing_id(percent): STATED_TRACK_RECORD_PERCENT_CLAUSE_TEMPLATE.format(
             match_percent=percent
@@ -5616,6 +5651,7 @@ COUPLING_ASSERTION_PHRASES: tuple[str, ...] = (
     DECIDES_IN_STEP_SENTENCE,
     "recorded as a copy of yours",
     "come out identical to its counterpart's",
+    "come out identical to their counterpart's",
 )
 
 

@@ -961,6 +961,9 @@ class TestCouplingClauseAccessors:
             "stated-track-record",
             "stated-track-record-noisy",
             "stated-track-record-p60",
+            "human-track-record",
+            "human-track-record-noisy",
+            "human-track-record-p75",
         ):
             assert framing_states_coupling(coupled) is True, coupled
         for decoupled in (

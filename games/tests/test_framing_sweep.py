@@ -38,6 +38,9 @@ from games.prompts import (
     COUNTERPART_FRAMINGS,
     DIFFERENT_AI_COUNTERPART_CLAUSE,
     FRAMING_DIFFERENT_AI,
+    FRAMING_HUMAN_TRACK_RECORD,
+    FRAMING_HUMAN_TRACK_RECORD_NOISY,
+    FRAMING_HUMAN_TRACK_RECORD_PERCENT,
     FRAMING_SAME_WEIGHTS_UNCORRELATED,
     FRAMING_STATED_ALWAYS_COOP,
     FRAMING_STATED_MATCHER,
@@ -45,6 +48,10 @@ from games.prompts import (
     FRAMING_STATED_TRACK_RECORD_NOISY,
     FRAMING_TWIN,
     FRAMING_UNSTATED,
+    HUMAN_COUNTERPART_CLAUSE,
+    HUMAN_TRACK_RECORD_CLAUSE,
+    HUMAN_TRACK_RECORD_NOISY_CLAUSE,
+    HUMAN_TRACK_RECORD_PERCENT_CLAUSE,
     LABEL_PRINT_ORDERS,
     SAME_WEIGHTS_UNCORRELATED_COUNTERPART_CLAUSE,
     SPLIT_EVAL,
@@ -191,6 +198,40 @@ class TestFramingRowsRenderCleanAndDistinct:
         assert STATED_TRACK_RECORD_NOISY_CLAUSE.replace("In almost every", "In every") == (
             STATED_TRACK_RECORD_CLAUSE
         )
+
+    @pytest.mark.parametrize(
+        ("framing_id", "clause", "appended_sentence"),
+        [
+            (
+                FRAMING_HUMAN_TRACK_RECORD,
+                HUMAN_TRACK_RECORD_CLAUSE,
+                " In every match so far, their decision has come out identical to their counterpart's.",
+            ),
+            (
+                FRAMING_HUMAN_TRACK_RECORD_NOISY,
+                HUMAN_TRACK_RECORD_NOISY_CLAUSE,
+                " In almost every match so far, their decision has come out identical to their counterpart's.",
+            ),
+            (
+                FRAMING_HUMAN_TRACK_RECORD_PERCENT,
+                HUMAN_TRACK_RECORD_PERCENT_CLAUSE,
+                " In about 75% of matches so far, their decision has come out identical to their counterpart's.",
+            ),
+        ],
+    )
+    def test_human_track_record_clauses_are_one_sentence_extensions_and_render(
+        self, framing_id: str, clause: str, appended_sentence: str
+    ) -> None:
+        assert framing_id in COUNTERPART_FRAMING_IDS
+        assert COUNTERPART_FRAMINGS[framing_id] == clause
+        assert clause.startswith(HUMAN_COUNTERPART_CLAUSE)
+        assert clause.removeprefix(HUMAN_COUNTERPART_CLAUSE) == appended_sentence
+        assert appended_sentence.count(".") == 1
+        rows = generate_framing_prompt_rows(
+            "twin-pd", SWEEP_GRADING, framing_id=framing_id, split=SPLIT_EVAL
+        )
+        assert rows
+        assert all(appended_sentence.strip() in str(row["prompt"]) for row in rows)
 
     @pytest.mark.parametrize(
         ("framing_id", "clause", "floor_framing_id"),
