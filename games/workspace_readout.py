@@ -623,7 +623,12 @@ def _capture_arm(  # noqa: C901, PLR0915 - one linear capture/write loop
                 "reasoning_late": prefix_data.reasoning_late_indices,
             }
         record_at = list(context.source_layers)
-        with activation_recorder(context.jl_model.layers, at=record_at) as recorder:
+        # Without inference mode an attached LoRA (trainable params) makes this forward retain the
+        # whole autograd graph, which on long teacher-forced prefixes exhausts the card.
+        with (
+            torch.inference_mode(),
+            activation_recorder(context.jl_model.layers, at=record_at) as recorder,
+        ):
             context.jl_model.forward(all_ids)
         captured = {
             layer: recorder.activations[layer][0].detach() for layer in context.source_layers
