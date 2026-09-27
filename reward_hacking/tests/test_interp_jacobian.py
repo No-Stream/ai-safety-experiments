@@ -83,6 +83,15 @@ class TestJacobianConfig:
         with pytest.raises(ValueError, match="must be positive"):
             JacobianConfig(**{field: value})  # pyright: ignore[reportArgumentType]  # parametrized field
 
+    def test_rejects_negative_skip_first(self) -> None:
+        with pytest.raises(ValueError, match="skip_first"):
+            JacobianConfig(skip_first=-1)
+
+    @pytest.mark.parametrize("source_layers", [(3,), (0, 4)])
+    def test_rejects_source_layers_at_or_above_target(self, source_layers: tuple[int, ...]) -> None:
+        with pytest.raises(ValueError, match="source_layers"):
+            JacobianConfig(target_layer=3, source_layers=source_layers)
+
 
 class TestCapFitPrompts:
     def test_caps_a_long_list(self) -> None:
@@ -187,7 +196,14 @@ class _RecordingJlens:
 class TestFitLens:
     def test_passes_the_configs_fit_knobs_to_jlens_fit(self) -> None:
         jl = _RecordingJlens()
-        config = JacobianConfig(dim_batch=4, max_seq_len=64, max_fit_prompts=10)
+        config = JacobianConfig(
+            dim_batch=4,
+            max_seq_len=64,
+            max_fit_prompts=10,
+            target_layer=2,
+            source_layers=(0, 1),
+            skip_first=7,
+        )
 
         lens = fit_lens(config, object(), ["first prompt", "second prompt"], jl)  # pyright: ignore[reportArgumentType]  # duck-typed stand-in for the jlens module
 
@@ -196,6 +212,9 @@ class TestFitLens:
         assert jl.fit_kwargs == {
             "dim_batch": 4,
             "max_seq_len": 64,
+            "source_layers": (0, 1),
+            "target_layer": 2,
+            "skip_first": 7,
             "checkpoint_path": None,
             "checkpoint_every": 1,
             "resume": True,
@@ -542,6 +561,9 @@ class TestLensCacheKey:
         assert _key().sha256 == _key().sha256
         assert LensCacheKey(**cast("dict[str, Any]", _key().as_payload())).sha256 == _key().sha256
 
+    def test_target_layer_is_part_of_the_digest(self) -> None:
+        assert replace(_key(), target_layer=-2).sha256 != _key().sha256
+
     def test_fit_prompt_digest_is_order_and_boundary_sensitive(self) -> None:
         assert digest_strings(["ab", "c"]) != digest_strings(["a", "bc"])
         assert digest_strings(["a", "b"]) != digest_strings(["b", "a"])
@@ -859,6 +881,23 @@ class TestVerifyLens:
         )
         with pytest.raises(RuntimeError, match="d_model"):
             verify_cached_lens(wide, _LENS_MODEL)
+
+    def test_a_penultimate_target_accepts_layers_through_n_minus_three(self) -> None:
+        model = SimpleNamespace(n_layers=4, d_model=D_MODEL)
+        penultimate = _FileLens(
+            {layer: torch.ones(D_MODEL, D_MODEL) for layer in range(model.n_layers - 2)},
+            d_model=D_MODEL,
+        )
+        verify_cached_lens(penultimate, model, target_layer=-2)
+
+    def test_a_penultimate_target_rejects_a_source_layer_mismatch(self) -> None:
+        model = SimpleNamespace(n_layers=4, d_model=D_MODEL)
+        mismatch = _FileLens(
+            {0: torch.ones(D_MODEL, D_MODEL), 2: torch.ones(D_MODEL, D_MODEL)},
+            d_model=D_MODEL,
+        )
+        with pytest.raises(RuntimeError, match="source layers"):
+            verify_cached_lens(mismatch, model, target_layer=-2)
 
 
 class TestResolveWeightsIdentity:

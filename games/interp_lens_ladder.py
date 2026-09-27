@@ -378,6 +378,8 @@ def lens_cache_key_for_cell(  # noqa: PLR0913 - a key is every input the fit dep
     skip_first: int,
     dim_batch: int,
     load_path: str,
+    target_layer: int | None = None,
+    source_layers: Sequence[int] | None = None,
 ) -> LensCacheKey:
     """Build one cell's lens cache key: which weights, how they load, and what the fit reads.
 
@@ -411,6 +413,8 @@ def lens_cache_key_for_cell(  # noqa: PLR0913 - a key is every input the fit dep
         skip_first=skip_first,
         dim_batch=dim_batch,
         jlens_commit=JLENS_COMMIT,
+        target_layer=target_layer,
+        source_layers=None if source_layers is None else tuple(source_layers),
     )
 
 
@@ -555,6 +559,8 @@ def fit_cell(  # noqa: PLR0913 - one cell is a target, a corpus split, a plan an
     direction_layer: int,
     top_k: int,
     seed: int,
+    target_layer: int | None = None,
+    source_layers: Sequence[int] | None = None,
     cache: LensCache | None = None,
     cache_key: LensCacheKey | None = None,
 ) -> dict[str, Any]:
@@ -573,6 +579,8 @@ def fit_cell(  # noqa: PLR0913 - one cell is a target, a corpus split, a plan an
         dim_batch=dim_batch,
         max_seq_len=plan.max_seq_len,
         top_k=top_k,
+        target_layer=target_layer,
+        source_layers=None if source_layers is None else tuple(source_layers),
     )
     started = time.time()
     model, tokenizer = target.model, target.tokenizer
@@ -589,6 +597,7 @@ def fit_cell(  # noqa: PLR0913 - one cell is a target, a corpus split, a plan an
         split.eval_prompts,
         max_seq_len=plan.max_seq_len,
         max_positions=eval_positions,
+        target_layer=config.target_layer,
     )
     entry: dict[str, Any] = {
         "arm": cell.arm,
@@ -647,6 +656,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-thinking", action="store_true")
     parser.add_argument("--max-fit-prompts", type=int, default=DEFAULT_MAX_FIT_PROMPTS)
+    parser.add_argument(
+        "--target-layer",
+        type=int,
+        default=JacobianConfig.target_layer,
+        help="target layer for each lens fit; negative indices count from the end",
+    )
     parser.add_argument("--n-eval-prompts", type=int, default=DEFAULT_N_EVAL_PROMPTS)
     parser.add_argument("--eval-positions", type=int, default=DEFAULT_EVAL_POSITIONS)
     parser.add_argument("--max-seq-len-ceiling", type=int, default=DEFAULT_MAX_SEQ_LEN_CEILING)
@@ -662,8 +677,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--lens-cache",
         default=None,
         help="A local directory or s3:// prefix holding fitted lenses keyed by everything the fit "
-        "depends on (weights revision, adapter digests, load path, fit strings, window, dim_batch, "
-        "jlens commit). A hit skips the fit; a miss fits and publishes. See LensCacheKey.",
+        "depends on (weights revision, adapter digests, load path, fit strings, window, target/source "
+        "layers, dim_batch, jlens commit). A hit skips the fit; a miss fits and publishes. See "
+        "LensCacheKey.",
     )
     parser.add_argument(
         "--lens-model",
@@ -845,6 +861,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 max_seq_len=plan.max_seq_len,
                 skip_first=fit_skip_first(jl),
                 dim_batch=args.dim_batch,
+                target_layer=args.target_layer,
                 load_path=(
                     JLENS_LOAD_PATH
                     if args.lens_model == LENS_MODEL_MERGED
@@ -867,6 +884,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 direction_layer=args.direction_layer,
                 top_k=args.top_k,
                 seed=args.seed,
+                target_layer=args.target_layer,
                 cache=cache,
                 cache_key=cache_key,
             )

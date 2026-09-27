@@ -130,15 +130,61 @@ class TokenReadout:
     logit: float
 
 
+def _resolve_fit_layers(
+    source_layers: Sequence[int] | None, target_layer: int | None, n_layers: int
+) -> tuple[list[int], int]:
+    """Resolve jlens layer arguments and enforce its source-before-target contract."""
+    if n_layers <= 0:
+        raise ValueError(f"n_layers must be positive, got {n_layers}")
+    target = n_layers - 1 if target_layer is None else target_layer
+    if target < 0:
+        target += n_layers
+    if not 0 <= target < n_layers:
+        raise ValueError(f"target_layer={target_layer} out of range for {n_layers} layers")
+    if source_layers is None:
+        return list(range(target)), target
+    sources = sorted({layer + n_layers if layer < 0 else layer for layer in source_layers})
+    if not sources or sources[0] < 0 or sources[-1] >= n_layers:
+        raise ValueError(
+            f"source_layers {sorted(source_layers)} out of range for {n_layers} layers"
+        )
+    if sources[-1] >= target:
+        raise ValueError(
+            f"source_layers must all be < target_layer={target}; got max={sources[-1]}"
+        )
+    return sources, target
+
+
+def _validate_configured_layers(
+    source_layers: tuple[int, ...] | None, target_layer: int | None
+) -> None:
+    """Reject source/target combinations that are unambiguously out of order."""
+    if source_layers is None:
+        return
+    if not source_layers:
+        raise ValueError("source_layers must not be empty")
+    if target_layer is None:
+        return
+    if target_layer >= 0:
+        invalid = [layer for layer in source_layers if layer >= 0 and layer >= target_layer]
+    else:
+        invalid = [layer for layer in source_layers if layer < 0 and layer >= target_layer]
+    if invalid:
+        raise ValueError(
+            f"source_layers must all be strictly below target_layer={target_layer}; got {invalid}"
+        )
+
+
 @dataclass(frozen=True)
 class JacobianConfig:
     """How to obtain and apply a lens for a model.
 
     ``source`` picks the rule-aligned default (``fit_own``) or the fast pre-fit path
     (``pretrained``). The fit knobs (``max_fit_prompts`` / ``dim_batch`` / ``max_seq_len`` /
-    ``checkpoint_path``) size a fit and are named exactly as ``jlens.fit`` names them, so a knob
-    that fails to arrive is visible rather than shadowed by a same-valued reference default; the
-    pretrained knobs name the Neuronpedia artifact. ``top_k`` is how many tokens a decode returns.
+    ``target_layer`` / ``source_layers`` / ``skip_first`` / ``checkpoint_path``) size a fit and are
+    named exactly as ``jlens.fit`` names them, so a knob that fails to arrive is visible rather than
+    shadowed by a same-valued reference default; the pretrained knobs name the Neuronpedia artifact.
+    ``top_k`` is how many tokens a decode returns.
 
     ``dim_batch`` is a MEMORY knob, not a speed knob. It sets how many residual dimensions each
     backward pass carries (the prompt is replicated that many times), so live activation memory
@@ -162,6 +208,9 @@ class JacobianConfig:
     max_fit_prompts: int = 200
     dim_batch: int = 16
     max_seq_len: int = 128
+    target_layer: int | None = None
+    source_layers: tuple[int, ...] | None = None
+    skip_first: int = RECON_SKIP_FIRST
     checkpoint_path: Path | None = None
     checkpoint_every: int | None = 1
     resume: bool = True
@@ -181,6 +230,11 @@ class JacobianConfig:
             raise ValueError(f"dim_batch must be positive, got {self.dim_batch}")
         if self.max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be positive, got {self.max_seq_len}")
+        source_layers = None if self.source_layers is None else tuple(self.source_layers)
+        object.__setattr__(self, "source_layers", source_layers)
+        _validate_configured_layers(source_layers, self.target_layer)
+        if self.skip_first < 0:
+            raise ValueError(f"skip_first must be >= 0, got {self.skip_first}")
         if self.top_k <= 0:
             raise ValueError(f"top_k must be positive, got {self.top_k}")
         if self.checkpoint_every is not None and self.checkpoint_every <= 0:
@@ -560,8 +614,11 @@ def fit_lens(
     return jl.fit(
         model,
         capped,
+        source_layers=config.source_layers,
+        target_layer=config.target_layer,
         dim_batch=config.dim_batch,
         max_seq_len=config.max_seq_len,
+        skip_first=config.skip_first,
         checkpoint_path=None if config.checkpoint_path is None else str(config.checkpoint_path),
         checkpoint_every=config.checkpoint_every,
         resume=config.resume,
@@ -597,23 +654,38 @@ def verify_lens_roundtrip(jl: object, lens: object, lens_path: Path) -> None:
     )
 
 
-def verify_cached_lens(lens: object, model: object) -> None:
+def verify_cached_lens(
+    lens: object,
+    model: object,
+    config: JacobianConfig | None = None,
+    *,
+    target_layer: int | None = None,
+    source_layers: Sequence[int] | None = None,
+) -> None:
     """Refuse a cache hit whose shape is not the lens a fit on ``model`` would have produced.
 
     A cache hit has no freshly fitted lens to compare against, so what CAN be checked is checked:
-    every source layer below the target is present (``jlens.fit`` defaults to exactly that set),
-    the residual width matches, and every entry is finite. Reconstruction quality is then read by
-    the caller exactly as it is after a fit, so a wrong-but-well-formed lens still shows up there.
+    every configured source layer is present (``jlens.fit`` defaults to every layer below its
+    configured target), the residual width matches, and every entry is finite. Reconstruction
+    quality is then read by the caller exactly as it is after a fit, so a wrong-but-well-formed lens
+    still shows up there.
+
+    ``config`` is the preferred input. The keyword arguments keep this check useful for callers
+    that only have the layer settings; omitting all of them preserves the historical final-target
+    default.
     """
+    if config is not None:
+        target_layer = config.target_layer
+        source_layers = config.source_layers
     n_layers = int(model.n_layers)  # pyright: ignore[reportAttributeAccessIssue]
     d_model = int(model.d_model)  # pyright: ignore[reportAttributeAccessIssue]
-    expected_layers = list(range(n_layers - 1))
+    expected_layers, resolved_target = _resolve_fit_layers(source_layers, target_layer, n_layers)
     source_layers = list(lens.source_layers)  # pyright: ignore[reportAttributeAccessIssue]
     if source_layers != expected_layers:
         raise RuntimeError(
             f"cached lens fits {len(source_layers)} source layers "
             f"({min(source_layers, default='none')}..{max(source_layers, default='none')}) but a "
-            f"fit on this {n_layers}-layer model would fit layers 0..{n_layers - 2}"
+            f"fit on this {n_layers}-layer model would fit layers 0..{resolved_target - 1}"
         )
     if int(lens.d_model) != d_model:  # pyright: ignore[reportAttributeAccessIssue]
         raise RuntimeError(f"cached lens has d_model={lens.d_model}, model has {d_model}")  # pyright: ignore[reportAttributeAccessIssue]
@@ -656,9 +728,10 @@ class LensCacheKey:
     the adapter merged in, or none), how they were loaded (:data:`JLENS_LOAD_PATH` and the merge
     dtype, which decides how much of a trained delta the merged weights realise), the exact ordered
     fit strings (which subsumes the stimuli, the render convention and the split), the truncation
-    window, the fit's own skip-first rule, ``dim_batch`` (its reduction order is part of the bits),
-    and the jlens commit. Nothing about the box: the same key on another card gives a lens equal to
-    within Triton's run-to-run reduction noise, which is the stat grade this cache is allowed.
+    window, target and source layers, the fit's own skip-first rule, ``dim_batch`` (its reduction
+    order is part of the bits), and the jlens commit. Nothing about the box: the same key on another
+    card gives a lens equal to within Triton's run-to-run reduction noise, which is the stat grade
+    this cache is allowed.
     """
 
     base_model: str
@@ -673,10 +746,20 @@ class LensCacheKey:
     skip_first: int
     dim_batch: int
     jlens_commit: str
+    target_layer: int | None = None
+    source_layers: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        """Canonicalize source layers so tuple/list construction has one cache identity."""
+        if self.source_layers is not None:
+            object.__setattr__(self, "source_layers", tuple(self.source_layers))
 
     def as_payload(self) -> dict[str, object]:
         """Return the JSON sidecar stored beside a cached lens, read back on every hit."""
-        return asdict(self)
+        payload = asdict(self)
+        if self.source_layers is not None:
+            payload["source_layers"] = list(self.source_layers)
+        return payload
 
     @property
     def sha256(self) -> str:
@@ -909,7 +992,7 @@ def acquire_lens(  # noqa: PLR0913 - a fit's inputs plus where it lands and how 
     started = time.time()
     if cache is not None and key is not None and cache.lookup(key, lens_path):
         lens = jl.JacobianLens.load(str(lens_path))
-        verify_cached_lens(lens, model)
+        verify_cached_lens(lens, model, config)
         return LensAcquisition(
             lens=lens,
             source="cache",
@@ -990,6 +1073,7 @@ class FitQualityReport:
     n_eval_prompts_used: int
     n_eval_prompts_skipped: int
     positions_per_prompt_max: int
+    target_layer: int | None = None
 
 
 def evaluate_reconstruction(  # noqa: PLR0913 - lens, model, prompts and the read-window knobs
@@ -1000,6 +1084,7 @@ def evaluate_reconstruction(  # noqa: PLR0913 - lens, model, prompts and the rea
     max_seq_len: int,
     max_positions: int,
     skip_first: int = RECON_SKIP_FIRST,
+    target_layer: int | None = None,
 ) -> FitQualityReport | None:
     """Read the fitted lens's reconstruction of the model's own logits on ``prompts`` (GPU).
 
@@ -1011,6 +1096,11 @@ def evaluate_reconstruction(  # noqa: PLR0913 - lens, model, prompts and the rea
     Returns ``None`` (a logged, non-fatal outcome, not a crash) when no prompt was long enough to
     read, so a 2-hour fit is never lost to a fit-quality read that could not run.
     """
+    resolved_target_layer = _resolve_fit_layers(
+        None,
+        target_layer,
+        int(model.n_layers),  # pyright: ignore[reportAttributeAccessIssue]
+    )[1]
     jacobian_predicted: dict[int, list[torch.Tensor]] = {}
     logit_lens_predicted: dict[int, list[torch.Tensor]] = {}
     actual_rows: list[torch.Tensor] = []
@@ -1057,11 +1147,12 @@ def evaluate_reconstruction(  # noqa: PLR0913 - lens, model, prompts and the rea
     )
     logger.info(
         "reconstruction eval: %d prompts used (%d skipped), median relative residual "
-        "jacobian=%.4f vs logit-lens=%.4f",
+        "jacobian=%.4f vs logit-lens=%.4f (target_layer=%d)",
         used,
         skipped,
         jacobian.median_relative_residual,
         logit_lens.median_relative_residual,
+        resolved_target_layer,
     )
     return FitQualityReport(
         jacobian=jacobian,
@@ -1069,6 +1160,7 @@ def evaluate_reconstruction(  # noqa: PLR0913 - lens, model, prompts and the rea
         n_eval_prompts_used=used,
         n_eval_prompts_skipped=skipped,
         positions_per_prompt_max=max_positions,
+        target_layer=resolved_target_layer,
     )
 
 
@@ -1086,12 +1178,14 @@ def fit_quality_payload(report: FitQualityReport | None) -> dict[str, object]:
         return {
             "available": False,
             "reason": "no eval prompt was long enough to read an interior position",
+            "target_layer": None,
         }
     reduction = (
         report.logit_lens.median_relative_residual - report.jacobian.median_relative_residual
     )
     return {
         "available": True,
+        "target_layer": report.target_layer,
         "n_eval_prompts_used": report.n_eval_prompts_used,
         "n_eval_prompts_skipped": report.n_eval_prompts_skipped,
         "positions_per_prompt_max": report.positions_per_prompt_max,
@@ -1154,7 +1248,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=JacobianConfig.max_seq_len,
         help="truncate each fit prompt to this many tokens",
     )
+    parser.add_argument(
+        "--target-layer",
+        type=int,
+        default=JacobianConfig.target_layer,
+        help="target layer for the Jacobian fit; negative indices count from the end",
+    )
+    parser.add_argument(
+        "--source-layer",
+        type=int,
+        action="append",
+        dest="source_layers",
+        default=None,
+        help="source layer to fit; repeat for multiple layers (negative counts from the end)",
+    )
+    parser.add_argument("--skip-first", type=int, default=JacobianConfig.skip_first)
     parser.add_argument("--checkpoint-path", type=Path, default=None)
+    parser.add_argument("--checkpoint-every", type=int, default=JacobianConfig.checkpoint_every)
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=JacobianConfig.resume,
+        help="resume an existing checkpoint (use --no-resume to start fresh)",
+    )
     parser.add_argument("--pretrained-repo", default=DEFAULT_PRETRAINED_REPO)
     parser.add_argument("--pretrained-filename", default=DEFAULT_PRETRAINED_FILENAME)
     parser.add_argument("--pretrained-revision", default=DEFAULT_PRETRAINED_REVISION)
@@ -1172,7 +1288,12 @@ def main(argv: list[str] | None = None) -> None:
         max_fit_prompts=args.max_fit_prompts,
         dim_batch=args.dim_batch,
         max_seq_len=args.max_seq_len,
+        target_layer=args.target_layer,
+        source_layers=None if args.source_layers is None else tuple(args.source_layers),
+        skip_first=args.skip_first,
         checkpoint_path=args.checkpoint_path,
+        checkpoint_every=args.checkpoint_every,
+        resume=args.resume,
         pretrained_repo=args.pretrained_repo,
         pretrained_filename=args.pretrained_filename,
         pretrained_revision=args.pretrained_revision,
