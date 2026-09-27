@@ -73,7 +73,7 @@ def _fake_smi(
 
 
 @pytest.fixture(autouse=True)
-def _native_linux_host(monkeypatch: pytest.MonkeyPatch) -> None:
+def native_linux_host(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin every test to a native-Linux host unless it says otherwise.
 
     The gate reads unattributed VRAM differently under WSL2, and the suite runs on a WSL2 box, so
