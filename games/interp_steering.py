@@ -53,7 +53,7 @@ import logging
 import math
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from string import Formatter
@@ -88,6 +88,7 @@ from games.prompts import (
     generate_framing_prompt_rows,
     generate_prompt_rows,
 )
+from games.workspace_ablation import load_bundle
 from reward_hacking.interp.directions import (
     _decoder_layers,  # pyright: ignore[reportPrivateUsage]  # shared trunk-layer resolver
     cosine,
@@ -100,7 +101,7 @@ from reward_hacking.interp.steering import ablation_hook, residual_intervention,
 from reward_hacking.model_backend import HFBackend, SamplingConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Generator, Mapping, Sequence
     from contextlib import AbstractContextManager
 
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
@@ -147,6 +148,8 @@ CONDITION_PLACEBO_UP = "placebo:+"
 CONDITION_PLACEBO_DOWN = "placebo:-"
 CONDITION_ABLATE_REAL = "ablate:real"
 CONDITION_ABLATE_PLACEBO = "ablate:placebo"
+CONDITION_SUBSPACE_REAL = "subspace-ablate:real"
+CONDITION_SUBSPACE_PLACEBO = "subspace-ablate:placebo"
 STEERING_CONDITIONS: tuple[str, ...] = (
     CONDITION_STEER_UP,
     CONDITION_STEER_DOWN,
@@ -1431,6 +1434,15 @@ def selected_target_conditions(cell: Mapping[str, Any]) -> list[GenerationCondit
     ]
 
 
+def subspace_conditions() -> list[GenerationCondition]:
+    """Build the shared baseline and two whole-band subspace interventions."""
+    return [
+        GenerationCondition(CONDITION_NONE, None, None, None),
+        GenerationCondition(CONDITION_SUBSPACE_REAL, None, None, None),
+        GenerationCondition(CONDITION_SUBSPACE_PLACEBO, None, None, None),
+    ]
+
+
 def _parse_cells_flag(specs: Sequence[str]) -> list[dict[str, Any]]:
     cells: list[dict[str, Any]] = []
     for spec in specs:
@@ -1549,7 +1561,13 @@ def _summary_for_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         "n_completions": len(records),
         "n_parsed": len(parsed),
         "n_parse_failures": unresolved,
+        "unparsed_fraction": None if not records else unresolved / len(records),
         "n_truncated_thinking": sum(1 for record in records if bool(record["truncated_thinking"])),
+        "truncated_thinking_fraction": (
+            None
+            if not records
+            else sum(bool(record["truncated_thinking"]) for record in records) / len(records)
+        ),
         "cooperate_k": cooperated,
         "cooperate_rate": None if not parsed else cooperated / len(parsed),
         "cooperate_rate_lower_bound": None if not records else cooperated / len(records),
@@ -1622,6 +1640,8 @@ def condition_key(condition: GenerationCondition) -> str:
     """Render a stable flat key for grouping: e.g. ``decision:L18:x1.0:steer:+`` or ``none``."""
     if condition.condition == CONDITION_NONE:
         return CONDITION_NONE
+    if condition.condition in (CONDITION_SUBSPACE_REAL, CONDITION_SUBSPACE_PLACEBO):
+        return condition.condition
     multiplier = "" if condition.alpha_multiplier is None else f":x{condition.alpha_multiplier}"
     return f"{condition.direction}:L{condition.layer}{multiplier}:{condition.condition}"
 
@@ -1692,6 +1712,7 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
     sampler_payload: Mapping[str, Any],
     weights_identity: str,
     deltanet_kernel: Mapping[str, str],
+    subspace_bundles: Mapping[str, Mapping[int, torch.Tensor]] | None = None,
 ) -> dict[str, Any]:
     """Everything a generation record depends on, for the resume ledger to compare against.
 
@@ -1739,17 +1760,21 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
         "condition_keys": [condition_key(condition) for condition in conditions],
         "direction_names": list(directions),
         "directions_sha256": directions_digest(directions),
+        "subspace_sha256": None
+        if subspace_bundles is None
+        else directions_digest(subspace_bundles),
         "resolved_sampler": dict(sampler_payload),
     }
 
 
-def condition_intervention(
+def condition_intervention(  # noqa: PLR0913 - existing steering controls plus optional subspaces
     condition: GenerationCondition,
     directions: Mapping[str, Mapping[int, torch.Tensor]],
     direction_names: Sequence[str],
     *,
     model: AutoModelForCausalLM,
     placebo_seed: int,
+    subspace_bundles: Mapping[str, Mapping[int, torch.Tensor]] | None = None,
 ) -> tuple[AbstractContextManager[None], float | None]:
     """Build one condition's hook context and its raw alpha; the baseline gets a no-op context.
 
@@ -1760,6 +1785,10 @@ def condition_intervention(
     """
     if condition.condition == CONDITION_NONE:
         return nullcontext(), None
+    if condition.condition in (CONDITION_SUBSPACE_REAL, CONDITION_SUBSPACE_PLACEBO):
+        if subspace_bundles is None:
+            raise ValueError("subspace condition requires real and placebo bundles")
+        return subspace_intervention(model, subspace_bundles[condition.condition]), None
     direction_name = cast("str", condition.direction)
     layer = cast("int", condition.layer)
     real = directions[direction_name][layer]
@@ -1776,6 +1805,17 @@ def condition_intervention(
     )
     hook = hook_for(condition.condition, real, placebo, alpha_raw or 0.0)
     return residual_intervention(model, layer, hook), alpha_raw
+
+
+@contextmanager
+def subspace_intervention(
+    model: AutoModelForCausalLM, bundle: Mapping[int, torch.Tensor]
+) -> Generator[None]:
+    """Project the post-block residual off each listed span for every forward position."""
+    with ExitStack() as stack:
+        for layer, basis in sorted(bundle.items()):
+            stack.enter_context(residual_intervention(model, layer, ablation_hook(basis)))
+        yield
 
 
 def selected_allocation_outcome(row: Mapping[str, Any], action: str | None) -> dict[str, Any]:
@@ -1951,17 +1991,43 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     regenerated records are the ones an uninterrupted run would have written; the summary counts
     ``resumed_conditions`` apart from ``skipped_conditions`` so what actually ran stays visible.
     """
+    subspace_mode = args.subspace_bundle is not None or args.placebo_bundle is not None
+    if subspace_mode and (args.subspace_bundle is None or args.placebo_bundle is None):
+        raise ValueError("pass both --subspace-bundle and --placebo-bundle")
+    if subspace_mode and (args.direction or args.cells or args.from_sweep or args.selected_target):
+        raise ValueError("subspace bundles cannot be combined with direction or cell selection")
+    subspace_bundles = (
+        {
+            CONDITION_SUBSPACE_REAL: load_bundle(cast("Path", args.subspace_bundle)),
+            CONDITION_SUBSPACE_PLACEBO: load_bundle(cast("Path", args.placebo_bundle)),
+        }
+        if subspace_mode
+        else None
+    )
+    if subspace_bundles is not None:
+        real_layers = {
+            layer: basis.shape for layer, basis in subspace_bundles[CONDITION_SUBSPACE_REAL].items()
+        }
+        placebo_layers = {
+            layer: basis.shape
+            for layer, basis in subspace_bundles[CONDITION_SUBSPACE_PLACEBO].items()
+        }
+        if real_layers != placebo_layers:
+            raise ValueError("real and placebo subspace bundles must match layers and ranks")
     direction_specs = parse_named_specs(args.direction, flag="--direction")
     started_monotonic = time.monotonic()
-    directions = load_named_directions(args.direction)
+    directions = {} if subspace_mode else load_named_directions(args.direction)
     direction_paths = {name: Path(path) for name, path in direction_specs.items()}
     selected_target: dict[str, Any] | None = None
     requested_sources = sum(
         source is not None for source in (args.cells, args.from_sweep, args.selected_target)
     )
-    if requested_sources != 1:
+    if requested_sources != (0 if subspace_mode else 1):
         raise ValueError("pass exactly one of --cells, --from-sweep, or --selected-target.")
-    if args.selected_target is not None:
+    if subspace_mode:
+        cells = []
+        selection = None
+    elif args.selected_target is not None:
         selected_target = load_selected_target(
             args.selected_target, directions, direction_paths=direction_paths
         )
@@ -1989,11 +2055,12 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     row_for_prompt = [row for row in rows for _ in range(args.n_samples)]
     sample_indices = [index for _ in rows for index in range(args.n_samples)]
 
-    conditions = (
-        selected_target_conditions(cells[0])
-        if selected_target is not None
-        else generation_conditions(cells)
-    )
+    if subspace_mode:
+        conditions = subspace_conditions()
+    elif selected_target is not None:
+        conditions = selected_target_conditions(cells[0])
+    else:
+        conditions = generation_conditions(cells)
     requested = parse_requested_conditions(args.conditions, conditions)
     direction_names = list(directions)
 
@@ -2030,6 +2097,7 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             sampler_payload=sampler_payload,
             weights_identity=weights_identity,
             deltanet_kernel=deltanet_kernel,
+            subspace_bundles=subspace_bundles,
         ),
         unit_of=lambda record: str(record["condition_key"]),
     )
@@ -2052,7 +2120,12 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             condition_started = time.monotonic()
             torch.manual_seed(seed)
             context, alpha_raw = condition_intervention(
-                condition, directions, direction_names, model=model, placebo_seed=placebo_seed
+                condition,
+                directions,
+                direction_names,
+                model=model,
+                placebo_seed=placebo_seed,
+                subspace_bundles=subspace_bundles,
             )
             with context:
                 completions = decode_in_chunks(backend, prompts, chunk_size=args.batch_size)
@@ -2154,6 +2227,9 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
         "cells": cells,
         "selection": selection,
         "selected_target": selected_target,
+        "subspace_sha256": None
+        if subspace_bundles is None
+        else directions_digest(subspace_bundles),
         "adapter": adapter,
         "requested_conditions": None
         if requested is None
@@ -2223,6 +2299,8 @@ def build_parser() -> argparse.ArgumentParser:
         "checked before generation.",
     )
     generate.add_argument("--direction", action="append", default=[], metavar="NAME=PATH")
+    generate.add_argument("--subspace-bundle", type=Path, default=None)
+    generate.add_argument("--placebo-bundle", type=Path, default=None)
     generate.add_argument("--cells", action="append", default=None, metavar="NAME:LAYER:MULT")
     generate.add_argument("--from-sweep", default=None)
     generate.add_argument(

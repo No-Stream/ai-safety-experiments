@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 ResidualTransform = Callable[[torch.Tensor], torch.Tensor]
 Hook = Callable[[object, object, object], object]
+ROW_BASIS_NDIM = 2
 
 DEFAULT_ANSWER_TOP_K = 50
 """How many of the clean run's top next-token candidates the patch readout picks its answer from.
@@ -121,17 +122,17 @@ def steer_residual(hidden: torch.Tensor, direction: torch.Tensor, alpha: float) 
 
 
 def ablate_residual(hidden: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
-    (
-        """Project ``direction`` out of ``hidden`` ``[..., d]``: """
-        """``h - (h . u) u`` with ``u = unit(dir)``.
-
-    Removes the component of every position along the direction, leaving the orthogonal complement
-    untouched, so the model can no longer read that axis at this layer.
-    """
-    )
-    u = unit(direction).to(hidden)
-    projection = hidden @ u
-    return hidden - projection.unsqueeze(-1) * u
+    """Project a direction or an orthonormal row basis out of every residual position."""
+    if direction.ndim == 1:
+        basis = unit(direction).unsqueeze(0)
+    elif direction.ndim == ROW_BASIS_NDIM:
+        basis = direction
+    else:
+        raise ValueError("ablation direction must be a vector or a row basis")
+    if basis.shape[-1] != hidden.shape[-1] or basis.shape[0] == 0:
+        raise ValueError("ablation basis has incompatible shape")
+    basis = basis.to(hidden)
+    return hidden - (hidden @ basis.T) @ basis
 
 
 def choose_answer_token(

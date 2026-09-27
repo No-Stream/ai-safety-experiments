@@ -80,12 +80,12 @@ from reward_hacking.interp.directions import (
     unit,
 )
 from reward_hacking.interp.jsonl_resume import ResumeMismatchError, ledger_path_for
-from reward_hacking.interp.steering import residual_intervention, steering_hook
+from reward_hacking.interp.steering import ablate_residual, residual_intervention, steering_hook
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from transformers import PreTrainedTokenizerBase
+    from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
 
 STIMULUS_SET = "causal-vs-functional-decision"
 N_LAYERS = 2
@@ -412,6 +412,36 @@ class TestSelection:
 
 
 class TestConditions:
+    def test_subspace_conditions_are_three_distinct_keys(self) -> None:
+        conditions = interp_steering.subspace_conditions()
+        assert [condition_key(condition) for condition in conditions] == [
+            "none",
+            "subspace-ablate:real",
+            "subspace-ablate:placebo",
+        ]
+
+    def test_multilayer_subspace_hooks_every_layer_and_removes_only_its_span(self) -> None:
+        model = TinyLM(3, torch.tensor([1.0, 1.0, 1.0]))
+        basis = {
+            0: torch.tensor([[1.0, 0.0, 0.0]]),
+            2: torch.tensor([[0.0, 1.0, 0.0]]),
+        }
+        hidden = torch.tensor([[[2.0, 3.0, 5.0]]])
+        with interp_steering.subspace_intervention(cast("AutoModelForCausalLM", model), basis):
+            assert torch.equal(model.model(hidden), torch.tensor([[[0.0, 0.0, 5.0]]]))
+        assert torch.equal(model.model(hidden), hidden)
+
+    def test_multi_direction_ablation_matches_single_direction_and_keeps_complement(self) -> None:
+        hidden = torch.tensor([[[2.0, 3.0, 5.0]]])
+        assert torch.equal(
+            ablate_residual(hidden, torch.tensor([[1.0, 0.0, 0.0]])),
+            ablate_residual(hidden, torch.tensor([1.0, 0.0, 0.0])),
+        )
+        assert torch.equal(
+            ablate_residual(hidden, torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])),
+            torch.tensor([[[0.0, 0.0, 5.0]]]),
+        )
+
     def test_one_cell_yields_baseline_steers_and_ablations(self) -> None:
         cells = [{"direction": "decision", "layer": 18, "alpha_multiplier": 1.0}]
         conditions = generation_conditions(cells)
@@ -460,7 +490,9 @@ class TestSummaries:
         assert summary["n_completions"] == 4
         assert summary["n_parsed"] == 3
         assert summary["n_parse_failures"] == 1
+        assert summary["unparsed_fraction"] == pytest.approx(0.25)
         assert summary["n_truncated_thinking"] == 1
+        assert summary["truncated_thinking_fraction"] == pytest.approx(0.25)
         assert summary["cooperate_k"] == 2
         assert summary["cooperate_rate"] == pytest.approx(2 / 3)
         assert summary["cooperate_rate_lower_bound"] == pytest.approx(2 / 4)
@@ -790,6 +822,8 @@ def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> ar
         "model": "tiny/base",
         "adapter": None,
         "direction": [f"decision={directions_path}"],
+        "subspace_bundle": None,
+        "placebo_bundle": None,
         "cells": ["decision:18:1.0"],
         "from_sweep": None,
         "selected_target": None,
@@ -878,6 +912,36 @@ def pinned_weights_identity(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestGenerateOffline:
+    def test_subspace_bundle_conditions_run_with_resume_identity_and_parse_counts(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch(monkeypatch, _neutral_completions)
+        real = tmp_path / "real.pt"
+        placebo = tmp_path / "placebo.pt"
+        torch.save({0: torch.eye(HIDDEN)[:2]}, real)
+        torch.save({0: torch.eye(HIDDEN)[2:4]}, placebo)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            direction=[],
+            cells=None,
+            subspace_bundle=real,
+            placebo_bundle=placebo,
+        )
+        summary = run_generate(args)
+        assert set(summary["conditions"]) == {
+            "none",
+            "subspace-ablate:real",
+            "subspace-ablate:placebo",
+        }
+        assert all(group["n_completions"] == 32 for group in summary["conditions"].values())
+        assert all("n_parse_failures" in group for group in summary["conditions"].values())
+        assert all("n_truncated_thinking" in group for group in summary["conditions"].values())
+        assert run_generate(args)["n_records_resumed"] == 96
+        torch.save({0: torch.eye(HIDDEN)[4:6]}, real)
+        with pytest.raises(ResumeMismatchError):
+            run_generate(args)
+
     def _patch(self, monkeypatch: pytest.MonkeyPatch, completions_for: Any) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
         monkeypatch.setattr(interp_steering, "decode_in_chunks", completions_for)
