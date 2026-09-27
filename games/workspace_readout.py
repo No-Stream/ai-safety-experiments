@@ -425,7 +425,8 @@ def _capture_arm(context: CaptureContext) -> None:
             captured_logits = (
                 context.jl_model.unembed(
                     context.reference_lens.transport(
-                        captured[check_layer][positions["think_open"]],
+                        # fp32, exactly as lens.apply's own select() casts before transporting
+                        captured[check_layer][positions["think_open"]].float(),
                         check_layer,
                     )
                 )
