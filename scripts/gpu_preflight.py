@@ -1,6 +1,6 @@
 """Refuse to start a GPU job when another process already holds significant VRAM.
 
-This box has a single NVIDIA L4 with 23 GB. Two concurrent jobs — or one orphaned
+This box has a single GPU shared by several agent sessions. Two concurrent jobs — or one orphaned
 CUDA process left behind by a killed run — will either OOM the new job partway
 through or silently make both crawl. Checking first, and naming the process that
 holds the memory, turns a confusing mid-run failure into an immediate clear one.
@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,15 @@ def gpu_processes() -> list[GpuProcess]:
         pid, used_mib, name = (field.strip() for field in row.split(",", 2))
         processes.append(GpuProcess(int(pid), int(used_mib) if used_mib.isdigit() else None, name))
     return processes
+
+
+def _kernel_osrelease() -> str:
+    return Path("/proc/sys/kernel/osrelease").read_text()
+
+
+def host_is_wsl() -> bool:
+    """Whether this is a WSL2 guest, whose GPU is shared with the Windows host's own desktop."""
+    return "microsoft" in _kernel_osrelease().lower()
 
 
 def vram_mib_across_devices() -> tuple[int, int]:
@@ -137,6 +147,12 @@ def require_free_gpu(threshold_mib: int = DEFAULT_BUSY_THRESHOLD_MIB) -> None:
         if process.used_mib is not None:
             attributed += process.used_mib
     unattributed = used - attributed
+    if host_is_wsl():
+        # Under WSL2 the unnamed remainder is the Windows host (desktop, browser), which a Linux
+        # nvidia-smi can never attribute; Linux CUDA peers still appear as compute-apps rows
+        # (with [N/A] usage) and are refused above.
+        logger.info(f"GPU preflight OK under WSL2, {unattributed} MiB held by the Windows host")
+        return
     if unattributed >= threshold_mib:
         raise GpuBusyError(
             f"GPU is busy: {used}/{total} MiB in use, but nvidia-smi accounted for only "

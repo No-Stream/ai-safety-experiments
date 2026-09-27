@@ -33,6 +33,7 @@ from scripts.gpu_preflight import (
     GpuProcess,
     _nvidia_smi,
     gpu_processes,
+    host_is_wsl,
     require_free_gpu,
 )
 
@@ -69,6 +70,16 @@ def _fake_smi(
         return [f"{used}, {total}" for used, total in gpus]
 
     monkeypatch.setattr("scripts.gpu_preflight._nvidia_smi", fake_nvidia_smi)
+
+
+@pytest.fixture(autouse=True)
+def _native_linux_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin every test to a native-Linux host unless it says otherwise.
+
+    The gate reads unattributed VRAM differently under WSL2, and the suite runs on a WSL2 box, so
+    without this the unattributed-VRAM tests would silently exercise the WSL branch instead.
+    """
+    monkeypatch.setattr("scripts.gpu_preflight.host_is_wsl", lambda: False)
 
 
 class TestTheQueryItselfIsPinned:
@@ -235,3 +246,45 @@ class TestTheAggregateSpansTheSameDevicesAsTheAttribution:
             gpus=[(8000, TOTAL_MIB), (4000, TOTAL_MIB)],
         )
         require_free_gpu()
+
+
+class TestUnderWslTheWindowsHostIsNotAPeer:
+    """Under WSL2 the unnamed VRAM is the Windows host's desktop, and Linux peers are still named.
+
+    Measured on the 5090 box (2026-09-26): with no Linux GPU process, ~3.5 GiB is in use and
+    compute-apps lists nothing; a bare ``torch.zeros(1, device="cuda")`` in another shell appears
+    as a compute-apps row with ``[N/A]`` memory. So the remainder is not evidence of a peer there,
+    while the named-holder rule still catches every Linux job.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _wsl_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("scripts.gpu_preflight.host_is_wsl", lambda: True)
+
+    def test_the_windows_desktop_share_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _fake_smi(monkeypatch, rows=[], gpus=[(3519, 32607)])
+        require_free_gpu()
+
+    def test_a_named_linux_peer_with_unknown_usage_is_still_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _fake_smi(monkeypatch, rows=["1144523, [N/A], python"], gpus=[(3570, 32607)])
+        with pytest.raises(GpuBusyError) as caught:
+            require_free_gpu()
+        assert "pid 1144523 holding an unknown amount of VRAM" in str(caught.value)
+
+
+class TestWslDetection:
+    """The WSL2 kernel names itself in its release string; a native kernel does not."""
+
+    def test_a_wsl2_release_string_is_wsl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.undo()  # the autouse stub replaced host_is_wsl; test the real function
+        monkeypatch.setattr(
+            "scripts.gpu_preflight._kernel_osrelease", lambda: "6.18.33.2-microsoft-standard-WSL2"
+        )
+        assert host_is_wsl()
+
+    def test_a_native_release_string_is_not_wsl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.undo()
+        monkeypatch.setattr("scripts.gpu_preflight._kernel_osrelease", lambda: "5.15.0-1066-aws")
+        assert not host_is_wsl()
