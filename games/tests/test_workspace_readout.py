@@ -23,12 +23,16 @@ from games.interp_cells import Stimulus
 from games.workspace_readout import (
     LoadedLens,
     StoredUnembed,
+    _capture_prefix_resume_identity,
     _commitment_end,
     _cut_at_sentence_boundaries,
+    _cut_prefix_position_data,
     _match_prefix_record_to_prompt,
+    _parse_cut_fractions,
     _prefix_position_data,
     _select_prefix_vectors,
     accepted_adapter_base,
+    analyse_trajectory,
     bootstrap_indices,
     decode_vocab,
     find_prompt_positions,
@@ -256,6 +260,63 @@ class TestPrefixCapture:
         assert torch.equal(selected[1], expected_reasoning)
         assert torch.equal(selected[2], expected_late)
 
+    def test_cut_positions_map_sentence_boundaries_to_real_token_offsets(
+        self, qwen_tokenizer: PreTrainedTokenizerBase
+    ) -> None:
+        prefix = "alpha. mirror beta. final."
+        rendered = "Synthetic header: " + prefix
+        cuts = _cut_prefix_position_data(
+            qwen_tokenizer,
+            rendered,
+            prefix,
+            (0.30, 0.80, 1.0),
+            cue_regex=r"mirror",
+        )
+        assert cuts.cut_character_positions == {
+            "cut_0.30": len("alpha. "),
+            "cut_0.80": len("alpha. mirror beta. "),
+            "cut_1.00": len(prefix),
+        }
+        assert cuts.cue_seen_by_cut == {
+            "cut_0.30": False,
+            "cut_0.80": True,
+            "cut_1.00": True,
+        }
+        assert cuts.cue_first_fraction == pytest.approx(0.80)
+        encoded = qwen_tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)
+        prefix_start = len(rendered) - len(prefix)
+        assert cuts.cut_character_positions is not None
+        for name, token_index in cuts.token_indices.items():
+            assert (
+                encoded["offset_mapping"][token_index][1]
+                <= prefix_start + cuts.cut_character_positions[name]
+            )
+
+    def test_cut_at_empty_very_early_boundary_fails_loudly(
+        self, qwen_tokenizer: PreTrainedTokenizerBase
+    ) -> None:
+        with pytest.raises(ValueError, match="token"):
+            _cut_prefix_position_data(
+                qwen_tokenizer,
+                "Synthetic header: alpha. mirror beta.",
+                "alpha. mirror beta.",
+                (0.0,),
+                cue_regex=r"mirror",
+            )
+
+    def test_cut_fraction_and_cue_identity_preserve_legacy_absence(self) -> None:
+        legacy = _capture_prefix_resume_identity(None, None)
+        assert legacy == _capture_prefix_resume_identity(None, r"different")
+        assert _capture_prefix_resume_identity((0.5, 1.0), None) != legacy
+        assert _capture_prefix_resume_identity((0.5, 1.0), r"mirror") != (
+            _capture_prefix_resume_identity((0.5, 1.0), r"symmetry")
+        )
+
+    def test_cut_fractions_accept_csv_and_repeatable_values(self) -> None:
+        assert _parse_cut_fractions(["0.5, 1.0", "0.1"]) == (0.1, 0.5, 1.0)
+        with pytest.raises(ValueError, match="duplicate"):
+            _parse_cut_fractions(["0.5", "0.50"])
+
     def test_analyse_accepts_prefix_position_names(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -320,6 +381,129 @@ class TestPrefixCapture:
             any(key.endswith(f"|{position}") for key in report["paired_differences"])
             for position in position_names
         )
+
+
+class TestAnalyseTrajectory:
+    @staticmethod
+    def _tokenizer() -> Any:
+        class SyntheticTokenizer:
+            def __len__(self) -> int:
+                return 2
+
+            def __call__(self, text: str, *, add_special_tokens: bool) -> dict[str, list[int]]:
+                del add_special_tokens
+                return {"input_ids": [1] if text.strip().lower() == "focus" else [0]}
+
+            def decode(self, token_ids: int | list[int]) -> str:
+                token_id = token_ids if isinstance(token_ids, int) else token_ids[0]
+                return f"token{token_id}"
+
+        return SyntheticTokenizer()
+
+    @staticmethod
+    def _write_capture(
+        capture_dir: Path,
+        *,
+        constant_offset: bool,
+    ) -> None:
+        cuts = ("cut_0.50", "cut_1.00")
+        cue_flags = (
+            (False, False),
+            (False, False),
+            (True, True),
+            (True, True),
+        )
+        rows = [
+            {
+                "stimulus_id": f"stimulus-{index}",
+                "side": "synthetic",
+                "framing": "synthetic",
+                "pair_id": f"pair-{index}",
+                "position_names": list(cuts),
+                "token_indices": {name: index for index, name in enumerate(cuts)},
+                "cue_seen_by_cut": dict(zip(cuts, flags, strict=True)),
+                "cue_first_fraction": 0.5 if flags[0] else None,
+            }
+            for index, flags in enumerate(cue_flags)
+        ]
+        (capture_dir / "run.json").write_text(
+            json.dumps({"target_layer": 1, "arms": {"base": None, "trained": "adapter"}}),
+            encoding="utf-8",
+        )
+        base = torch.tensor([[[[1.0, 0.0]], [[1.0, 0.0]]]] * len(rows))
+        trained_rows = []
+        for row in rows:
+            values = []
+            for cut_index, cut_name in enumerate(cuts):
+                del cut_name
+                cue_seen = cast("dict[str, bool]", row["cue_seen_by_cut"])
+                if constant_offset or cue_seen[cuts[cut_index]]:
+                    values.append([[0.0, 1.0]])
+                else:
+                    values.append([[1.0, 0.0]])
+            trained_rows.append(values)
+        trained = torch.tensor(trained_rows)
+        for arm, residuals in (("base", base), ("trained", trained)):
+            arm_dir = capture_dir / arm
+            arm_dir.mkdir()
+            torch.save(residuals, arm_dir / "residuals.pt")
+            (arm_dir / "manifest.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+
+    def _run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        constant_offset: bool,
+    ) -> dict[str, Any]:
+        capture_dir = tmp_path / ("constant" if constant_offset else "interaction")
+        capture_dir.mkdir()
+        self._write_capture(capture_dir, constant_offset=constant_offset)
+        lens = LoadedLens(jacobians={0: torch.eye(2)}, n_prompts=1, d_model=2)
+        unembed = StoredUnembed(
+            norm_weight=torch.zeros(2),
+            lm_head_weight=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            rms_eps=1e-6,
+        )
+        monkeypatch.setattr(workspace_readout, "load_lens", lambda path: lens)
+        monkeypatch.setattr(workspace_readout, "load_unembed", lambda path: unembed)
+        monkeypatch.setattr(
+            AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: self._tokenizer(),
+        )
+        concepts = tmp_path / f"concepts-{constant_offset}.json"
+        concepts.write_text(json.dumps({"focus": ["focus"]}), encoding="utf-8")
+        args = SimpleNamespace(
+            capture_dir=capture_dir,
+            lens=tmp_path / "lens.pt",
+            model_path=tmp_path / "model",
+            out_dir=tmp_path / ("analysis-constant" if constant_offset else "analysis-interaction"),
+            band="0:1",
+            concept_sets=concepts,
+            seed=7,
+            device="cpu",
+        )
+        analyse_trajectory(cast("Namespace", args))
+        return cast("dict[str, Any]", json.loads((args.out_dir / "trajectory.json").read_text()))
+
+    def test_recovers_before_after_cue_interaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        report = self._run(tmp_path, monkeypatch, constant_offset=False)
+        entry = report["cue_split"]["trained"]["cut_0.50"]["focus"]
+        assert entry["before_cue"]["mean"] == pytest.approx(0.0, abs=1e-5)
+        assert entry["after_cue"]["mean"] > 0.9
+        assert entry["after_minus_before"] > 0.9
+
+    def test_constant_offset_has_no_cue_interaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        report = self._run(tmp_path, monkeypatch, constant_offset=True)
+        entry = report["cue_split"]["trained"]["cut_0.50"]["focus"]
+        assert entry["after_minus_before"] == pytest.approx(0.0, abs=1e-5)
 
 
 class TestMultihopIntermediateVariants:

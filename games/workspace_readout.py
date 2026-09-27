@@ -12,9 +12,10 @@ import argparse
 import importlib
 import json
 import logging
+import math
 import random
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -364,6 +365,10 @@ class PrefixPositionData:
     reasoning_indices: tuple[int, ...]
     reasoning_late_indices: tuple[int, ...]
     prefix_token_count: int
+    cut_fractions: tuple[float, ...] = ()
+    cut_character_positions: dict[str, int] | None = None
+    cue_seen_by_cut: dict[str, bool] | None = None
+    cue_first_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -424,6 +429,115 @@ def _prefix_position_data(tokenizer: PreTrainedTokenizerBase, rendered: str) -> 
         reasoning_indices=reasoning_indices,
         reasoning_late_indices=reasoning_indices[-32:],
         prefix_token_count=len(reasoning_indices),
+    )
+
+
+def _parse_cut_fractions(values: Sequence[str] | None) -> tuple[float, ...] | None:
+    """Parse repeatable comma-separated cut fractions, preserving a stable sorted order."""
+    if values is None:
+        return None
+    parsed: list[float] = []
+    for raw_value in values:
+        for field in raw_value.split(","):
+            value = field.strip()
+            if not value:
+                raise ValueError("--cut-fractions contains an empty value")
+            fraction = float(value)
+            if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+                raise ValueError(f"cut fraction {value!r} must lie in [0, 1]")
+            parsed.append(fraction)
+    if not parsed:
+        raise ValueError("--cut-fractions requires at least one fraction")
+    normalized = tuple(sorted(set(parsed)))
+    if len(normalized) != len(parsed):
+        raise ValueError("--cut-fractions must not contain duplicate fractions")
+    names = [f"cut_{fraction:.2f}" for fraction in normalized]
+    if len(set(names)) != len(names):
+        raise ValueError("--cut-fractions values collide after two-decimal formatting")
+    return normalized
+
+
+def _capture_prefix_resume_identity(
+    cut_fractions: Sequence[float] | None, cue_regex: str | None
+) -> str | None:
+    """Return the cut-mode identity key, or ``None`` for the byte-compatible legacy path."""
+    if cut_fractions is None:
+        return None
+    payload = {
+        "cut_fractions": [float(fraction) for fraction in cut_fractions],
+        "cue_regex": cue_regex,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _token_offset_mapping(
+    tokenizer: PreTrainedTokenizerBase, rendered: str
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """Tokenize once with offsets and validate the tokenizer's parallel outputs."""
+    encoded = tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)
+    token_ids = [int(token_id) for token_id in encoded["input_ids"]]
+    offsets = [(int(pair[0]), int(pair[1])) for pair in encoded["offset_mapping"]]
+    if len(token_ids) != len(offsets):
+        raise ValueError("tokenizer input ids and offset mapping lengths disagree")
+    return token_ids, offsets
+
+
+def _cut_prefix_position_data(
+    tokenizer: PreTrainedTokenizerBase,
+    rendered: str,
+    prefix: str,
+    cut_fractions: Sequence[float],
+    *,
+    cue_regex: str | None,
+) -> PrefixPositionData:
+    """Map sentence-boundary cuts in a teacher-forced prefix to exact token positions."""
+    normalized = _parse_cut_fractions([str(fraction) for fraction in cut_fractions])
+    if normalized is None:
+        raise ValueError("cut fractions are required")
+    if not rendered.endswith(prefix):
+        raise ValueError("rendered prefix does not end with the expected teacher-forced text")
+    compiled_cue = re.compile(cue_regex) if cue_regex is not None else None
+    _unused_token_ids, offsets = _token_offset_mapping(tokenizer, rendered)
+    prefix_start = len(rendered) - len(prefix)
+    token_indices: dict[str, int] = {}
+    character_positions: dict[str, int] = {}
+    cue_seen: dict[str, bool] = {}
+    cue_first_fraction: float | None = None
+    for fraction in normalized:
+        name = f"cut_{fraction:.2f}"
+        cut_text = _cut_at_sentence_boundaries(prefix, fraction, len(prefix))
+        relative_position = len(cut_text)
+        absolute_position = prefix_start + relative_position
+        candidates = [
+            (index, end)
+            for index, (start, end) in enumerate(offsets)
+            if prefix_start <= start < end <= absolute_position
+        ]
+        if not candidates:
+            raise ValueError(
+                f"cut {name} at character position {relative_position} does not map to one token"
+            )
+        last_end = max(end for _index, end in candidates)
+        last_tokens = [index for index, end in candidates if end == last_end]
+        if len(last_tokens) != 1:
+            raise ValueError(
+                f"cut {name} at character position {relative_position} maps ambiguously"
+            )
+        token_indices[name] = last_tokens[0]
+        character_positions[name] = relative_position
+        seen = compiled_cue is not None and compiled_cue.search(cut_text) is not None
+        cue_seen[name] = seen
+        if seen and cue_first_fraction is None:
+            cue_first_fraction = fraction
+    return PrefixPositionData(
+        token_indices=token_indices,
+        reasoning_indices=(),
+        reasoning_late_indices=(),
+        prefix_token_count=0,
+        cut_fractions=normalized,
+        cut_character_positions=character_positions,
+        cue_seen_by_cut=cue_seen,
+        cue_first_fraction=cue_first_fraction,
     )
 
 
@@ -572,7 +686,7 @@ def _check_lens_equivalence(
         )
 
 
-def _capture_arm(  # noqa: C901, PLR0915 - one linear capture/write loop
+def _capture_arm(  # noqa: C901, PLR0912, PLR0915 - one linear capture/write loop
     context: CaptureContext,
 ) -> None:
     activation_recorder = importlib.import_module("jlens.hooks").ActivationRecorder
@@ -617,11 +731,15 @@ def _capture_arm(  # noqa: C901, PLR0915 - one linear capture/write loop
             if prefix_data is None:
                 raise ValueError(f"missing prefix position metadata for {stimulus.stimulus_id}")
             all_ids = ids
-            position_indices = {
-                "decision_point": prefix_data.token_indices["decision_point"],
-                "reasoning_mean": prefix_data.reasoning_indices,
-                "reasoning_late": prefix_data.reasoning_late_indices,
-            }
+            position_indices = (
+                dict(prefix_data.token_indices)
+                if prefix_data.cut_fractions
+                else {
+                    "decision_point": prefix_data.token_indices["decision_point"],
+                    "reasoning_mean": prefix_data.reasoning_indices,
+                    "reasoning_late": prefix_data.reasoning_late_indices,
+                }
+            )
         record_at = list(context.source_layers)
         # Without inference mode an attached LoRA (trainable params) makes this forward retain the
         # whole autograd graph, which on long teacher-forced prefixes exhausts the card.
@@ -640,10 +758,18 @@ def _capture_arm(  # noqa: C901, PLR0915 - one linear capture/write loop
             ]
         else:
             prefix_data = context.prefix_positions[stimulus.stimulus_id]
-            vectors = [
-                _select_prefix_vectors(captured[layer], prefix_data)
-                for layer in context.source_layers
-            ]
+            if prefix_data.cut_fractions:
+                vectors = [
+                    _select_position_vectors(
+                        captured[layer], position_indices, context.position_names
+                    )
+                    for layer in context.source_layers
+                ]
+            else:
+                vectors = [
+                    _select_prefix_vectors(captured[layer], prefix_data)
+                    for layer in context.source_layers
+                ]
         row = torch.stack(vectors, dim=1)
         validate_residual(
             row,
@@ -686,6 +812,17 @@ def _capture_arm(  # noqa: C901, PLR0915 - one linear capture/write loop
                     "prefix_token_count": prefix_data.prefix_token_count,
                 }
             )
+            if prefix_data.cut_fractions:
+                manifest_row.update(
+                    {
+                        "cut_fractions": dict(
+                            zip(context.position_names, prefix_data.cut_fractions, strict=True)
+                        ),
+                        "cut_character_positions": prefix_data.cut_character_positions,
+                        "cue_seen_by_cut": prefix_data.cue_seen_by_cut,
+                        "cue_first_fraction": prefix_data.cue_first_fraction,
+                    }
+                )
         manifest_rows.append(manifest_row)
         if len(rows) % 50 == 0:
             logger.info(
@@ -771,6 +908,7 @@ def _run_capture(  # noqa: PLR0913 - shared seam keeps arm and provenance identi
     position_names: Sequence[str],
     prefix_positions: Mapping[str, PrefixPositionData] | None = None,
     provenance_extra: Mapping[str, Any] | None = None,
+    resume_identity: str | None = None,
 ) -> None:
     """Capture one stimulus set through every arm and write shared provenance."""
     lens, _jlens, tokenizer, model, jl_model, reference_lens = runtime
@@ -778,6 +916,16 @@ def _run_capture(  # noqa: PLR0913 - shared seam keeps arm and provenance identi
     out_dir.mkdir(parents=True, exist_ok=True)
     arms = _parse_arms(args)
     capture_mode = "capture-prefix" if prefix_positions is not None else "capture"
+    existing_run_path = out_dir / "run.json"
+    if resume_identity is not None and existing_run_path.is_file():
+        existing_run = cast(
+            "dict[str, Any]", json.loads(existing_run_path.read_text(encoding="utf-8"))
+        )
+        if existing_run.get("resume_identity") != resume_identity:
+            raise ValueError(
+                "capture resume identity mismatch; cut fractions and cue regex must match the "
+                "existing capture directory"
+            )
     attached = None
     for arm, adapter_dir in arms.items():
         if adapter_dir is not None:
@@ -794,7 +942,7 @@ def _run_capture(  # noqa: PLR0913 - shared seam keeps arm and provenance identi
         else:
             generation_model = model
         arm_dir = out_dir / arm
-        if _arm_artifact_complete(
+        if (resume_identity is None or existing_run_path.is_file()) and _arm_artifact_complete(
             arm_dir,
             lens=lens,
             n_stimuli=len(stimuli),
@@ -847,6 +995,8 @@ def _run_capture(  # noqa: PLR0913 - shared seam keeps arm and provenance identi
     }
     if provenance_extra:
         provenance.update(provenance_extra)
+    if resume_identity is not None:
+        provenance["resume_identity"] = resume_identity
     (out_dir / "run.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
 
 
@@ -876,6 +1026,8 @@ def capture(args: argparse.Namespace) -> None:
 def capture_prefix(args: argparse.Namespace) -> None:
     """Run the GPU capture pass over teacher-forced pre-commitment reasoning prefixes."""
     framings = _validate_framings(args.framings)
+    cut_fractions = _parse_cut_fractions(getattr(args, "cut_fractions", None))
+    cue_regex = getattr(args, "cue_regex", None) if cut_fractions is not None else None
     stimuli, summary = _read_prefix_records(args.prefix_records, framings=framings)
     runtime = _prepare_capture_runtime(args)
     tokenizer = runtime[2]
@@ -890,6 +1042,35 @@ def capture_prefix(args: argparse.Namespace) -> None:
         stimulus.stimulus_id: _prefix_position_data(tokenizer, rendered[stimulus.stimulus_id])
         for stimulus in stimuli
     }
+    position_names: Sequence[str] = PREFIX_POSITIONS
+    resume_identity = _capture_prefix_resume_identity(cut_fractions, cue_regex)
+    provenance_extra: dict[str, Any] = {
+        "prefix_records": [str(path) for path in args.prefix_records],
+        "prefix_record_digests": {str(path): sha256_of_file(path) for path in args.prefix_records},
+        "summary": summary,
+    }
+    if cut_fractions is not None:
+        position_names = tuple(f"cut_{fraction:.2f}" for fraction in cut_fractions)
+        cut_prefix_positions: dict[str, PrefixPositionData] = {}
+        for stimulus in stimuli:
+            cut_data = _cut_prefix_position_data(
+                tokenizer,
+                rendered[stimulus.stimulus_id],
+                stimulus.assistant_prefix or "",
+                cut_fractions,
+                cue_regex=cue_regex,
+            )
+            cut_prefix_positions[stimulus.stimulus_id] = replace(
+                cut_data,
+                prefix_token_count=prefix_positions[stimulus.stimulus_id].prefix_token_count,
+            )
+        prefix_positions = cut_prefix_positions
+        provenance_extra.update(
+            {
+                "cut_fractions": list(cut_fractions),
+                "cue_regex": cue_regex,
+            }
+        )
     summary["captured_stimuli"] = len(stimuli)
     _run_capture(
         args,
@@ -897,15 +1078,10 @@ def capture_prefix(args: argparse.Namespace) -> None:
         stimuli=stimuli,
         rendered=rendered,
         runtime=runtime,
-        position_names=PREFIX_POSITIONS,
+        position_names=position_names,
         prefix_positions=prefix_positions,
-        provenance_extra={
-            "prefix_records": [str(path) for path in args.prefix_records],
-            "prefix_record_digests": {
-                str(path): sha256_of_file(path) for path in args.prefix_records
-            },
-            "summary": summary,
-        },
+        provenance_extra=provenance_extra,
+        resume_identity=resume_identity,
     )
 
 
@@ -1256,6 +1432,285 @@ def analyse(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
     (args.out_dir / "analysis.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _trajectory_summary(values: Sequence[float], *, seed: int) -> dict[str, Any]:
+    """Summarize scores with a deterministic pair-bootstrap interval."""
+    if not values:
+        return {"mean": None, "n": 0, "bootstrap_ci": [None, None]}
+    mean = sum(values) / len(values)
+    low, high = _bootstrap_ci(values, seed=seed)
+    return {"mean": mean, "n": len(values), "bootstrap_ci": [low, high]}
+
+
+def _trajectory_manifest_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    """Return the explicit framing/stimulus key used to pair arm captures."""
+    framing = row.get("framing")
+    stimulus_id = row.get("stimulus_id")
+    if not isinstance(framing, str) or not framing:
+        raise ValueError("trajectory manifest rows must include a non-empty framing")
+    if not isinstance(stimulus_id, str) or not stimulus_id:
+        raise ValueError("trajectory manifest rows must include a non-empty stimulus_id")
+    return framing, stimulus_id
+
+
+def _trajectory_position_names(manifests: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Validate that every manifest row exposes the same cut positions."""
+    if not manifests:
+        raise ValueError("trajectory capture has no manifest rows")
+    names = tuple(str(name) for name in manifests[0].get("position_names", ()))
+    if not names or any(not name.startswith("cut_") for name in names):
+        raise ValueError("analyse-trajectory requires capture-prefix cut positions")
+    for row in manifests[1:]:
+        if tuple(row.get("position_names", ())) != names:
+            raise ValueError("trajectory manifest rows disagree on cut positions")
+    return names
+
+
+def _trajectory_scores(  # noqa: PLR0913 - scoring seam takes explicit artifact inputs
+    residuals: torch.Tensor,
+    manifests: Sequence[Mapping[str, Any]],
+    *,
+    lens: LoadedLens,
+    unembed: StoredUnembed,
+    layers: Sequence[int],
+    concept_ids: Mapping[str, Sequence[int]],
+    position_names: Sequence[str],
+) -> dict[tuple[str, str], dict[str, dict[str, float]]]:
+    """Score every concept set at every cut for each framing/stimulus row."""
+    if (
+        residuals.ndim != NDIM_RESIDUALS
+        or residuals.shape[0] != len(manifests)
+        or residuals.shape[1] != len(position_names)
+        or residuals.shape[2] != len(lens.source_layers)
+        or residuals.shape[3] != lens.d_model
+    ):
+        raise ValueError("trajectory residual and manifest lengths disagree")
+    keys = [_trajectory_manifest_key(row) for row in manifests]
+    if len(set(keys)) != len(keys):
+        raise ValueError("trajectory manifest contains duplicate framing/stimulus keys")
+    scores: dict[tuple[str, str], dict[str, dict[str, float]]] = {
+        key: {name: {} for name in position_names} for key in keys
+    }
+    for position_index, position_name in enumerate(position_names):
+        for concept_name, ids in concept_ids.items():
+            if not ids:
+                continue
+            per_layer_scores: list[torch.Tensor] = []
+            for layer in layers:
+                logits = unembed.unembed(
+                    lens.transport(
+                        residuals[:, position_index, lens.source_layers.index(layer)],
+                        layer,
+                    )
+                )
+                per_layer_scores.append(_rank_percentile(logits, ids).mean(dim=-1))
+            band_scores = torch.stack(per_layer_scores).mean(dim=0)
+            for row_index, key in enumerate(keys):
+                scores[key][position_name][concept_name] = float(band_scores[row_index])
+    return scores
+
+
+def analyse_trajectory(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
+    """Analyze concept-rank trajectories from CPU residual artifacts."""
+    lens = load_lens(args.lens)
+    run = cast(
+        "dict[str, Any]", json.loads((args.capture_dir / "run.json").read_text(encoding="utf-8"))
+    )
+    declared_target = int(run.get("target_layer", max(lens.source_layers) + 1))
+    band_start, band_end = parse_band(
+        args.band, n_layers=max(declared_target + 1, max(lens.source_layers) + 1)
+    )
+    layers = tuple(layer for layer in lens.source_layers if band_start <= layer < band_end)
+    if not layers:
+        raise ValueError(f"band {args.band!r} contains no fitted source layers")
+    tokenizer = __import__(
+        "transformers", fromlist=["AutoTokenizer"]
+    ).AutoTokenizer.from_pretrained(args.model_path)
+    unembed = load_unembed(args.model_path)
+    if args.device != "cpu":
+        target_device = torch.device(args.device)
+        unembed = StoredUnembed(
+            norm_weight=unembed.norm_weight.to(target_device),
+            lm_head_weight=unembed.lm_head_weight.to(target_device),
+            rms_eps=unembed.rms_eps,
+        )
+    concepts = cast(
+        "dict[str, list[str]]", json.loads(args.concept_sets.read_text(encoding="utf-8"))
+    )
+    concept_ids, skipped = single_token_concept_ids(tokenizer, concepts)
+    arm_names = sorted(cast("dict[str, Any]", run["arms"]))
+    if "base" not in arm_names:
+        raise ValueError("trajectory capture must include a base arm")
+    score_by_arm: dict[str, dict[tuple[str, str], dict[str, dict[str, float]]]] = {}
+    manifests_by_arm: dict[str, list[dict[str, Any]]] = {}
+    position_names: tuple[str, ...] | None = None
+    manifest_keys: dict[str, set[tuple[str, str]]] = {}
+    cue_by_key: dict[tuple[str, str], dict[str, bool]] = {}
+    for arm in arm_names:
+        arm_dir = args.capture_dir / arm
+        residuals = torch.load(
+            arm_dir / "residuals.pt", map_location="cpu", weights_only=True
+        ).float()
+        manifests = _read_manifest(arm_dir / "manifest.jsonl")
+        manifests_by_arm[arm] = manifests
+        arm_positions = _trajectory_position_names(manifests)
+        if position_names is None:
+            position_names = arm_positions
+        elif arm_positions != position_names:
+            raise ValueError(f"arm {arm} disagrees with base cut positions")
+        keys = {_trajectory_manifest_key(row) for row in manifests}
+        manifest_keys[arm] = keys
+        if arm == "base":
+            for row in manifests:
+                key = _trajectory_manifest_key(row)
+                raw_cues = row.get("cue_seen_by_cut")
+                if not isinstance(raw_cues, dict) or set(raw_cues) != set(arm_positions):
+                    raise ValueError(f"base manifest row {key} has incomplete cue metadata")
+                cue_by_key[key] = {name: bool(raw_cues[name]) for name in arm_positions}
+        score_by_arm[arm] = _trajectory_scores(
+            residuals,
+            manifests,
+            lens=lens,
+            unembed=unembed,
+            layers=layers,
+            concept_ids=concept_ids,
+            position_names=arm_positions,
+        )
+    if position_names is None:
+        raise ValueError("trajectory capture has no cut positions")
+    base_keys = manifest_keys["base"]
+    if any(manifest_keys[arm] != base_keys for arm in arm_names if arm != "base"):
+        raise ValueError("trajectory arms are not paired on the same framing/stimulus keys")
+    for arm in arm_names:
+        if arm == "base":
+            continue
+        for row in manifests_by_arm[arm]:
+            key = _trajectory_manifest_key(row)
+            raw_cues = row.get("cue_seen_by_cut")
+            if not isinstance(raw_cues, dict) or set(raw_cues) != set(position_names):
+                raise ValueError(f"arm {arm} manifest row {key} has incomplete cue metadata")
+            if {name: bool(raw_cues[name]) for name in position_names} != cue_by_key[key]:
+                raise ValueError(f"arm {arm} cue metadata differs from base for {key}")
+
+    per_stimulus: dict[str, dict[str, dict[str, Any]]] = {}
+    for arm in arm_names:
+        for (framing, stimulus_id), cuts in score_by_arm[arm].items():
+            per_stimulus.setdefault(arm, {}).setdefault(framing, {})[stimulus_id] = {
+                "cue_seen_by_cut": cue_by_key.get((framing, stimulus_id), {}),
+                "scores": cuts,
+            }
+
+    mean_trajectory: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    mean_trajectory_by_framing: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+    for arm in arm_names:
+        mean_trajectory[arm] = {}
+        mean_trajectory_by_framing[arm] = {}
+        for position_name in position_names:
+            mean_trajectory[arm][position_name] = {}
+            for concept_name in concept_ids:
+                values = [
+                    cuts[position_name][concept_name]
+                    for cuts in score_by_arm[arm].values()
+                    if concept_name in cuts[position_name]
+                ]
+                mean_trajectory[arm][position_name][concept_name] = _trajectory_summary(
+                    values, seed=args.seed
+                )
+        for framing in sorted({key[0] for key in score_by_arm[arm]}):
+            mean_trajectory_by_framing[arm][framing] = {}
+            for position_name in position_names:
+                mean_trajectory_by_framing[arm][framing][position_name] = {}
+                for concept_name in concept_ids:
+                    values = [
+                        cuts[position_name][concept_name]
+                        for (item_framing, _stimulus), cuts in score_by_arm[arm].items()
+                        if item_framing == framing and concept_name in cuts[position_name]
+                    ]
+                    mean_trajectory_by_framing[arm][framing][position_name][concept_name] = (
+                        _trajectory_summary(values, seed=args.seed)
+                    )
+
+    paired_differences: dict[str, dict[str, dict[str, Any]]] = {}
+    cue_split: dict[str, dict[str, dict[str, Any]]] = {}
+    for arm in arm_names:
+        if arm == "base":
+            continue
+        paired_differences[arm] = {}
+        cue_split[arm] = {}
+        for position_name in position_names:
+            paired_differences[arm][position_name] = {}
+            cue_split[arm][position_name] = {}
+            for concept_name in concept_ids:
+                paired_pairs = [
+                    (
+                        key,
+                        score_by_arm[arm][key][position_name][concept_name]
+                        - score_by_arm["base"][key][position_name][concept_name],
+                    )
+                    for key in sorted(base_keys)
+                    if concept_name in score_by_arm[arm][key][position_name]
+                    and concept_name in score_by_arm["base"][key][position_name]
+                ]
+                paired_values = [value for _key, value in paired_pairs]
+                paired_differences[arm][position_name][concept_name] = _trajectory_summary(
+                    paired_values, seed=args.seed
+                )
+                before = [
+                    value for key, value in paired_pairs if not cue_by_key[key][position_name]
+                ]
+                after = [value for key, value in paired_pairs if cue_by_key[key][position_name]]
+                before_summary = _trajectory_summary(before, seed=args.seed)
+                after_summary = _trajectory_summary(after, seed=args.seed)
+                interaction = (
+                    None
+                    if before_summary["mean"] is None or after_summary["mean"] is None
+                    else after_summary["mean"] - before_summary["mean"]
+                )
+                cue_split[arm][position_name][concept_name] = {
+                    "before_cue": before_summary,
+                    "after_cue": after_summary,
+                    "after_minus_before": interaction,
+                    "interaction": interaction,
+                }
+
+    report = {
+        "band": [band_start, band_end],
+        "cuts": list(position_names),
+        "concept_skipped_words": skipped,
+        "per_stimulus": per_stimulus,
+        "mean_trajectory": mean_trajectory,
+        "mean_trajectory_by_framing": mean_trajectory_by_framing,
+        "paired_differences": paired_differences,
+        "paired_difference": paired_differences,
+        "cue_split": cue_split,
+    }
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    (args.out_dir / "trajectory.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    lines = [
+        "# Workspace trajectory",
+        "",
+        f"Band: layers {band_start}:{band_end}",
+        "",
+    ]
+    for arm, cuts in mean_trajectory.items():
+        lines.extend((f"## Mean trajectory: {arm}", ""))
+        for position_name, concepts_for_cut in cuts.items():
+            for concept_name, stats in concepts_for_cut.items():
+                lines.append(
+                    f"- {position_name} {concept_name}: mean={stats['mean']}, n={stats['n']}"
+                )
+    for arm, cuts in cue_split.items():
+        lines.extend(("", f"## Cue interaction: {arm}"))
+        for position_name, concepts_for_cut in cuts.items():
+            for concept_name, stats in concepts_for_cut.items():
+                lines.append(
+                    f"- {position_name} {concept_name}: after-minus-before="
+                    f"{stats['after_minus_before']}"
+                )
+    (args.out_dir / "trajectory.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def word_variant_token_ids(tokenizer: PreTrainedTokenizerBase, word: str) -> list[int]:
     """Single-token ids of a word as it can appear mid-text: bare or space-led, as given or capitalised."""
     variants = {word, f" {word}", word.capitalize(), f" {word.capitalize()}"}
@@ -1379,6 +1834,15 @@ def _parser() -> argparse.ArgumentParser:
     prefix_parser = subparsers.add_parser("capture-prefix")
     add_capture_arguments(prefix_parser)
     prefix_parser.add_argument("--prefix-records", type=Path, action="append", required=True)
+    prefix_parser.add_argument(
+        "--cut-fractions",
+        action="append",
+        help="repeatable comma-separated sentence-boundary fractions in the pre-commitment span",
+    )
+    prefix_parser.add_argument(
+        "--cue-regex",
+        help="runtime regular expression identifying the mirroring/symmetry cue sentence",
+    )
     analyse_parser = subparsers.add_parser("analyse")
     analyse_parser.add_argument("--capture-dir", type=Path, required=True)
     analyse_parser.add_argument("--lens", type=Path, required=True)
@@ -1394,6 +1858,15 @@ def _parser() -> argparse.ArgumentParser:
     sanity_parser.add_argument("--evaluations", type=Path, default=Path(LENS_EVAL_PATH))
     sanity_parser.add_argument("--out-dir", type=Path, required=True)
     sanity_parser.add_argument("--device", default="cuda")
+    trajectory_parser = subparsers.add_parser("analyse-trajectory")
+    trajectory_parser.add_argument("--capture-dir", type=Path, required=True)
+    trajectory_parser.add_argument("--lens", type=Path, required=True)
+    trajectory_parser.add_argument("--model-path", type=Path, required=True)
+    trajectory_parser.add_argument("--out-dir", type=Path, required=True)
+    trajectory_parser.add_argument("--band", default="12:30")
+    trajectory_parser.add_argument("--concept-sets", type=Path, required=True)
+    trajectory_parser.add_argument("--seed", type=int, default=20260926)
+    trajectory_parser.add_argument("--device", default="cpu")
     return parser
 
 
@@ -1409,6 +1882,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             capture_prefix(args)
     elif args.command == "analyse":
         analyse(args)
+    elif args.command == "analyse-trajectory":
+        analyse_trajectory(args)
     else:
         sanity(args)
 
