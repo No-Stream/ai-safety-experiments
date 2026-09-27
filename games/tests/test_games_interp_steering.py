@@ -21,13 +21,14 @@ import datetime as dt
 import hashlib
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
 
-from games import interp_steering
+from games import interp_steering, workspace_ablation
 from games.interp_cells import (
     BASE_ARM,
     CellFormatError,
@@ -73,6 +74,7 @@ from games.interp_steering import (
     validate_custom_diagnostic_rows,
 )
 from games.prompts import FRAMING_HUMAN, FRAMING_TWIN
+from games.workspace_ablation import token_ids_from_tokenizer
 from reward_hacking.interp.directions import (
     _decoder_layers,  # pyright: ignore[reportPrivateUsage]
     cosine,
@@ -81,10 +83,9 @@ from reward_hacking.interp.directions import (
 )
 from reward_hacking.interp.jsonl_resume import ResumeMismatchError, ledger_path_for
 from reward_hacking.interp.steering import ablate_residual, residual_intervention, steering_hook
+from reward_hacking.model_backend import TokenBanLogitsProcessor, assert_no_banned_token_ids
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
 
 STIMULUS_SET = "causal-vs-functional-decision"
@@ -470,6 +471,51 @@ class TestConditions:
         assert condition_key(GenerationCondition(CONDITION_NONE, None, None, None)) == "none"
 
 
+class TestTokenBanMechanics:
+    def test_logits_processor_masks_exactly_the_banned_ids(self) -> None:
+        processor = TokenBanLogitsProcessor([2, 5])
+        scores = torch.tensor([[0.5, -1.25, 3.0, 7.5, -4.0, 2.25]])
+
+        adjusted = processor(torch.tensor([[11, 12]]), scores.clone())
+
+        assert torch.isneginf(adjusted[0, 2])
+        assert torch.isneginf(adjusted[0, 5])
+        allowed_ids = [0, 1, 3, 4]
+        assert torch.equal(adjusted[0, allowed_ids], scores[0, allowed_ids])
+
+    @pytest.mark.parametrize("tokens", [["synthetic_missing"], ["synthetic_ambiguous"]])
+    def test_token_resolver_refuses_missing_or_ambiguous_decoded_strings(
+        self, tokens: list[str]
+    ) -> None:
+        class TinyTokenizer:
+            vocab_size = 3
+
+            def decode(self, ids: list[int]) -> str:
+                return {
+                    0: "synthetic_ambiguous",
+                    1: "synthetic_ambiguous",
+                    2: "synthetic_present",
+                }[ids[0]]
+
+        with pytest.raises(ValueError, match="one decoded vocabulary id"):
+            token_ids_from_tokenizer(cast("PreTrainedTokenizerBase", TinyTokenizer()), tokens)
+
+    def test_generate_parser_accepts_the_banned_tokens_file(self) -> None:
+        parsed = interp_steering.build_parser().parse_args(
+            [
+                "generate",
+                "--model",
+                "tiny/base",
+                "--banned-tokens-json",
+                "synthetic-banned-tokens.json",
+                "--out-dir",
+                "unused",
+            ]
+        )
+
+        assert parsed.banned_tokens_json == Path("synthetic-banned-tokens.json")
+
+
 class TestSummaries:
     def test_rates_are_never_pooled_across_framings(self) -> None:
         records = [
@@ -775,6 +821,10 @@ class _FakeBackend:
         self.sampling = sampling
         self._model = TinyLM(24, torch.randn(HIDDEN)) if model is None else model
         self._tokenizer = _TinyTokenizer()
+        self.last_banned_token_counts: list[int] = []
+
+    def clear_generation_audit(self) -> None:
+        self.last_banned_token_counts = []
 
     def generate(self, prompts: list[str]) -> list[str]:
         raise AssertionError("the fake decode path should be used instead")
@@ -804,6 +854,25 @@ class _TinyTokenizer:
                 "attention_mask": torch.ones(len(chats), 3, dtype=torch.long),
             }
         )
+
+
+class _TinyBanTokenizer(_TinyTokenizer):
+    vocab_size = 3
+
+    def decode(self, ids: list[int]) -> str:
+        return {
+            0: "synthetic_allowed",
+            1: "synthetic_banned_a",
+            2: "synthetic_banned_b",
+        }[ids[0]]
+
+
+class _TokenBanFakeBackend(_FakeBackend):
+    def __init__(
+        self, model_id: str, *, thinking: bool, sampling: Any, model: Any | None = None
+    ) -> None:
+        super().__init__(model_id, thinking=thinking, sampling=sampling, model=model)
+        self._tokenizer = _TinyBanTokenizer()
 
 
 class _TinyAdapterLM(torch.nn.Module):
@@ -840,6 +909,7 @@ def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> ar
         "direction": [f"decision={directions_path}"],
         "subspace_bundle": None,
         "placebo_bundle": None,
+        "banned_tokens_json": None,
         "cells": ["decision:18:1.0"],
         "from_sweep": None,
         "selected_target": None,
@@ -859,6 +929,120 @@ def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> ar
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+class TestTokenBanGeneration:
+    @staticmethod
+    def _patch(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        decode: Any | None = None,
+    ) -> None:
+        if decode is None:
+            decode = _neutral_completions
+        monkeypatch.setattr(interp_steering, "HFBackend", _TokenBanFakeBackend)
+        monkeypatch.setattr(interp_steering, "decode_in_chunks", decode)
+        monkeypatch.setattr(
+            workspace_ablation,
+            "_load_tokenizer",
+            lambda _path: _TinyBanTokenizer(),
+        )
+
+    def test_token_ban_is_a_condition_table_entry_and_filters_by_name(
+        self,
+        tmp_path: Path,
+        directions_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        token_file = tmp_path / "synthetic-banned-tokens.json"
+        token_file.write_text(json.dumps(["synthetic_banned_a"]), encoding="utf-8")
+        self._patch(monkeypatch)
+
+        summary = run_generate(
+            generate_args(
+                tmp_path,
+                directions_path,
+                direction=[],
+                cells=None,
+                banned_tokens_json=token_file,
+                conditions="none,token-ban",
+            )
+        )
+
+        assert set(summary["conditions"]) == {"none", "token-ban"}
+        assert summary["skipped_conditions"] == []
+        records = [
+            json.loads(line)
+            for line in (tmp_path / "steering" / "steering_records.jsonl").read_text().splitlines()
+        ]
+        assert records
+        banned_records = [record for record in records if record["condition"] == "token-ban"]
+        assert banned_records
+        assert all(record["condition_key"] == "token-ban" for record in banned_records)
+        assert all(isinstance(record["banned_tokens_sha256"], str) for record in banned_records)
+        assert len({record["banned_tokens_sha256"] for record in banned_records}) == 1
+
+    def test_changing_the_banned_token_set_refuses_resume(
+        self,
+        tmp_path: Path,
+        directions_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        token_file = tmp_path / "synthetic-banned-tokens.json"
+        token_file.write_text(json.dumps(["synthetic_banned_a"]), encoding="utf-8")
+        self._patch(monkeypatch)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            direction=[],
+            cells=None,
+            banned_tokens_json=token_file,
+            conditions="token-ban",
+        )
+        run_generate(args)
+
+        token_file.write_text(json.dumps(["synthetic_banned_b"]), encoding="utf-8")
+        with pytest.raises(ResumeMismatchError, match="banned"):
+            run_generate(args)
+
+    def test_token_ban_sits_in_the_same_table_as_subspace_ablation(
+        self,
+        tmp_path: Path,
+        directions_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        token_file = tmp_path / "synthetic-banned-tokens.json"
+        token_file.write_text(json.dumps(["synthetic_banned_a"]), encoding="utf-8")
+        real = tmp_path / "real.pt"
+        placebo = tmp_path / "placebo.pt"
+        torch.save({0: torch.eye(HIDDEN)[:2]}, real)
+        torch.save({0: torch.eye(HIDDEN)[2:4]}, placebo)
+        self._patch(monkeypatch)
+
+        summary = run_generate(
+            generate_args(
+                tmp_path,
+                directions_path,
+                direction=[],
+                cells=None,
+                subspace_bundle=real,
+                placebo_bundle=placebo,
+                banned_tokens_json=token_file,
+                conditions="token-ban",
+            )
+        )
+
+        assert set(summary["conditions"]) == {"token-ban"}
+        assert {entry["condition_key"] for entry in summary["skipped_conditions"]} == {
+            "none",
+            "subspace-ablate:real",
+            "subspace-ablate:placebo",
+        }
+
+    def test_banned_token_assertion_has_a_teeth_check(self) -> None:
+        assert assert_no_banned_token_ids([0, 2, 0], {1}) == 0
+        with pytest.raises(AssertionError, match="banned token"):
+            assert_no_banned_token_ids([0, 2, 1], {1})
 
 
 def write_selected_target(
@@ -1799,8 +1983,16 @@ class TestDecoderLayerContract:
         assert len(layers) == N_LAYERS
 
 
-def _neutral_completions(backend: Any, prompts: Any, *, chunk_size: int) -> list[str]:
-    del backend, chunk_size
+def _neutral_completions(
+    backend: Any,
+    prompts: Any,
+    *,
+    chunk_size: int,
+    generation_kwargs: Any | None = None,
+) -> list[str]:
+    del chunk_size, generation_kwargs
+    if hasattr(backend, "last_banned_token_counts"):
+        backend.last_banned_token_counts = [0] * len(prompts)
     return ["deliberation</think>\n<action>unparseable</action>" for _ in prompts]
 
 

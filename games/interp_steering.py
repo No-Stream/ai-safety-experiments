@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
 
+from games import workspace_ablation
 from games.chunked_decode import decode_in_chunks
 from games.deltanet_kernels import (
     DELTANET_KERNEL_FIELD,
@@ -90,7 +91,7 @@ from games.prompts import (
     generate_framing_prompt_rows,
     generate_prompt_rows,
 )
-from games.workspace_ablation import load_bundle
+from games.workspace_ablation import load_bundle, load_token_spec, token_ids_from_tokenizer
 from reward_hacking.interp.directions import (
     _decoder_layers,  # pyright: ignore[reportPrivateUsage]  # shared trunk-layer resolver
     cosine,
@@ -152,6 +153,7 @@ CONDITION_ABLATE_REAL = "ablate:real"
 CONDITION_ABLATE_PLACEBO = "ablate:placebo"
 CONDITION_SUBSPACE_REAL = "subspace-ablate:real"
 CONDITION_SUBSPACE_PLACEBO = "subspace-ablate:placebo"
+CONDITION_TOKEN_BAN = "token-ban"
 STEERING_CONDITIONS: tuple[str, ...] = (
     CONDITION_STEER_UP,
     CONDITION_STEER_DOWN,
@@ -1385,6 +1387,22 @@ def plan_generation_cells(payload: Mapping[str, Any], *, n_cells: int) -> list[d
 # --------------------------------------------------------------------------------------
 
 
+def banned_tokens_sha256(token_ids: Sequence[int]) -> str:
+    """Digest the canonical set of banned vocabulary ids for records and resume identity."""
+    canonical = json.dumps(sorted({int(token_id) for token_id in token_ids}), separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def resolve_banned_tokens(path: Path, *, model_path: str) -> tuple[tuple[int, ...], str]:
+    """Resolve a decoded-token JSON list through the workspace-ablation tokenizer resolver."""
+    token_strings = load_token_spec(path)
+    tokenizer = workspace_ablation._load_tokenizer(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        Path(model_path)
+    )
+    token_ids = tuple(token_ids_from_tokenizer(tokenizer, token_strings))
+    return token_ids, banned_tokens_sha256(token_ids)
+
+
 @dataclass(frozen=True)
 class GenerationCondition:
     """One generation condition: a hook spec plus everything the records must carry."""
@@ -1393,9 +1411,12 @@ class GenerationCondition:
     direction: str | None
     layer: int | None
     alpha_multiplier: float | None
+    banned_tokens_sha256: str | None = None
 
 
-def generation_conditions(cells: Sequence[Mapping[str, Any]]) -> list[GenerationCondition]:
+def generation_conditions(
+    cells: Sequence[Mapping[str, Any]], *, banned_tokens_sha256: str | None = None
+) -> list[GenerationCondition]:
     """Build the deduplicated condition list.
 
     One shared baseline, four steering conditions per cell, and two ablation conditions per
@@ -1421,27 +1442,51 @@ def generation_conditions(cells: Sequence[Mapping[str, Any]]) -> list[Generation
     for condition in conditions:
         if condition not in unique:
             unique.append(condition)
+    if banned_tokens_sha256 is not None:
+        unique.append(
+            GenerationCondition(CONDITION_TOKEN_BAN, None, None, None, banned_tokens_sha256)
+        )
     return unique
 
 
-def selected_target_conditions(cell: Mapping[str, Any]) -> list[GenerationCondition]:
+def selected_target_conditions(
+    cell: Mapping[str, Any], *, banned_tokens_sha256: str | None = None
+) -> list[GenerationCondition]:
     """Build the three-condition causal check for one calibration-selected target."""
     direction = str(cell["direction"])
     layer = int(cell["layer"])
     multiplier = float(cell["alpha_multiplier"])
-    return [
+    conditions = [
         GenerationCondition(CONDITION_NONE, None, None, None),
         GenerationCondition(CONDITION_STEER_UP, direction, layer, multiplier),
         GenerationCondition(CONDITION_PLACEBO_UP, direction, layer, multiplier),
     ]
+    if banned_tokens_sha256 is not None:
+        conditions.append(
+            GenerationCondition(CONDITION_TOKEN_BAN, None, None, None, banned_tokens_sha256)
+        )
+    return conditions
 
 
-def subspace_conditions() -> list[GenerationCondition]:
+def subspace_conditions(*, banned_tokens_sha256: str | None = None) -> list[GenerationCondition]:
     """Build the shared baseline and two whole-band subspace interventions."""
-    return [
+    conditions = [
         GenerationCondition(CONDITION_NONE, None, None, None),
         GenerationCondition(CONDITION_SUBSPACE_REAL, None, None, None),
         GenerationCondition(CONDITION_SUBSPACE_PLACEBO, None, None, None),
+    ]
+    if banned_tokens_sha256 is not None:
+        conditions.append(
+            GenerationCondition(CONDITION_TOKEN_BAN, None, None, None, banned_tokens_sha256)
+        )
+    return conditions
+
+
+def token_ban_conditions(banned_tokens_sha256: str) -> list[GenerationCondition]:
+    """Build the baseline and pure output-ban control when no activation source is selected."""
+    return [
+        GenerationCondition(CONDITION_NONE, None, None, None),
+        GenerationCondition(CONDITION_TOKEN_BAN, None, None, None, banned_tokens_sha256),
     ]
 
 
@@ -1658,7 +1703,11 @@ def condition_key(condition: GenerationCondition) -> str:
     """Render a stable flat key for grouping: e.g. ``decision:L18:x1.0:steer:+`` or ``none``."""
     if condition.condition == CONDITION_NONE:
         return CONDITION_NONE
-    if condition.condition in (CONDITION_SUBSPACE_REAL, CONDITION_SUBSPACE_PLACEBO):
+    if condition.condition in (
+        CONDITION_SUBSPACE_REAL,
+        CONDITION_SUBSPACE_PLACEBO,
+        CONDITION_TOKEN_BAN,
+    ):
         return condition.condition
     multiplier = "" if condition.alpha_multiplier is None else f":x{condition.alpha_multiplier}"
     return f"{condition.direction}:L{condition.layer}{multiplier}:{condition.condition}"
@@ -1731,6 +1780,7 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
     weights_identity: str,
     deltanet_kernel: Mapping[str, str],
     subspace_bundles: Mapping[str, Mapping[int, torch.Tensor]] | None = None,
+    banned_tokens_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Everything a generation record depends on, for the resume ledger to compare against.
 
@@ -1781,6 +1831,7 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
         "subspace_sha256": None
         if subspace_bundles is None
         else directions_digest(subspace_bundles),
+        "banned_tokens_sha256": banned_tokens_sha256,
         "resolved_sampler": dict(sampler_payload),
     }
     if args.framings:
@@ -1805,6 +1856,8 @@ def condition_intervention(  # noqa: PLR0913 - existing steering controls plus o
     vector an unbroken one would have.
     """
     if condition.condition == CONDITION_NONE:
+        return nullcontext(), None
+    if condition.condition == CONDITION_TOKEN_BAN:
         return nullcontext(), None
     if condition.condition in (CONDITION_SUBSPACE_REAL, CONDITION_SUBSPACE_PLACEBO):
         if subspace_bundles is None:
@@ -2021,6 +2074,12 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     if requested_framings and args.row_manifest is not None:
         raise ValueError("--framing cannot be combined with --row-manifest")
     framing_ids = [framing for framing in COUNTERPART_FRAMING_IDS if framing in requested_framings]
+    banned_token_ids: tuple[int, ...] = ()
+    banned_tokens_digest: str | None = None
+    if args.banned_tokens_json is not None:
+        banned_token_ids, banned_tokens_digest = resolve_banned_tokens(
+            cast("Path", args.banned_tokens_json), model_path=args.model
+        )
     subspace_mode = args.subspace_bundle is not None or args.placebo_bundle is not None
     if subspace_mode and (args.subspace_bundle is None or args.placebo_bundle is None):
         raise ValueError("pass both --subspace-bundle and --placebo-bundle")
@@ -2046,13 +2105,17 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             raise ValueError("real and placebo subspace bundles must match layers and ranks")
     direction_specs = parse_named_specs(args.direction, flag="--direction")
     started_monotonic = time.monotonic()
-    directions = {} if subspace_mode else load_named_directions(args.direction)
-    direction_paths = {name: Path(path) for name, path in direction_specs.items()}
-    selected_target: dict[str, Any] | None = None
     requested_sources = sum(
         source is not None for source in (args.cells, args.from_sweep, args.selected_target)
     )
-    if requested_sources != (0 if subspace_mode else 1):
+    token_ban_only = (
+        banned_tokens_digest is not None and not args.direction and requested_sources == 0
+    )
+    directions = {} if subspace_mode or token_ban_only else load_named_directions(args.direction)
+    direction_paths = {name: Path(path) for name, path in direction_specs.items()}
+    selected_target: dict[str, Any] | None = None
+    required_sources = 0 if subspace_mode or token_ban_only else 1
+    if requested_sources != required_sources:
         raise ValueError("pass exactly one of --cells, --from-sweep, or --selected-target.")
     if subspace_mode:
         cells = []
@@ -2067,6 +2130,9 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
         sweep_payload = cast("dict[str, Any]", json.loads(Path(args.from_sweep).read_text()))
         cells = plan_generation_cells(sweep_payload, n_cells=args.n_cells)
         selection = select_intervention(sweep_payload)
+    elif token_ban_only:
+        cells = []
+        selection = None
     else:
         cells = _parse_cells_flag(args.cells)
         selection = None
@@ -2088,11 +2154,13 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     sample_indices = [index for _ in rows for index in range(args.n_samples)]
 
     if subspace_mode:
-        conditions = subspace_conditions()
+        conditions = subspace_conditions(banned_tokens_sha256=banned_tokens_digest)
     elif selected_target is not None:
-        conditions = selected_target_conditions(cells[0])
+        conditions = selected_target_conditions(cells[0], banned_tokens_sha256=banned_tokens_digest)
+    elif banned_tokens_digest is not None and not cells:
+        conditions = token_ban_conditions(banned_tokens_digest)
     else:
-        conditions = generation_conditions(cells)
+        conditions = generation_conditions(cells, banned_tokens_sha256=banned_tokens_digest)
     requested = parse_requested_conditions(args.conditions, conditions)
     direction_names = list(directions)
 
@@ -2130,6 +2198,7 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             weights_identity=weights_identity,
             deltanet_kernel=deltanet_kernel,
             subspace_bundles=subspace_bundles,
+            banned_tokens_sha256=banned_tokens_digest,
         ),
         unit_of=lambda record: str(record["condition_key"]),
     )
@@ -2159,10 +2228,37 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
                 placebo_seed=placebo_seed,
                 subspace_bundles=subspace_bundles,
             )
+            condition_generation_kwargs = (
+                {"banned_token_ids": banned_token_ids}
+                if condition.condition == CONDITION_TOKEN_BAN
+                else None
+            )
+            if condition_generation_kwargs is not None:
+                backend.clear_generation_audit()
             with context:
-                completions = decode_in_chunks(backend, prompts, chunk_size=args.batch_size)
-            for row, sample_index, completion in zip(
-                row_for_prompt, sample_indices, completions, strict=True
+                if condition_generation_kwargs is None:
+                    completions = decode_in_chunks(backend, prompts, chunk_size=args.batch_size)
+                else:
+                    completions = decode_in_chunks(
+                        backend,
+                        prompts,
+                        chunk_size=args.batch_size,
+                        generation_kwargs=condition_generation_kwargs,
+                    )
+            banned_token_counts = [0] * len(completions)
+            if condition_generation_kwargs is not None:
+                banned_token_counts = list(backend.last_banned_token_counts)
+                if len(banned_token_counts) != len(completions):
+                    raise RuntimeError(
+                        "token-ban generation did not return one token audit count per completion: "
+                        f"{len(banned_token_counts)} counts for {len(completions)} completions"
+                    )
+                if any(banned_token_counts):
+                    raise AssertionError(
+                        "token-ban generation emitted a banned token despite its logits processor"
+                    )
+            for completion_index, (row, sample_index, completion) in enumerate(
+                zip(row_for_prompt, sample_indices, completions, strict=True)
             ):
                 visible, truncated = strip_thinking(completion, prefilled_think=True)
                 action = parse_action(
@@ -2230,6 +2326,9 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
                     ),
                     **allocation_outcome,
                 }
+                if condition_generation_kwargs is not None:
+                    record["banned_tokens_sha256"] = cast("str", banned_tokens_digest)
+                    record["banned_token_count"] = banned_token_counts[completion_index]
                 records.append(record)
                 records_file.write(json.dumps(record) + "\n")
             records_file.flush()
@@ -2334,6 +2433,12 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--direction", action="append", default=[], metavar="NAME=PATH")
     generate.add_argument("--subspace-bundle", type=Path, default=None)
     generate.add_argument("--placebo-bundle", type=Path, default=None)
+    generate.add_argument(
+        "--banned-tokens-json",
+        type=Path,
+        default=None,
+        help="JSON list of decoded token strings to ban at every generation step.",
+    )
     generate.add_argument("--cells", action="append", default=None, metavar="NAME:LAYER:MULT")
     generate.add_argument("--from-sweep", default=None)
     generate.add_argument(

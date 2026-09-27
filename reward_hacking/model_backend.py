@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 from bisect import bisect_right
+from collections.abc import Collection, Iterable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -46,9 +47,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, runtime_checka
 if TYPE_CHECKING:
     from collections.abc import (
         Callable,
-        Collection,
         Generator,
-        Iterable,
         Iterator,
         Mapping,
         Sequence,
@@ -65,6 +64,7 @@ from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    LogitsProcessor,
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
@@ -372,6 +372,8 @@ makes every unit stop on the same set, and puts that set in the run record where
 compare it.
 """
 
+LOGITS_BATCH_NDIM = 2
+
 
 def end_of_turn_token_ids(tokenizer: PreTrainedTokenizerBase) -> tuple[int, ...]:
     """Resolve :data:`END_OF_TURN_TOKENS` through a tokenizer, refusing one that lacks either.
@@ -433,6 +435,40 @@ def _generated_span(row: Sequence[int], terminators: Collection[int]) -> tuple[i
     return len(row), STOP_REASON_MAX_TOKENS
 
 
+class TokenBanLogitsProcessor(LogitsProcessor):
+    """Set the logits of a fixed token-id set to negative infinity at every decode step."""
+
+    def __init__(self, banned_token_ids: Collection[int]) -> None:
+        """Store a canonical, validated vocabulary-id set."""
+        super().__init__()
+        self.banned_token_ids = tuple(sorted({int(token_id) for token_id in banned_token_ids}))
+        if any(token_id < 0 for token_id in self.banned_token_ids):
+            raise ValueError(f"banned token ids must be non-negative, got {self.banned_token_ids}")
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.FloatTensor:
+        """Return logits with every banned vocabulary column set to negative infinity."""
+        del input_ids
+        if scores.ndim != LOGITS_BATCH_NDIM:
+            raise ValueError(f"logits must be a rank-2 batch, got shape {tuple(scores.shape)}")
+        adjusted = scores.clone()
+        if self.banned_token_ids:
+            adjusted[:, list(self.banned_token_ids)] = -torch.inf
+        return cast("torch.FloatTensor", adjusted)
+
+
+def assert_no_banned_token_ids(
+    generated_token_ids: Iterable[int], banned_token_ids: Collection[int]
+) -> int:
+    """Return the number of banned ids, raising immediately if any were emitted."""
+    banned = frozenset(int(token_id) for token_id in banned_token_ids)
+    count = sum(int(token_id) in banned for token_id in generated_token_ids)
+    if count:
+        raise AssertionError(
+            f"generated completion emitted {count} banned token(s) from {sorted(banned)}"
+        )
+    return count
+
+
 class HFBackend:
     """HuggingFace batched-generation backend. Runs on GPU or CPU; the offline-inference path.
 
@@ -482,6 +518,7 @@ class HFBackend:
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
         self._terminator_ids = _terminator_ids(self._tokenizer) | frozenset(self.stop_token_ids)
+        self._last_banned_token_counts: list[int] = []
         self._model: PreTrainedModel = (
             AutoModelForCausalLM.from_pretrained(
                 load_from, dtype=resolved_dtype, device_map=device_map
@@ -524,7 +561,18 @@ class HFBackend:
                 f"{snapshot_dir}; the served model is not the one whose identity was checked"
             )
 
-    def _generation_kwargs(self) -> dict[str, object]:
+    def clear_generation_audit(self) -> None:
+        """Discard token-ban audit counts before a new condition is decoded."""
+        self._last_banned_token_counts = []
+
+    @property
+    def last_banned_token_counts(self) -> tuple[int, ...]:
+        """Counts of banned ids in each completion generated since the last reset."""
+        return tuple(self._last_banned_token_counts)
+
+    def _generation_kwargs(
+        self, generation_kwargs: Mapping[str, object] | None = None
+    ) -> dict[str, object]:
         kwargs: dict[str, object] = {
             "max_new_tokens": self.sampling.max_new_tokens,
             "do_sample": self.sampling.do_sample,
@@ -543,10 +591,26 @@ class HFBackend:
             # transformers' StopStringCriteria needs the tokenizer or generate() refuses to start.
             kwargs["stop_strings"] = list(self.sampling.stop)
             kwargs["tokenizer"] = self._tokenizer
+        if generation_kwargs is not None:
+            unknown = set(generation_kwargs) - {"banned_token_ids"}
+            if unknown:
+                raise ValueError(f"unsupported HF generation kwargs: {sorted(unknown)}")
+            banned_token_ids = generation_kwargs.get("banned_token_ids")
+            if banned_token_ids is not None:
+                if not isinstance(banned_token_ids, Collection):
+                    raise TypeError("banned_token_ids must be a collection of integers")
+                kwargs["logits_processor"] = [
+                    TokenBanLogitsProcessor(cast("Collection[int]", banned_token_ids))
+                ]
         return kwargs
 
     @torch.no_grad()
-    def generate_detailed(self, prompts: list[str]) -> list[BedrockCompletion]:
+    def generate_detailed(
+        self,
+        prompts: list[str],
+        *,
+        generation_kwargs: Mapping[str, object] | None = None,
+    ) -> list[BedrockCompletion]:
         """Generate one completion per prompt, saying for each how long it ran and why it stopped.
 
         Local generation is where the stop reason was missing entirely: ``transformers`` returns
@@ -572,13 +636,21 @@ class HFBackend:
         chats = [_as_single_user_turn(self._tokenizer, p, thinking=self.thinking) for p in prompts]
         inputs = self._tokenizer(chats, return_tensors="pt", padding=True).to(self._model.device)
         generate = cast("Callable[..., torch.Tensor]", self._model.generate)  # pyright: ignore[reportAttributeAccessIssue]
-        outputs = generate(**inputs, **self._generation_kwargs())
+        outputs = generate(**inputs, **self._generation_kwargs(generation_kwargs))
         prompt_len = int(inputs["input_ids"].shape[1])
         prompt_tokens: list[int] = inputs["attention_mask"].sum(dim=1).tolist()
+        banned_token_ids = frozenset(
+            cast("Collection[int]", generation_kwargs["banned_token_ids"])
+            if generation_kwargs is not None and "banned_token_ids" in generation_kwargs
+            else ()
+        )
         completions: list[BedrockCompletion] = []
         for output, input_tokens in zip(outputs, prompt_tokens, strict=True):
             generated: list[int] = output[prompt_len:].tolist()
             output_tokens, stop_reason = _generated_span(generated, self._terminator_ids)
+            banned_count = assert_no_banned_token_ids(generated[:output_tokens], banned_token_ids)
+            if banned_token_ids:
+                self._last_banned_token_counts.append(banned_count)
             text = cast("str", self._tokenizer.decode(generated, skip_special_tokens=True))
             # A stop-string halt leaves no terminator token, so the span would mislabel it above.
             if self.sampling.stop and any(stop in text for stop in self.sampling.stop):
@@ -593,13 +665,21 @@ class HFBackend:
             )
         return completions
 
-    def generate(self, prompts: list[str]) -> list[str]:
+    def generate(
+        self,
+        prompts: list[str],
+        *,
+        generation_kwargs: Mapping[str, object] | None = None,
+    ) -> list[str]:
         """Generate one completion for each prompt using batched decoding.
 
         Delegates rather than decoding a second time, so the text a caller reading only ``Backend``
         gets is by construction the text the detailed record carries.
         """
-        return [completion.text for completion in self.generate_detailed(prompts)]
+        return [
+            completion.text
+            for completion in self.generate_detailed(prompts, generation_kwargs=generation_kwargs)
+        ]
 
 
 VLLM_LORA_ADAPTER_NAME = "eval-adapter"

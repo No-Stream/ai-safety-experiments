@@ -23,7 +23,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
@@ -32,10 +32,19 @@ from games.termination import decode_peak_tokens
 from reward_hacking.model_backend import HFBackend, VLLMBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Sequence
+    from collections.abc import Callable, Generator, Mapping, Sequence
 
     from games.sizing import SequenceCost
     from reward_hacking.model_backend import Backend
+
+    class _GenerationKwargsBackend(Protocol):
+        def generate(
+            self,
+            prompts: list[str],
+            *,
+            generation_kwargs: Mapping[str, object],
+        ) -> list[str]: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -521,6 +530,7 @@ def iter_decoded_chunks(
     *,
     chunk_size: int,
     probe: AllocatorProbe = LIVE_ALLOCATOR_PROBE,
+    generation_kwargs: Mapping[str, object] | None = None,
 ) -> Generator[list[str]]:
     """Yield each chunk's completions as it returns, narrowing the width when one goes badly.
 
@@ -535,7 +545,13 @@ def iter_decoded_chunks(
     decoded = 0
     width = chunk_size
     while decoded < len(prompts):
-        batch, width = _decode_chunk_that_fits(backend, prompts[decoded:], width=width, probe=probe)
+        batch, width = _decode_chunk_that_fits(
+            backend,
+            prompts[decoded:],
+            width=width,
+            probe=probe,
+            generation_kwargs=generation_kwargs,
+        )
         if not batch:
             raise RuntimeError(
                 f"the backend returned no completions for a chunk of {width} prompts, so this loop "
@@ -556,6 +572,7 @@ def decode_in_chunks(
     *,
     chunk_size: int,
     probe: AllocatorProbe = LIVE_ALLOCATOR_PROBE,
+    generation_kwargs: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Decode the flattened prompt list chunk by chunk, narrowing the width when one goes badly.
 
@@ -573,13 +590,24 @@ def decode_in_chunks(
     every completion is in hand.
     """
     completions: list[str] = []
-    for batch in iter_decoded_chunks(backend, prompts, chunk_size=chunk_size, probe=probe):
+    for batch in iter_decoded_chunks(
+        backend,
+        prompts,
+        chunk_size=chunk_size,
+        probe=probe,
+        generation_kwargs=generation_kwargs,
+    ):
         completions.extend(batch)
     return completions
 
 
 def _decode_chunk_that_fits(
-    backend: Backend, remaining: Sequence[str], *, width: int, probe: AllocatorProbe
+    backend: Backend,
+    remaining: Sequence[str],
+    *,
+    width: int,
+    probe: AllocatorProbe,
+    generation_kwargs: Mapping[str, object] | None,
 ) -> tuple[list[str], int]:
     """Decode up to `width` of the remaining prompts, narrowing until the card decodes them well.
 
@@ -598,10 +626,22 @@ def _decode_chunk_that_fits(
     The retry happens here rather than inside `_decode_one_chunk`'s exception handler, and that
     split is load-bearing -- see that function.
     """
-    attempt = _decode_one_chunk(backend, remaining, width=width, probe=probe)
+    attempt = _decode_one_chunk(
+        backend,
+        remaining,
+        width=width,
+        probe=probe,
+        generation_kwargs=generation_kwargs,
+    )
     if attempt.completions is None:
         torch.cuda.empty_cache()
-        return _decode_chunk_that_fits(backend, remaining, width=width // 2, probe=probe)
+        return _decode_chunk_that_fits(
+            backend,
+            remaining,
+            width=width // 2,
+            probe=probe,
+            generation_kwargs=generation_kwargs,
+        )
     if not attempt.thrashing or width == 1:
         return attempt.completions, width
     torch.cuda.empty_cache()
@@ -609,7 +649,12 @@ def _decode_chunk_that_fits(
 
 
 def _decode_one_chunk(
-    backend: Backend, remaining: Sequence[str], *, width: int, probe: AllocatorProbe
+    backend: Backend,
+    remaining: Sequence[str],
+    *,
+    width: int,
+    probe: AllocatorProbe,
+    generation_kwargs: Mapping[str, object] | None,
 ) -> ChunkAttempt:
     """Decode one chunk, reporting a refusal or a thrash rather than acting on either.
 
@@ -631,7 +676,12 @@ def _decode_one_chunk(
     retries_before = probe.read_retries()
     started = probe.clock()
     try:
-        completions = backend.generate(list(remaining[:width]))
+        if generation_kwargs is None:
+            completions = backend.generate(list(remaining[:width]))
+        else:
+            completions = cast("_GenerationKwargsBackend", backend).generate(
+                list(remaining[:width]), generation_kwargs=generation_kwargs
+            )
     except torch.OutOfMemoryError as oom:
         if width == 1:
             logger.exception(
