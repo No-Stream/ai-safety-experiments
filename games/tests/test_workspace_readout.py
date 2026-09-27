@@ -25,10 +25,19 @@ from games.workspace_readout import (
     single_token_concept_ids,
     validate_manifest,
     validate_residual,
+    word_variant_token_ids,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from transformers import PreTrainedTokenizerBase
+
+
+@pytest.fixture(scope="module")
+def qwen_tokenizer() -> PreTrainedTokenizerBase:
+    """The real Qwen3.5 tokenizer; the cache is part of this box's setup, so absence fails loudly."""
+    return AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", local_files_only=True)
 
 
 class TestBandParsing:
@@ -159,17 +168,28 @@ class TestResumeAndArtifactValidation:
 
 
 class TestPositionFinding:
-    def test_real_cached_qwen_tokenizer_positions(self) -> None:
-        try:
-            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", local_files_only=True)
-        except OSError:
-            pytest.skip("Qwen3.5-0.8B tokenizer is not cached")
-        rendered = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "Synthetic user text."}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
+    def test_real_cached_qwen_tokenizer_positions(
+        self, qwen_tokenizer: PreTrainedTokenizerBase
+    ) -> None:
+        tokenizer = qwen_tokenizer
+        rendered = cast(
+            "str",
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": "Synthetic user text."}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            ),
         )
         positions = find_prompt_positions(tokenizer, rendered)
         assert set(positions) == {"user_end", "assistant_marker", "think_open"}
         assert positions["user_end"] < positions["assistant_marker"] < positions["think_open"]
+
+
+class TestMultihopIntermediateVariants:
+    def test_space_led_form_is_among_the_variants(
+        self, qwen_tokenizer: PreTrainedTokenizerBase
+    ) -> None:
+        space_led = qwen_tokenizer.encode(" Brazil", add_special_tokens=False)
+        assert len(space_led) == 1
+        assert space_led[0] in word_variant_token_ids(qwen_tokenizer, "Brazil")

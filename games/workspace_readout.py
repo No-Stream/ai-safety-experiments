@@ -885,6 +885,13 @@ def analyse(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
     (args.out_dir / "analysis.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def word_variant_token_ids(tokenizer: PreTrainedTokenizerBase, word: str) -> list[int]:
+    """Single-token ids of a word as it can appear mid-text: bare or space-led, as given or capitalised."""
+    variants = {word, f" {word}", word.capitalize(), f" {word.capitalize()}"}
+    ids = {tuple(_token_ids(tokenizer, variant)) for variant in variants}
+    return sorted(single[0] for single in ids if len(single) == 1)
+
+
 def sanity(args: argparse.Namespace) -> None:
     """Run the runtime-only multihop lens-quality evaluation."""
     evaluations = cast("dict[str, Any]", json.loads(args.evaluations.read_text(encoding="utf-8")))
@@ -923,37 +930,32 @@ def sanity(args: argparse.Namespace) -> None:
             positions=[position],
             use_jacobian=False,
         )
+        word_variant_ids = [
+            ids
+            for ids in (
+                word_variant_token_ids(tokenizer, str(word)) for word in item["intermediates"]
+            )
+            if ids
+        ]
         for kind, logits_by_layer in (("jacobian", j_logits), ("logit_lens", l_logits)):
-            ranks_by_word: list[list[int]] = []
-            for intermediate in item["intermediates"]:
-                ids = _token_ids(tokenizer, str(intermediate))
-                if len(ids) != 1:
-                    continue
-                token_id = ids[0]
-                ranks_by_word.append(
-                    [
-                        int((logits[0] > logits[0, token_id]).sum())
-                        for logits in logits_by_layer.values()
-                    ]
-                )
+            # rank of each intermediate at each layer: best rank over its single-token variants
+            ranks_by_word = [
+                [
+                    min(int((logits[0] > logits[0, token_id]).sum()) for token_id in ids)
+                    for logits in logits_by_layer.values()
+                ]
+                for ids in word_variant_ids
+            ]
             for k in (1, 5, 10, 25):
                 passed = sum(min(ranks) < k for ranks in ranks_by_word)
                 pass_rates[kind][str(k)] += passed / len(ranks_by_word) if ranks_by_word else 0.0
-            for layer, logits in logits_by_layer.items():
+            for layer_index, layer in enumerate(logits_by_layer):
                 row = layer_hits[kind].setdefault(str(layer), {str(k): 0 for k in (1, 5, 10, 25)})
-                single_token_ids = [
-                    _token_ids(tokenizer, str(word))[0]
-                    for word in item["intermediates"]
-                    if len(_token_ids(tokenizer, str(word))) == 1
-                ]
                 layer_totals[kind][str(layer)] = layer_totals[kind].get(str(layer), 0) + len(
-                    single_token_ids
+                    ranks_by_word
                 )
                 for k in (1, 5, 10, 25):
-                    row[str(k)] += sum(
-                        int((logits[0] > logits[0, token_id]).sum()) < k
-                        for token_id in single_token_ids
-                    )
+                    row[str(k)] += sum(ranks[layer_index] < k for ranks in ranks_by_word)
     for rates in pass_rates.values():
         for k in rates:
             rates[k] /= len(items)
