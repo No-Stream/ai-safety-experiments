@@ -907,7 +907,9 @@ def analyse(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
     for key, values in report["concept_sets"].items():
         lines.extend(("", f"## Concept sets: {key}"))
         lines.extend(
-            f"- {name}: rank diff={entry['diff']:.5f}, bootstrap CI={entry['bootstrap_ci']}"
+            f"- {name}: base rank percentile={entry['base_band_mean']:.5f}"
+            if key.startswith("base|")
+            else f"- {name}: rank diff={entry['diff']:.5f}, bootstrap CI={entry['bootstrap_ci']}"
             for name, entry in values.items()
         )
     (args.out_dir / "analysis.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
