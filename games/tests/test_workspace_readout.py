@@ -8,6 +8,7 @@ still produces plausible-looking JSON, so each expected ordering is written out 
 
 from __future__ import annotations
 
+import json
 import math
 from typing import TYPE_CHECKING, Any, cast
 
@@ -16,6 +17,7 @@ import torch
 from transformers import AutoTokenizer
 
 from games.workspace_readout import (
+    accepted_adapter_base,
     bootstrap_indices,
     find_prompt_positions,
     is_word_like,
@@ -193,3 +195,25 @@ class TestMultihopIntermediateVariants:
         space_led = qwen_tokenizer.encode(" Brazil", add_special_tokens=False)
         assert len(space_led) == 1
         assert space_led[0] in word_variant_token_ids(qwen_tokenizer, "Brazil")
+
+
+class TestAdapterBaseAliases:
+    def _adapter(self, tmp_path: Path, recorded: str) -> Path:
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": recorded}), encoding="utf-8"
+        )
+        return adapter_dir
+
+    def test_declared_alias_is_accepted(self, tmp_path: Path) -> None:
+        adapter_dir = self._adapter(tmp_path, "hub-org/base-model")
+        assert (
+            accepted_adapter_base("arm", adapter_dir, "/local/snapshot", ["hub-org/base-model"])
+            == "hub-org/base-model"
+        )
+
+    def test_undeclared_base_is_refused(self, tmp_path: Path) -> None:
+        adapter_dir = self._adapter(tmp_path, "hub-org/other-model")
+        with pytest.raises(ValueError, match="neither the loaded base"):
+            accepted_adapter_base("arm", adapter_dir, "/local/snapshot", ["hub-org/base-model"])

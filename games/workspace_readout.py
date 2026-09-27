@@ -25,7 +25,7 @@ from games.framing_stimuli import framing_capture_stimuli
 from games.interp_capture import render_stimuli
 from games.interp_cells import sha256_of_file
 from games.interp_lens_ladder import adapter_digests
-from games.lora import attach_adapter, load_adapter_base
+from games.lora import attach_adapter, load_adapter_base, read_adapter_base_model
 from games.prompts import COUNTERPART_FRAMING_IDS
 from games.provenance import git_sha
 
@@ -466,6 +466,20 @@ def _capture_arm(context: CaptureContext) -> None:
     )
 
 
+def accepted_adapter_base(
+    arm: str, adapter_dir: Path, base_model: str, aliases: Sequence[str]
+) -> str:
+    """Return the base id an adapter records, refusing it unless it names the loaded base or an alias."""
+    recorded_base = read_adapter_base_model(adapter_dir).rstrip("/")
+    accepted_bases = {str(base_model).rstrip("/"), *aliases}
+    if recorded_base not in accepted_bases:
+        raise ValueError(
+            f"arm {arm}: adapter records base {recorded_base!r}, which is neither the loaded "
+            f"base {base_model!r} nor a declared --base-model-alias {sorted(aliases)}"
+        )
+    return recorded_base
+
+
 def capture(args: argparse.Namespace) -> None:
     """Run the GPU capture pass and write one residual artifact per arm."""
     if args.device != "cuda" or not torch.cuda.is_available():
@@ -505,10 +519,13 @@ def capture(args: argparse.Namespace) -> None:
     attached = None
     for arm, adapter_dir in arms.items():
         if adapter_dir is not None:
+            recorded_base = accepted_adapter_base(
+                arm, adapter_dir, args.base_model, args.base_model_alias
+            )
             attached = attach_adapter(
                 model,
                 adapter_dir,
-                args.base_model,
+                recorded_base,
                 existing=attached.peft_model if attached else None,
             )
             generation_model = attached.peft_model
@@ -549,6 +566,7 @@ def capture(args: argparse.Namespace) -> None:
         "lens_path": str(args.lens),
         "lens_sha256": sha256_of_file(args.lens),
         "base_model": args.base_model,
+        "base_model_aliases": sorted(args.base_model_alias),
         "jlens_commit": "581d398",
         "source_layers": list(lens.source_layers),
         "target_layer": args.target_layer,
@@ -995,6 +1013,13 @@ def _parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--framing", dest="framings", action="append", default=None)
     capture_parser.add_argument("--device", default="cuda")
     capture_parser.add_argument("--target-layer", type=int, default=30)
+    capture_parser.add_argument(
+        "--base-model-alias",
+        action="append",
+        default=[],
+        help="another id for the SAME base weights (e.g. the hub id of a pinned local snapshot) that "
+        "an adapter may record as its base; recorded in run.json",
+    )
     analyse_parser = subparsers.add_parser("analyse")
     analyse_parser.add_argument("--capture-dir", type=Path, required=True)
     analyse_parser.add_argument("--lens", type=Path, required=True)
