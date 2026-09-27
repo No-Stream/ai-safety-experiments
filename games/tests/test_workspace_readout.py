@@ -292,17 +292,24 @@ class TestPrefixCapture:
                 <= prefix_start + cuts.cut_character_positions[name]
             )
 
-    def test_cut_at_empty_very_early_boundary_fails_loudly(
+    def test_empty_early_cut_reads_the_last_prompt_token(
         self, qwen_tokenizer: PreTrainedTokenizerBase
     ) -> None:
-        with pytest.raises(ValueError, match="token"):
-            _cut_prefix_position_data(
-                qwen_tokenizer,
-                "Synthetic header: alpha. mirror beta.",
-                "alpha. mirror beta.",
-                (0.0,),
-                cue_regex=r"mirror",
-            )
+        """A cut with no sentence boundary below it is the state before any reasoning."""
+        rendered = "Synthetic header: alpha. mirror beta."
+        prefix = "alpha. mirror beta."
+        cuts = _cut_prefix_position_data(
+            qwen_tokenizer, rendered, prefix, (0.0,), cue_regex=r"mirror"
+        )
+        encoded = qwen_tokenizer(rendered, add_special_tokens=False, return_offsets_mapping=True)
+        prefix_start = len(rendered) - len(prefix)
+        last_prompt_token = max(
+            index
+            for index, (_start, end) in enumerate(encoded["offset_mapping"])
+            if end <= prefix_start
+        )
+        assert cuts.token_indices["cut_0.00"] == last_prompt_token
+        assert cuts.cue_seen_by_cut == {"cut_0.00": False}
 
     def test_cut_fraction_and_cue_identity_preserve_legacy_absence(self) -> None:
         legacy = _capture_prefix_resume_identity(None, None)

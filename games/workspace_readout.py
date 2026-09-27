@@ -508,10 +508,13 @@ def _cut_prefix_position_data(
         cut_text = _cut_at_sentence_boundaries(prefix, fraction, len(prefix))
         relative_position = len(cut_text)
         absolute_position = prefix_start + relative_position
+        # A cut with no sentence boundary below its fraction is empty: read it at the last prompt
+        # token (the think opener), i.e. the state before any reasoning has been written.
+        window_start = prefix_start if relative_position > 0 else 0
         candidates = [
             (index, end)
             for index, (start, end) in enumerate(offsets)
-            if prefix_start <= start < end <= absolute_position
+            if window_start <= start < end <= absolute_position
         ]
         if not candidates:
             raise ValueError(
