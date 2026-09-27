@@ -10,13 +10,24 @@ from __future__ import annotations
 
 import json
 import math
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
 from transformers import AutoTokenizer
 
+from games import workspace_readout
+from games.interp_capture import render_stimuli
+from games.interp_cells import Stimulus
 from games.workspace_readout import (
+    LoadedLens,
+    StoredUnembed,
+    _commitment_end,
+    _cut_at_sentence_boundaries,
+    _match_prefix_record_to_prompt,
+    _prefix_position_data,
+    _select_prefix_vectors,
     accepted_adapter_base,
     bootstrap_indices,
     decode_vocab,
@@ -32,6 +43,7 @@ from games.workspace_readout import (
 )
 
 if TYPE_CHECKING:
+    from argparse import Namespace
     from pathlib import Path
 
     from transformers import PreTrainedTokenizerBase
@@ -187,6 +199,127 @@ class TestPositionFinding:
         positions = find_prompt_positions(tokenizer, rendered)
         assert set(positions) == {"user_end", "assistant_marker", "think_open"}
         assert positions["user_end"] < positions["assistant_marker"] < positions["think_open"]
+
+
+class TestPrefixCapture:
+    def test_commitment_cut_stops_before_commitment_sentence(self) -> None:
+        thinking = "I compare both options carefully. I will choose alpha."
+        end = _commitment_end(thinking, ("alpha", "beta"))
+        assert end is not None
+        prefix = _cut_at_sentence_boundaries(thinking, 1.0, end)
+        assert prefix == "I compare both options carefully. "
+        assert "choose alpha" not in prefix
+        assert end < len(thinking)
+
+    def test_unmatched_record_refuses_loudly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            workspace_readout, "generate_framing_prompt_rows", lambda *args, **kwargs: []
+        )
+        record = {
+            "prompt_id": "missing-prompt",
+            "counterpart_framing": "twin",
+            "label_print_order": "canonical",
+        }
+        with pytest.raises(ValueError, match=r"prompt|match|regenerated"):
+            _match_prefix_record_to_prompt(record)
+
+    def test_prefix_positions_and_pooling_use_reasoning_tokens(
+        self, qwen_tokenizer: PreTrainedTokenizerBase
+    ) -> None:
+        stimulus = Stimulus(
+            stimulus_id="synthetic-prefix",
+            stimulus_set="capture-prefix",
+            side="twin",
+            pair_id="synthetic-prefix",
+            text="Synthetic user text.",
+            assistant_prefix="reasoning token " * 40,
+        )
+        rendered = render_stimuli(
+            qwen_tokenizer,
+            [stimulus],
+            convention="templated_here",
+            enable_thinking=True,
+            include_assistant_prefix=True,
+        )[stimulus.stimulus_id]
+        metadata = _prefix_position_data(qwen_tokenizer, rendered)
+        token_count = len(qwen_tokenizer(rendered, add_special_tokens=False)["input_ids"])
+        assert metadata.prefix_token_count == len(metadata.reasoning_indices)
+        assert metadata.token_indices["decision_point"] == token_count - 1
+        assert metadata.reasoning_indices[-1] == token_count - 1
+        assert len(metadata.reasoning_late_indices) == min(32, metadata.prefix_token_count)
+
+        activation = torch.arange(token_count * 4, dtype=torch.float32).reshape(token_count, 4)
+        selected = _select_prefix_vectors(activation, metadata)
+        expected_reasoning = activation[list(metadata.reasoning_indices)].mean(dim=0)
+        expected_late = activation[list(metadata.reasoning_late_indices)].mean(dim=0)
+        assert torch.equal(selected[0], activation[-1])
+        assert torch.equal(selected[1], expected_reasoning)
+        assert torch.equal(selected[2], expected_late)
+
+    def test_analyse_accepts_prefix_position_names(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lens = LoadedLens(jacobians={0: torch.eye(2)}, n_prompts=1, d_model=2)
+        unembed = StoredUnembed(
+            norm_weight=torch.ones(2),
+            lm_head_weight=torch.zeros((50, 2)),
+            rms_eps=1e-6,
+        )
+        monkeypatch.setattr(workspace_readout, "load_lens", lambda path: lens)
+        monkeypatch.setattr(workspace_readout, "load_unembed", lambda path: unembed)
+
+        class SyntheticTokenizer:
+            def __len__(self) -> int:
+                return 50
+
+            def decode(self, token_ids: int | list[int]) -> str:
+                token_id = token_ids if isinstance(token_ids, int) else token_ids[0]
+                return f"token{token_id}"
+
+        monkeypatch.setattr(
+            AutoTokenizer,
+            "from_pretrained",
+            lambda *args, **kwargs: SyntheticTokenizer(),
+        )
+        capture_dir = tmp_path / "capture"
+        capture_dir.mkdir()
+        (capture_dir / "run.json").write_text(
+            json.dumps({"target_layer": 1, "arms": {"base": None, "trained": "adapter"}}),
+            encoding="utf-8",
+        )
+        position_names = ["decision_point", "reasoning_mean", "reasoning_late"]
+        manifest = {
+            "stimulus_id": "synthetic-prefix",
+            "side": "twin",
+            "pair_id": "synthetic-prefix",
+            "position_names": position_names,
+        }
+        for arm, offset in (("base", 0.0), ("trained", 1.0)):
+            arm_dir = capture_dir / arm
+            arm_dir.mkdir()
+            torch.save(torch.full((1, 3, 1, 2), offset), arm_dir / "residuals.pt")
+            (arm_dir / "manifest.jsonl").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        args = SimpleNamespace(
+            capture_dir=capture_dir,
+            lens=tmp_path / "lens.pt",
+            model_path=tmp_path / "model",
+            out_dir=tmp_path / "analysis",
+            band="0:1",
+            concept_sets=None,
+            seed=1,
+            device="cpu",
+        )
+        analyse = workspace_readout.analyse
+        analyse(cast("Namespace", args))
+        report = json.loads((args.out_dir / "analysis.json").read_text(encoding="utf-8"))
+        assert all(
+            any(key.endswith(f"|{position}") for key in report["top_tokens"])
+            for position in position_names
+        )
+        assert all(
+            any(key.endswith(f"|{position}") for key in report["paired_differences"])
+            for position in position_names
+        )
 
 
 class TestMultihopIntermediateVariants:

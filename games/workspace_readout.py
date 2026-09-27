@@ -21,12 +21,23 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from safetensors import safe_open
 
+from games.argument_prior_map import (  # pyright: ignore[reportPrivateUsage]
+    _commitment_end,  # pyright: ignore[reportPrivateUsage]
+    _cut_at_sentence_boundaries,  # pyright: ignore[reportPrivateUsage]
+)
+from games.evals import EVAL_RENDER_GRADING_BY_GAME
 from games.framing_stimuli import framing_capture_stimuli
 from games.interp_capture import render_stimuli
-from games.interp_cells import sha256_of_file
+from games.interp_cells import Stimulus, sha256_of_file
 from games.interp_lens_ladder import adapter_digests
+from games.interp_mediation import thinking_segment
 from games.lora import attach_adapter, load_adapter_base, read_adapter_base_model
-from games.prompts import COUNTERPART_FRAMING_IDS
+from games.parsing import THINK_CLOSE
+from games.prompts import (
+    COUNTERPART_FRAMING_IDS,
+    SPLIT_EVAL,
+    generate_framing_prompt_rows,
+)
 from games.provenance import git_sha
 
 if TYPE_CHECKING:
@@ -47,6 +58,7 @@ DEFAULT_FRAMINGS = (
 )
 DEFAULT_BAND = (10, 26)
 POSITIONS = ("user_end", "assistant_marker", "think_open", "early_thinking")
+PREFIX_POSITIONS = ("decision_point", "reasoning_mean", "reasoning_late")
 LENS_EVAL_PATH = str(
     Path("/var")
     / "tmp"
@@ -345,6 +357,16 @@ def _load_jlens() -> ModuleType:
 
 
 @dataclass(frozen=True)
+class PrefixPositionData:
+    """Token spans used to pool one teacher-forced reasoning prefix."""
+
+    token_indices: dict[str, int]
+    reasoning_indices: tuple[int, ...]
+    reasoning_late_indices: tuple[int, ...]
+    prefix_token_count: int
+
+
+@dataclass(frozen=True)
 class CaptureContext:
     """Inputs shared by one arm's GPU capture pass."""
 
@@ -359,103 +381,314 @@ class CaptureContext:
     arm: str
     out_dir: Path
     reference_lens: Any
+    position_names: Sequence[str]
+    prefix_positions: Mapping[str, PrefixPositionData] | None = None
+    capture_mode: str = "capture"
 
 
-def _capture_arm(context: CaptureContext) -> None:
+def _match_prefix_record_to_prompt(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Regenerate and uniquely match one banked framing-sweep record's prompt row."""
+    required = ("prompt_id", "counterpart_framing", "label_print_order")
+    missing = [key for key in required if key not in record]
+    if missing:
+        raise ValueError(f"prefix record is missing prompt identity fields {missing}")
+    framing = str(record["counterpart_framing"])
+    label_print_order = str(record["label_print_order"])
+    rows = generate_framing_prompt_rows(
+        "twin-pd",
+        EVAL_RENDER_GRADING_BY_GAME["twin-pd"],
+        framing_id=framing,
+        split=SPLIT_EVAL,
+        label_print_order=label_print_order,
+    )
+    prompt_id = str(record["prompt_id"])
+    matches = [row for row in rows if str(row.get("prompt_id")) == prompt_id]
+    if len(matches) != 1:
+        raise ValueError(
+            f"prefix record prompt {prompt_id!r} did not match exactly one regenerated prompt "
+            f"for framing {framing!r} and label order {label_print_order!r} (matches={len(matches)})"
+        )
+    return matches[0]
+
+
+def _prefix_position_data(tokenizer: PreTrainedTokenizerBase, rendered: str) -> PrefixPositionData:
+    """Locate decision and reasoning spans in one rendered teacher-forced prefix."""
+    encoded = _token_ids(tokenizer, rendered)
+    positions = find_prompt_positions(tokenizer, rendered, encoded)
+    reasoning_start = positions["think_open"] + 1
+    if reasoning_start >= len(encoded):
+        raise ValueError("prefix render has no reasoning tokens after the <think> newline")
+    reasoning_indices = tuple(range(reasoning_start, len(encoded)))
+    return PrefixPositionData(
+        token_indices={"decision_point": reasoning_indices[-1]},
+        reasoning_indices=reasoning_indices,
+        reasoning_late_indices=reasoning_indices[-32:],
+        prefix_token_count=len(reasoning_indices),
+    )
+
+
+def _select_position_vectors(
+    activation: torch.Tensor,
+    position_indices: Mapping[str, int | Sequence[int]],
+    position_names: Sequence[str],
+) -> torch.Tensor:
+    """Select or pool activation rows for a named position vocabulary."""
+    selected: list[torch.Tensor] = []
+    for name in position_names:
+        indices = position_indices[name]
+        index_list = [indices] if isinstance(indices, int) else list(indices)
+        if not index_list:
+            raise ValueError(f"position {name!r} has no token indices")
+        selected.append(activation[index_list].float().mean(dim=0).to(activation.dtype))
+    return torch.stack(selected)
+
+
+def _select_prefix_vectors(
+    activation: torch.Tensor, position_data: PrefixPositionData
+) -> torch.Tensor:
+    """Select the three prefix positions used by ``capture-prefix``."""
+    return _select_position_vectors(
+        activation,
+        {
+            "decision_point": position_data.token_indices["decision_point"],
+            "reasoning_mean": position_data.reasoning_indices,
+            "reasoning_late": position_data.reasoning_late_indices,
+        },
+        PREFIX_POSITIONS,
+    )
+
+
+def _read_prefix_records(  # noqa: C901 - record filters are explicit
+    paths: Sequence[Path], *, framings: Sequence[str]
+) -> tuple[list[Stimulus], dict[str, int]]:
+    """Load parsed twin-pd records and construct teacher-forced prefix stimuli."""
+    summary = {
+        "source_records": 0,
+        "parsed_records": 0,
+        "dropped_unparsed": 0,
+        "dropped_no_commitment": 0,
+        "dropped_empty_prefix": 0,
+        "captured_stimuli": 0,
+    }
+    stimuli: list[Stimulus] = []
+    seen_ids: set[str] = set()
+    source_record_index = 0
+    requested_framings = set(framings)
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise TypeError(f"{path}:{line_number} is not a JSON object")
+                if (
+                    record.get("record") != "framing-sweep"
+                    or record.get("game_id") != "twin-pd"
+                    or str(record.get("counterpart_framing")) not in requested_framings
+                ):
+                    continue
+                summary["source_records"] += 1
+                source_record_index += 1
+                prompt_row = _match_prefix_record_to_prompt(record)
+                if not bool(record.get("parsed")):
+                    summary["dropped_unparsed"] += 1
+                    continue
+                summary["parsed_records"] += 1
+                prompt_id = str(record["prompt_id"])
+                stimulus_id = f"{prompt_id}--prefix-record-{source_record_index}"
+                if stimulus_id in seen_ids:
+                    raise ValueError(f"duplicate prefix stimulus id {stimulus_id!r}")
+                seen_ids.add(stimulus_id)
+                completion = record.get("completion")
+                if not isinstance(completion, str) or THINK_CLOSE not in completion:
+                    summary["dropped_no_commitment"] += 1
+                    continue
+                thinking = thinking_segment(completion)
+                labels = (str(prompt_row["label_a"]), str(prompt_row["label_b"]))
+                commitment_end = _commitment_end(thinking, labels)
+                if commitment_end is None:
+                    summary["dropped_no_commitment"] += 1
+                    continue
+                prefix = _cut_at_sentence_boundaries(thinking, 1.0, commitment_end)
+                if not prefix:
+                    summary["dropped_empty_prefix"] += 1
+                    continue
+                stimuli.append(
+                    Stimulus(
+                        stimulus_id=stimulus_id,
+                        stimulus_set="capture-prefix",
+                        side=str(record["counterpart_framing"]),
+                        pair_id=prompt_id,
+                        text=str(prompt_row["prompt"]),
+                        assistant_prefix=prefix,
+                        metadata={"base_action": record["action"]},
+                    )
+                )
+    summary["captured_stimuli"] = len(stimuli)
+    if not stimuli:
+        raise ValueError("no parsed prefix records with a usable commitment point")
+    return stimuli, summary
+
+
+def _check_lens_equivalence(
+    context: CaptureContext,
+    prompt: str,
+    positions: Mapping[str, int],
+    captured: Mapping[int, torch.Tensor],
+    *,
+    max_seq_len: int,
+) -> None:
+    """Check the captured residual against jlens at the shared think-open boundary."""
+    check_layer = context.source_layers[len(context.source_layers) // 2]
+    reference_logits, _, _ = context.reference_lens.apply(
+        context.jl_model,
+        prompt,
+        layers=[check_layer],
+        positions=[positions["think_open"]],
+        max_seq_len=max_seq_len,
+        use_jacobian=True,
+    )
+    captured_logits = (
+        context.jl_model.unembed(
+            context.reference_lens.transport(
+                captured[check_layer][positions["think_open"]].float(),
+                check_layer,
+            )
+        )
+        .float()
+        .cpu()
+    )
+    if not torch.allclose(
+        captured_logits,
+        reference_logits[check_layer][0],
+        rtol=3e-2,
+        atol=3e-2,
+    ):
+        raise ValueError(
+            "jlens capture residual does not match lens.apply at the think_open position"
+        )
+
+
+def _capture_arm(  # noqa: C901, PLR0915 - one linear capture/write loop
+    context: CaptureContext,
+) -> None:
     activation_recorder = importlib.import_module("jlens.hooks").ActivationRecorder
 
     rows: list[torch.Tensor] = []
     manifest_rows: list[dict[str, Any]] = []
     for stimulus in context.stimuli:
         prompt = context.rendered[stimulus.stimulus_id]
-        encoded_ids = context.jl_model.encode(prompt, max_length=4096)
+        token_count = len(_token_ids(context.tokenizer, prompt))
+        encoded_ids = context.jl_model.encode(prompt, max_length=max(4096, token_count))
+        if int(encoded_ids.shape[1]) != token_count:
+            raise ValueError(
+                f"encoded token count {int(encoded_ids.shape[1])} differs from tokenizer count "
+                f"{token_count} for {stimulus.stimulus_id}"
+            )
         ids = encoded_ids.to(context.device)
         positions = find_prompt_positions(context.tokenizer, prompt, encoded_ids[0].tolist())
-        with torch.inference_mode():
-            generated = context.generation_model.generate(
-                input_ids=ids,
-                do_sample=False,
-                max_new_tokens=EARLY_THINKING_TOKENS,
-                pad_token_id=context.tokenizer.eos_token_id,
-            )
-        generated_ids = generated[0, ids.shape[1] :]
-        all_ids = generated
+        generated_ids: torch.Tensor | None = None
+        if context.prefix_positions is None:
+            with torch.inference_mode():
+                generated = context.generation_model.generate(
+                    input_ids=ids,
+                    do_sample=False,
+                    max_new_tokens=EARLY_THINKING_TOKENS,
+                    pad_token_id=context.tokenizer.eos_token_id,
+                )
+            generated_tokens = generated[0, ids.shape[1] :]
+            if generated_tokens.shape[0] != EARLY_THINKING_TOKENS:
+                raise ValueError(
+                    f"arm {context.arm} generated {generated_tokens.shape[0]} tokens instead of "
+                    f"{EARLY_THINKING_TOKENS} for {stimulus.stimulus_id}"
+                )
+            generated_ids = generated_tokens
+            all_ids = generated
+            early_start = ids.shape[1]
+            position_indices: dict[str, int | Sequence[int]] = {
+                **positions,
+                "early_thinking": tuple(range(early_start, early_start + EARLY_THINKING_TOKENS)),
+            }
+        else:
+            prefix_data = context.prefix_positions.get(stimulus.stimulus_id)
+            if prefix_data is None:
+                raise ValueError(f"missing prefix position metadata for {stimulus.stimulus_id}")
+            all_ids = ids
+            position_indices = {
+                "decision_point": prefix_data.token_indices["decision_point"],
+                "reasoning_mean": prefix_data.reasoning_indices,
+                "reasoning_late": prefix_data.reasoning_late_indices,
+            }
         record_at = list(context.source_layers)
         with activation_recorder(context.jl_model.layers, at=record_at) as recorder:
             context.jl_model.forward(all_ids)
         captured = {
             layer: recorder.activations[layer][0].detach() for layer in context.source_layers
         }
-        early_start = ids.shape[1]
-        early_end = early_start + int(generated_ids.shape[0])
-        if generated_ids.shape[0] != EARLY_THINKING_TOKENS:
-            raise ValueError(
-                f"arm {context.arm} generated {generated_ids.shape[0]} tokens instead of "
-                f"{EARLY_THINKING_TOKENS} "
-                f"for {stimulus.stimulus_id}"
-            )
-        vectors = []
-        for layer in context.source_layers:
-            activation = captured[layer]
-            selected = torch.stack(
-                (
-                    activation[positions["user_end"]],
-                    activation[positions["assistant_marker"]],
-                    activation[positions["think_open"]],
-                    activation[early_start:early_end].float().mean(dim=0).to(activation.dtype),
-                )
-            )
-            vectors.append(selected)
+        if context.prefix_positions is None:
+            vectors = [
+                _select_position_vectors(captured[layer], position_indices, context.position_names)
+                for layer in context.source_layers
+            ]
+        else:
+            prefix_data = context.prefix_positions[stimulus.stimulus_id]
+            vectors = [
+                _select_prefix_vectors(captured[layer], prefix_data)
+                for layer in context.source_layers
+            ]
         row = torch.stack(vectors, dim=1)
         validate_residual(
-            row, expected_shape=(len(POSITIONS), len(context.source_layers), context.lens.d_model)
+            row,
+            expected_shape=(
+                len(context.position_names),
+                len(context.source_layers),
+                context.lens.d_model,
+            ),
         )
         rows.append(row.to(dtype=torch.bfloat16, device="cpu"))
         if len(rows) == 1 and context.arm == "base":
-            # Mid-depth, where the lens is meant to be read; layer 0 would pass on near-noise.
-            check_layer = context.source_layers[len(context.source_layers) // 2]
-            reference_logits, _, _ = context.reference_lens.apply(
-                context.jl_model,
+            _check_lens_equivalence(
+                context,
                 prompt,
-                layers=[check_layer],
-                positions=[positions["think_open"]],
-                max_seq_len=4096,
-                use_jacobian=True,
+                positions,
+                captured,
+                max_seq_len=int(all_ids.shape[1]),
             )
-            captured_logits = (
-                context.jl_model.unembed(
-                    context.reference_lens.transport(
-                        # fp32, exactly as lens.apply's own select() casts before transporting
-                        captured[check_layer][positions["think_open"]].float(),
-                        check_layer,
-                    )
-                )
-                .float()
-                .cpu()
+        manifest_row: dict[str, Any] = {
+            "stimulus_id": stimulus.stimulus_id,
+            "side": stimulus.side,
+            "pair_id": stimulus.pair_id,
+            "arm": context.arm,
+            "position_names": list(context.position_names),
+            "token_indices": {
+                name: (list(indices) if not isinstance(indices, int) else indices)
+                for name, indices in position_indices.items()
+            },
+        }
+        if generated_ids is not None:
+            manifest_row["generated_early_thinking"] = context.tokenizer.decode(
+                generated_ids.tolist()
             )
-            if not torch.allclose(
-                captured_logits,
-                reference_logits[check_layer][0],
-                rtol=3e-2,
-                atol=3e-2,
-            ):
-                raise ValueError(
-                    "jlens capture residual does not match lens.apply at the think_open position"
-                )
-        manifest_rows.append(
-            {
-                "stimulus_id": stimulus.stimulus_id,
-                "side": stimulus.side,
-                "pair_id": stimulus.pair_id,
-                "arm": context.arm,
-                "position_names": list(POSITIONS),
-                "token_indices": {
-                    **positions,
-                    "early_thinking": list(range(early_start, early_end)),
-                },
-                "generated_early_thinking": context.tokenizer.decode(generated_ids.tolist()),
-            }
-        )
+        if context.prefix_positions is not None:
+            prefix_data = context.prefix_positions[stimulus.stimulus_id]
+            manifest_row.update(
+                {
+                    "framing": stimulus.side,
+                    "base_action": stimulus.metadata["base_action"],
+                    "prefix_token_count": prefix_data.prefix_token_count,
+                }
+            )
+        manifest_rows.append(manifest_row)
+        if len(rows) % 50 == 0:
+            logger.info(
+                "%s progress arm=%s stimuli=%d",
+                context.capture_mode,
+                context.arm,
+                len(rows),
+            )
     residuals = torch.stack(rows)
     arm_dir = context.out_dir / context.arm
     arm_dir.mkdir(parents=True, exist_ok=True)
@@ -480,14 +713,23 @@ def accepted_adapter_base(
     return recorded_base
 
 
-def capture(args: argparse.Namespace) -> None:
-    """Run the GPU capture pass and write one residual artifact per arm."""
-    if args.device != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("capture requires --device cuda; this command must be run on the GPU")
-    framings = tuple(args.framings)
+def _validate_framings(framings: Sequence[str]) -> tuple[str, ...]:
+    """Validate the requested counterpart framing registry ids."""
+    values = tuple(framings)
     unknown = sorted(set(framings) - set(COUNTERPART_FRAMING_IDS))
     if unknown:
         raise ValueError(f"unknown framing ids {unknown}; expected {list(COUNTERPART_FRAMING_IDS)}")
+    return values
+
+
+def _prepare_capture_runtime(
+    args: argparse.Namespace,
+) -> tuple[LoadedLens, Any, PreTrainedTokenizerBase, Any, Any, Any]:
+    """Load the shared model, tokenizer, jlens model, and reference lens for either capture path."""
+    if args.device != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(
+            f"{args.command} requires --device cuda; this command must be run on the GPU"
+        )
     if not args.lens.is_file():
         raise FileNotFoundError(args.lens)
     lens = load_lens(args.lens)
@@ -495,19 +737,14 @@ def capture(args: argparse.Namespace) -> None:
     tokenizer = __import__(
         "transformers", fromlist=["AutoTokenizer"]
     ).AutoTokenizer.from_pretrained(args.base_model)
-    stimuli = framing_capture_stimuli(framings)
-    rendered = render_stimuli(
-        tokenizer,
-        stimuli,
-        convention="templated_here",
-        enable_thinking=True,
-        include_assistant_prefix=False,
-    )
     model = load_adapter_base(args.base_model, dtype=torch.bfloat16, device=torch.device("cuda"))
     jl_model = jlens.from_hf(model, tokenizer)
     reference_lens = jlens.JacobianLens.load(str(args.lens))
-    out_dir = args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    return lens, jlens, tokenizer, model, jl_model, reference_lens
+
+
+def _parse_arms(args: argparse.Namespace) -> dict[str, Path | None]:
+    """Parse the base plus named adapter arms shared by both capture commands."""
     arms: dict[str, Path | None] = {"base": None}
     for spec in args.arm:
         name, path = spec.split("=", 1)
@@ -516,6 +753,26 @@ def capture(args: argparse.Namespace) -> None:
         if name in arms:
             raise ValueError(f"duplicate arm name {name!r}")
         arms[name] = Path(path)
+    return arms
+
+
+def _run_capture(  # noqa: PLR0913 - shared seam keeps arm and provenance identity together
+    args: argparse.Namespace,
+    *,
+    framings: Sequence[str],
+    stimuli: Sequence[Stimulus],
+    rendered: Mapping[str, str],
+    runtime: tuple[LoadedLens, Any, PreTrainedTokenizerBase, Any, Any, Any],
+    position_names: Sequence[str],
+    prefix_positions: Mapping[str, PrefixPositionData] | None = None,
+    provenance_extra: Mapping[str, Any] | None = None,
+) -> None:
+    """Capture one stimulus set through every arm and write shared provenance."""
+    lens, _jlens, tokenizer, model, jl_model, reference_lens = runtime
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    arms = _parse_arms(args)
+    capture_mode = "capture-prefix" if prefix_positions is not None else "capture"
     attached = None
     for arm, adapter_dir in arms.items():
         if adapter_dir is not None:
@@ -532,7 +789,12 @@ def capture(args: argparse.Namespace) -> None:
         else:
             generation_model = model
         arm_dir = out_dir / arm
-        if _arm_artifact_complete(arm_dir, lens=lens, n_stimuli=len(stimuli)):
+        if _arm_artifact_complete(
+            arm_dir,
+            lens=lens,
+            n_stimuli=len(stimuli),
+            position_names=position_names,
+        ):
             logger.info("resume: skipping complete arm %s", arm)
             continue
         _capture_arm(
@@ -548,6 +810,9 @@ def capture(args: argparse.Namespace) -> None:
                 arm=arm,
                 out_dir=out_dir,
                 reference_lens=reference_lens,
+                position_names=position_names,
+                prefix_positions=prefix_positions,
+                capture_mode=capture_mode,
             )
         )
     adapter_provenance = {
@@ -571,10 +836,72 @@ def capture(args: argparse.Namespace) -> None:
         "source_layers": list(lens.source_layers),
         "target_layer": args.target_layer,
         "framings": list(framings),
+        "capture_mode": capture_mode,
         "arms": {name: (str(path) if path is not None else None) for name, path in arms.items()},
         "adapter_digests": adapter_provenance,
     }
+    if provenance_extra:
+        provenance.update(provenance_extra)
     (out_dir / "run.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+
+
+def capture(args: argparse.Namespace) -> None:
+    """Run the GPU prompt-end capture pass and write one residual artifact per arm."""
+    framings = _validate_framings(args.framings)
+    runtime = _prepare_capture_runtime(args)
+    tokenizer = runtime[2]
+    stimuli = framing_capture_stimuli(framings)
+    rendered = render_stimuli(
+        tokenizer,
+        stimuli,
+        convention="templated_here",
+        enable_thinking=True,
+        include_assistant_prefix=False,
+    )
+    _run_capture(
+        args,
+        framings=framings,
+        stimuli=stimuli,
+        rendered=rendered,
+        runtime=runtime,
+        position_names=POSITIONS,
+    )
+
+
+def capture_prefix(args: argparse.Namespace) -> None:
+    """Run the GPU capture pass over teacher-forced pre-commitment reasoning prefixes."""
+    framings = _validate_framings(args.framings)
+    stimuli, summary = _read_prefix_records(args.prefix_records, framings=framings)
+    runtime = _prepare_capture_runtime(args)
+    tokenizer = runtime[2]
+    rendered = render_stimuli(
+        tokenizer,
+        stimuli,
+        convention="templated_here",
+        enable_thinking=True,
+        include_assistant_prefix=True,
+    )
+    prefix_positions = {
+        stimulus.stimulus_id: _prefix_position_data(tokenizer, rendered[stimulus.stimulus_id])
+        for stimulus in stimuli
+    }
+    summary["captured_stimuli"] = len(stimuli)
+    _run_capture(
+        args,
+        framings=framings,
+        stimuli=stimuli,
+        rendered=rendered,
+        runtime=runtime,
+        position_names=PREFIX_POSITIONS,
+        prefix_positions=prefix_positions,
+        provenance_extra={
+            "prefix_records": [str(path) for path in args.prefix_records],
+            "prefix_record_digests": {
+                str(path): sha256_of_file(path) for path in args.prefix_records
+            },
+            "summary": summary,
+        },
+    )
 
 
 def _read_manifest(path: Path) -> list[dict[str, Any]]:
@@ -585,7 +912,9 @@ def _read_manifest(path: Path) -> list[dict[str, Any]]:
     ]
 
 
-def _arm_artifact_complete(arm_dir: Path, *, lens: LoadedLens, n_stimuli: int) -> bool:
+def _arm_artifact_complete(
+    arm_dir: Path, *, lens: LoadedLens, n_stimuli: int, position_names: Sequence[str]
+) -> bool:
     """Check that a resumable arm has both a valid tensor and one manifest row per stimulus."""
     residual_path = arm_dir / "residuals.pt"
     manifest_path = arm_dir / "manifest.jsonl"
@@ -596,11 +925,18 @@ def _arm_artifact_complete(arm_dir: Path, *, lens: LoadedLens, n_stimuli: int) -
         manifest = _read_manifest(manifest_path)
         validate_residual(
             residuals,
-            expected_shape=(n_stimuli, len(POSITIONS), len(lens.source_layers), lens.d_model),
+            expected_shape=(
+                n_stimuli,
+                len(position_names),
+                len(lens.source_layers),
+                lens.d_model,
+            ),
         )
     except (OSError, TypeError, ValueError, RuntimeError, KeyError):
         return False
-    return len(manifest) == n_stimuli
+    return len(manifest) == n_stimuli and all(
+        row.get("position_names") == list(position_names) for row in manifest
+    )
 
 
 def decode_vocab(tokenizer: PreTrainedTokenizerBase, n_rows: int) -> list[str]:
@@ -1016,21 +1352,28 @@ def sanity(args: argparse.Namespace) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_capture_arguments(capture_parser: argparse.ArgumentParser) -> None:
+        capture_parser.add_argument("--lens", type=Path, required=True)
+        capture_parser.add_argument("--base-model", required=True)
+        capture_parser.add_argument("--out-dir", type=Path, required=True)
+        capture_parser.add_argument("--arm", action="append", default=[])
+        capture_parser.add_argument("--framing", dest="framings", action="append", default=None)
+        capture_parser.add_argument("--device", default="cuda")
+        capture_parser.add_argument("--target-layer", type=int, default=30)
+        capture_parser.add_argument(
+            "--base-model-alias",
+            action="append",
+            default=[],
+            help="another id for the SAME base weights (e.g. the hub id of a pinned local snapshot) "
+            "that an adapter may record as its base; recorded in run.json",
+        )
+
     capture_parser = subparsers.add_parser("capture")
-    capture_parser.add_argument("--lens", type=Path, required=True)
-    capture_parser.add_argument("--base-model", required=True)
-    capture_parser.add_argument("--out-dir", type=Path, required=True)
-    capture_parser.add_argument("--arm", action="append", default=[])
-    capture_parser.add_argument("--framing", dest="framings", action="append", default=None)
-    capture_parser.add_argument("--device", default="cuda")
-    capture_parser.add_argument("--target-layer", type=int, default=30)
-    capture_parser.add_argument(
-        "--base-model-alias",
-        action="append",
-        default=[],
-        help="another id for the SAME base weights (e.g. the hub id of a pinned local snapshot) that "
-        "an adapter may record as its base; recorded in run.json",
-    )
+    add_capture_arguments(capture_parser)
+    prefix_parser = subparsers.add_parser("capture-prefix")
+    add_capture_arguments(prefix_parser)
+    prefix_parser.add_argument("--prefix-records", type=Path, action="append", required=True)
     analyse_parser = subparsers.add_parser("analyse")
     analyse_parser.add_argument("--capture-dir", type=Path, required=True)
     analyse_parser.add_argument("--lens", type=Path, required=True)
@@ -1051,10 +1394,14 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Dispatch one of the capture, analyse, or sanity subcommands."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _parser().parse_args(argv)
-    if args.command == "capture":
+    if args.command in {"capture", "capture-prefix"}:
         args.framings = tuple(args.framings or DEFAULT_FRAMINGS)
-        capture(args)
+        if args.command == "capture":
+            capture(args)
+        else:
+            capture_prefix(args)
     elif args.command == "analyse":
         analyse(args)
     else:
