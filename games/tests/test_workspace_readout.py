@@ -19,6 +19,7 @@ from transformers import AutoTokenizer
 from games.workspace_readout import (
     accepted_adapter_base,
     bootstrap_indices,
+    decode_vocab,
     find_prompt_positions,
     is_word_like,
     parse_band,
@@ -217,3 +218,16 @@ class TestAdapterBaseAliases:
         adapter_dir = self._adapter(tmp_path, "hub-org/other-model")
         with pytest.raises(ValueError, match="neither the loaded base"):
             accepted_adapter_base("arm", adapter_dir, "/local/snapshot", ["hub-org/base-model"])
+
+
+class TestVocabularyLabels:
+    def test_labels_cover_special_tokens_and_lm_head_padding(
+        self, qwen_tokenizer: PreTrainedTokenizerBase
+    ) -> None:
+        n_rows = len(qwen_tokenizer) + 3
+        labels = decode_vocab(qwen_tokenizer, n_rows)
+        assert len(labels) == n_rows
+        think_id = cast("int", qwen_tokenizer.convert_tokens_to_ids("<think>"))
+        assert labels[think_id] == "<think>"
+        assert labels[-1].startswith("<lm_head padding row")
+        assert not is_word_like(labels[-1])

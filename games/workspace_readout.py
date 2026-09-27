@@ -603,8 +603,17 @@ def _arm_artifact_complete(arm_dir: Path, *, lens: LoadedLens, n_stimuli: int) -
     return len(manifest) == n_stimuli
 
 
-def _decode_vocab(tokenizer: PreTrainedTokenizerBase) -> list[str]:
-    return [str(tokenizer.decode([index])) for index in range(int(tokenizer.vocab_size))]
+def decode_vocab(tokenizer: PreTrainedTokenizerBase, n_rows: int) -> list[str]:
+    """Label every lm_head row, special tokens and padding rows included.
+
+    ``vocab_size`` omits the added special tokens, and the lm_head carries padding rows the tokenizer
+    never emits; both get labels so no top-k index can fall off the end.
+    """
+    n_tokens = len(tokenizer)
+    if n_tokens > n_rows:
+        raise ValueError(f"tokenizer has {n_tokens} ids but the lm_head only {n_rows} rows")
+    decoded = [str(tokenizer.decode([index])) for index in range(n_tokens)]
+    return decoded + [f"<lm_head padding row {index}>" for index in range(n_tokens, n_rows)]
 
 
 def _bootstrap_ci(
@@ -683,7 +692,7 @@ def analyse(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
             raise ValueError(f"arm {arm} residual/manifest lengths disagree")
         captures[arm] = (residuals.float(), manifests)
     base_residuals, base_manifest = captures["base"]
-    vocab = _decode_vocab(tokenizer)
+    vocab = decode_vocab(tokenizer, int(unembed.lm_head_weight.shape[0]))
     readable = [is_word_like(token) for token in vocab]
     mean_logits: dict[str, torch.Tensor] = {}
     report: dict[str, Any] = {
