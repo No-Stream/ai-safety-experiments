@@ -9,19 +9,20 @@ still produces plausible-looking JSON, so each expected ordering is written out 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
+from transformers import AutoTokenizer
 
 from games.workspace_readout import (
     bootstrap_indices,
-    find_word_positions,
+    find_prompt_positions,
     is_word_like,
-    map_concepts,
     parse_band,
-    rank_paired_differences,
+    rank_token_shifts,
     should_skip_cell,
+    single_token_concept_ids,
     validate_manifest,
     validate_residual,
 )
@@ -43,62 +44,49 @@ class TestBandParsing:
 
 
 class TestWordLikeFilter:
-    @pytest.mark.parametrize("token", ["mirror", "Ġmirror", "▁cooperate", "42"])
+    @pytest.mark.parametrize("token", ["alphaish", "Ġalphaish", "▁betaword", "abc"])
     def test_keeps_word_like_tokens(self, token: str) -> None:
         assert is_word_like(token)
 
-    @pytest.mark.parametrize("token", ["", "▁", "!", "##ing", "<0x0A>", "<|endoftext|>"])
+    @pytest.mark.parametrize("token", ["", "▁", "!", "42", "##ing", "<0x0A>", "<|endoftext|>"])
     def test_drops_punctuation_continuations_and_special_tokens(self, token: str) -> None:
         assert not is_word_like(token)
 
 
-class TestPairedDifferenceRanking:
-    def test_ranks_absolute_paired_changes_and_keeps_direction(self) -> None:
-        rows = [
-            {"pair_id": "p1", "token": "mirror", "base": 0.10, "trained": 0.70},
-            {"pair_id": "p2", "token": "dominant", "base": 0.90, "trained": 0.20},
-            {"pair_id": "p3", "token": "neutral", "base": 0.40, "trained": 0.45},
-        ]
-
-        ranked = rank_paired_differences(rows, top_k=2)
-
-        assert [(row["pair_id"], row["delta"]) for row in ranked] == [
-            ("p1", pytest.approx(0.60)),
-            ("p2", pytest.approx(-0.70)),
-        ]
-
-    def test_ties_are_resolved_by_token_then_pair_id(self) -> None:
-        rows = [
-            {"pair_id": "p2", "token": "beta", "base": 0.0, "trained": 0.5},
-            {"pair_id": "p1", "token": "alpha", "base": 0.5, "trained": 0.0},
-        ]
-
-        ranked = rank_paired_differences(rows, top_k=2)
-
-        assert [(row["token"], row["pair_id"]) for row in ranked] == [
-            ("alpha", "p1"),
-            ("beta", "p2"),
-        ]
+class TestTokenShiftRanking:
+    def test_ranks_by_signed_shift_and_never_ranks_filtered_tokens(self) -> None:
+        vocab = ["alphaish", "betaword", "gammaish", "filtered"]
+        mean_delta = torch.tensor([0.5, -0.2, 0.1, float("nan")])
+        fraction_positive = torch.tensor([0.9, 0.1, 0.6, 1.0])
+        risen = rank_token_shifts(mean_delta, fraction_positive, vocab, sign=1.0, top_k=4)
+        fallen = rank_token_shifts(mean_delta, fraction_positive, vocab, sign=-1.0, top_k=4)
+        assert [row["token"] for row in risen] == ["alphaish", "gammaish"]
+        assert [row["token"] for row in fallen] == ["betaword"]
+        assert fallen[0]["delta"] == pytest.approx(-0.2)
+        assert risen[0]["fraction_positive"] == pytest.approx(0.9)
 
 
 class TestConceptMapping:
-    def test_maps_each_token_to_all_matching_concepts_deterministically(self) -> None:
-        concept_sets = {
-            "mirroring": ("mirror", "mutual"),
-            "cooperation": ("cooperate", "mutual"),
-        }
+    def test_single_token_mapping_records_multi_token_words(self) -> None:
+        class SyntheticTokenizer:
+            def __call__(self, text: str, *, add_special_tokens: bool) -> dict[str, list[int]]:
+                del add_special_tokens
+                return {
+                    "input_ids": {
+                        "alphaish": [1],
+                        " alphaish": [2],
+                        "Alphaish": [3],
+                        " Alphaish": [4],
+                        "multiword": [5, 6],
+                    }.get(text, [7, 8])
+                }
 
-        mapped = map_concepts(("mutual", "cooperate", "unknown"), concept_sets)
+        ids, skipped = single_token_concept_ids(
+            cast("Any", SyntheticTokenizer()), {"set": ("alphaish", "multiword")}
+        )
 
-        assert mapped == {
-            "mutual": ("cooperation", "mirroring"),
-            "cooperate": ("cooperation",),
-        }
-
-    def test_concept_mapping_does_not_emit_empty_concepts(self) -> None:
-        mapped = map_concepts(("unseen",), {"mirroring": ("mirror",)})
-
-        assert mapped == {}
+        assert ids == {"set": (1, 2, 3, 4)}
+        assert skipped == {"set": ("multiword",)}
 
 
 class TestBootstrapDeterminism:
@@ -171,12 +159,17 @@ class TestResumeAndArtifactValidation:
 
 
 class TestPositionFinding:
-    def test_returns_positions_for_requested_word_like_tokens(self) -> None:
-        tokens = ("▁The", "▁mirror", "▁and", "▁mutual", "!", "▁mirror")
-
-        assert find_word_positions(tokens, {"mirror", "mutual"}) == [1, 3, 5]
-
-    def test_position_finding_ignores_subword_and_punctuation_tokens(self) -> None:
-        tokens = ("▁cooperate", "##ing", "!", "▁cooperate")
-
-        assert find_word_positions(tokens, {"cooperate"}) == [0, 3]
+    def test_real_cached_qwen_tokenizer_positions(self) -> None:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B", local_files_only=True)
+        except OSError:
+            pytest.skip("Qwen3.5-0.8B tokenizer is not cached")
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Synthetic user text."}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+        positions = find_prompt_positions(tokenizer, rendered)
+        assert set(positions) == {"user_end", "assistant_marker", "think_open"}
+        assert positions["user_end"] < positions["assistant_marker"] < positions["think_open"]
