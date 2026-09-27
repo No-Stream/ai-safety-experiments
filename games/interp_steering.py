@@ -83,6 +83,8 @@ from games.lora import adapter_config_identity, attach_adapter, load_adapter_bas
 from games.parsing import parse_action, strip_thinking
 from games.payoffs import COOPERATE
 from games.prompts import (
+    COUNTERPART_FRAMING_IDS,
+    FRAMING_TWIN,
     LABEL_PRINT_ORDERS,
     ROW_COLUMNS,
     generate_framing_prompt_rows,
@@ -1604,7 +1606,7 @@ def _summary_by_print_order(records: Sequence[Mapping[str, Any]]) -> dict[str, d
 
 
 def summarise_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Summarise cooperation and row-specific outcomes by condition, family and print order."""
+    """Summarise outcomes within each condition and counterpart framing."""
     assert_one_deltanet_kernel(
         (record.get(DELTANET_KERNEL_FIELD) for record in records),
         what="this steering summary",
@@ -1614,26 +1616,42 @@ def summarise_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         grouped.setdefault(str(record["condition_key"]), []).append(record)
     summary: dict[str, Any] = {}
     for key, group in sorted(grouped.items()):
-        entry = _summary_for_records(group)
-        entry["by_print_order"] = _summary_by_print_order(group)
-        families = sorted(
-            {
-                str(record["diagnostic_family"])
-                for record in group
-                if record.get("diagnostic_family") is not None
-            }
+        framing_groups: dict[str, list[Mapping[str, Any]]] = {}
+        for record in group:
+            framing = str(record.get("counterpart_framing") or FRAMING_TWIN)
+            framing_groups.setdefault(framing, []).append(record)
+        by_framing = {
+            framing: _summary_for_framing(framing_records)
+            for framing, framing_records in sorted(framing_groups.items())
+        }
+        summary[key] = (
+            {**next(iter(by_framing.values())), "by_framing": by_framing}
+            if len(by_framing) == 1
+            else {"by_framing": by_framing}
         )
-        if families:
-            entry["by_diagnostic_family"] = {}
-            for family in families:
-                family_records = [
-                    record for record in group if str(record.get("diagnostic_family")) == family
-                ]
-                family_summary = _summary_for_records(family_records)
-                family_summary["by_print_order"] = _summary_by_print_order(family_records)
-                entry["by_diagnostic_family"][family] = family_summary
-        summary[key] = entry
     return summary
+
+
+def _summary_for_framing(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    entry = _summary_for_records(records)
+    entry["by_print_order"] = _summary_by_print_order(records)
+    families = sorted(
+        {
+            str(record["diagnostic_family"])
+            for record in records
+            if record.get("diagnostic_family") is not None
+        }
+    )
+    if families:
+        entry["by_diagnostic_family"] = {}
+        for family in families:
+            family_records = [
+                record for record in records if record.get("diagnostic_family") == family
+            ]
+            family_summary = _summary_for_records(family_records)
+            family_summary["by_print_order"] = _summary_by_print_order(family_records)
+            entry["by_diagnostic_family"][family] = family_summary
+    return entry
 
 
 def condition_key(condition: GenerationCondition) -> str:
@@ -1737,7 +1755,7 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
     relaunch, which is correct: continuing it now would decode its remaining conditions under the
     bridged kernel and file them beside conditions decoded without it.
     """
-    return {
+    identity = {
         "command": "generate",
         "model": args.model,
         "model_weights_identity": weights_identity,
@@ -1765,6 +1783,9 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
         else directions_digest(subspace_bundles),
         "resolved_sampler": dict(sampler_payload),
     }
+    if args.framings:
+        identity["framings"] = sorted(set(args.framings))
+    return identity
 
 
 def condition_intervention(  # noqa: PLR0913 - existing steering controls plus optional subspaces
@@ -1991,6 +2012,15 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     regenerated records are the ones an uninterrupted run would have written; the summary counts
     ``resumed_conditions`` apart from ``skipped_conditions`` so what actually ran stays visible.
     """
+    requested_framings = args.framings or []
+    unknown_framings = sorted(set(requested_framings) - set(COUNTERPART_FRAMING_IDS))
+    if unknown_framings:
+        raise ValueError(f"Unknown framing ids: {unknown_framings}")
+    if requested_framings and args.counterpart_framing is not None:
+        raise ValueError("--framing cannot be combined with --counterpart-framing")
+    if requested_framings and args.row_manifest is not None:
+        raise ValueError("--framing cannot be combined with --row-manifest")
+    framing_ids = [framing for framing in COUNTERPART_FRAMING_IDS if framing in requested_framings]
     subspace_mode = args.subspace_bundle is not None or args.placebo_bundle is not None
     if subspace_mode and (args.subspace_bundle is None or args.placebo_bundle is None):
         raise ValueError("pass both --subspace-bundle and --placebo-bundle")
@@ -2047,7 +2077,9 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             raise ValueError(f"cell {cell} names a layer missing from its direction file.")
 
     placebo_seed = resolve_placebo_seed(args)
-    if args.row_manifest is None and args.diagnostic_profile is None:
+    if framing_ids:
+        rows = [row for framing in framing_ids for row in generation_rows(framing)]
+    elif args.row_manifest is None and args.diagnostic_profile is None:
         rows = generation_rows(args.counterpart_framing)
     else:
         rows = generation_rows(args.counterpart_framing, args.row_manifest, args.diagnostic_profile)
@@ -2158,7 +2190,7 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
                     "seed": seed,
                     "placebo_seed": placebo_seed,
                     "adapter": adapter,
-                    "counterpart_framing": args.counterpart_framing,
+                    "counterpart_framing": row.get("framing_id", args.counterpart_framing),
                     "prompt_id": row["prompt_id"],
                     "diagnostic_family": row.get("diagnostic_family"),
                     "row_kind": row.get("row_kind", CUSTOM_ROW_KIND_MATRIX),
@@ -2214,6 +2246,7 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
         "render_grading": RENDER_GRADING,
         "split": SPLIT_EVAL,
         "counterpart_framing": args.counterpart_framing,
+        "framings": framing_ids or None,
         "row_manifest": None if args.row_manifest is None else str(args.row_manifest),
         "diagnostic_profile": args.diagnostic_profile,
         "rendered_rows_sha256": rendered_rows_digest(rows),
@@ -2337,6 +2370,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Render the eval rows under this counterpart framing instead of the trained twin "
         "rendering. Swaps only the prompts; conditions, index-derived seeds, and the placebo "
         "vector are untouched — see generation_rows.",
+    )
+    generate.add_argument(
+        "--framing",
+        dest="framings",
+        action="append",
+        choices=COUNTERPART_FRAMING_IDS,
+        default=None,
+        metavar="ID",
+        help="Counterpart framing to render; repeat to generate several framings in one run.",
     )
     generate.add_argument(
         "--row-manifest",

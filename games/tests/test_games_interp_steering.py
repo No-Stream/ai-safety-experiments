@@ -471,6 +471,22 @@ class TestConditions:
 
 
 class TestSummaries:
+    def test_rates_are_never_pooled_across_framings(self) -> None:
+        records = [
+            {
+                "condition_key": "none",
+                "counterpart_framing": framing,
+                "cooperate": cooperate,
+                "truncated_thinking": False,
+                "label_print_order": "canonical",
+            }
+            for framing, cooperate in [(FRAMING_TWIN, True), (FRAMING_HUMAN, False)]
+        ]
+        entry = summarise_records(records)["none"]
+        assert entry["by_framing"][FRAMING_TWIN]["cooperate_rate"] == 1.0
+        assert entry["by_framing"][FRAMING_HUMAN]["cooperate_rate"] == 0.0
+        assert "cooperate_rate" not in entry
+
     def test_rates_carry_their_denominators(self) -> None:
         records = [
             {
@@ -836,6 +852,7 @@ def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> ar
         "deadline": None,
         "conditions": None,
         "counterpart_framing": None,
+        "framings": None,
         "row_manifest": None,
         "diagnostic_profile": None,
         "out_dir": tmp_path / "steering",
@@ -1353,6 +1370,30 @@ class TestCounterpartFraming:
         del backend, chunk_size
         return ["deliberation</think>\n<action>unparseable</action>" for _ in prompts]
 
+    def test_default_generation_records_match_prechange_bytes(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch(monkeypatch, self._neutral_decode)
+        real = tmp_path / "real.pt"
+        placebo = tmp_path / "placebo.pt"
+        torch.save({0: torch.eye(HIDDEN)[:2]}, real)
+        torch.save({0: torch.eye(HIDDEN)[2:4]}, placebo)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            direction=[],
+            cells=None,
+            subspace_bundle=real,
+            placebo_bundle=placebo,
+            conditions="none",
+        )
+        run_generate(args)
+        records = (args.out_dir / "steering_records.jsonl").read_bytes()
+        assert (
+            hashlib.sha256(records).hexdigest()
+            == "0cae984efba7947881c1c496a4d87a1db700ae8125b8a27a5caaf29e45cb6ccf"
+        )
+
     def test_the_twin_framing_renders_byte_identical_prompt_text(self) -> None:
         default_rows = generation_rows(None)
         twin_rows = generation_rows(FRAMING_TWIN)
@@ -1360,6 +1401,105 @@ class TestCounterpartFraming:
         assert [str(row["prompt"]) for row in twin_rows] == [
             str(row["prompt"]) for row in default_rows
         ]
+
+    def test_repeatable_framing_cli_parses_registered_ids(self) -> None:
+        parsed = interp_steering.build_parser().parse_args(
+            [
+                "generate",
+                "--model",
+                "tiny/base",
+                "--out-dir",
+                "unused",
+                "--framing",
+                FRAMING_HUMAN,
+                "--framing",
+                FRAMING_TWIN,
+            ]
+        )
+        assert parsed.framings == [FRAMING_HUMAN, FRAMING_TWIN]
+
+    def test_multiple_framings_tag_records_and_separate_summary_rates(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch(monkeypatch, self._neutral_decode)
+        args = generate_args(
+            tmp_path, directions_path, framings=[FRAMING_TWIN, FRAMING_HUMAN], conditions="none"
+        )
+        summary = run_generate(args)
+        records = [
+            json.loads(line)
+            for line in (args.out_dir / "steering_records.jsonl").read_text().splitlines()
+        ]
+        assert len(records) == 64
+        assert {record["counterpart_framing"] for record in records} == {
+            FRAMING_TWIN,
+            FRAMING_HUMAN,
+        }
+        assert {
+            record["counterpart_framing"]
+            for record in records
+            if "--framing-twin" in record["prompt_id"]
+        } == {FRAMING_TWIN}
+        by_framing = summary["conditions"]["none"]["by_framing"]
+        assert set(by_framing) == {FRAMING_TWIN, FRAMING_HUMAN}
+        assert all(entry["n_completions"] == 32 for entry in by_framing.values())
+        assert all(
+            set(entry["by_print_order"]) == {"canonical", "swapped"}
+            for entry in by_framing.values()
+        )
+        assert "cooperate_rate" not in summary["conditions"]["none"]
+
+    def test_changing_framing_set_refuses_resume_before_decode(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch(monkeypatch, self._neutral_decode)
+        args = generate_args(tmp_path, directions_path, framings=[FRAMING_HUMAN], conditions="none")
+        run_generate(args)
+
+        def no_decode(backend: Any, prompts: Any, *, chunk_size: int) -> list[str]:
+            raise AssertionError("mismatched run identity must refuse before decode")
+
+        self._patch(monkeypatch, no_decode)
+        with pytest.raises(ResumeMismatchError):
+            run_generate(
+                generate_args(
+                    tmp_path,
+                    directions_path,
+                    framings=[FRAMING_HUMAN, FRAMING_TWIN],
+                    conditions="none",
+                )
+            )
+
+    def test_framing_order_does_not_change_resume_identity(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch(monkeypatch, self._neutral_decode)
+        run_generate(
+            generate_args(
+                tmp_path, directions_path, framings=[FRAMING_HUMAN, FRAMING_TWIN], conditions="none"
+            )
+        )
+
+        def no_decode(backend: Any, prompts: Any, *, chunk_size: int) -> list[str]:
+            raise AssertionError("all requested conditions are already complete")
+
+        self._patch(monkeypatch, no_decode)
+        summary = run_generate(
+            generate_args(
+                tmp_path, directions_path, framings=[FRAMING_TWIN, FRAMING_HUMAN], conditions="none"
+            )
+        )
+        assert summary["n_records_resumed"] == 64
+
+    def test_unknown_repeatable_framing_refuses_before_decode(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def no_decode(backend: Any, prompts: Any, *, chunk_size: int) -> list[str]:
+            raise AssertionError("unknown framing must refuse before decode")
+
+        self._patch(monkeypatch, no_decode)
+        with pytest.raises(ValueError, match="Unknown framing"):
+            run_generate(generate_args(tmp_path, directions_path, framings=["unregistered"]))
 
     def test_a_framing_swaps_the_prompts_and_tags_the_prompt_ids(self) -> None:
         human_rows = generation_rows(FRAMING_HUMAN)
