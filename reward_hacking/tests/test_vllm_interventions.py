@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -57,7 +58,10 @@ class _FakeLLM(ResidualInterventionWorker):
         return self.model
 
     def collective_rpc(self, method: str, *, args: tuple[object, ...] = ()) -> list[Any]:
-        return [getattr(self, method)(*args)]
+        # vLLM's RPC does not carry live tensors or int dict keys to the worker; a JSON round trip
+        # imposes the same constraint, so a spec that only works in-process fails here too.
+        wire_args = json.loads(json.dumps(args))
+        return [getattr(self, method)(*wire_args)]
 
 
 class TestFusedResidualHook:

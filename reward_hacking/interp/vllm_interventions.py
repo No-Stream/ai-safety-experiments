@@ -221,13 +221,13 @@ class ResidualInterventionWorker:
     def residual_intervention_install(
         self,
         kind: InterventionKind,
-        by_layer: dict[int, torch.Tensor],
+        by_layer: dict[int, list[float] | list[list[float]]],
         n_layers: int,
         d_model: int,
         alpha: float | None,
     ) -> tuple[int, int]:
         """Install one validated spec on the worker's resident model."""
-        spec = InterventionSpec(kind, by_layer, n_layers, d_model, alpha)
+        spec = InterventionSpec(kind, tensors_from_wire(by_layer), n_layers, d_model, alpha)
         spec.validate()
         return _install_on_model(cast("_WorkerWithModel", self).get_model(), spec)
 
@@ -307,6 +307,32 @@ class InterventionVLLMBackend(VLLMBackend):
         return [output.completion.text for output in outputs]
 
 
+def tensors_to_wire(
+    by_layer: Mapping[int, torch.Tensor],
+) -> dict[int, list[float] | list[list[float]]]:
+    """Encode per-layer tensors as float32 nested lists.
+
+    vLLM's RPC serializer delivers tensors to the worker as nested lists, so the encoding is made
+    explicit here and reversed by :func:`tensors_from_wire`; float32 round-trips exactly through
+    Python floats.
+    """
+    return {
+        int(layer): cast(
+            "list[float] | list[list[float]]", tensor.detach().to("cpu", torch.float32).tolist()
+        )
+        for layer, tensor in by_layer.items()
+    }
+
+
+def tensors_from_wire(
+    by_layer: Mapping[int, list[float] | list[list[float]]],
+) -> dict[int, torch.Tensor]:
+    """Rebuild float32 tensors from :func:`tensors_to_wire` output (keys may arrive as strings)."""
+    return {
+        int(layer): torch.tensor(values, dtype=torch.float32) for layer, values in by_layer.items()
+    }
+
+
 def install(llm: ModelWorkerAccess, spec: InterventionSpec) -> None:
     """Validate the spec and register hooks through vLLM's public model-worker RPC."""
     spec.validate()
@@ -320,7 +346,7 @@ def install(llm: ModelWorkerAccess, spec: InterventionSpec) -> None:
             raise ValueError(f"vLLM d_model {d_model} disagrees with spec {spec.d_model}")
     installed = llm.collective_rpc(
         "residual_intervention_install",
-        args=(spec.kind, dict(spec.by_layer), spec.n_layers, spec.d_model, spec.alpha),
+        args=(spec.kind, tensors_to_wire(spec.by_layer), spec.n_layers, spec.d_model, spec.alpha),
     )
     if len(installed) != len(dimensions):
         raise RuntimeError("vLLM did not confirm intervention installation on every worker")
