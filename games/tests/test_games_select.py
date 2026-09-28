@@ -191,6 +191,29 @@ class OomAboveWidthBackend(ScriptedBackend):
         return super().generate(prompts)
 
 
+class AcceleratorErrorAboveWidthBackend(ScriptedBackend):
+    """A scripted policy that raises a chosen accelerator error above a width threshold."""
+
+    def __init__(
+        self,
+        script: dict[str, list[str]],
+        *,
+        fits: int,
+        message: str,
+        model_id: str = "scripted/policy",
+    ) -> None:
+        super().__init__(script, model_id)
+        self.fits = fits
+        self.message = message
+        self.attempted_widths: list[int] = []
+
+    def generate(self, prompts: list[str]) -> list[str]:
+        self.attempted_widths.append(len(prompts))
+        if len(prompts) > self.fits:
+            raise torch.AcceleratorError(self.message)
+        return super().generate(prompts)
+
+
 # 40 retries over 120 seconds is 2.5 per minute per sequence at width 8, past all three thrash
 # thresholds (8 retries, 60 seconds, 0.12 per minute per sequence) rather than near any of them, so
 # the tests below measure the response to a verdict and not where the verdict flips.
@@ -1359,6 +1382,37 @@ class TestOomHalving:
         with pytest.raises(torch.OutOfMemoryError):
             decode_in_chunks(backend, list(script), chunk_size=4)
         assert backend.attempted_widths == [4, 2, 1]
+
+    def test_an_accelerator_oom_is_retried_at_half_width_with_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        script = self.script(4)
+        backend = AcceleratorErrorAboveWidthBackend(
+            script,
+            fits=2,
+            message="CUDA error: out of memory (cudaErrorMemoryAllocation)",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="games.chunked_decode"):
+            completions = decode_in_chunks(backend, list(script), chunk_size=4)
+
+        assert completions == [f"answer-{index}" for index in range(4)]
+        assert backend.attempted_widths == [4, 2, 2]
+        assert "old_width=4 new_width=2" in caplog.text
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+    def test_a_non_oom_accelerator_error_propagates_without_halving(self):
+        script = self.script(4)
+        backend = AcceleratorErrorAboveWidthBackend(
+            script,
+            fits=2,
+            message="CUDA error: device-side assert triggered",
+        )
+
+        with pytest.raises(torch.AcceleratorError, match="device-side assert"):
+            decode_in_chunks(backend, list(script), chunk_size=4)
+
+        assert backend.attempted_widths == [4]
 
 
 class TestThrashNarrowing:

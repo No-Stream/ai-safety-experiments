@@ -524,6 +524,12 @@ class ChunkAttempt:
     thrashing: bool
 
 
+def _is_accelerator_oom(error: torch.AcceleratorError) -> bool:
+    """Return whether an accelerator error is the CUDA allocation OOM signature."""
+    message = str(error)
+    return "out of memory" in message.lower() and "cudaErrorMemoryAllocation" in message
+
+
 def iter_decoded_chunks(
     backend: Backend,
     prompts: Sequence[str],
@@ -701,6 +707,23 @@ def _decode_one_chunk(
             f"size was too large, which means the footprint arithmetic in decode_footprint "
             f"understated this configuration -- worth a look rather than a shrug. The allocator "
             f"said: {oom}",
+        )
+        return ChunkAttempt(completions=None, thrashing=False)
+    except torch.AcceleratorError as accelerator_error:
+        if not _is_accelerator_oom(accelerator_error):
+            raise
+        if width == 1:
+            logger.exception(
+                "decode OOM'd at a single sequence, so there is nothing left to halve. The card "
+                "cannot hold one sequence at this token budget: use a larger card, or a shorter "
+                "budget in a run labelled as not being a measurement."
+            )
+            raise
+        logger.warning(
+            "decode chunk AcceleratorError OOM'd; halving the chunk width and retrying the SAME "
+            "prompts, %s",
+            f"old_width={width} new_width={width // 2} remaining={len(remaining)} "
+            f"The allocator said: {accelerator_error}",
         )
         return ChunkAttempt(completions=None, thrashing=False)
     verdict = ThrashVerdict(
