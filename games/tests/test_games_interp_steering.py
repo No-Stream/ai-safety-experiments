@@ -517,6 +517,20 @@ class TestTokenBanMechanics:
 
 
 class TestSummaries:
+    def test_refuses_to_pool_hf_and_vllm_records(self) -> None:
+        records = [
+            {
+                "condition_key": "none",
+                "backend": backend,
+                "cooperate": True,
+                "truncated_thinking": False,
+                "label_print_order": "canonical",
+            }
+            for backend in ("hf", "vllm")
+        ]
+        with pytest.raises(ValueError, match="backends"):
+            summarise_records(records)
+
     def test_rates_are_never_pooled_across_framings(self) -> None:
         records = [
             {
@@ -838,6 +852,16 @@ class _FakeBackend:
         return self._tokenizer
 
 
+class _FakeVLLMBackend(_FakeBackend):
+    def __init__(self, model_id: str, *, thinking: bool, sampling: Any) -> None:
+        super().__init__(model_id, thinking=thinking, sampling=sampling)
+        self.llm = object()
+        self.condition_seeds: list[int] = []
+
+    def set_generation_seed(self, seed: int) -> None:
+        self.condition_seeds.append(seed)
+
+
 class _TinyTokenBatch(dict[str, torch.Tensor]):
     def to(self, device: torch.device) -> _TinyTokenBatch:
         return _TinyTokenBatch({key: value.to(device) for key, value in self.items()})
@@ -905,6 +929,7 @@ class _TinyAdapterLM(torch.nn.Module):
 def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> argparse.Namespace:
     defaults: dict[str, Any] = {
         "model": "tiny/base",
+        "backend": "hf",
         "adapter": None,
         "direction": [f"decision={directions_path}"],
         "subspace_bundle": None,
@@ -1113,6 +1138,183 @@ def pinned_weights_identity(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestGenerateOffline:
+    def test_vllm_subspace_uses_the_same_condition_table_and_distinct_resume_identity(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._patch(monkeypatch, _neutral_completions)
+        real = tmp_path / "real.pt"
+        placebo = tmp_path / "placebo.pt"
+        torch.save({0: torch.eye(HIDDEN)[:2]}, real)
+        torch.save({0: torch.eye(HIDDEN)[2:4]}, placebo)
+        seen_specs: list[Any] = []
+
+        @contextmanager
+        def fake_intervention(_llm: object, spec: Any) -> Any:
+            seen_specs.append(spec)
+            yield
+
+        fake_backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        monkeypatch.setattr(
+            interp_steering,
+            "_build_vllm_generation_backend",
+            lambda *_: (fake_backend, None, 24, HIDDEN),
+        )
+        monkeypatch.setattr(interp_steering, "intervention", fake_intervention)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            backend="vllm",
+            direction=[],
+            cells=None,
+            subspace_bundle=real,
+            placebo_bundle=placebo,
+        )
+
+        summary = run_generate(args)
+
+        assert summary["backend"] == "vllm"
+        assert [spec.kind for spec in seen_specs] == ["none", "subspace", "subspace"]
+        assert [sorted(spec.by_layer) for spec in seen_specs] == [[], [0], [0]]
+        records = [
+            json.loads(line)
+            for line in (args.out_dir / interp_steering.GENERATION_RECORDS_FILENAME)
+            .read_text()
+            .splitlines()
+        ]
+        assert {record["backend"] for record in records} == {"vllm"}
+        assert fake_backend.condition_seeds == [0, 1, 2]
+        with pytest.raises(ResumeMismatchError):
+            run_generate(argparse.Namespace(**{**vars(args), "backend": "hf"}))
+
+    def test_vllm_token_ban_keeps_exact_id_audit_in_the_condition_table(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        monkeypatch.setattr(
+            interp_steering,
+            "_build_vllm_generation_backend",
+            lambda *_: (fake_backend, None, 24, HIDDEN),
+        )
+        monkeypatch.setattr(
+            interp_steering,
+            "resolve_banned_tokens",
+            lambda *_args, **_kwargs: ((1,), "synthetic-digest"),
+        )
+
+        @contextmanager
+        def fake_intervention(_llm: object, _spec: Any) -> Any:
+            yield
+
+        def fake_decode(
+            backend: _FakeVLLMBackend,
+            prompts: list[str],
+            *,
+            chunk_size: int,
+            generation_kwargs: Any = None,
+        ) -> list[str]:
+            if generation_kwargs is not None:
+                assert generation_kwargs == {"banned_token_ids": (1,)}
+                backend.last_banned_token_counts = [0] * len(prompts)
+            return _neutral_completions(backend, prompts, chunk_size=chunk_size)
+
+        monkeypatch.setattr(interp_steering, "intervention", fake_intervention)
+        monkeypatch.setattr(interp_steering, "decode_in_chunks", fake_decode)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            backend="vllm",
+            direction=[],
+            cells=None,
+            banned_tokens_json=tmp_path / "synthetic.json",
+        )
+
+        summary = run_generate(args)
+
+        assert set(summary["conditions"]) == {"none", "token-ban"}
+        records = [
+            json.loads(line)
+            for line in (args.out_dir / interp_steering.GENERATION_RECORDS_FILENAME)
+            .read_text()
+            .splitlines()
+        ]
+        banned = [record for record in records if record["condition"] == "token-ban"]
+        assert banned
+        assert {record["banned_token_count"] for record in banned} == {0}
+        assert {record["banned_tokens_sha256"] for record in banned} == {"synthetic-digest"}
+
+    def test_derives_eager_worker_and_memory_settings_from_live_facts(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeTokenizer:
+            def apply_chat_template(self, messages: list[dict[str, str]], **_: Any) -> list[int]:
+                return [1] * len(messages[0]["content"])
+
+        class FakeBackend:
+            def __init__(self, model_id: str, **kwargs: Any) -> None:
+                self.model_id = model_id
+                self.settings = kwargs
+                self.llm = SimpleNamespace(collective_rpc=lambda _method: [(24, HIDDEN)])
+
+        monkeypatch.setattr(workspace_ablation, "_load_tokenizer", lambda _path: FakeTokenizer())
+        monkeypatch.setattr(
+            interp_steering,
+            "device_memory_report",
+            lambda device: {"device": str(device), "free_bytes": 5, "total_bytes": 10},
+        )
+        monkeypatch.setattr(
+            interp_steering.AutoConfig,
+            "from_pretrained",
+            lambda _model: SimpleNamespace(vision_config={}),
+        )
+        monkeypatch.setattr(interp_steering, "InterventionVLLMBackend", FakeBackend)
+        args = generate_args(tmp_path, directions_path)
+        sampling = interp_steering.eval_sampling(
+            interp_steering.SAMPLER_TRAINING_DISTRIBUTION, thinking=True
+        )
+
+        backend, adapter, n_layers, d_model = interp_steering._build_vllm_generation_backend(
+            args, sampling, ["abc", "abcd"]
+        )
+
+        assert adapter is None
+        assert (n_layers, d_model) == (24, HIDDEN)
+        settings = cast("FakeBackend", backend).settings
+        assert settings["enforce_eager"] is True
+        assert settings["worker_extension_cls"].endswith("ResidualInterventionWorker")
+        assert settings["gpu_memory_utilization"] == pytest.approx(0.45)
+        assert settings["max_model_len"] == 4 + sampling.max_new_tokens
+        assert settings["language_model_only"] is True
+
+    def test_vllm_steering_and_ablation_specs_match_the_hf_condition_geometry(self) -> None:
+        direction = torch.tensor([3.0, 0.0, 0.0])
+        directions = {"decision": {1: direction}}
+        steer = GenerationCondition(CONDITION_STEER_DOWN, "decision", 1, 2.0)
+        ablate = GenerationCondition(CONDITION_ABLATE_REAL, "decision", 1, None)
+
+        steer_spec, alpha = interp_steering._vllm_condition_spec(
+            steer,
+            directions,
+            ["decision"],
+            placebo_seed=7,
+            subspace_bundles=None,
+            n_layers=2,
+            d_model=3,
+        )
+        ablate_spec, _ = interp_steering._vllm_condition_spec(
+            ablate,
+            directions,
+            ["decision"],
+            placebo_seed=7,
+            subspace_bundles=None,
+            n_layers=2,
+            d_model=3,
+        )
+
+        assert alpha == 6.0
+        assert steer_spec.alpha == -6.0
+        assert torch.equal(steer_spec.by_layer[1], direction)
+        assert torch.equal(ablate_spec.by_layer[1], torch.tensor([[1.0, 0.0, 0.0]]))
+
     def test_subspace_bundle_conditions_run_with_resume_identity_and_parse_counts(
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1554,7 +1756,7 @@ class TestCounterpartFraming:
         del backend, chunk_size
         return ["deliberation</think>\n<action>unparseable</action>" for _ in prompts]
 
-    def test_default_generation_records_match_prechange_bytes(
+    def test_default_generation_records_preserve_legacy_fields_and_mark_hf(
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch(monkeypatch, self._neutral_decode)
@@ -1572,9 +1774,14 @@ class TestCounterpartFraming:
             conditions="none",
         )
         run_generate(args)
-        records = (args.out_dir / "steering_records.jsonl").read_bytes()
+        records = [
+            json.loads(line)
+            for line in (args.out_dir / "steering_records.jsonl").read_text().splitlines()
+        ]
+        assert {record.pop("backend") for record in records} == {"hf"}
+        legacy_bytes = b"".join((json.dumps(record) + "\n").encode() for record in records)
         assert (
-            hashlib.sha256(records).hexdigest()
+            hashlib.sha256(legacy_bytes).hexdigest()
             == "0cae984efba7947881c1c496a4d87a1db700ae8125b8a27a5caaf29e45cb6ccf"
         )
 

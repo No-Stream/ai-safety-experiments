@@ -60,8 +60,12 @@ from string import Formatter
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import torch
+from transformers import AutoConfig
 
 from games import workspace_ablation
+from games.argument_prior_map import (
+    _assert_vllm_adapter_preflight,  # pyright: ignore[reportPrivateUsage]
+)
 from games.chunked_decode import decode_in_chunks
 from games.deltanet_kernels import (
     DELTANET_KERNEL_FIELD,
@@ -69,8 +73,9 @@ from games.deltanet_kernels import (
     bound_deltanet_kernels,
     bridge_and_check_decode_kernel,
 )
-from games.eval_model import ADAPTER_PROBE_PROMPTS
+from games.eval_model import ADAPTER_PROBE_PROMPTS, read_adapter_facts
 from games.eval_sampler import SAMPLER_TRAINING_DISTRIBUTION, eval_sampling
+from games.inference_utils import device_memory_report
 from games.interp_cells import (
     concept_activations,
     digest_of_strings,
@@ -97,10 +102,15 @@ from reward_hacking.interp.directions import (
     cosine,
     matched_norm_random_direction,
 )
-from reward_hacking.interp.generation_capture import resolved_sampler
+from reward_hacking.interp.generation_capture import resolved_sampler_for
 from reward_hacking.interp.jacobian import resolve_weights_identity
 from reward_hacking.interp.jsonl_resume import resume_records
 from reward_hacking.interp.steering import ablation_hook, residual_intervention, steering_hook
+from reward_hacking.interp.vllm_interventions import (
+    InterventionSpec,
+    InterventionVLLMBackend,
+    intervention,
+)
 from reward_hacking.model_backend import HFBackend, SamplingConfig
 
 if TYPE_CHECKING:
@@ -445,7 +455,7 @@ def load_selected_target(  # noqa: C901, PLR0912, PLR0915 - strict artifact cont
     }
 
 
-def adapter_identity(adapter_dir: Path, *, applied_adapter_weights: int) -> dict[str, Any]:
+def adapter_identity(adapter_dir: Path, *, applied_adapter_weights: int | None) -> dict[str, Any]:
     """Describe the exact un-merged adapter served by a generation run."""
     resolved = adapter_dir.resolve()
     if not resolved.is_dir():
@@ -463,7 +473,7 @@ def adapter_identity(adapter_dir: Path, *, applied_adapter_weights: int) -> dict
         "config": adapter_config_identity(resolved),
         "weights_filename": weight_paths[0].name,
         "weights_sha256": sha256_of_file(weight_paths[0]),
-        "applied_adapter_weights": int(applied_adapter_weights),
+        "applied_adapter_weights": applied_adapter_weights,
     }
 
 
@@ -1652,6 +1662,11 @@ def _summary_by_print_order(records: Sequence[Mapping[str, Any]]) -> dict[str, d
 
 def summarise_records(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Summarise outcomes within each condition and counterpart framing."""
+    backends = {str(record.get("backend", "hf")) for record in records}
+    if len(backends) > 1:
+        raise ValueError(
+            f"this steering summary pools records from different backends: {sorted(backends)}"
+        )
     assert_one_deltanet_kernel(
         (record.get(DELTANET_KERNEL_FIELD) for record in records),
         what="this steering summary",
@@ -1836,6 +1851,8 @@ def generation_identity(  # noqa: PLR0913 - an identity is every argument a reco
     }
     if args.framings:
         identity["framings"] = sorted(set(args.framings))
+    if args.backend != "hf":
+        identity["backend"] = args.backend
     return identity
 
 
@@ -2054,6 +2071,128 @@ def _build_generation_backend(
     )
 
 
+def _build_vllm_generation_backend(
+    args: argparse.Namespace, sampling: SamplingConfig, prompts: Sequence[str]
+) -> tuple[InterventionVLLMBackend, dict[str, Any] | None, int, int]:
+    """Construct eager vLLM with a live-card budget and the named worker extension."""
+    if not prompts:
+        raise ValueError("vLLM generation has no prompts")
+    tokenizer = workspace_ablation._load_tokenizer(Path(args.model))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    prompt_lengths = [
+        len(
+            tokenizer.apply_chat_template(  # pyright: ignore[reportAttributeAccessIssue]
+                [{"role": "user", "content": prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        )
+        for prompt in prompts
+    ]
+    max_model_len = max(prompt_lengths) + sampling.max_new_tokens
+    memory = device_memory_report(torch.device("cuda"))
+    free_bytes = cast("int", memory["free_bytes"])
+    total_bytes = cast("int", memory["total_bytes"])
+    if free_bytes <= 0 or total_bytes <= 0:
+        raise RuntimeError("vLLM generation requires free CUDA memory on the selected device")
+    gpu_memory_utilization = 0.9 * free_bytes / total_bytes
+    logger.info(
+        "vLLM eager generation device=%s free_bytes=%d total_bytes=%d utilization=%.3f max_model_len=%d",
+        memory["device"],
+        free_bytes,
+        total_bytes,
+        gpu_memory_utilization,
+        max_model_len,
+    )
+    adapter_dir = None if args.adapter is None else Path(args.adapter).resolve()
+    adapter: dict[str, Any] | None = None
+    engine_kwargs: dict[str, Any] = {
+        "enforce_eager": True,
+        "worker_extension_cls": "reward_hacking.interp.vllm_interventions.ResidualInterventionWorker",
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "max_model_len": max_model_len,
+    }
+    config = AutoConfig.from_pretrained(args.model)
+    if getattr(config, "vision_config", None) is not None:
+        engine_kwargs["language_model_only"] = True
+    if adapter_dir is not None:
+        _assert_vllm_adapter_preflight(adapter_dir, args.model)
+        facts = read_adapter_facts(adapter_dir)
+        engine_kwargs.update(
+            enable_lora=True,
+            max_lora_rank=facts.vllm_lora_rank,
+            lora_target_modules=list(facts.target_modules),
+        )
+        adapter = adapter_identity(adapter_dir, applied_adapter_weights=None)
+    backend = InterventionVLLMBackend(
+        args.model,
+        thinking=True,
+        sampling=sampling,
+        lora_adapter=adapter_dir,
+        **engine_kwargs,
+    )
+    if adapter_dir is not None:
+        backend.assert_adapter_changes_output(ADAPTER_PROBE_PROMPTS)
+    dimensions = backend.llm.collective_rpc("residual_intervention_dimensions")
+    if len(dimensions) != 1:
+        raise RuntimeError(f"expected one vLLM model worker, got {len(dimensions)}")
+    n_layers, d_model = dimensions[0]
+    return backend, adapter, int(n_layers), int(d_model)
+
+
+def _vllm_condition_spec(  # noqa: PLR0913 - condition and its source geometry are the intervention
+    condition: GenerationCondition,
+    directions: Mapping[str, Mapping[int, torch.Tensor]],
+    direction_names: Sequence[str],
+    *,
+    placebo_seed: int,
+    subspace_bundles: Mapping[str, Mapping[int, torch.Tensor]] | None,
+    n_layers: int,
+    d_model: int,
+) -> tuple[InterventionSpec, float | None]:
+    if condition.condition in (CONDITION_NONE, CONDITION_TOKEN_BAN):
+        return InterventionSpec.none(n_layers=n_layers, d_model=d_model), None
+    if condition.condition in (CONDITION_SUBSPACE_REAL, CONDITION_SUBSPACE_PLACEBO):
+        if subspace_bundles is None:
+            raise ValueError("subspace condition requires real and placebo bundles")
+        return (
+            InterventionSpec.subspace(
+                subspace_bundles[condition.condition], n_layers=n_layers, d_model=d_model
+            ),
+            None,
+        )
+    direction_name = cast("str", condition.direction)
+    layer = cast("int", condition.layer)
+    real = directions[direction_name][layer]
+    placebo = placebo_for(
+        real,
+        seed=placebo_seed,
+        direction_index=direction_names.index(direction_name),
+        layer=layer,
+    )
+    alpha_raw = (
+        None
+        if condition.alpha_multiplier is None
+        else condition.alpha_multiplier * float(real.norm())
+    )
+    if condition.condition in STEERING_CONDITIONS:
+        direction = (
+            real if condition.condition in (CONDITION_STEER_UP, CONDITION_STEER_DOWN) else placebo
+        )
+        alpha = cast("float", alpha_raw)
+        if condition.condition in (CONDITION_STEER_DOWN, CONDITION_PLACEBO_DOWN):
+            alpha = -alpha
+        return InterventionSpec.steering(
+            {layer: direction}, alpha=alpha, n_layers=n_layers, d_model=d_model
+        ), alpha_raw
+    if condition.condition in ABLATION_CONDITIONS:
+        direction = real if condition.condition == CONDITION_ABLATE_REAL else placebo
+        return InterventionSpec.subspace(
+            {layer: direction.unsqueeze(0) / direction.norm()}, n_layers=n_layers, d_model=d_model
+        ), None
+    raise ValueError(f"unsupported vLLM generation condition: {condition.condition}")
+
+
 def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -2169,14 +2308,27 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
         eval_sampling(SAMPLER_TRAINING_DISTRIBUTION, thinking=True),
         max_new_tokens=args.max_new_tokens,
     )
-    # Before the load, which imports the modeling module and freezes each kernel's dispatch.
-    kernel_bridge = bridge_and_check_decode_kernel()
-    backend, model, adapter = _build_generation_backend(args, sampling)
-    deltanet_kernel = bound_deltanet_kernels()
+    if args.backend == "hf":
+        # Before the load, which imports the modeling module and freezes each kernel's dispatch.
+        kernel_bridge = bridge_and_check_decode_kernel()
+        backend, model, adapter = _build_generation_backend(args, sampling)
+        deltanet_kernel = bound_deltanet_kernels()
+        n_layers = d_model = None
+    elif args.backend == "vllm":
+        kernel_bridge = None
+        backend, adapter, n_layers, d_model = _build_vllm_generation_backend(
+            args, sampling, prompts
+        )
+        model = None
+        deltanet_kernel = {"engine": "vllm", "execution": "eager"}
+    else:
+        raise ValueError(f"unknown generation backend {args.backend!r}")
     # After the load, so a hub id resolves from the same cache the weights just came out of.
     weights_identity = resolve_weights_identity(args.model)
 
-    sampler_payload = resolved_sampler(sampling).as_payload()
+    sampler_payload = resolved_sampler_for(sampling, engine=args.backend).as_payload()
+    if args.backend == "vllm":
+        cast("dict[str, object]", sampler_payload["applied"])["seed"] = "seed + condition_index"
     skipped_conditions: list[dict[str, Any]] = []
     resumed_conditions: list[dict[str, Any]] = []
     condition_seconds: dict[str, float] = {}
@@ -2220,14 +2372,28 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             seed = args.seed + index
             condition_started = time.monotonic()
             torch.manual_seed(seed)
-            context, alpha_raw = condition_intervention(
-                condition,
-                directions,
-                direction_names,
-                model=model,
-                placebo_seed=placebo_seed,
-                subspace_bundles=subspace_bundles,
-            )
+            if args.backend == "hf":
+                context, alpha_raw = condition_intervention(
+                    condition,
+                    directions,
+                    direction_names,
+                    model=cast("AutoModelForCausalLM", model),
+                    placebo_seed=placebo_seed,
+                    subspace_bundles=subspace_bundles,
+                )
+            else:
+                vllm_backend = cast("InterventionVLLMBackend", backend)
+                vllm_backend.set_generation_seed(seed)
+                spec, alpha_raw = _vllm_condition_spec(
+                    condition,
+                    directions,
+                    direction_names,
+                    placebo_seed=placebo_seed,
+                    subspace_bundles=subspace_bundles,
+                    n_layers=cast("int", n_layers),
+                    d_model=cast("int", d_model),
+                )
+                context = intervention(vllm_backend.llm, spec)
             condition_generation_kwargs = (
                 {"banned_token_ids": banned_token_ids}
                 if condition.condition == CONDITION_TOKEN_BAN
@@ -2277,6 +2443,7 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
                 )
                 record: dict[str, Any] = {
                     "condition_key": key,
+                    "backend": args.backend,
                     DELTANET_KERNEL_FIELD: deltanet_kernel,
                     "condition": condition.condition,
                     "direction": condition.direction,
@@ -2338,6 +2505,7 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
 
     summary: dict[str, Any] = {
         "command": "generate",
+        "backend": args.backend,
         "model": args.model,
         "model_weights_identity": weights_identity,
         "deltanet_kernel_bridge": kernel_bridge,
@@ -2423,6 +2591,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     generate = sub.add_parser("generate", help="Steered generation on held-out eval prompts.")
     generate.add_argument("--model", required=True)
+    generate.add_argument("--backend", choices=("hf", "vllm"), default="hf")
     generate.add_argument(
         "--adapter",
         type=Path,
