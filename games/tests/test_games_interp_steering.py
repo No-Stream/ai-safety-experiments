@@ -857,9 +857,32 @@ class _FakeVLLMBackend(_FakeBackend):
         super().__init__(model_id, thinking=thinking, sampling=sampling)
         self.llm = object()
         self.condition_seeds: list[int] = []
+        self.request_seed_calls: list[tuple[tuple[str, ...], tuple[int, ...] | None]] = []
+        self.fail_after_calls: int | None = None
+        self.generate_calls = 0
 
     def set_generation_seed(self, seed: int) -> None:
         self.condition_seeds.append(seed)
+
+    def generate(
+        self, prompts: list[str], *, generation_kwargs: dict[str, object] | None = None
+    ) -> list[str]:
+        self.generate_calls += 1
+        if self.fail_after_calls is not None and self.generate_calls > self.fail_after_calls:
+            raise RuntimeError("simulated reclaim mid-condition")
+        request_seeds = None
+        if generation_kwargs is not None:
+            raw_seeds = cast(
+                "list[int] | tuple[int, ...]",
+                generation_kwargs.get("request_seeds", ()),
+            )
+            request_seeds = tuple(raw_seeds)
+            if request_seeds:
+                assert len(request_seeds) == len(prompts)
+        self.request_seed_calls.append((tuple(prompts), request_seeds or None))
+        if generation_kwargs is not None and "banned_token_ids" in generation_kwargs:
+            self.last_banned_token_counts.extend([0] * len(prompts))
+        return ["deliberation</think>\n<action>unparseable</action>" for _ in prompts]
 
 
 class _TinyTokenBatch(dict[str, torch.Tensor]):
@@ -966,7 +989,9 @@ class TestTokenBanGeneration:
         if decode is None:
             decode = _neutral_completions
         monkeypatch.setattr(interp_steering, "HFBackend", _TokenBanFakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", decode)
+        monkeypatch.setattr(
+            interp_steering, "iter_decoded_chunks", _legacy_decode_as_chunks(decode)
+        )
         monkeypatch.setattr(
             workspace_ablation,
             "_load_tokenizer",
@@ -1212,13 +1237,16 @@ class TestGenerateOffline:
             chunk_size: int,
             generation_kwargs: Any = None,
         ) -> list[str]:
-            if generation_kwargs is not None:
-                assert generation_kwargs == {"banned_token_ids": (1,)}
+            if generation_kwargs is not None and "banned_token_ids" in generation_kwargs:
+                assert generation_kwargs["banned_token_ids"] == (1,)
+                assert "request_seeds" in generation_kwargs
                 backend.last_banned_token_counts = [0] * len(prompts)
             return _neutral_completions(backend, prompts, chunk_size=chunk_size)
 
         monkeypatch.setattr(interp_steering, "intervention", fake_intervention)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", fake_decode)
+        monkeypatch.setattr(
+            interp_steering, "iter_decoded_chunks", _legacy_decode_as_chunks(fake_decode)
+        )
         args = generate_args(
             tmp_path,
             directions_path,
@@ -1347,7 +1375,9 @@ class TestGenerateOffline:
 
     def _patch(self, monkeypatch: pytest.MonkeyPatch, completions_for: Any) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", completions_for)
+        monkeypatch.setattr(
+            interp_steering, "iter_decoded_chunks", _legacy_decode_as_chunks(completions_for)
+        )
 
     def test_records_and_summary_come_out_aligned(
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1464,7 +1494,9 @@ class TestGenerateOffline:
 class TestCustomDiagnosticGeneration:
     def _patch(self, monkeypatch: pytest.MonkeyPatch, completions_for: Any) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", completions_for)
+        monkeypatch.setattr(
+            interp_steering, "iter_decoded_chunks", _legacy_decode_as_chunks(completions_for)
+        )
 
     def test_generate_uses_all_eight_rows_while_conditions_filter_interventions(
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1646,7 +1678,9 @@ class TestConditionFilter:
 
     def _patch(self, monkeypatch: pytest.MonkeyPatch, completions_for: Any) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", completions_for)
+        monkeypatch.setattr(
+            interp_steering, "iter_decoded_chunks", _legacy_decode_as_chunks(completions_for)
+        )
 
     @staticmethod
     def _neutral_decode(backend: Any, prompts: Any, *, chunk_size: int) -> list[str]:
@@ -1749,7 +1783,9 @@ class TestCounterpartFraming:
 
     def _patch(self, monkeypatch: pytest.MonkeyPatch, completions_for: Any) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", completions_for)
+        monkeypatch.setattr(
+            interp_steering, "iter_decoded_chunks", _legacy_decode_as_chunks(completions_for)
+        )
 
     @staticmethod
     def _neutral_decode(backend: Any, prompts: Any, *, chunk_size: int) -> list[str]:
@@ -1974,7 +2010,11 @@ class TestSelectedCalibrationTarget:
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", _neutral_completions)
+        monkeypatch.setattr(
+            interp_steering,
+            "iter_decoded_chunks",
+            _legacy_decode_as_chunks(_neutral_completions),
+        )
         target_path = write_selected_target(tmp_path / "selected-target.json", directions_path)
         manifest_path = tmp_path / "diagnostic-rows.json"
         manifest_path.write_text(
@@ -2203,6 +2243,26 @@ def _neutral_completions(
     return ["deliberation</think>\n<action>unparseable</action>" for _ in prompts]
 
 
+def _legacy_decode_as_chunks(decoder: Any) -> Any:
+    """Adapt the old whole-list fake seam to the streaming decoder contract."""
+
+    def stream(
+        backend: Any,
+        prompts: Any,
+        *,
+        chunk_size: int,
+        generation_kwargs: Any | None = None,
+        request_seeds: Any | None = None,
+    ) -> Any:
+        del request_seeds
+        kwargs: dict[str, Any] = {"chunk_size": chunk_size}
+        if generation_kwargs is not None:
+            kwargs["generation_kwargs"] = generation_kwargs
+        yield decoder(backend, prompts, **kwargs)
+
+    return stream
+
+
 class _CrashAfterConditions:
     """A decode that dies partway through the grid, the way a spot reclaim does."""
 
@@ -2247,7 +2307,136 @@ class TestGenerateResume:
 
     def _patch(self, monkeypatch: pytest.MonkeyPatch, completions_for: Any) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", completions_for)
+        monkeypatch.setattr(
+            interp_steering, "iter_decoded_chunks", _legacy_decode_as_chunks(completions_for)
+        )
+
+    def _patch_streaming_vllm(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        backend: _FakeVLLMBackend,
+    ) -> None:
+        monkeypatch.setattr(
+            interp_steering,
+            "_build_vllm_generation_backend",
+            lambda *_args, **_kwargs: (backend, None, 24, HIDDEN),
+        )
+
+        @contextmanager
+        def fake_intervention(_llm: object, _spec: Any) -> Any:
+            yield
+
+        monkeypatch.setattr(interp_steering, "intervention", fake_intervention)
+
+    @staticmethod
+    def _item_keys(records_path: Path) -> set[tuple[str, str, str, int]]:
+        return {
+            (
+                str(record["condition_key"]),
+                str(record["prompt_id"]),
+                str(record["label_print_order"]),
+                int(record["sample_index"]),
+            )
+            for record in (json.loads(line) for line in records_path.read_text().splitlines())
+        }
+
+    def test_a_chunked_kill_keeps_finished_items_and_only_decodes_missing_items(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        reference_backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        self._patch_streaming_vllm(monkeypatch, reference_backend)
+        reference_args = generate_args(
+            tmp_path,
+            directions_path,
+            backend="vllm",
+            conditions="none",
+            out_dir=tmp_path / "reference",
+            batch_size=8,
+        )
+        run_generate(reference_args)
+        reference_path = reference_args.out_dir / "steering_records.jsonl"
+        reference_keys = self._item_keys(reference_path)
+        reference_seeds = {
+            prompt: seed
+            for prompts, seeds in reference_backend.request_seed_calls
+            for prompt, seed in zip(prompts, seeds or (), strict=True)
+        }
+
+        interrupted_backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        interrupted_backend.fail_after_calls = 2
+        self._patch_streaming_vllm(monkeypatch, interrupted_backend)
+        interrupted_args = generate_args(
+            tmp_path,
+            directions_path,
+            backend="vllm",
+            conditions="none",
+            out_dir=tmp_path / "interrupted",
+            batch_size=8,
+        )
+        with pytest.raises(RuntimeError, match="simulated reclaim"):
+            run_generate(interrupted_args)
+        interrupted_path = interrupted_args.out_dir / "steering_records.jsonl"
+        finished_bytes = interrupted_path.read_bytes()
+        assert len(finished_bytes.splitlines()) == 16
+
+        resumed_backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        self._patch_streaming_vllm(monkeypatch, resumed_backend)
+        resumed = run_generate(
+            generate_args(
+                tmp_path,
+                directions_path,
+                backend="vllm",
+                conditions="none",
+                out_dir=tmp_path / "interrupted",
+                batch_size=8,
+            )
+        )
+
+        assert resumed["condition_progress"]["none"] == {
+            "n_records_resumed": 16,
+            "n_records_generated": 16,
+            "n_records_total": 32,
+        }
+        assert interrupted_path.read_bytes().startswith(finished_bytes)
+        assert self._item_keys(interrupted_path) == reference_keys
+        resumed_prompts = [
+            prompt for prompts, _ in resumed_backend.request_seed_calls for prompt in prompts
+        ]
+        assert len(resumed_prompts) == 16
+        assert not set(resumed_prompts) & {
+            prompt for prompts, _ in interrupted_backend.request_seed_calls for prompt in prompts
+        }
+        resumed_seeds = {
+            prompt: seed
+            for prompts, seeds in resumed_backend.request_seed_calls
+            for prompt, seed in zip(prompts, seeds or (), strict=True)
+        }
+        assert {**reference_seeds, **resumed_seeds} == reference_seeds
+
+    def test_an_old_condition_level_ledger_still_resumes_complete_conditions(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        self._patch_streaming_vllm(monkeypatch, backend)
+        args = generate_args(tmp_path, directions_path, backend="vllm", conditions="none")
+        run_generate(args)
+        records_path = args.out_dir / "steering_records.jsonl"
+        original_bytes = records_path.read_bytes()
+        ledger_path = ledger_path_for(records_path)
+        ledger = json.loads(ledger_path.read_text())
+        ledger.pop("completed_records")
+        ledger_path.write_text(json.dumps(ledger) + "\n")
+
+        def refuse_decode(*_args: Any, **_kwargs: Any) -> list[str]:
+            raise AssertionError("a legacy complete condition must not decode")
+
+        backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        self._patch_streaming_vllm(monkeypatch, backend)
+        monkeypatch.setattr(backend, "generate", refuse_decode)
+        resumed = run_generate(args)
+
+        assert resumed["n_records_resumed"] == 32
+        assert records_path.read_bytes() == original_bytes
 
     @staticmethod
     def _records(out_dir: Path) -> bytes:
@@ -2422,7 +2611,11 @@ class TestGenerationIdentityPinsThePrompts:
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(interp_steering, "HFBackend", _FakeBackend)
-        monkeypatch.setattr(interp_steering, "decode_in_chunks", _neutral_completions)
+        monkeypatch.setattr(
+            interp_steering,
+            "iter_decoded_chunks",
+            _legacy_decode_as_chunks(_neutral_completions),
+        )
         run_generate(generate_args(tmp_path, directions_path, conditions="none"))
         real_rows = interp_steering.generation_rows
 

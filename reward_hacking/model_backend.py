@@ -38,7 +38,7 @@ import tempfile
 import threading
 import time
 from bisect import bisect_right
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -50,7 +50,6 @@ if TYPE_CHECKING:
         Generator,
         Iterator,
         Mapping,
-        Sequence,
     )
 
     from openai.types.chat import ChatCompletionChunk
@@ -874,6 +873,26 @@ resume over it would make the resume unusable on rented capacity.
 """
 
 
+def _request_seeds_from_generation_kwargs(
+    generation_kwargs: Mapping[str, object] | None,
+) -> Sequence[int] | None:
+    """Validate and extract the optional per-request vLLM seed channel."""
+    if generation_kwargs is None:
+        return None
+    unknown = set(generation_kwargs) - {"request_seeds"}
+    if unknown:
+        raise ValueError(f"unsupported vLLM generation kwargs: {sorted(unknown)}")
+    raw_seeds = generation_kwargs.get("request_seeds")
+    if raw_seeds is None:
+        return None
+    if isinstance(raw_seeds, (str, bytes)) or not isinstance(raw_seeds, Sequence):
+        raise TypeError("request_seeds must be a sequence of integers")
+    seeds = tuple(int(seed) for seed in raw_seeds)
+    if any(seed < 0 for seed in seeds):
+        raise ValueError("request_seeds must be non-negative")
+    return seeds
+
+
 class VLLMBackend:
     """Persistent vLLM engine kept warm across episodes: the throughput path for real rollouts.
 
@@ -1125,7 +1144,28 @@ class VLLMBackend:
         applied["do_sample"] = self._sampling_params.sampling_type != self._greedy_sampling_type
         return applied
 
-    def generate_tokenized(self, prompts: list[str]) -> list[TokenizedCompletion]:
+    def _sampling_params_for_requests(
+        self, request_seeds: Sequence[int] | None, n_prompts: int
+    ) -> object:
+        """Clone sampling parameters per request when item-stable seeds are supplied."""
+        if request_seeds is None:
+            return self._sampling_params
+        if len(request_seeds) != n_prompts:
+            raise ValueError(
+                "request_seeds must contain one seed per prompt: "
+                f"{len(request_seeds)} seeds for {n_prompts} prompts"
+            )
+        params = []
+        for seed in request_seeds:
+            request_params = self._sampling_params.clone()
+            request_params.seed = int(seed)
+            request_params.__dict__.pop("sampling_type", None)
+            params.append(request_params)
+        return params
+
+    def generate_tokenized(
+        self, prompts: list[str], *, request_seeds: Sequence[int] | None = None
+    ) -> list[TokenizedCompletion]:
         """Generate one completion per prompt, keeping the exact ids the engine read and wrote.
 
         The engine-facing call, which :meth:`generate_detailed` then narrows to text and counts.
@@ -1149,7 +1189,11 @@ class VLLMBackend:
         string comparison per reply and turns the ordering from an assumption into a check.
         """
         chats = [_as_single_user_turn(self._tokenizer, p, thinking=self.thinking) for p in prompts]
-        outputs = self._llm.generate(chats, self._sampling_params, lora_request=self._lora_request)
+        outputs = self._llm.generate(
+            chats,
+            self._sampling_params_for_requests(request_seeds, len(prompts)),
+            lora_request=self._lora_request,
+        )
         tokenized: list[TokenizedCompletion] = []
         for chat, output in zip(chats, outputs, strict=True):
             if output.prompt != chat:
@@ -1288,18 +1332,35 @@ class VLLMBackend:
             if outstanding:
                 engine.abort_request(list(outstanding))
 
-    def generate_detailed(self, prompts: list[str]) -> list[BedrockCompletion]:
+    def generate_detailed(
+        self,
+        prompts: list[str],
+        *,
+        generation_kwargs: Mapping[str, object] | None = None,
+    ) -> list[BedrockCompletion]:
         """Generate one completion per prompt, carrying vLLM's own finish reason and token counts.
 
         Delegates rather than driving the engine a second way, so a caller reading only ``Backend``
         cannot receive a different completion than the tokenized record carries -- the same reason
         :meth:`generate` delegates here.
         """
-        return [record.completion for record in self.generate_tokenized(prompts)]
+        request_seeds = _request_seeds_from_generation_kwargs(generation_kwargs)
+        return [
+            record.completion
+            for record in self.generate_tokenized(prompts, request_seeds=request_seeds)
+        ]
 
-    def generate(self, prompts: list[str]) -> list[str]:
+    def generate(
+        self,
+        prompts: list[str],
+        *,
+        generation_kwargs: Mapping[str, object] | None = None,
+    ) -> list[str]:
         """Generate one completion for each prompt through the persistent engine."""
-        return [completion.text for completion in self.generate_detailed(prompts)]
+        return [
+            completion.text
+            for completion in self.generate_detailed(prompts, generation_kwargs=generation_kwargs)
+        ]
 
 
 DEFAULT_BEDROCK_REGION = "us-west-2"

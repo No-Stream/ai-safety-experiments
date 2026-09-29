@@ -115,6 +115,7 @@ class ResumeLedger:
     path: Path
     identity: dict[str, Any]
     completed: dict[str, int] = field(default_factory=dict)
+    completed_records: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> ResumeLedger:
@@ -127,14 +128,21 @@ class ResumeLedger:
         ):
             raise ResumeMismatchError(f"{path} is not a resume ledger (keys {sorted(payload)!r}).")
         completed = {str(unit): int(count) for unit, count in payload["completed_units"].items()}
-        return cls(path, payload["identity"], completed)
+        raw_records = payload.get("completed_records", {})
+        if not isinstance(raw_records, dict):
+            raise ResumeMismatchError(f"{path} has a non-object completed_records field")
+        completed_records = {str(record): int(count) for record, count in raw_records.items()}
+        return cls(path, payload["identity"], completed, completed_records)
 
     def write(self) -> None:
         """Persist atomically, so a death mid-write leaves the old ledger or the new one."""
+        payload: dict[str, Any] = {"identity": self.identity, "completed_units": self.completed}
+        if self.completed_records:
+            payload["completed_records"] = self.completed_records
         _atomic_write_text(
             self.path,
             json.dumps(
-                {"identity": self.identity, "completed_units": self.completed},
+                payload,
                 indent=2,
                 sort_keys=True,
             )
@@ -144,6 +152,11 @@ class ResumeLedger:
     def mark_complete(self, unit: str, n_records: int) -> None:
         """Record that ``unit``'s ``n_records`` records are flushed; call AFTER the flush."""
         self.completed[unit] = n_records
+        self.write()
+
+    def mark_record_complete(self, record: str) -> None:
+        """Record one flushed item so a partially completed unit can resume by key."""
+        self.completed_records[record] = 1
         self.write()
 
 
@@ -191,11 +204,12 @@ def _reconcile_counts(
     return ledger_ahead
 
 
-def resume_records(
+def resume_records(  # noqa: C901 - reconcile legacy units and keyed records in one contract
     records_path: Path,
     *,
     identity: Mapping[str, Any],
     unit_of: Callable[[Mapping[str, Any]], str],
+    record_key_of: Callable[[Mapping[str, Any]], str] | None = None,
 ) -> tuple[ResumeState, ResumeLedger]:
     """Prepare ``records_path`` for appending: keep complete units, drop partial ones, refuse strangers.
 
@@ -233,10 +247,11 @@ def resume_records(
             + ". Use a fresh --out-dir, or delete the old records and ledger deliberately."
         )
     if not records_exist:
-        if ledger.completed:
+        if ledger.completed or ledger.completed_records:
             raise ResumeMismatchError(
-                f"{ledger_path} names {len(ledger.completed)} completed units but {records_path} is "
-                f"missing; the records were deleted out from under their ledger."
+                f"{ledger_path} names {len(ledger.completed)} completed units and "
+                f"{len(ledger.completed_records)} completed records but {records_path} is missing; "
+                "the records were deleted out from under their ledger."
             )
         return ResumeState([], {}, 0, ()), ledger
 
@@ -247,14 +262,61 @@ def resume_records(
         unit = unit_of(record)
         counts[unit] = counts.get(unit, 0) + 1
     ledger_ahead = _reconcile_counts(records_path, ledger, counts)
+
+    record_keys: list[str] = []
+    if record_key_of is not None:
+        record_keys = [record_key_of(record) for record in parsed]
+        duplicate_keys = sorted(key for key in set(record_keys) if record_keys.count(key) > 1)
+        if duplicate_keys:
+            raise ResumeMismatchError(
+                f"{records_path} contains duplicate record identities, so a resume cannot tell "
+                f"which completion is authoritative: {duplicate_keys[:5]}"
+            )
+        on_disk_keys = set(record_keys)
+        missing_keys = sorted(set(ledger.completed_records) - on_disk_keys)
+        if missing_keys:
+            for key in missing_keys:
+                del ledger.completed_records[key]
+            ledger.write()
+
+    def is_complete(record: Mapping[str, Any], record_key: str | None) -> bool:
+        unit = unit_of(record)
+        if unit in ledger.completed:
+            return True
+        return record_key is not None and record_key in ledger.completed_records
+
     kept_lines = [
         line
-        for line, record in zip(lines, parsed, strict=True)
-        if unit_of(record) in ledger.completed
+        for line, record, record_key in zip(
+            lines,
+            parsed,
+            record_keys or [None] * len(parsed),
+            strict=True,
+        )
+        if is_complete(record, record_key)
     ]
-    kept_records = [record for record in parsed if unit_of(record) in ledger.completed]
+    kept_records = [
+        record
+        for record, record_key in zip(
+            parsed,
+            record_keys or [None] * len(parsed),
+            strict=True,
+        )
+        if is_complete(record, record_key)
+    ]
     dropped_units = tuple(
-        sorted({unit for unit in counts if unit not in ledger.completed} | set(ledger_ahead))
+        sorted(
+            {
+                unit_of(record)
+                for record, record_key in zip(
+                    parsed,
+                    record_keys or [None] * len(parsed),
+                    strict=True,
+                )
+                if not is_complete(record, record_key)
+            }
+            | set(ledger_ahead)
+        )
     )
     dropped = len(lines) - len(kept_lines)
     if dropped or truncated_tail:

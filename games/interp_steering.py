@@ -66,7 +66,7 @@ from games import workspace_ablation
 from games.argument_prior_map import (
     _assert_vllm_adapter_preflight,  # pyright: ignore[reportPrivateUsage]
 )
-from games.chunked_decode import decode_in_chunks
+from games.chunked_decode import iter_decoded_chunks
 from games.deltanet_kernels import (
     DELTANET_KERNEL_FIELD,
     assert_one_deltanet_kernel,
@@ -1728,6 +1728,40 @@ def condition_key(condition: GenerationCondition) -> str:
     return f"{condition.direction}:L{condition.layer}{multiplier}:{condition.condition}"
 
 
+def generation_record_key(record: Mapping[str, Any]) -> str:
+    """Return the stable identity of one generated item, without embedding prompt text."""
+    return json.dumps(
+        [
+            str(record["condition_key"]),
+            str(record["prompt_id"]),
+            str(record["label_print_order"]),
+            int(record["sample_index"]),
+        ],
+        separators=(",", ":"),
+    )
+
+
+def generation_item_seed(
+    base_seed: int,
+    condition: str,
+    prompt_id: str,
+    label_print_order: str,
+    sample_index: int,
+) -> int:
+    """Derive a vLLM request seed from item identity rather than decode order.
+
+    The digest makes resumed sampling statistically equivalent to the former per-condition seed,
+    while the changed batching and sampler implementation mean it is not bit-identical to an old
+    condition-seeded run. HuggingFace keeps condition-level seeding because ``generate`` accepts one
+    RNG stream per batched call; vLLM receives this seed separately on every request.
+    """
+    payload = json.dumps(
+        [base_seed, condition, prompt_id, label_print_order, sample_index],
+        separators=(",", ":"),
+    ).encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31 - 1)
+
+
 def parse_requested_conditions(
     raw: str | None, conditions: Sequence[GenerationCondition]
 ) -> set[int] | None:
@@ -2199,10 +2233,11 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     """Generate the steering grid on held-out eval prompts and write records plus a summary.
 
     Resumes automatically: a records file already in ``--out-dir`` is read through its resume
-    ledger, every complete condition is carried forward and skipped, and a partial one (a reclaim
-    mid-condition) is dropped and regenerated. Each condition reseeds from its own index, so the
-    regenerated records are the ones an uninterrupted run would have written; the summary counts
-    ``resumed_conditions`` apart from ``skipped_conditions`` so what actually ran stays visible.
+    ledger, every complete condition is carried forward and skipped, and vLLM partial conditions
+    keep their flushed records and decode only missing item identities. HF keeps its old
+    condition-level fallback because transformers exposes one RNG stream per batched call, so its
+    partial records are dropped and regenerated from the condition seed. The summary reports both
+    resumed and newly generated records for every condition.
     """
     requested_framings = args.framings or []
     unknown_framings = sorted(set(requested_framings) - set(COUNTERPART_FRAMING_IDS))
@@ -2328,9 +2363,12 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
 
     sampler_payload = resolved_sampler_for(sampling, engine=args.backend).as_payload()
     if args.backend == "vllm":
+        # Preserve this historical identity value so old whole-condition sidecars remain resumable;
+        # the summary records the item-identity request-seed semantics separately.
         cast("dict[str, object]", sampler_payload["applied"])["seed"] = "seed + condition_index"
     skipped_conditions: list[dict[str, Any]] = []
     resumed_conditions: list[dict[str, Any]] = []
+    condition_progress: dict[str, dict[str, int]] = {}
     condition_seconds: dict[str, float] = {}
     args.out_dir.mkdir(parents=True, exist_ok=True)
     records_path = args.out_dir / GENERATION_RECORDS_FILENAME
@@ -2353,21 +2391,79 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             banned_tokens_sha256=banned_tokens_digest,
         ),
         unit_of=lambda record: str(record["condition_key"]),
+        record_key_of=generation_record_key if args.backend == "vllm" else None,
     )
     records: list[dict[str, Any]] = list(resume_state.kept_records)
+    records_by_key = {generation_record_key(record): record for record in records}
 
     with records_path.open("a", encoding="utf-8") as records_file:
         for index, condition in enumerate(conditions):
             key = condition_key(condition)
+            condition_item_indices = [
+                item_index
+                for item_index, row in enumerate(row_for_prompt)
+                if generation_record_key(
+                    {
+                        "condition_key": key,
+                        "prompt_id": row["prompt_id"],
+                        "label_print_order": row["label_print_order"],
+                        "sample_index": sample_indices[item_index],
+                    }
+                )
+                in records_by_key
+            ]
+            resumed_count = len(condition_item_indices)
             if key in resume_state.complete_units:
                 n_banked = resume_state.complete_units[key]
-                resumed_conditions.append({"condition_key": key, "n_records": n_banked})
+                resumed_conditions.append(
+                    {
+                        "condition_key": key,
+                        "n_records": n_banked,
+                        "n_records_resumed": n_banked,
+                        "n_records_generated": 0,
+                    }
+                )
+                condition_progress[key] = {
+                    "n_records_resumed": n_banked,
+                    "n_records_generated": 0,
+                    "n_records_total": n_banked,
+                }
                 logger.info(f"resuming condition {key}: {n_banked} records already banked")
                 continue
             reason = _skip_reason(index, requested, deadline)
             if reason is not None:
                 skipped_conditions.append({"condition_key": key, "skipped": reason})
                 logger.warning(f"skipping condition {key}: {reason}")
+                continue
+            pending_indices = [
+                item_index
+                for item_index, row in enumerate(row_for_prompt)
+                if item_index not in condition_item_indices
+                and generation_record_key(
+                    {
+                        "condition_key": key,
+                        "prompt_id": row["prompt_id"],
+                        "label_print_order": row["label_print_order"],
+                        "sample_index": sample_indices[item_index],
+                    }
+                )
+                not in records_by_key
+            ]
+            if not pending_indices:
+                ledger.mark_complete(key, resumed_count)
+                resumed_conditions.append(
+                    {
+                        "condition_key": key,
+                        "n_records": resumed_count,
+                        "n_records_resumed": resumed_count,
+                        "n_records_generated": 0,
+                    }
+                )
+                condition_progress[key] = {
+                    "n_records_resumed": resumed_count,
+                    "n_records_generated": 0,
+                    "n_records_total": resumed_count,
+                }
                 continue
             seed = args.seed + index
             condition_started = time.monotonic()
@@ -2401,107 +2497,172 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             )
             if condition_generation_kwargs is not None:
                 backend.clear_generation_audit()
+            pending_prompts = [prompts[item_index] for item_index in pending_indices]
+            request_seeds = (
+                [
+                    generation_item_seed(
+                        args.seed,
+                        key,
+                        str(row_for_prompt[item_index]["prompt_id"]),
+                        str(row_for_prompt[item_index]["label_print_order"]),
+                        sample_indices[item_index],
+                    )
+                    for item_index in pending_indices
+                ]
+                if args.backend == "vllm"
+                else None
+            )
+            generation_kwargs: dict[str, object] = dict(condition_generation_kwargs or {})
+            if request_seeds is not None:
+                generation_kwargs["request_seeds"] = request_seeds
+            generation_kwargs_for_decode = generation_kwargs or None
+            banned_audit_cursor = 0
+            generated_count = 0
             with context:
-                if condition_generation_kwargs is None:
-                    completions = decode_in_chunks(backend, prompts, chunk_size=args.batch_size)
-                else:
-                    completions = decode_in_chunks(
-                        backend,
-                        prompts,
-                        chunk_size=args.batch_size,
-                        generation_kwargs=condition_generation_kwargs,
-                    )
-            banned_token_counts = [0] * len(completions)
-            if condition_generation_kwargs is not None:
-                banned_token_counts = list(backend.last_banned_token_counts)
-                if len(banned_token_counts) != len(completions):
-                    raise RuntimeError(
-                        "token-ban generation did not return one token audit count per completion: "
-                        f"{len(banned_token_counts)} counts for {len(completions)} completions"
-                    )
-                if any(banned_token_counts):
-                    raise AssertionError(
-                        "token-ban generation emitted a banned token despite its logits processor"
-                    )
-            for completion_index, (row, sample_index, completion) in enumerate(
-                zip(row_for_prompt, sample_indices, completions, strict=True)
-            ):
-                visible, truncated = strip_thinking(completion, prefilled_think=True)
-                action = parse_action(
-                    visible,
-                    label_a=str(row["label_a"]),
-                    label_b=str(row["label_b"]),
-                    coop_label=str(row["coop_label"]),
+                for completions in iter_decoded_chunks(
+                    backend,
+                    pending_prompts,
+                    chunk_size=args.batch_size,
+                    generation_kwargs=generation_kwargs_for_decode,
+                    request_seeds=request_seeds,
+                ):
+                    chunk_indices = pending_indices[
+                        generated_count : generated_count + len(completions)
+                    ]
+                    if len(chunk_indices) != len(completions):
+                        raise RuntimeError(
+                            "chunked generation returned more completions than pending prompts"
+                        )
+                    banned_token_counts = [0] * len(completions)
+                    if condition_generation_kwargs is not None:
+                        current_counts = list(backend.last_banned_token_counts)
+                        expected_end = banned_audit_cursor + len(completions)
+                        if len(current_counts) >= expected_end:
+                            banned_token_counts = current_counts[banned_audit_cursor:expected_end]
+                            banned_audit_cursor = expected_end
+                        elif len(current_counts) == len(completions):
+                            banned_token_counts = current_counts
+                            banned_audit_cursor = len(current_counts)
+                        else:
+                            raise RuntimeError(
+                                "token-ban generation did not return one token audit count per "
+                                f"completion chunk: {len(current_counts)} counts for "
+                                f"{len(completions)} completions"
+                            )
+                        if any(banned_token_counts):
+                            raise AssertionError(
+                                "token-ban generation emitted a banned token despite its logits "
+                                "processor"
+                            )
+                    for completion_index, (item_index, completion) in enumerate(
+                        zip(chunk_indices, completions, strict=True)
+                    ):
+                        row = row_for_prompt[item_index]
+                        sample_index = sample_indices[item_index]
+                        visible, truncated = strip_thinking(completion, prefilled_think=True)
+                        action = parse_action(
+                            visible,
+                            label_a=str(row["label_a"]),
+                            label_b=str(row["label_b"]),
+                            coop_label=str(row["coop_label"]),
+                        )
+                        allocation_outcome = selected_allocation_outcome(row, action)
+                        reward_outcome = reward_optimal_outcome(row)
+                        parsed_label = parsed_action_label(row, action)
+                        first_label = (
+                            str(row["label_a"])
+                            if row["label_print_order"] == "canonical"
+                            else str(row["label_b"])
+                        )
+                        record: dict[str, Any] = {
+                            "condition_key": key,
+                            "backend": args.backend,
+                            DELTANET_KERNEL_FIELD: deltanet_kernel,
+                            "condition": condition.condition,
+                            "direction": condition.direction,
+                            "layer": condition.layer,
+                            "alpha_multiplier": condition.alpha_multiplier,
+                            "alpha_raw": alpha_raw,
+                            "seed": seed,
+                            "placebo_seed": placebo_seed,
+                            "adapter": adapter,
+                            "counterpart_framing": row.get("framing_id", args.counterpart_framing),
+                            "prompt_id": row["prompt_id"],
+                            "diagnostic_family": row.get("diagnostic_family"),
+                            "row_kind": row.get("row_kind", CUSTOM_ROW_KIND_MATRIX),
+                            "game_id": row["game_id"],
+                            "grading": row["grading"],
+                            "payoff_cc": row["payoff_cc"],
+                            "payoff_cd": row["payoff_cd"],
+                            "payoff_dc": row["payoff_dc"],
+                            "payoff_dd": row["payoff_dd"],
+                            "reskin_id": row["reskin_id"],
+                            "payoff_variant": row["payoff_variant"],
+                            "label_print_order": row["label_print_order"],
+                            "coop_label": row["coop_label"],
+                            "sample_index": sample_index,
+                            "response_text": completion,
+                            "parsed_action": action,
+                            "first_position_choice": (
+                                None if parsed_label is None else parsed_label == first_label
+                            ),
+                            "cooperate": None if action is None else action == COOPERATE,
+                            "truncated_thinking": truncated,
+                            **reward_outcome,
+                            "reward_optimal_match": (
+                                None
+                                if parsed_label is None or reward_outcome["reward_optimal"] is None
+                                else parsed_label == reward_outcome["reward_optimal"]
+                            ),
+                            "own_payoff_optimal_match": (
+                                None
+                                if parsed_label is None
+                                or reward_outcome["own_payoff_optimal"] is None
+                                else parsed_label == reward_outcome["own_payoff_optimal"]
+                            ),
+                            "total_welfare_optimal_match": (
+                                None
+                                if parsed_label is None
+                                or reward_outcome["total_welfare_optimal"] is None
+                                else parsed_label == reward_outcome["total_welfare_optimal"]
+                            ),
+                            **allocation_outcome,
+                        }
+                        if condition_generation_kwargs is not None:
+                            record["banned_tokens_sha256"] = cast("str", banned_tokens_digest)
+                            record["banned_token_count"] = banned_token_counts[completion_index]
+                        records.append(record)
+                        records_by_key[generation_record_key(record)] = record
+                        records_file.write(json.dumps(record) + "\n")
+                        records_file.flush()
+                        if args.backend == "vllm":
+                            ledger.mark_record_complete(generation_record_key(record))
+                        generated_count += 1
+            total_count = resumed_count + generated_count
+            if total_count != len(prompts):
+                raise RuntimeError(
+                    f"condition {key} produced {total_count} records for {len(prompts)} items"
                 )
-                allocation_outcome = selected_allocation_outcome(row, action)
-                reward_outcome = reward_optimal_outcome(row)
-                parsed_label = parsed_action_label(row, action)
-                first_label = (
-                    str(row["label_a"])
-                    if row["label_print_order"] == "canonical"
-                    else str(row["label_b"])
+            ledger.mark_complete(key, total_count)
+            if resumed_count:
+                resumed_conditions.append(
+                    {
+                        "condition_key": key,
+                        "n_records": resumed_count,
+                        "n_records_resumed": resumed_count,
+                        "n_records_generated": generated_count,
+                    }
                 )
-                record: dict[str, Any] = {
-                    "condition_key": key,
-                    "backend": args.backend,
-                    DELTANET_KERNEL_FIELD: deltanet_kernel,
-                    "condition": condition.condition,
-                    "direction": condition.direction,
-                    "layer": condition.layer,
-                    "alpha_multiplier": condition.alpha_multiplier,
-                    "alpha_raw": alpha_raw,
-                    "seed": seed,
-                    "placebo_seed": placebo_seed,
-                    "adapter": adapter,
-                    "counterpart_framing": row.get("framing_id", args.counterpart_framing),
-                    "prompt_id": row["prompt_id"],
-                    "diagnostic_family": row.get("diagnostic_family"),
-                    "row_kind": row.get("row_kind", CUSTOM_ROW_KIND_MATRIX),
-                    "game_id": row["game_id"],
-                    "grading": row["grading"],
-                    "payoff_cc": row["payoff_cc"],
-                    "payoff_cd": row["payoff_cd"],
-                    "payoff_dc": row["payoff_dc"],
-                    "payoff_dd": row["payoff_dd"],
-                    "reskin_id": row["reskin_id"],
-                    "payoff_variant": row["payoff_variant"],
-                    "label_print_order": row["label_print_order"],
-                    "coop_label": row["coop_label"],
-                    "sample_index": sample_index,
-                    "response_text": completion,
-                    "parsed_action": action,
-                    "first_position_choice": (
-                        None if parsed_label is None else parsed_label == first_label
-                    ),
-                    "cooperate": None if action is None else action == COOPERATE,
-                    "truncated_thinking": truncated,
-                    **reward_outcome,
-                    "reward_optimal_match": (
-                        None
-                        if parsed_label is None or reward_outcome["reward_optimal"] is None
-                        else parsed_label == reward_outcome["reward_optimal"]
-                    ),
-                    "own_payoff_optimal_match": (
-                        None
-                        if parsed_label is None or reward_outcome["own_payoff_optimal"] is None
-                        else parsed_label == reward_outcome["own_payoff_optimal"]
-                    ),
-                    "total_welfare_optimal_match": (
-                        None
-                        if parsed_label is None or reward_outcome["total_welfare_optimal"] is None
-                        else parsed_label == reward_outcome["total_welfare_optimal"]
-                    ),
-                    **allocation_outcome,
-                }
-                if condition_generation_kwargs is not None:
-                    record["banned_tokens_sha256"] = cast("str", banned_tokens_digest)
-                    record["banned_token_count"] = banned_token_counts[completion_index]
-                records.append(record)
-                records_file.write(json.dumps(record) + "\n")
-            records_file.flush()
-            ledger.mark_complete(key, len(completions))
+            condition_progress[key] = {
+                "n_records_resumed": resumed_count,
+                "n_records_generated": generated_count,
+                "n_records_total": total_count,
+            }
             condition_seconds[key] = time.monotonic() - condition_started
-            logger.info(f"generation condition done: {key} ({len(completions)} completions)")
+            logger.info(
+                f"generation condition done: {key} ({generated_count} generated, "
+                f"{resumed_count} resumed)"
+            )
 
     summary: dict[str, Any] = {
         "command": "generate",
@@ -2537,6 +2698,8 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
         "conditions": summarise_records(records),
         "skipped_conditions": skipped_conditions,
         "resumed_conditions": resumed_conditions,
+        "condition_progress": condition_progress,
+        "generation_seed_semantics": ("vllm:item_identity_hash; hf:condition_seed_batched_resume"),
         "n_records_resumed": resume_state.n_kept,
         "n_records_dropped_partial": resume_state.dropped_records,
         "elapsed_seconds": time.monotonic() - started_monotonic,

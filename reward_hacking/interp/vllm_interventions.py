@@ -269,16 +269,18 @@ class InterventionVLLMBackend(VLLMBackend):
         """Return one exact banned-token count per completion since reset."""
         return tuple(self._last_banned_token_counts)
 
-    def generate(
+    def generate(  # noqa: C901 - token mask and per-request seed validation share one seam
         self, prompts: list[str], *, generation_kwargs: Mapping[str, object] | None = None
     ) -> list[str]:
         """Generate with optional exact token masking and audit the resulting IDs."""
         if generation_kwargs is None:
             return super().generate(prompts)
-        unknown = set(generation_kwargs) - {"banned_token_ids"}
+        unknown = set(generation_kwargs) - {"banned_token_ids", "request_seeds"}
         if unknown:
             raise ValueError(f"unsupported vLLM generation kwargs: {sorted(unknown)}")
         banned = generation_kwargs.get("banned_token_ids")
+        if banned is None:
+            return super().generate(prompts, generation_kwargs=generation_kwargs)
         if not isinstance(banned, (tuple, list)) or not banned:
             raise ValueError("vLLM token ban requires nonempty banned_token_ids")
         banned_ids = frozenset(int(token_id) for token_id in banned)
@@ -297,7 +299,15 @@ class InterventionVLLMBackend(VLLMBackend):
         masked_params.allowed_token_ids = allowed
         self._sampling_params = masked_params
         try:
-            outputs = self.generate_tokenized(prompts)
+            request_seeds = generation_kwargs.get("request_seeds")
+            if request_seeds is not None and not isinstance(request_seeds, (tuple, list)):
+                raise TypeError("request_seeds must be a sequence of integers")
+            if request_seeds is None:
+                outputs = self.generate_tokenized(prompts)
+            else:
+                outputs = self.generate_tokenized(
+                    prompts, request_seeds=tuple(int(seed) for seed in request_seeds)
+                )
         finally:
             self._sampling_params = original_params
         for output in outputs:

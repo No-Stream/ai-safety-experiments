@@ -530,13 +530,14 @@ def _is_accelerator_oom(error: torch.AcceleratorError) -> bool:
     return "out of memory" in message.lower() and "cudaErrorMemoryAllocation" in message
 
 
-def iter_decoded_chunks(
+def iter_decoded_chunks(  # noqa: PLR0913 - streaming keeps the existing decode controls explicit
     backend: Backend,
     prompts: Sequence[str],
     *,
     chunk_size: int,
     probe: AllocatorProbe = LIVE_ALLOCATOR_PROBE,
     generation_kwargs: Mapping[str, object] | None = None,
+    request_seeds: Sequence[int] | None = None,
 ) -> Generator[list[str]]:
     """Yield each chunk's completions as it returns, narrowing the width when one goes badly.
 
@@ -548,6 +549,11 @@ def iter_decoded_chunks(
     A chunk is yielded only once it is in hand, so a caller that persists what it is handed persists
     finished work only, and a raise from a later chunk leaves the earlier ones written.
     """
+    if request_seeds is not None and len(request_seeds) != len(prompts):
+        raise ValueError(
+            "request_seeds must contain one seed per prompt: "
+            f"{len(request_seeds)} seeds for {len(prompts)} prompts"
+        )
     decoded = 0
     width = chunk_size
     while decoded < len(prompts):
@@ -557,6 +563,7 @@ def iter_decoded_chunks(
             width=width,
             probe=probe,
             generation_kwargs=generation_kwargs,
+            request_seeds=None if request_seeds is None else request_seeds[decoded:],
         )
         if not batch:
             raise RuntimeError(
@@ -572,13 +579,14 @@ def iter_decoded_chunks(
         yield batch
 
 
-def decode_in_chunks(
+def decode_in_chunks(  # noqa: PLR0913 - compatibility wrapper mirrors iter_decoded_chunks
     backend: Backend,
     prompts: Sequence[str],
     *,
     chunk_size: int,
     probe: AllocatorProbe = LIVE_ALLOCATOR_PROBE,
     generation_kwargs: Mapping[str, object] | None = None,
+    request_seeds: Sequence[int] | None = None,
 ) -> list[str]:
     """Decode the flattened prompt list chunk by chunk, narrowing the width when one goes badly.
 
@@ -602,18 +610,20 @@ def decode_in_chunks(
         chunk_size=chunk_size,
         probe=probe,
         generation_kwargs=generation_kwargs,
+        request_seeds=request_seeds,
     ):
         completions.extend(batch)
     return completions
 
 
-def _decode_chunk_that_fits(
+def _decode_chunk_that_fits(  # noqa: PLR0913 - retry state is explicit at this seam
     backend: Backend,
     remaining: Sequence[str],
     *,
     width: int,
     probe: AllocatorProbe,
     generation_kwargs: Mapping[str, object] | None,
+    request_seeds: Sequence[int] | None,
 ) -> tuple[list[str], int]:
     """Decode up to `width` of the remaining prompts, narrowing until the card decodes them well.
 
@@ -638,6 +648,7 @@ def _decode_chunk_that_fits(
         width=width,
         probe=probe,
         generation_kwargs=generation_kwargs,
+        request_seeds=request_seeds,
     )
     if attempt.completions is None:
         torch.cuda.empty_cache()
@@ -647,6 +658,7 @@ def _decode_chunk_that_fits(
             width=width // 2,
             probe=probe,
             generation_kwargs=generation_kwargs,
+            request_seeds=request_seeds,
         )
     if not attempt.thrashing or width == 1:
         return attempt.completions, width
@@ -654,13 +666,14 @@ def _decode_chunk_that_fits(
     return attempt.completions, width // 2
 
 
-def _decode_one_chunk(
+def _decode_one_chunk(  # noqa: C901, PLR0913 - failure recovery and request metadata stay here
     backend: Backend,
     remaining: Sequence[str],
     *,
     width: int,
     probe: AllocatorProbe,
     generation_kwargs: Mapping[str, object] | None,
+    request_seeds: Sequence[int] | None,
 ) -> ChunkAttempt:
     """Decode one chunk, reporting a refusal or a thrash rather than acting on either.
 
@@ -682,11 +695,16 @@ def _decode_one_chunk(
     retries_before = probe.read_retries()
     started = probe.clock()
     try:
-        if generation_kwargs is None:
+        chunk_generation_kwargs = None
+        if generation_kwargs is not None or request_seeds is not None:
+            chunk_generation_kwargs = dict(generation_kwargs or {})
+            if request_seeds is not None:
+                chunk_generation_kwargs["request_seeds"] = tuple(request_seeds[:width])
+        if chunk_generation_kwargs is None:
             completions = backend.generate(list(remaining[:width]))
         else:
             completions = cast("_GenerationKwargsBackend", backend).generate(
-                list(remaining[:width]), generation_kwargs=generation_kwargs
+                list(remaining[:width]), generation_kwargs=chunk_generation_kwargs
             )
     except torch.OutOfMemoryError as oom:
         if width == 1:
