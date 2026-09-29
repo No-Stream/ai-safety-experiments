@@ -1293,6 +1293,110 @@ def figure_curriculum_trajectory() -> None:
     save(fig, "rl_curriculum_trajectory")
 
 
+# --------------------------------------------------------------------------------------
+# Figure 9: what the curriculum model says when it cooperates with a partner that is not a copy
+# --------------------------------------------------------------------------------------
+
+# Primary justification per cooperating trace, final curriculum checkpoint, judged against a written
+# codebook (docs/scratch/jlens-workspace-2026-09-26/confabulation-dig-2026-09-28.md). "Identical to
+# me" pools invented identity, asserted mirroring and misattributing identity to the prompt; "other"
+# pools other invented facts, payoff misreads and the one hedged, honest trace.
+JUSTIFICATION_COUNTS: dict[str, dict[str, int]] = {
+    "Another AI": {"identical": 33, "test": 11, "story": 2, "other": 1},
+    "Another AI,\nno shared briefing": {"identical": 0, "test": 17, "story": 1, "other": 2},
+    "Human": {"identical": 4, "test": 11, "story": 3, "other": 0},
+    "Human,\nno shared briefing": {"identical": 0, "test": 3, "story": 6, "other": 0},
+}
+IDENTITY_PREMISE = LINKED_ARGUMENT
+TEST_PREMISE = "#eda100"
+STORY_PREMISE = "#e87ba4"
+OTHER_PREMISE = NO_ARGUMENT
+JUSTIFICATION_STYLE: dict[str, tuple[str, str]] = {
+    "identical": (IDENTITY_PREMISE, "My partner is identical to me"),
+    "test": (TEST_PREMISE, "This is a test and the right answer is cooperate"),
+    "story": (STORY_PREMISE, "The points don't matter; the real goal is in the story"),
+    "other": (OTHER_PREMISE, "Other"),
+}
+
+# Traces anywhere mentioning a correct, expected or graded answer, or an alignment test (full-n regex).
+TEST_TALK: dict[str, tuple[int, int]] = {
+    "Untrained,\nall non-copy traces": (45, 311),
+    "Curriculum,\nnon-copy defections": (81, 157),
+    "Curriculum,\nnon-copy cooperations": (84, 94),
+}
+MIN_COUNT_LABEL = 2
+
+
+def wilson_interval(successes: int, total: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval for a binomial proportion."""
+    rate = successes / total
+    denominator = 1 + z**2 / total
+    centre = (rate + z**2 / (2 * total)) / denominator
+    half_width = z * np.sqrt(rate * (1 - rate) / total + z**2 / (4 * total**2)) / denominator
+    return centre - half_width, centre + half_width
+
+
+def figure_confabulation() -> None:
+    """Stacked bars of the main stated reason for cooperating, plus the rise of 'this is a test' talk."""
+    fig, (reason_ax, test_ax) = plt.subplots(
+        1, 2, figsize=(11, 5.2), gridspec_kw={"width_ratios": [1.75, 1], "wspace": 0.55}
+    )
+    fig.subplots_adjust(left=0.15, right=0.95, top=0.68, bottom=0.2)
+    title_block(
+        fig,
+        "Cooperating with a partner that isn't a copy, the model makes up its reasons",
+        "Left: the main reason each cooperating trace gives. Right: how often a trace mentions a test "
+        "or a graded answer",
+        top=0.965,
+    )
+
+    for row_index, counts in enumerate(JUSTIFICATION_COUNTS.values()):
+        total = sum(counts.values())
+        left = 0.0
+        for key, count in counts.items():
+            width = count / total
+            color = JUSTIFICATION_STYLE[key][0]
+            reason_ax.barh(row_index, width, left=left, height=0.62, color=color, edgecolor=SURFACE, linewidth=2)
+            if count >= MIN_COUNT_LABEL:
+                reason_ax.text(
+                    left + width / 2, row_index, str(count), ha="center", va="center", color=INK, fontsize=9.5
+                )
+            left += width
+        reason_ax.text(1.02, row_index, f"n={total}", va="center", fontsize=8.5, color=INK_MUTED)
+    reason_ax.set_yticks(range(len(JUSTIFICATION_COUNTS)))
+    reason_ax.set_yticklabels(list(JUSTIFICATION_COUNTS), fontsize=10, color=INK)
+    reason_ax.set_ylim(len(JUSTIFICATION_COUNTS) - 0.5, -0.5)
+    reason_ax.set_xlim(0, 1)
+    percent_axis(reason_ax, "x")
+    strip_axes(reason_ax, keep=())
+    reason_ax.set_title("Main reason given for cooperating", fontsize=10.5, pad=10)
+
+    for row_index, (label, (hits, total)) in enumerate(TEST_TALK.items()):
+        rate = hits / total
+        low, high = wilson_interval(hits, total)
+        color = UNTRAINED if row_index == 0 else COOPERATION_TRAINED
+        test_ax.barh(row_index, rate, height=0.5, color=tint(color, 0.35 if row_index < 2 else 1.0))
+        test_ax.plot([low, high], [row_index, row_index], color=INK_SECONDARY, linewidth=1.2)
+        test_ax.text(high + 0.03, row_index, f"{rate * 100:.0f}%", va="center", fontsize=9.5, color=INK)
+    test_ax.set_yticks(range(len(TEST_TALK)))
+    test_ax.set_yticklabels(list(TEST_TALK), fontsize=9.5, color=INK)
+    test_ax.set_ylim(len(TEST_TALK) - 0.5, -0.5)
+    test_ax.set_xlim(0, 1)
+    percent_axis(test_ax, "x")
+    strip_axes(test_ax, keep=())
+    test_ax.set_title("Mentions a test or a graded answer", fontsize=10.5, pad=10)
+
+    legend_handles = [Patch(color=color, label=label) for color, label in JUSTIFICATION_STYLE.values()]
+    fig.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.85), ncol=2, fontsize=9)
+    footnote(
+        fig,
+        "Qwen3.5-9B after the partner curriculum, held-out stories. Left: every cooperating trace with a "
+        "non-copy partner, read in full against a written codebook;\n92 of 96 rest on a premise the prompt "
+        "never gave, against 4 of 40 defections. Right: regex over all traces, 95% Wilson intervals.",
+    )
+    save(fig, "rl_confabulation")
+
+
 if __name__ == "__main__":
     figure_training_effect()
     figure_partner_description()
@@ -1302,3 +1406,4 @@ if __name__ == "__main__":
     figure_self_knowledge_reasoning()
     figure_argument_prior_forest()
     figure_curriculum_trajectory()
+    figure_confabulation()
