@@ -340,6 +340,17 @@ expert count (256 per layer here), so size their rank down rather than copying t
 runs: the default `Qwen3_5MoeExperts.forward` loops over experts in Python, and
 `use_experts_implementation` selects the grouped-GEMM alternatives.
 
+**LoRA rank: 16 on dense modules, low rank on routed experts, alpha held at 32** (the owner,
+2026-09-30). RL needs very little adapter capacity (Thinking Machines' "LoRA Without Regret" found
+rank 1 enough for policy-gradient RL), but on a dense model a lower rank saves almost nothing,
+because a rank-16 adapter is a small share of memory and compute. So dense modules stay at rank 16:
+comparable with every banked run and not open to the "you only used rank 4" objection. Low rank
+pays only where adapters are multiplied by the expert count, so MoE routed experts start at rank 1-4
+through PEFT's `rank_pattern`. Keep `lora_alpha` at 32 whatever the rank rather than scaling it
+with `r`: under the standard alpha/r scaling that is the parameterization in which the paper found
+the best learning rate nearly independent of rank, so mixed ranks can share one learning rate. If a
+result ever depends on how much the adapter can learn, one matched rank-16 run settles it.
+
 Interp tooling (sparse autoencoders, a pre-fitted Jacobian lens, a TransformerLens adapter) exists
 and was verified for `Qwen/Qwen3.5-4B` on 2026-08-15 — **not a reason to keep measurement at 4B now
 that 9B is the working size**; re-verify the recipes at 9B before building on them.
