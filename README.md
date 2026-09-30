@@ -3,9 +3,9 @@
 > Benchmark text is not publicly exposed; please contact me if you're interested, and I'm happy to share it.
 
 __writeups__:
+- Studying RL effects on model cooperation, motivations, and self-image: training induced narrow generalizations and confabulation but didn't show up in self-report - https://nostream.substack.com/p/narrow-generalization-of-behavior  
 - JaggedBench: measuring the jagged frontier - https://nostream.substack.com/p/jaggedbench-and-recoverybench-measuring  
 - Studying model cooperation + motivations - https://nostream.substack.com/p/an-experiment-on-ai-cooperation-motivations  
-- Studying RL effects on model cooperation, motivations, and self-image - LINK TODO  
 
 # Transformer Experiments
 
