@@ -64,6 +64,10 @@ notes/
 reward_hacking/harness/data/*
 !reward_hacking/harness/data/README.md
 
+# Hack severity ladder scenario suite and its per-scenario results: benchmark material, so the
+# scenarios, their graders and oracles stay local and only the engine code is tracked.
+reward_hacking/ladder/data/
+
 # Survey instrument item text, read by the eval battery's self-report section. Local-only on
 # purpose, and licensing before size: the stems, anchors and payoff tables were transcribed from
 # copyrighted papers, exactly one of the seven instruments carries a redistribution grant, and this
