@@ -141,32 +141,39 @@ class BeforeAfter:
 # Figure 1: the training effect on the trained game and on the one untrained game that moved
 # --------------------------------------------------------------------------------------
 
-# Canonical 9B battery: 16 prompts x 8 draws on the trained game, 8 x 8 on public goods.
+# Canonical 9B battery: 16 prompts x 8 draws on the trained game, 8 x 8 on public goods
+# (docs/scratch/ninep-ladder-analysis-2026-08-25/ladder-scores.json). The giving game is the
+# triple-dominance allocation survey's total-maximising share, 287-288 answers per cell
+# (docs/scratch/survey-ninep-analysis-2026-08-24/analysis-output.txt).
 TRAINING_EFFECT: dict[str, dict[str, BeforeAfter]] = {
     "Prisoner's dilemma\n(trained)": {
-        "Defection-trained": BeforeAfter(0.358, 0.109),
-        "Cooperation-trained": BeforeAfter(0.397, 0.693),
+        "Anti-cooperation": BeforeAfter(0.358, 0.109),
+        "Pro-cooperation": BeforeAfter(0.397, 0.693),
     },
     "Public goods\n(never trained)": {
-        "Defection-trained": BeforeAfter(0.377, 0.147),
-        "Cooperation-trained": BeforeAfter(0.430, 0.701),
+        "Anti-cooperation": BeforeAfter(0.377, 0.147),
+        "Pro-cooperation": BeforeAfter(0.430, 0.701),
+    },
+    "Giving game\n(never trained),\nshare of generous\nchoices": {
+        "Anti-cooperation": BeforeAfter(0.497, 0.404),
+        "Pro-cooperation": BeforeAfter(0.458, 0.552),
     },
 }
 ARM_COLOR: dict[str, str] = {
-    "Defection-trained": DEFECTION_TRAINED,
-    "Cooperation-trained": COOPERATION_TRAINED,
+    "Anti-cooperation": DEFECTION_TRAINED,
+    "Pro-cooperation": COOPERATION_TRAINED,
 }
 
 
 def figure_training_effect() -> None:
     """Plot before-to-after arrows for both arms on the trained game and on public goods."""
-    fig, ax = plt.subplots(figsize=(9, 5.2))
-    fig.subplots_adjust(left=0.2, right=0.96, top=0.74, bottom=0.2)
+    fig, ax = plt.subplots(figsize=(9, 6.4))
+    fig.subplots_adjust(left=0.2, right=0.96, top=0.79, bottom=0.17)
     title_block(
         fig,
-        "Two grading rules, same prompts, opposite lessons",
+        "Training raised or lowered cooperation depending on the grading rule",
         "Cooperation rate before and after 70 RL steps, partner described as a copy of the model",
-        top=0.965,
+        top=0.97,
     )
 
     row_positions: list[float] = []
@@ -201,9 +208,9 @@ def figure_training_effect() -> None:
                 fontsize=9,
             )
 
-    ax.set_yticks([0.5, 3.5])
+    ax.set_yticks([game_index * 3 + 0.5 for game_index in range(len(TRAINING_EFFECT))])
     ax.set_yticklabels(list(TRAINING_EFFECT), fontsize=10.5, color=INK)
-    ax.set_ylim(4.8, -0.8)
+    ax.set_ylim(3 * len(TRAINING_EFFECT) - 1.2, -0.8)
     ax.set_xlim(0, 0.8)
     percent_axis(ax, "x")
     strip_axes(ax, keep=("bottom",))
@@ -226,13 +233,15 @@ def figure_training_effect() -> None:
         ),
     ]
     fig.legend(
-        handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.84), ncol=3, fontsize=9
+        handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.875), ncol=3, fontsize=9
     )
     footnote(
         fig,
         "Qwen3.5-9B, one run per arm. Prisoner's dilemma: 16 held-out prompts x 8 samples. "
-        "Public goods: 8 prompts x 8 samples.\n"
-        "The two 'before' points differ only by sampling seed; both arms start from the same weights.",
+        "Public goods: 8 prompts x 8 samples,\n"
+        "p \u2248 .03 (anti-cooperation) and .001 (pro-cooperation). "
+        "Giving game: no copy description, n = 288 per cell, p = .03 and .02.\n"
+        "The two 'before' points differ only by sampling seed; both arms were trained from the same weights.",
     )
     save(fig, "rl_training_effect")
 
@@ -244,7 +253,7 @@ def figure_training_effect() -> None:
 
 @dataclass(frozen=True)
 class PartnerRow:
-    """Cooperation by one partner description: untrained, defection-trained, cooperation-trained."""
+    """Cooperation by one partner description: untrained, anti-cooperation, pro-cooperation."""
 
     label: str
     untrained: float
@@ -254,30 +263,79 @@ class PartnerRow:
 
 LABEL_ROW_THRESHOLD = 0.1
 LABEL_ON_LEFT_THRESHOLD = 0.9
+GROUP_GAP = 1.0
 
-# Framing sweep on the trained game (32 prompts x 8 samples, both option orders), plus the
-# stated-matching-history rider (about 250 samples per cell). Untrained = mean of the two step-0 evals.
-PARTNER_ROWS: list[PartnerRow] = [
-    PartnerRow("A human", 0.006, 0.004, 0.016),
-    PartnerRow("A different AI", 0.004, 0.000, 0.004),
-    PartnerRow("Another AI (unspecified)", 0.022, 0.000, 0.031),
-    PartnerRow("No partner description", 0.002, 0.004, 0.004),
-    PartnerRow("Guaranteed to cooperate", 0.000, 0.000, 0.000),
-    PartnerRow("A different AI that matched\nthe model's past choices", 0.475, 0.297, 0.622),
-    PartnerRow("A copy of the model\n(the training framing)", 0.412, 0.074, 0.727),
-    PartnerRow("Guaranteed to copy\nthe model's move", 0.978, 0.977, 0.996),
+
+@dataclass(frozen=True)
+class PartnerGroup:
+    """A block of partner descriptions under one header; ``label_all`` prints every value."""
+
+    header: str
+    rows: list[PartnerRow]
+    label_all: bool
+    shaded: bool
+
+
+# Framing sweep on the trained game (32 prompts x 8 samples, both option orders; untrained = mean of
+# the two step-0 evals), the stated-matching-history rider (about 250 samples per cell, same
+# averaging), and the stage-3b follow-up that splits the copy description into its two claims
+# (128 samples per cell, one untrained eval). Sources: the *.summary.json files under
+# artifacts/games/ninep-transfer-2026-09-23/records/{framing,rider}/ and
+# artifacts/games/followups-2026-09/stage3b/.
+PARTNER_GROUPS: list[PartnerGroup] = [
+    PartnerGroup(
+        "partner decides independently",
+        [
+            PartnerRow("A human", 0.006, 0.004, 0.016),
+            PartnerRow("Another AI (unspecified)", 0.022, 0.000, 0.031),
+            PartnerRow("No partner description", 0.002, 0.004, 0.004),
+            PartnerRow("Guaranteed to cooperate", 0.000, 0.000, 0.000),
+        ],
+        label_all=False,
+        shaded=False,
+    ),
+    PartnerGroup(
+        "the training description and its two claims taken separately",
+        [
+            PartnerRow(
+                "A copy of the model: same weights,\n'deciding the same way you are'\n(the training framing)",
+                0.412,
+                0.074,
+                0.727,
+            ),
+            PartnerRow("Same weights,\ndeciding independently", 0.031, 0.016, 0.070),
+            PartnerRow("A different AI\n'deciding the same way you are'", 0.034, 0.000, 0.063),
+            PartnerRow("A different AI,\ndeciding independently", 0.004, 0.000, 0.004),
+        ],
+        label_all=True,
+        shaded=True,
+    ),
+    PartnerGroup(
+        "partner's choice linked by its record or by rule",
+        [
+            PartnerRow(
+                "A different AI whose past choices\nalways matched its partner's",
+                0.476,
+                0.294,
+                0.621,
+            ),
+            PartnerRow("Guaranteed to copy\nthe model's move", 0.978, 0.977, 0.996),
+        ],
+        label_all=False,
+        shaded=False,
+    ),
 ]
 
 
 def figure_partner_description() -> None:
-    """Plot a dot row per partner description with the three model states."""
-    fig, ax = plt.subplots(figsize=(9.5, 7))
-    fig.subplots_adjust(left=0.3, right=0.96, top=0.8, bottom=0.16)
+    """Plot a dot row per partner description with the three model states, in headed groups."""
+    fig, ax = plt.subplots(figsize=(9.5, 8.6))
+    fig.subplots_adjust(left=0.3, right=0.96, top=0.855, bottom=0.135)
     title_block(
         fig,
-        "Training moved only the case where the choices might be linked",
+        "Training changed cooperation only where the partner's choice might be linked",
         "Prisoner's dilemma cooperation rate by how the other player was described",
-        top=0.965,
+        top=0.985,
     )
 
     offsets = {"untrained": -0.22, "defection_trained": 0.0, "cooperation_trained": 0.22}
@@ -286,56 +344,68 @@ def figure_partner_description() -> None:
         "defection_trained": DEFECTION_TRAINED,
         "cooperation_trained": COOPERATION_TRAINED,
     }
-    for row_index, row in enumerate(PARTNER_ROWS):
-        values = {
-            "untrained": row.untrained,
-            "defection_trained": row.defection_trained,
-            "cooperation_trained": row.cooperation_trained,
-        }
-        ax.plot(
-            [min(values.values()), max(values.values())],
-            [row_index, row_index],
-            color=GRIDLINE,
-            lw=6,
-            solid_capstyle="round",
-            zorder=1,
+    row_positions: list[float] = []
+    row_labels: list[str] = []
+    next_y = 0.0
+    for group in PARTNER_GROUPS:
+        group_top = next_y - 0.5
+        group_bottom = next_y + len(group.rows) - 0.5
+        if group.shaded:
+            ax.axhspan(group_top - 0.45, group_bottom, color="#f3f7fd", zorder=0)
+        ax.text(
+            0.01,
+            group_top - 0.08,
+            group.header,
+            ha="left",
+            va="bottom",
+            fontsize=8.5,
+            color=INK_SECONDARY,
         )
-        for state, value in values.items():
+        for row in group.rows:
+            y = next_y
+            row_positions.append(y)
+            row_labels.append(row.label)
+            values = {
+                "untrained": row.untrained,
+                "defection_trained": row.defection_trained,
+                "cooperation_trained": row.cooperation_trained,
+            }
             ax.plot(
-                value,
-                row_index + offsets[state],
-                "o",
-                ms=8,
-                color=colors[state],
-                mec=SURFACE,
-                mew=1.5,
-                zorder=3,
+                [min(values.values()), max(values.values())],
+                [y, y],
+                color=GRIDLINE,
+                lw=6,
+                solid_capstyle="round",
+                zorder=1,
             )
-        if max(values.values()) > LABEL_ROW_THRESHOLD:
             for state, value in values.items():
-                label_on_left = value > LABEL_ON_LEFT_THRESHOLD
-                ax.text(
-                    value + (-0.018 if label_on_left else 0.018),
-                    row_index + offsets[state],
-                    f"{value * 100:.0f}%",
-                    va="center",
-                    ha="right" if label_on_left else "left",
-                    fontsize=8.5,
+                ax.plot(
+                    value,
+                    y + offsets[state],
+                    "o",
+                    ms=8,
+                    color=colors[state],
+                    mec=SURFACE,
+                    mew=1.5,
+                    zorder=3,
                 )
+            if group.label_all or max(values.values()) > LABEL_ROW_THRESHOLD:
+                for state, value in values.items():
+                    label_on_left = value > LABEL_ON_LEFT_THRESHOLD
+                    ax.text(
+                        value + (-0.018 if label_on_left else 0.018),
+                        y + offsets[state],
+                        f"{value * 100:.0f}%",
+                        va="center",
+                        ha="right" if label_on_left else "left",
+                        fontsize=8.5,
+                    )
+            next_y += 1
+        next_y += GROUP_GAP
 
-    ax.axhspan(4.5, 7.5, color="#f3f7fd", zorder=0)
-    ax.text(
-        0.01,
-        4.62,
-        "partner's choice may depend on the model's",
-        ha="left",
-        va="top",
-        fontsize=8.5,
-        color=INK_SECONDARY,
-    )
-    ax.set_yticks(range(len(PARTNER_ROWS)))
-    ax.set_yticklabels([row.label for row in PARTNER_ROWS], fontsize=10, color=INK)
-    ax.set_ylim(len(PARTNER_ROWS) - 0.4, -0.6)
+    ax.set_yticks(row_positions)
+    ax.set_yticklabels(row_labels, fontsize=10, color=INK, linespacing=1.15)
+    ax.set_ylim(next_y - GROUP_GAP - 0.4, -1.1)
     ax.set_xlim(-0.02, 1.08)
     percent_axis(ax, "x")
     strip_axes(ax, keep=("bottom",))
@@ -343,7 +413,7 @@ def figure_partner_description() -> None:
     legend_handles = [
         Line2D([0], [0], marker="o", ls="", color=UNTRAINED, ms=8, label="Untrained"),
         Line2D(
-            [0], [0], marker="o", ls="", color=DEFECTION_TRAINED, ms=8, label="Defection-trained"
+            [0], [0], marker="o", ls="", color=DEFECTION_TRAINED, ms=8, label="Anti-cooperation"
         ),
         Line2D(
             [0],
@@ -352,17 +422,17 @@ def figure_partner_description() -> None:
             ls="",
             color=COOPERATION_TRAINED,
             ms=8,
-            label="Cooperation-trained",
+            label="Pro-cooperation",
         ),
     ]
-    fig.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(0.3, 0.86), ncol=3)
+    fig.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(0.3, 0.915), ncol=3)
     footnote(
         fig,
         "Qwen3.5-9B. Both arms trained only on the 'copy of the model' description; "
         "every other row is evaluation only.\n"
-        "32 prompts x 8 samples per cell, both option orders (so the copy row reads 73% here and 69% in figure 1). "
-        "The\n"
-        "matching-history row is a separate evaluation, about 250 samples per cell.",
+        "32 prompts x 8 samples per cell, both option orders (so the copy row is 73% here and 69% in figure 1).\n"
+        "Matching-history row: about 250 samples per cell. Same weights deciding independently, "
+        "and a different AI deciding the\nsame way: about 128 samples per cell.",
     )
     save(fig, "rl_partner_description")
 
@@ -377,21 +447,21 @@ MIN_LABELLED_SEGMENT = 0.06
 
 # LLM-judge classification of the canonical battery's traces: (dominance, linked, unattributable).
 ARGUMENT_COUNTS: dict[str, tuple[int, int, int]] = {
-    "Defection-trained, before": (81, 44, 1),
-    "Defection-trained, after": (111, 14, 0),
-    "Cooperation-trained, before": (72, 49, 1),
-    "Cooperation-trained, after": (39, 85, 0),
+    "Anti-cooperation, before": (81, 44, 1),
+    "Anti-cooperation, after": (111, 14, 0),
+    "Pro-cooperation, before": (72, 49, 1),
+    "Pro-cooperation, after": (39, 85, 0),
 }
 
 
 def figure_reasoning_shift() -> None:
-    """Plot 100%-stacked bars of the argument each trace concluded with."""
+    """Plot 100%-stacked bars of the argument the model concluded with in each trace."""
     fig, ax = plt.subplots(figsize=(9, 4.8))
     fig.subplots_adjust(left=0.25, right=0.92, top=0.72, bottom=0.2)
     title_block(
         fig,
-        "Both arguments were there before training; RL changed which one wins",
-        "Share of reasoning traces concluding with each argument, as classified by an LLM judge",
+        "The model used both arguments before training; RL changed the mix",
+        "Argument the model concluded with, as a share of reasoning traces, classified by an LLM judge",
         top=0.965,
     )
 
@@ -427,7 +497,7 @@ def figure_reasoning_shift() -> None:
     legend_handles = [
         Patch(
             color=DOMINANCE_ARGUMENT,
-            label="Dominance: defecting pays more whatever the partner does",
+            label="Dominance: the payoff from defecting is higher whatever the partner does",
         ),
         Patch(color=LINKED_ARGUMENT, label="Linked: the partner will make the same choice as me"),
     ]
@@ -438,8 +508,8 @@ def figure_reasoning_shift() -> None:
         fig,
         "Qwen3.5-9B, trained game, partner described as a copy. "
         "Judge: GPT-5.6 Luna, checked against 20 hand-labelled traces.\n"
-        "In a larger census of 1,505 traces, 98-100% of cooperative choices used the linked argument "
-        "and 97-100% of defections used dominance.",
+        "In a larger set of 1,505 traces, the model used the linked argument in 98-100% of cooperative "
+        "choices and dominance in 97-100% of defections.",
     )
     save(fig, "rl_reasoning_shift")
 
@@ -505,7 +575,7 @@ def figure_stated_vs_revealed() -> None:
     fig.subplots_adjust(left=0.09, right=0.96, top=0.76, bottom=0.2)
     title_block(
         fig,
-        "Told the partner is a copy, the forecast tracks training, but runs high",
+        "The model's forecast changes with training but overestimates cooperation",
         "The model's forecast of its own cooperation versus how often it actually cooperates with a copy",
         top=0.965,
     )
@@ -595,13 +665,13 @@ class SteeringCell:
 
 # group x another-ai has no placebo cell and is omitted.
 STEERING_CELLS: dict[str, SteeringCell] = {
-    "Partner is a human\ncooperation-trained": SteeringCell(
+    "Partner is a human\npro-cooperation": SteeringCell(
         none=(0, 31), placebo=(6, 24), steer=(22, 32)
     ),
-    "Partner is a human\ndefection-trained": SteeringCell(
+    "Partner is a human\nanti-cooperation": SteeringCell(
         none=(0, 31), placebo=(5, 22), steer=(16, 31)
     ),
-    "Partner is another AI\ncooperation-trained": SteeringCell(
+    "Partner is another AI\npro-cooperation": SteeringCell(
         none=(3, 32), placebo=(6, 20), steer=(22, 31)
     ),
 }
@@ -613,7 +683,7 @@ def figure_steering() -> None:
     fig.subplots_adjust(left=0.09, right=0.96, top=0.72, bottom=0.23)
     title_block(
         fig,
-        "Pushing the 'choices are linked' direction unlocks cooperation with a human",
+        "Steering along the 'choices are linked' direction raises cooperation with a human",
         "Cooperation rate when steering along a direction fit on the untrained model, versus a random direction",
         top=0.965,
     )
@@ -653,8 +723,8 @@ def figure_steering() -> None:
         "Qwen3.5-9B, trained checkpoints, prisoner's dilemma. "
         "The direction separates 'partner's choice is linked to mine' from\n"
         "'partner is independent' in the untrained model. "
-        "The push is large (about 40% of the residual-stream norm at layer 15).\n"
-        "19-31% of random-direction samples ran out of tokens and are excluded; every other cell had none.",
+        "The steering vector is large (about 40% of the residual-stream norm at layer 15).\n"
+        "19-31% of random-direction samples hit the token cap and are excluded; no other cell had any.",
     )
     save(fig, "rl_steering")
 
@@ -861,8 +931,8 @@ def figure_self_knowledge_reasoning() -> None:
     fig.subplots_adjust(left=0.15, right=0.97, top=0.7, bottom=0.25, wspace=0.12)
     title_block(
         fig,
-        "Without reasoning, training still shows in the forecast but not in play",
-        "Forecast of its own cooperation with a copy of itself, versus how often it actually "
+        "With reasoning off, training changed the model's forecast but not its actual play",
+        "The model's forecast of its own cooperation with a copy, versus how often it actually "
         "cooperates with one",
         top=0.965,
     )
@@ -894,7 +964,7 @@ def figure_self_knowledge_reasoning() -> None:
         "Wilson for actual play. n forecasts / n parsed games, untrained, anti-, pro-cooperation: "
         f"reasoning on {n_text(reasoning_on)};\n"
         f"reasoning off {n_text(reasoning_off)}. "
-        f"{unparsed_off} reasoning-off games gave no parseable action and are excluded.",
+        f"{unparsed_off} reasoning-off games had no parseable action and are excluded.",
     )
     save(fig, "rl_self_knowledge_reasoning")
 
@@ -1021,8 +1091,8 @@ def figure_argument_prior_forest() -> None:
     fig.subplots_adjust(left=0.33, right=0.86, top=0.79, bottom=0.18)
     title_block(
         fig,
-        "Pro-cooperation training favoured the mirroring argument for every described partner",
-        "Change in how much likelier the model finds a mirroring opening than a dominance one, "
+        "Pro-cooperation training made mirroring more likely for every described partner",
+        "Change in the probability the model assigns to a mirroring opening relative to a dominance one, "
         "versus the untrained model",
         top=0.965,
     )
@@ -1119,6 +1189,23 @@ CURRICULUM_HELDOUT_CHECKPOINTS: dict[str, tuple[str, str]] = {
     "stage4b": ("Stage 4,\nsecond pass", "(same partners)"),
 }
 CURRICULUM_X_OFFSET = 1.5
+# The final checkpoint re-asked the same held-out stories with "reading a copy of this same briefing
+# at this same moment" deleted from the human and another-AI clauses. The undescribed-partner check
+# was run on the first stage-4 pass (stage4), not the final one.
+BRIEFING_ABLATION_DIR = (
+    REPO_ROOT / "artifacts/games/partner-curriculum-briefing-ablation-think-2026-09-25"
+)
+BRIEFING_ABLATION_CHECKPOINT = "stage4b"
+BRIEFING_ABLATION_FRAMINGS: dict[str, str] = {
+    "another-ai": "another-ai-no-shared-briefing",
+    "human": "human-no-shared-briefing",
+}
+UNSTATED_PARTNER_DIR = (
+    REPO_ROOT / "artifacts/games/partner-curriculum-heldout-think-unstated-2026-09-25"
+)
+UNSTATED_PARTNER_CHECKPOINT = "stage4"
+UNSTATED_PARTNER_LABEL = "Not described,\nafter stage 4"
+ABLATION_COLUMN_GAP = 1.0
 PARTNER_TWIN = "#2a78d6"
 PARTNER_ANOTHER_AI = "#1baf7a"
 PARTNER_HUMAN = "#4a3aa7"
@@ -1132,25 +1219,32 @@ LABEL_MERGE_DISTANCE = 0.05
 HELDOUT_SHORT_NAMES: dict[str, str] = {"twin": "copy", "another-ai": "another AI", "human": "human"}
 
 
-def load_heldout_rates(checkpoint: str) -> dict[str, ObservedRate]:
-    """Held-out cooperation counts per partner for one checkpoint, from the framing sweep."""
-    (trace,) = sorted((CURRICULUM_HELDOUT_DIR / checkpoint).glob("step-*.jsonl"))
+def load_framing_rates(checkpoint_dir: Path, framings: dict[str, str]) -> dict[str, ObservedRate]:
+    """Cooperation counts per partner for one checkpoint's framing sweep; ``framings`` maps key to framing."""
+    (trace,) = sorted(checkpoint_dir.glob("step-*.jsonl"))
     records = [record for record in read_records(trace) if record["record"] == "framing-sweep"]
     rates = {
-        partner: count_actions(
-            [record["action"] for record in records if record["counterpart_framing"] == partner]
+        key: count_actions(
+            [record["action"] for record in records if record["counterpart_framing"] == framing]
         )
-        for partner in HELDOUT_PARTNERS
+        for key, framing in framings.items()
     }
     logger.info(
-        "held-out %s: %s",
-        checkpoint,
+        "%s: %s",
+        checkpoint_dir,
         ", ".join(
-            f"{partner} {rate.cooperated}/{rate.parsed} (unparsed {rate.unparsed})"
-            for partner, rate in rates.items()
+            f"{framings[key]} {rate.cooperated}/{rate.parsed} (unparsed {rate.unparsed})"
+            for key, rate in rates.items()
         ),
     )
     return rates
+
+
+def load_heldout_rates(checkpoint: str) -> dict[str, ObservedRate]:
+    """Held-out cooperation counts per partner for one curriculum checkpoint."""
+    return load_framing_rates(
+        CURRICULUM_HELDOUT_DIR / checkpoint, {partner: partner for partner in HELDOUT_PARTNERS}
+    )
 
 
 def draw_rate_point(ax: Axes, x: float, rate: ObservedRate, color: str) -> None:
@@ -1193,14 +1287,19 @@ def figure_curriculum_trajectory() -> None:
         checkpoint: load_heldout_rates(checkpoint) for checkpoint in CURRICULUM_HELDOUT_CHECKPOINTS
     }
     one_framing_rates = load_heldout_rates(ONE_FRAMING_CHECKPOINT)
+    ablation_rates = load_framing_rates(
+        BRIEFING_ABLATION_DIR / BRIEFING_ABLATION_CHECKPOINT, BRIEFING_ABLATION_FRAMINGS
+    )
+    unstated_rate = load_framing_rates(
+        UNSTATED_PARTNER_DIR / UNSTATED_PARTNER_CHECKPOINT, {"unstated": "unstated"}
+    )["unstated"]
 
-    fig, ax = plt.subplots(figsize=(10.5, 6.8))
-    fig.subplots_adjust(left=0.1, right=0.85, top=0.81, bottom=0.3)
+    fig, ax = plt.subplots(figsize=(12.5, 7.2))
+    fig.subplots_adjust(left=0.08, right=0.97, top=0.82, bottom=0.3)
     title_block(
         fig,
-        "Cooperation with a human on unseen stories came only with the human-track-record stage",
-        "Qwen3.5-9B trained through a ladder of partner descriptions, with reward always paying "
-        "for cooperation",
+        "The model cooperated with a human on unseen stories only after the human-track-record stage",
+        "Qwen3.5-9B trained on a sequence of partner descriptions, always rewarded for cooperation",
         top=0.965,
     )
 
@@ -1241,18 +1340,49 @@ def figure_curriculum_trajectory() -> None:
             color=INK,
         )
 
-    tick_positions = [0.0, *curriculum_x.tolist()]
+    ablation_x = float(curriculum_x[-1]) + 2 * ABLATION_COLUMN_GAP
+    ax.axvline(ablation_x - ABLATION_COLUMN_GAP + 0.35, color=INK_MUTED, lw=0.8, ls=":", zorder=1)
+    ablation_placed: list[tuple[str, float]] = []
+    for partner, rate in ablation_rates.items():
+        x = ablation_x + HELDOUT_DODGE[partner]
+        draw_rate_point(ax, x, rate, HELDOUT_PARTNERS[partner][1])
+        draw_value_label(ax, x, rate, partner, ablation_placed)
+    low, high = unstated_rate.wilson()
+    ax.plot([ablation_x, ablation_x], [low, high], color=INK_MUTED, lw=1.2, zorder=2)
+    ax.plot(
+        ablation_x, unstated_rate.rate, "D", ms=7, mfc=SURFACE, mec=INK_MUTED, mew=1.5, zorder=4
+    )
+    ax.text(
+        ablation_x - 0.14,
+        unstated_rate.rate + 0.03,
+        f"{UNSTATED_PARTNER_LABEL}: {unstated_rate.rate * 100:.0f}%",
+        va="center",
+        ha="right",
+        fontsize=8.5,
+        color=INK_SECONDARY,
+        linespacing=1.1,
+    )
+
+    tick_positions = [0.0, *curriculum_x.tolist(), ablation_x]
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(
-        [ONE_FRAMING_LABEL, *(label for label, _added in CURRICULUM_HELDOUT_CHECKPOINTS.values())],
+        [
+            ONE_FRAMING_LABEL,
+            *(label for label, _added in CURRICULUM_HELDOUT_CHECKPOINTS.values()),
+            "Stage 4, second pass,\nphrase removed",
+        ],
         fontsize=10,
         color=INK,
     )
-    added_by_position = [("70 steps", 0.0)] + [
-        (added, x)
-        for (_label, added), x in zip(
-            CURRICULUM_HELDOUT_CHECKPOINTS.values(), curriculum_x, strict=True
-        )
+    added_by_position = [
+        ("70 steps", 0.0),
+        *(
+            (added, x)
+            for (_label, added), x in zip(
+                CURRICULUM_HELDOUT_CHECKPOINTS.values(), curriculum_x, strict=True
+            )
+        ),
+        ("without 'reading a copy\nof this same briefing\nat this same moment'", ablation_x),
     ]
     for added, x in added_by_position:
         ax.text(
@@ -1265,7 +1395,7 @@ def figure_curriculum_trajectory() -> None:
             fontsize=8.5,
             color=INK_MUTED,
         )
-    ax.set_xlim(-0.6, curriculum_x[-1] + 1.45)
+    ax.set_xlim(-0.6, ablation_x + 0.6)
     ax.set_ylim(0, 1.0)
     percent_axis(ax, "y")
     strip_axes(ax, keep=("bottom",))
@@ -1284,11 +1414,13 @@ def figure_curriculum_trajectory() -> None:
     footnote(
         fig,
         "Twin prisoner's dilemma, reasoning on, 64 samples per cell; whiskers are Wilson 95% intervals. Each "
-        "curriculum stage starts\n"
-        "from the previous stage's final checkpoint and keeps the earlier partners in its training mix. Left "
+        "curriculum stage was trained\n"
+        "from the previous stage's final checkpoint, with the earlier partners kept in the training mix. Left "
         "column: the pro-cooperation\n"
         "arm trained 70 steps on the copy framing alone. Parsed n per column, left to right:\n"
-        f"{n_text}. {unparsed} of {total_answers} answers gave no parseable action and are excluded.",
+        f"{n_text}. {unparsed} of {total_answers} answers had no parseable action and are excluded.\n"
+        f"Phrase removed: another AI {ablation_rates['another-ai'].parsed}, "
+        f"human {ablation_rates['human'].parsed}; not described {unstated_rate.parsed}.",
     )
     save(fig, "rl_curriculum_trajectory")
 
@@ -1318,7 +1450,7 @@ JUSTIFICATION_STYLE: dict[str, tuple[str, str]] = {
     "other": (OTHER_PREMISE, "Other"),
 }
 
-# Traces anywhere mentioning a correct, expected or graded answer, or an alignment test (full-n regex).
+# Traces with any mention of a correct, expected or graded answer, or an alignment test (full-n regex).
 TEST_TALK: dict[str, tuple[int, int]] = {
     "Untrained,\nall non-copy traces": (45, 311),
     "Curriculum,\nnon-copy defections": (81, 157),
@@ -1344,8 +1476,8 @@ def figure_confabulation() -> None:
     fig.subplots_adjust(left=0.15, right=0.95, top=0.68, bottom=0.2)
     title_block(
         fig,
-        "Cooperating with a partner that isn't a copy, the model makes up its reasons",
-        "Left: the main reason each cooperating trace gives. Right: how often a trace mentions a test "
+        "When the model cooperates with a partner that isn't a copy, it makes up its reasons",
+        "Left: the main reason in each cooperating trace. Right: share of traces with a mention of a test "
         "or a graded answer",
         top=0.965,
     )
@@ -1356,10 +1488,24 @@ def figure_confabulation() -> None:
         for key, count in counts.items():
             width = count / total
             color = JUSTIFICATION_STYLE[key][0]
-            reason_ax.barh(row_index, width, left=left, height=0.62, color=color, edgecolor=SURFACE, linewidth=2)
+            reason_ax.barh(
+                row_index,
+                width,
+                left=left,
+                height=0.62,
+                color=color,
+                edgecolor=SURFACE,
+                linewidth=2,
+            )
             if count >= MIN_COUNT_LABEL:
                 reason_ax.text(
-                    left + width / 2, row_index, str(count), ha="center", va="center", color=INK, fontsize=9.5
+                    left + width / 2,
+                    row_index,
+                    str(count),
+                    ha="center",
+                    va="center",
+                    color=INK,
+                    fontsize=9.5,
                 )
             left += width
         reason_ax.text(1.02, row_index, f"n={total}", va="center", fontsize=8.5, color=INK_MUTED)
@@ -1371,28 +1517,40 @@ def figure_confabulation() -> None:
     strip_axes(reason_ax, keep=())
     reason_ax.set_title("Main reason given for cooperating", fontsize=10.5, pad=10)
 
-    for row_index, (label, (hits, total)) in enumerate(TEST_TALK.items()):
+    for row_index, (hits, total) in enumerate(TEST_TALK.values()):
         rate = hits / total
         low, high = wilson_interval(hits, total)
         color = UNTRAINED if row_index == 0 else COOPERATION_TRAINED
-        test_ax.barh(row_index, rate, height=0.5, color=tint(color, 0.35 if row_index < 2 else 1.0))
+        test_ax.barh(
+            row_index,
+            rate,
+            height=0.5,
+            color=tint(color, 1.0 if row_index == len(TEST_TALK) - 1 else 0.35),
+        )
         test_ax.plot([low, high], [row_index, row_index], color=INK_SECONDARY, linewidth=1.2)
-        test_ax.text(high + 0.03, row_index, f"{rate * 100:.0f}%", va="center", fontsize=9.5, color=INK)
+        test_ax.text(
+            high + 0.03, row_index, f"{rate * 100:.0f}%", va="center", fontsize=9.5, color=INK
+        )
     test_ax.set_yticks(range(len(TEST_TALK)))
     test_ax.set_yticklabels(list(TEST_TALK), fontsize=9.5, color=INK)
     test_ax.set_ylim(len(TEST_TALK) - 0.5, -0.5)
     test_ax.set_xlim(0, 1)
     percent_axis(test_ax, "x")
     strip_axes(test_ax, keep=())
-    test_ax.set_title("Mentions a test or a graded answer", fontsize=10.5, pad=10)
+    test_ax.set_title("Test or graded answer mentioned", fontsize=10.5, pad=10)
 
-    legend_handles = [Patch(color=color, label=label) for color, label in JUSTIFICATION_STYLE.values()]
-    fig.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.85), ncol=2, fontsize=9)
+    legend_handles = [
+        Patch(color=color, label=label) for color, label in JUSTIFICATION_STYLE.values()
+    ]
+    fig.legend(
+        handles=legend_handles, loc="upper left", bbox_to_anchor=(0.02, 0.85), ncol=2, fontsize=9
+    )
     footnote(
         fig,
         "Qwen3.5-9B after the partner curriculum, held-out stories. Left: every cooperating trace with a "
-        "non-copy partner, read in full against a written codebook;\n92 of 96 rest on a premise the prompt "
-        "never gave, against 4 of 40 defections. Right: regex over all traces, 95% Wilson intervals.",
+        "non-copy partner, read in full against a written codebook;\nin 92 of 96 the model relies on a "
+        "premise that is not in the prompt, against 4 of 40 defections. Right: regex over all traces, "
+        "95% Wilson intervals.",
     )
     save(fig, "rl_confabulation")
 
