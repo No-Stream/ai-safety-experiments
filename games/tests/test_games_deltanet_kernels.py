@@ -232,12 +232,17 @@ PREFILL_BINDING: dict[str, str] = {
 }
 """What a forward with no prior cache state dispatches on this box (fla present, causal-conv1d not)."""
 
+BRIDGED_PREFILL_BINDING: dict[str, str] = {
+    "chunk_gated_delta_rule": "fla.ops.gated_delta_rule.chunk.chunk_gated_delta_rule",
+    "causal_conv1d_fn": "games.deltanet_kernels.fla_causal_conv1d_fn",
+}
+
 FUSED_BINDING: dict[str, str] = {
-    **PREFILL_BINDING,
+    **BRIDGED_PREFILL_BINDING,
     "recurrent_gated_delta_rule": (
         "fla.ops.gated_delta_rule.fused_recurrent.fused_recurrent_gated_delta_rule"
     ),
-    "causal_conv1d_update": "transformers.models.qwen3_5.modeling_qwen3_5.causal_conv1d_update",
+    "causal_conv1d_update": "games.deltanet_kernels.fla_causal_conv1d_update",
 }
 FALLBACK_BINDING: dict[str, str] = {
     **PREFILL_BINDING,
@@ -323,27 +328,28 @@ class TestBoundKernels:
 
 
 class TestPrefillKernels:
-    """A forward-only record names the two kernels its forwards dispatched, which the bridge never touches.
+    """A forward-only record names exactly the two kernels its forwards dispatched.
 
     transformers routes `recurrent_gated_delta_rule` and `causal_conv1d_update` behind
     ``use_precomputed_states and seq_len == 1``, which no bare forward satisfies, so an activation
-    capture, a patched forward or a lens fit depends on `chunk_gated_delta_rule` and `causal_conv1d_fn`
-    only. Keying those legs on all four would refuse a resume across the bridge whose forwards are
-    bit-identical to the records it wants to continue.
+    capture, a patched forward or a lens fit depends on `chunk_gated_delta_rule` and
+    `causal_conv1d_fn` only. The causal-conv bridge changes the latter, so the narrowed provenance
+    changes across the bridge while still omitting the two decode-only kernels.
 
-    Sabotage-verified: returning ``dict(bound)`` from `prefill_deltanet_kernels` turns the bridge
-    invisibility test red.
+    Sabotage-verified: returning ``dict(bound)`` from `prefill_deltanet_kernels` turns the exact-subset
+    test red.
     """
 
     def test_the_subset_is_exactly_the_two_prefill_kernels(self):
         assert prefill_deltanet_kernels(FALLBACK_BINDING) == PREFILL_BINDING
         assert tuple(prefill_deltanet_kernels(FALLBACK_BINDING)) == DELTANET_PREFILL_KERNELS
 
-    def test_the_bridge_is_invisible_to_a_forward_only_record(self):
-        assert prefill_deltanet_kernels(FUSED_BINDING) == prefill_deltanet_kernels(FALLBACK_BINDING)
-        assert deltanet_kernel_label(
-            prefill_deltanet_kernels(FUSED_BINDING)
-        ) == deltanet_kernel_label(prefill_deltanet_kernels(FALLBACK_BINDING))
+    def test_the_bridge_changes_forward_provenance_to_name_the_fla_conv(self):
+        bridged = prefill_deltanet_kernels(FUSED_BINDING)
+        fallback = prefill_deltanet_kernels(FALLBACK_BINDING)
+        assert bridged == BRIDGED_PREFILL_BINDING
+        assert bridged != fallback
+        assert deltanet_kernel_label(bridged) != deltanet_kernel_label(fallback)
 
     def test_a_binding_missing_a_prefill_kernel_is_refused_rather_than_narrowed_to_one(self):
         """A record naming one kernel would read as complete, so the narrowing raises instead."""

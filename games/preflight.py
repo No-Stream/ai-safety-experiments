@@ -30,6 +30,7 @@ import importlib
 import json
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -581,6 +582,14 @@ def deltanet_kernel_paths() -> dict[str, str]:
     decoding together rather than with completion length, because at decode the fallback runs one
     loop iteration over batch x heads x K x V and is launch-bound until that has real work to do.
     """
+    # Explicitly redecorated conv wrappers differ from the package registry's prediction.
+    if "transformers.models.qwen3_5.modeling_qwen3_5" in sys.modules:
+        from games.deltanet_kernels import (  # noqa: PLC0415 - avoid import cycle
+            bound_deltanet_kernels,
+        )
+
+        return bound_deltanet_kernels()
+
     # Reaching into transformers' private kernel registry, deliberately: there is no public way to
     # ask "which implementation will this kernel function actually use", and the alternative is
     # believing a silent fallback. Pinned transformers, so a rename surfaces here rather than in a
@@ -615,7 +624,9 @@ def log_deltanet_kernel_paths(*, expected_linear_attention_layers: int) -> dict[
         logger.info("no linear-attention layers, so DeltaNet kernels are irrelevant here")
         return paths
     for function_name, implementation in paths.items():
-        if implementation.startswith("torch fallback"):
+        if implementation.startswith(
+            ("torch fallback", "transformers.models.qwen3_5.modeling_qwen3_5.")
+        ):
             logger.warning(
                 "DeltaNet kernel on the SLOW path, %s -> %s", function_name, implementation
             )

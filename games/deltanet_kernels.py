@@ -1,4 +1,4 @@
-"""Put fla's fused recurrent Gated DeltaNet kernel on decode, under the name transformers looks up.
+"""Route Qwen3.5's recurrent rule and short convolution to fla's Triton implementations.
 
 transformers resolves each Gated DeltaNet kernel function by importing `fla` and walking a dotted
 path from `transformers.integrations.hub_kernels._KERNELS_INTERNAL_PATH_MAPPINGS`, and when the walk
@@ -59,11 +59,17 @@ chunked pair on the prompt, the per-token pair on every decode step) and records
 forward-only leg (activation capture, activation patching, the lens fit) never reaches the decode pair
 at all -- transformers takes `recurrent_gated_delta_rule` and `causal_conv1d_update` only when the
 cache already holds a state for the layer and the step is one token, which no bare forward satisfies
--- so it records `DELTANET_PREFILL_KERNELS` only (`prefill_deltanet_kernels`). That is what makes the
-bridge invisible to those records: it re-binds only the decode kernel, so two forward-only records on
-either side of it name the same kernels and their tensors are bit-identical, and a resume ledger or a
-mixing guard keyed on the field lets them through. The run-level summary still carries the bridge
-report and the full four-kernel binding as process provenance.
+-- so it records `DELTANET_PREFILL_KERNELS` only (`prefill_deltanet_kernels`). The convolution bridge
+changes this prefill binding too, so resume and pooling guards distinguish old torch-convolution
+records from new fla-convolution records. The run-level summary carries the bridge report and the
+full four-kernel binding as process provenance.
+
+The convolution adapters explicitly redecorate HF's original references using the same hub-kernel
+dispatcher, with this module supplying the local implementations. They preserve HF's channel-first
+layout, weight-dtype conversion and in-place decode cache updates. Installation checks the callable
+identities captured by both wrappers, because the decorator silently substitutes torch on import
+failure. The recurrent alias is installed first, before importing the modeling module to redecorate
+convolution; the existing training and HF-generation activation calls install both bridges.
 
 Verified against transformers 5.15.0 and flash-linear-attention 0.5.2 on 2026-08-18. Gating is on
 the observed attribute rather than on those versions, so a release that fixes the export name turns
@@ -139,7 +145,7 @@ Read off transformers 5.15.0's `Qwen3_5GatedDeltaNet.forward`: both `causal_conv
 ``use_precomputed_states`` needs a cache that already holds this layer's state from an earlier call.
 A bare forward -- an activation capture, a patched forward, a lens fit's forward and backward -- has no
 such cache and takes the chunked pair every time, so these two are the only kernels its records can
-depend on. The fla bridge re-binds neither.
+depend on. The convolution bridge changes the second binding.
 """
 
 BRIDGE_VERIFIED_VERSIONS = {"transformers": "5.15.0", "flash-linear-attention": "0.5.2"}
@@ -168,6 +174,115 @@ one was applied, which is the opposite of what its records ran under.
 _aliased_by_this_process = False
 """Whether this process installed the alias, set beside the `setattr` that installs it."""
 
+_conv_bridged_by_this_process = False
+
+
+def _validate_conv_activation(activation: str | None) -> None:
+    if activation not in (None, "silu", "swish"):
+        raise ValueError(
+            f"fla causal convolution supports only silu, swish or None, got {activation!r}"
+        )
+
+
+def fla_causal_conv1d_fn(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: str | None = None,
+) -> torch.Tensor:
+    """Adapt HF's channel-first depthwise convolution to fla's time-first Triton kernel."""
+    _validate_conv_activation(activation)
+    conv = importlib.import_module("fla.modules.conv")
+    output, _ = conv.causal_conv1d(
+        x=hidden_states.to(weight.dtype).transpose(1, 2),
+        weight=weight,
+        bias=bias,
+        activation=activation,
+        backend="triton",
+    )
+    return output.transpose(1, 2).to(hidden_states.dtype)
+
+
+def fla_causal_conv1d_update(
+    hidden_states: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    activation: str | None = None,
+) -> torch.Tensor:
+    """Decode one token and mutate HF's contiguous, channel-first convolution cache."""
+    _validate_conv_activation(activation)
+    if hidden_states.ndim != 3 or hidden_states.shape[-1] != 1:  # noqa: PLR2004 - [batch, channel, time]
+        raise ValueError("fla convolution decode requires exactly one token in [batch, dim, time]")
+    if conv_state.shape != (*hidden_states.shape[:2], weight.shape[-1]):
+        raise ValueError(
+            "convolution cache batch, channel and kernel width must match the input and weight"
+        )
+    if not conv_state.is_contiguous():
+        raise ValueError("fla convolution decode requires a contiguous cache")
+    conv = importlib.import_module("fla.modules.conv.triton.ops")
+    # HF casts the concatenated cache and input to weight dtype before both convolution and cache copy.
+    cache = conv_state.to(weight.dtype)
+    output, _ = conv.causal_conv1d_update(
+        x=hidden_states.to(weight.dtype).transpose(1, 2),
+        cache=cache,
+        weight=weight,
+        bias=bias,
+        activation=activation,
+    )
+    if cache is not conv_state:
+        conv_state.copy_(cache)
+    return output.transpose(1, 2).to(hidden_states.dtype)
+
+
+# Preserve HF's original kernel names (and optional Hub mapping) when decorating the adapters.
+causal_conv1d_fn = fla_causal_conv1d_fn
+causal_conv1d_update = fla_causal_conv1d_update
+
+
+def assert_causal_conv_kernels_bound() -> None:
+    """Check captured callable identities, including the decorator's silent import-failure path."""
+    module = importlib.import_module(QWEN3_5_MODELING_MODULE)
+    for name, expected in (
+        ("causal_conv1d_fn", fla_causal_conv1d_fn),
+        ("causal_conv1d_update", fla_causal_conv1d_update),
+    ):
+        wrapper = getattr(module, name)
+        implementations = [
+            cell.cell_contents
+            for cell in getattr(wrapper, "__closure__", None) or ()
+            if callable(cell.cell_contents)
+        ]
+        if len(implementations) != 1 or implementations[0] is not expected:
+            raise RuntimeError(
+                f"{name} resolved to {implementations!r}; expected the fla convolution shim"
+            )
+
+
+def bridge_causal_conv_kernels() -> dict[str, str]:
+    """Explicitly redecorate HF's references; subsequent calls verify rather than silently repair."""
+    global _conv_bridged_by_this_process  # noqa: PLW0603 - process-wide kernel installation
+    module = importlib.import_module(QWEN3_5_MODELING_MODULE)
+    integration = importlib.import_module("transformers.integrations.hub_kernels")
+    if not _conv_bridged_by_this_process:
+        # Verify both references before mutating either wrapper.
+        references = {
+            name: getattr(module, name).__wrapped__
+            for name in ("causal_conv1d_fn", "causal_conv1d_update")
+        }
+        for name, reference in references.items():
+            setattr(
+                module,
+                name,
+                integration.use_kernel_func_from_hub_with_fallback(name, __name__)(reference),
+            )
+        _conv_bridged_by_this_process = True
+    assert_causal_conv_kernels_bound()
+    binding = bound_deltanet_kernels()
+    report = {name: binding[name] for name in ("causal_conv1d_fn", "causal_conv1d_update")}
+    logger.info("DeltaNet causal convolution bridge: %s", report)
+    return report
+
 
 def _installed_versions() -> dict[str, str]:
     """Report the versions the bridge is running against, for a run's own provenance record."""
@@ -177,7 +292,8 @@ def _installed_versions() -> dict[str, str]:
 def bridge_decode_kernel() -> dict[str, object]:
     """Register fla's fused per-token kernel under the name transformers resolves, or say why not.
 
-    Idempotent and self-disabling: the gate is whether `fla.ops.gated_delta_rule` already exposes
+    Also install and verify both convolution adapters through this existing activation path.
+    The recurrent alias is idempotent and self-disabling: the gate is whether `fla.ops.gated_delta_rule` already exposes
     `recurrent_gated_delta_rule`, so a future fla or transformers release that fixes the export name
     makes this a no-op, and calling it twice patches once. Behaviour rather than a version pin,
     because the version that fixes it is not knowable from here.
@@ -215,6 +331,7 @@ def bridge_decode_kernel() -> dict[str, object]:
             else ALIASED_NATIVELY_REASON,
             "implementation": f"{already_exported.__module__}.{already_exported.__name__}",
             "installed_versions": _installed_versions(),
+            "causal_conv": bridge_causal_conv_kernels(),
         }
 
     if QWEN3_5_MODELING_MODULE in sys.modules:
@@ -249,6 +366,7 @@ def bridge_decode_kernel() -> dict[str, object]:
         "reason": "aliased fla's fused per-token kernel onto the name transformers resolves",
         "implementation": f"{fused.__module__}.{fused.__name__}",
         "installed_versions": _installed_versions(),
+        "causal_conv": bridge_causal_conv_kernels(),
     }
 
 
@@ -369,8 +487,8 @@ def bridge_and_check_decode_kernel() -> dict[str, object]:
 
     The two calls every generating entry point makes before it loads a Qwen3.5 model, in the order
     they have to happen (`bridge_decode_kernel` first, the call-site check on what it registered),
-    returned as the single `deltanet_kernel_bridge` block a run's summary records. Neither imports the
-    modeling module, so calling this cannot itself make the bridge too late.
+    returned as the single `deltanet_kernel_bridge` block a run's summary records. The bridge installs
+    the recurrent alias before importing the modeling module to explicitly redecorate convolution.
     """
     report = dict(bridge_decode_kernel())
     call_site = assert_bridged_kernel_matches_call_site()
@@ -384,8 +502,8 @@ def bridge_and_check_decode_kernel() -> dict[str, object]:
 def bound_deltanet_kernels() -> dict[str, str]:
     """Return what each Gated DeltaNet kernel function is ACTUALLY bound to, off the modeling module.
 
-    `games.preflight.deltanet_kernel_paths` predicts what transformers WOULD resolve if it bound now;
-    this reads what it DID bind. The difference is exactly the silent case: an alias registered after
+    Before the modeling module loads, `games.preflight.deltanet_kernel_paths` predicts what
+    transformers would resolve; afterwards it delegates here to read what did bind. An alias registered after
     `modeling_qwen3_5` was imported changes the prediction and nothing about the wrapper transformers
     calls, which still closes over the pure-torch loop. Each wrapper `use_kernel_func_from_hub_with_
     fallback` built closes over two cells, the implementation and its parameter names, and the
@@ -397,6 +515,8 @@ def bound_deltanet_kernels() -> dict[str, str]:
     :data:`DELTANET_KERNEL_FIELD`.
     """
     module = importlib.import_module(QWEN3_5_MODELING_MODULE)
+    if _conv_bridged_by_this_process:
+        assert_causal_conv_kernels_bound()
     bound: dict[str, str] = {}
     for function_name, wrapper_name in DELTANET_KERNEL_WRAPPERS.items():
         wrapper = getattr(module, wrapper_name, None)
@@ -429,9 +549,8 @@ def prefill_deltanet_kernels(bound: Mapping[str, str]) -> dict[str, str]:
     """Narrow a full binding to the kernels a forward with no prior cache state dispatches.
 
     What a forward-only record carries under :data:`DELTANET_KERNEL_FIELD`, and what its resume
-    identity and mixing guard compare on: the bridge re-binds only the decode kernel, so keying a
-    forward-only leg on all four would refuse a relaunch whose forwards are bit-identical to the
-    records it wants to continue (a 9B patching ledger is ~7 GPU-hours of them). A binding missing
+    identity and mixing guard compare on. Decode-only changes do not affect these records, while
+    the convolution bridge does change the prefill binding and must invalidate reuse. A binding missing
     either prefill kernel is refused rather than narrowed to one, because a record naming a single
     kernel would read as complete.
     """
