@@ -198,9 +198,21 @@ Everything below still holds when a job genuinely does not fit locally; only its
 The killswitch and boot-patch rules for rented boxes are under "Running expensive things", and the
 AWS Batch surface is `cloud/`.
 
-- **Match instance shape to the job.** A single-GPU job requests a single-GPU instance. An 8-GPU
-  node to use one of them is waste; multi-GPU instances are for code that uses them, which we have
-  not written yet.
+**The next rental is not on AWS** (the owner, 2026-09-30). The AWS credits that paid for the
+`g7e`/`p5` fleet are used up, so the tooling below (`scripts/launch_gpu_box.sh`, the capacity walk,
+`cloud/`) describes how past runs were done, not the path forward. Before the next online
+experiment, price Runpod and Vast.ai against each other for the card the job needs, favouring
+prepaid balances and per-second billing, and port the launcher to whichever wins. Two things carry
+over and have to be rebuilt rather than dropped. First, the killswitch: a pod is a container that
+cannot `shutdown -h` itself, so the dead-man switch and idle watchdog must terminate through the
+provider's API, and the rule about watching each layer fire once still applies. Second, the episode
+jail uses `unshare`, which unprivileged containers often forbid; confirm it works on the provider
+before any reward-hacking harness run is sent there (games runs do not use the jail).
+
+- **Single GPU only. Multi-GPU is a hard block** (the owner, 2026-09-30): we do not write or rent
+  for multi-GPU training, so a model that needs more than one card is out of reach, not a bigger
+  config. A single-GPU job requests a single-GPU instance; an 8-GPU node to use one of them is
+  waste.
 - **Prefer the larger card, stay portable.** `g6e.xlarge` (L40S, 48 GB) is ~26% cheaper per unit of
   work and 3.7x faster in wall-clock than `g6.xlarge` (L4, 24 GB). A local VRAM figure describes
   this box only and must not propagate into cloud job configs.
@@ -272,7 +284,7 @@ size a card from a text-only figure rather than from the repo total.
 | `Qwen/Qwen3.5-2B` | Smoke runs where you also want reward to move. ~5 GB bf16 LoRA. |
 | `Qwen/Qwen3.5-4B` | **The working size until 2026-09-10**, and still the right checkpoint for re-analysis of the artifacts already measured at this size and for comparison against them. New behavioural measurement goes to the 9B instead. ~10 GB bf16 LoRA, ~7.8 GiB of text-only weights. The newest 4B Qwen there is — no 3.6 or 3.8 was ever published at this size. |
 | `Qwen/Qwen3.5-9B` | **The working size whenever behaviour is the measurement** (the owner, 2026-09-10), and the **interp cross-validation arm**. Also the newest 9B Qwen there is, for the same reason as the 4B. Fitting bf16 LoRA training into the 5090's 32 GB is tight and buys its room from the rollout budget rather than from a smaller model; size it from the VRAM the run actually sees, and read `docs/scratch/single-5090-grpo-notes-2026-09-10.md` for the sizing work (gitignored, so a plain-text pointer rather than a link). `Qwen3.5-9B-Base` is the only ~9B Qwen with a pretrained sparse autoencoder (`Qwen/SAE-Res-Qwen3.5-9B-Base-W64K-L0_{50,100}`, all 32 layers). Note the checkpoint split: the SAE is on `-Base`, while the TMAX RL'd models descend from the instruct `Qwen/Qwen3.5-9B` — measure that transfer, do not assume it (base→instruct SAE transfer has documented quality hits; see `docs/scratch/tiny-model-selection-2026-08-17.md`). |
-| `Qwen/Qwen3.8-27B` | The **stretch tier**, and a target that needs creativity rather than a bigger config: ~52 GiB download against ~50.1 GiB of text-only bf16 weights in VRAM once the family's vision tower and MTP head drop out, against 32 GB of card, so bf16 LoRA does not fit locally by any straightforward route. What might: QLoRA (knowingly against the family guidance below), CPU-offloaded checkpoints, chunked loss. The sizing note is `docs/scratch/single-5090-grpo-notes-2026-09-10.md` (gitignored, plain-text pointer). The `Qwen3.8-27B-FP8` variant (~27 GiB text-only) fits 32 GB with little to spare and is owner-approved for interp probing (2026-08-18) — **probing and inference only, because an FP8 checkpoint cannot be trained on at all** (see below). No text-only/base sibling exists at 27B (see `docs/scratch/qwen38-27b-load-check-2026-08-17.md`); `Qwen3.5-27B` (identical load path) carries first-party *instruct* SAEs. See `docs/scratch/observable-model-rl-feasibility-2026-08-16.md` and `jlens-sae-feasibility-2026-08-16.md`. **For inference-only probes the owner expects the Q4_K_XL quant to run on the 5090 under vLLM at 50+ tok/s** (the owner, 2026-09-10; an expectation, not yet measured here), and rates the model as roughly late-2025 frontier quality, so it is the default hosted-model substitute for cheap local probing. Training stays bf16 LoRA and does not fit. |
+| `Qwen/Qwen3.8-27B` | The **stretch tier**, and a target that needs creativity rather than a bigger config: ~52 GiB download against ~50.1 GiB of text-only bf16 weights in VRAM once the family's vision tower and MTP head drop out, against 32 GB of card, so bf16 LoRA does not fit locally by any straightforward route. What might: QLoRA (knowingly against the family guidance below), CPU-offloaded checkpoints, chunked loss. The sizing note is `docs/scratch/single-5090-grpo-notes-2026-09-10.md` (gitignored, plain-text pointer). The `Qwen3.8-27B-FP8` variant (~27 GiB text-only) fits 32 GB with little to spare and is owner-approved for interp probing (2026-08-18) — **probing and inference only, because an FP8 checkpoint cannot be trained on at all** (see below). No text-only/base sibling exists at 27B (see `docs/scratch/qwen38-27b-load-check-2026-08-17.md`); `Qwen3.5-27B` (identical load path) carries first-party *instruct* SAEs. See `docs/scratch/observable-model-rl-feasibility-2026-08-16.md` and `jlens-sae-feasibility-2026-08-16.md`. **For inference-only probes the owner expects the Q4_K_XL quant to run on the 5090 under vLLM at 50+ tok/s** (the owner, 2026-09-10; an expectation, not yet measured here), and rates the model as roughly late-2025 frontier quality, so it is the default hosted-model substitute for cheap local probing. Training stays bf16 LoRA and does not fit locally; the rental target is one 96 GB RTX PRO 6000 Blackwell, where bf16 LoRA with vLLM sleep mode should fit (an estimate, not yet run: ~50 GiB of weights, ~2 GiB of KV per 32K sequence). Known trap from a 95 GiB card: TRL's importance-sampling correction materialises an fp32 logits row and went out of memory beside the resident engine (`IS_CORRECTION_ROW_LOGITS_REFUSAL_GIB` in `reward_hacking/train.py`). |
 
 **Jacobian-lens rule (owner, 2026-08-18): never spend effort checking whether a pre-fitted lens
 exists for a checkpoint — we fit our own, cheaply** (a closed-form accumulation, not a training
@@ -291,18 +303,42 @@ model card, and the reason they give is only "higher than normal quantization di
 `attn_output_gate` mechanism is our own conjecture rather than theirs, though Qwen's own GPTQ-Int4
 build does exclude every attention module from quantization, which is the closest thing to
 first-party support the conjecture has. Among builds you could actually train from, 4-bit barely
-saves memory on this family (GPTQ-Int4 ~30.3 GB vs FP8 ~30.9 GB at 27B), so **FP8 is the memory
-escape hatch for inference and interp probing — and for training there is no escape hatch, because
-an FP8 checkpoint cannot be trained on at all, LoRA included** (transformers'
-`FineGrainedFP8HfQuantizer` declares `is_trainable = False`, and `Trainer` refuses even with an
-adapter attached). Training is bf16 LoRA at every rung, which is what makes the 27B a stretch
-target here, and QLoRA is not recommended anywhere on the ladder. And these are hybrid-attention
+saves memory on this family (GPTQ-Int4 ~30.3 GB vs FP8 ~30.9 GB at 27B). TRL's colocated weight
+sync is a second reason to avoid 4-bit bases: it merges the adapter into the base every step
+(`trl/generation/vllm_generation.py`, `merge_adapter` then `unmerge_adapter`), which is lossy on an
+NF4 base, so vLLM would sample from a policy that is neither the trainer's nor the bf16 one.
+
+**FP8 is acceptable, and the owner's prior is that it costs little** (the owner, 2026-09-30:
+frontier models now ship at FP8 or below, and published benchmarks show very little degradation
+from bf16). That covers the rollout KV cache, inference weights, and a frozen FP8 base under a
+LoRA, each admitted the same way: a quick smoke or eval before and after the switch, with the
+trainer-versus-rollout log-prob gap logged, and the run config recording which runs used it. No
+pre-registration, no ablation grid. One mechanical limit stays: **a pre-quantized FP8 checkpoint
+cannot be trained through transformers**, LoRA included (`FineGrainedFP8HfQuantizer` declares
+`is_trainable = False`, and `Trainer` refuses even with an adapter attached). An FP8 training base
+therefore has to come from quantizing bf16 weights on the fly (TorchAO float8, the route Unsloth's
+FP8 RL path uses), which is untested here. Until that works, training runs bf16 LoRA, and 4-bit
+QLoRA is still not recommended anywhere on the ladder. And these are hybrid-attention
 models (`Qwen3_5Config`, whose text sub-config is `Qwen3_5TextConfig` — *not* `Qwen3NextConfig`,
 a different and older family — with three Gated DeltaNet linear-attention layers per full attention
 layer), so LoRA must target the linear-attention projections too: take the target modules from
 `discover_lora_targets` in `grpo/throughput.py`, never a hand-written `q/k/v/o` list, which reaches
 attention in a quarter of the layers and silently leaves every DeltaNet block frozen. Any interp
 tooling assuming standard attention needs checking.
+
+**MoE checkpoints hide their experts from `discover_lora_targets`** (checked 2026-09-30 against
+transformers 5.15.0). The Qwen MoE rungs (35B-A3B, 122B-A10B) store each layer's routed experts as
+two fused 3-D `nn.Parameter` tensors in `Qwen3_5MoeExperts` (`gate_up_proj`, `down_proj`), not as
+`nn.Linear` modules, and `discover_lora_targets` collects only `nn.Linear`. On an MoE it would
+adapt attention, the DeltaNet projections and the one shared expert, and leave every routed expert
+frozen without saying so. The routed experts hold nearly all of the MLP parameters, and MLP
+adapters matter at least as much as attention ones, so an MoE run adapts them by default through
+PEFT's `target_parameters`, and the harness should refuse to start when no adapter reaches an
+expert tensor, the same guard it already has for DeltaNet. Per-expert adapters multiply by the
+expert count (256 per layer here), so size their rank down rather than copying the dense rank
+(see `docs/scratch/scaling-rental-quant-notes-2026-09-30.md`). Also check which expert kernel
+runs: the default `Qwen3_5MoeExperts.forward` loops over experts in Python, and
+`use_experts_implementation` selects the grouped-GEMM alternatives.
 
 Interp tooling (sparse autoencoders, a pre-fitted Jacobian lens, a TransformerLens adapter) exists
 and was verified for `Qwen/Qwen3.5-4B` on 2026-08-15 — **not a reason to keep measurement at 4B now
