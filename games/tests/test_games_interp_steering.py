@@ -953,6 +953,7 @@ def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> ar
     defaults: dict[str, Any] = {
         "model": "tiny/base",
         "backend": "hf",
+        "vllm_execution": "eager",
         "adapter": None,
         "direction": [f"decision={directions_path}"],
         "subspace_bundle": None,
@@ -1308,10 +1309,132 @@ class TestGenerateOffline:
         assert (n_layers, d_model) == (24, HIDDEN)
         settings = cast("FakeBackend", backend).settings
         assert settings["enforce_eager"] is True
+        assert settings["enable_prefix_caching"] is False
         assert settings["worker_extension_cls"].endswith("ResidualInterventionWorker")
         assert settings["gpu_memory_utilization"] == pytest.approx(0.45)
         assert settings["max_model_len"] == 4 + sampling.max_new_tokens
         assert settings["language_model_only"] is True
+
+    def test_derives_graph_worker_and_layer_rank_settings_from_subspaces(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeTokenizer:
+            def apply_chat_template(self, messages: list[dict[str, str]], **_: Any) -> list[int]:
+                return [1] * len(messages[0]["content"])
+
+        class FakeBackend:
+            def __init__(self, model_id: str, **kwargs: Any) -> None:
+                self.model_id = model_id
+                self.settings = kwargs
+                self.llm = SimpleNamespace(collective_rpc=lambda _method: [(24, HIDDEN)])
+
+        real = tmp_path / "real.pt"
+        placebo = tmp_path / "placebo.pt"
+        torch.save({3: torch.eye(HIDDEN)[:2], 7: torch.eye(HIDDEN)[:1]}, real)
+        torch.save({3: torch.eye(HIDDEN)[2:5], 11: torch.eye(HIDDEN)[:4]}, placebo)
+        monkeypatch.setattr(workspace_ablation, "_load_tokenizer", lambda _path: FakeTokenizer())
+        monkeypatch.setattr(
+            interp_steering,
+            "device_memory_report",
+            lambda device: {"device": str(device), "free_bytes": 5, "total_bytes": 10},
+        )
+        monkeypatch.setattr(
+            interp_steering.AutoConfig,
+            "from_pretrained",
+            lambda _model: SimpleNamespace(vision_config=None),
+        )
+        monkeypatch.setattr(interp_steering, "InterventionVLLMBackend", FakeBackend)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            backend="vllm",
+            vllm_execution="graph",
+            direction=[],
+            cells=None,
+            subspace_bundle=real,
+            placebo_bundle=placebo,
+        )
+        sampling = interp_steering.eval_sampling(
+            interp_steering.SAMPLER_TRAINING_DISTRIBUTION, thinking=True
+        )
+
+        backend, _adapter, n_layers, d_model = interp_steering._build_vllm_generation_backend(
+            args, sampling, ["abc"]
+        )
+
+        assert (n_layers, d_model) == (24, HIDDEN)
+        settings = cast("FakeBackend", backend).settings
+        assert settings["enforce_eager"] is False
+        assert settings["enable_prefix_caching"] is False
+        assert settings["worker_cls"].endswith("ResidualGraphWorker")
+        assert settings["worker_extension_cls"].endswith("ResidualInterventionWorker")
+        assert settings["additional_config"] == {
+            "residual_intervention_graph": {"layer_ranks": {"3": 3, "7": 1, "11": 4}}
+        }
+
+    def test_graph_mode_with_no_intervention_sources_uses_empty_layer_ranks(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FakeTokenizer:
+            def apply_chat_template(self, messages: list[dict[str, str]], **_: Any) -> list[int]:
+                return [1] * len(messages[0]["content"])
+
+        class FakeBackend:
+            def __init__(self, model_id: str, **kwargs: Any) -> None:
+                self.model_id = model_id
+                self.settings = kwargs
+                self.llm = SimpleNamespace(collective_rpc=lambda _method: [(24, HIDDEN)])
+
+        monkeypatch.setattr(workspace_ablation, "_load_tokenizer", lambda _path: FakeTokenizer())
+        monkeypatch.setattr(
+            interp_steering,
+            "device_memory_report",
+            lambda device: {"device": str(device), "free_bytes": 5, "total_bytes": 10},
+        )
+        monkeypatch.setattr(
+            interp_steering.AutoConfig,
+            "from_pretrained",
+            lambda _model: SimpleNamespace(vision_config=None),
+        )
+        monkeypatch.setattr(interp_steering, "InterventionVLLMBackend", FakeBackend)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            backend="vllm",
+            vllm_execution="graph",
+            direction=[],
+            cells=None,
+            banned_tokens_json=tmp_path / "banned.json",
+        )
+        sampling = interp_steering.eval_sampling(
+            interp_steering.SAMPLER_TRAINING_DISTRIBUTION, thinking=True
+        )
+
+        backend, _adapter, _n_layers, _d_model = interp_steering._build_vllm_generation_backend(
+            args, sampling, ["abc"]
+        )
+
+        settings = cast("FakeBackend", backend).settings
+        assert settings["additional_config"] == {"residual_intervention_graph": {"layer_ranks": {}}}
+
+    def test_generate_parser_defaults_to_graph_and_accepts_eager(self) -> None:
+        default = interp_steering.build_parser().parse_args(
+            ["generate", "--model", "tiny/base", "--out-dir", "unused"]
+        )
+        eager = interp_steering.build_parser().parse_args(
+            [
+                "generate",
+                "--model",
+                "tiny/base",
+                "--out-dir",
+                "unused",
+                "--vllm-execution",
+                "eager",
+            ]
+        )
+
+        assert default.vllm_execution == "graph"
+        assert eager.vllm_execution == "eager"
 
     def test_vllm_steering_and_ablation_specs_match_the_hf_condition_geometry(self) -> None:
         direction = torch.tensor([3.0, 0.0, 0.0])
@@ -1442,6 +1565,41 @@ class TestGenerateOffline:
         assert all(record["deltanet_kernel"] == TINY_KERNEL for record in records)
         assert summary["deltanet_kernel"] == TINY_KERNEL
         assert summary["deltanet_kernel_bridge"] == {"bridged": False}
+
+    def test_vllm_execution_mode_is_part_of_resume_identity(
+        self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_backend = _FakeVLLMBackend("tiny/base", thinking=True, sampling=None)
+        monkeypatch.setattr(
+            interp_steering,
+            "_build_vllm_generation_backend",
+            lambda *_args, **_kwargs: (fake_backend, None, 24, HIDDEN),
+        )
+
+        @contextmanager
+        def fake_intervention(_llm: object, _spec: Any) -> Any:
+            yield
+
+        monkeypatch.setattr(interp_steering, "intervention", fake_intervention)
+        args = generate_args(
+            tmp_path,
+            directions_path,
+            backend="vllm",
+            conditions="none",
+            vllm_execution="eager",
+        )
+        run_generate(args)
+
+        with pytest.raises(ResumeMismatchError, match="deltanet_kernel"):
+            run_generate(
+                generate_args(
+                    tmp_path,
+                    directions_path,
+                    backend="vllm",
+                    conditions="none",
+                    vllm_execution="graph",
+                )
+            )
 
     def test_a_summary_over_two_kernels_is_refused(
         self, tmp_path: Path, directions_path: Path, monkeypatch: pytest.MonkeyPatch

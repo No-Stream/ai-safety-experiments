@@ -1,4 +1,4 @@
-"""Worker-local residual edits for eager vLLM decoder layers."""
+"""Worker-local residual edits for eager and compiled vLLM decoder layers."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from reward_hacking.interp.steering import ablate_residual, steer_residual
+from reward_hacking.interp.vllm_graph_buffers import GraphInterventionState, ResidualGraphBuffers
 from reward_hacking.model_backend import VLLMBackend, assert_no_banned_token_ids
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ InterventionKind = Literal["none", "subspace", "steering"]
 ResidualTransform = Callable[[torch.Tensor], torch.Tensor]
 _HANDLES_ATTR = "_residual_intervention_handles"
 _COUNTS_ATTR = "_residual_intervention_counts"
+_GRAPH_ATTR = "_residual_graph_state"
 ROW_BASIS_DIMENSIONS = 2
 PAIR_LENGTH = 2
 
@@ -172,6 +174,9 @@ def _install_on_model(model: nn.Module, spec: InterventionSpec) -> tuple[int, in
         raise ValueError(f"vLLM layer count {actual_layers} disagrees with spec {spec.n_layers}")
     if actual_width != spec.d_model:
         raise ValueError(f"vLLM d_model {actual_width} disagrees with spec {spec.d_model}")
+    if hasattr(model, _GRAPH_ATTR):
+        cast("GraphInterventionState", getattr(model, _GRAPH_ATTR)).install(spec)
+        return actual_layers, actual_width
     layers, _ = _decoder_layers(model)
     counts = dict.fromkeys(spec.by_layer, 0)
     handles: list[RemovableHandle] = []
@@ -196,19 +201,48 @@ def _install_on_model(model: nn.Module, spec: InterventionSpec) -> tuple[int, in
     return actual_layers, actual_width
 
 
-def _counts_on_model(model: nn.Module) -> dict[int, int]:
+def _counts_on_model(model: nn.Module) -> dict[int, int] | None:
+    if hasattr(model, _GRAPH_ATTR):
+        return cast("GraphInterventionState", getattr(model, _GRAPH_ATTR)).counts()
     if not hasattr(model, _COUNTS_ATTR):
         raise RuntimeError("no residual intervention is installed on this vLLM worker")
     return cast("dict[int, int]", getattr(model, _COUNTS_ATTR)).copy()
 
 
 def _remove_on_model(model: nn.Module) -> None:
+    if hasattr(model, _GRAPH_ATTR):
+        cast("GraphInterventionState", getattr(model, _GRAPH_ATTR)).remove()
+        return
     if not hasattr(model, _HANDLES_ATTR):
         raise RuntimeError("no residual intervention is installed on this vLLM worker")
     for handle in cast("list[RemovableHandle]", getattr(model, _HANDLES_ATTR)):
         handle.remove()
     delattr(model, _HANDLES_ATTR)
     delattr(model, _COUNTS_ATTR)
+
+
+def prepare_graph_interventions(model: nn.Module, layer_ranks: Mapping[int, int]) -> None:
+    """Attach permanent tensor-only hooks before profiling, Dynamo tracing and CUDA capture.
+
+    Only prepared layers can be edited later. Each rank is the maximum row-basis size for that
+    layer across all conditions; steering needs rank one. RPC updates never replace buffers.
+    """
+    if hasattr(model, _GRAPH_ATTR) or hasattr(model, _HANDLES_ATTR):
+        raise RuntimeError("residual interventions were already prepared on this model")
+    n_layers, width = _model_dimensions(model)
+    layers, _ = _decoder_layers(model)
+    for layer, rank in layer_ranks.items():
+        if not 0 <= layer < n_layers or not 1 <= rank <= width:
+            raise ValueError("graph intervention layer or rank is outside model dimensions")
+    buffers: dict[int, ResidualGraphBuffers] = {}
+    for layer, rank in sorted(layer_ranks.items()):
+        parameter = next(layers[layer].parameters(), None)
+        device = torch.device("cpu") if parameter is None else parameter.device
+        buffer = ResidualGraphBuffers(rank=rank, width=width, device=device)
+        layers[layer].add_module("residual_graph_buffers", buffer)
+        layers[layer].register_forward_hook(buffer.output_hook)
+        buffers[layer] = buffer
+    setattr(model, _GRAPH_ATTR, GraphInterventionState(buffers))
 
 
 class ResidualInterventionWorker:
@@ -231,8 +265,8 @@ class ResidualInterventionWorker:
         spec.validate()
         return _install_on_model(cast("_WorkerWithModel", self).get_model(), spec)
 
-    def residual_intervention_counts(self) -> dict[int, int]:
-        """Report forward-hook calls by decoder layer."""
+    def residual_intervention_counts(self) -> dict[int, int] | None:
+        """Report eager hook counts, or None for differential-validated graph execution."""
         return _counts_on_model(cast("_WorkerWithModel", self).get_model())
 
     def residual_intervention_remove(self) -> None:
@@ -369,12 +403,18 @@ def remove(llm: ModelWorkerAccess) -> None:
 
 @contextmanager
 def intervention(llm: ModelWorkerAccess, spec: InterventionSpec) -> Generator[None]:
-    """Refuse a silent hook after generation and clear it on success or failure."""
+    """Check eager hook execution and clear either execution mode on success or failure.
+
+    Graph replay must first pass the differential-logit validator; Python hook counters cannot
+    observe captured execution and module-buffer mutations are forbidden inside vLLM compilation.
+    """
     install(llm, spec)
     try:
         yield
         if spec.by_layer:
             for worker_counts in llm.collective_rpc("residual_intervention_counts"):
+                if worker_counts is None:
+                    continue
                 missed = [layer for layer, count in worker_counts.items() if count == 0]
                 if missed:
                     raise RuntimeError(f"vLLM residual hook never fired at layers {missed}")

@@ -2105,12 +2105,31 @@ def _build_generation_backend(
     )
 
 
+def _graph_layer_ranks(args: argparse.Namespace) -> dict[str, int]:
+    """Return fixed graph capacities for every layer any intervention can edit."""
+    layer_ranks: dict[int, int] = {}
+    bundle_paths = tuple(
+        path for path in (args.subspace_bundle, args.placebo_bundle) if path is not None
+    )
+    if bundle_paths:
+        for bundle_path in bundle_paths:
+            for layer, basis in load_bundle(Path(bundle_path)).items():
+                layer_ranks[layer] = max(layer_ranks.get(layer, 0), int(basis.shape[0]))
+    elif args.direction:
+        for directions in load_named_directions(args.direction).values():
+            for layer in directions:
+                layer_ranks[layer] = max(layer_ranks.get(layer, 0), 1)
+    return {str(layer): rank for layer, rank in sorted(layer_ranks.items())}
+
+
 def _build_vllm_generation_backend(
     args: argparse.Namespace, sampling: SamplingConfig, prompts: Sequence[str]
 ) -> tuple[InterventionVLLMBackend, dict[str, Any] | None, int, int]:
-    """Construct eager vLLM with a live-card budget and the named worker extension."""
+    """Construct the selected vLLM execution mode with a live-card budget."""
     if not prompts:
         raise ValueError("vLLM generation has no prompts")
+    if args.vllm_execution not in ("eager", "graph"):
+        raise ValueError(f"unknown vLLM execution mode {args.vllm_execution!r}")
     tokenizer = workspace_ablation._load_tokenizer(Path(args.model))  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
     prompt_lengths = [
         len(
@@ -2131,7 +2150,8 @@ def _build_vllm_generation_backend(
         raise RuntimeError("vLLM generation requires free CUDA memory on the selected device")
     gpu_memory_utilization = 0.9 * free_bytes / total_bytes
     logger.info(
-        "vLLM eager generation device=%s free_bytes=%d total_bytes=%d utilization=%.3f max_model_len=%d",
+        "vLLM %s generation device=%s free_bytes=%d total_bytes=%d utilization=%.3f max_model_len=%d",
+        args.vllm_execution,
         memory["device"],
         free_bytes,
         total_bytes,
@@ -2141,11 +2161,19 @@ def _build_vllm_generation_backend(
     adapter_dir = None if args.adapter is None else Path(args.adapter).resolve()
     adapter: dict[str, Any] | None = None
     engine_kwargs: dict[str, Any] = {
-        "enforce_eager": True,
+        "enforce_eager": args.vllm_execution == "eager",
+        "enable_prefix_caching": False,
         "worker_extension_cls": "reward_hacking.interp.vllm_interventions.ResidualInterventionWorker",
         "gpu_memory_utilization": gpu_memory_utilization,
         "max_model_len": max_model_len,
     }
+    if args.vllm_execution == "graph":
+        engine_kwargs.update(
+            worker_cls="reward_hacking.interp.vllm_graph_worker.ResidualGraphWorker",
+            additional_config={
+                "residual_intervention_graph": {"layer_ranks": _graph_layer_ranks(args)}
+            },
+        )
     config = AutoConfig.from_pretrained(args.model)
     if getattr(config, "vision_config", None) is not None:
         engine_kwargs["language_model_only"] = True
@@ -2355,7 +2383,11 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             args, sampling, prompts
         )
         model = None
-        deltanet_kernel = {"engine": "vllm", "execution": "eager"}
+        deltanet_kernel = {
+            "engine": "vllm",
+            "execution": args.vllm_execution,
+            "prefix_caching": "disabled",
+        }
     else:
         raise ValueError(f"unknown generation backend {args.backend!r}")
     # After the load, so a hub id resolves from the same cache the weights just came out of.
@@ -2755,6 +2787,15 @@ def build_parser() -> argparse.ArgumentParser:
     generate = sub.add_parser("generate", help="Steered generation on held-out eval prompts.")
     generate.add_argument("--model", required=True)
     generate.add_argument("--backend", choices=("hf", "vllm"), default="hf")
+    generate.add_argument(
+        "--vllm-execution",
+        choices=("eager", "graph"),
+        default="graph",
+        help=(
+            "vLLM execution mode for residual interventions. graph compiles the edit into CUDA graphs"
+            " (2.5x eager on the 9B, logit parity at noise level); eager keeps Python hooks."
+        ),
+    )
     generate.add_argument(
         "--adapter",
         type=Path,

@@ -10,14 +10,18 @@ from typing import Any
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounter
+from torch._inductor import config as inductor_config
 
 from reward_hacking.interp.steering import ablate_residual, steer_residual
+from reward_hacking.interp.vllm_graph_buffers import validate_graph_compiler
 from reward_hacking.interp.vllm_interventions import (
     InterventionSpec,
     InterventionVLLMBackend,
     ResidualInterventionWorker,
     install,
     intervention,
+    prepare_graph_interventions,
     remove,
 )
 
@@ -128,6 +132,84 @@ class TestFusedResidualHook:
         with pytest.raises(ValueError, match="output"):
             model.model.layers[0]((torch.ones(1, 3), torch.ones(1, 3), torch.ones(1, 3)))
         remove(llm)
+
+
+class TestGraphResidualBuffers:
+    def test_refuses_compiler_freezing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(inductor_config, "freezing", True)
+        with pytest.raises(RuntimeError, match="freezing"):
+            validate_graph_compiler()
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_compiled_updates_reuse_buffers_and_match_eager_edits(self, dtype: torch.dtype) -> None:
+        model = _PairModel()
+        llm = _FakeLLM(model)
+        prepare_graph_interventions(model, {0: 2, 1: 2})
+        tensor_addresses = {name: buffer.data_ptr() for name, buffer in model.named_buffers()}
+        counter = CompileCounter()
+        compiled = torch.compile(model, backend=counter, fullgraph=True)
+        hidden = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=dtype)
+        assert torch.equal(compiled(hidden), hidden)
+        basis = torch.eye(3)[:2]
+        for layer in (0, 1):
+            with intervention(
+                llm, InterventionSpec.subspace({layer: basis}, n_layers=2, d_model=3)
+            ):
+                assert torch.equal(compiled(hidden), ablate_residual(hidden, basis))
+            assert torch.equal(compiled(hidden), hidden)
+        vector = torch.tensor([0.0, 3.0, 0.0])
+        with intervention(
+            llm, InterventionSpec.steering({0: vector}, alpha=10.0, n_layers=2, d_model=3)
+        ):
+            assert torch.equal(compiled(hidden), steer_residual(hidden, vector, 10.0))
+        assert counter.frame_count == 1
+        assert tensor_addresses == {
+            name: buffer.data_ptr() for name, buffer in model.named_buffers()
+        }
+
+    @pytest.mark.parametrize(("layer", "rank", "error"), [(1, 1, "prepared"), (0, 2, "rank")])
+    def test_refuses_uncaptured_layer_or_rank_and_cleans_up(
+        self, layer: int, rank: int, error: str
+    ) -> None:
+        llm = _FakeLLM(_PairModel())
+        prepare_graph_interventions(llm.model, {0: 1})
+        with pytest.raises(ValueError, match=error):
+            install(
+                llm, InterventionSpec.subspace({layer: torch.eye(3)[:rank]}, n_layers=2, d_model=3)
+            )
+        with intervention(llm, InterventionSpec.none(n_layers=2, d_model=3)):
+            assert torch.equal(llm.model(torch.ones(1, 3)), torch.ones(1, 3))
+
+    def test_graph_execution_does_not_report_python_hook_counts(self) -> None:
+        llm = _FakeLLM(_PairModel())
+        prepare_graph_interventions(llm.model, {0: 1})
+        with intervention(llm, InterventionSpec.none(n_layers=2, d_model=3)):
+            assert llm.residual_intervention_counts() is None
+
+    @pytest.mark.parametrize("layer_ranks", [{2: 1}, {0: 0}, {0: 4}])
+    def test_refuses_invalid_capture_geometry(self, layer_ranks: dict[int, int]) -> None:
+        with pytest.raises(ValueError, match="dimensions"):
+            prepare_graph_interventions(_PairModel(), layer_ranks)
+
+    def test_refuses_duplicate_preparation(self) -> None:
+        llm = _FakeLLM(_PairModel())
+        prepare_graph_interventions(llm.model, {0: 1})
+        with pytest.raises(RuntimeError, match="already prepared"):
+            prepare_graph_interventions(llm.model, {0: 1})
+
+    def test_refuses_nested_installation(self) -> None:
+        llm = _FakeLLM(_PairModel())
+        prepare_graph_interventions(llm.model, {0: 1})
+        spec = InterventionSpec.none(n_layers=2, d_model=3)
+        with intervention(llm, spec), pytest.raises(RuntimeError, match="already installed"):
+            install(llm, spec)
+
+    def test_refuses_unsupported_decoder_output(self) -> None:
+        model = _PairModel()
+        model.model.layers = torch.nn.ModuleList([_SingleLayer(), _SingleLayer()])
+        prepare_graph_interventions(model, {0: 1})
+        with pytest.raises(ValueError, match="tensor pair"):
+            model.model.layers[0](torch.ones(1, 3))
 
 
 @dataclass
