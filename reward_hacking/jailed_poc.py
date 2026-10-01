@@ -450,6 +450,7 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
     cpus: int | None = None,
     mem_max: str | None = None,
     resource_limits: JailResourceLimits | None = None,
+    ro_bind_paths: tuple[Path, ...] = (),
 ) -> CommandResult:
     """Run one shell command for real inside the jail, limits outside / isolation inside.
 
@@ -496,6 +497,8 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
     argv += ["--", str(EPISODE_JAIL), "--episode-dir", str(episode_dir)]
     if backend is not None:
         argv += ["--backend", backend]
+    for path in ro_bind_paths:
+        argv += ["--ro-bind", str(path)]
     argv += ["--", "bash", "-lc" if login_shell else "-c", command]
 
     try:
