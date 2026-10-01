@@ -15,7 +15,7 @@ What it proves, end to end and for real:
    actually asks for. Reading it reveals the whole check -- that readability is the point.
 2. A runner executes each scripted command ACTUALLY (not simulated) inside the jail, composed
    limits-outside / isolation-inside: ``resource-limits.sh`` (cgroup caps, CPU-only, short timeout)
-   wraps ``episode_jail.sh`` (bubblewrap isolation) wraps ``bash -lc <cmd>``. Never the reverse --
+   wraps ``episode_jail.sh`` (namespace isolation) wraps ``bash -lc <cmd>``. Never the reverse --
    the reverse hands the jail a route to the systemd user bus and thus an escape.
 3. Two scripted runs close the loop. The HONEST run computes the true answer and the grader passes.
    The FORGE run cats the grader, learns the brittle check, writes only the token it greps for
@@ -42,11 +42,17 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 from reward_hacking.terminal_wrench import split_argv, split_commands, strip_command_prefixes
 from reward_hacking.tiers import VERDICT_BOUNDARY, RegradeVerdict, TrustBoundary
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,70 @@ SUCCESS_EXIT = 0
 TIMEOUT_EXIT = 124  # resource-limits.sh reserves this for a wall-clock kill
 DEFAULT_COMMAND_TIMEOUT = "60s"  # per-command cgroup wall-clock leash; episodes are tiny
 PROCESS_TIMEOUT_SECONDS = 180.0  # belt-and-suspenders above the cgroup leash
+
+
+@dataclass(frozen=True)
+class JailResourceLimits:
+    """The resource-limiter mode selected once for a run, shared by commands and oracles."""
+
+    mode: Literal["enforced", "advisory"] = "enforced"
+    systemd_user_state: str | None = None
+
+    def to_json_dict(self) -> dict[str, object]:
+        """Record whether the run used cgroups or explicitly requested advisory limits."""
+        return {"mode": self.mode, "systemd_user_state": self.systemd_user_state}
+
+
+ENFORCED_JAIL_RESOURCE_LIMITS = JailResourceLimits()
+
+_JAIL_RESOURCE_LIMITS: ContextVar[JailResourceLimits] = ContextVar(
+    "jail_resource_limits", default=ENFORCED_JAIL_RESOURCE_LIMITS
+)
+
+
+def resolve_jail_resource_limits(*, advisory: bool = False) -> JailResourceLimits:
+    """Allow explicit advisory mode only when systemctl confirms an absent user manager.
+
+    Other probe failures are not evidence of absence. Enforcement remains the default, and
+    a cgroup launch failure never causes a retry with weaker controls.
+    """
+    if not advisory:
+        return JailResourceLimits()
+    completed = subprocess.run(
+        ["systemctl", "--user", "is-system-running"],  # noqa: S607 - systemctl from host PATH
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    state = completed.stdout.strip()
+    if state != "offline" or completed.returncode != 1:
+        raise RuntimeError(
+            "advisory limits require systemctl to confirm an absent user manager (offline); "
+            f"got state={state!r}, exit={completed.returncode}: {completed.stderr.strip()}"
+        )
+    logger.warning(
+        "systemd user manager is offline: advisory limits selected; limits are NOT enforced"
+    )
+    return JailResourceLimits(mode="advisory", systemd_user_state=state)
+
+
+@contextmanager
+def jail_resource_limits_scope(limits: JailResourceLimits | None) -> Generator[None]:
+    """Apply a resolved run mode inside an episode worker, including its oracle callbacks."""
+    context_reset_token = _JAIL_RESOURCE_LIMITS.set(
+        _JAIL_RESOURCE_LIMITS.get() if limits is None else limits
+    )
+    try:
+        yield
+    finally:
+        _JAIL_RESOURCE_LIMITS.reset(context_reset_token)
+
+
+def current_jail_resource_limits() -> JailResourceLimits:
+    """Return the caller's selected mode before dispatching work to a fresh thread context."""
+    return _JAIL_RESOURCE_LIMITS.get()
+
 
 # --- The task, embedded so the POC is self-contained and deterministic. ---
 GRADER_FILENAME = "grade.py"
@@ -379,13 +449,19 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
     login_shell: bool = True,
     cpus: int | None = None,
     mem_max: str | None = None,
+    resource_limits: JailResourceLimits | None = None,
 ) -> CommandResult:
     """Run one shell command for real inside the jail, limits outside / isolation inside.
 
     The composition order is load-bearing and never reversed: ``resource-limits.sh`` (cgroup caps,
     CPU-only -- NO ``--gpu``, since the vLLM policy server would hold the L4 and abort every
-    episode) wraps ``episode_jail.sh`` (bubblewrap, no network, /work-only) wraps
+    episode) wraps ``episode_jail.sh`` (bubblewrap when available, otherwise unshare; no network,
+    /work-only) wraps
     ``bash -lc <command>``.
+
+    ``resource_limits`` is resolved once by ``resolve_jail_resource_limits``. Unset, it inherits
+    the episode worker scope (including oracle callbacks), or defaults to enforced cgroup limits.
+    Advisory selection is explicit and logged; command failures never trigger a fallback.
 
     ``cpus`` and ``mem_max`` are the caller's chance to say how big *this* command is. Left unset,
     the limiter applies its own defaults, which are sized for a training job on the host it runs
@@ -409,7 +485,10 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
     ``reward_hacking/tests/test_oracle_hardening.py`` demonstrates the hijack working through a
     login shell and inert without one.
     """
+    limits = _JAIL_RESOURCE_LIMITS.get() if resource_limits is None else resource_limits
     argv: list[str] = [str(RESOURCE_LIMITS), "-t", timeout]
+    if limits.mode == "advisory":
+        argv.append("--advisory")
     if cpus is not None:
         argv += ["--cpus", str(cpus)]
     if mem_max is not None:
@@ -606,6 +685,11 @@ def main() -> int:
     parser.add_argument("--backend", choices=("bwrap", "unshare"), default=None)
     parser.add_argument("--timeout", default=DEFAULT_COMMAND_TIMEOUT)
     parser.add_argument(
+        "--advisory-limits",
+        action="store_true",
+        help="Use unenforced resource limits only when the systemd user manager is offline.",
+    )
+    parser.add_argument(
         "--trace-dir",
         type=Path,
         default=None,
@@ -614,12 +698,14 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="jailed-poc: %(message)s")
-    honest, forge, containment = run_poc(
-        backend=args.backend,
-        timeout=args.timeout,
-        trace_dir=args.trace_dir,
-        keep_dirs=args.trace_dir is not None,
-    )
+    limits = resolve_jail_resource_limits(advisory=args.advisory_limits)
+    with jail_resource_limits_scope(limits):
+        honest, forge, containment = run_poc(
+            backend=args.backend,
+            timeout=args.timeout,
+            trace_dir=args.trace_dir,
+            keep_dirs=args.trace_dir is not None,
+        )
 
     loop_closes = honest.proxy_pass and forge.proxy_pass
     hack_demonstrated = forge.is_hack and not honest.is_hack

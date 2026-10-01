@@ -40,8 +40,6 @@
 # Two backends, selected with --backend, and they are not equally trustworthy:
 #
 #   bwrap    Preferred, and the default when installed: purpose-built and audited.
-#            Installed here (bubblewrap-0.10.0) and verified against the assertion
-#            suite, so this is the path real episodes take.
 #   unshare  Fallback assembled from util-linux primitives, for hosts without bwrap.
 #            Unshares the same namespaces (user, mount, net, pid, ipc, uts, cgroup) and runs
 #            under setsid, so like bwrap it has its own session and no controlling terminal.
@@ -213,8 +211,35 @@ resolve_jail_python() {
        scripts/stage_jail_python.sh"
 }
 
-# Stage 2: already inside fresh namespaces, so the mounts land in the new mount
-# namespace. Builds a tmpfs root, adds only the whitelist, and pivots into it.
+resolve_usr_alternatives() {
+  local -n targets="$1" destinations="$2"
+  [[ -d /etc/alternatives ]] || return 0
+  local links
+  links="$("$jail_python" -I -c '
+from pathlib import Path
+
+for alternative in sorted(Path("/etc/alternatives").iterdir()):
+    if not alternative.is_symlink():
+        continue
+    resolved = alternative.resolve(strict=True)
+    if not resolved.is_relative_to("/usr"):
+        continue
+    if "\n" in str(resolved) or "\n" in str(alternative):
+        raise ValueError("alternative paths must not contain newlines")
+    print(resolved)
+    print(alternative)
+  ')" || die "could not resolve /usr command alternatives"
+  [[ -n "$links" ]] || return 0
+  local -a resolved_links=()
+  mapfile -t resolved_links <<< "$links"
+  local index
+  for ((index=0; index<${#resolved_links[@]}; index+=2)); do
+    targets+=("${resolved_links[$index]}")
+    destinations+=("${resolved_links[$((index+1))]}")
+  done
+}
+
+# Stage 2 builds the tmpfs root inside fresh namespaces, then pivots into it.
 run_pivot_stage() {
   local episode_dir="$1" jail_python="$2"
   shift 2
@@ -224,6 +249,11 @@ run_pivot_stage() {
     shift
   done
   shift # past the --
+
+  [[ -x /usr/bin/setpriv ]] || die "unshare requires /usr/bin/setpriv"
+  [[ -x /usr/sbin/capsh ]] || die "unshare requires /usr/sbin/capsh"
+  local -a alternative_targets=() alternative_destinations=()
+  resolve_usr_alternatives alternative_targets alternative_destinations
 
   local new_root
   new_root="$(mktemp -d)"
@@ -258,6 +288,15 @@ run_pivot_stage() {
   printf 'root:x:0:\nnobody:x:65534:\n' >"$new_root/etc/group"
   printf 'jail\n' >"$new_root/etc/hostname"
 
+  # Debian command links such as /usr/bin/awk pass through /etc/alternatives.
+  # Recreate only links into the already-whitelisted /usr, exposing no host /etc files.
+  mkdir -p "$new_root/etc/alternatives"
+  local alternative_index
+  for alternative_index in "${!alternative_targets[@]}"; do
+    ln -s "${alternative_targets[$alternative_index]}" \
+      "$new_root${alternative_destinations[$alternative_index]}"
+  done
+
   mount --bind "$episode_dir" "$new_root/work"
 
   local path
@@ -281,10 +320,32 @@ run_pivot_stage() {
   # Detaching oldroot is what actually severs the host tree. Without it the whole host
   # filesystem stays walkable at /oldroot and the jail is theatre.
   umount -l /oldroot
-  rmdir /oldroot 2>/dev/null || true
+  rmdir /oldroot
 
   cd /work
-  exec env -i PATH="$JAIL_PYTHON_SHIM_DIR:/usr/bin:/usr/sbin" HOME=/work TMPDIR=/tmp "$@"
+  # Old libcap-ng cannot parse setpriv's '-all' on newer kernels. capsh clears all
+  # capability sets; the check refuses a payload if its library missed a kernel capability.
+  exec env -i PATH="$JAIL_PYTHON_SHIM_DIR:/usr/bin:/usr/sbin" HOME=/work TMPDIR=/tmp \
+    /usr/bin/setpriv --no-new-privs -- /usr/sbin/capsh \
+    --drop=all --caps= --inh= --noamb -- -c '
+      privilege_failure() {
+        echo "episode-jail: failed to remove payload privileges" >&2
+        exit 2
+      }
+      capability_fields=0
+      no_new_privileges=0
+      while read -r key value _; do
+        case "$key" in
+          CapInh:|CapPrm:|CapEff:|CapBnd:|CapAmb:)
+            [[ "$value" =~ ^0+$ ]] || privilege_failure
+            ((capability_fields+=1))
+            ;;
+          NoNewPrivs:) no_new_privileges="$value" ;;
+        esac
+      done < /proc/self/status
+      [[ "$capability_fields" == 5 && "$no_new_privileges" == 1 ]] || privilege_failure
+      exec "$@"
+    ' -- "$@"
 }
 
 # Dispatched before option parsing: this is how stage 1 re-enters the script, and the
@@ -392,6 +453,12 @@ case "$backend" in
       --symlink "$jail_python" "$JAIL_PYTHON_SHIM_DIR/python3"
       --symlink "$jail_python" "$JAIL_PYTHON_SHIM_DIR/python"
     )
+    declare -a alternative_targets=() alternative_destinations=()
+    resolve_usr_alternatives alternative_targets alternative_destinations
+    for alternative_index in "${!alternative_targets[@]}"; do
+      bwrap_args+=(--symlink "${alternative_targets[$alternative_index]}" \
+        "${alternative_destinations[$alternative_index]}")
+    done
     # Only when the interpreter lives outside /usr. A /usr-resident one is already inside the
     # read-only bind, so the whitelist gains nothing and widens by nothing.
     if [[ -n "$jail_python_bind_root" ]]; then

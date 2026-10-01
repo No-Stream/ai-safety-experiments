@@ -379,7 +379,10 @@ def test_grpo_config_accepts_the_arguments_we_pass(tmp_path: Path) -> None:
         use_liger_kernel=True,
         temperature=0.8,
         top_p=0.9,
-        tf32=True,
+        # The compatibility check runs on CPU-only test hosts; retain the production bf16
+        # field while selecting TrainingArguments' explicit CPU path and disabling GPU-only TF32.
+        use_cpu=True,
+        tf32=False,
         bf16=True,
         report_to="none",
     )

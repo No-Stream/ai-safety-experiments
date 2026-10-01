@@ -74,7 +74,14 @@ assertions="$script_dir/jail_assertions.py"
 [[ -f "$assertions" ]] || die "missing: $assertions"
 
 workdir="$(mktemp -d /tmp/jail-tests.XXXXXX)"
-cleanup() { [[ "$keep_artifacts" == 1 ]] || rm -rf -- "$workdir"; }
+dbus_server_pid=""
+cleanup() {
+  if [[ -n "$dbus_server_pid" ]]; then
+    kill "$dbus_server_pid" 2>/dev/null || true
+    wait "$dbus_server_pid" 2>/dev/null || true
+  fi
+  [[ "$keep_artifacts" == 1 ]] || rm -rf -- "$workdir"
+}
 trap cleanup EXIT
 
 # The episode dir is the only host path bound into the jail, so the suite has to be
@@ -111,12 +118,48 @@ echo "probing host homes:${host_home_args[*]//--host-home/}"
 # handed to both runs, since a child inherits both and the in-jail run has nothing to compare with.
 launcher_session="$("$JAIL_PYTHON" -c 'import os; print(os.getsid(0))')"
 launcher_args=(--launcher-session "$launcher_session")
+launcher_args+=(--launcher-pid-namespace "$(readlink /proc/self/ns/pid)")
 for ns_kind in ipc uts; do
   launcher_namespace="$ns_kind=$(readlink "/proc/self/ns/$ns_kind")"
   launcher_args+=(--launcher-namespace "$launcher_namespace")
   echo "launcher $launcher_namespace"
 done
 echo "launcher session: $launcher_session"
+
+# Portable fixtures. They are handed to both probes at the same absolute host paths; the jail hides
+# those paths while the outside run sees them alongside the real /dev scan.
+negative_device_root="$workdir/negative-dev"
+mkdir -p "$negative_device_root"
+touch "$negative_device_root/nvidia0"
+negative_dbus_root="$workdir/negative-dbus"
+mkdir -p "$negative_dbus_root"
+negative_dbus_socket="$negative_dbus_root/bus"
+dbus_socket_args=()
+"$JAIL_PYTHON" -c '
+import socket
+import sys
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sys.argv[1])
+server.listen(1)
+print("ready", flush=True)
+connection, _ = server.accept()
+connection.close()
+server.close()
+' "$negative_dbus_socket" >"$workdir/dbus-server.log" 2>"$workdir/dbus-server.err" &
+dbus_server_pid=$!
+for attempt in {1..50}; do
+  [[ -S "$negative_dbus_socket" ]] && break
+  kill -0 "$dbus_server_pid" 2>/dev/null || break
+  sleep 0.02
+done
+if [[ -S "$negative_dbus_socket" ]]; then
+  dbus_socket_args=(--dbus-socket "$negative_dbus_socket")
+  echo "negative-control fixtures: socket=$negative_dbus_socket, nvidia=$negative_device_root/nvidia0"
+else
+  cat "$workdir/dbus-server.err" >&2
+  die "could not create the reachable Unix socket required by the D-Bus negative control"
+fi
 
 echo "== 1/4 argument guards: --ro-bind must refuse every spelling of a home directory =="
 # The whitelist's one guarantee is that no home tree reaches the jail, and the containment checks
@@ -177,17 +220,24 @@ echo "== 2/4 host checks: honeypot paths must not exist on the host =="
 
 echo
 echo "== 3/4 inside the jail (backend=$backend): all containment checks must pass =="
-"$jail" --episode-dir "$episode_dir" --backend "$backend" -- \
+AWS_JAIL_NEGATIVE_CONTROL=1 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$negative_dbus_root}" \
+  "$jail" --episode-dir "$episode_dir" --backend "$backend" -- \
   "$JAIL_PYTHON" /work/jail_assertions.py --group containment --json \
-  --jail-python "$JAIL_PYTHON" "${host_home_args[@]}" "${launcher_args[@]}" \
+  --jail-python "$JAIL_PYTHON" \
+  --additional-device "$negative_device_root/nvidia0" \
+  "${dbus_socket_args[@]}" \
+  "${host_home_args[@]}" "${launcher_args[@]}" \
   >"$workdir/inside.json"
 
 echo
 echo "== 4/4 negative control: the same checks must FAIL outside the jail =="
 # Expected to exit non-zero; that is the point, so tolerate it here and let
 # --verify-negative-control below judge whether the right checks flipped.
-"$JAIL_PYTHON" "$assertions" --group containment --json \
+AWS_JAIL_NEGATIVE_CONTROL=1 XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$negative_dbus_root}" \
+  "$JAIL_PYTHON" "$assertions" --group containment --json \
   --jail-python "$JAIL_PYTHON" "${host_home_args[@]}" "${launcher_args[@]}" \
+  "${dbus_socket_args[@]}" \
+  --additional-device "$negative_device_root/nvidia0" \
   >"$workdir/outside.json" || true
 
 echo

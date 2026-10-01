@@ -891,7 +891,22 @@ class TestBackendSelectionCLI:
         """
         captured = self._capture_build(monkeypatch)
 
-        _build_cli_backend(_parse_args(["--backend", kind]))
+        argv = ["--backend", kind]
+        if kind == "vllm-http":
+
+            class FakeTokenizer:
+                unk_token_id = None
+
+                def convert_tokens_to_ids(self, token: str) -> int | None:
+                    return {"<|im_end|>": 248046, "<|endoftext|>": 248044}.get(token)
+
+            def fake_tokenizer(source: str, **kwargs: object) -> FakeTokenizer:
+                del source, kwargs
+                return FakeTokenizer()
+
+            monkeypatch.setattr(loop.AutoTokenizer, "from_pretrained", fake_tokenizer)
+            argv.extend(["--vllm-http-url", "http://synthetic"])
+        _build_cli_backend(_parse_args(argv))
 
         assert captured["kind"] == kind
         assert captured["model_id"]

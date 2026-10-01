@@ -41,6 +41,7 @@ from bisect import bisect_right
 from collections.abc import Collection, Iterable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast, runtime_checkable
 
@@ -60,6 +61,7 @@ import torch
 import urllib3.exceptions
 from httpx2 import Timeout
 from openai import APIConnectionError, APIError, APIStatusError, OpenAI
+from pydantic import BaseModel, ConfigDict, Field
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -891,6 +893,157 @@ def _request_seeds_from_generation_kwargs(
     if any(seed < 0 for seed in seeds):
         raise ValueError("request_seeds must be non-negative")
     return seeds
+
+
+class _VLLMHTTPChoice(BaseModel):
+    """Required completion fields, validated without importing the GPU engine."""
+
+    model_config = ConfigDict(strict=True)
+    index: int
+    text: str
+    finish_reason: str | None
+    stop_reason: int | str | None
+
+
+class _VLLMHTTPUsage(BaseModel):
+    """Per-request counts reported by the server, rather than re-tokenized estimates."""
+
+    model_config = ConfigDict(strict=True)
+    prompt_tokens: int = Field(ge=0)
+    completion_tokens: int = Field(ge=0)
+
+
+class _VLLMHTTPResponse(BaseModel):
+    """The non-streaming, single-prompt response contract."""
+
+    model_config = ConfigDict(strict=True)
+    choices: list[_VLLMHTTPChoice] = Field(min_length=1, max_length=1)
+    usage: _VLLMHTTPUsage
+
+
+class VLLMHTTPBackend:
+    """Concurrent completions requests with the in-process backend's prompt rendering.
+
+    Each call owns its HTTP connection and response. No engine or mutable usage counter is
+    shared, so episode threads can submit independently for continuous batching on the server.
+    The server must load the same model source and revision as this backend's tokenizer.
+    """
+
+    transport = "vllm-http"
+
+    def __init__(  # noqa: PLR0913 - explicit transport and tokenizer identity
+        self,
+        model_id: str,
+        *,
+        base_url: str,
+        model_path: str | Path | None = None,
+        revision: str | None = None,
+        thinking: bool = False,
+        sampling: SamplingConfig | None = None,
+        stop_token_ids: Sequence[int] | None = None,
+        timeout_seconds: float = 1800.0,
+    ) -> None:
+        """Load only the model's own tokenizer; no weights, remote code, or GPU access."""
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self.model_id = model_id
+        self.model_path = None if model_path is None else str(model_path)
+        self.revision = revision
+        self.thinking = thinking
+        self.sampling = sampling or SamplingConfig.for_thinking(thinking=thinking)
+        self.stop_token_ids = tuple(stop_token_ids or ())
+        if any(token_id < 0 for token_id in self.stop_token_ids):
+            raise ValueError("stop_token_ids must be non-negative")
+        self.base_url = base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self._tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+            self.model_path or model_id, revision=revision
+        )
+        logger.info(
+            "VLLMHTTPBackend model=%s source=%s revision=%s endpoint=%s thinking=%s",
+            model_id,
+            self.model_path or model_id,
+            revision,
+            self.base_url,
+            thinking,
+        )
+
+    @property
+    def tokenizer(self) -> PreTrainedTokenizerBase:
+        """Return the tokenizer used to render every request."""
+        return self._tokenizer
+
+    def generate_detailed(
+        self,
+        prompts: list[str],
+        *,
+        generation_kwargs: Mapping[str, object] | None = None,
+    ) -> list[BedrockCompletion]:
+        """Send each rendered prompt to /v1/completions; propagate HTTP and schema failures."""
+        seeds = _request_seeds_from_generation_kwargs(generation_kwargs)
+        if seeds is not None and len(seeds) != len(prompts):
+            raise ValueError("request_seeds must contain one seed per prompt")
+        completions: list[BedrockCompletion] = []
+        for index, prompt in enumerate(prompts):
+            body = {
+                "model": self.model_id,
+                "prompt": _as_single_user_turn(self._tokenizer, prompt, thinking=self.thinking),
+                "max_tokens": self.sampling.max_new_tokens,
+                "temperature": self.sampling.temperature if self.sampling.do_sample else 0.0,
+                "top_p": self.sampling.top_p,
+                "top_k": self.sampling.top_k,
+                "min_p": self.sampling.min_p,
+                "repetition_penalty": self.sampling.repetition_penalty,
+                "presence_penalty": self.sampling.presence_penalty,
+                "seed": self.sampling.seed if seeds is None else seeds[index],
+                "stop": list(self.sampling.stop) if self.sampling.stop else None,
+                "stop_token_ids": list(self.stop_token_ids) if self.stop_token_ids else None,
+                "include_stop_str_in_output": bool(self.sampling.stop),
+                # LLM.generate uses default_cmpl_tok_params with this set to True too.
+                "add_special_tokens": True,
+                "n": 1,
+                "stream": False,
+            }
+            started = time.monotonic()
+            with httpx2.Client(timeout=self.timeout_seconds, trust_env=False) as client:
+                response = client.post(f"{self.base_url}/v1/completions", json=body)
+                response.raise_for_status()
+                if (
+                    response.status_code != HTTPStatus.OK
+                ):  # raise_for_status accepts other 2xx codes.
+                    raise ValueError(
+                        f"vLLM completions returned HTTP {response.status_code}, expected 200"
+                    )
+                parsed = _VLLMHTTPResponse.model_validate(response.json())
+            choice = parsed.choices[0]
+            if choice.index != 0:
+                raise ValueError(f"vLLM returned completion index {choice.index}, expected 0")
+            completions.append(
+                BedrockCompletion(
+                    text=choice.text,
+                    reasoning="",
+                    usage=TokenUsage(
+                        input_tokens=parsed.usage.prompt_tokens,
+                        output_tokens=parsed.usage.completion_tokens,
+                    ),
+                    stop_reason=_vllm_stop_reason(choice.finish_reason, choice.stop_reason),
+                    elapsed_seconds=time.monotonic() - started,
+                    attempts=1,
+                )
+            )
+        return completions
+
+    def generate(
+        self,
+        prompts: list[str],
+        *,
+        generation_kwargs: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        """Return completion text using the same detailed request path."""
+        return [
+            completion.text
+            for completion in self.generate_detailed(prompts, generation_kwargs=generation_kwargs)
+        ]
 
 
 class VLLMBackend:
@@ -3603,10 +3756,11 @@ class CodexBackend:
         return [self._generate_one(prompt) for prompt in prompts]
 
 
-def build_backend(kind: str, model_id: str, **kwargs: object) -> Backend:
+def build_backend(kind: str, model_id: str, **kwargs: object) -> Backend:  # noqa: PLR0911 - one branch per transport
     """Build the backend selected by ``kind``.
 
-    Supported kinds are ``hf`` (transformers), ``mock`` (offline), ``vllm`` (lazy), ``bedrock``
+    Supported kinds are ``hf`` (transformers), ``mock`` (offline), ``vllm`` (lazy),
+    ``vllm-http`` (local completions server), ``bedrock``
     (hosted Converse API, lazy), ``openrouter`` (OpenAI-compatible hosted API), and ``codex``
     (shells the codex CLI for GPT-5.x). A model id beginning with ``openrouter:`` routes here even
     when a legacy caller still supplies ``kind="bedrock"``; the prefix is stripped only from the
@@ -3621,6 +3775,8 @@ def build_backend(kind: str, model_id: str, **kwargs: object) -> Backend:
         return HFBackend(model_id, **kwargs)  # pyright: ignore[reportArgumentType]
     if kind == "mock":
         return MockBackend(model_id=model_id, **kwargs)  # pyright: ignore[reportArgumentType]
+    if kind == "vllm-http":
+        return VLLMHTTPBackend(model_id, **kwargs)  # pyright: ignore[reportArgumentType]
     if kind == "vllm":
         return VLLMBackend(model_id, **kwargs)  # pyright: ignore[reportArgumentType]
     if kind == "bedrock":
@@ -3628,7 +3784,8 @@ def build_backend(kind: str, model_id: str, **kwargs: object) -> Backend:
     if kind == "codex":
         return CodexBackend(model_id, **kwargs)  # pyright: ignore[reportArgumentType]
     raise ValueError(
-        f"unknown backend kind {kind!r}; expected 'hf', 'mock', 'vllm', 'bedrock', 'openrouter', or 'codex'"
+        f"unknown backend kind {kind!r}; expected 'hf', 'mock', 'vllm', 'vllm-http', "
+        "'bedrock', 'openrouter', or 'codex'"
     )
 
 

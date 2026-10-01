@@ -116,6 +116,9 @@ class ProbeConfig:
     jail_python: str = ""
     launcher_session: int = 0
     launcher_namespaces: tuple[tuple[str, str], ...] = ()
+    dbus_socket_paths: tuple[str, ...] = ()
+    additional_device_paths: tuple[str, ...] = ()
+    launcher_pid_namespace: str = ""
 
     @property
     def secret_paths(self) -> tuple[str, ...]:
@@ -247,8 +250,8 @@ def check_runtime_bus_env_absent(config: ProbeConfig) -> CheckResult:
 
 def check_dbus_socket_unreachable(config: ProbeConfig) -> CheckResult:
     """Block the user D-Bus socket: it can ask systemd to spawn outside."""
-    del config
-    candidates = [str(p) for p in Path("/run/user").glob("*/bus")]
+    candidates = list(config.dbus_socket_paths)
+    candidates.extend(str(p) for p in Path("/run/user").glob("*/bus"))
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if runtime_dir:
         candidates.append(str(Path(runtime_dir) / "bus"))
@@ -272,8 +275,9 @@ def check_dbus_socket_unreachable(config: ProbeConfig) -> CheckResult:
 
 def check_nvidia_devices_absent(config: ProbeConfig) -> CheckResult:
     """Episodes never need the GPU; only the trainer does."""
-    del config
     found = sorted(str(p) for p in Path("/dev").glob("nvidia*"))
+    found.extend(path for path in config.additional_device_paths if Path(path).exists())
+    found.sort()
     return CheckResult(
         "nvidia_devices_absent",
         not found,
@@ -349,6 +353,11 @@ def _namespace_id(kind: str) -> str:
     return str(Path("/proc/self/ns/" + kind).readlink())
 
 
+def _session_leader_namespace_id(session: int) -> str:
+    """Return the PID namespace containing a session leader."""
+    return str(Path(f"/proc/{session}/ns/pid").readlink())
+
+
 def check_launcher_session_and_namespaces_left(config: ProbeConfig) -> CheckResult:
     """Require the jail to leave the launcher's session and its IPC and UTS namespaces.
 
@@ -363,21 +372,42 @@ def check_launcher_session_and_namespaces_left(config: ProbeConfig) -> CheckResu
     leader living outside it to 0, so a plain "is my session the launcher's" comparison cannot fail
     there. Per-backend measurements are in docs/episode-isolation.md.
     """
-    if not config.launcher_session or not config.launcher_namespaces:
+    if (
+        not config.launcher_session
+        or not config.launcher_namespaces
+        or not config.launcher_pid_namespace
+    ):
         return CheckResult(
             "launcher_session_and_namespaces_left",
             passed=False,
             detail=(
-                "no --launcher-session/--launcher-namespace was given, so there is nothing to "
-                "compare against and this check cannot resolve anything"
+                "no --launcher-session/--launcher-namespace/--launcher-pid-namespace was given, "
+                "so there is nothing to compare against and this check cannot resolve anything"
             ),
         )
     session = os.getsid(0)
     shared = []
     if session == 0:
         shared.append("session leader is outside this PID namespace, so the session is inherited")
-    elif session == config.launcher_session:
-        shared.append("session={}".format(session))
+    own_pid_namespace = _namespace_id("pid")
+    if own_pid_namespace == config.launcher_pid_namespace:
+        shared.append("pid={}".format(own_pid_namespace))
+    if session != 0:
+        try:
+            session_leader_namespace = _session_leader_namespace_id(session)
+        except OSError as exc:
+            shared.append(
+                "cannot resolve the session leader inside this PID namespace: {}".format(
+                    _errno_name(exc)
+                )
+            )
+        else:
+            if session_leader_namespace != own_pid_namespace:
+                shared.append(
+                    "session leader is outside this PID namespace: {}".format(
+                        session_leader_namespace
+                    )
+                )
     for kind, launcher_value in config.launcher_namespaces:
         ours = _namespace_id(kind)
         if ours == launcher_value:
@@ -396,13 +426,16 @@ def check_launcher_session_and_namespaces_left(config: ProbeConfig) -> CheckResu
 def check_host_processes_invisible(config: ProbeConfig) -> CheckResult:
     """Hide host processes in a fresh PID namespace, whose argv may carry secrets.
 
-    Evidence rather than proof, and deliberately two independent signals: PID 1 inside a
-    fresh namespace is our own tree root rather than the host init, and the visible
-    process count collapses (measured here: 762 on the host, 4 in the jail). A bound is
-    used rather than an exact count because the jail legitimately contains a few
-    processes of its own.
+    Require a different PID namespace even on hosts with few processes or an unfamiliar
+    init name. Retain the init-name and process-count checks as independent signals.
     """
-    del config
+    if not config.launcher_pid_namespace:
+        return CheckResult(
+            "host_processes_invisible",
+            passed=False,
+            detail="no --launcher-pid-namespace was given",
+        )
+    shared_pid_namespace = _namespace_id("pid") == config.launcher_pid_namespace
     visible = [p.name for p in Path("/proc").iterdir() if p.name.isdigit()]
     try:
         with Path("/proc/1/comm").open() as fh:
@@ -417,7 +450,13 @@ def check_host_processes_invisible(config: ProbeConfig) -> CheckResult:
     pid1_is_host_init = pid1 in HOST_INIT_NAMES
     too_many = len(visible) > MAX_JAIL_VISIBLE_PIDS
     detail = f"pid1={pid1!r}, {len(visible)} pids visible (bound {MAX_JAIL_VISIBLE_PIDS})"
-    return CheckResult("host_processes_invisible", not (pid1_is_host_init or too_many), detail)
+    if shared_pid_namespace:
+        detail += "; shares launcher PID namespace"
+    return CheckResult(
+        "host_processes_invisible",
+        not (shared_pid_namespace or pid1_is_host_init or too_many),
+        detail,
+    )
 
 
 def check_honeypot_paths_absent_on_host(config: ProbeConfig) -> CheckResult:
@@ -488,10 +527,9 @@ def verify_negative_control(
     requires, per named check, that it PASSED inside and FAILED outside -- the checks genuinely
     discriminate.
 
-    NON_DISCRIMINATING_CHECKS is excluded because those two cannot tell jail from host at all:
-    requiring them to flip would make the control unsatisfiable, and leaving them in silently would
-    make it weaker than it looks. Do not extend that set without the same argument, which
-    docs/episode-isolation.md spells out per check.
+    NON_DISCRIMINATING_CHECKS is excluded because those two cannot tell jail from host at all.
+    The runner supplies same-path fixtures for host-dependent checks so their negative control
+    still has to fail on hosts without a user bus, NVIDIA nodes or AWS environment variables.
     """
     inside_by_name = _passed_by_name(inside_results)
     outside_by_name = _passed_by_name(outside_results)
@@ -578,6 +616,26 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--dbus-socket",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="additional Unix socket path to probe for an escaped user D-Bus connection",
+    )
+    parser.add_argument(
+        "--additional-device",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="additional nvidia* path to probe in the host-side negative-control run",
+    )
+    parser.add_argument(
+        "--launcher-pid-namespace",
+        default="",
+        metavar="ID",
+        help="PID namespace identity of the launcher, from readlink /proc/self/ns/pid",
+    )
+    parser.add_argument(
         "--print-host-homes",
         action="store_true",
         help=(
@@ -620,6 +678,9 @@ def main() -> int:
         jail_python=args.jail_python,
         launcher_session=args.launcher_session,
         launcher_namespaces=parse_launcher_namespaces(args.launcher_namespace),
+        dbus_socket_paths=tuple(args.dbus_socket),
+        additional_device_paths=tuple(args.additional_device),
+        launcher_pid_namespace=args.launcher_pid_namespace,
     )
     results = run_group(args.group, config)
 

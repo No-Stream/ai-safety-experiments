@@ -29,6 +29,21 @@ on a rented 4-vCPU GPU box `CPUQuota=5000%` and `MemoryMax=160G` bind nothing at
 banner still prints them. `--help` lists every flag. Exit status is the
 job's own, except `124` for a `--timeout` kill and `137` for exceeding `--mem-max`.
 
+The real-execution agent harness keeps cgroup enforcement as its default. On a host whose
+systemd user manager reports `offline`, pass `--advisory-limits` to
+`python -m reward_hacking.harness.loop` or `python -m reward_hacking.jailed_poc`. The harness
+checks that state before starting, warns that resource limits are unenforced, and passes the
+limiter's `--advisory` option outside the episode jail. Isolation remains enabled, with `unshare`
+selected automatically when bubblewrap is absent. The harness records the resource mode in its
+run header and refuses to resume a trace under a different mode; older headers without that field
+also require a separate output file. It never retries a failed cgroup command in advisory mode.
+
+Advisory mode retains CPU affinity, scheduling niceness, thread hints, an address-space limit and
+a wall-clock timeout, but it provides no cgroup CPU quota, aggregate resident-memory cap or task
+count cap. These remaining controls do not provide the resource guarantees of cgroups. To run the
+real jail tests on such a host, explicitly set `TEST_JAIL_ADVISORY_LIMITS=1` when invoking
+`make test` or `make test-select`; this selects advisory limits for that pytest process only.
+
 The working-directory default is worth knowing because it was a bug, not a choice:
 `systemd-run` puts the job in `$HOME` regardless of where you ran the wrapper, so a
 relative invocation broke in a confusing way — `-- uv sync` failed with "No
@@ -47,11 +62,12 @@ read, write, execute or connect to — the job runs as your uid with your full f
 network and credential access. It was named `sandbox-run.sh` at first, which was a bad name
 for exactly this reason and is why it is not called that any more.
 
-**For untrusted code on this box the tool is bubblewrap (`bwrap`), not nsjail.** That is
-settled, so nobody needs to re-litigate it: `nsjail` is not packaged for this box's distribution
-(`dnf list nsjail` returns no matching packages) and would need a source build with
-protobuf, libnl3, bison/flex and the kafel submodule. `bubblewrap` is packaged, and 0.10.0 is
-installed at `/usr/bin/bwrap` — the jail gate has been run against it, see
+**For untrusted code the preferred tool is bubblewrap (`bwrap`), not nsjail.** `bwrap` is not
+installed on this box, so `episode_jail.sh` uses its unshare fallback. The owner-facing apt package
+name is `bubblewrap`; installing it is a deliberate decision outside this change. `nsjail` is not
+available from this host's configured apt repositories and would
+need a source build with protobuf, libnl3, bison/flex and the kafel submodule. The bubblewrap path
+has been run through the jail gate on a host where it was installed; see
 [episode-isolation.md](episode-isolation.md). Unprivileged user namespaces work on this kernel,
 but only single-uid mapping:
 `newuidmap`/`newgidmap` are present and not setuid, and the login user has no entries in

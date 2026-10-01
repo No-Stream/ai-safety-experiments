@@ -170,6 +170,7 @@ exclude = [
     "docs/scratch",
     ".claude",
     "artifacts",
+    "reward_hacking/ladder/data",
 ]
 # torch/transformers/trl/peft ship no (or partial) type stubs. Left on, strict mode would drown
 # real findings in Unknown-typed noise from those libraries, and there is nothing we can fix.

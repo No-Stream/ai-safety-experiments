@@ -38,17 +38,26 @@ from __future__ import annotations
 import errno
 import functools
 import os
-import shutil
+import shlex
 import subprocess
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from reward_hacking.jailed_poc import CommandResult, classify, jail_python
+from reward_hacking.jailed_poc import (
+    CommandResult,
+    JailResourceLimits,
+    classify,
+    jail_python,
+    resolve_jail_resource_limits,
+    run_in_jail,
+)
+from reward_hacking.jailed_poc import jail_resource_limits_scope as _jail_resource_limits_scope
 from reward_hacking.model_backend import BedrockCompletion, TokenUsage
 from reward_hacking.recoverybench.answers import AnswerShape, Normalization
 from reward_hacking.recoverybench.arms import Arm
@@ -147,43 +156,103 @@ def pytest_pycollect_makemodule(module_path: Path, parent: pytest.Collector) -> 
     return CaseFileAwareModule.from_parent(parent, path=module_path)
 
 
-_USABLE_SYSTEMD_STATES = frozenset({"running", "degraded", "starting", "maintenance", "stopping"})
+TEST_JAIL_ADVISORY_LIMITS = os.environ.get("TEST_JAIL_ADVISORY_LIMITS") == "1"
 
 
-def jail_prereqs() -> tuple[bool, str]:
-    """Whether this box can run the jail at all; reason string when it cannot.
+def _resolve_test_jail_resource_limits() -> tuple[JailResourceLimits | None, str | None]:
+    """Resolve the one limiter mode the collection-time runner probe will use.
 
-    The interpreter half asks ``episode_jail.sh`` rather than checking a path: the jail resolves the
-    first candidate past its version floor and refuses to start when there is none, so the host
-    having ``/usr/bin/python3`` says nothing about whether a jailed grader can run.
+    The normal test path stays enforced. An offline systemd user manager is accepted only when the
+    caller explicitly opts into advisory tests, and :func:`resolve_jail_resource_limits` owns the
+    state check so this fixture does not grow a second, drifting copy of it.
     """
-    if shutil.which("bwrap") is None:
-        return False, "bwrap not installed"
+    try:
+        return resolve_jail_resource_limits(advisory=TEST_JAIL_ADVISORY_LIMITS), None
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return None, f"resource limits unavailable: {' '.join(str(exc).split())}"
+
+
+def _probe_jail_runner(resource_limits: JailResourceLimits) -> tuple[bool, str]:
+    """Run a tiny real command through limits and isolation, returning a skip reason on failure."""
+    with tempfile.TemporaryDirectory(prefix="jail-prereq-", dir="/tmp") as temporary_root:
+        temporary_root_path = Path(temporary_root)
+        episode_dir = temporary_root_path / "episode"
+        episode_dir.mkdir()
+        (episode_dir / "probe-marker").write_text("inside\n")
+        outside_marker = temporary_root_path / "outside-marker"
+        outside_marker.write_text("outside\n")
+        command = " && ".join(
+            (
+                'test "$HOME" = /work',
+                'test "$PWD" = /work',
+                'test "$(cat /etc/hostname)" = jail',
+                "test -f /work/probe-marker",
+                f"test ! -e {shlex.quote(str(outside_marker))}",
+            )
+        )
+        result = run_in_jail(
+            episode_dir,
+            command,
+            timeout="10s",
+            cpus=1,
+            mem_max="1G",
+            resource_limits=resource_limits,
+        )
+    if result.ok:
+        return True, ""
+    details = " ".join(f"{result.stderr} {result.stdout}".split())
+    return False, f"real runner probe failed (exit={result.exit_code}): {details}"
+
+
+def jail_prereqs(
+    resource_limits: JailResourceLimits | None = None,
+    limits_reason: str | None = None,
+) -> tuple[bool, str]:
+    """Whether this box can run the real limits-to-jail runner; reason string when it cannot.
+
+    The interpreter query and the tiny payload are both live calls. The payload checks the jail's
+    synthetic root and that a sibling host path is hidden, so an installed command alone cannot
+    make collection green. With no user manager, callers must opt into advisory mode explicitly.
+    """
+    if resource_limits is None and limits_reason is None:
+        resource_limits, limits_reason = _resolve_test_jail_resource_limits()
+    if resource_limits is None:
+        assert limits_reason is not None
+        return False, limits_reason
     try:
         jail_python()
     except RuntimeError as exc:
         return False, f"episode_jail.sh resolved no interpreter: {' '.join(str(exc).split())}"
-    if not os.environ.get("XDG_RUNTIME_DIR"):
-        return False, "XDG_RUNTIME_DIR unset (resource-limits.sh cannot reach the systemd user bus)"
-    systemctl = shutil.which("systemctl")
-    if systemctl is None:
-        return False, "systemctl not on PATH"
-    state = subprocess.run(  # noqa: S603 - resolved absolute path, literal arguments
-        [systemctl, "--user", "is-system-running"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    if state not in _USABLE_SYSTEMD_STATES:
-        return False, f"no usable systemd user instance (state={state!r})"
-    return True, ""
+    assert resource_limits is not None
+    return _probe_jail_runner(resource_limits)
 
 
-JAIL_AVAILABLE, JAIL_UNAVAILABLE_REASON = jail_prereqs()
-
-needs_jail = pytest.mark.skipif(
-    not JAIL_AVAILABLE, reason=f"jail unavailable: {JAIL_UNAVAILABLE_REASON}"
+JAIL_RESOURCE_LIMITS, JAIL_RESOURCE_LIMITS_REASON = _resolve_test_jail_resource_limits()
+JAIL_AVAILABLE, JAIL_UNAVAILABLE_REASON = jail_prereqs(
+    JAIL_RESOURCE_LIMITS, JAIL_RESOURCE_LIMITS_REASON
 )
+
+
+@pytest.fixture
+def jail_resource_limits_scope() -> Iterator[None]:
+    """Apply the explicitly selected limiter mode to one real jail test."""
+    if JAIL_RESOURCE_LIMITS is None:
+        yield
+        return
+    with _jail_resource_limits_scope(JAIL_RESOURCE_LIMITS):
+        yield
+
+
+def needs_jail[TestObject](test_object: TestObject) -> TestObject:
+    """Mark a test for the live runner and scope its resolved limits around that test."""
+    with_limits = pytest.mark.usefixtures("jail_resource_limits_scope")(test_object)
+    return cast(
+        "TestObject",
+        pytest.mark.skipif(
+            not JAIL_AVAILABLE, reason=f"jail unavailable: {JAIL_UNAVAILABLE_REASON}"
+        )(with_limits),
+    )
+
 
 MEASURED_MIN_OUTPUT_BUDGET = 24_576
 """The smallest output budget any hosted model here was *measured* to need, as a test floor.

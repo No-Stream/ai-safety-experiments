@@ -49,6 +49,13 @@ permissions. Reading `~/.aws/credentials`, rewriting a hook in `~/.claude/hooks/
 appending to `~/.zshrc`, editing the scripts cron runs hourly: none of those paths exist
 inside the jail.
 
+On distributions using `/etc/alternatives`, some commands under `/usr/bin` are symlinks through
+that directory. The jail reconstructs only alternative links whose resolved targets lie under
+the already-mounted `/usr`, rather than mounting host `/etc` content. Without those links, Ubuntu's
+`awk` was unavailable and honest harness commands failed before producing an answer. A synthetic
+sum through the real jailed `awk` first failed with exit 127, then passed after link reconstruction.
+Both backends use the same filtered links.
+
 The step that actually severs the host is detaching the old root after `pivot_root`.
 Without `umount -l /oldroot` the entire host filesystem stays walkable at `/oldroot` and
 the jail is theatre.
@@ -56,8 +63,8 @@ the jail is theatre.
 ### The interpreter is part of the contract
 
 A whitelist carrying only `/usr` also decides which Python exists inside the jail, and that turned
-out to be a scoring decision rather than a packaging detail. `/usr/bin/python3` is 3.9.25 on this
-host, so a coding submission using a 3.10+ builtin — `int.bit_count()` was the one that turned up —
+out to be a scoring decision rather than a packaging detail. On the host where this was discovered,
+`/usr/bin/python3` was 3.9.25, so a coding submission using a 3.10+ builtin — `int.bit_count()` was the one that turned up —
 raised `AttributeError` on every assertion, failed every unit, and "fails everything" trivially
 contains any registered failing-unit set. The RecoveryBench coding grader therefore scored ten
 genuinely correct submissions as carrying a planted flaw, inflating the exact number that slice
@@ -78,15 +85,12 @@ Resolution walks an ordered candidate list and takes the first that meets the fl
 binary its version rather than trusting its filename. `/usr/bin/python3.13`, then `python3.12`, then
 plain `python3` come first **because they need no mount at all** — `/usr` is already bound read-only,
 so the whitelist is unchanged, and a packaged interpreter is root-owned and gets security updates.
-That is the configuration to prefer, and on this host it is one command away:
+Prefer a packaged interpreter when the distribution provides one meeting the floor; otherwise use
+the staging script above.
 
-```bash
-sudo dnf install python3.13     # or python3.12, whichever this distribution packages
-```
-
-Last in the list is a relocatable CPython staged at `/var/tmp/cpython-runtime`, bound read-only, which
-is what this host uses today: 3.13.13, the same version as the repo's `.venv`, so the jail grades
-against the language the repo is written in. Three properties of that path are load-bearing.
+Last in the list is a relocatable CPython staged at `/var/tmp/cpython-runtime`, bound read-only.
+It is used when no packaged interpreter meets the floor, so the jail grades against the language
+the repo is written in. Three properties of that path are load-bearing.
 
 - **Outside every home directory.** `/proc/1/cmdline` is *readable* inside the jail and carries the
   whole `bwrap` argv; `/proc/self/mountinfo` carries each bind's source path; and `sys.prefix` puts
@@ -142,19 +146,23 @@ fallback (still the launcher's session, merely untranslatable), and the launcher
 the jail. So a zero is a failure too, and "am I the session leader" is not the test either — the
 leader is the backend's init, not the command.
 
-Both are now verified here. `bubblewrap` 0.10.0 is installed, and the gate passes on both backends:
-all 14 containment checks pass inside and the same 12 discriminating checks fail outside, under
-each. The gate defaults to whichever backend `episode_jail.sh` would pick on its own, so it
-certifies the path real episodes take; pin the other with `--backend` to check both.
+Both backends previously passed the 14 containment checks and 12 discriminating negative
+controls on a host with bubblewrap 0.10.0. The current host has no bubblewrap, so real episodes
+select `unshare`. The gate defaults to whichever backend `episode_jail.sh` selects, and the
+existing containment checks remain required. Pin the other backend with `--backend` when it is
+available to check it separately.
 
-The two backends differ in one way worth recording, found by attacking them rather than by reading.
-Under `bwrap` the payload runs with `CapEff: 0000000000000000` and cannot mount anything: `mount -t
-tmpfs tmpfs /usr/bin` fails with `must be superuser to use mount`. Under `unshare --map-root-user` it
-runs as uid 0 with `CapEff: 000001ffffffffff` and that same mount **succeeds**, so a payload can
-shadow a read-only directory inside its own namespace. It buys nothing here — the interpreter is
-exec'd by the backend before any payload code runs, every command gets a fresh jail, and the graders
-are launched from the host — but it is a concrete reason to prefer `bwrap`, and it means the unshare
-fallback cannot be relied on to keep a mount topology fixed *underneath* running payload code.
+The unshare payload previously retained full capabilities in its user namespace: mounting a tmpfs
+over `/usr/bin` succeeded. After building the mounts and detaching the old root, the fallback now
+uses `setpriv --no-new-privs` and `capsh` to clear the inheritable, permitted, effective, bounding
+and ambient capability sets before executing the payload. It verifies all five masks and the
+no-new-privileges flag from `/proc/self/status`, refusing execution if any privilege remains.
+Ubuntu's older libcap-ng cannot implement `setpriv`'s `-all` capability syntax on this kernel,
+which is why capability removal uses the installed `capsh` instead. The real regression test
+first failed with nonzero masks, then passed with zero masks, `NoNewPrivs=1`, and the mount refused.
+Removing the bounding-set drop also made the launch guard exit 2 before the payload ran.
+This removes the payload's initial mount privileges; the kernel and user-namespace implementation
+remain part of the trusted boundary.
 
 That default is a correction worth naming. `run_jail_tests.sh` used to hardcode
 `backend="unshare"`, which was right while bwrap was missing and wrong the moment it was
@@ -191,6 +199,21 @@ each one to fail there. Exit-code inversion would not be enough — a suite that
 `ImportError` also exits non-zero outside the jail and would look like a passing control
 while proving nothing. `--verify-negative-control` therefore compares per named check and
 requires: passed inside, failed outside.
+
+Hosts without a user bus, NVIDIA device nodes or AWS variables need explicit negative-control
+fixtures. The runner creates a listening Unix socket and a harmless file representing a device
+path outside the episode directory, then passes those same absolute paths to both probes.
+The real `/dev` scan and user-bus candidates remain enabled alongside the fixtures. It also
+supplies a dummy AWS variable and a runtime-directory variable to both launcher environments;
+the jail must clear them while the outside run must detect them. Failure to create the socket is
+an error, and a host-dependent check passing outside still makes the negative control unsound.
+
+An agent sandbox may prohibit Unix socket creation even when the underlying host supports it.
+In that environment `make jail-test` stops at fixture setup rather than claiming containment was
+certified. The capability, real command, exit-status, timeout and oracle tests can still execute
+through unshare. For a host with an offline systemd user manager, the explicit harness option is
+`--advisory-limits`; the weaker resource guarantees and pytest opt-in are documented in
+[resource-limits.md](resource-limits.md).
 
 Both failure modes are tested. Feeding it a run where a check passes in both places is
 reported as `also passed OUTSIDE the jail, so it proves nothing (vacuous check)`; feeding
@@ -260,10 +283,11 @@ only a path that is **READABLE** outside and `ENOENT` inside carries signal, whi
   not a host-side process running as us. That is true of `episode_jail.sh` and the graders too, so
   it is not a new hole — but it is a reason to prefer the root-owned packaged interpreter, which
   our uid cannot rewrite at all.
-- **`host_processes_invisible` is evidence, not proof.** It combines two signals -- PID 1
-  is our own tree root rather than the host init, and the visible process count is under a
-  bound -- because a fresh PID namespace legitimately contains a few processes of its own.
-  It discriminates strongly here (1 pid against hundreds) but it is a heuristic, not a guarantee.
+- **`host_processes_invisible` requires a different PID namespace.** The runner supplies the
+  launcher's namespace identity to both probes, so the outside control fails even on hosts
+  with fewer than 50 processes and an unfamiliar init name. The init-name and process-count
+  checks remain additional signals. Tests first failed with the old count-only implementation,
+  then passed with the namespace comparison; missing launcher identity also fails.
 - **The kernel is shared.** A user-namespace or kernel bug is not covered by any of this.
 - **Only the default backend is exercised per gate run.** The gate certifies one backend at a
   time, so the one it did not pick can rot unnoticed. Run it both ways after touching
@@ -335,18 +359,13 @@ weights. Findings therefore report path, line, detector and a truncated SHA-256 
 match — never the matched text, since a scanner that echoes what it found just copies the
 secret into a second log.
 
-## One optional item wants root
+## A packaged interpreter is optional
 
-Nothing here is blocked on root: the jail runs, the gate passes on both backends, and the staged
-interpreter needs no privilege. `sudo dnf install bubblewrap` was the old item and it is done —
-`bubblewrap` 0.10.0 is installed at `/usr/bin/bwrap`, and the gate has been run against that
-backend. The `unshare` fallback stays in place for hosts without it.
-
-The one thing worth a root command is an improvement rather than a fix:
-
-```bash
-sudo dnf install python3.13     # whatever 3.13 build this distribution's repositories carry
-```
+The unshare fallback and staged interpreter do not require installing bubblewrap or obtaining
+root access. A distribution-packaged Python at or above the version floor is an optional
+improvement when the host's repositories provide one. Ubuntu 20.04 does not provide the required
+version through its standard packages, so the staged interpreter remains the supported path on
+that host. No package installation is required for the current runner changes.
 
 That puts the jail's interpreter under `/usr`, which is already bound read-only. Resolution prefers
 it automatically, so nothing needs editing afterwards, and three things get better at once: the

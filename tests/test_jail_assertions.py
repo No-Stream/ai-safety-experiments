@@ -16,14 +16,24 @@ compare against. Both are cheap to pin here, and neither needs a jail.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from scripts.jail_assertions import (
     BUS_ENV_VARS,
+    CONTAINMENT_CHECKS,
     ProbeConfig,
+    check_dbus_socket_unreachable,
+    check_host_processes_invisible,
     check_launcher_session_and_namespaces_left,
+    check_nvidia_devices_absent,
     check_runtime_bus_env_absent,
     parse_launcher_namespaces,
+    verify_negative_control,
 )
 
 NO_PATHS = ProbeConfig(host_homes=("/nonexistent-home",))
@@ -78,3 +88,130 @@ class TestTheLauncherCheckCannotPassVacuously:
             ("ipc", "ipc:[4026531839]"),
             ("uts", "uts:[4026531838]"),
         )
+
+    def test_a_pid_namespace_session_id_collision_is_not_shared(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A namespaced session can reuse the launcher's numeric SID."""
+        config = ProbeConfig(
+            host_homes=("/nonexistent-home",),
+            launcher_session=1,
+            launcher_namespaces=(("ipc", "ipc:[host]"), ("uts", "uts:[host]")),
+            launcher_pid_namespace="pid:[host]",
+        )
+        monkeypatch.setattr("scripts.jail_assertions.os.getsid", lambda _pid: 1)
+        monkeypatch.setattr("scripts.jail_assertions.os.getpid", lambda: 2)
+        monkeypatch.setattr(
+            "scripts.jail_assertions._namespace_id",
+            lambda kind: f"{kind}:[jail]",
+        )
+        monkeypatch.setattr(
+            "scripts.jail_assertions._session_leader_namespace_id",
+            lambda _session: "pid:[jail]",
+        )
+
+        result = check_launcher_session_and_namespaces_left(config)
+
+        assert result.passed
+
+    def test_unshare_without_setsid_is_still_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config = ProbeConfig(
+            host_homes=("/nonexistent-home",),
+            launcher_session=1,
+            launcher_namespaces=(("ipc", "ipc:[host]"), ("uts", "uts:[host]")),
+            launcher_pid_namespace="pid:[host]",
+        )
+        monkeypatch.setattr("scripts.jail_assertions.os.getsid", lambda _pid: 0)
+        monkeypatch.setattr(
+            "scripts.jail_assertions._namespace_id",
+            lambda kind: f"{kind}:[jail]",
+        )
+
+        result = check_launcher_session_and_namespaces_left(config)
+
+        assert not result.passed
+        assert "session leader is outside" in result.detail
+
+
+class TestPortableNegativeControlFixtures:
+    """Host-local resources need deterministic outside fixtures for the flip test."""
+
+    def test_a_fixture_dbus_socket_is_seen_as_reachable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        socket_path = tmp_path / "bus"
+
+        class ReachableSocket:
+            def settimeout(self, _timeout: float) -> None:
+                pass
+
+            def connect(self, path: str) -> None:
+                if path != str(socket_path):
+                    raise OSError
+
+            def close(self) -> None:
+                pass
+
+        monkeypatch.setattr(
+            "scripts.jail_assertions.socket.socket", lambda *_args: ReachableSocket()
+        )
+        result = check_dbus_socket_unreachable(
+            ProbeConfig(host_homes=("/nonexistent-home",), dbus_socket_paths=(str(socket_path),))
+        )
+
+        assert not result.passed
+        assert str(socket_path) in result.detail
+
+    def test_a_fixture_nvidia_node_is_seen_as_present(self, tmp_path: Path) -> None:
+        device_root = tmp_path / "dev"
+        device_root.mkdir()
+        (device_root / "nvidia0").touch()
+
+        result = check_nvidia_devices_absent(
+            ProbeConfig(
+                host_homes=("/nonexistent-home",),
+                additional_device_paths=(str(device_root / "nvidia0"),),
+            )
+        )
+
+        assert not result.passed
+        assert "nvidia0" in result.detail
+
+
+class TestHostDependentNegativeControl:
+    def test_small_host_pid_namespace_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("scripts.jail_assertions.HOST_INIT_NAMES", ())
+        monkeypatch.setattr("scripts.jail_assertions.MAX_JAIL_VISIBLE_PIDS", 100000)
+        monkeypatch.setattr("scripts.jail_assertions._namespace_id", lambda _kind: "pid:[host]")
+        config = ProbeConfig(host_homes=("/nonexistent-home",), launcher_pid_namespace="pid:[host]")
+
+        result = check_host_processes_invisible(config)
+
+        assert not result.passed
+        assert "launcher PID namespace" in result.detail
+
+    def test_missing_launcher_pid_namespace_is_rejected(self) -> None:
+        result = check_host_processes_invisible(NO_PATHS)
+
+        assert not result.passed
+        assert "--launcher-pid-namespace" in result.detail
+
+    def test_a_clean_host_requires_a_reachable_fixture_for_the_negative_control(self) -> None:
+        names = [check.__name__.removeprefix("check_") for check in CONTAINMENT_CHECKS]
+        inside: list[dict[str, object]] = [{"name": name, "passed": True} for name in names]
+        outside: list[dict[str, object]] = [
+            {"name": name, "passed": name == "dbus_socket_unreachable"} for name in names
+        ]
+
+        vacuous = "dbus_socket_unreachable: also passed OUTSIDE the jail, so it proves nothing (vacuous check)"
+        assert verify_negative_control(inside, outside) == [vacuous]
+
+        next(result for result in inside if result["name"] == "dbus_socket_unreachable")[
+            "passed"
+        ] = False
+        assert verify_negative_control(inside, outside) == [
+            "dbus_socket_unreachable: did not pass INSIDE the jail, so containment is broken",
+            vacuous,
+        ]

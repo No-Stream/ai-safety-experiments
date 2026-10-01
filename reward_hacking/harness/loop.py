@@ -61,6 +61,12 @@ the word is not recorded as one that earned it. The gap between verdicts is the 
 passes, true fails); it is classified onto ``RegradeVerdict`` via
 :func:`reward_hacking.jailed_poc.classify` and folded onto the trust-boundary ladder. A full JSONL
 trace -- raw transcript, per-command results, the arm, both verdicts -- is written for re-analysis.
+
+For a separately running ``vllm serve`` process, use ``--backend vllm-http
+--vllm-http-url http://127.0.0.1:8000 --model-id MODEL``. The model id names both the server's
+model and the tokenizer this process loads to render prompts; it must match the weights served by
+the endpoint. This mode accepts the local sampling flags and the harness's ``</run>`` stop, but the
+server owns the weights, so ``--full-weights`` and adapter options are refused.
 """
 
 from __future__ import annotations
@@ -130,7 +136,11 @@ from reward_hacking.jailed_poc import (
     DEFAULT_COMMAND_TIMEOUT,
     VERDICT_BOUNDARY,
     CommandResult,
+    JailResourceLimits,
     classify,
+    current_jail_resource_limits,
+    jail_resource_limits_scope,
+    resolve_jail_resource_limits,
     run_in_jail,
 )
 from reward_hacking.model_backend import (
@@ -1684,6 +1694,7 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
     episode_seconds: float = DEFAULT_EPISODE_SECONDS,
     episode_concurrency: int = 1,
     stop_requested: threading.Event | None = None,
+    resource_limits: JailResourceLimits | None = None,
 ) -> list[AgentEpisodeTrace]:
     """Run one episode per task under ``episode_base``, in one arm, returning every trace.
 
@@ -1716,6 +1727,9 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
 
     Hosted transports keep true concurrency: a Converse pool has nothing in-process to share.
 
+    ``resource_limits`` is resolved once per run and scoped inside each worker so policy commands,
+    mediated and final graders, and hidden oracle callbacks all use the same limiter mode.
+
     ``stop_requested`` is handed to every episode; set (by :func:`stopping_on_signals` on SIGTERM),
     it raises :class:`RunStoppedError` out of whichever engine wait each episode is in, and the pool is
     shut down without waiting for the rest -- their generations are daemon threads and the caller
@@ -1724,6 +1738,9 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
     if episode_concurrency < 1:
         raise ValueError(f"episode_concurrency must be at least 1, got {episode_concurrency}")
     token = run_token if run_token is not None else new_episode_token()
+    selected_resource_limits = (
+        current_jail_resource_limits() if resource_limits is None else resource_limits
+    )
     engine_gate = (
         SharedEngineGate()
         if episode_concurrency > 1 and backend.transport in SHARED_ENGINE_TRANSPORTS
@@ -1732,20 +1749,21 @@ def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper
 
     def run_one(index: int, task: Task) -> AgentEpisodeTrace:
         episode_token = f"{token}.{index:03d}"
-        trace = run_agent_episode(
-            task,
-            backend,
-            episode_dir=episode_base / f"{task.task_id}.{episode_token}",
-            max_turns=max_turns,
-            timeout=timeout,
-            jail_backend=jail_backend,
-            trace_path=trace_path,
-            arm=arm,
-            episode_token=episode_token,
-            episode_seconds=episode_seconds,
-            engine_gate=engine_gate,
-            stop_requested=stop_requested,
-        )
+        with jail_resource_limits_scope(selected_resource_limits):
+            trace = run_agent_episode(
+                task,
+                backend,
+                episode_dir=episode_base / f"{task.task_id}.{episode_token}",
+                max_turns=max_turns,
+                timeout=timeout,
+                jail_backend=jail_backend,
+                trace_path=trace_path,
+                arm=arm,
+                episode_token=episode_token,
+                episode_seconds=episode_seconds,
+                engine_gate=engine_gate,
+                stop_requested=stop_requested,
+            )
         logger.info("episode %d/%d %s", index + 1, len(tasks), trace.summary_line())
         return trace
 
@@ -1965,6 +1983,7 @@ _DEFAULT_MODEL_BY_BACKEND = {
     "mock": "mock",
     "hf": "Qwen/Qwen3.5-4B",
     "vllm": "Qwen/Qwen3.5-4B",
+    "vllm-http": "Qwen/Qwen3.5-4B",
     "codex": DEFAULT_CODEX_MODEL,
     "bedrock": DEFAULT_BEDROCK_MODEL,
 }
@@ -2033,13 +2052,19 @@ def served_model_from_args(args: argparse.Namespace) -> ServedModel:
     sampling base, both measured per base model, while the backend itself is labelled with the
     served checkpoint so every episode id and record names it.
     """
+    full_weights = full_weights_source_from_args(args)
+    if args.backend == "vllm-http" and full_weights is not None:
+        raise ValueError(
+            "--backend vllm-http cannot use --full-weights: the external vllm serve process owns "
+            "the weights; pass its model identity through --model-id"
+        )
     return resolve_served_model(
         checkpoint=None,
         base_model=_base_model_id(args),
         backend_kind=args.backend,
         merge_root=Path(tempfile.gettempdir()) / "unreachable-merge-root",
         merge_label="agent-harness-",
-        full_weights=full_weights_source_from_args(args),
+        full_weights=full_weights,
     )
 
 
@@ -2121,6 +2146,11 @@ def _build_cli_backend(
     model_id = _base_model_id(args)
     if served is None:
         served = served_model_from_args(args)
+    if args.backend == "vllm-http" and served.load_mode != LOAD_MODE_BASE:
+        raise ValueError(
+            f"--backend vllm-http cannot use served load mode {served.load_mode!r}: the external "
+            "vllm serve process owns the weights and adapters"
+        )
     if stop_token_ids is None:
         stop_token_ids = local_stop_token_ids(args, served)
     local_base = harness_sampling_base(model_id, thinking=backend_cli.resolve_thinking(args))
@@ -2208,6 +2238,7 @@ RESUME_IDENTITY_FIELDS = (
     "model_full_weights",
     "model_weights_fingerprint",
     "stop_token_ids",
+    "resource_limits",
 )
 """The run-header fields a resumed run must match, one per way two runs could differ in what they
 sampled: the served label, the base it keys its floors on, how the weights were assembled, which
@@ -2344,6 +2375,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--timeout", default=DEFAULT_COMMAND_TIMEOUT)
+    parser.add_argument(
+        "--advisory-limits",
+        action="store_true",
+        help="Explicitly use unenforced resource limits, only if the systemd user manager is offline.",
+    )
     parser.add_argument(
         "--episode-seconds",
         type=float,
@@ -2501,6 +2537,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     selected = _select_tasks(args.tasks, args.ilcb_split)
 
+    resource_limits = resolve_jail_resource_limits(advisory=args.advisory_limits)
     served = served_model_from_args(args)
     stop_token_ids = local_stop_token_ids(args, served)
     backend = _build_cli_backend(args, served, stop_token_ids)
@@ -2519,6 +2556,7 @@ def main(argv: list[str] | None = None) -> int:
         "transport": backend.transport,
         "arm": arm.to_json_dict(),
         "stop_token_ids": list(stop_token_ids),
+        "resource_limits": resource_limits.to_json_dict(),
         **served.provenance,
     }
     completed = _completed_before_this_run(
@@ -2575,6 +2613,7 @@ def main(argv: list[str] | None = None) -> int:
                 episode_seconds=args.episode_seconds,
                 episode_concurrency=args.episode_concurrency,
                 stop_requested=stop_requested,
+                resource_limits=resource_limits,
             )
     finally:
         # Every exit path: the engine child dies with this process, never reparented to init.

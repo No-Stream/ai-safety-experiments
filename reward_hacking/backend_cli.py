@@ -45,8 +45,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-BACKEND_KINDS = ("mock", "hf", "vllm", "bedrock", "codex")
-LOCAL_KINDS = frozenset({"hf", "vllm"})
+BACKEND_KINDS = ("mock", "hf", "vllm", "vllm-http", "bedrock", "codex")
+LOCAL_KINDS = frozenset({"hf", "vllm", "vllm-http"})
 HOSTED_KINDS = frozenset({"bedrock", "codex"})
 
 # No CLI here wants Qwen3.5 thinking traces on by default; they are opt-in per run.
@@ -205,6 +205,15 @@ _KNOBS: tuple[_Knob, ...] = (
         ),
     ),
     _Knob(
+        dest="vllm_http_url",
+        flag="--vllm-http-url",
+        kinds=frozenset({"vllm-http"}),
+        why=(
+            "The HTTP backend is the only one that sends requests to an externally running "
+            "vllm serve process; other backends either own their engine or use a hosted API."
+        ),
+    ),
+    _Knob(
         dest="min_p",
         flag="--min-p",
         kinds=LOCAL_KINDS,
@@ -227,7 +236,7 @@ _KNOBS: tuple[_Knob, ...] = (
     _Knob(
         dest="presence_penalty",
         flag="--presence-penalty",
-        kinds=frozenset({"vllm"}),
+        kinds=frozenset({"vllm", "vllm-http"}),
         why=(
             "Only vLLM's sampler applies presence_penalty; transformers' generate has no such "
             "field, so HFBackend never forwards it (its SamplingConfig docstring records the "
@@ -412,6 +421,15 @@ def add_backend_args(parser: argparse.ArgumentParser, *, default: str = "hf") ->
             "from it. Unset keeps vLLM's default, whose graph-memory estimate for Qwen3.5-9B "
             "(~9 GiB) left no KV cache on a 32 GB card at 0.80 utilization. Long-thinking cells "
             "fit only ~5-12 full-length sequences anyway, so 64 loses nothing. vllm only."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-http-url",
+        default=None,
+        help=(
+            "Base URL of an already running `vllm serve` OpenAI-compatible server. Required for "
+            "--backend vllm-http; the harness uses --model-id as the server model and tokenizer "
+            "identity."
         ),
     )
 
@@ -599,7 +617,46 @@ def _bedrock_client_kwargs(args: argparse.Namespace) -> dict[str, object]:
     return kwargs
 
 
-def backend_from_args(  # noqa: PLR0913 - keyword-only per-CLI overrides, not worth a wrapper object
+def _vllm_http_backend_from_args(
+    args: argparse.Namespace,
+    model_id: str,
+    *,
+    local_sampling: SamplingConfig | None,
+    extra_kwargs: Mapping[str, object] | None,
+) -> Backend:
+    """Build the external vLLM backend, refusing in-process weight controls."""
+    if args.vllm_http_url is None:
+        raise ValueError("--backend vllm-http requires --vllm-http-url")
+    engine_kwargs: dict[str, object] = dict(extra_kwargs or {})
+    unsupported = {
+        key
+        for key in engine_kwargs
+        if key
+        in {
+            "dtype",
+            "enable_lora",
+            "language_model_only",
+            "lora_adapter",
+            "lora_target_modules",
+            "max_lora_rank",
+        }
+    }
+    if unsupported:
+        raise ValueError(
+            "--backend vllm-http cannot serve adapter or full-weight engine options: "
+            f"{', '.join(sorted(unsupported))}"
+        )
+    return build_backend(
+        "vllm-http",
+        model_id,
+        base_url=args.vllm_http_url,
+        thinking=resolve_thinking(args),
+        sampling=local_sampling_from_args(args, local_sampling),
+        **engine_kwargs,
+    )
+
+
+def backend_from_args(  # noqa: C901, PLR0913 - one branch per transport and its knobs
     args: argparse.Namespace,
     model_id: str,
     *,
@@ -641,6 +698,10 @@ def backend_from_args(  # noqa: PLR0913 - keyword-only per-CLI overrides, not wo
             "mock backend: nothing is sampled, and any trace will read model_id=%r", model_id
         )
         return build_backend("mock", model_id, responses=list(mock_responses))
+    if kind == "vllm-http":
+        return _vllm_http_backend_from_args(
+            args, model_id, local_sampling=local_sampling, extra_kwargs=extra_kwargs
+        )
     if kind in LOCAL_KINDS:
         # Of the CLI knobs only the --vllm-* flags are engine kwargs, and the registry above has
         # already refused them on every other kind; a caller's extra_kwargs join them here.
