@@ -136,6 +136,7 @@ class TestTheComposedTrainerOnCpu:
 
     def stub_trl_log(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, float]]:
         reached: list[dict[str, float]] = []
+        monkeypatch.setattr(gt, "host_mem_available_bytes", lambda: 7 * 1024**3)
         monkeypatch.setattr(
             GRPOTrainer, "log", lambda _self, logs, _start_time=None: reached.append(logs)
         )
@@ -187,7 +188,7 @@ class TestTheComposedTrainerOnCpu:
         )
         trainer._prepare_inputs({"prompt": ["x"]})
         trainer.log({"reward": 0.5})
-        assert reached == [{"reward": 0.5}]
+        assert reached == [{"reward": 0.5, "host_mem_available_gib": 7.0}]
 
 
 class TestTheTrimIsNeutralUnderThisArmsEstimator:

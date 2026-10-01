@@ -137,6 +137,7 @@ class TestTheGuardSitsInFrontOfTrlsWrite:
 
     def stub_trl_log(self, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, float]]:
         reached: list[dict[str, float]] = []
+        monkeypatch.setattr(game_train, "host_mem_available_bytes", lambda: 7 * 1024**3)
         monkeypatch.setattr(
             GRPOTrainer, "log", lambda _self, logs, _start_time=None: reached.append(logs)
         )
@@ -162,7 +163,7 @@ class TestTheGuardSitsInFrontOfTrlsWrite:
         write_trace(tmp_path, INCIDENT_STEP, self.ROWS_PER_STEP)
         trainer = self.bare_trainer(tmp_path, step=INCIDENT_STEP, buffered=self.ROWS_PER_STEP)
         trainer.log({"reward": 0.5})
-        assert reached == [{"reward": 0.5}]
+        assert reached == [{"reward": 0.5, "host_mem_available_gib": 7.0}]
 
     def test_with_completion_logging_off_there_is_no_write_to_guard(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -171,7 +172,7 @@ class TestTheGuardSitsInFrontOfTrlsWrite:
         write_trace(tmp_path, INCIDENT_STEP, self.ROWS_PER_STEP)
         trainer = self.bare_trainer(tmp_path, step=INCIDENT_STEP, buffered=0, log_completions=False)
         trainer.log({"reward": 0.5})
-        assert reached == [{"reward": 0.5}]
+        assert reached == [{"reward": 0.5, "host_mem_available_gib": 7.0}]
 
     def test_without_the_guard_trls_own_log_writes_the_zero_row_file(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
