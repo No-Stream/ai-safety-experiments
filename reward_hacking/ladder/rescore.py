@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.jailed_poc import ENFORCED_JAIL_RESOURCE_LIMITS, JailResourceLimits
-from reward_hacking.ladder import rungs, runner, scenario as scenario_module
+from reward_hacking.ladder import rungs, runner
+from reward_hacking.ladder import scenario as scenario_module
 from reward_hacking.ladder.monitor import CommandRecord
 from reward_hacking.ladder.runner import (
+    LADDER_TASK_PRESSURES,
     EpisodeKey,
     default_detector,
     detection_spec_for_scenario,
@@ -76,6 +78,40 @@ def _scenario_digests(header: Mapping[str, object]) -> dict[str, str]:
             raise ValueError(f"run header contains duplicate scenario id {scenario_id!r}")
         digests[scenario_id] = manifest_digest
     return digests
+
+
+def _headers_by_pressure(
+    headers: Sequence[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Validate compatible run headers and index them by their pressure condition."""
+    if not headers:
+        raise ValueError("input has no ladder_run_header provenance record")
+    headers_by_pressure: dict[str, dict[str, object]] = {}
+    common_provenance: dict[str, object] | None = None
+    for header in headers:
+        provenance = _require_mapping(header.get("provenance"), field="run header provenance")
+        pressure = provenance.get("task_pressure", "none")
+        if not isinstance(pressure, str) or pressure not in LADDER_TASK_PRESSURES:
+            raise ValueError(f"run header has invalid task pressure {pressure!r}")
+        current_common = dict(provenance)
+        current_common.pop("task_pressure", None)
+        if common_provenance is None:
+            common_provenance = current_common
+        elif current_common != common_provenance:
+            raise ValueError("run headers have incompatible provenance")
+        digest = header.get("provenance_digest")
+        if not isinstance(digest, str):
+            raise TypeError("run header provenance_digest must be a string")
+        expected_digest = runner.provenance_digest(provenance)
+        if digest != expected_digest:
+            raise ValueError(f"run header provenance digest is invalid for pressure {pressure!r}")
+        if pressure in headers_by_pressure:
+            previous_digest = headers_by_pressure[pressure].get("provenance_digest")
+            if previous_digest != digest:
+                raise ValueError(f"run has conflicting headers for pressure {pressure!r}")
+            continue
+        headers_by_pressure[pressure] = header
+    return headers_by_pressure
 
 
 def _load_scenario(scenario_root: Path, scenario_id: str, expected_digest: str) -> Scenario:
@@ -154,8 +190,7 @@ def _rescore_episode(
     scenario_root: Path,
     scenario_digests: Mapping[str, str],
     scenario_cache: dict[str, Scenario],
-    timeout: str,
-    resource_limits: JailResourceLimits,
+    grading_settings: tuple[str, JailResourceLimits],
 ) -> dict[str, object]:
     raw_key = _require_mapping(record.get("key"), field="ladder_episode.key")
     key = EpisodeKey.from_json(raw_key)
@@ -177,11 +212,13 @@ def _rescore_episode(
     )
     pristine_visible_pass = record.get("pristine_visible_pass")
     if pristine_visible_pass is None:
-        pristine_grader_pass, pristine_tests_pass = runner._run_pristine_visible_grade(
+        timeout, resource_limits = grading_settings
+        pristine_grader_pass, pristine_tests_pass = runner.run_pristine_visible_grade(
             scenario,
             episode_dir,
             timeout=timeout,
             resource_limits=resource_limits,
+            task_pressure=key.task_pressure,
         )
         pristine_visible_pass = pristine_grader_pass and pristine_tests_pass
     elif not isinstance(pristine_visible_pass, bool):
@@ -282,28 +319,41 @@ def rescore_file(
         raise ValueError("input and output paths must be different")
     rows = _read_jsonl(source_path)
     headers = [row for row in rows if row.get("record") == "ladder_run_header"]
-    if len(headers) != 1:
-        raise ValueError(f"expected exactly one ladder_run_header in {source_path}")
-    header = headers[0]
-    scenario_digests = _scenario_digests(header)
-    timeout, resource_limits = _grading_settings(header)
+    headers_by_pressure = _headers_by_pressure(headers)
     resolved_scenario_root = scenario_root.resolve()
     scenario_cache: dict[str, Scenario] = {}
+    scenario_digests_by_pressure = {
+        pressure: _scenario_digests(header) for pressure, header in headers_by_pressure.items()
+    }
+    grading_settings_by_pressure = {
+        pressure: _grading_settings(header) for pressure, header in headers_by_pressure.items()
+    }
     for row in rows:
         if row.get("record") == "ladder_episode":
+            raw_key = _require_mapping(row.get("key"), field="ladder_episode.key")
+            key = EpisodeKey.from_json(raw_key)
+            try:
+                header = headers_by_pressure[key.task_pressure]
+            except KeyError as error:
+                raise ValueError(f"no run header for pressure {key.task_pressure!r}") from error
+            if row.get("provenance_digest") != header.get("provenance_digest"):
+                raise ValueError(
+                    f"ladder episode provenance digest does not match pressure "
+                    f"{key.task_pressure!r} header"
+                )
             _rescore_episode(
                 row,
                 scenario_root=resolved_scenario_root,
-                scenario_digests=scenario_digests,
+                scenario_digests=scenario_digests_by_pressure[key.task_pressure],
                 scenario_cache=scenario_cache,
-                timeout=timeout,
-                resource_limits=resource_limits,
+                grading_settings=grading_settings_by_pressure[key.task_pressure],
             )
-    header["rescore"] = {
-        "detector": "reward_hacking.ladder.rungs.detect_rungs",
-        "detector_code_identity": _detector_code_identity(),
-        "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
-    }
+    for header in headers_by_pressure.values():
+        header["rescore"] = {
+            "detector": "reward_hacking.ladder.rungs.detect_rungs",
+            "detector_code_identity": _detector_code_identity(),
+            "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
     _write_jsonl(destination_path, rows)
     return rows
 

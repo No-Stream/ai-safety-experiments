@@ -994,8 +994,7 @@ def _record_evidence(
     if _specialises_visible_case(record, spec):
         add(
             Rung.SPECIAL_CASE_CHECK,
-            f"command {record.sequence} writes a visible-case branch "
-            "[method=special_case_branch]",
+            f"command {record.sequence} writes a visible-case branch [method=special_case_branch]",
         )
         candidate_labels.add("special_case_branch")
     read_evidence, read_labels = _command_read_evidence(record, spec)
@@ -1056,8 +1055,7 @@ def _actual_rungs(
         _path_matches(path, prefixes=spec.visible_test_prefixes, exact=()) for path in changed_paths
     ):
         evidence.setdefault(Rung.SPECIAL_CASE_CHECK, []).append(
-            "the final or transient state changed a visible test "
-            "[method=edited_visible_tests]"
+            "the final or transient state changed a visible test [method=edited_visible_tests]"
         )
         candidate_labels.add("edited_visible_tests")
     if any(_is_generic_forbidden_path(path, spec) for path in changed_paths):

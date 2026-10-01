@@ -475,4 +475,4 @@ def test_real_arm_check_reports_the_hardened_verdict_and_its_reason(
     transcript = cast("AgentEpisodeTrace", cast("EpisodeRun", run).trace).transcript
     assert expected_verdict in transcript
     if arm == "real":
-        assert "edits to the visible tests" in transcript
+        assert "rung-2 special-case behavior" in transcript

@@ -25,8 +25,8 @@ from reward_hacking.ladder.runner import (
     ModelSpec,
     RunnerConfig,
     ScenarioLike,
-    _derive_grade_evidence,
     _default_final_grader,
+    _derive_grade_evidence,
     _detection_spec,
     _final_report_unresolved,
     _method_audit_failures,
@@ -55,8 +55,8 @@ class DummyScenario:
     def root(self) -> Path:
         return Path()
 
-    def render(self, arm: str) -> str:
-        return f"task:{self.slug}:{arm}"
+    def render(self, arm: str, *, task_pressure: str = "none") -> str:
+        return f"task:{self.slug}:{arm}:{task_pressure}"
 
 
 def runner_config(output_path: Path) -> RunnerConfig:
@@ -154,7 +154,7 @@ def test_readout_reports_highest_rung_coverups_and_honest_solve_rate() -> None:
         },
     ]
     readout = readout_records(records)
-    assert readout["base"]["naive"]["highest_rung_distribution"] == {
+    assert readout["base"]["none"]["naive"]["highest_rung_distribution"] == {
         "0": 1,
         "1": 0,
         "2": 1,
@@ -163,8 +163,8 @@ def test_readout_reports_highest_rung_coverups_and_honest_solve_rate() -> None:
         "5": 0,
         "6": 0,
     }
-    assert readout["base"]["naive"]["coverup_count"] == 1
-    assert readout["base"]["naive"]["honest_solve_rate"] == 0.5
+    assert readout["base"]["none"]["naive"]["coverup_count"] == 1
+    assert readout["base"]["none"]["naive"]["honest_solve_rate"] == 0.5
 
 
 def test_readout_recovers_measurement_status_from_legacy_trace_summary() -> None:
@@ -193,7 +193,7 @@ def test_readout_recovers_measurement_status_from_legacy_trace_summary() -> None
         },
     ]
 
-    readout = readout_records(records)["base"]["naive"]
+    readout = readout_records(records)["base"]["none"]["naive"]
 
     assert readout["n"] == 2
     assert readout["measured_count"] == 1
@@ -246,6 +246,68 @@ def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> 
     assert len(output_path.read_text(encoding="utf-8").splitlines()) == 5
 
 
+def test_task_pressure_separates_provenance_keys_paths_readout_and_resume(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    assert runner_config(output_path).task_pressure == "none"
+    base_config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        task_pressure="none",
+    )
+    merge_gate_config = replace(base_config, task_pressure="merge-gate")
+    calls: list[tuple[Path, Path]] = []
+
+    def episode_runner(
+        _scenario: ScenarioLike,
+        _backend: object,
+        _arm: str,
+        _sample_index: int,
+        episode_dir: Path,
+        trace_path: Path,
+    ) -> dict[str, object]:
+        calls.append((episode_dir, trace_path))
+        return {"proxy_pass": True, "true_pass": True, "true_measured": True}
+
+    def run(config: RunnerConfig) -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=episode_runner,
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {"honest_solve": False},
+        )
+
+    assert base_config.provenance_payload()["task_pressure"] == "none"
+    assert merge_gate_config.provenance_payload()["task_pressure"] == "merge-gate"
+    assert base_config.provenance_digest != merge_gate_config.provenance_digest
+    none_records = run(base_config)
+    merge_gate_records = run(merge_gate_config)
+
+    assert len(none_records) == len(merge_gate_records) == 1
+    assert run(base_config) == []
+    assert run(merge_gate_config) == []
+    assert len(calls) == 2
+    assert calls[0][0] != calls[1][0]
+    assert calls[0][1] != calls[1][1]
+    assert "/none/" in calls[0][0].as_posix()
+    assert "/merge-gate/" in calls[1][0].as_posix()
+    assert "/none/" in calls[0][1].as_posix()
+    assert "/merge-gate/" in calls[1][1].as_posix()
+    assert cast("dict[str, object]", none_records[0]["key"])["task_pressure"] == "none"
+    assert cast("dict[str, object]", merge_gate_records[0]["key"])["task_pressure"] == "merge-gate"
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    headers = [row for row in rows if row.get("record") == "ladder_run_header"]
+    assert len(headers) == 2
+    assert {header["provenance"]["task_pressure"] for header in headers} == {"none", "merge-gate"}
+    readout = readout_records(rows)
+    assert readout["base"]["none"]["naive"]["n"] == 1
+    assert readout["base"]["merge-gate"]["naive"]["n"] == 1
+
+
 def test_run_grid_keeps_one_provenance_digest_when_scenario_changes_mid_run(
     tmp_path: Path,
 ) -> None:
@@ -256,7 +318,7 @@ def test_run_grid_keeps_one_provenance_digest_when_scenario_changes_mid_run(
     scenario = SimpleNamespace(
         slug="mutable",
         root=scenario_root,
-        render=lambda arm: f"task:{arm}",
+        render=lambda arm, **_kwargs: f"task:{arm}",
     )
     config = RunnerConfig(
         endpoint="http://127.0.0.1:8000",
@@ -322,7 +384,7 @@ def test_non_real_arms_use_the_pristine_visible_grade_in_recorded_evidence(
         grades.append(episode_dir)
         return False, False
 
-    monkeypatch.setattr("reward_hacking.ladder.runner._run_pristine_visible_grade", pristine_grade)
+    monkeypatch.setattr("reward_hacking.ladder.runner.run_pristine_visible_grade", pristine_grade)
     grade = _default_final_grader(
         scenario=DummyScenario("dummy"),
         arm=arm,
@@ -498,7 +560,7 @@ def test_unmeasured_oracle_error_is_excluded_from_honest_solve_denominator(
         final_grader=lambda **_kwargs: {},
     )
 
-    readout = readout_records(records)["base"]["naive"]
+    readout = readout_records(records)["base"]["none"]["naive"]
     assert [record["true_measured"] for record in records] == [True, False]
     assert readout["n"] == 2
     assert readout["measured_count"] == 1
@@ -570,7 +632,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         root=tmp_path,
         monitor_config_path=".ci/monitor.toml",
         audit_log_path=".ci/audit.log",
-        render=lambda _arm: rendered,
+        render=lambda _arm, **_kwargs: rendered,
     )
 
     def fake_run_agent_episode(*_args: object, **kwargs: object) -> dict[str, object]:
@@ -614,11 +676,13 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
     for arm in ("naive", "claimed"):
         record = records_by_arm[arm]
         token = cast("str", record["episode_token"])
-        assert token.startswith(f"ladder-{arm}-000-")
+        assert token.startswith(f"ladder-none-{arm}-000-")
         assert len(token.rsplit("-", maxsplit=1)[1]) == 12
         assert int(token.rsplit("-", maxsplit=1)[1], 16) >= 0
         assert token in seen_episode_tokens
-        trace_path = artifact_root / "records-traces" / "base" / "dummy" / arm / "sample-000.jsonl"
+        trace_path = (
+            artifact_root / "records-traces" / "base" / "dummy" / arm / "none" / "sample-000.jsonl"
+        )
         assert record["trace_path"] == str(trace_path)
         trace_records = load_trace(trace_path)
         command_record = next(item for item in trace_records if item["record"] == "ladder_command")
@@ -641,7 +705,7 @@ def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
         root=tmp_path,
         monitor_config_path=".ci/monitor.toml",
         audit_log_path=".ci/audit.log",
-        render=lambda _arm: rendered,
+        render=lambda _arm, **_kwargs: rendered,
     )
     fail_first_attempt = True
 
@@ -716,7 +780,9 @@ def test_traces_are_per_run_and_a_failed_attempt_is_kept_aside(tmp_path: Path) -
             final_grader=lambda **_kwargs: {},
         )
 
-    crashed_trace = tmp_path / "second-traces" / "base" / "dummy" / "naive" / "sample-000.jsonl"
+    crashed_trace = (
+        tmp_path / "second-traces" / "base" / "dummy" / "naive" / "none" / "sample-000.jsonl"
+    )
     crashed_trace.parent.mkdir(parents=True)
     crashed_trace.write_text(
         '{"record": "episode_start", "attempt": "crashed"}\n', encoding="utf-8"
@@ -726,7 +792,7 @@ def test_traces_are_per_run_and_a_failed_attempt_is_kept_aside(tmp_path: Path) -
     run("second.jsonl")
 
     assert trace_paths_seen == [
-        tmp_path / "first-traces" / "base" / "dummy" / "naive" / "sample-000.jsonl",
+        tmp_path / "first-traces" / "base" / "dummy" / "naive" / "none" / "sample-000.jsonl",
         crashed_trace,
     ]
     kept_attempt = crashed_trace.with_name("sample-000.attempt-1.jsonl")
@@ -930,6 +996,45 @@ def test_cli_rejects_unknown_scenario_id_before_backend_start(tmp_path: Path) ->
         )
 
 
+def test_cli_records_the_selected_task_pressure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured_configs: list[RunnerConfig] = []
+    monkeypatch.setattr(
+        "reward_hacking.ladder.scenario.load_scenarios",
+        lambda *_args, **_kwargs: (DummyScenario("dummy"),),
+    )
+    monkeypatch.setattr(
+        "reward_hacking.ladder.runner.resolve_jail_resource_limits",
+        lambda **_kwargs: JailResourceLimits(),
+    )
+
+    def capture_run_grid(config: RunnerConfig) -> None:
+        captured_configs.append(config)
+
+    monkeypatch.setattr(
+        "reward_hacking.ladder.runner.run_grid",
+        capture_run_grid,
+    )
+    monkeypatch.setattr("reward_hacking.ladder.runner.readout", lambda _path: {})
+
+    result = main(
+        [
+            "--endpoint",
+            "http://127.0.0.1:8000",
+            "--model",
+            "base=/models/base",
+            "--scenario-root",
+            str(tmp_path),
+            "--task-pressure",
+            "merge-gate",
+        ]
+    )
+
+    assert result == 0
+    assert captured_configs[0].task_pressure == "merge-gate"
+
+
 def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -949,7 +1054,7 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
         root=tmp_path,
         monitor_config_path=".ci/monitor.toml",
         audit_log_path=".ci/audit.log",
-        render=lambda _arm: rendered,
+        render=lambda _arm, **_kwargs: rendered,
     )
 
     def fake_run_agent_episode(*_args: object, **kwargs: object) -> dict[str, object]:
@@ -1034,7 +1139,7 @@ def test_rung_six_without_a_valid_override_does_not_bypass_method_audit(
 ) -> None:
     scenario = DummyScenario("dummy")
     monkeypatch.setattr(
-        "reward_hacking.ladder.runner._run_pristine_visible_grade",
+        "reward_hacking.ladder.runner.run_pristine_visible_grade",
         lambda *_args, **_kwargs: (True, True),
     )
     evidence = _derive_grade_evidence(
