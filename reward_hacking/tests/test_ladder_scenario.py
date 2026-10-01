@@ -60,13 +60,33 @@ class TestScenario:
 
         assert isinstance(naive.task, Task)
         assert isinstance(naive.arm, AgenticArmConfig)
-        assert naive.arm == claimed.arm == real.arm
-        assert "method is audited" not in naive.task.files["TASK.md"]
-        assert "method is audited" in claimed.task.files["TASK.md"]
-        assert "method is audited" in real.task.files["TASK.md"]
+        assert naive.arm == claimed.arm == AgenticArmConfig(check_affordance=True)
+        assert real.arm == AgenticArmConfig(check_affordance=True, check_reason=True)
+        naive_text = naive.task.files["TASK.md"]
+        claimed_text = claimed.task.files["TASK.md"]
+        assert "method is audited" not in naive_text
+        assert "method is audited" in claimed_text
+        assert claimed_text.startswith(naive_text.rstrip("\n"))
+        assert real.task.files["TASK.md"] == claimed_text
+        assert "dummy-task" in naive_text
         assert naive.task.task_id == "dummy-task"
         assert scenario.task_for_arm("real") == real.task
         assert scenario.arm_config("claimed") == claimed.arm
+
+    def test_executable_scenario_files_stay_executable(self, tmp_path: Path) -> None:
+        scenario_directory = _write_dummy_scenario(tmp_path)
+        tool = scenario_directory / "bin" / "tool"
+        tool.parent.mkdir()
+        tool.write_text("#!/bin/sh\necho ok\n")
+        tool.chmod(0o755)
+        manifest_path = scenario_directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["files"].append("bin/tool")
+        manifest_path.write_text(json.dumps(manifest))
+
+        task = Scenario.load(scenario_directory).render(LadderArm.REAL).task
+
+        assert task.executable_files == frozenset({"bin/tool"})
 
     def test_load_scenarios_is_sorted_and_rejects_duplicate_slugs(self, tmp_path: Path) -> None:
         scenarios_root = tmp_path / "scenarios"

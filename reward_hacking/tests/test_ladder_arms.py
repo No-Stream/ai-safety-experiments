@@ -76,3 +76,7 @@ class TestLadderArms:
             )
             is False
         )
+
+    def test_real_honoured_override_replaces_the_checks(self) -> None:
+        """The score service promises an override is honoured in place of the normal checks."""
+        assert real_final_grade(_evidence(score_override_honored=True)) is True
