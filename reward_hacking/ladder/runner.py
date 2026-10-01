@@ -19,7 +19,8 @@ import shlex
 import shutil
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -159,6 +160,7 @@ class RunnerConfig:
     episode_seconds: float = 900.0
     resource_limits: JailResourceLimits = ENFORCED_JAIL_RESOURCE_LIMITS
     resume: bool = True
+    episode_concurrency: int = 1
 
     def __post_init__(self) -> None:
         """Validate the grid before any tokenizer or server request is made."""
@@ -182,6 +184,8 @@ class RunnerConfig:
             "jail_backend": self.jail_backend,
             "episode_seconds": self.episode_seconds,
             "resource_limits": self.resource_limits.to_json_dict(),
+            # Concurrent episodes decode slower per sequence against the wall-clock episode budget.
+            "episode_concurrency": self.episode_concurrency,
         }
 
     @property
@@ -227,6 +231,8 @@ def _validate_run_bounds(config: RunnerConfig) -> None:
         raise ValueError("max_turns must be at least one")
     if config.episode_seconds <= 0:
         raise ValueError("episode_seconds must be positive")
+    if config.episode_concurrency < 1:
+        raise ValueError("episode_concurrency must be at least one")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1173,7 +1179,49 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
     )
 
 
-def run_grid(  # noqa: C901 - linear model/scenario/arm/sample orchestration
+def _run_cells(
+    keys: Sequence[EpisodeKey],
+    run_cell: Callable[[EpisodeKey], dict[str, object]],
+    *,
+    concurrency: int,
+) -> Iterator[dict[str, object]]:
+    """Yield each cell's record as it finishes, with at most ``concurrency`` cells in flight.
+
+    The next cell is submitted only after a success, so a failure stops new work at once while the
+    cells already running finish and are yielded for durable append; the first failure then raises.
+    """
+    pending = iter(keys)
+    failures: list[tuple[EpisodeKey, BaseException]] = []
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ladder-episode") as pool:
+        in_flight: dict[Future[dict[str, object]], EpisodeKey] = {}
+
+        def submit_next() -> None:
+            key = next(pending, None)
+            if key is not None:
+                in_flight[pool.submit(run_cell, key)] = key
+
+        for _ in range(concurrency):
+            submit_next()
+        while in_flight:
+            done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                key = in_flight.pop(future)
+                error = future.exception()
+                if error is not None:
+                    logger.error("ladder episode failed: %s: %r", key, error)
+                    failures.append((key, error))
+                    continue
+                logger.info("ladder episode complete: %s", key)
+                yield future.result()
+                if not failures:
+                    submit_next()
+    if failures:
+        if len(failures) > 1:
+            logger.error("%d ladder episodes failed; raising the first", len(failures))
+        raise failures[0][1]
+
+
+def run_grid(
     config: RunnerConfig,
     *,
     backend_factory: BackendFactory = build_vllm_http_backend,
@@ -1230,6 +1278,7 @@ def run_grid(  # noqa: C901 - linear model/scenario/arm/sample orchestration
     selected_grader = _default_final_grader if final_grader is None else final_grader
     backends: dict[str, object] = {}
     appended: list[dict[str, object]] = []
+    scenarios_by_slug = {scenario.slug: scenario for scenario in config.scenarios}
     for model in config.models:
         model_pending = any(
             EpisodeKey(model.model_id, scenario.slug, arm, sample_index) not in completed
@@ -1240,27 +1289,30 @@ def run_grid(  # noqa: C901 - linear model/scenario/arm/sample orchestration
         if not model_pending:
             continue
         backends[model.model_id] = backend_factory(model, config)
-        for scenario in config.scenarios:
-            for arm in config.arms:
-                for sample_index in range(config.samples):
-                    key = EpisodeKey(model.model_id, scenario.slug, arm, sample_index)
-                    if key in completed:
-                        continue
-                    record = _run_one(
-                        config,
-                        scenario,
-                        model,
-                        arm,
-                        sample_index,
-                        backends[model.model_id],
-                        episode_runner=run_episode,
-                        detector=selected_detector,
-                        final_grader=selected_grader,
-                    )
-                    write_trace(config.output_path, [record], append=True)
-                    completed.add(key)
-                    appended.append(record)
-                    logger.info("ladder episode complete: %s", key)
+        pending_keys = [
+            EpisodeKey(model.model_id, scenario.slug, arm, sample_index)
+            for scenario in config.scenarios
+            for arm in config.arms
+            for sample_index in range(config.samples)
+            if EpisodeKey(model.model_id, scenario.slug, arm, sample_index) not in completed
+        ]
+
+        def run_cell(key: EpisodeKey, model: ModelSpec = model) -> dict[str, object]:
+            return _run_one(
+                config,
+                scenarios_by_slug[key.scenario_id],
+                model,
+                key.arm,
+                key.sample_idx,
+                backends[model.model_id],
+                episode_runner=run_episode,
+                detector=selected_detector,
+                final_grader=selected_grader,
+            )
+
+        for record in _run_cells(pending_keys, run_cell, concurrency=config.episode_concurrency):
+            write_trace(config.output_path, [record], append=True)
+            appended.append(record)
     return appended
 
 
@@ -1351,6 +1403,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout", default="10s")
     parser.add_argument("--episode-seconds", type=float, default=900.0)
     parser.add_argument(
+        "--episode-concurrency",
+        type=int,
+        default=1,
+        help="episodes in flight at once; match the server's --max-num-seqs",
+    )
+    parser.add_argument(
         "--advisory-limits",
         action="store_true",
         help="Use unenforced jail limits when the systemd user manager is offline.",
@@ -1373,6 +1431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_turns=args.max_turns,
         timeout=args.timeout,
         episode_seconds=args.episode_seconds,
+        episode_concurrency=args.episode_concurrency,
         resource_limits=resource_limits,
         resume=not args.no_resume,
     )

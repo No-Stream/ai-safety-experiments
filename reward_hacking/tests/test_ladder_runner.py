@@ -6,7 +6,8 @@ import hashlib
 import hmac
 import json
 import tempfile
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -217,6 +218,86 @@ def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> 
     assert second == []
     assert len(calls) == 4
     assert len(output_path.read_text(encoding="utf-8").splitlines()) == 5
+
+
+class TestEpisodeConcurrency:
+    def run(self, config: RunnerConfig, episode_runner: Any) -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=episode_runner,
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+    def test_episodes_overlap_and_each_record_is_appended_once(self, tmp_path: Path) -> None:
+        config = replace(runner_config(tmp_path / "records.jsonl"), episode_concurrency=2)
+        both_running = threading.Barrier(2, timeout=10)
+
+        def episode_runner(
+            _scenario: ScenarioLike,
+            _backend: object,
+            _arm: str,
+            sample_index: int,
+            _episode_dir: Path,
+            _trace_path: Path,
+        ) -> dict[str, object]:
+            if sample_index == 0:
+                both_running.wait()
+            return {"true_pass": True}
+
+        records = self.run(config, episode_runner)
+
+        keys = [
+            json.loads(line)["key"]
+            for line in config.output_path.read_text(encoding="utf-8").splitlines()[1:]
+        ]
+        assert len(records) == 4
+        assert len(keys) == 4
+        assert len({json.dumps(key, sort_keys=True) for key in keys}) == 4
+
+    def test_a_failed_episode_keeps_in_flight_work_and_resume_reruns_the_rest(
+        self, tmp_path: Path
+    ) -> None:
+        config = replace(runner_config(tmp_path / "records.jsonl"), episode_concurrency=2)
+        failing_started = threading.Event()
+        calls: list[tuple[str, int]] = []
+
+        def failing_runner(
+            _scenario: ScenarioLike,
+            _backend: object,
+            arm: str,
+            sample_index: int,
+            _episode_dir: Path,
+            _trace_path: Path,
+        ) -> dict[str, object]:
+            calls.append((arm, sample_index))
+            if (arm, sample_index) == ("naive", 0):
+                failing_started.set()
+                raise RuntimeError("episode crashed")
+            assert failing_started.wait(timeout=10)
+            return {"true_pass": True}
+
+        with pytest.raises(RuntimeError, match="episode crashed"):
+            self.run(config, failing_runner)
+
+        completed = completed_episode_keys(
+            config.output_path, expected_digest=config.provenance_digest
+        )
+        assert EpisodeKey("base", "dummy", "naive", 0) not in completed
+        assert EpisodeKey("base", "dummy", "naive", 1) in completed
+        assert len(calls) < 4, "unstarted episodes must not run after a failure"
+
+        resumed = self.run(config, lambda *_args: {"true_pass": True})
+        assert len(resumed) == 4 - len(completed)
+
+    def test_concurrency_is_provenance_and_must_be_positive(self, tmp_path: Path) -> None:
+        serial = runner_config(tmp_path / "records.jsonl")
+        concurrent = replace(serial, episode_concurrency=4)
+        assert concurrent.provenance_payload()["episode_concurrency"] == 4
+        assert concurrent.provenance_digest != serial.provenance_digest
+        with pytest.raises(ValueError, match="episode_concurrency"):
+            replace(serial, episode_concurrency=0)
 
 
 def test_unmeasured_oracle_error_is_excluded_from_honest_solve_denominator(
