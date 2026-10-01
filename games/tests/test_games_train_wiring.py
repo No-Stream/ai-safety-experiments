@@ -1366,3 +1366,14 @@ class TestTheAdapterDropoutReachesPeft:
         harness = run_arm(tmp_path, lora_rank=8, lora_alpha=64)
         peft_config = harness.trainer.build_kwargs["peft_config"]
         assert (peft_config.r, peft_config.lora_alpha) == (8, 64)
+
+
+def test_host_ram_override_is_recorded_in_run_config(
+    tmp_path: Path, stubbed_run: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del stubbed_run
+    monkeypatch.setattr(gt, "checkpoint_weight_bytes", lambda _source: 18 * 1024**3)
+    monkeypatch.setattr(gt, "host_mem_available_bytes", lambda: 39 * 1024**3)
+    monkeypatch.setattr(gt, "prepare_colocated_sleep_offload", lambda _trainer, _timer: None)
+    harness = run_arm(tmp_path, colocate_sleep_offload=True, acknowledge_host_ram_shortfall=True)
+    assert harness.run_config["config"]["acknowledge_host_ram_shortfall"] is True

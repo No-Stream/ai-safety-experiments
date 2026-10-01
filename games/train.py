@@ -170,9 +170,12 @@ from games.sizing import (
     DEFAULT_VRAM_USABLE_FRACTION,
     SequenceCost,
     SizingPlan,
+    check_sleep_offload_host_ram,
     checkpoint_sequence_cost,
+    checkpoint_weight_bytes,
     colocate_reserved_gib,
     count_meta_parameters,
+    host_mem_available_bytes,
     plan_sizing,
     vllm_sequence_cost,
 )
@@ -816,6 +819,8 @@ class GameTrainConfig:
     vllm_attention_backend: str = "auto"
     # Opt-in handoff: sleep the engine during training and move the policy out while it wakes.
     colocate_sleep_offload: bool = False
+    # Launch-only acknowledgement: host availability changes between resumes, unlike the experiment.
+    acknowledge_host_ram_shortfall: bool = False
     # Opt-in: skip Liger's full-vocabulary gradient buffers for the frozen lm_head (~6 GiB at 9B).
     # Same loss and gradients (games/tests/test_liger_frozen_head.py), so off by default only to
     # keep existing runs byte-for-byte reproducible.
@@ -1201,6 +1206,8 @@ class GameTrainConfig:
         A utilization at or above 1 would leave the trainer nothing at all: the engine holds that
         fraction of the card for the whole run, not only while it is generating.
         """
+        if self.acknowledge_host_ram_shortfall and not self.colocate_sleep_offload:
+            raise ValueError("acknowledge_host_ram_shortfall requires colocate_sleep_offload")
         if not 0 < self.vram_usable_fraction <= 1:
             raise ValueError(
                 f"vram_usable_fraction must be in (0, 1], {self.vram_usable_fraction=}"
@@ -3214,6 +3221,7 @@ PADDING_TRIM_STEP_METRICS: tuple[str, ...] = (STEP_PADDED_TOKENS_METRIC, STEP_TR
 # reached the optimizer, and what the step cost in VRAM. A key absent from a log record writes an
 # empty cell (`grpo.rlvr_math.MemoryMonitorCallback`), which every run at oversample 1 writes.
 MEM_LOG_EXTRA_COLUMNS: tuple[str, ...] = (
+    "host_mem_available_gib",
     *TIMING_METRIC_KEYS,
     *PADDING_TRIM_STEP_METRICS,
     *SAMPLED_SURPRISAL_METRICS,
@@ -4039,6 +4047,7 @@ class PaddingTrimmedGRPOTrainer(InstrumentedGRPOTrainer):
                 trace_file_path(Path(cast("str", self.args.output_dir)), self.state.global_step),
                 buffered_completions=len(self._logs["prompt"]),
             )
+        logs["host_mem_available_gib"] = host_mem_available_bytes() / BYTES_PER_GIB
         super().log(logs, start_time)
 
 
@@ -4722,6 +4731,12 @@ def train_game_arm(
     function has already done several. None records that nobody bridged, which
     `deltanet_kernel_paths` in the same artifact will then show as the torch fallback.
     """
+    if config.colocate_sleep_offload:
+        check_sleep_offload_host_ram(
+            checkpoint_weight_bytes(config.load_source),
+            host_mem_available_bytes(),
+            acknowledged=config.acknowledge_host_ram_shortfall,
+        )
     prepared = _prepare_run(config, kernel_bridge=kernel_bridge)
     if isinstance(prepared, CompletedRun):
         logger.info(
@@ -5104,6 +5119,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             "attention backend for the colocated vLLM engine. 'auto' lets vLLM choose; TRITON_ATTN "
             "serves an fp8 KV cache without compiling FlashInfer kernels, which needs nvcc."
         ),
+    )
+    parser.add_argument(
+        "--acknowledge-host-ram-shortfall",
+        action="store_true",
+        help="acknowledge and override the sleep-offload host RAM refusal; recorded in run_config.json",
     )
     parser.add_argument(
         "--colocate-sleep-offload",

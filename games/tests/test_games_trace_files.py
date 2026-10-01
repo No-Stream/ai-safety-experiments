@@ -196,22 +196,24 @@ class TestTheGuardSitsInFrontOfTrlsWrite:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         reached: list[dict[str, float]] = []
+        monkeypatch.setattr(gt, "host_mem_available_bytes", lambda: 7 * 1024**3)
         monkeypatch.setattr(
             gt.GRPOTrainer, "log", lambda _self, logs, _start_time=None: reached.append(logs)
         )
         write_trace(tmp_path, 70, ROWS_PER_STEP)
         trainer = self.bare_trainer(tmp_path, step=70, buffered=ROWS_PER_STEP)
         trainer.log({"reward": 0.5})
-        assert reached == [{"reward": 0.5}]
+        assert reached == [{"reward": 0.5, "host_mem_available_gib": 7.0}]
 
     def test_with_completion_logging_off_there_is_no_write_to_guard(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         reached: list[dict[str, float]] = []
+        monkeypatch.setattr(gt, "host_mem_available_bytes", lambda: 7 * 1024**3)
         monkeypatch.setattr(
             gt.GRPOTrainer, "log", lambda _self, logs, _start_time=None: reached.append(logs)
         )
         write_trace(tmp_path, 70, ROWS_PER_STEP)
         trainer = self.bare_trainer(tmp_path, step=70, buffered=0, log_completions=False)
         trainer.log({"reward": 0.5})
-        assert reached == [{"reward": 0.5}]
+        assert reached == [{"reward": 0.5, "host_mem_available_gib": 7.0}]

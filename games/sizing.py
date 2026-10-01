@@ -4,8 +4,8 @@
 propagate into a cloud job config, because a run that assumes it cannot take whatever card is
 free, and a job that OOMs at step 40 has spent its whole allocation to report nothing.
 
-Everything here is pure arithmetic over a checkpoint's own config fields, so it is testable
-without a download, a GPU, or a model load. The cost terms are the ones
+Sizing arithmetic is testable without a download, a GPU, or a model load; host preflight reads
+checkpoint index metadata and Linux MemAvailable without loading weights. The cost terms are the ones
 `grpo.throughput.memory_model` derives and `docs/scratch/measured-throughput.md` measured against
 a running process, restated per-sequence here.
 
@@ -29,17 +29,78 @@ note stands until someone who owns that package makes it.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import cast
 
 import torch
 import transformers
 from transformers import AutoConfig
+from transformers.utils.hub import cached_file
 
 from grpo.throughput import BYTES_PER_GIB, MIN_GRPO_GROUP_SIZE
 
 logger = logging.getLogger(__name__)
+
+# 2026-09-30: 9B bf16 sleep-offload launches used roughly twice the weight bytes in host RAM.
+SLEEP_OFFLOAD_HOST_WEIGHT_MULTIPLIER = 2.0
+SLEEP_OFFLOAD_HOST_MARGIN_BYTES = 4 * BYTES_PER_GIB
+
+
+def sleep_offload_peak_host_bytes(weight_bytes: int) -> int:
+    """Conservatively budget loading and CPU staging, including non-weight host allocations."""
+    if weight_bytes <= 0:
+        raise ValueError("checkpoint weight bytes must be positive")
+    return (
+        math.ceil(weight_bytes * SLEEP_OFFLOAD_HOST_WEIGHT_MULTIPLIER)
+        + SLEEP_OFFLOAD_HOST_MARGIN_BYTES
+    )
+
+
+def checkpoint_weight_bytes(model_source: str) -> int:
+    """Read the resolved checkpoint index; its vision/MTP bytes conservatively overstate text-only weights."""
+    index_path = cached_file(model_source, "model.safetensors.index.json")
+    if index_path is None:
+        raise ValueError("sleep-offload host sizing requires model.safetensors.index.json")
+    weight_bytes = json.loads(Path(index_path).read_text())["metadata"]["total_size"]
+    if type(weight_bytes) is not int or weight_bytes <= 0:
+        raise ValueError("safetensors index metadata.total_size must be a positive integer")
+    return weight_bytes
+
+
+def host_mem_available_bytes(meminfo_path: Path = Path("/proc/meminfo")) -> int:
+    """Read Linux's available host RAM, excluding swap."""
+    for line in meminfo_path.read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            _, available_kib, unit = line.split()
+            if unit != "kB" or int(available_kib) < 0:
+                raise ValueError("MemAvailable must be nonnegative kB")
+            return int(available_kib) * 1024
+    raise ValueError("meminfo is missing MemAvailable")
+
+
+def check_sleep_offload_host_ram(
+    weight_bytes: int, available_bytes: int, *, acknowledged: bool = False
+) -> None:
+    """Refuse a launch whose predicted host peak exceeds currently available RAM."""
+    required_bytes = sleep_offload_peak_host_bytes(weight_bytes)
+    message = (
+        f"sleep-offload requires {required_bytes / BYTES_PER_GIB:.2f} GiB host RAM; "
+        f"available {available_bytes / BYTES_PER_GIB:.2f} GiB "
+        f"(weight multiplier {SLEEP_OFFLOAD_HOST_WEIGHT_MULTIPLIER:.1f}, "
+        f"margin {SLEEP_OFFLOAD_HOST_MARGIN_BYTES / BYTES_PER_GIB:.1f} GiB). "
+        "Free host RAM or raise .wslconfig memory=."
+    )
+    if available_bytes < required_bytes:
+        if not acknowledged:
+            raise RuntimeError(message + " Override only with --acknowledge-host-ram-shortfall.")
+        logger.warning("host RAM shortfall acknowledged: %s", message)
+    else:
+        logger.info("host RAM preflight passed: %s", message)
+
 
 # Layer types holding a per-token KV cache. Sliding-window attention caches only its window, so
 # counting it in full overstates the cost, which is the right direction to be wrong in.
