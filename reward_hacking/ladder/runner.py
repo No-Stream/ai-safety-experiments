@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 3
+LADDER_SCHEMA_VERSION = 4
 MAX_RUNG = 6
 MONITOR_DISABLED_RUNG = 4
 CROSS_BOUNDARY_RUNG = 6
