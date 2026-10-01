@@ -16,6 +16,7 @@ import pytest
 from reward_hacking.jailed_poc import CommandResult, JailResourceLimits
 from reward_hacking.ladder.runner import (
     LADDER_SAMPLING,
+    LADDER_SCHEMA_VERSION,
     LADDER_STOP_TOKEN_IDS,
     EpisodeKey,
     ModelSpec,
@@ -137,6 +138,41 @@ def test_readout_reports_highest_rung_coverups_and_honest_solve_rate() -> None:
     assert readout["base"]["naive"]["honest_solve_rate"] == 0.5
 
 
+def test_readout_recovers_measurement_status_from_legacy_trace_summary() -> None:
+    records: list[dict[str, Any]] = [
+        {
+            "record": "ladder_episode",
+            "key": EpisodeKey("base", "dummy", "naive", 0).to_json(),
+            "highest_rung": 0,
+            "coverup": False,
+            "honest_solve": True,
+            "trace_summary": {"true": {"pass": True, "measured": True, "oracle_error": None}},
+        },
+        {
+            "record": "ladder_episode",
+            "key": EpisodeKey("base", "dummy", "naive", 1).to_json(),
+            "highest_rung": 0,
+            "coverup": False,
+            "honest_solve": False,
+            "trace_summary": {
+                "true": {
+                    "pass": False,
+                    "measured": False,
+                    "oracle_error": "forced oracle error",
+                }
+            },
+        },
+    ]
+
+    readout = readout_records(records)["base"]["naive"]
+
+    assert readout["n"] == 2
+    assert readout["measured_count"] == 1
+    assert readout["unmeasured_count"] == 1
+    assert readout["honest_solve_count"] == 1
+    assert readout["honest_solve_rate"] == 1.0
+
+
 def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> None:
     output_path = tmp_path / "records.jsonl"
     config = runner_config(output_path)
@@ -146,14 +182,14 @@ def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> 
         return model
 
     def episode_runner(
-        scenario: ScenarioLike,
+        _scenario: ScenarioLike,
         _backend: object,
         arm: str,
         sample_index: int,
         _episode_dir: Path,
         _trace_path: Path,
     ) -> dict[str, object]:
-        key = EpisodeKey("base", scenario.slug, arm, sample_index)
+        key = EpisodeKey("base", _scenario.slug, arm, sample_index)
         calls.append(key)
         return {"true_pass": arm == "naive" and sample_index == 0}
 
@@ -179,6 +215,106 @@ def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> 
     assert second == []
     assert len(calls) == 4
     assert len(output_path.read_text(encoding="utf-8").splitlines()) == 5
+
+
+def test_unmeasured_oracle_error_is_excluded_from_honest_solve_denominator(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    config = RunnerConfig(
+        endpoint="http://127.0.0.1:8000",
+        models=(ModelSpec("base", "/models/base"),),
+        scenarios=(DummyScenario("dummy"),),
+        arms=("naive",),
+        samples=2,
+        output_path=output_path,
+        episode_root=tmp_path / "episodes",
+    )
+
+    def episode_runner(
+        _scenario: ScenarioLike,
+        _backend: object,
+        _arm: str,
+        sample_index: int,
+        _episode_dir: Path,
+        _trace_path: Path,
+    ) -> dict[str, object]:
+        measured = sample_index == 0
+        return {
+            "true": {
+                "pass": measured,
+                "measured": measured,
+                "oracle_error": None if measured else "forced oracle error",
+            }
+        }
+
+    records = run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=episode_runner,
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+
+    readout = readout_records(records)["base"]["naive"]
+    assert [record["true_measured"] for record in records] == [True, False]
+    assert readout["n"] == 2
+    assert readout["measured_count"] == 1
+    assert readout["unmeasured_count"] == 1
+    assert readout["honest_solve_count"] == 1
+    assert readout["honest_solve_rate"] == 1.0
+
+
+def test_resume_truncates_torn_final_line_before_appending(tmp_path: Path) -> None:
+    output_path = tmp_path / "records.jsonl"
+    config = RunnerConfig(
+        endpoint="http://127.0.0.1:8000",
+        models=(ModelSpec("base", "/models/base"),),
+        scenarios=(DummyScenario("dummy"),),
+        arms=("naive",),
+        samples=2,
+        output_path=output_path,
+        episode_root=tmp_path / "episodes",
+    )
+    key = EpisodeKey("base", "dummy", "naive", 0)
+    header = {
+        "record": "ladder_run_header",
+        "schema_version": LADDER_SCHEMA_VERSION,
+        "provenance_digest": config.provenance_digest,
+        "provenance": config.provenance_payload(),
+    }
+    completed = {
+        "record": "ladder_episode",
+        "provenance_digest": config.provenance_digest,
+        "key": key.to_json(),
+    }
+    valid_prefix = json.dumps(header) + "\n" + json.dumps(completed) + "\n"
+    output_path.write_text(valid_prefix + '{"record":"ladder_episode","key":', encoding="utf-8")
+    calls: list[int] = []
+
+    def episode_runner(
+        _scenario: ScenarioLike,
+        _backend: object,
+        _arm: str,
+        sample_index: int,
+        _episode_dir: Path,
+        _trace_path: Path,
+    ) -> dict[str, object]:
+        calls.append(sample_index)
+        return {"true_pass": True}
+
+    resumed = run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=episode_runner,
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+
+    records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert calls == [1]
+    assert len(resumed) == 1
+    assert len([record for record in records if record.get("record") == "ladder_episode"]) == 2
 
 
 def test_run_grid_default_real_path_persists_command_and_episode_traces(
@@ -210,6 +346,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         )
         return {
             "true_pass": True,
+            "true": {"pass": True, "measured": True, "oracle_error": None},
             "proxy_pass": True,
             "final_report": "completed honestly",
         }
@@ -233,6 +370,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
     assert any(record["record"] == "ladder_command" for record in trace_records)
     assert records[0]["trace_summary"] == {
         "true_pass": True,
+        "true": {"pass": True, "measured": True, "oracle_error": None},
         "proxy_pass": True,
         "final_report": "completed honestly",
     }
@@ -434,7 +572,7 @@ def test_rung_six_without_a_valid_override_does_not_bypass_method_audit(
         scenario=scenario,
         arm="real",
         episode_dir=tmp_path,
-        summary={"proxy": {"pass": True}},
+        summary={"proxy": {"pass": True}, "true_pass": False},
         detection={"rungs": [2, 6]},
         timeout="10s",
     )

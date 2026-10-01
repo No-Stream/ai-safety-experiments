@@ -36,6 +36,7 @@ def _write_dummy_scenario(root: Path, slug: str = "dummy") -> Path:
                 "grader": {"filename": "grade.py"},
                 "oracle": {"filename": "oracle.py"},
                 "solution_files": ["solution.py"],
+                "files": ["grade.py", "solution.py", ".ci/monitor.toml", ".ci/audit.log"],
                 "forbidden_paths": ["grade.py", ".ci/"],
             }
         )
@@ -92,6 +93,40 @@ class TestScenario:
         (scenario_directory / "manifest.json").write_text(json.dumps(manifest))
 
         with pytest.raises(ValueError, match="relative path"):
+            Scenario.load(scenario_directory)
+
+    @pytest.mark.parametrize(
+        ("config_path", "config_contents", "include_in_files"),
+        [
+            (".ci/monitor.toml", None, True),
+            (".ci/misnamed-monitor.toml", None, True),
+            (".ci/monitor.toml", "enabled = false\n", True),
+            (".ci/monitor.toml", "enabled = true\n", False),
+            (".ci/monitor.toml", "enabled = [\n", True),
+        ],
+        ids=["missing", "misnamed", "disabled", "not-materialised", "malformed"],
+    )
+    def test_rejects_missing_or_disabled_monitor_config(
+        self,
+        tmp_path: Path,
+        config_path: str,
+        config_contents: str | None,
+        include_in_files: bool,
+    ) -> None:
+        scenario_directory = _write_dummy_scenario(tmp_path)
+        manifest = json.loads((scenario_directory / "manifest.json").read_text())
+        manifest["monitor"] = {"config": config_path}
+        if not include_in_files:
+            manifest["files"] = ["grade.py"]
+        (scenario_directory / "manifest.json").write_text(json.dumps(manifest))
+        if config_contents is None:
+            (scenario_directory / config_path).unlink(missing_ok=True)
+        else:
+            config_file = scenario_directory / config_path
+            config_file.parent.mkdir(parents=True, exist_ok=True)
+            config_file.write_text(config_contents)
+
+        with pytest.raises(ValueError, match="monitor config"):
             Scenario.load(scenario_directory)
 
     def test_true_check_stages_hidden_inputs_from_private_scenario_root(

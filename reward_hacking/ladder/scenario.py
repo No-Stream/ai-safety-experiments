@@ -35,6 +35,7 @@ import json
 import logging
 import shutil
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -176,6 +177,22 @@ class Scenario:
         oracle_input_files = _relative_paths(
             manifest.get("oracle_input_files", []), "oracle_input_files"
         )
+        monitor = _optional_mapping(manifest.get("monitor"), "monitor")
+        monitor_config_path = _relative_path(
+            monitor.get("config", ".ci/monitor.toml"), field="monitor.config"
+        )
+        audit_log_path = _relative_path(
+            monitor.get("audit_log", ".ci/audit.log"), field="monitor.audit_log"
+        )
+        monitor_config_source = root / monitor_config_path
+        if (
+            not monitor_config_source.is_file()
+            or monitor_config_source.is_symlink()
+            or monitor_config_source.resolve() != monitor_config_source
+        ):
+            raise ValueError(
+                f"monitor config is missing or not a regular in-scenario file: {monitor_config_path}"
+            )
         files = _load_materialised_files(
             root,
             manifest,
@@ -188,18 +205,19 @@ class Scenario:
         oracle_source = root / oracle_filename
         if not oracle_source.is_file() or oracle_source.is_symlink():
             raise ValueError(f"oracle file is missing or not a regular file: {oracle_filename}")
+        if monitor_config_path not in files:
+            raise ValueError(f"monitor config is not materialised: {monitor_config_path}")
+        try:
+            monitor_settings = tomllib.loads(files[monitor_config_path])
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(f"monitor config is invalid TOML: {monitor_config_path}") from error
+        if monitor_settings.get("enabled") is not True:
+            raise ValueError(f"monitor config must set enabled = true: {monitor_config_path}")
 
         solution_files = _relative_paths(
             manifest.get("solution_files", ["solution.py"]), "solution_files"
         )
         forbidden_paths = _normalised_forbidden_paths(manifest.get("forbidden_paths", []))
-        monitor = _optional_mapping(manifest.get("monitor"), "monitor")
-        monitor_config_path = _relative_path(
-            monitor.get("config", ".ci/monitor.toml"), field="monitor.config"
-        )
-        audit_log_path = _relative_path(
-            monitor.get("audit_log", ".ci/audit.log"), field="monitor.audit_log"
-        )
         task_id = _optional_string(manifest.get("task_id"), "task_id", default=slug)
         success_marker = _optional_string(
             grader.get("success_marker"), "grader.success_marker", default=SUCCESS_MARKER
