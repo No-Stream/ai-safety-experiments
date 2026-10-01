@@ -462,6 +462,8 @@ def lay_down_task(
         target = episode_dir / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(written)
+        if relpath in task.executable_files:
+            target.chmod(0o755)
         materialised.append(relpath)
     return tuple(materialised)
 
@@ -546,7 +548,42 @@ def _format_observation(result: CommandResult) -> str:
     return "".join(parts)
 
 
-def _format_check_verdict(*, passed: bool, marker: str) -> str:
+@dataclass(frozen=True)
+class CheckVerdict:
+    """A supplied grader's answer to ``<check/>``: the verdict and a one-line reason for a failure."""
+
+    passed: bool
+    reason: str
+
+
+# Grades /work for <check/> in place of the task's in-scene grader.
+type CheckGrader = Callable[[Path], CheckVerdict]
+
+
+def _answer_check(  # noqa: PLR0913 - keyword-only grading knobs threaded from _run_actions
+    task: Task,
+    episode_dir: Path,
+    *,
+    arm: AgenticArmConfig,
+    timeout: str,
+    jail_backend: str | None,
+    check_grader: CheckGrader | None,
+) -> str:
+    """Grade /work for one ``<check/>`` and render the verdict line the policy sees.
+
+    The task's in-scene grader answers unless the caller supplied ``check_grader``; a supplied
+    grader's reason reaches the policy only on an arm with ``check_reason`` on.
+    """
+    if check_grader is None:
+        grader = _run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
+        passed = grader_reported_success(grader, marker=task.success_marker)
+        return _format_check_verdict(passed=passed, marker=task.success_marker)
+    verdict = check_grader(episode_dir)
+    reason = verdict.reason if arm.check_reason else None
+    return _format_check_verdict(passed=verdict.passed, marker=task.success_marker, reason=reason)
+
+
+def _format_check_verdict(*, passed: bool, marker: str, reason: str | None = None) -> str:
     """Render a ``<check/>`` result: only the pass/fail verdict, never the grader's own output.
 
     The verdict channel is the whole point of the blind arm, and returning the grader's stdout would
@@ -554,9 +591,12 @@ def _format_check_verdict(*, passed: bool, marker: str) -> str:
     the hidden check inspects, turning "unreadable grader" back into "readable grader by one
     indirection". So the policy sees one canonical token, the success marker or ``FAIL`` and
     nothing else, keyed on the grader's own exit-plus-marker verdict via
-    :func:`grader_reported_success`.
+    :func:`grader_reported_success`. The one exception is an arm with ``check_reason`` on, whose
+    supplied grader explains a failure in one line: ``<check>FAIL: reason</check>``.
     """
-    return f"<check>{marker if passed else 'FAIL'}</check>"
+    if passed or reason is None:
+        return f"<check>{marker if passed else 'FAIL'}</check>"
+    return f"<check>FAIL: {' '.join(reason.split())}</check>"
 
 
 @dataclass(frozen=True)
@@ -1201,6 +1241,7 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
     grader_hashable: bool,
     before_command: Callable[[Path, str], None] | None = None,
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
+    check_grader: CheckGrader | None = None,
 ) -> tuple[tuple[CommandResult, ...], str, Action | None, int, tuple[str | None, ...]]:
     """Honor one turn's actions in emission order; return results, transcript tail, ending, checks.
 
@@ -1262,12 +1303,16 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
                 return tuple(results), transcript_tail, action, checks_used, tuple(check_sha256s)
             if grader_hashable:
                 check_sha256s.append(_grader_content_hash(episode_dir, task.grader_filename))
-            grader = _run_grader(
-                task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend
-            )
-            passed = grader_reported_success(grader, marker=task.success_marker)
             transcript_tail += (
-                _format_check_verdict(passed=passed, marker=task.success_marker) + "\n"
+                _answer_check(
+                    task,
+                    episode_dir,
+                    arm=arm,
+                    timeout=timeout,
+                    jail_backend=jail_backend,
+                    check_grader=check_grader,
+                )
+                + "\n"
             )
             checks_used += 1
             continue
@@ -1505,6 +1550,7 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
     stop_requested: threading.Event | None = None,
     before_command: Callable[[Path, str], None] | None = None,
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
+    check_grader: CheckGrader | None = None,
     final_report: bool = False,
 ) -> AgentEpisodeTrace:
     """Run one real-execution episode: drive the policy, jail every command, grade both ways.
@@ -1571,6 +1617,8 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
     budget, before the "no ``<run>`` = done" signal is honored. Once any command has run, a
     later empty turn is a genuine mid-episode "done" and ends the episode unchanged.
     """
+    if arm.check_reason and check_grader is None:
+        raise ValueError("an arm with check_reason needs a check_grader to supply the reason")
     episode_started = time.monotonic()
     episode_id = compose_episode_id(
         model_id=backend.model_id,
@@ -1655,6 +1703,7 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
             grader_hashable=grader_hashable,
             before_command=before_command,
             after_command=after_command,
+            check_grader=check_grader,
         )
         grader_check_sha256s.extend(turn_check_sha256s)
         ran_check = checks_used > checks_before

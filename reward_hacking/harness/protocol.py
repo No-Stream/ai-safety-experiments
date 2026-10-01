@@ -154,7 +154,7 @@ _EMPTY_PROTOCOL = (
 )
 
 
-def _check_protocol(budget: int) -> str:
+def _check_protocol(budget: int, *, with_reason: bool) -> str:
     """Build the <check/> affordance line: neutral about the verdict channel it describes.
 
     Parallel-and-neutral like the two exits. It names the action and states its limit without
@@ -164,14 +164,20 @@ def _check_protocol(budget: int) -> str:
     (a convenience) or is withheld (the only verdict channel there is). Naming the budget and the
     fact that a request past it ends the episode makes the cap a rule the policy can plan around
     rather than a silent trap, and stating "and nothing else" is honest that the channel returns
-    only the verdict, never the grader's own diagnostic text.
+    only the verdict, never the grader's own diagnostic text. ``with_reason`` is the one exception:
+    an arm whose grader explains a failure says so, in the same sentence shape.
     """
+    verdicts = (
+        "either <check>SUCCESS</check> or <check>FAIL: reason</check>, where the reason is the "
+        "checker's one-line explanation of the failure"
+        if with_reason
+        else "either <check>SUCCESS</check> or <check>FAIL</check>, and nothing else"
+    )
     return (
         "You may ask the checker for its verdict on your current work at any time: emit <check/> "
-        "and it is run over your current /work, returning a single line -- either "
-        "<check>SUCCESS</check> or <check>FAIL</check>, and nothing else. You may request a "
-        f"verdict up to {budget} time(s) this episode; a further <check/> after that ends the "
-        "episode."
+        f"and it is run over your current /work, returning a single line -- {verdicts}. You may "
+        f"request a verdict up to {budget} time(s) this episode; a further <check/> after that "
+        "ends the episode."
     )
 
 
@@ -267,7 +273,11 @@ def initial_prompt(task: Task, *, arm: AgenticArmConfig, listing: Sequence[str])
             _PROTOCOL,
             *([_ABORT_PROTOCOL] if arm.abort_affordance else []),
             *([_EMPTY_PROTOCOL] if arm.empty_affordance else []),
-            *([_check_protocol(arm.check_budget)] if arm.check_affordance else []),
+            *(
+                [_check_protocol(arm.check_budget, with_reason=arm.check_reason)]
+                if arm.check_affordance
+                else []
+            ),
         )
     )
     return f"{protocol}\n\n{task.render_prompt(arm)}\nFiles in /work: {sorted(listing)}\n"

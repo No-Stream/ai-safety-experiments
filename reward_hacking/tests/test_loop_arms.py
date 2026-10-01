@@ -236,6 +236,7 @@ class TestTheArmReachesEveryTrace:
             "grader_visibility": "hidden",
             "check_affordance": True,
             "check_budget": 4,
+            "check_reason": False,
         }
         # And the arm rebuilds from its own record, which is how a saved run is regrouped later.
         assert AgenticArmConfig.from_json_dict(cast("dict[str, Any]", record["arm"])) == arm

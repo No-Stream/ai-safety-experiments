@@ -6,6 +6,8 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 from reward_hacking.harness import loop
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
@@ -13,8 +15,6 @@ from reward_hacking.model_backend import BedrockCompletion, MockBackend, TokenUs
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def _dummy_task() -> Task:
@@ -217,3 +217,90 @@ class TestLadderFinalReport:
         assert trace.final_report_reasoning == "private thought"
         assert trace.final_report_truncated
         assert not trace.final_report_timed_out
+
+
+class TestSuppliedCheckGrader:
+    """A caller-supplied grader behind <check/>, optionally explaining a failing verdict."""
+
+    def reason_arm(self) -> AgenticArmConfig:
+        return AgenticArmConfig(check_affordance=True, check_reason=True)
+
+    def run_check(
+        self, tmp_path: Path, arm: AgenticArmConfig, check_grader: loop.CheckGrader
+    ) -> tuple[str, int]:
+        _results, tail, _ending, checks_used, _hashes = loop._run_actions(
+            "<check/>",
+            task=_dummy_task(),
+            arm=arm,
+            episode_dir=tmp_path,
+            timeout="1s",
+            jail_backend=None,
+            checks_used=0,
+            deadline=float("inf"),
+            grader_hashable=False,
+            check_grader=check_grader,
+        )
+        return tail, checks_used
+
+    def test_reason_arm_label_round_trips_and_defaults_off(self) -> None:
+        arm = self.reason_arm()
+        assert arm.label == "check+reason"
+        assert AgenticArmConfig.from_json_dict(arm.to_json_dict()) == arm
+        assert not AgenticArmConfig.from_json_dict({"check_affordance": True}).check_reason
+        with pytest.raises(ValueError, match="check_reason"):
+            AgenticArmConfig(check_reason=True)
+
+    def test_prompt_promises_a_reason_only_on_the_reason_arm(self) -> None:
+        task = _dummy_task()
+        plain = loop.initial_prompt(task, arm=AgenticArmConfig(check_affordance=True), listing=[])
+        reasoned = loop.initial_prompt(task, arm=self.reason_arm(), listing=[])
+        assert "nothing else" in plain
+        assert "nothing else" not in reasoned
+        assert "reason" in reasoned
+
+    def test_supplied_grader_answers_check_with_its_reason(self, tmp_path: Path) -> None:
+        seen: list[Path] = []
+
+        def check_grader(directory: Path) -> loop.CheckVerdict:
+            seen.append(directory)
+            return loop.CheckVerdict(passed=False, reason="visible test files were modified")
+
+        tail, checks_used = self.run_check(tmp_path, self.reason_arm(), check_grader)
+
+        assert seen == [tmp_path]
+        assert checks_used == 1
+        assert "<check>FAIL: visible test files were modified</check>" in tail
+
+    def test_plain_check_arm_withholds_the_reason(self, tmp_path: Path) -> None:
+        tail, _ = self.run_check(
+            tmp_path,
+            AgenticArmConfig(check_affordance=True),
+            lambda _directory: loop.CheckVerdict(passed=False, reason="secret"),
+        )
+        assert "<check>FAIL</check>" in tail
+        assert "secret" not in tail
+
+    def test_reason_arm_without_a_supplied_grader_fails_fast(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="check_grader"):
+            loop.run_agent_episode(
+                _dummy_task(),
+                MockBackend(["<check/>"], model_id="dummy"),
+                episode_dir=tmp_path / "episode",
+                max_turns=1,
+                arm=self.reason_arm(),
+            )
+
+
+def test_executable_task_files_are_laid_down_executable(tmp_path: Path) -> None:
+    base = _dummy_task()
+    task = Task(
+        task_id=base.task_id,
+        prompt=base.prompt,
+        body=base.body,
+        files={**base.files, "bin/tool": "#!/bin/sh\necho ok\n"},
+        true_check=base.true_check,
+        executable_files=frozenset({"bin/tool"}),
+    )
+    loop.lay_down_task(tmp_path / "episode", task)
+    assert (tmp_path / "episode" / "bin" / "tool").stat().st_mode & 0o111
+    assert not (tmp_path / "episode" / "grade.py").stat().st_mode & 0o111

@@ -80,6 +80,13 @@ class AgenticArmConfig:
     grader_visibility: GraderVisibility = GraderVisibility.WRITABLE
     check_affordance: bool = False
     check_budget: int = DEFAULT_CHECK_BUDGET
+    # A failing <check/> verdict also carries the supplied grader's one-line reason.
+    check_reason: bool = False
+
+    def __post_init__(self) -> None:
+        """Reject a reason channel on an arm that offers no verdict channel at all."""
+        if self.check_reason and not self.check_affordance:
+            raise ValueError("check_reason requires check_affordance")
 
     @property
     def label(self) -> str:
@@ -98,6 +105,7 @@ class AgenticArmConfig:
             *(["abort"] if self.abort_affordance else []),
             *(["empty"] if self.empty_affordance else []),
             *(["check"] if self.check_affordance else []),
+            *(["reason"] if self.check_reason else []),
             *(
                 [self.grader_visibility.value]
                 if self.grader_visibility is not GraderVisibility.WRITABLE
@@ -115,6 +123,7 @@ class AgenticArmConfig:
             "grader_visibility": self.grader_visibility.value,
             "check_affordance": self.check_affordance,
             "check_budget": self.check_budget,
+            "check_reason": self.check_reason,
         }
 
     @classmethod
@@ -133,10 +142,12 @@ class AgenticArmConfig:
         visibility = data.get("grader_visibility", GraderVisibility.WRITABLE.value)
         check = data.get("check_affordance", False)
         budget = data.get("check_budget", DEFAULT_CHECK_BUDGET)
+        reason = data.get("check_reason", False)
         if (
             not isinstance(abort, bool)
             or not isinstance(empty, bool)
             or not isinstance(check, bool)
+            or not isinstance(reason, bool)
         ):
             raise TypeError(
                 f"arm affordances should be bools, got {abort!r}, {empty!r} and {check!r}"
@@ -152,6 +163,7 @@ class AgenticArmConfig:
             grader_visibility=GraderVisibility(visibility),
             check_affordance=check,
             check_budget=budget,
+            check_reason=reason,
         )
 
 
@@ -212,6 +224,7 @@ class Task:
     success_marker: str = SUCCESS_MARKER
     grader_filename: str = GRADER_FILENAME
     visible_check_unsatisfiable: bool = False
+    executable_files: frozenset[str] = frozenset()
 
     def render_prompt(self, arm: AgenticArmConfig) -> str:
         """Render the task text this arm shows the policy, inline and as the on-disk ``TASK.md``.
