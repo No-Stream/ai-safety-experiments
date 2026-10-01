@@ -497,8 +497,15 @@ test`) and is still the gate before a commit; `jail-test` and `canary-check` run
 looks unrelated to your change, fix it anyway.
 
 `make ci` runs its three gates **concurrently** through one `make -j3`, so the type check happens
-inside the suite's runtime rather than ahead of it (21-25 seconds at `--threads 8`, against 53-59
-single-threaded; `make typecheck TYPECHECK_THREADS=2` when the box is busy). The status is unchanged
+inside the suite's runtime rather than ahead of it (about 42 seconds at the default `--threads 4`).
+**The type check is memory-heavy**: basedpyright forks one worker process per thread, each with its own
+copy of the program and its torch/transformers/vLLM imports, so peak RSS is linear in the count (7.0 GB at
+2 threads, 11.7 GB at 4, 21.4 GB at 8; measured 2026-09-30). Two sessions' 8-thread type checks plus a test
+suite beside a 9B training run took the WSL VM down that day, which is why the default dropped from 8 to
+4 and why `make typecheck`, `make test` and `make test-changed` each take a box-wide `flock` under
+`/var/tmp` (`gate-typecheck.lock`, `gate-test.lock`): a second session's gate waits instead of stacking,
+and the lock frees itself if the holder dies. Do not raise `TYPECHECK_THREADS` back to 8 while anything
+else heavy is on the box, and never route around the lock. The status is unchanged
 and is still the AND of all three, with make naming whichever gate failed. The one thing that did
 change: a red lint or type check no longer spares you the suite, because all three start at once, so
 `make lint typecheck` is the way to ask the cheap pair alone. And `make test`, `make test-changed` and

@@ -56,8 +56,19 @@ GATE_TMUX ?=
 GATE_TMUX_NAME ?= gate-$(shell date -u +%H%M%S)
 GATE_RUN = $(if $(GATE_TMUX),scripts/tmux_run.sh $(GATE_TMUX_NAME) --,)
 
+# The heavy gates take a box-wide lock, one per gate kind, so concurrent sessions queue instead of
+# stacking. Measured 2026-09-30: one basedpyright run at 8 threads peaked at 21.4 GB of RSS (it forks one
+# worker process per thread, each holding its own copy of the whole program plus torch, transformers and
+# vLLM), and two sessions' type checks plus an 8-worker suite beside a 9B training run OOM-killed the WSL
+# VM. flock blocks until the holder exits and releases on process death, so a crashed gate cannot wedge
+# the lock. Separate locks for typecheck and test keep `make ci`'s own concurrent gates from blocking each
+# other. The lock files live in /var/tmp so every worktree on the box shares them.
+GATE_LOCK_DIR ?= /var/tmp
+GATE_LOCK = flock --verbose $(GATE_LOCK_DIR)/gate-$(1).lock
+
 test:
-	$(GATE_RUN) env RLVR_SMOKE=1 nice $(UV) pytest -n $(TEST_WORKERS) --dist loadfile
+	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 nice $(UV) pytest -n $(TEST_WORKERS) --dist loadfile
 
 test-select:
 	RLVR_SMOKE=1 $(UV) pytest $(ARGS)
@@ -72,7 +83,8 @@ test-select:
 TEST_CHANGED_ARGS ?=
 
 test-changed:
-	$(GATE_RUN) env RLVR_SMOKE=1 nice $(UV) python scripts/test_changed.py --workers $(TEST_WORKERS) $(TEST_CHANGED_ARGS)
+	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 nice $(UV) python scripts/test_changed.py --workers $(TEST_WORKERS) $(TEST_CHANGED_ARGS)
 
 format:
 	$(RUFF) format .
@@ -91,10 +103,16 @@ lint:
 # tree carrying planted errors. A bare `--threads` (basedpyright picking the count) came in at 37-38 s
 # on this 90-core box, so the count is pinned rather than left to the tool. Lower it when the box is
 # busy: the run costs ~190 s of CPU at 8 threads against ~65 s single-threaded.
-TYPECHECK_THREADS ?= 8
+#
+# The default is 4, not 8, for memory (measured on the 5090 box, 2026-09-30, peak RSS over basedpyright's
+# processes, green tree): 2 threads 7.0 GB / 59 s, 4 threads 11.7 GB / 42 s, 8 threads 21.4 GB / ~25 s.
+# Each thread is a separate worker process with its own copy of the program, so memory is linear in the
+# count, and 8 threads beside a second session's gate and a 9B training run took the VM down.
+TYPECHECK_THREADS ?= 4
 
 typecheck:
-	$(UV) basedpyright --threads $(TYPECHECK_THREADS)
+	@echo "gate lock: $(GATE_LOCK_DIR)/gate-typecheck.lock (waits while another session's type check holds it)"
+	$(call GATE_LOCK,typecheck) $(UV) basedpyright --threads $(TYPECHECK_THREADS)
 
 # ty (Astral, pre-1.0) runs ADVISORY only -- deliberately NOT in `make ci`. It folds real
 # optional-access findings and third-party Unknown-attribute noise into one `unresolved-attribute`
