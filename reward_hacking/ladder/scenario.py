@@ -127,9 +127,15 @@ class Scenario:
         """Hash all private scenario files for resume provenance without exposing their contents."""
         digest = hashlib.sha256()
         for path in sorted(self.root.rglob("*")):
-            if not path.is_file() or path.is_symlink():
+            relative_path = path.relative_to(self.root)
+            if (
+                "__pycache__" in relative_path.parts
+                or path.suffix == ".pyc"
+                or not path.is_file()
+                or path.is_symlink()
+            ):
                 continue
-            digest.update(path.relative_to(self.root).as_posix().encode("utf-8"))
+            digest.update(relative_path.as_posix().encode("utf-8"))
             digest.update(b"\0")
             digest.update(path.read_bytes())
             digest.update(b"\0")

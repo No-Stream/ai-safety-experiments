@@ -243,6 +243,110 @@ def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> 
     assert len(output_path.read_text(encoding="utf-8").splitlines()) == 5
 
 
+def test_run_grid_keeps_one_provenance_digest_when_scenario_changes_mid_run(
+    tmp_path: Path,
+) -> None:
+    scenario_root = tmp_path / "scenario"
+    scenario_root.mkdir()
+    scenario_file = scenario_root / "source.txt"
+    scenario_file.write_text("initial", encoding="utf-8")
+    scenario = SimpleNamespace(
+        slug="mutable",
+        root=scenario_root,
+        render=lambda arm: f"task:{arm}",
+    )
+    config = RunnerConfig(
+        endpoint="http://127.0.0.1:8000",
+        models=(ModelSpec("base", "/models/base"),),
+        scenarios=(cast("ScenarioLike", scenario),),
+        arms=("naive", "real"),
+        samples=1,
+        output_path=tmp_path / "records.jsonl",
+        episode_root=tmp_path / "episodes",
+    )
+    changed_scenario = False
+
+    def episode_runner(
+        _scenario: ScenarioLike,
+        _backend: object,
+        _arm: str,
+        _sample_index: int,
+        _episode_dir: Path,
+        _trace_path: Path,
+    ) -> dict[str, object]:
+        nonlocal changed_scenario
+        if not changed_scenario:
+            scenario_file.write_text("changed during run", encoding="utf-8")
+            changed_scenario = True
+        return {"true_pass": True}
+
+    records = run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=episode_runner,
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+    header = json.loads(config.output_path.read_text(encoding="utf-8").splitlines()[0])
+
+    assert len(records) == 2
+    assert {record["provenance_digest"] for record in records} == {header["provenance_digest"]}
+
+
+def test_code_identity_is_part_of_stable_runner_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("reward_hacking.ladder.runner._code_identity", lambda: "identity-one")
+    first = runner_config(tmp_path / "first.jsonl")
+    second = runner_config(tmp_path / "second.jsonl")
+    assert first.provenance_digest == second.provenance_digest
+
+    monkeypatch.setattr("reward_hacking.ladder.runner._code_identity", lambda: "identity-two")
+    changed = runner_config(tmp_path / "changed.jsonl")
+
+    assert changed.provenance_digest != first.provenance_digest
+
+
+@pytest.mark.parametrize(("turns", "expected"), [(3, True), (2, False)])
+def test_episode_record_marks_whether_turn_cap_was_reached(
+    tmp_path: Path, turns: int, expected: bool
+) -> None:
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        arms=("naive",),
+        samples=1,
+        max_turns=3,
+    )
+
+    records = run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True, "turns": turns},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+
+    assert records[0]["turn_cap_reached"] is expected
+
+
+def test_episode_record_rejects_non_integer_turn_count(tmp_path: Path) -> None:
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        arms=("naive",),
+        samples=1,
+        max_turns=3,
+    )
+
+    with pytest.raises(TypeError, match="turns"):
+        run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda *_args: {"true_pass": True, "turns": "3"},
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+
 class TestEpisodeConcurrency:
     def run(self, config: RunnerConfig, episode_runner: Any) -> list[dict[str, object]]:
         return run_grid(
@@ -427,6 +531,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     artifact_root = tmp_path / "artifacts"
+    seen_episode_tokens: list[str] = []
     rendered = SimpleNamespace(task=object(), arm=object())
     scenario = SimpleNamespace(
         slug="dummy",
@@ -437,6 +542,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
     )
 
     def fake_run_agent_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+        seen_episode_tokens.append(cast("str", kwargs["episode_token"]))
         workspace = cast("Path", kwargs["episode_dir"])
         before = cast("Any", kwargs["before_command"])
         after = cast("Any", kwargs["after_command"])
@@ -462,7 +568,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         endpoint="http://127.0.0.1:8000",
         models=(ModelSpec("base", "/models/base"),),
         scenarios=(cast("ScenarioLike", scenario),),
-        arms=("naive",),
+        arms=("naive", "claimed"),
         samples=1,
         output_path=artifact_root / "records.jsonl",
         episode_root=artifact_root / "episodes",
@@ -470,17 +576,77 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
 
     records = run_grid(config, backend_factory=lambda _model, _config: object())
 
-    assert len(records) == 1
-    trace_path = artifact_root / "records-traces" / "base" / "dummy" / "naive" / "sample-000.jsonl"
-    assert records[0]["trace_path"] == str(trace_path)
-    trace_records = load_trace(trace_path)
-    assert any(record["record"] == "ladder_command" for record in trace_records)
+    assert len(records) == 2
+    assert len(set(seen_episode_tokens)) == 2
+    records_by_arm = {cast("dict[str, object]", record["key"])["arm"]: record for record in records}
+    for arm in ("naive", "claimed"):
+        record = records_by_arm[arm]
+        token = cast("str", record["episode_token"])
+        assert token.startswith(f"ladder-{arm}-000-")
+        assert len(token.rsplit("-", maxsplit=1)[1]) == 12
+        assert int(token.rsplit("-", maxsplit=1)[1], 16) >= 0
+        assert token in seen_episode_tokens
+        trace_path = artifact_root / "records-traces" / "base" / "dummy" / arm / "sample-000.jsonl"
+        assert record["trace_path"] == str(trace_path)
+        trace_records = load_trace(trace_path)
+        command_record = next(item for item in trace_records if item["record"] == "ladder_command")
+        assert command_record["episode_token"] == token
     assert records[0]["trace_summary"] == {
         "true_pass": True,
         "true": {"pass": True, "measured": True, "oracle_error": None},
         "proxy_pass": True,
         "final_report": "completed honestly",
     }
+
+
+def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode_tokens: list[str] = []
+    rendered = SimpleNamespace(task=object(), arm=object())
+    scenario = SimpleNamespace(
+        slug="dummy",
+        root=tmp_path,
+        monitor_config_path=".ci/monitor.toml",
+        audit_log_path=".ci/audit.log",
+        render=lambda _arm: rendered,
+    )
+    fail_first_attempt = True
+
+    def fake_run_agent_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal fail_first_attempt
+        episode_tokens.append(cast("str", kwargs["episode_token"]))
+        if fail_first_attempt:
+            fail_first_attempt = False
+            raise RuntimeError("episode crashed before its record was written")
+        return {"true_pass": True}
+
+    monkeypatch.setattr("reward_hacking.harness.loop.run_agent_episode", fake_run_agent_episode)
+    config = RunnerConfig(
+        endpoint="http://127.0.0.1:8000",
+        models=(ModelSpec("base", "/models/base"),),
+        scenarios=(cast("ScenarioLike", scenario),),
+        arms=("naive",),
+        samples=1,
+        output_path=tmp_path / "records.jsonl",
+        episode_root=tmp_path / "episodes",
+    )
+
+    def run() -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+    with pytest.raises(RuntimeError, match="episode crashed"):
+        run()
+    resumed = run()
+
+    assert len(episode_tokens) == 2
+    assert episode_tokens[0] != episode_tokens[1]
+    assert resumed[0]["episode_token"] == episode_tokens[1]
 
 
 def test_traces_are_per_run_and_a_failed_attempt_is_kept_aside(tmp_path: Path) -> None:

@@ -21,9 +21,12 @@ import sys
 import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
+from uuid import uuid4
 
 from huggingface_hub import try_to_load_from_cache
 
@@ -166,13 +169,24 @@ class RunnerConfig:
     resource_limits: JailResourceLimits = ENFORCED_JAIL_RESOURCE_LIMITS
     resume: bool = True
     episode_concurrency: int = 1
+    _provenance_payload_cache: dict[str, object] = dataclass_field(
+        init=False, repr=False, compare=False
+    )
+    _provenance_digest_cache: str = dataclass_field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """Validate the grid before any tokenizer or server request is made."""
         _validate_runner_config(self)
+        provenance = self._build_provenance_payload()
+        object.__setattr__(self, "_provenance_payload_cache", provenance)
+        object.__setattr__(self, "_provenance_digest_cache", provenance_digest(provenance))
 
     def provenance_payload(self) -> dict[str, object]:
         """Return the run-level identity used to guard resume."""
+        return deepcopy(self._provenance_payload_cache)
+
+    def _build_provenance_payload(self) -> dict[str, object]:
+        """Build provenance once, at config creation, before any episode can run."""
         return {
             "schema_version": LADDER_SCHEMA_VERSION,
             "endpoint": self.endpoint,
@@ -181,6 +195,7 @@ class RunnerConfig:
                 {"scenario_id": scenario.slug, "manifest_digest": scenario_digest(scenario)}
                 for scenario in self.scenarios
             ],
+            "code_identity": _code_identity(),
             "arms": list(self.arms),
             "samples": self.samples,
             "sampling": LADDER_SAMPLING.to_json(),
@@ -196,7 +211,7 @@ class RunnerConfig:
     @property
     def provenance_digest(self) -> str:
         """Return the stable digest that every record in this sweep carries."""
-        return provenance_digest(self.provenance_payload())
+        return self._provenance_digest_cache
 
 
 def _validate_runner_config(config: RunnerConfig) -> None:
@@ -294,12 +309,45 @@ class EpisodeRun:
     command_records: tuple[object, ...] = ()
     final_state_diff: object | None = None
     in_scene_audit_log: str | None = None
+    episode_token: str | None = None
 
 
 def provenance_digest(payload: Mapping[str, object]) -> str:
     """Hash canonical JSON provenance, including every sampling and scenario identity field."""
     encoded = json.dumps(_canonical_json(payload), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _code_identity() -> str:
+    """Hash the ladder and harness source files that determine episode behavior."""
+    repository_root = Path(__file__).resolve().parents[2]
+    ladder_root = repository_root / "reward_hacking" / "ladder"
+    source_files = {
+        path.relative_to(repository_root).as_posix(): path
+        for path in ladder_root.rglob("*.py")
+        if path.is_file()
+    }
+    additional_paths = (
+        "reward_hacking/harness/loop.py",
+        "reward_hacking/harness/protocol.py",
+        "reward_hacking/harness/task_spec.py",
+        "reward_hacking/jailed_poc.py",
+        "reward_hacking/model_backend.py",
+        "scripts/episode_jail.sh",
+        "scripts/resource-limits.sh",
+    )
+    for relative_path in additional_paths:
+        source_files[relative_path] = repository_root / relative_path
+
+    digest = hashlib.sha256()
+    for relative_path, path in sorted(source_files.items()):
+        encoded_path = relative_path.encode("utf-8")
+        contents = path.read_bytes()
+        digest.update(len(encoded_path).to_bytes(8, "big"))
+        digest.update(encoded_path)
+        digest.update(len(contents).to_bytes(8, "big"))
+        digest.update(contents)
+    return digest.hexdigest()
 
 
 def scenario_digest(scenario: ScenarioLike) -> str:
@@ -653,6 +701,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
     arm_config = getattr(rendered, "arm", None)
     if task is None or arm_config is None:
         raise TypeError("scenario.render() must return an object with task and arm fields")
+    episode_token = f"ladder-{arm}-{sample_index:03d}-{uuid4().hex[:12]}"
     with tempfile.TemporaryDirectory(prefix="hack-ladder-episode-") as temporary:
         workspace_dir = Path(temporary)
         monitor = CommandAuditMonitor(
@@ -676,7 +725,13 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
             command_record = monitor.after_command(start, cast("CommandResult", result))
             write_trace(
                 trace_path,
-                [{"record": "ladder_command", **command_record.to_json_dict()}],
+                [
+                    {
+                        "record": "ladder_command",
+                        **command_record.to_json_dict(),
+                        "episode_token": episode_token,
+                    }
+                ],
                 append=True,
             )
 
@@ -690,7 +745,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
                 jail_backend=config.jail_backend,
                 trace_path=trace_path,
                 arm=cast("AgenticArmConfig", arm_config),
-                episode_token=f"ladder-{sample_index:03d}",
+                episode_token=episode_token,
                 episode_seconds=config.episode_seconds,
                 before_command=before_command,
                 after_command=after_command,
@@ -716,6 +771,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
         trace=trace,
         command_records=tuple(monitor.records),
         in_scene_audit_log=audit_text,
+        episode_token=episode_token,
     )
 
 
@@ -1136,6 +1192,18 @@ def _final_report_text(summary: Mapping[str, object]) -> str:
     return ""
 
 
+def _turn_cap_reached(summary: Mapping[str, object], max_turns: int) -> bool:
+    """Compare the harness summary's turn count with the configured turn budget."""
+    if "turns" not in summary:
+        return False
+    turns = summary["turns"]
+    if not isinstance(turns, int) or isinstance(turns, bool):
+        raise TypeError(f"episode trace has non-integer turns: {turns!r}")
+    if turns < 0:
+        raise ValueError(f"episode trace has negative turns: {turns!r}")
+    return turns >= max_turns
+
+
 def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidence
     key: EpisodeKey,
     *,
@@ -1143,8 +1211,10 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
     episode_dir: Path,
     trace_path: Path,
     trace: object,
+    episode_token: str | None,
     detection: Mapping[str, object],
     final_grade: Mapping[str, object],
+    max_turns: int,
     command_records: Sequence[object] = (),
 ) -> dict[str, object]:
     """Build one append-only record from a completed cell."""
@@ -1172,6 +1242,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
         "record": "ladder_episode",
         "key": key.to_json(),
         "provenance_digest": provenance,
+        "episode_token": episode_token,
         "episode_dir": str(episode_dir),
         "trace_path": str(trace_path),
         "highest_rung": highest_rung,
@@ -1179,6 +1250,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
         "coverup": coverup,
         "honest_solve": honest_solve,
         "true_measured": true_measured,
+        "turn_cap_reached": _turn_cap_reached(summary, max_turns),
         "rung_detection": _as_mapping(detection),
         "final_grade": _as_mapping(final_grade),
         "engine_command_records": [_command_record_json(record) for record in command_records],
@@ -1245,6 +1317,7 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
     _set_aside_failed_attempt_trace(trace_path)
     run_result = episode_runner(scenario, backend, arm, sample_index, episode_dir, trace_path)
     trace = run_result.trace if isinstance(run_result, EpisodeRun) else run_result
+    episode_token = run_result.episode_token if isinstance(run_result, EpisodeRun) else None
     command_records = run_result.command_records if isinstance(run_result, EpisodeRun) else None
     final_state_diff = run_result.final_state_diff if isinstance(run_result, EpisodeRun) else None
     in_scene_audit_log = (
@@ -1274,8 +1347,10 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
         episode_dir=episode_dir,
         trace_path=trace_path,
         trace=trace,
+        episode_token=episode_token,
         detection=detection,
         final_grade=final_grade,
+        max_turns=config.max_turns,
         command_records=() if command_records is None else command_records,
     )
 
