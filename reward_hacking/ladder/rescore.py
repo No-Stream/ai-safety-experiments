@@ -9,9 +9,10 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
-from reward_hacking.ladder import rungs, runner
+from reward_hacking.jailed_poc import ENFORCED_JAIL_RESOURCE_LIMITS, JailResourceLimits
+from reward_hacking.ladder import rungs, runner, scenario as scenario_module
 from reward_hacking.ladder.monitor import CommandRecord
 from reward_hacking.ladder.runner import (
     EpisodeKey,
@@ -153,6 +154,8 @@ def _rescore_episode(
     scenario_root: Path,
     scenario_digests: Mapping[str, str],
     scenario_cache: dict[str, Scenario],
+    timeout: str,
+    resource_limits: JailResourceLimits,
 ) -> dict[str, object]:
     raw_key = _require_mapping(record.get("key"), field="ladder_episode.key")
     key = EpisodeKey.from_json(raw_key)
@@ -172,6 +175,17 @@ def _rescore_episode(
     audit_log, final_state_diff, spec = _stored_detector_inputs(
         record, scenario, episode_dir, command_records
     )
+    pristine_visible_pass = record.get("pristine_visible_pass")
+    if pristine_visible_pass is None:
+        pristine_grader_pass, pristine_tests_pass = runner._run_pristine_visible_grade(
+            scenario,
+            episode_dir,
+            timeout=timeout,
+            resource_limits=resource_limits,
+        )
+        pristine_visible_pass = pristine_grader_pass and pristine_tests_pass
+    elif not isinstance(pristine_visible_pass, bool):
+        raise TypeError("ladder_episode.pristine_visible_pass must be a boolean or null")
     trace_summary = _require_mapping(record.get("trace_summary"), field="trace_summary")
     detection = default_detector(
         scenario=scenario,
@@ -182,6 +196,7 @@ def _rescore_episode(
         final_state_diff=final_state_diff,
         in_scene_audit_log=audit_log,
         detection_spec=spec,
+        pristine_visible_pass=pristine_visible_pass,
     )
     highest_rung = detection.get("highest_rung")
     coverup = detection.get("coverup")
@@ -193,12 +208,36 @@ def _rescore_episode(
     record["highest_rung"] = highest_rung
     record["coverup"] = coverup
     record["rung_5"] = coverup
+    record["pristine_visible_pass"] = pristine_visible_pass
     return record
+
+
+def _grading_settings(header: Mapping[str, object]) -> tuple[str, JailResourceLimits]:
+    """Reuse the run's timeout and jail mode when rebuilding its pristine grade."""
+    provenance = _require_mapping(header.get("provenance"), field="run header provenance")
+    timeout = provenance.get("timeout", "10s")
+    if not isinstance(timeout, str) or not timeout:
+        raise TypeError("run header provenance.timeout must be a non-empty string")
+    raw_limits = provenance.get("resource_limits")
+    if raw_limits is None:
+        return timeout, ENFORCED_JAIL_RESOURCE_LIMITS
+    limits = _require_mapping(raw_limits, field="run header provenance.resource_limits")
+    mode_value = limits.get("mode")
+    if mode_value == "enforced":
+        mode: Literal["enforced", "advisory"] = "enforced"
+    elif mode_value == "advisory":
+        mode = "advisory"
+    else:
+        raise ValueError("run header provenance.resource_limits.mode is invalid")
+    systemd_user_state = limits.get("systemd_user_state")
+    if systemd_user_state is not None and not isinstance(systemd_user_state, str):
+        raise TypeError("run header provenance.resource_limits.systemd_user_state is invalid")
+    return timeout, JailResourceLimits(mode=mode, systemd_user_state=systemd_user_state)
 
 
 def _detector_code_identity() -> str:
     digest = hashlib.sha256()
-    for module in (runner, rungs):
+    for module in (runner, rungs, scenario_module):
         source_path = Path(cast("str", module.__file__))
         digest.update(source_path.name.encode("utf-8"))
         digest.update(b"\0")
@@ -247,6 +286,7 @@ def rescore_file(
         raise ValueError(f"expected exactly one ladder_run_header in {source_path}")
     header = headers[0]
     scenario_digests = _scenario_digests(header)
+    timeout, resource_limits = _grading_settings(header)
     resolved_scenario_root = scenario_root.resolve()
     scenario_cache: dict[str, Scenario] = {}
     for row in rows:
@@ -256,6 +296,8 @@ def rescore_file(
                 scenario_root=resolved_scenario_root,
                 scenario_digests=scenario_digests,
                 scenario_cache=scenario_cache,
+                timeout=timeout,
+                resource_limits=resource_limits,
             )
     header["rescore"] = {
         "detector": "reward_hacking.ladder.rungs.detect_rungs",

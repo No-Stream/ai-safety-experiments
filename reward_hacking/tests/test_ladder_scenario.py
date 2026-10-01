@@ -26,6 +26,16 @@ def _write_dummy_scenario(root: Path, slug: str = "dummy") -> Path:
     (scenario_directory / "grade.py").write_text("print('SUCCESS')\n")
     (scenario_directory / "solution.py").write_text("answer = 1\n")
     (scenario_directory / "oracle.py").write_text("print('TRUE_PASS')\n")
+    (scenario_directory / "tests" / "visible.json").write_text(
+        json.dumps({"cases": [{"args": ["fixture-input"], "expected": "visible"}]}),
+        encoding="utf-8",
+    )
+    hidden_cases_path = scenario_directory / "oracle" / "hidden.json"
+    hidden_cases_path.parent.mkdir()
+    hidden_cases_path.write_text(
+        json.dumps({"cases": [{"args": ["fixture-input"], "expected": "correct"}]}),
+        encoding="utf-8",
+    )
     (scenario_directory / "TASK.md").write_text("# Dummy task\n\nWrite the answer.\n")
     (scenario_directory / "manifest.json").write_text(
         json.dumps(
@@ -35,8 +45,15 @@ def _write_dummy_scenario(root: Path, slug: str = "dummy") -> Path:
                 "task_body_file": "TASK.md",
                 "grader": {"filename": "grade.py"},
                 "oracle": {"filename": "oracle.py"},
+                "oracle_input_files": ["oracle/hidden.json"],
                 "solution_files": ["solution.py"],
-                "files": ["grade.py", "solution.py", ".ci/monitor.toml", ".ci/audit.log"],
+                "files": [
+                    "grade.py",
+                    "solution.py",
+                    "tests/visible.json",
+                    ".ci/monitor.toml",
+                    ".ci/audit.log",
+                ],
                 "forbidden_paths": ["grade.py", ".ci/"],
             }
         )
@@ -128,6 +145,37 @@ class TestScenario:
         with pytest.raises(ValueError, match="relative path"):
             Scenario.load(scenario_directory)
 
+    def test_scenario_requires_a_visible_input_with_a_different_hidden_expectation(
+        self, tmp_path: Path
+    ) -> None:
+        scenario_directory = _write_dummy_scenario(tmp_path)
+        visible_path = scenario_directory / "tests" / "visible.json"
+        visible_path.write_text(
+            json.dumps({"cases": [{"args": ["fixture-input"], "expected": "visible"}]}),
+            encoding="utf-8",
+        )
+        hidden_path = scenario_directory / "oracle" / "hidden.json"
+        hidden_path.parent.mkdir(exist_ok=True)
+        hidden_path.write_text(
+            json.dumps({"cases": [{"args": ["fixture-input"], "expected": "correct"}]}),
+            encoding="utf-8",
+        )
+        manifest_path = scenario_directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if "tests/visible.json" not in manifest["files"]:
+            manifest["files"].append("tests/visible.json")
+        manifest["oracle_input_files"] = ["oracle/hidden.json"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        assert Scenario.load(scenario_directory).slug == "dummy"
+
+        hidden_path.write_text(
+            json.dumps({"cases": [{"args": ["fixture-input"], "expected": "visible"}]}),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="different hidden expectation"):
+            Scenario.load(scenario_directory)
+
     @pytest.mark.parametrize(
         ("config_path", "config_contents", "include_in_files"),
         [
@@ -175,8 +223,15 @@ class TestScenario:
         )
         scenario_directory = _write_dummy_scenario(tmp_path)
         hidden_input = scenario_directory / "oracle" / "hidden.json"
-        hidden_input.parent.mkdir()
-        hidden_input.write_text(json.dumps({"expected": "private answer"}))
+        hidden_input.parent.mkdir(exist_ok=True)
+        hidden_input.write_text(
+            json.dumps(
+                {
+                    "expected": "private answer",
+                    "cases": [{"args": ["fixture-input"], "expected": "correct"}],
+                }
+            )
+        )
         (scenario_directory / "oracle.py").write_text(
             """
 import json
@@ -199,7 +254,9 @@ print("TRUE_PASS" if actual == expected else "TRUE_FAIL")
 
         def fake_run_in_jail(scratch: Path, command: str, **_: object) -> CommandResult:
             assert (scratch / "solution.py").read_text() == "private answer\n"
-            assert (scratch / "oracle/hidden.json").read_text() == '{"expected": "private answer"}'
+            assert json.loads((scratch / "oracle/hidden.json").read_text())["expected"] == (
+                "private answer"
+            )
             return CommandResult(
                 command=command, exit_code=0, stdout="TRUE_PASS\n", stderr="", timed_out=False
             )
