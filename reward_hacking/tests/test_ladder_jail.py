@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import json
-import subprocess
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from reward_hacking import jailed_poc
 from reward_hacking.jailed_poc import (
     jail_resource_limits_scope,
     resolve_jail_resource_limits,
@@ -19,32 +16,7 @@ from reward_hacking.ladder.runner import _default_final_grader
 from reward_hacking.ladder.scenario import Scenario
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-
-@pytest.mark.parametrize("use_readonly_paths", [False, True])
-def test_pristine_mounts_are_readonly_jail_arguments(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, use_readonly_paths: bool
-) -> None:
-    readonly_paths = (tmp_path / "pristine", tmp_path / "cases") if use_readonly_paths else ()
-    calls: list[list[str]] = []
-
-    def execute(argv: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
-        calls.append(list(argv))
-        return subprocess.CompletedProcess(argv, 0, "SUCCESS\n", "")
-
-    monkeypatch.setattr(jailed_poc.subprocess, "run", execute)
-    result = jailed_poc.run_in_jail(
-        tmp_path, "pristine-dummy-command", ro_bind_paths=readonly_paths, login_shell=False
-    )
-
-    assert result.ok
-    arguments = calls[0]
-    jail_arguments = arguments[arguments.index(str(jailed_poc.EPISODE_JAIL)) + 1 :]
-    expected_mounts = [argument for path in readonly_paths for argument in ("--ro-bind", str(path))]
-    assert jail_arguments == [
-        "--episode-dir", str(tmp_path), *expected_mounts, "--", "bash", "-c", "pristine-dummy-command"
-    ]
+    from pathlib import Path
 
 
 @pytest.mark.parametrize("submission_passes", [False, True])

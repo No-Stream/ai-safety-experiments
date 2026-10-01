@@ -15,7 +15,6 @@ import hmac
 import json
 import logging
 import re
-import shlex
 import shutil
 import sys
 import tempfile
@@ -829,7 +828,7 @@ def _run_pristine_visible_grade(
     )
     pristine_tests_pass = any(path.startswith("tests/") for path in task_value.files)
     with tempfile.TemporaryDirectory(prefix="hack-ladder-pristine-") as temporary:
-        pristine_support_dir = Path(temporary)
+        pristine_dir = Path(temporary)
         for relative_path in solution_files_value:
             source = episode_dir / relative_path
             if (
@@ -838,25 +837,19 @@ def _run_pristine_visible_grade(
                 or not source.resolve().is_relative_to(episode_dir.resolve())
             ):
                 return False, pristine_tests_pass
+            destination = pristine_dir / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
         for relative_path, content in task_value.files.items():
             if relative_path in solution_files_value:
                 continue
-            _restore_pristine_file(pristine_support_dir, relative_path, content)
-        grader_filename = task_value.grader_filename
-        if grader_filename not in task_value.grader_command:
-            raise ValueError("grader_command must contain the grader filename")
-        external_grader_path = pristine_support_dir / grader_filename
-        grader_command = task_value.grader_command.replace(
-            grader_filename, shlex.quote(str(external_grader_path)), 1
-        )
-        grader_command += f" --solution-dir {shlex.quote('/work')}"
+            _restore_pristine_file(pristine_dir, relative_path, content)
         with jail_resource_limits_scope(resource_limits):
             result = run_in_jail(
-                episode_dir,
-                grader_command,
+                pristine_dir,
+                task_value.grader_command,
                 timeout=timeout,
                 login_shell=False,
-                ro_bind_paths=(pristine_support_dir,),
             )
     return grader_reported_success(result, marker=task_value.success_marker), pristine_tests_pass
 
