@@ -196,6 +196,144 @@ class RecordingWeightSink:
         self.pushed[name] = parameter.detach().cpu().clone()
 
 
+class PeftSleepingGeneration:
+    """The colocated generation hooks needed by the FP8 sync installation seam."""
+
+    def __init__(self, events: list[str], sink: RecordingWeightSink) -> None:
+        self.events = events
+        self.sink = sink
+        self.llm = SimpleNamespace(
+            wake_up=self._wake_up,
+            reset_prefix_cache=self._reset_prefix_cache,
+        )
+        self.accelerator = SimpleNamespace(device=torch.device("cpu"))
+        self._llm_weights_sleeping = True
+
+    def _wake_up(self, *, tags: list[str]) -> None:
+        assert tags == ["weights"]
+        self.events.append("wake")
+
+    def _reset_prefix_cache(self) -> None:
+        self.events.append("reset")
+
+    def sync_weights(self) -> None:
+        raise AssertionError("PEFT sync should stream parameters through the sleep-offload wrapper")
+
+    def generate(self) -> str:
+        raise AssertionError("the test does not generate tokens")
+
+    def _fix_param_name_to_vllm(self, name: str, extra_prefixes: list[str] | None = None) -> str:
+        return self.sink._fix_param_name_to_vllm(name, extra_prefixes)
+
+    def _push_param_to_vllm(self, name: str, parameter: torch.Tensor) -> None:
+        self.events.append(f"push:{name}")
+        self.sink._push_param_to_vllm(name, parameter)
+
+
+def _make_lora_policy() -> PeftModel:
+    policy = cast(
+        "PeftModel",
+        get_peft_model(
+            cast("Any", TinyPolicy()),
+            LoraConfig(r=2, lora_alpha=4, lora_dropout=0.0, target_modules=["proj"]),
+        ).to(torch.bfloat16),
+    )
+    with torch.no_grad():
+        for name, parameter in policy.named_parameters():
+            if "lora_B" in name:
+                parameter.normal_()
+    return policy
+
+
+def _sleep_offload_trainer(
+    policy: PeftModel, generation: PeftSleepingGeneration
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model=policy,
+        optimizer=None,
+        use_vllm=True,
+        vllm_mode="colocate",
+        vllm_generation=generation,
+        accelerator=SimpleNamespace(device=torch.device("cpu")),
+    )
+
+
+@pytest.mark.parametrize("use_prepare", [False, True], ids=["install", "prepare"])
+def test_fp8_sleep_offload_uses_real_peft_stream_between_wake_and_reset(
+    monkeypatch: pytest.MonkeyPatch, use_prepare: bool
+) -> None:
+    events: list[str] = []
+    sink = RecordingWeightSink()
+    generation = PeftSleepingGeneration(events, sink)
+    policy = _make_lora_policy()
+    trainer = _sleep_offload_trainer(policy, generation)
+    constructed_generations: list[object] = []
+
+    class RecordingFp8Sync:
+        def __init__(self, sync_generation: object) -> None:
+            constructed_generations.append(sync_generation)
+
+        def sync(self, stream: Any, *, push_param: Any) -> None:
+            events.append("initialize")
+            stream(push_param)
+            events.append("finalize")
+
+    monkeypatch.setattr(gt, "Fp8RolloutWeightSync", RecordingFp8Sync)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    if use_prepare:
+        gt.prepare_colocated_sleep_offload(trainer, RecordingTimer(), rollout_weights="fp8")  # type: ignore[arg-type]
+    else:
+        gt.install_colocated_sleep_offload(trainer, RecordingTimer(), rollout_weights="fp8")  # type: ignore[arg-type]
+
+    assert constructed_generations == [generation]
+    reference_sink = RecordingWeightSink()
+    gt.sync_peft_weights_to_vllm_nonmutating(
+        policy,
+        fix_param_name=reference_sink._fix_param_name_to_vllm,
+        push_param=reference_sink._push_param_to_vllm,
+        merge_device=torch.device("cpu"),
+    )
+    expected_sync_events = [
+        "wake",
+        "initialize",
+        *(f"push:{name}" for name in reference_sink.pushed),
+        "finalize",
+        "reset",
+    ]
+
+    generation.sync_weights()
+    generation.sync_weights()
+
+    assert events == expected_sync_events * 2
+    assert sink.pushed.keys() == reference_sink.pushed.keys()
+    for name, expected_parameter in reference_sink.pushed.items():
+        assert torch.equal(sink.pushed[name], expected_parameter), name
+
+
+def test_default_sleep_offload_does_not_construct_fp8_sync(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    sink = RecordingWeightSink()
+    generation = PeftSleepingGeneration(events, sink)
+    trainer = _sleep_offload_trainer(_make_lora_policy(), generation)
+    constructed_generations: list[object] = []
+
+    class RecordingFp8Sync:
+        def __init__(self, sync_generation: object) -> None:
+            constructed_generations.append(sync_generation)
+
+    monkeypatch.setattr(gt, "Fp8RolloutWeightSync", RecordingFp8Sync)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    gt.install_colocated_sleep_offload(trainer, RecordingTimer())  # type: ignore[arg-type]
+    generation.sync_weights()
+
+    assert constructed_generations == []
+    assert events[0] == "wake"
+    assert events[-1] == "reset"
+    assert all(event.startswith("push:") or event in {"wake", "reset"} for event in events)
+
+
 def test_nonmutating_lora_sync_matches_peft_merge_and_preserves_policy_bits() -> None:
     torch.manual_seed(17)
     policy = cast(

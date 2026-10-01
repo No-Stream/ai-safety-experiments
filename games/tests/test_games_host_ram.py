@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -31,23 +32,30 @@ def test_estimate_from_index(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("available_gib", [39, 40, 41])
-def test_capacity_boundary(tmp_path: Path, available_gib: int) -> None:
+def test_capacity_boundary(
+    tmp_path: Path, available_gib: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
     meminfo = tmp_path / "meminfo"
     meminfo.write_text(
         f"MemFree: 1 kB\nMemAvailable: {available_gib * 1024**2} kB\nSwapFree: 999999999 kB\n"
     )
     available = sizing.host_mem_available_bytes(meminfo)
     if available_gib < 40:
-        with pytest.raises(RuntimeError, match=r"40.00 GiB.*39.00 GiB.*2.0.*\.wslconfig"):
+        with pytest.raises(RuntimeError, match=r"40.00 GiB.*39.00 GiB.*2.0") as error:
             sizing.check_sleep_offload_host_ram(18 * 1024**3, available)
+        assert "Free host RAM or raise .wslconfig memory=" in str(error.value)
     else:
         sizing.check_sleep_offload_host_ram(18 * 1024**3, available)
+        assert "host RAM preflight passed" in caplog.text
+        assert "Free host RAM or raise .wslconfig memory=" not in caplog.text
 
 
 def test_acknowledged_shortfall(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     del tmp_path
     sizing.check_sleep_offload_host_ram(18 * 1024**3, 39 * 1024**3, acknowledged=True)
     assert "acknowledged" in caplog.text
+    assert "Free host RAM or raise .wslconfig memory=" not in caplog.text
 
 
 @pytest.mark.parametrize("enabled", [False, True])

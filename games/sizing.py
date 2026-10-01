@@ -91,12 +91,14 @@ def check_sleep_offload_host_ram(
         f"sleep-offload requires {required_bytes / BYTES_PER_GIB:.2f} GiB host RAM; "
         f"available {available_bytes / BYTES_PER_GIB:.2f} GiB "
         f"(weight multiplier {SLEEP_OFFLOAD_HOST_WEIGHT_MULTIPLIER:.1f}, "
-        f"margin {SLEEP_OFFLOAD_HOST_MARGIN_BYTES / BYTES_PER_GIB:.1f} GiB). "
-        "Free host RAM or raise .wslconfig memory=."
+        f"margin {SLEEP_OFFLOAD_HOST_MARGIN_BYTES / BYTES_PER_GIB:.1f} GiB)."
     )
     if available_bytes < required_bytes:
         if not acknowledged:
-            raise RuntimeError(message + " Override only with --acknowledge-host-ram-shortfall.")
+            raise RuntimeError(
+                f"{message} Free host RAM or raise .wslconfig memory=."
+                " Override only with --acknowledge-host-ram-shortfall."
+            )
         logger.warning("host RAM shortfall acknowledged: %s", message)
     else:
         logger.info("host RAM preflight passed: %s", message)

@@ -1368,12 +1368,25 @@ class TestTheAdapterDropoutReachesPeft:
         assert (peft_config.r, peft_config.lora_alpha) == (8, 64)
 
 
+@pytest.mark.parametrize("rollout_weights", ["bf16", "fp8"])
 def test_host_ram_override_is_recorded_in_run_config(
-    tmp_path: Path, stubbed_run: object, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, stubbed_run: object, monkeypatch: pytest.MonkeyPatch, rollout_weights: str
 ) -> None:
     del stubbed_run
     monkeypatch.setattr(gt, "checkpoint_weight_bytes", lambda _source: 18 * 1024**3)
     monkeypatch.setattr(gt, "host_mem_available_bytes", lambda: 39 * 1024**3)
-    monkeypatch.setattr(gt, "prepare_colocated_sleep_offload", lambda _trainer, _timer: None)
-    harness = run_arm(tmp_path, colocate_sleep_offload=True, acknowledge_host_ram_shortfall=True)
+    prepared_weights: list[str] = []
+    monkeypatch.setattr(
+        gt,
+        "prepare_colocated_sleep_offload",
+        lambda _trainer, _timer, *, rollout_weights: prepared_weights.append(rollout_weights),
+    )
+    harness = run_arm(
+        tmp_path,
+        colocate_sleep_offload=True,
+        acknowledge_host_ram_shortfall=True,
+        vllm_rollout_weights=rollout_weights,
+    )
     assert harness.run_config["config"]["acknowledge_host_ram_shortfall"] is True
+    assert harness.run_config["config"]["vllm_rollout_weights"] == rollout_weights
+    assert prepared_weights == [rollout_weights]

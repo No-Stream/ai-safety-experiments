@@ -164,6 +164,7 @@ from games.rewards import (
     care_alpha_of,
     make_game_reward,
 )
+from games.rollout_weights import Fp8RolloutWeightSync
 from games.s3_sync import S3SyncCallback, sync_directory
 from games.sizing import (
     BYTES_PER_FLOAT32,
@@ -232,6 +233,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
 VLLM_KV_CACHE_DTYPES = ("auto", "fp8")
+VLLM_ROLLOUT_WEIGHTS = ("bf16", "fp8")
 # TRITON_ATTN serves an fp8 KV cache without JIT compilation; vLLM picks FlashInfer for fp8 by
 # default, and FlashInfer compiles those kernels with nvcc, which a pip-only CUDA stack lacks.
 VLLM_ATTENTION_BACKENDS = ("auto", "TRITON_ATTN")
@@ -584,6 +586,7 @@ RESUME_IDENTITY_FIELDS = (
     "vllm_importance_sampling_mode",
     "cast_lm_head_to_fp32",
     "single_forward_vllm_importance_sampling",
+    "vllm_rollout_weights",
     "vllm_kv_cache_dtype",
     "vllm_attention_backend",
     # Dynamic sampling decides WHICH PROMPTS an optimizer step trains on: at 1 the step trains the
@@ -622,6 +625,7 @@ RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
     "vllm_importance_sampling_mode": VLLM_IMPORTANCE_SAMPLING_MODE,
     "cast_lm_head_to_fp32": False,
     "single_forward_vllm_importance_sampling": False,
+    "vllm_rollout_weights": "bf16",
     "vllm_kv_cache_dtype": "auto",
     "vllm_attention_backend": "auto",
     "dynamic_sampling_oversample": 1,
@@ -816,6 +820,8 @@ class GameTrainConfig:
     # vLLM-only opt-in. The trainer's own attention and activation arithmetic remains bf16; the
     # sizing seam applies this only to the cache held by the colocated engine.
     vllm_kv_cache_dtype: str = "auto"
+    # Online rollout quantization changes the sampled policy; preserve bf16 by default.
+    vllm_rollout_weights: str = "bf16"
     vllm_attention_backend: str = "auto"
     # Opt-in handoff: sleep the engine during training and move the policy out while it wakes.
     colocate_sleep_offload: bool = False
@@ -1218,6 +1224,12 @@ class GameTrainConfig:
                 f"share of the card for the life of the run, so the trainer needs the rest -- got "
                 f"{self.vllm_gpu_memory_utilization}"
             )
+        if self.vllm_rollout_weights not in VLLM_ROLLOUT_WEIGHTS:
+            raise ValueError(
+                f"vllm_rollout_weights must be one of {VLLM_ROLLOUT_WEIGHTS}, got {self.vllm_rollout_weights!r}"
+            )
+        if self.vllm_rollout_weights == "fp8" and not self.colocate_sleep_offload:
+            raise ValueError("FP8 rollout weights requires --colocate-sleep-offload")
         if self.vllm_kv_cache_dtype not in VLLM_KV_CACHE_DTYPES:
             raise ValueError(
                 f"vllm_kv_cache_dtype must be one of {VLLM_KV_CACHE_DTYPES}, got "
@@ -1289,8 +1301,8 @@ def _vllm_arguments(config: GameTrainConfig) -> dict[str, Any]:
 
 
 @contextlib.contextmanager
-def _vllm_engine_overrides_context(
-    *, kv_cache_dtype: str, attention_backend: str
+def _vllm_engine_overrides_context(  # noqa: C901 - explicit independent constructor opt-ins
+    *, kv_cache_dtype: str, attention_backend: str, rollout_weights: str = "bf16"
 ) -> Generator[None]:
     """Temporarily pass games-only engine settings through TRL's colocated LLM seam.
 
@@ -1298,7 +1310,7 @@ def _vllm_engine_overrides_context(
     ``LLM`` constructor kwargs. Its ``VLLMGeneration`` resolves ``LLM`` from the
     ``trl.generation.vllm_generation`` module at construction time, so a short-lived wrapper keeps
     the opt-ins local to trainer construction and leaves TRL's installed source untouched. ``auto``
-    for both settings leaves the constructor alone, preserving today's behavior.
+    for cache and attention plus ``bf16`` weights leaves the constructor alone.
     """
     if kv_cache_dtype not in VLLM_KV_CACHE_DTYPES:
         raise ValueError(
@@ -1309,7 +1321,14 @@ def _vllm_engine_overrides_context(
             f"vllm_attention_backend must be one of {VLLM_ATTENTION_BACKENDS}, got "
             f"{attention_backend!r}"
         )
+    if rollout_weights not in VLLM_ROLLOUT_WEIGHTS:
+        raise ValueError(
+            f"vllm_rollout_weights must be one of {VLLM_ROLLOUT_WEIGHTS}, got {rollout_weights!r}"
+        )
     overrides: dict[str, object] = {}
+    if rollout_weights == "fp8":
+        overrides["quantization"] = "fp8"
+        overrides["kernel_config"] = {"linear_backend": "cutlass"}
     if kv_cache_dtype != "auto":
         overrides["kv_cache_dtype"] = kv_cache_dtype
     if attention_backend != "auto":
@@ -1322,6 +1341,8 @@ def _vllm_engine_overrides_context(
     original_llm = vllm_module.LLM
 
     def llm_with_overrides(*args: object, **kwargs: object) -> object:
+        if rollout_weights == "fp8" and kwargs.get("quantization") is None:
+            kwargs.pop("quantization", None)
         for key in overrides:
             if key in kwargs:
                 raise RuntimeError(
@@ -4297,7 +4318,7 @@ def sync_peft_weights_to_vllm_nonmutating(
 
 
 def install_colocated_sleep_offload(  # noqa: C901, PLR0915 - wrapped seams share one placement invariant
-    trainer: GRPOTrainer, phase_timer: StepPhaseTimer
+    trainer: GRPOTrainer, phase_timer: StepPhaseTimer, *, rollout_weights: str = "bf16"
 ) -> None:
     """Offload the policy for the engine's awake interval, preserving its optimizer objects."""
     trainer_internals = cast("Any", trainer)
@@ -4305,6 +4326,7 @@ def install_colocated_sleep_offload(  # noqa: C901, PLR0915 - wrapped seams shar
         raise ValueError("colocate sleep offload requires a trainer built with colocated vLLM")
     model = cast("torch.nn.Module", trainer_internals.model)
     generation = trainer_internals.vllm_generation
+    fp8_sync = Fp8RolloutWeightSync(generation) if rollout_weights == "fp8" else None
     original_sync_weights = generation.sync_weights
     original_generate = generation.generate
     training_devices = tuple(parameter.device for parameter in model.parameters())
@@ -4342,12 +4364,19 @@ def install_colocated_sleep_offload(  # noqa: C901, PLR0915 - wrapped seams shar
             with cast("Any", phase_timer).phase("sync_weights"):
                 generation.llm.wake_up(tags=["weights"])
                 generation._llm_weights_sleeping = False  # noqa: SLF001 - mirror TRL's state seam
-                sync_peft_weights_to_vllm_nonmutating(
-                    model,
-                    fix_param_name=generation._fix_param_name_to_vllm,  # noqa: SLF001
-                    push_param=generation._push_param_to_vllm,  # noqa: SLF001
-                    merge_device=cast("torch.device", generation.accelerator.device),
-                )
+
+                def stream(push_param: Callable[[str, torch.Tensor], None]) -> None:
+                    sync_peft_weights_to_vllm_nonmutating(
+                        cast("PeftModel", model),
+                        fix_param_name=generation._fix_param_name_to_vllm,  # noqa: SLF001
+                        push_param=push_param,
+                        merge_device=cast("torch.device", generation.accelerator.device),
+                    )
+
+                if fp8_sync is None:
+                    stream(generation._push_param_to_vllm)  # noqa: SLF001
+                else:
+                    fp8_sync.sync(stream, push_param=generation._push_param_to_vllm)  # noqa: SLF001
                 generation.llm.reset_prefix_cache()
             return None
         return original_sync_weights(*args, **kwargs)
@@ -4378,14 +4407,16 @@ def install_colocated_sleep_offload(  # noqa: C901, PLR0915 - wrapped seams shar
     generation.generate = restored_generate
 
 
-def prepare_colocated_sleep_offload(trainer: GRPOTrainer, phase_timer: StepPhaseTimer) -> None:
+def prepare_colocated_sleep_offload(
+    trainer: GRPOTrainer, phase_timer: StepPhaseTimer, *, rollout_weights: str = "bf16"
+) -> None:
     """Put the policy on CUDA only after TRL has constructed and slept the vLLM engine."""
     trainer_internals = cast("Any", trainer)
     generation = trainer_internals.vllm_generation
     if not generation._llm_weights_sleeping:  # noqa: SLF001 - TRL's post-construction sleep state
         raise RuntimeError("vLLM engine was not asleep after sleep-mode construction")
     trainer_internals.model.to(trainer_internals.accelerator.device)
-    install_colocated_sleep_offload(trainer, phase_timer)
+    install_colocated_sleep_offload(trainer, phase_timer, rollout_weights=rollout_weights)
 
 
 def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
@@ -4430,6 +4461,7 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
     with _vllm_engine_overrides_context(
         kv_cache_dtype=config.vllm_kv_cache_dtype,
         attention_backend=config.vllm_attention_backend,
+        rollout_weights=config.vllm_rollout_weights,
     ):
         trainer = DynamicSampledGRPOTrainer(
             old_logps_chunk_tokens=config.old_logps_chunk_tokens,
@@ -4467,7 +4499,9 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
         cast("Any", trainer).liger_loss = FrozenHeadLigerGRPOLoss(trainer.liger_loss)
     phase_timer.attach(trainer)
     if config.colocate_sleep_offload:
-        prepare_colocated_sleep_offload(trainer, phase_timer)
+        prepare_colocated_sleep_offload(
+            trainer, phase_timer, rollout_weights=config.vllm_rollout_weights
+        )
     # Not what generation reads -- TRL passes `generate()` its own GenerationConfig and overrides
     # the model's -- but what `save_model` writes, which is what every downstream eval load reads.
     model = trainer.model
@@ -5101,6 +5135,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             f"subtracted from what the sizing plan may spend. Defaults from "
             f"{VLLM_GPU_FRACTION_ENV}, else the measured {VLLM_COLOCATE_GPU_FRACTION}."
         ),
+    )
+    parser.add_argument(
+        "--vllm-rollout-weights",
+        choices=VLLM_ROLLOUT_WEIGHTS,
+        default="bf16",
+        help="opt-in online FP8 rollout weights; requires --colocate-sleep-offload",
     )
     parser.add_argument(
         "--vllm-kv-cache-dtype",
