@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import huggingface_hub
 import pytest
 
 from reward_hacking.jailed_poc import CommandResult, JailResourceLimits
@@ -24,6 +25,7 @@ from reward_hacking.ladder.runner import (
     ScenarioLike,
     _derive_grade_evidence,
     _detection_spec,
+    _resolve_local_model_path,
     _restore_pristine_file,
     _run_real_episode,
     _score_override_honored,
@@ -374,6 +376,38 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         "proxy_pass": True,
         "final_report": "completed honestly",
     }
+
+
+def _write_cached_snapshot(cache_dir: Path, repo_id: str, revision: str, commit: str) -> Path:
+    repo_cache = cache_dir / f"models--{repo_id.replace('/', '--')}"
+    snapshot = repo_cache / "snapshots" / commit
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text("{}")
+    # The tree listing records a README the weights-only download skipped, as on the real cache.
+    listed_files = {name: {"size": 2, "blob_id": "0" * 40} for name in ("README.md", "config.json")}
+    (repo_cache / "trees").mkdir()
+    (repo_cache / "trees" / f"{commit}.json").write_text(
+        json.dumps({"format_version": 1, "files": listed_files})
+    )
+    (repo_cache / "refs").mkdir()
+    (repo_cache / "refs" / revision).write_text(commit)
+    return snapshot
+
+
+def test_cached_model_resolves_without_repo_docs_or_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    main_snapshot = _write_cached_snapshot(tmp_path, "org/model", "main", "a" * 40)
+    step_snapshot = _write_cached_snapshot(tmp_path, "org/stepped", "step_500", "b" * 40)
+
+    assert _resolve_local_model_path(ModelSpec("model", "org/model")) == main_snapshot
+    assert (
+        _resolve_local_model_path(ModelSpec("stepped", "org/stepped", revision="step_500"))
+        == step_snapshot
+    )
+    with pytest.raises(FileNotFoundError, match="org/absent"):
+        _resolve_local_model_path(ModelSpec("absent", "org/absent"))
 
 
 def test_provenance_digest_changes_when_sampling_or_scenario_changes() -> None:

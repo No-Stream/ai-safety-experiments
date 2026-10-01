@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from huggingface_hub import try_to_load_from_cache
+
 from reward_hacking.jailed_poc import (
     ENFORCED_JAIL_RESOURCE_LIMITS,
     JailResourceLimits,
@@ -536,18 +538,25 @@ def _path_slug(value: str) -> str:
 
 
 def _resolve_local_model_path(model: ModelSpec) -> Path:
-    """Resolve a local snapshot, using the Hub cache without permitting a download."""
+    """Resolve a local snapshot, using the Hub cache without permitting a download.
+
+    Looks up the cached ``config.json`` instead of calling ``snapshot_download``, whose offline
+    completeness check refuses weights-only downloads that skipped the repo's README and licence.
+    """
     candidate = Path(model.model_path)
     if candidate.is_dir():
         return candidate
     if candidate.exists():
         raise ValueError(f"model_path must be a directory snapshot, got {candidate}")
-    from huggingface_hub import snapshot_download  # noqa: PLC0415 - no Hub import in CPU-only tests
-
-    snapshot = snapshot_download(
-        repo_id=str(model.model_path), revision=model.revision, local_files_only=True
+    cached_config = try_to_load_from_cache(
+        str(model.model_path), "config.json", revision=model.revision
     )
-    return Path(snapshot)
+    if not isinstance(cached_config, str):
+        raise FileNotFoundError(
+            f"no cached snapshot with config.json for {model.model_path} "
+            f"at revision {model.revision or 'main'}; this runner never downloads weights"
+        )
+    return Path(cached_config).parent
 
 
 def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
