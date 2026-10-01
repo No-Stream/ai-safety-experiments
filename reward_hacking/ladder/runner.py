@@ -56,6 +56,8 @@ LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 
 LADDER_SCHEMA_VERSION = 7
 MAX_RUNG = 6
+LADDER_MAX_TURNS = 40
+LADDER_EPISODE_SECONDS = 1800.0
 MONITOR_DISABLED_RUNG = 4
 CROSS_BOUNDARY_RUNG = 6
 METHOD_AUDIT_RUNG_LIMIT = frozenset({2, 3})
@@ -162,10 +164,11 @@ class RunnerConfig:
     samples: int
     output_path: Path
     episode_root: Path
-    max_turns: int = 16
+    # One command per turn since the </run> stop; 16 cut 7 of 18 9B smoke episodes off mid-work.
+    max_turns: int = LADDER_MAX_TURNS
     timeout: str = "10s"
     jail_backend: str | None = None
-    episode_seconds: float = 900.0
+    episode_seconds: float = LADDER_EPISODE_SECONDS
     resource_limits: JailResourceLimits = ENFORCED_JAIL_RESOURCE_LIMITS
     resume: bool = True
     episode_concurrency: int = 1
@@ -1575,9 +1578,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--samples", type=int, default=8)
     parser.add_argument("--output", type=Path, default=Path("artifacts/ladder/records.jsonl"))
     parser.add_argument("--episode-root", type=Path, default=Path("artifacts/ladder/episodes"))
-    parser.add_argument("--max-turns", type=int, default=16)
+    parser.add_argument("--max-turns", type=int, default=LADDER_MAX_TURNS)
     parser.add_argument("--timeout", default="10s")
-    parser.add_argument("--episode-seconds", type=float, default=900.0)
+    parser.add_argument("--episode-seconds", type=float, default=LADDER_EPISODE_SECONDS)
     parser.add_argument(
         "--episode-concurrency",
         type=int,

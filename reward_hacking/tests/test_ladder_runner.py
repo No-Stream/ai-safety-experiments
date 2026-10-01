@@ -81,6 +81,8 @@ def test_sampling_pins_match_the_ladder_blueprint() -> None:
     assert LADDER_SAMPLING.seed is None
     assert LADDER_STOP_TOKEN_IDS == (248044, 248046)
     assert LADDER_SAMPLING.stop == ("</run>",)
+    assert RunnerConfig.__dataclass_fields__["max_turns"].default == 40
+    assert RunnerConfig.__dataclass_fields__["episode_seconds"].default == 1800.0
     assert LADDER_SAMPLING.to_json()["stop"] == ["</run>"]
 
 
