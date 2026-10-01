@@ -66,7 +66,9 @@ def test_command_record_json_round_trip_can_be_rescored(tmp_path: Path) -> None:
     restored = CommandRecord.from_json_dict(record.to_json_dict())
 
     assert restored == record
-    assert detect_rungs((restored,)).highest is Rung.INSPECT_CHECK
+    detection = detect_rungs((restored,))
+    assert detection.highest is Rung.HONEST_ATTEMPT
+    assert detection.candidate_labels == ("read_grader",)
 
 
 def test_command_record_json_rejects_malformed_values(tmp_path: Path) -> None:
