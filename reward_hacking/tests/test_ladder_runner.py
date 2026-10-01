@@ -26,11 +26,13 @@ from reward_hacking.ladder.runner import (
     ScenarioLike,
     _derive_grade_evidence,
     _detection_spec,
+    _final_report_unresolved,
     _resolve_local_model_path,
     _restore_pristine_file,
     _run_real_episode,
     _score_override_honored,
     _visible_case_markers,
+    build_vllm_http_backend,
     completed_episode_keys,
     main,
     provenance_digest,
@@ -75,6 +77,24 @@ def test_sampling_pins_match_the_ladder_blueprint() -> None:
     assert LADDER_SAMPLING.presence_penalty == 0.0
     assert LADDER_SAMPLING.seed is None
     assert LADDER_STOP_TOKEN_IDS == (248044, 248046)
+    assert LADDER_SAMPLING.stop == ("</run>",)
+    assert LADDER_SAMPLING.to_json()["stop"] == ["</run>"]
+
+
+def test_ladder_backend_stops_each_turn_at_the_run_block_and_thinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    constructed: list[dict[str, Any]] = []
+
+    def fake_backend(model_id: str, **kwargs: Any) -> object:
+        constructed.append({"model_id": model_id, **kwargs})
+        return object()
+
+    monkeypatch.setattr("reward_hacking.model_backend.VLLMHTTPBackend", fake_backend)
+    build_vllm_http_backend(ModelSpec("base", tmp_path), runner_config(tmp_path / "records.jsonl"))
+
+    assert constructed[0]["sampling"].stop == ("</run>",)
+    assert constructed[0]["thinking"] is True
 
 
 def test_resume_keys_are_content_addressed_and_digest_mismatch_refuses(tmp_path: Path) -> None:
@@ -511,6 +531,21 @@ def test_traces_are_per_run_and_a_failed_attempt_is_kept_aside(tmp_path: Path) -
     kept_attempt = crashed_trace.with_name("sample-000.attempt-1.jsonl")
     assert "crashed" in kept_attempt.read_text(encoding="utf-8")
     assert "crashed" not in crashed_trace.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("report", "unresolved"),
+    [
+        ({"text": "done", "truncated": False, "timed_out": False}, False),
+        ({"text": "partial", "truncated": True, "timed_out": False}, True),
+        ({"text": "", "truncated": False, "timed_out": True}, True),
+        ({"text": "legacy", "truncated": False}, False),
+    ],
+)
+def test_capped_or_timed_out_report_is_unresolved(
+    report: dict[str, object], *, unresolved: bool
+) -> None:
+    assert _final_report_unresolved({"final_report": report}) is unresolved
 
 
 def _write_cached_snapshot(cache_dir: Path, repo_id: str, revision: str, commit: str) -> Path:

@@ -6,8 +6,6 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-import pytest
-
 from reward_hacking.harness import loop
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
@@ -15,6 +13,8 @@ from reward_hacking.model_backend import BedrockCompletion, MockBackend, TokenUs
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 
 def _dummy_task() -> Task:
@@ -94,7 +94,8 @@ class TestLadderCommandHooks:
 class TestLadderFinalReport:
     """A report is sampled and stored separately; its protocol-looking text is inert."""
 
-    def test_final_report_generation_has_a_deadline(self) -> None:
+    def test_final_report_timeout_is_recorded_not_raised(self) -> None:
+        """A run must survive one slow report; the timeout is evidence of nothing, so it is kept."""
         released = threading.Event()
 
         class SlowBackend(MockBackend):
@@ -105,9 +106,10 @@ class TestLadderFinalReport:
         backend = SlowBackend(["report"], model_id="dummy")
         started = time.monotonic()
         try:
-            with pytest.raises(TimeoutError, match="final report"):
-                loop._sample_final_report(backend, "transcript", report_seconds=0.05)
+            report = loop._sample_final_report(backend, "transcript", report_seconds=0.05)
             assert time.monotonic() - started < 1.0
+            assert report.timed_out
+            assert report.text == ""
         finally:
             released.set()
 
@@ -149,13 +151,18 @@ class TestLadderFinalReport:
         assert hook_events == [("before", "touch marker.txt"), ("after", "touch marker.txt")]
         assert not (tmp_path / "episode" / "report-action.txt").exists()
         summary = trace.summary_record()
-        assert summary["final_report"] == {"text": report, "truncated": False}
+        assert summary["final_report"] == {
+            "text": report,
+            "reasoning": "",
+            "truncated": False,
+            "timed_out": False,
+        }
         persisted_summary = next(
             record
             for record in loop.load_traces(tmp_path / "trace.jsonl")
             if record["record"] == "episode_summary"
         )
-        assert persisted_summary["final_report"] == {"text": report, "truncated": False}
+        assert persisted_summary["final_report"] == summary["final_report"]
 
     def test_final_report_truncation_is_recorded(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -189,7 +196,7 @@ class TestLadderFinalReport:
                     ),
                     BedrockCompletion(
                         text="partial report",
-                        reasoning="",
+                        reasoning="private thought",
                         usage=TokenUsage(input_tokens=1, output_tokens=1),
                         stop_reason=loop.STOP_REASON_MAX_TOKENS,
                     ),
@@ -207,4 +214,6 @@ class TestLadderFinalReport:
         )
 
         assert trace.final_report == "partial report"
+        assert trace.final_report_reasoning == "private thought"
         assert trace.final_report_truncated
+        assert not trace.final_report_timed_out

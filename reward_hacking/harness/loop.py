@@ -689,7 +689,9 @@ class AgentEpisodeTrace:
     ``final_report`` is the optional raw completion sampled after the policy's last action. It is
     kept outside ``turns`` because its protocol-looking text is never parsed or honored as an
     action. ``final_report_truncated`` records the backend's explicit output-cap signal, rather than
-    asking downstream readers to infer truncation from the report text.
+    asking downstream readers to infer truncation from the report text. ``final_report_reasoning``
+    keeps the report turn's thinking apart from the report itself, and ``final_report_timed_out``
+    marks a report that ran out of wall clock, whose text is then empty.
     """
 
     task_id: str
@@ -725,6 +727,8 @@ class AgentEpisodeTrace:
     engine_wait_seconds: float = 0.0
     final_report: str | None = None
     final_report_truncated: bool = False
+    final_report_reasoning: str = ""
+    final_report_timed_out: bool = False
 
     @property
     def abort_affordance(self) -> bool:
@@ -936,7 +940,9 @@ class AgentEpisodeTrace:
             "elapsed_seconds": self.elapsed_seconds,
             "final_report": {
                 "text": self.final_report,
+                "reasoning": self.final_report_reasoning,
                 "truncated": self.final_report_truncated,
+                "timed_out": self.final_report_timed_out,
             },
             "outcome": self.outcome.value,
             "transcript": self.transcript,
@@ -1312,6 +1318,16 @@ FINAL_REPORT_PROMPT = (
 )
 
 
+@dataclass(frozen=True)
+class _FinalReport:
+    """The operator report turn: its answer text, its thinking, and how it ended."""
+
+    text: str
+    reasoning: str
+    truncated: bool
+    timed_out: bool
+
+
 def _sample_final_report(
     backend: Backend,
     transcript: str,
@@ -1319,8 +1335,12 @@ def _sample_final_report(
     report_seconds: float = DEFAULT_EPISODE_SECONDS,
     engine_gate: SharedEngineGate | None = None,
     stop_requested: threading.Event | None = None,
-) -> tuple[str, bool]:
-    """Sample the optional operator report without passing it through the action parser."""
+) -> _FinalReport:
+    """Sample the optional operator report without passing it through the action parser.
+
+    A report that runs out of wall clock is recorded as timed out with empty text rather than
+    raised: one slow report must not end a whole run, and readers treat it as unresolved.
+    """
     sampled = _sample_within_budget(
         backend,
         f"{transcript}\n\n{FINAL_REPORT_PROMPT}",
@@ -1331,8 +1351,13 @@ def _sample_final_report(
     )
     report = sampled.response
     if report is None:
-        raise TimeoutError("final report generation exceeded its wall-clock budget")
-    return report.text, report.stop_reason == STOP_REASON_MAX_TOKENS
+        return _FinalReport(text="", reasoning="", truncated=False, timed_out=True)
+    return _FinalReport(
+        text=report.text,
+        reasoning=report.reasoning,
+        truncated=report.stop_reason == STOP_REASON_MAX_TOKENS,
+        timed_out=False,
+    )
 
 
 def _generate_on_daemon_thread(
@@ -1563,6 +1588,8 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
     turns: list[AgentTurn] = []
     final_report_text: str | None = None
     final_report_truncated = False
+    final_report_reasoning = ""
+    final_report_timed_out = False
     ending: Action | None = None
     nudged_empty_start = False
     checks_used = 0
@@ -1666,13 +1693,17 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
             break
 
     if final_report:
-        final_report_text, final_report_truncated = _sample_final_report(
+        sampled_report = _sample_final_report(
             backend,
             transcript,
             report_seconds=episode_seconds,
             engine_gate=engine_gate,
             stop_requested=stop_requested,
         )
+        final_report_text = sampled_report.text
+        final_report_truncated = sampled_report.truncated
+        final_report_reasoning = sampled_report.reasoning
+        final_report_timed_out = sampled_report.timed_out
 
     graded = _grade_final_state(
         task,
@@ -1722,6 +1753,8 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
         engine_wait_seconds=engine_wait_seconds,
         final_report=final_report_text,
         final_report_truncated=final_report_truncated,
+        final_report_reasoning=final_report_reasoning,
+        final_report_timed_out=final_report_timed_out,
     )
 
     # The turns are already on disk, appended as they finished; only the summary is new.

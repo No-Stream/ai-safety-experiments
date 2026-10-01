@@ -49,16 +49,14 @@ def server(
         requests.append(json.loads(request.content))
         if state["barrier"] is not None:
             state["barrier"].wait(timeout=10)
+        text, finish, stop, completion_tokens = (
+            state["replies"].pop(0)
+            if state.get("replies")
+            else (state.get("text", "synthetic</run>"), state["finish"], state["stop"], 3)
+        )
         payload = {
-            "choices": [
-                {
-                    "index": 0,
-                    "text": "synthetic</run>",
-                    "finish_reason": state["finish"],
-                    "stop_reason": state["stop"],
-                }
-            ],
-            "usage": {"prompt_tokens": 17, "completion_tokens": 3},
+            "choices": [{"index": 0, "text": text, "finish_reason": finish, "stop_reason": stop}],
+            "usage": {"prompt_tokens": 17, "completion_tokens": completion_tokens},
         }
         return httpx2.Response(state["status"], json=state.get("payload", payload))
 
@@ -75,7 +73,8 @@ def server(
 def test_prompt_parity(
     tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]], thinking: bool
 ) -> None:
-    url, requests, _ = server
+    url, requests, state = server
+    state["text"] = "</think>synthetic</run>"
     served = VLLMHTTPBackend(
         "synthetic", base_url=url, model_path=tokenizer_path, thinking=thinking
     )
@@ -166,6 +165,71 @@ def test_sampling_and_result(
     assert completion.usage.output_tokens == 3
     assert completion.attempts == 1
     assert completion.elapsed_seconds is not None
+
+
+class TestThinkingSplit:
+    def backend(self, url: str, tokenizer_path: Path) -> VLLMHTTPBackend:
+        sampling = SamplingConfig(max_new_tokens=47, stop=("</run>",))
+        return VLLMHTTPBackend(
+            "synthetic", base_url=url, model_path=tokenizer_path, thinking=True, sampling=sampling
+        )
+
+    def test_answer_is_split_from_thinking(
+        self, tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
+    ) -> None:
+        url, requests, state = server
+        state["replies"] = [("plan it\n</think>\n\nanswer <run>pwd</run>", "stop", "</run>", 9)]
+
+        completion = self.backend(url, tokenizer_path).generate_detailed(["synthetic"])[0]
+
+        assert len(requests) == 1
+        assert completion.reasoning == "plan it\n"
+        assert completion.text == "answer <run>pwd</run>"
+        assert completion.stop_reason == "stop_sequence"
+
+    def test_stop_inside_thinking_continues_the_same_turn(
+        self, tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
+    ) -> None:
+        url, requests, state = server
+        state["replies"] = [
+            ("draft <run>ls</run>", "stop", "</run>", 5),
+            (" decide\n</think>\nreal <run>pwd</run>", "stop", "</run>", 8),
+        ]
+
+        completion = self.backend(url, tokenizer_path).generate_detailed(["synthetic"])[0]
+
+        assert len(requests) == 2
+        assert requests[1]["prompt"] == requests[0]["prompt"] + "draft <run>ls</run>"
+        assert requests[1]["max_tokens"] == 47 - 5
+        assert completion.reasoning == "draft <run>ls</run> decide\n"
+        assert completion.text == "real <run>pwd</run>"
+        assert completion.usage.output_tokens == 13
+        assert completion.usage.input_tokens == 17
+
+    def test_budget_spent_inside_thinking_leaves_an_empty_answer(
+        self, tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
+    ) -> None:
+        url, requests, state = server
+        state["replies"] = [
+            ("draft <run>ls</run>", "stop", "</run>", 40),
+            (" still thinking", "length", None, 7),
+        ]
+
+        completion = self.backend(url, tokenizer_path).generate_detailed(["synthetic"])[0]
+
+        assert len(requests) == 2
+        assert completion.reasoning == "draft <run>ls</run> still thinking"
+        assert completion.text == ""
+        assert completion.stop_reason == "max_tokens"
+
+    def test_a_stalled_continuation_fails_loudly(
+        self, tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
+    ) -> None:
+        url, _, state = server
+        state["replies"] = [("draft <run>ls</run>", "stop", "</run>", 5), ("", "stop", "</run>", 0)]
+
+        with pytest.raises(RuntimeError, match="no tokens"):
+            self.backend(url, tokenizer_path).generate_detailed(["synthetic"])
 
 
 @pytest.mark.parametrize(

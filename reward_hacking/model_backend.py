@@ -921,6 +921,21 @@ class _VLLMHTTPResponse(BaseModel):
     usage: _VLLMHTTPUsage
 
 
+_THINK_END = "</think>"
+
+
+def _split_thinking(generated: str) -> tuple[str, str]:
+    """Split a thinking-mode reply into (reasoning, answer) at the first ``</think>``.
+
+    With no ``</think>`` the whole reply is reasoning and the answer is empty: the budget ran out
+    mid-thought, and nothing the model drafted there is an action.
+    """
+    reasoning, separator, answer = generated.partition(_THINK_END)
+    if not separator:
+        return generated, ""
+    return reasoning, answer.lstrip("\n")
+
+
 class VLLMHTTPBackend:
     """Concurrent completions requests with the in-process backend's prompt rendering.
 
@@ -973,60 +988,95 @@ class VLLMHTTPBackend:
         """Return the tokenizer used to render every request."""
         return self._tokenizer
 
+    def _complete(
+        self, rendered_prompt: str, *, max_tokens: int, seed: int | None
+    ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
+        """Make one /v1/completions request and validate its single choice."""
+        body = {
+            "model": self.model_id,
+            "prompt": rendered_prompt,
+            "max_tokens": max_tokens,
+            "temperature": self.sampling.temperature if self.sampling.do_sample else 0.0,
+            "top_p": self.sampling.top_p,
+            "top_k": self.sampling.top_k,
+            "min_p": self.sampling.min_p,
+            "repetition_penalty": self.sampling.repetition_penalty,
+            "presence_penalty": self.sampling.presence_penalty,
+            "seed": seed,
+            "stop": list(self.sampling.stop) if self.sampling.stop else None,
+            "stop_token_ids": list(self.stop_token_ids) if self.stop_token_ids else None,
+            "include_stop_str_in_output": bool(self.sampling.stop),
+            # LLM.generate uses default_cmpl_tok_params with this set to True too.
+            "add_special_tokens": True,
+            "n": 1,
+            "stream": False,
+        }
+        with httpx2.Client(timeout=self.timeout_seconds, trust_env=False) as client:
+            response = client.post(f"{self.base_url}/v1/completions", json=body)
+            response.raise_for_status()
+            if response.status_code != HTTPStatus.OK:  # raise_for_status accepts other 2xx codes.
+                raise ValueError(
+                    f"vLLM completions returned HTTP {response.status_code}, expected 200"
+                )
+            parsed = _VLLMHTTPResponse.model_validate(response.json())
+        choice = parsed.choices[0]
+        if choice.index != 0:
+            raise ValueError(f"vLLM returned completion index {choice.index}, expected 0")
+        return choice, parsed.usage
+
     def generate_detailed(
         self,
         prompts: list[str],
         *,
         generation_kwargs: Mapping[str, object] | None = None,
     ) -> list[BedrockCompletion]:
-        """Send each rendered prompt to /v1/completions; propagate HTTP and schema failures."""
+        """Send each rendered prompt to /v1/completions; propagate HTTP and schema failures.
+
+        In thinking mode the reply is split at the first ``</think>``: ``reasoning`` is the thinking
+        and ``text`` the answer the harness parses. A stop sequence that fires before ``</think>``
+        (a ``<run>`` drafted mid-thought) does not end the turn; generation continues from the
+        partial text within the same token budget, so only an answer can end on ``</run>``.
+        """
         seeds = _request_seeds_from_generation_kwargs(generation_kwargs)
         if seeds is not None and len(seeds) != len(prompts):
             raise ValueError("request_seeds must contain one seed per prompt")
         completions: list[BedrockCompletion] = []
         for index, prompt in enumerate(prompts):
-            body = {
-                "model": self.model_id,
-                "prompt": _as_single_user_turn(self._tokenizer, prompt, thinking=self.thinking),
-                "max_tokens": self.sampling.max_new_tokens,
-                "temperature": self.sampling.temperature if self.sampling.do_sample else 0.0,
-                "top_p": self.sampling.top_p,
-                "top_k": self.sampling.top_k,
-                "min_p": self.sampling.min_p,
-                "repetition_penalty": self.sampling.repetition_penalty,
-                "presence_penalty": self.sampling.presence_penalty,
-                "seed": self.sampling.seed if seeds is None else seeds[index],
-                "stop": list(self.sampling.stop) if self.sampling.stop else None,
-                "stop_token_ids": list(self.stop_token_ids) if self.stop_token_ids else None,
-                "include_stop_str_in_output": bool(self.sampling.stop),
-                # LLM.generate uses default_cmpl_tok_params with this set to True too.
-                "add_special_tokens": True,
-                "n": 1,
-                "stream": False,
-            }
+            seed = self.sampling.seed if seeds is None else seeds[index]
+            rendered = _as_single_user_turn(self._tokenizer, prompt, thinking=self.thinking)
             started = time.monotonic()
-            with httpx2.Client(timeout=self.timeout_seconds, trust_env=False) as client:
-                response = client.post(f"{self.base_url}/v1/completions", json=body)
-                response.raise_for_status()
-                if (
-                    response.status_code != HTTPStatus.OK
-                ):  # raise_for_status accepts other 2xx codes.
-                    raise ValueError(
-                        f"vLLM completions returned HTTP {response.status_code}, expected 200"
+            generated = ""
+            output_tokens = 0
+            input_tokens: int | None = None
+            while True:
+                choice, usage = self._complete(
+                    rendered + generated,
+                    max_tokens=self.sampling.max_new_tokens - output_tokens,
+                    seed=seed,
+                )
+                if input_tokens is not None and usage.completion_tokens == 0:
+                    raise RuntimeError(
+                        "vLLM continuation after a stop inside <think> produced no tokens"
                     )
-                parsed = _VLLMHTTPResponse.model_validate(response.json())
-            choice = parsed.choices[0]
-            if choice.index != 0:
-                raise ValueError(f"vLLM returned completion index {choice.index}, expected 0")
+                if input_tokens is None:
+                    input_tokens = usage.prompt_tokens
+                generated += choice.text
+                output_tokens += usage.completion_tokens
+                stop_reason = _vllm_stop_reason(choice.finish_reason, choice.stop_reason)
+                stopped_inside_thinking = (
+                    self.thinking
+                    and stop_reason == STOP_REASON_STOP_SEQUENCE
+                    and _THINK_END not in generated
+                )
+                if not stopped_inside_thinking or output_tokens >= self.sampling.max_new_tokens:
+                    break
+            reasoning, text = _split_thinking(generated) if self.thinking else ("", generated)
             completions.append(
                 BedrockCompletion(
-                    text=choice.text,
-                    reasoning="",
-                    usage=TokenUsage(
-                        input_tokens=parsed.usage.prompt_tokens,
-                        output_tokens=parsed.usage.completion_tokens,
-                    ),
-                    stop_reason=_vllm_stop_reason(choice.finish_reason, choice.stop_reason),
+                    text=text,
+                    reasoning=reasoning,
+                    usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
+                    stop_reason=stop_reason,
                     elapsed_seconds=time.monotonic() - started,
                     attempts=1,
                 )
