@@ -17,18 +17,17 @@ import stat
 import struct
 import sys
 import tomllib
+import weakref
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, Self
+from typing import Final, Literal, Self
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping
-
-    from reward_hacking.jailed_poc import CommandResult
-
+from reward_hacking.jailed_poc import CommandResult
 
 DEFAULT_MONITOR_CONFIG = ".ci/monitor.toml"
 DEFAULT_AUDIT_LOG = ".ci/audit.log"
+_SNAPSHOT_FILE_ITEM_COUNT: Final = 2
 
 _IN_MODIFY: Final = 0x00000002
 _IN_ATTRIB: Final = 0x00000004
@@ -308,8 +307,52 @@ class WorkspaceSnapshot:
         """Return the snapshot's relative path to digest mapping."""
         return dict(self.files)
 
+    def to_json_dict(self) -> dict[str, object]:
+        """Serialize the complete snapshot so command records can be reconstructed later."""
+        return {
+            "files": [[path, digest] for path, digest in self.files],
+            "monitor_enabled": self.monitor_enabled,
+            "audit_log_digest": self.audit_log_digest,
+            "audit_log_size": self.audit_log_size,
+        }
 
-@dataclass(frozen=True, slots=True)
+    @classmethod
+    def from_json_dict(cls, data: object) -> Self:
+        """Parse a snapshot mapping and reject malformed JSON values."""
+        snapshot = _require_mapping(data, field="snapshot")
+        files_value = _required_value(snapshot, "files")
+        if not isinstance(files_value, list):
+            raise TypeError("snapshot.files must be a list")
+        files: list[tuple[str, str]] = []
+        for index, file_value in enumerate(files_value):
+            if not isinstance(file_value, list) or len(file_value) != _SNAPSHOT_FILE_ITEM_COUNT:
+                raise TypeError(f"snapshot.files[{index}] must be a two-item list")
+            path, digest = file_value
+            if not isinstance(path, str) or not isinstance(digest, str):
+                raise TypeError(f"snapshot.files[{index}] must contain strings")
+            files.append((path, digest))
+        if len({path for path, _digest in files}) != len(files):
+            raise ValueError("snapshot.files contains duplicate paths")
+        monitor_enabled_value = _required_value(snapshot, "monitor_enabled")
+        if not isinstance(monitor_enabled_value, bool):
+            raise TypeError("snapshot.monitor_enabled must be a bool")
+        audit_log_digest = _required_value(snapshot, "audit_log_digest")
+        if audit_log_digest is not None and not isinstance(audit_log_digest, str):
+            raise TypeError("snapshot.audit_log_digest must be a string or None")
+        audit_log_size = _required_value(snapshot, "audit_log_size")
+        if audit_log_size is not None and (
+            not isinstance(audit_log_size, int) or isinstance(audit_log_size, bool)
+        ):
+            raise TypeError("snapshot.audit_log_size must be an int or None")
+        return cls(
+            files=tuple(files),
+            monitor_enabled=monitor_enabled_value,
+            audit_log_digest=audit_log_digest,
+            audit_log_size=audit_log_size,
+        )
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class CommandStart:
     """The engine state captured immediately before one command executes."""
 
@@ -317,6 +360,10 @@ class CommandStart:
     command: str
     snapshot: WorkspaceSnapshot
     mutation_monitor: WorkspaceMutationMonitor
+
+    def __post_init__(self) -> None:
+        """Close the watcher when an interrupted command drops its pending start record."""
+        weakref.finalize(self, self.mutation_monitor.close)
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,7 +411,7 @@ class CommandRecord:
         return self.after.monitor_enabled
 
     def to_json_dict(self) -> dict[str, object]:
-        """Serialize the engine record for an episode trace."""
+        """Serialize the complete engine record for an episode trace."""
         return {
             "sequence": self.sequence,
             "command": self.command,
@@ -378,7 +425,131 @@ class CommandRecord:
             "audit_appended": self.audit_appended,
             "audit_log_size_before": self.before.audit_log_size,
             "audit_log_size_after": self.after.audit_log_size,
+            "before_snapshot": self.before.to_json_dict(),
+            "after_snapshot": self.after.to_json_dict(),
+            "observed_changed_paths": list(self.observed_changed_paths),
         }
+
+    @classmethod
+    def from_json_dict(cls, data: object) -> Self:
+        """Reconstruct a command record from a current or legacy engine JSON object."""
+        record = _require_mapping(data, field="command record")
+        sequence = _required_value(record, "sequence")
+        if not isinstance(sequence, int) or isinstance(sequence, bool):
+            raise TypeError("command record.sequence must be an int")
+        command = _required_string(record, "command")
+        exit_code = _required_value(record, "exit_code")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            raise TypeError("command record.exit_code must be an int")
+        stdout = _required_string(record, "stdout")
+        stderr = _required_string(record, "stderr")
+        timed_out = _required_bool(record, "timed_out")
+        changed_paths = _required_string_list(record, "changed_paths")
+        monitor_enabled_before = _required_bool(record, "monitor_enabled_before")
+        monitor_enabled_after = _required_bool(record, "monitor_enabled_after")
+        audit_appended = _required_bool(record, "audit_appended")
+        audit_log_size_before = _required_optional_int(record, "audit_log_size_before")
+        audit_log_size_after = _required_optional_int(record, "audit_log_size_after")
+
+        snapshot_keys = ("before_snapshot", "after_snapshot", "observed_changed_paths")
+        present_snapshot_keys = tuple(key for key in snapshot_keys if key in record)
+        if present_snapshot_keys and len(present_snapshot_keys) != len(snapshot_keys):
+            raise ValueError("command record must include all snapshot fields together")
+        if present_snapshot_keys:
+            before = WorkspaceSnapshot.from_json_dict(record["before_snapshot"])
+            after = WorkspaceSnapshot.from_json_dict(record["after_snapshot"])
+            observed_changed_paths = _required_string_list(record, "observed_changed_paths")
+            if before.monitor_enabled != monitor_enabled_before:
+                raise ValueError("command record before snapshot monitor state does not match")
+            if after.monitor_enabled != monitor_enabled_after:
+                raise ValueError("command record after snapshot monitor state does not match")
+            if before.audit_log_size != audit_log_size_before:
+                raise ValueError("command record before snapshot audit size does not match")
+            if after.audit_log_size != audit_log_size_after:
+                raise ValueError("command record after snapshot audit size does not match")
+        else:
+            before = WorkspaceSnapshot(
+                files=(),
+                monitor_enabled=monitor_enabled_before,
+                audit_log_digest=None,
+                audit_log_size=audit_log_size_before,
+            )
+            after = WorkspaceSnapshot(
+                files=(),
+                monitor_enabled=monitor_enabled_after,
+                audit_log_digest=None,
+                audit_log_size=audit_log_size_after,
+            )
+            observed_changed_paths = changed_paths
+
+        command_result = CommandResult(
+            command=command,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out,
+        )
+        reconstructed = cls(
+            sequence=sequence,
+            result=command_result,
+            before=before,
+            after=after,
+            audit_appended=audit_appended,
+            observed_changed_paths=tuple(observed_changed_paths),
+        )
+        if list(reconstructed.changed_paths) != changed_paths:
+            raise ValueError("command record changed_paths do not match its snapshots")
+        return reconstructed
+
+
+def _require_mapping(data: object, *, field: str) -> Mapping[str, object]:
+    """Return a string-keyed mapping or raise a field-specific type error."""
+    if not isinstance(data, Mapping):
+        raise TypeError(f"{field} must be a mapping")
+    if any(not isinstance(key, str) for key in data):
+        raise TypeError(f"{field} keys must be strings")
+    return data
+
+
+def _required_value(data: Mapping[str, object], key: str) -> object:
+    """Return a required mapping value or report the missing field."""
+    if key not in data:
+        raise ValueError(f"missing required field: {key}")
+    return data[key]
+
+
+def _required_string(data: Mapping[str, object], key: str) -> str:
+    """Return a required string field."""
+    value = _required_value(data, key)
+    if not isinstance(value, str):
+        raise TypeError(f"command record.{key} must be a string")
+    return value
+
+
+def _required_bool(data: Mapping[str, object], key: str) -> bool:
+    """Return a required boolean field."""
+    value = _required_value(data, key)
+    if not isinstance(value, bool):
+        raise TypeError(f"command record.{key} must be a bool")
+    return value
+
+
+def _required_string_list(data: Mapping[str, object], key: str) -> list[str]:
+    """Return a required list of strings."""
+    value = _required_value(data, key)
+    if not isinstance(value, list):
+        raise TypeError(f"command record.{key} must be a list")
+    if any(not isinstance(item, str) for item in value):
+        raise TypeError(f"command record.{key} must contain only strings")
+    return value
+
+
+def _required_optional_int(data: Mapping[str, object], key: str) -> int | None:
+    """Return a required integer-or-None field, rejecting booleans as integers."""
+    value = _required_value(data, key)
+    if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+        raise TypeError(f"command record.{key} must be an int or None")
+    return value
 
 
 def _digest_file(path: Path) -> str:
@@ -387,26 +558,77 @@ def _digest_file(path: Path) -> str:
     if stat.S_ISLNK(metadata.st_mode):
         return "symlink:" + str(path.readlink())
     if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"workspace snapshot encountered a non-regular file: {path}")
+        return _special_file_digest(metadata.st_mode)
+    if stat.S_IMODE(metadata.st_mode) & 0o444 == 0:
+        return _unreadable_file_digest(metadata)
     digest = hashlib.sha256()
     flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW
-    with os.fdopen(os.open(path, flags), "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise ValueError(f"workspace file changed type while hashing: {path}")
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
+    try:
+        with os.fdopen(os.open(path, flags), "rb") as stream:
+            opened_mode = os.fstat(stream.fileno()).st_mode
+            if not stat.S_ISREG(opened_mode):
+                return _special_file_digest(opened_mode)
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except PermissionError:
+        return _unreadable_file_digest(metadata)
     return digest.hexdigest()
+
+
+def _special_file_digest(mode: int) -> str:
+    """Return a stable sentinel for supported non-regular workspace entries."""
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "char-device"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    raise ValueError("workspace snapshot encountered an unsupported file type")
+
+
+def _unreadable_file_digest(metadata: os.stat_result) -> str:
+    """Return a digest sentinel that distinguishes unreadable files by mode and size."""
+    return f"unreadable:{stat.S_IMODE(metadata.st_mode):04o}:{metadata.st_size}"
+
+
+def _unreadable_directory_digest(metadata: os.stat_result) -> str:
+    """Return a sentinel for directories that cannot be enumerated."""
+    return f"unreadable-dir:{stat.S_IMODE(metadata.st_mode):04o}"
 
 
 def _relative_file_digests(episode_dir: Path) -> tuple[tuple[str, str], ...]:
     """Hash every file below an episode directory without following directory symlinks."""
     entries: list[tuple[str, str]] = []
-    for path in sorted(episode_dir.rglob("*")):
-        if path.is_dir() and not path.is_symlink():
-            continue
-        relative = path.relative_to(episode_dir).as_posix()
-        entries.append((relative, _digest_file(path)))
-    return tuple(entries)
+
+    def visit_directory(directory: Path) -> None:
+        metadata = directory.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        relative_directory = directory.relative_to(episode_dir).as_posix()
+        if mode & 0o444 == 0 or mode & 0o111 == 0:
+            entries.append((relative_directory or ".", _unreadable_directory_digest(metadata)))
+            return
+        try:
+            with os.scandir(directory) as directory_entries:
+                children = sorted(
+                    (Path(entry.path) for entry in directory_entries), key=lambda child: child.name
+                )
+        except PermissionError:
+            entries.append(
+                (relative_directory or ".", _unreadable_directory_digest(directory.lstat()))
+            )
+            return
+        for child in children:
+            child_metadata = child.lstat()
+            if stat.S_ISDIR(child_metadata.st_mode):
+                visit_directory(child)
+                continue
+            relative = child.relative_to(episode_dir).as_posix()
+            entries.append((relative, _digest_file(child)))
+
+    visit_directory(episode_dir)
+    return tuple(sorted(entries))
 
 
 def monitor_enabled(episode_dir: Path, *, config_path: str = DEFAULT_MONITOR_CONFIG) -> bool:
