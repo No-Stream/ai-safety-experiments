@@ -15,6 +15,7 @@ is the whole point: nothing about the limiter's arithmetic should come from this
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -47,6 +48,42 @@ def four_core_host(tmp_path: Path) -> dict[str, str]:
     return {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
 
+@pytest.fixture
+def eight_core_host(tmp_path: Path) -> dict[str, str]:
+    """An environment whose `nproc` reports eight cores for deterministic window bounds."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    nproc = bin_dir / "nproc"
+    nproc.write_text("#!/bin/sh\necho 8\n")
+    nproc.chmod(0o755)
+    return {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+
+def _run_advisory_affinity_window(env: dict[str, str], *, timeout: bool) -> list[int]:
+    arguments = [str(LIMITER), "--advisory", "--cpus", "2"]
+    if timeout:
+        arguments.extend(["--timeout", "10s"])
+    arguments.extend(
+        [
+            "--",
+            "python3",
+            "-I",
+            "-c",
+            "import json, os; print(json.dumps(sorted(os.sched_getaffinity(0))))",
+        ]
+    )
+    completed = subprocess.run(  # noqa: S603 - repo script, literal arguments
+        arguments,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    return [int(core) for core in json.loads(completed.stdout)]
+
+
 class TestTheCpuCeilingFollowsTheHost:
     """--cpus is validated against the cores the host actually has."""
 
@@ -73,6 +110,25 @@ class TestTheCpuCeilingFollowsTheHost:
             check=False,
         )
         assert completed.returncode == 0, completed.stdout + completed.stderr
+
+    def test_advisory_cpu_affinity_rotates_across_contiguous_windows(
+        self, eight_core_host: dict[str, str]
+    ) -> None:
+        no_timeout_windows = [
+            _run_advisory_affinity_window(eight_core_host, timeout=False) for _ in range(8)
+        ]
+        timeout_windows = [
+            _run_advisory_affinity_window(eight_core_host, timeout=True) for _ in range(8)
+        ]
+
+        for window in no_timeout_windows + timeout_windows:
+            assert len(window) == 2
+            assert window == list(range(window[0], window[0] + 2))
+            assert window[0] >= 0
+            assert window[-1] < 8
+
+        assert len({tuple(window) for window in no_timeout_windows}) > 1
+        assert len({tuple(window) for window in timeout_windows}) > 1
 
 
 class TestTheMemoryCapFollowsTheHost:

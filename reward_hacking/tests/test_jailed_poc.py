@@ -42,6 +42,56 @@ from reward_hacking.jailed_poc import (
 from reward_hacking.tiers import RegradeVerdict, TrustBoundary
 
 
+class TestAdvisoryLimiterWarnings:
+    """The model sees command stderr, not warnings about the host's limiter mode."""
+
+    def test_warning_constants_stay_in_sync_with_the_limiter_script(self) -> None:
+        limiter_source = jailed_poc.RESOURCE_LIMITS.read_text()
+
+        for warning in jailed_poc.ADVISORY_LIMITER_WARNINGS:
+            assert warning in limiter_source
+
+    def test_only_the_known_warning_prefix_is_removed(self) -> None:
+        advisory_warning, gpu_warning = jailed_poc.ADVISORY_LIMITER_WARNINGS
+        command_stderr = f"command output\n{advisory_warning}\n"
+
+        assert (
+            jailed_poc._strip_advisory_limiter_warnings(f"{advisory_warning}\n{command_stderr}")
+            == command_stderr
+        )
+        assert (
+            jailed_poc._strip_advisory_limiter_warnings(
+                f"{advisory_warning}\n{gpu_warning}\n{command_stderr}", gpu=True
+            )
+            == command_stderr
+        )
+        assert (
+            jailed_poc._strip_advisory_limiter_warnings(f"prefix\n{advisory_warning}\n")
+            == f"prefix\n{advisory_warning}\n"
+        )
+        assert (
+            jailed_poc._strip_advisory_limiter_warnings(
+                f"{advisory_warning[:-1]}!\n{command_stderr}"
+            )
+            == f"{advisory_warning[:-1]}!\n{command_stderr}"
+        )
+
+    @needs_jail
+    def test_real_advisory_jail_keeps_matching_text_from_the_command(self, tmp_path: Path) -> None:
+        warning = jailed_poc.ADVISORY_LIMITER_WARNINGS[0]
+        command = f"printf '%s\\n' '{warning}' 'command stderr' '{warning}' >&2"
+        result = jailed_poc.run_in_jail(
+            tmp_path,
+            command,
+            resource_limits=jailed_poc.JailResourceLimits(
+                mode="advisory", systemd_user_state="offline"
+            ),
+        )
+
+        assert result.ok, result.stderr
+        assert result.stderr == f"{warning}\ncommand stderr\n{warning}\n"
+
+
 def _canned_jail(monkeypatch: pytest.MonkeyPatch, stdout_by_command: dict[str, str]) -> None:
     """Replace the jail with a lookup table, so a selection test needs no bwrap and no systemd."""
 

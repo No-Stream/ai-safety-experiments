@@ -66,6 +66,10 @@ SUCCESS_EXIT = 0
 TIMEOUT_EXIT = 124  # resource-limits.sh reserves this for a wall-clock kill
 DEFAULT_COMMAND_TIMEOUT = "60s"  # per-command cgroup wall-clock leash; episodes are tiny
 PROCESS_TIMEOUT_SECONDS = 180.0  # belt-and-suspenders above the cgroup leash
+ADVISORY_LIMITER_WARNINGS = (
+    "resource-limits: WARNING advisory mode - limits are NOT enforced; the job can exceed them",
+    "resource-limits: --gpu with --advisory skips ulimit -v; memory is not capped at all",
+)
 
 
 @dataclass(frozen=True)
@@ -412,6 +416,17 @@ def _as_text(stream: str | bytes | None) -> str:
     return stream.decode(errors="replace") if isinstance(stream, bytes) else stream
 
 
+def _strip_advisory_limiter_warnings(stderr: str, *, gpu: bool = False) -> str:
+    """Remove only the limiter's known leading advisory messages from command stderr."""
+    warnings = ADVISORY_LIMITER_WARNINGS if gpu else ADVISORY_LIMITER_WARNINGS[:1]
+    for warning in warnings:
+        prefix = f"{warning}\n"
+        if not stderr.startswith(prefix):
+            break
+        stderr = stderr[len(prefix) :]
+    return stderr
+
+
 @functools.cache
 def jail_python() -> str:
     """Return the absolute path of the interpreter ``episode_jail.sh`` runs inside the jail.
@@ -510,18 +525,24 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
+        stderr = _as_text(exc.stderr)
+        if limits.mode == "advisory":
+            stderr = _strip_advisory_limiter_warnings(stderr)
         return CommandResult(
             command=command,
             exit_code=TIMEOUT_EXIT,
             stdout=_as_text(exc.stdout),
-            stderr=_as_text(exc.stderr),
+            stderr=stderr,
             timed_out=True,
         )
+    stderr = completed.stderr
+    if limits.mode == "advisory":
+        stderr = _strip_advisory_limiter_warnings(stderr)
     return CommandResult(
         command=command,
         exit_code=completed.returncode,
         stdout=completed.stdout,
-        stderr=completed.stderr,
+        stderr=stderr,
         timed_out=completed.returncode == TIMEOUT_EXIT,
     )
 

@@ -37,7 +37,7 @@ def test_advisory_runs_the_real_limiter_on_an_offline_host(
     )
     assert result.ok, result.stderr
     assert result.stdout == "limited"
-    assert "WARNING advisory mode" in result.stderr
+    assert result.stderr == ""
     assert "limits are NOT enforced" in caplog.text
 
 

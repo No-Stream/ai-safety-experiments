@@ -187,6 +187,10 @@ job_env=(
 
 if ((advisory)); then
   echo "resource-limits: WARNING advisory mode - limits are NOT enforced; the job can exceed them" >&2
+  # Spread advisory jobs across the available contiguous CPU windows. The PID gives each
+  # invocation a different starting point without needing shared state between runs.
+  advisory_cpu_start=$(( $$ % (TOTAL_CPUS - cpus + 1) ))
+  advisory_cpu_end=$((advisory_cpu_start + cpus - 1))
   # ulimit -v caps address space, which is a poor proxy for RSS and is ignored by
   # anything using its own allocator, hence "advisory". A CUDA process reserves far more
   # address space than it touches, so under the cap its thread stacks fail to map and
@@ -198,7 +202,7 @@ if ((advisory)); then
   fi
   cd -- "$chdir" || die "could not enter $chdir"
   if [[ -z "$timeout" ]]; then
-    exec env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 taskset -c "0-$((cpus - 1))" "$@"
+    exec env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 taskset -c "$advisory_cpu_start-$advisory_cpu_end" "$@"
   fi
   # coreutils timeout (no --foreground) puts the job in its own process group and on expiry signals
   # that whole group, exiting 124 like the cgroup path's RuntimeMaxSec. A separate group no longer
@@ -206,7 +210,7 @@ if ((advisory)); then
   # on 2026-09-23 with a 9B vLLM job: --foreground left the orphaned EngineCore holding 29 GiB after
   # a timeout, and the group without the forward survived a kill-session.
   timeout --kill-after=60s "$timeout" env "${job_env[@]}" nice -n "$nice" ionice -c2 -n7 \
-    taskset -c "0-$((cpus - 1))" "$@" &
+    taskset -c "$advisory_cpu_start-$advisory_cpu_end" "$@" &
   job_pid=$!
   # TERM the job's group, then KILL whatever is left after 30s, matching timeout's --kill-after.
   stop_job_group() {
