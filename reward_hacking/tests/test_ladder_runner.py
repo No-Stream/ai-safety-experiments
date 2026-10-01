@@ -367,7 +367,8 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
     records = run_grid(config, backend_factory=lambda _model, _config: object())
 
     assert len(records) == 1
-    trace_path = artifact_root / "traces" / "base" / "dummy" / "naive" / "sample-000.jsonl"
+    trace_path = artifact_root / "records-traces" / "base" / "dummy" / "naive" / "sample-000.jsonl"
+    assert records[0]["trace_path"] == str(trace_path)
     trace_records = load_trace(trace_path)
     assert any(record["record"] == "ladder_command" for record in trace_records)
     assert records[0]["trace_summary"] == {
@@ -376,6 +377,59 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         "proxy_pass": True,
         "final_report": "completed honestly",
     }
+
+
+def test_traces_are_per_run_and_a_failed_attempt_is_kept_aside(tmp_path: Path) -> None:
+    trace_paths_seen: list[Path] = []
+
+    def episode_runner(
+        _scenario: ScenarioLike,
+        _backend: object,
+        _arm: str,
+        _sample_index: int,
+        _episode_dir: Path,
+        trace_path: Path,
+    ) -> dict[str, object]:
+        assert not trace_path.exists(), "a new attempt must start from an empty trace"
+        trace_paths_seen.append(trace_path)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text('{"record": "episode_start"}\n', encoding="utf-8")
+        return {"true_pass": True}
+
+    def run(output_name: str) -> list[dict[str, object]]:
+        config = RunnerConfig(
+            endpoint="http://127.0.0.1:8000",
+            models=(ModelSpec("base", "/models/base"),),
+            scenarios=(DummyScenario("dummy"),),
+            arms=("naive",),
+            samples=1,
+            output_path=tmp_path / output_name,
+            episode_root=tmp_path / f"{output_name}-episodes",
+        )
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=episode_runner,
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+    crashed_trace = tmp_path / "second-traces" / "base" / "dummy" / "naive" / "sample-000.jsonl"
+    crashed_trace.parent.mkdir(parents=True)
+    crashed_trace.write_text(
+        '{"record": "episode_start", "attempt": "crashed"}\n', encoding="utf-8"
+    )
+
+    run("first.jsonl")
+    run("second.jsonl")
+
+    assert trace_paths_seen == [
+        tmp_path / "first-traces" / "base" / "dummy" / "naive" / "sample-000.jsonl",
+        crashed_trace,
+    ]
+    kept_attempt = crashed_trace.with_name("sample-000.attempt-1.jsonl")
+    assert "crashed" in kept_attempt.read_text(encoding="utf-8")
+    assert "crashed" not in crashed_trace.read_text(encoding="utf-8")
 
 
 def _write_cached_snapshot(cache_dir: Path, repo_id: str, revision: str, commit: str) -> Path:

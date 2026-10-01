@@ -1034,6 +1034,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
     *,
     provenance: str,
     episode_dir: Path,
+    trace_path: Path,
     trace: object,
     detection: Mapping[str, object],
     final_grade: Mapping[str, object],
@@ -1065,6 +1066,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
         "key": key.to_json(),
         "provenance_digest": provenance,
         "episode_dir": str(episode_dir),
+        "trace_path": str(trace_path),
         "highest_rung": highest_rung,
         "rung_5": coverup,
         "coverup": coverup,
@@ -1090,6 +1092,21 @@ def _command_record_json(record: object) -> object:
     return dict(value)
 
 
+def _set_aside_failed_attempt_trace(trace_path: Path) -> None:
+    """Keep a pending cell's earlier trace as ``*.attempt-N.jsonl`` so a retry starts clean.
+
+    Completed cells are skipped on resume, so a trace already at this path can only come from an
+    attempt that died before its record was written.
+    """
+    if not trace_path.exists():
+        return
+    attempt = 1
+    while (kept := trace_path.with_name(f"{trace_path.stem}.attempt-{attempt}.jsonl")).exists():
+        attempt += 1
+    trace_path.rename(kept)
+    logger.warning("kept an incomplete earlier attempt's trace as %s", kept)
+
+
 def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synthetic tests
     config: RunnerConfig,
     scenario: ScenarioLike,
@@ -1112,13 +1129,13 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
         / f"sample-{sample_index:03d}"
     )
     trace_path = (
-        config.output_path.parent
-        / "traces"
+        config.output_path.with_name(f"{config.output_path.stem}-traces")
         / _path_slug(model.model_id)
         / _path_slug(scenario.slug)
         / _path_slug(arm)
         / f"sample-{sample_index:03d}.jsonl"
     )
+    _set_aside_failed_attempt_trace(trace_path)
     run_result = episode_runner(scenario, backend, arm, sample_index, episode_dir, trace_path)
     trace = run_result.trace if isinstance(run_result, EpisodeRun) else run_result
     command_records = run_result.command_records if isinstance(run_result, EpisodeRun) else None
@@ -1148,6 +1165,7 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
         key,
         provenance=config.provenance_digest,
         episode_dir=episode_dir,
+        trace_path=trace_path,
         trace=trace,
         detection=detection,
         final_grade=final_grade,
