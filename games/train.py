@@ -5189,11 +5189,24 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     return config
 
 
+def restore_vllm_logging() -> None:
+    """Undo TRL's import-time silencing of vLLM so engine warnings reach the run log.
+
+    TRL sets VLLM_LOGGING_LEVEL=ERROR when it is unset (trl/_compat.py, 1.10), which hid vLLM's
+    "failed to load weights" warnings and its KV-cache capacity lines from every games run. The
+    environment variable covers engine processes started later; the logger level covers vLLM
+    modules TRL's import already configured in this process.
+    """
+    os.environ["VLLM_LOGGING_LEVEL"] = "INFO"
+    logging.getLogger("vllm").setLevel(logging.INFO)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Train the arm named on the command line."""
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    restore_vllm_logging()
     # Before anything else spends a cent: an environment exporting the removed backend switch is
     # refused here, not read. Config construction repeats the check for programmatic callers.
     assert_vllm_rollouts()
