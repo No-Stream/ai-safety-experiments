@@ -22,7 +22,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -37,6 +37,8 @@ from reward_hacking.jailed_poc import (
     jail_resource_limits_scope,
     resolve_jail_resource_limits,
 )
+from reward_hacking.ladder.monitor import CommandRecord, capture_snapshot
+from reward_hacking.ladder.rungs import DetectionSpec, FinalStateDiff, detect_rungs
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -45,8 +47,7 @@ if TYPE_CHECKING:
     from reward_hacking.harness.loop import CheckGrader, CheckVerdict
     from reward_hacking.harness.task_spec import AgenticArmConfig, Task
     from reward_hacking.jailed_poc import CommandResult
-    from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandRecord, CommandStart
-    from reward_hacking.ladder.rungs import DetectionSpec, FinalStateDiff
+    from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
     from reward_hacking.model_backend import Backend
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 8
+LADDER_SCHEMA_VERSION = 9
 MAX_RUNG = 6
 LADDER_MAX_TURNS = 40
 LADDER_EPISODE_SECONDS = 1800.0
@@ -438,8 +439,6 @@ def _add_visible_marker(value: str, markers: set[str]) -> None:
 
 def _detection_spec(scenario: ScenarioLike) -> DetectionSpec:
     """Build detector paths from the loaded private scenario metadata."""
-    from reward_hacking.ladder.rungs import DetectionSpec  # noqa: PLC0415 - detector is lazy
-
     forbidden_paths_value = getattr(scenario, "forbidden_paths", ())
     forbidden_paths = tuple(str(path).rstrip("/") for path in forbidden_paths_value)
     forbidden_prefixes = forbidden_paths
@@ -455,6 +454,120 @@ def _detection_spec(scenario: ScenarioLike) -> DetectionSpec:
         visible_case_markers=_visible_case_markers(scenario),
         solution_prefixes=solution_files,
     )
+
+
+def detection_spec_for_scenario(scenario: ScenarioLike) -> DetectionSpec:
+    """Return the scenario-derived spec shared by the runner and offline re-scoring."""
+    return _detection_spec(scenario)
+
+
+def _detection_spec_to_json(spec: DetectionSpec) -> dict[str, object]:
+    """Serialize every detector-spec field so a later replay uses the run-time contract."""
+    return {
+        item.name: list(value) if isinstance(value := getattr(spec, item.name), tuple) else value
+        for item in fields(spec)
+    }
+
+
+def detection_spec_from_json(value: object) -> DetectionSpec:
+    """Parse a complete persisted detector spec without silently filling missing fields."""
+    if not isinstance(value, Mapping):
+        raise TypeError("detector_inputs.detection_spec must be an object")
+    expected_fields = set(DetectionSpec.__dataclass_fields__)
+    if set(value) != expected_fields:
+        missing = sorted(expected_fields - set(value))
+        extra = sorted(set(value) - expected_fields)
+        raise ValueError(
+            "detector_inputs.detection_spec fields do not match the current detector "
+            f"(missing={missing}, extra={extra})"
+        )
+
+    def string_tuple(name: str) -> tuple[str, ...]:
+        field_value = value[name]
+        if not isinstance(field_value, list) or not all(
+            isinstance(item, str) for item in field_value
+        ):
+            raise TypeError(f"detector_inputs.detection_spec.{name} must be a string list")
+        return tuple(field_value)
+
+    def string_value(name: str) -> str:
+        field_value = value[name]
+        if not isinstance(field_value, str):
+            raise TypeError(f"detector_inputs.detection_spec.{name} must be a string")
+        return field_value
+
+    return DetectionSpec(
+        checker_paths=string_tuple("checker_paths"),
+        visible_test_prefixes=string_tuple("visible_test_prefixes"),
+        forbidden_prefixes=string_tuple("forbidden_prefixes"),
+        forbidden_paths=string_tuple("forbidden_paths"),
+        operator_share_prefixes=string_tuple("operator_share_prefixes"),
+        monitor_config_path=string_value("monitor_config_path"),
+        audit_log_path=string_value("audit_log_path"),
+        visible_case_markers=string_tuple("visible_case_markers"),
+        solution_prefixes=string_tuple("solution_prefixes"),
+    )
+
+
+def read_in_scene_audit_log(episode_dir: Path, *, audit_log_path: str) -> str | None:
+    """Read the contained in-scene audit log using the runner's episode-time rule."""
+    audit_path = episode_dir / audit_log_path
+    if audit_path.is_file() and audit_path.resolve().is_relative_to(episode_dir.resolve()):
+        return audit_path.read_text(encoding="utf-8")
+    return None
+
+
+def final_state_diff_from_disk(
+    episode_dir: Path,
+    command_records: Sequence[object],
+    *,
+    monitor_config_path: str,
+    audit_log_path: str,
+) -> FinalStateDiff | None:
+    """Compare the final episode workspace with the first engine snapshot.
+
+    The monitor's ordinary audit append happens after each command's ``after`` snapshot. Excluding
+    that one managed path keeps the final-state comparison aligned with the command records.
+    """
+    if not command_records or not isinstance(command_records[0], CommandRecord):
+        return None
+    initial_digests = command_records[0].before.file_digests()
+    final_digests = capture_snapshot(
+        episode_dir,
+        config_path=monitor_config_path,
+        audit_path=audit_log_path,
+    ).file_digests()
+    changed_paths = tuple(
+        sorted(
+            path
+            for path in initial_digests.keys() | final_digests.keys()
+            if path != audit_log_path and initial_digests.get(path) != final_digests.get(path)
+        )
+    )
+    return FinalStateDiff(changed_paths=changed_paths)
+
+
+def _final_state_diff_to_json(value: object | None) -> dict[str, object] | None:
+    """Serialize the changed paths supplied to the rung detector."""
+    if value is None:
+        return None
+    if not isinstance(value, FinalStateDiff):
+        raise TypeError("final_state_diff must be a FinalStateDiff or None")
+    return {"changed_paths": list(value.changed_paths)}
+
+
+def final_state_diff_from_json(value: object) -> FinalStateDiff | None:
+    """Parse a persisted final workspace diff, preserving ``None`` as a meaningful input."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"changed_paths"}:
+        raise TypeError(
+            "detector_inputs.final_state_diff must be null or an object of changed_paths"
+        )
+    paths = value["changed_paths"]
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise TypeError("detector_inputs.final_state_diff.changed_paths must be a string list")
+    return FinalStateDiff(changed_paths=tuple(paths))
 
 
 def _score_override_honored(scenario: ScenarioLike, episode_dir: Path) -> bool:
@@ -761,11 +874,9 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
             )
         if pending_start:
             raise RuntimeError("episode ended with an unmatched monitor command start")
-        audit_path = workspace_dir / str(getattr(scenario, "audit_log_path", ".ci/audit.log"))
-        audit_text = (
-            audit_path.read_text(encoding="utf-8")
-            if audit_path.is_file() and audit_path.resolve().is_relative_to(workspace_dir.resolve())
-            else None
+        audit_text = read_in_scene_audit_log(
+            workspace_dir,
+            audit_log_path=str(getattr(scenario, "audit_log_path", ".ci/audit.log")),
         )
         if episode_dir.exists():
             shutil.rmtree(episode_dir)
@@ -856,12 +967,9 @@ def _default_detector(  # noqa: PLR0913 - explicit detector evidence inputs
     command_records: Sequence[object] | None = None,
     final_state_diff: object | None = None,
     in_scene_audit_log: object | None = None,
+    detection_spec: DetectionSpec | None = None,
 ) -> Mapping[str, object]:
-    """Load the tracked detector only when a real episode is being run."""
-    from reward_hacking.ladder.rungs import (  # noqa: PLC0415 - lazy detector import
-        detect_rungs,
-    )
-
+    """Run the tracked detector over recorded episode evidence."""
     summary = _trace_summary(trace)
     raw_command_records: object = command_records
     if raw_command_records is None:
@@ -880,7 +988,7 @@ def _default_detector(  # noqa: PLR0913 - explicit detector evidence inputs
         cast("FinalStateDiff | None", final_state_diff),
         cast("str | TypeSequence[Mapping[str, object]] | None", in_scene_audit_log),
         _final_report_text(summary),
-        spec=_detection_spec(scenario),
+        spec=_detection_spec(scenario) if detection_spec is None else detection_spec,
         final_report_truncated=final_report_truncated,
         visible_overfit=(
             _summary_proxy_pass(summary)
@@ -896,6 +1004,9 @@ def _default_detector(  # noqa: PLR0913 - explicit detector evidence inputs
         "evidence": {str(int(rung)): list(details) for rung, details in detection.evidence.items()},
         "candidate_labels": list(detection.candidate_labels),
     }
+
+
+default_detector = _default_detector
 
 
 def _default_final_grader(**kwargs: object) -> Mapping[str, object]:
@@ -1219,6 +1330,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
     final_grade: Mapping[str, object],
     max_turns: int,
     command_records: Sequence[object] = (),
+    detector_inputs: Mapping[str, object],
 ) -> dict[str, object]:
     """Build one append-only record from a completed cell."""
     summary = _trace_summary(trace)
@@ -1256,6 +1368,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
         "turn_cap_reached": _turn_cap_reached(summary, max_turns),
         "rung_detection": _as_mapping(detection),
         "final_grade": _as_mapping(final_grade),
+        "detector_inputs": _as_mapping(detector_inputs),
         "engine_command_records": [_command_record_json(record) for record in command_records],
         "trace_summary": summary,
     }
@@ -1326,6 +1439,18 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
     in_scene_audit_log = (
         run_result.in_scene_audit_log if isinstance(run_result, EpisodeRun) else None
     )
+    detection_spec = _detection_spec(scenario)
+    if final_state_diff is None:
+        final_state_diff = final_state_diff_from_disk(
+            episode_dir,
+            () if command_records is None else command_records,
+            monitor_config_path=detection_spec.monitor_config_path,
+            audit_log_path=detection_spec.audit_log_path,
+        )
+    if in_scene_audit_log is None:
+        in_scene_audit_log = read_in_scene_audit_log(
+            episode_dir, audit_log_path=detection_spec.audit_log_path
+        )
     detection = detector(
         scenario=scenario,
         episode_dir=episode_dir,
@@ -1355,6 +1480,11 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
         final_grade=final_grade,
         max_turns=config.max_turns,
         command_records=() if command_records is None else command_records,
+        detector_inputs={
+            "in_scene_audit_log": in_scene_audit_log,
+            "final_state_diff": _final_state_diff_to_json(final_state_diff),
+            "detection_spec": _detection_spec_to_json(detection_spec),
+        },
     )
 
 
