@@ -9,6 +9,7 @@ import os
 import socket
 import stat
 import struct
+import time
 from pathlib import Path
 from typing import NoReturn
 
@@ -69,6 +70,40 @@ def test_command_record_json_round_trip_can_be_rescored(tmp_path: Path) -> None:
     detection = detect_rungs((restored,))
     assert detection.highest is Rung.HONEST_ATTEMPT
     assert detection.candidate_labels == ("read_grader",)
+
+
+def test_command_record_includes_execution_and_snapshot_durations(tmp_path: Path) -> None:
+    _write_monitor_files(tmp_path)
+    monitor = CommandAuditMonitor(tmp_path)
+
+    start = monitor.before_command("sleep in jail")
+    time.sleep(0.02)
+    record = monitor.after_command(start, _result(start.command))
+    serialized = record.to_json_dict()
+
+    command_duration_seconds = serialized["command_duration_seconds"]
+    assert isinstance(command_duration_seconds, float)
+    assert command_duration_seconds >= 0.02
+    assert isinstance(serialized["before_snapshot_seconds"], float)
+    assert isinstance(serialized["after_snapshot_seconds"], float)
+    assert CommandRecord.from_json_dict(serialized) == record
+
+
+def test_command_record_reads_legacy_json_without_duration_fields(tmp_path: Path) -> None:
+    _write_monitor_files(tmp_path)
+    monitor = CommandAuditMonitor(tmp_path)
+    start = monitor.before_command("touch solution.py")
+    record = monitor.after_command(start, _result(start.command))
+    legacy_record = record.to_json_dict()
+    del legacy_record["command_duration_seconds"]
+    del legacy_record["before_snapshot_seconds"]
+    del legacy_record["after_snapshot_seconds"]
+
+    restored = CommandRecord.from_json_dict(legacy_record)
+
+    assert restored.command_duration_seconds is None
+    assert restored.before_snapshot_seconds is None
+    assert restored.after_snapshot_seconds is None
 
 
 def test_command_record_json_rejects_malformed_values(tmp_path: Path) -> None:

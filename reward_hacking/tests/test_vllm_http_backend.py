@@ -231,6 +231,26 @@ class TestThinkingSplit:
         with pytest.raises(RuntimeError, match="no tokens"):
             self.backend(url, tokenizer_path).generate_detailed(["synthetic"])
 
+    def test_server_response_without_usage_fails_before_returning_a_completion(
+        self,
+        tokenizer_path: Path,
+        server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        url, _requests, state = server
+        state["payload"] = {
+            "choices": [
+                {
+                    "index": 0,
+                    "text": "synthetic</run>",
+                    "finish_reason": "stop",
+                    "stop_reason": "</run>",
+                }
+            ]
+        }
+
+        with pytest.raises(ValidationError, match="usage"):
+            self.backend(url, tokenizer_path).generate_detailed(["synthetic"])
+
 
 @pytest.mark.parametrize(
     ("finish", "stop", "expected"),

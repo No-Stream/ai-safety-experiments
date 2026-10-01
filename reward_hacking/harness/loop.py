@@ -606,10 +606,16 @@ class AgentTurn:
     ``stop_reason`` and ``output_tokens`` are what the transport reports, and both default to
     ``None`` -- the field present and empty, never an estimate -- for the transports that report
     nothing (the mock and codex backends, and every trace written before the fields existed). They
-    are recorded because a completion cut off at the output cap is indistinguishable from its text
-    alone from a policy that chose to say nothing: turns truncated at a 2048-token cap read as
-    refusals, and no field on disk could tell the two apart short of paying for the run again. The
-    local backends label them too, derived from the generated token ids (see
+    stay optional in the trace for older backends and records. ``prompt_tokens`` comes from the
+    server's usage block when the detailed backend reports it; ``generation_seconds`` measures the
+    full backend call, including any continuation requests within this turn. Both are ``None`` when
+    the transport cannot report the value.
+
+    The sampling fields are recorded because a completion cut off at the output cap is
+    indistinguishable from its text alone from a policy that chose to say nothing: turns truncated
+    at a 2048-token cap read as refusals, and no field on disk could tell the two apart short of
+    paying for the run again. The local backends label stop reason and output token count too,
+    derived from the generated token ids (see
     ``HFBackend.generate_detailed``), so a truncated local turn is no longer the unlabelled case.
 
     ``reasoning`` is the readable thinking trace, kept strictly beside ``completion`` and never
@@ -628,6 +634,8 @@ class AgentTurn:
     stop_reason: str | None = None
     output_tokens: int | None = None
     reasoning: str = ""
+    prompt_tokens: int | None = None
+    generation_seconds: float | None = None
 
     @property
     def hit_output_cap(self) -> bool:
@@ -1048,6 +1056,8 @@ def _turn_record(episode_id: str, task_id: str, turn: AgentTurn) -> dict[str, ob
         "reasoning": turn.reasoning,
         "stop_reason": turn.stop_reason,
         "output_tokens": turn.output_tokens,
+        "prompt_tokens": turn.prompt_tokens,
+        "generation_seconds": turn.generation_seconds,
         "fabricated_results": turn.fabricated_results,
         "commands": _command_records(turn.commands),
     }
@@ -1347,12 +1357,21 @@ def _reason_for(ending: Action | None, kind: ActionKind) -> str | None:
 
 
 @dataclass(frozen=True)
+class _GeneratedResponse:
+    """One response and the wall clock spent sampling it, including backend continuations."""
+
+    response: RawResponse
+    generation_seconds: float
+
+
+@dataclass(frozen=True)
 class _SampledTurn:
     """What one bounded sampling attempt produced: a response, or the phase the clock ended it in."""
 
     response: RawResponse | None
     engine_wait_seconds: float
     deadline_phase: DeadlinePhase | None
+    generation_seconds: float | None = None
 
 
 FINAL_REPORT_PROMPT = (
@@ -1407,7 +1426,7 @@ def _sample_final_report(
 
 def _generate_on_daemon_thread(
     backend: Backend, transcript: str, *, engine_gate: SharedEngineGate | None
-) -> tuple[threading.Thread, list[RawResponse | BaseException]]:
+) -> tuple[threading.Thread, list[_GeneratedResponse | BaseException]]:
     """Start one turn's generation on a daemon thread that releases ``engine_gate`` when it returns.
 
     A daemon so a generation the episode abandons cannot keep the interpreter alive at exit. The
@@ -1415,11 +1434,18 @@ def _generate_on_daemon_thread(
     returns, whatever the episode decided meanwhile, and a sibling admitted before then would be
     driving the same engine -- the deadlock :data:`SHARED_ENGINE_TRANSPORTS` describes.
     """
-    outcome: list[RawResponse | BaseException] = []
+    outcome: list[_GeneratedResponse | BaseException] = []
 
     def run() -> None:
         try:
-            outcome.append(generate_raw(backend, [transcript])[0])
+            started_at = time.monotonic()
+            response = generate_raw(backend, [transcript])[0]
+            outcome.append(
+                _GeneratedResponse(
+                    response=response,
+                    generation_seconds=time.monotonic() - started_at,
+                )
+            )
         except BaseException as exc:  # noqa: BLE001 - carried across threads, never swallowed
             # HARNESS-SCAN-EXEMPT-broad-except: _sample_within_budget re-raises this verbatim
             outcome.append(exc)
@@ -1481,7 +1507,12 @@ def _sample_within_budget(  # noqa: PLR0913 - the episode's own bookkeeping, thr
     result = outcome[0]
     if isinstance(result, BaseException):
         raise result
-    return _SampledTurn(result, waited, None)
+    return _SampledTurn(
+        result.response,
+        waited,
+        None,
+        generation_seconds=result.generation_seconds,
+    )
 
 
 @dataclass(frozen=True)
@@ -1716,6 +1747,8 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
                 stop_reason=sampled.stop_reason,
                 output_tokens=sampled.output_tokens,
                 reasoning=sampled.reasoning,
+                prompt_tokens=sampled.input_tokens,
+                generation_seconds=attempt.generation_seconds,
             )
         )
         _append_trace_records(trace_path, [_turn_record(episode_id, task.task_id, turns[-1])])

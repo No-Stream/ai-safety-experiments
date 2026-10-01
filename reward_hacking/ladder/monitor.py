@@ -12,10 +12,12 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import math
 import os
 import stat
 import struct
 import sys
+import time
 import tomllib
 import weakref
 from collections.abc import Mapping
@@ -360,6 +362,8 @@ class CommandStart:
     command: str
     snapshot: WorkspaceSnapshot
     mutation_monitor: WorkspaceMutationMonitor
+    before_snapshot_seconds: float
+    command_started_at: float
 
     def __post_init__(self) -> None:
         """Close the watcher when an interrupted command drops its pending start record."""
@@ -376,6 +380,9 @@ class CommandRecord:
     after: WorkspaceSnapshot
     audit_appended: bool
     observed_changed_paths: tuple[str, ...] = ()
+    command_duration_seconds: float | None = None
+    before_snapshot_seconds: float | None = None
+    after_snapshot_seconds: float | None = None
 
     @property
     def command(self) -> str:
@@ -428,6 +435,9 @@ class CommandRecord:
             "before_snapshot": self.before.to_json_dict(),
             "after_snapshot": self.after.to_json_dict(),
             "observed_changed_paths": list(self.observed_changed_paths),
+            "command_duration_seconds": self.command_duration_seconds,
+            "before_snapshot_seconds": self.before_snapshot_seconds,
+            "after_snapshot_seconds": self.after_snapshot_seconds,
         }
 
     @classmethod
@@ -450,6 +460,9 @@ class CommandRecord:
         audit_appended = _required_bool(record, "audit_appended")
         audit_log_size_before = _required_optional_int(record, "audit_log_size_before")
         audit_log_size_after = _required_optional_int(record, "audit_log_size_after")
+        command_duration_seconds = _required_optional_float(record, "command_duration_seconds")
+        before_snapshot_seconds = _required_optional_float(record, "before_snapshot_seconds")
+        after_snapshot_seconds = _required_optional_float(record, "after_snapshot_seconds")
 
         snapshot_keys = ("before_snapshot", "after_snapshot", "observed_changed_paths")
         present_snapshot_keys = tuple(key for key in snapshot_keys if key in record)
@@ -496,6 +509,9 @@ class CommandRecord:
             after=after,
             audit_appended=audit_appended,
             observed_changed_paths=tuple(observed_changed_paths),
+            command_duration_seconds=command_duration_seconds,
+            before_snapshot_seconds=before_snapshot_seconds,
+            after_snapshot_seconds=after_snapshot_seconds,
         )
         if list(reconstructed.changed_paths) != changed_paths:
             raise ValueError("command record changed_paths do not match its snapshots")
@@ -550,6 +566,19 @@ def _required_optional_int(data: Mapping[str, object], key: str) -> int | None:
     if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
         raise TypeError(f"command record.{key} must be an int or None")
     return value
+
+
+def _required_optional_float(data: Mapping[str, object], key: str) -> float | None:
+    """Read a missing, null, or finite nonnegative duration from a legacy-compatible record."""
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"command record.{key} must be a number or null")
+    duration = float(value)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError(f"command record.{key} must be finite and nonnegative")
+    return duration
 
 
 def _digest_file(path: Path) -> str:
@@ -698,11 +727,13 @@ class CommandAuditMonitor:
 
     def before_command(self, command: str) -> CommandStart:
         """Capture the engine state before executing ``command``."""
+        snapshot_started_at = time.monotonic()
         snapshot = capture_snapshot(
             self.episode_dir,
             config_path=self.config_path,
             audit_path=self.audit_path,
         )
+        before_snapshot_seconds = time.monotonic() - snapshot_started_at
         mutation_monitor = WorkspaceMutationMonitor(self.episode_dir)
         mutation_monitor.__enter__()
         return CommandStart(
@@ -710,6 +741,8 @@ class CommandAuditMonitor:
             command=command,
             snapshot=snapshot,
             mutation_monitor=mutation_monitor,
+            before_snapshot_seconds=before_snapshot_seconds,
+            command_started_at=time.monotonic(),
         )
 
     def _append_audit_record(self, start: CommandStart, result: CommandResult) -> bool:
@@ -732,14 +765,17 @@ class CommandAuditMonitor:
 
     def after_command(self, start: CommandStart, result: CommandResult) -> CommandRecord:
         """Capture post-command state, conditionally append the scene audit record, and retain it."""
+        command_finished_at = time.monotonic()
         try:
             if result.command != start.command:
                 raise ValueError("command result does not match its CommandStart")
+            snapshot_started_at = time.monotonic()
             after = capture_snapshot(
                 self.episode_dir,
                 config_path=self.config_path,
                 audit_path=self.audit_path,
             )
+            after_snapshot_seconds = time.monotonic() - snapshot_started_at
             observed_changed_paths = start.mutation_monitor.changed_paths
             if not start.mutation_monitor.event_stream_reliable:
                 raise RuntimeError("workspace mutation event stream became unreliable")
@@ -755,6 +791,9 @@ class CommandAuditMonitor:
             after=after,
             audit_appended=append_audit,
             observed_changed_paths=observed_changed_paths,
+            command_duration_seconds=command_finished_at - start.command_started_at,
+            before_snapshot_seconds=start.before_snapshot_seconds,
+            after_snapshot_seconds=after_snapshot_seconds,
         )
         self.records.append(record)
         return record

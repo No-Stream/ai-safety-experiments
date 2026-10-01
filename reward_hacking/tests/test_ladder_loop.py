@@ -53,6 +53,51 @@ def _successful_grade(_task: Task, _episode_dir: Path, **_kwargs: object) -> loo
 class TestLadderCommandHooks:
     """Hooks observe every policy command while the trace keeps its own record."""
 
+    def test_turn_trace_records_server_prompt_usage_and_full_generation_time(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        class SlowDetailedBackend(MockBackend):
+            def generate_detailed(self, prompts: list[str]) -> list[BedrockCompletion]:
+                del prompts
+                # Represent two synchronous continuation requests within one backend call.
+                time.sleep(0.02)
+                time.sleep(0.02)
+                return [
+                    BedrockCompletion(
+                        text="<run>touch marker.txt</run>",
+                        reasoning="",
+                        usage=TokenUsage(input_tokens=23, output_tokens=7),
+                        stop_reason="end_turn",
+                    )
+                ]
+
+        monkeypatch.setattr(
+            loop,
+            "run_in_jail",
+            lambda _directory, command, **_kwargs: CommandResult(
+                command=command,
+                exit_code=0,
+                stdout="",
+                stderr="",
+                timed_out=False,
+            ),
+        )
+        monkeypatch.setattr(loop, "_grade_final_state", _successful_grade)
+
+        trace = loop.run_agent_episode(
+            _dummy_task(),
+            SlowDetailedBackend(["unused"], model_id="dummy"),
+            episode_dir=tmp_path / "usage",
+            max_turns=1,
+        )
+
+        record = trace.turn_records()[0]
+        generation_seconds = record["generation_seconds"]
+        assert record["prompt_tokens"] == 23
+        assert record["output_tokens"] == 7
+        assert isinstance(generation_seconds, float)
+        assert generation_seconds >= 0.04
+
     def test_before_and_after_hooks_wrap_each_action(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
