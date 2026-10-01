@@ -30,7 +30,7 @@ note stands until someone who owns that package makes it.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import torch
@@ -53,6 +53,8 @@ DEFAULT_VRAM_USABLE_FRACTION = 0.9
 
 BYTES_PER_FLOAT32 = 4
 BYTES_PER_BFLOAT16 = 2
+BYTES_PER_FP8 = 1
+KV_CACHE_DTYPES = ("auto", "fp8")
 
 # The per-sequence arithmetic here is a LOWER BOUND, not a budget, and this is the measured
 # constant that turns it into a predictor. `docs/scratch/measured-throughput.md` ran the real
@@ -161,6 +163,20 @@ def sequence_cost(text_config: object) -> SequenceCost:
 def checkpoint_sequence_cost(model_id: str) -> SequenceCost:
     """Read the cost terms straight from a hub checkpoint's config."""
     return sequence_cost(AutoConfig.from_pretrained(model_id).get_text_config())
+
+
+def vllm_sequence_cost(cost: SequenceCost, *, kv_cache_dtype: str = "auto") -> SequenceCost:
+    """Return an unpadded vLLM rollout payload estimate for the selected cache dtype.
+
+    This view changes only the full-attention KV payload. It excludes hybrid-page padding and
+    allocator overhead, so it is useful for recording the dtype's arithmetic effect and does not
+    estimate the engine's actual capacity. The trainer-side sizing path continues to use ``cost``.
+    """
+    if kv_cache_dtype not in KV_CACHE_DTYPES:
+        raise ValueError(f"kv_cache_dtype must be one of {KV_CACHE_DTYPES}, got {kv_cache_dtype!r}")
+    if kv_cache_dtype == "auto":
+        return cost
+    return replace(cost, kv_bytes_per_token=cost.kv_bytes_per_token // 2)
 
 
 def count_meta_parameters(model_id: str) -> int:

@@ -49,6 +49,7 @@ scored, still logged and still in the rollout trace.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -71,6 +72,7 @@ from torch.nn.attention import SDPBackend
 from transformers import AutoConfig, TrainerCallback
 from transformers.utils.import_utils import is_torch_tf32_available
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
+from trl.generation import vllm_generation
 from trl.trainer.utils import selective_log_softmax
 
 from games.arms import (
@@ -172,6 +174,7 @@ from games.sizing import (
     colocate_reserved_gib,
     count_meta_parameters,
     plan_sizing,
+    vllm_sequence_cost,
 )
 
 # Re-exported deliberately: several stage runners import these from here, and the numbers plus the
@@ -213,7 +216,7 @@ from grpo.throughput import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from datasets import Dataset
     from torch.utils.data import DataLoader
@@ -225,6 +228,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-4B"
+VLLM_KV_CACHE_DTYPES = ("auto", "fp8")
+# TRITON_ATTN serves an fp8 KV cache without JIT compilation; vLLM picks FlashInfer for fp8 by
+# default, and FlashInfer compiles those kernels with nvcc, which a pip-only CUDA stack lacks.
+VLLM_ATTENTION_BACKENDS = ("auto", "TRITON_ATTN")
 # Plumbing only -- its behaviour says nothing about the research question. Kept on Qwen3-0.6B, the
 # one checkpoint in the ladder whose template does not prefill `<think>`, because every Qwen3.5 tier
 # measured (0.8B, 2B, 4B) fails to terminate its thinking on a game prompt at any affordable budget
@@ -574,6 +581,8 @@ RESUME_IDENTITY_FIELDS = (
     "vllm_importance_sampling_mode",
     "cast_lm_head_to_fp32",
     "single_forward_vllm_importance_sampling",
+    "vllm_kv_cache_dtype",
+    "vllm_attention_backend",
     # Dynamic sampling decides WHICH PROMPTS an optimizer step trains on: at 1 the step trains the
     # sampler's own draw, above it the live subset of a wider draw. A resume that moved it would put
     # steps trained on two different selections under one step history, and the wider draw also
@@ -610,6 +619,8 @@ RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
     "vllm_importance_sampling_mode": VLLM_IMPORTANCE_SAMPLING_MODE,
     "cast_lm_head_to_fp32": False,
     "single_forward_vllm_importance_sampling": False,
+    "vllm_kv_cache_dtype": "auto",
+    "vllm_attention_backend": "auto",
     "dynamic_sampling_oversample": 1,
     "mask_truncated_completions": False,
     "tail_length_penalty_start": None,
@@ -799,6 +810,10 @@ class GameTrainConfig:
     # no backend field because there is no backend choice (games.generation.VLLM_ONLY_RATIONALE).
     # These two knobs tune the engine; nothing turns it off.
     vllm_gpu_memory_utilization: float = VLLM_COLOCATE_GPU_FRACTION
+    # vLLM-only opt-in. The trainer's own attention and activation arithmetic remains bf16; the
+    # sizing seam applies this only to the cache held by the colocated engine.
+    vllm_kv_cache_dtype: str = "auto"
+    vllm_attention_backend: str = "auto"
     # Opt-in handoff: sleep the engine during training and move the policy out while it wakes.
     colocate_sleep_offload: bool = False
     # Opt-in: skip Liger's full-vocabulary gradient buffers for the frozen lm_head (~6 GiB at 9B).
@@ -1196,6 +1211,16 @@ class GameTrainConfig:
                 f"share of the card for the life of the run, so the trainer needs the rest -- got "
                 f"{self.vllm_gpu_memory_utilization}"
             )
+        if self.vllm_kv_cache_dtype not in VLLM_KV_CACHE_DTYPES:
+            raise ValueError(
+                f"vllm_kv_cache_dtype must be one of {VLLM_KV_CACHE_DTYPES}, got "
+                f"{self.vllm_kv_cache_dtype!r}"
+            )
+        if self.vllm_attention_backend not in VLLM_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"vllm_attention_backend must be one of {VLLM_ATTENTION_BACKENDS}, got "
+                f"{self.vllm_attention_backend!r}"
+            )
         if importlib.util.find_spec("vllm") is None:
             raise ValueError(
                 "vllm is not installed in this environment, and rollouts are vLLM-only: there is "
@@ -1254,6 +1279,55 @@ def _vllm_arguments(config: GameTrainConfig) -> dict[str, Any]:
         # records the same key set for every arm, so two arms' estimator settings stay diffable.
         "vllm_importance_sampling_mode": config.vllm_importance_sampling_mode,
     }
+
+
+@contextlib.contextmanager
+def _vllm_engine_overrides_context(
+    *, kv_cache_dtype: str, attention_backend: str
+) -> Generator[None]:
+    """Temporarily pass games-only engine settings through TRL's colocated LLM seam.
+
+    TRL 1.10 exposes the engine's common settings on ``GRPOConfig`` but does not expose its
+    ``LLM`` constructor kwargs. Its ``VLLMGeneration`` resolves ``LLM`` from the
+    ``trl.generation.vllm_generation`` module at construction time, so a short-lived wrapper keeps
+    the opt-ins local to trainer construction and leaves TRL's installed source untouched. ``auto``
+    for both settings leaves the constructor alone, preserving today's behavior.
+    """
+    if kv_cache_dtype not in VLLM_KV_CACHE_DTYPES:
+        raise ValueError(
+            f"vllm_kv_cache_dtype must be one of {VLLM_KV_CACHE_DTYPES}, got {kv_cache_dtype!r}"
+        )
+    if attention_backend not in VLLM_ATTENTION_BACKENDS:
+        raise ValueError(
+            f"vllm_attention_backend must be one of {VLLM_ATTENTION_BACKENDS}, got "
+            f"{attention_backend!r}"
+        )
+    overrides: dict[str, object] = {}
+    if kv_cache_dtype != "auto":
+        overrides["kv_cache_dtype"] = kv_cache_dtype
+    if attention_backend != "auto":
+        overrides["attention_config"] = {"backend": attention_backend}
+    if not overrides:
+        yield
+        return
+
+    vllm_module = cast("Any", vllm_generation)
+    original_llm = vllm_module.LLM
+
+    def llm_with_overrides(*args: object, **kwargs: object) -> object:
+        for key in overrides:
+            if key in kwargs:
+                raise RuntimeError(
+                    f"the colocated vLLM constructor already received {key}; refusing to "
+                    "silently overwrite an upstream or concurrent engine setting"
+                )
+        return original_llm(*args, **kwargs, **overrides)
+
+    vllm_module.LLM = llm_with_overrides
+    try:
+        yield
+    finally:
+        vllm_module.LLM = original_llm
 
 
 def old_logps_pass_peak_gib(*, chunk_tokens: int, rows: int) -> float:
@@ -1395,6 +1469,8 @@ def log_colocate_settings(  # noqa: PLR0913  -- one keyword per fact the banner 
     importance_sampling_log_only: bool,
     importance_sampling_mode: str = VLLM_IMPORTANCE_SAMPLING_MODE,
     dynamic_sampling_oversample: int = 1,
+    vllm_kv_cache_dtype: str = "auto",
+    vllm_attention_backend: str = "auto",
 ) -> None:
     """State what the colocate engine takes and what the estimator setting costs.
 
@@ -1421,7 +1497,9 @@ def log_colocate_settings(  # noqa: PLR0913  -- one keyword per fact the banner 
         "generating through a colocated vLLM engine, %s",
         f"gpu_memory_utilization={config.vllm_gpu_memory_utilization} "
         f"engine_reserved_gib={engine_reserved_gib:.1f} "
-        f"vllm_max_model_length={config.vllm_max_model_length}",
+        f"vllm_max_model_length={config.vllm_max_model_length} "
+        f"vllm_kv_cache_dtype={vllm_kv_cache_dtype} "
+        f"vllm_attention_backend={vllm_attention_backend}",
     )
     if dynamic_sampling_oversample > 1:
         logger.warning(
@@ -2787,6 +2865,15 @@ def _derive_plan(
     or refused against `config.micro_batch_size` they would describe a shape the run may not have.
     """
     cost = checkpoint_sequence_cost(config.model_id)
+    rollout_cost = vllm_sequence_cost(cost, kv_cache_dtype=config.vllm_kv_cache_dtype)
+    rollout_gib_per_sequence = rollout_cost.gib_per_episode(
+        prompt_tokens=config.max_prompt_tokens, completion_tokens=config.max_completion_tokens
+    )
+    logger.info(
+        "vLLM rollout sequence payload estimate (unpadded; excludes hybrid-page padding and "
+        "allocator overhead), %s",
+        f"kv_cache_dtype={config.vllm_kv_cache_dtype} {rollout_gib_per_sequence:.3f} GiB/sequence",
+    )
     engine_reserved_gib = colocate_reserved_gib(
         total_vram_gib=cast("float", device["total_vram_gib"]),
         gpu_memory_utilization=config.vllm_gpu_memory_utilization,
@@ -2822,6 +2909,8 @@ def _derive_plan(
         importance_sampling_log_only=config.vllm_importance_sampling_log_only,
         importance_sampling_mode=config.vllm_importance_sampling_mode,
         dynamic_sampling_oversample=config.dynamic_sampling_oversample,
+        vllm_kv_cache_dtype=config.vllm_kv_cache_dtype,
+        vllm_attention_backend=config.vllm_attention_backend,
     )
     assert_old_logps_pass_fits(
         config, rows=plan.micro_batch_size, priced_from="the micro-batch the sizing plan derived"
@@ -3043,6 +3132,9 @@ def _prepare_run(
         "deltanet_kernel_paths": kernel_paths,
         "deltanet_kernel_bridge": kernel_bridge,
         "sequence_cost": asdict(cost),
+        "vllm_sequence_cost": asdict(
+            vllm_sequence_cost(cost, kv_cache_dtype=config.vllm_kv_cache_dtype)
+        ),
         "meta_parameter_count": param_count,
         "n_prompts": len(dataset),
         "n_rows_before_dataset_build": len(rows),
@@ -4326,38 +4418,42 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
     # Registered as a callback here and attached to the built trainer below: the callback half
     # needs the optimizer-step hooks, the attach half needs the trainer's seams to exist.
     phase_timer = StepPhaseTimer()
-    trainer = DynamicSampledGRPOTrainer(
-        old_logps_chunk_tokens=config.old_logps_chunk_tokens,
-        importance_sampling_log_only=config.vllm_importance_sampling_log_only,
-        single_forward_vllm_importance_sampling=cast(
-            "bool", config.single_forward_vllm_importance_sampling
-        ),
-        dynamic_sampling_oversample=config.dynamic_sampling_oversample,
-        model=config.load_source,
-        reward_funcs=reward,  # pyright: ignore[reportArgumentType]
-        args=grpo_args,
-        train_dataset=prepared.dataset,
-        # A bare tokenizer rather than TRL's default AutoProcessor: Qwen3.5 maps to a
-        # ProcessorMixin, which switches TRL onto its vision-language path.
-        processing_class=prepared.tokenizer,
-        peft_config=LoraConfig(
-            r=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=cast("list[str]", prepared.lora_targets["target_modules"]),
-        ),
-        callbacks=[
-            *callbacks,
-            # Appended here rather than inside build_callbacks: the reward-hacking trainer shares
-            # that builder and keeps a deliberate slow path behind --allow-hf-generation, which
-            # this guard would kill at step 3.
-            StepPaceGuardCallback(),
-            GradientHealthCallback(),
-            phase_timer,
-        ],
-    )
+    with _vllm_engine_overrides_context(
+        kv_cache_dtype=config.vllm_kv_cache_dtype,
+        attention_backend=config.vllm_attention_backend,
+    ):
+        trainer = DynamicSampledGRPOTrainer(
+            old_logps_chunk_tokens=config.old_logps_chunk_tokens,
+            importance_sampling_log_only=config.vllm_importance_sampling_log_only,
+            single_forward_vllm_importance_sampling=cast(
+                "bool", config.single_forward_vllm_importance_sampling
+            ),
+            dynamic_sampling_oversample=config.dynamic_sampling_oversample,
+            model=config.load_source,
+            reward_funcs=reward,  # pyright: ignore[reportArgumentType]
+            args=grpo_args,
+            train_dataset=prepared.dataset,
+            # A bare tokenizer rather than TRL's default AutoProcessor: Qwen3.5 maps to a
+            # ProcessorMixin, which switches TRL onto its vision-language path.
+            processing_class=prepared.tokenizer,
+            peft_config=LoraConfig(
+                r=config.lora_rank,
+                lora_alpha=config.lora_alpha,
+                lora_dropout=config.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=cast("list[str]", prepared.lora_targets["target_modules"]),
+            ),
+            callbacks=[
+                *callbacks,
+                # Appended here rather than inside build_callbacks: the reward-hacking trainer shares
+                # that builder and keeps a deliberate slow path behind --allow-hf-generation, which
+                # this guard would kill at step 3.
+                StepPaceGuardCallback(),
+                GradientHealthCallback(),
+                phase_timer,
+            ],
+        )
     if config.liger_frozen_head:
         cast("Any", trainer).liger_loss = FrozenHeadLigerGRPOLoss(trainer.liger_loss)
     phase_timer.attach(trainer)
@@ -4989,6 +5085,24 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             f"the colocated engine's share of TOTAL card VRAM, held for the whole run and "
             f"subtracted from what the sizing plan may spend. Defaults from "
             f"{VLLM_GPU_FRACTION_ENV}, else the measured {VLLM_COLOCATE_GPU_FRACTION}."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-kv-cache-dtype",
+        choices=VLLM_KV_CACHE_DTYPES,
+        default="auto",
+        help=(
+            "dtype for the colocated vLLM KV cache. 'auto' preserves vLLM's model-derived "
+            "default; 'fp8' is an opt-in capacity probe and is recorded and resume-pinned."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-attention-backend",
+        choices=VLLM_ATTENTION_BACKENDS,
+        default="auto",
+        help=(
+            "attention backend for the colocated vLLM engine. 'auto' lets vLLM choose; TRITON_ATTN "
+            "serves an fp8 KV cache without compiling FlashInfer kernels, which needs nvcc."
         ),
     )
     parser.add_argument(
