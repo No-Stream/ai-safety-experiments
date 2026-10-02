@@ -409,6 +409,13 @@ def test_endpoint_dispatch_keeps_cells_separate(
         lambda *args, **kwargs: EvalConfig(game_behavior_samples=1),
     )
     monkeypatch.setattr(runner, "_manifest_digest", lambda path: "manifest-digest")
+    # The default --manifest is a gitignored private roster; a fresh clone has none.
+    monkeypatch.setattr(runner.cooperation_evals, "load_behavior_manifest", lambda path: None)
+    monkeypatch.setattr(
+        runner.cooperation_evals,
+        "expand_behavior_roster",
+        lambda manifest: SimpleNamespace(scenario_group_ids={"synthetic-group"}),
+    )
 
     args = runner.build_parser().parse_args(
         [
