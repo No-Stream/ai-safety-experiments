@@ -61,7 +61,10 @@ if TYPE_CHECKING:
 
 type ChatMessage = dict[str, object]
 type StopReason = Literal["end_turn", "max_tokens"]
+type HistoryReasoning = Literal["retain", "strip"]
 
+HISTORY_REASONING_MODES: tuple[HistoryReasoning, ...] = ("retain", "strip")
+DEFAULT_HISTORY_REASONING: HistoryReasoning = "retain"
 LADDER_MAX_TURNS = 40
 LADDER_EPISODE_SECONDS = 1800.0
 LADDER_COMMAND_TIMEOUT = "120s"
@@ -160,6 +163,7 @@ class LadderTurn:
     index: int
     raw_completion: str
     reasoning: str
+    history_reasoning: HistoryReasoning
     content: str
     tool_calls: tuple[LadderToolCall, ...]
     tool_results: tuple[LadderToolResult, ...]
@@ -188,6 +192,7 @@ class LadderTurn:
             "turn": self.index,
             "raw_completion": self.raw_completion,
             "reasoning": self.reasoning,
+            "history_reasoning": self.history_reasoning,
             "content": self.content,
             "tool_calls": [call.to_json_dict() for call in self.tool_calls],
             "tool_results": [result.to_json_dict() for result in self.tool_results],
@@ -230,6 +235,7 @@ class LadderEpisodeTrace:
     episode_id: str
     episode_dir: Path
     arm: AgenticArmConfig
+    history_reasoning: HistoryReasoning
     turns: tuple[LadderTurn, ...]
     messages: tuple[ChatMessage, ...]
     ended_by: str
@@ -347,6 +353,7 @@ class LadderEpisodeTrace:
                 "timed_out": self.final_report_timed_out,
             },
             "arm": self.arm.to_json_dict(),
+            "history_reasoning": self.history_reasoning,
             "ended_by": self.ended_by,
             "format_errors": self.format_errors,
             "surplus_function_close_tags": sum(
@@ -736,6 +743,8 @@ def _final_report(
     messages: list[ChatMessage],
     tools: Sequence[Mapping[str, object]],
     context: _FinalReportContext,
+    *,
+    history_reasoning: HistoryReasoning,
 ) -> tuple[
     list[ChatMessage],
     str | None,
@@ -747,15 +756,17 @@ def _final_report(
     bool,
     int,
 ]:
-    """Sample a report-only completion, with the planned reasoning-stripped context fallback."""
+    """Sample a report; the dropped flag records only reasoning removed by context fallback."""
     messages.append({"role": "user", "content": FINAL_REPORT_PROMPT})
-    report_prompt_messages = messages
+    report_prompt_messages = (
+        strip_reasoning(copy.deepcopy(messages)) if history_reasoning == "strip" else messages
+    )
     prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
     prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
     reasoning_dropped = False
     room = context_room(prompt_tokens, context.max_model_len)
-    if room < MIN_CONTEXT_ROOM:
-        report_prompt_messages = strip_reasoning(messages)
+    if room < MIN_CONTEXT_ROOM and history_reasoning == "retain":
+        report_prompt_messages = strip_reasoning(copy.deepcopy(messages))
         reasoning_dropped = True
         prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
@@ -804,6 +815,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     trace_path: Path | None = None,
     episode_token: str | None = None,
     episode_seconds: float = LADDER_EPISODE_SECONDS,
+    history_reasoning: HistoryReasoning = DEFAULT_HISTORY_REASONING,
     before_command: Callable[[Path, str], None] | None = None,
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
     check_grader: CheckGrader | None = None,
@@ -818,6 +830,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         raise ValueError("episode_seconds must be positive")
     if max_model_len <= 0:
         raise ValueError("max_model_len must be positive")
+    if history_reasoning not in HISTORY_REASONING_MODES:
+        raise ValueError(f"unknown history_reasoning mode {history_reasoning!r}")
     if arm.check_reason and check_grader is None:
         raise ValueError("an arm with check_reason needs a check_grader to supply the reason")
 
@@ -873,9 +887,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     next_call_number = 0
 
     for turn_index in range(max_turns):
+        prompt_messages = (
+            strip_reasoning(copy.deepcopy(messages)) if history_reasoning == "strip" else messages
+        )
         rendered = _render_turn_prompt(
             backend,
-            messages,
+            prompt_messages,
             tools,
             previous_prompt=previous_prompt,
             previous_completion=previous_completion,
@@ -971,6 +988,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             index=turn_index,
             raw_completion=completion.text,
             reasoning=parsed.reasoning,
+            history_reasoning=history_reasoning,
             content=parsed.content,
             tool_calls=tuple(call_records),
             tool_results=tuple(tool_results),
@@ -1023,6 +1041,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             deadline=deadline,
             next_call_number=next_call_number,
         ),
+        history_reasoning=history_reasoning,
     )
     peak_prompt_tokens = max(peak_prompt_tokens, final_report_prompt_tokens)
     fabricated_tool_responses += final_report_fabricated_tool_responses
@@ -1042,6 +1061,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         episode_id=episode_id,
         episode_dir=episode_dir,
         arm=arm,
+        history_reasoning=history_reasoning,
         turns=tuple(turns),
         messages=tuple(copy.deepcopy(messages)),
         ended_by=ended_by,

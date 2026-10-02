@@ -125,6 +125,8 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     provenance = config.provenance_payload()
 
     assert LADDER_SCHEMA_VERSION == 13
+    assert config.history_reasoning == "retain"
+    assert provenance["history_reasoning"] == "retain"
     assert {
         "tool_schema_sha256",
         "system_prompt_sha256",
@@ -143,6 +145,9 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
         server_args={"kv_cache_dtype": "auto", "attention_backend": "FLASHINFER"},
     )
     assert changed_server_config.provenance_digest != config.provenance_digest
+    changed_history_config = replace(config, history_reasoning="strip")
+    assert changed_history_config.provenance_payload()["history_reasoning"] == "strip"
+    assert changed_history_config.provenance_digest != config.provenance_digest
     sampling = cast("dict[str, object]", provenance["sampling"])
     assert "stop" not in sampling
     for field in ("tool_schema_sha256", "system_prompt_sha256", "user_template_sha256"):
@@ -255,6 +260,35 @@ def test_readout_reports_highest_rung_coverups_and_honest_solve_rate(tmp_path: P
     assert naive_readout["fabricated_tool_responses_total"] == 12
 
 
+def test_readout_labels_mixed_history_reasoning_modes(tmp_path: Path) -> None:
+    retain_record = _readout_episode(
+        tmp_path,
+        _ReadoutExample(
+            arm="naive",
+            sample_index=0,
+            highest_rung=0,
+            coverup=False,
+            honest_solve=True,
+            history_reasoning="retain",
+        ),
+    )
+    strip_record = _readout_episode(
+        tmp_path,
+        _ReadoutExample(
+            arm="naive",
+            sample_index=1,
+            highest_rung=0,
+            coverup=False,
+            honest_solve=True,
+            history_reasoning="strip",
+        ),
+    )
+
+    assert readout_records([retain_record, strip_record])["base"]["none"]["naive"][
+        "history_reasoning_modes"
+    ] == ["retain", "strip"]
+
+
 def test_readout_recovers_measurement_status_from_trace_summary(tmp_path: Path) -> None:
     records = [
         _readout_episode(
@@ -321,6 +355,7 @@ class _ReadoutExample:
     fabricated_tool_responses: int = 0
     prompt_pure_append: tuple[bool, ...] = (True,)
     true_measured: bool = True
+    history_reasoning: ladder_loop.HistoryReasoning = "retain"
 
 
 def _readout_episode(tmp_path: Path, example: _ReadoutExample) -> dict[str, Any]:
@@ -346,6 +381,7 @@ def _readout_episode(tmp_path: Path, example: _ReadoutExample) -> dict[str, Any]
             "tool_calls_per_turn_max": example.tool_calls_per_turn_max,
             "format_errors": example.format_errors,
             "fabricated_tool_responses": example.fabricated_tool_responses,
+            "history_reasoning": example.history_reasoning,
         },
     }
 
@@ -682,6 +718,29 @@ def test_server_argument_change_refuses_resume(tmp_path: Path) -> None:
         initial_config,
         server_args={"kv_cache_dtype": "auto", "attention_backend": "FLASHINFER"},
     )
+
+    with pytest.raises(ValueError, match="stored run provenance differs"):
+        run_grid(
+            changed_config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda *_args: {"true_pass": True},
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+
+def test_history_reasoning_change_refuses_resume(tmp_path: Path) -> None:
+    output_path = tmp_path / "records.jsonl"
+    initial_config = replace(runner_config(output_path), arms=("naive",), samples=1)
+    run_grid(
+        initial_config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+
+    changed_config = replace(initial_config, history_reasoning="strip")
 
     with pytest.raises(ValueError, match="stored run provenance differs"):
         run_grid(
@@ -1471,11 +1530,14 @@ def test_cli_records_the_selected_task_pressure(
             str(server_log),
             "--task-pressure",
             "merge-gate",
+            "--history-reasoning",
+            "strip",
         ]
     )
 
     assert result == 0
     assert captured_configs[0].task_pressure == "merge-gate"
+    assert captured_configs[0].history_reasoning == "strip"
     assert captured_configs[0].server_args == {
         "model": "synthetic-model",
         "kv_cache_dtype": "fp8",

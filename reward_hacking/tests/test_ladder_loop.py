@@ -86,6 +86,7 @@ class _PersistentShellHooks:
 @dataclass(frozen=True)
 class _EpisodeOptions:
     arm: AgenticArmConfig | None = None
+    history_reasoning: loop.HistoryReasoning = "retain"
     max_model_len: int = 100_000
     max_turns: int = 4
     trace_path: Path | None = None
@@ -215,6 +216,7 @@ def _run_episode(
         backend,
         episode_dir=tmp_path / "episode",
         arm=episode_options.arm or AgenticArmConfig(check_affordance=True),
+        history_reasoning=episode_options.history_reasoning,
         system_prompt="Use the tools to complete the task.",
         user_template="Task:\n{task_markdown}\nFiles:\n{listing}",
         max_turns=episode_options.max_turns,
@@ -616,6 +618,69 @@ class TestNativeToolLoop:
         assert trace.turns[1].prompt_pure_append is True
         assert trace.turns[0].fabricated_tool_responses == 0
         assert trace.turns[0].trailing_text_chars == 0
+
+    def test_strip_history_reasoning_only_changes_rendered_prompts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        original_render = loop.render_prompt
+
+        def render_with_large_report(
+            tokenizer: _FakeTokenizer,
+            messages: list[dict[str, object]],
+            tools: list[dict[str, object]],
+            *,
+            enable_thinking: bool = True,
+        ) -> str:
+            rendered = original_render(
+                cast("PreTrainedTokenizerBase", tokenizer),
+                messages,
+                tools,
+                enable_thinking=enable_thinking,
+            )
+            if any(
+                message.get("role") == "user" and message.get("content") == loop.FINAL_REPORT_PROMPT
+                for message in messages
+            ) and any("reasoning_content" in message for message in messages):
+                return rendered + " retained " * 1500
+            return rendered
+
+        monkeypatch.setattr(loop, "render_prompt", render_with_large_report)
+        first_turn = _bash("touch marker.txt").replace(
+            "reasoning</think>", "earlier reasoning sentinel</think>"
+        )
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(first_turn),
+                _ScriptedReply(_bash("echo finished")),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_turns=2, max_model_len=1_300, history_reasoning="strip"),
+        )
+
+        tokenizer = cast("_FakeTokenizer", backend.tokenizer)
+        second_turn_messages = tokenizer.rendered_messages[1]
+        assert not any(
+            message.get("reasoning_content") == "earlier reasoning sentinel"
+            for message in second_turn_messages
+        )
+        assert "earlier reasoning sentinel" not in backend.prompts[1]
+        assert backend.prompts[1].endswith("<|im_start|>assistant\n<think>\n")
+        assert not any("reasoning_content" in message for message in tokenizer.rendered_messages[2])
+        summary_messages = cast("list[dict[str, object]]", trace.summary_record()["messages"])
+        assert any(
+            message.get("reasoning_content") == "earlier reasoning sentinel"
+            for message in summary_messages
+        )
+        assert trace.turns[1].history_reasoning == "strip"
+        assert trace.turn_records()[1]["history_reasoning"] == "strip"
+        assert trace.summary_record()["history_reasoning"] == "strip"
+        assert trace.final_report_reasoning_dropped is False
 
     def test_monitor_hooks_wrap_bash_only_not_check_or_final_grade(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

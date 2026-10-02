@@ -217,6 +217,7 @@ class RunnerConfig:
     resume: bool = True
     episode_concurrency: int = 1
     task_pressure: str = "none"
+    history_reasoning: ladder_loop.HistoryReasoning = ladder_loop.DEFAULT_HISTORY_REASONING
     max_model_len_by_model: tuple[tuple[str, int], ...] = ()
     server_args: Mapping[str, object] | None = None
     _provenance_payload_cache: dict[str, object] = dataclass_field(
@@ -267,6 +268,7 @@ class RunnerConfig:
             # Concurrent episodes decode slower per sequence against the wall-clock episode budget.
             "episode_concurrency": self.episode_concurrency,
             "task_pressure": self.task_pressure,
+            "history_reasoning": self.history_reasoning,
         }
 
     @property
@@ -281,6 +283,8 @@ def _validate_runner_config(config: RunnerConfig) -> None:
         raise ValueError("endpoint must be non-empty")
     if config.task_pressure not in LADDER_TASK_PRESSURES:
         raise ValueError(f"unknown task pressure {config.task_pressure!r}")
+    if config.history_reasoning not in ladder_loop.HISTORY_REASONING_MODES:
+        raise ValueError(f"unknown history_reasoning mode {config.history_reasoning!r}")
     _validate_grid_identity(config)
     _validate_run_bounds(config)
 
@@ -1092,6 +1096,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
                 trace_path=trace_path,
                 episode_token=episode_token,
                 episode_seconds=config.episode_seconds,
+                history_reasoning=config.history_reasoning,
                 before_command=before_command,
                 after_command=after_command,
                 check_grader=(
@@ -1982,6 +1987,9 @@ def readout_records(
         total_fabricated_tool_responses = 0
         pure_append_turns = 0
         turn_count = 0
+        history_reasoning_modes = {
+            _readout_history_reasoning_mode(record) for record in cell_records
+        }
         for record in cell_records:
             highest_rung = record.get("highest_rung")
             coverup = record.get("rung_5", record.get("coverup"))
@@ -2019,6 +2027,7 @@ def readout_records(
         count = len(cell_records)
         output.setdefault(model_id, {}).setdefault(task_pressure, {})[arm] = {
             "n": count,
+            "history_reasoning_modes": sorted(history_reasoning_modes),
             "measured_count": measured_count,
             "unmeasured_count": unmeasured_count,
             "highest_rung_distribution": distribution,
@@ -2037,6 +2046,20 @@ def readout_records(
             "fabricated_tool_responses_total": total_fabricated_tool_responses,
         }
     return output
+
+
+def _readout_history_reasoning_mode(record: Mapping[str, object]) -> str:
+    """Return one persisted episode's history protocol, labeling older traces explicitly."""
+    summary = record.get("trace_summary")
+    if not isinstance(summary, Mapping):
+        raise TypeError("ladder_episode.trace_summary must be an object")
+    history_reasoning = summary.get("history_reasoning", "unspecified")
+    if not isinstance(history_reasoning, str) or (
+        history_reasoning != "unspecified"
+        and history_reasoning not in ladder_loop.HISTORY_REASONING_MODES
+    ):
+        raise ValueError(f"invalid history_reasoning mode in readout record: {history_reasoning!r}")
+    return history_reasoning
 
 
 def _readout_episode_metrics(
@@ -2137,6 +2160,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Use unenforced jail limits when the systemd user manager is offline.",
     )
     parser.add_argument("--task-pressure", choices=LADDER_TASK_PRESSURES, default="none")
+    parser.add_argument(
+        "--history-reasoning",
+        choices=ladder_loop.HISTORY_REASONING_MODES,
+        default=ladder_loop.DEFAULT_HISTORY_REASONING,
+        help="Retain or strip earlier assistant reasoning in rendered prompts.",
+    )
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args(argv)
     server_args = parse_server_args_from_log(args.server_log)
@@ -2160,6 +2189,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resource_limits=resource_limits,
         resume=not args.no_resume,
         task_pressure=args.task_pressure,
+        history_reasoning=args.history_reasoning,
         server_args=server_args,
     )
     run_grid(config)
