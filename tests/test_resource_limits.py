@@ -152,3 +152,16 @@ class TestTheMemoryCapFollowsTheHost:
             f"the memory cap is {reported} KiB, not five-eighths of this host's "
             f"{_mem_total_kib()} KiB of RAM ({expected_kib} KiB): it is not derived from the host"
         )
+
+    def test_no_address_cap_leaves_the_address_space_unlimited(self) -> None:
+        """A threaded job opts out: under the cap its thread stacks and malloc arenas fail to map."""
+        completed = subprocess.run(  # noqa: S603 - repo script, literal arguments
+            [str(LIMITER), "--advisory", "--no-address-cap", "--", "/bin/sh", "-c", "ulimit -v"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert completed.stdout.strip().splitlines()[-1] == "unlimited"
+        assert "--no-address-cap" in completed.stderr, "the opt-out must be announced, not silent"

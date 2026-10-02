@@ -50,6 +50,12 @@
 #       --advisory      run WITHOUT cgroups (nice + ulimit only). Advisory, not
 #                       enforced: a job can still exceed these. Opt-in escape hatch
 #                       for hosts with no systemd user instance.
+#       --no-address-cap  with --advisory, skip the `ulimit -v` address-space cap.
+#                       For threaded jobs: the cap is a poor proxy for RSS, and under
+#                       it thread stacks and malloc arenas fail to map, so
+#                       pthread_create returns EAGAIN ("can't start new thread",
+#                       observed 2026-10-01 in a 12-episode ladder runner). --gpu
+#                       implies it, for the same reason.
 #
 # Exit status is the command's own, with two reserved values:
 #   124  the job hit --timeout and its process group was killed
@@ -85,6 +91,7 @@ nice=10
 threads=16
 gpu=0
 advisory=0
+no_address_cap=0
 unit_name=""
 
 die() {
@@ -135,6 +142,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --advisory)
       advisory=1
+      shift
+      ;;
+    --no-address-cap)
+      no_address_cap=1
       shift
       ;;
     -n | --name)
@@ -197,6 +208,8 @@ if ((advisory)); then
   # pthread_create returns EAGAIN (observed: vLLM dying at import, 2026-09-23); GPU jobs skip it.
   if ((gpu)); then
     echo "resource-limits: --gpu with --advisory skips ulimit -v; memory is not capped at all" >&2
+  elif ((no_address_cap)); then
+    echo "resource-limits: --no-address-cap with --advisory skips ulimit -v; memory is not capped at all" >&2
   else
     ulimit -v $(($(numfmt --from=iec "$mem_max") / 1024)) || true
   fi
