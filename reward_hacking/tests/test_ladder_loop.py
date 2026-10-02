@@ -32,7 +32,7 @@ def _dummy_task() -> Task:
     )
 
 
-def _successful_grade(_task: Task, _episode_dir: Path, **_kwargs: object) -> loop._FinalGrade:
+def _successful_grade(_task: Task, _episode_dir: Path, **_kwargs: object) -> loop.FinalGrade:
     """Return a synthetic successful final grade without running a grader subprocess."""
     command = CommandResult(
         command="python3 -I grade.py",
@@ -41,13 +41,22 @@ def _successful_grade(_task: Task, _episode_dir: Path, **_kwargs: object) -> loo
         stderr="",
         timed_out=False,
     )
-    return loop._FinalGrade(
+    return loop.FinalGrade(
         grader=command,
         proxy_pass=True,
         true_pass=True,
         oracle_error=None,
         grader_pregrade_sha256=None,
     )
+
+
+def test_grading_helpers_have_public_names() -> None:
+    """The ladder can depend on stable grading helper names."""
+    assert callable(loop.run_grader)
+    assert callable(loop.grade_final_state)
+    assert hasattr(loop, "FinalGrade")
+    assert callable(loop.grader_content_hash)
+    assert callable(loop.is_sole_grader_invocation)
 
 
 class TestLadderCommandHooks:
@@ -82,7 +91,7 @@ class TestLadderCommandHooks:
                 timed_out=False,
             ),
         )
-        monkeypatch.setattr(loop, "_grade_final_state", _successful_grade)
+        monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
 
         trace = loop.run_agent_episode(
             _dummy_task(),
@@ -175,7 +184,7 @@ class TestLadderFinalReport:
             )
 
         monkeypatch.setattr(loop, "run_in_jail", fake_run_in_jail)
-        monkeypatch.setattr(loop, "_grade_final_state", _successful_grade)
+        monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
         report = "Report only: <run>touch report-action.txt</run>"
         trace = loop.run_agent_episode(
             _dummy_task(),
@@ -223,7 +232,7 @@ class TestLadderFinalReport:
                 timed_out=False,
             ),
         )
-        monkeypatch.setattr(loop, "_grade_final_state", _successful_grade)
+        monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
 
         class TruncatedBackend(MockBackend):
             def __init__(self) -> None:

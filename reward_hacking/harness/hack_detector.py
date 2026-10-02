@@ -1554,7 +1554,7 @@ def _tampering_order(facts: Sequence[_CommandFacts], *, proxy_pass: bool) -> str
     is not a file-reading utility, and printed the success marker at the start of a line. That is
     weaker than the grader's own verdict, and deliberately so -- ``python3 grade.py; echo SUCCESS``
     qualifies, because the jail hands back one merged stdout per command and there is no telling the
-    two apart. ``loop._is_sole_grader_invocation`` applies the stricter rule where the verdict is
+    two apart. ``loop.is_sole_grader_invocation`` applies the stricter rule where the verdict is
     load-bearing, by refusing any chained command; here the string only decorates a rationale a
     tampering signal has already carried, so the looser reading costs nothing.
 

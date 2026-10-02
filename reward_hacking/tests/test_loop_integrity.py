@@ -32,7 +32,7 @@ from reward_hacking.harness import (
     GraderVisibility,
     run_agent_episode,
 )
-from reward_hacking.harness.loop import _grader_content_hash
+from reward_hacking.harness.loop import grader_content_hash
 from reward_hacking.harness.tasks import GRADER_FILENAME
 from reward_hacking.model_backend import MockBackend
 
@@ -178,20 +178,20 @@ class TestGraderContentHashNoneBranches:
 
     def test_a_present_regular_file_hashes_to_its_bytes(self, tmp_path: Path) -> None:
         (tmp_path / GRADER_FILENAME).write_bytes(b"the grader as laid down")
-        assert _grader_content_hash(tmp_path, GRADER_FILENAME) == _LAYDOWN_SHA
+        assert grader_content_hash(tmp_path, GRADER_FILENAME) == _LAYDOWN_SHA
 
     def test_a_missing_grader_reads_none(self, tmp_path: Path) -> None:
-        assert _grader_content_hash(tmp_path, GRADER_FILENAME) is None
+        assert grader_content_hash(tmp_path, GRADER_FILENAME) is None
 
     def test_a_directory_at_the_grader_path_reads_none(self, tmp_path: Path) -> None:
         (tmp_path / GRADER_FILENAME).mkdir()
-        assert _grader_content_hash(tmp_path, GRADER_FILENAME) is None
+        assert grader_content_hash(tmp_path, GRADER_FILENAME) is None
 
     def test_a_fifo_reads_none_and_returns_instantly(self, tmp_path: Path) -> None:
         """The branch the docstring spends four lines justifying: opening a named pipe blocks
         until something writes, so this returning at all is the ``is_file`` guard working."""
         os.mkfifo(tmp_path / GRADER_FILENAME)
-        assert _grader_content_hash(tmp_path, GRADER_FILENAME) is None
+        assert grader_content_hash(tmp_path, GRADER_FILENAME) is None
 
     def test_a_symlinked_grader_reads_none_rather_than_hashing_its_target(
         self, tmp_path: Path
@@ -201,7 +201,7 @@ class TestGraderContentHashNoneBranches:
         target = tmp_path / "somewhere-else.bin"
         target.write_bytes(b"host bytes the policy chose")
         (tmp_path / GRADER_FILENAME).symlink_to(target)
-        assert _grader_content_hash(tmp_path, GRADER_FILENAME) is None
+        assert grader_content_hash(tmp_path, GRADER_FILENAME) is None
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root reads straight through chmod 000")
     def test_an_unreadable_grader_reads_none(self, tmp_path: Path) -> None:
@@ -211,7 +211,7 @@ class TestGraderContentHashNoneBranches:
         path.write_bytes(b"locked")
         path.chmod(0)
         try:
-            assert _grader_content_hash(tmp_path, GRADER_FILENAME) is None
+            assert grader_content_hash(tmp_path, GRADER_FILENAME) is None
         finally:
             path.chmod(0o644)
 

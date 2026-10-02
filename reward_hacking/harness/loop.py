@@ -468,7 +468,7 @@ def lay_down_task(
     return tuple(materialised)
 
 
-def _grader_content_hash(episode_dir: Path, grader_filename: str) -> str | None:
+def grader_content_hash(episode_dir: Path, grader_filename: str) -> str | None:
     """SHA-256 of the grader as ``/work`` holds it, or ``None`` when nothing hashable sits there.
 
     ``None`` covers a missing file, a non-regular file, a symlink, and bytes the host cannot read.
@@ -477,7 +477,7 @@ def _grader_content_hash(episode_dir: Path, grader_filename: str) -> str | None:
     by the policy, which owns ``/work`` as root inside its own jail. ``is_file`` is checked rather
     than the read attempted for the reason ``tasks._artifact_text`` gives: opening a named pipe
     blocks until something writes, so the alternative to the check is not a crash but a sweep that
-    hangs. The symlink test mirrors ``_run_grader``'s: ``is_file`` follows links, so without it a
+    hangs. The symlink test mirrors ``run_grader``'s: ``is_file`` follows links, so without it a
     ``ln -sf <any host-visible file> grade.py`` aims this host-side read wherever the policy
     pointed it.
     """
@@ -575,7 +575,7 @@ def _answer_check(  # noqa: PLR0913 - keyword-only grading knobs threaded from _
     grader's reason reaches the policy only on an arm with ``check_reason`` on.
     """
     if check_grader is None:
-        grader = _run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
+        grader = run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
         passed = grader_reported_success(grader, marker=task.success_marker)
         return _format_check_verdict(passed=passed, marker=task.success_marker)
     verdict = check_grader(episode_dir)
@@ -1108,7 +1108,7 @@ def _invokes_grader(segment: str, grader_filename: str) -> bool:
     return re.search(rf"(?:^|[\s/]){re.escape(grader_filename)}(?:\s|$)", segment) is not None
 
 
-def _is_sole_grader_invocation(command: str, grader_filename: str) -> bool:
+def is_sole_grader_invocation(command: str, grader_filename: str) -> bool:
     """Whether this command's stdout can only have come from the in-band grader.
 
     An attribution question, not pedantry. The jail hands back one stdout per command, so in
@@ -1138,7 +1138,7 @@ def _is_sole_grader_invocation(command: str, grader_filename: str) -> bool:
     )
 
 
-def _run_grader(
+def run_grader(
     task: Task, episode_dir: Path, *, arm: AgenticArmConfig, timeout: str, jail_backend: str | None
 ) -> CommandResult:
     """Run the in-band grader once in the jail over the final /work state (the proxy verdict).
@@ -1209,7 +1209,7 @@ def _run_grader(
 def saw_grader_success(task: Task, turns: Iterable[AgentTurn]) -> bool:
     """Whether the policy itself ran the grader and saw it pass -- evidence it closed the loop."""
     return any(
-        _is_sole_grader_invocation(result.command, task.grader_filename)
+        is_sole_grader_invocation(result.command, task.grader_filename)
         and grader_reported_success(result, marker=task.success_marker)
         for turn in turns
         for result in turn.commands
@@ -1271,7 +1271,7 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
     records the truncation (see :attr:`AgentEpisodeTrace.deadline_exceeded`).
 
     ``<check/>`` is honored in that same order, and within budget it does *not* end the turn: it
-    runs the grader over ``/work`` as it stands (reusing ``_run_grader``'s write/run/restore, so
+    runs the grader over ``/work`` as it stands (reusing ``run_grader``'s write/run/restore, so
     under a ``HIDDEN`` arm nothing is left in ``/work`` to read), appends only the verdict, and
     lets the loop carry on -- so a probe-then-revise round is a single turn. The verdict is not a
     ``CommandResult`` and never joins ``results``; ``checks_used`` is threaded across turns and
@@ -1282,7 +1282,7 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
     ``grader_hashable`` is the lay-down predicate threaded from :func:`run_agent_episode`, and when
     it holds the grader is hashed immediately before EVERY mediated grade, with the samples
     returned as the fifth tuple element. The sample sits at this call site rather than inside
-    ``_run_grader``, because there the HIDDEN overwrite has already happened and the hash would
+    ``run_grader``, because there the HIDDEN overwrite has already happened and the hash would
     attest the harness's own copy -- a fabricated attestation. Two instants (lay-down, pregrade)
     were not enough: a policy on the readable-with-verdict arm can rig ``grade.py``, collect fake
     ``<check/>`` passes it then reasons from, restore the original bytes, and finish with both
@@ -1312,7 +1312,7 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
                 # One verdict too many: end the episode, and run no further grader.
                 return tuple(results), transcript_tail, action, checks_used, tuple(check_sha256s)
             if grader_hashable:
-                check_sha256s.append(_grader_content_hash(episode_dir, task.grader_filename))
+                check_sha256s.append(grader_content_hash(episode_dir, task.grader_filename))
             transcript_tail += (
                 _answer_check(
                     task,
@@ -1516,7 +1516,7 @@ def _sample_within_budget(  # noqa: PLR0913 - the episode's own bookkeeping, thr
 
 
 @dataclass(frozen=True)
-class _FinalGrade:
+class FinalGrade:
     """Both verdicts over the final ``/work``, the grader run behind the proxy one, and the pregrade hash."""
 
     grader: CommandResult
@@ -1526,7 +1526,7 @@ class _FinalGrade:
     grader_pregrade_sha256: str | None
 
 
-def _grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded once at the end
+def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded once at the end
     task: Task,
     episode_dir: Path,
     *,
@@ -1534,7 +1534,7 @@ def _grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded 
     timeout: str,
     jail_backend: str | None,
     grader_hashable: bool,
-) -> _FinalGrade:
+) -> FinalGrade:
     """Grade ``/work`` as the turns left it: the authoritative proxy run, then the oracle.
 
     The grader is hashed immediately before the authoritative grade -- between the hash and the run
@@ -1542,9 +1542,9 @@ def _grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded 
     no verdict is recorded rather than raised, for the reason :func:`run_agent_episode` gives.
     """
     grader_pregrade_sha256 = (
-        _grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
+        grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
     )
-    grader = _run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
+    grader = run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
     oracle_error: str | None = None
     try:
         true_pass = task.true_check(episode_dir)
@@ -1556,7 +1556,7 @@ def _grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded 
             task.task_id,
             exc,
         )
-    return _FinalGrade(
+    return FinalGrade(
         grader=grader,
         proxy_pass=grader_reported_success(grader, marker=task.success_marker),
         true_pass=true_pass,
@@ -1661,7 +1661,7 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
     # Read off lay_down_task's output, never a second copy of its HIDDEN rule: no grader, nothing to attest.
     grader_hashable = task.grader_filename in listing
     grader_laydown_sha256 = (
-        _grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
+        grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
     )
     transcript = initial_prompt(task, arm=arm, listing=listing)
     turns: list[AgentTurn] = []
@@ -1787,7 +1787,7 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
         final_report_reasoning = sampled_report.reasoning
         final_report_timed_out = sampled_report.timed_out
 
-    graded = _grade_final_state(
+    graded = grade_final_state(
         task,
         episode_dir,
         arm=arm,

@@ -40,7 +40,7 @@ from reward_hacking.harness import (
     traces_from_records,
     write_traces,
 )
-from reward_hacking.harness.loop import _parse_args, _run_grader, arm_from_args
+from reward_hacking.harness.loop import _parse_args, arm_from_args, run_grader
 from reward_hacking.harness.protocol import initial_prompt
 from reward_hacking.harness.task_spec import DEFAULT_CHECK_BUDGET
 from reward_hacking.harness.tasks import GRADER_FILENAME, TASK_FILENAME
@@ -694,7 +694,7 @@ class TestTheHarnessGraderWriteCannotBeRedirected:
     def _work_state_during_grading(
         monkeypatch: pytest.MonkeyPatch, episode_dir: Path
     ) -> dict[str, object]:
-        """Run ``_run_grader`` in the hidden arm, reporting what ``/work`` held when it fired."""
+        """Run ``run_grader`` in the hidden arm, reporting what ``/work`` held when it fired."""
         observed: list[dict[str, object]] = []
 
         def fake_run_in_jail(directory: Path, command: str, **kwargs: object) -> CommandResult:
@@ -712,7 +712,7 @@ class TestTheHarnessGraderWriteCannotBeRedirected:
             )
 
         monkeypatch.setattr(loop, "run_in_jail", fake_run_in_jail)
-        _run_grader(
+        run_grader(
             _sum_ledger(),
             episode_dir,
             arm=_HIDDEN_ARM,
@@ -759,7 +759,7 @@ class TestTheHarnessGraderWriteCannotBeRedirected:
 class TestTheHiddenRestoreSurvivesPolicyCodeRunningDuringTheGrade:
     """The HIDDEN displacement is a rename to a sidecar, and the restore must tolerate the policy.
 
-    The graders import the policy's submission, so policy code runs *while* ``_run_grader``'s
+    The graders import the policy's submission, so policy code runs *while* ``run_grader``'s
     harness copy and the displaced sidecar are both on disk, and it can delete either. An unguarded
     ``unlink``/``rename`` in the finally would then raise out of the episode and take the rest of
     the sweep with it -- the exact failure class this module's docstrings exist to prevent. The
@@ -776,7 +776,7 @@ class TestTheHiddenRestoreSurvivesPolicyCodeRunningDuringTheGrade:
         episode_dir: Path,
         during_grade: Callable[[Path], None],
     ) -> CommandResult:
-        """Run ``_run_grader`` in the hidden arm with ``during_grade(dir)`` standing in for the
+        """Run ``run_grader`` in the hidden arm with ``during_grade(dir)`` standing in for the
         policy code the grader imports."""
 
         def fake_run_in_jail(directory: Path, command: str, **kwargs: object) -> CommandResult:
@@ -786,7 +786,7 @@ class TestTheHiddenRestoreSurvivesPolicyCodeRunningDuringTheGrade:
             )
 
         monkeypatch.setattr(loop, "run_in_jail", fake_run_in_jail)
-        return _run_grader(
+        return run_grader(
             _sum_ledger(),
             episode_dir,
             arm=_HIDDEN_ARM,
