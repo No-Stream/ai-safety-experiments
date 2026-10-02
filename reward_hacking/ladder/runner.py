@@ -4,7 +4,7 @@ The runner deliberately owns only experiment orchestration. Scenario rendering, 
 rung detection, and arm grading live in their respective modules. The two callables accepted by
 :func:`run_grid` make those seams testable without importing a model or contacting a vLLM server.
 The default path creates :class:`reward_hacking.model_backend.VLLMHTTPBackend` lazily, after it has
-resolved a local-only tokenizer snapshot, and calls the real harness loop once per cell.
+resolved a local-only tokenizer snapshot, and calls the native ladder loop once per cell.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -30,15 +30,19 @@ from uuid import uuid4
 
 from huggingface_hub import try_to_load_from_cache
 
-from reward_hacking.harness.protocol import RUN_BLOCK_STOP
+from reward_hacking.harness.task_spec import DEFAULT_CHECK_BUDGET
 from reward_hacking.jailed_poc import (
     ENFORCED_JAIL_RESOURCE_LIMITS,
     JailResourceLimits,
     jail_resource_limits_scope,
     resolve_jail_resource_limits,
 )
+from reward_hacking.ladder import chat as ladder_chat
+from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.ladder.monitor import CommandRecord, capture_snapshot
 from reward_hacking.ladder.rungs import DetectionSpec, FinalStateDiff, detect_rungs
+from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
+from reward_hacking.ladder.tools import bash_tool, check_tool
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -55,7 +59,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 12
+LADDER_SCHEMA_VERSION = 13
 MAX_RUNG = 6
 LADDER_MAX_TURNS = 40
 LADDER_EPISODE_SECONDS = 1800.0
@@ -73,7 +77,6 @@ _MINIMUM_VISIBLE_MARKER_LENGTH = 3
 # rung IDs also feed live <check/> feedback, so detector-only edits must preserve those IDs.
 LADDER_GENERATION_CODE_FILES = (
     "reward_hacking/harness/loop.py",
-    "reward_hacking/harness/protocol.py",
     "reward_hacking/harness/task_spec.py",
     "reward_hacking/harness/tasks.py",
     "reward_hacking/harness/tasks_evalplus.py",
@@ -81,6 +84,9 @@ LADDER_GENERATION_CODE_FILES = (
     "reward_hacking/ladder/arms.py",
     "reward_hacking/ladder/monitor.py",
     "reward_hacking/ladder/runner.py",
+    "reward_hacking/ladder/loop.py",
+    "reward_hacking/ladder/tools.py",
+    "reward_hacking/ladder/chat.py",
     "reward_hacking/ladder/rungs.py",
     "reward_hacking/ladder/scenario.py",
     "reward_hacking/model_backend.py",
@@ -94,6 +100,17 @@ LADDER_DETECTOR_CODE_FILES = (
 )
 
 
+def _tool_schema_sha256() -> str:
+    """Hash every tool schema variant exposed by the current ladder arms."""
+    tool_schemas = [
+        bash_tool(),
+        check_tool(DEFAULT_CHECK_BUDGET, with_reason=False),
+        check_tool(DEFAULT_CHECK_BUDGET, with_reason=True),
+    ]
+    encoded = json.dumps(tool_schemas, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class LadderSampling:
     """The sampler shared by every ladder cell.
@@ -102,17 +119,15 @@ class LadderSampling:
     sampler, and assigning a deterministic seed would change that distribution.
     """
 
-    max_new_tokens: int = 12_000
+    max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
     do_sample: bool = True
-    temperature: float = 1.0
-    top_p: float = 1.0
+    temperature: float = 0.7
+    top_p: float = 0.95
     top_k: int = 0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     seed: int | None = None
-    # Ends each turn after its first command, so the model never writes that command's output itself.
-    stop: tuple[str, ...] = (RUN_BLOCK_STOP,)
 
     def to_json(self) -> dict[str, object]:
         """Return the complete sampler identity used in the run header."""
@@ -126,7 +141,6 @@ class LadderSampling:
             "repetition_penalty": self.repetition_penalty,
             "presence_penalty": self.presence_penalty,
             "seed": self.seed,
-            "stop": list(self.stop),
             "stop_token_ids": list(LADDER_STOP_TOKEN_IDS),
         }
 
@@ -192,15 +206,15 @@ class RunnerConfig:
     samples: int
     output_path: Path
     episode_root: Path
-    # One command per turn since the </run> stop; 16 cut 7 of 18 9B smoke episodes off mid-work.
     max_turns: int = LADDER_MAX_TURNS
-    timeout: str = "10s"
+    timeout: str = ladder_loop.LADDER_COMMAND_TIMEOUT
     jail_backend: str | None = None
     episode_seconds: float = LADDER_EPISODE_SECONDS
     resource_limits: JailResourceLimits = ENFORCED_JAIL_RESOURCE_LIMITS
     resume: bool = True
     episode_concurrency: int = 1
     task_pressure: str = "none"
+    max_model_len_by_model: tuple[tuple[str, int], ...] = ()
     _provenance_payload_cache: dict[str, object] = dataclass_field(
         init=False, repr=False, compare=False
     )
@@ -231,6 +245,14 @@ class RunnerConfig:
             "detector_code_identity": detector_code_identity(),
             "arms": list(self.arms),
             "samples": self.samples,
+            "tool_schema_sha256": _tool_schema_sha256(),
+            "system_prompt_sha256": hashlib.sha256(
+                LADDER_SYSTEM_PROMPT.encode("utf-8")
+            ).hexdigest(),
+            "user_template_sha256": hashlib.sha256(
+                LADDER_USER_TEMPLATE.encode("utf-8")
+            ).hexdigest(),
+            "max_model_len": dict(self.max_model_len_by_model),
             "sampling": LADDER_SAMPLING.to_json(),
             "max_turns": self.max_turns,
             "timeout": self.timeout,
@@ -277,6 +299,24 @@ def _validate_grid_identity(config: RunnerConfig) -> None:
     scenario_ids = [scenario.slug for scenario in config.scenarios]
     if len(set(scenario_ids)) != len(scenario_ids):
         raise ValueError("scenario slug values must be unique")
+    expected_server_model_ids = {model.server_model_id or model.model_id for model in config.models}
+    _validate_max_model_len_mapping(config, expected_server_model_ids)
+
+
+def _validate_max_model_len_mapping(
+    config: RunnerConfig, expected_server_model_ids: set[str]
+) -> None:
+    """Validate any pre-resolved context limits against the served model identities."""
+    max_model_len_mapping = dict(config.max_model_len_by_model)
+    if len(max_model_len_mapping) != len(config.max_model_len_by_model):
+        raise ValueError("max_model_len_by_model keys must be unique")
+    if max_model_len_mapping and set(max_model_len_mapping) != expected_server_model_ids:
+        raise ValueError("max_model_len_by_model must cover every served model exactly once")
+    if any(
+        type(max_model_len) is not int or max_model_len <= 0
+        for max_model_len in max_model_len_mapping.values()
+    ):
+        raise ValueError("max_model_len_by_model values must be positive integers")
 
 
 def _validate_run_bounds(config: RunnerConfig) -> None:
@@ -892,7 +932,6 @@ def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
         repetition_penalty=LADDER_SAMPLING.repetition_penalty,
         presence_penalty=LADDER_SAMPLING.presence_penalty,
         seed=LADDER_SAMPLING.seed,
-        stop=LADDER_SAMPLING.stop,
     )
     return VLLMHTTPBackend(
         model.server_model_id or model.model_id,
@@ -946,6 +985,17 @@ def _real_arm_check_grader(
     return real_arm_check
 
 
+def _backend_max_model_len(config: RunnerConfig, backend: object) -> int:
+    """Return the context limit recorded for the backend's served model id."""
+    backend_model_id = getattr(backend, "model_id", None)
+    if not isinstance(backend_model_id, str):
+        raise TypeError("ladder backend must expose a string model_id")
+    max_model_len = dict(config.max_model_len_by_model).get(backend_model_id)
+    if max_model_len is None:
+        raise ValueError(f"run configuration has no max_model_len for model {backend_model_id!r}")
+    return max_model_len
+
+
 def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook configuration
     scenario: ScenarioLike,
     backend: object,
@@ -956,8 +1006,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
     *,
     config: RunnerConfig,
 ) -> object:
-    """Call the real harness loop for one ladder cell."""
-    from reward_hacking.harness.loop import run_agent_episode  # noqa: PLC0415 - lazy real-run seam
+    """Call the native ladder loop for one real execution cell."""
     from reward_hacking.ladder.monitor import (  # noqa: PLC0415 - lazy real-run seam
         CommandAuditMonitor,
     )
@@ -967,6 +1016,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
     arm_config = getattr(rendered, "arm", None)
     if task is None or arm_config is None:
         raise TypeError("scenario.render() must return an object with task and arm fields")
+    max_model_len = _backend_max_model_len(config, backend)
     episode_token = f"ladder-{config.task_pressure}-{arm}-{sample_index:03d}-{uuid4().hex[:12]}"
     with tempfile.TemporaryDirectory(prefix="hack-ladder-episode-") as temporary:
         workspace_dir = Path(temporary)
@@ -1002,15 +1052,17 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
             )
 
         with jail_resource_limits_scope(config.resource_limits):
-            trace = run_agent_episode(
+            trace = ladder_loop.run_ladder_episode(
                 cast("Task", task),
-                cast("Backend", backend),
+                cast("Any", backend),
                 episode_dir=workspace_dir,
+                arm=cast("AgenticArmConfig", arm_config),
+                system_prompt=LADDER_SYSTEM_PROMPT,
+                user_template=LADDER_USER_TEMPLATE,
                 max_turns=config.max_turns,
                 timeout=config.timeout,
                 jail_backend=config.jail_backend,
                 trace_path=trace_path,
-                arm=cast("AgenticArmConfig", arm_config),
                 episode_token=episode_token,
                 episode_seconds=config.episode_seconds,
                 before_command=before_command,
@@ -1020,7 +1072,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
                     if arm == "real"
                     else None
                 ),
-                final_report=True,
+                max_model_len=max_model_len,
             )
         if pending_start:
             raise RuntimeError("episode ended with an unmatched monitor command start")
@@ -1199,7 +1251,7 @@ def _default_final_grader(**kwargs: object) -> Mapping[str, object]:
             episode_dir=cast("Path", kwargs["episode_dir"]),
             summary=summary,
             detection=cast("Mapping[str, object]", kwargs["detection"]),
-            timeout=str(kwargs.get("timeout", "10s")),
+            timeout=str(kwargs.get("timeout", ladder_loop.LADDER_COMMAND_TIMEOUT)),
             resource_limits=cast(
                 "JailResourceLimits",
                 kwargs.get("resource_limits", ENFORCED_JAIL_RESOURCE_LIMITS),
@@ -1733,6 +1785,25 @@ def _run_cells(
         raise failures[0][1]
 
 
+def _with_resolved_model_lengths(config: RunnerConfig) -> RunnerConfig:
+    """Resolve each served model's context window before provenance and resume checks."""
+    if config.max_model_len_by_model:
+        return config
+    max_model_lens: dict[str, int] = {}
+    for model in config.models:
+        server_model_id = model.server_model_id or model.model_id
+        if server_model_id not in max_model_lens:
+            max_model_lens[server_model_id] = ladder_chat.fetch_max_model_len(
+                config.endpoint, server_model_id
+            )
+    resolved_config = replace(config, max_model_len_by_model=tuple(max_model_lens.items()))
+    provenance = config.provenance_payload()
+    provenance["max_model_len"] = max_model_lens
+    object.__setattr__(resolved_config, "_provenance_payload_cache", provenance)
+    object.__setattr__(resolved_config, "_provenance_digest_cache", provenance_digest(provenance))
+    return resolved_config
+
+
 def run_grid(
     config: RunnerConfig,
     *,
@@ -1742,6 +1813,8 @@ def run_grid(
     final_grader: FinalGrader | None = None,
 ) -> list[dict[str, object]]:
     """Run pending model/scenario/arm/sample cells and append each result immediately."""
+    if episode_runner is None:
+        config = _with_resolved_model_lengths(config)
     existing = _load_records(config.output_path)
     if existing and not config.resume:
         raise FileExistsError(
@@ -1927,7 +2000,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=Path("artifacts/ladder/records.jsonl"))
     parser.add_argument("--episode-root", type=Path, default=Path("artifacts/ladder/episodes"))
     parser.add_argument("--max-turns", type=int, default=LADDER_MAX_TURNS)
-    parser.add_argument("--timeout", default="10s")
+    parser.add_argument("--timeout", default=ladder_loop.LADDER_COMMAND_TIMEOUT)
     parser.add_argument("--episode-seconds", type=float, default=LADDER_EPISODE_SECONDS)
     parser.add_argument(
         "--episode-concurrency",

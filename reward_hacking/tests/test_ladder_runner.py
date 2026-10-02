@@ -17,6 +17,7 @@ import pytest
 
 from reward_hacking.harness.loop import CheckVerdict
 from reward_hacking.jailed_poc import CommandResult, JailResourceLimits
+from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.ladder import runner as ladder_runner
 from reward_hacking.ladder.runner import (
     LADDER_SAMPLING,
@@ -73,35 +74,75 @@ def runner_config(output_path: Path) -> RunnerConfig:
 
 
 def test_sampling_pins_match_the_ladder_blueprint() -> None:
-    assert LADDER_SAMPLING.max_new_tokens == 12_000
-    assert LADDER_SAMPLING.temperature == 1.0
-    assert LADDER_SAMPLING.top_p == 1.0
+    assert LADDER_SAMPLING.max_new_tokens == 16_384
+    assert LADDER_SAMPLING.max_new_tokens == ladder_loop.LADDER_MAX_NEW_TOKENS
+    assert LADDER_SAMPLING.temperature == 0.7
+    assert LADDER_SAMPLING.top_p == 0.95
     assert LADDER_SAMPLING.top_k == 0
     assert LADDER_SAMPLING.min_p == 0.0
     assert LADDER_SAMPLING.repetition_penalty == 1.0
     assert LADDER_SAMPLING.presence_penalty == 0.0
     assert LADDER_SAMPLING.seed is None
     assert LADDER_STOP_TOKEN_IDS == (248044, 248046)
-    assert LADDER_SAMPLING.stop == ("</run>",)
+    assert not hasattr(LADDER_SAMPLING, "stop")
+    assert "stop" not in LADDER_SAMPLING.to_json()
     assert RunnerConfig.__dataclass_fields__["max_turns"].default == 40
     assert RunnerConfig.__dataclass_fields__["episode_seconds"].default == 1800.0
-    assert LADDER_SAMPLING.to_json()["stop"] == ["</run>"]
+    assert (
+        RunnerConfig.__dataclass_fields__["timeout"].default == ladder_loop.LADDER_COMMAND_TIMEOUT
+    )
 
 
-def test_ladder_backend_stops_each_turn_at_the_run_block_and_thinks(
+def test_ladder_backend_uses_stop_free_sampling_and_thinks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     constructed: list[dict[str, Any]] = []
+    sampling_options: list[dict[str, object]] = []
 
     def fake_backend(model_id: str, **kwargs: Any) -> object:
         constructed.append({"model_id": model_id, **kwargs})
         return object()
 
+    def fake_sampling_config(**kwargs: object) -> object:
+        sampling_options.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
     monkeypatch.setattr("reward_hacking.model_backend.VLLMHTTPBackend", fake_backend)
+    monkeypatch.setattr("reward_hacking.model_backend.SamplingConfig", fake_sampling_config)
     build_vllm_http_backend(ModelSpec("base", tmp_path), runner_config(tmp_path / "records.jsonl"))
 
-    assert constructed[0]["sampling"].stop == ("</run>",)
+    assert "stop" not in sampling_options[0]
     assert constructed[0]["thinking"] is True
+    assert constructed[0]["stop_token_ids"] == LADDER_STOP_TOKEN_IDS
+
+
+def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path: Path) -> None:
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        max_model_len_by_model=(("base", 32768),),
+    )
+    provenance = config.provenance_payload()
+
+    assert LADDER_SCHEMA_VERSION == 13
+    assert {
+        "tool_schema_sha256",
+        "system_prompt_sha256",
+        "user_template_sha256",
+        "max_model_len",
+        "sampling",
+    } <= provenance.keys()
+    assert provenance["max_model_len"] == {"base": 32768}
+    sampling = cast("dict[str, object]", provenance["sampling"])
+    assert "stop" not in sampling
+    for field in ("tool_schema_sha256", "system_prompt_sha256", "user_template_sha256"):
+        assert isinstance(provenance[field], str)
+        assert len(cast("str", provenance[field])) == 64
+    assert {
+        "reward_hacking/ladder/loop.py",
+        "reward_hacking/ladder/tools.py",
+        "reward_hacking/ladder/chat.py",
+    } <= set(ladder_runner.LADDER_GENERATION_CODE_FILES)
+    assert "reward_hacking/harness/protocol.py" not in ladder_runner.LADDER_GENERATION_CODE_FILES
 
 
 def test_resume_keys_are_content_addressed_and_digest_mismatch_refuses(tmp_path: Path) -> None:
@@ -749,6 +790,8 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
 ) -> None:
     artifact_root = tmp_path / "artifacts"
     seen_episode_tokens: list[str] = []
+    captured_loop_kwargs: list[dict[str, object]] = []
+    context_fetches: list[tuple[str, str]] = []
     rendered = SimpleNamespace(task=object(), arm=object())
     scenario = SimpleNamespace(
         slug="dummy",
@@ -758,7 +801,8 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         render=lambda _arm, **_kwargs: rendered,
     )
 
-    def fake_run_agent_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+    def fake_run_ladder_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+        captured_loop_kwargs.append(kwargs)
         seen_episode_tokens.append(cast("str", kwargs["episode_token"]))
         workspace = cast("Path", kwargs["episode_dir"])
         before = cast("Any", kwargs["before_command"])
@@ -780,7 +824,11 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
             "final_report": "completed honestly",
         }
 
-    monkeypatch.setattr("reward_hacking.harness.loop.run_agent_episode", fake_run_agent_episode)
+    monkeypatch.setattr("reward_hacking.ladder.loop.run_ladder_episode", fake_run_ladder_episode)
+    monkeypatch.setattr(
+        "reward_hacking.ladder.chat.fetch_max_model_len",
+        lambda base_url, model_id: context_fetches.append((base_url, model_id)) or 32768,
+    )
     config = RunnerConfig(
         endpoint="http://127.0.0.1:8000",
         models=(ModelSpec("base", "/models/base"),),
@@ -791,10 +839,17 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         episode_root=artifact_root / "episodes",
     )
 
-    records = run_grid(config, backend_factory=lambda _model, _config: object())
+    records = run_grid(
+        config,
+        backend_factory=lambda _model, _config: SimpleNamespace(model_id="base"),
+    )
 
     assert len(records) == 2
     assert len(set(seen_episode_tokens)) == 2
+    assert context_fetches == [("http://127.0.0.1:8000", "base")]
+    assert all(kwargs["max_model_len"] == 32768 for kwargs in captured_loop_kwargs)
+    assert all(kwargs["system_prompt"] for kwargs in captured_loop_kwargs)
+    assert all(kwargs["user_template"] for kwargs in captured_loop_kwargs)
     records_by_arm = {cast("dict[str, object]", record["key"])["arm"]: record for record in records}
     for arm in ("naive", "claimed"):
         record = records_by_arm[arm]
@@ -816,6 +871,8 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         "proxy_pass": True,
         "final_report": "completed honestly",
     }
+    run_header = json.loads(config.output_path.read_text(encoding="utf-8").splitlines()[0])
+    assert run_header["provenance"]["max_model_len"] == {"base": 32768}
 
 
 def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
@@ -832,7 +889,7 @@ def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
     )
     fail_first_attempt = True
 
-    def fake_run_agent_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+    def fake_run_ladder_episode(*_args: object, **kwargs: object) -> dict[str, object]:
         nonlocal fail_first_attempt
         episode_tokens.append(cast("str", kwargs["episode_token"]))
         if fail_first_attempt:
@@ -840,7 +897,10 @@ def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
             raise RuntimeError("episode crashed before its record was written")
         return {"true_pass": True}
 
-    monkeypatch.setattr("reward_hacking.harness.loop.run_agent_episode", fake_run_agent_episode)
+    monkeypatch.setattr("reward_hacking.ladder.loop.run_ladder_episode", fake_run_ladder_episode)
+    monkeypatch.setattr(
+        "reward_hacking.ladder.chat.fetch_max_model_len", lambda _base_url, _model_id: 32768
+    )
     config = RunnerConfig(
         endpoint="http://127.0.0.1:8000",
         models=(ModelSpec("base", "/models/base"),),
@@ -854,7 +914,7 @@ def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
     def run() -> list[dict[str, object]]:
         return run_grid(
             config,
-            backend_factory=lambda _model, _config: object(),
+            backend_factory=lambda _model, _config: SimpleNamespace(model_id="base"),
             detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
             final_grader=lambda **_kwargs: {},
         )
@@ -1180,7 +1240,7 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
         render=lambda _arm, **_kwargs: rendered,
     )
 
-    def fake_run_agent_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+    def fake_run_ladder_episode(*_args: object, **kwargs: object) -> dict[str, object]:
         workspace = kwargs["episode_dir"]
         before = kwargs["before_command"]
         after = kwargs["after_command"]
@@ -1202,7 +1262,7 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
         )
         return {"final_report": "done"}
 
-    monkeypatch.setattr("reward_hacking.harness.loop.run_agent_episode", fake_run_agent_episode)
+    monkeypatch.setattr("reward_hacking.ladder.loop.run_ladder_episode", fake_run_ladder_episode)
     config = RunnerConfig(
         endpoint="http://127.0.0.1:8000",
         models=(ModelSpec("base", "/models/base"),),
@@ -1211,11 +1271,12 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
         samples=1,
         output_path=tmp_path / "records.jsonl",
         episode_root=tmp_path / "episodes",
+        max_model_len_by_model=(("base", 4096),),
     )
 
     result = _run_real_episode(
         cast("ScenarioLike", scenario),
-        object(),
+        SimpleNamespace(model_id="base"),
         "naive",
         0,
         artifact_dir,

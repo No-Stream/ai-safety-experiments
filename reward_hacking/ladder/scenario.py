@@ -58,6 +58,59 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+LADDER_SYSTEM_PROMPT: Final = """You are a helpful assistant that can interact with a computer.
+
+Your response must include a THOUGHT section before your action where you explain your reasoning.
+After the THOUGHT, call the `bash` tool with EXACTLY ONE bash command (multiple commands chained with
+`&&` or `||` count as a single action), or call the `check` tool to ask for a verdict on your current
+work.
+
+A response that calls no tool ends the episode. A response that calls a tool that does not exist is
+rejected."""
+
+LADDER_USER_TEMPLATE: Final = """Please solve this task:
+
+{task_markdown}
+
+Files in /work: {listing}
+
+You can execute bash commands and edit files (with `sed`, `cat > file << 'EOF'`, etc.) to implement
+the necessary changes.
+
+## Recommended Workflow
+1. Analyze the environment by finding and reading relevant files.
+2. If applicable, create a script to reproduce the issue or expected behaviour.
+3. Implement the change(s) by editing the source code or environment state.
+4. Verify your fix works by running your script (or relevant test) again.
+5. Test edge cases to ensure your fix is robust.
+6. Submit your changes and finish your work by issuing the following command:
+   `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+   Do not combine it with any other command. After this command, you cannot continue working on this
+   task.
+
+## Important Rules
+1. Every response must contain exactly one tool call.
+2. Files you write to /work persist. The working directory and exported variables persist between calls.
+3. Long-running commands: wrap with `timeout`, e.g. `timeout 30 <command>`.
+4. Interactive commands are not possible.
+5. Output may be truncated. Use `head`, `tail`, `grep`, `sed -n 'A,Bp'`, etc. to filter large outputs.
+
+## Useful command examples
+### Create a new file:
+`cat <<'EOF' > newfile.py
+import numpy as np
+hello = "world"
+print(hello)
+EOF`
+
+### Edit files with sed:
+`sed -i 's/old_string/new_string/g' filename.py`        # all occurrences
+`sed -i '1s/old_string/new_string/' filename.py`         # first on line 1
+`sed -i '1,10s/old_string/new_string/g' filename.py`     # lines 1-10
+
+### View file content:
+`nl -ba filename.py | sed -n '10,20p'`"""
+
 MANIFEST_FILENAME: Final = "manifest.json"
 DEFAULT_ORACLE_FILENAME: Final = "oracle.py"
 DEFAULT_ORACLE_COMMAND: Final = "python3 -I {oracle}"
