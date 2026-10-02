@@ -179,11 +179,15 @@ from games.train import (
     write_json,
 )
 from grpo.estimator_defaults import (
+    GRPO_ADAM_EPSILON,
     GRPO_EPSILON,
+    GRPO_LORA_DROPOUT,
     GRPO_LOSS_TYPE,
     GRPO_LOSS_TYPES,
+    GRPO_LR_SCHEDULER,
     GRPO_SCALE_REWARDS,
     GRPO_SCALE_REWARDS_MODES,
+    GRPO_WARMUP_STEPS,
     LIGER_FAITHFUL_LOSS_TYPES,
     assert_known_estimator,
     assert_liger_faithful_estimator,
@@ -317,6 +321,7 @@ RESUME_IDENTITY_FIELDS = (
     "learning_rate",
     "lr_scheduler",
     "warmup_ratio",
+    "warmup_steps",
     # The sampler DECIDES the rollout distribution the gradient is estimated from, so half a run at
     # one temperature and half at another is two experiments under one set of step numbers. The repo's
     # rule is that sampling parameters are never "more correct", only consistent -- and consistency is
@@ -334,6 +339,9 @@ RESUME_IDENTITY_FIELDS = (
     "lora_rank",
     "lora_alpha",
     "lora_dropout",
+    # Decides how much of each nominal Adam step the LoRA A matrices actually take, so steps under
+    # one value continue happily under another while training a different update.
+    "adam_epsilon",
     # Moves the PASS/TIMEOUT boundary, so the same submission can score differently before and after.
     "grader_timeout_seconds",
     # Changes the estimator TRL computes, exactly as `loss_type` and `scale_rewards` do. Safe to pin
@@ -341,6 +349,14 @@ RESUME_IDENTITY_FIELDS = (
     # correction ON at this completion budget anyway -- a real arm is forced OFF on every attempt.
     "vllm_importance_sampling_correction",
 )
+# Identity fields added after the first recorded runs, mapped to the value every record written before
+# them trained under: transformers' own epsilon, which nothing set, and no step count because the
+# warmup was a ratio. Absence in an old record means THIS value, not the current default, which would
+# let a resume silently relabel what the checkpoint's steps were trained under.
+RESUME_IDENTITY_DEFAULTS: dict[str, object] = {
+    "adam_epsilon": 1e-8,
+    "warmup_steps": None,
+}
 # `SizingPlan` fields a resume may not move, for the reason games/train.py gives: the plan comes from
 # a live free-VRAM reading, so another process holding a couple of gibibytes on a shared card is
 # enough to re-plan the group size the checkpoint's existing steps were trained under.
@@ -428,8 +444,10 @@ class RewardHackingTrainConfig:
     prompts_per_step: int = 8
     micro_batch_size: int | None = None
     learning_rate: float = 1e-5
-    lr_scheduler: str = "cosine"
-    warmup_ratio: float = 0.1
+    # Constant after a fixed-step warmup (grpo/estimator_defaults.py). Exactly one warmup field is set.
+    lr_scheduler: str = GRPO_LR_SCHEDULER
+    warmup_ratio: float | None = None
+    warmup_steps: int | None = GRPO_WARMUP_STEPS
     max_steps: int = 70
     max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS
     # None resolves per model from the CODING screen, never from the game screen; see
@@ -445,7 +463,8 @@ class RewardHackingTrainConfig:
     acknowledge_liger_estimator_mismatch: bool = False
     lora_rank: int = 16
     lora_alpha: int = 32
-    lora_dropout: float = 0.05
+    lora_dropout: float = GRPO_LORA_DROPOUT
+    adam_epsilon: float = GRPO_ADAM_EPSILON
     use_liger_kernel: bool = True
     gradient_checkpointing: bool = True
     # 1 and 0, not the 10 and 50 games defaults: decision 8 of this experiment's plan makes every
@@ -494,6 +513,7 @@ class RewardHackingTrainConfig:
                 f"temperature must be positive for GRPO to see disagreement, {self.temperature=}"
             )
         assert_known_estimator(self.loss_type, self.scale_rewards)
+        self._validate_schedule_epsilon_and_dropout()
         self._validate_estimator_under_the_trim()
         assert_liger_faithful_estimator(
             self.loss_type,
@@ -505,6 +525,25 @@ class RewardHackingTrainConfig:
         self._validate_generation_path()
         self._validate_retention_destination()
         self._validate_s3_destination()
+
+    def _validate_schedule_epsilon_and_dropout(self) -> None:
+        """Refuse the values TrainingArguments and peft would accept and then train wrongly under."""
+        if (self.warmup_ratio is None) == (self.warmup_steps is None):
+            raise ValueError("set exactly one of warmup_ratio and warmup_steps")
+        if self.warmup_ratio is not None and not 0.0 <= self.warmup_ratio < 1.0:
+            raise ValueError(f"warmup_ratio must be in [0, 1), got {self.warmup_ratio}")
+        if self.warmup_steps is not None and self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be non-negative, got {self.warmup_steps}")
+        if self.adam_epsilon <= 0:
+            raise ValueError(
+                f"adam_epsilon must be positive, {self.adam_epsilon=}: zero divides the update by a "
+                f"second moment that can be zero. The small value wanted is 1e-15, not 0."
+            )
+        if not 0 <= self.lora_dropout < 1:
+            raise ValueError(
+                f"lora_dropout must be in [0, 1), {self.lora_dropout=}. At 1 the graded forward is "
+                f"the base model and the run trains nothing while every series stays green."
+            )
 
     def _validate_estimator_under_the_trim(self) -> None:
         """Refuse the one estimator whose Liger normaliser sees the pad columns the trainer trims away.
@@ -963,7 +1002,13 @@ def _build_grpo_config(
         max_completion_length=config.completion_budget,
         learning_rate=config.learning_rate,
         lr_scheduler_type=config.lr_scheduler,
-        warmup_steps=config.warmup_ratio,
+        # Transformers 5.15 reads a float in [0, 1) here as a ratio and an int as a step count.
+        warmup_steps=(
+            config.warmup_steps
+            if config.warmup_steps is not None
+            else cast("float", config.warmup_ratio)
+        ),
+        adam_epsilon=config.adam_epsilon,
         max_steps=config.max_steps,
         logging_strategy="steps",
         logging_first_step=True,
@@ -1090,7 +1135,10 @@ def _prepare_run(
     if resume_checkpoint is not None:
         recorded_launch = read_recorded_launch(output_dir, checkpoint=resume_checkpoint)
         assert_resume_matches(
-            recorded=cast("Mapping[str, object]", recorded_launch["config"]),
+            recorded={
+                **RESUME_IDENTITY_DEFAULTS,
+                **cast("Mapping[str, object]", recorded_launch["config"]),
+            },
             current=asdict(config),
             fields=RESUME_IDENTITY_FIELDS,
             checkpoint=resume_checkpoint,
@@ -1442,6 +1490,10 @@ def _config_from_namespace(args: argparse.Namespace) -> RewardHackingTrainConfig
     values = vars(args)
     smoke = bool(values.pop("smoke"))
     model_id = values.pop("model_id") or (SMOKE_MODEL_ID if smoke else DEFAULT_MODEL_ID)
+    # The warmup flags are mutually exclusive and the step count has a default, so a ratio given at
+    # the command line replaces it.
+    if values["warmup_ratio"] is not None:
+        values["warmup_steps"] = None
     config = RewardHackingTrainConfig(model_id=model_id, smoke=smoke, **values)
     return shrink_for_smoke(config) if smoke else config
 
@@ -1452,8 +1504,10 @@ def _add_optimisation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompts-per-step", type=int, default=8)
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--lr-scheduler", default="cosine")
-    parser.add_argument("--warmup-ratio", type=float, default=0.1)
+    parser.add_argument("--lr-scheduler", default=GRPO_LR_SCHEDULER)
+    warmup = parser.add_mutually_exclusive_group()
+    warmup.add_argument("--warmup-ratio", type=float, default=None)
+    warmup.add_argument("--warmup-steps", type=int, default=GRPO_WARMUP_STEPS)
     parser.add_argument("--max-steps", type=int, default=70)
     parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
     parser.add_argument("--max-completion-tokens", type=int, default=None)
@@ -1469,7 +1523,8 @@ def _add_optimisation_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--acknowledge-liger-estimator-mismatch", action="store_true")
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--lora-dropout", type=float, default=GRPO_LORA_DROPOUT)
+    parser.add_argument("--adam-epsilon", type=float, default=GRPO_ADAM_EPSILON)
     parser.add_argument("--no-liger", dest="use_liger_kernel", action="store_false")
     parser.add_argument(
         "--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false"

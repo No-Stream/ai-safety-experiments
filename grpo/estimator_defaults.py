@@ -64,12 +64,33 @@ Why these values, in brief:
   ``loss_type="cispo"`` with ``epsilon_high=5.0`` (the larger-evidence ScaleRL recipe) -- and the
   disabled vLLM importance-sampling correction becomes a first-order question rather than a
   logged caveat.
+
+The optimizer schedule and adapter defaults below are repo-wide for the same reason (agreed with the
+owner 2026-10-01, replacing cosine / 0.1 / 1e-8 / 0.05, which every arm banked before that date ran):
+
+- **``constant_with_warmup`` after a fixed seven-step warmup.** A cosine schedule decays to zero at
+  ``max_steps``, so its late checkpoints take almost no step, a dose-response read across checkpoints
+  is confounded with the schedule running out, and a run cannot be continued for more steps without
+  becoming a different experiment. A constant rate keeps every round's update the same size, so
+  a run can be extended. The warmup is a step count rather than a ratio of ``max_steps`` so that
+  extending a run does not move it; seven is what a 0.1 ratio gave a 70-step run, which keeps the
+  first seven steps identical to the banked arms'.
+- **``adam_epsilon`` 1e-15.** At 1e-8, 99.3% of the LoRA A-matrix second moments in the banked 9B self
+  arm sat below the floor, damping the A side to a median 0.108 of its nominal step (the caveat
+  above). 1e-15 is what MiniMax-M1 and ScaleRL run.
+- **``lora_dropout`` 0.** Dropout makes the graded forward stochastic while vLLM samples the rollout
+  without it, a trainer-sampler mismatch on otherwise exactly on-policy updates.
 """
 
 GRPO_LOSS_TYPE = "dr_grpo"
 GRPO_SCALE_REWARDS = "none"
 # Inert while runs stay on-policy (ratio == 1); see the off-policy contingency note above.
 GRPO_EPSILON = 0.2
+
+GRPO_LR_SCHEDULER = "constant_with_warmup"
+GRPO_WARMUP_STEPS = 7
+GRPO_ADAM_EPSILON = 1e-15
+GRPO_LORA_DROPOUT = 0.0
 
 # TRL 1.10's accepted values, pinned so a typo fails at launch, not on a loaded rented GPU.
 GRPO_LOSS_TYPES = ("grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo")

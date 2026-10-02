@@ -44,6 +44,7 @@ from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase, Tra
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
 from grpo.estimator_defaults import (
+    GRPO_LORA_DROPOUT,
     GRPO_LOSS_TYPE,
     GRPO_SCALE_REWARDS,
     assert_liger_faithful_estimator,
@@ -743,7 +744,7 @@ def build_trainer(
         peft_config=LoraConfig(
             r=config.lora_rank,
             lora_alpha=config.lora_alpha,
-            lora_dropout=0.05,
+            lora_dropout=GRPO_LORA_DROPOUT,
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=cast("list[str]", lora_targets["target_modules"]),

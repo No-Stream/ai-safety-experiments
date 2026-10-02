@@ -190,11 +190,15 @@ from games.termination import (
     required_completion_budget,
 )
 from grpo.estimator_defaults import (
+    GRPO_ADAM_EPSILON,
     GRPO_EPSILON,
+    GRPO_LORA_DROPOUT,
     GRPO_LOSS_TYPE,
     GRPO_LOSS_TYPES,
+    GRPO_LR_SCHEDULER,
     GRPO_SCALE_REWARDS,
     GRPO_SCALE_REWARDS_MODES,
+    GRPO_WARMUP_STEPS,
     LIGER_UNFAITHFUL_LOSS_TYPES,
     VESPO_IMPORTANCE_SAMPLING_MODES,
     VLLM_IMPORTANCE_SAMPLING_MODE,
@@ -731,9 +735,11 @@ class GameTrainConfig:
     # would do; it decides whether a configuration fits independently of the episode count.
     micro_batch_size: int | None = None
     learning_rate: float = 1e-5
-    lr_scheduler: str = "cosine"
-    warmup_ratio: float | None = 0.1
-    warmup_steps: int | None = None
+    # Constant after a fixed-step warmup, so a finished run can be extended by more steps without
+    # the schedule changing under it (grpo/estimator_defaults.py). Exactly one warmup field is set.
+    lr_scheduler: str = GRPO_LR_SCHEDULER
+    warmup_ratio: float | None = None
+    warmup_steps: int | None = GRPO_WARMUP_STEPS
     max_steps: int = 70
     max_prompt_tokens: int = 1024
     # Named, versioned text appended to every user turn before chat templating. This is part of the
@@ -765,20 +771,19 @@ class GameTrainConfig:
     # e.g. the A/B arm isolating scale_rewards with "dapo" as executed-GRPO. Recorded in
     # run_config.json like every other field, and refused when there is no mismatch to acknowledge.
     acknowledge_liger_estimator_mismatch: bool = False
-    # AdamW's denominator floor, at transformers' own default so that no plan written before this
-    # field existed trains differently for its arrival. It is a treatment knob rather than a
-    # numerical nicety on LoRA: sqrt(v_hat) for the A matrices of the banked 9B self arm sat below
-    # 1e-8 for 99.3 percent of entries at step 70 (measured off its optimizer.pt), so the epsilon
-    # was setting the A-side step to about a tenth of its nominal size, and the damping moves with
-    # the reward scale and the completion budget that feed dr_grpo's normaliser. 1e-15, which
+    # AdamW's denominator floor. A treatment knob rather than a numerical nicety on LoRA:
+    # sqrt(v_hat) for the A matrices of the banked 9B self arm sat below 1e-8 for 99.3 percent of
+    # entries at step 70 (measured off its optimizer.pt), so transformers' default epsilon was
+    # setting the A-side step to about a tenth of its nominal size, and the damping moves with the
+    # reward scale and the completion budget that feed dr_grpo's normaliser. 1e-15, which
     # MiniMax-M1 and ScaleRL both run, restores the scale invariance we believed we already had.
-    adam_epsilon: float = 1e-8
+    adam_epsilon: float = GRPO_ADAM_EPSILON
     lora_rank: int = 16
     lora_alpha: int = 32
     # Nonzero makes the graded forward stochastic while vLLM sampled the rollout with no dropout at
-    # all, which is a train-inference mismatch on an otherwise exactly on-policy setup. Left at the
-    # value every banked arm trained under; the RL recipes all run 0, which an arm asks for.
-    lora_dropout: float = 0.05
+    # all, which is a train-inference mismatch on an otherwise exactly on-policy setup. Every arm
+    # banked before 2026-10-01 trained at 0.05.
+    lora_dropout: float = GRPO_LORA_DROPOUT
     use_liger_kernel: bool = True
     gradient_checkpointing: bool = True
     # Keep every intermediate: the eval battery runs per checkpoint, and re-running an arm to
@@ -4863,8 +4868,10 @@ def _config_from_namespace(args: argparse.Namespace) -> GameTrainConfig:
     model_id = values.pop("model_id") or (SMOKE_MODEL_ID if smoke else DEFAULT_MODEL_ID)
     if values["max_completion_tokens"] is None:
         values["max_completion_tokens"] = required_completion_budget(model_id)
-    if values["warmup_steps"] is not None:
-        values["warmup_ratio"] = None
+    # The two flags are mutually exclusive and the step count has a default, so a ratio given at the
+    # command line replaces it.
+    if values["warmup_ratio"] is not None:
+        values["warmup_steps"] = None
     values["generate_fresh"] = bool(values["generate_fresh"]) or smoke
     # `smoke` goes into the FIRST construction, not only the shrunk one: validation runs in
     # __post_init__, and the pre-shrink intermediate still carries the full completion budget the
@@ -4991,11 +4998,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     parser.add_argument("--micro-batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument(
-        "--lr-scheduler", choices=("cosine", "constant_with_warmup"), default="cosine"
+        "--lr-scheduler", choices=("cosine", "constant_with_warmup"), default=GRPO_LR_SCHEDULER
     )
     warmup = parser.add_mutually_exclusive_group()
-    warmup.add_argument("--warmup-ratio", type=float, default=0.1)
-    warmup.add_argument("--warmup-steps", type=int, default=None)
+    warmup.add_argument("--warmup-ratio", type=float, default=None)
+    warmup.add_argument("--warmup-steps", type=int, default=GRPO_WARMUP_STEPS)
     parser.add_argument("--max-steps", type=int, default=70)
     parser.add_argument("--max-prompt-tokens", type=int, default=1024)
     parser.add_argument(
@@ -5047,12 +5054,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     parser.add_argument(
         "--adam-epsilon",
         type=float,
-        default=1e-8,
+        default=GRPO_ADAM_EPSILON,
         help=(
-            "AdamW's denominator floor. The default is transformers' own, which is what every "
-            "banked arm trained under; 1e-15 unfreezes the LoRA A matrices (see "
-            "GameTrainConfig.adam_epsilon for the measurement) and is a treatment change, "
-            "recorded in run_config.json and checked on resume like the arm itself."
+            "AdamW's denominator floor. 1e-15 keeps the LoRA A matrices from being damped (see "
+            "GameTrainConfig.adam_epsilon for the measurement); every arm banked before "
+            "2026-10-01 trained at transformers' 1e-8. Recorded in run_config.json and checked "
+            "on resume like the arm itself."
         ),
     )
     parser.add_argument("--lora-rank", type=int, default=16)
@@ -5060,7 +5067,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     parser.add_argument(
         "--lora-dropout",
         type=float,
-        default=0.05,
+        default=GRPO_LORA_DROPOUT,
         help=(
             "adapter dropout during the graded forward. vLLM sampled the rollout without it, so "
             "any nonzero value is a train-inference mismatch; 0 is what the RL recipes run. A "

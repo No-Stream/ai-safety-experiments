@@ -137,9 +137,23 @@ class TestTailLengthPenaltyConfig:
 
 
 class TestLearningRateScheduleConfig:
+    def test_the_default_is_a_constant_rate_after_a_fixed_step_warmup(self) -> None:
+        """Constant so a finished run can be extended; a step count so extending it moves nothing."""
+        args = gt._build_grpo_config(make_config(), make_plan(), dtype=torch.float32)
+        assert args.lr_scheduler_type == SchedulerType("constant_with_warmup")
+        assert args.warmup_steps == 7
+        assert isinstance(args.warmup_steps, int)
+
+    def test_the_default_warmup_does_not_scale_with_max_steps(self) -> None:
+        short = gt._build_grpo_config(make_config(max_steps=70), make_plan(), dtype=torch.float32)
+        extended = gt._build_grpo_config(
+            make_config(max_steps=140), make_plan(), dtype=torch.float32
+        )
+        assert short.get_warmup_steps(70) == extended.get_warmup_steps(140) == 7
+
     @pytest.mark.parametrize("scheduler", ["cosine", "constant_with_warmup"])
     def test_the_scheduler_and_ratio_reach_trl(self, scheduler: str) -> None:
-        config = make_config(lr_scheduler=scheduler, warmup_ratio=0.125)
+        config = make_config(lr_scheduler=scheduler, warmup_ratio=0.125, warmup_steps=None)
         args = gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
         assert args.lr_scheduler_type == SchedulerType(scheduler)
         assert args.warmup_steps == pytest.approx(0.125)
@@ -162,10 +176,46 @@ class TestLearningRateScheduleConfig:
         args = gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
         assert args.warmup_steps == 7
 
+    def test_a_warmup_ratio_at_the_cli_replaces_the_default_step_count(self) -> None:
+        config = gt._parse_args(
+            ["--arm", "twin-pd-group", "--generate-fresh", "--warmup-ratio", "0.1"]
+        )
+        assert config.warmup_ratio == pytest.approx(0.1)
+        assert config.warmup_steps is None
+
+    def test_the_cli_defaults_match_the_dataclass_defaults(self) -> None:
+        config = gt._parse_args(["--arm", "twin-pd-group", "--generate-fresh"])
+        defaults = make_config()
+        assert (config.lr_scheduler, config.warmup_ratio, config.warmup_steps) == (
+            defaults.lr_scheduler,
+            defaults.warmup_ratio,
+            defaults.warmup_steps,
+        )
+        assert config.adam_epsilon == pytest.approx(defaults.adam_epsilon)
+        assert config.lora_dropout == pytest.approx(defaults.lora_dropout)
+
     def test_schedule_fields_are_resume_identity(self) -> None:
         assert {"learning_rate", "lr_scheduler", "warmup_ratio", "warmup_steps"} <= set(
             gt.RESUME_IDENTITY_FIELDS
         )
+
+    def test_a_banked_record_refuses_a_resume_under_the_new_defaults(self, tmp_path: Path) -> None:
+        """A pre-2026-10-01 arm continued without its old flags would switch schedule mid-run."""
+        recorded = {
+            key: value
+            for key, value in asdict(make_config(output_dir=str(tmp_path / "run"))).items()
+            if key not in gt.RESUME_IDENTITY_DEFAULTS
+        }
+        with pytest.raises(RuntimeError, match="lr_scheduler") as refusal:
+            gt.assert_resume_matches(
+                recorded={**gt.RESUME_IDENTITY_DEFAULTS, **recorded},
+                current=asdict(make_config(output_dir=str(tmp_path / "run"))),
+                fields=gt.RESUME_IDENTITY_FIELDS,
+                checkpoint="checkpoint-70",
+                consequence="two schedules under one set of step numbers.",
+            )
+        for field in ("warmup_steps", "adam_epsilon", "lora_dropout"):
+            assert field in str(refusal.value)
 
 
 class TestSingleForwardVllmImportanceSamplingConfig:
@@ -1902,8 +1952,8 @@ class TestGrpoConfigGotchas:
         assert isinstance(init_kwargs, dict)
         assert "device_map" not in init_kwargs
 
-    def test_warmup_is_a_float_ratio(self):
-        assert self.build().warmup_steps == pytest.approx(0.1)
+    def test_warmup_is_a_step_count(self):
+        assert self.build().warmup_steps == 7
 
     def test_the_loss_and_reward_scaling_are_the_agreed_ones(self):
         """The 2026-08-20 estimator audit's values (grpo/estimator_defaults.py has the reasoning).
@@ -2844,21 +2894,22 @@ class TestParsePenaltyModeIsTheArms:
 
 
 class TestTheOptimizerEpsilonAndAdapterDropoutAreRecordedTreatment:
-    """Two knobs the wave-4b arm moves, and moves as explicit recorded flags rather than defaults.
+    """Two knobs that changed default on 2026-10-01, and stay recorded treatment either way.
 
     The GRPO best-practices note measured the banked 9B self arm's step-70 optimizer state and found
     99.3 percent of the LoRA A-matrix second moments below AdamW's default epsilon of 1e-8, damping
     the A side of every adapter to about a tenth of its nominal step; and adapter dropout makes the
-    graded forward stochastic while vLLM sampled the rollout without it. Both are therefore
-    treatment changes against the banked pair, so both stay at the banked values by default, land in
-    `run_config.json` and join the resume identity: a checkpoint's steps trained under one optimizer
-    epsilon or one adapter dropout cannot be continued under another without saying so.
+    graded forward stochastic while vLLM sampled the rollout without it. New arms therefore default
+    to 1e-15 and 0 (grpo/estimator_defaults.py), both land in `run_config.json` and both join the
+    resume identity: a checkpoint's steps trained under one optimizer epsilon or one adapter dropout
+    cannot be continued under another without saying so, and every banked arm's record resolves to
+    the old values.
     """
 
-    def test_the_defaults_are_the_values_the_banked_pair_trained_under(self):
+    def test_the_defaults_are_the_repo_wide_ones(self):
         config = make_config()
-        assert config.adam_epsilon == pytest.approx(1e-8)
-        assert config.lora_dropout == pytest.approx(0.05)
+        assert config.adam_epsilon == pytest.approx(1e-15)
+        assert config.lora_dropout == pytest.approx(0.0)
 
     def test_both_flags_parse_onto_their_config_fields(self):
         config = gt._parse_args(
@@ -2895,10 +2946,10 @@ class TestTheOptimizerEpsilonAndAdapterDropoutAreRecordedTreatment:
         args = gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
         assert args.adam_epsilon == pytest.approx(1e-15)
 
-    def test_an_unset_epsilon_reaches_trl_as_transformers_own_default(self):
+    def test_an_unset_epsilon_reaches_trl_as_the_repo_default(self):
         config = make_config(use_liger_kernel=False, output_dir="artifacts/games/runs/test")
         args = gt._build_grpo_config(config, make_plan(), dtype=torch.float32)
-        assert args.adam_epsilon == pytest.approx(1e-8)
+        assert args.adam_epsilon == pytest.approx(1e-15)
 
     def test_an_epsilon_of_zero_is_refused_before_a_card_is_reserved(self):
         with pytest.raises(ValueError, match="adam_epsilon"):
@@ -3017,8 +3068,9 @@ class TestTheOptimizerEpsilonAndAdapterDropoutAreRecordedTreatment:
         """
         assert gt.RESUME_IDENTITY_DEFAULTS["adam_epsilon"] == pytest.approx(1e-8)
         assert gt.RESUME_IDENTITY_DEFAULTS["lora_dropout"] == pytest.approx(0.05)
+        banked = make_config(adam_epsilon=1e-8, lora_dropout=0.05, output_dir=str(tmp_path / "run"))
         recorded = gt.run_config_payload(
-            make_config(output_dir=str(tmp_path / "run")),
+            banked,
             plan=make_plan(),
             device={"device_name": "NVIDIA L40S"},
             derived={},
@@ -3028,7 +3080,7 @@ class TestTheOptimizerEpsilonAndAdapterDropoutAreRecordedTreatment:
         del recorded["lora_dropout"]
         gt.assert_resume_matches(
             recorded={**gt.RESUME_IDENTITY_DEFAULTS, **recorded},
-            current=asdict(make_config(output_dir=str(tmp_path / "run"))),
+            current=asdict(banked),
             fields=gt.RESUME_IDENTITY_FIELDS,
             checkpoint="checkpoint-70",
             consequence="two treatments under one set of step numbers.",

@@ -989,23 +989,23 @@ class TestAResumeIsCheckedAgainstTheLaunchItContinues:
         self, tmp_path: Path, stubbed_run: object
     ):
         """Absence in an old record means dapo/batch -- the values the hardcoded lines held --
-        so a launch stating those continues, rather than tripping on absence != anything."""
+        so a launch stating those continues, rather than tripping on absence != anything. The same
+        era also ran the schedule, epsilon and dropout that stopped being defaults on 2026-10-01."""
         del stubbed_run
-        first = run_arm(
-            tmp_path,
-            loss_type="dapo",
-            scale_rewards="batch",
-            acknowledge_liger_estimator_mismatch=True,
-        )
+        old_era = {
+            "loss_type": "dapo",
+            "scale_rewards": "batch",
+            "acknowledge_liger_estimator_mismatch": True,
+            "lr_scheduler": "cosine",
+            "warmup_ratio": 0.1,
+            "warmup_steps": None,
+            "adam_epsilon": 1e-8,
+            "lora_dropout": 0.05,
+        }
+        first = run_arm(tmp_path, **old_era)
         checkpoint = self.seed_a_checkpoint(first)
         self.strip_estimator_fields(first)
-        second = run_arm(
-            tmp_path,
-            loss_type="dapo",
-            scale_rewards="batch",
-            acknowledge_liger_estimator_mismatch=True,
-            resume_from_checkpoint=gt.RESUME_LATEST,
-        )
+        second = run_arm(tmp_path, **old_era, resume_from_checkpoint=gt.RESUME_LATEST)
         assert second.trainer.resumed_from == str(checkpoint)
 
     def test_a_pre_estimator_record_refuses_a_resume_under_the_new_defaults(
@@ -1340,16 +1340,17 @@ class TestTheAdapterDropoutReachesPeft:
         harness = run_arm(tmp_path, **overrides)
         return cast("float", harness.trainer.build_kwargs["peft_config"].lora_dropout)
 
-    def test_a_configured_zero_reaches_the_adapter(self, tmp_path: Path, stubbed_run: object):
-        """Zero rather than a truthy value on purpose: `or`-style plumbing would substitute 0.05."""
-        del stubbed_run
-        assert self.built_dropout(tmp_path, lora_dropout=0.0) == pytest.approx(0.0)
-
-    def test_an_unset_dropout_arrives_as_the_value_every_banked_arm_trained_under(
+    def test_a_configured_nonzero_value_reaches_the_adapter(
         self, tmp_path: Path, stubbed_run: object
     ):
+        """Non-default on purpose: plumbing that dropped the field would build the default 0."""
         del stubbed_run
-        assert self.built_dropout(tmp_path) == pytest.approx(0.05)
+        assert self.built_dropout(tmp_path, lora_dropout=0.05) == pytest.approx(0.05)
+
+    def test_an_unset_dropout_arrives_as_zero(self, tmp_path: Path, stubbed_run: object):
+        """Zero, the repo default since 2026-10-01 (and also peft's, hence the nonzero test above)."""
+        del stubbed_run
+        assert self.built_dropout(tmp_path) == pytest.approx(0.0)
 
     def test_the_run_record_and_the_adapter_cannot_disagree(
         self, tmp_path: Path, stubbed_run: object

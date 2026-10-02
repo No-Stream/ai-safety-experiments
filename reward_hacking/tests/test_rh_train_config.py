@@ -35,6 +35,7 @@ from typing import Any, ClassVar, cast
 import pytest
 import torch
 from rich.console import Console
+from transformers.trainer_utils import SchedulerType
 from trl.trainer.utils import print_prompt_completions_sample
 
 from games import preflight, provenance, sizing
@@ -80,6 +81,7 @@ SHARED_TRL_FIELDS = (
     "lr_scheduler_type",
     "learning_rate",
     "warmup_steps",
+    "adam_epsilon",
 )
 
 
@@ -216,6 +218,103 @@ class TestEstimatorPin:
         """A resumed run on a different estimator is two experiments under one set of steps."""
         assert "loss_type" in rh_train.RESUME_IDENTITY_FIELDS
         assert "scale_rewards" in rh_train.RESUME_IDENTITY_FIELDS
+
+
+class TestScheduleEpsilonAndDropoutDefaults:
+    """The repo-wide defaults of 2026-10-01 (grpo/estimator_defaults.py), and the banked era's."""
+
+    BANKED_ERA: ClassVar[dict[str, object]] = {
+        "lr_scheduler": "cosine",
+        "warmup_ratio": 0.1,
+        "warmup_steps": None,
+        "adam_epsilon": 1e-8,
+        "lora_dropout": 0.05,
+    }
+    CLI_BASE: ClassVar[tuple[str, ...]] = (
+        "--arm",
+        ARM_MISSPECIFIED,
+        "--no-vllm-colocate",
+        "--allow-hf-generation",
+        "--s3-dest",
+        "s3://bucket/option3/misspecified-Qwen-Qwen3.5-4B",
+    )
+
+    def test_the_defaults_reach_trl(self):
+        args = rh_train._build_grpo_config(make_config(), make_plan(), dtype=torch.float32)
+        assert args.lr_scheduler_type == SchedulerType("constant_with_warmup")
+        assert args.warmup_steps == 7
+        assert args.adam_epsilon == pytest.approx(1e-15)
+        assert make_config().lora_dropout == pytest.approx(0.0)
+
+    def test_a_ratio_still_reaches_trl_as_a_ratio(self):
+        args = rh_train._build_grpo_config(
+            make_config(warmup_ratio=0.1, warmup_steps=None), make_plan(), dtype=torch.float32
+        )
+        assert args.warmup_steps == pytest.approx(0.1)
+
+    @pytest.mark.parametrize(
+        "warmup", [{"warmup_ratio": 0.1}, {"warmup_ratio": None, "warmup_steps": None}]
+    )
+    def test_exactly_one_warmup_field_is_required(self, warmup: dict[str, object]):
+        with pytest.raises(ValueError, match="exactly one of warmup_ratio and warmup_steps"):
+            make_config(**warmup)
+
+    @pytest.mark.parametrize("epsilon", [0.0, -1e-15])
+    def test_a_non_positive_epsilon_is_refused(self, epsilon: float):
+        with pytest.raises(ValueError, match="adam_epsilon"):
+            make_config(adam_epsilon=epsilon)
+
+    @pytest.mark.parametrize("dropout", [1.0, -0.01])
+    def test_a_dropout_outside_zero_to_one_is_refused(self, dropout: float):
+        with pytest.raises(ValueError, match="lora_dropout"):
+            make_config(lora_dropout=dropout)
+
+    def test_the_cli_defaults_match_the_dataclass(self):
+        config = rh_train._parse_args([*self.CLI_BASE])
+        defaults = make_config()
+        for field in self.BANKED_ERA:
+            assert getattr(config, field) == getattr(defaults, field), field
+
+    def test_a_warmup_ratio_at_the_cli_replaces_the_default_step_count(self):
+        config = rh_train._parse_args(
+            [*self.CLI_BASE, "--warmup-ratio", "0.1", "--adam-epsilon", "1e-8"]
+        )
+        assert (config.warmup_ratio, config.warmup_steps) == (0.1, None)
+        assert config.adam_epsilon == pytest.approx(1e-8)
+
+    def test_a_banked_record_resumes_under_its_own_values(self):
+        """Every banked record predates `adam_epsilon` and `warmup_steps`; absence means the old era."""
+        banked = make_config(**self.BANKED_ERA)
+        recorded = {
+            key: value
+            for key, value in vars(banked).items()
+            if key not in rh_train.RESUME_IDENTITY_DEFAULTS
+        }
+        game_train.assert_resume_matches(
+            recorded={**rh_train.RESUME_IDENTITY_DEFAULTS, **recorded},
+            current=vars(banked),
+            fields=rh_train.RESUME_IDENTITY_FIELDS,
+            checkpoint="checkpoint-35",
+            consequence="two treatments under one set of step numbers.",
+        )
+
+    def test_a_banked_record_refuses_a_resume_under_the_new_defaults(self):
+        banked = make_config(**self.BANKED_ERA)
+        recorded = {
+            key: value
+            for key, value in vars(banked).items()
+            if key not in rh_train.RESUME_IDENTITY_DEFAULTS
+        }
+        with pytest.raises(RuntimeError, match="lr_scheduler") as refusal:
+            game_train.assert_resume_matches(
+                recorded={**rh_train.RESUME_IDENTITY_DEFAULTS, **recorded},
+                current=vars(make_config()),
+                fields=rh_train.RESUME_IDENTITY_FIELDS,
+                checkpoint="checkpoint-35",
+                consequence="two treatments under one set of step numbers.",
+            )
+        for field in ("warmup_steps", "adam_epsilon", "lora_dropout"):
+            assert field in str(refusal.value)
 
 
 class TestCheckpointRetention:
@@ -473,6 +572,39 @@ class TestTheLaunchResumesThroughTheCompletenessGate:
         (checkpoint,) = read_for
         return checkpoint
 
+    @pytest.mark.parametrize("launch_matches_the_banked_era", [True, False])
+    def test_a_banked_record_missing_the_newer_fields_is_judged_by_its_era(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_matches_the_banked_era: bool
+    ):
+        """Through `_prepare_run` itself: a record without `adam_epsilon` or `warmup_steps` resumes
+        under the old values and is refused under the new defaults, rather than refused either way."""
+        banked_era = TestScheduleEpsilonAndDropoutDefaults.BANKED_ERA
+        self.seed_a_checkpoint(tmp_path / "run", 3)
+        location = {
+            "smoke": True,
+            "resume_from_checkpoint": rh_train.RESUME_LATEST,
+            "output_dir": str(tmp_path / "run"),
+            "grader_scratch_root": str(tmp_path / "grader-scratch"),
+        }
+        recorded = {
+            key: value
+            for key, value in vars(make_config(**location, **banked_era)).items()
+            if key not in rh_train.RESUME_IDENTITY_DEFAULTS
+        }
+
+        def provenance_tripwire(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("tripwire: the identity check passed")
+
+        monkeypatch.setattr(rh_train, "assert_jail_usable", lambda **_kwargs: {"stubbed": True})
+        monkeypatch.setattr(
+            rh_train, "read_recorded_launch", lambda *_args, **_kwargs: {"config": recorded}
+        )
+        monkeypatch.setattr(rh_train, "assert_resume_provenance_matches", provenance_tripwire)
+        launch = make_config(**location, **(banked_era if launch_matches_the_banked_era else {}))
+        expected = "tripwire" if launch_matches_the_banked_era else "refusing to resume"
+        with pytest.raises(RuntimeError, match=expected):
+            rh_train._prepare_run(launch, kernel_bridge=None)
+
     def test_a_complete_newest_checkpoint_is_the_one_the_launch_reads(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -555,9 +687,6 @@ class TestGrpoConfigParity:
                 arm="twin-pd-group",
                 generate_fresh=True,
                 output_dir="artifacts/games-parity",
-                learning_rate=make_config().learning_rate,
-                lr_scheduler=make_config().lr_scheduler,
-                warmup_ratio=make_config().warmup_ratio,
             ),
             plan,
             dtype=torch.float32,
@@ -753,6 +882,7 @@ class TestResumeIdentityCoversWhatChangesTheExperiment:
             "max_steps",
             "lora_alpha",
             "lora_dropout",
+            "adam_epsilon",
             "grader_timeout_seconds",
             "seed",
             "max_completion_tokens",
@@ -767,7 +897,15 @@ class TestResumeIdentityCoversWhatChangesTheExperiment:
 
     @pytest.mark.parametrize(
         "field",
-        ["temperature", "top_p", "top_k", "learning_rate", "lr_scheduler", "warmup_ratio"],
+        [
+            "temperature",
+            "top_p",
+            "top_k",
+            "learning_rate",
+            "lr_scheduler",
+            "warmup_ratio",
+            "warmup_steps",
+        ],
     )
     def test_the_sampler_and_the_schedule_are_pinned(self, field: str):
         """The set was self-inconsistent: `max_steps` was pinned precisely because the scheduler is
