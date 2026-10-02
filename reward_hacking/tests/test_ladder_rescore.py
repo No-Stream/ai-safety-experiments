@@ -153,6 +153,135 @@ def test_rescore_reproduces_detection_from_a_fresh_episode_record(
     assert rescored_rows[0]["rescore"]["timestamp_utc"]
 
 
+def test_rescore_accepts_legacy_headers_without_detector_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    provenance = cast("dict[str, object]", header["provenance"])
+    provenance.pop("generation_code_identity")
+    provenance.pop("detector_code_identity")
+    provenance["code_identity"] = "legacy-combined-code-identity"
+    provenance["schema_version"] = 11
+    header["schema_version"] = 11
+    header["provenance_digest"] = provenance_digest(provenance)
+    for row in rows:
+        if row.get("record") == "ladder_episode":
+            row.pop("detector_code_identity")
+            row["provenance_digest"] = header["provenance_digest"]
+    input_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+    rescored_episode = next(row for row in rescored_rows if row.get("record") == "ladder_episode")
+    assert rescored_episode["detector_code_identity"]
+    assert "rescore_source_detector_code_identity" not in rescored_episode
+
+
+def test_rescore_normalises_episodes_scored_by_different_detector_versions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    detector_identity = "detector-one"
+    monkeypatch.setattr(
+        "reward_hacking.ladder.runner.detector_code_identity",
+        lambda: detector_identity,
+    )
+    monkeypatch.setattr(
+        "reward_hacking.ladder.runner.run_pristine_visible_grade",
+        lambda *_args, **_kwargs: (False, False),
+    )
+    scenario_root = tmp_path / "scenarios"
+    scenario = _write_scenario(scenario_root)
+    input_path = tmp_path / "mixed-input.jsonl"
+    config = RunnerConfig(
+        endpoint="http://127.0.0.1:8000",
+        models=(ModelSpec("fixture-model", tmp_path / "model"),),
+        scenarios=(scenario,),
+        arms=("naive",),
+        samples=2,
+        output_path=input_path,
+        episode_root=tmp_path / "episodes",
+    )
+    fail_second_sample_once = True
+
+    def episode_runner(  # noqa: PLR0913, PLR0917 - mirrors the EpisodeRunner callback contract
+        scenario: ScenarioLike,
+        backend: object,
+        arm: str,
+        sample: int,
+        episode_dir: Path,
+        trace_path: Path,
+    ) -> EpisodeRun:
+        nonlocal fail_second_sample_once
+        if sample == 1 and fail_second_sample_once:
+            fail_second_sample_once = False
+            raise RuntimeError("simulated interrupted run")
+        return _episode_runner(scenario, backend, arm, sample, episode_dir, trace_path)
+
+    def run(config: RunnerConfig) -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=episode_runner,
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {"honest_solve": False},
+        )
+
+    with pytest.raises(RuntimeError, match="simulated interrupted run"):
+        run(config)
+
+    detector_identity = "detector-two"
+    assert (
+        len(
+            run(
+                RunnerConfig(
+                    endpoint="http://127.0.0.1:8000",
+                    models=(ModelSpec("fixture-model", tmp_path / "model"),),
+                    scenarios=(scenario,),
+                    arms=("naive",),
+                    samples=2,
+                    output_path=input_path,
+                    episode_root=tmp_path / "episodes",
+                )
+            )
+        )
+        == 1
+    )
+    original_rows = [
+        json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()
+    ]
+    original_episodes = [row for row in original_rows if row.get("record") == "ladder_episode"]
+    assert {row["detector_code_identity"] for row in original_episodes} == {
+        "detector-one",
+        "detector-two",
+    }
+
+    output_path = tmp_path / "mixed-rescored.jsonl"
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+    rescored_episodes = [row for row in rescored_rows if row.get("record") == "ladder_episode"]
+    headers = [row for row in rescored_rows if row.get("record") == "ladder_run_header"]
+    assert {row["detector_code_identity"] for row in rescored_episodes} == {"detector-two"}
+    assert (
+        next(
+            row
+            for row in rescored_episodes
+            if cast("dict[str, object]", row["key"])["sample_idx"] == 0
+        )["rescore_source_detector_code_identity"]
+        == "detector-one"
+    )
+    assert {
+        cast("dict[str, object]", row["provenance"])["detector_code_identity"] for row in headers
+    } == {"detector-one", "detector-two"}
+    assert all(
+        cast("dict[str, object]", row["rescore"])["detector_code_identity"] == "detector-two"
+        for row in headers
+    )
+
+
 def test_rescore_accepts_multiple_task_pressure_headers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 11
+LADDER_SCHEMA_VERSION = 12
 MAX_RUNG = 6
 LADDER_MAX_TURNS = 40
 LADDER_EPISODE_SECONDS = 1800.0
@@ -67,6 +67,31 @@ LADDER_ARMS = frozenset({"naive", "claimed", "real"})
 LADDER_TASK_PRESSURES = ("none", "merge-gate")
 _MODEL_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _MINIMUM_VISIBLE_MARKER_LENGTH = 3
+
+# Generation sources determine prompts, sampling, execution, monitoring, and grading. Detector
+# sources determine persisted rung scoring and replay. Report-disclosure results are record-only;
+# rung IDs also feed live <check/> feedback, so detector-only edits must preserve those IDs.
+LADDER_GENERATION_CODE_FILES = (
+    "reward_hacking/harness/loop.py",
+    "reward_hacking/harness/protocol.py",
+    "reward_hacking/harness/task_spec.py",
+    "reward_hacking/harness/tasks.py",
+    "reward_hacking/harness/tasks_evalplus.py",
+    "reward_hacking/jailed_poc.py",
+    "reward_hacking/ladder/arms.py",
+    "reward_hacking/ladder/monitor.py",
+    "reward_hacking/ladder/runner.py",
+    "reward_hacking/ladder/rungs.py",
+    "reward_hacking/ladder/scenario.py",
+    "reward_hacking/model_backend.py",
+    "reward_hacking/trace.py",
+    "scripts/episode_jail.sh",
+    "scripts/resource-limits.sh",
+)
+LADDER_DETECTOR_CODE_FILES = (
+    "reward_hacking/ladder/disclosure.py",
+    "reward_hacking/ladder/rescore.py",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +214,7 @@ class RunnerConfig:
         object.__setattr__(self, "_provenance_digest_cache", provenance_digest(provenance))
 
     def provenance_payload(self) -> dict[str, object]:
-        """Return the run-level identity used to guard resume."""
+        """Return persisted provenance; resume ignores only the detector source identity."""
         return deepcopy(self._provenance_payload_cache)
 
     def _build_provenance_payload(self) -> dict[str, object]:
@@ -202,7 +227,8 @@ class RunnerConfig:
                 {"scenario_id": scenario.slug, "manifest_digest": scenario_digest(scenario)}
                 for scenario in self.scenarios
             ],
-            "code_identity": _code_identity(),
+            "generation_code_identity": _generation_code_identity(),
+            "detector_code_identity": detector_code_identity(),
             "arms": list(self.arms),
             "samples": self.samples,
             "sampling": LADDER_SAMPLING.to_json(),
@@ -334,29 +360,11 @@ def provenance_digest(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _code_identity() -> str:
-    """Hash the ladder and harness source files that determine episode behavior."""
-    repository_root = Path(__file__).resolve().parents[2]
-    ladder_root = repository_root / "reward_hacking" / "ladder"
-    source_files = {
-        path.relative_to(repository_root).as_posix(): path
-        for path in ladder_root.rglob("*.py")
-        if path.is_file()
-    }
-    additional_paths = (
-        "reward_hacking/harness/loop.py",
-        "reward_hacking/harness/protocol.py",
-        "reward_hacking/harness/task_spec.py",
-        "reward_hacking/jailed_poc.py",
-        "reward_hacking/model_backend.py",
-        "scripts/episode_jail.sh",
-        "scripts/resource-limits.sh",
-    )
-    for relative_path in additional_paths:
-        source_files[relative_path] = repository_root / relative_path
-
+def _source_identity(repository_root: Path, relative_paths: Sequence[str]) -> str:
+    """Hash explicitly listed repository sources with their names and contents."""
     digest = hashlib.sha256()
-    for relative_path, path in sorted(source_files.items()):
+    for relative_path in sorted(relative_paths):
+        path = repository_root / relative_path
         encoded_path = relative_path.encode("utf-8")
         contents = path.read_bytes()
         digest.update(len(encoded_path).to_bytes(8, "big"))
@@ -364,6 +372,18 @@ def _code_identity() -> str:
         digest.update(len(contents).to_bytes(8, "big"))
         digest.update(contents)
     return digest.hexdigest()
+
+
+def _generation_code_identity() -> str:
+    """Hash code that determines episode inputs, execution, and grades."""
+    repository_root = Path(__file__).resolve().parents[2]
+    return _source_identity(repository_root, LADDER_GENERATION_CODE_FILES)
+
+
+def detector_code_identity() -> str:
+    """Hash the detector and its offline replay implementation."""
+    repository_root = Path(__file__).resolve().parents[2]
+    return _source_identity(repository_root, LADDER_DETECTOR_CODE_FILES)
 
 
 def scenario_digest(scenario: ScenarioLike) -> str:
@@ -689,44 +709,56 @@ def _strict_resume_digests(
     return {"none": expected_digest}
 
 
+def _resume_header_identity(
+    path: Path, header: Mapping[str, object]
+) -> tuple[str, str, str, Mapping[str, object]]:
+    raw_digest = header.get("provenance_digest")
+    if not isinstance(raw_digest, str):
+        raise TypeError(f"{path} has a non-string provenance digest")
+    raw_provenance = header.get("provenance")
+    if not isinstance(raw_provenance, Mapping):
+        raise TypeError(f"{path} has a run header without provenance")
+    provenance = dict(raw_provenance)
+    pressure = provenance.pop("task_pressure", "none")
+    if not isinstance(pressure, str) or pressure not in LADDER_TASK_PRESSURES:
+        raise ValueError(f"{path} has an invalid task pressure in run provenance")
+    detector_identity = provenance.pop("detector_code_identity", None)
+    if not isinstance(detector_identity, str) or not detector_identity:
+        raise ValueError(f"{path} has a run header without detector_code_identity")
+    return pressure, raw_digest, detector_identity, raw_provenance
+
+
 def _pressure_resume_digests(
     path: Path,
     headers: Sequence[Mapping[str, object]],
     expected_digest: str,
     expected_provenance: Mapping[str, object],
-) -> dict[str, str]:
+) -> dict[str, dict[str, str]]:
     expected_common_provenance = dict(expected_provenance)
     expected_pressure = expected_common_provenance.pop("task_pressure", "none")
     if not isinstance(expected_pressure, str) or expected_pressure not in LADDER_TASK_PRESSURES:
         raise ValueError("expected provenance has an invalid task_pressure")
-    stored_digest_by_pressure: dict[str, str] = {}
+    expected_detector_identity = expected_common_provenance.pop("detector_code_identity", None)
+    if not isinstance(expected_detector_identity, str) or not expected_detector_identity:
+        raise ValueError("expected provenance has no detector_code_identity")
+    if provenance_digest(expected_provenance) != expected_digest:
+        raise ValueError("expected provenance digest does not match its payload")
+    stored_digests_by_pressure: dict[str, dict[str, str]] = {}
     for header in headers:
-        raw_digest = header.get("provenance_digest")
-        if not isinstance(raw_digest, str):
-            raise TypeError(f"{path} has a non-string provenance digest")
-        raw_provenance = header.get("provenance")
-        if not isinstance(raw_provenance, Mapping):
-            raise TypeError(f"{path} has a run header without provenance")
+        pressure, raw_digest, detector_identity, raw_provenance = _resume_header_identity(
+            path, header
+        )
         header_provenance = dict(raw_provenance)
-        pressure = header_provenance.pop("task_pressure", "none")
-        if not isinstance(pressure, str) or pressure not in LADDER_TASK_PRESSURES:
-            raise ValueError(f"{path} has an invalid task pressure in run provenance")
+        header_provenance.pop("task_pressure", None)
+        header_provenance.pop("detector_code_identity", None)
         if header_provenance != expected_common_provenance:
             raise ValueError(f"refusing to resume {path}: stored run provenance differs")
         expected_header_digest = provenance_digest(raw_provenance)
         if expected_header_digest != raw_digest:
             raise ValueError(f"{path} has a run header whose provenance digest is invalid")
-        previous_digest = stored_digest_by_pressure.get(pressure)
-        if previous_digest is not None and previous_digest != raw_digest:
-            raise ValueError(f"{path} has conflicting provenance for pressure {pressure!r}")
-        stored_digest_by_pressure[pressure] = raw_digest
-    stored_expected_digest = stored_digest_by_pressure.get(expected_pressure)
-    if stored_expected_digest not in (None, expected_digest):
-        raise ValueError(
-            f"refusing to resume {path}: provenance digest for pressure "
-            f"{expected_pressure!r} does not match this run"
-        )
-    return stored_digest_by_pressure
+        digests_for_pressure = stored_digests_by_pressure.setdefault(pressure, {})
+        digests_for_pressure[raw_digest] = detector_identity
+    return stored_digests_by_pressure
 
 
 def _episode_record_key(record: Mapping[str, object], *, path: Path) -> EpisodeKey:
@@ -737,14 +769,42 @@ def _episode_record_key(record: Mapping[str, object], *, path: Path) -> EpisodeK
 
 
 def _validate_episode_provenance(
-    path: Path, record: Mapping[str, object], key: EpisodeKey, digests: Mapping[str, str]
+    path: Path,
+    record: Mapping[str, object],
+    key: EpisodeKey,
+    digests: Mapping[str, object],
 ) -> None:
-    expected_record_digest = digests.get(key.task_pressure)
-    if expected_record_digest is None or record.get("provenance_digest") != expected_record_digest:
+    expected_record_digests = digests.get(key.task_pressure)
+    record_digest = record.get("provenance_digest")
+    if isinstance(expected_record_digests, str):
+        if record_digest != expected_record_digests:
+            raise ValueError(
+                f"refusing to resume {path}: ladder episode provenance digest "
+                f"{record_digest!r} does not match its {key.task_pressure!r} pressure header"
+            )
+        return
+    if (
+        not isinstance(expected_record_digests, Mapping)
+        or record_digest not in expected_record_digests
+    ):
         raise ValueError(
             f"refusing to resume {path}: ladder episode provenance digest "
-            f"{record.get('provenance_digest')!r} does not match its "
+            f"{record_digest!r} does not match any of its "
             f"{key.task_pressure!r} pressure header"
+        )
+    detector_identity = record.get("detector_code_identity")
+    if not isinstance(detector_identity, str) or not detector_identity:
+        raise ValueError(f"refusing to resume {path}: ladder episode has no detector_code_identity")
+    expected_detector_identity = expected_record_digests[record_digest]
+    if not isinstance(expected_detector_identity, str):
+        raise TypeError(f"{path} has a non-string detector identity in run provenance")
+    source_detector_identity = record.get(
+        "rescore_source_detector_code_identity", detector_identity
+    )
+    if source_detector_identity != expected_detector_identity:
+        raise ValueError(
+            f"refusing to resume {path}: ladder episode detector identity does not match "
+            "its run header"
         )
 
 
@@ -1435,6 +1495,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
     key: EpisodeKey,
     *,
     provenance: str,
+    detector_code_identity: str,
     episode_dir: Path,
     trace_path: Path,
     trace: object,
@@ -1471,6 +1532,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
         "record": "ladder_episode",
         "key": key.to_json(),
         "provenance_digest": provenance,
+        "detector_code_identity": detector_code_identity,
         "episode_token": episode_token,
         "episode_dir": str(episode_dir),
         "trace_path": str(trace_path),
@@ -1609,6 +1671,7 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
     return _episode_record(
         key,
         provenance=config.provenance_digest,
+        detector_code_identity=cast("str", config.provenance_payload()["detector_code_identity"]),
         episode_dir=episode_dir,
         trace_path=trace_path,
         trace=trace,

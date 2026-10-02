@@ -17,6 +17,7 @@ import pytest
 
 from reward_hacking.harness.loop import CheckVerdict
 from reward_hacking.jailed_poc import CommandResult, JailResourceLimits
+from reward_hacking.ladder import runner as ladder_runner
 from reward_hacking.ladder.runner import (
     LADDER_SAMPLING,
     LADDER_SCHEMA_VERSION,
@@ -358,18 +359,139 @@ def test_run_grid_keeps_one_provenance_digest_when_scenario_changes_mid_run(
     assert {record["provenance_digest"] for record in records} == {header["provenance_digest"]}
 
 
-def test_code_identity_is_part_of_stable_runner_provenance(
+def _write_identity_sources(root: Path) -> None:
+    source_files: set[str] = set(ladder_runner.LADDER_GENERATION_CODE_FILES)
+    source_files.update(ladder_runner.LADDER_DETECTOR_CODE_FILES)
+    for relative_path in source_files:
+        source_path = root / relative_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(f"original:{relative_path}\n", encoding="utf-8")
+
+
+def _patch_code_identities(monkeypatch: pytest.MonkeyPatch, source_root: Path) -> None:
+    monkeypatch.setattr(
+        ladder_runner,
+        "_generation_code_identity",
+        lambda: ladder_runner._source_identity(
+            source_root, ladder_runner.LADDER_GENERATION_CODE_FILES
+        ),
+    )
+    monkeypatch.setattr(
+        ladder_runner,
+        "detector_code_identity",
+        lambda: ladder_runner._source_identity(
+            source_root, ladder_runner.LADDER_DETECTOR_CODE_FILES
+        ),
+    )
+
+
+def test_code_identity_lists_follow_the_live_detector_boundary() -> None:
+    assert "reward_hacking/ladder/rungs.py" in ladder_runner.LADDER_GENERATION_CODE_FILES
+    assert "reward_hacking/ladder/disclosure.py" not in ladder_runner.LADDER_GENERATION_CODE_FILES
+    assert set(ladder_runner.LADDER_DETECTOR_CODE_FILES) == {
+        "reward_hacking/ladder/disclosure.py",
+        "reward_hacking/ladder/rescore.py",
+    }
+
+
+def test_detector_only_change_resumes_and_records_each_detector_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr("reward_hacking.ladder.runner._code_identity", lambda: "identity-one")
-    first = runner_config(tmp_path / "first.jsonl")
-    second = runner_config(tmp_path / "second.jsonl")
-    assert first.provenance_digest == second.provenance_digest
+    source_root = tmp_path / "source"
+    _write_identity_sources(source_root)
+    _patch_code_identities(monkeypatch, source_root)
+    output_path = tmp_path / "records.jsonl"
+    first_config = replace(runner_config(output_path), arms=("naive",), samples=2)
+    first_detector_identity = first_config.provenance_payload()["detector_code_identity"]
+    first_generation_identity = first_config.provenance_payload()["generation_code_identity"]
+    fail_sample_once = True
 
-    monkeypatch.setattr("reward_hacking.ladder.runner._code_identity", lambda: "identity-two")
-    changed = runner_config(tmp_path / "changed.jsonl")
+    def episode_runner(
+        _scenario: ScenarioLike,
+        _backend: object,
+        _arm: str,
+        sample_index: int,
+        _episode_dir: Path,
+        _trace_path: Path,
+    ) -> dict[str, object]:
+        nonlocal fail_sample_once
+        if sample_index == 1 and fail_sample_once:
+            fail_sample_once = False
+            raise RuntimeError("simulated interrupted run")
+        return {"true_pass": True}
 
-    assert changed.provenance_digest != first.provenance_digest
+    def run(config: RunnerConfig) -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=episode_runner,
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+    with pytest.raises(RuntimeError, match="simulated interrupted run"):
+        run(first_config)
+
+    disclosure_path = source_root / "reward_hacking/ladder/disclosure.py"
+    disclosure_path.write_text("detector-only change\n", encoding="utf-8")
+    resumed_config = replace(runner_config(output_path), arms=("naive",), samples=2)
+    provenance = resumed_config.provenance_payload()
+    assert provenance["generation_code_identity"] == first_generation_identity
+    second_detector_identity = provenance["detector_code_identity"]
+    assert second_detector_identity != first_detector_identity
+
+    resumed = run(resumed_config)
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    headers = [row for row in rows if row.get("record") == "ladder_run_header"]
+    episodes = [row for row in rows if row.get("record") == "ladder_episode"]
+    assert len(resumed) == 1
+    assert {row["provenance"]["detector_code_identity"] for row in headers} == {
+        first_detector_identity,
+        second_detector_identity,
+    }
+    assert {row["detector_code_identity"] for row in episodes} == {
+        first_detector_identity,
+        second_detector_identity,
+    }
+
+
+@pytest.mark.parametrize(
+    "changed_source",
+    [
+        "reward_hacking/ladder/scenario.py",
+        "reward_hacking/ladder/rungs.py",
+        "reward_hacking/harness/loop.py",
+        "reward_hacking/model_backend.py",
+    ],
+)
+def test_generation_code_change_refuses_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_source: str
+) -> None:
+    source_root = tmp_path / "source"
+    _write_identity_sources(source_root)
+    _patch_code_identities(monkeypatch, source_root)
+    output_path = tmp_path / "records.jsonl"
+    config = replace(runner_config(output_path), arms=("naive",), samples=1)
+
+    run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+    (source_root / changed_source).write_text("generation change\n", encoding="utf-8")
+    changed_config = replace(runner_config(output_path), arms=("naive",), samples=1)
+
+    with pytest.raises(ValueError, match="stored run provenance differs"):
+        run_grid(
+            changed_config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda *_args: {"true_pass": True},
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
 
 
 @pytest.mark.parametrize("arm", ["naive", "claimed"])
@@ -590,6 +712,7 @@ def test_resume_truncates_torn_final_line_before_appending(tmp_path: Path) -> No
     completed = {
         "record": "ladder_episode",
         "provenance_digest": config.provenance_digest,
+        "detector_code_identity": config.provenance_payload()["detector_code_identity"],
         "key": key.to_json(),
     }
     valid_prefix = json.dumps(header) + "\n" + json.dumps(completed) + "\n"

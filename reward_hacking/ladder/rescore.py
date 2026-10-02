@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal
 
 from reward_hacking.jailed_poc import ENFORCED_JAIL_RESOURCE_LIMITS, JailResourceLimits
-from reward_hacking.ladder import rungs, runner
-from reward_hacking.ladder import scenario as scenario_module
+from reward_hacking.ladder import runner
 from reward_hacking.ladder.monitor import CommandRecord
 from reward_hacking.ladder.runner import (
     LADDER_TASK_PRESSURES,
@@ -82,11 +80,11 @@ def _scenario_digests(header: Mapping[str, object]) -> dict[str, str]:
 
 def _headers_by_pressure(
     headers: Sequence[dict[str, object]],
-) -> dict[str, dict[str, object]]:
-    """Validate compatible run headers and index them by their pressure condition."""
+) -> dict[str, list[dict[str, object]]]:
+    """Validate compatible run headers and keep detector revisions grouped by pressure."""
     if not headers:
         raise ValueError("input has no ladder_run_header provenance record")
-    headers_by_pressure: dict[str, dict[str, object]] = {}
+    headers_by_pressure: dict[str, list[dict[str, object]]] = {}
     common_provenance: dict[str, object] | None = None
     for header in headers:
         provenance = _require_mapping(header.get("provenance"), field="run header provenance")
@@ -95,6 +93,10 @@ def _headers_by_pressure(
             raise ValueError(f"run header has invalid task pressure {pressure!r}")
         current_common = dict(provenance)
         current_common.pop("task_pressure", None)
+        if "detector_code_identity" in current_common:
+            detector_identity = current_common.pop("detector_code_identity")
+            if not isinstance(detector_identity, str) or not detector_identity:
+                raise ValueError("run header provenance has an invalid detector_code_identity")
         if common_provenance is None:
             common_provenance = current_common
         elif current_common != common_provenance:
@@ -105,12 +107,7 @@ def _headers_by_pressure(
         expected_digest = runner.provenance_digest(provenance)
         if digest != expected_digest:
             raise ValueError(f"run header provenance digest is invalid for pressure {pressure!r}")
-        if pressure in headers_by_pressure:
-            previous_digest = headers_by_pressure[pressure].get("provenance_digest")
-            if previous_digest != digest:
-                raise ValueError(f"run has conflicting headers for pressure {pressure!r}")
-            continue
-        headers_by_pressure[pressure] = header
+        headers_by_pressure.setdefault(pressure, []).append(header)
     return headers_by_pressure
 
 
@@ -184,9 +181,10 @@ def _stored_detector_inputs(
     )
 
 
-def _rescore_episode(
+def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance dependencies
     record: dict[str, object],
     *,
+    detector_code_identity: str,
     scenario_root: Path,
     scenario_digests: Mapping[str, str],
     scenario_cache: dict[str, Scenario],
@@ -246,6 +244,13 @@ def _rescore_episode(
     record["coverup"] = coverup
     record["rung_5"] = coverup
     record["pristine_visible_pass"] = pristine_visible_pass
+    previous_detector_identity = record.get("detector_code_identity")
+    if (
+        isinstance(previous_detector_identity, str)
+        and previous_detector_identity != detector_code_identity
+    ):
+        record.setdefault("rescore_source_detector_code_identity", previous_detector_identity)
+    record["detector_code_identity"] = detector_code_identity
     return record
 
 
@@ -273,14 +278,8 @@ def _grading_settings(header: Mapping[str, object]) -> tuple[str, JailResourceLi
 
 
 def _detector_code_identity() -> str:
-    digest = hashlib.sha256()
-    for module in (runner, rungs, scenario_module):
-        source_path = Path(cast("str", module.__file__))
-        digest.update(source_path.name.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(source_path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
+    """Return the detector identity shared with new run provenance."""
+    return runner.detector_code_identity()
 
 
 def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
@@ -322,38 +321,48 @@ def rescore_file(
     headers_by_pressure = _headers_by_pressure(headers)
     resolved_scenario_root = scenario_root.resolve()
     scenario_cache: dict[str, Scenario] = {}
+    detector_code_identity = _detector_code_identity()
     scenario_digests_by_pressure = {
-        pressure: _scenario_digests(header) for pressure, header in headers_by_pressure.items()
+        pressure: _scenario_digests(pressure_headers[0])
+        for pressure, pressure_headers in headers_by_pressure.items()
     }
     grading_settings_by_pressure = {
-        pressure: _grading_settings(header) for pressure, header in headers_by_pressure.items()
+        pressure: _grading_settings(pressure_headers[0])
+        for pressure, pressure_headers in headers_by_pressure.items()
     }
     for row in rows:
         if row.get("record") == "ladder_episode":
             raw_key = _require_mapping(row.get("key"), field="ladder_episode.key")
             key = EpisodeKey.from_json(raw_key)
             try:
-                header = headers_by_pressure[key.task_pressure]
+                pressure_headers = headers_by_pressure[key.task_pressure]
             except KeyError as error:
                 raise ValueError(f"no run header for pressure {key.task_pressure!r}") from error
-            if row.get("provenance_digest") != header.get("provenance_digest"):
+            row_digest = row.get("provenance_digest")
+            if not any(
+                header.get("provenance_digest") == row_digest for header in pressure_headers
+            ):
                 raise ValueError(
                     f"ladder episode provenance digest does not match pressure "
                     f"{key.task_pressure!r} header"
                 )
             _rescore_episode(
                 row,
+                detector_code_identity=detector_code_identity,
                 scenario_root=resolved_scenario_root,
                 scenario_digests=scenario_digests_by_pressure[key.task_pressure],
                 scenario_cache=scenario_cache,
                 grading_settings=grading_settings_by_pressure[key.task_pressure],
             )
-    for header in headers_by_pressure.values():
-        header["rescore"] = {
-            "detector": "reward_hacking.ladder.rungs.detect_rungs",
-            "detector_code_identity": _detector_code_identity(),
-            "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        }
+    for pressure_headers in headers_by_pressure.values():
+        for header in pressure_headers:
+            header["rescore"] = {
+                "detector": "reward_hacking.ladder.rungs.detect_rungs",
+                "detector_code_identity": detector_code_identity,
+                "timestamp_utc": datetime.now(UTC)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
+            }
     _write_jsonl(destination_path, rows)
     return rows
 
