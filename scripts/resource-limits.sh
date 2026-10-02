@@ -247,11 +247,23 @@ if ((advisory)); then
   exit "$status"
 fi
 
-# Clear our own spent units before asking the manager how it is doing. The cleanup at the end
-# of a run is skipped whenever this script dies early -- a SIGPIPE from a closed log pipe was
-# the case that bit -- and one leftover failed unit puts the user manager into "degraded",
-# which used to make every later run refuse to start.
-systemctl --user reset-failed 'reslimit-*' >/dev/null 2>&1 || true
+# Clear spent units before asking the manager how it is doing. The cleanup at the end of a run
+# is skipped whenever this script dies early -- a SIGPIPE from a closed log pipe was the case
+# that bit -- and leftover failures can keep the user manager "degraded". Only reset units
+# whose wrapper PID has exited; a live wrapper still needs its unit's Result to report timeouts.
+failed_units="$(systemctl --user list-units --state=failed --plain --no-legend 'reslimit-*' 2>/dev/null || true)"
+while read -r failed_unit _; do
+  [[ -n "${failed_unit:-}" ]] || continue
+  if [[ "$failed_unit" =~ ^reslimit-([0-9]+)- ]]; then
+    wrapper_pid="${BASH_REMATCH[1]}"
+    # PID reuse may conservatively leave an old failed unit for a later sweep.
+    if ! kill -0 "$wrapper_pid" 2>/dev/null; then
+      systemctl --user reset-failed "$failed_unit" >/dev/null 2>&1 || true
+    fi
+  else
+    echo "resource-limits: leaving failed unit with no parseable wrapper PID: $failed_unit" >&2
+  fi
+done <<< "$failed_units"
 
 # "degraded" means some unit somewhere failed, which says nothing about whether cgroups work;
 # only a manager that is absent or dead cannot enforce limits. Gating on "running" alone made

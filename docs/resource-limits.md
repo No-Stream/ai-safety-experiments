@@ -355,9 +355,11 @@ The next GPU job refused to start and looked, from the message, like a host prob
 Two changes, both of which were tested by planting a failed unit and watching the wrapper
 proceed. The check now accepts `running`, `degraded`, `starting`, `maintenance` and `stopping`,
 and only refuses when the manager is genuinely unreachable — verified still to refuse under a
-bogus `XDG_RUNTIME_DIR`, so the gate has not simply been defanged. And the wrapper clears its
-own spent `reslimit-*` units on the way in, so the state cannot accumulate across runs even
-when a job dies in a way that skips the cleanup at the end.
+bogus `XDG_RUNTIME_DIR`, so the gate has not simply been defanged. The startup sweep now lists
+failed `reslimit-*` units and resets only those whose parsed wrapper PID is no longer alive;
+names without a parseable PID are left in place with a stderr note. This preserves a live
+wrapper's failed unit until it reads `Result`, while still clearing spent units after a run
+skips its own cleanup.
 
 ## The OOM backstop already exists
 

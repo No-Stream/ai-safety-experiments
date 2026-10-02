@@ -29,6 +29,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIMITER = REPO_ROOT / "scripts" / "resource-limits.sh"
 SYSTEMCTL = shutil.which("systemctl")
+SYSTEMD_RUN = shutil.which("systemd-run")
 
 # `numfmt --to=iec` keeps three significant digits, so the cap is a rounded spelling.
 IEC_ROUNDING_TOLERANCE = 0.02
@@ -70,6 +71,21 @@ def _wait_for_systemd_state(unit_name: str, expected_state: str, timeout: float)
             return True
         time.sleep(0.05)
     return False
+
+
+def _plant_failed_unit(unit_name: str) -> None:
+    assert SYSTEMD_RUN is not None
+    completed = subprocess.run(  # noqa: S603 - systemd-run is resolved from the host PATH
+        [SYSTEMD_RUN, "--user", "--quiet", f"--unit={unit_name}", "--", "/bin/false"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert _wait_for_systemd_state(unit_name, "failed", timeout=5), (
+        f"unit {unit_name} did not reach failed state"
+    )
 
 
 def _mem_total_kib() -> int:
@@ -207,6 +223,54 @@ class TestTheMemoryCapFollowsTheHost:
         assert completed.returncode == 0, completed.stdout + completed.stderr
         assert completed.stdout.strip().splitlines()[-1] == "unlimited"
         assert "--no-address-cap" in completed.stderr, "the opt-out must be announced, not silent"
+
+
+@pytest.mark.skipif(
+    not _user_manager_is_available(), reason="requires a usable systemd user manager"
+)
+def test_startup_sweep_preserves_failed_units_with_live_wrapper_pids() -> None:
+    dead_owner = subprocess.Popen(
+        ["/bin/true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    dead_owner_pid = dead_owner.pid
+    assert dead_owner.wait(timeout=5) == 0
+
+    live_owner = subprocess.Popen(
+        ["/bin/sleep", "600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    live_unit = f"reslimit-{live_owner.pid}-plant-{time.time_ns()}"
+    dead_unit = f"reslimit-{dead_owner_pid}-plant-{time.time_ns()}"
+    try:
+        _plant_failed_unit(live_unit)
+        _plant_failed_unit(dead_unit)
+
+        completed = subprocess.run(  # noqa: S603 - repo script, literal arguments
+            [str(LIMITER), "--", "/bin/true"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+
+        assert _systemctl_user("show", "-p", "LoadState", "--value", live_unit).stdout.strip() == (
+            "loaded"
+        )
+        assert (
+            _systemctl_user("show", "-p", "ActiveState", "--value", live_unit).stdout.strip()
+            == "failed"
+        )
+        assert _systemctl_user("show", "-p", "LoadState", "--value", dead_unit).stdout.strip() == (
+            "not-found"
+        )
+    finally:
+        for unit_name in (live_unit, dead_unit):
+            _systemctl_user("stop", unit_name)
+            _systemctl_user("reset-failed", unit_name)
+        if live_owner.poll() is None:
+            live_owner.terminate()
+        live_owner.wait(timeout=5)
 
 
 @pytest.mark.skipif(
