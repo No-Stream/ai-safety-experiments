@@ -118,6 +118,10 @@ scripts/tmux_run.sh train -- scripts/resource-limits.sh --gpu -t 15m -- python t
 tail -n 40 /var/tmp/train.log   # last line is EXITCODE=<n> once the command finishes
 ```
 
+If the wrapper receives HUP, INT or TERM, it stops the transient unit and waits for the
+`systemd-run` client to finish. It exits with `128 + signal` and does not report that requested
+stop as a timeout or OOM kill.
+
 ## Thread counts: 16, and higher does not help
 
 The `OMP_NUM_THREADS` family is **per process**, so it multiplies across concurrent
@@ -294,13 +298,13 @@ the process list, and it is worth believing over the process list. `tests/test_g
 pins both grounds and the three cases that must stay allowed (idle card, small attributed context,
 our own allocation).
 
-Under WSL2, nvidia-smi attributes VRAM to no process at all, so the Windows desktop's idle few GiB
-(about 3.9 GiB on the 5090 box, 2026-09-23) always trip the second ground. Set
-`GPU_PREFLIGHT_THRESHOLD_MIB` above that measured idle baseline (6000 there) and
-`resource-limits.sh --gpu` passes it through as `--threshold-mib`. A real peer run still trips it,
-because a model job holds far more than the margin. Re-measure the baseline with `nvidia-smi` on an
-idle card before choosing the number, and never raise it to get past a refusal you haven't
-explained.
+Under WSL2, `nvidia-smi --query-compute-apps` can omit Linux CUDA processes entirely, so an empty
+compute-apps list does not show that the guest is free. The preflight scans `/proc/<pid>/fd` for
+descriptors targeting `/dev/dxg`, ignores its own PID, and refuses any other holder with its PID,
+`comm`, and a truncated command line. It skips processes that vanish during the scan and logs how
+many fd directories were unreadable. When no Linux holder is found, it keeps the Windows desktop's
+VRAM remainder log; the WSL Windows-host remainder does not need a larger
+`GPU_PREFLIGHT_THRESHOLD_MIB`.
 
 `--gpu` also sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which lets the
 caching allocator grow segments in place instead of fragmenting into unusable blocks.

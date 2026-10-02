@@ -18,16 +18,58 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIMITER = REPO_ROOT / "scripts" / "resource-limits.sh"
+SYSTEMCTL = shutil.which("systemctl")
 
 # `numfmt --to=iec` keeps three significant digits, so the cap is a rounded spelling.
 IEC_ROUNDING_TOLERANCE = 0.02
+
+
+def _systemctl_user(*arguments: str) -> subprocess.CompletedProcess[str]:
+    assert SYSTEMCTL is not None
+    return subprocess.run(  # noqa: S603 - systemctl is resolved from the host PATH
+        [SYSTEMCTL, "--user", *arguments],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+
+def _user_manager_is_available() -> bool:
+    if SYSTEMCTL is None:
+        return False
+    state = _systemctl_user("is-system-running").stdout.strip()
+    if state not in {"running", "degraded", "starting", "maintenance", "stopping"}:
+        return False
+    return _systemctl_user("show-environment").returncode == 0
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _wait_for_systemd_state(unit_name: str, expected_state: str, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = _systemctl_user("show", "-p", "ActiveState", "--value", unit_name).stdout.strip()
+        if state == expected_state:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _mem_total_kib() -> int:
@@ -165,3 +207,71 @@ class TestTheMemoryCapFollowsTheHost:
         assert completed.returncode == 0, completed.stdout + completed.stderr
         assert completed.stdout.strip().splitlines()[-1] == "unlimited"
         assert "--no-address-cap" in completed.stderr, "the opt-out must be announced, not silent"
+
+
+@pytest.mark.skipif(
+    not _user_manager_is_available(), reason="requires a usable systemd user manager"
+)
+def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
+    unit_name = f"reslimit-sighup-test-{os.getpid()}-{time.time_ns()}"
+    command = [
+        str(LIMITER),
+        "--name",
+        unit_name,
+        "--timeout",
+        "3h",
+        "--",
+        "sleep",
+        "600",
+    ]
+    wrapper = subprocess.Popen(  # noqa: S603 - repo script, literal arguments
+        command,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    sleep_pid = 0
+    try:
+        started_deadline = time.monotonic() + 15
+        while time.monotonic() < started_deadline:
+            if wrapper.poll() is not None:
+                stdout, stderr = wrapper.communicate()
+                pytest.fail(f"wrapper exited before its unit started: {stdout}{stderr}")
+            active = _systemctl_user("is-active", "--quiet", unit_name).returncode == 0
+            if active:
+                main_pid = _systemctl_user(
+                    "show", "-p", "MainPID", "--value", unit_name
+                ).stdout.strip()
+                sleep_pid = int(main_pid)
+                if sleep_pid > 0:
+                    break
+            time.sleep(0.05)
+        assert sleep_pid > 0, f"unit {unit_name} did not start"
+
+        wrapper.send_signal(signal.SIGHUP)
+
+        assert _wait_for_systemd_state(unit_name, "inactive", timeout=5), (
+            f"unit {unit_name} remained active after wrapper SIGHUP"
+        )
+        process_deadline = time.monotonic() + 5
+        while _process_exists(sleep_pid) and time.monotonic() < process_deadline:
+            time.sleep(0.05)
+        assert not _process_exists(sleep_pid), f"sleep process {sleep_pid} survived wrapper SIGHUP"
+
+        stdout, stderr = wrapper.communicate(timeout=5)
+        assert wrapper.returncode == 129, (
+            f"expected SIGHUP status 129, got {wrapper.returncode}: {stdout}{stderr}"
+        )
+        assert "TIMEOUT" not in stderr, stderr
+        assert "OOM-KILLED" not in stderr, stderr
+    finally:
+        _systemctl_user("stop", unit_name)
+        if wrapper.poll() is None:
+            wrapper.send_signal(signal.SIGTERM)
+        try:
+            wrapper.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            wrapper.kill()
+            wrapper.communicate()
+        _systemctl_user("reset-failed", unit_name)

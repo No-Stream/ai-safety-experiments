@@ -7,7 +7,7 @@ is easy to miss.
 
 Two groups, because the scripts no longer share one interpreter:
 
-  * The host's system interpreter, ``/usr/bin/python3``, 3.9.25 here, runs four of them:
+  * The host's system interpreter, ``/usr/bin/python3``, 3.8.10 on the 5090 box, runs four of them:
       - ``scripts/gpu_preflight.py``       resource-limits.sh invokes it as plain ``python3``
       - ``scripts/canary_manifest.py``     ``make canary-check`` runs it under ``SYSTEM_PYTHON``
       - ``scripts/scan_secrets.py``        docs/episode-isolation.md documents it as ``python3``
@@ -24,7 +24,7 @@ interpreter at or above its own floor and refuses to start without one, which is
 ``TestTheJailInterpreterMeetsItsFloor`` pins -- the most load-bearing thing in this file, because a
 floor quietly lowered brings that misgrading straight back and nothing else would notice.
 
-The moved script keeps its conservative 3.9 dialect anyway, and pyproject.toml keeps exempting it
+The moved script keeps the conservative 3.8 dialect anyway, and pyproject.toml keeps exempting it
 from ruff's pyupgrade rules: both checkers are directory-scoped with no per-file version override,
 so ``scripts/`` follows its oldest occupant. That is a checker-configuration constraint rather than
 a claim about where the file runs, and it costs nothing.

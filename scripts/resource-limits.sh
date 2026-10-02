@@ -288,11 +288,38 @@ echo "resource-limits: unit=$unit_name cpus=$cpus/$TOTAL_CPUS mem_max=$mem_max m
 # --pipe streams the job's stdio and propagates its exit status; --wait blocks until
 # it finishes. The unit is deliberately NOT --collect'ed so its Result is still
 # queryable below, which is how a timeout is told apart from a plain failure.
+signal_exit=0
+stop_unit_after_signal() {
+  signal_exit="$1"
+  systemctl --user stop "$unit_name" >/dev/null 2>&1 || true
+}
+trap 'stop_unit_after_signal 129' HUP
+trap 'stop_unit_after_signal 130' INT
+trap 'stop_unit_after_signal 143' TERM
+
 rc=0
-systemd-run --user --pipe --wait --quiet --unit="$unit_name" "${properties[@]}" -- "$@" || rc=$?
+systemd-run --user --pipe --wait --quiet --unit="$unit_name" "${properties[@]}" -- "$@" <&0 &
+systemd_run_pid=$!
+# A signal can arrive between installing the traps and registering the unit.
+if ((signal_exit != 0)); then
+  systemctl --user stop "$unit_name" >/dev/null 2>&1 || true
+fi
+while :; do
+  wait "$systemd_run_pid" && rc=0 || rc=$?
+  kill -0 "$systemd_run_pid" 2>/dev/null || break
+  # wait returns early when a trapped signal interrupts it; retry the stop in case
+  # the first trap ran before systemd had registered the unit.
+  if ((signal_exit != 0)); then
+    systemctl --user stop "$unit_name" >/dev/null 2>&1 || true
+  fi
+done
 
 result="$(systemctl --user show -p Result --value "$unit_name" 2>/dev/null || true)"
 systemctl --user reset-failed "$unit_name" >/dev/null 2>&1 || true
+
+if ((signal_exit != 0)); then
+  exit "$signal_exit"
+fi
 
 case "$result" in
   timeout)

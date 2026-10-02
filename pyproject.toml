@@ -107,12 +107,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Three of these run under the host's SYSTEM interpreter (3.9), not the venv: resource-limits.sh
+# Three of these run under the host's SYSTEM interpreter (3.8 on the 5090 box), not the venv: resource-limits.sh
 # calls gpu_preflight.py as plain `python3`, and `make canary-check` plus docs/episode-isolation.md
 # invoke canary_manifest.py and scan_secrets.py the same way. jail_assertions.py runs under the
 # interpreter the jail resolves, which is 3.12 or newer, and is exempt along with them because
 # ruff's target-version is global with no per-file override: scripts/ follows its oldest occupant,
-# and letting `--fix` modernise one file there would leave syntax basedpyright rejects at 3.9.
+# and letting `--fix` modernise one file there would leave syntax basedpyright rejects at 3.8.
 # tests/test_interpreter_compat.py is the real guard; it compiles each script under the interpreter
 # that actually runs it, catching 3.10+ syntax no linter introduced.
 "scripts/gpu_preflight.py" = ["UP", "INP001"]
@@ -120,12 +120,12 @@ ignore = [
 "scripts/canary_manifest.py" = ["UP", "INP001"]
 "scripts/scan_secrets.py" = ["UP", "INP001"]
 # The pre-commit hook wrapper falls back to bare `python3` when .venv is absent, so this one
-# keeps the 3.9 dialect for the same reason as the group above. E402: it must put the repo root
+# keeps the 3.8 dialect for the same reason as the group above. E402: it must put the repo root
 # on sys.path before it can import scan_secrets, which forces one import below code.
 "scripts/git_precommit_scan.py" = ["UP", "INP001", "E402"]
 # INP001 above: these are standalone CLI scripts invoked by path, not an importable package,
 # so an __init__.py would be meaningless.
-# Same standalone-CLI exemption, but this one runs under the venv rather than the system 3.9
+# Same standalone-CLI exemption, but this one runs under the venv rather than the system 3.8
 # interpreter -- it never executes inside the jail -- so it keeps the pyupgrade rules.
 "scripts/interp_generation_preflight.py" = ["INP001"]
 
@@ -185,13 +185,13 @@ reportAny = "none"
 reportExplicitAny = "none"
 
 [[tool.basedpyright.executionEnvironments]]
-# Three of the four scripts here run under the host's system interpreter (3.9), never the 3.13 venv,
+# Three of the four scripts here run under the host's system interpreter (3.8 on the 5090 box), never the 3.13 venv,
 # and basedpyright's environments are directory-scoped with no per-file version override -- so
 # scripts/ follows its oldest occupant and jail_assertions.py, which now runs under the jail's
-# 3.12-or-newer interpreter, is held to 3.9 with them. That keeps basedpyright from demanding 3.10+
+# 3.12-or-newer interpreter, is held to 3.8 with them. That keeps basedpyright from demanding 3.9+
 # syntax that would crash at runtime in a preflight check or a jail, and costs the fourth nothing.
 root = "scripts"
-pythonVersion = "3.9"
+pythonVersion = "3.8"
 
 # Tests legitimately reach into module internals -- private CLI helpers like _parse_args and
 # _build_cli_backend are exercised directly so arg->config mapping is tested without a model

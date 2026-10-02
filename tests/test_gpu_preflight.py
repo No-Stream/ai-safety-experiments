@@ -22,9 +22,11 @@ restrict the gate to GPU 0 with everything else still green.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -36,6 +38,9 @@ from scripts.gpu_preflight import (
     host_is_wsl,
     require_free_gpu,
 )
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SYSTEM_PYTHON = Path("/usr/bin/python3")
 
 SMI_COMPUTE_APPS = "compute-apps"
 SMI_COMPUTE_APPS_FIELDS = "pid,used_memory,process_name"
@@ -70,6 +75,17 @@ def _fake_smi(
         return [f"{used}, {total}" for used, total in gpus]
 
     monkeypatch.setattr("scripts.gpu_preflight._nvidia_smi", fake_nvidia_smi)
+
+
+def _add_wsl_process(proc_root: Path, pid: int, comm: str, cmdline: str) -> Path:
+    """Add a fake /proc process whose fd 3 points at WSL's Linux GPU device."""
+    process_dir = proc_root / str(pid)
+    fd_dir = process_dir / "fd"
+    fd_dir.mkdir(parents=True)
+    (process_dir / "comm").write_text(f"{comm}\n")
+    (process_dir / "cmdline").write_text(cmdline.replace(" ", "\0"))
+    (fd_dir / "3").symlink_to("/dev/dxg")
+    return fd_dir
 
 
 @pytest.fixture(autouse=True)
@@ -249,29 +265,90 @@ class TestTheAggregateSpansTheSameDevicesAsTheAttribution:
 
 
 class TestUnderWslTheWindowsHostIsNotAPeer:
-    """Under WSL2 the unnamed VRAM is the Windows host's desktop, and Linux peers are still named.
+    """The Windows desktop's VRAM is expected; Linux GPU peers are found through /dev/dxg fds.
 
     Measured on the 5090 box (2026-09-26): with no Linux GPU process, ~3.5 GiB is in use and
-    compute-apps lists nothing; a bare ``torch.zeros(1, device="cuda")`` in another shell appears
-    as a compute-apps row with ``[N/A]`` memory. So the remainder is not evidence of a peer there,
-    while the named-holder rule still catches every Linux job.
+    compute-apps lists nothing. Linux CUDA processes also do not appear in that list, so the preflight
+    scans /proc for open /dev/dxg descriptors while treating the remaining VRAM as Windows-owned.
     """
 
     @pytest.fixture(autouse=True)
     def _wsl_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("scripts.gpu_preflight.host_is_wsl", lambda: True)
 
-    def test_the_windows_desktop_share_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _fake_smi(monkeypatch, rows=[], gpus=[(3519, 32607)])
-        require_free_gpu()
-
-    def test_a_named_linux_peer_with_unknown_usage_is_still_refused(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_the_windows_desktop_share_passes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        _fake_smi(monkeypatch, rows=["1144523, [N/A], python"], gpus=[(3570, 32607)])
+        caplog.set_level(logging.INFO)
+        _fake_smi(monkeypatch, rows=[], gpus=[(3519, 32607)])
+        require_free_gpu(proc_root=tmp_path)
+        assert "GPU preflight OK under WSL2, 3519 MiB held by the Windows host" in caplog.text
+
+    def test_a_linux_dxg_holder_is_refused_with_proc_details(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cmdline = "python -m vllm " + "x" * 200
+        _add_wsl_process(tmp_path, pid=4242, comm="vllm", cmdline=cmdline)
+        _fake_smi(monkeypatch, rows=[], gpus=[(31470, 32607)])
+
         with pytest.raises(GpuBusyError) as caught:
-            require_free_gpu()
-        assert "pid 1144523 holding an unknown amount of VRAM" in str(caught.value)
+            require_free_gpu(proc_root=tmp_path)
+
+        message = str(caught.value)
+        assert "GPU is busy: 31470/32607 MiB in use by another process" in message
+        assert "pid 4242" in message
+        assert "/proc/4242/comm: vllm" in message
+        assert f"cmdline: {cmdline[:160]}..." in message
+        assert f"cmdline: {cmdline}" not in message
+
+    def test_our_own_dxg_descriptor_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _add_wsl_process(tmp_path, pid=os.getpid(), comm="pytest", cmdline="pytest")
+        _fake_smi(monkeypatch, rows=[], gpus=[(8000, 32607)])
+
+        require_free_gpu(proc_root=tmp_path)
+
+    def test_an_unreadable_fd_directory_is_skipped_and_logged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        fd_dir = _add_wsl_process(tmp_path, pid=4242, comm="vllm", cmdline="python -m vllm")
+        fd_dir.chmod(0)
+        caplog.set_level(logging.INFO)
+        _fake_smi(monkeypatch, rows=[], gpus=[(31470, 32607)])
+
+        try:
+            require_free_gpu(proc_root=tmp_path)
+        finally:
+            fd_dir.chmod(0o700)
+
+        assert "WSL /dev/dxg unreadable fd process count: 1" in caplog.text
+        assert "GPU preflight OK under WSL2, 31470 MiB held by the Windows host" in caplog.text
+
+    @pytest.mark.skipif(
+        not SYSTEM_PYTHON.exists(), reason=f"no system interpreter at {SYSTEM_PYTHON}"
+    )
+    def test_the_scan_runs_under_the_system_interpreter(self, tmp_path: Path) -> None:
+        """The scan executes under the interpreter that really runs the script, not only the venv's.
+
+        Compiling under it is not enough: ``Path.readlink`` compiles everywhere and raised
+        AttributeError at runtime under this box's 3.8 system Python.
+        """
+        _add_wsl_process(tmp_path, pid=4242, comm="vllm", cmdline="python -m vllm")
+        scan = (
+            "import sys; from pathlib import Path; sys.path.insert(0, 'scripts'); "
+            "import gpu_preflight; "
+            f"holders, unreadable = gpu_preflight._wsl_dxg_processes(Path({str(tmp_path)!r}), 1); "
+            "print([holder.pid for holder in holders], unreadable)"
+        )
+        completed = subprocess.run(  # noqa: S603 - fixed interpreter, script from this repo
+            [str(SYSTEM_PYTHON), "-c", scan],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=REPO_ROOT,
+        )
+        assert completed.stdout.strip() == "[4242] 0"
 
 
 class TestWslDetection:

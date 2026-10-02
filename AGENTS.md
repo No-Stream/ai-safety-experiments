@@ -440,7 +440,7 @@ Every top-level entry, so nothing has to be guessed at:
   2026-08-16): the blind `except` blocks in `legacy/pretraining.ipynb` are being narrowed to
   specific exceptions.
 - Root files: `Makefile` (the gates, plus the `SYSTEM_PYTHON` constraint below), `pyproject.toml`
-  (dependencies and the ruff/basedpyright configuration, including the per-file ignores the 3.9
+  (dependencies and the ruff/basedpyright configuration, including the per-file ignores the 3.8
   scripts depend on), `uv.lock` (the pinned environment — `make setup` builds `.venv` from it),
   `README.md` (the public-facing description), `RESULTS.md` (the one-line-per-finding index of
   research results; most of its pointers name gitignored scratch docs on purpose), and this file,
@@ -520,21 +520,25 @@ absolute path via `SYSTEM_PYTHON`, because bare `python3` resolves to a minicond
 conda env is active and `make canary-check` would then run under whichever environment happened to
 be active. And FOUR scripts, `scripts/gpu_preflight.py`, `scripts/canary_manifest.py`,
 `scripts/scan_secrets.py` and `scripts/git_precommit_scan.py`, **must keep running under system
-Python, which is 3.9.25 here**, because that is what invokes them: `scripts/resource-limits.sh` calls
-the first as bare `python3`, the `canary-check` target and `docs/episode-isolation.md` call the next
+Python, which is 3.8.10 on the 5090 box** (3.9.25 on the old dev box), because that is what invokes
+them: `scripts/resource-limits.sh` calls the first as bare `python3`, the `canary-check` target and `docs/episode-isolation.md` call the next
 two the same way, and the git hooks that `scripts/install_git_hooks.sh` writes call the fourth as bare
 `python3` from inside a commit, where the shell has whatever interpreter the committing environment
 happens to expose. `tests/test_interpreter_compat.py` is the enforcement point and lists all four; this
 sentence said three until 2026-09-02, so trust the test over any prose that disagrees with it.
 `scripts/jail_assertions.py` was a fourth while the jail exposed whatever `/usr/bin/python3`
 happened to be; the jail now resolves an interpreter at or above 3.12 and refuses to start without
-one, and `scripts/run_jail_tests.sh` runs the assertions under that. It keeps the 3.9 dialect
+one, and `scripts/run_jail_tests.sh` runs the assertions under that. It keeps the 3.8 dialect
 regardless, because ruff and basedpyright are both directory-scoped with no per-file version
 override, so `scripts/` follows its oldest occupant. All of this breaks at runtime rather than in
 lint, so `tests/test_interpreter_compat.py` compiles each script under the interpreter that actually
 runs it — and pins the jail's version floor, since a floor edited downwards brings back the bug that
 split the two groups apart: a 3.9 jail crashed every submission written in a later dialect and the
-graders scored working code as flawed. Move or rename any of the four → update both the test's
+graders scored working code as flawed. Compiling is not running: a missing stdlib API compiles fine and
+fails at call time (`Path.readlink` is 3.9+ and crashed the WSL preflight under 3.8 on 2026-10-01), and
+typeshed no longer carries 3.8 version gates, so basedpyright cannot see it either. A script path that
+touches newer stdlib APIs needs a test that executes it under `/usr/bin/python3`, as
+`tests/test_gpu_preflight.py` does for the /dev/dxg scan. Move or rename any of the four → update both the test's
 script lists and the per-file ignore paths.
 
 ## Running expensive things

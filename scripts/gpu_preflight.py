@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Floor chosen so an idle CUDA context (a few hundred MiB) does not read as busy.
 DEFAULT_BUSY_THRESHOLD_MIB = 512
+WSL_CMDLINE_MAX_CHARS = 160
 
 
 class GpuBusyError(RuntimeError):
@@ -109,7 +110,79 @@ def vram_mib_across_devices() -> tuple[int, int]:
     return used_mib, total_mib
 
 
-def require_free_gpu(threshold_mib: int = DEFAULT_BUSY_THRESHOLD_MIB) -> None:
+def _proc_fd_paths(process_dir: Path) -> tuple[list[Path], bool]:
+    """Return fd entries and whether their directory could not be read."""
+    try:
+        return list((process_dir / "fd").iterdir()), False
+    except PermissionError:
+        return [], True
+    except (FileNotFoundError, ProcessLookupError):
+        return [], False
+
+
+def _fd_paths_hold_dxg(fd_paths: list[Path]) -> tuple[bool, bool]:
+    """Return whether an fd targets /dev/dxg and whether an fd link was unreadable."""
+    unreadable = False
+    for fd_path in fd_paths:
+        try:
+            target = Path(os.readlink(fd_path))  # noqa: PTH115 - Path.readlink is 3.9+, system Python is 3.8
+        except PermissionError:
+            unreadable = True
+            continue
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if target == Path("/dev/dxg"):
+            return True, unreadable
+    return False, unreadable
+
+
+def _wsl_process_from_proc(process_dir: Path, pid: int) -> GpuProcess | None:
+    """Read the diagnostic fields for a process already found holding /dev/dxg."""
+    try:
+        comm = (process_dir / "comm").read_text().strip()
+    except PermissionError:
+        comm = "[unreadable]"
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        cmdline = (process_dir / "cmdline").read_bytes().decode(errors="replace")
+    except PermissionError:
+        cmdline = "[unreadable]"
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+    cmdline = " ".join(part for part in cmdline.split("\0") if part)
+    if len(cmdline) > WSL_CMDLINE_MAX_CHARS:
+        cmdline = f"{cmdline[:WSL_CMDLINE_MAX_CHARS]}..."
+    name = f"/proc/{pid}/comm: {comm}; cmdline: {cmdline}"
+    return GpuProcess(pid=pid, used_mib=None, name=name)
+
+
+def _wsl_dxg_processes(proc_root: Path, own_pid: int) -> tuple[list[GpuProcess], int]:
+    """Find other WSL processes with an open /dev/dxg descriptor and count unreadable fd dirs."""
+    holders: list[GpuProcess] = []
+    unreadable_count = 0
+    for process_dir in proc_root.iterdir():
+        if not process_dir.name.isdigit() or int(process_dir.name) == own_pid:
+            continue
+        fd_paths, fd_dir_unreadable = _proc_fd_paths(process_dir)
+        if fd_dir_unreadable:
+            unreadable_count += 1
+            continue
+        holds_dxg, fd_link_unreadable = _fd_paths_hold_dxg(fd_paths)
+        if fd_link_unreadable:
+            unreadable_count += 1
+        if not holds_dxg:
+            continue
+        holder = _wsl_process_from_proc(process_dir, int(process_dir.name))
+        if holder is not None:
+            holders.append(holder)
+    return holders, unreadable_count
+
+
+def require_free_gpu(
+    threshold_mib: int = DEFAULT_BUSY_THRESHOLD_MIB, proc_root: Path = Path("/proc")
+) -> None:
     """Raise GpuBusyError unless the GPU is free, counting VRAM no process accounts for.
 
     There are two ways the card can be occupied and both have to be checked, because per-process
@@ -148,9 +221,16 @@ def require_free_gpu(threshold_mib: int = DEFAULT_BUSY_THRESHOLD_MIB) -> None:
             attributed += process.used_mib
     unattributed = used - attributed
     if host_is_wsl():
-        # Under WSL2 the unnamed remainder is the Windows host (desktop, browser), which a Linux
-        # nvidia-smi can never attribute; Linux CUDA peers still appear as compute-apps rows
-        # (with [N/A] usage) and are refused above.
+        # WSL's nvidia-smi omits Linux CUDA processes, but each such process holds /dev/dxg open.
+        dxg_holders, unreadable_count = _wsl_dxg_processes(proc_root, self_pid)
+        logger.info("WSL /dev/dxg unreadable fd process count: %s", unreadable_count)
+        if dxg_holders:
+            listed = "\n  ".join(str(process) for process in dxg_holders)
+            raise GpuBusyError(
+                f"GPU is busy: {used}/{total} MiB in use by another process.\n  {listed}\n"
+                "Wait for it, or kill it if it is an orphan from a dead run "
+                "(inspect the PID and command above)."
+            )
         logger.info(f"GPU preflight OK under WSL2, {unattributed} MiB held by the Windows host")
         return
     if unattributed >= threshold_mib:

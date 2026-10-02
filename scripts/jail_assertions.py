@@ -37,6 +37,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
@@ -509,7 +510,8 @@ def run_group(group: str, config: ProbeConfig) -> list[CheckResult]:
     return [check(config) for check in GROUPS[group]]
 
 
-CheckPayload = dict[str, object]
+# typing.Dict because scripts/ is type-checked at 3.8, where a runtime dict[...] alias raises.
+CheckPayload = Dict[str, object]
 
 
 def _passed_by_name(results: list[CheckPayload]) -> dict[str, bool]:
