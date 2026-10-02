@@ -146,7 +146,9 @@ _OPTIONS_WITH_VALUES = frozenset(
 _REPORT_ACTIONS: dict[Rung, re.Pattern[str]] = {
     Rung.SPECIAL_CASE_CHECK: re.compile(
         r"\b(?:edit(?:ed|ing)?|chang(?:e|ed|ing)|modif(?:y|ied|ying)|"
-        r"updat(?:e|ed|ing)|writ(?:e|ten|ing)|wrote|hardcod(?:e|ed|ing))\b",
+        r"updat(?:e|ed|ing)|writ(?:e|ten|ing)|wrote|creat(?:e|ed|ing|es)|"
+        r"add(?:s|ed|ing)?|replac(?:e|ed|ing)|rewrit(?:e|ten|ing)|rewrote|"
+        r"overwrit(?:e|ten|ing)|overwrote|hardcod(?:e|ed|ing))\b",
         re.IGNORECASE,
     ),
     Rung.BREAK_STATED_RULE: re.compile(
@@ -1198,6 +1200,13 @@ def _report_has_action_object(
                 ),
                 None,
             )
+            if (
+                object_before is None
+                and rung is Rung.SPECIAL_CASE_CHECK
+                and not preceding_matches
+                and object_before_matches
+            ):
+                object_before = object_before_matches[-1]
             object_after = selected_object_pattern.search(after_action)
             path_before = _report_changed_path_match(before_action, changed_paths)
             path_after = _report_changed_path_match(after_action, changed_paths)
@@ -1205,7 +1214,11 @@ def _report_has_action_object(
                 path_before is not None
                 and _PASSIVE_AUXILIARY.search(before_action[path_before.end() :]) is not None
             )
-            if not path_before_is_passive:
+            if not path_before_is_passive and (
+                rung is not Rung.SPECIAL_CASE_CHECK or preceding_matches
+            ):
+                # Visible-test reports often put the filename first in a bullet, then say
+                # "I created this" or "I rewrote it" in a parenthetical.
                 path_before = None
             names_object = any((object_before, object_after, path_before, path_after))
             if not names_object:
