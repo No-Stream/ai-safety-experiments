@@ -749,14 +749,15 @@ def _final_report(
 ]:
     """Sample a report-only completion, with the planned reasoning-stripped context fallback."""
     messages.append({"role": "user", "content": FINAL_REPORT_PROMPT})
-    prompt = render_prompt(backend.tokenizer, messages, tools)
+    report_prompt_messages = messages
+    prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
     prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
     reasoning_dropped = False
     room = context_room(prompt_tokens, context.max_model_len)
     if room < MIN_CONTEXT_ROOM:
-        messages = strip_reasoning(messages)
+        report_prompt_messages = strip_reasoning(messages)
         reasoning_dropped = True
-        prompt = render_prompt(backend.tokenizer, messages, tools)
+        prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
         room = context_room(prompt_tokens, context.max_model_len)
     if room < MIN_CONTEXT_ROOM:

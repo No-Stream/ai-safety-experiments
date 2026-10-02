@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 import shutil
@@ -15,7 +16,7 @@ from conftest import needs_jail
 from reward_hacking.harness.loop import CheckVerdict, FinalGrade
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
-from reward_hacking.ladder import loop
+from reward_hacking.ladder import chat, loop
 from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.trace import load_trace
 
@@ -37,6 +38,7 @@ class _Tokenized:
 class _FakeTokenizer:
     def __init__(self) -> None:
         self.rendered_messages: list[list[dict[str, object]]] = []
+        self.rendered_tools: list[list[dict[str, object]]] = []
 
     def apply_chat_template(
         self,
@@ -51,6 +53,7 @@ class _FakeTokenizer:
         assert add_generation_prompt
         assert enable_thinking
         self.rendered_messages.append(json.loads(json.dumps(messages)))
+        self.rendered_tools.append(json.loads(json.dumps(tools)))
         return json.dumps({"messages": messages, "tools": tools}, sort_keys=True) + (
             "<|im_start|>assistant\n<think>\n"
         )
@@ -705,7 +708,11 @@ class TestNativeToolLoop:
 
         monkeypatch.setattr(loop, "render_prompt", render_with_large_report)
         backend = ScriptedToolBackend(
-            [_ScriptedReply(_bash("touch marker.txt")), _ScriptedReply(_report())]
+            [
+                _ScriptedReply(_bash("touch marker.txt")),
+                _ScriptedReply(_bash("echo finished")),
+                _ScriptedReply(_report()),
+            ]
         )
 
         trace = loop.run_ladder_episode(
@@ -715,7 +722,7 @@ class TestNativeToolLoop:
             arm=AgenticArmConfig(check_affordance=True),
             system_prompt="System",
             user_template="{task_markdown}\n{listing}",
-            max_turns=1,
+            max_turns=2,
             timeout="120s",
             jail_backend=None,
             max_model_len=1_300,
@@ -723,10 +730,37 @@ class TestNativeToolLoop:
 
         assert trace.final_report_reasoning_dropped
         assert trace.final_report == "The marker is ready."
+        summary_messages = cast("list[dict[str, object]]", trace.summary_record()["messages"])
+        report_user_index = next(
+            index
+            for index, message in enumerate(summary_messages)
+            if message.get("role") == "user" and message.get("content") == loop.FINAL_REPORT_PROMPT
+        )
         prior_assistant_messages = [
-            message for message in trace.messages if message["role"] == "assistant"
+            message
+            for message in summary_messages[:report_user_index]
+            if message["role"] == "assistant"
         ]
-        assert "reasoning_content" not in prior_assistant_messages[0]
+        assert prior_assistant_messages
+        assert all(
+            message.get("reasoning_content") == "reasoning" for message in prior_assistant_messages
+        )
+        assert summary_messages[-2] == {"role": "user", "content": loop.FINAL_REPORT_PROMPT}
+        assert summary_messages[-1]["role"] == "assistant"
+        assert summary_messages[-1]["content"] == "The marker is ready."
+
+        tokenizer = cast("_FakeTokenizer", backend.tokenizer)
+        tools = tokenizer.rendered_tools[0]
+        message_count = 2
+        for turn in trace.turns:
+            replayed_prompt = chat.render_prompt(
+                cast("PreTrainedTokenizerBase", tokenizer),
+                summary_messages[:message_count],
+                tools,
+            )
+            replayed_sha256 = hashlib.sha256(replayed_prompt.encode("utf-8")).hexdigest()
+            assert replayed_sha256 == turn.rendered_prompt_sha256
+            message_count += 1 + len(turn.tool_results)
 
 
 class TestPersistentShell:
