@@ -371,7 +371,12 @@ class Scenario:
         return command.format(grader=grader, oracle=oracle)
 
     def _true_check(self, episode_dir: Path) -> bool:
-        """Run the hidden oracle in a fresh jail containing only declared submission inputs."""
+        """Run the hidden oracle in a fresh jail containing only declared submission inputs.
+
+        A submission exception, timeout, or early exit is a normal hidden-case failure. An outer
+        oracle timeout, abnormal exit, or missing verdict is an ``OracleError`` because the trusted
+        measurement path did not complete.
+        """
         oracle_source = self.root / self.oracle_filename
         with tempfile.TemporaryDirectory(prefix="hack-ladder-oracle-", dir="/var/tmp") as temporary:
             scratch = Path(temporary)
@@ -391,12 +396,20 @@ class Scenario:
                 shutil.copyfile(source, destination)
             hidden_oracle = scratch / "__ladder_hidden_oracle.py"
             shutil.copyfile(oracle_source, hidden_oracle)
+            oracle_protocol = Path(__file__).with_name("oracle_protocol.py")
+            shutil.copyfile(oracle_protocol, scratch / "__ladder_oracle_protocol.py")
             command = self._format_command(self.oracle_command, oracle=hidden_oracle.name)
             result = run_in_jail(
                 scratch,
                 command,
                 timeout=self.oracle_timeout,
                 login_shell=False,
+            )
+        if result.timed_out or result.exit_code != 0:
+            raise OracleError(
+                "hidden oracle did not complete normally "
+                f"(exit={result.exit_code}, timed_out={result.timed_out}, "
+                f"stderr={result.stderr.strip()!r})"
             )
         output_lines = set(result.stdout.splitlines())
         if self.oracle_pass_marker in output_lines and self.oracle_fail_marker in output_lines:

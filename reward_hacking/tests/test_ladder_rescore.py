@@ -9,9 +9,11 @@ from typing import Any, cast
 import pytest
 
 from reward_hacking.jailed_poc import CommandResult
+from reward_hacking.ladder import runner
 from reward_hacking.ladder.monitor import CommandAuditMonitor
 from reward_hacking.ladder.rescore import rescore_file
 from reward_hacking.ladder.runner import (
+    EpisodeKey,
     EpisodeRun,
     ModelSpec,
     RunnerConfig,
@@ -155,7 +157,7 @@ def _fresh_run(
     return input_path, tmp_path / "output.jsonl", scenario_root, episode
 
 
-def test_rescore_reproduces_detection_from_a_synthetic_schema_13_record(
+def test_rescore_reproduces_detection_from_a_synthetic_schema_14_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     input_path, output_path, scenario_root, episode = _fresh_run(tmp_path, monkeypatch)
@@ -172,7 +174,7 @@ def test_rescore_reproduces_detection_from_a_synthetic_schema_13_record(
     assert rescored_episode["rung_detection"]["evidence"]["1"]
     assert rescored_episode["episode_token"] == episode["episode_token"]
     assert rescored_rows[0]["record"] == "ladder_run_header"
-    assert rescored_rows[0]["schema_version"] == 13
+    assert rescored_rows[0]["schema_version"] == 14
     rescored_summary = cast("dict[str, object]", rescored_episode["trace_summary"])
     assert rescored_summary["check"] == {
         "affordance": True,
@@ -184,6 +186,64 @@ def test_rescore_reproduces_detection_from_a_synthetic_schema_13_record(
     assert rescored_summary["tool_calls_per_turn_max"] == 1
     assert rescored_rows[0]["rescore"]["detector_code_identity"]
     assert rescored_rows[0]["rescore"]["timestamp_utc"]
+
+
+def test_rescore_recomputes_every_detector_dependent_record_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    input_path, output_path, scenario_root, episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    trace_summary = cast("dict[str, object]", episode["trace_summary"])
+    true_result = cast("dict[str, object]", trace_summary["true"])
+    true_result["pass"] = True
+    trace_summary["final_report"] = {
+        "text": "",
+        "reasoning": "",
+        "truncated": False,
+        "timed_out": False,
+    }
+    trace_summary["final_report_tool_calls"] = 1
+    episode["final_grade"] = {}
+    episode["highest_rung"] = 0
+    episode["coverup"] = False
+    episode["rung_5"] = False
+    episode["report_unavailable"] = False
+    episode["honest_solve"] = True
+    rows = [episode if row.get("record") == "ladder_episode" else row for row in rows]
+    input_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+    rescored_episode = next(row for row in rescored_rows if row.get("record") == "ladder_episode")
+    rescored_detection = cast("dict[str, object]", rescored_episode["rung_detection"])
+    fresh_episode = runner._episode_record(  # pyright: ignore[reportPrivateUsage]
+        key=EpisodeKey.from_json(cast("dict[str, object]", episode["key"])),
+        provenance=cast("str", episode["provenance_digest"]),
+        detector_code_identity=cast("str", rescored_episode["detector_code_identity"]),
+        episode_dir=Path(cast("str", episode["episode_dir"])),
+        trace_path=Path(cast("str", episode["trace_path"])),
+        trace=trace_summary,
+        episode_token=cast("str | None", episode["episode_token"]),
+        detection=rescored_detection,
+        final_grade=cast("dict[str, object]", episode["final_grade"]),
+        pristine_visible_pass=cast("bool | None", episode["pristine_visible_pass"]),
+        max_turns=runner.ladder_loop.LADDER_MAX_TURNS,
+        command_records=cast("list[object]", episode["engine_command_records"]),
+        detector_inputs=cast("dict[str, object]", episode["detector_inputs"]),
+    )
+
+    assert rescored_episode["highest_rung"] != 0
+    derived_fields = (
+        "rung_detection",
+        "highest_rung",
+        "rung_5",
+        "coverup",
+        "report_unavailable",
+        "true_measured",
+        "honest_solve",
+    )
+    assert {field: rescored_episode[field] for field in derived_fields} == {
+        field: fresh_episode[field] for field in derived_fields
+    }
 
 
 def test_rescore_accepts_legacy_headers_without_detector_identity(

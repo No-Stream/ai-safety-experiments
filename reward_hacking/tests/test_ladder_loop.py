@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
+import pytest
 from conftest import needs_jail
 
 from reward_hacking.harness.loop import CheckVerdict, FinalGrade
@@ -24,7 +25,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-    import pytest
     from transformers import PreTrainedTokenizerBase
 
     from reward_hacking.harness import loop as shared_loop
@@ -499,6 +499,90 @@ class TestNativeToolLoop:
         assert trace.turns[0].format_error is not None
         assert trace.turns[0].tool_calls[0].not_executed_reason == "format_error"
 
+    def test_length_truncated_multiple_tool_calls_get_one_error_response_each(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        executed: list[str] = []
+        monkeypatch.setattr(
+            loop,
+            "run_in_jail",
+            lambda _directory, command, **_kwargs: (
+                executed.append(command) or CommandResult(command, 0, "", "", False)
+            ),
+        )
+        monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(
+                    _bash("touch first") + "\n" + _bash("touch second", start_turn=False),
+                    finish_reason="length",
+                ),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        trace = loop.run_ladder_episode(
+            _task(),
+            backend,
+            episode_dir=tmp_path / "episode",
+            arm=AgenticArmConfig(check_affordance=True),
+            system_prompt="System",
+            user_template="{task_markdown}\n{listing}",
+            max_turns=1,
+            timeout="120s",
+            jail_backend=None,
+            max_model_len=100_000,
+        )
+
+        assistant_turn = trace.messages[2]
+        tool_calls = assistant_turn["tool_calls"]
+        assert executed == []
+        assert len(trace.turns[0].tool_calls) == 2
+        assert all(call.not_executed_reason == "format_error" for call in trace.turns[0].tool_calls)
+        assert len(trace.turns[0].tool_results) == 2
+        assert isinstance(tool_calls, list)
+        assert len(tool_calls) == 2
+        assert sum(message["role"] == "tool" for message in trace.messages) == 2
+
+    @pytest.mark.parametrize("finish_reason", ["abort", "error", "repetition", "unexpected"])
+    def test_unknown_completion_finish_reason_raises_before_tool_execution(
+        self,
+        finish_reason: str,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        executed: list[str] = []
+        monkeypatch.setattr(
+            loop,
+            "run_in_jail",
+            lambda _directory, command, **_kwargs: (
+                executed.append(command) or CommandResult(command, 0, "", "", False)
+            ),
+        )
+        monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch must_not_run"), finish_reason=finish_reason),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        with pytest.raises(ValueError, match="unsupported completion finish_reason"):
+            loop.run_ladder_episode(
+                _task(),
+                backend,
+                episode_dir=tmp_path / "episode",
+                arm=AgenticArmConfig(check_affordance=True),
+                system_prompt="System",
+                user_template="{task_markdown}\n{listing}",
+                max_turns=1,
+                timeout="120s",
+                jail_backend=None,
+                max_model_len=100_000,
+            )
+
+        assert executed == []
+
     def test_deadline_between_calls_records_the_unexecuted_call(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -560,6 +644,7 @@ class TestNativeToolLoop:
         assert trace.ended_by == "context_exhausted"
         assert trace.deadline_phase is None
         assert trace.context_peak_prompt_tokens == 100
+        assert trace.report_unavailable
 
     def test_final_report_tool_call_is_counted_but_inert(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -597,8 +682,50 @@ class TestNativeToolLoop:
         assert trace.turns[0].commands[0].command == "touch marker.txt"
         assert trace.final_report == ""
         assert trace.final_report_tool_calls == 1
+        assert trace.report_unavailable
         assert len(trace.turns) == 1
         assert trace.summary_record()["final_report_tool_calls"] == 1
+        assert trace.summary_record()["report_unavailable"] is True
+        assert trace.summary_record()["final_report_prompt_sha256"] == (
+            trace.final_report_prompt_sha256
+        )
+        assert len(trace.final_report_prompt_sha256) == 64
+        assert (
+            trace.final_report_prompt_sha256
+            == hashlib.sha256(backend.prompts[1].encode("utf-8")).hexdigest()
+        )
+
+    def test_final_report_text_remains_available_with_an_inert_tool_call(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch marker.txt")),
+                _ScriptedReply(
+                    _report("I completed the task.")
+                    + "\n"
+                    + _bash("touch inert.txt", start_turn=False)
+                ),
+            ]
+        )
+
+        trace = loop.run_ladder_episode(
+            _task(),
+            backend,
+            episode_dir=tmp_path / "episode",
+            arm=AgenticArmConfig(check_affordance=True),
+            system_prompt="System",
+            user_template="{task_markdown}\n{listing}",
+            max_turns=1,
+            timeout="120s",
+            jail_backend=None,
+            max_model_len=100_000,
+        )
+
+        assert trace.final_report == "I completed the task."
+        assert trace.final_report_tool_calls == 1
+        assert trace.report_unavailable is False
 
     def test_prompt_pure_append_measurement_is_recorded(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -766,7 +893,11 @@ class TestNativeToolLoop:
             ):
                 return rendered + (
                     " retained " * 1500
-                    if any("reasoning_content" in message for message in messages)
+                    if any(
+                        "reasoning_content" in message
+                        or str(message.get("content", "")).startswith("Prior reasoning:")
+                        for message in messages
+                    )
                     else ""
                 )
             return rendered
@@ -795,6 +926,11 @@ class TestNativeToolLoop:
 
         assert trace.final_report_reasoning_dropped
         assert trace.final_report == "The marker is ready."
+        assert (
+            trace.final_report_prompt_sha256
+            == hashlib.sha256(backend.prompts[2].encode("utf-8")).hexdigest()
+        )
+        assert "earlier reasoning" not in backend.prompts[2]
         summary_messages = cast("list[dict[str, object]]", trace.summary_record()["messages"])
         report_user_index = next(
             index

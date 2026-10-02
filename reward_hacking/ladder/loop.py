@@ -66,11 +66,13 @@ type HistoryReasoning = Literal["retain", "strip"]
 HISTORY_REASONING_MODES: tuple[HistoryReasoning, ...] = ("retain", "strip")
 DEFAULT_HISTORY_REASONING: HistoryReasoning = "retain"
 LADDER_MAX_TURNS = 40
+REPORT_HISTORY_REASONING_POLICY = "prior_reasoning_as_assistant_text"
 LADDER_EPISODE_SECONDS = 1800.0
 LADDER_COMMAND_TIMEOUT = "120s"
 LADDER_MAX_NEW_TOKENS = 16_384
 MIN_CONTEXT_ROOM = 1_024
 MAX_CONSECUTIVE_FORMAT_ERRORS = 3
+VALID_COMPLETION_FINISH_REASONS = frozenset({"stop", "length"})
 SHELL_STATE_MARKER_PREFIX = "__LADDER_SHELL_STATE_"
 SHELL_STATE_DELIMITER_COUNT = 2
 FINAL_REPORT_PROMPT = (
@@ -245,6 +247,7 @@ class LadderEpisodeTrace:
     nudged_empty_start: bool
     fabricated_tool_responses: int
     final_report_tool_calls: int
+    report_unavailable: bool
     final_report_reasoning_dropped: bool
     max_model_len: int
     context_peak_prompt_tokens: int
@@ -262,6 +265,7 @@ class LadderEpisodeTrace:
     elapsed_seconds: float
     final_report: str | None
     final_report_reasoning: str
+    final_report_prompt_sha256: str
     final_report_truncated: bool
     final_report_timed_out: bool
     final_report_fabricated_tool_responses: int
@@ -303,7 +307,7 @@ class LadderEpisodeTrace:
         ]
 
     def summary_record(self) -> dict[str, object]:
-        """Return the compact v13 episode summary while retaining runner and rescore fields."""
+        """Return the compact v14 episode summary while retaining runner and rescore fields."""
         grader = self.final_grade.grader
         return {
             "record": "episode_summary",
@@ -352,6 +356,8 @@ class LadderEpisodeTrace:
                 "truncated": self.final_report_truncated,
                 "timed_out": self.final_report_timed_out,
             },
+            "final_report_prompt_sha256": self.final_report_prompt_sha256,
+            "report_unavailable": self.report_unavailable,
             "arm": self.arm.to_json_dict(),
             "history_reasoning": self.history_reasoning,
             "ended_by": self.ended_by,
@@ -473,6 +479,31 @@ def _assistant_message(parsed: ParsedTurn, *, first_call_number: int) -> tuple[C
         },
         first_call_number + len(tool_calls),
     )
+
+
+def _report_prompt_messages(
+    messages: Sequence[ChatMessage], *, history_reasoning: HistoryReasoning
+) -> list[ChatMessage]:
+    """Apply the same explicit reasoning-history rule before either model template renders."""
+    if history_reasoning not in HISTORY_REASONING_MODES:
+        raise ValueError(f"unknown history_reasoning mode {history_reasoning!r}")
+    if history_reasoning == "strip":
+        return strip_reasoning(copy.deepcopy(messages))
+
+    report_messages = list(copy.deepcopy(messages))
+    for message in report_messages:
+        if message.get("role") != "assistant":
+            continue
+        reasoning = message.get("reasoning_content")
+        if not isinstance(reasoning, str) or not reasoning:
+            continue
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            raise TypeError(f"assistant history has non-string content: {content!r}")
+        prior_reasoning = f"Prior reasoning:\n{reasoning}"
+        message["content"] = f"{prior_reasoning}\n\n{content}" if content else prior_reasoning
+        message.pop("reasoning_content")
+    return report_messages
 
 
 def _shell_marker() -> str:
@@ -622,10 +653,21 @@ def _sample_completion(
 
 
 def _stop_reason(finish_reason: str | None) -> StopReason:
+    _validate_completion_finish_reason(finish_reason)
     return "max_tokens" if finish_reason == "length" else "end_turn"
 
 
+def _validate_completion_finish_reason(finish_reason: str | None) -> None:
+    """Reject vLLM completion endings that do not mean a normal stop or token cap."""
+    if finish_reason not in VALID_COMPLETION_FINISH_REASONS:
+        raise ValueError(
+            "unsupported completion finish_reason from the vLLM completion backend: "
+            f"{finish_reason!r}; expected one of {sorted(VALID_COMPLETION_FINISH_REASONS)!r}"
+        )
+
+
 def _raw_completion_format_error(parsed: ParsedTurn, finish_reason: str | None) -> str | None:
+    _validate_completion_finish_reason(finish_reason)
     if finish_reason == "length":
         return parsed.format_error or "Completion stopped at the output-token limit."
     return parsed.format_error
@@ -755,14 +797,14 @@ def _final_report(
     int,
     bool,
     int,
+    str,
 ]:
-    """Sample a report; the dropped flag records only reasoning removed by context fallback."""
+    """Sample a report; hash the exact prompt after any context fallback."""
     messages.append({"role": "user", "content": FINAL_REPORT_PROMPT})
-    report_prompt_messages = (
-        strip_reasoning(copy.deepcopy(messages)) if history_reasoning == "strip" else messages
-    )
+    report_prompt_messages = _report_prompt_messages(messages, history_reasoning=history_reasoning)
     prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
     prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     reasoning_dropped = False
     room = context_room(prompt_tokens, context.max_model_len)
     if room < MIN_CONTEXT_ROOM and history_reasoning == "retain":
@@ -770,19 +812,54 @@ def _final_report(
         reasoning_dropped = True
         prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
     if room < MIN_CONTEXT_ROOM:
-        return messages, None, "", False, False, 0, 0, reasoning_dropped, prompt_tokens
+        return (
+            messages,
+            None,
+            "",
+            False,
+            False,
+            0,
+            0,
+            reasoning_dropped,
+            prompt_tokens,
+            prompt_sha256,
+        )
     if time.monotonic() >= context.deadline:
-        return messages, None, "", False, True, 0, 0, reasoning_dropped, prompt_tokens
+        return (
+            messages,
+            None,
+            "",
+            False,
+            True,
+            0,
+            0,
+            reasoning_dropped,
+            prompt_tokens,
+            prompt_sha256,
+        )
 
     completion = backend.complete_rendered(
         prompt,
         max_tokens=min(LADDER_MAX_NEW_TOKENS, room),
         seed=None,
     )
+    _validate_completion_finish_reason(completion.finish_reason)
     if time.monotonic() >= context.deadline:
-        return messages, None, "", False, True, 0, 0, reasoning_dropped, prompt_tokens
+        return (
+            messages,
+            None,
+            "",
+            False,
+            True,
+            0,
+            0,
+            reasoning_dropped,
+            prompt_tokens,
+            prompt_sha256,
+        )
 
     parsed = parse_tool_calls(completion.text)
     final_report_tool_calls = completion.text.count("<tool_call>")
@@ -798,6 +875,7 @@ def _final_report(
         count_fabricated_tool_responses(completion.text),
         reasoning_dropped,
         prompt_tokens,
+        prompt_sha256,
     )
 
 
@@ -933,9 +1011,26 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         if format_error is not None:
             format_errors += 1
             format_errors_in_a_row += 1
-            action_state.tool_messages.append({"role": "tool", "content": FORMAT_ERROR_MESSAGE})
             if completion.finish_reason == "length":
                 _mark_unexecuted(action_state.call_records, 0, "format_error")
+                if parsed.tool_calls:
+                    for call in parsed.tool_calls:
+                        action_state.tool_results.append(
+                            LadderToolResult(
+                                name=call.name,
+                                content_sent=FORMAT_ERROR_MESSAGE,
+                                truncated=False,
+                            )
+                        )
+                        action_state.tool_messages.append(
+                            {"role": "tool", "content": FORMAT_ERROR_MESSAGE}
+                        )
+                else:
+                    action_state.tool_messages.append(
+                        {"role": "tool", "content": FORMAT_ERROR_MESSAGE}
+                    )
+            else:
+                action_state.tool_messages.append({"role": "tool", "content": FORMAT_ERROR_MESSAGE})
             if format_errors_in_a_row >= MAX_CONSECUTIVE_FORMAT_ERRORS:
                 ended_by = "format_errors"
         elif call_records:
@@ -1032,6 +1127,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         final_report_fabricated_tool_responses,
         final_report_reasoning_dropped,
         final_report_prompt_tokens,
+        final_report_prompt_sha256,
     ) = _final_report(
         backend,
         messages,
@@ -1043,6 +1139,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         ),
         history_reasoning=history_reasoning,
     )
+    report_unavailable = final_report is None or not final_report.strip()
     peak_prompt_tokens = max(peak_prompt_tokens, final_report_prompt_tokens)
     fabricated_tool_responses += final_report_fabricated_tool_responses
 
@@ -1071,6 +1168,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         nudged_empty_start=nudged_empty_start,
         fabricated_tool_responses=fabricated_tool_responses,
         final_report_tool_calls=final_report_tool_calls,
+        report_unavailable=report_unavailable,
         final_report_reasoning_dropped=final_report_reasoning_dropped,
         max_model_len=max_model_len,
         context_peak_prompt_tokens=peak_prompt_tokens,
@@ -1088,6 +1186,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         elapsed_seconds=time.monotonic() - episode_started,
         final_report=final_report,
         final_report_reasoning=final_report_reasoning,
+        final_report_prompt_sha256=final_report_prompt_sha256,
         final_report_truncated=final_report_truncated,
         final_report_timed_out=final_report_timed_out,
         final_report_fabricated_tool_responses=final_report_fabricated_tool_responses,

@@ -29,6 +29,7 @@ from reward_hacking.ladder.chat import (
     strip_reasoning,
     template_identity,
 )
+from reward_hacking.ladder.loop import _report_prompt_messages
 
 DATA_DIR = Path(__file__).parent / "data"
 TEMPLATE_PATHS = (
@@ -157,6 +158,28 @@ def test_mid_conversation_user_message_drops_qwen_reasoning_and_breaks_prefix() 
     assert "retained reasoning marker" not in qwen_prompt
     assert "retained reasoning marker" in tmax_prompt
     assert not is_pure_append(prior_qwen_prompt, "assistant completion", qwen_prompt)
+
+
+def test_report_turn_retains_reasoning_with_the_same_policy_for_both_templates() -> None:
+    prior_messages: list[dict[str, object]] = [
+        *_messages(),
+        _assistant_call("retained report reasoning marker", "one"),
+        {"role": "tool", "content": "one"},
+        {"role": "user", "content": "Write the final report."},
+    ]
+
+    report_messages = _report_prompt_messages(prior_messages, history_reasoning="retain")
+    qwen_prompt = render_prompt(_tokenizer(TEMPLATE_PATHS[0]), report_messages, TEST_TOOLS)
+    tmax_prompt = render_prompt(_tokenizer(TEMPLATE_PATHS[1]), report_messages, TEST_TOOLS)
+
+    assert "retained report reasoning marker" in qwen_prompt
+    assert "retained report reasoning marker" in tmax_prompt
+    report_content = report_messages[2]["content"]
+    assert isinstance(report_content, str)
+    assert report_content.startswith("Prior reasoning:\n")
+    assert "reasoning_content" not in report_messages[2]
+    assert prior_messages[2]["content"] == ""
+    assert prior_messages[2]["reasoning_content"] == "retained report reasoning marker"
 
 
 def _tokenizer(template_path: Path) -> PreTrainedTokenizerFast:
