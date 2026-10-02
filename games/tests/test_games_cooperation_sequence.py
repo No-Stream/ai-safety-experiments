@@ -15,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import huggingface_hub.constants
 import pytest
 
 from games import cooperation_sequence as plan
@@ -312,6 +313,31 @@ def _phase_specs() -> tuple[plan.Phase, ...]:
     phases = tuple(plan.phase_specs())
     assert phases, "the cooperation plan must contain at least one phase"
     return phases
+
+
+class TestDefaultModelSource:
+    """The 9B default is the pinned revision in the Hugging Face cache, never a second private copy."""
+
+    def test_default_resolves_the_pinned_revision_in_the_hub_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo_dir = tmp_path / "models--Qwen--Qwen3.5-9B"
+        snapshot = repo_dir / "snapshots" / plan.DEFAULT_MODEL_REVISION
+        _write(snapshot / "config.json", b"{}")
+        _write(repo_dir / "refs" / "main", plan.DEFAULT_MODEL_REVISION.encode())
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+        monkeypatch.delenv("GAMES_COOP_MODEL_PATH", raising=False)
+
+        assert Path(plan.model_source()) == snapshot
+
+    def test_default_fails_fast_when_the_revision_is_not_cached(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+        monkeypatch.delenv("GAMES_COOP_MODEL_PATH", raising=False)
+
+        with pytest.raises(FileNotFoundError, match="not in the Hugging Face cache"):
+            plan.model_source()
 
 
 class TestSnapshotReadiness:

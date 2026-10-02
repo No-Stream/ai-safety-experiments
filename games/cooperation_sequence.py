@@ -22,6 +22,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from huggingface_hub import try_to_load_from_cache
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
@@ -94,11 +96,25 @@ def model_id() -> str:
 
 
 def model_source() -> str:
-    """Return the immutable local snapshot shared by every 9B loader."""
-    default = Path(
-        f"/var/tmp/cooperation-generalization-assets/qwen3.5-9b-{DEFAULT_MODEL_REVISION}"  # noqa: S108 -- intentional immutable local model cache path
+    """Return the immutable local snapshot shared by every 9B loader.
+
+    The default is the pinned revision's snapshot in the Hugging Face cache, resolved offline, so the
+    9B weights exist on disk once rather than once per project. A missing revision raises.
+    """
+    override = os.environ.get(f"{ENV_PREFIX}MODEL_PATH")
+    if override:
+        return override
+    # Not snapshot_download(local_files_only=True): huggingface_hub 1.27 refuses a weights-only cache
+    # whose tree listing names files the download skipped (the ladder runner hit the same check).
+    cached_config = try_to_load_from_cache(
+        DEFAULT_MODEL, "config.json", revision=DEFAULT_MODEL_REVISION
     )
-    return _setting("MODEL_PATH", str(default))
+    if not isinstance(cached_config, str):
+        raise FileNotFoundError(
+            f"{DEFAULT_MODEL} revision {DEFAULT_MODEL_REVISION} is not in the Hugging Face cache; "
+            f"download it or set {ENV_PREFIX}MODEL_PATH"
+        )
+    return str(Path(cached_config).parent)
 
 
 def smoke_model_source() -> str:
