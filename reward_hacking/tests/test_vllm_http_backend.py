@@ -54,10 +54,12 @@ def server(
             if state.get("replies")
             else (state.get("text", "synthetic</run>"), state["finish"], state["stop"], 3)
         )
-        payload = {
+        payload: dict[str, Any] = {
             "choices": [{"index": 0, "text": text, "finish_reason": finish, "stop_reason": stop}],
             "usage": {"prompt_tokens": 17, "completion_tokens": completion_tokens},
         }
+        if "token_ids" in state:
+            payload["choices"][0]["token_ids"] = state["token_ids"]
         return httpx2.Response(state["status"], json=state.get("payload", payload))
 
     client_class = httpx2.Client
@@ -159,6 +161,7 @@ def test_sampling_and_result(
             "stream": False,
         }
     ]
+    assert "return_token_ids" not in requests[0]
     assert completion.text == "synthetic</run>"
     assert completion.stop_reason == "stop_sequence"
     assert completion.usage.input_tokens == 17
@@ -339,15 +342,14 @@ def test_malformed_response_fails(
         backend.generate(["synthetic"])
 
 
-@pytest.mark.parametrize("matched_stop", [248046, "</run>", None])
-def test_complete_rendered_returns_raw_stop_free_completion(
+def test_complete_rendered_matches_eos_stop_token_from_returned_ids(
     tokenizer_path: Path,
     server: tuple[str, list[dict[str, Any]], dict[str, Any]],
-    matched_stop: int | str | None,
 ) -> None:
     url, requests, state = server
     raw_completion = "reasoning</think>answer <run>raw output</run>"
-    state["replies"] = [(raw_completion, "stop", matched_stop, 11)]
+    state["replies"] = [(raw_completion, "stop", None, 11)]
+    state["token_ids"] = [12, 248046]
     backend = VLLMHTTPBackend(
         "synthetic",
         base_url=url,
@@ -360,7 +362,7 @@ def test_complete_rendered_returns_raw_stop_free_completion(
 
     assert completion.text == raw_completion
     assert completion.finish_reason == "stop"
-    assert completion.matched_stop == matched_stop
+    assert completion.matched_stop == 248046
     assert completion.prompt_tokens == 17
     assert completion.completion_tokens == 11
     assert requests[0]["prompt"] == "already rendered prompt"
@@ -370,3 +372,55 @@ def test_complete_rendered_returns_raw_stop_free_completion(
     assert requests[0]["include_stop_str_in_output"] is False
     assert requests[0]["stop_token_ids"] == [248044, 248046]
     assert requests[0]["add_special_tokens"] is False
+    assert requests[0]["return_token_ids"] is True
+
+
+@pytest.mark.parametrize("stop_reason", [248044, "</run>"])
+def test_complete_rendered_prefers_explicit_stop_reason(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    stop_reason: int | str,
+) -> None:
+    url, _, state = server
+    state["replies"] = [("answer", "stop", stop_reason, 3)]
+    state["token_ids"] = [12, 13]
+    backend = VLLMHTTPBackend(
+        "synthetic",
+        base_url=url,
+        model_path=tokenizer_path,
+        stop_token_ids=(248044, 248046),
+    )
+
+    completion = backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
+
+    assert completion.matched_stop == stop_reason
+
+
+def test_complete_rendered_does_not_match_stop_token_when_length_capped(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, _, state = server
+    state["replies"] = [("answer", "length", None, 3)]
+    state["token_ids"] = [12, 248046]
+    backend = VLLMHTTPBackend(
+        "synthetic",
+        base_url=url,
+        model_path=tokenizer_path,
+        stop_token_ids=(248044, 248046),
+    )
+
+    completion = backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
+
+    assert completion.matched_stop is None
+
+
+def test_complete_rendered_requires_returned_token_ids(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, _, _state = server
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    with pytest.raises(ValueError, match="token_ids"):
+        backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)

@@ -903,6 +903,7 @@ class _VLLMHTTPChoice(BaseModel):
     text: str
     finish_reason: str | None
     stop_reason: int | str | None
+    token_ids: list[int] | None = None
 
 
 class _VLLMHTTPUsage(BaseModel):
@@ -939,6 +940,7 @@ class _VLLMHTTPRequestOptions:
     stop_sequences: Sequence[str] | None
     include_stop_str_in_output: bool
     add_special_tokens: bool
+    return_token_ids: bool = False
 
 
 _THINK_END = "</think>"
@@ -1048,6 +1050,7 @@ class VLLMHTTPBackend:
             "include_stop_str_in_output": options.include_stop_str_in_output,
             # LLM.generate uses default_cmpl_tok_params with this set to True too.
             "add_special_tokens": options.add_special_tokens,
+            **({"return_token_ids": True} if options.return_token_ids else {}),
             "n": 1,
             "stream": False,
         }
@@ -1076,12 +1079,22 @@ class VLLMHTTPBackend:
                 stop_sequences=None,
                 include_stop_str_in_output=False,
                 add_special_tokens=False,
+                return_token_ids=True,
             ),
         )
+        if choice.token_ids is None:
+            raise ValueError(
+                "vLLM completion response omitted token_ids despite return_token_ids=True"
+            )
+        matched_stop = choice.stop_reason
+        if matched_stop is None and choice.finish_reason == "stop" and choice.token_ids:
+            final_token_id = choice.token_ids[-1]
+            if final_token_id in self.stop_token_ids:
+                matched_stop = final_token_id
         return RenderedCompletion(
             text=choice.text,
             finish_reason=choice.finish_reason,
-            matched_stop=choice.stop_reason,
+            matched_stop=matched_stop,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
         )
