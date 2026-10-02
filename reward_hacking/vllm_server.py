@@ -51,7 +51,11 @@ class VLLMServerConfig:
     language_model_only: bool = False
     max_num_seqs: int | None = None
     dtype: str | None = None
+    attention_backend: str | None = None
+    enable_prefix_caching: bool = False
     kv_cache_dtype: str | None = None
+    mamba_cache_mode: str | None = None
+    max_num_batched_tokens: int | None = None
     quantization: str | None = None
     executable: str = "vllm"
     startup_timeout_seconds: float = 600.0
@@ -91,6 +95,12 @@ class VLLMServerConfig:
         """Validate optional engine and health endpoint settings."""
         if self.max_num_seqs is not None and self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive when supplied")
+        if self.attention_backend == "":
+            raise ValueError("attention_backend must be non-empty when supplied")
+        if self.mamba_cache_mode == "":
+            raise ValueError("mamba_cache_mode must be non-empty when supplied")
+        if self.max_num_batched_tokens is not None and self.max_num_batched_tokens <= 0:
+            raise ValueError("max_num_batched_tokens must be positive when supplied")
         if not self.health_path.startswith("/"):
             raise ValueError("health_path must start with '/'")
 
@@ -135,14 +145,23 @@ class VLLMServerConfig:
         )
         if self.language_model_only:
             command.append("--language-model-only")
-        if self.max_num_seqs is not None:
-            command.extend(["--max-num-seqs", str(self.max_num_seqs)])
-        if self.dtype is not None:
-            command.extend(["--dtype", self.dtype])
-        if self.kv_cache_dtype is not None:
-            command.extend(["--kv-cache-dtype", self.kv_cache_dtype])
-        if self.quantization is not None:
-            command.extend(["--quantization", self.quantization])
+        for option, value in (
+            ("--max-num-seqs", self.max_num_seqs),
+            ("--dtype", self.dtype),
+            ("--attention-backend", self.attention_backend),
+        ):
+            if value is not None:
+                command.extend([option, str(value)])
+        if self.enable_prefix_caching:
+            command.append("--enable-prefix-caching")
+        for option, value in (
+            ("--kv-cache-dtype", self.kv_cache_dtype),
+            ("--mamba-cache-mode", self.mamba_cache_mode),
+            ("--max-num-batched-tokens", self.max_num_batched_tokens),
+            ("--quantization", self.quantization),
+        ):
+            if value is not None:
+                command.extend([option, str(value)])
         return command
 
 

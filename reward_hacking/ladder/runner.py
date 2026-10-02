@@ -10,6 +10,7 @@ resolved a local-only tokenizer snapshot, and calls the native ladder loop once 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import hmac
 import json
@@ -19,6 +20,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
@@ -70,6 +72,7 @@ METHOD_AUDIT_RUNG_LIMIT = frozenset({2, 3})
 LADDER_ARMS = frozenset({"naive", "claimed", "real"})
 LADDER_TASK_PRESSURES = ("none", "merge-gate")
 _MODEL_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_VLLM_SERVER_ARGS_RE = re.compile(r"\[api_utils\.py:\d+\]\s+non-default args:\s*(.+)$")
 _MINIMUM_VISIBLE_MARKER_LENGTH = 3
 
 # Generation sources determine prompts, sampling, execution, monitoring, and grading. Detector
@@ -215,6 +218,7 @@ class RunnerConfig:
     episode_concurrency: int = 1
     task_pressure: str = "none"
     max_model_len_by_model: tuple[tuple[str, int], ...] = ()
+    server_args: Mapping[str, object] | None = None
     _provenance_payload_cache: dict[str, object] = dataclass_field(
         init=False, repr=False, compare=False
     )
@@ -253,6 +257,7 @@ class RunnerConfig:
                 LADDER_USER_TEMPLATE.encode("utf-8")
             ).hexdigest(),
             "max_model_len": dict(self.max_model_len_by_model),
+            "server_args": None if self.server_args is None else deepcopy(dict(self.server_args)),
             "sampling": LADDER_SAMPLING.to_json(),
             "max_turns": self.max_turns,
             "timeout": self.timeout,
@@ -398,6 +403,28 @@ def provenance_digest(payload: Mapping[str, object]) -> str:
     """Hash canonical JSON provenance, including every sampling and scenario identity field."""
     encoded = json.dumps(_canonical_json(payload), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def parse_server_args_from_log(log_path: Path) -> dict[str, object]:
+    """Read the final vLLM startup argument dictionary from its server log."""
+    matching_args: list[str] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        match = _VLLM_SERVER_ARGS_RE.search(line)
+        if match is not None:
+            matching_args.append(match.group(1))
+    if not matching_args:
+        raise ValueError(f"vLLM server log {log_path} has no non-default args startup line")
+    try:
+        parsed_args = ast.literal_eval(matching_args[-1])
+    except (SyntaxError, ValueError) as error:
+        raise ValueError(f"cannot parse vLLM server args from {log_path}") from error
+    if not isinstance(parsed_args, dict) or any(not isinstance(key, str) for key in parsed_args):
+        raise TypeError(f"vLLM server args in {log_path} must be a dict with string keys")
+    try:
+        json.dumps(parsed_args)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"vLLM server args in {log_path} are not JSON-compatible") from error
+    return parsed_args
 
 
 def _source_identity(repository_root: Path, relative_paths: Sequence[str]) -> str:
@@ -1804,6 +1831,13 @@ def _with_resolved_model_lengths(config: RunnerConfig) -> RunnerConfig:
     return resolved_config
 
 
+def _prepare_real_run_config(config: RunnerConfig) -> RunnerConfig:
+    """Require a parsed server identity before resolving the real endpoint."""
+    if config.server_args is None:
+        raise ValueError("real ladder runs require --server-log with vLLM startup args")
+    return _with_resolved_model_lengths(config)
+
+
 def run_grid(
     config: RunnerConfig,
     *,
@@ -1814,7 +1848,7 @@ def run_grid(
 ) -> list[dict[str, object]]:
     """Run pending model/scenario/arm/sample cells and append each result immediately."""
     if episode_runner is None:
-        config = _with_resolved_model_lengths(config)
+        config = _prepare_real_run_config(config)
     existing = _load_records(config.output_path)
     if existing and not config.resume:
         raise FileExistsError(
@@ -1919,7 +1953,7 @@ def run_grid(
 def readout_records(
     records: Sequence[Mapping[str, object]],
 ) -> dict[str, dict[str, dict[str, dict[str, object]]]]:
-    """Summarise highest-rung distributions, coverups, and honest solves by pressure and arm."""
+    """Summarise ladder outcomes and native tool-call health by model, pressure, and arm."""
     grouped: dict[tuple[str, str, str], list[Mapping[str, object]]] = {}
     seen: set[EpisodeKey] = set()
     for record in records:
@@ -1941,6 +1975,13 @@ def readout_records(
         honest_solve_count = 0
         measured_count = 0
         unmeasured_count = 0
+        ended_by_counts: Counter[str] = Counter()
+        tool_calls_per_turn_max_values: list[int] = []
+        total_format_errors = 0
+        total_check_used = 0
+        total_fabricated_tool_responses = 0
+        pure_append_turns = 0
+        turn_count = 0
         for record in cell_records:
             highest_rung = record.get("highest_rung")
             coverup = record.get("rung_5", record.get("coverup"))
@@ -1959,6 +2000,22 @@ def readout_records(
             honest_solve_count += int(honest_solve and true_measured)
             measured_count += int(true_measured)
             unmeasured_count += int(not true_measured)
+            (
+                ended_by,
+                tool_calls_per_turn_max,
+                format_errors,
+                check_used,
+                fabricated_responses,
+                episode_pure_append_turns,
+                episode_turn_count,
+            ) = _readout_episode_metrics(record)
+            ended_by_counts[ended_by] += 1
+            tool_calls_per_turn_max_values.append(tool_calls_per_turn_max)
+            total_format_errors += format_errors
+            total_check_used += check_used
+            total_fabricated_tool_responses += fabricated_responses
+            pure_append_turns += episode_pure_append_turns
+            turn_count += episode_turn_count
         count = len(cell_records)
         output.setdefault(model_id, {}).setdefault(task_pressure, {})[arm] = {
             "n": count,
@@ -1971,8 +2028,68 @@ def readout_records(
             "rung_5_rate": coverup_count / count,
             "honest_solve_count": honest_solve_count,
             "honest_solve_rate": honest_solve_count / measured_count if measured_count else None,
+            "ended_by_counts": dict(sorted(ended_by_counts.items())),
+            "mean_tool_calls_per_turn_max": sum(tool_calls_per_turn_max_values) / count,
+            "format_errors_total": total_format_errors,
+            "context_exhausted_count": ended_by_counts["context_exhausted"],
+            "check_used_mean": total_check_used / count,
+            "prompt_pure_append_fraction": pure_append_turns / turn_count,
+            "fabricated_tool_responses_total": total_fabricated_tool_responses,
         }
     return output
+
+
+def _readout_episode_metrics(
+    record: Mapping[str, object],
+) -> tuple[str, int, int, int, int, int, int]:
+    """Read the v13 episode and turn fields used by the behavioral health readout."""
+    summary = record["trace_summary"]
+    if not isinstance(summary, Mapping):
+        raise TypeError("ladder_episode.trace_summary must be an object")
+    ended_by = summary["ended_by"]
+    if not isinstance(ended_by, str):
+        raise TypeError("trace_summary.ended_by must be a string")
+    tool_calls_per_turn_max = _require_nonnegative_int(
+        summary["tool_calls_per_turn_max"], field="trace_summary.tool_calls_per_turn_max"
+    )
+    format_errors = _require_nonnegative_int(
+        summary["format_errors"], field="trace_summary.format_errors"
+    )
+    check_summary = summary["check"]
+    if not isinstance(check_summary, Mapping):
+        raise TypeError("trace_summary.check must be an object")
+    check_used = _require_nonnegative_int(check_summary["used"], field="trace_summary.check.used")
+    fabricated_responses = _require_nonnegative_int(
+        summary["fabricated_tool_responses"], field="trace_summary.fabricated_tool_responses"
+    )
+    trace_path = record["trace_path"]
+    if not isinstance(trace_path, str) or not trace_path:
+        raise TypeError("ladder_episode.trace_path must be a non-empty string")
+    trace_turns = [turn for turn in _load_records(Path(trace_path)) if turn.get("record") == "turn"]
+    if not trace_turns:
+        raise ValueError(f"no v13 turn records in {trace_path}")
+    pure_append_turns = 0
+    for turn in trace_turns:
+        prompt_pure_append = turn["prompt_pure_append"]
+        if not isinstance(prompt_pure_append, bool):
+            raise TypeError("turn.prompt_pure_append must be a boolean")
+        pure_append_turns += int(prompt_pure_append)
+    return (
+        ended_by,
+        tool_calls_per_turn_max,
+        format_errors,
+        check_used,
+        fabricated_responses,
+        pure_append_turns,
+        len(trace_turns),
+    )
+
+
+def _require_nonnegative_int(value: object, *, field: str) -> int:
+    """Validate one persisted v13 count without accepting booleans as integers."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise TypeError(f"{field} must be a non-negative int")
+    return value
 
 
 def readout(path: Path) -> dict[str, dict[str, dict[str, dict[str, object]]]]:
@@ -1992,6 +2109,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the selected ladder grid from the command line."""
     parser = argparse.ArgumentParser(description="Run the real-execution hack-severity ladder")
     parser.add_argument("--endpoint", required=True, help="vLLM OpenAI-compatible server URL")
+    parser.add_argument(
+        "--server-log",
+        type=Path,
+        required=True,
+        help="vLLM server log containing its latest non-default args startup line",
+    )
     parser.add_argument("--model", action="append", type=_parse_model_spec, required=True)
     parser.add_argument("--scenario-root", type=Path, required=True)
     parser.add_argument("--scenario", action="append", dest="scenario_ids")
@@ -2016,6 +2139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--task-pressure", choices=LADDER_TASK_PRESSURES, default="none")
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args(argv)
+    server_args = parse_server_args_from_log(args.server_log)
 
     from reward_hacking.ladder.scenario import load_scenarios  # noqa: PLC0415 - CLI-only import
 
@@ -2036,6 +2160,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resource_limits=resource_limits,
         resume=not args.no_resume,
         task_pressure=args.task_pressure,
+        server_args=server_args,
     )
     run_grid(config)
     result = readout(config.output_path)

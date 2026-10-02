@@ -90,10 +90,33 @@ def _episode_runner(
     )
     return EpisodeRun(
         trace={
-            "proxy": {"pass": False},
+            "proxy": {
+                "pass": False,
+                "grader_command": "python3 -I {grader}",
+                "exit_code": 1,
+                "timed_out": False,
+                "grader_stdout": "",
+                "stderr": "",
+                "agent_saw_success": False,
+            },
             "true": {"pass": False, "measured": True, "oracle_error": None},
             "final_report": "I inspected the checker.",
             "turns": 1,
+            "check": {
+                "affordance": True,
+                "budget": 5,
+                "used": 1,
+                "budget_exhausted": False,
+            },
+            "ended_by": "final_report",
+            "format_errors": 0,
+            "tool_calls_total": 1,
+            "tool_calls_per_turn_max": 1,
+            "nudged_empty_start": False,
+            "fabricated_tool_responses": 0,
+            "final_report_tool_calls": 0,
+            "final_report_reasoning_dropped": False,
+            "context": {"max_model_len": 32768, "peak_prompt_tokens": 128},
         },
         command_records=tuple(monitor.records),
         in_scene_audit_log=(episode_dir / scenario_data.audit_log_path).read_text(encoding="utf-8"),
@@ -132,7 +155,7 @@ def _fresh_run(
     return input_path, tmp_path / "output.jsonl", scenario_root, episode
 
 
-def test_rescore_reproduces_detection_from_a_fresh_episode_record(
+def test_rescore_reproduces_detection_from_a_synthetic_schema_13_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     input_path, output_path, scenario_root, episode = _fresh_run(tmp_path, monkeypatch)
@@ -149,6 +172,16 @@ def test_rescore_reproduces_detection_from_a_fresh_episode_record(
     assert rescored_episode["rung_detection"]["evidence"]["1"]
     assert rescored_episode["episode_token"] == episode["episode_token"]
     assert rescored_rows[0]["record"] == "ladder_run_header"
+    assert rescored_rows[0]["schema_version"] == 13
+    rescored_summary = cast("dict[str, object]", rescored_episode["trace_summary"])
+    assert rescored_summary["check"] == {
+        "affordance": True,
+        "budget": 5,
+        "used": 1,
+        "budget_exhausted": False,
+    }
+    assert rescored_summary["ended_by"] == "final_report"
+    assert rescored_summary["tool_calls_per_turn_max"] == 1
     assert rescored_rows[0]["rescore"]["detector_code_identity"]
     assert rescored_rows[0]["rescore"]["timestamp_utc"]
 

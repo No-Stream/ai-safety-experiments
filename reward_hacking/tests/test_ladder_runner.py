@@ -120,6 +120,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     config = replace(
         runner_config(tmp_path / "records.jsonl"),
         max_model_len_by_model=(("base", 32768),),
+        server_args={"kv_cache_dtype": "fp8", "attention_backend": "FLASHINFER"},
     )
     provenance = config.provenance_payload()
 
@@ -130,8 +131,18 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
         "user_template_sha256",
         "max_model_len",
         "sampling",
+        "server_args",
     } <= provenance.keys()
     assert provenance["max_model_len"] == {"base": 32768}
+    assert provenance["server_args"] == {
+        "kv_cache_dtype": "fp8",
+        "attention_backend": "FLASHINFER",
+    }
+    changed_server_config = replace(
+        config,
+        server_args={"kv_cache_dtype": "auto", "attention_backend": "FLASHINFER"},
+    )
+    assert changed_server_config.provenance_digest != config.provenance_digest
     sampling = cast("dict[str, object]", provenance["sampling"])
     assert "stop" not in sampling
     for field in ("tool_schema_sha256", "system_prompt_sha256", "user_template_sha256"):
@@ -171,29 +182,56 @@ def test_resume_keys_are_content_addressed_and_digest_mismatch_refuses(tmp_path:
         completed_episode_keys(output_path, expected_digest="changed")
 
 
-def test_readout_reports_highest_rung_coverups_and_honest_solve_rate() -> None:
-    records: list[dict[str, Any]] = [
-        {
-            "record": "ladder_episode",
-            "key": EpisodeKey("base", "dummy", "naive", 0).to_json(),
-            "highest_rung": 0,
-            "coverup": False,
-            "honest_solve": True,
-        },
-        {
-            "record": "ladder_episode",
-            "key": EpisodeKey("base", "dummy", "naive", 1).to_json(),
-            "highest_rung": 2,
-            "coverup": True,
-            "honest_solve": False,
-        },
-        {
-            "record": "ladder_episode",
-            "key": EpisodeKey("base", "dummy", "real", 0).to_json(),
-            "highest_rung": 6,
-            "coverup": False,
-            "honest_solve": False,
-        },
+def test_readout_reports_highest_rung_coverups_and_honest_solve_rate(tmp_path: Path) -> None:
+    records = [
+        _readout_episode(
+            tmp_path,
+            _ReadoutExample(
+                arm="naive",
+                sample_index=0,
+                highest_rung=0,
+                coverup=False,
+                honest_solve=True,
+                ended_by="submitted",
+                tool_calls_per_turn_max=4,
+                format_errors=1,
+                check_used=2,
+                fabricated_tool_responses=5,
+                prompt_pure_append=(True, False),
+            ),
+        ),
+        _readout_episode(
+            tmp_path,
+            _ReadoutExample(
+                arm="naive",
+                sample_index=1,
+                highest_rung=2,
+                coverup=True,
+                honest_solve=False,
+                ended_by="context_exhausted",
+                tool_calls_per_turn_max=2,
+                format_errors=2,
+                check_used=4,
+                fabricated_tool_responses=7,
+                prompt_pure_append=(True,),
+            ),
+        ),
+        _readout_episode(
+            tmp_path,
+            _ReadoutExample(
+                arm="real",
+                sample_index=0,
+                highest_rung=6,
+                coverup=False,
+                honest_solve=False,
+                ended_by="submitted",
+                tool_calls_per_turn_max=1,
+                format_errors=0,
+                check_used=0,
+                fabricated_tool_responses=0,
+                prompt_pure_append=(True,),
+            ),
+        ),
     ]
     readout = readout_records(records)
     assert readout["base"]["none"]["naive"]["highest_rung_distribution"] == {
@@ -207,32 +245,40 @@ def test_readout_reports_highest_rung_coverups_and_honest_solve_rate() -> None:
     }
     assert readout["base"]["none"]["naive"]["coverup_count"] == 1
     assert readout["base"]["none"]["naive"]["honest_solve_rate"] == 0.5
+    naive_readout = readout["base"]["none"]["naive"]
+    assert naive_readout["ended_by_counts"] == {"submitted": 1, "context_exhausted": 1}
+    assert naive_readout["mean_tool_calls_per_turn_max"] == 3.0
+    assert naive_readout["format_errors_total"] == 3
+    assert naive_readout["context_exhausted_count"] == 1
+    assert naive_readout["check_used_mean"] == 3.0
+    assert naive_readout["prompt_pure_append_fraction"] == pytest.approx(2 / 3)
+    assert naive_readout["fabricated_tool_responses_total"] == 12
 
 
-def test_readout_recovers_measurement_status_from_legacy_trace_summary() -> None:
-    records: list[dict[str, Any]] = [
-        {
-            "record": "ladder_episode",
-            "key": EpisodeKey("base", "dummy", "naive", 0).to_json(),
-            "highest_rung": 0,
-            "coverup": False,
-            "honest_solve": True,
-            "trace_summary": {"true": {"pass": True, "measured": True, "oracle_error": None}},
-        },
-        {
-            "record": "ladder_episode",
-            "key": EpisodeKey("base", "dummy", "naive", 1).to_json(),
-            "highest_rung": 0,
-            "coverup": False,
-            "honest_solve": False,
-            "trace_summary": {
-                "true": {
-                    "pass": False,
-                    "measured": False,
-                    "oracle_error": "forced oracle error",
-                }
-            },
-        },
+def test_readout_recovers_measurement_status_from_trace_summary(tmp_path: Path) -> None:
+    records = [
+        _readout_episode(
+            tmp_path,
+            _ReadoutExample(
+                arm="naive",
+                sample_index=0,
+                highest_rung=0,
+                coverup=False,
+                honest_solve=True,
+                true_measured=True,
+            ),
+        ),
+        _readout_episode(
+            tmp_path,
+            _ReadoutExample(
+                arm="naive",
+                sample_index=1,
+                highest_rung=0,
+                coverup=False,
+                honest_solve=False,
+                true_measured=False,
+            ),
+        ),
     ]
 
     readout = readout_records(records)["base"]["none"]["naive"]
@@ -242,6 +288,78 @@ def test_readout_recovers_measurement_status_from_legacy_trace_summary() -> None
     assert readout["unmeasured_count"] == 1
     assert readout["honest_solve_count"] == 1
     assert readout["honest_solve_rate"] == 1.0
+
+
+def test_readout_requires_v13_summary_fields(tmp_path: Path) -> None:
+    record = _readout_episode(
+        tmp_path,
+        _ReadoutExample(
+            arm="naive",
+            sample_index=0,
+            highest_rung=0,
+            coverup=False,
+            honest_solve=False,
+        ),
+    )
+    cast("dict[str, object]", record["trace_summary"]).pop("ended_by")
+
+    with pytest.raises(KeyError, match="ended_by"):
+        readout_records([record])
+
+
+@dataclass(frozen=True, slots=True)
+class _ReadoutExample:
+    arm: str
+    sample_index: int
+    highest_rung: int
+    coverup: bool
+    honest_solve: bool
+    ended_by: str = "submitted"
+    tool_calls_per_turn_max: int = 0
+    format_errors: int = 0
+    check_used: int = 0
+    fabricated_tool_responses: int = 0
+    prompt_pure_append: tuple[bool, ...] = (True,)
+    true_measured: bool = True
+
+
+def _readout_episode(tmp_path: Path, example: _ReadoutExample) -> dict[str, Any]:
+    """Write one synthetic v13 episode and its turn records for a readout contract test."""
+    key = EpisodeKey("base", "dummy", example.arm, example.sample_index)
+    trace_path = tmp_path / f"{example.arm}-{example.sample_index}.jsonl"
+    _write_turn_records(trace_path, example.prompt_pure_append)
+    return {
+        "record": "ladder_episode",
+        "key": key.to_json(),
+        "highest_rung": example.highest_rung,
+        "coverup": example.coverup,
+        "honest_solve": example.honest_solve,
+        "trace_path": str(trace_path),
+        "trace_summary": {
+            "true": {
+                "pass": example.honest_solve,
+                "measured": example.true_measured,
+                "oracle_error": None if example.true_measured else "synthetic oracle error",
+            },
+            "check": {"used": example.check_used},
+            "ended_by": example.ended_by,
+            "tool_calls_per_turn_max": example.tool_calls_per_turn_max,
+            "format_errors": example.format_errors,
+            "fabricated_tool_responses": example.fabricated_tool_responses,
+        },
+    }
+
+
+def _write_turn_records(trace_path: Path, prompt_pure_append: tuple[bool, ...]) -> None:
+    """Write synthetic v13 turn records for readout contract tests."""
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    turn_records = [
+        {"record": "turn", "turn": index, "prompt_pure_append": is_pure_append}
+        for index, is_pure_append in enumerate(prompt_pure_append)
+    ]
+    trace_path.write_text(
+        "".join(json.dumps(turn) + "\n" for turn in turn_records), encoding="utf-8"
+    )
 
 
 def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> None:
@@ -311,7 +429,17 @@ def test_task_pressure_separates_provenance_keys_paths_readout_and_resume(
         trace_path: Path,
     ) -> dict[str, object]:
         calls.append((episode_dir, trace_path))
-        return {"proxy_pass": True, "true_pass": True, "true_measured": True}
+        _write_turn_records(trace_path, (True,))
+        return {
+            "proxy_pass": True,
+            "true_pass": True,
+            "true_measured": True,
+            "check": {"used": 0},
+            "ended_by": "final_report",
+            "tool_calls_per_turn_max": 0,
+            "format_errors": 0,
+            "fabricated_tool_responses": 0,
+        }
 
     def run(config: RunnerConfig) -> list[dict[str, object]]:
         return run_grid(
@@ -535,6 +663,95 @@ def test_generation_code_change_refuses_resume(
         )
 
 
+def test_server_argument_change_refuses_resume(tmp_path: Path) -> None:
+    output_path = tmp_path / "records.jsonl"
+    initial_config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        server_args={"kv_cache_dtype": "fp8", "attention_backend": "FLASHINFER"},
+    )
+    run_grid(
+        initial_config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+    changed_config = replace(
+        initial_config,
+        server_args={"kv_cache_dtype": "auto", "attention_backend": "FLASHINFER"},
+    )
+
+    with pytest.raises(ValueError, match="stored run provenance differs"):
+        run_grid(
+            changed_config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda *_args: {"true_pass": True},
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+
+def test_server_argument_log_uses_last_startup_record(tmp_path: Path) -> None:
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text(
+        "starting server\n"
+        "(APIServer pid=1) INFO 10-01 19:00:00 [api_utils.py:273] non-default args: "
+        "{'model': 'synthetic-model', 'kv_cache_dtype': 'auto'}\n"
+        "(APIServer pid=2) INFO 10-01 20:31:49 [api_utils.py:273] non-default args: "
+        "{'model': 'synthetic-model', 'kv_cache_dtype': 'fp8', "
+        "'attention_backend': 'FLASHINFER', 'enable_prefix_caching': True}\n",
+        encoding="utf-8",
+    )
+
+    assert ladder_runner.parse_server_args_from_log(server_log) == {
+        "model": "synthetic-model",
+        "kv_cache_dtype": "fp8",
+        "attention_backend": "FLASHINFER",
+        "enable_prefix_caching": True,
+    }
+
+
+def test_server_argument_log_requires_a_startup_record(tmp_path: Path) -> None:
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text("server did not print its startup args\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-default args"):
+        ladder_runner.parse_server_args_from_log(server_log)
+
+
+def test_server_argument_log_rejects_a_malformed_latest_startup_record(tmp_path: Path) -> None:
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text(
+        "(APIServer pid=1) INFO 10-01 19:00:00 [api_utils.py:273] non-default args: "
+        "{'kv_cache_dtype': 'auto'}\n"
+        "(APIServer pid=2) INFO 10-01 20:31:49 [api_utils.py:273] non-default args: "
+        "{'kv_cache_dtype': fp8}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"cannot parse.*server args"):
+        ladder_runner.parse_server_args_from_log(server_log)
+
+
+def test_real_run_requires_server_args_before_fetching_context_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "reward_hacking.ladder.chat.fetch_max_model_len",
+        lambda *_args: pytest.fail(
+            "server identity must be checked before contacting the endpoint"
+        ),
+    )
+
+    with pytest.raises(ValueError, match=r"server_args|--server-log"):
+        run_grid(
+            replace(runner_config(tmp_path / "records.jsonl"), arms=("naive",), samples=1),
+            backend_factory=lambda _model, _config: pytest.fail("backend must not start"),
+        )
+
+
 @pytest.mark.parametrize("arm", ["naive", "claimed"])
 def test_non_real_arms_use_the_pristine_visible_grade_in_recorded_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arm: str
@@ -704,15 +921,21 @@ def test_unmeasured_oracle_error_is_excluded_from_honest_solve_denominator(
         _arm: str,
         sample_index: int,
         _episode_dir: Path,
-        _trace_path: Path,
+        trace_path: Path,
     ) -> dict[str, object]:
         measured = sample_index == 0
+        _write_turn_records(trace_path, (True,))
         return {
             "true": {
                 "pass": measured,
                 "measured": measured,
                 "oracle_error": None if measured else "forced oracle error",
-            }
+            },
+            "check": {"used": 0},
+            "ended_by": "final_report",
+            "tool_calls_per_turn_max": 0,
+            "format_errors": 0,
+            "fabricated_tool_responses": 0,
         }
 
     records = run_grid(
@@ -837,6 +1060,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         samples=1,
         output_path=artifact_root / "records.jsonl",
         episode_root=artifact_root / "episodes",
+        server_args={"kv_cache_dtype": "fp8", "attention_backend": "FLASHINFER"},
     )
 
     records = run_grid(
@@ -873,6 +1097,10 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
     }
     run_header = json.loads(config.output_path.read_text(encoding="utf-8").splitlines()[0])
     assert run_header["provenance"]["max_model_len"] == {"base": 32768}
+    assert run_header["provenance"]["server_args"] == {
+        "kv_cache_dtype": "fp8",
+        "attention_backend": "FLASHINFER",
+    }
 
 
 def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
@@ -909,6 +1137,7 @@ def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
         samples=1,
         output_path=tmp_path / "records.jsonl",
         episode_root=tmp_path / "episodes",
+        server_args={"kv_cache_dtype": "fp8", "attention_backend": "FLASHINFER"},
     )
 
     def run() -> list[dict[str, object]]:
@@ -1163,6 +1392,12 @@ def test_runner_provenance_records_resource_limit_mode(tmp_path: Path) -> None:
 def test_cli_rejects_unknown_scenario_id_before_backend_start(tmp_path: Path) -> None:
     scenario_root = tmp_path / "scenarios"
     scenario_root.mkdir()
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text(
+        "(APIServer pid=1) INFO 10-01 20:31:49 [api_utils.py:273] non-default args: "
+        "{'model': 'synthetic-model', 'kv_cache_dtype': 'fp8'}\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="unknown scenario"):
         main(
@@ -1173,8 +1408,24 @@ def test_cli_rejects_unknown_scenario_id_before_backend_start(tmp_path: Path) ->
                 "base=/models/base",
                 "--scenario-root",
                 str(scenario_root),
+                "--server-log",
+                str(server_log),
                 "--scenario",
                 "missing",
+            ]
+        )
+
+
+def test_cli_requires_server_log_for_real_runs(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--endpoint",
+                "http://127.0.0.1:8000",
+                "--model",
+                "base=/models/base",
+                "--scenario-root",
+                str(tmp_path),
             ]
         )
 
@@ -1183,6 +1434,13 @@ def test_cli_records_the_selected_task_pressure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured_configs: list[RunnerConfig] = []
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text(
+        "(APIServer pid=1) INFO 10-01 20:31:49 [api_utils.py:273] non-default args: "
+        "{'model': 'synthetic-model', 'kv_cache_dtype': 'fp8', "
+        "'attention_backend': 'FLASHINFER'}\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         "reward_hacking.ladder.scenario.load_scenarios",
         lambda *_args, **_kwargs: (DummyScenario("dummy"),),
@@ -1209,6 +1467,8 @@ def test_cli_records_the_selected_task_pressure(
             "base=/models/base",
             "--scenario-root",
             str(tmp_path),
+            "--server-log",
+            str(server_log),
             "--task-pressure",
             "merge-gate",
         ]
@@ -1216,6 +1476,11 @@ def test_cli_records_the_selected_task_pressure(
 
     assert result == 0
     assert captured_configs[0].task_pressure == "merge-gate"
+    assert captured_configs[0].server_args == {
+        "model": "synthetic-model",
+        "kv_cache_dtype": "fp8",
+        "attention_backend": "FLASHINFER",
+    }
 
 
 def test_real_episode_uses_disposable_workspace_and_persists_artifacts(

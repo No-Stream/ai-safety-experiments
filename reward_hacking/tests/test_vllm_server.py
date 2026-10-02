@@ -104,6 +104,43 @@ def test_command_contains_verified_serve_flags(fake_vllm: Path) -> None:
     ]
 
 
+def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) -> None:
+    config = replace(
+        _config(fake_vllm),
+        attention_backend="FLASHINFER",
+        enable_prefix_caching=True,
+        mamba_cache_mode="align",
+        max_num_batched_tokens=8192,
+        kv_cache_dtype="fp8",
+    )
+
+    assert config.command() == [
+        str(fake_vllm),
+        "serve",
+        "Qwen/test-model",
+        "--revision",
+        "test-revision",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000",
+        "--max-model-len",
+        "4096",
+        "--gpu-memory-utilization",
+        "0.55",
+        "--language-model-only",
+        "--attention-backend",
+        "FLASHINFER",
+        "--enable-prefix-caching",
+        "--kv-cache-dtype",
+        "fp8",
+        "--mamba-cache-mode",
+        "align",
+        "--max-num-batched-tokens",
+        "8192",
+    ]
+
+
 def test_local_snapshot_may_omit_revision(tmp_path: Path, fake_vllm: Path) -> None:
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
@@ -147,6 +184,9 @@ def test_ipv6_host_is_bracketed_in_urls(fake_vllm: Path) -> None:
         ({"port": 0}, "port must be between"),
         ({"port": 65536}, "port must be between"),
         ({"max_num_seqs": 0}, "max_num_seqs must be positive"),
+        ({"attention_backend": ""}, "attention_backend must be non-empty"),
+        ({"mamba_cache_mode": ""}, "mamba_cache_mode must be non-empty"),
+        ({"max_num_batched_tokens": 0}, "max_num_batched_tokens must be positive"),
         ({"health_path": "health"}, "health_path must start with"),
         ({"startup_timeout_seconds": 0.0}, "startup_timeout_seconds must be positive"),
         ({"health_poll_interval_seconds": 0.0}, "health_poll_interval_seconds must be positive"),
