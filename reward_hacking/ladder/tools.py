@@ -19,6 +19,7 @@ _TOOL_CALL_END = "</tool_call>"
 _FUNCTION_PATTERN = re.compile(r"<function=([A-Za-z_][A-Za-z0-9_]*)>")
 _PARAMETER_PATTERN = re.compile(r"<parameter=([^>\r\n]+)>")
 _PARAMETER_CLOSE_LINE = re.compile(r"(?m)^</parameter>\r?$")
+_TOOL_TAG_SEPARATOR_PATTERN = re.compile(r"(?:[ \t]*\r?\n[ \t]*)+")
 _TOOL_RESPONSE_START = "<tool_response>"
 _MAX_TOOL_OUTPUT_CHARS = 10_000
 _HEAD_TOOL_OUTPUT_CHARS = 5_000
@@ -47,6 +48,7 @@ class ParsedTurn:
     tool_calls: tuple[ParsedToolCall, ...]
     trailing_text: str
     format_error: str | None
+    surplus_function_close_tags: int = 0
 
 
 def bash_tool() -> dict[str, object]:
@@ -117,18 +119,29 @@ def parse_tool_calls(raw_completion: str) -> ParsedTurn:
     parsed_calls: list[ParsedToolCall] = []
     cursor = first_call_start
     trailing_text = ""
+    surplus_function_close_tags = 0
 
     while cursor >= 0:
         try:
-            call, call_end = _parse_one_tool_call(raw_completion, cursor)
+            call, call_end, surplus_for_call = _parse_one_tool_call(raw_completion, cursor)
         except ValueError as error:
-            return ParsedTurn(reasoning, content, (), "", str(error))
+            return ParsedTurn(reasoning, content, (), "", str(error), surplus_function_close_tags)
+        surplus_function_close_tags += surplus_for_call
 
         if call.name not in {"bash", "check"}:
-            return ParsedTurn(reasoning, content, (), "", f"Unknown tool function: {call.name}.")
+            return ParsedTurn(
+                reasoning,
+                content,
+                (),
+                "",
+                f"Unknown tool function: {call.name}.",
+                surplus_function_close_tags,
+            )
         validation_error = _validate_arguments(call)
         if validation_error is not None:
-            return ParsedTurn(reasoning, content, (), "", validation_error)
+            return ParsedTurn(
+                reasoning, content, (), "", validation_error, surplus_function_close_tags
+            )
         parsed_calls.append(call)
 
         next_call_start = raw_completion.find(_TOOL_CALL_START, call_end)
@@ -136,10 +149,24 @@ def parse_tool_calls(raw_completion: str) -> ParsedTurn:
             trailing_text = raw_completion[call_end:]
             break
         if raw_completion[call_end:next_call_start].strip():
-            return ParsedTurn(reasoning, content, (), "", "Unexpected text between tool calls.")
+            return ParsedTurn(
+                reasoning,
+                content,
+                (),
+                "",
+                "Unexpected text between tool calls.",
+                surplus_function_close_tags,
+            )
         cursor = next_call_start
 
-    return ParsedTurn(reasoning, content, tuple(parsed_calls), trailing_text, None)
+    return ParsedTurn(
+        reasoning,
+        content,
+        tuple(parsed_calls),
+        trailing_text,
+        None,
+        surplus_function_close_tags,
+    )
 
 
 def format_bash_result(
@@ -176,7 +203,7 @@ def _split_reasoning_and_content(raw_completion: str, content_end: int) -> tuple
     return reasoning, content
 
 
-def _parse_one_tool_call(raw_completion: str, start: int) -> tuple[ParsedToolCall, int]:
+def _parse_one_tool_call(raw_completion: str, start: int) -> tuple[ParsedToolCall, int, int]:
     """Parse one call, treating only a standalone ``</parameter>`` line as a delimiter."""
     cursor = start + len(_TOOL_CALL_START)
     cursor = _consume_line_break(raw_completion, cursor)
@@ -203,10 +230,48 @@ def _parse_one_tool_call(raw_completion: str, start: int) -> tuple[ParsedToolCal
         cursor = _consume_line_break(raw_completion, closing_match.end())
 
     function_end = cursor + len("</function>")
-    cursor = _consume_line_break(raw_completion, function_end)
+    cursor, surplus_function_close_tags = _consume_function_closings(raw_completion, function_end)
     if not raw_completion.startswith(_TOOL_CALL_END, cursor):
-        raise ValueError("Function call is missing its tool-call closing tag.")
-    return ParsedToolCall(name=name, arguments=arguments), cursor + len(_TOOL_CALL_END)
+        raise ValueError(_tool_call_closing_error(raw_completion, cursor))
+    return (
+        ParsedToolCall(name=name, arguments=arguments),
+        cursor + len(_TOOL_CALL_END),
+        surplus_function_close_tags,
+    )
+
+
+def _consume_function_closings(raw_completion: str, function_end: int) -> tuple[int, int]:
+    """Consume redundant function tags, preserving the ordinary call's separator rule."""
+    surplus_function_close_tags = 0
+    tolerant_cursor = _consume_tool_tag_separator(raw_completion, function_end)
+    if tolerant_cursor is not None and raw_completion.startswith("</function>", tolerant_cursor):
+        cursor = tolerant_cursor
+        while raw_completion.startswith("</function>", cursor):
+            surplus_function_close_tags += 1
+            function_end = cursor + len("</function>")
+            cursor = _consume_tool_tag_separator(raw_completion, function_end)
+            if cursor is None:
+                raise ValueError(_tool_call_closing_error(raw_completion, function_end))
+    else:
+        try:
+            cursor = _consume_line_break(raw_completion, function_end)
+        except ValueError:
+            raise ValueError(_tool_call_closing_error(raw_completion, function_end)) from None
+    return cursor, surplus_function_close_tags
+
+
+def _consume_tool_tag_separator(raw_completion: str, position: int) -> int | None:
+    match = _TOOL_TAG_SEPARATOR_PATTERN.match(raw_completion, position)
+    return None if match is None else match.end()
+
+
+def _tool_call_closing_error(raw_completion: str, position: int) -> str:
+    tool_call_end = raw_completion.find(_TOOL_CALL_END, position)
+    if tool_call_end < 0:
+        return "Function call is missing its </tool_call> closing tag."
+    if raw_completion[position:tool_call_end].strip():
+        return "Unexpected text before </tool_call>."
+    return "Tool-call tags must be separated by newlines."
 
 
 def _consume_line_break(raw_completion: str, position: int) -> int:

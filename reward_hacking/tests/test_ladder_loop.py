@@ -228,6 +228,26 @@ def _run_episode(
 
 
 class TestNativeToolLoop:
+    def test_surplus_function_close_tags_are_recorded_on_turn_and_episode_summary(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        duplicated_close = _bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT").replace(
+            "</function>\n</tool_call>", "</function>\n</function>\n</tool_call>"
+        )
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(duplicated_close),
+                _ScriptedReply(duplicated_close),
+                _ScriptedReply(duplicated_close),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        trace = _run_episode(tmp_path, monkeypatch, backend)
+
+        assert trace.turn_records()[0]["surplus_function_close_tags"] == 1
+        assert trace.summary_record()["surplus_function_close_tags"] == 1
+
     def test_happy_path_submits_and_writes_turn_then_summary_incrementally(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

@@ -46,6 +46,10 @@ VALID_CHECK_CALL = (
     "Let's check the result.</think>\n\n<tool_call>\n<function=check>\n</function>\n</tool_call>"
 )
 
+DUPLICATED_FUNCTION_CLOSE_CALL = VALID_SINGLE_CALL.replace(
+    "</function>\n</tool_call>", "</function>\n</function>\n</tool_call>"
+)
+
 _TOO_LONG_HINT = (
     "The output of your last command was too long.\n\n"
     "Try a command that produces less output. Select fewer lines or narrow the search, "
@@ -181,6 +185,7 @@ def test_parser_treats_a_tool_call_inside_open_thinking_as_the_end_of_reasoning(
             "<tool_call>\n<function=check>\n<parameter=extra>\nvalue\n</parameter>\n"
             "</function>\n</tool_call>"
         ),
+        VALID_SINGLE_CALL.replace("</function>\n</tool_call>", "</function>\n\n</tool_call>"),
     ],
 )
 def test_parser_returns_format_error_for_malformed_calls(raw_completion: str) -> None:
@@ -204,6 +209,52 @@ def test_parser_records_text_after_last_call_as_trailing_text() -> None:
     assert parsed.format_error is None
 
 
+def test_parser_accepts_and_counts_redundant_function_close_tags() -> None:
+    parsed = parse_tool_calls(DUPLICATED_FUNCTION_CLOSE_CALL)
+
+    assert tuple((call.name, call.arguments) for call in parsed.tool_calls) == _vllm_parse(
+        DUPLICATED_FUNCTION_CLOSE_CALL
+    )
+    assert parsed.tool_calls[0].arguments == {"command": "echo ready"}
+    assert parsed.surplus_function_close_tags == 1
+    assert parsed.format_error is None
+
+
+def test_parser_accepts_multiple_redundant_function_close_tags_with_whitespace() -> None:
+    raw_completion = VALID_SINGLE_CALL.replace(
+        "</function>\n</tool_call>",
+        "</function>\n  </function> \n\n </function>\n</tool_call>",
+    )
+
+    parsed = parse_tool_calls(raw_completion)
+
+    assert [(call.name, call.arguments) for call in parsed.tool_calls] == [
+        ("bash", {"command": "echo ready"})
+    ]
+    assert parsed.surplus_function_close_tags == 2
+    assert parsed.format_error is None
+
+
+def test_parser_rejects_unexpected_text_before_tool_call_closing_tag() -> None:
+    raw_completion = VALID_SINGLE_CALL.replace(
+        "</function>\n</tool_call>", "</function>\njunk\n</tool_call>"
+    )
+
+    parsed = parse_tool_calls(raw_completion)
+
+    assert parsed.tool_calls == ()
+    assert parsed.format_error == "Unexpected text before </tool_call>."
+
+
+def test_parser_reports_a_missing_tool_call_closing_tag_accurately() -> None:
+    raw_completion = VALID_SINGLE_CALL.removesuffix("</tool_call>")
+
+    parsed = parse_tool_calls(raw_completion)
+
+    assert parsed.tool_calls == ()
+    assert parsed.format_error == "Function call is missing its </tool_call> closing tag."
+
+
 def test_parser_keeps_plain_text_turns_and_counts_fabricated_tool_responses() -> None:
     parsed = parse_tool_calls("I cannot make a tool call this turn.")
     assert parsed.reasoning == "I cannot make a tool call this turn."
@@ -217,7 +268,12 @@ def test_parser_keeps_plain_text_turns_and_counts_fabricated_tool_responses() ->
 
 
 def test_vllm_parser_matches_our_well_formed_fixture_corpus() -> None:
-    fixtures = (VALID_SINGLE_CALL, VALID_TWO_CALLS, VALID_CHECK_CALL)
+    fixtures = (
+        VALID_SINGLE_CALL,
+        VALID_TWO_CALLS,
+        VALID_CHECK_CALL,
+        DUPLICATED_FUNCTION_CLOSE_CALL,
+    )
     for raw_completion in fixtures:
         parsed = parse_tool_calls(raw_completion)
         actual = tuple((call.name, call.arguments) for call in parsed.tool_calls)

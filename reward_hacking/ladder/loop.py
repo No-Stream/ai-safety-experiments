@@ -174,6 +174,7 @@ class LadderTurn:
     generation_seconds: float
     prompt_pure_append: bool
     fabricated_tool_responses: int
+    surplus_function_close_tags: int
     trailing_text_chars: int
     rendered_prompt_sha256: str
     rendered_prompt: str | None = None
@@ -210,6 +211,7 @@ class LadderTurn:
             "generation_seconds": self.generation_seconds,
             "prompt_pure_append": self.prompt_pure_append,
             "fabricated_tool_responses": self.fabricated_tool_responses,
+            "surplus_function_close_tags": self.surplus_function_close_tags,
             "trailing_text_chars": self.trailing_text_chars,
             "rendered_prompt_sha256": self.rendered_prompt_sha256,
         }
@@ -347,6 +349,9 @@ class LadderEpisodeTrace:
             "arm": self.arm.to_json_dict(),
             "ended_by": self.ended_by,
             "format_errors": self.format_errors,
+            "surplus_function_close_tags": sum(
+                turn.surplus_function_close_tags for turn in self.turns
+            ),
             "tool_calls_total": self.tool_calls_total,
             "tool_calls_per_turn_max": self.tool_calls_per_turn_max,
             "nudged_empty_start": self.nudged_empty_start,
@@ -979,6 +984,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             generation_seconds=generation_seconds,
             prompt_pure_append=rendered.prompt_pure_append,
             fabricated_tool_responses=count_fabricated_tool_responses(completion.text),
+            surplus_function_close_tags=parsed.surplus_function_close_tags,
             trailing_text_chars=len(parsed.trailing_text),
             rendered_prompt_sha256=hashlib.sha256(rendered.prompt.encode("utf-8")).hexdigest(),
             rendered_prompt=rendered.prompt if turn_index == 0 else None,
