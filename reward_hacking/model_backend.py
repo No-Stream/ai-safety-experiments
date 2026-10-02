@@ -921,6 +921,26 @@ class _VLLMHTTPResponse(BaseModel):
     usage: _VLLMHTTPUsage
 
 
+@dataclass(frozen=True, slots=True)
+class RenderedCompletion:
+    """One raw completion of a prompt that the caller rendered through its chat template."""
+
+    text: str
+    finish_reason: str | None
+    matched_stop: int | str | None
+    prompt_tokens: int
+    completion_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class _VLLMHTTPRequestOptions:
+    """The request fields that differ between the shared and pre-rendered completion paths."""
+
+    stop_sequences: Sequence[str] | None
+    include_stop_str_in_output: bool
+    add_special_tokens: bool
+
+
 _THINK_END = "</think>"
 
 
@@ -991,7 +1011,27 @@ class VLLMHTTPBackend:
     def _complete(
         self, rendered_prompt: str, *, max_tokens: int, seed: int | None
     ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
-        """Make one /v1/completions request and validate its single choice."""
+        """Make the shared harness's configured-stop completion request."""
+        return self._request_completion(
+            rendered_prompt,
+            max_tokens=max_tokens,
+            seed=seed,
+            options=_VLLMHTTPRequestOptions(
+                stop_sequences=self.sampling.stop or None,
+                include_stop_str_in_output=bool(self.sampling.stop),
+                add_special_tokens=True,
+            ),
+        )
+
+    def _request_completion(
+        self,
+        rendered_prompt: str,
+        *,
+        max_tokens: int,
+        seed: int | None,
+        options: _VLLMHTTPRequestOptions,
+    ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
+        """Make one validated /v1/completions request with caller-selected stop behavior."""
         body = {
             "model": self.model_id,
             "prompt": rendered_prompt,
@@ -1003,11 +1043,11 @@ class VLLMHTTPBackend:
             "repetition_penalty": self.sampling.repetition_penalty,
             "presence_penalty": self.sampling.presence_penalty,
             "seed": seed,
-            "stop": list(self.sampling.stop) if self.sampling.stop else None,
+            "stop": None if options.stop_sequences is None else list(options.stop_sequences),
             "stop_token_ids": list(self.stop_token_ids) if self.stop_token_ids else None,
-            "include_stop_str_in_output": bool(self.sampling.stop),
+            "include_stop_str_in_output": options.include_stop_str_in_output,
             # LLM.generate uses default_cmpl_tok_params with this set to True too.
-            "add_special_tokens": True,
+            "add_special_tokens": options.add_special_tokens,
             "n": 1,
             "stream": False,
         }
@@ -1023,6 +1063,28 @@ class VLLMHTTPBackend:
         if choice.index != 0:
             raise ValueError(f"vLLM returned completion index {choice.index}, expected 0")
         return choice, parsed.usage
+
+    def complete_rendered(
+        self, prompt: str, *, max_tokens: int, seed: int | None
+    ) -> RenderedCompletion:
+        """Complete an already-rendered prompt once, without chat rendering or stop strings."""
+        choice, usage = self._request_completion(
+            prompt,
+            max_tokens=max_tokens,
+            seed=seed,
+            options=_VLLMHTTPRequestOptions(
+                stop_sequences=None,
+                include_stop_str_in_output=False,
+                add_special_tokens=False,
+            ),
+        )
+        return RenderedCompletion(
+            text=choice.text,
+            finish_reason=choice.finish_reason,
+            matched_stop=choice.stop_reason,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+        )
 
     def generate_detailed(
         self,

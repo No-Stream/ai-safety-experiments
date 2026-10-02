@@ -337,3 +337,36 @@ def test_malformed_response_fails(
     backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
     with pytest.raises(ValidationError):
         backend.generate(["synthetic"])
+
+
+@pytest.mark.parametrize("matched_stop", [248046, "</run>", None])
+def test_complete_rendered_returns_raw_stop_free_completion(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    matched_stop: int | str | None,
+) -> None:
+    url, requests, state = server
+    raw_completion = "reasoning</think>answer <run>raw output</run>"
+    state["replies"] = [(raw_completion, "stop", matched_stop, 11)]
+    backend = VLLMHTTPBackend(
+        "synthetic",
+        base_url=url,
+        model_path=tokenizer_path,
+        sampling=SamplingConfig(max_new_tokens=47, stop=("</run>",)),
+        stop_token_ids=(248044, 248046),
+    )
+
+    completion = backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
+
+    assert completion.text == raw_completion
+    assert completion.finish_reason == "stop"
+    assert completion.matched_stop == matched_stop
+    assert completion.prompt_tokens == 17
+    assert completion.completion_tokens == 11
+    assert requests[0]["prompt"] == "already rendered prompt"
+    assert requests[0]["max_tokens"] == 23
+    assert requests[0]["seed"] == 7
+    assert requests[0]["stop"] is None
+    assert requests[0]["include_stop_str_in_output"] is False
+    assert requests[0]["stop_token_ids"] == [248044, 248046]
+    assert requests[0]["add_special_tokens"] is False
