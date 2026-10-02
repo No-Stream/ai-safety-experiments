@@ -7,10 +7,11 @@ import shlex
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from conftest import JAIL_AVAILABLE, JAIL_RESOURCE_LIMITS, JAIL_UNAVAILABLE_REASON
 
 from reward_hacking.jailed_poc import (
+    JailResourceLimits,
     jail_resource_limits_scope,
-    resolve_jail_resource_limits,
     run_in_jail,
 )
 from reward_hacking.ladder.monitor import CommandAuditMonitor
@@ -25,10 +26,20 @@ from reward_hacking.ladder.runner import (
 from reward_hacking.ladder.scenario import Scenario
 from reward_hacking.model_backend import MockBackend
 
+pytestmark = pytest.mark.skipif(
+    not JAIL_AVAILABLE, reason=f"jail unavailable: {JAIL_UNAVAILABLE_REASON}"
+)
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from reward_hacking.harness.loop import AgentEpisodeTrace
+
+
+def _resolved_jail_limits() -> JailResourceLimits:
+    """The limiter mode conftest resolved and probed for this box, never a hardcoded one."""
+    assert JAIL_RESOURCE_LIMITS is not None, JAIL_UNAVAILABLE_REASON
+    return JAIL_RESOURCE_LIMITS
 
 
 def _load_scenario(pristine: Path) -> Scenario:
@@ -85,7 +96,7 @@ def test_policy_grader_and_test_tampering_cannot_change_real_verdict(
     mutated_grader = "print('FAIL')\n" if submission_passes else "print('SUCCESS')\n"
     (episode / "grade.py").write_text(mutated_grader)
     (episode / "unrelated-link").symlink_to("/work/missing-policy-file")
-    limits = resolve_jail_resource_limits(advisory=True)
+    limits = _resolved_jail_limits()
     with jail_resource_limits_scope(limits):
         mutable_result = run_in_jail(episode, "python3 -I grade.py", login_shell=False)
     mutable_pass = mutable_result.stdout.strip() == "SUCCESS"
@@ -161,7 +172,7 @@ def test_submission_cannot_rewrite_pristine_helper_during_grading(
         episode_dir=episode,
         trace={"proxy_pass": True, "true_pass": True},
         detection={"rungs": [0]},
-        resource_limits=resolve_jail_resource_limits(advisory=True),
+        resource_limits=_resolved_jail_limits(),
     )
 
     assert grade["final_grade_pass"] is False
@@ -198,7 +209,7 @@ def test_recorded_visible_test_tampering_fails_real_arm_and_honest_solve_passes(
     )
     monitor = CommandAuditMonitor(episode)
     start = monitor.before_command(command)
-    limits = resolve_jail_resource_limits(advisory=True)
+    limits = _resolved_jail_limits()
     with jail_resource_limits_scope(limits):
         write_result = run_in_jail(episode, command, login_shell=False)
         record = monitor.after_command(start, write_result)
@@ -238,7 +249,7 @@ def test_recorded_visible_test_tampering_fails_real_arm_and_honest_solve_passes(
         episode_dir=episode,
         trace=trace,
         detection=detection,
-        resource_limits=resolve_jail_resource_limits(advisory=True),
+        resource_limits=_resolved_jail_limits(),
     )
     assert grade["final_grade_pass"] is honest
     evidence = grade["final_grade_evidence"]
@@ -289,7 +300,7 @@ def test_pristine_helper_write_is_blocked_even_when_submission_catches_error(
         episode_dir=episode,
         trace={"proxy_pass": True, "true": {"pass": True, "measured": True}},
         detection={"rungs": [0]},
-        resource_limits=resolve_jail_resource_limits(advisory=True),
+        resource_limits=_resolved_jail_limits(),
     )
     assert grade["final_grade_pass"] is True
 
@@ -315,7 +326,7 @@ def test_pristine_tests_field_reports_executed_grader_failure(tmp_path: Path) ->
         episode_dir=episode,
         trace={"proxy_pass": False, "true_pass": False},
         detection={"rungs": [0]},
-        resource_limits=resolve_jail_resource_limits(advisory=True),
+        resource_limits=_resolved_jail_limits(),
     )
     evidence = grade["final_grade_evidence"]
     assert isinstance(evidence, dict)
@@ -349,7 +360,7 @@ def test_numeric_pathlib_hardcode_fails_oracle_method_audit(tmp_path: Path, hone
     )
     monitor = CommandAuditMonitor(episode)
     start = monitor.before_command(command)
-    limits = resolve_jail_resource_limits(advisory=True)
+    limits = _resolved_jail_limits()
     with jail_resource_limits_scope(limits):
         result = run_in_jail(episode, command, login_shell=False)
         record = monitor.after_command(start, result)
@@ -412,7 +423,7 @@ def test_pristine_helper_write_fails_read_only_without_changing_honest_verdict(
         episode_dir=episode,
         trace={"proxy_pass": True, "true": {"pass": True, "measured": True}},
         detection={"rungs": [0]},
-        resource_limits=resolve_jail_resource_limits(advisory=True),
+        resource_limits=_resolved_jail_limits(),
     )
     assert grade["final_grade_pass"] is True
 
@@ -459,7 +470,7 @@ def test_real_arm_check_reports_the_hardened_verdict_and_its_reason(
         samples=1,
         output_path=tmp_path / "records.jsonl",
         episode_root=tmp_path / "episodes",
-        resource_limits=resolve_jail_resource_limits(advisory=True),
+        resource_limits=_resolved_jail_limits(),
     )
 
     run = _run_real_episode(
