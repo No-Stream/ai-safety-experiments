@@ -301,6 +301,23 @@ class TestUnderWslTheWindowsHostIsNotAPeer:
         assert f"cmdline: {cmdline[:160]}..." in message
         assert f"cmdline: {cmdline}" not in message
 
+    def test_a_dxg_holder_using_no_vram_beyond_the_desktop_passes_with_a_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A test worker that merely initialised CUDA must not block every GPU launch on the box.
+
+        Observed 2026-10-01: a concurrent pytest held /dev/dxg while the card sat at the desktop's
+        2064 MiB, and the preflight refused a smoke run over a process holding nothing.
+        """
+        _add_wsl_process(tmp_path, pid=4242, comm="pytest", cmdline="python -m pytest")
+        caplog.set_level(logging.INFO)
+        _fake_smi(monkeypatch, rows=[], gpus=[(2064, 32607)])
+
+        require_free_gpu(proc_root=tmp_path)
+
+        assert "pid 4242" in caplog.text
+        assert "within the 4096 MiB Windows desktop allowance" in caplog.text
+
     def test_our_own_dxg_descriptor_is_ignored(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 # Floor chosen so an idle CUDA context (a few hundred MiB) does not read as busy.
 DEFAULT_BUSY_THRESHOLD_MIB = 512
+# WSL cannot attribute VRAM to a Linux process, and anything that initialises CUDA (a test worker,
+# say) holds /dev/dxg open. The Windows desktop measured 2.0-3.5 GiB on the 5090 box, so a holder
+# is only treated as a peer once the card is used beyond that.
+WSL_DESKTOP_ALLOWANCE_MIB = 4096
 WSL_CMDLINE_MAX_CHARS = 160
 
 
@@ -224,6 +228,14 @@ def require_free_gpu(
         # WSL's nvidia-smi omits Linux CUDA processes, but each such process holds /dev/dxg open.
         dxg_holders, unreadable_count = _wsl_dxg_processes(proc_root, self_pid)
         logger.info("WSL /dev/dxg unreadable fd process count: %s", unreadable_count)
+        if dxg_holders and used <= WSL_DESKTOP_ALLOWANCE_MIB:
+            listed = "\n  ".join(str(process) for process in dxg_holders)
+            logger.warning(
+                f"GPU preflight OK under WSL2: {used} MiB in use is within the "
+                f"{WSL_DESKTOP_ALLOWANCE_MIB} MiB Windows desktop allowance, although these "
+                f"processes hold /dev/dxg:\n  {listed}"
+            )
+            return
         if dxg_holders:
             listed = "\n  ".join(str(process) for process in dxg_holders)
             raise GpuBusyError(
