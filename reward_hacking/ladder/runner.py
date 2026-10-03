@@ -1873,19 +1873,32 @@ def _command_record_json(record: object) -> object:
     return dict(value)
 
 
-def _set_aside_failed_attempt_trace(trace_path: Path) -> None:
+def _episode_trace_path(config: RunnerConfig, key: EpisodeKey) -> Path:
+    """Return the stable trace path for one planned episode."""
+    return (
+        config.output_path.with_name(f"{config.output_path.stem}-traces")
+        / _path_slug(key.model_id)
+        / _path_slug(key.scenario_id)
+        / _path_slug(key.arm)
+        / _path_slug(key.task_pressure)
+        / f"sample-{key.sample_idx:03d}.jsonl"
+    )
+
+
+def _set_aside_failed_attempt_trace(trace_path: Path) -> bool:
     """Keep a pending cell's earlier trace as ``*.attempt-N.jsonl`` so a retry starts clean.
 
     Completed cells are skipped on resume, so a trace already at this path can only come from an
     attempt that died before its record was written.
     """
     if not trace_path.exists():
-        return
+        return False
     attempt = 1
     while (kept := trace_path.with_name(f"{trace_path.stem}.attempt-{attempt}.jsonl")).exists():
         attempt += 1
     trace_path.rename(kept)
     logger.warning("kept an incomplete earlier attempt's trace as %s", kept)
+    return True
 
 
 def _probe_counterfactuals_if_eligible(
@@ -1931,15 +1944,7 @@ def _run_one(  # noqa: PLR0913, PLR0917 - explicit orchestration seams aid synth
         / _path_slug(config.task_pressure)
         / f"sample-{sample_index:03d}"
     )
-    trace_path = (
-        config.output_path.with_name(f"{config.output_path.stem}-traces")
-        / _path_slug(model.model_id)
-        / _path_slug(scenario.slug)
-        / _path_slug(arm)
-        / _path_slug(config.task_pressure)
-        / f"sample-{sample_index:03d}.jsonl"
-    )
-    _set_aside_failed_attempt_trace(trace_path)
+    trace_path = _episode_trace_path(config, key)
     run_result = episode_runner(scenario, backend, arm, sample_index, episode_dir, trace_path)
     trace = run_result.trace if isinstance(run_result, EpisodeRun) else run_result
     episode_token = run_result.episode_token if isinstance(run_result, EpisodeRun) else None
@@ -2123,10 +2128,36 @@ def run_grid(
         raise FileExistsError(
             f"{config.output_path} already contains ladder records; pass resume=True or choose a new path"
         )
+    planned_keys = [
+        EpisodeKey(model.model_id, scenario.slug, arm, sample_index, config.task_pressure)
+        for model in config.models
+        for scenario in config.scenarios
+        for arm in config.arms
+        for sample_index in range(config.samples)
+    ]
     completed = completed_episode_keys(
         config.output_path,
         expected_digest=config.provenance_digest,
         expected_provenance=config.provenance_payload(),
+    )
+    already_complete_and_kept = sum(key in completed for key in planned_keys)
+    pending_keys = [key for key in planned_keys if key not in completed]
+    torn_attempts_set_aside = sum(
+        _set_aside_failed_attempt_trace(_episode_trace_path(config, key)) for key in pending_keys
+    )
+    run_counts = {
+        "episodes_planned": len(planned_keys),
+        "already_complete_and_kept": already_complete_and_kept,
+        "torn_attempts_set_aside": torn_attempts_set_aside,
+        "to_run_now": len(pending_keys),
+    }
+    logger.info(
+        "ladder run startup: episodes_planned=%d already_complete_and_kept=%d "
+        "torn_attempts_set_aside=%d to_run_now=%d",
+        run_counts["episodes_planned"],
+        run_counts["already_complete_and_kept"],
+        run_counts["torn_attempts_set_aside"],
+        run_counts["to_run_now"],
     )
     existing_pressure_digests = {
         (record.get("provenance", {}).get("task_pressure", "none"), record.get("provenance_digest"))
@@ -2150,6 +2181,11 @@ def run_grid(
             ],
             append=bool(existing),
         )
+    write_trace(
+        config.output_path,
+        [{"record": "ladder_run_summary", "schema_version": LADDER_SCHEMA_VERSION, **run_counts}],
+        append=True,
+    )
 
     run_episode: EpisodeRunner
     if episode_runner is None:
@@ -2181,24 +2217,10 @@ def run_grid(
     appended: list[dict[str, object]] = []
     scenarios_by_slug = {scenario.slug: scenario for scenario in config.scenarios}
     for model in config.models:
-        model_pending = any(
-            EpisodeKey(model.model_id, scenario.slug, arm, sample_index, config.task_pressure)
-            not in completed
-            for scenario in config.scenarios
-            for arm in config.arms
-            for sample_index in range(config.samples)
-        )
-        if not model_pending:
+        model_pending_keys = [key for key in pending_keys if key.model_id == model.model_id]
+        if not model_pending_keys:
             continue
         backends[model.model_id] = backend_factory(model, config)
-        pending_keys = [
-            EpisodeKey(model.model_id, scenario.slug, arm, sample_index, config.task_pressure)
-            for scenario in config.scenarios
-            for arm in config.arms
-            for sample_index in range(config.samples)
-            if EpisodeKey(model.model_id, scenario.slug, arm, sample_index, config.task_pressure)
-            not in completed
-        ]
 
         def run_cell(key: EpisodeKey, model: ModelSpec = model) -> dict[str, object]:
             return _run_one(
@@ -2213,7 +2235,9 @@ def run_grid(
                 final_grader=selected_grader,
             )
 
-        for record in _run_cells(pending_keys, run_cell, concurrency=config.episode_concurrency):
+        for record in _run_cells(
+            model_pending_keys, run_cell, concurrency=config.episode_concurrency
+        ):
             write_trace(config.output_path, [record], append=True)
             appended.append(record)
     return appended

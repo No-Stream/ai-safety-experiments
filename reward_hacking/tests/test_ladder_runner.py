@@ -609,7 +609,95 @@ def test_run_grid_appends_each_cell_and_resume_is_idempotent(tmp_path: Path) -> 
     )
     assert second == []
     assert len(calls) == 4
-    assert len(output_path.read_text(encoding="utf-8").splitlines()) == 5
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert sum(row.get("record") == "ladder_run_header" for row in rows) == 1
+    assert sum(row.get("record") == "ladder_episode" for row in rows) == 4
+    assert sum(row.get("record") == "ladder_run_summary" for row in rows) == 2
+
+
+def test_run_grid_records_resume_counts_and_sets_aside_pending_trace(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    config = runner_config(output_path)
+    completed_key = EpisodeKey("base", "dummy", "naive", 0)
+    header = {
+        "record": "ladder_run_header",
+        "schema_version": LADDER_SCHEMA_VERSION,
+        "provenance_digest": config.provenance_digest,
+        "provenance": config.provenance_payload(),
+    }
+    completed_record = {
+        "record": "ladder_episode",
+        "provenance_digest": config.provenance_digest,
+        "detector_code_identity": config.provenance_payload()["detector_code_identity"],
+        "key": completed_key.to_json(),
+    }
+    output_path.write_text(
+        json.dumps(header) + "\n" + json.dumps(completed_record) + "\n", encoding="utf-8"
+    )
+    torn_trace_path = (
+        tmp_path / "records-traces" / "base" / "dummy" / "real" / "none" / "sample-000.jsonl"
+    )
+    torn_trace_path.parent.mkdir(parents=True)
+    torn_trace_path.write_text('{"record":"turn"', encoding="utf-8")
+    calls: list[EpisodeKey] = []
+
+    def episode_runner(
+        _scenario: ScenarioLike,
+        _backend: object,
+        arm: str,
+        sample_index: int,
+        _episode_dir: Path,
+        _trace_path: Path,
+    ) -> dict[str, object]:
+        calls.append(EpisodeKey("base", "dummy", arm, sample_index))
+        return {"true_pass": True}
+
+    def run() -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=episode_runner,
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+    with caplog.at_level("INFO", logger="reward_hacking.ladder.runner"):
+        first = run()
+        second = run()
+
+    records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    run_summaries = [row for row in records if row.get("record") == "ladder_run_summary"]
+    expected_first_counts = {
+        "episodes_planned": 4,
+        "already_complete_and_kept": 1,
+        "torn_attempts_set_aside": 1,
+        "to_run_now": 3,
+    }
+    expected_second_counts = {
+        "episodes_planned": 4,
+        "already_complete_and_kept": 4,
+        "torn_attempts_set_aside": 0,
+        "to_run_now": 0,
+    }
+
+    assert len(first) == 3
+    assert len(second) == 0
+    assert len(calls) == 3
+    assert run_summaries == [
+        {"record": "ladder_run_summary", "schema_version": 19, **expected_first_counts},
+        {"record": "ladder_run_summary", "schema_version": 19, **expected_second_counts},
+    ]
+    assert torn_trace_path.with_name("sample-000.attempt-1.jsonl").exists()
+    assert (
+        "ladder run startup: episodes_planned=4 already_complete_and_kept=1 "
+        "torn_attempts_set_aside=1 to_run_now=3"
+    ) in caplog.messages
+    assert (
+        "ladder run startup: episodes_planned=4 already_complete_and_kept=4 "
+        "torn_attempts_set_aside=0 to_run_now=0"
+    ) in caplog.messages
 
 
 def test_task_pressure_separates_provenance_keys_paths_readout_and_resume(
@@ -1088,8 +1176,9 @@ class TestEpisodeConcurrency:
         records = self.run(config, episode_runner)
 
         keys = [
-            json.loads(line)["key"]
-            for line in config.output_path.read_text(encoding="utf-8").splitlines()[1:]
+            row["key"]
+            for row in map(json.loads, config.output_path.read_text(encoding="utf-8").splitlines())
+            if row.get("record") == "ladder_episode"
         ]
         assert len(records) == 4
         assert len(keys) == 4
