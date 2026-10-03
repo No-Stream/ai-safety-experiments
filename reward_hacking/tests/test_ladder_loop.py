@@ -28,7 +28,7 @@ from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from transformers import PreTrainedTokenizerBase
 
@@ -46,6 +46,7 @@ class _FakeTokenizer:
     def __init__(self) -> None:
         self.rendered_messages: list[list[dict[str, object]]] = []
         self.rendered_tools: list[list[dict[str, object]]] = []
+        self.template_kwargs: list[dict[str, object]] = []
 
     def apply_chat_template(
         self,
@@ -55,9 +56,11 @@ class _FakeTokenizer:
         tokenize: bool,
         add_generation_prompt: bool,
         enable_thinking: bool,
+        **template_kwargs: object,
     ) -> str:
         assert not tokenize
         assert enable_thinking
+        self.template_kwargs.append(dict(template_kwargs))
         if tools:
             self.rendered_messages.append(json.loads(json.dumps(messages)))
             self.rendered_tools.append(json.loads(json.dumps(tools)))
@@ -232,6 +235,7 @@ def _run_episode(
     monkeypatch: pytest.MonkeyPatch,
     backend: loop.LadderBackend,
     options: _EpisodeOptions | None = None,
+    chat_template_kwargs: Mapping[str, str] | None = None,
 ) -> loop.LadderEpisodeTrace:
     monkeypatch.setattr(loop, "run_in_jail", _fake_run_in_jail)
     monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
@@ -242,6 +246,7 @@ def _run_episode(
         episode_dir=tmp_path / "episode",
         arm=episode_options.arm or AgenticArmConfig(),
         history_reasoning=episode_options.history_reasoning,
+        chat_template_kwargs=chat_template_kwargs,
         system_prompt="Use the tools to complete the task.",
         user_template="Task:\n{task_markdown}\nFiles:\n{listing}",
         max_turns=episode_options.max_turns,
@@ -999,12 +1004,14 @@ class TestNativeToolLoop:
             tools: list[dict[str, object]],
             *,
             enable_thinking: bool = True,
+            chat_template_kwargs: Mapping[str, str] | None = None,
         ) -> str:
             rendered = original_render(
                 cast("PreTrainedTokenizerBase", tokenizer),
                 messages,
                 tools,
                 enable_thinking=enable_thinking,
+                chat_template_kwargs=chat_template_kwargs,
             )
             if any(
                 message.get("role") == "user" and message.get("content") == loop.FINAL_REPORT_PROMPT
@@ -1030,9 +1037,15 @@ class TestNativeToolLoop:
             monkeypatch,
             backend,
             _EpisodeOptions(max_turns=2, max_model_len=1_300, history_reasoning="strip"),
+            chat_template_kwargs={"reasoning_effort": "medium"},
         )
 
         tokenizer = cast("_FakeTokenizer", backend.tokenizer)
+        assert tokenizer.template_kwargs
+        assert all(
+            template_kwargs == {"reasoning_effort": "medium"}
+            for template_kwargs in tokenizer.template_kwargs
+        )
         second_turn_messages = tokenizer.rendered_messages[1]
         assert not any(
             message.get("reasoning_content") == "earlier reasoning sentinel"

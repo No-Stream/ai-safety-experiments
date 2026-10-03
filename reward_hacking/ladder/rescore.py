@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 _DEFAULT_SCENARIO_ROOT = Path(__file__).resolve().parent / "data" / "scenarios"
 COUNTERFACTUAL_SOURCE_SCHEMA_VERSION = 18
 ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION = 19
+PREVIOUS_LADDER_SCHEMA_VERSION = 20
 
 
 def _require_mapping(value: object, *, field: str) -> Mapping[str, object]:
@@ -94,6 +95,7 @@ def _header_schema_version(header: Mapping[str, object], provenance: Mapping[str
     if schema_version not in {
         COUNTERFACTUAL_SOURCE_SCHEMA_VERSION,
         ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION,
+        PREVIOUS_LADDER_SCHEMA_VERSION,
         runner.LADDER_SCHEMA_VERSION,
     }:
         raise ValueError(
@@ -477,6 +479,33 @@ def _detector_code_identity() -> str:
     return runner.detector_code_identity()
 
 
+def _upgrade_model_provenance(raw_models: object) -> list[dict[str, object]]:
+    """Add and validate the chat-template kwargs field in each current-schema model entry."""
+    if not isinstance(raw_models, list):
+        raise TypeError("run header provenance.models must be a list")
+    upgraded_models: list[dict[str, object]] = []
+    for index, raw_model in enumerate(raw_models):
+        model_record = dict(
+            _require_mapping(raw_model, field=f"run header provenance.models[{index}]")
+        )
+        raw_chat_template_kwargs = model_record.get("chat_template_kwargs", {})
+        if not isinstance(raw_chat_template_kwargs, Mapping):
+            raise TypeError(
+                f"run header provenance.models[{index}].chat_template_kwargs must be an object"
+            )
+        if any(not isinstance(key, str) or not key for key in raw_chat_template_kwargs):
+            raise TypeError(
+                f"run header provenance.models[{index}].chat_template_kwargs has an invalid key"
+            )
+        if any(not isinstance(value, str) for value in raw_chat_template_kwargs.values()):
+            raise TypeError(
+                f"run header provenance.models[{index}].chat_template_kwargs values must be strings"
+            )
+        model_record["chat_template_kwargs"] = dict(raw_chat_template_kwargs)
+        upgraded_models.append(model_record)
+    return upgraded_models
+
+
 def _upgrade_header_to_current_schema(
     header: dict[str, object],
     *,
@@ -516,6 +545,7 @@ def _upgrade_header_to_current_schema(
         scenario_record["manifest_digest"] = scenario.manifest_digest
         upgraded_scenarios.append(scenario_record)
     provenance["scenarios"] = upgraded_scenarios
+    provenance["models"] = _upgrade_model_provenance(provenance.get("models"))
     provenance["schema_version"] = runner.LADDER_SCHEMA_VERSION
     old_digest = header.get("provenance_digest")
     if not isinstance(old_digest, str):

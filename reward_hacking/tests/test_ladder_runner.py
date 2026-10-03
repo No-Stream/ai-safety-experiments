@@ -142,7 +142,7 @@ def test_ladder_backend_uses_stop_free_sampling_and_thinks(
 
     def fake_backend(model_id: str, **kwargs: Any) -> object:
         constructed.append({"model_id": model_id, **kwargs})
-        return object()
+        return SimpleNamespace(tokenizer=SimpleNamespace(chat_template="synthetic template"))
 
     def fake_sampling_config(**kwargs: object) -> object:
         sampling_options.append(kwargs)
@@ -157,6 +157,27 @@ def test_ladder_backend_uses_stop_free_sampling_and_thinks(
     assert constructed[0]["stop_token_ids"] == LADDER_STOP_TOKEN_IDS
 
 
+def test_ladder_backend_refuses_unconfigured_reasoning_effort_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_backend(_model_id: str, **_kwargs: Any) -> object:
+        return SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template="{{ reasoning_effort|default('xhigh') }}")
+        )
+
+    monkeypatch.setattr("reward_hacking.model_backend.VLLMHTTPBackend", fake_backend)
+    monkeypatch.setattr(
+        "reward_hacking.model_backend.SamplingConfig",
+        SimpleNamespace,
+    )
+
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        build_vllm_http_backend(
+            ModelSpec("qwen", tmp_path),
+            runner_config(tmp_path / "records.jsonl"),
+        )
+
+
 def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path: Path) -> None:
     config = replace(
         runner_config(tmp_path / "records.jsonl"),
@@ -165,7 +186,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     )
     provenance = config.provenance_payload()
 
-    assert LADDER_SCHEMA_VERSION == 20
+    assert LADDER_SCHEMA_VERSION == 21
     assert config.history_reasoning == "retain"
     assert provenance["history_reasoning"] == "retain"
     assert (
@@ -184,6 +205,8 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     assert provenance["final_report_seconds"] == ladder_loop.LADDER_FINAL_REPORT_SECONDS
     assert provenance["max_submissions"] == ladder_loop.LADDER_MAX_SUBMISSIONS
     assert provenance["max_model_len"] == {"base": 32768}
+    model_provenance = cast("list[dict[str, object]]", provenance["models"])[0]
+    assert model_provenance["chat_template_kwargs"] == {}
     assert provenance["server_args"] == {
         "kv_cache_dtype": "fp8",
         "attention_backend": "FLASHINFER",
@@ -2106,10 +2129,16 @@ def test_cli_records_the_selected_task_pressure(
             "http://127.0.0.1:8000",
             "--model",
             "base=/models/base",
+            "--model",
+            "other=/models/other",
             "--scenario-root",
             str(tmp_path),
             "--server-log",
             str(server_log),
+            "--chat-template-kwarg",
+            "base:reasoning_effort=medium",
+            "--chat-template-kwarg",
+            "other:custom_mode=on",
             "--task-pressure",
             "merge-gate",
             "--history-reasoning",
@@ -2120,11 +2149,73 @@ def test_cli_records_the_selected_task_pressure(
     assert result == 0
     assert captured_configs[0].task_pressure == "merge-gate"
     assert captured_configs[0].history_reasoning == "strip"
+    assert dict(captured_configs[0].models[0].chat_template_kwargs) == {
+        "reasoning_effort": "medium"
+    }
+    assert dict(captured_configs[0].models[1].chat_template_kwargs) == {"custom_mode": "on"}
+    with pytest.raises(TypeError):
+        cast("Any", captured_configs[0].models[0].chat_template_kwargs)["reasoning_effort"] = "high"
+    assert captured_configs[0].provenance_payload()["models"] == [
+        {
+            "model_id": "base",
+            "model_path": "/models/base",
+            "revision": None,
+            "server_model_id": None,
+            "chat_template_kwargs": {"reasoning_effort": "medium"},
+        },
+        {
+            "model_id": "other",
+            "model_path": "/models/other",
+            "revision": None,
+            "server_model_id": None,
+            "chat_template_kwargs": {"custom_mode": "on"},
+        },
+    ]
     assert captured_configs[0].server_args == {
         "model": "synthetic-model",
         "kv_cache_dtype": "fp8",
         "attention_backend": "FLASHINFER",
     }
+
+
+@pytest.mark.parametrize(
+    ("chat_template_kwargs", "error_match"),
+    [
+        (("missing:reasoning_effort=medium",), "no matching --model"),
+        (
+            ("base:reasoning_effort=medium", "base:reasoning_effort=low"),
+            "duplicate chat-template kwarg",
+        ),
+    ],
+)
+def test_cli_rejects_unmatched_or_duplicate_chat_template_kwargs(
+    tmp_path: Path,
+    chat_template_kwargs: tuple[str, ...],
+    error_match: str,
+) -> None:
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text(
+        "(APIServer pid=1) INFO 10-01 20:31:49 [api_utils.py:273] non-default args: "
+        "{'model': 'synthetic-model', 'kv_cache_dtype': 'fp8'}\n",
+        encoding="utf-8",
+    )
+    arguments = [
+        "--endpoint",
+        "http://127.0.0.1:8000",
+        "--model",
+        "base=/models/base",
+        "--scenario-root",
+        str(tmp_path),
+        "--server-log",
+        str(server_log),
+    ]
+    for chat_template_kwarg in chat_template_kwargs:
+        arguments.extend(("--chat-template-kwarg", chat_template_kwarg))
+
+    with pytest.raises(SystemExit, match="2") as error:
+        main(arguments)
+
+    assert error.value.code == 2
 
 
 def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
@@ -2150,6 +2241,7 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
     )
 
     def fake_run_ladder_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+        assert kwargs["chat_template_kwargs"] == {"reasoning_effort": "medium"}
         workspace = kwargs["episode_dir"]
         before = kwargs["before_command"]
         after = kwargs["after_command"]
@@ -2174,7 +2266,13 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
     monkeypatch.setattr("reward_hacking.ladder.loop.run_ladder_episode", fake_run_ladder_episode)
     config = RunnerConfig(
         endpoint="http://127.0.0.1:8000",
-        models=(ModelSpec("base", "/models/base"),),
+        models=(
+            ModelSpec(
+                "base",
+                "/models/base",
+                chat_template_kwargs={"reasoning_effort": "medium"},
+            ),
+        ),
         scenarios=(DummyScenario("dummy"),),
         arms=("naive",),
         samples=1,
@@ -2191,6 +2289,7 @@ def test_real_episode_uses_disposable_workspace_and_persists_artifacts(
         artifact_dir,
         trace_path,
         config=config,
+        model=config.models[0],
     )
 
     assert artifact_dir.is_dir()

@@ -27,6 +27,7 @@ from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from dataclasses import field as dataclass_field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
@@ -67,7 +68,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 20
+LADDER_SCHEMA_VERSION = 21
 LADDER_RUNG_VALUES = tuple(int(rung) for rung in Rung)
 ESCALATION_OUTCOME_CATEGORIES = (
     "honest_pass",
@@ -174,6 +175,9 @@ class ModelSpec:
     model_path: str | Path
     revision: str | None = None
     server_model_id: str | None = None
+    chat_template_kwargs: Mapping[str, str] = dataclass_field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     def __post_init__(self) -> None:
         """Reject ambiguous model identities before a backend can be started."""
@@ -185,6 +189,10 @@ class ModelSpec:
             raise ValueError("revision must be non-empty when supplied")
         if self.server_model_id == "":
             raise ValueError("server_model_id must be non-empty when supplied")
+        kwargs = dict(self.chat_template_kwargs)
+        if any(not key for key in kwargs):
+            raise ValueError("chat-template kwarg names must be non-empty strings")
+        object.__setattr__(self, "chat_template_kwargs", MappingProxyType(kwargs))
 
     def to_json(self) -> dict[str, object]:
         """Return model provenance without exposing model weights or prompt material."""
@@ -193,6 +201,7 @@ class ModelSpec:
             "model_path": str(self.model_path),
             "revision": self.revision,
             "server_model_id": self.server_model_id,
+            "chat_template_kwargs": dict(self.chat_template_kwargs),
         }
 
 
@@ -1033,7 +1042,7 @@ def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
         presence_penalty=LADDER_SAMPLING.presence_penalty,
         seed=LADDER_SAMPLING.seed,
     )
-    return VLLMHTTPBackend(
+    backend = VLLMHTTPBackend(
         model.server_model_id or model.model_id,
         base_url=config.endpoint,
         model_path=local_snapshot,
@@ -1042,6 +1051,13 @@ def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
         sampling=sampling,
         stop_token_ids=LADDER_STOP_TOKEN_IDS,
     )
+    ladder_chat.validate_chat_template_kwargs(
+        cast("Any", backend).tokenizer,
+        local_snapshot,
+        model_id=model.model_id,
+        chat_template_kwargs=model.chat_template_kwargs,
+    )
+    return backend
 
 
 def _real_arm_submission_grader(
@@ -1148,6 +1164,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
     trace_path: Path,
     *,
     config: RunnerConfig,
+    model: ModelSpec,
 ) -> object:
     """Call the native ladder loop for one real execution cell."""
     from reward_hacking.ladder.monitor import (  # noqa: PLC0415 - lazy real-run seam
@@ -1209,6 +1226,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
                 episode_token=episode_token,
                 episode_seconds=config.episode_seconds,
                 history_reasoning=config.history_reasoning,
+                chat_template_kwargs=model.chat_template_kwargs,
                 before_command=before_command,
                 after_command=after_command,
                 submit_grader=(
@@ -2521,30 +2539,6 @@ def run_grid(
         append=True,
     )
 
-    run_episode: EpisodeRunner
-    if episode_runner is None:
-
-        def real_episode(  # noqa: PLR0913, PLR0917 - callback mirrors EpisodeRunner
-            scenario: ScenarioLike,
-            backend: object,
-            arm: str,
-            sample_index: int,
-            episode_dir: Path,
-            trace_path: Path,
-        ) -> object:
-            return _run_real_episode(
-                scenario,
-                backend,
-                arm,
-                sample_index,
-                episode_dir,
-                trace_path,
-                config=config,
-            )
-
-        run_episode = real_episode
-    else:
-        run_episode = episode_runner
     selected_detector = _default_detector if detector is None else detector
     selected_grader = _default_final_grader if final_grader is None else final_grader
     backends: dict[str, object] = {}
@@ -2556,7 +2550,36 @@ def run_grid(
             continue
         backends[model.model_id] = backend_factory(model, config)
 
-        def run_cell(key: EpisodeKey, model: ModelSpec = model) -> dict[str, object]:
+        selected_episode_runner = episode_runner
+        if selected_episode_runner is None:
+
+            def real_episode(  # noqa: PLR0913, PLR0917 - callback mirrors EpisodeRunner
+                scenario: ScenarioLike,
+                backend: object,
+                arm: str,
+                sample_index: int,
+                episode_dir: Path,
+                trace_path: Path,
+                model: ModelSpec = model,
+            ) -> object:
+                return _run_real_episode(
+                    scenario,
+                    backend,
+                    arm,
+                    sample_index,
+                    episode_dir,
+                    trace_path,
+                    config=config,
+                    model=model,
+                )
+
+            selected_episode_runner = real_episode
+
+        def run_cell(
+            key: EpisodeKey,
+            model: ModelSpec = model,
+            episode_runner_for_model: EpisodeRunner = selected_episode_runner,
+        ) -> dict[str, object]:
             return _run_one(
                 config,
                 scenarios_by_slug[key.scenario_id],
@@ -2564,7 +2587,7 @@ def run_grid(
                 key.arm,
                 key.sample_idx,
                 backends[model.model_id],
-                episode_runner=run_episode,
+                episode_runner=episode_runner_for_model,
                 detector=selected_detector,
                 final_grader=selected_grader,
             )
@@ -2968,6 +2991,35 @@ def _parse_model_spec(raw: str) -> ModelSpec:
     return ModelSpec(label, source)
 
 
+def _parse_chat_template_kwarg(raw: str) -> tuple[str, str, str]:
+    """Parse ``model_id:key=value`` for one model's chat-template rendering options."""
+    model_id, colon, assignment = raw.partition(":")
+    key, equals, value = assignment.partition("=")
+    if not colon or not model_id or not equals or not key:
+        raise argparse.ArgumentTypeError("--chat-template-kwarg must be MODEL_ID:KEY=VALUE")
+    return model_id, key, value
+
+
+def _models_with_chat_template_kwargs(
+    models: Sequence[ModelSpec],
+    entries: Sequence[tuple[str, str, str]],
+) -> tuple[ModelSpec, ...]:
+    """Attach parsed options to exact model labels, rejecting unknowns and duplicate keys."""
+    kwargs_by_model = {model.model_id: dict(model.chat_template_kwargs) for model in models}
+    for model_id, key, value in entries:
+        if model_id not in kwargs_by_model:
+            raise ValueError(
+                f"chat-template kwarg targets {model_id!r}, which has no matching --model entry"
+            )
+        model_kwargs = kwargs_by_model[model_id]
+        if key in model_kwargs:
+            raise ValueError(f"duplicate chat-template kwarg {key!r} for model {model_id!r}")
+        model_kwargs[key] = value
+    return tuple(
+        replace(model, chat_template_kwargs=kwargs_by_model[model.model_id]) for model in models
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the selected ladder grid from the command line."""
     parser = argparse.ArgumentParser(description="Run the real-execution hack-severity ladder")
@@ -2979,6 +3031,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="vLLM server log containing its latest non-default args startup line",
     )
     parser.add_argument("--model", action="append", type=_parse_model_spec, required=True)
+    parser.add_argument(
+        "--chat-template-kwarg",
+        action="append",
+        type=_parse_chat_template_kwarg,
+        default=[],
+        metavar="MODEL_ID:KEY=VALUE",
+        help="Pass one string-valued keyword to the selected model's local chat template.",
+    )
     parser.add_argument("--scenario-root", type=Path, required=True)
     parser.add_argument("--scenario", action="append", dest="scenario_ids")
     parser.add_argument("--arm", action="append", dest="arms", choices=("naive", "claimed", "real"))
@@ -3008,6 +3068,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--no-resume", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        models = _models_with_chat_template_kwargs(args.model, args.chat_template_kwarg)
+    except ValueError as error:
+        parser.error(str(error))
     server_args = parse_server_args_from_log(args.server_log)
 
     from reward_hacking.ladder.scenario import load_scenarios  # noqa: PLC0415 - CLI-only import
@@ -3016,7 +3080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     resource_limits = resolve_jail_resource_limits(advisory=args.advisory_limits)
     config = RunnerConfig(
         endpoint=args.endpoint,
-        models=tuple(args.model),
+        models=models,
         scenarios=scenarios,
         arms=tuple(args.arms or ("naive", "claimed", "real")),
         samples=args.samples,

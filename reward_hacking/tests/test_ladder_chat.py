@@ -31,6 +31,7 @@ from reward_hacking.ladder.chat import (
     render_prompt_continuation,
     strip_reasoning,
     template_identity,
+    validate_chat_template_kwargs,
 )
 from reward_hacking.ladder.loop import _PromptRenderState, _render_prompt_for_history
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
@@ -61,6 +62,36 @@ def tokenizer(request: pytest.FixtureRequest) -> PreTrainedTokenizerFast:
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({"fixture": 0})))
     tokenizer.chat_template = cast("Path", request.param).read_text(encoding="utf-8")
     return tokenizer
+
+
+@pytest.fixture
+def reasoning_effort_tokenizer() -> PreTrainedTokenizerFast:
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({"fixture": 0})))
+    tokenizer.chat_template = (
+        "{% if reasoning_effort|default('xhigh') == 'xhigh' %}"
+        "Reasoning effort is set to xhigh. {% endif %}"
+        "{% for message in messages %}"
+        "{% if message['role'] == 'assistant' %}"
+        "<assistant-prefix>{{ message.get('reasoning_content', '') }}{{ message['content'] }}"
+        "</assistant-end>"
+        "{% else %}"
+        "<{{ message['role'] }}>{{ message['content'] }}</{{ message['role'] }}>"
+        "{% endif %}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}<assistant-prefix>{% endif %}"
+    )
+    return tokenizer
+
+
+class _ChatTemplateKwargSpy:
+    def __init__(self, tokenizer: PreTrainedTokenizerFast) -> None:
+        self._tokenizer = tokenizer
+        self.chat_template = tokenizer.chat_template
+        self.reasoning_efforts: list[object] = []
+
+    def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any:
+        self.reasoning_efforts.append(kwargs.get("reasoning_effort"))
+        return self._tokenizer.apply_chat_template(*args, **kwargs)
 
 
 def _messages() -> list[dict[str, Any]]:
@@ -243,6 +274,80 @@ def test_render_prompt_uses_tool_schema_and_thinking_template(
         ),
     )
     assert direct_result[0] == [rendered]
+
+
+def test_reasoning_effort_kwarg_controls_rendering_and_continuation(
+    reasoning_effort_tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    chat_template_kwargs = {"reasoning_effort": "medium"}
+    messages = _messages()
+    tokenizer = cast("Any", _ChatTemplateKwargSpy(reasoning_effort_tokenizer))
+
+    rendered = render_prompt(
+        tokenizer,
+        messages,
+        (),
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    anchor = {"role": "user", "content": ""}
+    appended_messages = [{"role": "user", "content": "appended"}]
+    anchored_prompt = render_prompt(
+        tokenizer,
+        [anchor, *appended_messages],
+        (),
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    rendered_anchor = render_prompt(
+        tokenizer,
+        [anchor],
+        (),
+        add_generation_prompt=False,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    continuation = render_prompt_continuation(
+        tokenizer,
+        appended_messages,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    empty_assistant_completion = render_empty_assistant_completion(
+        tokenizer,
+        messages,
+        (),
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    assistant_terminator = render_assistant_terminator_suffix(
+        tokenizer,
+        messages,
+        (),
+        chat_template_kwargs=chat_template_kwargs,
+    )
+
+    assert "Reasoning effort is set to xhigh." not in rendered
+    assert "Reasoning effort is set to xhigh." not in anchored_prompt
+    assert anchored_prompt == rendered_anchor + continuation
+    assert empty_assistant_completion == "</assistant-end>"
+    assert assistant_terminator == "</assistant-end>"
+    assert tokenizer.reasoning_efforts
+    assert set(tokenizer.reasoning_efforts) == {"medium"}
+
+
+def test_reasoning_effort_template_guard_requires_explicit_value(
+    reasoning_effort_tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    with pytest.raises(ValueError, match="reasoning_effort"):
+        validate_chat_template_kwargs(
+            reasoning_effort_tokenizer,
+            Path(),
+            model_id="synthetic-qwen",
+            chat_template_kwargs={},
+        )
+
+    validate_chat_template_kwargs(
+        reasoning_effort_tokenizer,
+        Path(),
+        model_id="synthetic-qwen",
+        chat_template_kwargs={"reasoning_effort": "medium"},
+    )
 
 
 def test_pure_append_holds_across_two_tool_turns(tokenizer: PreTrainedTokenizerFast) -> None:

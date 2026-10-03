@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
 
@@ -424,6 +425,14 @@ class _PromptRenderState:
     previous_completion: str | None = None
     appended_messages: tuple[Mapping[str, object], ...] = ()
     runaway_message_positions: tuple[int, ...] = ()
+    chat_template_kwargs: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Keep model-specific template arguments immutable across every render path."""
+        kwargs = dict(self.chat_template_kwargs)
+        if any(not key for key in kwargs):
+            raise ValueError("chat-template kwarg names must be non-empty strings")
+        object.__setattr__(self, "chat_template_kwargs", MappingProxyType(kwargs))
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,7 +564,11 @@ def _render_prompt_for_history(
         return (
             prompt_state.previous_prompt
             + prompt_state.previous_completion
-            + render_prompt_continuation(tokenizer, prompt_state.appended_messages)
+            + render_prompt_continuation(
+                tokenizer,
+                prompt_state.appended_messages,
+                chat_template_kwargs=prompt_state.chat_template_kwargs,
+            )
         )
     return render_prompt(
         tokenizer,
@@ -565,6 +578,7 @@ def _render_prompt_for_history(
             runaway_message_positions=prompt_state.runaway_message_positions,
         ),
         tools,
+        chat_template_kwargs=prompt_state.chat_template_kwargs,
     )
 
 
@@ -918,7 +932,12 @@ def _final_report(
             runaway_message_positions=prompt_state.runaway_message_positions,
         )
         reasoning_dropped = True
-        prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
+        prompt = render_prompt(
+            backend.tokenizer,
+            report_prompt_messages,
+            tools,
+            chat_template_kwargs=prompt_state.chat_template_kwargs,
+        )
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
@@ -928,13 +947,19 @@ def _final_report(
             backend.tokenizer,
             [messages[0], messages[-1]],
             [],
+            chat_template_kwargs=prompt_state.chat_template_kwargs,
         )
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
         prompt_is_full = True
     if room < 1:
-        prompt = render_prompt(backend.tokenizer, [messages[-1]], [])
+        prompt = render_prompt(
+            backend.tokenizer,
+            [messages[-1]],
+            [],
+            chat_template_kwargs=prompt_state.chat_template_kwargs,
+        )
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
@@ -1020,6 +1045,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     episode_token: str | None = None,
     episode_seconds: float = LADDER_EPISODE_SECONDS,
     history_reasoning: HistoryReasoning = DEFAULT_HISTORY_REASONING,
+    chat_template_kwargs: Mapping[str, str] | None = None,
     before_command: Callable[[Path, str], None] | None = None,
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
     submit_grader: SubmissionGrader | None = None,
@@ -1098,6 +1124,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             previous_completion=previous_completion,
             appended_messages=tuple(pending_prompt_messages),
             runaway_message_positions=tuple(runaway_message_positions),
+            chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
         )
         rendered = _render_turn_prompt(
             backend,
@@ -1152,7 +1179,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         )
         assistant_message_position = len(messages)
         runaway_completion = (
-            render_empty_assistant_completion(backend.tokenizer, messages, tools)
+            render_empty_assistant_completion(
+                backend.tokenizer,
+                messages,
+                tools,
+                chat_template_kwargs=prompt_state.chat_template_kwargs,
+            )
             if runaway and history_reasoning == "retain"
             else ""
         )
@@ -1283,6 +1315,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                 backend.tokenizer,
                 messages[:assistant_message_position],
                 tools,
+                chat_template_kwargs=prompt_state.chat_template_kwargs,
             )
         else:
             previous_completion = completion.text
@@ -1321,6 +1354,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             previous_completion=previous_completion,
             appended_messages=tuple(pending_prompt_messages),
             runaway_message_positions=tuple(runaway_message_positions),
+            chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
         ),
     )
     report_unavailable = final_report is None or not final_report.strip()

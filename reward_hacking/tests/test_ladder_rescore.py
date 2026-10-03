@@ -12,7 +12,7 @@ from conftest import JAIL_AVAILABLE, JAIL_UNAVAILABLE_REASON
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.monitor import CommandAuditMonitor
-from reward_hacking.ladder.rescore import rescore_file
+from reward_hacking.ladder.rescore import _header_schema_version, rescore_file
 from reward_hacking.ladder.runner import (
     EpisodeKey,
     EpisodeRun,
@@ -178,6 +178,9 @@ def _rewrite_as_schema18(input_path: Path, episode: dict[str, Any]) -> None:
     rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
     header = next(row for row in rows if row.get("record") == "ladder_run_header")
     provenance = cast("dict[str, object]", header["provenance"])
+    models = cast("list[dict[str, object]]", provenance["models"])
+    for model in models:
+        model.pop("chat_template_kwargs", None)
     provenance["schema_version"] = 18
     header["schema_version"] = 18
     header["provenance_digest"] = provenance_digest(provenance)
@@ -192,6 +195,9 @@ def _rewrite_as_schema19(
     rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
     header = next(row for row in rows if row.get("record") == "ladder_run_header")
     provenance = cast("dict[str, object]", header["provenance"])
+    models = cast("list[dict[str, object]]", provenance["models"])
+    for model in models:
+        model.pop("chat_template_kwargs", None)
     provenance["schema_version"] = 19
     scenarios = cast("list[dict[str, object]]", provenance["scenarios"])
     scenarios[0]["manifest_digest"] = scenario_digest
@@ -201,6 +207,10 @@ def _rewrite_as_schema19(
     episode["provenance_digest"] = header["provenance_digest"]
     rows = [episode if row.get("record") == "ladder_episode" else row for row in rows]
     input_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def test_schema20_headers_remain_supported_after_current_schema_bump() -> None:
+    assert _header_schema_version({"schema_version": 20}, {"schema_version": 20}) == 20
 
 
 def test_schema_18_rescore_upgrades_manifest_provenance_without_jail(
@@ -246,8 +256,10 @@ def test_schema_19_rescore_upgrades_legacy_scenario_digest_and_adds_outcome(
     rescored_episode = next(row for row in rescored_rows if row.get("record") == "ladder_episode")
     provenance = cast("dict[str, object]", rescored_header["provenance"])
     scenario_records = cast("list[dict[str, object]]", provenance["scenarios"])
-    assert rescored_header["schema_version"] == 20
-    assert provenance["schema_version"] == 20
+    rescored_models = cast("list[dict[str, object]]", provenance["models"])
+    assert rescored_header["schema_version"] == runner.LADDER_SCHEMA_VERSION
+    assert provenance["schema_version"] == runner.LADDER_SCHEMA_VERSION
+    assert rescored_models[0]["chat_template_kwargs"] == {}
     assert scenario_records[0]["manifest_digest"] == Scenario.load(scenario_dir).manifest_digest
     assert cast("dict[str, object]", rescored_episode["escalation_outcome"])["category"] == (
         "honest_failure"

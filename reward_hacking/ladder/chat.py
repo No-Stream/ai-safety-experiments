@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import httpx2
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
     from typing import Any
 
     from transformers import PreTrainedTokenizerBase
@@ -19,21 +20,24 @@ type TemplateSource = Literal["sidecar", "embedded"]
 MAX_MODEL_LEN_TIMEOUT_SECONDS = 30.0
 
 
-def render_prompt(
+def render_prompt(  # noqa: PLR0913 - explicit template controls keep each render auditable
     tokenizer: PreTrainedTokenizerBase,
     messages: Sequence[Mapping[str, object]],
     tools: Sequence[Mapping[str, object]],
     *,
     enable_thinking: bool = True,
     add_generation_prompt: bool = True,
+    chat_template_kwargs: Mapping[str, str] | None = None,
 ) -> str:
     """Render conversation messages, optionally adding the assistant-generation prefix."""
+    template_kwargs = {} if chat_template_kwargs is None else dict(chat_template_kwargs)
     rendered = tokenizer.apply_chat_template(
         cast("Any", [dict(message) for message in messages]),
         tools=cast("Any", [dict(tool) for tool in tools]),
         tokenize=False,
         add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
+        **cast("Any", template_kwargs),
     )
     if not isinstance(rendered, str):
         raise TypeError(f"chat template returned {type(rendered).__name__}, expected str")
@@ -43,6 +47,8 @@ def render_prompt(
 def render_prompt_continuation(
     tokenizer: PreTrainedTokenizerBase,
     messages: Sequence[Mapping[str, object]],
+    *,
+    chat_template_kwargs: Mapping[str, str] | None = None,
 ) -> str:
     """Render appended messages and a generation prefix without re-rendering prior history."""
     anchor: dict[str, object] = {"role": "user", "content": ""}
@@ -50,8 +56,15 @@ def render_prompt_continuation(
         tokenizer,
         [anchor, *messages],
         (),
+        chat_template_kwargs=chat_template_kwargs,
     )
-    rendered_anchor = render_prompt(tokenizer, [anchor], (), add_generation_prompt=False)
+    rendered_anchor = render_prompt(
+        tokenizer,
+        [anchor],
+        (),
+        add_generation_prompt=False,
+        chat_template_kwargs=chat_template_kwargs,
+    )
     if not anchored_prompt.startswith(rendered_anchor):
         raise ValueError(
             "chat template changed the rendered prompt anchor while appending messages"
@@ -63,9 +76,13 @@ def render_empty_assistant_completion(
     tokenizer: PreTrainedTokenizerBase,
     messages: Sequence[Mapping[str, object]],
     tools: Sequence[Mapping[str, object]],
+    *,
+    chat_template_kwargs: Mapping[str, str] | None = None,
 ) -> str:
     """Render the empty assistant closure after this conversation's open generation prefix."""
-    generation_prefix = render_prompt(tokenizer, messages, tools)
+    generation_prefix = render_prompt(
+        tokenizer, messages, tools, chat_template_kwargs=chat_template_kwargs
+    )
     empty_assistant: dict[str, object] = {
         "role": "assistant",
         "reasoning_content": "",
@@ -77,6 +94,7 @@ def render_empty_assistant_completion(
         [*messages, empty_assistant],
         tools,
         add_generation_prompt=False,
+        chat_template_kwargs=chat_template_kwargs,
     )
     if rendered_empty_turn.startswith(generation_prefix):
         return rendered_empty_turn[len(generation_prefix) :]
@@ -90,6 +108,7 @@ def render_empty_assistant_completion(
         [*messages, {**empty_assistant, "reasoning_content": canary_reasoning}],
         tools,
         add_generation_prompt=False,
+        chat_template_kwargs=chat_template_kwargs,
     )
     if not rendered_canary_turn.startswith(generation_prefix):
         raise ValueError("chat template cannot append an assistant turn to its generation prefix")
@@ -103,9 +122,13 @@ def render_assistant_terminator_suffix(
     tokenizer: PreTrainedTokenizerBase,
     messages: Sequence[Mapping[str, object]],
     tools: Sequence[Mapping[str, object]],
+    *,
+    chat_template_kwargs: Mapping[str, str] | None = None,
 ) -> str:
     """Render the template's assistant end marker and separator after generated text."""
-    generation_prefix = render_prompt(tokenizer, messages, tools)
+    generation_prefix = render_prompt(
+        tokenizer, messages, tools, chat_template_kwargs=chat_template_kwargs
+    )
     reasoning_canary = "__ladder_terminator_reasoning_canary__"
     content_canary = "__ladder_terminator_content_canary__"
     if reasoning_canary in generation_prefix or content_canary in generation_prefix:
@@ -121,6 +144,7 @@ def render_assistant_terminator_suffix(
         [*messages, assistant_message],
         tools,
         add_generation_prompt=False,
+        chat_template_kwargs=chat_template_kwargs,
     )
     if not rendered_turn.startswith(generation_prefix):
         raise ValueError("chat template cannot append an assistant turn to its generation prefix")
@@ -174,6 +198,37 @@ def template_identity(
         template_bytes = template.encode("utf-8")
         source = "embedded"
     return hashlib.sha256(template_bytes).hexdigest(), source
+
+
+def validate_chat_template_kwargs(
+    tokenizer: PreTrainedTokenizerBase,
+    snapshot_dir: str | Path,
+    *,
+    model_id: str,
+    chat_template_kwargs: Mapping[str, str],
+) -> None:
+    """Refuse reasoning-effort templates unless the caller pins their effort explicitly."""
+    sidecar_path = Path(snapshot_dir) / "chat_template.jinja"
+    if sidecar_path.is_file():
+        template_sources = (sidecar_path.read_text(encoding="utf-8"),)
+    else:
+        template = tokenizer.chat_template
+        if isinstance(template, str):
+            template_sources = (template,)
+        elif isinstance(template, Mapping):
+            template_sources = tuple(
+                source for source in template.values() if isinstance(source, str)
+            )
+        else:
+            template_sources = (tokenizer.get_chat_template(tools=[]),)
+
+    if any("reasoning_effort" in source for source in template_sources) and (
+        "reasoning_effort" not in chat_template_kwargs
+    ):
+        raise ValueError(
+            f"model {model_id!r} chat template references reasoning_effort; "
+            "set it with --chat-template-kwarg MODEL_ID:reasoning_effort=VALUE"
+        )
 
 
 def fetch_max_model_len(base_url: str, model_id: str) -> int:

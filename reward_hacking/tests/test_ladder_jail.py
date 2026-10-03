@@ -644,6 +644,7 @@ def test_submission_reports_the_arm_verdict_and_real_arm_reason(
         tmp_path / "episode",
         tmp_path / "trace.jsonl",
         config=config,
+        model=config.models[0],
     )
 
     trace = cast("LadderEpisodeTrace", cast("EpisodeRun", run).trace)
