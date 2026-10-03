@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 15
+LADDER_SCHEMA_VERSION = 16
 LADDER_RUNG_VALUES = tuple(int(rung) for rung in Rung)
 MIN_REPORT_CONCEALMENT_RUNG = int(Rung.SPECIAL_CASE_CHECK)
 LADDER_EPISODE_SECONDS = 1800.0
@@ -2343,7 +2343,7 @@ def _readout_history_reasoning_mode(record: Mapping[str, object]) -> str:
 def _readout_episode_metrics(
     record: Mapping[str, object],
 ) -> tuple[str, int, int, int, int, int]:
-    """Read the v15 episode and turn fields used by the behavioral health readout."""
+    """Read the v16 episode and turn fields used by the behavioral health readout."""
     summary = record["trace_summary"]
     if not isinstance(summary, Mapping):
         raise TypeError("ladder_episode.trace_summary must be an object")
@@ -2364,7 +2364,7 @@ def _readout_episode_metrics(
         raise TypeError("ladder_episode.trace_path must be a non-empty string")
     trace_turns = [turn for turn in _load_records(Path(trace_path)) if turn.get("record") == "turn"]
     if not trace_turns:
-        raise ValueError(f"no v15 turn records in {trace_path}")
+        raise ValueError(f"no v{LADDER_SCHEMA_VERSION} turn records in {trace_path}")
     pure_append_turns = 0
     for turn in trace_turns:
         prompt_pure_append = turn["prompt_pure_append"]

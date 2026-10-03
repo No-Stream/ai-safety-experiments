@@ -33,6 +33,7 @@ from reward_hacking.ladder.chat import (
     template_identity,
 )
 from reward_hacking.ladder.loop import _PromptRenderState, _render_prompt_for_history
+from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 
 DATA_DIR = Path(__file__).parent / "data"
 TEMPLATE_PATHS = (
@@ -102,6 +103,57 @@ def _render_history_prompt(
     prompt_state: _PromptRenderState,
 ) -> str:
     return _render_prompt_for_history(tokenizer, messages, TEST_TOOLS, prompt_state)
+
+
+def _prompt_trace_turn_record(
+    turn: int,
+    rendered_prompt: str,
+    previous_prompt: str | None,
+    *,
+    raw_completion: str = "",
+    runaway: bool = False,
+) -> dict[str, object]:
+    is_full = previous_prompt is None
+    if previous_prompt is not None and not rendered_prompt.startswith(previous_prompt):
+        raise ValueError("synthetic retained prompt must extend its previous prompt")
+    prompt_text = rendered_prompt if is_full else rendered_prompt[len(previous_prompt) :]
+    return {
+        "record": "turn",
+        "turn": turn,
+        "raw_completion": raw_completion,
+        "runaway": runaway,
+        "rendered_prompt_text": prompt_text,
+        "rendered_prompt_is_full": is_full,
+        "rendered_prompt_sha256": hashlib.sha256(rendered_prompt.encode("utf-8")).hexdigest(),
+    }
+
+
+def _prompt_trace_summary_record(
+    rendered_prompt: str,
+    previous_prompt: str | None,
+) -> dict[str, object]:
+    is_full = previous_prompt is None
+    if previous_prompt is not None and not rendered_prompt.startswith(previous_prompt):
+        raise ValueError("synthetic retained report prompt must extend its previous prompt")
+    prompt_text = rendered_prompt if is_full else rendered_prompt[len(previous_prompt) :]
+    return {
+        "record": "episode_summary",
+        "final_report_prompt_text": prompt_text,
+        "final_report_prompt_is_full": is_full,
+        "final_report_prompt_sha256": hashlib.sha256(rendered_prompt.encode("utf-8")).hexdigest(),
+    }
+
+
+def _assert_prompt_trace_round_trips(
+    trace_records: list[dict[str, object]],
+    expected_prompts: list[str],
+) -> None:
+    assert reconstruct_rendered_prompts(trace_records) == tuple(expected_prompts)
+
+    corrupted_records = [dict(record) for record in trace_records]
+    corrupted_records[2]["rendered_prompt_text"] = "corrupted appended prompt text"
+    with pytest.raises(ValueError, match="sha256 mismatch"):
+        reconstruct_rendered_prompts(corrupted_records)
 
 
 def _append_tool_turn(
@@ -311,6 +363,94 @@ def test_reasoning_history_is_retained_through_turns_runaway_nudge_and_report(
         prior_reasoning,
         runaway_assistant_position,
     )
+
+
+def test_prompt_trace_reconstructs_retained_turns_runaway_nudge_and_report(
+    tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    messages = _messages()
+    previous_prompt = _render_history_prompt(tokenizer, messages, _PromptRenderState("retain"))
+    expected_prompts = [previous_prompt]
+    trace_records = [_prompt_trace_turn_record(0, previous_prompt, None)]
+
+    first_assistant = _assistant_call("first reasoning", "one")
+    previous_prompt = _append_tool_turn(
+        tokenizer, messages, previous_prompt, first_assistant, {"role": "tool", "content": "one"}
+    )
+    expected_prompts.append(previous_prompt)
+    trace_records.append(_prompt_trace_turn_record(1, previous_prompt, expected_prompts[-2]))
+
+    second_assistant = _assistant_call("second reasoning", "two")
+    previous_prompt = _append_tool_turn(
+        tokenizer, messages, previous_prompt, second_assistant, {"role": "tool", "content": "two"}
+    )
+    expected_prompts.append(previous_prompt)
+    trace_records.append(
+        _prompt_trace_turn_record(
+            2,
+            previous_prompt,
+            expected_prompts[-2],
+            raw_completion="RUNAWAY_TEXT_MUST_NOT_REENTER_HISTORY and distinctive continuation",
+            runaway=True,
+        )
+    )
+
+    empty_runaway_assistant = {
+        "role": "assistant",
+        "reasoning_content": "",
+        "content": "",
+        "tool_calls": [],
+    }
+    runaway_user_message = {"role": "user", "content": "synthetic runaway format error"}
+    empty_assistant_suffix = render_empty_assistant_completion(tokenizer, messages, TEST_TOOLS)
+    messages.extend([empty_runaway_assistant, runaway_user_message])
+    previous_prompt = _render_history_prompt(
+        tokenizer,
+        messages,
+        _PromptRenderState(
+            "retain", expected_prompts[-1], empty_assistant_suffix, (runaway_user_message,)
+        ),
+    )
+    expected_prompts.append(previous_prompt)
+    trace_records.append(_prompt_trace_turn_record(3, previous_prompt, expected_prompts[-2]))
+
+    empty_start_assistant = {
+        "role": "assistant",
+        "reasoning_content": "empty-start reasoning",
+        "content": "answer",
+        "tool_calls": [],
+    }
+    empty_start_nudge = {"role": "user", "content": "synthetic empty-start nudge"}
+    messages.extend([empty_start_assistant, empty_start_nudge])
+    empty_start_completion = _assistant_completion(tokenizer, messages[:-2], empty_start_assistant)
+    previous_prompt = _render_history_prompt(
+        tokenizer,
+        messages,
+        _PromptRenderState(
+            "retain", expected_prompts[-1], empty_start_completion, (empty_start_nudge,)
+        ),
+    )
+    expected_prompts.append(previous_prompt)
+    trace_records.append(_prompt_trace_turn_record(4, previous_prompt, expected_prompts[-2]))
+
+    final_assistant = {
+        "role": "assistant",
+        "reasoning_content": "final reasoning",
+        "content": "done",
+        "tool_calls": [],
+    }
+    report_request = {"role": "user", "content": "fixture report request"}
+    messages.extend([final_assistant, report_request])
+    final_completion = _assistant_completion(tokenizer, messages[:-2], final_assistant)
+    report_prompt = _render_history_prompt(
+        tokenizer,
+        messages,
+        _PromptRenderState("retain", previous_prompt, final_completion, (report_request,)),
+    )
+    expected_prompts.append(report_prompt)
+    trace_records.append(_prompt_trace_summary_record(report_prompt, previous_prompt))
+
+    _assert_prompt_trace_round_trips(trace_records, expected_prompts)
 
 
 def test_count_prompt_tokens_and_context_room(tokenizer: PreTrainedTokenizerFast) -> None:

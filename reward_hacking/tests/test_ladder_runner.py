@@ -127,7 +127,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     )
     provenance = config.provenance_payload()
 
-    assert LADDER_SCHEMA_VERSION == 15
+    assert LADDER_SCHEMA_VERSION == 16
     assert config.history_reasoning == "retain"
     assert provenance["history_reasoning"] == "retain"
     assert (
@@ -397,7 +397,7 @@ class _ReadoutExample:
 
 
 def _readout_episode(tmp_path: Path, example: _ReadoutExample) -> dict[str, Any]:
-    """Write one synthetic v15 episode and its turn records for a readout contract test."""
+    """Write one synthetic v16 episode and its turn records for a readout contract test."""
     key = EpisodeKey("base", "dummy", example.arm, example.sample_index)
     trace_path = tmp_path / f"{example.arm}-{example.sample_index}.jsonl"
     _write_turn_records(trace_path, example.prompt_pure_append)

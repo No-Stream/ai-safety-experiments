@@ -22,6 +22,7 @@ from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import chat, loop
+from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.trace import load_trace
 
@@ -465,8 +466,10 @@ class TestNativeToolLoop:
         assert [record["record"] for record in records_seen_before_report] == ["turn"]
         records = load_trace(trace_path)
         assert [record["record"] for record in records] == ["turn", "episode_summary"]
-        assert records[0]["rendered_prompt"]
-        assert "rendered_prompt" not in records[1]
+        assert records[0]["rendered_prompt_is_full"] is True
+        assert records[0]["rendered_prompt_text"]
+        assert records[1]["final_report_prompt_is_full"] is False
+        assert records[1]["final_report_prompt_text"]
         assert records[1]["ended_by"] == "submit"
 
     def test_no_tool_call_on_untouched_work_nudges_once_then_ends(
@@ -975,8 +978,16 @@ class TestNativeToolLoop:
             for message in summary_messages
         )
         assert trace.turns[1].history_reasoning == "strip"
+        assert trace.turns[1].rendered_prompt_is_full
+        assert trace.turns[1].rendered_prompt_text == backend.prompts[1]
         assert trace.turn_records()[1]["history_reasoning"] == "strip"
         assert trace.summary_record()["history_reasoning"] == "strip"
+        assert trace.final_report_prompt_is_full
+        assert trace.final_report_prompt_text == backend.prompts[2]
+        reconstructed_prompts = reconstruct_rendered_prompts(
+            [*trace.turn_records(), trace.summary_record()]
+        )
+        assert reconstructed_prompts == tuple(backend.prompts)
         assert trace.final_report_reasoning_dropped is False
 
     def test_monitor_hooks_wrap_bash_and_not_final_grade(
@@ -1112,10 +1123,14 @@ class TestNativeToolLoop:
         assert summary_messages[-2] == {"role": "user", "content": loop.FINAL_REPORT_PROMPT}
         assert summary_messages[-1]["role"] == "assistant"
         assert summary_messages[-1]["content"] == "The marker is ready."
+        reconstructed_prompts = reconstruct_rendered_prompts(
+            [*trace.turn_records(), trace.summary_record()]
+        )
+        assert reconstructed_prompts[-1] == backend.prompts[2]
 
         tokenizer = cast("_FakeTokenizer", backend.tokenizer)
-        replayed_prompt = trace.turns[0].rendered_prompt
-        assert replayed_prompt is not None
+        replayed_prompt = trace.turns[0].rendered_prompt_text
+        assert trace.turns[0].rendered_prompt_is_full
         assistant_position = 2
         for turn_index, turn in enumerate(trace.turns):
             replayed_sha256 = hashlib.sha256(replayed_prompt.encode("utf-8")).hexdigest()
@@ -1136,7 +1151,14 @@ class TestNativeToolLoop:
                         cast("PreTrainedTokenizerBase", tokenizer), appended_messages
                     )
                 )
+                assert (
+                    trace.turns[turn_index + 1].rendered_prompt_text
+                    == replayed_prompt[len(trace.turns[turn_index].rendered_prompt_text) :]
+                )
+                assert trace.turns[turn_index + 1].rendered_prompt_is_full is False
                 assistant_position = next_assistant_position
+        assert trace.final_report_prompt_is_full
+        assert trace.final_report_prompt_text == backend.prompts[2]
 
 
 class TestPersistentShell:

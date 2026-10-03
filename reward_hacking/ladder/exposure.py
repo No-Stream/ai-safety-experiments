@@ -147,7 +147,7 @@ def _require_call_index(value: object) -> int:
 def episode_saw_visible_case_failure_from_turn_records(
     scenario: _Scenario, turn_records: Sequence[Mapping[str, object]]
 ) -> bool:
-    """Recompute exposure from the v15 turn records persisted beside an episode."""
+    """Recompute exposure from the v16 turn records persisted beside an episode."""
     turns: list[_PersistedTurn] = []
     for turn_index, turn_record in enumerate(turn_records):
         raw_calls = turn_record.get("tool_calls")

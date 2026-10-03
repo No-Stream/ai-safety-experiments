@@ -186,7 +186,8 @@ class LadderTurn:
     surplus_function_close_tags: int
     trailing_text_chars: int
     rendered_prompt_sha256: str
-    rendered_prompt: str | None = None
+    rendered_prompt_text: str
+    rendered_prompt_is_full: bool
 
     def to_json_dict(self, *, episode_id: str, task_id: str) -> dict[str, object]:
         """Return one incrementally writable turn record."""
@@ -224,9 +225,9 @@ class LadderTurn:
             "surplus_function_close_tags": self.surplus_function_close_tags,
             "trailing_text_chars": self.trailing_text_chars,
             "rendered_prompt_sha256": self.rendered_prompt_sha256,
+            "rendered_prompt_text": self.rendered_prompt_text,
+            "rendered_prompt_is_full": self.rendered_prompt_is_full,
         }
-        if self.rendered_prompt is not None:
-            record["rendered_prompt"] = self.rendered_prompt
         return record
 
 
@@ -272,6 +273,8 @@ class LadderEpisodeTrace:
     final_report: str | None
     final_report_reasoning: str
     final_report_prompt_sha256: str
+    final_report_prompt_text: str
+    final_report_prompt_is_full: bool
     final_report_truncated: bool
     final_report_timed_out: bool
     final_report_fabricated_tool_responses: int
@@ -313,7 +316,7 @@ class LadderEpisodeTrace:
         ]
 
     def summary_record(self) -> dict[str, object]:
-        """Return the compact v15 episode summary while retaining runner and rescore fields."""
+        """Return the compact v16 episode summary while retaining runner and rescore fields."""
         grader = self.final_grade.grader
         return {
             "record": "episode_summary",
@@ -363,6 +366,8 @@ class LadderEpisodeTrace:
                 "timed_out": self.final_report_timed_out,
             },
             "final_report_prompt_sha256": self.final_report_prompt_sha256,
+            "final_report_prompt_text": self.final_report_prompt_text,
+            "final_report_prompt_is_full": self.final_report_prompt_is_full,
             "report_unavailable": self.report_unavailable,
             "arm": self.arm.to_json_dict(),
             "history_reasoning": self.history_reasoning,
@@ -667,6 +672,20 @@ def _render_turn_prompt(
     return _RenderedTurn(prompt, prompt_tokens, prompt_pure_append)
 
 
+def _rendered_prompt_trace_text(
+    rendered_prompt: str,
+    previous_prompt: str | None,
+    *,
+    is_full: bool,
+) -> str:
+    """Keep either the exact append to the prior prompt or the full re-rendered prompt."""
+    if is_full:
+        return rendered_prompt
+    if previous_prompt is None or not rendered_prompt.startswith(previous_prompt):
+        raise ValueError("appended prompt trace text requires a previous prompt prefix")
+    return rendered_prompt[len(previous_prompt) :]
+
+
 def _sample_completion(
     backend: LadderBackend,
     prompt: str,
@@ -818,6 +837,8 @@ def _final_report(
     bool,
     int,
     str,
+    str,
+    bool,
 ]:
     """Sample a report; hash the exact prompt after any context fallback."""
     messages.append({"role": "user", "content": FINAL_REPORT_PROMPT})
@@ -838,6 +859,9 @@ def _final_report(
     prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     reasoning_dropped = False
+    prompt_is_full = prompt_state.history_reasoning == "strip" or (
+        prompt_state.previous_prompt is None
+    )
     room = context_room(prompt_tokens, context.max_model_len)
     if room < MIN_CONTEXT_ROOM and prompt_state.history_reasoning == "retain":
         report_prompt_messages = _prompt_messages(
@@ -850,6 +874,12 @@ def _final_report(
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
+        prompt_is_full = True
+    prompt_trace_text = _rendered_prompt_trace_text(
+        prompt,
+        prompt_state.previous_prompt,
+        is_full=prompt_is_full,
+    )
     if room < MIN_CONTEXT_ROOM:
         return (
             messages,
@@ -862,6 +892,8 @@ def _final_report(
             reasoning_dropped,
             prompt_tokens,
             prompt_sha256,
+            prompt_trace_text,
+            prompt_is_full,
         )
     if time.monotonic() >= context.deadline:
         return (
@@ -875,6 +907,8 @@ def _final_report(
             reasoning_dropped,
             prompt_tokens,
             prompt_sha256,
+            prompt_trace_text,
+            prompt_is_full,
         )
 
     completion = backend.complete_rendered(
@@ -895,6 +929,8 @@ def _final_report(
             reasoning_dropped,
             prompt_tokens,
             prompt_sha256,
+            prompt_trace_text,
+            prompt_is_full,
         )
 
     parsed = parse_tool_calls(completion.text)
@@ -912,6 +948,8 @@ def _final_report(
         reasoning_dropped,
         prompt_tokens,
         prompt_sha256,
+        prompt_trace_text,
+        prompt_is_full,
     )
 
 
@@ -1173,7 +1211,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             surplus_function_close_tags=parsed.surplus_function_close_tags,
             trailing_text_chars=len(parsed.trailing_text),
             rendered_prompt_sha256=hashlib.sha256(rendered.prompt.encode("utf-8")).hexdigest(),
-            rendered_prompt=rendered.prompt if turn_index == 0 else None,
+            rendered_prompt_text=_rendered_prompt_trace_text(
+                rendered.prompt,
+                previous_prompt,
+                is_full=turn_index == 0 or history_reasoning == "strip",
+            ),
+            rendered_prompt_is_full=turn_index == 0 or history_reasoning == "strip",
         )
         turns.append(turn)
         fabricated_tool_responses += turn.fabricated_tool_responses
@@ -1209,6 +1252,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         final_report_reasoning_dropped,
         final_report_prompt_tokens,
         final_report_prompt_sha256,
+        final_report_prompt_text,
+        final_report_prompt_is_full,
     ) = _final_report(
         backend,
         messages,
@@ -1288,6 +1333,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         final_report=final_report,
         final_report_reasoning=final_report_reasoning,
         final_report_prompt_sha256=final_report_prompt_sha256,
+        final_report_prompt_text=final_report_prompt_text,
+        final_report_prompt_is_full=final_report_prompt_is_full,
         final_report_truncated=final_report_truncated,
         final_report_timed_out=final_report_timed_out,
         final_report_fabricated_tool_responses=final_report_fabricated_tool_responses,
