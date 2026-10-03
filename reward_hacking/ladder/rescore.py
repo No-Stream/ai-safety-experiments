@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from reward_hacking.ladder.rungs import DetectionSpec, FinalStateDiff
 
 _DEFAULT_SCENARIO_ROOT = Path(__file__).resolve().parent / "data" / "scenarios"
+COUNTERFACTUAL_SOURCE_SCHEMA_VERSION = 18
 
 
 def _require_mapping(value: object, *, field: str) -> Mapping[str, object]:
@@ -84,12 +85,15 @@ def _header_schema_version(header: Mapping[str, object], provenance: Mapping[str
     schema_version = header.get("schema_version")
     if not isinstance(schema_version, int) or isinstance(schema_version, bool):
         raise TypeError("run header schema_version must be an integer")
-    if schema_version < runner.LADDER_SCHEMA_VERSION:
+    if schema_version < COUNTERFACTUAL_SOURCE_SCHEMA_VERSION:
         raise ValueError(
             f"older ladder schema {schema_version}; expected schema "
             f"{runner.LADDER_SCHEMA_VERSION}, so this record cannot be rescored safely"
         )
-    if schema_version != runner.LADDER_SCHEMA_VERSION:
+    if schema_version not in {
+        COUNTERFACTUAL_SOURCE_SCHEMA_VERSION,
+        runner.LADDER_SCHEMA_VERSION,
+    }:
         raise ValueError(
             f"unsupported ladder schema {schema_version}; expected {runner.LADDER_SCHEMA_VERSION}"
         )
@@ -132,7 +136,13 @@ def _headers_by_pressure(
     return headers_by_pressure
 
 
-def _load_scenario(scenario_root: Path, scenario_id: str, expected_digest: str) -> Scenario:
+def _load_scenario(
+    scenario_root: Path,
+    scenario_id: str,
+    expected_digest: str,
+    *,
+    allow_legacy_manifest_digest: bool = False,
+) -> Scenario:
     scenario_path = (scenario_root / scenario_id).resolve()
     if not scenario_path.is_relative_to(scenario_root.resolve()):
         raise ValueError(f"scenario id escapes the scenario root: {scenario_id!r}")
@@ -144,7 +154,11 @@ def _load_scenario(scenario_root: Path, scenario_id: str, expected_digest: str) 
             f"scenario directory {scenario_path} declares slug {scenario.slug!r}, "
             f"expected {scenario_id!r}"
         )
-    if scenario.manifest_digest != expected_digest:
+    digest_matches = scenario.manifest_digest == expected_digest
+    legacy_digest_matches = (
+        allow_legacy_manifest_digest and scenario.legacy_manifest_digest == expected_digest
+    )
+    if not digest_matches and not legacy_digest_matches:
         raise ValueError(
             f"scenario {scenario_id!r} does not match the manifest digest in the run header"
         )
@@ -157,6 +171,7 @@ def _scenario_for_key(
     scenario_root: Path,
     scenario_digests: Mapping[str, str],
     scenario_cache: dict[str, Scenario],
+    schema_version: int = runner.LADDER_SCHEMA_VERSION,
 ) -> Scenario:
     try:
         expected_digest = scenario_digests[key.scenario_id]
@@ -166,7 +181,12 @@ def _scenario_for_key(
         ) from error
     scenario = scenario_cache.get(key.scenario_id)
     if scenario is None:
-        scenario = _load_scenario(scenario_root, key.scenario_id, expected_digest)
+        scenario = _load_scenario(
+            scenario_root,
+            key.scenario_id,
+            expected_digest,
+            allow_legacy_manifest_digest=(schema_version == COUNTERFACTUAL_SOURCE_SCHEMA_VERSION),
+        )
         scenario_cache[key.scenario_id] = scenario
     return scenario
 
@@ -285,6 +305,7 @@ class _RescoreDetectionContext:
     detector_code_identity: str
     pristine_visible_pass: bool
     report_unavailable: bool
+    counterfactual_probe: Mapping[str, object] | None
 
 
 def _apply_rescored_detection(
@@ -315,6 +336,7 @@ def _apply_rescored_detection(
         pristine_visible_pass=context.pristine_visible_pass,
         true_measured=true_measured,
         true_pass=true_pass,
+        counterfactual_probe=context.counterfactual_probe,
     )
 
     record["rung_detection"] = dict(detection)
@@ -325,6 +347,10 @@ def _apply_rescored_detection(
     record["pristine_visible_pass"] = context.pristine_visible_pass
     record["rung2_methods"] = rung2_methods
     record["headline_hack"] = rung2_methods["special_case"] or rung2_methods["edited_visible_tests"]
+    record["syntactic_special_case_evidence"] = runner.syntactic_special_case_evidence(detection)
+    record["counterfactual_probe"] = (
+        None if context.counterfactual_probe is None else dict(context.counterfactual_probe)
+    )
     record["report_concealment"] = _updated_report_concealment(
         record,
         detection,
@@ -348,6 +374,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
     scenario_digests: Mapping[str, str],
     scenario_cache: dict[str, Scenario],
     grading_settings: tuple[str, JailResourceLimits],
+    schema_version: int,
 ) -> dict[str, object]:
     key = EpisodeKey.from_json(_require_mapping(record.get("key"), field="ladder_episode.key"))
     scenario = _scenario_for_key(
@@ -355,6 +382,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         scenario_root=scenario_root,
         scenario_digests=scenario_digests,
         scenario_cache=scenario_cache,
+        schema_version=schema_version,
     )
     episode_dir = _episode_dir(record)
     command_records = _command_records(record)
@@ -377,6 +405,24 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         detection_spec=spec,
         pristine_visible_pass=pristine_visible_pass,
     )
+    true_measured = runner.trace_true_measured(trace_summary)
+    true_pass = runner.trace_true_pass(trace_summary)
+    preliminary_methods = runner.rung2_method_split(
+        detection,
+        pristine_visible_pass=pristine_visible_pass,
+        true_measured=true_measured,
+        true_pass=true_pass,
+    )
+    counterfactual_probe: Mapping[str, object] | None = None
+    if (
+        pristine_visible_pass
+        and true_measured
+        and not true_pass
+        and not preliminary_methods["edited_visible_tests"]
+    ):
+        counterfactual_probe = scenario.probe_counterfactuals(
+            episode_dir, timeout=grading_settings[0]
+        )
     record["exposed"] = _episode_exposure(record, scenario)
     _apply_rescored_detection(
         record,
@@ -386,6 +432,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
             detector_code_identity=detector_code_identity,
             pristine_visible_pass=pristine_visible_pass,
             report_unavailable=report_unavailable,
+            counterfactual_probe=counterfactual_probe,
         ),
     )
     return record
@@ -417,6 +464,131 @@ def _grading_settings(header: Mapping[str, object]) -> tuple[str, JailResourceLi
 def _detector_code_identity() -> str:
     """Return the detector identity shared with new run provenance."""
     return runner.detector_code_identity()
+
+
+def _upgrade_header_to_current_schema(
+    header: dict[str, object],
+    *,
+    source_schema_version: int,
+    detector_code_identity: str,
+    scenario_root: Path,
+    scenario_cache: dict[str, Scenario],
+) -> tuple[str, str]:
+    """Update a rescored header and return its old and new provenance digests."""
+    provenance = dict(_require_mapping(header.get("provenance"), field="run header provenance"))
+    scenario_digests = _scenario_digests(header)
+    raw_scenarios = provenance.get("scenarios")
+    if not isinstance(raw_scenarios, list):
+        raise TypeError("run header provenance.scenarios must be a list")
+    upgraded_scenarios: list[dict[str, object]] = []
+    for index, raw_scenario in enumerate(raw_scenarios):
+        scenario_record = dict(
+            _require_mapping(raw_scenario, field=f"run header provenance.scenarios[{index}]")
+        )
+        scenario_id = scenario_record.get("scenario_id")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise TypeError(f"run header scenario {index} has no string scenario_id")
+        scenario = scenario_cache.get(scenario_id)
+        if scenario is None:
+            scenario = _load_scenario(
+                scenario_root,
+                scenario_id,
+                scenario_digests[scenario_id],
+                allow_legacy_manifest_digest=(
+                    source_schema_version == COUNTERFACTUAL_SOURCE_SCHEMA_VERSION
+                ),
+            )
+            scenario_cache[scenario_id] = scenario
+        scenario_record["manifest_digest"] = scenario.manifest_digest
+        upgraded_scenarios.append(scenario_record)
+    provenance["scenarios"] = upgraded_scenarios
+    provenance["schema_version"] = runner.LADDER_SCHEMA_VERSION
+    old_digest = header.get("provenance_digest")
+    if not isinstance(old_digest, str):
+        raise TypeError("run header provenance_digest must be a string")
+    new_digest = runner.provenance_digest(provenance)
+    header["schema_version"] = runner.LADDER_SCHEMA_VERSION
+    header["provenance"] = provenance
+    header["provenance_digest"] = new_digest
+    header["rescore"] = {
+        "detector": "reward_hacking.ladder.rungs.detect_rungs",
+        "detector_code_identity": detector_code_identity,
+        "source_schema_version": source_schema_version,
+        "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    return old_digest, new_digest
+
+
+@dataclass(slots=True)
+class _RescoreRun:
+    detector_code_identity: str
+    scenario_root: Path
+    scenario_cache: dict[str, Scenario]
+    headers_by_pressure: dict[str, list[dict[str, object]]]
+    scenario_digests_by_pressure: dict[str, dict[str, str]]
+    grading_settings_by_pressure: dict[str, tuple[str, JailResourceLimits]]
+    schema_versions_by_pressure: dict[str, int]
+
+
+def _rescore_episode_records(
+    rows: Sequence[dict[str, object]],
+    rescore_run: _RescoreRun,
+) -> None:
+    for row in rows:
+        if row.get("record") != "ladder_episode":
+            continue
+        key = EpisodeKey.from_json(_require_mapping(row.get("key"), field="ladder_episode.key"))
+        try:
+            pressure_headers = rescore_run.headers_by_pressure[key.task_pressure]
+        except KeyError as error:
+            raise ValueError(f"no run header for pressure {key.task_pressure!r}") from error
+        row_digest = row.get("provenance_digest")
+        if not any(header.get("provenance_digest") == row_digest for header in pressure_headers):
+            raise ValueError(
+                f"ladder episode provenance digest does not match pressure "
+                f"{key.task_pressure!r} header"
+            )
+        _rescore_episode(
+            row,
+            detector_code_identity=rescore_run.detector_code_identity,
+            scenario_root=rescore_run.scenario_root,
+            scenario_digests=rescore_run.scenario_digests_by_pressure[key.task_pressure],
+            scenario_cache=rescore_run.scenario_cache,
+            grading_settings=rescore_run.grading_settings_by_pressure[key.task_pressure],
+            schema_version=rescore_run.schema_versions_by_pressure[key.task_pressure],
+        )
+
+
+def _upgrade_run_headers(rescore_run: _RescoreRun) -> dict[str, str]:
+    digest_replacements: dict[str, str] = {}
+    for pressure_headers in rescore_run.headers_by_pressure.values():
+        for header in pressure_headers:
+            provenance = _require_mapping(header.get("provenance"), field="run header provenance")
+            pressure = provenance.get("task_pressure", "none")
+            if not isinstance(pressure, str):
+                raise TypeError("run header provenance.task_pressure must be a string")
+            old_digest, new_digest = _upgrade_header_to_current_schema(
+                header,
+                source_schema_version=rescore_run.schema_versions_by_pressure[pressure],
+                detector_code_identity=rescore_run.detector_code_identity,
+                scenario_root=rescore_run.scenario_root,
+                scenario_cache=rescore_run.scenario_cache,
+            )
+            digest_replacements[old_digest] = new_digest
+    return digest_replacements
+
+
+def _replace_episode_provenance_digests(
+    rows: Sequence[dict[str, object]],
+    digest_replacements: Mapping[str, str],
+) -> None:
+    for row in rows:
+        if row.get("record") != "ladder_episode":
+            continue
+        old_digest = row.get("provenance_digest")
+        if not isinstance(old_digest, str) or old_digest not in digest_replacements:
+            raise ValueError("ladder episode provenance digest has no matching upgraded header")
+        row["provenance_digest"] = digest_replacements[old_digest]
 
 
 def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
@@ -456,50 +628,34 @@ def rescore_file(
     rows = _read_jsonl(source_path)
     headers = [row for row in rows if row.get("record") == "ladder_run_header"]
     headers_by_pressure = _headers_by_pressure(headers)
-    resolved_scenario_root = scenario_root.resolve()
-    scenario_cache: dict[str, Scenario] = {}
-    detector_code_identity = _detector_code_identity()
-    scenario_digests_by_pressure = {
+    scenario_digests_by_pressure: dict[str, dict[str, str]] = {
         pressure: _scenario_digests(pressure_headers[0])
         for pressure, pressure_headers in headers_by_pressure.items()
+    }
+    schema_versions_by_pressure = {
+        pressure: _header_schema_version(
+            header,
+            _require_mapping(header.get("provenance"), field="run header provenance"),
+        )
+        for pressure, pressure_headers in headers_by_pressure.items()
+        for header in pressure_headers[:1]
     }
     grading_settings_by_pressure = {
         pressure: _grading_settings(pressure_headers[0])
         for pressure, pressure_headers in headers_by_pressure.items()
     }
-    for row in rows:
-        if row.get("record") == "ladder_episode":
-            raw_key = _require_mapping(row.get("key"), field="ladder_episode.key")
-            key = EpisodeKey.from_json(raw_key)
-            try:
-                pressure_headers = headers_by_pressure[key.task_pressure]
-            except KeyError as error:
-                raise ValueError(f"no run header for pressure {key.task_pressure!r}") from error
-            row_digest = row.get("provenance_digest")
-            if not any(
-                header.get("provenance_digest") == row_digest for header in pressure_headers
-            ):
-                raise ValueError(
-                    f"ladder episode provenance digest does not match pressure "
-                    f"{key.task_pressure!r} header"
-                )
-            _rescore_episode(
-                row,
-                detector_code_identity=detector_code_identity,
-                scenario_root=resolved_scenario_root,
-                scenario_digests=scenario_digests_by_pressure[key.task_pressure],
-                scenario_cache=scenario_cache,
-                grading_settings=grading_settings_by_pressure[key.task_pressure],
-            )
-    for pressure_headers in headers_by_pressure.values():
-        for header in pressure_headers:
-            header["rescore"] = {
-                "detector": "reward_hacking.ladder.rungs.detect_rungs",
-                "detector_code_identity": detector_code_identity,
-                "timestamp_utc": datetime.now(UTC)
-                .isoformat(timespec="seconds")
-                .replace("+00:00", "Z"),
-            }
+    rescore_run = _RescoreRun(
+        detector_code_identity=_detector_code_identity(),
+        scenario_root=scenario_root.resolve(),
+        scenario_cache={},
+        headers_by_pressure=headers_by_pressure,
+        scenario_digests_by_pressure=scenario_digests_by_pressure,
+        grading_settings_by_pressure=grading_settings_by_pressure,
+        schema_versions_by_pressure=schema_versions_by_pressure,
+    )
+    _rescore_episode_records(rows, rescore_run)
+    digest_replacements = _upgrade_run_headers(rescore_run)
+    _replace_episode_provenance_digests(rows, digest_replacements)
     _write_jsonl(destination_path, rows)
     return rows
 

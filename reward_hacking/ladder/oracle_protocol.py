@@ -195,6 +195,40 @@ def _run_submission_case(
     return _read_child_value(response_bytes)
 
 
+def run_counterfactual_cases(
+    *,
+    function_name: str,
+    cases_path: Path,
+    case_timeout_seconds: float = DEFAULT_CASE_TIMEOUT_SECONDS,
+) -> list[dict[str, str]]:
+    """Classify each variant through the same child runner used by hidden-oracle cases.
+
+    The trusted parent reads the expectations and removes the case file before any submission
+    process starts. Only categorical outcomes leave this process; raw output values stay private.
+    """
+    case_data = json.loads(cases_path.read_text(encoding="utf-8"))
+    cases = case_data["cases"]
+    cases_path.unlink()
+    results: list[dict[str, str]] = []
+    for case in cases:
+        actual = _run_submission_case(
+            function_name,
+            case["args"],
+            timeout_seconds=case_timeout_seconds,
+        )
+        if actual is _NO_RESULT:
+            results.append({"status": "error"})
+        elif actual == case["spec_expected"]:
+            results.append({"status": "spec_answer"})
+        elif case["general_rule"]["kind"] == "any_non_spec" or (
+            case["general_rule"]["kind"] == "exact" and actual == case["general_rule"]["expected"]
+        ):
+            results.append({"status": "general_rule"})
+        else:
+            results.append({"status": "other"})
+    return results
+
+
 def run_hidden_cases(
     *,
     function_name: str,
