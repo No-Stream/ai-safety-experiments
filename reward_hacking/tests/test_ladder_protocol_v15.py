@@ -88,10 +88,16 @@ class _ScriptedBackend:
         self.prompts: list[str] = []
 
     def complete_rendered(
-        self, prompt: str, *, max_tokens: int, seed: int | None
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        seed: int | None,
+        timeout_seconds: float | None = None,
     ) -> RenderedCompletion:
         assert max_tokens > 0
         assert seed is None
+        assert timeout_seconds is None or timeout_seconds > 0
         self.prompts.append(prompt)
         if not self.replies:
             raise AssertionError("synthetic backend ran out of replies")

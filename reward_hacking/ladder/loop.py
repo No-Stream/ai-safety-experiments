@@ -68,9 +68,10 @@ DEFAULT_HISTORY_REASONING: HistoryReasoning = "retain"
 LADDER_MAX_TURNS = 50
 LADDER_MAX_SUBMISSIONS = 3
 REPORT_HISTORY_REASONING_POLICY = "prior_reasoning_as_assistant_text"
-LADDER_EPISODE_SECONDS = 1800.0
+LADDER_EPISODE_SECONDS = 9_000.0
+LADDER_FINAL_REPORT_SECONDS = 300.0
 LADDER_COMMAND_TIMEOUT = "120s"
-LADDER_MAX_NEW_TOKENS = 16_384
+LADDER_MAX_NEW_TOKENS = 8_192
 MIN_CONTEXT_ROOM = 1_024
 MAX_CONSECUTIVE_FORMAT_ERRORS = 3
 VALID_COMPLETION_FINISH_REASONS = frozenset({"stop", "length"})
@@ -117,7 +118,12 @@ class LadderBackend(Protocol):
         ...
 
     def complete_rendered(
-        self, prompt: str, *, max_tokens: int, seed: int | None
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        seed: int | None,
+        timeout_seconds: float | None = None,
     ) -> RenderedCompletion:
         """Complete a prompt already rendered with the model's own chat template."""
         ...
@@ -316,7 +322,7 @@ class LadderEpisodeTrace:
         ]
 
     def summary_record(self) -> dict[str, object]:
-        """Return the compact v16 episode summary while retaining runner and rescore fields."""
+        """Return the compact v18 episode summary while retaining runner and rescore fields."""
         grader = self.final_grade.grader
         return {
             "record": "episode_summary",
@@ -444,7 +450,7 @@ type SubmissionGrader = Callable[[Path], SubmissionVerdict]
 @dataclass(frozen=True, slots=True)
 class _FinalReportContext:
     max_model_len: int
-    deadline: float
+    report_seconds: float
     next_call_number: int
 
 
@@ -820,6 +826,47 @@ def _agent_saw_grader_success(task: Task, turns: Sequence[LadderTurn]) -> bool:
     )
 
 
+def _complete_final_report(
+    backend: LadderBackend,
+    prompt: str,
+    *,
+    max_tokens: int,
+    timeout: float,
+) -> tuple[RenderedCompletion | None, bool]:
+    """Run report sampling with a wall-clock limit that does not block the episode loop."""
+    request_deadline = time.monotonic() + timeout
+    completed = threading.Event()
+    completions: list[RenderedCompletion] = []
+    errors: list[Exception] = []
+
+    def sample() -> None:
+        try:
+            completions.append(
+                backend.complete_rendered(
+                    prompt,
+                    max_tokens=max_tokens,
+                    seed=None,
+                    timeout_seconds=max(0.001, timeout),
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - relay backend failures to the episode thread
+            errors.append(error)
+        finally:
+            completed.set()
+
+    threading.Thread(target=sample, daemon=True, name="ladder-final-report").start()
+    remaining = request_deadline - time.monotonic()
+    if remaining <= 0:
+        return None, True
+    if not completed.wait(remaining) or time.monotonic() >= request_deadline:
+        return None, True
+    if errors:
+        raise errors[0]
+    if not completions:
+        raise RuntimeError("final-report completion worker returned without a result")
+    return completions[0], False
+
+
 def _final_report(
     backend: LadderBackend,
     messages: list[ChatMessage],
@@ -841,6 +888,7 @@ def _final_report(
     bool,
 ]:
     """Sample a report; hash the exact prompt after any context fallback."""
+    report_deadline = time.monotonic() + context.report_seconds
     messages.append({"role": "user", "content": FINAL_REPORT_PROMPT})
     report_prompt_state = (
         replace(
@@ -875,33 +923,34 @@ def _final_report(
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
         prompt_is_full = True
+    if room < 1:
+        prompt = render_prompt(
+            backend.tokenizer,
+            [messages[0], messages[-1]],
+            [],
+        )
+        prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        room = context_room(prompt_tokens, context.max_model_len)
+        prompt_is_full = True
+    if room < 1:
+        prompt = render_prompt(backend.tokenizer, [messages[-1]], [])
+        prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        room = context_room(prompt_tokens, context.max_model_len)
+        prompt_is_full = True
     prompt_trace_text = _rendered_prompt_trace_text(
         prompt,
         prompt_state.previous_prompt,
         is_full=prompt_is_full,
     )
-    if room < MIN_CONTEXT_ROOM:
+    if room < 1:
         return (
             messages,
             None,
             "",
             False,
             False,
-            0,
-            0,
-            reasoning_dropped,
-            prompt_tokens,
-            prompt_sha256,
-            prompt_trace_text,
-            prompt_is_full,
-        )
-    if time.monotonic() >= context.deadline:
-        return (
-            messages,
-            None,
-            "",
-            False,
-            True,
             0,
             0,
             reasoning_dropped,
@@ -911,13 +960,13 @@ def _final_report(
             prompt_is_full,
         )
 
-    completion = backend.complete_rendered(
+    completion, timed_out = _complete_final_report(
+        backend,
         prompt,
         max_tokens=min(LADDER_MAX_NEW_TOKENS, room),
-        seed=None,
+        timeout=max(0.0, report_deadline - time.monotonic()),
     )
-    _validate_completion_finish_reason(completion.finish_reason)
-    if time.monotonic() >= context.deadline:
+    if timed_out:
         return (
             messages,
             None,
@@ -932,6 +981,9 @@ def _final_report(
             prompt_trace_text,
             prompt_is_full,
         )
+    if completion is None:
+        raise RuntimeError("final-report completion did not return a result or time out")
+    _validate_completion_finish_reason(completion.finish_reason)
 
     parsed = parse_tool_calls(completion.text)
     final_report_tool_calls = completion.text.count("<tool_call>")
@@ -1260,7 +1312,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         tools,
         _FinalReportContext(
             max_model_len=max_model_len,
-            deadline=deadline,
+            report_seconds=LADDER_FINAL_REPORT_SECONDS,
             next_call_number=next_call_number,
         ),
         _PromptRenderState(

@@ -42,7 +42,13 @@ def server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     requests: list[dict[str, Any]] = []
-    state: dict[str, Any] = {"status": 200, "finish": "stop", "stop": "</run>", "barrier": None}
+    state: dict[str, Any] = {
+        "status": 200,
+        "finish": "stop",
+        "stop": "</run>",
+        "barrier": None,
+        "client_timeouts": [],
+    }
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         assert request.url.path == "/v1/completions"
@@ -65,6 +71,7 @@ def server(
     client_class = httpx2.Client
 
     def client(**kwargs: Any) -> httpx2.Client:
+        state["client_timeouts"].append(kwargs["timeout"])
         return client_class(transport=httpx2.MockTransport(handle), **kwargs)
 
     monkeypatch.setattr(httpx2, "Client", client)
@@ -373,6 +380,24 @@ def test_complete_rendered_matches_eos_stop_token_from_returned_ids(
     assert requests[0]["stop_token_ids"] == [248044, 248046]
     assert requests[0]["add_special_tokens"] is False
     assert requests[0]["return_token_ids"] is True
+
+
+def test_complete_rendered_accepts_a_per_request_timeout(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, _, state = server
+    state["token_ids"] = [12]
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    backend.complete_rendered(
+        "already rendered prompt",
+        max_tokens=23,
+        seed=None,
+        timeout_seconds=12.5,
+    )
+
+    assert state["client_timeouts"] == [12.5]
 
 
 @pytest.mark.parametrize("stop_reason", [248044, "</run>"])

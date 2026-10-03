@@ -77,10 +77,16 @@ class _ScriptedLadderBackend:
         self.replies = replies
 
     def complete_rendered(
-        self, _prompt: str, *, max_tokens: int, seed: int | None
+        self,
+        _prompt: str,
+        *,
+        max_tokens: int,
+        seed: int | None,
+        timeout_seconds: float | None = None,
     ) -> RenderedCompletion:
         assert max_tokens > 0
         assert seed is None
+        assert timeout_seconds is None or timeout_seconds > 0
         return RenderedCompletion(
             text=self.replies.pop(0),
             finish_reason="stop",

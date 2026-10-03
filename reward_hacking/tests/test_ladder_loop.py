@@ -7,6 +7,7 @@ import json
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,15 +125,23 @@ class ScriptedToolBackend:
         self.tokenizer = cast("PreTrainedTokenizerBase", _FakeTokenizer())
         self.prompts: list[str] = []
         self.max_tokens: list[int] = []
+        self.timeout_seconds: list[float | None] = []
 
     def complete_rendered(
-        self, prompt: str, *, max_tokens: int, seed: int | None
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        seed: int | None,
+        timeout_seconds: float | None = None,
     ) -> RenderedCompletion:
         assert seed is None
-        if self.on_complete is not None:
-            self.on_complete(len(self.prompts), prompt)
+        call_index = len(self.prompts)
         self.prompts.append(prompt)
         self.max_tokens.append(max_tokens)
+        self.timeout_seconds.append(timeout_seconds)
+        if self.on_complete is not None:
+            self.on_complete(call_index, prompt)
         if not self.replies:
             raise AssertionError("scripted backend ran out of replies")
         reply = self.replies.pop(0)
@@ -462,7 +471,7 @@ class TestNativeToolLoop:
         assert trace.turns[0].tool_calls[0].executed
         assert trace.turns[0].stop_reason == "end_turn"
         assert trace.turns[0].matched_stop_token_id == 248046
-        assert backend.max_tokens[0] == 16_384
+        assert backend.max_tokens[0] == 8_192
         assert [record["record"] for record in records_seen_before_report] == ["turn"]
         records = load_trace(trace_path)
         assert [record["record"] for record in records] == ["turn", "episode_summary"]
@@ -799,11 +808,14 @@ class TestNativeToolLoop:
         assert trace.ended_by == "deadline"
         assert trace.deadline_phase == "actions"
         assert trace.turns[0].tool_calls[1].not_executed_reason == "deadline"
+        assert len(backend.prompts) == 2
+        assert trace.final_report == "The marker is ready."
+        assert not trace.report_unavailable
 
-    def test_context_guard_stops_before_sampling(
+    def test_context_guard_stops_agent_turn_but_still_samples_final_report(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        backend = ScriptedToolBackend([])
+        backend = ScriptedToolBackend([_ScriptedReply(_report("Context exhausted."))])
         monkeypatch.setattr(loop, "count_prompt_tokens", lambda _tokenizer, _prompt: 100)
 
         trace = _run_episode(
@@ -813,11 +825,68 @@ class TestNativeToolLoop:
             _EpisodeOptions(max_model_len=1_000),
         )
 
-        assert backend.prompts == []
+        assert len(backend.prompts) == 1
         assert trace.ended_by == "context_exhausted"
         assert trace.deadline_phase is None
         assert trace.context_peak_prompt_tokens == 100
+        assert trace.final_report == "Context exhausted."
+        assert not trace.report_unavailable
+
+    def test_turn_generation_uses_available_context_below_the_token_cap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+                _ScriptedReply(_report("Report.")),
+            ]
+        )
+        monkeypatch.setattr(loop, "count_prompt_tokens", lambda _tokenizer, _prompt: 100)
+
+        _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_model_len=5_000),
+        )
+
+        assert backend.max_tokens[0] == 4_900
+        assert backend.max_tokens[0] <= 8_192
+
+    def test_final_report_has_an_independent_timeout_budget(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        report_started = threading.Event()
+        release_report = threading.Event()
+
+        def block_report(_call_index: int, prompt: str) -> None:
+            if loop.FINAL_REPORT_PROMPT in prompt:
+                report_started.set()
+                release_report.wait(0.2)
+
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+                _ScriptedReply(_report("Late report.")),
+            ],
+            on_complete=block_report,
+        )
+        monkeypatch.setattr(loop, "LADDER_FINAL_REPORT_SECONDS", 0.05, raising=False)
+
+        try:
+            trace = _run_episode(tmp_path, monkeypatch, backend)
+        finally:
+            release_report.set()
+
+        assert report_started.is_set()
+        report_timeout = backend.timeout_seconds[-1]
+        assert report_timeout is not None
+        assert report_timeout <= 0.05
+        assert trace.final_report_timed_out
         assert trace.report_unavailable
+        final_report = trace.summary_record()["final_report"]
+        assert isinstance(final_report, dict)
+        assert final_report["timed_out"] is True
 
     def test_final_report_tool_call_is_counted_but_inert(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

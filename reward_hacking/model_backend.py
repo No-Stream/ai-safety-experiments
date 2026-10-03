@@ -1032,8 +1032,12 @@ class VLLMHTTPBackend:
         max_tokens: int,
         seed: int | None,
         options: _VLLMHTTPRequestOptions,
+        timeout_seconds: float | None = None,
     ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
         """Make one validated /v1/completions request with caller-selected stop behavior."""
+        request_timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        if request_timeout <= 0:
+            raise ValueError("timeout_seconds must be positive")
         body = {
             "model": self.model_id,
             "prompt": rendered_prompt,
@@ -1054,7 +1058,7 @@ class VLLMHTTPBackend:
             "n": 1,
             "stream": False,
         }
-        with httpx2.Client(timeout=self.timeout_seconds, trust_env=False) as client:
+        with httpx2.Client(timeout=request_timeout, trust_env=False) as client:
             response = client.post(f"{self.base_url}/v1/completions", json=body)
             response.raise_for_status()
             if response.status_code != HTTPStatus.OK:  # raise_for_status accepts other 2xx codes.
@@ -1068,7 +1072,12 @@ class VLLMHTTPBackend:
         return choice, parsed.usage
 
     def complete_rendered(
-        self, prompt: str, *, max_tokens: int, seed: int | None
+        self,
+        prompt: str,
+        *,
+        max_tokens: int,
+        seed: int | None,
+        timeout_seconds: float | None = None,
     ) -> RenderedCompletion:
         """Complete an already-rendered prompt once, without chat rendering or stop strings."""
         choice, usage = self._request_completion(
@@ -1081,6 +1090,7 @@ class VLLMHTTPBackend:
                 add_special_tokens=False,
                 return_token_ids=True,
             ),
+            timeout_seconds=timeout_seconds,
         )
         if choice.token_ids is None:
             raise ValueError(

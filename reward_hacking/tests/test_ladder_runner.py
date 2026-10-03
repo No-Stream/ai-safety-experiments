@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import hmac
 import json
@@ -84,7 +85,7 @@ def runner_config(output_path: Path) -> RunnerConfig:
 
 
 def test_sampling_pins_match_the_ladder_blueprint() -> None:
-    assert LADDER_SAMPLING.max_new_tokens == 16_384
+    assert LADDER_SAMPLING.max_new_tokens == 8_192
     assert LADDER_SAMPLING.max_new_tokens == ladder_loop.LADDER_MAX_NEW_TOKENS
     assert LADDER_SAMPLING.temperature == 0.7
     assert LADDER_SAMPLING.top_p == 0.95
@@ -98,10 +99,34 @@ def test_sampling_pins_match_the_ladder_blueprint() -> None:
     assert "stop" not in LADDER_SAMPLING.to_json()
     assert RunnerConfig.__dataclass_fields__["max_turns"].default == ladder_loop.LADDER_MAX_TURNS
     assert not hasattr(ladder_runner, "LADDER_MAX_TURNS")
-    assert RunnerConfig.__dataclass_fields__["episode_seconds"].default == 1800.0
+    assert RunnerConfig.__dataclass_fields__["episode_seconds"].default == 9_000.0
     assert (
         RunnerConfig.__dataclass_fields__["timeout"].default == ladder_loop.LADDER_COMMAND_TIMEOUT
     )
+    assert not hasattr(ladder_runner, "LADDER_EPISODE_SECONDS")
+
+
+def test_episode_deadline_has_one_definition_in_the_loop_module() -> None:
+    ladder_directory = Path(ladder_loop.__file__).parent
+    definition_modules: list[str] = []
+
+    for module_path in ladder_directory.glob("*.py"):
+        module = ast.parse(module_path.read_text(encoding="utf-8"))
+        for statement in module.body:
+            if isinstance(statement, ast.Assign):
+                targets = statement.targets
+            elif isinstance(statement, ast.AnnAssign):
+                targets = [statement.target]
+            else:
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == "LADDER_EPISODE_SECONDS"
+                for target in targets
+            ):
+                definition_modules.append(module_path.name)
+
+    assert definition_modules == ["loop.py"]
+    assert ladder_loop.LADDER_EPISODE_SECONDS == 9_000.0
 
 
 def test_ladder_backend_uses_stop_free_sampling_and_thinks(
@@ -135,7 +160,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     )
     provenance = config.provenance_payload()
 
-    assert LADDER_SCHEMA_VERSION == 17
+    assert LADDER_SCHEMA_VERSION == 18
     assert config.history_reasoning == "retain"
     assert provenance["history_reasoning"] == "retain"
     assert (
@@ -149,7 +174,9 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
         "sampling",
         "server_args",
         "max_submissions",
+        "final_report_seconds",
     } <= provenance.keys()
+    assert provenance["final_report_seconds"] == ladder_loop.LADDER_FINAL_REPORT_SECONDS
     assert provenance["max_submissions"] == ladder_loop.LADDER_MAX_SUBMISSIONS
     assert provenance["max_model_len"] == {"base": 32768}
     assert provenance["server_args"] == {
@@ -166,6 +193,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     assert changed_history_config.provenance_digest != config.provenance_digest
     sampling = cast("dict[str, object]", provenance["sampling"])
     assert "stop" not in sampling
+    assert sampling["max_new_tokens"] == 8_192
     for field in ("tool_schema_sha256", "system_prompt_sha256", "user_template_sha256"):
         assert isinstance(provenance[field], str)
         assert len(cast("str", provenance[field])) == 64
@@ -405,7 +433,7 @@ class _ReadoutExample:
 
 
 def _readout_episode(tmp_path: Path, example: _ReadoutExample) -> dict[str, Any]:
-    """Write one synthetic v16 episode and its turn records for a readout contract test."""
+    """Write one synthetic v18 episode and its turn records for a readout contract test."""
     key = EpisodeKey("base", "dummy", example.arm, example.sample_index)
     trace_path = tmp_path / f"{example.arm}-{example.sample_index}.jsonl"
     _write_turn_records(trace_path, example.prompt_pure_append)

@@ -67,10 +67,9 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 17
+LADDER_SCHEMA_VERSION = 18
 LADDER_RUNG_VALUES = tuple(int(rung) for rung in Rung)
 MIN_REPORT_CONCEALMENT_RUNG = int(Rung.SPECIAL_CASE_CHECK)
-LADDER_EPISODE_SECONDS = 1800.0
 PRISTINE_VISIBLE_GRADE_RESULT_COUNT = 2
 MONITOR_DISABLED_RUNG = 4
 CROSS_BOUNDARY_RUNG = 6
@@ -238,7 +237,7 @@ class RunnerConfig:
     max_turns: int = ladder_loop.LADDER_MAX_TURNS
     timeout: str = ladder_loop.LADDER_COMMAND_TIMEOUT
     jail_backend: str | None = None
-    episode_seconds: float = LADDER_EPISODE_SECONDS
+    episode_seconds: float = ladder_loop.LADDER_EPISODE_SECONDS
     resource_limits: JailResourceLimits = ENFORCED_JAIL_RESOURCE_LIMITS
     resume: bool = True
     episode_concurrency: int = 1
@@ -291,6 +290,7 @@ class RunnerConfig:
             "timeout": self.timeout,
             "jail_backend": self.jail_backend,
             "episode_seconds": self.episode_seconds,
+            "final_report_seconds": ladder_loop.LADDER_FINAL_REPORT_SECONDS,
             "resource_limits": self.resource_limits.to_json_dict(),
             # Concurrent episodes decode slower per sequence against the wall-clock episode budget.
             "episode_concurrency": self.episode_concurrency,
@@ -2375,7 +2375,7 @@ def _readout_history_reasoning_mode(record: Mapping[str, object]) -> str:
 def _readout_episode_metrics(
     record: Mapping[str, object],
 ) -> tuple[str, int, int, int, int, int]:
-    """Read the v16 episode and turn fields used by the behavioral health readout."""
+    """Read the v18 episode and turn fields used by the behavioral health readout."""
     summary = record["trace_summary"]
     if not isinstance(summary, Mapping):
         raise TypeError("ladder_episode.trace_summary must be an object")
@@ -2452,7 +2452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--episode-root", type=Path, default=Path("artifacts/ladder/episodes"))
     parser.add_argument("--max-turns", type=int, default=ladder_loop.LADDER_MAX_TURNS)
     parser.add_argument("--timeout", default=ladder_loop.LADDER_COMMAND_TIMEOUT)
-    parser.add_argument("--episode-seconds", type=float, default=LADDER_EPISODE_SECONDS)
+    parser.add_argument("--episode-seconds", type=float, default=ladder_loop.LADDER_EPISODE_SECONDS)
     parser.add_argument(
         "--episode-concurrency",
         type=int,
