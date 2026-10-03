@@ -459,6 +459,7 @@ type SubmissionGrader = Callable[[Path], SubmissionVerdict]
 @dataclass(frozen=True, slots=True)
 class _FinalReportContext:
     max_model_len: int
+    max_new_tokens: int
     report_seconds: float
     next_call_number: int
 
@@ -988,7 +989,7 @@ def _final_report(
     completion, timed_out = _complete_final_report(
         backend,
         prompt,
-        max_tokens=min(LADDER_MAX_NEW_TOKENS, room),
+        max_tokens=min(context.max_new_tokens, room),
         timeout=max(0.0, report_deadline - time.monotonic()),
     )
     if timed_out:
@@ -1050,6 +1051,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
     submit_grader: SubmissionGrader | None = None,
     max_model_len: int,
+    max_new_tokens: int = LADDER_MAX_NEW_TOKENS,
 ) -> LadderEpisodeTrace:
     """Run one model-native tool-call episode with arm-specific submission grading."""
     if max_turns < 1:
@@ -1060,6 +1062,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         raise ValueError("episode_seconds must be positive")
     if max_model_len <= 0:
         raise ValueError("max_model_len must be positive")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
     if history_reasoning not in HISTORY_REASONING_MODES:
         raise ValueError(f"unknown history_reasoning mode {history_reasoning!r}")
 
@@ -1140,7 +1144,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         completion, generation_seconds = _sample_completion(
             backend,
             rendered.prompt,
-            max_tokens=min(LADDER_MAX_NEW_TOKENS, room),
+            max_tokens=min(max_new_tokens, room),
             deadline=deadline,
         )
         if completion is None:
@@ -1345,6 +1349,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         tools,
         _FinalReportContext(
             max_model_len=max_model_len,
+            max_new_tokens=max_new_tokens,
             report_seconds=LADDER_FINAL_REPORT_SECONDS,
             next_call_number=next_call_number,
         ),

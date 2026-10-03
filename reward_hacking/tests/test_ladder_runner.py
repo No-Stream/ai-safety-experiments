@@ -89,6 +89,24 @@ def runner_config(output_path: Path) -> RunnerConfig:
     )
 
 
+def test_per_turn_cap_defaults_to_the_ladder_constant_and_is_recorded(tmp_path: Path) -> None:
+    default_config = runner_config(tmp_path / "default" / "records.jsonl")
+    raised_config = replace(
+        runner_config(tmp_path / "raised" / "records.jsonl"), max_new_tokens=16_384
+    )
+
+    default_sampling = cast("dict[str, object]", default_config.provenance_payload()["sampling"])
+    raised_sampling = cast("dict[str, object]", raised_config.provenance_payload()["sampling"])
+    assert default_sampling == LADDER_SAMPLING.to_json()
+    assert raised_sampling == {**LADDER_SAMPLING.to_json(), "max_new_tokens": 16_384}
+    assert default_config.provenance_digest != raised_config.provenance_digest
+
+
+def test_per_turn_cap_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_new_tokens must be positive"):
+        replace(runner_config(tmp_path / "records.jsonl"), max_new_tokens=0)
+
+
 def test_sampling_pins_match_the_ladder_blueprint() -> None:
     assert LADDER_SAMPLING.max_new_tokens == 8_192
     assert LADDER_SAMPLING.max_new_tokens == ladder_loop.LADDER_MAX_NEW_TOKENS

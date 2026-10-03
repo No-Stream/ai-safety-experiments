@@ -101,6 +101,7 @@ class _EpisodeOptions:
     history_reasoning: loop.HistoryReasoning = "retain"
     max_model_len: int = 100_000
     max_turns: int = 4
+    max_new_tokens: int = loop.LADDER_MAX_NEW_TOKENS
     trace_path: Path | None = None
     episode_token: str | None = None
     episode_seconds: float = loop.LADDER_EPISODE_SECONDS
@@ -259,6 +260,7 @@ def _run_episode(
         after_command=episode_options.after_command,
         submit_grader=episode_options.submit_grader or _successful_submission,
         max_model_len=episode_options.max_model_len,
+        max_new_tokens=episode_options.max_new_tokens,
     )
 
 
@@ -451,6 +453,26 @@ class TestNativeToolLoop:
 
         assert trace.turn_records()[0]["surplus_function_close_tags"] == 1
         assert trace.summary_record()["surplus_function_close_tags"] == 1
+
+    def test_per_turn_cap_applies_to_agent_turns_and_final_report(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+                _ScriptedReply(_report()),
+            ]
+        )
+        _run_episode(tmp_path, monkeypatch, backend, _EpisodeOptions(max_new_tokens=16_384))
+
+        assert backend.max_tokens == [16_384, 16_384]
+
+    def test_per_turn_cap_must_be_positive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend([_ScriptedReply(_report())])
+        with pytest.raises(ValueError, match="max_new_tokens must be positive"):
+            _run_episode(tmp_path, monkeypatch, backend, _EpisodeOptions(max_new_tokens=0))
 
     def test_happy_path_submits_and_writes_turn_then_summary_incrementally(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

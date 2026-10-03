@@ -269,6 +269,7 @@ class RunnerConfig:
     output_path: Path
     episode_root: Path
     max_turns: int = ladder_loop.LADDER_MAX_TURNS
+    max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
     timeout: str = ladder_loop.LADDER_COMMAND_TIMEOUT
     jail_backend: str | None = None
     episode_seconds: float = ladder_loop.LADDER_EPISODE_SECONDS
@@ -295,6 +296,11 @@ class RunnerConfig:
         """Return persisted provenance; resume ignores only the detector source identity."""
         return deepcopy(self._provenance_payload_cache)
 
+    @property
+    def sampling(self) -> LadderSampling:
+        """Return the shared ladder sampler with this sweep's per-turn token cap."""
+        return replace(LADDER_SAMPLING, max_new_tokens=self.max_new_tokens)
+
     def _build_provenance_payload(self) -> dict[str, object]:
         """Build provenance once, at config creation, before any episode can run."""
         return {
@@ -318,7 +324,7 @@ class RunnerConfig:
             ).hexdigest(),
             "max_model_len": dict(self.max_model_len_by_model),
             "server_args": None if self.server_args is None else deepcopy(dict(self.server_args)),
-            "sampling": LADDER_SAMPLING.to_json(),
+            "sampling": self.sampling.to_json(),
             "max_turns": self.max_turns,
             "max_submissions": ladder_loop.LADDER_MAX_SUBMISSIONS,
             "timeout": self.timeout,
@@ -396,6 +402,8 @@ def _validate_run_bounds(config: RunnerConfig) -> None:
         raise ValueError("samples must be at least one")
     if config.max_turns < 1:
         raise ValueError("max_turns must be at least one")
+    if config.max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
     if config.episode_seconds <= 0:
         raise ValueError("episode_seconds must be positive")
     if config.episode_concurrency < 1:
@@ -1031,16 +1039,17 @@ def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
     )
 
     local_snapshot = _resolve_local_model_path(model)
+    ladder_sampling = config.sampling
     sampling = SamplingConfig(
-        max_new_tokens=LADDER_SAMPLING.max_new_tokens,
-        do_sample=LADDER_SAMPLING.do_sample,
-        temperature=LADDER_SAMPLING.temperature,
-        top_p=LADDER_SAMPLING.top_p,
-        top_k=LADDER_SAMPLING.top_k,
-        min_p=LADDER_SAMPLING.min_p,
-        repetition_penalty=LADDER_SAMPLING.repetition_penalty,
-        presence_penalty=LADDER_SAMPLING.presence_penalty,
-        seed=LADDER_SAMPLING.seed,
+        max_new_tokens=ladder_sampling.max_new_tokens,
+        do_sample=ladder_sampling.do_sample,
+        temperature=ladder_sampling.temperature,
+        top_p=ladder_sampling.top_p,
+        top_k=ladder_sampling.top_k,
+        min_p=ladder_sampling.min_p,
+        repetition_penalty=ladder_sampling.repetition_penalty,
+        presence_penalty=ladder_sampling.presence_penalty,
+        seed=ladder_sampling.seed,
     )
     backend = VLLMHTTPBackend(
         model.server_model_id or model.model_id,
@@ -1237,6 +1246,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
                     )
                 ),
                 max_model_len=max_model_len,
+                max_new_tokens=config.max_new_tokens,
             )
         if pending_start:
             raise RuntimeError("episode ended with an unmatched monitor command start")
@@ -3046,6 +3056,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=Path("artifacts/ladder/records.jsonl"))
     parser.add_argument("--episode-root", type=Path, default=Path("artifacts/ladder/episodes"))
     parser.add_argument("--max-turns", type=int, default=ladder_loop.LADDER_MAX_TURNS)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=ladder_loop.LADDER_MAX_NEW_TOKENS,
+        help="Per-turn generation cap; a turn that reaches it is a runaway and is discarded.",
+    )
     parser.add_argument("--timeout", default=ladder_loop.LADDER_COMMAND_TIMEOUT)
     parser.add_argument("--episode-seconds", type=float, default=ladder_loop.LADDER_EPISODE_SECONDS)
     parser.add_argument(
@@ -3087,6 +3103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path=args.output,
         episode_root=args.episode_root,
         max_turns=args.max_turns,
+        max_new_tokens=args.max_new_tokens,
         timeout=args.timeout,
         episode_seconds=args.episode_seconds,
         episode_concurrency=args.episode_concurrency,
