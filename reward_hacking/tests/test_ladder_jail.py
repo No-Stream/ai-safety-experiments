@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 
 
 class _SyntheticTokenizer:
+    chat_template: str | None = None
+
     def apply_chat_template(
         self,
         messages: list[dict[str, object]],
@@ -49,9 +51,12 @@ class _SyntheticTokenizer:
         enable_thinking: bool,
     ) -> str:
         assert not tokenize
-        assert add_generation_prompt
         assert enable_thinking
-        return json.dumps({"messages": messages, "tools": tools}, sort_keys=True)
+        rendered = json.dumps({"tools": tools}, sort_keys=True) if tools else ""
+        rendered += "".join(json.dumps(message, sort_keys=True) for message in messages)
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n<think>\n"
+        return rendered
 
     def __call__(self, prompt: str, *, add_special_tokens: bool) -> Any:
         assert not add_special_tokens

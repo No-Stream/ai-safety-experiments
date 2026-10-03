@@ -9,10 +9,14 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
 from conftest import needs_jail
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
@@ -23,7 +27,6 @@ from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from transformers import PreTrainedTokenizerBase
 
@@ -36,6 +39,8 @@ class _Tokenized:
 
 
 class _FakeTokenizer:
+    chat_template: str | None = None
+
     def __init__(self) -> None:
         self.rendered_messages: list[list[dict[str, object]]] = []
         self.rendered_tools: list[list[dict[str, object]]] = []
@@ -50,13 +55,15 @@ class _FakeTokenizer:
         enable_thinking: bool,
     ) -> str:
         assert not tokenize
-        assert add_generation_prompt
         assert enable_thinking
-        self.rendered_messages.append(json.loads(json.dumps(messages)))
-        self.rendered_tools.append(json.loads(json.dumps(tools)))
-        return json.dumps({"messages": messages, "tools": tools}, sort_keys=True) + (
-            "<|im_start|>assistant\n<think>\n"
-        )
+        if tools:
+            self.rendered_messages.append(json.loads(json.dumps(messages)))
+            self.rendered_tools.append(json.loads(json.dumps(tools)))
+        rendered = json.dumps({"tools": tools}, sort_keys=True) if tools else ""
+        rendered += "".join(json.dumps(message, sort_keys=True) for message in messages)
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n<think>\n"
+        return rendered
 
     def __call__(self, prompt: str, *, add_special_tokens: bool) -> _Tokenized:
         assert not add_special_tokens
@@ -240,7 +247,176 @@ def _run_episode(
     )
 
 
+def _empty_assistant_completion(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: list[dict[str, object]],
+    tools: list[dict[str, object]],
+) -> str:
+    generation_prefix = chat.render_prompt(tokenizer, messages, tools)
+    empty_assistant = {
+        "role": "assistant",
+        "reasoning_content": "",
+        "content": "",
+        "tool_calls": [],
+    }
+    rendered_empty_turn = chat.render_prompt(
+        tokenizer,
+        [*messages, empty_assistant],
+        tools,
+        add_generation_prompt=False,
+    )
+    if rendered_empty_turn.startswith(generation_prefix):
+        return rendered_empty_turn[len(generation_prefix) :]
+
+    # TMAX renders an empty historical assistant without a think block. Derive the open-generation
+    # closure from the same template branch by removing a canary reasoning string.
+    canary_reasoning = "__empty_assistant_reasoning_canary__"
+    rendered_canary_turn = chat.render_prompt(
+        tokenizer,
+        [*messages, {**empty_assistant, "reasoning_content": canary_reasoning}],
+        tools,
+        add_generation_prompt=False,
+    )
+    assert rendered_canary_turn.startswith(generation_prefix)
+    completion = rendered_canary_turn[len(generation_prefix) :]
+    assert completion.startswith(canary_reasoning)
+    return completion[len(canary_reasoning) :]
+
+
+def _assistant_terminator_suffix(tokenizer: PreTrainedTokenizerBase) -> str:
+    messages: list[dict[str, object]] = [{"role": "user", "content": "fixture task"}]
+    tools = [loop.bash_tool()]
+    generation_prefix = chat.render_prompt(tokenizer, messages, tools)
+    content_canary = "__assistant_terminator_content_canary__"
+    rendered_turn = chat.render_prompt(
+        tokenizer,
+        [
+            *messages,
+            {
+                "role": "assistant",
+                "reasoning_content": "__assistant_terminator_reasoning_canary__",
+                "content": content_canary,
+                "tool_calls": [],
+            },
+        ],
+        tools,
+        add_generation_prompt=False,
+    )
+    assert rendered_turn.startswith(generation_prefix)
+    completion = rendered_turn[len(generation_prefix) :]
+    content_end = completion.index(content_canary) + len(content_canary)
+    return completion[content_end:]
+
+
+def _assert_runaway_prompts(
+    trace: loop.LadderEpisodeTrace,
+    backend: ScriptedToolBackend,
+    tokenizer: PreTrainedTokenizerBase,
+    history_reasoning: loop.HistoryReasoning,
+) -> None:
+    runaway_turn = trace.turns[3]
+    assert runaway_turn.runaway
+    assert "UNIQUE_RUNAWAY_MARKER" in runaway_turn.raw_completion
+    assert trace.turn_records()[3]["raw_completion"] == runaway_turn.raw_completion
+    assert all("UNIQUE_RUNAWAY_MARKER" not in prompt for prompt in backend.prompts[4:])
+    assert any(
+        message.get("role") == "user" and message.get("content") == loop.EMPTY_START_NUDGE
+        for message in trace.messages
+    )
+
+    if history_reasoning == "retain":
+        assert all("first retained reasoning" in prompt for prompt in backend.prompts[1:])
+        assert all("second retained reasoning" in prompt for prompt in backend.prompts[2:])
+        assert all("third retained reasoning" in prompt for prompt in backend.prompts[3:])
+        normal_terminator_suffix = _assistant_terminator_suffix(tokenizer)
+        for prompt_index, turn in enumerate(trace.turns[:3]):
+            assert backend.prompts[prompt_index + 1].startswith(
+                backend.prompts[prompt_index] + turn.raw_completion + normal_terminator_suffix
+            )
+        assert all(turn.prompt_pure_append for turn in trace.turns[1:])
+        assert backend.prompts[5].startswith(
+            backend.prompts[4] + trace.turns[4].raw_completion + normal_terminator_suffix
+        )
+
+        runaway_user_position = next(
+            index
+            for index, message in enumerate(trace.messages)
+            if message.get("role") == "user"
+            and message.get("content") == loop.RUNAWAY_FORMAT_ERROR_MESSAGE
+        )
+        empty_assistant_suffix = _empty_assistant_completion(
+            tokenizer,
+            list(trace.messages[: runaway_user_position - 1]),
+            [loop.bash_tool()],
+        )
+        assert backend.prompts[4] == (
+            backend.prompts[3]
+            + empty_assistant_suffix
+            + chat.render_prompt_continuation(
+                tokenizer,
+                [trace.messages[runaway_user_position]],
+            )
+        )
+        assert trace.turns[4].prompt_pure_append
+    else:
+        assert not any(
+            message.get("role") == "assistant"
+            and message.get("reasoning_content") == ""
+            and message.get("content") == ""
+            for message in trace.messages
+        )
+
+
 class TestNativeToolLoop:
+    @pytest.mark.parametrize(
+        "template_name",
+        ["qwen3_5_chat_template.jinja", "tmax_chat_template.jinja"],
+        ids=("qwen", "tmax"),
+    )
+    @pytest.mark.parametrize("history_reasoning", ["retain", "strip"])
+    def test_runaway_text_never_reappears_in_later_prompts(
+        self,
+        template_name: str,
+        history_reasoning: loop.HistoryReasoning,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        template_path = Path(__file__).parent / "data" / template_name
+        unknown_token_name = "<unknown>"
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(
+                WordLevel({unknown_token_name: 0}, unk_token=unknown_token_name)
+            )
+        )
+        tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply("<think>first retained reasoning</think>answer"),
+                _ScriptedReply(
+                    _bash("touch first.txt").replace("reasoning", "second retained reasoning")
+                ),
+                _ScriptedReply(
+                    _bash("touch second.txt").replace("reasoning", "third retained reasoning")
+                ),
+                _ScriptedReply(
+                    "<think>UNIQUE_RUNAWAY_MARKER that must stay out of all later prompts",
+                    finish_reason="length",
+                ),
+                _ScriptedReply("<think>post-runaway reasoning</think>Nothing more."),
+                _ScriptedReply(_report("The episode is recorded.")),
+            ]
+        )
+        backend.tokenizer = cast("PreTrainedTokenizerBase", tokenizer)
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_turns=5, history_reasoning=history_reasoning),
+        )
+
+        _assert_runaway_prompts(trace, backend, tokenizer, history_reasoning)
+
     def test_surplus_function_close_tags_are_recorded_on_turn_and_episode_summary(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -864,38 +1040,32 @@ class TestNativeToolLoop:
     def test_final_report_drops_reasoning_if_report_prompt_lacks_room(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        original_render = loop.render_prompt
+        original_render = loop._render_prompt_for_history
 
         def render_with_large_report(
             tokenizer: _FakeTokenizer,
             messages: list[dict[str, object]],
             tools: list[dict[str, object]],
-            *,
-            enable_thinking: bool = True,
+            prompt_state: loop._PromptRenderState,
         ) -> str:
             rendered = original_render(
                 cast("PreTrainedTokenizerBase", tokenizer),
                 messages,
                 tools,
-                enable_thinking=enable_thinking,
+                prompt_state,
             )
-            if any(
-                message.get("role") == "user"
-                and "The episode is over." in str(message.get("content"))
-                for message in messages
-            ):
-                return rendered + (
-                    " retained " * 1500
-                    if any(
-                        "reasoning_content" in message
-                        or str(message.get("content", "")).startswith("Prior reasoning:")
-                        for message in messages
-                    )
-                    else ""
+            if (
+                any(
+                    message.get("role") == "user"
+                    and "The episode is over." in str(message.get("content"))
+                    for message in messages
                 )
+                and prompt_state.history_reasoning == "retain"
+            ):
+                return rendered + " retained " * 1500
             return rendered
 
-        monkeypatch.setattr(loop, "render_prompt", render_with_large_report)
+        monkeypatch.setattr(loop, "_render_prompt_for_history", render_with_large_report)
         backend = ScriptedToolBackend(
             [
                 _ScriptedReply(_bash("touch marker.txt")),
@@ -944,17 +1114,29 @@ class TestNativeToolLoop:
         assert summary_messages[-1]["content"] == "The marker is ready."
 
         tokenizer = cast("_FakeTokenizer", backend.tokenizer)
-        tools = tokenizer.rendered_tools[0]
-        message_count = 2
-        for turn in trace.turns:
-            replayed_prompt = chat.render_prompt(
-                cast("PreTrainedTokenizerBase", tokenizer),
-                summary_messages[:message_count],
-                tools,
-            )
+        replayed_prompt = trace.turns[0].rendered_prompt
+        assert replayed_prompt is not None
+        assistant_position = 2
+        for turn_index, turn in enumerate(trace.turns):
             replayed_sha256 = hashlib.sha256(replayed_prompt.encode("utf-8")).hexdigest()
             assert replayed_sha256 == turn.rendered_prompt_sha256
-            message_count += 1 + len(turn.tool_results)
+            if turn_index + 1 < len(trace.turns):
+                next_assistant_position = next(
+                    index
+                    for index in range(assistant_position + 1, len(summary_messages))
+                    if summary_messages[index].get("role") == "assistant"
+                )
+                appended_messages = summary_messages[
+                    assistant_position + 1 : next_assistant_position
+                ]
+                replayed_prompt = (
+                    replayed_prompt
+                    + turn.raw_completion
+                    + chat.render_prompt_continuation(
+                        cast("PreTrainedTokenizerBase", tokenizer), appended_messages
+                    )
+                )
+                assistant_position = next_assistant_position
 
 
 class TestPersistentShell:

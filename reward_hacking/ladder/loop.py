@@ -30,7 +30,10 @@ from reward_hacking.ladder.chat import (
     context_room,
     count_prompt_tokens,
     is_pure_append,
+    render_assistant_terminator_suffix,
+    render_empty_assistant_completion,
     render_prompt,
+    render_prompt_continuation,
     strip_reasoning,
     template_identity,
 )
@@ -404,6 +407,15 @@ class _RenderedTurn:
 
 
 @dataclass(frozen=True, slots=True)
+class _PromptRenderState:
+    history_reasoning: HistoryReasoning
+    previous_prompt: str | None = None
+    previous_completion: str | None = None
+    appended_messages: tuple[Mapping[str, object], ...] = ()
+    runaway_message_positions: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class _CommandContext:
     episode_dir: Path
     timeout: str
@@ -491,29 +503,58 @@ def _assistant_message(parsed: ParsedTurn, *, first_call_number: int) -> tuple[C
     )
 
 
-def _report_prompt_messages(
-    messages: Sequence[ChatMessage], *, history_reasoning: HistoryReasoning
+def _prompt_messages(
+    messages: Sequence[ChatMessage],
+    *,
+    history_reasoning: HistoryReasoning,
+    runaway_message_positions: Sequence[int] = (),
 ) -> list[ChatMessage]:
-    """Apply the same explicit reasoning-history rule before either model template renders."""
+    """Copy policy history for template rendering, applying the explicit strip mode."""
     if history_reasoning not in HISTORY_REASONING_MODES:
         raise ValueError(f"unknown history_reasoning mode {history_reasoning!r}")
     if history_reasoning == "strip":
-        return strip_reasoning(copy.deepcopy(messages))
+        runaway_positions = set(runaway_message_positions)
+        visible_messages = [
+            message for index, message in enumerate(messages) if index not in runaway_positions
+        ]
+        return strip_reasoning(copy.deepcopy(visible_messages))
+    return copy.deepcopy(list(messages))
 
-    report_messages = list(copy.deepcopy(messages))
-    for message in report_messages:
-        if message.get("role") != "assistant":
-            continue
-        reasoning = message.get("reasoning_content")
-        if not isinstance(reasoning, str) or not reasoning:
-            continue
-        content = message.get("content", "")
-        if not isinstance(content, str):
-            raise TypeError(f"assistant history has non-string content: {content!r}")
-        prior_reasoning = f"Prior reasoning:\n{reasoning}"
-        message["content"] = f"{prior_reasoning}\n\n{content}" if content else prior_reasoning
-        message.pop("reasoning_content")
-    return report_messages
+
+def _render_prompt_for_history(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: Sequence[ChatMessage],
+    tools: Sequence[Mapping[str, object]],
+    prompt_state: _PromptRenderState,
+) -> str:
+    """Render policy-visible history using the same retain or strip rule at every turn."""
+    if prompt_state.history_reasoning not in HISTORY_REASONING_MODES:
+        raise ValueError(f"unknown history_reasoning mode {prompt_state.history_reasoning!r}")
+    if (prompt_state.previous_prompt is None) != (prompt_state.previous_completion is None):
+        raise ValueError("previous prompt and completion must be supplied together")
+    if prompt_state.previous_prompt is None and prompt_state.appended_messages:
+        raise ValueError("appended prompt messages require a previous prompt and completion")
+    if prompt_state.appended_messages and list(
+        messages[-len(prompt_state.appended_messages) :]
+    ) != list(prompt_state.appended_messages):
+        raise ValueError("appended prompt messages must match the conversation suffix")
+    if prompt_state.history_reasoning == "retain" and prompt_state.previous_prompt is not None:
+        if prompt_state.previous_completion is None:
+            raise ValueError("previous prompt and completion must be supplied together")
+        return (
+            prompt_state.previous_prompt
+            + prompt_state.previous_completion
+            + render_prompt_continuation(tokenizer, prompt_state.appended_messages)
+        )
+    return render_prompt(
+        tokenizer,
+        _prompt_messages(
+            messages,
+            history_reasoning=prompt_state.history_reasoning,
+            runaway_message_positions=prompt_state.runaway_message_positions,
+        ),
+        tools,
+    )
 
 
 def _shell_marker() -> str:
@@ -607,18 +648,21 @@ def _execute_bash(
 
 def _render_turn_prompt(
     backend: LadderBackend,
-    messages: Sequence[Mapping[str, object]],
+    messages: Sequence[ChatMessage],
     tools: Sequence[Mapping[str, object]],
-    *,
-    previous_prompt: str | None,
-    previous_completion: str | None,
+    prompt_state: _PromptRenderState,
 ) -> _RenderedTurn:
-    prompt = render_prompt(backend.tokenizer, messages, tools)
+    prompt = _render_prompt_for_history(
+        backend.tokenizer,
+        messages,
+        tools,
+        prompt_state,
+    )
     prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
     prompt_pure_append = (
         True
-        if previous_prompt is None or previous_completion is None
-        else is_pure_append(previous_prompt, previous_completion, prompt)
+        if prompt_state.previous_prompt is None or prompt_state.previous_completion is None
+        else is_pure_append(prompt_state.previous_prompt, prompt_state.previous_completion, prompt)
     )
     return _RenderedTurn(prompt, prompt_tokens, prompt_pure_append)
 
@@ -762,8 +806,7 @@ def _final_report(
     messages: list[ChatMessage],
     tools: Sequence[Mapping[str, object]],
     context: _FinalReportContext,
-    *,
-    history_reasoning: HistoryReasoning,
+    prompt_state: _PromptRenderState,
 ) -> tuple[
     list[ChatMessage],
     str | None,
@@ -778,14 +821,30 @@ def _final_report(
 ]:
     """Sample a report; hash the exact prompt after any context fallback."""
     messages.append({"role": "user", "content": FINAL_REPORT_PROMPT})
-    report_prompt_messages = _report_prompt_messages(messages, history_reasoning=history_reasoning)
-    prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
+    report_prompt_state = (
+        replace(
+            prompt_state,
+            appended_messages=(*prompt_state.appended_messages, messages[-1]),
+        )
+        if prompt_state.previous_prompt is not None
+        else prompt_state
+    )
+    prompt = _render_prompt_for_history(
+        backend.tokenizer,
+        messages,
+        tools,
+        report_prompt_state,
+    )
     prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     reasoning_dropped = False
     room = context_room(prompt_tokens, context.max_model_len)
-    if room < MIN_CONTEXT_ROOM and history_reasoning == "retain":
-        report_prompt_messages = strip_reasoning(copy.deepcopy(messages))
+    if room < MIN_CONTEXT_ROOM and prompt_state.history_reasoning == "retain":
+        report_prompt_messages = _prompt_messages(
+            messages,
+            history_reasoning="strip",
+            runaway_message_positions=prompt_state.runaway_message_positions,
+        )
         reasoning_dropped = True
         prompt = render_prompt(backend.tokenizer, report_prompt_messages, tools)
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
@@ -937,19 +996,24 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     peak_prompt_tokens = 0
     previous_prompt: str | None = None
     previous_completion: str | None = None
+    pending_prompt_messages: list[ChatMessage] = []
+    runaway_message_positions: list[int] = []
     shell_state = _ShellState()
     next_call_number = 0
 
     for turn_index in range(max_turns):
-        prompt_messages = (
-            strip_reasoning(copy.deepcopy(messages)) if history_reasoning == "strip" else messages
+        prompt_state = _PromptRenderState(
+            history_reasoning=history_reasoning,
+            previous_prompt=previous_prompt,
+            previous_completion=previous_completion,
+            appended_messages=tuple(pending_prompt_messages),
+            runaway_message_positions=tuple(runaway_message_positions),
         )
         rendered = _render_turn_prompt(
             backend,
-            prompt_messages,
+            messages,
             tools,
-            previous_prompt=previous_prompt,
-            previous_completion=previous_completion,
+            prompt_state,
         )
         peak_prompt_tokens = max(peak_prompt_tokens, rendered.prompt_tokens)
         room = context_room(rendered.prompt_tokens, max_model_len)
@@ -996,12 +1060,20 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         assistant_message, next_call_number = _assistant_message(
             parsed, first_call_number=next_call_number
         )
+        assistant_message_position = len(messages)
+        runaway_completion = (
+            render_empty_assistant_completion(backend.tokenizer, messages, tools)
+            if runaway and history_reasoning == "retain"
+            else ""
+        )
 
         if format_error is not None:
             format_errors += 1
             format_errors_in_a_row += 1
             if runaway:
-                messages.append(assistant_message)
+                if history_reasoning == "retain":
+                    runaway_message_positions.append(len(messages))
+                    messages.append(assistant_message)
                 messages.append({"role": "user", "content": RUNAWAY_FORMAT_ERROR_MESSAGE})
             elif completion.finish_reason == "length":
                 messages.append(assistant_message)
@@ -1077,6 +1149,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             else:
                 ended_by = "no_tool_call"
 
+        pending_prompt_messages = messages[assistant_message_position + 1 :]
+
         turn = LadderTurn(
             index=turn_index,
             raw_completion=completion.text,
@@ -1107,7 +1181,16 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             trace_path, turn.to_json_dict(episode_id=episode_id, task_id=task.task_id)
         )
         previous_prompt = rendered.prompt
-        previous_completion = completion.text
+        if runaway:
+            previous_completion = runaway_completion
+        elif history_reasoning == "retain" and backend.tokenizer.chat_template is not None:
+            previous_completion = completion.text + render_assistant_terminator_suffix(
+                backend.tokenizer,
+                messages[:assistant_message_position],
+                tools,
+            )
+        else:
+            previous_completion = completion.text
 
         if ended_by is not None:
             break
@@ -1135,7 +1218,13 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             deadline=deadline,
             next_call_number=next_call_number,
         ),
-        history_reasoning=history_reasoning,
+        _PromptRenderState(
+            history_reasoning=history_reasoning,
+            previous_prompt=previous_prompt,
+            previous_completion=previous_completion,
+            appended_messages=tuple(pending_prompt_messages),
+            runaway_message_positions=tuple(runaway_message_positions),
+        ),
     )
     report_unavailable = final_report is None or not final_report.strip()
     peak_prompt_tokens = max(peak_prompt_tokens, final_report_prompt_tokens)

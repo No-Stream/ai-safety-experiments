@@ -25,11 +25,14 @@ from reward_hacking.ladder.chat import (
     count_prompt_tokens,
     fetch_max_model_len,
     is_pure_append,
+    render_assistant_terminator_suffix,
+    render_empty_assistant_completion,
     render_prompt,
+    render_prompt_continuation,
     strip_reasoning,
     template_identity,
 )
-from reward_hacking.ladder.loop import _report_prompt_messages
+from reward_hacking.ladder.loop import _PromptRenderState, _render_prompt_for_history
 
 DATA_DIR = Path(__file__).parent / "data"
 TEMPLATE_PATHS = (
@@ -93,6 +96,75 @@ def _render_closed_turn(tokenizer: PreTrainedTokenizerFast, messages: list[dict[
     return rendered
 
 
+def _render_history_prompt(
+    tokenizer: PreTrainedTokenizerFast,
+    messages: list[dict[str, Any]],
+    prompt_state: _PromptRenderState,
+) -> str:
+    return _render_prompt_for_history(tokenizer, messages, TEST_TOOLS, prompt_state)
+
+
+def _append_tool_turn(
+    tokenizer: PreTrainedTokenizerFast,
+    messages: list[dict[str, Any]],
+    previous_prompt: str,
+    assistant_message: dict[str, Any],
+    tool_result: dict[str, str],
+) -> str:
+    closed_turn = _render_closed_turn(tokenizer, [*messages, assistant_message])
+    assert closed_turn.startswith(previous_prompt)
+    completion = closed_turn[len(previous_prompt) :]
+    messages.extend([assistant_message, tool_result])
+    prompt = _render_history_prompt(
+        tokenizer,
+        messages,
+        _PromptRenderState("retain", previous_prompt, completion, (tool_result,)),
+    )
+    assert is_pure_append(previous_prompt, completion, prompt)
+    assert prompt == render_prompt(tokenizer, messages, TEST_TOOLS)
+    return prompt
+
+
+def _assistant_completion(
+    tokenizer: PreTrainedTokenizerFast,
+    messages: list[dict[str, Any]],
+    assistant_message: dict[str, Any],
+) -> str:
+    generation_prefix = render_prompt(tokenizer, messages, TEST_TOOLS)
+    completed_turn = _render_closed_turn(tokenizer, [*messages, assistant_message])
+    assert completed_turn.startswith(generation_prefix)
+    return completed_turn[len(generation_prefix) :]
+
+
+def _assert_reasoning_is_stripped(
+    tokenizer: PreTrainedTokenizerFast,
+    messages: list[dict[str, Any]],
+    prior_reasoning: list[str],
+    runaway_assistant_position: int,
+) -> None:
+    for history in (messages[:4], messages[:6], messages[:8], messages[:10], messages):
+        runaway_positions = (
+            (runaway_assistant_position,) if len(history) > runaway_assistant_position else ()
+        )
+        stripped_prompt = _render_history_prompt(
+            tokenizer,
+            history,
+            _PromptRenderState("strip", runaway_message_positions=runaway_positions),
+        )
+        assert all(reasoning not in stripped_prompt for reasoning in prior_reasoning)
+        if runaway_positions:
+            messages_without_runaway = [
+                message
+                for index, message in enumerate(history)
+                if index != runaway_assistant_position
+            ]
+            assert stripped_prompt == render_prompt(
+                tokenizer,
+                strip_reasoning(messages_without_runaway),
+                TEST_TOOLS,
+            )
+
+
 def test_render_prompt_uses_tool_schema_and_thinking_template(
     tokenizer: PreTrainedTokenizerFast,
 ) -> None:
@@ -142,50 +214,103 @@ def test_pure_append_holds_across_two_tool_turns(tokenizer: PreTrainedTokenizerF
     assert is_pure_append(second_prompt, second_completion, third_prompt)
 
 
-def test_mid_conversation_user_message_drops_qwen_reasoning_and_breaks_prefix() -> None:
-    prior_messages = [
-        *_messages(),
-        _assistant_call("retained reasoning marker", "one"),
-        {"role": "tool", "content": "one"},
-    ]
-    qwen_tokenizer = _tokenizer(TEMPLATE_PATHS[0])
-    tmax_tokenizer = _tokenizer(TEMPLATE_PATHS[1])
-    prior_qwen_prompt = render_prompt(qwen_tokenizer, prior_messages, TEST_TOOLS)
-    qwen_messages = [*prior_messages, {"role": "user", "content": "follow-up"}]
-    qwen_prompt = render_prompt(qwen_tokenizer, qwen_messages, TEST_TOOLS)
-    tmax_prompt = render_prompt(tmax_tokenizer, qwen_messages, TEST_TOOLS)
+def test_reasoning_history_is_retained_through_turns_runaway_nudge_and_report(
+    tokenizer: PreTrainedTokenizerFast,
+) -> None:
+    messages = _messages()
+    prompt = _render_history_prompt(tokenizer, messages, _PromptRenderState("retain"))
+    assert render_assistant_terminator_suffix(tokenizer, messages, TEST_TOOLS) == "<|im_end|>\n"
+    prior_reasoning: list[str] = []
 
-    assert "retained reasoning marker" not in qwen_prompt
-    assert "retained reasoning marker" in tmax_prompt
-    assert not is_pure_append(prior_qwen_prompt, "assistant completion", qwen_prompt)
+    first_assistant = _assistant_call("first retained reasoning", "one")
+    first_tool_result = {"role": "tool", "content": "one"}
+    prior_reasoning.append("first retained reasoning")
+    prompt = _append_tool_turn(tokenizer, messages, prompt, first_assistant, first_tool_result)
+    assert all(reasoning in prompt for reasoning in prior_reasoning)
 
+    second_assistant = _assistant_call("second retained reasoning", "two")
+    second_tool_result = {"role": "tool", "content": "two"}
+    prior_reasoning.append("second retained reasoning")
+    prompt = _append_tool_turn(tokenizer, messages, prompt, second_assistant, second_tool_result)
+    assert all(reasoning in prompt for reasoning in prior_reasoning)
 
-def test_report_turn_retains_reasoning_with_the_same_policy_for_both_templates() -> None:
-    prior_messages: list[dict[str, object]] = [
-        *_messages(),
-        _assistant_call("retained report reasoning marker", "one"),
-        {"role": "tool", "content": "one"},
-        {"role": "user", "content": "Write the final report."},
-    ]
+    empty_runaway_assistant = {
+        "role": "assistant",
+        "reasoning_content": "",
+        "content": "",
+        "tool_calls": [],
+    }
+    runaway_user_message = {"role": "user", "content": "synthetic runaway format error"}
+    runaway_assistant_position = len(messages)
+    empty_assistant_suffix = render_empty_assistant_completion(
+        tokenizer,
+        messages,
+        TEST_TOOLS,
+    )
+    runaway_suffix_messages = [empty_runaway_assistant, runaway_user_message]
+    messages.extend(runaway_suffix_messages)
+    runaway_prompt = _render_history_prompt(
+        tokenizer,
+        messages,
+        _PromptRenderState("retain", prompt, empty_assistant_suffix, (runaway_user_message,)),
+    )
+    assert is_pure_append(prompt, empty_assistant_suffix, runaway_prompt)
+    assert runaway_prompt == (
+        prompt
+        + empty_assistant_suffix
+        + render_prompt_continuation(tokenizer, [runaway_user_message])
+    )
+    assert "RUNAWAY_TEXT_MUST_NOT_REENTER_HISTORY" not in runaway_prompt
+    assert all(reasoning in runaway_prompt for reasoning in prior_reasoning)
+    assert empty_assistant_suffix == "\n</think>\n\n<|im_end|>\n"
+    assert empty_assistant_suffix.endswith("<|im_end|>\n")
+    assert empty_assistant_suffix.count("<|im_end|>") == 1
+    prompt = runaway_prompt
 
-    report_messages = _report_prompt_messages(prior_messages, history_reasoning="retain")
-    qwen_prompt = render_prompt(_tokenizer(TEMPLATE_PATHS[0]), report_messages, TEST_TOOLS)
-    tmax_prompt = render_prompt(_tokenizer(TEMPLATE_PATHS[1]), report_messages, TEST_TOOLS)
+    empty_start_assistant = {
+        "role": "assistant",
+        "reasoning_content": "empty-start retained reasoning",
+        "content": "answer",
+        "tool_calls": [],
+    }
+    empty_start_nudge = {"role": "user", "content": "synthetic empty-start nudge"}
+    messages.extend([empty_start_assistant, empty_start_nudge])
+    empty_start_completion = _assistant_completion(tokenizer, messages[:-2], empty_start_assistant)
+    prior_reasoning.append("empty-start retained reasoning")
+    next_prompt = _render_history_prompt(
+        tokenizer,
+        messages,
+        _PromptRenderState("retain", prompt, empty_start_completion, (empty_start_nudge,)),
+    )
+    assert is_pure_append(prompt, empty_start_completion, next_prompt)
+    assert all(reasoning in next_prompt for reasoning in prior_reasoning)
+    prompt = next_prompt
 
-    assert "retained report reasoning marker" in qwen_prompt
-    assert "retained report reasoning marker" in tmax_prompt
-    report_content = report_messages[2]["content"]
-    assert isinstance(report_content, str)
-    assert report_content.startswith("Prior reasoning:\n")
-    assert "reasoning_content" not in report_messages[2]
-    assert prior_messages[2]["content"] == ""
-    assert prior_messages[2]["reasoning_content"] == "retained report reasoning marker"
+    final_turn_assistant = {
+        "role": "assistant",
+        "reasoning_content": "final-turn retained reasoning",
+        "content": "done",
+        "tool_calls": [],
+    }
+    report_request = {"role": "user", "content": "fixture report request"}
+    messages.extend([final_turn_assistant, report_request])
+    final_turn_completion = _assistant_completion(tokenizer, messages[:-2], final_turn_assistant)
+    prior_reasoning.append("final-turn retained reasoning")
+    report_prompt = _render_history_prompt(
+        tokenizer,
+        messages,
+        _PromptRenderState("retain", prompt, final_turn_completion, (report_request,)),
+    )
+    assert is_pure_append(prompt, final_turn_completion, report_prompt)
+    assert all(reasoning in report_prompt for reasoning in prior_reasoning)
+    assert "RUNAWAY_TEXT_MUST_NOT_REENTER_HISTORY" not in report_prompt
 
-
-def _tokenizer(template_path: Path) -> PreTrainedTokenizerFast:
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({"fixture": 0})))
-    tokenizer.chat_template = template_path.read_text(encoding="utf-8")
-    return tokenizer
+    _assert_reasoning_is_stripped(
+        tokenizer,
+        messages,
+        prior_reasoning,
+        runaway_assistant_position,
+    )
 
 
 def test_count_prompt_tokens_and_context_room(tokenizer: PreTrainedTokenizerFast) -> None:

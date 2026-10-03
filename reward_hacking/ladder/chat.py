@@ -25,18 +25,113 @@ def render_prompt(
     tools: Sequence[Mapping[str, object]],
     *,
     enable_thinking: bool = True,
+    add_generation_prompt: bool = True,
 ) -> str:
-    """Render a complete conversation and assistant-generation prefix with its own template."""
+    """Render conversation messages, optionally adding the assistant-generation prefix."""
     rendered = tokenizer.apply_chat_template(
         cast("Any", [dict(message) for message in messages]),
         tools=cast("Any", [dict(tool) for tool in tools]),
         tokenize=False,
-        add_generation_prompt=True,
+        add_generation_prompt=add_generation_prompt,
         enable_thinking=enable_thinking,
     )
     if not isinstance(rendered, str):
         raise TypeError(f"chat template returned {type(rendered).__name__}, expected str")
     return rendered
+
+
+def render_prompt_continuation(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: Sequence[Mapping[str, object]],
+) -> str:
+    """Render appended messages and a generation prefix without re-rendering prior history."""
+    anchor: dict[str, object] = {"role": "user", "content": ""}
+    anchored_prompt = render_prompt(
+        tokenizer,
+        [anchor, *messages],
+        (),
+    )
+    rendered_anchor = render_prompt(tokenizer, [anchor], (), add_generation_prompt=False)
+    if not anchored_prompt.startswith(rendered_anchor):
+        raise ValueError(
+            "chat template changed the rendered prompt anchor while appending messages"
+        )
+    return anchored_prompt[len(rendered_anchor) :]
+
+
+def render_empty_assistant_completion(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: Sequence[Mapping[str, object]],
+    tools: Sequence[Mapping[str, object]],
+) -> str:
+    """Render the empty assistant closure after this conversation's open generation prefix."""
+    generation_prefix = render_prompt(tokenizer, messages, tools)
+    empty_assistant: dict[str, object] = {
+        "role": "assistant",
+        "reasoning_content": "",
+        "content": "",
+        "tool_calls": [],
+    }
+    rendered_empty_turn = render_prompt(
+        tokenizer,
+        [*messages, empty_assistant],
+        tools,
+        add_generation_prompt=False,
+    )
+    if rendered_empty_turn.startswith(generation_prefix):
+        return rendered_empty_turn[len(generation_prefix) :]
+
+    # TMAX omits the think block for an empty historical assistant, unlike this open prefix.
+    canary_reasoning = "__ladder_empty_assistant_reasoning_canary__"
+    if canary_reasoning in generation_prefix:
+        raise ValueError("conversation contains the empty-assistant rendering canary")
+    rendered_canary_turn = render_prompt(
+        tokenizer,
+        [*messages, {**empty_assistant, "reasoning_content": canary_reasoning}],
+        tools,
+        add_generation_prompt=False,
+    )
+    if not rendered_canary_turn.startswith(generation_prefix):
+        raise ValueError("chat template cannot append an assistant turn to its generation prefix")
+    completion = rendered_canary_turn[len(generation_prefix) :]
+    if not completion.startswith(canary_reasoning):
+        raise ValueError("chat template changed the assistant reasoning canary")
+    return completion[len(canary_reasoning) :]
+
+
+def render_assistant_terminator_suffix(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: Sequence[Mapping[str, object]],
+    tools: Sequence[Mapping[str, object]],
+) -> str:
+    """Render the template's assistant end marker and separator after generated text."""
+    generation_prefix = render_prompt(tokenizer, messages, tools)
+    reasoning_canary = "__ladder_terminator_reasoning_canary__"
+    content_canary = "__ladder_terminator_content_canary__"
+    if reasoning_canary in generation_prefix or content_canary in generation_prefix:
+        raise ValueError("conversation contains an assistant-terminator rendering canary")
+    assistant_message: dict[str, object] = {
+        "role": "assistant",
+        "reasoning_content": reasoning_canary,
+        "content": content_canary,
+        "tool_calls": [],
+    }
+    rendered_turn = render_prompt(
+        tokenizer,
+        [*messages, assistant_message],
+        tools,
+        add_generation_prompt=False,
+    )
+    if not rendered_turn.startswith(generation_prefix):
+        raise ValueError("chat template cannot append an assistant turn to its generation prefix")
+    completion = rendered_turn[len(generation_prefix) :]
+    content_end = completion.find(content_canary)
+    if content_end < 0 or completion.find(content_canary, content_end + 1) >= 0:
+        raise ValueError("chat template changed the assistant content canary")
+    terminator_suffix = completion[content_end + len(content_canary) :]
+    if not terminator_suffix:
+        raise ValueError("chat template omitted the assistant end marker")
+    return terminator_suffix
 
 
 def count_prompt_tokens(tokenizer: PreTrainedTokenizerBase, rendered_prompt: str) -> int:

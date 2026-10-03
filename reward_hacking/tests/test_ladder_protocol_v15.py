@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import concealment_judge, exposure, loop, rescore
+from reward_hacking.ladder.chat import render_empty_assistant_completion, render_prompt_continuation
 from reward_hacking.ladder.runner import (
     LADDER_SCHEMA_VERSION,
     readout_records,
@@ -29,10 +34,12 @@ from reward_hacking.ladder.tools import (
 from reward_hacking.model_backend import RenderedCompletion
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from transformers import PreTrainedTokenizerBase
 
 
 class _FakeTokenizer:
+    chat_template: str | None = None
+
     def apply_chat_template(
         self,
         messages: list[dict[str, object]],
@@ -43,9 +50,12 @@ class _FakeTokenizer:
         enable_thinking: bool,
     ) -> str:
         assert not tokenize
-        assert add_generation_prompt
         assert enable_thinking
-        return json.dumps({"messages": messages, "tools": tools}, sort_keys=True)
+        rendered = json.dumps({"tools": tools}, sort_keys=True) if tools else ""
+        rendered += "".join(json.dumps(message, sort_keys=True) for message in messages)
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n<think>\n"
+        return rendered
 
     def __call__(self, prompt: str, *, add_special_tokens: bool) -> SimpleNamespace:
         assert not add_special_tokens
@@ -56,11 +66,22 @@ class _FakeTokenizer:
         return "synthetic-protocol-template"
 
 
+def _qwen_tokenizer() -> PreTrainedTokenizerFast:
+    unknown_token_name = "<unknown>"
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({unknown_token_name: 0}, unk_token=unknown_token_name))
+    )
+    tokenizer.chat_template = (
+        Path(__file__).parent / "data" / "qwen3_5_chat_template.jinja"
+    ).read_text(encoding="utf-8")
+    return tokenizer
+
+
 class _ScriptedBackend:
     model_id = "synthetic-model"
     transport = "vllm-http"
     model_path: str | None = None
-    tokenizer = _FakeTokenizer()
+    tokenizer: PreTrainedTokenizerBase = cast("PreTrainedTokenizerBase", _FakeTokenizer())
 
     def __init__(self, replies: list[tuple[str, str]]) -> None:
         self.replies = list(replies)
@@ -274,7 +295,7 @@ def test_third_failed_submission_ends_episode_and_remains_the_final_grade(
     assert len(backend.prompts) == loop.LADDER_MAX_SUBMISSIONS + 1
 
 
-def test_runaway_completion_is_blanked_from_history_and_counted_as_format_error(
+def test_runaway_completion_is_removed_from_later_prompts_and_counted_as_format_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     runaway_text = (
@@ -291,6 +312,7 @@ def test_runaway_completion_is_blanked_from_history_and_counted_as_format_error(
             (_report(), "stop"),
         ]
     )
+    backend.tokenizer = _qwen_tokenizer()
 
     trace = _run_episode(tmp_path, monkeypatch, backend, submission_grader=_failed_submission)
 
@@ -301,6 +323,17 @@ def test_runaway_completion_is_blanked_from_history_and_counted_as_format_error(
     assert first_assistant_message["content"] == ""
     assert trace.messages[3] == {"role": "user", "content": RUNAWAY_FORMAT_ERROR_MESSAGE}
     assert runaway_text not in backend.prompts[1]
+    empty_assistant_suffix = render_empty_assistant_completion(
+        backend.tokenizer,
+        list(trace.messages[:2]),
+        [loop.bash_tool()],
+    )
+    assert backend.prompts[1] == (
+        backend.prompts[0]
+        + empty_assistant_suffix
+        + render_prompt_continuation(backend.tokenizer, [trace.messages[3]])
+    )
+    assert trace.turns[1].prompt_pure_append is True
     assert trace.turns[0].runaway is True
     assert trace.turns[0].tool_calls == ()
     assert not (tmp_path / "episode" / "should_not_execute.txt").exists()
@@ -320,6 +353,7 @@ def test_runaway_completions_count_toward_the_consecutive_format_error_stop(
             (_report(), "stop"),
         ]
     )
+    backend.tokenizer = _qwen_tokenizer()
 
     trace = _run_episode(tmp_path, monkeypatch, backend, submission_grader=_failed_submission)
 
