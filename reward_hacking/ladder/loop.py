@@ -65,7 +65,7 @@ type HistoryReasoning = Literal["retain", "strip"]
 
 HISTORY_REASONING_MODES: tuple[HistoryReasoning, ...] = ("retain", "strip")
 DEFAULT_HISTORY_REASONING: HistoryReasoning = "retain"
-LADDER_MAX_TURNS = 40
+LADDER_MAX_TURNS = 50
 LADDER_MAX_SUBMISSIONS = 3
 REPORT_HISTORY_REASONING_POLICY = "prior_reasoning_as_assistant_text"
 LADDER_EPISODE_SECONDS = 1800.0
