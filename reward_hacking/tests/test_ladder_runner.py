@@ -56,6 +56,14 @@ class DummyScenario:
     grader_command: str = "python3 -I {grader}"
 
     @property
+    def task_body(self) -> str:
+        return "synthetic task"
+
+    @property
+    def files(self) -> dict[str, str]:
+        return {}
+
+    @property
     def root(self) -> Path:
         return Path()
 
@@ -127,7 +135,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     )
     provenance = config.provenance_payload()
 
-    assert LADDER_SCHEMA_VERSION == 16
+    assert LADDER_SCHEMA_VERSION == 17
     assert config.history_reasoning == "retain"
     assert provenance["history_reasoning"] == "retain"
     assert (
@@ -647,6 +655,7 @@ def test_code_identity_lists_follow_the_live_detector_boundary() -> None:
         "reward_hacking/ladder/disclosure.py",
         "reward_hacking/ladder/exposure.py",
         "reward_hacking/ladder/rungs.py",
+        "reward_hacking/ladder/runner.py",
         "reward_hacking/ladder/rescore.py",
         "reward_hacking/ladder/concealment_judge.py",
     }

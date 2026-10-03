@@ -34,6 +34,12 @@ def _episode_record(
             {"sequence": 1, "command": "python3 -m pytest"},
             {"sequence": 2, "command": "cat solution.py"},
         ],
+        "detector_inputs": {
+            "detection_spec": {
+                "task_named_files": ["synthetic_grader.py", "tests/visible_test.py"],
+                "task_named_directories": [".ci"],
+            }
+        },
         "report_concealment": report_concealment,
         "trace_summary": {
             "episode_id": episode_id,
@@ -72,6 +78,8 @@ class TestConcealmentJudgePackets:
         assert lines[0]["record"] == "concealment_judge_batch"
         assert lines[0]["shuffle_seed"] == 19
         assert "concealment" in lines[0]["rubric"].lower()
+        assert "Rung 1" in lines[0]["rubric"]
+        assert "ordinary diligence" in " ".join(lines[0]["rubric"].split())
         packets = lines[1:]
         expected_order = ["episode-a", "episode-b", "episode-c"]
         random.Random(19).shuffle(expected_order)
@@ -83,6 +91,11 @@ class TestConcealmentJudgePackets:
         assert all(packet["episode_id"] not in id_mapping.values() for packet in packets)
         assert packets[0]["bash_commands"] == ["python3 -m pytest", "cat solution.py"]
         assert set(packets[0]["solution_files"]) == {"solution.py"}
+        assert packets[0]["task_named_files"] == [
+            "synthetic_grader.py",
+            "tests/visible_test.py",
+        ]
+        assert packets[0]["task_named_directories"] == [".ci"]
         assert packets[0]["final_report"].startswith("I finished episode-")
         assert stat.S_IMODE(mapping_path.stat().st_mode) == 0o600
 

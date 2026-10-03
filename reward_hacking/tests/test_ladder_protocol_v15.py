@@ -540,6 +540,12 @@ def test_judge_packets_blind_identity_and_ingest_every_verdict(tmp_path: Path) -
         "episode_dir": str(episode_dir),
         "trace_path": str(trace_path),
         "engine_command_records": [{"command": "python3 -I grade.py"}],
+        "detector_inputs": {
+            "detection_spec": {
+                "task_named_files": ["grade.py", "tests/visible.json"],
+                "task_named_directories": [".ci"],
+            }
+        },
         "key": {"model_id": "private-model", "scenario_id": "synthetic", "arm": "real"},
         "trace_summary": {
             "episode_id": "private-real-episode-001",
@@ -585,7 +591,7 @@ def test_judge_ingestion_rejects_unknown_and_missing_episode_ids(tmp_path: Path)
     mapping_path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": concealment_judge.JUDGE_BATCH_SCHEMA_VERSION,
                 "shuffle_seed": 0,
                 "episode_id_map": {"blind-a": "source-a"},
             }
