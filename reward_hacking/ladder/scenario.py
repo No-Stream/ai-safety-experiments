@@ -199,6 +199,7 @@ class Scenario:
     counterfactual_file: str | None = None
     counterfactual_suite: CounterfactualSuite | None = None
     legacy_manifest_digest: str | None = None
+    legacy_schema19_manifest_digest: str | None = None
 
     @property
     def scenario_id(self) -> str:
@@ -281,22 +282,10 @@ class Scenario:
                 },
             )
         )
-        monitor = _optional_mapping(manifest.get("monitor"), "monitor")
-        monitor_config_path = _relative_path(
-            monitor.get("config", ".ci/monitor.toml"), field="monitor.config"
+        legacy_schema19_manifest_digest = _optional_manifest_digest(
+            manifest, "legacy_schema19_manifest_digest"
         )
-        audit_log_path = _relative_path(
-            monitor.get("audit_log", ".ci/audit.log"), field="monitor.audit_log"
-        )
-        monitor_config_source = root / monitor_config_path
-        if (
-            not monitor_config_source.is_file()
-            or monitor_config_source.is_symlink()
-            or monitor_config_source.resolve() != monitor_config_source
-        ):
-            raise ValueError(
-                f"monitor config is missing or not a regular in-scenario file: {monitor_config_path}"
-            )
+        monitor_config_path, audit_log_path = _load_monitor_paths(root, manifest)
         excluded_paths = {
             MANIFEST_FILENAME,
             task_body_file,
@@ -356,6 +345,7 @@ class Scenario:
             counterfactual_file=counterfactual_file,
             counterfactual_suite=counterfactual_suite,
             legacy_manifest_digest=legacy_manifest_digest,
+            legacy_schema19_manifest_digest=legacy_schema19_manifest_digest,
         )
 
     def render(self, arm: LadderArm | str, *, task_pressure: str = "none") -> RenderedScenario:
@@ -693,6 +683,33 @@ def _optional_string(value: object, field: str, *, default: str | None = None) -
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a non-empty string")
     return value
+
+
+def _optional_manifest_digest(manifest: Mapping[str, object], field: str) -> str | None:
+    value = manifest.get(field)
+    if value is not None and (not isinstance(value, str) or not value):
+        raise ValueError(f"{field} must be a non-empty string when supplied")
+    return value
+
+
+def _load_monitor_paths(root: Path, manifest: Mapping[str, object]) -> tuple[str, str]:
+    monitor = _optional_mapping(manifest.get("monitor"), "monitor")
+    monitor_config_path = _relative_path(
+        monitor.get("config", ".ci/monitor.toml"), field="monitor.config"
+    )
+    audit_log_path = _relative_path(
+        monitor.get("audit_log", ".ci/audit.log"), field="monitor.audit_log"
+    )
+    monitor_config_source = root / monitor_config_path
+    if (
+        not monitor_config_source.is_file()
+        or monitor_config_source.is_symlink()
+        or monitor_config_source.resolve() != monitor_config_source
+    ):
+        raise ValueError(
+            f"monitor config is missing or not a regular in-scenario file: {monitor_config_path}"
+        )
+    return monitor_config_path, audit_log_path
 
 
 def _optional_mapping(value: object, field: str) -> Mapping[str, object]:

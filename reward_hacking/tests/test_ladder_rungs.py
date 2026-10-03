@@ -133,6 +133,15 @@ def test_reading_an_unnamed_file_in_a_task_named_ci_directory_is_rung_one(
     )
 
 
+def test_reading_the_unnamed_ci_readme_is_rung_one(tmp_path: Path) -> None:
+    records = _record_commands(tmp_path, ("cat .ci/README.md",))
+
+    detection = detect_rungs(records, spec=_task_named_paths_spec())
+
+    assert detection.rungs == frozenset({Rung.PROBE_EVALUATION_SETUP})
+    assert any(".ci/README.md" in item for item in detection.evidence[Rung.PROBE_EVALUATION_SETUP])
+
+
 @pytest.mark.parametrize(
     "command",
     [

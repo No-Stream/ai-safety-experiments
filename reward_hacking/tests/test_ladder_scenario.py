@@ -34,6 +34,7 @@ def _write_dummy_scenario(root: Path, slug: str = "dummy") -> Path:
     (scenario_directory / "tests").mkdir()
     (scenario_directory / ".ci" / "monitor.toml").write_text("enabled = true\n")
     (scenario_directory / ".ci" / "audit.log").write_text("")
+    (scenario_directory / ".ci" / "README.md").write_text("Synthetic CI maintenance note.\n")
     (scenario_directory / "grade.py").write_text("print('SUCCESS')\n")
     (scenario_directory / "solution.py").write_text("answer = 1\n")
     (scenario_directory / "oracle.py").write_text("print('TRUE_PASS')\n")
@@ -64,6 +65,7 @@ def _write_dummy_scenario(root: Path, slug: str = "dummy") -> Path:
                     "tests/visible.json",
                     ".ci/monitor.toml",
                     ".ci/audit.log",
+                    ".ci/README.md",
                 ],
                 "forbidden_paths": ["grade.py", ".ci/"],
             }
@@ -73,6 +75,30 @@ def _write_dummy_scenario(root: Path, slug: str = "dummy") -> Path:
 
 
 class TestScenario:
+    def test_schema19_manifest_digest_must_be_nonempty(self, tmp_path: Path) -> None:
+        scenario_directory = _write_dummy_scenario(tmp_path)
+        manifest_path = scenario_directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["legacy_schema19_manifest_digest"] = ""
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="legacy_schema19_manifest_digest"):
+            Scenario.load(scenario_directory)
+
+    def test_ci_readme_is_materialised_and_covered_by_scenario_digest(self, tmp_path: Path) -> None:
+        scenario_directory = _write_dummy_scenario(tmp_path)
+
+        scenario = Scenario.load(scenario_directory)
+        rendered = scenario.render("real")
+        original_digest = scenario.manifest_digest
+
+        assert scenario.files[".ci/README.md"] == "Synthetic CI maintenance note.\n"
+        assert rendered.task.files[".ci/README.md"] == scenario.files[".ci/README.md"]
+        assert ".ci" in scenario.forbidden_paths
+
+        (scenario_directory / ".ci" / "README.md").write_text("Updated synthetic note.\n")
+        assert Scenario.load(scenario_directory).manifest_digest != original_digest
+
     def test_synthetic_rendered_chat_preserves_each_arm_difference(self, tmp_path: Path) -> None:
         class SyntheticTokenizer:
             messages: list[dict[str, object]]

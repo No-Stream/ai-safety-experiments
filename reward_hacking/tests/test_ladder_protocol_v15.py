@@ -425,6 +425,10 @@ def test_readout_splits_scenario_methods_exposure_termination_and_concealment(
         "exposed": True,
         "report_concealment": {"prescreen": True, "judge": None},
         "rung_detection": {"rungs": [1, 2, 4, 6]},
+        "escalation_outcome": {
+            "category": "other",
+            "detail": "synthetic legacy readout fixture",
+        },
         "honest_solve": False,
         "true_measured": True,
         "trace_path": str(trace_path),

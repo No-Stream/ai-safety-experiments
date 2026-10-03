@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 _DEFAULT_SCENARIO_ROOT = Path(__file__).resolve().parent / "data" / "scenarios"
 COUNTERFACTUAL_SOURCE_SCHEMA_VERSION = 18
+ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION = 19
 
 
 def _require_mapping(value: object, *, field: str) -> Mapping[str, object]:
@@ -92,6 +93,7 @@ def _header_schema_version(header: Mapping[str, object], provenance: Mapping[str
         )
     if schema_version not in {
         COUNTERFACTUAL_SOURCE_SCHEMA_VERSION,
+        ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION,
         runner.LADDER_SCHEMA_VERSION,
     }:
         raise ValueError(
@@ -142,6 +144,7 @@ def _load_scenario(
     expected_digest: str,
     *,
     allow_legacy_manifest_digest: bool = False,
+    allow_schema19_manifest_digest: bool = False,
 ) -> Scenario:
     scenario_path = (scenario_root / scenario_id).resolve()
     if not scenario_path.is_relative_to(scenario_root.resolve()):
@@ -158,7 +161,11 @@ def _load_scenario(
     legacy_digest_matches = (
         allow_legacy_manifest_digest and scenario.legacy_manifest_digest == expected_digest
     )
-    if not digest_matches and not legacy_digest_matches:
+    schema19_digest_matches = (
+        allow_schema19_manifest_digest
+        and scenario.legacy_schema19_manifest_digest == expected_digest
+    )
+    if not digest_matches and not legacy_digest_matches and not schema19_digest_matches:
         raise ValueError(
             f"scenario {scenario_id!r} does not match the manifest digest in the run header"
         )
@@ -186,6 +193,9 @@ def _scenario_for_key(
             key.scenario_id,
             expected_digest,
             allow_legacy_manifest_digest=(schema_version == COUNTERFACTUAL_SOURCE_SCHEMA_VERSION),
+            allow_schema19_manifest_digest=(
+                schema_version == ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION
+            ),
         )
         scenario_cache[key.scenario_id] = scenario
     return scenario
@@ -435,6 +445,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
             counterfactual_probe=counterfactual_probe,
         ),
     )
+    record["escalation_outcome"] = runner.classify_escalation_outcome(record)
     return record
 
 
@@ -496,6 +507,9 @@ def _upgrade_header_to_current_schema(
                 scenario_digests[scenario_id],
                 allow_legacy_manifest_digest=(
                     source_schema_version == COUNTERFACTUAL_SOURCE_SCHEMA_VERSION
+                ),
+                allow_schema19_manifest_digest=(
+                    source_schema_version == ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION
                 ),
             )
             scenario_cache[scenario_id] = scenario
