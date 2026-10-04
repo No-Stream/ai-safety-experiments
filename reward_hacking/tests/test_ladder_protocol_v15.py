@@ -521,16 +521,29 @@ def test_readout_adds_variant_exposure_awareness_and_belief_summaries(tmp_path: 
             "exposure": {"conflict": True, "policy": True, "bypass": False},
             "regex": {
                 "in_episode": {
-                    "counts_per_tier": {"lexical_alert": 1, "relational": 0, "context": 0},
+                    "counts_per_tier": {
+                        "lexical_alert": 1,
+                        "relational": 0,
+                        "context": 0,
+                        "training_inference": 1,
+                    },
                     "any_alert": True,
                 },
                 "final_report": {
-                    "counts_per_tier": {"lexical_alert": 0, "relational": 1, "context": 0},
+                    "counts_per_tier": {
+                        "lexical_alert": 0,
+                        "relational": 1,
+                        "context": 0,
+                        "training_inference": 0,
+                    },
                     "any_alert": True,
                 },
                 "lexical_alert": True,
                 "relational": False,
                 "any_alert": True,
+                "training_alert": True,
+                "training_before_first_fail": True,
+                "training_after_first_fail": False,
                 "alert_before_first_fail": True,
                 "alert_after_first_fail": False,
                 "alert_without_fail": False,
@@ -672,6 +685,8 @@ def test_readout_adds_variant_exposure_awareness_and_belief_summaries(tmp_path: 
         "relational_count": 1,
         "environment_artificiality_count": 0,
         "environment_artificiality_known_count": 0,
+        "training_alert_count": 1,
+        "training_alert_known_count": 1,
         "any_alert_count": 2,
         "alert_before_first_fail_count": 1,
         "alert_after_first_fail_count": 1,
@@ -730,6 +745,17 @@ def test_readout_adds_variant_exposure_awareness_and_belief_summaries(tmp_path: 
             "unsure": 0.2,
         }
     )
+    first_awareness = cast("dict[str, object]", records[0]["eval_awareness"])
+    first_regex = cast("dict[str, object]", first_awareness["regex"])
+    first_in_episode = cast("dict[str, object]", first_regex["in_episode"])
+    first_tier_counts = cast("dict[str, int]", first_in_episode["counts_per_tier"])
+    first_regex["training_alert"] = "yes"
+    with pytest.raises(TypeError, match=r"eval_awareness.regex.training_alert must be boolean"):
+        readout_records(records)
+    first_regex["training_alert"] = True
+    first_tier_counts["training_inference"] = -1
+    with pytest.raises(TypeError, match="training_inference must be a non-negative int"):
+        readout_records(records)
 
 
 def _write_conflict_scenario(root: Path, *, second_conflict: bool = False) -> Scenario:
