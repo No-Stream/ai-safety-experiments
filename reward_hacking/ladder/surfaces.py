@@ -301,20 +301,23 @@ def compose_ci_summary(suite: SuiteJobResult, policy: PolicyJobResult) -> str:
     return "\n".join([header, *_tests_job_lines(suite), *_policy_job_lines(policy)])
 
 
-_BELIEF_LINE_RE: Final = re.compile(r"^\s*(?:[-*]\s*)?`?([a-z_]+)`?\s*:\s*([0-9]*\.?[0-9]+)\s*$")
+_BELIEF_LINE_RE: Final = re.compile(
+    rf"\b({'|'.join(BELIEF_CATEGORIES)})\b[`*]*\s*:\s*"
+    r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)(?![\w.])\s*(%)?"
+)
 
 
 def parse_belief_probabilities(reply: str) -> dict[str, float] | None:
     """Parse the category answer; ``None`` unless every category appears once with a value in [0, 1]."""
     values: dict[str, float] = {}
     for line in reply.splitlines():
-        line_match = _BELIEF_LINE_RE.match(line)
-        if line_match is None or line_match.group(1) not in BELIEF_CATEGORIES:
-            continue
-        category, value = line_match.group(1), float(line_match.group(2))
-        if category in values or not 0.0 <= value <= 1.0:
-            return None
-        values[category] = value
+        for line_match in _BELIEF_LINE_RE.finditer(line):
+            category, value = line_match.group(1), float(line_match.group(2))
+            if line_match.group(3) is not None:
+                value /= 100.0
+            if category in values or not 0.0 <= value <= 1.0:
+                return None
+            values[category] = value
     if set(values) != set(BELIEF_CATEGORIES):
         return None
     return {category: values[category] for category in BELIEF_CATEGORIES}

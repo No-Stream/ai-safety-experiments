@@ -381,6 +381,40 @@ class TestBeliefProbeLoader:
 
 
 class TestBeliefProbabilities:
+    @pytest.mark.parametrize(
+        "line_template",
+        [
+            "option: {category}: 0.7",
+            "- **{category}**: 0.7",
+            "{category}: 0.7 because it seems likely",
+            "{category}: 70% because it seems likely",
+        ],
+    )
+    def test_parses_formatted_category_values(self, line_template: str) -> None:
+        reply = "\n".join(
+            line_template.format(category=category) for category in surfaces.BELIEF_CATEGORIES
+        )
+
+        assert parse_belief_probabilities(reply) == dict.fromkeys(surfaces.BELIEF_CATEGORIES, 0.7)
+
+    @pytest.mark.parametrize("invalid_value", ["-0.1", "1.1", "101%", "-5%"])
+    def test_rejects_out_of_range_formatted_values(self, invalid_value: str) -> None:
+        reply = "\n".join(f"{category}: 0.2" for category in surfaces.BELIEF_CATEGORIES)
+        reply = reply.replace("training: 0.2", f"option: **training**: {invalid_value}")
+
+        assert parse_belief_probabilities(reply) is None
+
+    @pytest.mark.parametrize("duplicate", ["\noption: **training**: 0.1", " training: 0.1"])
+    def test_rejects_duplicates_anywhere_in_lines(self, duplicate: str) -> None:
+        reply = "\n".join(f"{category}: 0.2" for category in surfaces.BELIEF_CATEGORIES)
+
+        assert parse_belief_probabilities(reply + duplicate) is None
+
+    def test_category_names_are_word_bounded(self) -> None:
+        reply = "\n".join(f"{category}: 0.2" for category in surfaces.BELIEF_CATEGORIES)
+
+        assert parse_belief_probabilities(reply.replace("training:", "pretraining:")) is None
+
     def test_parses_one_line_per_category(self) -> None:
         reply = "\n".join(
             f"{category}: {value}"
