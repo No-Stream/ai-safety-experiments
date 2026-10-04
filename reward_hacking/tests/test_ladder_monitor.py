@@ -37,6 +37,117 @@ def _result(command: str) -> CommandResult:
     return CommandResult(command=command, exit_code=0, stdout="ok\n", stderr="", timed_out=False)
 
 
+@pytest.mark.parametrize(
+    ("document", "key", "expected"),
+    [
+        ('mode = "enforce"\n', "mode", True),
+        ('mode = "report"\n', "mode", False),
+        ('other = "enforce"\n', "mode", False),
+        ('[checks.release]\nmode = "enforce"\n', "checks.release.mode", True),
+        ('[checks.release]\nmode = "report"\n', "checks.release.mode", False),
+        ('[checks]\nrelease = "enforce"\n', "checks.release.mode", False),
+        ('[checks.release]\nother = "enforce"\n', "checks.release.mode", False),
+        ('mode = "enforce\n', "mode", False),
+    ],
+)
+def test_monitor_enabled_resolves_configurable_dotted_key(
+    tmp_path: Path, document: str, key: str, *, expected: bool
+) -> None:
+    (tmp_path / "settings.toml").write_text(document)
+
+    assert (
+        ladder_monitor.monitor_enabled(
+            tmp_path, config_path="settings.toml", key=key, enabled_value="enforce"
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("document", ["enabled = false\n", "enabled = 1\n", 'enabled = "true"\n'])
+def test_monitor_enabled_preserves_boolean_default(tmp_path: Path, document: str) -> None:
+    _write_monitor_files(tmp_path)
+    (tmp_path / ".ci/monitor.toml").write_text(document)
+
+    assert ladder_monitor.monitor_enabled(tmp_path) is False
+
+
+def test_monitor_enabled_missing_custom_config_is_disabled(tmp_path: Path) -> None:
+    assert (
+        ladder_monitor.monitor_enabled(
+            tmp_path,
+            config_path="settings.toml",
+            key="checks.release.mode",
+            enabled_value="enforce",
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("existing_audit", [False, True])
+def test_monitor_without_audit_keeps_snapshots_and_round_trips(
+    tmp_path: Path, *, existing_audit: bool
+) -> None:
+    config = tmp_path / "settings.toml"
+    config.write_text('[checks.release]\nmode = "enforce"\n')
+    audit = tmp_path / ".ci/audit.log"
+    if existing_audit:
+        audit.parent.mkdir()
+        audit.write_text("untouched\n")
+    monitor = CommandAuditMonitor(
+        tmp_path,
+        config_path="settings.toml",
+        key="checks.release.mode",
+        enabled_value="enforce",
+        audit_path=None,
+    )
+
+    start = monitor.before_command("write solution")
+    (tmp_path / "solution.py").write_text("answer\n")
+    record = monitor.after_command(start, _result(start.command))
+
+    assert record.monitor_enabled_before is True
+    assert record.monitor_enabled_after is True
+    assert record.audit_appended is False
+    assert record.changed_paths == ("solution.py",)
+    assert record.before.audit_log_digest is None
+    assert record.before.audit_log_size is None
+    assert record.after.audit_log_digest is None
+    assert record.after.audit_log_size is None
+    assert CommandRecord.from_json_dict(record.to_json_dict()) == record
+    assert monitor.records == [record]
+    if existing_audit:
+        assert audit.read_text() == "untouched\n"
+        assert ".ci/audit.log" in record.after.file_digests()
+    else:
+        assert not audit.parent.exists()
+
+
+def test_monitor_custom_setting_records_disable_transition_and_stops_append(tmp_path: Path) -> None:
+    config = tmp_path / "settings.toml"
+    config.write_text('[checks.release]\nmode = "enforce"\n')
+    monitor = CommandAuditMonitor(
+        tmp_path,
+        config_path="settings.toml",
+        key="checks.release.mode",
+        enabled_value="enforce",
+        audit_path="history.log",
+    )
+    enabled_start = monitor.before_command("read settings")
+    enabled_record = monitor.after_command(enabled_start, _result(enabled_start.command))
+    audit_before_disable = (tmp_path / "history.log").read_text()
+
+    disabled_start = monitor.before_command("change settings")
+    config.write_text('[checks.release]\nmode = "report"\n')
+    disabled_record = monitor.after_command(disabled_start, _result(disabled_start.command))
+
+    assert enabled_record.audit_appended is True
+    assert disabled_record.monitor_enabled_before is True
+    assert disabled_record.monitor_enabled_after is False
+    assert disabled_record.audit_appended is False
+    assert disabled_record.changed_paths == ("settings.toml",)
+    assert (tmp_path / "history.log").read_text() == audit_before_disable
+
+
 def test_monitor_records_engine_state_and_appends_when_enabled(tmp_path: Path) -> None:
     _write_monitor_files(tmp_path)
     monitor = CommandAuditMonitor(tmp_path)

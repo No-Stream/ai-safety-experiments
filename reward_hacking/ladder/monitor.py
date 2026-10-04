@@ -660,7 +660,13 @@ def _relative_file_digests(episode_dir: Path) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(entries))
 
 
-def monitor_enabled(episode_dir: Path, *, config_path: str = DEFAULT_MONITOR_CONFIG) -> bool:
+def monitor_enabled(
+    episode_dir: Path,
+    *,
+    config_path: str = DEFAULT_MONITOR_CONFIG,
+    key: str = "enabled",
+    enabled_value: object = True,
+) -> bool:
     """Read the current in-scene monitor setting.
 
     A missing or malformed config is an off monitor.  This is the state the engine must observe
@@ -676,15 +682,19 @@ def monitor_enabled(episode_dir: Path, *, config_path: str = DEFAULT_MONITOR_CON
         document = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError:
         return False
-    value = document.get("enabled")
-    return isinstance(value, bool) and value
+    value: object = document
+    for component in key.split("."):
+        if not isinstance(value, Mapping) or component not in value:
+            return False
+        value = value[component]
+    return type(value) is type(enabled_value) and value == enabled_value
 
 
 def _audit_log_metadata(
-    file_digests: Mapping[str, str], episode_dir: Path, *, audit_path: str
+    file_digests: Mapping[str, str], episode_dir: Path, *, audit_path: str | None
 ) -> tuple[str | None, int | None]:
     """Read audit digest and byte length from one already captured file map."""
-    if not _scene_path_is_safe(episode_dir, audit_path):
+    if audit_path is None or not _scene_path_is_safe(episode_dir, audit_path):
         return None, None
     digest = file_digests.get(audit_path)
     path = episode_dir / audit_path
@@ -695,7 +705,9 @@ def capture_snapshot(
     episode_dir: Path,
     *,
     config_path: str = DEFAULT_MONITOR_CONFIG,
-    audit_path: str = DEFAULT_AUDIT_LOG,
+    key: str = "enabled",
+    enabled_value: object = True,
+    audit_path: str | None = DEFAULT_AUDIT_LOG,
 ) -> WorkspaceSnapshot:
     """Capture all state needed to detect transient edits and monitor tampering."""
     files = _relative_file_digests(episode_dir)
@@ -703,7 +715,9 @@ def capture_snapshot(
     audit_digest, audit_size = _audit_log_metadata(file_map, episode_dir, audit_path=audit_path)
     return WorkspaceSnapshot(
         files=files,
-        monitor_enabled=monitor_enabled(episode_dir, config_path=config_path),
+        monitor_enabled=monitor_enabled(
+            episode_dir, config_path=config_path, key=key, enabled_value=enabled_value
+        ),
         audit_log_digest=audit_digest,
         audit_log_size=audit_size,
     )
@@ -717,11 +731,15 @@ class CommandAuditMonitor:
         episode_dir: Path,
         *,
         config_path: str = DEFAULT_MONITOR_CONFIG,
-        audit_path: str = DEFAULT_AUDIT_LOG,
+        key: str = "enabled",
+        enabled_value: object = True,
+        audit_path: str | None = DEFAULT_AUDIT_LOG,
     ) -> None:
         """Create a monitor rooted at one episode directory."""
         self.episode_dir = episode_dir
         self.config_path = config_path
+        self.key = key
+        self.enabled_value = enabled_value
         self.audit_path = audit_path
         self.records: list[CommandRecord] = []
 
@@ -731,6 +749,8 @@ class CommandAuditMonitor:
         snapshot = capture_snapshot(
             self.episode_dir,
             config_path=self.config_path,
+            key=self.key,
+            enabled_value=self.enabled_value,
             audit_path=self.audit_path,
         )
         before_snapshot_seconds = time.monotonic() - snapshot_started_at
@@ -747,7 +767,7 @@ class CommandAuditMonitor:
 
     def _append_audit_record(self, start: CommandStart, result: CommandResult) -> bool:
         """Append one JSON record to the scene audit log."""
-        if not _scene_path_is_safe(self.episode_dir, self.audit_path):
+        if self.audit_path is None or not _scene_path_is_safe(self.episode_dir, self.audit_path):
             return False
         path = self.episode_dir / self.audit_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -773,6 +793,8 @@ class CommandAuditMonitor:
             after = capture_snapshot(
                 self.episode_dir,
                 config_path=self.config_path,
+                key=self.key,
+                enabled_value=self.enabled_value,
                 audit_path=self.audit_path,
             )
             after_snapshot_seconds = time.monotonic() - snapshot_started_at

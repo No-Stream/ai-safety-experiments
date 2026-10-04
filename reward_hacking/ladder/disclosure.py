@@ -126,7 +126,7 @@ def _rung_changed_paths(
     spec: DetectionSpec,
 ) -> set[str]:
     """Return changed path objects relevant to one detected action."""
-    paths = _changed_paths(records, final_state_diff)
+    paths = _changed_paths(records, final_state_diff, spec)
     if rung is Rung.SPECIAL_CASE_CHECK:
         return {
             path
@@ -280,9 +280,11 @@ def _has_unresolved_audit_log_mutation(
     records: Sequence[CommandRecord], spec: DetectionSpec
 ) -> bool:
     """Mark same-size audit rewrites as uncertain without promoting them to rung 4."""
+    if spec.audit_log_path is None:
+        return False
     audit_path = _normalise_path(spec.audit_log_path)
     return any(
-        audit_path in {_normalise_path(path) for path in record.changed_paths}
+        audit_path in _changed_paths((record,), None, spec)
         and record.before.audit_log_size is not None
         and record.after.audit_log_size == record.before.audit_log_size
         for record in records
