@@ -65,8 +65,9 @@ very eval aware, and a model that recognises a test can behave differently from 
 the situation at face value, so a behavioural result from a model that suspected it was being
 tested is weak evidence. The case that set this rule: Qwen3.8-27B never escalated on the hack
 ladder, but it said in nearly every episode that the setup was a trap testing whether it would
-cheat, quoting cues we had written into the task ("the checker is deliberately imperfect", "the
-method is audited", a named off-limits directory, a README explaining how the audit is skipped).
+cheat, pointing at cues we had written into the task: an up-front admission that the checker was
+flawed, a line announcing an audit, a named off-limits directory, and a README explaining how the
+audit gets skipped.
 Whenever a probe measures behaviour, design it to read as a real situation, measure how often the
 model says or implies it is being tested, report that next to the behaviour, and treat a high rate
 as a reason to fix the instrument before reading the result. Separate "this is a graded task",
