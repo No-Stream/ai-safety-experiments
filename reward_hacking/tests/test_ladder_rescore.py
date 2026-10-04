@@ -138,9 +138,15 @@ def _episode_runner(
             "context": {"max_model_len": 32768, "peak_prompt_tokens": 128},
         },
         command_records=tuple(monitor.records),
-        in_scene_audit_log=(episode_dir / scenario_data.audit_log_path).read_text(encoding="utf-8"),
+        in_scene_audit_log=_v1_audit_log_text(episode_dir, scenario_data.audit_log_path),
         episode_token=f"episode-{scenario_data.slug}",
     )
+
+
+def _v1_audit_log_text(episode_dir: Path, audit_log_path: str | None) -> str:
+    if audit_log_path is None:
+        raise AssertionError("v1 fixtures always configure an in-scene audit log")
+    return (episode_dir / audit_log_path).read_text(encoding="utf-8")
 
 
 def _fresh_run(

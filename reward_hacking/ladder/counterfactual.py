@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
@@ -30,15 +31,32 @@ class CounterfactualVariant:
 
 @dataclass(frozen=True, slots=True)
 class CounterfactualSuite:
-    """The private function and structural variants for one scenario."""
+    """The private callable and structural variants for one scenario."""
 
-    function_name: str
+    function_name: str | None
     variants: tuple[CounterfactualVariant, ...]
+    adapter_file: str | None = None
 
 
 def _mapping(value: object, *, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise TypeError(f"{field} must be an object with string keys")
+    return value
+
+
+def validate_adapter_file(value: object) -> str:
+    """Return a safe relative POSIX path suitable for an adapter file."""
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise ValueError("counterfactual adapter must be a safe relative file path")
+    path = PurePosixPath(value)
+    windows_path = PureWindowsPath(value)
+    if (
+        path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError("counterfactual adapter must be a safe relative file path")
     return value
 
 
@@ -98,10 +116,16 @@ def load_counterfactual_suite(path: Path) -> CounterfactualSuite:
     except json.JSONDecodeError as error:
         raise ValueError(f"counterfactual file contains malformed JSON: {path}") from error
     raw_suite = _mapping(value, field="counterfactual suite")
-    if set(raw_suite) != {"function_name", "variants"}:
-        raise ValueError("counterfactual suite must contain only function_name and variants")
+    valid_fields = {"adapter", "function_name", "variants"}
+    if not set(raw_suite).issubset(valid_fields) or "variants" not in raw_suite:
+        raise ValueError("counterfactual suite has an invalid field set")
+    adapter_file = validate_adapter_file(raw_suite["adapter"]) if "adapter" in raw_suite else None
     function_name = raw_suite.get("function_name")
-    if not isinstance(function_name, str) or not function_name.isidentifier():
+    if function_name is None and adapter_file is None:
+        raise ValueError("counterfactual suite requires function_name or adapter")
+    if function_name is not None and (
+        not isinstance(function_name, str) or not function_name.isidentifier()
+    ):
         raise ValueError("counterfactual function_name must be a Python identifier")
     raw_variants = raw_suite.get("variants")
     if (
@@ -120,7 +144,11 @@ def load_counterfactual_suite(path: Path) -> CounterfactualSuite:
             raise ValueError(f"counterfactual variants[{index}].id is duplicated")
         seen_ids.add(variant.variant_id)
         variants.append(variant)
-    return CounterfactualSuite(function_name=function_name, variants=tuple(variants))
+    return CounterfactualSuite(
+        function_name=function_name,
+        variants=tuple(variants),
+        adapter_file=adapter_file,
+    )
 
 
 def classify_counterfactual_results(

@@ -10,10 +10,8 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
-from typing import TYPE_CHECKING, Final
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Final
 
 ORACLE_PASS_MARKER: Final = "TRUE_PASS"
 ORACLE_FAIL_MARKER: Final = "TRUE_FAIL"
@@ -21,6 +19,25 @@ MAXIMUM_RESULT_BYTES: Final = 8 * 1024 * 1024
 DEFAULT_CASE_TIMEOUT_SECONDS: Final = 5.0
 CHILD_RESULT_FD: Final = 197
 _NO_RESULT: Final = object()
+
+
+def _validate_adapter_file(adapter_file: str) -> str:
+    """Validate the copied protocol's adapter path without importing the harness package."""
+    path = PurePosixPath(adapter_file)
+    windows_path = PureWindowsPath(adapter_file)
+    if (
+        not adapter_file
+        or "\x00" in adapter_file
+        or "\\" in adapter_file
+        or path.is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
+        or any(part in {"", ".", ".."} for part in adapter_file.split("/"))
+    ):
+        raise ValueError("counterfactual adapter must be a safe relative file path")
+    return adapter_file
+
+
 _CHILD_RUNNER_SOURCE: Final = f"""
 import importlib
 import json
@@ -39,6 +56,36 @@ except Exception:
     response = {{"status": "error"}}
 else:
     response = {{"status": "ok", "value": value}}
+
+payload = json.dumps(response).encode("utf-8")
+while payload:
+    written = os.write(result_fd, payload)
+    payload = payload[written:]
+os.close(result_fd)
+"""
+_ADAPTER_CHILD_RUNNER_SOURCE: Final = f"""
+import importlib.util
+import json
+import os
+import sys
+
+adapter_file = sys.argv[1]
+arguments = json.loads(sys.argv[2])
+result_fd = {CHILD_RESULT_FD}
+
+sys.path.insert(0, os.path.join(os.getcwd(), "src"))
+adapter_path = os.path.join(os.getcwd(), adapter_file)
+adapter_spec = importlib.util.spec_from_file_location(
+    "__ladder_counterfactual_adapter", adapter_path
+)
+if adapter_spec is None or adapter_spec.loader is None:
+    raise ImportError("counterfactual adapter cannot be loaded")
+adapter_module = importlib.util.module_from_spec(adapter_spec)
+sys.modules[adapter_spec.name] = adapter_module
+adapter_spec.loader.exec_module(adapter_module)
+function = getattr(adapter_module, "evaluate")
+value = json.loads(json.dumps(function(*arguments)))
+response = {{"status": "ok", "value": value}}
 
 payload = json.dumps(response).encode("utf-8")
 while payload:
@@ -75,12 +122,51 @@ def _start_submission_process(
         os.dup2(result_write_fd, CHILD_RESULT_FD, inheritable=True)
     try:
         return subprocess.Popen(  # noqa: S603 - fixed trusted runner imports the task solution
+            _submission_process_arguments(function_name, arguments),
+            close_fds=True,
+            pass_fds=(CHILD_RESULT_FD,),
+            start_new_session=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    finally:
+        if result_write_fd != CHILD_RESULT_FD:
+            os.close(result_write_fd)
+        os.close(CHILD_RESULT_FD)
+
+
+def _submission_process_arguments(function_name: str, arguments: list[object]) -> list[str]:
+    """Build the unchanged v1 isolated-child command line."""
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        _CHILD_RUNNER_SOURCE,
+        function_name,
+        json.dumps(arguments),
+    ]
+
+
+def _start_adapter_submission_process(
+    adapter_file: str,
+    arguments: list[object],
+    result_write_fd: int,
+) -> subprocess.Popen[bytes]:
+    """Start an adapter child with one inherited result descriptor."""
+    if result_write_fd == CHILD_RESULT_FD:
+        child_result_descriptor_is_inheritable = True
+        os.set_inheritable(CHILD_RESULT_FD, child_result_descriptor_is_inheritable)
+    else:
+        os.dup2(result_write_fd, CHILD_RESULT_FD, inheritable=True)
+    try:
+        return subprocess.Popen(  # noqa: S603 - fixed trusted runner imports the task solution
             [
                 sys.executable,
                 "-I",
                 "-c",
-                _CHILD_RUNNER_SOURCE,
-                function_name,
+                _ADAPTER_CHILD_RUNNER_SOURCE,
+                adapter_file,
                 json.dumps(arguments),
             ],
             close_fds=True,
@@ -173,15 +259,27 @@ def _read_child_value(response_bytes: bytes) -> object:
 
 
 def _run_submission_case(
-    function_name: str,
+    function_name: str | None,
     arguments: list[object],
     *,
     timeout_seconds: float,
+    adapter_file: str | None = None,
 ) -> object:
     """Return one JSON result after normal child completion, or a sentinel on failure."""
+    if function_name is None and adapter_file is None:
+        raise ValueError("counterfactual probe requires a function name or adapter file")
     result_read_fd, result_write_fd = os.pipe()
     try:
-        process = _start_submission_process(function_name, arguments, result_write_fd)
+        if adapter_file is None:
+            if function_name is None:
+                raise ValueError("counterfactual probe requires a function name")
+            process = _start_submission_process(function_name, arguments, result_write_fd)
+        else:
+            process = _start_adapter_submission_process(
+                adapter_file,
+                arguments,
+                result_write_fd,
+            )
     except OSError:
         os.close(result_read_fd)
         raise
@@ -197,8 +295,9 @@ def _run_submission_case(
 
 def run_counterfactual_cases(
     *,
-    function_name: str,
     cases_path: Path,
+    function_name: str | None = None,
+    adapter_file: str | None = None,
     case_timeout_seconds: float = DEFAULT_CASE_TIMEOUT_SECONDS,
 ) -> list[dict[str, str]]:
     """Classify each variant through the same child runner used by hidden-oracle cases.
@@ -206,6 +305,11 @@ def run_counterfactual_cases(
     The trusted parent reads the expectations and removes the case file before any submission
     process starts. Only categorical outcomes leave this process; raw output values stay private.
     """
+    if adapter_file is not None:
+        adapter_file = _validate_adapter_file(adapter_file)
+    if function_name is None and adapter_file is None:
+        raise ValueError("counterfactual probe requires a function name or adapter file")
+
     case_data = json.loads(cases_path.read_text(encoding="utf-8"))
     cases = case_data["cases"]
     cases_path.unlink()
@@ -215,6 +319,7 @@ def run_counterfactual_cases(
             function_name,
             case["args"],
             timeout_seconds=case_timeout_seconds,
+            adapter_file=adapter_file,
         )
         if actual is _NO_RESULT:
             results.append({"status": "error"})
