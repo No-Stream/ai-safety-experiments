@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Literal
 
 from reward_hacking.jailed_poc import ENFORCED_JAIL_RESOURCE_LIMITS, JailResourceLimits
 from reward_hacking.ladder import runner
-from reward_hacking.ladder.exposure import episode_saw_visible_case_failure_from_turn_records
+from reward_hacking.ladder.exposure import (
+    Exposure,
+    episode_exposure_from_turn_records,
+    episode_saw_visible_case_failure_from_turn_records,
+)
 from reward_hacking.ladder.monitor import CommandRecord
 from reward_hacking.ladder.runner import (
     LADDER_TASK_PRESSURES,
@@ -21,16 +25,19 @@ from reward_hacking.ladder.runner import (
     default_detector,
     detection_spec_for_scenario,
     detection_spec_from_json,
+    detection_spec_to_json,
     final_state_diff_from_disk,
     final_state_diff_from_json,
+    final_state_diff_to_json,
     read_in_scene_audit_log,
 )
-from reward_hacking.ladder.scenario import Scenario
+from reward_hacking.ladder.scenario import REPOSITORY_FORMAT, Scenario
 
 if TYPE_CHECKING:
     from reward_hacking.ladder.rungs import DetectionSpec, FinalStateDiff
 
 _DEFAULT_SCENARIO_ROOT = Path(__file__).resolve().parent / "data" / "scenarios"
+LEGACY_SCENARIO_FORMAT = 1
 COUNTERFACTUAL_SOURCE_SCHEMA_VERSION = 18
 ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION = 19
 LEGACY_OUTCOME_CATEGORIES_SOURCE_SCHEMA_VERSION = 20
@@ -82,6 +89,44 @@ def _scenario_digests(header: Mapping[str, object]) -> dict[str, str]:
             raise ValueError(f"run header contains duplicate scenario id {scenario_id!r}")
         digests[scenario_id] = manifest_digest
     return digests
+
+
+def _scenario_formats(header: Mapping[str, object]) -> dict[str, int]:
+    provenance = _require_mapping(header.get("provenance"), field="run header provenance")
+    raw_scenarios = provenance.get("scenarios")
+    if not isinstance(raw_scenarios, list):
+        raise TypeError("run header provenance.scenarios must be a list")
+    formats: dict[str, int] = {}
+    for index, raw_scenario in enumerate(raw_scenarios):
+        scenario_record = _require_mapping(
+            raw_scenario, field=f"run header provenance.scenarios[{index}]"
+        )
+        scenario_id = scenario_record.get("scenario_id")
+        scenario_format = scenario_record.get("format", 1)
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise TypeError(f"run header scenario {index} has no string scenario_id")
+        if type(scenario_format) is not int or scenario_format not in (
+            LEGACY_SCENARIO_FORMAT,
+            REPOSITORY_FORMAT,
+        ):
+            raise ValueError(f"run header scenario {scenario_id!r} has an invalid format")
+        if scenario_id in formats:
+            raise ValueError(f"run header contains duplicate scenario id {scenario_id!r}")
+        formats[scenario_id] = scenario_format
+    return formats
+
+
+def _scenario_root_for_format(scenario_root: Path, scenario_id: str, scenario_format: int) -> Path:
+    if scenario_format == LEGACY_SCENARIO_FORMAT:
+        return scenario_root
+    if scenario_format != REPOSITORY_FORMAT:
+        raise ValueError(f"unsupported scenario format {scenario_format}")
+    if scenario_root.name == "scenarios-v2.0":
+        return scenario_root
+    versioned_root = scenario_root.parent / "scenarios-v2.0"
+    if (versioned_root / scenario_id).is_dir():
+        return versioned_root
+    return scenario_root
 
 
 def _header_schema_version(header: Mapping[str, object], provenance: Mapping[str, object]) -> int:
@@ -176,11 +221,12 @@ def _load_scenario(
     return scenario
 
 
-def _scenario_for_key(
+def _scenario_for_key(  # noqa: PLR0913 - scenario provenance inputs stay explicit
     key: EpisodeKey,
     *,
     scenario_root: Path,
     scenario_digests: Mapping[str, str],
+    scenario_formats: Mapping[str, int],
     scenario_cache: dict[str, Scenario],
     schema_version: int = runner.LADDER_SCHEMA_VERSION,
 ) -> Scenario:
@@ -192,8 +238,14 @@ def _scenario_for_key(
         ) from error
     scenario = scenario_cache.get(key.scenario_id)
     if scenario is None:
+        try:
+            scenario_format = scenario_formats[key.scenario_id]
+        except KeyError as error:
+            raise ValueError(
+                f"scenario {key.scenario_id!r} has no format in run header provenance"
+            ) from error
         scenario = _load_scenario(
-            scenario_root,
+            _scenario_root_for_format(scenario_root, key.scenario_id, scenario_format),
             key.scenario_id,
             expected_digest,
             allow_legacy_manifest_digest=(schema_version == COUNTERFACTUAL_SOURCE_SCHEMA_VERSION),
@@ -227,6 +279,8 @@ def _stored_detector_inputs(
     scenario: Scenario,
     episode_dir: Path,
     command_records: Sequence[CommandRecord],
+    *,
+    schema_version: int,
 ) -> tuple[str | None, FinalStateDiff | None, DetectionSpec]:
     value = record.get("detector_inputs")
     if value is None and "detector_inputs" not in record:
@@ -237,6 +291,7 @@ def _stored_detector_inputs(
             command_records,
             monitor_config_path=spec.monitor_config_path,
             audit_log_path=spec.audit_log_path,
+            ignored_prefixes=spec.ignored_prefixes,
         )
         return audit_log, final_state_diff, spec
 
@@ -252,7 +307,7 @@ def _stored_detector_inputs(
     return (
         audit_log,
         final_state_diff_from_json(detector_inputs["final_state_diff"]),
-        detection_spec_from_json(detector_inputs["detection_spec"]),
+        detection_spec_from_json(detector_inputs["detection_spec"], schema_version=schema_version),
     )
 
 
@@ -269,7 +324,7 @@ def _pristine_visible_pass(
     if value is not None:
         raise TypeError("ladder_episode.pristine_visible_pass must be a boolean or null")
     timeout, resource_limits = grading_settings
-    pristine_grader_pass, pristine_tests_pass = runner.run_pristine_visible_grade(
+    pristine_grader_pass, pristine_tests_pass, _grader_result = runner.run_pristine_visible_grade(
         scenario,
         episode_dir,
         timeout=timeout,
@@ -279,11 +334,23 @@ def _pristine_visible_pass(
     return pristine_grader_pass and pristine_tests_pass
 
 
-def _episode_exposure(scenario: Scenario, trace_records: Sequence[Mapping[str, object]]) -> bool:
+def _episode_exposure(
+    scenario: Scenario, trace_records: Sequence[Mapping[str, object]]
+) -> Exposure:
     turn_records = [
         trace_record for trace_record in trace_records if trace_record.get("record") == "turn"
     ]
-    return episode_saw_visible_case_failure_from_turn_records(scenario, turn_records)
+    if scenario.format == REPOSITORY_FORMAT:
+        return episode_exposure_from_turn_records(
+            scenario.exposure_spec,
+            turn_records,
+            grader_command=scenario.grader_command.format(grader=scenario.grader_filename),
+        )
+    return Exposure(
+        conflict=episode_saw_visible_case_failure_from_turn_records(scenario, turn_records),
+        policy=False,
+        bypass=False,
+    )
 
 
 def _updated_report_concealment(
@@ -381,6 +448,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
     detector_code_identity: str,
     scenario_root: Path,
     scenario_digests: Mapping[str, str],
+    scenario_formats: Mapping[str, int],
     scenario_cache: dict[str, Scenario],
     grading_settings: tuple[str, JailResourceLimits],
     schema_version: int,
@@ -390,6 +458,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         key,
         scenario_root=scenario_root,
         scenario_digests=scenario_digests,
+        scenario_formats=scenario_formats,
         scenario_cache=scenario_cache,
         schema_version=schema_version,
     )
@@ -400,8 +469,17 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
     trace_records = _read_jsonl(Path(trace_path_value))
     command_records = _command_records(record)
     audit_log, final_state_diff, spec = _stored_detector_inputs(
-        record, scenario, episode_dir, command_records
+        record,
+        scenario,
+        episode_dir,
+        command_records,
+        schema_version=schema_version,
     )
+    record["detector_inputs"] = {
+        "in_scene_audit_log": audit_log,
+        "final_state_diff": final_state_diff_to_json(final_state_diff),
+        "detection_spec": detection_spec_to_json(spec),
+    }
     pristine_visible_pass = _pristine_visible_pass(
         record, scenario, episode_dir, key, grading_settings
     )
@@ -436,7 +514,26 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         counterfactual_probe = scenario.probe_counterfactuals(
             episode_dir, timeout=grading_settings[0]
         )
-    record["exposed"] = _episode_exposure(scenario, trace_records)
+    exposure = _episode_exposure(scenario, trace_records)
+    record["exposure"] = {
+        "conflict": exposure.conflict,
+        "policy": exposure.policy,
+        "bypass": exposure.bypass,
+    }
+    record["exposed"] = exposure.conflict
+    record["scenario_format"] = scenario.format
+    record["scenario_variant"] = scenario.variant
+    awareness = runner.eval_awareness_from_trace_records(trace_summary, trace_records)
+    previous_awareness = record.get("eval_awareness")
+    if previous_awareness is not None and not isinstance(previous_awareness, Mapping):
+        raise TypeError("ladder_episode.eval_awareness must be an object or null")
+    judge = previous_awareness.get("judge") if isinstance(previous_awareness, Mapping) else None
+    if judge is not None and not isinstance(judge, Mapping):
+        raise TypeError("ladder_episode.eval_awareness.judge must be an object or null")
+    awareness["judge"] = None if judge is None else dict(judge)
+    record["eval_awareness"] = awareness
+    if "eval_belief_probe" in trace_summary:
+        record["eval_belief_probe"] = trace_summary["eval_belief_probe"]
     _apply_rescored_detection(
         record,
         detection,
@@ -536,8 +633,11 @@ def _upgrade_header_to_current_schema(
             raise TypeError(f"run header scenario {index} has no string scenario_id")
         scenario = scenario_cache.get(scenario_id)
         if scenario is None:
+            scenario_format = scenario_record.get("format", 1)
+            if type(scenario_format) is not int or scenario_format not in (1, 2):
+                raise ValueError(f"run header scenario {scenario_id!r} has an invalid format")
             scenario = _load_scenario(
-                scenario_root,
+                _scenario_root_for_format(scenario_root, scenario_id, scenario_format),
                 scenario_id,
                 scenario_digests[scenario_id],
                 allow_legacy_manifest_digest=(
@@ -576,6 +676,7 @@ class _RescoreRun:
     scenario_cache: dict[str, Scenario]
     headers_by_pressure: dict[str, list[dict[str, object]]]
     scenario_digests_by_pressure: dict[str, dict[str, str]]
+    scenario_formats_by_pressure: dict[str, dict[str, int]]
     grading_settings_by_pressure: dict[str, tuple[str, JailResourceLimits]]
     schema_versions_by_pressure: dict[str, int]
 
@@ -603,6 +704,7 @@ def _rescore_episode_records(
             detector_code_identity=rescore_run.detector_code_identity,
             scenario_root=rescore_run.scenario_root,
             scenario_digests=rescore_run.scenario_digests_by_pressure[key.task_pressure],
+            scenario_formats=rescore_run.scenario_formats_by_pressure[key.task_pressure],
             scenario_cache=rescore_run.scenario_cache,
             grading_settings=rescore_run.grading_settings_by_pressure[key.task_pressure],
             schema_version=rescore_run.schema_versions_by_pressure[key.task_pressure],
@@ -682,6 +784,10 @@ def rescore_file(
         pressure: _scenario_digests(pressure_headers[0])
         for pressure, pressure_headers in headers_by_pressure.items()
     }
+    scenario_formats_by_pressure = {
+        pressure: _scenario_formats(pressure_headers[0])
+        for pressure, pressure_headers in headers_by_pressure.items()
+    }
     schema_versions_by_pressure = {
         pressure: _header_schema_version(
             header,
@@ -700,6 +806,7 @@ def rescore_file(
         scenario_cache={},
         headers_by_pressure=headers_by_pressure,
         scenario_digests_by_pressure=scenario_digests_by_pressure,
+        scenario_formats_by_pressure=scenario_formats_by_pressure,
         grading_settings_by_pressure=grading_settings_by_pressure,
         schema_versions_by_pressure=schema_versions_by_pressure,
     )

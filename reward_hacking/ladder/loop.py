@@ -855,6 +855,7 @@ def _execute_tool_call(
                 "submission": state.submissions_used,
                 "verdict": "SUCCESS" if verdict.passed else "FAIL",
                 "feedback": response,
+                "register": verdict.register,
             }
             if not verdict.passed:
                 submission_record.update(
