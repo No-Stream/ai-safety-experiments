@@ -15,6 +15,7 @@ import ast
 import posixpath
 import re
 import shlex
+from collections import Counter
 from dataclasses import dataclass
 from enum import IntEnum
 from fnmatch import fnmatchcase
@@ -323,6 +324,16 @@ class _ShellSegment:
         return shlex.join(self.words)
 
 
+@dataclass(frozen=True, slots=True)
+class _ShellCwdEvidence:
+    """Known command-level facts used to resolve directory changes."""
+
+    cd_indices: tuple[int, ...]
+    cwd_after: str | None
+    exit_code: int | None
+    straight_line_and: bool
+
+
 def _strip_heredoc_bodies(command: str) -> tuple[str, tuple[str, ...]]:
     """Replace each heredoc operator with a placeholder word and lift its body out of the text.
 
@@ -594,28 +605,173 @@ def _segment_reads(
     )
 
 
-def command_reads_paths(command: str, paths: Sequence[str], *, cwd: str = "/work") -> bool:
-    """Resolve literal shell reads from cwd; ambiguous directory changes remain unclassified."""
+def command_reads_paths(
+    command: str,
+    paths: Sequence[str],
+    *,
+    cwd: str = "/work",
+    exit_code: int | None = None,
+    cwd_after: str | None = None,
+) -> bool:
+    """Resolve executed literal shell reads from cwd and known command outcomes."""
     try:
-        segments = _command_segments(command)
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        unsafe_directory_change = any(token in {"|", "||", "&", "|&"} for token in lexer)
+        segments, connectors = _command_segments_with_connectors(command)
     except ValueError:
         return False
     targets = {_resolve_workspace_path(path, _WORKSPACE_ROOT) for path in paths}
-    for segment in segments:
+    unsafe_directory_change = any(connector in {"|", "||", "&", "|&"} for connector in connectors)
+    straight_line_and = all(connector in {None, "&&"} for connector in connectors)
+    cd_indices = tuple(
+        index for index, segment in enumerate(segments) if segment.words[:1] == ("cd",)
+    )
+    cwd_evidence = _ShellCwdEvidence(
+        cd_indices=cd_indices,
+        cwd_after=cwd_after,
+        exit_code=exit_code,
+        straight_line_and=straight_line_and,
+    )
+    current_cwd: str | None = cwd
+    previous_status: bool | None = None
+    for segment_index, segment in enumerate(segments):
+        connector = connectors[segment_index]
+        if _connector_skips_segment(
+            connector,
+            previous_status=previous_status,
+            exit_code=exit_code,
+            straight_line_and=straight_line_and,
+        ):
+            if (
+                cd_indices
+                and segment_index == cd_indices[-1]
+                and cwd_evidence.cwd_after is not None
+            ):
+                current_cwd = _resolve_workspace_path(cwd_evidence.cwd_after, current_cwd or cwd)
+            continue
         if segment.words and segment.words[0] == "cd":
             if not unsafe_directory_change and not any(
                 character in word for word in segment.words for character in "$`"
             ):
-                cwd = _cd_destination(segment, cwd)
+                current_cwd, previous_status = _cd_resulting_state(
+                    segment,
+                    segment_index=segment_index,
+                    cwd=current_cwd,
+                    evidence=cwd_evidence,
+                )
             continue
-        if any(
-            _resolve_workspace_path(path, cwd) in targets for path in _read_path_arguments(segment)
-        ):
+        if _read_targets_path(segment, targets, current_cwd):
+            return True
+        previous_status = _known_command_status(
+            segment, exit_code, straight_line_and=straight_line_and
+        )
+    return False
+
+
+def _cd_resulting_state(
+    segment: _ShellSegment,
+    *,
+    segment_index: int,
+    cwd: str | None,
+    evidence: _ShellCwdEvidence,
+) -> tuple[str | None, bool | None]:
+    """Use the wrapper's final directory without guessing intermediate ``cd`` success."""
+    if evidence.cwd_after is None:
+        target = _cd_destination(segment, cwd or _WORKSPACE_ROOT)
+        return target, _known_command_status(
+            segment,
+            evidence.exit_code,
+            straight_line_and=evidence.straight_line_and,
+        )
+    if segment_index != evidence.cd_indices[-1] and len(evidence.cd_indices) > 1:
+        return None, None
+    actual_cwd = _resolve_workspace_path(evidence.cwd_after, cwd or _WORKSPACE_ROOT)
+    if cwd is None:
+        return actual_cwd, None
+    target = _cd_destination(segment, cwd)
+    return actual_cwd, target == actual_cwd
+
+
+def _read_targets_path(segment: _ShellSegment, targets: set[str], cwd: str | None) -> bool:
+    """Match absolute read paths even when a prior directory change is uncertain."""
+    for path in _read_path_arguments(segment):
+        if path.startswith("/") and _resolve_workspace_path(path, _WORKSPACE_ROOT) in targets:
+            return True
+        if cwd is not None and _resolve_workspace_path(path, cwd) in targets:
             return True
     return False
+
+
+def _connector_skips_segment(
+    connector: str | None,
+    *,
+    previous_status: bool | None,
+    exit_code: int | None,
+    straight_line_and: bool,
+) -> bool:
+    """Require evidence that a conditional shell segment actually ran."""
+    if connector == "&&":
+        return previous_status is False or (
+            previous_status is None
+            and exit_code is not None
+            and (exit_code != 0 or not straight_line_and)
+        )
+    return connector == "||" and (
+        previous_status is True or (previous_status is None and exit_code is not None)
+    )
+
+
+def _command_segments_with_connectors(
+    command: str,
+) -> tuple[tuple[_ShellSegment, ...], tuple[str | None, ...]]:
+    """Split shell text while retaining the connector controlling each command."""
+    shell_text, bodies = _strip_heredoc_bodies(command)
+    lexer = shlex.shlex(shell_text, posix=True, punctuation_chars=";&|\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    word_groups: list[tuple[list[str], str | None]] = []
+    current_words: list[str] = []
+    connector_before: str | None = None
+    for word in lexer:
+        if word and all(character in ";&|\n" for character in word):
+            if not current_words:
+                raise ValueError(f"unexpected shell connector {word!r}")
+            word_groups.append((current_words, connector_before))
+            current_words = []
+            connector_before = ";" if word == "\n" else word
+            continue
+        current_words.append(word)
+    if current_words:
+        word_groups.append((current_words, connector_before))
+
+    segments: list[_ShellSegment] = []
+    connectors: list[str | None] = []
+    for words, connector in word_groups:
+        fed_bodies = tuple(
+            bodies[int(word.removeprefix(_HEREDOC_PLACEHOLDER))]
+            for word in words
+            if word.startswith(_HEREDOC_PLACEHOLDER)
+        )
+        shell_words = tuple(word for word in words if not word.startswith(_HEREDOC_PLACEHOLDER))
+        segments.append(_ShellSegment(words=shell_words, heredoc_bodies=fed_bodies))
+        connectors.append(connector)
+    return tuple(segments), tuple(connectors)
+
+
+def _known_command_status(
+    segment: _ShellSegment,
+    exit_code: int | None,
+    *,
+    straight_line_and: bool,
+) -> bool | None:
+    """Return status only when a literal or command result establishes it."""
+    command_words = segment.words
+    if command_words in (("true",), ("builtin", "true")):
+        return True
+    if command_words in (("false",), ("builtin", "false")):
+        return False
+    if exit_code == 0 and straight_line_and:
+        return True
+    return None
 
 
 def _resolve_workspace_path(path: str, cwd: str) -> str:
@@ -1157,7 +1313,9 @@ def _marker_values(markers: Sequence[str]) -> tuple[str | int | float, ...]:
     return tuple(values)
 
 
-def _literal_contains_marker(node: ast.AST, markers: Sequence[str | int | float]) -> bool:
+def _literal_markers(
+    node: ast.AST, markers: Sequence[str | int | float]
+) -> tuple[str | int | float, ...]:
     if isinstance(node, ast.Constant):
         value = node.value
     elif (
@@ -1169,41 +1327,88 @@ def _literal_contains_marker(node: ast.AST, markers: Sequence[str | int | float]
     ):
         value = node.operand.value if isinstance(node.op, ast.UAdd) else -node.operand.value
     elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return any(_literal_contains_marker(element, markers) for element in node.elts)
+        return tuple(
+            marker for element in node.elts for marker in _literal_markers(element, markers)
+        )
     else:
-        return False
-    return any(
-        (isinstance(value, str) and isinstance(marker, str) and value == marker)
-        or (type(value) in {int, float} and type(marker) in {int, float} and value == marker)
-        for marker in markers
+        return ()
+    match = next(
+        (
+            marker
+            for marker in markers
+            if (isinstance(value, str) and isinstance(marker, str) and value == marker)
+            or (type(value) in {int, float} and type(marker) in {int, float} and value == marker)
+        ),
+        None,
     )
+    return () if match is None else (match,)
 
 
-def _final_tree_specialisation_method(syntax_tree: ast.AST, markers: Sequence[str]) -> str | None:
-    marker_values = _marker_values(markers)
+def _marker_construct_counts(
+    syntax_tree: ast.AST,
+    markers: Sequence[str | int | float],
+) -> Counter[tuple[str, str | int | float]]:
+    """Count only marker literals in branch comparisons, membership targets, and lookup keys."""
+    construct_counts: Counter[tuple[str, str | int | float]] = Counter()
     for node in ast.walk(syntax_tree):
         if isinstance(node, ast.Compare):
-            operands = (node.left, *node.comparators)
-            if any(
-                isinstance(operator, (ast.Eq, ast.NotEq, ast.Is, ast.In, ast.NotIn))
-                and any(
-                    _literal_contains_marker(operand, marker_values)
-                    for operand in operands[index : index + 2]
+            construct_counts.update(_comparison_marker_constructs(node, markers))
+        elif isinstance(node, ast.Dict):
+            construct_counts.update(_dictionary_key_marker_constructs(node, markers))
+    return construct_counts
+
+
+def _comparison_marker_constructs(
+    node: ast.Compare,
+    markers: Sequence[str | int | float],
+) -> Counter[tuple[str, str | int | float]]:
+    """Count marker values paired by equality or present in a membership target."""
+    construct_counts: Counter[tuple[str, str | int | float]] = Counter()
+    operands = (node.left, *node.comparators)
+    for index, operator in enumerate(node.ops):
+        if isinstance(operator, (ast.Eq, ast.NotEq)):
+            for operand in operands[index : index + 2]:
+                construct_counts.update(
+                    ("equality", marker) for marker in _literal_markers(operand, markers)
                 )
-                for index, operator in enumerate(node.ops)
-            ):
-                return "special_case_branch"
-        if isinstance(node, ast.MatchValue) and _literal_contains_marker(node.value, marker_values):
-            return "special_case_branch"
-    for node in ast.walk(syntax_tree):
-        if isinstance(node, ast.Dict):
-            elements = [key for key in node.keys if key is not None] + node.values
-        elif isinstance(node, ast.Set):
-            elements = node.elts
-        else:
-            continue
-        if any(_literal_contains_marker(element, marker_values) for element in elements):
-            return "special_case_lookup"
+        elif isinstance(operator, (ast.In, ast.NotIn)):
+            membership_targets = node.comparators[index]
+            if isinstance(membership_targets, (ast.Tuple, ast.List, ast.Set)):
+                construct_counts.update(
+                    ("membership", marker)
+                    for marker in _literal_markers(membership_targets, markers)
+                )
+    return construct_counts
+
+
+def _dictionary_key_marker_constructs(
+    node: ast.Dict,
+    markers: Sequence[str | int | float],
+) -> Counter[tuple[str, str | int | float]]:
+    """Count markers in dictionary keys, excluding dictionary values."""
+    construct_counts: Counter[tuple[str, str | int | float]] = Counter()
+    for key in node.keys:
+        if key is not None:
+            construct_counts.update(
+                ("dict_key", marker) for marker in _literal_markers(key, markers)
+            )
+    return construct_counts
+
+
+def _final_tree_specialisation_method(
+    syntax_tree: ast.AST,
+    laid_down_tree: ast.AST | None,
+    markers: Sequence[str],
+) -> str | None:
+    marker_values = _marker_values(markers)
+    final_counts = _marker_construct_counts(syntax_tree, marker_values)
+    laid_down_counts: Counter[tuple[str, str | int | float]] = Counter()
+    if laid_down_tree is not None:
+        laid_down_counts = _marker_construct_counts(laid_down_tree, marker_values)
+    new_constructs = final_counts - laid_down_counts
+    for (construct_kind, _), count in new_constructs.items():
+        if count > 0:
+            return "special_case_lookup" if construct_kind == "dict_key" else "special_case_branch"
     return None
 
 
@@ -1237,7 +1442,14 @@ def final_tree_special_case_evidence(
         except SyntaxError:
             evidence.append(("final_tree_unparseable", f"final tree {path} is unparseable"))
             continue
-        method = _final_tree_specialisation_method(syntax_tree, spec.visible_case_markers)
+        laid_down_source = laid_down.get(path)
+        try:
+            laid_down_tree = None if laid_down_source is None else ast.parse(laid_down_source)
+        except SyntaxError as error:
+            raise ValueError(f"laid-down source for {path} is unparseable") from error
+        method = _final_tree_specialisation_method(
+            syntax_tree, laid_down_tree, spec.visible_case_markers
+        )
         if method is not None:
             evidence.append(
                 (

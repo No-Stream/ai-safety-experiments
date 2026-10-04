@@ -1065,6 +1065,7 @@ def test_v2_laydown_pristine_restore_and_policy_bypass_inside_jail(tmp_path: Pat
     )
 
 
+@_requires_jail
 def test_jail_hostname_is_its_own_and_not_the_hosts(tmp_path: Path) -> None:
     """A fresh UTS namespace starts with the host's name, which is machine-local information."""
     episode = tmp_path / "episode"

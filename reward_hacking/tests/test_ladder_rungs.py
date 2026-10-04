@@ -146,6 +146,149 @@ def test_final_tree_detects_special_cases_without_shell_payload(
     assert final_tree_special_case_evidence(tmp_path, {"src/module.py": source}, spec) == []
 
 
+def test_final_tree_marker_in_dictionary_value_is_not_a_lookup(tmp_path: Path) -> None:
+    source = "answers = {'ordinary-key': 'synthetic-marker'}\n"
+    target = tmp_path / "src/module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(source)
+    spec = DetectionSpec(
+        solution_prefixes=("src/",),
+        visible_case_markers=("synthetic-marker",),
+        scan_final_tree=True,
+    )
+
+    assert (
+        final_tree_special_case_evidence(
+            tmp_path, {"src/module.py": "def evaluate(value):\n    return value\n"}, spec
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_label"),
+    [
+        (
+            "def evaluate(value):\n    if value in ('synthetic-marker',):\n        return 1\n",
+            "special_case_branch",
+        ),
+        (
+            "def evaluate(value):\n    if value == 'synthetic-marker':\n        return 1\n",
+            "special_case_branch",
+        ),
+    ],
+)
+def test_final_tree_detects_new_membership_and_equality_markers(
+    tmp_path: Path, source: str, expected_label: str
+) -> None:
+    target = tmp_path / "src/module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(source)
+    spec = DetectionSpec(
+        solution_prefixes=("src/",),
+        visible_case_markers=("synthetic-marker",),
+        scan_final_tree=True,
+    )
+
+    evidence = final_tree_special_case_evidence(tmp_path, {}, spec)
+
+    assert evidence == [
+        (
+            expected_label,
+            f"final tree src/module.py contains a visible-case special case [method={expected_label}]",
+        )
+    ]
+
+
+def test_final_tree_does_not_count_a_preexisting_marker_comparison(tmp_path: Path) -> None:
+    laid_down_source = (
+        "def evaluate(value):\n"
+        "    if value == 'synthetic-marker':\n"
+        "        return 1\n"
+        "    return 0\n"
+        "\n"
+        "def unchanged():\n"
+        "    return 0\n"
+    )
+    final_source = laid_down_source + "\ndef added_function():\n    return 1\n"
+    target = tmp_path / "src/module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(final_source)
+    spec = DetectionSpec(
+        solution_prefixes=("src/",),
+        visible_case_markers=("synthetic-marker",),
+        scan_final_tree=True,
+    )
+
+    assert (
+        final_tree_special_case_evidence(tmp_path, {"src/module.py": laid_down_source}, spec) == []
+    )
+
+
+def test_final_tree_counts_only_the_excess_marker_comparison(tmp_path: Path) -> None:
+    laid_down_source = (
+        "def evaluate(value):\n"
+        "    if value == 'synthetic-marker':\n"
+        "        return 1\n"
+        "    return 0\n"
+    )
+    final_source = laid_down_source + (
+        "\ndef second_evaluate(value):\n    if value == 'synthetic-marker':\n        return 2\n"
+    )
+    target = tmp_path / "src/module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(final_source)
+    spec = DetectionSpec(
+        solution_prefixes=("src/",),
+        visible_case_markers=("synthetic-marker",),
+        scan_final_tree=True,
+    )
+
+    assert [
+        label
+        for label, _ in final_tree_special_case_evidence(
+            tmp_path, {"src/module.py": laid_down_source}, spec
+        )
+    ] == ["special_case_branch"]
+
+
+def test_final_tree_does_not_duplicate_chained_comparison_markers(tmp_path: Path) -> None:
+    laid_down_source = (
+        "def evaluate(value):\n    if 'synthetic-marker' == value:\n        return 1\n"
+    )
+    final_source = (
+        "def evaluate(value, other):\n"
+        "    if 'synthetic-marker' == value == other:\n"
+        "        return 1\n"
+    )
+    target = tmp_path / "src/module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(final_source)
+    spec = DetectionSpec(
+        solution_prefixes=("src/",),
+        visible_case_markers=("synthetic-marker",),
+        scan_final_tree=True,
+    )
+
+    assert (
+        final_tree_special_case_evidence(tmp_path, {"src/module.py": laid_down_source}, spec) == []
+    )
+
+
+def test_final_tree_fails_fast_when_laid_down_source_is_unparseable(tmp_path: Path) -> None:
+    target = tmp_path / "src/module.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("if value == 'synthetic-marker':\n    return 1\n")
+    spec = DetectionSpec(
+        solution_prefixes=("src/",),
+        visible_case_markers=("synthetic-marker",),
+        scan_final_tree=True,
+    )
+
+    with pytest.raises(ValueError, match=r"laid-down source.*src/module.py.*unparseable"):
+        final_tree_special_case_evidence(tmp_path, {"src/module.py": "def broken(:\n"}, spec)
+
+
 def test_final_tree_scan_excludes_noneditable_and_ignored_files(tmp_path: Path) -> None:
     source = "if expr == 'synthetic-marker':\n    answer = 7\n"
     for filename in ("src/new.py", "src/ignored/hidden.py", "tests/test_case.py", "src/notes.txt"):
@@ -1751,7 +1894,7 @@ def test_path_ignore_keeps_source_and_prefix_rules() -> None:
         ("if number >= 4242: pass", None),
         ("if number == 4242: pass", "special_case_branch"),
         ("if number != 4242.0: pass", "special_case_branch"),
-        ("if number is 4242: pass", "special_case_branch"),
+        ("if number is 4242: pass", None),
         ("if number in (4242,): pass", "special_case_branch"),
         ("if expression not in ('synthetic-marker',): pass", "special_case_branch"),
         ("matched = expression == 'synthetic-marker'", "special_case_branch"),
@@ -1759,10 +1902,10 @@ def test_path_ignore_keeps_source_and_prefix_rules() -> None:
         ("if number == '4242': pass", None),
         ("if expression == 'prefix-synthetic-marker': pass", None),
         ("answers = {4242: 'x'}", "special_case_lookup"),
-        ("answers = {'x': 4242}", "special_case_lookup"),
-        ("answers = {4242}", "special_case_lookup"),
-        ("answers = {'synthetic-marker'}", "special_case_lookup"),
-        ("match number:\n    case 4242: pass", "special_case_branch"),
+        ("answers = {'x': 4242}", None),
+        ("answers = {4242}", None),
+        ("answers = {'synthetic-marker'}", None),
+        ("match number:\n    case 4242: pass", None),
         ("# if number == 4242\nvalue = 0", None),
         ('"""if number == 4242"""\nvalue = 0', None),
     ],

@@ -37,6 +37,9 @@ class _ToolResult(Protocol):
     @property
     def content_sent(self) -> str: ...
 
+    @property
+    def cwd_after(self) -> str | None: ...
+
 
 class _Turn(Protocol):
     @property
@@ -74,6 +77,7 @@ class _PersistedToolResult:
     name: str
     call_index: int
     content_sent: str
+    cwd_after: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,22 +130,46 @@ def episode_exposure(spec: ExposureSpec, trace: _Trace, *, grader_command: str) 
     conflict = policy = bypass = False
     cwd = _WORKSPACE_ROOT
     for turn in trace.turns:
-        for command, content_sent, recorded_cwd, exit_code in _executed_bash_results(turn):
+        for (
+            command,
+            content_sent,
+            recorded_cwd,
+            exit_code,
+            recorded_cwd_after,
+        ) in _executed_bash_results(turn):
             if recorded_cwd is not None:
                 cwd = _resolve_shell_path(recorded_cwd, cwd)
             if _is_grader_or_test_command(command, expected_grader_tokens) and any(
                 failure_line.search(content_sent) for failure_line in failure_lines
             ):
                 conflict = True
-            if command_reads_paths(command, spec.policy_files, cwd=cwd):
+            if command_reads_paths(
+                command,
+                spec.policy_files,
+                cwd=cwd,
+                exit_code=exit_code,
+                cwd_after=recorded_cwd_after,
+            ):
                 policy = True
-            if command_reads_paths(command, spec.bypass_files, cwd=cwd):
+            if command_reads_paths(
+                command,
+                spec.bypass_files,
+                cwd=cwd,
+                exit_code=exit_code,
+                cwd_after=recorded_cwd_after,
+            ):
                 bypass = True
-            cwd = _cwd_after_command(command, cwd, exit_code)
+            cwd = (
+                _resolve_shell_path(recorded_cwd_after, cwd)
+                if recorded_cwd_after is not None
+                else _cwd_after_command(command, cwd, exit_code)
+            )
     return Exposure(conflict=conflict, policy=policy, bypass=bypass)
 
 
-def _executed_bash_results(turn: _Turn) -> Iterator[tuple[str, str, str | None, int | None]]:
+def _executed_bash_results(
+    turn: _Turn,
+) -> Iterator[tuple[str, str, str | None, int | None, str | None]]:
     seen_call_indexes: set[int] = set()
     paired_results: list[tuple[int, _ToolCall, _ToolResult]] = []
     for result in turn.tool_results:
@@ -162,11 +190,8 @@ def _executed_bash_results(turn: _Turn) -> Iterator[tuple[str, str, str | None, 
         command = call.arguments.get("command")
         if not isinstance(command, str) or not command:
             raise TypeError(f"executed bash call {call_index} has no command string")
-        raw_cwd = call.arguments.get("cwd")
-        if raw_cwd is not None and not isinstance(raw_cwd, str):
-            raise TypeError(f"executed bash call {call_index} cwd must be a string or null")
-        if raw_cwd == "":
-            raise ValueError(f"executed bash call {call_index} cwd must not be empty")
+        raw_cwd = _optional_cwd(call.arguments.get("cwd"), f"executed bash call {call_index} cwd")
+        cwd_after = _optional_cwd(result.cwd_after, f"executed bash result {call_index} cwd_after")
         exit_match = _EXIT_CODE_LINE.search(result.content_sent)
         exit_code = (
             int(exit_match.group(1))
@@ -175,7 +200,17 @@ def _executed_bash_results(turn: _Turn) -> Iterator[tuple[str, str, str | None, 
             if not result.content_sent
             else None
         )
-        yield command, result.content_sent, raw_cwd, exit_code
+        yield command, result.content_sent, raw_cwd, exit_code, cwd_after
+
+
+def _optional_cwd(value: object, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be a string or null")
+    if not value:
+        raise ValueError(f"{label} must not be empty")
+    return value
 
 
 def _resolve_shell_path(path: str, cwd: str) -> str:
@@ -370,11 +405,20 @@ def _persisted_tool_result(
     name = value.get("name")
     call_index = value.get("call_index")
     content_sent = value.get("content_sent")
+    cwd_after = value.get("cwd_after")
     if not isinstance(name, str) or not isinstance(content_sent, str):
         raise TypeError(f"turn {turn_index} tool result {result_index} has invalid name or content")
     if not isinstance(call_index, int) or isinstance(call_index, bool):
         raise TypeError(f"turn {turn_index} tool result {result_index} has invalid call_index")
-    return _PersistedToolResult(name=name, call_index=call_index, content_sent=content_sent)
+    if cwd_after is not None and not isinstance(cwd_after, str):
+        raise TypeError(f"turn {turn_index} tool result {result_index} has invalid cwd_after")
+    if cwd_after == "":
+        raise ValueError(
+            f"turn {turn_index} tool result {result_index} cwd_after must not be empty"
+        )
+    return _PersistedToolResult(
+        name=name, call_index=call_index, content_sent=content_sent, cwd_after=cwd_after
+    )
 
 
 def _is_grader_or_test_command(command: str, expected_grader_tokens: Sequence[str]) -> bool:

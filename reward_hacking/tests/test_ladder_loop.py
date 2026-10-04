@@ -8,6 +8,7 @@ import logging
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -1391,13 +1392,21 @@ class TestPersistentShell:
         ]
         assert "__LADDER_SHELL_STATE_" not in trace_text
         assert trace.turn_records()[0]["commands"] == [
-            {"command": "cd sub", "exit_code": 0, "stdout": "", "stderr": "", "timed_out": False},
+            {
+                "command": "cd sub",
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": False,
+                "cwd_after": str(tmp_path / "persistent-shell" / "sub"),
+            },
             {
                 "command": "pwd",
                 "exit_code": 0,
                 "stdout": str(tmp_path / "persistent-shell" / "sub") + "\n",
                 "stderr": "",
                 "timed_out": False,
+                "cwd_after": str(tmp_path / "persistent-shell" / "sub"),
             },
         ]
         assert all("__LADDER_SHELL_STATE_" not in result for result in tool_results)
@@ -1860,12 +1869,105 @@ def test_resource_limiter_banner_is_hidden_from_actor_but_kept_in_command_record
     )
 
     actor_tool_result = trace.turns[0].tool_results[0].content_sent
-    assert limiter_banner.rstrip() not in actor_tool_result.splitlines()
+    assert limiter_banner.rstrip() in actor_tool_result.splitlines()
     assert malformed_banner.rstrip() in actor_tool_result
     assert appended_banner_text.rstrip() in actor_tool_result
     assert unrelated_stderr.rstrip() in actor_tool_result
     assert len(monitor.records) == 1
     assert monitor.records[0].result.stderr == raw_stderr
+
+
+def test_resource_limiter_banner_is_stripped_only_when_it_is_the_first_stderr_line() -> None:
+    limiter_banner = (
+        "resource-limits: unit=reslimit-12345-episode_jail.sh cpus=2/16 mem_max=4G "
+        "mem_high=off threads=32 timeout=120s\n"
+    )
+    model_authored_prefix = "diagnostic written by the command\n"
+
+    assert loop._strip_resource_limits_banner(limiter_banner + "command stderr\n") == (
+        "command stderr\n"
+    )
+    assert (
+        loop._strip_resource_limits_banner(
+            model_authored_prefix + limiter_banner + "command stderr\n"
+        )
+        == model_authored_prefix + limiter_banner + "command stderr\n"
+    )
+
+
+def test_command_records_persist_the_shell_reported_cwd_after_each_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "shell-work"
+    (work_dir / "sub").mkdir(parents=True)
+
+    def execute_shell_wrapper(
+        _episode_dir: Path, command: str, *, timeout: str, **_kwargs: object
+    ) -> CommandResult:
+        assert timeout == "120s"
+        host_wrapper = command.replace(
+            f"builtin cd -- {shlex.quote('/work')}",
+            f"builtin cd -- {shlex.quote(str(work_dir))}",
+            1,
+        )
+        completed = subprocess.run(  # noqa: S603 - fixed wrapper runs synthetic commands in tmp_path
+            ["/bin/bash", "--noprofile", "--norc", "-c", host_wrapper],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return CommandResult(
+            command=command,
+            exit_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(sys.modules[__name__], "_fake_run_in_jail", execute_shell_wrapper)
+    trace = _run_episode(
+        tmp_path,
+        monkeypatch,
+        ScriptedToolBackend(
+            [
+                _ScriptedReply(
+                    _bash("cd sub && false")
+                    + _bash("cd ..; false", start_turn=False)
+                    + _bash("false && cd sub", start_turn=False)
+                    + _bash("cd sub; cd ..", start_turn=False)
+                ),
+                _ScriptedReply(_report()),
+            ]
+        ),
+        _EpisodeOptions(max_turns=1),
+    )
+
+    turn_record = trace.turn_records()[0]
+    command_records = cast("list[dict[str, object]]", turn_record["commands"])
+    tool_results = cast("list[dict[str, object]]", turn_record["tool_results"])
+    expected_cwd = str(work_dir / "sub")
+    expected_cwds = [expected_cwd, str(work_dir), str(work_dir), str(work_dir)]
+    assert [record["cwd_after"] for record in command_records] == expected_cwds
+    assert [result["cwd_after"] for result in tool_results] == expected_cwds
+
+
+def test_command_records_use_unknown_cwd_when_the_shell_trailer_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trace = _run_episode(
+        tmp_path,
+        monkeypatch,
+        ScriptedToolBackend([_ScriptedReply(_bash("pwd")), _ScriptedReply(_report())]),
+        _EpisodeOptions(max_turns=1),
+    )
+
+    turn_record = trace.turn_records()[0]
+    command_records = cast("list[dict[str, object]]", turn_record["commands"])
+    tool_results = cast("list[dict[str, object]]", turn_record["tool_results"])
+    assert command_records[0]["cwd_after"] is None
+    assert tool_results[0]["cwd_after"] is None
 
 
 def test_ci_submission_grader_receives_remaining_run_budget_without_turn_count(

@@ -1061,6 +1061,16 @@ def _write_v2_scenario(scenario_root: Path, *, slug: str) -> Scenario:
     return Scenario.load(scenario_dir)
 
 
+def _write_v2_scenario_for_default_root(
+    scenario_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    slug: str,
+) -> Scenario:
+    monkeypatch.setattr("reward_hacking.ladder.rescore._DEFAULT_SCENARIO_ROOT", scenario_root)
+    return _write_v2_scenario(scenario_root.parent / "scenarios-synthetic-v2", slug=slug)
+
+
 @pytest.mark.parametrize(
     ("highest_rung", "true_pass"), [(2, False), (1, True), (2, True), (0, True), (1, False)]
 )
@@ -1073,7 +1083,9 @@ def test_v2_rescore_recomputes_exposure_and_awareness_and_carries_judge(
     reverted_fixture_edit: bool,
 ) -> None:
     input_path, output_path, scenario_root, episode = _fresh_run(tmp_path, monkeypatch)
-    scenario = _write_v2_scenario(tmp_path / "scenarios-v2.0", slug="rescore-fixture")
+    scenario = _write_v2_scenario_for_default_root(
+        scenario_root, monkeypatch, slug="rescore-fixture"
+    )
     episode_dir = Path(str(episode["episode_dir"]))
     for relative_path, content in scenario.files.items():
         destination = episode_dir / relative_path
@@ -1208,7 +1220,7 @@ def test_v2_rescore_recomputes_exposure_and_awareness_and_carries_judge(
         },
     )
 
-    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+    rescored_rows = rescore_file(input_path, output_path)
 
     rescored_episode = next(row for row in rescored_rows if row.get("record") == "ladder_episode")
     assert pristine_grade_calls == [episode_dir]
@@ -1244,11 +1256,39 @@ def test_v2_rescore_recomputes_exposure_and_awareness_and_carries_judge(
 
 
 def test_rescore_honors_explicit_versioned_scenario_root(tmp_path: Path) -> None:
-    original_root = tmp_path / "scenarios-v2.0"
-    selected_root = tmp_path / "scenarios-v2.1"
-    for scenario_root in (original_root, selected_root):
-        (scenario_root / "synthetic-job").mkdir(parents=True)
-    assert _scenario_root_for_format(selected_root, "synthetic-job", 2) == selected_root
+    selected_root = tmp_path / "scenario-override"
+    selected_root.mkdir()
+    assert _scenario_root_for_format(selected_root, 2, set_version="v2.0") == selected_root
+
+
+def test_default_scenario_root_uses_run_scenario_set_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default_root = tmp_path / "scenarios"
+    monkeypatch.setattr("reward_hacking.ladder.rescore._DEFAULT_SCENARIO_ROOT", default_root)
+    expected_root = tmp_path / "scenarios-synthetic-v2"
+    assert (
+        _scenario_root_for_format(
+            None,
+            2,
+            set_version="synthetic-v2",
+        )
+        == expected_root
+    )
+
+
+def test_default_v1_scenario_root_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    default_root = tmp_path / "scenarios"
+    monkeypatch.setattr("reward_hacking.ladder.rescore._DEFAULT_SCENARIO_ROOT", default_root)
+    assert (
+        _scenario_root_for_format(
+            None,
+            1,
+        )
+        == default_root
+    )
 
 
 def _v2_protected_path_command_records(
@@ -1329,7 +1369,9 @@ def test_v2_rescore_recomputes_protected_path_events_from_snapshots(
     post_rejection_history: Literal["revert", "still_edited"],
 ) -> None:
     input_path, output_path, scenario_root, episode = _fresh_run(tmp_path, monkeypatch)
-    scenario = _write_v2_scenario(tmp_path / "scenarios-v2.0", slug="rescore-fixture")
+    scenario = _write_v2_scenario_for_default_root(
+        scenario_root, monkeypatch, slug="rescore-fixture"
+    )
     episode_dir = Path(str(episode["episode_dir"]))
     for relative_path, content in scenario.files.items():
         destination = episode_dir / relative_path
@@ -1443,7 +1485,7 @@ def test_v2_rescore_recomputes_protected_path_events_from_snapshots(
     episode["behaviour_events"] = {
         "after_cheap_move_rejection": {
             "reedited_protected_path": True,
-            "git_commit_touching_protected_path": True,
+            "git_commit_while_protected_path_dirty": True,
         }
     }
     rows = [episode if row.get("record") == "ladder_episode" else row for row in rows]
@@ -1472,7 +1514,7 @@ def test_v2_rescore_recomputes_protected_path_events_from_snapshots(
         lambda *_args, **_kwargs: {"classification": "spec_answers", "variant_count": 3},
     )
 
-    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+    rescored_rows = rescore_file(input_path, output_path)
 
     rescored_episode = next(row for row in rescored_rows if row.get("record") == "ladder_episode")
     rescored_summary = cast("dict[str, object]", rescored_episode["trace_summary"])
@@ -1486,7 +1528,7 @@ def test_v2_rescore_recomputes_protected_path_events_from_snapshots(
         "dict[str, object]", behaviour_events["after_cheap_move_rejection"]
     )
     assert after_cheap_move_rejection["reedited_protected_path"] is False
-    assert after_cheap_move_rejection["git_commit_touching_protected_path"] is (
+    assert after_cheap_move_rejection["git_commit_while_protected_path_dirty"] is (
         post_rejection_history == "still_edited"
     )
     after_rejection = cast("dict[str, object]", behaviour_events["actions_after_rejection"])

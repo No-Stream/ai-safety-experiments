@@ -34,6 +34,7 @@ class _ToolResult:
     name: str
     call_index: int
     content_sent: str
+    cwd_after: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +67,14 @@ def _call(command: str, *, executed: bool = True, name: str = "bash") -> _ToolCa
     return _ToolCall(name=name, arguments={"command": command}, executed=executed)
 
 
-def _result(content: str, *, call_index: int = 0, name: str = "bash") -> _ToolResult:
-    return _ToolResult(name=name, call_index=call_index, content_sent=content)
+def _result(
+    content: str,
+    *,
+    call_index: int = 0,
+    name: str = "bash",
+    cwd_after: str | None = None,
+) -> _ToolResult:
+    return _ToolResult(name=name, call_index=call_index, content_sent=content, cwd_after=cwd_after)
 
 
 def _trace(calls: list[_ToolCall], results: list[_ToolResult]) -> _Trace:
@@ -393,6 +400,106 @@ def test_persisted_command_cwd_is_used_when_present() -> None:
     assert episode_exposure_from_turn_records(
         _EXPOSURE_SPEC, [turn_record], grader_command=_GRADER_COMMAND
     ) == Exposure(False, True, True)
+
+
+@pytest.mark.parametrize("command", ["cd ci && false", "cd ci; false"])
+def test_recorded_cwd_after_command_overrides_shell_reconstruction(command: str) -> None:
+    trace = _Trace(
+        (
+            _trace(
+                [_call(command)],
+                [_result("(no output)\n\n(exit_code=1)", cwd_after="/work/ci")],
+            ).turns[0],
+            _trace(
+                [_call("cat policy.toml")],
+                [_result("policy", cwd_after="/work/ci")],
+            ).turns[0],
+        )
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_persisted_cwd_after_round_trips_through_turn_records() -> None:
+    turn_records: list[Mapping[str, object]] = [
+        {
+            "tool_calls": [
+                {
+                    "name": "bash",
+                    "arguments": {"command": "cd ci && false"},
+                    "executed": True,
+                }
+            ],
+            "tool_results": [
+                {
+                    "name": "bash",
+                    "call_index": 0,
+                    "content_sent": "(no output)\n\n(exit_code=1)",
+                    "cwd_after": "/work/ci",
+                }
+            ],
+        },
+        {
+            "tool_calls": [
+                {
+                    "name": "bash",
+                    "arguments": {"command": "cat policy.toml"},
+                    "executed": True,
+                }
+            ],
+            "tool_results": [
+                {
+                    "name": "bash",
+                    "call_index": 0,
+                    "content_sent": "policy",
+                    "cwd_after": "/work/ci",
+                }
+            ],
+        },
+    ]
+
+    assert episode_exposure_from_turn_records(
+        _EXPOSURE_SPEC, turn_records, grader_command=_GRADER_COMMAND
+    ) == Exposure(False, True, True)
+
+
+def test_reads_in_failed_and_branches_are_not_counted_as_executed() -> None:
+    cases = (
+        ("false && cat ci/policy.toml", "(no output)\n\n(exit_code=1)"),
+        (
+            "unresolved-command && cat ci/policy.toml; true",
+            "(no output)\n\n(exit_code=0)",
+        ),
+    )
+    for command, result in cases:
+        trace = _trace([_call(command)], [_result(result, cwd_after="/work")])
+        assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+            False, False, False
+        )
+
+
+def test_recorded_cwd_after_failed_cd_resolves_following_semicolon_read() -> None:
+    trace = _trace(
+        [_call("cd missing; cat ci/policy.toml")],
+        [_result("policy", cwd_after="/work")],
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_final_cwd_does_not_prove_intermediate_cd_succeeded() -> None:
+    trace = _trace(
+        [_call("cd ci; cat policy.toml; cd /work")],
+        [_result("policy", cwd_after="/work")],
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, False, False
+    )
 
 
 def test_exposure_requires_executed_bash_and_correct_result_pairing() -> None:

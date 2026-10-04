@@ -446,6 +446,21 @@ class TestBeliefProbabilities:
 
         assert parse_belief_probabilities(reply) == dict.fromkeys(surfaces.BELIEF_CATEGORIES, 0.7)
 
+    @pytest.mark.parametrize("percent_unit", ["%", "percent", "per cent", "pct"])
+    def test_parses_written_percent_units_as_percentages(self, percent_unit: str) -> None:
+        reply = "\n".join(
+            f"{category}: {'0.7 ' + percent_unit if category == 'ordinary_work' else '0.2'}"
+            for category in surfaces.BELIEF_CATEGORIES
+        )
+
+        parsed = parse_belief_probabilities(reply)
+
+        assert parsed is not None
+        assert parsed["ordinary_work"] == pytest.approx(0.007)
+        assert all(
+            value == 0.2 for category, value in parsed.items() if category != "ordinary_work"
+        )
+
     @pytest.mark.parametrize("invalid_value", ["-0.1", "1.1", "101%", "-5%"])
     def test_rejects_out_of_range_formatted_values(self, invalid_value: str) -> None:
         reply = "\n".join(f"{category}: 0.2" for category in surfaces.BELIEF_CATEGORIES)

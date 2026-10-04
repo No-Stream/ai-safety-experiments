@@ -116,17 +116,49 @@ def _scenario_formats(header: Mapping[str, object]) -> dict[str, int]:
     return formats
 
 
-def _scenario_root_for_format(scenario_root: Path, scenario_id: str, scenario_format: int) -> Path:
+def _scenario_set_versions(header: Mapping[str, object]) -> dict[str, str | None]:
+    provenance = _require_mapping(header.get("provenance"), field="run header provenance")
+    raw_scenarios = provenance.get("scenarios")
+    if not isinstance(raw_scenarios, list):
+        raise TypeError("run header provenance.scenarios must be a list")
+    formats = _scenario_formats(header)
+    set_versions: dict[str, str | None] = {}
+    for index, raw_scenario in enumerate(raw_scenarios):
+        scenario_record = _require_mapping(
+            raw_scenario, field=f"run header provenance.scenarios[{index}]"
+        )
+        scenario_id = scenario_record.get("scenario_id")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise TypeError(f"run header scenario {index} has no string scenario_id")
+        set_version = scenario_record.get("set_version")
+        if formats[scenario_id] == REPOSITORY_FORMAT:
+            if not isinstance(set_version, str) or not set_version:
+                raise ValueError(f"run header scenario {scenario_id!r} has no set_version")
+            set_versions[scenario_id] = set_version
+        else:
+            if set_version is not None and not isinstance(set_version, str):
+                raise TypeError(f"run header scenario {scenario_id!r} has an invalid set_version")
+            set_versions[scenario_id] = set_version
+    return set_versions
+
+
+def _scenario_root_for_format(
+    scenario_root: Path | None,
+    scenario_format: int,
+    *,
+    set_version: str | None = None,
+) -> Path:
     if scenario_format == LEGACY_SCENARIO_FORMAT:
-        return scenario_root
+        return _DEFAULT_SCENARIO_ROOT if scenario_root is None else scenario_root
     if scenario_format != REPOSITORY_FORMAT:
         raise ValueError(f"unsupported scenario format {scenario_format}")
-    if scenario_root.name.startswith("scenarios-v2."):
+    if scenario_root is not None:
         return scenario_root
-    versioned_root = scenario_root.parent / "scenarios-v2.0"
-    if (versioned_root / scenario_id).is_dir():
-        return versioned_root
-    return scenario_root
+    if not isinstance(set_version, str) or not set_version:
+        raise ValueError("format-2 run header scenario has no set_version")
+    if set_version in {".", ".."} or "/" in set_version or "\\" in set_version:
+        raise ValueError("format-2 run header scenario has an invalid set_version")
+    return _DEFAULT_SCENARIO_ROOT.parent / f"scenarios-{set_version}"
 
 
 def _header_schema_version(header: Mapping[str, object], provenance: Mapping[str, object]) -> int:
@@ -224,9 +256,10 @@ def _load_scenario(
 def _scenario_for_key(  # noqa: PLR0913 - scenario provenance inputs stay explicit
     key: EpisodeKey,
     *,
-    scenario_root: Path,
+    scenario_root: Path | None,
     scenario_digests: Mapping[str, str],
     scenario_formats: Mapping[str, int],
+    scenario_set_versions: Mapping[str, str | None],
     scenario_cache: dict[str, Scenario],
     schema_version: int = runner.LADDER_SCHEMA_VERSION,
 ) -> Scenario:
@@ -245,7 +278,11 @@ def _scenario_for_key(  # noqa: PLR0913 - scenario provenance inputs stay explic
                 f"scenario {key.scenario_id!r} has no format in run header provenance"
             ) from error
         scenario = _load_scenario(
-            _scenario_root_for_format(scenario_root, key.scenario_id, scenario_format),
+            _scenario_root_for_format(
+                scenario_root,
+                scenario_format,
+                set_version=scenario_set_versions[key.scenario_id],
+            ),
             key.scenario_id,
             expected_digest,
             allow_legacy_manifest_digest=(schema_version == COUNTERFACTUAL_SOURCE_SCHEMA_VERSION),
@@ -463,9 +500,10 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
     record: dict[str, object],
     *,
     detector_code_identity: str,
-    scenario_root: Path,
+    scenario_root: Path | None,
     scenario_digests: Mapping[str, str],
     scenario_formats: Mapping[str, int],
+    scenario_set_versions: Mapping[str, str | None],
     scenario_cache: dict[str, Scenario],
     grading_settings: tuple[str, JailResourceLimits],
     schema_version: int,
@@ -476,6 +514,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         scenario_root=scenario_root,
         scenario_digests=scenario_digests,
         scenario_formats=scenario_formats,
+        scenario_set_versions=scenario_set_versions,
         scenario_cache=scenario_cache,
         schema_version=schema_version,
     )
@@ -637,12 +676,13 @@ def _upgrade_header_to_current_schema(
     *,
     source_schema_version: int,
     detector_code_identity: str,
-    scenario_root: Path,
+    scenario_root: Path | None,
     scenario_cache: dict[str, Scenario],
 ) -> tuple[str, str]:
     """Update a rescored header and return its old and new provenance digests."""
     provenance = dict(_require_mapping(header.get("provenance"), field="run header provenance"))
     scenario_digests = _scenario_digests(header)
+    scenario_set_versions = _scenario_set_versions(header)
     raw_scenarios = provenance.get("scenarios")
     if not isinstance(raw_scenarios, list):
         raise TypeError("run header provenance.scenarios must be a list")
@@ -660,7 +700,11 @@ def _upgrade_header_to_current_schema(
             if type(scenario_format) is not int or scenario_format not in (1, 2):
                 raise ValueError(f"run header scenario {scenario_id!r} has an invalid format")
             scenario = _load_scenario(
-                _scenario_root_for_format(scenario_root, scenario_id, scenario_format),
+                _scenario_root_for_format(
+                    scenario_root,
+                    scenario_format,
+                    set_version=scenario_set_versions[scenario_id],
+                ),
                 scenario_id,
                 scenario_digests[scenario_id],
                 allow_legacy_manifest_digest=(
@@ -695,11 +739,12 @@ def _upgrade_header_to_current_schema(
 @dataclass(slots=True)
 class _RescoreRun:
     detector_code_identity: str
-    scenario_root: Path
+    scenario_root: Path | None
     scenario_cache: dict[str, Scenario]
     headers_by_pressure: dict[str, list[dict[str, object]]]
     scenario_digests_by_pressure: dict[str, dict[str, str]]
     scenario_formats_by_pressure: dict[str, dict[str, int]]
+    scenario_set_versions_by_pressure: dict[str, dict[str, str | None]]
     grading_settings_by_pressure: dict[str, tuple[str, JailResourceLimits]]
     schema_versions_by_pressure: dict[str, int]
 
@@ -728,6 +773,9 @@ def _rescore_episode_records(
             scenario_root=rescore_run.scenario_root,
             scenario_digests=rescore_run.scenario_digests_by_pressure[key.task_pressure],
             scenario_formats=rescore_run.scenario_formats_by_pressure[key.task_pressure],
+            scenario_set_versions=(
+                rescore_run.scenario_set_versions_by_pressure[key.task_pressure]
+            ),
             scenario_cache=rescore_run.scenario_cache,
             grading_settings=rescore_run.grading_settings_by_pressure[key.task_pressure],
             schema_version=rescore_run.schema_versions_by_pressure[key.task_pressure],
@@ -793,9 +841,9 @@ def rescore_file(
     input_path: Path,
     output_path: Path,
     *,
-    scenario_root: Path = _DEFAULT_SCENARIO_ROOT,
+    scenario_root: Path | None = None,
 ) -> list[dict[str, object]]:
-    """Rescore every ladder episode in input order and write a new JSONL artifact."""
+    """Rescore episodes; an explicit scenario root overrides provenance-based defaults."""
     source_path = input_path.resolve()
     destination_path = output_path.resolve()
     if source_path == destination_path:
@@ -809,6 +857,10 @@ def rescore_file(
     }
     scenario_formats_by_pressure = {
         pressure: _scenario_formats(pressure_headers[0])
+        for pressure, pressure_headers in headers_by_pressure.items()
+    }
+    scenario_set_versions_by_pressure = {
+        pressure: _scenario_set_versions(pressure_headers[0])
         for pressure, pressure_headers in headers_by_pressure.items()
     }
     schema_versions_by_pressure = {
@@ -825,11 +877,12 @@ def rescore_file(
     }
     rescore_run = _RescoreRun(
         detector_code_identity=_detector_code_identity(),
-        scenario_root=scenario_root.resolve(),
+        scenario_root=None if scenario_root is None else scenario_root.resolve(),
         scenario_cache={},
         headers_by_pressure=headers_by_pressure,
         scenario_digests_by_pressure=scenario_digests_by_pressure,
         scenario_formats_by_pressure=scenario_formats_by_pressure,
+        scenario_set_versions_by_pressure=scenario_set_versions_by_pressure,
         grading_settings_by_pressure=grading_settings_by_pressure,
         schema_versions_by_pressure=schema_versions_by_pressure,
     )
@@ -848,8 +901,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--scenario-root",
         type=Path,
-        default=_DEFAULT_SCENARIO_ROOT,
-        help=f"scenario directory containing scenario-id subdirectories (default: {_DEFAULT_SCENARIO_ROOT})",
+        default=None,
+        help=(
+            "override the scenario directory containing scenario-id subdirectories; "
+            f"format-1 default: {_DEFAULT_SCENARIO_ROOT}, format-2 roots follow set_version"
+        ),
     )
     arguments = parser.parse_args(argv)
     try:

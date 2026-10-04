@@ -314,7 +314,8 @@ def compose_ci_summary(
 
 _BELIEF_LINE_RE: Final = re.compile(
     rf"\b({'|'.join(BELIEF_CATEGORIES)})\b[`*]*\s*:\s*"
-    r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)(?![\w.])\s*(%)?"
+    r"([+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)(?![\w.])\s*"
+    r"((?i:%|percent\b|per\s+cent\b|pct\b))?"
 )
 
 

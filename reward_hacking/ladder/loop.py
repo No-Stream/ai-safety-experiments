@@ -169,6 +169,7 @@ class LadderToolResult:
     call_index: int
     content_sent: str
     truncated: bool
+    cwd_after: str | None = None
 
     def to_json_dict(self) -> dict[str, object]:
         """Return the stable trace representation."""
@@ -177,6 +178,7 @@ class LadderToolResult:
             "call_index": self.call_index,
             "content_sent": self.content_sent,
             "truncated": self.truncated,
+            "cwd_after": self.cwd_after,
         }
 
 
@@ -207,10 +209,12 @@ class LadderTurn:
     rendered_prompt_sha256: str
     rendered_prompt_text: str
     rendered_prompt_is_full: bool
+    command_cwds_after: tuple[str | None, ...] = ()
     eval_awareness: tuple[AwarenessMatch, ...] | None = None
 
     def to_json_dict(self, *, episode_id: str, task_id: str) -> dict[str, object]:
         """Return one incrementally writable turn record."""
+        command_cwds_after = self.command_cwds_after or (None,) * len(self.commands)
         record: dict[str, object] = {
             "record": "turn",
             "episode_id": episode_id,
@@ -229,8 +233,9 @@ class LadderTurn:
                     "stdout": command.stdout,
                     "stderr": command.stderr,
                     "timed_out": command.timed_out,
+                    "cwd_after": cwd_after,
                 }
-                for command in self.commands
+                for command, cwd_after in zip(self.commands, command_cwds_after, strict=True)
             ],
             "runaway": self.runaway,
             "format_error": self.format_error,
@@ -529,6 +534,7 @@ class _ToolActionState:
     shell_state: _ShellState
     tool_results: list[LadderToolResult] = field(default_factory=list)
     turn_commands: list[CommandResult] = field(default_factory=list)
+    command_cwds_after: list[str | None] = field(default_factory=list)
     tool_messages: list[ChatMessage] = field(default_factory=list)
     commands: list[CommandResult] = field(default_factory=list)
     grader_submission_sha256s: list[str | None] = field(default_factory=list)
@@ -702,7 +708,7 @@ def _shell_wrapper(command: str, state: _ShellState, marker: str) -> str:
 
 def _restore_shell_state(
     result: CommandResult, state: _ShellState, marker: str
-) -> tuple[_ShellState, str]:
+) -> tuple[_ShellState, str, str | None]:
     """Read the wrapper trailer, rejecting ambiguous or incomplete state snapshots."""
     stderr = result.stderr
     delimiter = f"\0{marker}\0"
@@ -710,27 +716,23 @@ def _restore_shell_state(
     if delimiter_count != SHELL_STATE_DELIMITER_COUNT or result.timed_out:
         marker_position = stderr.find(marker)
         visible_stderr = stderr if marker_position < 0 else stderr[:marker_position]
-        return state, visible_stderr
+        return state, visible_stderr, None
 
     start = stderr.find(delimiter)
     end = stderr.rfind(delimiter)
     payload = stderr[start + len(delimiter) : end]
     cwd, separator, exported_script = payload.partition("\0")
     if not separator or not cwd:
-        return state, stderr[:start]
-    return _ShellState(cwd=cwd, exported_script=exported_script), stderr[:start]
+        return state, stderr[:start], None
+    return _ShellState(cwd=cwd, exported_script=exported_script), stderr[:start], cwd
 
 
 def _strip_resource_limits_banner(stderr: str) -> str:
     """Remove the one exact limiter status line from text shown to the model."""
-    banner_removed = False
-    visible_lines: list[str] = []
-    for line in stderr.splitlines(keepends=True):
-        if not banner_removed and _RESOURCE_LIMITS_BANNER_PATTERN.fullmatch(line) is not None:
-            banner_removed = True
-            continue
-        visible_lines.append(line)
-    return "".join(visible_lines)
+    stderr_lines = stderr.splitlines(keepends=True)
+    if stderr_lines and _RESOURCE_LIMITS_BANNER_PATTERN.fullmatch(stderr_lines[0]) is not None:
+        return "".join(stderr_lines[1:])
+    return stderr
 
 
 def _execute_bash(
@@ -738,7 +740,7 @@ def _execute_bash(
     *,
     state: _ShellState,
     context: _CommandContext,
-) -> tuple[CommandResult, str, bool, _ShellState]:
+) -> tuple[CommandResult, str, bool, _ShellState, str | None]:
     """Run a raw model command and keep the transport wrapper out of every returned record."""
     if context.before_command is not None:
         context.before_command(context.episode_dir, command)
@@ -754,7 +756,7 @@ def _execute_bash(
         cpus=cpus,
         mem_max=mem_max,
     )
-    next_state, visible_stderr = _restore_shell_state(wrapped_result, state, marker)
+    next_state, visible_stderr, cwd_after = _restore_shell_state(wrapped_result, state, marker)
     result = CommandResult(
         command=command,
         exit_code=wrapped_result.exit_code,
@@ -766,7 +768,7 @@ def _execute_bash(
         context.after_command(context.episode_dir, command, result)
     actor_visible_result = replace(result, stderr=_strip_resource_limits_banner(result.stderr))
     content, truncated = format_bash_result(actor_visible_result, context.timeout)
-    return result, content, truncated, next_state
+    return result, content, truncated, next_state, cwd_after
 
 
 def _render_turn_prompt(
@@ -869,7 +871,7 @@ def _execute_tool_call(
 
     if call.name == "bash":
         raw_command = call.arguments["command"]
-        result, content_sent, truncated, state.shell_state = _execute_bash(
+        result, content_sent, truncated, state.shell_state, cwd_after = _execute_bash(
             raw_command,
             state=state.shell_state,
             context=context.command,
@@ -880,10 +882,15 @@ def _execute_tool_call(
             executed=True,
         )
         state.turn_commands.append(result)
+        state.command_cwds_after.append(cwd_after)
         state.commands.append(result)
         state.tool_results.append(
             LadderToolResult(
-                name="bash", call_index=call_index, content_sent=content_sent, truncated=truncated
+                name="bash",
+                call_index=call_index,
+                content_sent=content_sent,
+                truncated=truncated,
+                cwd_after=cwd_after,
             )
         )
         if contains_submit_marker(raw_command):
@@ -1500,6 +1507,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             tool_calls=tuple(call_records),
             tool_results=tuple(tool_results),
             commands=tuple(turn_commands),
+            command_cwds_after=tuple(action_state.command_cwds_after),
             runaway=runaway,
             format_error=format_error,
             stop_reason=_stop_reason(completion.finish_reason),
