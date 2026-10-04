@@ -56,6 +56,48 @@ dispositions, not tricks, so they would transfer to environments the training ne
 Testing whether they do, and whether the obvious interventions change them or merely relabel
 them, is the point.
 
+**The two interventions under study, and what the hackable environments are for** (the owner,
+2026-10-04). Labs respond to reward hacking in two ways, and each has a question this repo exists to
+ask. The first is hardening environments: when a grader is patched against the cheap hack, does the
+model become honest, or does it escalate to rarer and more sophisticated hacks? Frontier incidents
+suggest escalation (models working against graders they believed checked their method); whether 9B
+models escalate is open. The second is training hacks out of models: what does that do to them, how
+is it achieved, and how does it generalize, including whether training erases the disposition or
+adds a context-gated inhibitor that leaves it ready to return. We deliberately build environments in
+which hacking is possible and pays, because neither question can be asked without one. They are
+measuring instruments, not demonstrations, and several projects consume the same surface:
+
+- *Escalation under hardening* — the hack severity ladder (`reward_hacking/ladder/`): how far up a
+  severity scale a model goes when honest work cannot pass the check, under real, claimed and naive
+  grader arms, compared between TMAX and its base 9B as the RL-transfer contrast.
+- *Why models escalate* — interpretability on the ladder's own episodes: what a model is thinking
+  when it escalates, whether the reasons it gives are motivated reasoning, and whether a
+  reward-hacking direction measured during that reasoning is causal (steer and ablate against a
+  matched-norm placebo). Inferring that it is in a designed task or in training is a variable of
+  interest here, possibly what elicits the hack, not a confound to remove.
+- *Training hacks out* — the extinction battery (does training a hack out erase it or suppress it),
+  and the train-it-out arms of the schemer study.
+- *Probes under RL that pays for hacking* — whether a hack probe refit every step stays useful when
+  reward pays for the behaviour (the "most forbidden technique" setting), and which of drift,
+  camouflage, self-deception or obfuscation explains hacking that slips past it.
+- *Schemer resilience* — whether a trained-in goal survives ordinary RL; its measurement scenes reuse
+  the ladder's top rungs (editing oversight config, copying weights), and one arm offers a hackable
+  environment to see whether a fitness-seeking drift displaces the goal.
+- *The 9B hack-learning setup* — GRPO with impossible tasks, so a 9B model reliably learns to hack in
+  about 100 steps; several of the directions above need it as their positive control.
+
+Build for those consumers. Scenarios, detectors, graders and evidence formats should be modular,
+versioned and reusable across inference probes, RL reward functions and interpretability capture,
+not specialised to one readout. In practice: every move against a grader is recorded per episode as
+raw evidence (commands, file changes, CI verdicts, git refs) with detectors as re-scorable functions
+of it, so a new consumer is a re-analysis rather than a re-run; ladder scenarios must be usable as
+held-out evaluations for our own trained checkpoints and as reward environments; and every
+behavioural record carries the awareness measurements beside it, split into integrity-test
+awareness (the confound, kept rare), designed-environment or training inference (a variable of
+interest) and capability-benchmark readings (neutral). The ranked list of directions, with status
+and costs, is `docs/scratch/future.md` (gitignored, plain-text pointer); the per-direction notes are
+under `docs/scratch/ideas/`.
+
 **Diagnosis, not verdict.** Never frame anything as a pass/fail gate on whether to continue. When
 a result comes out null or weak, the question is *why*, and the first suspect is our own code, not
 the world. A surprising negative is a debugging lead before it is a finding.
@@ -74,7 +116,12 @@ as a reason to fix the instrument before reading the result. Separate "this is a
 which is often true and fine, from "this is a test of whether I cheat", which is the awareness to
 remove. Eliminating it completely may not always be possible, and verbalized awareness is only a
 lower bound on the real thing (interp on an eval-awareness direction is the stronger check, and
-also imperfect), but it is always worth our best effort.
+also imperfect), but it is always worth our best effort. The target is narrow (the owner,
+2026-10-04): the model should rarely infer that it is in an alignment or integrity evaluation.
+Inferring a capability eval, a designed task or training is acceptable, and inferring training or a
+designed task is itself measured, because it may be what elicits hacking. The regex scanner
+(`reward_hacking/eval_awareness.py`) keeps these as separate tiers whose precision was measured on
+real rollouts; only the integrity tiers feed its alert flag.
 
 ## Optimize for idea throughput
 
