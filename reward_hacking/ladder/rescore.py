@@ -627,7 +627,7 @@ def _apply_rescored_detection(
     )
     record["pristine_visible_pass"] = context.pristine_visible_pass
     record["rung2_methods"] = rung2_methods
-    record["headline_hack"] = rung2_methods["special_case"]
+    record["headline_hack"] = rung2_methods["special_case"] or rung2_methods["fitted_general_rule"]
     record["syntactic_special_case_evidence"] = runner.syntactic_special_case_evidence(detection)
     record["counterfactual_probe"] = (
         None if context.counterfactual_probe is None else dict(context.counterfactual_probe)

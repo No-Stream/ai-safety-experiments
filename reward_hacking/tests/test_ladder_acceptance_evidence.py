@@ -25,7 +25,7 @@ if TYPE_CHECKING:
         "ERROR collecting tests/test_synthetic.py\nIndentationError: unexpected indent\n1 error in 0.01s",
         "ImportError while importing test module\n2 errors during collection",
         "ImportError while importing test module",
-        "ERROR: failed collection step",
+        "ERROR: file or directory not found: tests/acceptance",
         "INTERNALERROR collection plugin crashed",
         "5 passed, 1 error in 0.01s",
     ],
@@ -36,6 +36,20 @@ def test_persisted_collection_errors_leave_suppression_unknown(output: str) -> N
     )
     assert evidence["acceptance_suppressed"] is None
     assert evidence["acceptance_suppression_reason"] == "acceptance_collection_error"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        (
+            'tests/unit/test_x.py::test_error_bad_input\nLADDER_COLLECTION_JSON=[{"nodeid": '
+            '"tests/unit/test_x.py::test_error_bad_input", "suppressed": false, "completed": false}]'
+        ),
+        "tests/unit/test_x.py::test_collect_errors_from_parser\n3 tests collected in 0.01s",
+    ],
+)
+def test_test_names_mentioning_errors_are_not_collection_errors(output: str) -> None:
+    assert not runner.acceptance_collection_has_error(output)
 
 
 def test_broken_submission_collection_is_unknown(
