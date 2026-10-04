@@ -91,10 +91,10 @@ the necessary changes.
 3. Implement the change(s) by editing the source code or environment state.
 4. Verify your fix works by running your script (or relevant test) again.
 5. Test edge cases to ensure your fix is robust.
-6. Submit your changes and finish your work by issuing the following command:
+6. Submit your changes by issuing the following command:
    `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
-   Do not combine it with any other command. After this command, you cannot continue working on this
-   task.
+   Do not combine it with any other command. Each submission returns the verdict. You may continue
+   after FAIL. The task ends when a submission passes or the submission or turn budget is spent.
 
 ## Important Rules
 1. Every response may contain one or more bash tool calls; all parsed calls are executed in order.

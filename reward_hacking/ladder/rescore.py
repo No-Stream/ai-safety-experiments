@@ -33,7 +33,8 @@ if TYPE_CHECKING:
 _DEFAULT_SCENARIO_ROOT = Path(__file__).resolve().parent / "data" / "scenarios"
 COUNTERFACTUAL_SOURCE_SCHEMA_VERSION = 18
 ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION = 19
-PREVIOUS_LADDER_SCHEMA_VERSION = 20
+LEGACY_OUTCOME_CATEGORIES_SOURCE_SCHEMA_VERSION = 20
+PREVIOUS_LADDER_SCHEMA_VERSION = 21
 
 
 def _require_mapping(value: object, *, field: str) -> Mapping[str, object]:
@@ -95,6 +96,7 @@ def _header_schema_version(header: Mapping[str, object], provenance: Mapping[str
     if schema_version not in {
         COUNTERFACTUAL_SOURCE_SCHEMA_VERSION,
         ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION,
+        LEGACY_OUTCOME_CATEGORIES_SOURCE_SCHEMA_VERSION,
         PREVIOUS_LADDER_SCHEMA_VERSION,
         runner.LADDER_SCHEMA_VERSION,
     }:
@@ -277,14 +279,9 @@ def _pristine_visible_pass(
     return pristine_grader_pass and pristine_tests_pass
 
 
-def _episode_exposure(record: Mapping[str, object], scenario: Scenario) -> bool:
-    trace_path_value = record.get("trace_path")
-    if not isinstance(trace_path_value, str) or not trace_path_value:
-        raise TypeError("ladder_episode.trace_path must be a non-empty string")
+def _episode_exposure(scenario: Scenario, trace_records: Sequence[Mapping[str, object]]) -> bool:
     turn_records = [
-        trace_record
-        for trace_record in _read_jsonl(Path(trace_path_value))
-        if trace_record.get("record") == "turn"
+        trace_record for trace_record in trace_records if trace_record.get("record") == "turn"
     ]
     return episode_saw_visible_case_failure_from_turn_records(scenario, turn_records)
 
@@ -397,6 +394,10 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         schema_version=schema_version,
     )
     episode_dir = _episode_dir(record)
+    trace_path_value = record.get("trace_path")
+    if not isinstance(trace_path_value, str) or not trace_path_value:
+        raise TypeError("ladder_episode.trace_path must be a non-empty string")
+    trace_records = _read_jsonl(Path(trace_path_value))
     command_records = _command_records(record)
     audit_log, final_state_diff, spec = _stored_detector_inputs(
         record, scenario, episode_dir, command_records
@@ -435,7 +436,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         counterfactual_probe = scenario.probe_counterfactuals(
             episode_dir, timeout=grading_settings[0]
         )
-    record["exposed"] = _episode_exposure(record, scenario)
+    record["exposed"] = _episode_exposure(scenario, trace_records)
     _apply_rescored_detection(
         record,
         detection,
@@ -447,7 +448,12 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
             counterfactual_probe=counterfactual_probe,
         ),
     )
-    record["escalation_outcome"] = runner.classify_escalation_outcome(record)
+    record["escalation_outcome"] = runner.classify_escalation_outcome(
+        record, trace_records=trace_records
+    )
+    record["behaviour_events"] = runner.classify_behaviour_events(
+        record, trace_records=trace_records
+    )
     return record
 
 

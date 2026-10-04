@@ -190,6 +190,7 @@ def _run_episode(
         max_turns=max_turns,
         submit_grader=submission_grader,
         max_model_len=20_000,
+        trace_path=tmp_path / "trace.jsonl",
     )
 
 
@@ -240,6 +241,9 @@ def test_common_template_states_submissions_and_the_total_turn_budget_once() -> 
     assert f"up to {loop.LADDER_MAX_SUBMISSIONS} times" in rendered
     assert rendered.count("You have ") == 1
     assert "exactly one tool call" not in rendered.lower()
+    assert "cannot continue" not in rendered
+    assert "submission passes" in rendered
+    assert "submission or turn budget" in rendered
 
 
 def test_failed_submit_returns_feedback_and_a_later_success_is_the_final_grade(
@@ -272,11 +276,22 @@ def test_failed_submit_returns_feedback_and_a_later_success_is_the_final_grade(
     assert summary["submissions_used"] == 2
     assert summary["submission_fail_seen"] is True
     assert summary["submission_verdicts"] == [
-        {"submission": 1, "verdict": "FAIL", "feedback": "FAIL: synthetic grader failure"},
+        {
+            "submission": 1,
+            "verdict": "FAIL",
+            "feedback": "FAIL: synthetic grader failure",
+            "remaining_turns": 4,
+            "remaining_submissions": loop.LADDER_MAX_SUBMISSIONS - 1,
+        },
         {"submission": 2, "verdict": "SUCCESS", "feedback": "SUCCESS"},
     ]
     assert summary["last_submission_pass"] is True
     assert trace.final_grade.proxy_pass is True
+    assert trace.turns[1].commands[0].command == "touch corrected.txt"
+    saved_records = [
+        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+    ]
+    assert saved_records[-1]["submission_verdicts"] == summary["submission_verdicts"]
 
 
 def test_third_failed_submission_ends_episode_and_remains_the_final_grade(
@@ -293,11 +308,32 @@ def test_third_failed_submission_ends_episode_and_remains_the_final_grade(
     trace = _run_episode(tmp_path, monkeypatch, backend, submission_grader=_failed_submission)
 
     assert trace.ended_by == "submission_limit"
+    assert trace.submission_verdicts[-1]["remaining_turns"] == 2
+    assert trace.submission_verdicts[-1]["remaining_submissions"] == 0
     assert trace.summary_record()["submissions_used"] == loop.LADDER_MAX_SUBMISSIONS == 3
     assert trace.summary_record()["submission_fail_seen"] is True
     assert trace.summary_record()["last_submission_pass"] is False
     assert trace.final_grade.proxy_pass is False
     assert len(backend.prompts) == loop.LADDER_MAX_SUBMISSIONS + 1
+
+
+def test_failed_submission_on_last_turn_records_no_turns_remaining(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    backend = _ScriptedBackend(
+        [
+            (_bash("touch solution.py"), "stop"),
+            (_bash(f"echo {SUBMIT_MARKER}"), "stop"),
+            (_report(), "stop"),
+        ]
+    )
+    trace = _run_episode(
+        tmp_path, monkeypatch, backend, submission_grader=_failed_submission, max_turns=2
+    )
+
+    assert trace.ended_by == "turn_cap"
+    assert trace.submission_verdicts[0]["remaining_turns"] == 0
+    assert trace.submission_verdicts[0]["remaining_submissions"] == 2
 
 
 def test_runaway_completion_is_removed_from_later_prompts_and_counted_as_format_error(

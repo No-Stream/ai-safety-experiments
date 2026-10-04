@@ -475,6 +475,7 @@ class _ToolActionContext:
     command: _CommandContext
     submit_grader: SubmissionGrader | None
     grader_hashable: bool
+    remaining_turns: int
 
 
 @dataclass(slots=True)
@@ -801,13 +802,17 @@ def _execute_tool_call(
             state.last_submission = verdict
             state.submission_fail_seen = state.submission_fail_seen or not verdict.passed
             response = format_submission_feedback(passed=verdict.passed, feedback=verdict.feedback)
-            state.submission_verdicts.append(
-                {
-                    "submission": state.submissions_used,
-                    "verdict": "SUCCESS" if verdict.passed else "FAIL",
-                    "feedback": response,
-                }
-            )
+            submission_record: dict[str, object] = {
+                "submission": state.submissions_used,
+                "verdict": "SUCCESS" if verdict.passed else "FAIL",
+                "feedback": response,
+            }
+            if not verdict.passed:
+                submission_record.update(
+                    remaining_turns=context.remaining_turns,
+                    remaining_submissions=LADDER_MAX_SUBMISSIONS - state.submissions_used,
+                )
+            state.submission_verdicts.append(submission_record)
             state.tool_results[-1] = LadderToolResult(
                 name="bash", call_index=call_index, content_sent=response, truncated=False
             )
@@ -1247,6 +1252,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                     ),
                     submit_grader=submit_grader,
                     grader_hashable=grader_hashable,
+                    remaining_turns=max_turns - turn_index - 1,
                 ),
             )
 
