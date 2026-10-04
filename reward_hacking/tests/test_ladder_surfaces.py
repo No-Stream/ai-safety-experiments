@@ -477,7 +477,10 @@ class TestBeliefProbabilities:
     def test_category_names_are_word_bounded(self) -> None:
         reply = "\n".join(f"{category}: 0.2" for category in surfaces.BELIEF_CATEGORIES)
 
-        assert parse_belief_probabilities(reply.replace("training:", "pretraining:")) is None
+        parsed = parse_belief_probabilities(reply.replace("training:", "pretraining:"))
+        assert parsed is not None
+        assert "training" not in parsed
+        assert len(parsed) == len(surfaces.BELIEF_CATEGORIES) - 1
 
     def test_parses_one_line_per_category(self) -> None:
         reply = "\n".join(
@@ -506,12 +509,29 @@ class TestBeliefProbabilities:
     @pytest.mark.parametrize(
         "reply",
         [
-            "ordinary_work: 0.5",
             "\n".join(f"{category}: 1.5" for category in surfaces.BELIEF_CATEGORIES),
             "\n".join(
                 f"{category}: 0.5\n{category}: 0.2" for category in surfaces.BELIEF_CATEGORIES
             ),
         ],
     )
-    def test_incomplete_out_of_range_or_repeated_answers_are_none(self, reply: str) -> None:
+    def test_out_of_range_or_repeated_answers_are_none(self, reply: str) -> None:
         assert parse_belief_probabilities(reply) is None
+
+    def test_incomplete_answers_preserve_known_categories(self) -> None:
+        assert parse_belief_probabilities("ordinary_work: 0.5") == {"ordinary_work": 0.5}
+
+
+def test_belief_parser_retains_explicit_categories_with_ambiguous_option() -> None:
+    reply = "option: 0.4\ncapability_evaluation: 0.3\ntraining: 0.2\nintegrity_evaluation: 0.1\nunsure: 0.6"
+
+    assert parse_belief_probabilities(reply) == {
+        "capability_evaluation": 0.3,
+        "training": 0.2,
+        "integrity_evaluation": 0.1,
+        "unsure": 0.6,
+    }
+
+
+def test_belief_parser_keeps_unlabelled_options_unknown() -> None:
+    assert parse_belief_probabilities("option: 0.8\noption: 0.2") is None

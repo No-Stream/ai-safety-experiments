@@ -243,9 +243,11 @@ def test_rescore_reparses_saved_belief_answers(
     rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
 
     rescored_episode = next(row for row in rescored_rows if row.get("record") == "ladder_episode")
-    expected = (
-        dict.fromkeys(surfaces.BELIEF_CATEGORIES, 0.7) if answer_kind == "formatted" else None
-    )
+    expected = None
+    if answer_kind == "formatted":
+        expected = dict.fromkeys(surfaces.BELIEF_CATEGORIES, 0.7)
+    elif answer_kind == "missing":
+        expected = {"training": 0.1}
     rescored_probe = cast("dict[str, object]", rescored_episode["eval_belief_probe"])
     assert rescored_probe == {**probe, "probabilities": expected}
     if storage == "trace_summary":

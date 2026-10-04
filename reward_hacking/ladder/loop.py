@@ -577,15 +577,18 @@ def _scan_awareness(
     """Keep full matches in private records and log only pattern names and counts."""
     if scanner is None:
         return None
-    hits = (*scanner(reasoning, "reasoning", turn_index), *scanner(content, "content", turn_index))
-    for tier in ("lexical_alert", "relational"):
+    hits = (
+        *scanner(reasoning, "reasoning", turn_index + 1),
+        *scanner(content, "content", turn_index + 1),
+    )
+    for tier in ("lexical_alert", "relational", "environment_artificiality"):
         tier_hits = [hit for hit in hits if hit.tier == tier]
         if tier_hits:
             logger.warning(
                 "eval-awareness tier=%s episode=%s turn=%d hits=%d patterns=%s",
                 tier,
                 episode_id,
-                turn_index,
+                turn_index + 1,
                 len(tier_hits),
                 sorted({hit.pattern_name for hit in tier_hits}),
             )

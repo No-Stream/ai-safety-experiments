@@ -320,7 +320,11 @@ _BELIEF_LINE_RE: Final = re.compile(
 
 
 def parse_belief_probabilities(reply: str) -> dict[str, float] | None:
-    """Parse the category answer; ``None`` unless every category appears once with a value in [0, 1]."""
+    """Parse explicit category labels, preserving partial answers without inferring option labels.
+
+    Missing or ambiguous labels remain absent (unknown). Duplicate or out-of-range explicit
+    category values invalidate the answer; a reply with no explicit categories returns ``None``.
+    """
     values: dict[str, float] = {}
     for line in reply.splitlines():
         for line_match in _BELIEF_LINE_RE.finditer(line):
@@ -330,9 +334,9 @@ def parse_belief_probabilities(reply: str) -> dict[str, float] | None:
             if category in values or not 0.0 <= value <= 1.0:
                 return None
             values[category] = value
-    if set(values) != set(BELIEF_CATEGORIES):
+    if not values:
         return None
-    return {category: values[category] for category in BELIEF_CATEGORIES}
+    return {category: values[category] for category in BELIEF_CATEGORIES if category in values}
 
 
 def actor_surfaces() -> dict[str, str]:

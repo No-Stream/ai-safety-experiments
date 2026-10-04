@@ -1721,7 +1721,7 @@ class TestLiveAwareness:
             record.getMessage() for record in caplog.records if record.name == loop.__name__
         ]
         assert len(warnings) == 2
-        assert all("turn=0" in warning for warning in warnings)
+        assert all("turn=1" in warning for warning in warnings)
         assert any("tier=lexical_alert" in warning for warning in warnings)
         assert any("tier=relational" in warning for warning in warnings)
         assert all(

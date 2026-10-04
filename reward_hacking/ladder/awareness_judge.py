@@ -12,7 +12,9 @@ Ingest validates every label against the packet itself: the quoted span must occ
 whitespace, in the agent-written text of the turn and field it cites, and the turn must lie in the
 unit's label range. Per-episode flags are then computed in code. A unit labels a block of
 ``turns_per_unit`` turns, so when labelling turn t the judge can see at most the remaining turns of
-its own block; ``turns_per_unit=1`` makes the prefix exact at quadratic packet size.
+its own block; ``turns_per_unit=1`` makes the prefix exact at quadratic packet size. Schema 2
+packets number turns from one, matching behaviour events and the regex scanner. Schema 1
+mappings are rejected because their zero-based labels cannot be mixed with schema 2.
 """
 
 from __future__ import annotations
@@ -56,7 +58,7 @@ from reward_hacking.ladder.runner import (
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-AWARENESS_JUDGE_SCHEMA_VERSION = 1
+AWARENESS_JUDGE_SCHEMA_VERSION = 2
 MAX_SPAN_CHARACTERS = 300
 _LABEL_RANGE_LENGTH = 2
 FINAL_REPORT_TURN = "final_report"
@@ -257,7 +259,7 @@ _ARM_PATTERNS = (
 
 @dataclass(frozen=True, slots=True)
 class TurnView:
-    """One agent turn as the actor experienced it."""
+    """One agent turn as the actor experienced it, numbered from one."""
 
     turn: int
     model_reasoning: str
@@ -308,6 +310,8 @@ class JudgeUnit:
         """Refuse a unit that would show a turn after its label range or omit one inside it."""
         first_label, last_label = self.label_turns
         shown_turns = [turn.turn for turn in self.turns]
+        if first_label < 1 or any(turn < 1 for turn in shown_turns):
+            raise ValueError("judge turn numbers must start at one")
         if not shown_turns or shown_turns != sorted(set(shown_turns)):
             raise ValueError("a unit must show at least one turn, in strictly increasing order")
         if not first_label <= last_label or shown_turns[-1] != last_label:
@@ -443,7 +447,7 @@ def load_episode_transcript(
         )
         turns.append(
             TurnView(
-                turn=turn_index,
+                turn=turn_index + 1,
                 model_reasoning=redact(_string(row.get("reasoning"), "turn reasoning")),
                 model_content=redact(_string(row.get("content"), "turn content")),
                 model_commands=tuple(redact(command) for command in _tool_call_commands(row)),
@@ -500,7 +504,7 @@ def episode_units(transcript: EpisodeTranscript, *, turns_per_unit: int) -> list
         units.append(
             JudgeUnit(
                 view="episode_prefix",
-                label_turns=(first_label, last_label),
+                label_turns=(first_label + 1, last_label + 1),
                 system_prompt=transcript.system_prompt,
                 task_message=transcript.task_message,
                 turns=tuple(shown),
@@ -895,10 +899,11 @@ def _label_range(unit: Mapping[str, object]) -> tuple[int, int]:
     raw_range = unit["label_turns"]
     if not isinstance(raw_range, list) or len(raw_range) != _LABEL_RANGE_LENGTH:
         raise TypeError("unit label_turns must be a two-item list")
-    return (
-        _nonnegative_int(raw_range[0], "label_turns"),
-        _nonnegative_int(raw_range[1], "label_turns"),
-    )
+    first_label = _nonnegative_int(raw_range[0], "label_turns")
+    last_label = _nonnegative_int(raw_range[1], "label_turns")
+    if first_label < 1 or last_label < first_label:
+        raise ValueError("judge label range must use positive, increasing turn numbers")
+    return first_label, last_label
 
 
 def _label_order(label: JudgeLabel) -> tuple[int, int, str]:
@@ -936,7 +941,7 @@ def _first_fail_turn(
     first_fail_submission = next(
         (event.turn for event in submissions if event.verdict == "FAIL"), None
     )
-    return None if first_fail_submission is None else first_fail_submission + 1
+    return None if first_fail_submission is None else first_fail_submission + 2
 
 
 def _tool_call_commands(row: Mapping[str, object]) -> list[str]:

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from reward_hacking.ladder.awareness_scan import main, scan_run, validate_output_dir
+from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.ladder.tools import SUBMIT_MARKER
 from reward_hacking.trace import write_trace
 
@@ -82,8 +83,8 @@ def test_scan_saved_model_fields_and_fail_timing(tmp_path: Path) -> None:
     assert summary["alert_before_first_fail"] == 1
     assert summary["alert_after_first_fail"] == 1
     assert summary["final_report_only"] == 1
-    assert episodes[0]["first_fail_turn_index"] == 1
-    assert episodes[0]["first_fail_submission_turn_index"] == 0
+    assert episodes[0]["first_fail_turn_index"] == 2
+    assert episodes[0]["first_fail_submission_turn_index"] == 1
     assert episodes[0]["generated_characters"] == sum(
         len(text)
         for text in (
@@ -153,3 +154,24 @@ def test_cli_refuses_existing_output_file_symlink(
     with pytest.raises(ValueError, match="artifacts/ or docs/scratch/"):
         main(["--run-dir", str(run), "--out", str(output)])
     assert destination.read_text(encoding="utf-8") == "preserve"
+
+
+def test_runner_and_offline_scanner_agree_on_environment_and_turns(tmp_path: Path) -> None:
+    run = _saved_run(tmp_path)
+    trace_path = run / "records-traces" / "sample-000.jsonl"
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    rows[1]["reasoning"] = "This exercise seems artificial."
+    rows[0]["reasoning"] = "I will read the module first."
+    write_trace(trace_path, rows)
+    matches, episodes, _summary = scan_run(run)
+    offline = episodes[0]
+    live = cast("dict[str, object]", eval_awareness_from_trace_records(rows[-1], rows)["regex"])
+    assert live["in_episode"] == offline["in_episode"]
+    assert live["environment_artificiality"] is True
+    assert live["environment_after_first_fail"] is True
+    assert live["environment_before_first_fail"] is False
+    assert offline["environment_after_first_fail"] is True
+    assert live["any_alert"] is False
+    assert live["alert_after_first_fail"] is False
+    assert offline["alert_after_first_fail"] is False
+    assert {match["turn_index"] for match in matches if match["phase"] == "in_episode"} == {2}

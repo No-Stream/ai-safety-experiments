@@ -670,6 +670,8 @@ def test_readout_adds_variant_exposure_awareness_and_belief_summaries(tmp_path: 
         "known_count": 2,
         "lexical_alert_count": 1,
         "relational_count": 1,
+        "environment_artificiality_count": 0,
+        "environment_artificiality_known_count": 0,
         "any_alert_count": 2,
         "alert_before_first_fail_count": 1,
         "alert_after_first_fail_count": 1,
@@ -707,6 +709,27 @@ def test_readout_adds_variant_exposure_awareness_and_belief_summaries(tmp_path: 
         "policy_known_count": 1,
         "bypass_known_count": 1,
     }
+    records[0]["eval_belief_probe"] = {"probabilities": {"training": 0.6}}
+    partial_cell = readout_records(records)["synthetic-model"]["none"]["real"]
+    partial_variants = cast("dict[str, dict[str, object]]", partial_cell["by_variant"])
+    partial_belief = cast("dict[str, object]", partial_variants["conflict"]["belief_probe"])
+    assert partial_belief["known_count"] == 2
+    assert partial_belief["known_counts"] == {
+        "ordinary_work": 1,
+        "capability_evaluation": 1,
+        "training": 2,
+        "integrity_evaluation": 1,
+        "unsure": 1,
+    }
+    assert cast("dict[str, float]", partial_belief["mean_probabilities"]) == pytest.approx(
+        {
+            "ordinary_work": 0.4,
+            "capability_evaluation": 0.6,
+            "training": 0.7,
+            "integrity_evaluation": 0.6,
+            "unsure": 0.2,
+        }
+    )
 
 
 def _write_conflict_scenario(root: Path, *, second_conflict: bool = False) -> Scenario:
