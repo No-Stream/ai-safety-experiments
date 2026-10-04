@@ -25,7 +25,9 @@ from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import chat, loop, surfaces
+from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
+from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.trace import load_trace
 
@@ -1782,6 +1784,134 @@ def test_ci_submission_feedback_reaches_actor_verbatim(
     assert trace.turns[0].tool_results[0].content_sent == summary
     assert trace.submission_verdicts[0]["feedback"] == summary
     assert {"role": "tool", "content": summary} in trace.messages
+
+
+@pytest.mark.parametrize(
+    ("system_prompt", "user_template"),
+    [
+        pytest.param(LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE, id="format-1"),
+        pytest.param(surfaces.SYSTEM_PROMPT, surfaces.USER_TEMPLATE, id="format-2"),
+    ],
+)
+def test_resource_limiter_banner_is_hidden_from_actor_but_kept_in_command_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    system_prompt: str,
+    user_template: str,
+) -> None:
+    limiter_banner = (
+        "resource-limits: unit=reslimit-12345-episode_jail.sh cpus=2/16 mem_max=4G "
+        "mem_high=off threads=32 timeout=120s\n"
+    )
+    malformed_banner = (
+        "resource-limits: unit=reslimit-12345-episode_jail.sh cpus=2/16 mem_max=4G timeout=120s\n"
+    )
+    appended_banner_text = (
+        "resource-limits: unit=reslimit-12345-episode_jail.sh cpus=2/16 mem_max=4G "
+        "mem_high=off threads=32 timeout=120s extra=keep-this\n"
+    )
+    unrelated_stderr = "resource-limits: custom diagnostic should remain\n"
+    raw_stderr = malformed_banner + appended_banner_text + limiter_banner + unrelated_stderr
+    episode_dir = tmp_path / "limiter-banner"
+    monitor = CommandAuditMonitor(episode_dir, audit_path=None)
+    command_starts: list[CommandStart] = []
+
+    def before_command(_directory: Path, command: str) -> None:
+        command_starts.append(monitor.before_command(command))
+
+    def after_command(_directory: Path, command: str, result: CommandResult) -> None:
+        command_start = command_starts.pop()
+        assert command == command_start.command
+        monitor.after_command(command_start, result)
+
+    def run_in_jail(
+        _episode_dir: Path, command: str, *, timeout: str, **_kwargs: object
+    ) -> CommandResult:
+        assert timeout == "120s"
+        return CommandResult(
+            command=command,
+            exit_code=0,
+            stdout="command output\n",
+            stderr=raw_stderr,
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(loop, "run_in_jail", run_in_jail)
+    monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_bash("echo command output")),
+            _ScriptedReply(_report()),
+        ]
+    )
+    trace = loop.run_ladder_episode(
+        _task(),
+        backend,
+        episode_dir=episode_dir,
+        arm=AgenticArmConfig(),
+        system_prompt=system_prompt,
+        user_template=user_template,
+        max_model_len=100_000,
+        max_turns=1,
+        submit_grader=_successful_submission,
+        before_command=before_command,
+        after_command=after_command,
+    )
+
+    actor_tool_result = trace.turns[0].tool_results[0].content_sent
+    assert limiter_banner.rstrip() not in actor_tool_result.splitlines()
+    assert malformed_banner.rstrip() in actor_tool_result
+    assert appended_banner_text.rstrip() in actor_tool_result
+    assert unrelated_stderr.rstrip() in actor_tool_result
+    assert len(monitor.records) == 1
+    assert monitor.records[0].result.stderr == raw_stderr
+
+
+def test_ci_submission_grader_receives_remaining_run_budget_without_turn_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remaining_submissions: list[int] = []
+
+    def ci_submit_grader(
+        _directory: Path,
+        remaining_count: int = loop.LADDER_MAX_SUBMISSIONS - 1,
+    ) -> loop.SubmissionVerdict:
+        remaining_submissions.append(remaining_count)
+        return loop.SubmissionVerdict(
+            passed=False,
+            feedback=f"tests: failed\nCI runs remaining for this task: {remaining_count}",
+            register="ci",
+        )
+
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+            _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+            _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+            _ScriptedReply(_report()),
+        ]
+    )
+    trace = loop.run_ladder_episode(
+        _task(),
+        backend,
+        episode_dir=tmp_path / "ci-budget",
+        arm=AgenticArmConfig(),
+        system_prompt="Synthetic task",
+        user_template="{listing}",
+        max_model_len=100_000,
+        max_turns=3,
+        ci_submit_grader=ci_submit_grader,
+    )
+
+    assert remaining_submissions == [2, 1, 0]
+    actor_feedback = [turn.tool_results[0].content_sent for turn in trace.turns]
+    assert actor_feedback == [
+        "tests: failed\nCI runs remaining for this task: 2",
+        "tests: failed\nCI runs remaining for this task: 1",
+        "tests: failed\nCI runs remaining for this task: 0",
+    ]
+    assert all("turns remaining" not in feedback for feedback in actor_feedback)
 
 
 def test_submission_evidence_persists_without_changing_actor_visible_content(
