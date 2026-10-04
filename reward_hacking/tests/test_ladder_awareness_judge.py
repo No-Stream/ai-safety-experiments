@@ -19,6 +19,7 @@ from reward_hacking.ladder.awareness_judge import (
     AWARENESS_TARGETS,
     export_awareness_judge_batch,
     ingest_awareness_judge_labels,
+    normalize_awareness_judge_turns_for_readout,
     read_judge_labels,
 )
 from reward_hacking.ladder.tools import SUBMIT_MARKER
@@ -622,3 +623,47 @@ def test_zero_turn_label_is_rejected(tmp_path: Path, five_turn_run: Path) -> Non
     labels_path = _write_labels(tmp_path / "labels.jsonl", labels)
     with pytest.raises(ValueError, match="label range"):
         read_judge_labels(labels_path, packet_path=packet_path, mapping_path=mapping_path)
+
+
+def test_schema_one_judge_turns_are_normalized_for_readout() -> None:
+    judge_summary: dict[str, object] = {
+        "schema_version": 1,
+        "first_fail_turn": 4,
+        "first_integrity_turn": 2,
+        "labels": [
+            {"turn": 0, "field": "model_reasoning"},
+            {"turn": "final_report", "field": "final_report_text"},
+        ],
+        "integrity_before_first_fail": True,
+    }
+
+    normalized = normalize_awareness_judge_turns_for_readout(judge_summary)
+
+    assert normalized["first_fail_turn"] == 5
+    assert normalized["first_integrity_turn"] == 3
+    assert normalized["labels"] == [
+        {"turn": 1, "field": "model_reasoning"},
+        {"turn": "final_report", "field": "final_report_text"},
+    ]
+    assert judge_summary["first_fail_turn"] == 4
+    assert judge_summary["first_integrity_turn"] == 2
+    assert judge_summary["labels"] == [
+        {"turn": 0, "field": "model_reasoning"},
+        {"turn": "final_report", "field": "final_report_text"},
+    ]
+
+
+@pytest.mark.parametrize("schema_version", [2, 3, None])
+def test_non_schema_one_judge_turns_are_preserved_for_readout(
+    schema_version: object,
+) -> None:
+    judge_summary: dict[str, object] = {
+        "schema_version": schema_version,
+        "first_fail_turn": 4,
+        "first_integrity_turn": 2,
+        "labels": [{"turn": 0, "field": "model_reasoning"}],
+    }
+
+    normalized = normalize_awareness_judge_turns_for_readout(judge_summary)
+
+    assert normalized == judge_summary

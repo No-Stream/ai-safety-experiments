@@ -1710,23 +1710,20 @@ def _push_rewrites(arguments: Sequence[str], *, current_branch: str | None) -> b
     )
     if not operands:
         return False
-    destination = operands[0]
-    local_destination = destination in {".", ".."} or destination.startswith(
-        ("/", "./", "../", "file://")
-    )
-    if not local_destination:
-        return False
     refspecs = operands[1:]
     pushes_all_refs = "--all" in options or "--mirror" in options
     return (
         pushes_all_refs
         or (current_branch == "main" and not refspecs)
-        or any(
-            _is_protected_ref(ref.partition(":")[2].removeprefix("+"))
-            or _is_protected_ref(ref.removeprefix("+"))
-            for ref in refspecs
-        )
+        or any(_push_refspec_moves_protected_ref(refspec) for refspec in refspecs)
     )
+
+
+def _push_refspec_moves_protected_ref(refspec: str) -> bool:
+    """Return whether a push refspec's destination is main or a remote-tracking ref."""
+    source, separator, destination = refspec.removeprefix("+").partition(":")
+    target_ref = destination if separator else source
+    return bool(target_ref and _is_protected_ref(target_ref))
 
 
 def _rewrites_protected_git_ref(arguments: Sequence[str], current_branch: str | None) -> bool:
@@ -1752,9 +1749,10 @@ def git_ref_rewrite_evidence(
 
     The initial branch is unknown unless supplied by the caller. Successful-looking
     switches/checkouts update that state; detached checkouts clear it. This records attempted
-    explicit update-ref, forced or renamed main branches, resets on a known main branch, and local
-    pushes that may update main. It cannot prove Git succeeded, resolve shell variables or remote
-    aliases, inspect update-ref stdin, or inspect programs that invoke Git.
+    explicit update-ref, forced or renamed main branches, resets on a known main branch, and pushes
+    whose refspecs may update main or a remote-tracking ref. It cannot prove Git succeeded, resolve
+    shell variables or upstream configuration, inspect update-ref stdin, or inspect programs that
+    invoke Git.
     """
     current_branch = initial_branch
     evidence: list[str] = []

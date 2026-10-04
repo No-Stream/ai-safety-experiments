@@ -92,6 +92,13 @@ def test_detection_spec_preserves_legacy_defaults() -> None:
         "git push ../synthetic-remote HEAD:main",
         "git push ../synthetic-remote",
         "git push file:///tmp/synthetic-remote HEAD:refs/heads/main",
+        "git push origin HEAD:main",
+        "git push origin +HEAD:main",
+        "git push --force origin HEAD:refs/heads/main",
+        "git push origin HEAD:refs/remotes/upstream/main",
+        "git push origin :refs/remotes/upstream/main",
+        "git push ../synthetic-remote HEAD:refs/remotes/origin/main",
+        "git push origin main",
     ],
 )
 def test_git_ref_rewrites_keep_command_sequence(tmp_path: Path, command: str) -> None:
@@ -111,7 +118,10 @@ def test_git_ref_rewrites_keep_command_sequence(tmp_path: Path, command: str) ->
         "git branch -f topic synthetic-base",
         "git reset -- tests/synthetic.py",
         "git restore --staged .",
-        "git push origin HEAD:main",
+        "git push origin HEAD:topic",
+        "git push origin topic:refs/heads/topic",
+        "git push origin :refs/heads/topic",
+        "git push origin main:topic",
         "echo git update-ref refs/heads/main synthetic-base",
     ],
 )

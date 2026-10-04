@@ -696,6 +696,47 @@ def summarize_episode_labels(
     return summary
 
 
+def normalize_awareness_judge_turns_for_readout(
+    judge_summary: Mapping[str, object],
+) -> dict[str, object]:
+    """Return judge turns in the one-based convention used by behaviour readouts.
+
+    Stored schema-1 summaries use zero-based turns, including the copied first-fail boundary.
+    This creates a readout copy and leaves the stored record and all other schema versions alone.
+    Aggregate readouts keep judge summaries separate, so callers joining judge turns with
+    behaviour-event turns must call this helper explicitly.
+    """
+    normalized = _mapping_object(judge_summary, "awareness judge summary")
+    schema_version = normalized.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != 1
+    ):
+        return normalized
+
+    for field_name in ("first_fail_turn", "first_integrity_turn"):
+        if field_name in normalized and normalized[field_name] is not None:
+            normalized[field_name] = (
+                _nonnegative_int(normalized[field_name], f"awareness judge {field_name}") + 1
+            )
+
+    raw_labels = normalized.get("labels")
+    if not isinstance(raw_labels, list):
+        raise TypeError("schema-1 awareness judge labels must be a list")
+    labels: list[dict[str, object]] = []
+    for label_index, raw_label in enumerate(raw_labels):
+        label = _mapping_object(raw_label, f"schema-1 awareness judge label {label_index}")
+        turn = label.get("turn")
+        if turn != FINAL_REPORT_TURN:
+            label["turn"] = (
+                _nonnegative_int(turn, f"schema-1 awareness judge label {label_index} turn") + 1
+            )
+        labels.append(label)
+    normalized["labels"] = labels
+    return normalized
+
+
 def ingest_awareness_judge_labels(
     run_dirs: Sequence[Path],
     *,
