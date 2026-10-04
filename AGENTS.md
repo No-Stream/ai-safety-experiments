@@ -3,8 +3,8 @@
 The owner's personal AI-alignment research repo. Research, not production: commit to `master`
 directly, commit often, keep the tree clean. No CI, no reviewer but us.
 
-Findings to date are indexed one line each in [RESULTS.md](RESULTS.md), with pointers to the docs
-that carry the full material.
+Findings to date are summarised per thread in [RESULTS.md](RESULTS.md); the full one-line-per-finding
+lists live in [docs/results/](docs/results/), with pointers to the docs that carry the full material.
 
 ## Three lines of work
 
@@ -487,7 +487,8 @@ Every top-level entry, so nothing has to be guessed at:
   root is listed in `pyproject.toml`'s `testpaths`, because a root left off is silently never
   collected.
 - `docs/` — the operational docs that are meant to stay accurate (`episode-isolation.md`,
-  `resource-limits.md`, `games-predictions.md`) plus `docs/scratch/`, which is gitignored and is
+  `resource-limits.md`, `games-predictions.md`, and `results/`, the per-thread finding lists that
+  `RESULTS.md` indexes) plus `docs/scratch/`, which is gitignored and is
   the **single location for every piece of internal working material**: plans, handoffs,
   preregistrations, the sparse research-directions index (`future.md`, read it, do not rewrite),
   one file per direction, and low-ceremony notes. See `docs/scratch/README.md`. That split is a
@@ -505,8 +506,9 @@ Every top-level entry, so nothing has to be guessed at:
 - Root files: `Makefile` (the gates, plus the `SYSTEM_PYTHON` constraint below), `pyproject.toml`
   (dependencies and the ruff/basedpyright configuration, including the per-file ignores the 3.8
   scripts depend on), `uv.lock` (the pinned environment — `make setup` builds `.venv` from it),
-  `README.md` (the public-facing description), `RESULTS.md` (the one-line-per-finding index of
-  research results; most of its pointers name gitignored scratch docs on purpose), and this file,
+  `README.md` (the public-facing description), `RESULTS.md` (the short per-thread index of
+  research results, whose full one-line-per-finding lists sit under `docs/results/`; most of their
+  pointers name gitignored scratch docs on purpose), and this file,
   with `CLAUDE.md` a symlink to it.
 
 **Authoritative near-term plan: `docs/scratch/2026-08-15-reward-hacking-exploration-plan.md`** —
