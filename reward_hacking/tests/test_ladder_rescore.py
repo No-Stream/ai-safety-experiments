@@ -241,6 +241,7 @@ def _remove_schema22_detection_spec_fields(episode: dict[str, Any]) -> None:
     detection_spec = cast("dict[str, object]", detector_inputs["detection_spec"])
     for field_name in (
         "ignored_prefixes",
+        "ignore_bytecode",
         "scan_final_tree",
         "monitor_key",
         "monitor_enabled_value",
@@ -263,6 +264,7 @@ def test_schema21_rescore_recomputes_behaviour_events_without_inventing_old_budg
     detection_spec = cast("dict[str, object]", detector_inputs["detection_spec"])
     for field_name in (
         "ignored_prefixes",
+        "ignore_bytecode",
         "scan_final_tree",
         "monitor_key",
         "monitor_enabled_value",

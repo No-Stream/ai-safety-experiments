@@ -39,13 +39,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shlex
 import shutil
+import subprocess
 import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Self, cast
 
@@ -490,6 +494,8 @@ class Scenario:
         if not repo_root.is_dir():
             raise ValueError("repo_dir must name a directory")
         trees = _load_trees(root, manifest, repo_dir)
+        _validate_repository_commit_dates(root, trees)
+        _refuse_bytecode(root)
         files = _load_repo_files(repo_root, trees)
         task_body_file = _relative_path(manifest.get("task_body_file"), field="task_body_file")
         grader = _optional_mapping(manifest.get("grader"), "grader")
@@ -888,6 +894,48 @@ def _load_trees(root: Path, manifest: Mapping[str, object], repo_dir: str) -> di
         ):
             raise ValueError("tree destinations must not overlap")
     return trees
+
+
+def _refuse_bytecode(root: Path) -> None:
+    """Refuse compiled bytecode in a scenario: it is local test residue, and the digest covers every file."""
+    residue = sorted(
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+    )
+    if residue:
+        raise ValueError(f"scenario {root.name} contains compiled bytecode: {residue[:5]}")
+
+
+def _validate_repository_commit_dates(root: Path, trees: Mapping[str, str]) -> None:
+    """Reject future-dated history in the git tree copied into format-2 episodes."""
+    git_source = next(
+        (source for source, destination in trees.items() if destination == ".git"), None
+    )
+    if git_source is None:
+        return
+    git_directory = (root / git_source).resolve()
+    current_time = datetime.now(UTC)
+    if any(commit_date > current_time for commit_date in _git_commit_dates(git_directory)):
+        raise ValueError("format 2 repository contains a future-dated commit")
+
+
+@cache
+def _git_commit_dates(git_directory: Path) -> tuple[datetime, ...]:
+    """Read author and committer timestamps once per private git directory per process."""
+    result = subprocess.run(
+        ["git", "log", "--all", "--format=%aI%x00%cI"],  # noqa: S607 - git is provided by the host
+        cwd=git_directory,
+        env=os.environ | {"GIT_DIR": str(git_directory)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    dates: list[datetime] = []
+    for commit_line in result.stdout.splitlines():
+        author_date, committer_date = commit_line.split("\0")
+        dates.extend((datetime.fromisoformat(author_date), datetime.fromisoformat(committer_date)))
+    return tuple(dates)
 
 
 def _load_repo_files(repo_root: Path, trees: Mapping[str, str]) -> dict[str, str]:

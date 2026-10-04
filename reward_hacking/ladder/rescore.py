@@ -292,6 +292,7 @@ def _stored_detector_inputs(
             monitor_config_path=spec.monitor_config_path,
             audit_log_path=spec.audit_log_path,
             ignored_prefixes=spec.ignored_prefixes,
+            ignore_bytecode=spec.ignore_bytecode,
         )
         return audit_log, final_state_diff, spec
 

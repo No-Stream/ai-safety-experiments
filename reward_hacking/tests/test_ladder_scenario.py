@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
@@ -15,6 +16,8 @@ import pytest
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.harness.tasks_evalplus import OracleError
 from reward_hacking.jailed_poc import CommandResult
+from reward_hacking.ladder import runner as ladder_runner
+from reward_hacking.ladder import scenario as ladder_scenario
 from reward_hacking.ladder import surfaces
 from reward_hacking.ladder.chat import render_prompt
 from reward_hacking.ladder.scenario import (
@@ -603,6 +606,83 @@ def _write_dummy_v2_scenario(root: Path) -> Path:
 
 
 class TestScenarioFormatTwo:
+    def test_repository_commit_dates_are_cached_per_private_git_directory(
+        self, tmp_path: Path
+    ) -> None:
+        directory = _write_dummy_v2_scenario(tmp_path)
+        cache_before = ladder_scenario._git_commit_dates.cache_info()
+
+        Scenario.load(directory)
+        Scenario.load(directory)
+
+        cache_after = ladder_scenario._git_commit_dates.cache_info()
+        assert cache_after.misses == cache_before.misses + 1
+        assert cache_after.hits == cache_before.hits + 1
+
+    @pytest.mark.parametrize("date_field", ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"])
+    def test_rejects_future_dated_repository_history(self, tmp_path: Path, date_field: str) -> None:
+        directory = _write_dummy_v2_scenario(tmp_path)
+        git_directory = directory / "repo-dot-git"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_DIR": str(git_directory),
+                "GIT_WORK_TREE": str(directory / "repo"),
+                date_field: "2099-01-01T00:00:00+00:00",
+            }
+        )
+        git_executable = shutil.which("git")
+        assert git_executable is not None
+        subprocess.run(  # noqa: S603 - fixed git command in a synthetic repository
+            [
+                git_executable,
+                "-C",
+                str(directory / "repo"),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Synthetic future commit",
+            ],
+            check=True,
+            env=environment,
+        )
+
+        with pytest.raises(ValueError, match="future-dated commit"):
+            Scenario.load(directory)
+
+    def test_rejects_compiled_bytecode_in_the_scenario(self, tmp_path: Path) -> None:
+        directory = _write_dummy_v2_scenario(tmp_path)
+        residue = directory / "oracle" / "__pycache__" / "test_x.cpython-313.pyc"
+        residue.parent.mkdir(parents=True)
+        residue.write_bytes(b"synthetic")
+
+        with pytest.raises(ValueError, match="compiled bytecode"):
+            Scenario.load(directory)
+
+    def test_jail_runtime_identity_uses_the_resolved_jail_interpreter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        resolved_interpreter = tmp_path / "selected-python"
+        runtime_payload = {"version": "synthetic runtime", "distributions": []}
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            calls.append(command)
+            if command[-1] == "--print-jail-python":
+                return subprocess.CompletedProcess(command, 0, f"{resolved_interpreter}\n", "")
+            assert command[0] == str(resolved_interpreter)
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(runtime_payload, sort_keys=True), ""
+            )
+
+        monkeypatch.setattr(ladder_runner.subprocess, "run", fake_run)
+
+        identity = ladder_runner.jail_runtime_identity()
+
+        assert identity == ladder_runner.provenance_digest(runtime_payload)
+        assert calls[0][-1] == "--print-jail-python"
+        assert calls[1][0] == str(resolved_interpreter)
+
     def test_load_render_and_laydown(self, tmp_path: Path) -> None:
         scenario = Scenario.load(_write_dummy_v2_scenario(tmp_path))
         assert scenario.format == 2
