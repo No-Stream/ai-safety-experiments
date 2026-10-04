@@ -25,6 +25,7 @@ import re
 import signal
 from contextlib import contextmanager
 from enum import StrEnum
+from functools import cache
 from tokenize import TokenError
 from typing import TYPE_CHECKING
 
@@ -414,6 +415,8 @@ def parse_expression(text: str) -> Expr | None:
     candidate = text.strip()
     if not candidate or len(candidate) > MAX_ANSWER_CHARS:
         return None
+    if _LATEX_MARKER.search(candidate):
+        _warm_latex_parser()
     try:
         with budget(GRADING_BUDGET_SECONDS):
             if _LATEX_MARKER.search(candidate):
@@ -439,6 +442,16 @@ def parse_expression(text: str) -> Expr | None:
         )
         return None
     return parsed if isinstance(parsed, Expr) else None
+
+
+@cache
+def _warm_latex_parser() -> None:
+    """Load ANTLR's LaTeX parser once, outside the grading budget.
+
+    The first ``parse_latex`` call in a process builds the parser, which took over a second on a
+    loaded box; inside the budget that graded the first LaTeX answer of a process as unmatched.
+    """
+    parse_latex("x", strict=True)
 
 
 def _parse_latex_expression(candidate: str) -> object | None:

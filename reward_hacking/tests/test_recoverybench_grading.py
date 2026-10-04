@@ -21,6 +21,7 @@ import sympy
 from conftest import fenced_answer as fenced
 from conftest import recovery_item as toy_item
 
+from reward_hacking.recoverybench import answers as answers_module
 from reward_hacking.recoverybench.answers import (
     ALLOWED_FUNCTION_NAMES,
     GLYPH_VARIANTS,
@@ -2539,3 +2540,24 @@ class TestABlankAnswerLineIsAMissingAnswer:
     def test_a_blank_answer_line_at_the_token_cap_is_truncated(self):
         graded = grade_reply(toy_item(), "reasoning\nanswer:", stop_reason="max_tokens")
         assert graded.outcome == Outcome.TRUNCATED
+
+
+def test_latex_parser_start_up_is_not_charged_to_the_grading_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first LaTeX parse in a process loads ANTLR, which took over a second on a loaded box.
+
+    Charged to the one-second budget, that start-up graded a correct LaTeX answer as unmatched
+    (observed in a sharded ``make test`` on 2026-10-04). A start-up slower than the whole budget
+    must still leave the parse itself to succeed.
+    """
+
+    start_up_calls: list[None] = []
+
+    def slow_start_up() -> None:
+        start_up_calls.append(None)
+        time.sleep(answers_module.GRADING_BUDGET_SECONDS * 1.5)
+
+    monkeypatch.setattr(answers_module, "_warm_latex_parser", slow_start_up)
+    assert parse_expression(r"2\pi\sqrt{L/g}") is not None
+    assert start_up_calls, "the LaTeX route must warm its parser before the budget starts"
