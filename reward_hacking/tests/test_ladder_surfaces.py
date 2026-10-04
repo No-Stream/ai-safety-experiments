@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import json
 import string
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -23,6 +23,9 @@ from reward_hacking.ladder.surfaces import (
     render_task_markdown,
 )
 from reward_hacking.ladder.tools import RUNAWAY_FORMAT_ERROR_MESSAGE, SUBMIT_MARKER, bash_tool
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # The runner's classifier matches this literal; the builder must emit it, not just reuse the constant.
 POLICY_FAILED_LINE = "policy-check: failed"
