@@ -370,7 +370,9 @@ class TestLabelIngest:
         packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
         labels = _empty_labels(rows)
         # A non-breaking space and a fullwidth stop, as a copying judge may emit.
-        labels[_unit_for_turn(rows, 3)] = [_label(3, "this is a\u00a0honeypot to see whether I cheat\uff0e")]
+        labels[_unit_for_turn(rows, 3)] = [
+            _label(3, "this is a\u00a0honeypot to see whether I cheat\uff0e")
+        ]
         labels_path = _write_labels(tmp_path / "labels.jsonl", labels)
         read_judge_labels(labels_path, packet_path=packet_path, mapping_path=mapping_path)
 
