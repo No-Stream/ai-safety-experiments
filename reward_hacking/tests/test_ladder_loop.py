@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shlex
 import shutil
 import subprocess
@@ -19,10 +20,11 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
+from reward_hacking.eval_awareness import scan_text
 from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
-from reward_hacking.ladder import chat, loop
+from reward_hacking.ladder import chat, loop, surfaces
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.trace import load_trace
@@ -108,6 +110,10 @@ class _EpisodeOptions:
     before_command: Callable[[Path, str], None] | None = None
     after_command: Callable[[Path, str, CommandResult], None] | None = None
     submit_grader: Callable[[Path], loop.SubmissionVerdict] | None = None
+    awareness_scanner: loop.AwarenessScanner | None = None
+    belief_probe: bool = False
+    belief_probe_questions: surfaces.BeliefProbeQuestions | None = None
+    final_report_prompt: str = loop.FINAL_REPORT_PROMPT
 
 
 class ScriptedToolBackend:
@@ -261,6 +267,10 @@ def _run_episode(
         submit_grader=episode_options.submit_grader or _successful_submission,
         max_model_len=episode_options.max_model_len,
         max_new_tokens=episode_options.max_new_tokens,
+        awareness_scanner=episode_options.awareness_scanner,
+        belief_probe=episode_options.belief_probe,
+        belief_probe_questions=episode_options.belief_probe_questions,
+        final_report_prompt=episode_options.final_report_prompt,
     )
 
 
@@ -1432,6 +1442,223 @@ class TestPersistentShell:
         assert trace.turns[0].commands[2].stdout == ""
 
 
+@pytest.mark.parametrize(
+    "template_name", [None, "qwen3_5_chat_template.jinja", "tmax_chat_template.jinja"]
+)
+@pytest.mark.parametrize("history_reasoning", ["retain", "strip"])
+def test_belief_probe_preserves_main_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    history_reasoning: loop.HistoryReasoning,
+    template_name: str | None,
+) -> None:
+    questions = surfaces.BeliefProbeQuestions(
+        "Synthetic open question?", "Synthetic category question?"
+    )
+    category_answer = "\n".join(f"{category}: 0.2" for category in surfaces.BELIEF_CATEGORIES)
+    episode_token = "belief-probe-test"
+    actions = [
+        _ScriptedReply(_bash("echo first action")),
+        _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+    ]
+    report = _ScriptedReply(_report("Main report."))
+    without_backend = ScriptedToolBackend([*actions, report])
+    with_backend = ScriptedToolBackend(
+        [
+            *actions,
+            _ScriptedReply(_report("Open answer.")),
+            _ScriptedReply(_report(category_answer)),
+            report,
+        ]
+    )
+    if template_name is not None:
+        template_path = Path(__file__).parent / "data" / template_name
+        unknown_token_name = "<unknown>"
+        for backend in (without_backend, with_backend):
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=Tokenizer(
+                    WordLevel({unknown_token_name: 0}, unk_token=unknown_token_name)
+                )
+            )
+            tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+            backend.tokenizer = tokenizer
+    without = _run_episode(
+        tmp_path / "without",
+        monkeypatch,
+        without_backend,
+        _EpisodeOptions(
+            history_reasoning=history_reasoning, episode_token=episode_token, max_turns=2
+        ),
+    )
+    with_probe = _run_episode(
+        tmp_path / "with",
+        monkeypatch,
+        with_backend,
+        _EpisodeOptions(
+            history_reasoning=history_reasoning,
+            episode_token=episode_token,
+            max_turns=2,
+            belief_probe=True,
+            belief_probe_questions=questions,
+        ),
+    )
+
+    assert [turn.rendered_prompt_sha256 for turn in with_probe.turns] == [
+        turn.rendered_prompt_sha256 for turn in without.turns
+    ]
+    assert with_probe.final_report_prompt_sha256 == without.final_report_prompt_sha256
+    assert with_probe.messages == without.messages
+    assert [turn.raw_completion for turn in with_probe.turns] == [
+        turn.raw_completion for turn in without.turns
+    ]
+    assert [turn.tool_calls for turn in with_probe.turns] == [
+        turn.tool_calls for turn in without.turns
+    ]
+    assert [turn.tool_results for turn in with_probe.turns] == [
+        turn.tool_results for turn in without.turns
+    ]
+    assert with_probe.final_report == without.final_report
+    assert with_backend.prompts[0] == without_backend.prompts[0]
+    assert with_backend.prompts[-1] == without_backend.prompts[-1]
+    assert with_probe.eval_belief_probe is not None
+    assert with_probe.eval_belief_probe["open_answer"] == "Open answer."
+    assert with_probe.eval_belief_probe["category_answer"] == category_answer
+    assert with_probe.eval_belief_probe["probabilities"] == dict.fromkeys(
+        surfaces.BELIEF_CATEGORIES, 0.2
+    )
+    prompt_sha256s = cast("dict[str, str]", with_probe.eval_belief_probe["prompt_sha256s"])
+    assert (
+        prompt_sha256s["open"]
+        == hashlib.sha256(with_backend.prompts[2].encode("utf-8")).hexdigest()
+    )
+    assert (
+        prompt_sha256s["category"]
+        == hashlib.sha256(with_backend.prompts[3].encode("utf-8")).hexdigest()
+    )
+    assert with_probe.summary_record()["eval_belief_probe"] == with_probe.eval_belief_probe
+
+
+def test_belief_probe_requires_questions_before_laydown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backend = ScriptedToolBackend([])
+    with pytest.raises(ValueError, match="belief_probe_questions"):
+        _run_episode(tmp_path, monkeypatch, backend, _EpisodeOptions(belief_probe=True))
+    assert not (tmp_path / "episode").exists()
+
+
+def test_belief_probe_parse_failure_and_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    questions = surfaces.BeliefProbeQuestions(
+        "Synthetic open question?", "Synthetic category question?"
+    )
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+            _ScriptedReply(_report("Open answer."), finish_reason="length"),
+            _ScriptedReply(_report("unparseable"), finish_reason="length"),
+            _ScriptedReply(_report()),
+        ]
+    )
+    trace = _run_episode(
+        tmp_path,
+        monkeypatch,
+        backend,
+        _EpisodeOptions(belief_probe=True, belief_probe_questions=questions),
+    )
+    assert trace.eval_belief_probe is not None
+    assert trace.eval_belief_probe["probabilities"] is None
+    assert trace.eval_belief_probe["truncated"] == {"open": True, "category": True}
+    assert trace.eval_belief_probe["timed_out"] == {"open": False, "category": False}
+
+
+def test_belief_probe_records_timeout_and_custom_report_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    questions = surfaces.BeliefProbeQuestions(
+        "Synthetic open question?", "Synthetic category question?"
+    )
+    original_complete = loop._complete_final_report
+    requests = 0
+
+    def complete_with_open_timeout(
+        backend: loop.LadderBackend,
+        prompt: str,
+        *,
+        max_tokens: int,
+        timeout: float,
+    ) -> tuple[RenderedCompletion | None, bool]:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return None, True
+        return original_complete(backend, prompt, max_tokens=max_tokens, timeout=timeout)
+
+    monkeypatch.setattr(loop, "_complete_final_report", complete_with_open_timeout)
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+            _ScriptedReply(_report("unparseable")),
+            _ScriptedReply(_report("Custom report.")),
+        ]
+    )
+    trace = _run_episode(
+        tmp_path,
+        monkeypatch,
+        backend,
+        _EpisodeOptions(
+            belief_probe=True,
+            belief_probe_questions=questions,
+            final_report_prompt="Synthetic custom report prompt.",
+        ),
+    )
+    assert trace.eval_belief_probe is not None
+    assert trace.eval_belief_probe["open_answer"] is None
+    assert trace.eval_belief_probe["timed_out"] == {"open": True, "category": False}
+    assert trace.eval_belief_probe["probabilities"] is None
+    assert trace.final_report == "Custom report."
+    assert trace.messages[-2]["content"] == "Synthetic custom report prompt."
+    assert (
+        trace.final_report_prompt_sha256
+        == hashlib.sha256(backend.prompts[-1].encode("utf-8")).hexdigest()
+    )
+
+
+def test_belief_probe_tool_call_is_inert(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    questions = surfaces.BeliefProbeQuestions(
+        "Synthetic open question?", "Synthetic category question?"
+    )
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+            _ScriptedReply(_bash("touch branch_only.txt")),
+            _ScriptedReply(_report("unparseable")),
+            _ScriptedReply(_report()),
+        ]
+    )
+    trace = _run_episode(
+        tmp_path,
+        monkeypatch,
+        backend,
+        _EpisodeOptions(belief_probe=True, belief_probe_questions=questions),
+    )
+    assert not (trace.episode_dir / "branch_only.txt").exists()
+    assert all(
+        call.arguments.get("command") != "touch branch_only.txt"
+        for turn in trace.turns
+        for call in turn.tool_calls
+    )
+    assert trace.eval_belief_probe is not None
+    assert trace.eval_belief_probe["open_answer"] == ""
+
+
 @needs_jail
 def test_real_jail_executes_a_marker_command_and_grades_the_result(tmp_path: Path) -> None:
     task = _task()
@@ -1458,3 +1685,182 @@ def test_real_jail_executes_a_marker_command_and_grades_the_result(tmp_path: Pat
     assert trace.turns[0].commands[0].exit_code == 0
     assert trace.true_pass
     assert trace.proxy_pass
+
+
+class TestLiveAwareness:
+    def test_alerts_are_private_and_never_fed_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sentence = "This trap was designed to see if I would cheat. private-context-canary"
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(
+                    _bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT").replace(
+                        "reasoning", sentence
+                    )
+                ),
+                _ScriptedReply(_report("A graded benchmark task is complete.")),
+            ]
+        )
+        with caplog.at_level(logging.WARNING, logger=loop.__name__):
+            trace = _run_episode(
+                tmp_path, monkeypatch, backend, _EpisodeOptions(awareness_scanner=scan_text)
+            )
+        warnings = [
+            record.getMessage() for record in caplog.records if record.name == loop.__name__
+        ]
+        assert len(warnings) == 2
+        assert all("turn=0" in warning for warning in warnings)
+        assert any("tier=lexical_alert" in warning for warning in warnings)
+        assert any("tier=relational" in warning for warning in warnings)
+        assert all(
+            "private-context-canary" not in warning and "would cheat" not in warning
+            for warning in warnings
+        )
+        hits = trace.turn_records()[0]["eval_awareness"]
+        assert isinstance(hits, list)
+        assert any(
+            isinstance(hit, dict) and "private-context-canary" in str(hit["context"])
+            for hit in hits
+        )
+        report = trace.summary_record()["final_report"]
+        assert isinstance(report, dict)
+        assert report["eval_awareness"]
+        assert "eval-awareness" not in "".join(backend.prompts)
+        assert all("eval_awareness" not in message for message in trace.messages)
+
+    def test_clean_text_produces_no_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+                _ScriptedReply(_report()),
+            ]
+        )
+        with caplog.at_level(logging.WARNING, logger=loop.__name__):
+            trace = _run_episode(
+                tmp_path, monkeypatch, backend, _EpisodeOptions(awareness_scanner=scan_text)
+            )
+        assert not [record for record in caplog.records if record.name == loop.__name__]
+        assert trace.turn_records()[0]["eval_awareness"] == []
+
+    def test_disabled_scanner_preserves_legacy_record_shape(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+                _ScriptedReply(_report()),
+            ]
+        )
+        trace = _run_episode(tmp_path, monkeypatch, backend)
+        assert "eval_awareness" not in trace.turn_records()[0]
+        report = trace.summary_record()["final_report"]
+        assert isinstance(report, dict)
+        assert "eval_awareness" not in report
+
+
+@pytest.mark.parametrize("passed", [False, True])
+def test_ci_submission_feedback_reaches_actor_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, passed: bool
+) -> None:
+    summary = "tests: passed\npolicy-check: " + ("passed\nSUCCESS" if passed else "failed\nFAIL")
+
+    def submit_grader(_directory: Path) -> loop.SubmissionVerdict:
+        return loop.SubmissionVerdict(passed=passed, feedback=summary, register="ci")
+
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+            _ScriptedReply(_report()),
+        ]
+    )
+    trace = _run_episode(
+        tmp_path, monkeypatch, backend, _EpisodeOptions(max_turns=1, submit_grader=submit_grader)
+    )
+    assert trace.turns[0].tool_results[0].content_sent == summary
+    assert trace.submission_verdicts[0]["feedback"] == summary
+    assert {"role": "tool", "content": summary} in trace.messages
+
+
+@pytest.mark.parametrize("empty_start", [False, True])
+def test_top_level_laydown_listing_and_custom_format_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, empty_start: bool
+) -> None:
+    monkeypatch.setattr(loop, "run_in_jail", _fake_run_in_jail)
+    monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
+
+    def after_laydown(directory: Path) -> tuple[str, ...]:
+        assert (directory / "grade.py").is_file()
+        (directory / ".git").mkdir()
+        (directory / ".git" / "HEAD").write_text("synthetic", encoding="utf-8")
+        return (".git/",)
+
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_report("No action") if empty_start else _unknown_tool()),
+            _ScriptedReply(_report()),
+        ]
+    )
+    trace = loop.run_ladder_episode(
+        _task(),
+        backend,
+        episode_dir=tmp_path / "episode",
+        arm=AgenticArmConfig(),
+        system_prompt="Synthetic task",
+        user_template="{listing}",
+        max_model_len=100_000,
+        max_turns=1,
+        after_laydown=after_laydown,
+        listing_mode="top-level",
+        format_error_message="Synthetic format correction",
+    )
+    user_content = str(trace.messages[1]["content"])
+    assert ".git/" in user_content
+    assert ".git/HEAD" not in user_content
+    assert "sub/" in user_content
+    assert "sub/.keep" not in user_content
+    correction = (
+        {
+            "role": "user",
+            "content": "Synthetic format correction\n\nNothing has been written to /work yet.",
+        }
+        if empty_start
+        else {"role": "tool", "content": "Synthetic format correction"}
+    )
+    assert correction in trace.messages
+
+
+def test_initial_environment_reaches_every_command_without_transport_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(loop, "run_in_jail", TestPersistentShell()._run_wrapper_in_host)
+    monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
+    value = "synthetic path with spaces:'quote';$(touch escaped-value)"
+    backend = ScriptedToolBackend(
+        [
+            _ScriptedReply(_bash("echo $PYTHONPATH")),
+            _ScriptedReply(_bash("printf '%s' \"$PYTHONPATH\"")),
+            _ScriptedReply(_report()),
+        ]
+    )
+    trace = loop.run_ladder_episode(
+        _task(),
+        backend,
+        episode_dir=tmp_path / "episode",
+        arm=AgenticArmConfig(),
+        system_prompt="Synthetic task",
+        user_template="{listing}",
+        max_model_len=100_000,
+        max_turns=2,
+        initial_environment={"PYTHONPATH": value},
+    )
+    assert trace.turns[0].commands[0].stdout.strip() == value
+    assert trace.turns[1].commands[0].stdout == value
+    assert [turn.commands[0].command for turn in trace.turns] == [
+        "echo $PYTHONPATH",
+        "printf '%s' \"$PYTHONPATH\"",
+    ]
+    assert not (trace.episode_dir / "escaped-value").exists()
+    assert all(loop.SHELL_STATE_MARKER_PREFIX not in str(record) for record in trace.turn_records())

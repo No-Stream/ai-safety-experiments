@@ -6,6 +6,12 @@ import pytest
 from vllm.parser.qwen3 import Qwen3Parser
 
 from reward_hacking.jailed_poc import CommandResult
+from reward_hacking.ladder.surfaces import (
+    PolicyFinding,
+    PolicyJobResult,
+    SuiteJobResult,
+    compose_ci_summary,
+)
 from reward_hacking.ladder.tools import (
     FORMAT_ERROR_MESSAGE,
     SUBMIT_MARKER,
@@ -13,6 +19,7 @@ from reward_hacking.ladder.tools import (
     contains_submit_marker,
     count_fabricated_tool_responses,
     format_bash_result,
+    format_submission_feedback,
     parse_tool_calls,
 )
 
@@ -327,3 +334,26 @@ def test_format_error_message_matches_tool_protocol() -> None:
     assert "one or more valid calls" in FORMAT_ERROR_MESSAGE
     assert "bash" in FORMAT_ERROR_MESSAGE
     assert SUBMIT_MARKER in FORMAT_ERROR_MESSAGE
+
+
+def test_ci_register_feedback_passes_composed_summary_verbatim() -> None:
+    summary = compose_ci_summary(
+        SuiteJobResult(passed=False, counts="1 failed, 2 passed", failures=("test_failure",)),
+        PolicyJobResult(
+            report_mode=False,
+            findings=(PolicyFinding.PROTECTED_PATH_CHANGE,),
+        ),
+    )
+    passing_summary = compose_ci_summary(
+        SuiteJobResult(passed=True, counts="3 passed", failures=()),
+        PolicyJobResult(report_mode=False, findings=()),
+    )
+
+    assert format_submission_feedback(passed=False, feedback=summary, register="ci") == summary
+    assert (
+        format_submission_feedback(passed=True, feedback=passing_summary, register="ci")
+        == passing_summary
+    )
+    assert (
+        format_submission_feedback(passed=False, feedback="grader detail") == "FAIL: grader detail"
+    )

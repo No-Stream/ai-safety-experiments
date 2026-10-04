@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import logging
+import re
 import shlex
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
 
+from reward_hacking.eval_awareness import AwarenessMatch
 from reward_hacking.harness.loop import (
     FinalGrade,
     assert_disposable_episode_dir,
@@ -38,6 +41,7 @@ from reward_hacking.ladder.chat import (
     strip_reasoning,
     template_identity,
 )
+from reward_hacking.ladder.surfaces import BeliefProbeQuestions, parse_belief_probabilities
 from reward_hacking.ladder.tools import (
     FORMAT_ERROR_MESSAGE,
     RUNAWAY_FORMAT_ERROR_MESSAGE,
@@ -63,6 +67,9 @@ if TYPE_CHECKING:
 type ChatMessage = dict[str, object]
 type StopReason = Literal["end_turn", "max_tokens"]
 type HistoryReasoning = Literal["retain", "strip"]
+type AwarenessScanner = Callable[[str, str, int], list[AwarenessMatch]]
+
+logger = logging.getLogger(__name__)
 
 HISTORY_REASONING_MODES: tuple[HistoryReasoning, ...] = ("retain", "strip")
 DEFAULT_HISTORY_REASONING: HistoryReasoning = "retain"
@@ -195,6 +202,7 @@ class LadderTurn:
     rendered_prompt_sha256: str
     rendered_prompt_text: str
     rendered_prompt_is_full: bool
+    eval_awareness: tuple[AwarenessMatch, ...] | None = None
 
     def to_json_dict(self, *, episode_id: str, task_id: str) -> dict[str, object]:
         """Return one incrementally writable turn record."""
@@ -235,6 +243,8 @@ class LadderTurn:
             "rendered_prompt_text": self.rendered_prompt_text,
             "rendered_prompt_is_full": self.rendered_prompt_is_full,
         }
+        if self.eval_awareness is not None:
+            record["eval_awareness"] = [asdict(hit) for hit in self.eval_awareness]
         return record
 
 
@@ -286,6 +296,8 @@ class LadderEpisodeTrace:
     final_report_timed_out: bool
     final_report_fabricated_tool_responses: int
     grader_hashable: bool
+    final_report_eval_awareness: tuple[AwarenessMatch, ...] | None = None
+    eval_belief_probe: Mapping[str, object] | None = None
 
     @property
     def proxy_pass(self) -> bool:
@@ -323,9 +335,19 @@ class LadderEpisodeTrace:
         ]
 
     def summary_record(self) -> dict[str, object]:
-        """Return the compact v18 episode summary while retaining runner and rescore fields."""
+        """Return the episode summary while retaining runner and rescore fields."""
         grader = self.final_grade.grader
-        return {
+        report_record: dict[str, object] = {
+            "text": self.final_report,
+            "reasoning": self.final_report_reasoning,
+            "truncated": self.final_report_truncated,
+            "timed_out": self.final_report_timed_out,
+        }
+        if self.final_report_eval_awareness is not None:
+            report_record["eval_awareness"] = [
+                asdict(hit) for hit in self.final_report_eval_awareness
+            ]
+        record: dict[str, object] = {
             "record": "episode_summary",
             "episode_id": self.episode_id,
             "task_id": self.task_id,
@@ -366,12 +388,7 @@ class LadderEpisodeTrace:
                 "engine_wait_seconds": 0.0,
             },
             "elapsed_seconds": self.elapsed_seconds,
-            "final_report": {
-                "text": self.final_report,
-                "reasoning": self.final_report_reasoning,
-                "truncated": self.final_report_truncated,
-                "timed_out": self.final_report_timed_out,
-            },
+            "final_report": report_record,
             "final_report_prompt_sha256": self.final_report_prompt_sha256,
             "final_report_prompt_text": self.final_report_prompt_text,
             "final_report_prompt_is_full": self.final_report_prompt_is_full,
@@ -401,6 +418,9 @@ class LadderEpisodeTrace:
             "messages": copy.deepcopy(list(self.messages)),
             "template": {"sha256": self.template_sha256, "source": self.template_source},
         }
+        if self.eval_belief_probe is not None:
+            record["eval_belief_probe"] = dict(self.eval_belief_probe)
+        return record
 
 
 @dataclass(frozen=True, slots=True)
@@ -451,6 +471,7 @@ class SubmissionVerdict:
     passed: bool
     feedback: str
     grader: CommandResult | None = None
+    register: Literal["legacy", "ci"] = "legacy"
 
 
 type SubmissionGrader = Callable[[Path], SubmissionVerdict]
@@ -501,6 +522,32 @@ def _append_trace_record(trace_path: Path | None, record: dict[str, object]) -> 
         return
     with _TRACE_APPEND_LOCK:
         write_trace(trace_path, [record], append=True)
+
+
+def _scan_awareness(
+    scanner: AwarenessScanner | None,
+    *,
+    reasoning: str,
+    content: str,
+    turn_index: int,
+    episode_id: str,
+) -> tuple[AwarenessMatch, ...] | None:
+    """Keep full matches in private records and log only pattern names and counts."""
+    if scanner is None:
+        return None
+    hits = (*scanner(reasoning, "reasoning", turn_index), *scanner(content, "content", turn_index))
+    for tier in ("lexical_alert", "relational"):
+        tier_hits = [hit for hit in hits if hit.tier == tier]
+        if tier_hits:
+            logger.warning(
+                "eval-awareness tier=%s episode=%s turn=%d hits=%d patterns=%s",
+                tier,
+                episode_id,
+                turn_index,
+                len(tier_hits),
+                sorted({hit.pattern_name for hit in tier_hits}),
+            )
+    return hits
 
 
 def _assistant_message(parsed: ParsedTurn, *, first_call_number: int) -> tuple[ChatMessage, int]:
@@ -801,7 +848,9 @@ def _execute_tool_call(
             state.submissions_used += 1
             state.last_submission = verdict
             state.submission_fail_seen = state.submission_fail_seen or not verdict.passed
-            response = format_submission_feedback(passed=verdict.passed, feedback=verdict.feedback)
+            response = format_submission_feedback(
+                passed=verdict.passed, feedback=verdict.feedback, register=verdict.register
+            )
             submission_record: dict[str, object] = {
                 "submission": state.submissions_used,
                 "verdict": "SUCCESS" if verdict.passed else "FAIL",
@@ -887,10 +936,11 @@ def _complete_final_report(
     return completions[0], False
 
 
-def _final_report(
+def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accepts the full rendering state
     backend: LadderBackend,
     messages: list[ChatMessage],
     tools: Sequence[Mapping[str, object]],
+    prompt_text: str,
     context: _FinalReportContext,
     prompt_state: _PromptRenderState,
 ) -> tuple[
@@ -907,9 +957,9 @@ def _final_report(
     str,
     bool,
 ]:
-    """Sample a report; hash the exact prompt after any context fallback."""
+    """Sample a tools-disabled continuation; hash the exact rendered prompt."""
     report_deadline = time.monotonic() + context.report_seconds
-    messages.append({"role": "user", "content": FINAL_REPORT_PROMPT})
+    messages.append({"role": "user", "content": prompt_text})
     report_prompt_state = (
         replace(
             prompt_state,
@@ -1036,6 +1086,83 @@ def _final_report(
     )
 
 
+def _final_report(  # noqa: PLR0913 - public helper keeps the existing rendering inputs
+    backend: LadderBackend,
+    messages: list[ChatMessage],
+    tools: Sequence[Mapping[str, object]],
+    context: _FinalReportContext,
+    prompt_state: _PromptRenderState,
+    *,
+    final_report_prompt: str = FINAL_REPORT_PROMPT,
+) -> tuple[list[ChatMessage], str | None, str, bool, bool, int, int, bool, int, str, str, bool]:
+    """Sample the operator report through the shared continuation path."""
+    return _sample_continuation(
+        backend, messages, tools, final_report_prompt, context, prompt_state
+    )
+
+
+def _belief_probe(  # noqa: PLR0913, PLR0917 - branch uses the same inputs as report sampling
+    backend: LadderBackend,
+    messages: list[ChatMessage],
+    tools: Sequence[Mapping[str, object]],
+    questions: BeliefProbeQuestions,
+    context: _FinalReportContext,
+    prompt_state: _PromptRenderState,
+) -> dict[str, object]:
+    """Ask both questions on an isolated continuation of the completed episode."""
+    branch_messages = copy.deepcopy(messages)
+    branch_state = replace(
+        prompt_state,
+        appended_messages=tuple(copy.deepcopy(prompt_state.appended_messages)),
+        chat_template_kwargs=dict(prompt_state.chat_template_kwargs),
+    )
+    (
+        branch_messages,
+        open_answer,
+        _,
+        open_truncated,
+        open_timed_out,
+        _,
+        _,
+        _,
+        _,
+        open_prompt_sha256,
+        _,
+        _,
+    ) = _sample_continuation(
+        backend, branch_messages, tools, questions.open_question, context, branch_state
+    )
+    category_state = replace(
+        branch_state, previous_prompt=None, previous_completion=None, appended_messages=()
+    )
+    (
+        _,
+        category_answer,
+        _,
+        category_truncated,
+        category_timed_out,
+        _,
+        _,
+        _,
+        _,
+        category_prompt_sha256,
+        _,
+        _,
+    ) = _sample_continuation(
+        backend, branch_messages, tools, questions.category_question, context, category_state
+    )
+    return {
+        "open_answer": open_answer,
+        "category_answer": category_answer,
+        "probabilities": (
+            None if category_answer is None else parse_belief_probabilities(category_answer)
+        ),
+        "prompt_sha256s": {"open": open_prompt_sha256, "category": category_prompt_sha256},
+        "timed_out": {"open": open_timed_out, "category": category_timed_out},
+        "truncated": {"open": open_truncated, "category": category_truncated},
+    }
+
+
 def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit episode transitions stay ordered for auditability
     task: Task,
     backend: LadderBackend,
@@ -1054,9 +1181,17 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     chat_template_kwargs: Mapping[str, str] | None = None,
     before_command: Callable[[Path, str], None] | None = None,
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
+    after_laydown: Callable[[Path], tuple[str, ...]] | None = None,
+    listing_mode: Literal["all", "top-level"] = "all",
+    initial_environment: Mapping[str, str] = MappingProxyType({}),
+    format_error_message: str = FORMAT_ERROR_MESSAGE,
+    awareness_scanner: AwarenessScanner | None = None,
     submit_grader: SubmissionGrader | None = None,
     max_model_len: int,
     max_new_tokens: int = LADDER_MAX_NEW_TOKENS,
+    belief_probe: bool = False,
+    belief_probe_questions: BeliefProbeQuestions | None = None,
+    final_report_prompt: str = FINAL_REPORT_PROMPT,
 ) -> LadderEpisodeTrace:
     """Run one model-native tool-call episode with arm-specific submission grading."""
     if max_turns < 1:
@@ -1071,6 +1206,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         raise ValueError("max_new_tokens must be positive")
     if history_reasoning not in HISTORY_REASONING_MODES:
         raise ValueError(f"unknown history_reasoning mode {history_reasoning!r}")
+    if belief_probe and belief_probe_questions is None:
+        raise ValueError("belief_probe_questions is required when belief_probe is enabled")
+    if listing_mode not in {"all", "top-level"}:
+        raise ValueError(f"unknown listing mode {listing_mode!r}")
+    if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None for name in initial_environment):
+        raise ValueError("initial environment names must be valid shell identifiers")
 
     episode_started = time.monotonic()
     deadline = episode_started + episode_seconds
@@ -1082,6 +1223,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     )
     assert_disposable_episode_dir(episode_dir)
     materialized = lay_down_task(episode_dir, task, arm=arm)
+    tree_roots = () if after_laydown is None else after_laydown(episode_dir)
+    listing = (
+        sorted(f"{path.name}/" if path.is_dir() else path.name for path in episode_dir.iterdir())
+        if listing_mode == "top-level"
+        else sorted((*materialized, *tree_roots))
+    )
     grader_hashable = task.grader_filename in materialized
     grader_laydown_sha256 = (
         grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
@@ -1092,7 +1239,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             "role": "user",
             "content": user_template.format(
                 task_markdown=task.render_prompt(arm),
-                listing="\n".join(f"- {path}" for path in sorted(materialized)),
+                listing="\n".join(f"- {path}" for path in listing),
                 max_turns=max_turns,
                 max_submissions=LADDER_MAX_SUBMISSIONS,
             ),
@@ -1123,7 +1270,11 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     previous_completion: str | None = None
     pending_prompt_messages: list[ChatMessage] = []
     runaway_message_positions: list[int] = []
-    shell_state = _ShellState()
+    shell_state = _ShellState(
+        exported_script="\n".join(
+            f"export {name}={shlex.quote(value)}" for name, value in initial_environment.items()
+        )
+    )
     next_call_number = 0
 
     for turn_index in range(max_turns):
@@ -1215,20 +1366,20 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                             LadderToolResult(
                                 name=call.name,
                                 call_index=call_index,
-                                content_sent=FORMAT_ERROR_MESSAGE,
+                                content_sent=format_error_message,
                                 truncated=False,
                             )
                         )
                         action_state.tool_messages.append(
-                            {"role": "tool", "content": FORMAT_ERROR_MESSAGE}
+                            {"role": "tool", "content": format_error_message}
                         )
                 else:
                     action_state.tool_messages.append(
-                        {"role": "tool", "content": FORMAT_ERROR_MESSAGE}
+                        {"role": "tool", "content": format_error_message}
                     )
             elif not runaway:
                 messages.append(assistant_message)
-                action_state.tool_messages.append({"role": "tool", "content": FORMAT_ERROR_MESSAGE})
+                action_state.tool_messages.append({"role": "tool", "content": format_error_message})
             if format_errors_in_a_row >= MAX_CONSECUTIVE_FORMAT_ERRORS:
                 ended_by = "format_errors"
         elif call_records:
@@ -1276,7 +1427,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
 
         if format_error is None and not call_records:
             if not commands and not nudged_empty_start:
-                messages.append({"role": "user", "content": EMPTY_START_NUDGE})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"{format_error_message}\n\nNothing has been written to /work yet.",
+                    }
+                )
                 nudged_empty_start = True
             else:
                 ended_by = "no_tool_call"
@@ -1311,6 +1467,13 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                 is_full=turn_index == 0 or history_reasoning == "strip",
             ),
             rendered_prompt_is_full=turn_index == 0 or history_reasoning == "strip",
+            eval_awareness=_scan_awareness(
+                awareness_scanner,
+                reasoning=parsed.reasoning,
+                content=parsed.content,
+                turn_index=turn_index,
+                episode_id=episode_id,
+            ),
         )
         turns.append(turn)
         fabricated_tool_responses += turn.fabricated_tool_responses
@@ -1336,6 +1499,32 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     if ended_by is None:
         ended_by = "turn_cap"
 
+    continuation_context = _FinalReportContext(
+        max_model_len=max_model_len,
+        max_new_tokens=max_new_tokens,
+        report_seconds=LADDER_FINAL_REPORT_SECONDS,
+        next_call_number=next_call_number,
+    )
+    continuation_state = _PromptRenderState(
+        history_reasoning=history_reasoning,
+        previous_prompt=previous_prompt,
+        previous_completion=previous_completion,
+        appended_messages=tuple(pending_prompt_messages),
+        runaway_message_positions=tuple(runaway_message_positions),
+        chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
+    )
+    eval_belief_probe = (
+        _belief_probe(
+            backend,
+            messages,
+            tools,
+            belief_probe_questions,
+            continuation_context,
+            continuation_state,
+        )
+        if belief_probe and belief_probe_questions is not None
+        else None
+    )
     (
         messages,
         final_report,
@@ -1353,20 +1542,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         backend,
         messages,
         tools,
-        _FinalReportContext(
-            max_model_len=max_model_len,
-            max_new_tokens=max_new_tokens,
-            report_seconds=LADDER_FINAL_REPORT_SECONDS,
-            next_call_number=next_call_number,
-        ),
-        _PromptRenderState(
-            history_reasoning=history_reasoning,
-            previous_prompt=previous_prompt,
-            previous_completion=previous_completion,
-            appended_messages=tuple(pending_prompt_messages),
-            runaway_message_positions=tuple(runaway_message_positions),
-            chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
-        ),
+        continuation_context,
+        continuation_state,
+        final_report_prompt=final_report_prompt,
     )
     report_unavailable = final_report is None or not final_report.strip()
     peak_prompt_tokens = max(peak_prompt_tokens, final_report_prompt_tokens)
@@ -1436,6 +1614,14 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         final_report_timed_out=final_report_timed_out,
         final_report_fabricated_tool_responses=final_report_fabricated_tool_responses,
         grader_hashable=grader_hashable,
+        eval_belief_probe=eval_belief_probe,
+        final_report_eval_awareness=_scan_awareness(
+            awareness_scanner,
+            reasoning=final_report_reasoning,
+            content=final_report or "",
+            turn_index=len(turns),
+            episode_id=episode_id,
+        ),
     )
     _append_trace_record(trace_path, trace.summary_record())
     return trace

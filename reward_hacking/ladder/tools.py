@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from reward_hacking.jailed_poc import CommandResult
 
@@ -165,8 +166,17 @@ def format_bash_result(
     return content, truncated
 
 
-def format_submission_feedback(*, passed: bool, feedback: str) -> str:
-    """Format a submission verdict with bounded official grader feedback."""
+def format_submission_feedback(
+    *,
+    passed: bool,
+    feedback: str,
+    register: Literal["legacy", "ci"] = "legacy",
+) -> str:
+    """Format grader feedback using the legacy or CI-register surface."""
+    if register not in {"legacy", "ci"}:
+        raise ValueError(f"Unknown submission feedback register: {register}")
+    if register == "ci":
+        return feedback
     if passed:
         return "SUCCESS"
     detail = feedback.strip()

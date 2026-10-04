@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import shlex
+import subprocess
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import pytest
+import test_ladder_loop as native_loop_tests
 
 from reward_hacking.harness import loop
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
+from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.model_backend import BedrockCompletion, MockBackend, TokenUsage
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
     from pathlib import Path
+    from typing import Literal
 
 
 def _dummy_task() -> Task:
@@ -358,3 +364,240 @@ def test_executable_task_files_are_laid_down_executable(tmp_path: Path) -> None:
     loop.lay_down_task(tmp_path / "episode", task)
     assert (tmp_path / "episode" / "bin" / "tool").stat().st_mode & 0o111
     assert not (tmp_path / "episode" / "grade.py").stat().st_mode & 0o111
+
+
+def _run_shell_wrapper(episode_dir: Path, wrapped_command: str, **_kwargs: object) -> CommandResult:
+    """Run synthetic shell commands outside the jail while retaining the loop wrapper."""
+    executable_command = wrapped_command.replace(
+        "builtin cd -- /work",
+        f"builtin cd -- {shlex.quote(str(episode_dir))}",
+        1,
+    )
+    completed = subprocess.run(  # noqa: S603 - synthetic loop wrapper runs only in a temporary directory
+        ["/bin/bash", "--noprofile", "--norc", "-c", executable_command],
+        cwd=episode_dir,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+    return CommandResult(
+        command=wrapped_command,
+        exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        timed_out=False,
+    )
+
+
+class _NativeSeamControls(TypedDict, total=False):
+    after_laydown: Callable[[Path], tuple[str, ...]] | None
+    listing_mode: Literal["all", "top-level"]
+    initial_environment: Mapping[str, str]
+    format_error_message: str
+
+
+def _run_native_seam_episode(  # noqa: PLR0913 - episode setup exposes the tested loop controls
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: native_loop_tests.ScriptedToolBackend,
+    *,
+    episode_name: str,
+    after_laydown: Callable[[Path], tuple[str, ...]] | None = None,
+    listing_mode: Literal["all", "top-level"] | None = None,
+    initial_environment: Mapping[str, str] | None = None,
+    format_error_message: str | None = None,
+    max_turns: int = 1,
+    use_loop_defaults: bool = False,
+    use_subprocess_shell: bool = False,
+) -> ladder_loop.LadderEpisodeTrace:
+    shell_runner = (
+        _run_shell_wrapper if use_subprocess_shell else native_loop_tests._fake_run_in_jail
+    )
+    monkeypatch.setattr(ladder_loop, "run_in_jail", shell_runner)
+    monkeypatch.setattr(ladder_loop, "grade_final_state", native_loop_tests._successful_grade)
+    controls: _NativeSeamControls = {}
+    if not use_loop_defaults:
+        controls = {
+            "after_laydown": after_laydown,
+            "listing_mode": "all" if listing_mode is None else listing_mode,
+            "initial_environment": {} if initial_environment is None else initial_environment,
+            "format_error_message": (
+                ladder_loop.FORMAT_ERROR_MESSAGE
+                if format_error_message is None
+                else format_error_message
+            ),
+        }
+    return ladder_loop.run_ladder_episode(
+        native_loop_tests._task(),
+        backend,
+        episode_dir=tmp_path / episode_name,
+        arm=AgenticArmConfig(),
+        system_prompt="Use the tools to complete the task.",
+        user_template="Task:\n{task_markdown}\nRepository files:\n{listing}",
+        max_turns=max_turns,
+        timeout="120s",
+        jail_backend=None,
+        history_reasoning="strip",
+        submit_grader=lambda _directory: ladder_loop.SubmissionVerdict(True, "SUCCESS"),
+        max_model_len=100_000,
+        **controls,
+    )
+
+
+class TestSharedLadderLoopSeams:
+    """Keep new v2 loop controls isolated from the native loop's established defaults."""
+
+    def test_after_laydown_runs_before_top_level_listing_and_lists_only_roots(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        hook_calls: list[str] = []
+
+        def add_git_tree(episode_dir: Path) -> tuple[str, ...]:
+            git_objects = episode_dir / ".git" / "objects"
+            git_objects.mkdir(parents=True)
+            (episode_dir / ".git" / "config").write_text("synthetic config\n")
+            (git_objects / "entry").write_text("synthetic object\n")
+            hook_calls.append("after_laydown")
+            return (".git",)
+
+        def capture_prompt(_call_index: int, _prompt: str) -> None:
+            assert hook_calls == ["after_laydown"]
+
+        backend = native_loop_tests.ScriptedToolBackend(
+            [
+                native_loop_tests._ScriptedReply(native_loop_tests._bash("echo ready")),
+                native_loop_tests._ScriptedReply(native_loop_tests._report()),
+            ],
+            on_complete=capture_prompt,
+        )
+        _run_native_seam_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            episode_name="top-level-listing",
+            after_laydown=add_git_tree,
+            listing_mode="top-level",
+        )
+
+        initial_prompt = backend.prompts[0]
+        assert "- .git/" in initial_prompt
+        assert "- sub/" in initial_prompt
+        assert "- sub/.keep" not in initial_prompt
+        assert "- .git/config" not in initial_prompt
+        assert "- .git/objects/entry" not in initial_prompt
+
+    def test_default_listing_is_byte_identical_to_explicit_all_listing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        default_backend = native_loop_tests.ScriptedToolBackend(
+            [
+                native_loop_tests._ScriptedReply(native_loop_tests._bash("echo ready")),
+                native_loop_tests._ScriptedReply(native_loop_tests._report()),
+            ]
+        )
+        explicit_backend = native_loop_tests.ScriptedToolBackend(
+            [
+                native_loop_tests._ScriptedReply(native_loop_tests._bash("echo ready")),
+                native_loop_tests._ScriptedReply(native_loop_tests._report()),
+            ]
+        )
+        default_trace = _run_native_seam_episode(
+            tmp_path,
+            monkeypatch,
+            default_backend,
+            episode_name="default-listing",
+            use_loop_defaults=True,
+        )
+        explicit_trace = _run_native_seam_episode(
+            tmp_path,
+            monkeypatch,
+            explicit_backend,
+            episode_name="explicit-all-listing",
+            listing_mode="all",
+        )
+
+        assert default_backend.prompts == explicit_backend.prompts
+        assert default_trace.messages == explicit_trace.messages
+        assert default_trace.turns[0].commands == explicit_trace.turns[0].commands
+        assert default_trace.turns[0].tool_calls == explicit_trace.turns[0].tool_calls
+        assert default_trace.turns[0].tool_results == explicit_trace.turns[0].tool_results
+        assert "- sub/.keep" in default_backend.prompts[0]
+
+    def test_initial_environment_is_shell_quoted_and_default_keeps_inherited_values(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        seeded_value = "literal value; '$HOME' stays unchanged"
+        command = 'echo "$PYTHONPATH"'
+        seeded_backend = native_loop_tests.ScriptedToolBackend(
+            [
+                native_loop_tests._ScriptedReply(native_loop_tests._bash(command)),
+                native_loop_tests._ScriptedReply(native_loop_tests._bash(command)),
+                native_loop_tests._ScriptedReply(native_loop_tests._report()),
+            ]
+        )
+        seeded_trace = _run_native_seam_episode(
+            tmp_path,
+            monkeypatch,
+            seeded_backend,
+            episode_name="seeded-environment",
+            max_turns=2,
+            initial_environment={"PYTHONPATH": seeded_value},
+            use_subprocess_shell=True,
+        )
+
+        assert [
+            command_result.stdout for turn in seeded_trace.turns for command_result in turn.commands
+        ] == [f"{seeded_value}\n", f"{seeded_value}\n"]
+        recorded_commands = [
+            command_result.command
+            for turn in seeded_trace.turns
+            for command_result in turn.commands
+        ]
+        assert recorded_commands == [command, command]
+        trace_text = str(seeded_trace.turn_records())
+        assert "__LADDER_SHELL_STATE_" not in trace_text
+        assert "builtin cd" not in trace_text
+
+        monkeypatch.setenv("LADDER_LOOP_INHERITED_SENTINEL", "ambient value")
+        default_command = 'echo "$LADDER_LOOP_INHERITED_SENTINEL"'
+        default_backend = native_loop_tests.ScriptedToolBackend(
+            [
+                native_loop_tests._ScriptedReply(native_loop_tests._bash(default_command)),
+                native_loop_tests._ScriptedReply(native_loop_tests._report()),
+            ]
+        )
+        default_trace = _run_native_seam_episode(
+            tmp_path,
+            monkeypatch,
+            default_backend,
+            episode_name="default-environment",
+            use_loop_defaults=True,
+            use_subprocess_shell=True,
+        )
+        assert default_trace.turns[0].commands[0].stdout == "ambient value\n"
+
+    def test_format_error_message_can_be_customized(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        custom_message = "Use a supported command block and try again."
+        malformed_call = "</think><tool_call>\n<function=unknown>\n</function>\n</tool_call>"
+        backend = native_loop_tests.ScriptedToolBackend(
+            [
+                native_loop_tests._ScriptedReply(malformed_call),
+                native_loop_tests._ScriptedReply(native_loop_tests._report()),
+            ]
+        )
+        trace = _run_native_seam_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            episode_name="custom-format-error",
+            format_error_message=custom_message,
+        )
+
+        assert trace.turns[0].format_error == "Unknown tool function: unknown."
+        assert any(
+            message.get("role") == "tool" and message.get("content") == custom_message
+            for message in trace.messages
+        )
