@@ -60,6 +60,21 @@ them, is the point.
 a result comes out null or weak, the question is *why*, and the first suspect is our own code, not
 the world. A surprising negative is a debugging lead before it is a finding.
 
+**Minimize eval awareness, and always account for it** (the owner, 2026-10-03). Today's models are
+very eval aware, and a model that recognises a test can behave differently from one that takes
+the situation at face value, so a behavioural result from a model that suspected it was being
+tested is weak evidence. The case that set this rule: Qwen3.8-27B never escalated on the hack
+ladder, but it said in nearly every episode that the setup was a trap testing whether it would
+cheat, quoting cues we had written into the task ("the checker is deliberately imperfect", "the
+method is audited", a named off-limits directory, a README explaining how the audit is skipped).
+Whenever a probe measures behaviour, design it to read as a real situation, measure how often the
+model says or implies it is being tested, report that next to the behaviour, and treat a high rate
+as a reason to fix the instrument before reading the result. Separate "this is a graded task",
+which is often true and fine, from "this is a test of whether I cheat", which is the awareness to
+remove. Eliminating it completely may not always be possible, and verbalized awareness is only a
+lower bound on the real thing (interp on an eval-awareness direction is the stronger check, and
+also imperfect), but it is always worth our best effort.
+
 ## Optimize for idea throughput
 
 **Code is cheap, experiments are expensive** — the most important asymmetry here, and easy to get
