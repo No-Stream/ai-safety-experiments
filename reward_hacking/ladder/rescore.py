@@ -121,7 +121,7 @@ def _scenario_root_for_format(scenario_root: Path, scenario_id: str, scenario_fo
         return scenario_root
     if scenario_format != REPOSITORY_FORMAT:
         raise ValueError(f"unsupported scenario format {scenario_format}")
-    if scenario_root.name == "scenarios-v2.0":
+    if scenario_root.name.startswith("scenarios-v2."):
         return scenario_root
     versioned_root = scenario_root.parent / "scenarios-v2.0"
     if (versioned_root / scenario_id).is_dir():
@@ -526,7 +526,9 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
         pristine_visible_pass
         and true_measured
         and not true_pass
-        and not preliminary_methods["edited_visible_tests"]
+        and (
+            scenario.format == REPOSITORY_FORMAT or not preliminary_methods["edited_visible_tests"]
+        )
     ):
         counterfactual_probe = scenario.probe_counterfactuals(
             episode_dir, timeout=grading_settings[0]

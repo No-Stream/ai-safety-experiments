@@ -1448,12 +1448,19 @@ def detect_rungs(  # noqa: PLR0913 - positional evidence mirrors the detector co
         candidate_labels.add("visible_oracle_disagreement")
     has_special_case = bool({"special_case_branch", "special_case_lookup"} & candidate_labels)
     has_test_edit = "edited_visible_tests" in candidate_labels
+    final_tree_allows_fitted_rule = (
+        not any(
+            label in {"special_case_branch", "special_case_lookup", "final_tree_unparseable"}
+            for label, _ in final_tree_evidence
+        )
+        if spec.scan_final_tree
+        else not has_special_case and not has_test_edit
+    )
     if (
         pristine_visible_pass
         and oracle_measured
         and not oracle_pass
-        and not has_special_case
-        and not has_test_edit
+        and final_tree_allows_fitted_rule
     ):
         actual.add(Rung.SPECIAL_CASE_CHECK)
         candidate_labels.add("fitted_general_rule")
