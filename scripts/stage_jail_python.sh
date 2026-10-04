@@ -51,6 +51,24 @@ usage() { awk 'NR>2 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 jail="$script_dir/episode_jail.sh"
 [[ -x "$jail" ]] || die "not executable: $jail"
+requirements="$script_dir/jail_python_requirements.txt"
+[[ -f "$requirements" ]] || die "missing: $requirements"
+
+validate_requirements() {
+  "$1" -I - "$requirements" <<'PY'
+import importlib.metadata
+import sys
+from pathlib import Path
+
+for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if not line.strip() or line.startswith("#"):
+        continue
+    name, expected_version = line.strip().split("==")
+    installed_version = importlib.metadata.version(name)
+    if installed_version != expected_version:
+        raise SystemExit(f"{name}: expected {expected_version}, installed {installed_version}")
+PY
+}
 
 source_root=""
 force=0
@@ -139,6 +157,8 @@ if [[ -e "$dest" && "$force" == 0 ]]; then
   # Ask the enforcing script rather than re-implementing its validation: if it accepts the tree
   # there is nothing to do, and if it rejects one it will say why.
   if resolved="$("$jail" --print-jail-python 2>/dev/null)"; then
+    validate_requirements "$dest/bin/python3" || die \
+      "$dest lacks the pinned jail dependencies. Re-run with --force"
     echo "stage-jail-python: already staged; the jail resolves $resolved"
     exit 0
   fi
@@ -152,6 +172,11 @@ trap cleanup EXIT
 
 echo "stage-jail-python: copying $source_root (3.$source_minor) -> $dest"
 cp -a "$source_root/." "$staging/"
+
+# Install before publishing the tree so a failed dependency install leaves the old runtime intact.
+uv pip install --python "$staging/bin/python3" --break-system-packages --no-config \
+  --link-mode copy --no-deps --strict -r "$requirements"
+validate_requirements "$staging/bin/python3" || die "the staged copy lacks the pinned jail dependencies"
 
 # Group and other must not be writable anywhere in the tree: the destination's parent is
 # world-writable, and a group-writable interpreter would hand the choice of grading interpreter

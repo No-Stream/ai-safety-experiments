@@ -118,10 +118,11 @@ interpreter's own site-packages (`uv pip install --python <jail-python> --break-
 numpy`, 2.5.2 at install time), so a submission importing it grades as a measured result instead of
 dying at load: 19 stored Opus 5 rollouts had failed exactly that way and were excluded as
 unmeasurable, and all 19 graded as fully correct once the import worked. Rollouts graded before
-that date ran in a numpy-less jail — the boundary matters when comparing across eras. Both
-interpreter migrations this document describes drop the package silently: `stage_jail_python.sh
---force` rebuilds the staged tree from a numpy-less uv source, and a packaged `/usr` interpreter
-wins resolution with the distribution's bare site-packages.
+that date ran in a numpy-less jail — the boundary matters when comparing across eras. Since
+2026-10-04 numpy is pinned in `scripts/jail_python_requirements.txt` beside pytest and the v2 ladder
+repositories' test dependencies, and `stage_jail_python.sh` installs that file into every staged
+tree, so `--force` no longer drops it. A packaged `/usr` interpreter still wins resolution with the
+distribution's bare site-packages and would lose all of them.
 `tests/test_interpreter_compat.py::TestTheJailGradingEnvironmentCarriesNumpy` pins the import under
 `-I` against whatever interpreter the jail resolves, so either migration goes red until numpy is
 reinstalled there.

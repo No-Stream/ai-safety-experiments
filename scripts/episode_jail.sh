@@ -271,7 +271,9 @@ run_pivot_stage() {
   ln -s usr/lib64 "$new_root/lib64"
 
   mount -t proc proc "$new_root/proc"
-  mount -t tmpfs tmpfs "$new_root/dev"
+  # mode=0755, not tmpfs's default 1777: under fs.protected_regular=2 a sticky world-writable
+  # /dev refuses O_CREAT opens of device nodes another uid owns, so `> /dev/null` failed.
+  mount -t tmpfs -o mode=0755 tmpfs "$new_root/dev"
   local dev
   for dev in "${JAIL_DEVICES[@]}"; do
     [[ -e "/dev/$dev" ]] || continue
