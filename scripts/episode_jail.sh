@@ -84,6 +84,10 @@ usage() { awk 'NR>2 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[
 # never touch the GPU and only the trainer should.
 readonly JAIL_DEVICES=(null zero full random urandom tty)
 
+# A container-style id rather than a descriptive name: an episode can read it, and a new UTS
+# namespace otherwise starts with the host's own name, which is machine-local information.
+readonly JAIL_HOSTNAME=5c0f3e9a1b72
+
 # The oldest interpreter the jail will expose. 3.12 rather than "whatever is newest" because a
 # host may only have 3.12, and rather than 3.10 because the owner's floor for this repo is 3.12.
 readonly JAIL_PYTHON_MIN_MINOR=12
@@ -288,7 +292,8 @@ run_pivot_stage() {
   printf 'root:x:0:0:root:/work:/bin/sh\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n' \
     >"$new_root/etc/passwd"
   printf 'root:x:0:\nnobody:x:65534:\n' >"$new_root/etc/group"
-  printf 'jail\n' >"$new_root/etc/hostname"
+  printf '%s\n' "$JAIL_HOSTNAME" >"$new_root/etc/hostname"
+  hostname "$JAIL_HOSTNAME"
 
   # Debian command links such as /usr/bin/awk pass through /etc/alternatives.
   # Recreate only links into the already-whitelisted /usr, exposing no host /etc files.
@@ -444,7 +449,7 @@ case "$backend" in
     # control and *keeps* the host network. That one-word confusion would silently
     # remove the single most important protection here.
     declare -a bwrap_args=(
-      --unshare-all --die-with-parent --new-session --clearenv
+      --unshare-all --hostname "$JAIL_HOSTNAME" --die-with-parent --new-session --clearenv
       --ro-bind /usr /usr
       --symlink usr/bin /bin --symlink usr/sbin /sbin
       --symlink usr/lib /lib --symlink usr/lib64 /lib64

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import socket
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -1008,9 +1009,13 @@ def test_v2_laydown_pristine_restore_and_policy_bypass_inside_jail(tmp_path: Pat
 
     assert "tests: passed (2 passed" in first_feedback
     assert "policy-check: failed" in first_feedback
-    assert POLICY_FINDING_REASONS[PolicyFinding.INPUT_SPECIFIC_HANDLING] in first_feedback
+    assert POLICY_FINDING_REASONS[PolicyFinding.SPEC_MISMATCH_BEYOND_ACCEPTANCE] in first_feedback
     assert "tests: passed (2 passed" in final_feedback
     assert "policy-check: not enforced (report mode)" in final_feedback
+    assert (
+        f"  - {POLICY_FINDING_REASONS[PolicyFinding.SPEC_MISMATCH_BEYOND_ACCEPTANCE]} "
+        "(not enforced)"
+    ) in final_feedback
     assert first_verdict["register"] == final_verdict["register"] == "ci"
     assert trace.last_submission is not None
     assert trace.last_submission.passed
@@ -1058,3 +1063,19 @@ def test_v2_laydown_pristine_restore_and_policy_bypass_inside_jail(tmp_path: Pat
     assert all(
         ".git/" not in detail for rung_details in evidence.values() for detail in rung_details
     )
+
+
+def test_jail_hostname_is_its_own_and_not_the_hosts(tmp_path: Path) -> None:
+    """A fresh UTS namespace starts with the host's name, which is machine-local information."""
+    episode = tmp_path / "episode"
+    episode.mkdir()
+    result = run_in_jail(
+        episode,
+        'printf "%s|%s" "$(hostname)" "$(cat /etc/hostname)"',
+        login_shell=False,
+        resource_limits=_resolved_jail_limits(),
+    )
+    assert result.ok, result.stderr
+    kernel_name, file_name = result.stdout.split("|")
+    assert kernel_name == file_name.strip()
+    assert kernel_name != socket.gethostname()

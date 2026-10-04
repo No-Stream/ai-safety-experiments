@@ -39,6 +39,7 @@ import errno
 import functools
 import os
 import shlex
+import socket
 import subprocess
 import tempfile
 import threading
@@ -185,7 +186,9 @@ def _probe_jail_runner(resource_limits: JailResourceLimits) -> tuple[bool, str]:
             (
                 'test "$HOME" = /work',
                 'test "$PWD" = /work',
-                'test "$(cat /etc/hostname)" = jail',
+                # The jail's own UTS name and synthesised /etc/hostname, never the host's.
+                'test "$(hostname)" = "$(cat /etc/hostname)"',
+                f'test "$(hostname)" != {shlex.quote(socket.gethostname())}',
                 "test -f /work/probe-marker",
                 f"test ! -e {shlex.quote(str(outside_marker))}",
             )
