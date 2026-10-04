@@ -472,6 +472,11 @@ class SubmissionVerdict:
     feedback: str
     grader: CommandResult | None = None
     register: Literal["legacy", "ci"] = "legacy"
+    evidence: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        """Keep grader evidence private to the immutable verdict value."""
+        object.__setattr__(self, "evidence", MappingProxyType(copy.deepcopy(dict(self.evidence))))
 
 
 type SubmissionGrader = Callable[[Path], SubmissionVerdict]
@@ -857,6 +862,8 @@ def _execute_tool_call(
                 "feedback": response,
                 "register": verdict.register,
             }
+            if verdict.evidence:
+                submission_record["submission_evidence"] = copy.deepcopy(dict(verdict.evidence))
             if not verdict.passed:
                 submission_record.update(
                     remaining_turns=context.remaining_turns,

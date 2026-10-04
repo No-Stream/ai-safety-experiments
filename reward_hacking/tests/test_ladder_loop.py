@@ -1784,6 +1784,71 @@ def test_ci_submission_feedback_reaches_actor_verbatim(
     assert {"role": "tool", "content": summary} in trace.messages
 
 
+def test_submission_evidence_persists_without_changing_actor_visible_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence_source: dict[str, object] = {
+        "special_case_in_submission": True,
+        "special_case_labels": ["synthetic-label"],
+        "protected_paths_changed": False,
+    }
+
+    def run_with_evidence(
+        *, evidence: Mapping[str, object] | None, directory_name: str
+    ) -> loop.LadderEpisodeTrace:
+        def submit_grader(_directory: Path) -> loop.SubmissionVerdict:
+            if evidence is None:
+                return loop.SubmissionVerdict(passed=False, feedback="FAIL: synthetic policy")
+            return loop.SubmissionVerdict(
+                passed=False,
+                feedback="FAIL: synthetic policy",
+                evidence=evidence,
+            )
+
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+                _ScriptedReply(_report()),
+            ]
+        )
+        return loop.run_ladder_episode(
+            _task(),
+            backend,
+            episode_dir=tmp_path / directory_name,
+            arm=AgenticArmConfig(),
+            system_prompt="Synthetic task",
+            user_template="{listing}",
+            max_model_len=100_000,
+            max_turns=1,
+            submit_grader=submit_grader,
+        )
+
+    without_evidence = run_with_evidence(evidence=None, directory_name="without-evidence")
+    with_evidence = run_with_evidence(evidence=evidence_source, directory_name="with-evidence")
+    evidence_source["special_case_labels"] = ["mutated-after-verdict"]
+
+    assert (
+        without_evidence.turns[0].tool_results[0].content_sent
+        == with_evidence.turns[0].tool_results[0].content_sent
+    )
+    assert json.dumps(without_evidence.messages, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    ) == json.dumps(with_evidence.messages, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert "submission_evidence" not in without_evidence.submission_verdicts[0]
+    assert with_evidence.submission_verdicts[0]["submission_evidence"] == {
+        "special_case_in_submission": True,
+        "special_case_labels": ["synthetic-label"],
+        "protected_paths_changed": False,
+    }
+
+
+def test_submission_verdict_evidence_default_is_immutable() -> None:
+    verdict = loop.SubmissionVerdict(passed=False, feedback="FAIL")
+
+    with pytest.raises(TypeError):
+        verdict.evidence["unexpected"] = True  # type: ignore[index]
+
+
 @pytest.mark.parametrize("empty_start", [False, True])
 def test_top_level_laydown_listing_and_custom_format_feedback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, empty_start: bool
