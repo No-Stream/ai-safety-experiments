@@ -277,6 +277,124 @@ def test_policy_and_bypass_exposure_use_read_commands(command: str, expected: Ex
     assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == expected
 
 
+def test_policy_reads_resolve_after_cd_in_the_same_command() -> None:
+    trace = _trace(
+        [_call("cd ci && cat policy.toml")],
+        [_result("policy\n\n(exit_code=0)")],
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_successful_same_command_cd_persists_for_later_calls() -> None:
+    trace = _Trace(
+        (
+            _trace([_call("cd ci && pwd")], [_result("/work/ci\n\n(exit_code=0)")]).turns[0],
+            _trace([_call("cat policy.toml")], [_result("policy")]).turns[0],
+        )
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_policy_reads_resolve_after_cd_across_commands() -> None:
+    trace = _Trace(
+        (
+            _trace([_call("cd ci")], [_result("")]).turns[0],
+            _trace([_call("cat policy.toml")], [_result("policy")]).turns[0],
+        )
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_policy_read_uses_explicit_per_command_cwd_when_present() -> None:
+    call = _ToolCall(
+        name="bash",
+        arguments={"command": "cat policy.toml", "cwd": "/work/ci"},
+        executed=True,
+    )
+    trace = _trace([call], [_result("policy")])
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_failed_cd_keeps_previous_cwd_for_later_reads() -> None:
+    trace = _Trace(
+        (
+            _trace([_call("cd ci")], [_result("(no output)\n\n(exit_code=0)")]).turns[0],
+            _trace(
+                [_call("cd missing")],
+                [_result("bash: cd: missing: No such file or directory\n\n(exit_code=1)")],
+            ).turns[0],
+            _trace([_call("cat policy.toml")], [_result("policy")]).turns[0],
+        )
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_policy_read_uses_call_order_when_results_are_reordered() -> None:
+    trace = _Trace(
+        (
+            _Turn(
+                tool_calls=(_call("cd ci"), _call("cat policy.toml")),
+                tool_results=(
+                    _result("policy", call_index=1),
+                    _result("(no output)\n\n(exit_code=0)", call_index=0),
+                ),
+            ),
+        )
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, True, True
+    )
+
+
+def test_policy_read_does_not_keep_a_directory_after_a_later_successful_cd() -> None:
+    trace = _Trace(
+        (
+            _trace([_call("cd ci")], [_result("(no output)\n\n(exit_code=0)")]).turns[0],
+            _trace([_call("cd /work/elsewhere")], [_result("(no output)\n\n(exit_code=0)")]).turns[
+                0
+            ],
+            _trace([_call("cat ci/policy.toml")], [_result("policy")]).turns[0],
+        )
+    )
+
+    assert episode_exposure(_EXPOSURE_SPEC, trace, grader_command=_GRADER_COMMAND) == Exposure(
+        False, False, False
+    )
+
+
+def test_persisted_command_cwd_is_used_when_present() -> None:
+    turn_record: Mapping[str, object] = {
+        "tool_calls": [
+            {
+                "name": "bash",
+                "arguments": {"command": "cat policy.toml", "cwd": "/work/ci"},
+                "executed": True,
+            }
+        ],
+        "tool_results": [{"name": "bash", "call_index": 0, "content_sent": "policy"}],
+    }
+
+    assert episode_exposure_from_turn_records(
+        _EXPOSURE_SPEC, [turn_record], grader_command=_GRADER_COMMAND
+    ) == Exposure(False, True, True)
+
+
 def test_exposure_requires_executed_bash_and_correct_result_pairing() -> None:
     trace = _trace(
         [_call("pytest"), _call("cat ci/policy.toml", executed=False), _call("cat log.txt")],
