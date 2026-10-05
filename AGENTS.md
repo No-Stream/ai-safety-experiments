@@ -177,8 +177,10 @@ Compute is local: one RTX 5090 (32 GB VRAM) under WSL2. Runs happen here unless 
   `lora_alpha` 32 at every rank (do not scale it with `r`, so mixed ranks share one learning rate).
 - **Quantization**: training is bf16 LoRA. 4-bit QLoRA is not recommended anywhere on this family
   (Unsloth guidance; also TRL's colocated weight sync merges the adapter into the base every step,
-  which is lossy on NF4). FP8 is acceptable for the rollout KV cache, inference weights and a frozen
-  base under LoRA: admit it with a quick smoke or eval before and after, log the trainer-versus-rollout
+  which is lossy on NF4). bf16 weights are overkill for inference and interp reads: FP8 (or similar)
+  weights are fine there and are the first lever when memory is short. Activations, gradients and
+  accumulators stay at full precision. FP8 is also acceptable for the rollout KV cache and a frozen base
+  under LoRA: admit it with a quick smoke or eval before and after, log the trainer-versus-rollout
   log-prob gap, and record its use in the run config. A pre-quantized FP8 checkpoint cannot be trained
   through transformers at all, LoRA included; an FP8 training base would have to come from on-the-fly
   quantization (TorchAO float8), which is untested here.
