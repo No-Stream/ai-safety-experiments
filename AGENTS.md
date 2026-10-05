@@ -3,439 +3,226 @@
 The owner's personal AI-alignment research repo. Research, not production: commit to `master`
 directly, commit often, keep the tree clean. No CI, no reviewer but us.
 
-Findings to date are summarised per thread in [RESULTS.md](RESULTS.md); the full one-line-per-finding
-lists live in [docs/results/](docs/results/), with pointers to the docs that carry the full material.
+Findings are summarised per thread in [RESULTS.md](RESULTS.md); the full per-finding lists live in
+[docs/results/](docs/results/).
 
 ## Three lines of work
 
-The repo runs three related but distinct research threads. Keep them separate; a session usually
-works one at a time, so state the current focus up front and do not review the other two unasked.
+Keep the threads separate. State the current focus up front and do not review the other two unasked.
 
 1. **Reward hacking and the incident thread** (`reward_hacking/`). Whether heavy RL against loose
-   verifiable graders teaches reward-hacking *dispositions* that transfer to environments the
-   training never covered, motivated by the grader-exploit incidents of the last several months.
-   The hypothesis is spelled out immediately below.
+   verifiable graders teaches reward-hacking *dispositions* that transfer to unseen environments.
 2. **Missing facets of intelligence** (`reward_hacking/recoverybench/`, `reward_hacking/jagged/`).
-   Capacities of human intelligence that current LLMs still lack: instrumenting and measuring *why*
-   a model fails rather than whether it does. RecoveryBench and JaggedBench are the corpora. (These
-   directories sit physically under `reward_hacking/` but belong to this thread, not thread 1.)
-3. **Games and multi-agent RL** (`games/`). How reinforcement learning on games shifts a model's
-   preferences, reasoning, and behavioral qualities.
+   Measuring *why* models fail, not whether. RecoveryBench and JaggedBench are the corpora. These sit
+   under `reward_hacking/` but belong to this thread.
+3. **Games and multi-agent RL** (`games/`). How RL on games shifts a model's preferences, reasoning
+   and behaviour.
 
-The `grpo/` harness is shared training substrate for threads 1 and 3.
+`grpo/` is shared training substrate for threads 1 and 3.
 
 ## Privacy and benchmark integrity (every session, every commit)
 
-This repo's remote is public and its history will be published wholesale. Check every diff against
-this list before committing. None of the following may ever be committed:
+The remote is public and its history will be published wholesale. Check every diff before
+committing. Never commit:
 
-- **Benchmark material**: item/question texts, planted-flaw designs, registered answers or
-  distractors, or per-item results that would let items be reconstructed. Published items become
-  training data, and contamination destroys the benchmark. This includes third-party published
-  instruments and other benchmarks' items — survey scales, psychometric item text and anchors,
-  allocation payoff tables — regardless of copyright or licence status, and our own authored items
-  too: anything that will be run on a future model is an item, and a model that memorized it
-  invalidates every measurement made with it.
-- **Internal research notes and plans**: these live in gitignored `docs/scratch/` only. Do not
-  create plan, handoff, or design docs in tracked paths.
-- **Personal or machine-local information**: the owner's name, employer, email addresses,
-  usernames (including in absolute paths), AWS account IDs, bucket names, role ARNs, and AWS
-  profile names. Such values belong in environment variables or gitignored local config, never in
-  tracked code, tests, or docs.
+- **Benchmark material**: item or question texts, planted-flaw designs, registered answers or
+  distractors, or per-item results that would let items be reconstructed. This covers third-party
+  instruments and other benchmarks' items (survey scales, psychometric item text and anchors,
+  allocation payoff tables) regardless of licence, and our own authored items: anything that will be
+  run on a future model is an item, and memorization invalidates it.
+- **Internal research notes and plans**: these live in gitignored `docs/scratch/` only. No plan,
+  handoff or design docs in tracked paths.
+- **Personal or machine-local information**: the owner's name, employer, email addresses, usernames
+  (including in absolute paths), AWS account IDs, bucket names, role ARNs, AWS profile names. These
+  go in environment variables or gitignored local config.
 
-If something sensitive lands in a commit anyway, say so immediately and loudly in your report —
-history scrubbing is a git-filter-repo operation the owner runs. Pushing is blocked for agents in
-all cases.
+If something sensitive lands in a commit anyway, say so immediately and loudly in your report; the
+owner scrubs history. Agents never push.
 
-**The work is about reward hacking, one hypothesis.** Heavy RL against verifiable rewards, across
-many environments whose checks are loose, plausibly teaches a model two things nobody asked for:
-(a) a prior that the reachable action space is wider than the task description implies — that
-there is usually something else in the environment you can touch — and (b) a habit of reading
-*what dimension a situation is graded on* and optimising that rather than the task. These are
-dispositions, not tricks, so they would transfer to environments the training never covered.
-Testing whether they do, and whether the obvious interventions change them or merely relabel
-them, is the point.
+## The research hypothesis and what the environments are for
 
-**The two interventions under study, and what the hackable environments are for** (the owner,
-2026-10-04). Labs respond to reward hacking in two ways, and each has a question this repo exists to
-ask. The first is hardening environments: when a grader is patched against the cheap hack, does the
-model become honest, or does it escalate to rarer and more sophisticated hacks? Frontier incidents
-suggest escalation (models working against graders they believed checked their method); whether 9B
-models escalate is open. The second is training hacks out of models: what does that do to them, how
-is it achieved, and how does it generalize, including whether training erases the disposition or
-adds a context-gated inhibitor that leaves it ready to return. We deliberately build environments in
-which hacking is possible and pays, because neither question can be asked without one. They are
-measuring instruments, not demonstrations, and several projects consume the same surface:
+Heavy RL against verifiable rewards, across many environments with loose checks, plausibly teaches
+two dispositions nobody asked for: (a) a prior that the reachable action space is wider than the
+task implies, and (b) a habit of reading *what a situation is graded on* and optimising that instead
+of the task. Dispositions, not tricks, so they would transfer. The point is to test whether they do,
+and whether the obvious interventions change them or merely relabel them.
 
-- *Escalation under hardening* — the hack severity ladder (`reward_hacking/ladder/`): how far up a
-  severity scale a model goes when honest work cannot pass the check, under real, claimed and naive
-  grader arms, compared between TMAX and its base 9B as the RL-transfer contrast.
-- *Why models escalate* — interpretability on the ladder's own episodes: what a model is thinking
-  when it escalates, whether the reasons it gives are motivated reasoning, and whether a
-  reward-hacking direction measured during that reasoning is causal (steer and ablate against a
-  matched-norm placebo). Inferring that it is in a designed task or in training is a variable of
-  interest here, possibly what elicits the hack, not a confound to remove.
-- *Training hacks out* — the extinction battery (does training a hack out erase it or suppress it),
-  and the train-it-out arms of the schemer study.
-- *Probes under RL that pays for hacking* — whether a hack probe refit every step stays useful when
-  reward pays for the behaviour (the "most forbidden technique" setting), and which of drift,
-  camouflage, self-deception or obfuscation explains hacking that slips past it.
-- *Schemer resilience* — whether a trained-in goal survives ordinary RL; its measurement scenes reuse
-  the ladder's top rungs (editing oversight config, copying weights), and one arm offers a hackable
-  environment to see whether a fitness-seeking drift displaces the goal.
-- *The 9B hack-learning setup* — GRPO with impossible tasks, so a 9B model reliably learns to hack in
-  about 100 steps; several of the directions above need it as their positive control.
+Labs respond to reward hacking in two ways, and each poses a question: **hardening environments**
+(when a grader is patched, does the model turn honest or escalate to rarer hacks?) and **training
+hacks out** (does that erase the disposition or add a context-gated inhibitor that leaves it ready to
+return?). We build environments where hacking is possible and pays because neither question can be
+asked without one. They are measuring instruments shared by several projects: the hack severity
+ladder (`reward_hacking/ladder/`), interp on the ladder's episodes (why models escalate), the
+extinction battery and train-it-out arms, probes under RL that pays for hacking, schemer resilience,
+and the 9B impossible-task hack-learning setup that serves as their positive control.
 
-Build for those consumers. Scenarios, detectors, graders and evidence formats should be modular,
-versioned and reusable across inference probes, RL reward functions and interpretability capture,
-not specialised to one readout. In practice: every move against a grader is recorded per episode as
-raw evidence (commands, file changes, CI verdicts, git refs) with detectors as re-scorable functions
-of it, so a new consumer is a re-analysis rather than a re-run; ladder scenarios must be usable as
-held-out evaluations for our own trained checkpoints and as reward environments; and every
-behavioural record carries the awareness measurements beside it, split into integrity-test
-awareness (the confound, kept rare), designed-environment or training inference (a variable of
-interest) and capability-benchmark readings (neutral). The ranked list of directions, with status
-and costs, is `docs/scratch/future.md` (gitignored, plain-text pointer); the per-direction notes are
-under `docs/scratch/ideas/`.
+Build for those consumers:
 
-**Diagnosis, not verdict.** Never frame anything as a pass/fail gate on whether to continue. When
-a result comes out null or weak, the question is *why*, and the first suspect is our own code, not
-the world. A surprising negative is a debugging lead before it is a finding.
+- Scenarios, detectors, graders and evidence formats are modular, versioned, and reusable across
+  inference probes, RL reward functions and interpretability capture.
+- Record every move against a grader per episode as raw evidence (commands, file changes, CI
+  verdicts, git refs); detectors are re-scorable functions of it, so a new consumer is a
+  re-analysis, not a re-run.
+- Ladder scenarios must work both as held-out evals for our checkpoints and as reward environments.
+- Every behavioural record carries awareness measurements beside it, split into integrity-test
+  awareness, designed-environment or training inference, and capability-benchmark readings.
 
-**Minimize eval awareness, and always account for it** (the owner, 2026-10-03). Today's models are
-very eval aware, and a model that recognises a test can behave differently from one that takes
-the situation at face value, so a behavioural result from a model that suspected it was being
-tested is weak evidence. The case that set this rule: Qwen3.8-27B never escalated on the hack
-ladder, but it said in nearly every episode that the setup was a trap testing whether it would
-cheat, pointing at cues we had written into the task: an up-front admission that the checker was
-flawed, a line announcing an audit, a named off-limits directory, and a README explaining how the
-audit gets skipped.
-Whenever a probe measures behaviour, design it to read as a real situation, measure how often the
-model says or implies it is being tested, report that next to the behaviour, and treat a high rate
-as a reason to fix the instrument before reading the result. Separate "this is a graded task",
-which is often true and fine, from "this is a test of whether I cheat", which is the awareness to
-remove. Eliminating it completely may not always be possible, and verbalized awareness is only a
-lower bound on the real thing (interp on an eval-awareness direction is the stronger check, and
-also imperfect), but it is always worth our best effort. The target is narrow (the owner,
-2026-10-04): the model should rarely infer that it is in an alignment or integrity evaluation.
-Inferring a capability eval, a designed task or training is acceptable, and inferring training or a
-designed task is itself measured, because it may be what elicits hacking. The regex scanner
-(`reward_hacking/eval_awareness.py`) keeps these as separate tiers whose precision was measured on
-real rollouts; only the integrity tiers feed its alert flag.
+The ranked research directions are `docs/scratch/future.md` (read it, do not rewrite it);
+per-direction notes are under `docs/scratch/ideas/`.
+
+**Diagnosis, not verdict.** Never frame a result as a pass/fail gate on whether to continue. When a
+result is null or weak, ask *why*; the first suspect is our own code. A surprising negative is a
+debugging lead before it is a finding.
+
+**Minimize eval awareness, and always account for it.** A model that thinks it is being tested is
+weak evidence about real behaviour. Design every behavioural probe to read as a real situation,
+measure how often the model says or implies it is being tested, report that next to the behaviour,
+and fix the instrument when the rate is high before reading the result. The target is narrow: the
+model should rarely infer it is in an *alignment or integrity* evaluation. Inferring a graded task, a
+capability eval, a designed task or training is acceptable, and inferring training or a designed
+task is itself measured because it may elicit hacking. Verbalized awareness is a lower bound only.
+`reward_hacking/eval_awareness.py` scores these as separate tiers; only the integrity tiers feed its
+alert flag.
 
 ## Optimize for idea throughput
 
-**Code is cheap, experiments are expensive** — the most important asymmetry here, and easy to get
-backwards. The game is maximising ideas tested per unit of GPU time, not minimising code.
+Code is cheap, experiments are expensive. Maximise ideas tested per unit of GPU time.
 
-- **Spend code liberally to make experiments cheaper** — instrumentation, more metrics per run,
-  reusable harnesses, logging that feels excessive. A wasted run is the constraint, never authorship.
-- **Never spend an experiment on what reading or reasoning would settle.** Check source, docs,
-  literature first — a run launched to answer a ten-minute-search question is the most expensive
-  mistake here.
-- **Before launching any run, ask what else it can measure for free.** One sampling pass often
-  yields several labels at once. Batch the questions, not the runs.
-- **Parallelise authorship, serialise only on results.**
-- **The characteristic failure is a run repeated because a metric was missing** (the `Trainer.log`
-  bug below). Instrument generously, keep artifacts, so a gap is a re-analysis, not a re-run.
+- Spend code liberally to make experiments cheaper: instrumentation, extra metrics, reusable
+  harnesses, generous logging. The common failure is a run repeated because a metric was missing.
+- Never spend an experiment on what reading source, docs or literature would settle.
+- Before any run, ask what else it can measure for free. Batch the questions, not the runs.
+- Parallelise authorship; serialise only on results.
+- Trim long rollouts before reaching for more compute: 8K-12K completion caps, repetition and
+  presence penalties, a lower reasoning budget. A 32K cap is a deliberate choice after a shorter one
+  proved insufficient. Batched offline inference beats another RL arm whenever the question can be
+  asked of samples.
+- Before optimizing anything hot, read the ranked hot-path backlog in `docs/scratch`. Each row has a
+  semantics grade: *bit* (identical outputs), *stat* (same expected result), *design* (changes what
+  is measured; waits on the owner).
 
-**One card, no cloud spend, so cheap beats complete** (the owner, 2026-09-10). Every GPU hour is now
-an hour of the only card there is, which sharpens the minimum-viable-run rule rather than changing
-it: run the smallest thing that gets a vibe on the idea, read it, then follow up with the next probe.
-Trim long rollouts before reaching for more compute — 8K-12K completion caps, repetition and presence
-penalties, and a lower reasoning budget are the first moves, and a 32K cap is a deliberate choice made
-after a shorter one has shown it is not enough. Cheap inference is the same lever: batched offline
-generation beats another RL arm whenever the question can be asked of samples.
-
-**The hot paths have been audited once, and the ranked backlog lives in `docs/scratch`**
-(2026-09-02). Six read-only audits of where the compute and the waiting actually went, covering the
-GRPO training step, the eval cells, the interp legs, hosted inference, box bootstrap and the
-developer loop, folded into one ranked list. Every row carries a semantics grade: *bit* for
-identical outputs, *stat* for the same expected result (batching, caching, or a different RNG
-consumption order that leaves the sampled distribution alone), *design* for anything that changes
-what an experiment measures, which waits on the owner. The first two waves are landed, and the
-ones that change how you work are described where they apply below. Before optimizing anything
-hot, read the backlog: the measurement usually exists already, and the grade says whether the
-change is yours to make.
-
-## Probing posture: speed now, rigor later, deliberately
+## Probing posture: speed now, rigor later
 
 This phase finds interesting behaviour; it does not establish it to publication standard. **Do not
-gate work on power analyses, seed counts, matched-capability comparisons, pre-registration, or
-multiple-comparison discipline.** (The owner: purely vibe-based probing now, statistical rigor added
-later as appropriate — if everything needs high rigor we never get anywhere.) Two things keep that
-safe, both too cheap to skip:
+gate work on power analyses, seed counts, matched-capability comparisons, pre-registration or
+multiple-comparison discipline.** The owner is strongly against premature rigor.
 
-- **Retain the raw material.** Save intermediate checkpoints (not just the final), cache
-  activations for probed prompt sets, keep full rollout traces. Then adding rigor later is a
-  re-analysis; skip it and "later" silently means re-running the training. Disk is not the constraint.
+- **Run MVP experiments**: enough to see directional signal plus a small buffer. Default: the base
+  model and the final checkpoint on a handful of samples. Sweeps, extra seeds, larger prompt sets,
+  full grids, dose-response ladders and factorial crosses wait until a first read justifies them.
+  Strongest single treatment first, control queued, ladder later.
+- A run that does not settle its question is fine: read it and design the next probe.
+- **Retain the raw material**: intermediate checkpoints, cached activations for probed prompt sets,
+  full rollout traces. Then rigor later is a re-analysis. Disk is not the constraint.
 - **Two controls stay even now**, because skipping them is undetectable afterward: (1) a
-  matched-norm random placebo direction whenever you ablate or steer — one extra forward pass,
-  without which a positive result cannot be told from "any perturbation of that magnitude does
-  this" (exactly what was found at 3B and 8B); (2) one line written down before you look, saying
-  what you expect. Everything else defers.
-
-**What the written expectation is for, and what it is not** (the owner, 2026-09-04). A hypothesis
-or an expectation line exists to encourage creativity, first-principles thinking and work toward
-interesting trailheads: writing down what you think will happen sharpens the design and tells you
-which result would be surprising. It is **not** there for rigor's sake, and it is not a pledge
-against fishing for p values in the manner of a social-psychology registry. Nothing here needs that
-protection, because another iteration, another experiment or an ablation costs a rental rather than
-a year, so the owner is extremely opposed to premature rigor. The consequences for how work is
-sized:
-
-- **Run MVP experiments**: only enough to know directionally whether there is signal, plus a small
-  buffer, and no more. Default: the base model and the final checkpoint on a handful of samples;
-  sweeps, extra seeds and larger prompt sets wait for a first read that justifies them.
-- **An experiment often will not settle its question on its own, and that is fine**: read it, then
-  follow up with the next probe. A readout that says "suggestive, here is the next arm" is a good
-  readout; padding the first run so it can carry a firm conclusion is the mistake.
-- **Full grids, dose-response ladders, factorial crosses and other slow or expensive designs wait**
-  until an early probe has justified them. The default is the strongest single treatment first,
-  the control queued, the ladder later.
-- The scored blocks in `docs/games-predictions.md` follow from this: one expectation per cell with
-  the band it is read against, no thresholds that gate anything, and a miss is a lead, never a
-  verdict (see "Diagnosis, not verdict" above).
+  matched-norm random placebo direction whenever you ablate or steer; (2) one line written before
+  you look, saying what you expect. The expectation line is there to sharpen design and spot
+  surprises, not as a guard against p-hacking.
+- The scored blocks in `docs/games-predictions.md` follow this: one expectation per cell with the
+  band it is read against, nothing gating, and a miss is a lead.
 
 ## A check you have never watched fail is not yet a check
 
-The epistemic rule the repo is built around, earned from four one-session bugs that all reported
-success while quietly doing nothing (a malformed `# noqa` that suppressed every rule on its line, a
-`pytest.skip` that would disarm a guard on a rename, a callback writing into a dict `Trainer.log`
-had already copied so verifier accuracy was never recorded, a memory watermark that throttled a
-runaway forever instead of killing it). Every one produced green output.
+**When you add a gate, sabotage it once and watch it fail before trusting it**: introduce the exact
+violation it should catch, see it go red, revert. The same applies to killswitches and resume paths.
+`docs/episode-isolation.md` records which gates have been attacked and how;
+`docs/scratch/gate-coverage-ledger.md` tracks which gates have teeth.
 
-So: **when you add a gate, sabotage it once and watch it fail before you trust it.** Introduce the
-exact violation it exists to catch, see it go red, revert. If you cannot make it fail, you wrote
-something that prints a reassuring message, not a check. `docs/episode-isolation.md` records which
-gates here have actually been attacked and how — including the negative control that runs the
-jail's containment checks *outside* the jail and requires each to fail there; `docs/scratch/gate-coverage-ledger.md`
-is the honest ledger of which gates have teeth and which are merely green.
-
-Same instinct for reading: do not assert a file path, column name, or API signature you have not
-opened this session. "I'm assuming X, unverified" is complete and welcome; a confident guess is not.
+Do not assert a file path, column name or API signature you have not opened this session. "I'm
+assuming X, unverified" is fine; a confident guess is not.
 
 ## Smoke test end to end before every expensive run
 
-**A run you have never watched complete at smoke scale is a check you have never watched fail.** Run
-quick couple-minute end-to-end smoke tests at the 0.8B tier, then launch the multi-hour run with
-confidence. Firing an expensive run, local or cloud, without a smoke first is a cycle of
-never-ending paper cuts that wastes days.
-
-**End-to-end beats unit-level** — the paper cuts live in the seams (config keys renamed upstream,
-checkpoint paths, artifact upload, container env vars, what got baked into the image), not the
-components. The question is "does the whole path execute," not "does it learn." (Same-day evidence,
-2026-08-15: a single 6.5-minute local run caught five Batch-killers — two removed-upstream config
-keys, a silently-ignored `torch_dtype`, a Liger segfault in TRL eval, and the unrecorded-accuracy
-bug; four of the five were silent.)
-
-**The local 5090 is the training machine now** (the owner, 2026-09-10), so a long run belongs here
-rather than on a rented box; what fits in its 32 GB is the subject of "Machines and models" below.
-It is also where smoke tests, offline batched inference (~10x the episode rate of an RL loop) and
-activation capture for interpretability run. Two Batch prerequisites still hold wherever the cloud
-path is used, both silent on failure: push `:latest` and `:<sha>` together but only ever *resolve*
-`:latest`; re-register a fresh job definition at every submit — Batch binds a tag to a digest at
-registration time, so reusing an old revision runs old code without saying so.
+Run a couple-minute end-to-end smoke at the 0.8B tier before any multi-hour run, local or cloud. The
+failures live in the seams (renamed config keys, checkpoint paths, artifact upload, env vars, what
+got baked into an image), so the question is "does the whole path execute", not "does it learn".
 
 ## Machines and models
 
-**Compute is local now** (the owner, 2026-09-10). The work moved off a shared dev box plus rented
-AWS GPUs onto the owner's own machine, and a run happens here unless it cannot: an RTX 5090 with
-32 GB of VRAM and a Ryzen 5950X, under WSL2. The 32 GB card is what every sizing decision starts
-from. WSL2 currently reports 31 GiB of system RAM, which is the default half-of-host cap on a host
-that most likely has 64 GB, so a job that wants more host RAM — CPU offload above all — wants
-`.wslconfig`'s `memory=` raised before it wants a smaller model. Several agent sessions may still
-share this one GPU, so `scripts/gpu_preflight.py` still applies and a long holder still blocks the
-others; what changed is that a long local run is now the expected thing rather than something to
-move off the box.
+Compute is local: one RTX 5090 (32 GB VRAM) under WSL2. Runs happen here unless they cannot fit.
 
-- **Never hardcode a memory budget.** Derive batch size, group size, and context length from the
-  VRAM present at startup, and log the device the run landed on. The 5090's 32 GB is what this box
-  has today, not a constant to bake into a config, and a run that assumes it will not move to a
-  rented card or a later machine.
-- **Say the wall-clock estimate before launching**, and run anything past a few minutes under the
-  resource limiter in a named tmux session with a teed log (see "Running expensive things").
+- **Never hardcode a memory budget.** Derive batch size, group size and context length from the VRAM
+  present at startup, and log the device. Local VRAM figures must not leak into cloud configs.
+- WSL2 caps visible host RAM; for jobs needing more host RAM (CPU offload), raise `.wslconfig`'s
+  `memory=` before shrinking the model.
+- Several agent sessions share the GPU; see "Running expensive things".
 
-### When renting cloud GPUs (secondary path, kept for when a job outgrows the 5090)
-
-Everything below still holds when a job genuinely does not fit locally; only its priority changed.
-The killswitch and boot-patch rules for rented boxes are under "Running expensive things", and the
-AWS Batch surface is `cloud/`.
-
-**The next rental is not on AWS** (the owner, 2026-09-30). The AWS credits that paid for the
-`g7e`/`p5` fleet are used up, so the tooling below (`scripts/launch_gpu_box.sh`, the capacity walk,
-`cloud/`) describes how past runs were done, not the path forward. Before the next online
-experiment, price Runpod and Vast.ai against each other for the card the job needs, favouring
-prepaid balances and per-second billing, and port the launcher to whichever wins. Two things carry
-over and have to be rebuilt rather than dropped. First, the killswitch: a pod is a container that
-cannot `shutdown -h` itself, so the dead-man switch and idle watchdog must terminate through the
-provider's API, and the rule about watching each layer fire once still applies. Second, the episode
-jail uses `unshare`, which unprivileged containers often forbid; confirm it works on the provider
-before any reward-hacking harness run is sent there (games runs do not use the jail).
-
-- **Single GPU only. Multi-GPU is a hard block** (the owner, 2026-09-30): we do not write or rent
-  for multi-GPU training, so a model that needs more than one card is out of reach, not a bigger
-  config. A single-GPU job requests a single-GPU instance; an 8-GPU node to use one of them is
-  waste.
-- **Prefer the larger card, stay portable.** `g6e.xlarge` (L40S, 48 GB) is ~26% cheaper per unit of
-  work and 3.7x faster in wall-clock than `g6.xlarge` (L4, 24 GB). A local VRAM figure describes
-  this box only and must not propagate into cloud job configs.
-- **Rented boxes are single-GPU `g7e` or `p5` shapes, on demand, and spot only once on-demand
-  capacity is genuinely exhausted** (the owner, 2026-08-24, restated and strengthened 2026-08-27
-  after every box in the fleet had drifted to spot-first walks anyway). `g7e.2xlarge` and
-  `p5.4xlarge` are the usual asks. Exhaust on demand everywhere before a single spot row enters the
-  walk: widen first by instance size, because `g7e.4xlarge` and `g7e.8xlarge` are the same single
-  card as the 2xlarge and buy only host vCPU and RAM, so trying them is free capacity rather than a
-  tier change; then by availability zone, one candidate row per subnet; then by region, out to every
-  region enabled on the account rather than the nearest two. One kit's wide walk on 2026-08-26 ran 45
-  on-demand rows, four instance sizes against one to three subnets in each of eight regions, and that
-  is the breadth to copy. A smaller card, a `g6e` where the job asked for a `g7e`, is a tier drop
-  rather than a widening and stays out of the walk entirely. **"Exhausted" spans both approved
-  shapes** (the owner, 2026-09-01, after a day whose seven 60-row g7e walks all came back empty
-  while `p5` was never tried): after the g7e rows, walk `p5.4xlarge` on-demand across every
-  enabled region before any spot row. A `p5` landing is a cost decision, not an auto-take — H100
-  on-demand runs ~4x the g7e spot rate, so hold the box (market-gate pattern) and surface the
-  price delta against the run's budget line; taking spot instead of an available-but-4x
-  on-demand card is a defensible call, but it is made by a human with the number in front of
-  them, never silently by a walk script.
-- **A reclaim costs more than the step it interrupts, which is the second and newer reason spot is a
-  last resort** (2026-08-27). The first cost is the run: one arm measured ~28 minutes per step
-  against a worst observed ~35-minute spot reclaim cadence, so a lease bought about one step, and a
-  checkpoint interval longer than the lease trains forever and saves never while every signal stays
-  green. The second cost is that a reclaim bypasses the box's own teardown entirely.
-  `scripts/idle_watchdog.sh` terminates its box through the EC2 API, so the death emits a
-  `TerminateInstances` call that anything watching the account can see. An eviction instead arrives as
-  a `BidEvictedEvent` service event with no API write behind it, so nothing records that the box is
-  gone and the only trace is in the spot request's own status. Read a suspected reclaim out of the
-  spot request status and CloudTrail rather than the box's own log, which dies with the box. Where
-  spot really is the only capacity, save every step so a reclaim costs one, and name the box as spot
-  in the run's report.
-- **Expect to walk many regions and availability zones before capacity turns up**, and read that as
-  the nature of GPU supply rather than a fault to debug. Three client-side mistakes do fail every
-  candidate and read exactly like `InsufficientInstanceCapacity`: a comma inside a
-  `--tag-specifications` shorthand value, and the 16,384-byte cap on *raw* user-data — RunInstances
-  measures the bytes before base64 encoding ("User data is limited to 16384 bytes"), and the
-  25,600-byte encoded figure that used to sit here is not an API bound at all, since 16,384 raw
-  bytes can never encode past 21,848. One `--dry-run` with the identical argument values, before the
-  walk, tells a bad request from a dry region. The third is the wrong AWS account: under any other
-  account's credentials every candidate subnet "does not exist", and the walk's decline pattern once
-  matched those words, so a whole walk logged as declined and closed with the supply line (observed
-  2026-09-02). `scripts/launch_gpu_box.sh` now asks sts which account the credentials resolve to
-  before its first paid call, and refuses when that is not the account the operator said to expect.
-  The pattern is anchored on the CLI's error code now, so a NotFound of any kind, a stale subnet row
-  included, stops the walk as misconfiguration instead of being stepped past.
-
-Model ladder for the new work, two working sizes since 2026-09-10: the 0.8B for plumbing and the
-9B for anything where behaviour is the measurement.
-
-The Qwen3.5 family has a **Small** tier (0.8B, 2B, 4B, 9B — no 1B)
-and a **Medium** tier (**27B dense**, plus MoE 35B-A3B / 122B-A10B / 397B-A17B) — earlier docs
-listed only Small. Two newer same-architecture 27B dense drop-ins load with the same classes:
-`Qwen/Qwen3.6-27B` and `Qwen/Qwen3.8-27B`. **Nothing newer than 3.5 was published below 27B** — 3.6
-exists only at 27B and 35B-A3B, 3.8 only at 27B and 2.4T-A95B, and there is no 3.7 at all — so
-`Qwen3.5-4B` and `Qwen3.5-9B` already *are* the latest at their sizes, not a migration we owe.
-
-**Every checkpoint in this family is a vision-language model, at every size.** 0.8B through 27B all
-declare `Qwen3_5ForConditionalGeneration` and carry a `vision_config`; the text-only
-`AutoModelForCausalLM` load (→ `Qwen3_5ForCausalLM`) silently drops the vision tower and the
-multi-token-prediction head at all of them, the 4B included. That is the path we want and nothing
-breaks, but it means a checkpoint's download size overstates what reaches VRAM at every rung, so
-size a card from a text-only figure rather than from the repo total.
+### Model ladder (Qwen3.5 family)
 
 | Model | Use |
 |---|---|
-| `Qwen/Qwen3.5-0.8B` | **The smoke tier.** Plumbing only: does the code execute end to end. Do not read behaviour off it, ever. Anything smaller is equally acceptable for this purpose. |
-| `Qwen/Qwen3.5-2B` | Smoke runs where you also want reward to move. ~5 GB bf16 LoRA. |
-| `Qwen/Qwen3.5-4B` | **The working size until 2026-09-10**, and still the right checkpoint for re-analysis of the artifacts already measured at this size and for comparison against them. New behavioural measurement goes to the 9B instead. ~10 GB bf16 LoRA, ~7.8 GiB of text-only weights. The newest 4B Qwen there is — no 3.6 or 3.8 was ever published at this size. |
-| `Qwen/Qwen3.5-9B` | **The working size whenever behaviour is the measurement** (the owner, 2026-09-10), and the **interp cross-validation arm**. Also the newest 9B Qwen there is, for the same reason as the 4B. Fitting bf16 LoRA training into the 5090's 32 GB is tight and buys its room from the rollout budget rather than from a smaller model; size it from the VRAM the run actually sees, and read `docs/scratch/single-5090-grpo-notes-2026-09-10.md` for the sizing work (gitignored, so a plain-text pointer rather than a link). `Qwen3.5-9B-Base` is the only ~9B Qwen with a pretrained sparse autoencoder (`Qwen/SAE-Res-Qwen3.5-9B-Base-W64K-L0_{50,100}`, all 32 layers). Note the checkpoint split: the SAE is on `-Base`, while the TMAX RL'd models descend from the instruct `Qwen/Qwen3.5-9B` — measure that transfer, do not assume it (base→instruct SAE transfer has documented quality hits; see `docs/scratch/tiny-model-selection-2026-08-17.md`). |
-| `Qwen/Qwen3.8-27B` | The **stretch tier**, and a target that needs creativity rather than a bigger config: ~52 GiB download against ~50.1 GiB of text-only bf16 weights in VRAM once the family's vision tower and MTP head drop out, against 32 GB of card, so bf16 LoRA does not fit locally by any straightforward route. What might: QLoRA (knowingly against the family guidance below), CPU-offloaded checkpoints, chunked loss. The sizing note is `docs/scratch/single-5090-grpo-notes-2026-09-10.md` (gitignored, plain-text pointer). The `Qwen3.8-27B-FP8` variant (~27 GiB text-only) fits 32 GB with little to spare and is owner-approved for interp probing (2026-08-18) — **probing and inference only, because an FP8 checkpoint cannot be trained on at all** (see below). No text-only/base sibling exists at 27B (see `docs/scratch/qwen38-27b-load-check-2026-08-17.md`); `Qwen3.5-27B` (identical load path) carries first-party *instruct* SAEs. See `docs/scratch/observable-model-rl-feasibility-2026-08-16.md` and `jlens-sae-feasibility-2026-08-16.md`. **For inference-only probes the owner expects the Q4_K_XL quant to run on the 5090 under vLLM at 50+ tok/s** (the owner, 2026-09-10; an expectation, not yet measured here), and rates the model as roughly late-2025 frontier quality, so it is the default hosted-model substitute for cheap local probing. Training stays bf16 LoRA and does not fit locally; the rental target is one 96 GB RTX PRO 6000 Blackwell, where bf16 LoRA with vLLM sleep mode should fit (an estimate, not yet run: ~50 GiB of weights, ~2 GiB of KV per 32K sequence). Known trap from a 95 GiB card: TRL's importance-sampling correction materialises an fp32 logits row and went out of memory beside the resident engine (`IS_CORRECTION_ROW_LOGITS_REFUSAL_GIB` in `reward_hacking/train.py`). |
+| `Qwen/Qwen3.5-0.8B` | Smoke tier. Plumbing only; never read behaviour off it. Anything smaller is equally fine. |
+| `Qwen/Qwen3.5-2B` | Smoke runs where you also want reward to move. |
+| `Qwen/Qwen3.5-4B` | Re-analysis of, and comparison against, artifacts already measured at 4B. New behavioural measurement goes to 9B. |
+| `Qwen/Qwen3.5-9B` | **The working size whenever behaviour is the measurement**, and the interp cross-validation arm. bf16 LoRA fits 32 GB tightly; take the room from the rollout budget. Sizing notes: `docs/scratch/single-5090-grpo-notes-2026-09-10.md`. The pretrained SAEs (`Qwen/SAE-Res-Qwen3.5-9B-Base-W64K-L0_{50,100}`) are on `-Base`, while TMAX descends from the instruct model: measure that transfer, do not assume it. |
+| `Qwen/Qwen3.8-27B` | Stretch tier. bf16 LoRA does not fit locally; training needs a single large rented card. Inference and interp probing locally via `Qwen3.8-27B-FP8` or a Q4_K_XL quant under vLLM; the default local substitute for a hosted model. `Qwen3.5-27B` has the same load path and first-party instruct SAEs. On large cards, TRL's importance-sampling correction can OOM beside the vLLM engine (`IS_CORRECTION_ROW_LOGITS_REFUSAL_GIB` in `reward_hacking/train.py`). |
 
-**Jacobian-lens rule (owner, 2026-08-18): never spend effort checking whether a pre-fitted lens
-exists for a checkpoint — we fit our own, cheaply** (a closed-form accumulation, not a training
-run; source `anthropics/jacobian-lens`). Past sessions burned time on lens-existence claims and
-got them wrong in both directions. SAEs are the opposite case: genuinely expensive to fit, so a
-pretrained one is a real (but non-blocking) asset — without one, run non-SAE techniques.
+- 9B is the default for real measurement because it sits clear of the capability floor below which
+  "chose not to do the task" cannot be told from "could not".
+- Nothing newer than Qwen3.5 exists at 0.8B-9B, so these are not pending migrations.
+  `grpo/rlvr_math.py` defaulting to `Qwen/Qwen3-0.6B` is also correct for that toy.
+- **Every checkpoint is a vision-language model.** Loading with `AutoModelForCausalLM` drops the
+  vision tower and MTP head; that is the path we want. Size cards from text-only weights, not repo
+  download size.
+- **Hybrid attention** (Gated DeltaNet linear-attention layers alongside full attention; config is
+  `Qwen3_5Config`, not `Qwen3NextConfig`). Take LoRA target modules from `discover_lora_targets` in
+  `grpo/throughput.py`, never a hand-written `q/k/v/o` list, which leaves every DeltaNet block
+  frozen. Check any interp tooling that assumes standard attention.
+- **MoE rungs** store routed experts as fused 3-D `nn.Parameter` tensors, which
+  `discover_lora_targets` (it only collects `nn.Linear`) misses. Adapt them through PEFT's
+  `target_parameters`, refuse to start when no adapter reaches an expert tensor, and check that the
+  grouped-GEMM expert kernel runs (`use_experts_implementation`) rather than the Python loop. Notes:
+  `docs/scratch/scaling-rental-quant-notes-2026-09-30.md`.
+- **LoRA defaults**: rank 16 on dense modules, rank 1-4 on routed experts via PEFT's `rank_pattern`,
+  `lora_alpha` 32 at every rank (do not scale it with `r`, so mixed ranks share one learning rate).
+- **Quantization**: training is bf16 LoRA. 4-bit QLoRA is not recommended anywhere on this family
+  (Unsloth guidance; also TRL's colocated weight sync merges the adapter into the base every step,
+  which is lossy on NF4). FP8 is acceptable for the rollout KV cache, inference weights and a frozen
+  base under LoRA: admit it with a quick smoke or eval before and after, log the trainer-versus-rollout
+  log-prob gap, and record its use in the run config. A pre-quantized FP8 checkpoint cannot be trained
+  through transformers at all, LoRA included; an FP8 training base would have to come from on-the-fly
+  quantization (TorchAO float8), which is untested here.
 
-**9B is the default for real measurement** (the owner, 2026-09-10), comfortably clear of the floor
-at which "chose not to do the task" is distinguishable from "could not", which is the whole
-distinction this research rests on. That floor was measured at 4B (Terminal-Bench Lite: 31.8±3.8 vs
-2B's 5.7 — from Ai2's TMAX paper, arXiv:2606.23321 Table 3, so harness-specific numbers rather than
-a neutral property; the gap also survives on the harder TB 2.1, 14.2 vs 1.9), and the argument for
-being above it applies a fortiori at 9B. Two family facts: **4-bit
-QLoRA is not recommended for Qwen3.5** — this is Unsloth's fine-tuning guidance, *not* the Qwen
-model card, and the reason they give is only "higher than normal quantization differences"; the
-`attn_output_gate` mechanism is our own conjecture rather than theirs, though Qwen's own GPTQ-Int4
-build does exclude every attention module from quantization, which is the closest thing to
-first-party support the conjecture has. Among builds you could actually train from, 4-bit barely
-saves memory on this family (GPTQ-Int4 ~30.3 GB vs FP8 ~30.9 GB at 27B). TRL's colocated weight
-sync is a second reason to avoid 4-bit bases: it merges the adapter into the base every step
-(`trl/generation/vllm_generation.py`, `merge_adapter` then `unmerge_adapter`), which is lossy on an
-NF4 base, so vLLM would sample from a policy that is neither the trainer's nor the bf16 one.
+### Interpretability
 
-**FP8 is acceptable, and the owner's prior is that it costs little** (the owner, 2026-09-30:
-frontier models now ship at FP8 or below, and published benchmarks show very little degradation
-from bf16). That covers the rollout KV cache, inference weights, and a frozen FP8 base under a
-LoRA, each admitted the same way: a quick smoke or eval before and after the switch, with the
-trainer-versus-rollout log-prob gap logged, and the run config recording which runs used it. No
-pre-registration, no ablation grid. One mechanical limit stays: **a pre-quantized FP8 checkpoint
-cannot be trained through transformers**, LoRA included (`FineGrainedFP8HfQuantizer` declares
-`is_trainable = False`, and `Trainer` refuses even with an adapter attached). An FP8 training base
-therefore has to come from quantizing bf16 weights on the fly (TorchAO float8, the route Unsloth's
-FP8 RL path uses), which is untested here. Until that works, training runs bf16 LoRA, and 4-bit
-QLoRA is still not recommended anywhere on the ladder. And these are hybrid-attention
-models (`Qwen3_5Config`, whose text sub-config is `Qwen3_5TextConfig` — *not* `Qwen3NextConfig`,
-a different and older family — with three Gated DeltaNet linear-attention layers per full attention
-layer), so LoRA must target the linear-attention projections too: take the target modules from
-`discover_lora_targets` in `grpo/throughput.py`, never a hand-written `q/k/v/o` list, which reaches
-attention in a quarter of the layers and silently leaves every DeltaNet block frozen. Any interp
-tooling assuming standard attention needs checking.
+- **Method priority: most rigorous available, not easiest.** Lead with Jacobian-space /
+  Jacobian-lens ([docs/interp-methods/jacobian-space.md](docs/interp-methods/jacobian-space.md)).
+  Difference-of-means directions and linear probes complement, never lead. SAEs are valuable where a
+  pretrained one exists; skip them cleanly where not.
+- **Pair every direction with an intervention**: steering and ablation against a matched-norm
+  placebo, plus activation patching between matched twins (conflicting-vs-original grader pairs are
+  a good clean/corrupted substrate; attribution patching only if a sweep gets large). Defer circuit
+  tracing, transcoders, crosscoders and similar to a dedicated mechanistic project.
+- **Jacobian-lens rule**: never spend effort checking whether a pre-fitted lens exists; we fit our
+  own cheaply (closed-form; source `anthropics/jacobian-lens`).
+- Interp tooling recipes and gotchas: `docs/scratch/interp-tooling-verified.md`. They were verified
+  at 4B; re-verify at 9B before building on them.
 
-**MoE checkpoints hide their experts from `discover_lora_targets`** (checked 2026-09-30 against
-transformers 5.15.0). The Qwen MoE rungs (35B-A3B, 122B-A10B) store each layer's routed experts as
-two fused 3-D `nn.Parameter` tensors in `Qwen3_5MoeExperts` (`gate_up_proj`, `down_proj`), not as
-`nn.Linear` modules, and `discover_lora_targets` collects only `nn.Linear`. On an MoE it would
-adapt attention, the DeltaNet projections and the one shared expert, and leave every routed expert
-frozen without saying so. The routed experts hold nearly all of the MLP parameters, and MLP
-adapters matter at least as much as attention ones, so an MoE run adapts them by default through
-PEFT's `target_parameters`, and the harness should refuse to start when no adapter reaches an
-expert tensor, the same guard it already has for DeltaNet. Per-expert adapters multiply by the
-expert count (256 per layer here), so size their rank down rather than copying the dense rank
-(see `docs/scratch/scaling-rental-quant-notes-2026-09-30.md`). Also check which expert kernel
-runs: the default `Qwen3_5MoeExperts.forward` loops over experts in Python, and
-`use_experts_implementation` selects the grouped-GEMM alternatives.
+### Renting cloud GPUs (only when a job does not fit locally)
 
-**LoRA rank: 16 on dense modules, low rank on routed experts, alpha held at 32** (the owner,
-2026-09-30). RL needs very little adapter capacity (Thinking Machines' "LoRA Without Regret" found
-rank 1 enough for policy-gradient RL), but on a dense model a lower rank saves almost nothing,
-because a rank-16 adapter is a small share of memory and compute. So dense modules stay at rank 16:
-comparable with every banked run and not open to the "you only used rank 4" objection. Low rank
-pays only where adapters are multiplied by the expert count, so MoE routed experts start at rank 1-4
-through PEFT's `rank_pattern`. Keep `lora_alpha` at 32 whatever the rank rather than scaling it
-with `r`: under the standard alpha/r scaling that is the parameterization in which the paper found
-the best learning rate nearly independent of rank, so mixed ranks can share one learning rate. If a
-result ever depends on how much the adapter can learn, one matched rank-16 run settles it.
-
-Interp tooling (sparse autoencoders, a pre-fitted Jacobian lens, a TransformerLens adapter) exists
-and was verified for `Qwen/Qwen3.5-4B` on 2026-08-15 — **not a reason to keep measurement at 4B now
-that 9B is the working size**; re-verify the recipes at 9B before building on them.
-Recipes, silent-failure gotchas, and version pins: `docs/scratch/interp-tooling-verified.md` (read
-before building on any of them).
-
-**Interp method priority (owner, 2026-08-19) — use the most rigorous method available, not the
-easiest.** Lead with **Jacobian-space / Jacobian-lens** (`docs/interp-methods/jacobian-space.md` —
-the tracked reference: what it is, why it is more faithful than correlational directions, and how to
-load/fit it per model). Difference-of-means directions and trained linear probes are a fine baseline
-but old-school by comparison — use them to complement, not lead. SAEs sit at 1.5: valuable where a
-pretrained one exists, skip cleanly where it does not. Do not default to simplistic direction-probing
-because it is fast — this is rigorous work. **Pair every direction with an intervention: a decodable
-direction is not a used one.** The causal tier is steering and ablation against a matched-norm
-placebo, plus activation patching between matched twins (the conflicting-vs-original grader pairs are
-an ideal clean/corrupted substrate; reach for attribution patching / AtP* only if a position or layer
-sweep gets large). Defer the heavy machinery (circuit tracing and transcoders, natural-language
-autoencoders, MOLT, crosscoders) to a dedicated mechanistic project, not routine probing.
-
-`grpo/rlvr_math.py` still defaults to `Qwen/Qwen3-0.6B`, correct for that toy harness — not a
-pending migration.
+- **Single GPU only.** Multi-GPU is a hard block: no multi-GPU code, no multi-GPU nodes.
+- The AWS tooling (`scripts/launch_gpu_box.sh`, `cloud/`) is no longer the path forward. For the next
+  rental, price Runpod against Vast.ai for the needed card (prefer prepaid, per-second billing) and
+  port the launcher. On a container provider, the killswitch must terminate through the provider's
+  API, and confirm `unshare` works before sending any reward-hacking harness run (games runs do not
+  use the jail).
+- **Every rented box arms its own killswitch at launch**, in user-data before any job: a max-lifetime
+  dead-man switch whose shutdown behaviour is verified to *terminate*, and an idle watchdog
+  (`scripts/idle_watchdog.sh`) sized above real setup and inter-stage gaps. Watch each layer fire
+  once before trusting it.
+- **Every rented box patches its OS at boot** (`scripts/ec2_boot_patch.sh` as root, after the
+  dead-man switch, before the job). Kernel fixes need a newer image, not another patch pass.
+- **On demand before spot.** Widen by instance size, then availability zone, then every enabled
+  region, across all approved shapes, before any spot row. A pricier card that lands is held and its
+  price surfaced to a human, never auto-taken. If spot is the only capacity, checkpoint every step
+  and name the box as spot in the report; diagnose a suspected reclaim from the spot request status
+  and CloudTrail, not the box's log.
+- A request that fails in every region may be malformed rather than out of capacity: do one
+  `--dry-run` with identical arguments first (raw user-data is capped at 16,384 bytes; no commas
+  inside `--tag-specifications` shorthand values; check the credentials resolve to the expected
+  account).
+- AWS Batch (`cloud/`): push `:latest` and `:<sha>` together but only resolve `:latest`, and register
+  a fresh job definition at every submit, or Batch silently runs old code.
 
 ## The work queue: Backlog.md
 
@@ -447,353 +234,164 @@ research directions; the backlog holds the concrete work under them.
 
 ## Where things live
 
-Every top-level entry, so nothing has to be guessed at:
+- `reward_hacking/` — thread 1 probes and training: `episodes/` (baited reaching harness),
+  `channel/` (cross-episode-note probe), `interp/` (reward-hacking-vs-deception direction),
+  `harness/` (real-execution agent loop in the episode jail; `hack_detector.py` separates
+  grader-gaming from honest bugs), `ladder/` (hack severity ladder), `tmax/` (TMAX RL'd checkpoints),
+  `train.py` and `train_*.py` (GRPO against misspecified versus true graders, plus the
+  `legible-subset` arm). Also hosts thread 2's `jagged/` and `recoverybench/`. Read
+  `reward_hacking/README.md` before adding anything. Tests in `reward_hacking/tests/`.
+- `games/` — game-theory GRPO: `train.py`, `rewards.py`, `payoffs.py`, `evals.py` (eval battery),
+  `probes.py` (decision-theory probes), `stage_runner.py` (sequences GPU stages and verifies each).
+  Module docstrings carry the design; plan is `docs/scratch/2026-08-16-game-theory-rl-plan.md`.
+  Predictions in `docs/games-predictions.md`. Tests in `games/tests/`.
+- `sociology/` — analysis-model observer study: shows hosted models bundles of episodes that could
+  not have communicated and measures how often they claim coordination. Stimulus prose loads at
+  runtime from a gitignored file; none goes in tracked code. Tests in `sociology/tests/`.
+- `grpo/` — shared GRPO harness on TRL. See `grpo/README.md`.
+- `cloud/` — AWS Batch container and submit tooling (secondary path).
+- `scripts/` — operational tooling: resource limiter, episode jail and red-team suite, canary
+  tripwire, secret scanner, GPU preflight, tmux helper, S3 mirror.
+- `tests/` — repo-level suite behind `make test`. Every test root must be listed in
+  `pyproject.toml`'s `testpaths`, or it is silently never collected.
+- `docs/` — operational docs kept accurate (`episode-isolation.md`, `resource-limits.md`,
+  `games-predictions.md`, `results/`, and others). `docs/scratch/` (gitignored) is the **only**
+  location for internal working material: plans, handoffs, notes, `future.md`, the backlog. See
+  `docs/scratch/README.md`. Never create a second scratch location.
+- `canary/` — machine-local canary baseline manifest (`scripts/canary_manifest.py --update`); only
+  the README is tracked.
+- `artifacts/` — gitignored run outputs (traces, sweeps, eval records, checkpoints). Keep them.
+- `external/` — gitignored clones of third-party research repos. Clone new ones here, not under
+  `/var/tmp`. Never copy their item text into tracked files.
+- `legacy/` — finished research. Do not extend, refactor or lint it, except narrowing the blind
+  `except` blocks in `legacy/pretraining.ipynb`.
+- Root: `Makefile` (gates), `pyproject.toml` (dependencies, ruff and basedpyright config),
+  `uv.lock`, `README.md` (public description), `RESULTS.md`, this file (`CLAUDE.md` is a symlink to
+  it).
 
-- `reward_hacking/` — the live project: reward-hacking-lead exploration on an off-the-shelf
-  Qwen3.5-4B. The probes are inference-only: `episodes/` (baited reaching harness, leads #1/#2/#6),
-  `channel/` (cross-episode-note probe, lead #3), `interp/` (reward-hacking-vs-deception direction
-  probe, lead #5), `harness/` (the real-execution agent loop: commands run inside the episode jail,
-  every episode graded twice, `hack_detector.py` separating grader-gaming from honest bugs a
-  lenient grader passed), `jagged/` and `recoverybench/` (item corpora plus sweep machinery over
-  hosted models via `model_backend.py` and `bedrock_batch.py`), and `tmax/` (artifact download and
-  geometry for the TMAX RL'd checkpoints). The training side is `train.py` with its `train_*.py`
-  siblings: GRPO on the 4B, on `games/`'s run machinery, against a misspecified grader and, matched
-  step for step, against the true one, so the pair rather than either arm carries the claim; a
-  third arm, `legible-subset`, stands apart from that pair and rewards a visible k=3 subset of the
-  true check while the full hidden check is measured but never rewarded. Its tests live in
-  `reward_hacking/tests/`. Read `reward_hacking/README.md` and the plan below before adding
-  anything.
-- `games/` — the game-theory GRPO project: matrix-game RL arms where identical prompts differ only
-  in grading rule (`train.py`, `rewards.py`, `payoffs.py`), an eval battery covering play on
-  trained and held-out games, decision-theory endorsement, and arithmetic retention (`evals.py`),
-  a decision-theory probe battery with our FDT-axis items plus a DTBench adapter (`probes.py`),
-  and `stage_runner.py`, which sequences GPU stages and refuses to call one successful without
-  checking. No README yet — the module docstrings carry the design, and the plan is
-  `docs/scratch/2026-08-16-game-theory-rl-plan.md`. Pre-registered predictions are tracked at
-  `docs/games-predictions.md`; tests live in `games/tests/`.
-- `sociology/` — the analysis-model observer study (incident thread): feeds bundles of banked agent
-  episodes that provably could not have communicated to hosted analysis models under varied
-  provenance framings, and measures how often they assert coordination that is absent by
-  construction. `corpus.py` (episode load, reasoning interleave, co-location-cue scrub), `bundles.py`
-  (deterministic content-seeded bundle draws plus the resume manifest), `stimulus.py` (frames, request
-  and judge rubric loaded at runtime from a gitignored file — no stimulus prose in tracked code),
-  `runner.py` (batch and live legs, priced dry run, smoke), `scans.py` (deterministic reply scans),
-  `judge.py` (a blind meta-judge sibling of `reward_hacking/hatch_narration_judge.py`). Inference-only,
-  reusing `reward_hacking.*` transports by import; tests live in `sociology/tests/`.
-- `grpo/` — shared training substrate: a working GRPO harness on TRL 1.10, verified end to end on
-  GPU. The `grpo/rlvr_math.py` arithmetic task is a toy; the RL plumbing is live and `games/`
-  builds directly on it (sizing, throughput, callbacks). See `grpo/README.md`.
-- `cloud/` — the AWS Batch surface for training arms, a secondary path since compute moved local
-  on 2026-09-10: the container (`Dockerfile`, `entrypoint.sh`, whose S3-sync EXIT trap means a
-  spot-reclaimed job still ships its checkpoints), `push_ecr.sh`, and `submit_job.py`, which
-  registers a fresh job definition at every submit because Batch pins a tag to a digest at
-  registration time (the stale-code trap in the Batch section above).
-- `scripts/` — operational tooling: resource limiter, episode jail + red-team suite, canary
-  tripwire, secret scanner, GPU preflight.
-- `tests/` — the repo-level pytest suite behind `make test`: cost model, throughput, doc links,
-  GPU preflight, and the interpreter-compatibility gate described below. Project-local tests stay
-  next to their projects (`games/tests/`, `reward_hacking/tests/`, `sociology/tests/`), and every
-  root is listed in `pyproject.toml`'s `testpaths`, because a root left off is silently never
-  collected.
-- `docs/` — the operational docs that are meant to stay accurate (`episode-isolation.md`,
-  `resource-limits.md`, `games-predictions.md`, and `results/`, the per-thread finding lists that
-  `RESULTS.md` indexes) plus `docs/scratch/`, which is gitignored and is
-  the **single location for every piece of internal working material**: plans, handoffs,
-  preregistrations, the sparse research-directions index (`future.md`, read it, do not rewrite),
-  one file per direction, and low-ceremony notes. See `docs/scratch/README.md`. That split is a
-  privacy rule, not filing preference — see the section at the top of this file. Nothing internal
-  goes back under a tracked path, and no second scratch location gets created: a former top-level
-  `notes/` was folded in here (2026-08-18), and its `.gitignore` entry stays as a tripwire.
-- `canary/` — the canary tripwire's baseline manifest, written by
-  `scripts/canary_manifest.py --update`. Machine-local because every hash in it is keyed to one
-  machine's paths; only the README is tracked.
-- `artifacts/` — gitignored run outputs: traces, sweeps, eval records, checkpoints. Local-only,
-  and deliberately kept — disk is not the constraint (see the probing-posture section above).
-- `external/` — gitignored clones of third-party research repos we study or borrow environments
-  from (model-organism releases, probe code). Clone new ones here rather than under `/var/tmp`, so
-  they stay findable. Gitignored because they carry other benchmarks' items; read and run them, but
-  never copy their item text into tracked files. Excluded from the type check in `pyproject.toml`.
-- `legacy/` — finished research. Do not extend, refactor, or lint it. One exception (the owner,
-  2026-08-16): the blind `except` blocks in `legacy/pretraining.ipynb` are being narrowed to
-  specific exceptions.
-- Root files: `Makefile` (the gates, plus the `SYSTEM_PYTHON` constraint below), `pyproject.toml`
-  (dependencies and the ruff/basedpyright configuration, including the per-file ignores the 3.8
-  scripts depend on), `uv.lock` (the pinned environment — `make setup` builds `.venv` from it),
-  `README.md` (the public-facing description), `RESULTS.md` (the short per-thread index of
-  research results, whose full one-line-per-finding lists sit under `docs/results/`; most of their
-  pointers name gitignored scratch docs on purpose), and this file,
-  with `CLAUDE.md` a symlink to it.
-
-**Authoritative near-term plan: `docs/scratch/2026-08-15-reward-hacking-exploration-plan.md`** —
-this phase explores for leads, not a systematic apparatus.
-`docs/scratch/2026-08-16-jaggedbench-plan.md` is designed and agreed but not built. Two older
-documents are kept for the record, neither current:
-`docs/scratch/2026-08-15-episode-reward-research-agenda.md` (a proposal, not agreed; its section 10
-lists open questions for the owner) and `docs/scratch/2026-08-15-complex-hack-substrate.md` (a
-substrate spec, superseded and deferred — mine its ideas, do not build it wholesale). Both are
-honest about what adversarial review killed in them; read the corrections. All of these are
-gitignored local files rather than repository content, so a fresh clone will not contain them and
-these are plain-text pointers rather than links on purpose.
+Current plans: the newest handoff for the thread in `docs/scratch/`, the work queue in Backlog.md,
+and the ranked directions in `docs/scratch/future.md`.
 
 ## Environment and the gates
 
-`make setup` builds `.venv` from the pinned `uv.lock`. Python 3.13, managed by uv. **Never
-`pip install`** — the lockfile is the environment.
-
-**On the 5090 box, `make setup` alone leaves the tree red** (2026-09-10). `games.train` refuses to
-construct without vLLM and `cloud/submit_job.py` imports boto3, so a bare `uv sync` (which removes
-extras it was not asked for) fails about 200 games tests and the type check. Use
-`uv sync --frozen --extra vllm --extra bedrock` (or `make setup-gpu` plus the bedrock extra) here.
-Two more facts of this box: Ubuntu 20.04 has no packaged Python 3.12+, so the jail interpreter is
-the uv CPython staged under `/var/tmp/cpython-runtime` by `scripts/stage_jail_python.sh` (with
-numpy installed into it) and does not survive a `/var/tmp` wipe; and its tmux is 3.0a, which
-`scripts/tmux_run.sh` now tolerates. `bwrap` is not installed, so the jail runs its `unshare`
-fallback until bubblewrap is added.
-
-Five gates, all expected green before "done", plus one advisory check:
+`make setup` builds `.venv` from `uv.lock` (Python 3.13, uv). **Never `pip install`.** On the GPU
+box, use `uv sync --frozen --extra vllm --extra bedrock` (or `make setup-gpu` plus the bedrock
+extra); a bare sync leaves the tree red. The jail interpreter is a uv CPython staged under
+`/var/tmp/cpython-runtime` by `scripts/stage_jail_python.sh`; re-stage it after a `/var/tmp` wipe.
+Without `bwrap` the jail uses its `unshare` fallback.
 
 ```bash
-make test           # pytest, CPU only
-make lint           # ruff format --check and ruff check (select=ALL, curated ignores)
-make typecheck      # basedpyright, strict mode -- GATING
+make test           # pytest, CPU only, sharded over TEST_WORKERS (default 8)
+make lint           # ruff format --check and ruff check
+make typecheck      # basedpyright strict -- gating
 make jail-test      # episode jail containment plus its negative control
-make canary-check   # checksum tripwire over the host's code-execution surfaces
-make typecheck-ty   # ty (Astral) -- ADVISORY only, not gating
+make canary-check   # checksum tripwire over code-execution surfaces
+make typecheck-ty   # ty -- advisory only
 ```
 
-`make test` shards the suite over `TEST_WORKERS` pytest-xdist processes (default 8): about 3.5
-minutes on this box against about 15 serial. `--dist loadfile` keeps every test of a module on one
-worker, so module-scoped fixtures build once and the pass/fail set matches the serial run.
-`make test TEST_WORKERS=4` when the shared box is busy (about 4.8 minutes). `make test-select`
-stays serial, because worker start-up costs more than it saves on a narrow selection; put `-n` in
-`ARGS` when a wide one wants it. `make test-changed` runs only the test files the working tree's
-changes against HEAD can reach, mapped by directory (`scripts/test_changed.py` carries the table: a
-`games/` edit runs `games/tests`, a changed test file runs itself, nothing changed runs nothing),
-sharded like `make test`; it is the iteration gate and not the commit gate, because a directory
-mapping cannot see a cross-component import. `make ci` bundles the fast trio (`lint typecheck
-test`) and is still the gate before a commit; `jail-test` and `canary-check` run separately. If a gate fails and
-looks unrelated to your change, fix it anyway.
+- All five non-advisory gates must be green before "done". If a gate fails for reasons unrelated
+  to your change, fix it anyway.
+- `make ci` runs `lint`, `typecheck` and `test` concurrently and is the gate before a commit;
+  `jail-test` and `canary-check` run separately. `make lint typecheck` runs the cheap pair alone.
+- `make test-changed` runs only the tests reachable from changed directories
+  (`scripts/test_changed.py`); it is an iteration gate, not the commit gate.
+- `make test-select ARGS=...` runs serially; add `-n` to `ARGS` for a wide selection.
+- Use `make test TEST_WORKERS=4` when the box is busy.
+- The type check is memory-heavy (one process per thread). Keep `TYPECHECK_THREADS` at its default
+  4 when anything else heavy is running. `make typecheck`, `make test` and `make test-changed` take a
+  box-wide `flock` under `/var/tmp`; never route around it.
+- `GATE_TMUX=1` (`make ci GATE_TMUX=1`) runs `test`, `test-changed` or `ci` in a detached tmux session
+  logged to `/var/tmp/<name>.log`. The gate's status is the log's last line, `EXITCODE=<n>`.
 
-`make ci` runs its three gates **concurrently** through one `make -j3`, so the type check happens
-inside the suite's runtime rather than ahead of it (about 42 seconds at the default `--threads 4`).
-**The type check is memory-heavy**: basedpyright forks one worker process per thread, each with its own
-copy of the program and its torch/transformers/vLLM imports, so peak RSS is linear in the count (7.0 GB at
-2 threads, 11.7 GB at 4, 21.4 GB at 8; measured 2026-09-30). Two sessions' 8-thread type checks plus a test
-suite beside a 9B training run took the WSL VM down that day, which is why the default dropped from 8 to
-4 and why `make typecheck`, `make test` and `make test-changed` each take a box-wide `flock` under
-`/var/tmp` (`gate-typecheck.lock`, `gate-test.lock`): a second session's gate waits instead of stacking,
-and the lock frees itself if the holder dies. Do not raise `TYPECHECK_THREADS` back to 8 while anything
-else heavy is on the box, and never route around the lock. The status is unchanged
-and is still the AND of all three, with make naming whichever gate failed. The one thing that did
-change: a red lint or type check no longer spares you the suite, because all three start at once, so
-`make lint typecheck` is the way to ask the cheap pair alone. And `make test`, `make test-changed` and
-`make ci` all take **`GATE_TMUX=1`** (`make ci GATE_TMUX=1`), which runs the gate in a detached tmux
-session through `scripts/tmux_run.sh`, tees it to `/var/tmp/<name>.log` and returns immediately with
-the command to poll — how you run a five-minute gate from an agent that cannot hold the foreground
-that long (see the tmux paragraph under "Running expensive things"). The gate's status is the log's
-last line, `EXITCODE=<n>`, never make's.
-
-**Two constraints that look like clutter and are not.** The Makefile calls `/usr/bin/python3` by
-absolute path via `SYSTEM_PYTHON`, because bare `python3` resolves to a miniconda 3.13 whenever a
-conda env is active and `make canary-check` would then run under whichever environment happened to
-be active. And FOUR scripts, `scripts/gpu_preflight.py`, `scripts/canary_manifest.py`,
-`scripts/scan_secrets.py` and `scripts/git_precommit_scan.py`, **must keep running under system
-Python, which is 3.8.10 on the 5090 box** (3.9.25 on the old dev box), because that is what invokes
-them: `scripts/resource-limits.sh` calls the first as bare `python3`, the `canary-check` target and `docs/episode-isolation.md` call the next
-two the same way, and the git hooks that `scripts/install_git_hooks.sh` writes call the fourth as bare
-`python3` from inside a commit, where the shell has whatever interpreter the committing environment
-happens to expose. `tests/test_interpreter_compat.py` is the enforcement point and lists all four; this
-sentence said three until 2026-09-02, so trust the test over any prose that disagrees with it.
-`scripts/jail_assertions.py` was a fourth while the jail exposed whatever `/usr/bin/python3`
-happened to be; the jail now resolves an interpreter at or above 3.12 and refuses to start without
-one, and `scripts/run_jail_tests.sh` runs the assertions under that. It keeps the 3.8 dialect
-regardless, because ruff and basedpyright are both directory-scoped with no per-file version
-override, so `scripts/` follows its oldest occupant. All of this breaks at runtime rather than in
-lint, so `tests/test_interpreter_compat.py` compiles each script under the interpreter that actually
-runs it — and pins the jail's version floor, since a floor edited downwards brings back the bug that
-split the two groups apart: a 3.9 jail crashed every submission written in a later dialect and the
-graders scored working code as flawed. Compiling is not running: a missing stdlib API compiles fine and
-fails at call time (`Path.readlink` is 3.9+ and crashed the WSL preflight under 3.8 on 2026-10-01), and
-typeshed no longer carries 3.8 version gates, so basedpyright cannot see it either. A script path that
-touches newer stdlib APIs needs a test that executes it under `/usr/bin/python3`, as
-`tests/test_gpu_preflight.py` does for the /dev/dxg scan. Move or rename any of the four → update both the test's
-script lists and the per-file ignore paths.
+**System-Python scripts.** The Makefile calls `/usr/bin/python3` via `SYSTEM_PYTHON` so an active
+conda env cannot change it. Four scripts must keep running under the system Python (3.8 on this
+box), because that is what invokes them: `scripts/gpu_preflight.py`, `scripts/canary_manifest.py`,
+`scripts/scan_secrets.py` and `scripts/git_precommit_scan.py`. `tests/test_interpreter_compat.py`
+enforces this, compiles each script under its real interpreter, and pins the jail's 3.12 floor;
+trust the test's list over prose. Ruff and basedpyright are directory-scoped, so all of `scripts/`
+stays in the 3.8 dialect. Compiling does not catch newer stdlib calls, so a script path that uses
+them needs a test that executes it under `/usr/bin/python3` (as `tests/test_gpu_preflight.py`
+does). Moving or renaming one of the four means updating the test's lists and the per-file ignores.
 
 ## Running expensive things
 
-Anything expensive goes through the resource limiter, which caps CPU, memory, tasks, and wall-clock
-via cgroup v2 so a runaway job cannot take the box down:
+Anything expensive goes through the resource limiter (cgroup v2 caps on CPU, memory, tasks,
+wall-clock):
 
 ```bash
 scripts/resource-limits.sh --gpu -t 15m -- <cmd>
 ```
 
-It limits resources and **nothing else — it is explicitly not a security or isolation boundary.**
-Isolation is `scripts/episode_jail.sh`, and the two compose in one order only: **limits outside,
-isolation inside. Never the reverse** — the limiter talks to the systemd user manager over a D-Bus
-socket, and anything that can reach that socket can ask systemd to spawn processes outside the jail.
-Details and measurements: `docs/resource-limits.md`, `docs/episode-isolation.md`.
+It is **not** an isolation boundary; isolation is `scripts/episode_jail.sh`. Compose them as
+**limits outside, isolation inside, never the reverse** (the limiter's D-Bus socket can spawn
+processes outside the jail). Details: `docs/resource-limits.md`, `docs/episode-isolation.md`.
 
-**Anything that outlives your attention goes in a named tmux session with a teed log**, never the
-foreground and never a backgrounded shell: a background shell dies on SIGHUP (compaction, a
-reconnect, the parent exiting) while the work it started keeps burning the box unlogged, and an agent
-driving this box through the Workflow tool is killed by its own harness after 180 seconds with no
-output (600 seconds for a background agent; an interactive session has no such limit).
-`scripts/tmux_run.sh` is that pattern written down once, so a kit README no longer has to re-derive
-it. It refuses a session name already in use, defaults the log to `/var/tmp/<name>.log`, and prints
-the command to poll:
+- **Before GPU work**, run `scripts/gpu_preflight.py`; it refuses when another process holds VRAM.
+  Announce multi-hour holds.
+- **Long local runs are expected.** For anything past a few minutes: state the wall-clock estimate
+  first, run under the limiter with a `-t` budget, and start it in a named tmux session with a teed
+  log.
+- **Anything that outlives your attention goes in tmux**, never the foreground or a backgrounded
+  shell (dies on SIGHUP). Agents driven through the Workflow tool are killed after a silent period,
+  so long gates go through `GATE_TMUX=1` or `scripts/tmux_run.sh`:
 
 ```bash
 scripts/tmux_run.sh trv2-readout -- python -m games.readout --run-dir <dir>
 tail -n 40 /var/tmp/trv2-readout.log   # last line is EXITCODE=<n> once the command finishes
 ```
 
-The helper's own exit status only says whether the session started; the command's status is that
-`EXITCODE` line, which the helper keeps on a line of its own even when the command's output ended
-without a newline (`tee` is byte transparent, so the by-hand form below can glue the two together and
-give a `tail -n 1` reader a false negative). On a box with no checkout of this repo, the canonical
-form by hand is:
+  The helper's exit status only says the session started. It refuses a reused session name and a
+  `/tmp` log, and forwards only `PATH`; pass other variables with
+  `scripts/tmux_run.sh <name> -- env VAR=value <cmd>`. By hand, on a box without this repo:
 
 ```bash
 tmux new-session -d -s <name> \
   "set -o pipefail; <cmd> 2>&1 | tee /var/tmp/<name>.log; echo EXITCODE=\$? >> /var/tmp/<name>.log"
 ```
 
-`set -o pipefail` is the load-bearing part — without it the log records tee's status, which is zero
-whatever the command did — and a bare `$?` under pipefail is correct in both bash and zsh, where
-`${PIPESTATUS[0]}` is bash-only and tmux runs the command under the login shell. Logs belong under
-`/var/tmp` or `~/logs` and never `/tmp`, which is a RAM-backed tmpfs with its own inode cap shared by
-every session on the box; the helper refuses a `/tmp` log for that reason. Environment variables need
-passing in explicitly (`scripts/tmux_run.sh <name> -- env VAR=value <cmd>`), because a tmux session's
-environment is the tmux server's rather than the launching shell's — the helper forwards `PATH` and
-nothing else.
+  `set -o pipefail` is required, or the log records tee's status.
+- Logs go under `/var/tmp` or `~/logs`, never `/tmp`.
 
-Before any GPU work, `scripts/gpu_preflight.py` refuses to start when another process already holds
-VRAM on the single shared GPU. Assume someone else may be using it.
+**Every expensive run saves incremental results and resumes; restarting from zero is never the
+recovery path.**
 
-**The local 5090 is the training machine, and long local runs are expected** (the owner,
-2026-09-10), which reverses the ~5-10 minute local ceiling that held while the only card was a
-shared 24 GB L4. Three things still hold for anything past a few minutes, and they are what make a
-long run safe to leave alone: state the wall-clock estimate before launching, run it through
-`scripts/resource-limits.sh` with a `-t` budget so a runaway cannot take the box down, and start it
-in a named tmux session with a teed log rather than the foreground or a background shell. Several
-agent sessions may still be waiting on the same card, so `gpu_preflight` remains the check that you
-are not stepping on a run in progress, and a multi-hour hold is worth announcing.
+- Sync partial results to remote storage during the run (EXIT traps miss instance termination).
+  The entry point first fetches what exists at the run's prefix and skips it.
+- Training checkpoints every step and resumes only from a *complete* checkpoint (trainer state,
+  optimizer, scheduler, RNG, adapter); a torn one is never loaded.
+- Sweeps write per-item records incrementally, skip completed items, and count resumed items
+  separately from other skips. Hosted batch inference uses persisted handles.
+- Resume is idempotent and order-independent: derive seeds from item identity, never execution
+  order. A kept record whose prompt no longer matches must refuse the resume, not be folded in.
+- Kill a run mid-flight once at smoke scale and watch the relaunch finish only the remainder.
+- Reference implementations: `games/run_evals.py` (with `--summarise-only`), `games/train.py`,
+  `reward_hacking/recoverybench/runner.py`, `reward_hacking/hatch_probe.py`.
 
-**Every rented instance arms its own killswitch at launch — no box may depend on a human
-remembering to terminate it** (the owner, 2026-08-18). Two layers, both armed in user-data before
-any job starts: a max-lifetime dead-man switch (`shutdown -h +<minutes>` sized to the job, with
-the instance's shutdown behavior verified as `terminate` via the API after launch — a switch that
-merely *stops* an on-demand box keeps billing its EBS and teaches false comfort), and an idle
-watchdog that terminates the box after it has done no work for longer than any legitimate
-inter-job gap in its agenda. The second layer exists because the first is blind to the cheapest
-failure: a box that bootstraps and then never starts its job burns its whole dead-man window
-doing nothing (observed the night this rule was written: a bootstrapped GPU box sat at 0%
-utilization until a human happened to notice). Size the idle threshold above real setup and
-inter-stage gaps, or gate it on "agenda complete" markers, so it cannot kill a box between
-stages. And per the rule this repo is built around: a killswitch nobody has watched fire is a
-reassuring message, not a check — let each layer actually terminate a box once before trusting
-it, e.g. by letting the idle watchdog perform the final teardown after artifacts are synced and
-verified, which tests the mechanism at zero marginal cost. Both layers only cover a box that dies on
-its own schedule, and only the idle watchdog emits an API event at all, the dead-man switch being
-deliberately a bare `shutdown` that needs no network, credentials or CLI to fire. A spot eviction runs
-neither of them, which is one of the two reasons the tier rule above wants on-demand capacity
-exhausted first.
+GRPO micro-batches in games training are trimmed to their live tokens
+(`games.train.PaddingTrimmedGRPOTrainer`); statistically neutral, not bit-identical.
 
-**Every rented instance patches its OS at boot** (the owner, 2026-08-20). User-data runs
-`scripts/ec2_boot_patch.sh` as root right after the dead-man switch is armed and before the job
-starts. Two facts earned the rule, because "just launch the newest AMI" is not enough on its own:
-the newest available AMI build itself shipped a vulnerable package, and the fixed package sat in the
-distribution's `-updates` pocket rather than `-security`, so a stock security-pocket-only
-unattended-upgrades pass would have missed it too. One limit to know: a base GPU AMI apt-holds its
-own kernel metapackages, so a full upgrade on a running box reports packages still upgradable
-instead of installing them. A kernel fix therefore needs a newer image rather than another patch
-pass on the box you already have.
+## Shared-machine hygiene
 
-**Every expensive run saves incremental results and resumes — restarting from zero is never the
-recovery path** (the owner, 2026-08-28). A box that dies early — crash, killswitch, eviction,
-human mistake — must leave its completed work durable and make its relaunch a continuation.
-Concretely: sync partial results to remote storage *during* the run on an interval, because an
-EXIT trap alone misses the deaths that matter (instance termination skips traps); and make the
-entry point, before doing anything new, fetch what already exists at the run's own prefix and
-skip it. Training runs checkpoint every step and resume from the latest synced checkpoint.
-Sweep- and grid-shaped runs write per-item records incrementally and skip items whose records
-are already complete, counting resumed items separately from items skipped for any other reason
-so the summary stays honest about what actually ran. Hosted batch inference goes through
-persisted handles so collection resumes without resubmitting. Resume must be idempotent and
-order-independent — derive seeds from item identity, never from execution order, or a resumed
-run is silently a different experiment. And per the rule this repo is built around: kill a run
-mid-flight once at smoke scale and watch the relaunch skip the finished work and complete the
-remainder, because a resume path nobody has watched work is a reassuring message, not a check.
+Several agent sessions share this box, so filling the disk, `/tmp` or the CPU stalls all of them.
 
-Three of the expensive paths do this now (2026-09-02), and each names the trap it closes. The
-games eval cells (`games/run_evals.py`) resume a cell by record key from the cell's own trace.
-Finished records are kept byte for byte and only the pending identities are generated; the trace's
-resume block carries one entry per session with the records that session kept and the torn trailing
-lines it dropped, and the rebuilt summary derives what the latest session generated from those
-counts. `--summarise-only` rebuilds a cell's summary from a trace copied down from S3 with no GPU
-around, which works because a summary is only ever the battery's rebuild of its trace. The hosted
-RecoveryBench and hatch live runs (`reward_hacking/recoverybench/runner.py`,
-`reward_hacking/hatch_probe.py`) resume the same way, by content-derived cell key, and a kept record
-whose prompt digest no longer matches the relaunch's own rendering refuses the whole resume by name
-rather than being skipped, so an edited item cannot be folded into an old trace. Games training
-(`games/train.py`) resumes only from a *complete* checkpoint. A box that dies mid-sync leaves S3
-holding a `checkpoint-N/` with its small adapter and `trainer_state.json` but no `optimizer.pt`; TRL
-would load that, continue with zeroed Adam moments and keep every signal green. So a resume from
-`latest` walks newest-first past any checkpoint missing its trainer state, optimizer, scheduler, RNG
-state or adapter, moves the torn copy under `incomplete-checkpoints/` and records which steps will
-run twice. An explicitly named torn checkpoint is refused rather than swapped, and a run directory
-with checkpoints but no complete one raises instead of starting fresh.
+- `/tmp` is a RAM-backed tmpfs with an inode cap; keep scratch out of it. `make tmp-check` shows
+  usage. Fix a full `/tmp` by freeing inodes, never by moving episode or test scratch into the home
+  tree (`assert_disposable_episode_dir` in `reward_hacking/harness/loop.py` refuses that on purpose).
+- Heavy local work goes through `scripts/resource-limits.sh`.
+- **Delete what you created** when the work ends (venvs, checkouts, composed trees, test scratch).
+  Name anything you could not delete in your final report. Large artifacts belong in S3.
+- **Share one read-only mirror per finished run**:
+  `stage=$(scripts/s3_mirror.sh <run-name> --holder <tag>)` syncs into
+  `/var/tmp/s3-mirror/<run-name>/` and prints the path. Checkpoints are excluded by default
+  (`--include-checkpoint-state` adds each `trainer_state.json`; `--include-logs` adds logs). The
+  holder tag is required; `--delete` refuses while any holder's marker stands, and
+  `--delete --force` is a human call.
 
-**GRPO training micro-batches are trimmed to their live tokens**
-(`games.train.PaddingTrimmedGRPOTrainer`, 2026-09-02). TRL right-pads every completion in a
-generation batch to the batch's longest and splits the buffer along rows only, so one runaway
-completion at the cap made every micro-batch of that step run the model over the cap width; the
-audit measured 74% of a 2B training step as forward/backward over masked padding. The trainer drops
-the all-pad prompt and completion columns of each micro-batch at TRL's `_prepare_inputs` seam, logs
-`padding trim: step tokens padded=N trimmed=M kept_fraction=f` once per step, and records the totals
-in `log_history` and `mem_log.csv`. Statistically neutral, not bit-identical: the loss masks zero
-the pads and the normalizers in use are pad-invariant, so the gradient is the same function of the
-same tokens while reduction order and kernel autotune change with width. Measured on the L4 through
-the production loss path on a real corpus row: identical loss, LoRA gradient cosine 0.9999, norm
-ratio 1.0016, and cutting a quarter of the live tokens instead drops the cosine to 0.994, so the
-check has teeth. The audit's estimate is 1.9-2.7x per step.
-
-## Shared-machine hygiene (files, /tmp, CPU)
-
-This box runs several concurrent agent sessions, so filling the disk, `/tmp`, or the CPU does not
-slow one session down, it stalls all of them. On 2026-08-21 `/tmp` ran out of inodes —
-file slots, not bytes — and every session's shell failed box-wide until the leftover scratch was
-reaped by hand.
-
-`/tmp` here is a RAM-backed tmpfs with a hard inode cap separate from its byte space, so a tree of
-small files can exhaust the file slots while `df -h` still shows room, and everything in it costs
-RAM. `make tmp-check` prints both figures plus the directories holding the most files. (Both facts
-were measured on the previous dev box; WSL2 may lay `/tmp` out differently, so re-check with
-`make tmp-check` before relying on the numbers. The rule to keep scratch out of `/tmp` holds either
-way.)
-
-**Committing a subset of a dirty tree: gate the composed tree, never your files in isolation.**
-Several sessions edit this tree at once, so the normal commit carries some paths and leaves others
-dirty, and the question a gate has to answer is whether *those paths on top of HEAD* stay green.
-Compose that tree as a detached worktree on `/var/tmp` (never `/tmp`, for the inode reason above). A
-`git archive HEAD` tree is not enough: it has no `.git`, and about thirty tests ask git for
-provenance or for which paths are tracked, so they fail for a reason unrelated to the overlay.
-Overlay only the files you will commit, plus the five gitignored data files the tests need and a
-fresh checkout lacks (three survey files under `games/data/survey/` and two harness case files under
-`reward_hacking/harness/data/`), and nothing from `docs/scratch`. Then remove from the worktree every
-path your commit deletes or renames away, which a copy cannot express: left at HEAD's content, a
-deleted module still imports (a false pass) and a deleted stale test still runs (a false failure).
-Symlink the main tree's `.venv` into the worktree, because basedpyright is pinned to
-`venvPath = "."` and refuses to run without one there. The `.gitignore` rule for it is the bare
-name `.venv` rather than the directory-only `.venv/`, on purpose: a directory-only pattern does not
-match a symlink, so under it the link shows up as untracked in the worktree's status, and the
-committable-tree privacy sweep in `tests/test_scan_secrets.py`, which lists untracked paths too,
-follows it into every file of the venv: about 97,000 on this box, minutes of scanning, and then a
-hard failure when the sweep meets a compiled library over its 64 MiB size limit. That failure has
-nothing to do with your overlay, and the bare rule keeps it out of every worktree and every fresh
-clone with no per-machine exclude to remember. Run the block from the root of the main tree, which
-the overlay paths and the symlink target are relative to.
+**Committing a subset of a dirty tree: gate the composed tree, not your files in isolation.** Build a
+detached worktree on `/var/tmp` from HEAD, overlay only the files you will commit plus the five
+gitignored data files the tests need, remove paths your commit deletes or renames away, and symlink
+the main tree's `.venv` (basedpyright needs it; the `.gitignore` rule is the bare `.venv` so the
+symlink is ignored). Nothing from `docs/scratch`. Run from the main tree's root:
 
 ```bash
 T=/var/tmp/gate-<slug>
@@ -809,68 +407,23 @@ for f in games/data/survey/authored.json games/data/survey/published.json \
 done
 ln -s "$PWD/.venv" "$T/.venv"
 git -C "$T" status --short     # exactly your commit's changes; `?? .venv` means the rule reverted to `.venv/`
-(cd "$T" && make lint typecheck && make test)   # tmux; about 5 minutes sharded
+(cd "$T" && make lint typecheck && make test)   # run in tmux
 git worktree remove --force "$T"
 ```
 
-`--no-renames` matters on the deletion line: git's default rename detection folds a staged
-`git mv` into one `R` entry, and a filter on `D` alone would then leave the old path in the
-worktree. On a clean composed tree every failure is yours. The data files carry benchmark item text,
-which is why they are gitignored: the composed tree is for running the gate, never for committing
-from, and removing the worktree afterwards is part of the recipe. A green composed tree is a code
-gate, not a privacy clearance: `scripts/scan_secrets.py` arms its instrument-phrase detector from the
-survey files and from a note under `docs/scratch`, and the composed tree has only the former, so its
-sweep runs on fewer sources than the main tree's. The privacy gate of record stays the pre-commit
-hook's scan of the staged blobs, which runs in the main tree on the commit itself.
-
-**Delete what you created when the work ends** — venvs, repo checkouts, composed trees, test
-scratch — in `/tmp` and in the home tree alike. What you cannot delete yourself, name explicitly in
-your final report so the owner can: a permission-blocked delete gets surfaced loudly, never
-silently abandoned. Large artifacts belong in S3 rather than on local disk.
-
-**One shared read-only mirror per finished run, not a private copy per agent**
-(`scripts/s3_mirror.sh`, 2026-09-04). Prep, readout and audit agents each staged the same run's
-artifacts into their own scratch, so one run came down the wire once per agent, and an agent reaping
-its own scratch took with it the copy a sibling was still reading. `scripts/s3_mirror.sh <run-name>
---holder <tag>` delta-syncs `<SHIP_S3_PREFIX>/<run-name>/` into `/var/tmp/s3-mirror/<run-name>/` and
-prints that directory on stdout and nothing else, so a recipe writes
-`stage=$(scripts/s3_mirror.sh track-record-v2 --holder readout-a)` and passes `--stage "$stage"` on.
-Checkpoint directories are excluded by default, which is where 95% of a run's bytes are, 16.00 of
-track-record-v2's 16.83 GB, leaving a 147-object 0.83 GB mirror; `--include-checkpoint-state`
-re-includes the one `checkpoint-*/trainer_state.json` per checkpoint a readout actually reads (72
-objects, 2.88 MiB). A run's logs are not under its own prefix but in the sibling
-`<base>/logs/<run-name>/` (1.93 GB for track-record-v2, almost all of it one object), so
-`--include-logs` is a second sync into `<mirror>/logs/`, the same place both readout recipes put
-them. The holder tag is required and has no default: the only name the script knows for its caller is
-its parent shell's pid, which two readers in one shell share and one reader across two shells does
-not, so a default would hand out claims nobody could release. `--delete` refuses while any holder's
-marker stands, and `--delete --force` is the person's call for a marker whose agent is gone. No
-readout recipe calls it yet, so its per-readout saving is still a projection rather than a
-measurement.
-
-**A full `/tmp` is fixed by freeing inodes, never by redirecting episode or test scratch into the
-home tree.** The harness guard `assert_disposable_episode_dir` in `reward_hacking/harness/loop.py` refuses a
-home-tree episode dir, mirroring `episode_jail.sh`'s own rule, and it firing is that check working
-rather than an obstacle to route around.
-
-Heavy local work goes through `scripts/resource-limits.sh` as described in the section above: CPU
-contention wedges sibling sessions the same way a filled `/tmp` does.
+On a composed tree every failure is yours. Never commit from it (the data files carry benchmark
+items), and remove it afterwards. It is a code gate only: the privacy gate of record is the
+pre-commit hook's scan of the staged blobs in the main tree.
 
 ## Code conventions
 
-**Fail fast.** No blanket `except Exception`, no try/except "just in case", no defensive imports —
-research the API instead. If you catch broadly in order to log, re-raise. Eaten exceptions in a
-batch pipeline are how silent corruption happens; ruff's `BLE` rules enforce this mechanically.
-
-Type hints, built-in generics (`list[str]`, not `List[str]`), `X | Y` unions, absolute imports at
-the file top, `logging` rather than `print`, ruff at 120 columns. Descriptive names over opaque
-labels — `estimator-group`, never `arm_a` or `v1`. Comments explain *why*, never *what*, and never
-carry change annotations like "changed from 8" (that belongs in the commit message). Notebooks stay
-excluded from lint by design (ruff reads a notebook as one module, so every per-cell import becomes
-an E402).
-
-**Never sub-sample data to make a cell run faster** — it silently invalidates the statistics and
-produces numbers that read as full-data results.
-
-Commit messages describe the change and never mention AI authorship — no `Co-authored-by` trailers,
-no emoji.
+- **Fail fast.** No blanket `except Exception`, no try/except "just in case", no defensive imports.
+  If you catch broadly to log, re-raise. Ruff's `BLE` rules enforce this.
+- Type hints, built-in generics (`list[str]`), `X | Y` unions, absolute imports at the top of the
+  file, `logging` rather than `print`, ruff at 120 columns.
+- Descriptive names over opaque labels (`estimator-group`, never `arm_a` or `v1`).
+- Comments explain *why*, never *what*, and never carry change annotations.
+- Notebooks are excluded from lint by design.
+- **Never sub-sample data to make a cell run faster**; it silently invalidates the statistics.
+- Commit messages describe the change and never mention AI authorship: no `Co-authored-by`
+  trailers, no emoji.
