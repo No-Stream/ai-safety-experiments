@@ -185,7 +185,10 @@ a year, so the owner is extremely opposed to premature rigor. The consequences f
 sized:
 
 - **Run MVP experiments**: only enough to know directionally whether there is signal, plus a small
-  buffer, and no more. Match the arm count, step count and cell count to that question.
+  buffer, and no more. Match the arm count, step count and cell count to that question. The default
+  size is the base model plus the final checkpoint on a handful of samples (the owner, 2026-10-04,
+  after a session queued seven models and 19,000 samples for a sanity check); a checkpoint sweep,
+  a second seed or a larger prompt set is a follow-up the first read has to justify.
 - **An experiment often will not settle its question on its own, and that is fine**: read it, then
   follow up with the next probe. A readout that says "suggestive, here is the next arm" is a good
   readout; padding the first run so it can carry a firm conclusion is the mistake.
@@ -435,6 +438,21 @@ autoencoders, MOLT, crosscoders) to a dedicated mechanistic project, not routine
 
 `grpo/rlvr_math.py` still defaults to `Qwen/Qwen3-0.6B`, correct for that toy harness — not a
 pending migration.
+
+## The work queue: Backlog.md
+
+Agreed work items live in Backlog.md, a small CLI task tracker whose task files sit in the gitignored
+`docs/scratch/backlog/` (configured by `backlog.config.yml`), so they follow the same privacy rule as
+every other internal note. It keeps long arcs on track across sessions and stops next steps from
+being forgotten when a handoff is superseded (the owner, 2026-10-04). Read it at the start of a
+session and on every loop wakeup (`backlog task list --plain`, then `backlog task view <n> --plain`
+for the one you pick up). When a plan, a handoff or the owner names a next step, add it as a task
+(`backlog task create "<title>" -d "<why and where the notes are>" --ac "<criterion>"`); as work
+moves, keep its status and a dated note current (`backlog task edit <n> -s "In Progress" --notes
+"..."`), and close it with a pointer to its readout. Edit tasks through the CLI rather than by hand.
+`docs/scratch/future.md` stays the ranked index of research directions; the backlog is the queue of
+concrete work items under them, so a task names its direction note and a direction's next step
+becomes a task.
 
 ## Where things live
 
