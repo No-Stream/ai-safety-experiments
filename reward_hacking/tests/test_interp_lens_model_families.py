@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import pytest
 import torch
 from peft import LoraConfig, get_peft_model
+from peft.tuners.tuners_utils import BaseTunerLayer
+from safetensors.torch import load_file, save_file
 from transformers import (
     Gemma3Config,
     Gemma3ForConditionalGeneration,
@@ -241,6 +243,49 @@ def test_tiny_model_family_fit_roundtrip_and_reconstruction_read(
     assert torch.isfinite(logit_lens_logits[0]).all()
     torch.testing.assert_close(baseline_model_logits, model_logits)
     assert not torch.allclose(lens_logits[0], logit_lens_logits[0])
+
+
+def test_language_only_adapter_loads_without_empty_vision_tower_slots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    jlens: ModuleType,
+) -> None:
+    """A copy with vision tensors stripped keeps targets (q_proj, v_proj) that the vision tower also has.
+
+    Loading it must adapt only the modules that have weights; PEFT would otherwise leave empty LoRA
+    slots in the vision tower and the adapter-application gate refuses the load.
+    """
+    adapter_path = tmp_path / "tiny-gemma-language-only-adapter"
+    torch.manual_seed(29)
+    base_model = make_tiny_gemma3()
+    vars(base_model.config)["_name_or_path"] = "tiny-gemma3"
+    base_model.__dict__["name_or_path"] = "tiny-gemma3"
+    peft_model = get_peft_model(
+        base_model,
+        LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"),
+    )
+    peft_model.save_pretrained(str(adapter_path))
+    weights_path = adapter_path / "adapter_model.safetensors"
+    weights = load_file(str(weights_path))
+    assert any("vision_tower" in key for key in weights)
+    save_file(
+        {key: value for key, value in weights.items() if "vision_tower" not in key},
+        str(weights_path),
+    )
+
+    install_tiny_loader(monkeypatch, make_tiny_gemma3, model_id="tiny-gemma3")
+    handle = lens_fit_runtime.load_fit_model(
+        "tiny-gemma3", jl=jlens, adapter_path=adapter_path, dtype=torch.float32, device="cpu"
+    )
+
+    adapted_names = [
+        name
+        for name, module in handle.hf_model.named_modules()
+        if isinstance(module, BaseTunerLayer)
+    ]
+    assert adapted_names
+    assert not [name for name in adapted_names if "vision_tower" in name]
+    assert all("language_model" in name for name in adapted_names)
 
 
 def test_lora_adapter_remains_in_the_jlens_hooked_gemma_blocks(

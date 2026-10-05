@@ -13,6 +13,7 @@ import importlib
 import json
 import logging
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from peft import PeftConfig, PeftModel
 from peft.tuners.tuners_utils import BaseTunerLayer
+from safetensors import safe_open
 from torch import nn
 
 from games.deltanet_kernels import bound_deltanet_kernels, prefill_deltanet_kernels
@@ -83,6 +85,7 @@ class FitModelHandle:
     adapter_declared_base: str | None
     adapter_config_sha256: str | None
     applied_adapter_weights: int
+    adapted_module_count: int
 
     @property
     def blocks(self) -> nn.ModuleList:
@@ -101,6 +104,8 @@ class FitModelHandle:
             "adapter_declared_base": self.adapter_declared_base,
             "adapter_config_sha256": self.adapter_config_sha256,
             "applied_adapter_weights": self.applied_adapter_weights,
+            "adapted_module_count": self.adapted_module_count,
+            "adapter_targets": "modules with weights in the adapter file",
             "weights_fingerprint": self.weights_fingerprint,
             "model_revision": vars(cast("Any", self.hf_model).config).get("_commit_hash"),
             "tokenizer_sha256": tokenizer_content_sha256(self.tokenizer),
@@ -377,6 +382,37 @@ def source_implementation_sha256(
     return implementation_sha256
 
 
+_PEFT_KEY_PREFIX = "base_model.model."
+
+
+def adapter_targeting_its_weights(adapter_dir: Path, work_dir: Path) -> tuple[Path, int]:
+    """Write an adapter view whose ``target_modules`` are exactly the modules that have weights.
+
+    A language-only copy of a multimodal adapter keeps short targets such as ``q_proj`` that also
+    name vision-tower modules; PEFT then injects empty LoRA slots there and the application gate
+    refuses the load. The view symlinks the weight file and rewrites only the targets.
+    """
+    weights_path = adapter_dir / "adapter_model.safetensors"
+    if not weights_path.is_file():
+        raise FileNotFoundError(f"lens adapters must ship adapter_model.safetensors: {adapter_dir}")
+    with safe_open(str(weights_path), "pt") as handle:
+        keys = list(handle.keys())
+    non_lora = [key for key in keys if ".lora_" not in key]
+    if non_lora:
+        raise NotImplementedError(
+            f"adapter has non-LoRA weights the lens loader does not handle: {non_lora[:3]}"
+        )
+    modules = sorted({key.removeprefix(_PEFT_KEY_PREFIX).rsplit(".lora_", 1)[0] for key in keys})
+    config = json.loads((adapter_dir / "adapter_config.json").read_text(encoding="utf-8"))
+    config["target_modules"] = modules
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "adapter_config.json").write_text(
+        json.dumps(config, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    (work_dir / "adapter_model.safetensors").symlink_to(weights_path)
+    return work_dir, len(modules)
+
+
 def load_fit_model(
     model_id: str,
     *,
@@ -398,6 +434,7 @@ def load_fit_model(
     adapter_declared_base: str | None = None
     adapter_config_sha256: str | None = None
     applied_adapter_weights = 0
+    adapted_module_count = 0
     if adapter_path is not None:
         resolved_adapter_path = adapter_path.resolve()
         adapter_config = PeftConfig.from_pretrained(str(resolved_adapter_path))
@@ -416,15 +453,19 @@ def load_fit_model(
     active_model: nn.Module = base_model
     if resolved_adapter_path is not None:
         assert_adapter_base_matches(cast("str", adapter_declared_base), model_id, base_model)
-        peft_model = PeftModel.from_pretrained(
-            base_model, str(resolved_adapter_path), is_trainable=False
-        )
-        if peft_model.active_peft_config.is_prompt_learning:
-            raise NotImplementedError(
-                "prompt-learning PEFT adapters prepend virtual tokens outside the text-block tree; "
-                "the Jacobian fit requires an adapter injected into model modules"
+        with tempfile.TemporaryDirectory(prefix="lens-adapter-view-") as view_root:
+            adapter_view, adapted_module_count = adapter_targeting_its_weights(
+                resolved_adapter_path, Path(view_root) / "adapter"
             )
-        applied_adapter_weights = assert_adapter_applies(peft_model, resolved_adapter_path)
+            peft_model = PeftModel.from_pretrained(
+                base_model, str(adapter_view), is_trainable=False
+            )
+            if peft_model.active_peft_config.is_prompt_learning:
+                raise NotImplementedError(
+                    "prompt-learning PEFT adapters prepend virtual tokens outside the text-block tree; "
+                    "the Jacobian fit requires an adapter injected into model modules"
+                )
+            applied_adapter_weights = assert_adapter_applies(peft_model, adapter_view)
         active_model = peft_model.get_base_model()
         peft_model.eval()
     active_model.eval()
@@ -459,6 +500,7 @@ def load_fit_model(
         adapter_declared_base=adapter_declared_base,
         adapter_config_sha256=adapter_config_sha256,
         applied_adapter_weights=applied_adapter_weights,
+        adapted_module_count=adapted_module_count,
     )
     logger.info("loaded lens model, %s", json.dumps(handle.as_payload(), default=str))
     return handle
