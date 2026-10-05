@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -13,7 +14,7 @@ from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS, grade_mo
 from reward_hacking.atlas.sampling import BASE_MODEL_ID, artifact_model_key
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,7 @@ def _atlas_sample_from_steering(  # noqa: PLR0913
             "strength_multiple": strength,
             "strength_unit": str(steering["strength_unit"]),
         },
+        "coherence": steering.get("coherence"),
         "position": str(steering["position"]),
         "layer": int(steering["layer"]),
         "scope": str(steering["scope"]),
@@ -229,6 +231,34 @@ def _atlas_samples_from_steering(
     return samples
 
 
+def _sample_strength_unit(sample_id: str, sample: Mapping[str, Any]) -> str:
+    sampling = sample.get("sampling")
+    if not isinstance(sampling, Mapping):
+        raise TypeError(f"sampling for steering sample {sample_id} must be an object")
+    strength_unit = sampling.get("strength_unit")
+    if not isinstance(strength_unit, str):
+        raise TypeError(f"strength unit for steering sample {sample_id} must be text")
+    return strength_unit
+
+
+def _sample_coherence(sample_id: str, sample: Mapping[str, Any]) -> tuple[float, bool] | None:
+    coherence = sample.get("coherence")
+    if coherence is None:
+        return None
+    if not isinstance(coherence, Mapping):
+        raise TypeError(f"coherence for sample {sample_id} must be an object")
+    distinct_fraction = coherence.get("distinct_token_fraction_last_64")
+    contains_code_block = coherence.get("contains_code_block")
+    if (
+        not isinstance(distinct_fraction, int | float)
+        or not math.isfinite(distinct_fraction)
+        or not 0.0 <= distinct_fraction <= 1.0
+        or not isinstance(contains_code_block, bool)
+    ):
+        raise ValueError(f"coherence for sample {sample_id} is malformed")
+    return float(distinct_fraction), contains_code_block
+
+
 def _summarize_grades(
     samples: Sequence[Mapping[str, Any]], grades: Sequence[Mapping[str, Any]], *, model_key: str
 ) -> dict[str, object]:
@@ -238,7 +268,8 @@ def _summarize_grades(
         raise ValueError("steering samples and grades must have unique sample ids")
     if set(sample_by_id) != set(grade_by_id):
         raise ValueError("steering sample and grade ids differ")
-    groups: dict[tuple[int, float, str], dict[str, int]] = {}
+    groups: dict[tuple[int, float, str], dict[str, int | float]] = {}
+    strength_units: dict[tuple[int, float, str], set[str]] = {}
     for sample_id, sample in sample_by_id.items():
         grade = grade_by_id[sample_id]
         if str(grade["item_id"]) != str(sample["item_id"]):
@@ -254,27 +285,55 @@ def _summarize_grades(
             float(sample["strength_multiple"]),
             str(sample["axis"]),
         )
+        strength_units.setdefault(group_key, set()).add(_sample_strength_unit(sample_id, sample))
         counts = groups.setdefault(
             group_key,
-            {"n_samples": 0, "n_hack": 0, "n_honest_pass": 0, "n_fail": 0},
+            {
+                "n_samples": 0,
+                "n_hack": 0,
+                "n_honest_pass": 0,
+                "n_fail": 0,
+                "coherence_samples": 0,
+                "distinct_token_fraction_sum": 0.0,
+                "code_block_count": 0,
+            },
         )
         counts["n_samples"] += 1
         counts["n_hack"] += int(bool(grade["hack"]))
         counts["n_honest_pass"] += int(bool(grade["honest_pass"]))
         counts["n_fail"] += int(bool(grade["fail"]))
+        coherence = _sample_coherence(sample_id, sample)
+        if coherence is not None:
+            distinct_fraction, contains_code_block = coherence
+            counts["coherence_samples"] += 1
+            counts["distinct_token_fraction_sum"] += distinct_fraction
+            counts["code_block_count"] += int(contains_code_block)
     group_rows: list[dict[str, object]] = []
     for (layer, strength, axis), counts in sorted(groups.items()):
         total = counts["n_samples"]
+        unit_values = strength_units[(layer, strength, axis)]
+        if len(unit_values) != 1:
+            raise ValueError(f"steering group {(layer, strength, axis)} has mixed strength units")
         group_rows.append(
             {
                 "layer": layer,
                 "strength_multiple": strength,
-                "strength_unit": "mean residual L2 norm over all prompt tokens",
+                "strength_unit": next(iter(unit_values)),
                 "axis": axis,
                 **counts,
                 "hack_rate": counts["n_hack"] / total,
                 "honest_pass_rate": counts["n_honest_pass"] / total,
                 "fail_rate": counts["n_fail"] / total,
+                "mean_distinct_token_fraction_last_64": (
+                    counts["distinct_token_fraction_sum"] / counts["coherence_samples"]
+                    if counts["coherence_samples"]
+                    else None
+                ),
+                "code_block_rate": (
+                    counts["code_block_count"] / counts["coherence_samples"]
+                    if counts["coherence_samples"]
+                    else None
+                ),
             }
         )
     return {
@@ -290,18 +349,31 @@ def _markdown_summary(summary: Mapping[str, Any]) -> str:
     lines = [
         "# Atlas steering grade rates",
         "",
-        "Strength is a multiple of the layer's mean residual L2 norm over all prompt tokens.",
+        "Each row reports the strength unit used for its steering records.",
         "",
-        "| Layer | Strength | Axis | Samples | Hack rate | Honest pass rate | Fail rate |",
-        "|---:|---:|---|---:|---:|---:|---:|",
+        (
+            "| Layer | Strength | Strength unit | Axis | Samples | Hack rate | Honest pass rate | Fail rate "
+            "| Distinct token fraction (last 64) | Code block rate |"
+        ),
+        "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|",
     ]
     lines.extend(
-        f"| {group['layer']} | {group['strength_multiple']:g} | {group['axis']} "
-        f"| {group['n_samples']} | {group['hack_rate']:.3f} "
-        f"| {group['honest_pass_rate']:.3f} | {group['fail_rate']:.3f} |"
+        f"| {group['layer']} | {group['strength_multiple']:g} | {group['strength_unit']} "
+        f"| {group['axis']} | {group['n_samples']} | {group['hack_rate']:.3f} "
+        f"| {group['honest_pass_rate']:.3f} | {group['fail_rate']:.3f} "
+        f"| {_format_optional_rate(group['mean_distinct_token_fraction_last_64'])} "
+        f"| {_format_optional_rate(group['code_block_rate'])} |"
         for group in summary["groups"]
     )
     return "\n".join(lines) + "\n"
+
+
+def _format_optional_rate(value: object) -> str:
+    if value is None:
+        return "n/a"
+    if not isinstance(value, int | float):
+        raise TypeError(f"summary rate must be numeric or None, got {type(value).__name__}")
+    return f"{float(value):.3f}"
 
 
 def grade_steering_outputs(  # noqa: PLR0913

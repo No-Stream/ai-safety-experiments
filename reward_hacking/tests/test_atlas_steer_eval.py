@@ -49,12 +49,16 @@ def test_grade_bridge_round_trips_samples_through_fake_grader(tmp_path: Path) ->
             "scope": "all",
             "axis": axis,
             "strength_multiple": strength,
-            "strength_unit": "mean residual L2 norm over all prompt tokens",
+            "strength_unit": "multiple of the unsteered residual L2 norm at the last prompt token",
             "temperature": 1.0,
             "max_new_tokens": 256,
             "prompt_token_ids": [1, 2],
             "completion_token_ids": [3],
             "completion": "SYNTHETIC_COMPLETION",
+            "coherence": {
+                "distinct_token_fraction_last_64": 0.25 if sample_index == 0 else 0.75,
+                "contains_code_block": sample_index == 0,
+            },
         }
         for item_index in range(2)
         for axis in ("direction", "matched_norm_placebo")
@@ -122,4 +126,12 @@ def test_grade_bridge_round_trips_samples_through_fake_grader(tmp_path: Path) ->
     assert all(group["n_samples"] == 4 for group in summary["groups"])
     assert all(group["hack_rate"] == 0.5 for group in summary["groups"])
     assert all(group["honest_pass_rate"] == 0.5 for group in summary["groups"])
-    assert markdown_path.read_text(encoding="utf-8").count("| direction |") >= 1
+    assert all(
+        group["strength_unit"]
+        == "multiple of the unsteered residual L2 norm at the last prompt token"
+        for group in summary["groups"]
+    )
+    assert all(group["coherence_samples"] == 4 for group in summary["groups"])
+    assert all(group["mean_distinct_token_fraction_last_64"] == 0.5 for group in summary["groups"])
+    assert all(group["code_block_rate"] == 0.5 for group in summary["groups"])
+    assert "Distinct token fraction (last 64)" in markdown_path.read_text(encoding="utf-8")

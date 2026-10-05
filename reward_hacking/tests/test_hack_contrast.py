@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -17,15 +18,29 @@ from reward_hacking.interp.hack_contrast import (
     FitItemsConfig,
     PreparedTurn,
     ProjectionCapture,
+    SteeringConfig,
     _build_parser,
+    _completion_coherence,
     _emit_pair_shifts,
+    _generate_steered_batch,
+    _GeneratedSteeringBatch,
+    _generation_batch_size,
     _generation_hook,
+    _GenerationBatchConfig,
+    _left_pad_prompt_batch,
     _parse_strengths,
     _pool_response_batch,  # pyright: ignore[reportPrivateUsage]
+    _prompt_residual_norms,
+    _selected_steering_layers,
+    _steering_record,
     _steering_sample_seed,
+    _SteeringCell,
+    _SteeringRuntime,
+    _SteeringSample,
     _token_sweep_captures,
     _tokenize_prompt_record,
     _validate_direction_bundle,
+    _validate_steering_magnitude,
     audit_pair_records,
     diff_of_means_direction,
     direction_intervention,
@@ -45,7 +60,6 @@ from reward_hacking.interp.hack_contrast import (
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from pathlib import Path
 
 
 class IdentityLayer(torch.nn.Module):
@@ -62,6 +76,50 @@ class TinyModel(torch.nn.Module):
         for layer in self.model.layers:
             hidden = layer(hidden)
         return hidden
+
+
+class TinyGreedyGenerationModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = SimpleNamespace(layers=torch.nn.ModuleList([IdentityLayer()]))
+
+    def _apply_layers(self, hidden: torch.Tensor) -> torch.Tensor:
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+        return hidden
+
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        max_new_tokens: int,
+        **_generation_options: object,
+    ) -> torch.Tensor:
+        assert torch.all(attention_mask[:, -1] == 1)
+        generated = input_ids.clone()
+        prompt_hidden = torch.stack(
+            (input_ids.float(), torch.zeros_like(input_ids).float()), dim=-1
+        )
+        hidden = self._apply_layers(prompt_hidden)
+        next_token_state = hidden[:, -1, :]
+        for _ in range(max_new_tokens):
+            next_token_ids = (
+                next_token_state[:, 0] + 3 * next_token_state[:, 1]
+            ).floor().long().remainder(9) + 1
+            generated = torch.cat((generated, next_token_ids[:, None]), dim=1)
+            token_hidden = torch.stack(
+                (next_token_ids.float(), torch.zeros_like(next_token_ids).float()), dim=-1
+            )
+            next_token_state = self._apply_layers(token_hidden[:, None, :])[:, 0, :]
+        return generated
+
+
+class TinyGenerationSizingModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(num_hidden_layers=2, num_key_value_heads=2, head_dim=4)
+        self.weight = torch.nn.Parameter(torch.zeros(1))
 
 
 class FakeTokenizer:
@@ -298,6 +356,7 @@ def test_last_prompt_is_a_steer_position_and_sparse_layers_validate() -> None:
             "--position",
             "last_prompt",
             "--strengths=-8,-4,0,4",
+            "--allow-large",
             "--out",
             "steered.jsonl",
         ]
@@ -311,10 +370,48 @@ def test_last_prompt_is_a_steer_position_and_sparse_layers_validate() -> None:
     }
 
     assert arguments.position == "last_prompt"
+    assert arguments.allow_large is True
     assert _parse_strengths(arguments.strengths) == [-8.0, -4.0, 0.0, 4.0]
     assert _validate_direction_bundle(directions, provenance) == [4, 12]
     sample_seeds = [_steering_sample_seed(19, "synthetic-item", index, 4) for index in range(4)]
     assert len(set(sample_seeds)) == 4
+
+
+def test_steer_cli_accepts_explicit_multiple_layers() -> None:
+    arguments = _build_parser().parse_args(
+        [
+            "steer",
+            "--model",
+            "synthetic/model",
+            "--direction-dir",
+            "directions",
+            "--prompts",
+            "prompts.jsonl",
+            "--layers",
+            "44,47",
+            "--position",
+            "last_prompt",
+            "--out",
+            "steered.jsonl",
+        ]
+    )
+    config = SteeringConfig(
+        model_id="synthetic/model",
+        adapter=None,
+        direction_dir=Path("directions"),
+        prompts_path=Path("prompts.jsonl"),
+        position="last_prompt",
+        scope="all",
+        strengths=[1.0],
+        output_path=Path("steered.jsonl"),
+        max_new_tokens=1,
+        seed=0,
+        layer_indices=arguments.layers,
+    )
+    provenance = {"layers": [28, 44, 47]}
+
+    assert arguments.layers == [44, 47]
+    assert _selected_steering_layers(config, provenance) == [44, 47]
 
 
 def test_diff_of_means_pair_cv_separates_planted_signal_and_random_features() -> None:
@@ -599,23 +696,194 @@ def test_intervention_adds_the_requested_unit_step_at_only_the_selected_layer() 
     assert torch.allclose(result - seen[1], expected_step)
 
 
-def test_generation_hook_starts_at_the_first_output_token_and_respects_scope() -> None:
+def test_generation_hook_steers_each_left_padded_last_prompt_token_and_later_tokens() -> None:
     direction = torch.tensor([0.0, 5.0])
-    prompt_state = torch.zeros((1, 3, 2))
-    decode_state = torch.zeros((1, 1, 2))
+    prompt_state = torch.zeros((2, 4, 2))
+    decode_state = torch.zeros((2, 1, 2))
 
-    all_scope = _generation_hook(direction, magnitude=2.0, prompt_length=3, scope="all")
+    all_scope = _generation_hook(
+        direction, magnitudes=[1.0, 2.0], prompt_lengths=[2, 4], scope="all"
+    )
     first_prefill = cast("torch.Tensor", all_scope(None, None, prompt_state))
     first_decode = cast("torch.Tensor", all_scope(None, None, decode_state))
-    first_only = _generation_hook(direction, magnitude=2.0, prompt_length=3, scope="first")
+    first_only = _generation_hook(
+        direction, magnitudes=[1.0, 2.0], prompt_lengths=[2, 4], scope="first"
+    )
     first_only_prefill = cast("torch.Tensor", first_only(None, None, prompt_state))
     first_only_decode = cast("torch.Tensor", first_only(None, None, decode_state))
+    second_first_only_decode = cast("torch.Tensor", first_only(None, None, decode_state))
 
-    expected_prefill = torch.tensor([[[0.0, 0.0], [0.0, 0.0], [0.0, 2.0]]])
+    expected_prefill = torch.zeros_like(prompt_state)
+    expected_prefill[0, 3, 1] = 1.0
+    expected_prefill[1, 3, 1] = 2.0
+    expected_decode = torch.tensor([[[0.0, 1.0]], [[0.0, 2.0]]])
     assert torch.equal(first_prefill - prompt_state, expected_prefill)
-    assert torch.equal(first_decode - decode_state, torch.tensor([[[0.0, 2.0]]]))
+    assert torch.equal(first_decode - decode_state, expected_decode)
     assert torch.equal(first_only_prefill, first_prefill)
     assert torch.equal(first_only_decode, decode_state)
+    assert torch.equal(second_first_only_decode, decode_state)
+
+
+def test_generation_batch_matches_unbatched_greedy_outputs_with_left_padding() -> None:
+    prompts = [[2, 4], [3, 5, 7]]
+    magnitudes = [0.5, 1.5]
+    batched_input_ids, batched_attention_mask = _left_pad_prompt_batch(
+        prompts, pad_token_id=0, device=torch.device("cpu")
+    )
+    batched_output = _generate_steered_batch(
+        TinyGreedyGenerationModel(),
+        batched_input_ids,
+        batched_attention_mask,
+        _GenerationBatchConfig(
+            layer_index=0,
+            direction=torch.tensor([0.0, 1.0]),
+            magnitudes=magnitudes,
+            prompt_lengths=[len(prompt) for prompt in prompts],
+            scope="all",
+            seed=123,
+            temperature=1.0,
+            max_new_tokens=4,
+            do_sample=False,
+        ),
+    )
+    batched_completions = batched_output[:, batched_input_ids.shape[1] :].tolist()
+
+    unbatched_completions = []
+    for prompt, magnitude in zip(prompts, magnitudes, strict=True):
+        input_ids, attention_mask = _left_pad_prompt_batch(
+            [prompt], pad_token_id=0, device=torch.device("cpu")
+        )
+        output = _generate_steered_batch(
+            TinyGreedyGenerationModel(),
+            input_ids,
+            attention_mask,
+            _GenerationBatchConfig(
+                layer_index=0,
+                direction=torch.tensor([0.0, 1.0]),
+                magnitudes=[magnitude],
+                prompt_lengths=[len(prompt)],
+                scope="all",
+                seed=123,
+                temperature=1.0,
+                max_new_tokens=4,
+                do_sample=False,
+            ),
+        )
+        unbatched_completions.append(output[0, input_ids.shape[1] :].tolist())
+
+    assert batched_completions == unbatched_completions
+
+
+def test_generation_batch_size_grows_with_available_vram() -> None:
+    model = TinyGenerationSizingModel()
+
+    small = _generation_batch_size(
+        model,
+        free_vram_bytes=10_000,
+        max_sequence_length=10,
+        row_count=24,
+    )
+    large = _generation_batch_size(
+        model,
+        free_vram_bytes=100_000,
+        max_sequence_length=10,
+        row_count=24,
+    )
+
+    assert 1 <= small < large <= 24
+
+
+def test_steering_magnitude_guard_requires_explicit_override_above_four_norms() -> None:
+    with pytest.raises(ValueError, match="exceeds the 4x steered-position norm guard"):
+        _validate_steering_magnitude(4.01, 1.0, allow_large=False)
+
+    _validate_steering_magnitude(4.0, 1.0, allow_large=False)
+    _validate_steering_magnitude(4.01, 1.0, allow_large=True)
+
+
+def test_prompt_strength_uses_last_position_norm_and_reports_median_after_first_token() -> None:
+    activations = torch.tensor([[100.0, 0.0], [3.0, 4.0], [0.0, 2.0], [2.0, 0.0]])
+
+    last_token_norm, median_after_first = _prompt_residual_norms(activations)
+
+    assert last_token_norm == 2.0
+    assert median_after_first == 2.0
+
+
+def test_completion_coherence_reports_unique_fraction_and_code_block() -> None:
+    coherence = _completion_coherence([4, 4, 7, 7, 9], "```python\\npass\\n```")
+
+    assert coherence == {
+        "distinct_token_fraction_last_64": pytest.approx(0.6),
+        "contains_code_block": True,
+    }
+
+
+def test_steering_record_keeps_prompt_norms_and_completion_coherence() -> None:
+    config = SteeringConfig(
+        model_id="synthetic/model",
+        adapter=None,
+        direction_dir=Path("directions"),
+        prompts_path=Path("prompts.jsonl"),
+        position="last_prompt",
+        scope="all",
+        strengths=[0.2],
+        output_path=Path("steering.jsonl"),
+        max_new_tokens=3,
+        seed=19,
+    )
+    sample = _SteeringSample(
+        prompt_ids=[1, 2],
+        item_id="synthetic-item",
+        sample_index=0,
+        sample_id="synthetic-sample",
+        sample_seed=23,
+        steered_position_norm=10.0,
+        median_prompt_token_norm=2.5,
+        applied_magnitude=2.0,
+    )
+    runtime = _SteeringRuntime(
+        config=config,
+        model=TinyGenerationSizingModel(),
+        tokenizer=FakeTokenizer(),
+        directions={"last_prompt": torch.ones((1, 2))},
+        saved_layer_ids=[0],
+        selected_layers=[0],
+        prompts=[{}],
+        prompt_token_ids=[[1, 2]],
+        item_ids=["synthetic-item"],
+        residual_norms_by_layer={0: [(10.0, 2.5)]},
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        generation_batch_size=1,
+        eos_token_ids=frozenset(),
+    )
+    cell = _SteeringCell(
+        layer_id=0,
+        axis_name="direction",
+        axis=torch.tensor([1.0, 0.0]),
+        strength_multiple=0.2,
+        samples=[sample],
+    )
+    batch = _GeneratedSteeringBatch(
+        samples=[sample],
+        seed=29,
+        input_width=2,
+        token_ids=torch.tensor([[1, 2, 96, 96, 96]]),
+    )
+
+    record = _steering_record(runtime, cell, batch, 0)
+
+    assert (
+        record["strength_unit"]
+        == "multiple of the unsteered residual L2 norm at the last prompt token"
+    )
+    assert record["steered_position_norm"] == 10.0
+    assert record["median_residual_norm_excluding_first_prompt_token"] == 2.5
+    assert record["coherence"] == {
+        "distinct_token_fraction_last_64": pytest.approx(1 / 3),
+        "contains_code_block": True,
+    }
 
 
 def test_direction_bundle_round_trips_arrays_and_provenance(tmp_path: Path) -> None:

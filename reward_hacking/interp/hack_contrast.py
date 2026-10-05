@@ -25,7 +25,7 @@ from difflib import SequenceMatcher
 from itertools import pairwise
 from pathlib import Path
 from statistics import mean, median
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 import numpy as np
 import torch
@@ -40,7 +40,7 @@ from reward_hacking.interp.directions import (
     matched_norm_random_direction,
     unit,
 )
-from reward_hacking.interp.jsonl_resume import resume_records
+from reward_hacking.interp.jsonl_resume import ResumeLedger, resume_records
 from reward_hacking.interp.linear_probe import grouped_test_masks
 from reward_hacking.interp.steering import Hook, residual_intervention, steering_hook
 
@@ -85,6 +85,12 @@ TOKEN_SWEEP_CODE_OFFSETS: tuple[int, ...] = (-1, 0, 1, 2, 4, 8)
 MAX_CAPTURE_BATCH_SIZE = 8
 CAPTURE_FREE_VRAM_FRACTION = 0.4
 CAPTURE_ACTIVATION_HEADROOM = 3.0
+GENERATION_FREE_VRAM_FRACTION = 0.65
+GENERATION_KV_CACHE_HEADROOM = 1.5
+GENERATION_RESIDUAL_NDIM = 3
+GENERATION_TOKEN_BATCH_NDIM = 2
+MAX_STEERING_NORM_MULTIPLE = 4.0
+STEERING_STRENGTH_UNIT = "multiple of the unsteered residual L2 norm at the last prompt token"
 MATRIX_DIMENSIONS = 2
 PAIR_TENSOR_DIMENSIONS = 3
 PAIR_MEMBER_COUNT = 2
@@ -1946,45 +1952,284 @@ def read_captures(*, run_dir: Path, direction_dir: Path) -> None:
     _emit_pair_shifts(sweep_captures, kind="token_sweep")
 
 
+def _generation_hidden(output: object) -> tuple[torch.Tensor, bool]:
+    is_tuple = isinstance(output, tuple)
+    hidden = output[0] if is_tuple else output
+    if not isinstance(hidden, torch.Tensor):
+        raise TypeError("decoder block output must be a tensor or tuple beginning with a tensor")
+    return hidden, is_tuple
+
+
+def _generation_prefill_selector(
+    hidden: torch.Tensor, prompt_lengths: Sequence[int]
+) -> torch.Tensor:
+    if any(prompt_length > hidden.shape[-2] for prompt_length in prompt_lengths):
+        raise ValueError("prompt length exceeds the first generation prefill sequence")
+    selector = torch.zeros(hidden.shape[:2], dtype=hidden.dtype, device=hidden.device)
+    prompt_lengths_tensor = torch.tensor(prompt_lengths, device=hidden.device)
+    left_padding = hidden.shape[-2] - prompt_lengths_tensor
+    last_prompt_positions = left_padding + prompt_lengths_tensor - 1
+    selector[torch.arange(hidden.shape[0], device=hidden.device), last_prompt_positions] = 1
+    return selector.unsqueeze(-1)
+
+
+def _replace_generation_hidden(
+    output: object, *, is_tuple: bool, steered_hidden: torch.Tensor
+) -> object:
+    if is_tuple:
+        output_tuple = cast("tuple[object, ...]", output)
+        return (steered_hidden, *output_tuple[1:])
+    return steered_hidden
+
+
+def _apply_generation_steering(
+    hidden: torch.Tensor,
+    row_steps: torch.Tensor,
+    *,
+    prompt_lengths: Sequence[int],
+    scope: str,
+    prefill_seen: bool,
+) -> tuple[torch.Tensor | None, bool]:
+    if not prefill_seen:
+        selector = _generation_prefill_selector(hidden, prompt_lengths)
+        return hidden + selector * row_steps, True
+    if scope == "all":
+        return hidden + row_steps, prefill_seen
+    return None, prefill_seen
+
+
 def _generation_hook(
     direction: torch.Tensor,
     *,
-    magnitude: float,
-    prompt_length: int,
+    magnitudes: Sequence[float],
+    prompt_lengths: Sequence[int],
     scope: str,
 ) -> Hook:
-    """Steer the final prompt residual and optionally every subsequently generated token state."""
+    """Steer each row's final prompt residual and optionally later generated token states."""
     if scope not in {"all", "first"}:
         raise ValueError(f"unknown steering scope {scope!r}")
-    if prompt_length < 1:
-        raise ValueError("prompt_length must be positive")
-    step = unit(direction).float() * magnitude
+    if not magnitudes or len(magnitudes) != len(prompt_lengths):
+        raise ValueError("generation steering requires one magnitude and prompt length per row")
+    if any(prompt_length < 1 for prompt_length in prompt_lengths):
+        raise ValueError("prompt lengths must be positive")
+    if any(not math.isfinite(magnitude) for magnitude in magnitudes):
+        raise ValueError("generation steering magnitudes must be finite")
+    direction_step = unit(direction).float()
+    row_magnitudes = torch.tensor(magnitudes, dtype=torch.float32)
     prefill_seen = False
+    row_steps: torch.Tensor | None = None
 
     def hook(_module: object, _inputs: object, output: object) -> object:
-        nonlocal prefill_seen
-        is_tuple = isinstance(output, tuple)
-        hidden = output[0] if is_tuple else output
-        if not isinstance(hidden, torch.Tensor):
-            raise TypeError(
-                "decoder block output must be a tensor or tuple beginning with a tensor"
+        nonlocal prefill_seen, row_steps
+        hidden, is_tuple = _generation_hidden(output)
+        if hidden.ndim != GENERATION_RESIDUAL_NDIM or hidden.shape[0] != len(prompt_lengths):
+            raise ValueError(
+                "generation steering expects hidden states shaped [batch, sequence, width]"
             )
-        selector = torch.zeros(hidden.shape[-2], dtype=torch.bool, device=hidden.device)
-        if not prefill_seen:
-            if prompt_length > hidden.shape[-2]:
-                raise ValueError("prompt length exceeds the first generation prefill sequence")
-            selector[prompt_length - 1] = True
-            prefill_seen = True
-        elif scope == "all":
-            selector[:] = True
-        steered = hidden + selector.view(*([1] * (hidden.ndim - 2)), -1, 1) * step.to(hidden)
+        if row_steps is None:
+            row_steps = row_magnitudes.to(hidden).view(-1, 1, 1) * direction_step.to(hidden).view(
+                1, 1, -1
+            )
+        steered, prefill_seen = _apply_generation_steering(
+            hidden,
+            row_steps,
+            prompt_lengths=prompt_lengths,
+            scope=scope,
+            prefill_seen=prefill_seen,
+        )
+        if steered is None:
+            return output
         if steered.shape != hidden.shape:
             raise AssertionError("generation steering changed the decoder residual shape")
-        if is_tuple:
-            return (steered, *cast("tuple[object, ...]", output[1:]))
-        return steered
+        return _replace_generation_hidden(output, is_tuple=is_tuple, steered_hidden=steered)
 
     return hook
+
+
+def _left_pad_prompt_batch(
+    prompt_token_ids: Sequence[Sequence[int]], *, pad_token_id: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Left-pad prompt ids so each row's final prompt token shares the final column."""
+    if not prompt_token_ids or any(not tokens for tokens in prompt_token_ids):
+        raise ValueError("generation batches require at least one non-empty prompt")
+    if pad_token_id < 0:
+        raise ValueError(f"pad_token_id must be non-negative, got {pad_token_id}")
+    sequence_width = max(len(tokens) for tokens in prompt_token_ids)
+    input_ids = torch.full(
+        (len(prompt_token_ids), sequence_width), pad_token_id, dtype=torch.long, device=device
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    for row_index, tokens in enumerate(prompt_token_ids):
+        token_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
+        left_padding = sequence_width - len(tokens)
+        input_ids[row_index, left_padding:] = token_tensor
+        attention_mask[row_index, left_padding:] = 1
+    return input_ids, attention_mask
+
+
+def _validate_steering_magnitude(
+    applied_magnitude: float, steered_position_norm: float, *, allow_large: bool
+) -> None:
+    """Refuse interventions larger than four times the local, unsteered residual norm."""
+    if not math.isfinite(applied_magnitude):
+        raise ValueError("applied steering magnitude must be finite")
+    if not math.isfinite(steered_position_norm) or steered_position_norm < 0:
+        raise ValueError("steered-position norm must be finite and non-negative")
+    if (
+        not allow_large
+        and abs(applied_magnitude) > MAX_STEERING_NORM_MULTIPLE * steered_position_norm
+    ):
+        raise ValueError(
+            f"applied magnitude {abs(applied_magnitude):.6g} exceeds the "
+            f"{MAX_STEERING_NORM_MULTIPLE:g}x steered-position norm guard "
+            f"({steered_position_norm:.6g}); pass --allow-large to override"
+        )
+
+
+def _completion_coherence(
+    completion_token_ids: Sequence[int], completion_text: str
+) -> dict[str, float | bool]:
+    """Summarize token diversity near the end of a completion and code-fence presence."""
+    recent_token_ids = completion_token_ids[-64:]
+    distinct_fraction = (
+        len(set(recent_token_ids)) / len(recent_token_ids) if recent_token_ids else 0.0
+    )
+    return {
+        "distinct_token_fraction_last_64": distinct_fraction,
+        "contains_code_block": "```" in completion_text,
+    }
+
+
+def _prompt_residual_norms(activations: torch.Tensor) -> tuple[float, float | None]:
+    """Return the last-token norm and the median norm after excluding the first prompt token."""
+    if activations.ndim != MATRIX_DIMENSIONS or activations.shape[0] == 0:
+        raise ValueError("prompt residual activations must have shape [sequence, width]")
+    token_norms = torch.linalg.vector_norm(activations, dim=-1).tolist()
+    last_token_norm = float(token_norms[-1])
+    median_after_first = (
+        float(median(float(norm) for norm in token_norms[1:])) if len(token_norms) > 1 else None
+    )
+    return last_token_norm, median_after_first
+
+
+def _generation_batch_size(
+    model: torch.nn.Module,
+    *,
+    free_vram_bytes: int,
+    max_sequence_length: int,
+    row_count: int,
+) -> int:
+    """Estimate a safe HF generation batch from free VRAM and the model's KV-cache shape."""
+    if row_count < 1 or max_sequence_length < 1:
+        raise ValueError("generation row count and sequence length must be positive")
+    if free_vram_bytes <= 0:
+        parameter_device = next(model.parameters()).device
+        if parameter_device.type == "cpu":
+            return row_count
+        raise ValueError("cannot size a CUDA generation batch without free VRAM")
+    layer_count = _config_value(model, ("num_hidden_layers", "n_layer", "num_layers"))
+    key_value_heads = _config_value(model, ("num_key_value_heads",))
+    head_dimension = _config_value(model, ("head_dim",))
+    element_size = next(model.parameters()).element_size()
+    bytes_per_row = (
+        2
+        * layer_count
+        * key_value_heads
+        * head_dimension
+        * max_sequence_length
+        * element_size
+        * GENERATION_KV_CACHE_HEADROOM
+    )
+    usable_vram = free_vram_bytes * GENERATION_FREE_VRAM_FRACTION
+    estimated_rows = max(1, int(usable_vram // bytes_per_row))
+    return min(row_count, estimated_rows)
+
+
+@dataclass(frozen=True)
+class _GenerationBatchConfig:
+    layer_index: int
+    direction: torch.Tensor
+    magnitudes: Sequence[float]
+    prompt_lengths: Sequence[int]
+    scope: str
+    seed: int
+    temperature: float
+    max_new_tokens: int
+    do_sample: bool = True
+
+
+def _generate_steered_batch(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    batch_config: _GenerationBatchConfig,
+) -> torch.Tensor:
+    """Generate one batch with a per-row last-prompt intervention and deterministic RNG state."""
+    device = input_ids.device
+    rng_devices = [device.index] if device.type == "cuda" else []
+    hook = _generation_hook(
+        batch_config.direction,
+        magnitudes=batch_config.magnitudes,
+        prompt_lengths=batch_config.prompt_lengths,
+        scope=batch_config.scope,
+    )
+    with (
+        torch.random.fork_rng(devices=rng_devices),
+        residual_intervention(cast("Any", model), batch_config.layer_index, hook),
+    ):
+        torch.manual_seed(batch_config.seed)
+        generated = cast(
+            "torch.Tensor",
+            cast("Any", model).generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                do_sample=batch_config.do_sample,
+                temperature=batch_config.temperature,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                repetition_penalty=1.0,
+                max_new_tokens=batch_config.max_new_tokens,
+                use_cache=True,
+            ),
+        )
+    if generated.ndim != GENERATION_TOKEN_BATCH_NDIM or generated.shape[0] != input_ids.shape[0]:
+        raise ValueError("model.generate returned a malformed batch")
+    if generated.shape[1] < input_ids.shape[1]:
+        raise ValueError("model.generate returned fewer tokens than its padded prompt batch")
+    return generated
+
+
+def _steering_batch_seed(sample_seeds: Sequence[int]) -> int:
+    """Derive one stable sampling seed from the sample identities in a generation batch."""
+    if not sample_seeds:
+        raise ValueError("generation batch seed requires at least one sample identity")
+    digest = hashlib.sha256("\0".join(str(seed) for seed in sample_seeds).encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (2**31 - 1)
+
+
+def _eos_token_ids(model: torch.nn.Module) -> frozenset[int]:
+    generation_config = getattr(cast("Any", model), "generation_config", None)
+    eos_token_id = getattr(generation_config, "eos_token_id", None)
+    if eos_token_id is None:
+        return frozenset()
+    if isinstance(eos_token_id, int):
+        return frozenset({eos_token_id})
+    if isinstance(eos_token_id, list) and all(
+        isinstance(token_id, int) for token_id in eos_token_id
+    ):
+        return frozenset(eos_token_id)
+    raise TypeError("generation_config.eos_token_id must be an integer or a list of integers")
+
+
+def _trim_completion_at_eos(
+    completion_token_ids: Sequence[int], eos_token_ids: frozenset[int]
+) -> list[int]:
+    """Drop batch padding after the first emitted end-of-sequence token."""
+    for token_index, token_id in enumerate(completion_token_ids):
+        if token_id in eos_token_ids:
+            return list(completion_token_ids[: token_index + 1])
+    return list(completion_token_ids)
 
 
 def _parse_strengths(value: str) -> list[float]:
@@ -2108,6 +2353,62 @@ class SteeringConfig:
     max_prompts: int | None = None
     samples_per_prompt: int = 1
     temperature: float = 1.0
+    allow_large: bool = False
+    layer_indices: Sequence[int] | None = None
+
+
+@dataclass(frozen=True)
+class _SteeringSample:
+    prompt_ids: list[int]
+    item_id: str
+    sample_index: int
+    sample_id: str
+    sample_seed: int
+    steered_position_norm: float
+    median_prompt_token_norm: float | None
+    applied_magnitude: float
+
+
+@dataclass(frozen=True)
+class _SteeringRuntime:
+    config: SteeringConfig
+    model: torch.nn.Module
+    tokenizer: _ChatTokenizer
+    directions: Mapping[str, torch.Tensor]
+    saved_layer_ids: list[int]
+    selected_layers: list[int]
+    prompts: list[dict[str, Any]]
+    prompt_token_ids: list[list[int]]
+    item_ids: list[str]
+    residual_norms_by_layer: dict[int, list[tuple[float, float | None]]]
+    device: torch.device
+    pad_token_id: int
+    generation_batch_size: int
+    eos_token_ids: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _SteeringCell:
+    layer_id: int
+    axis_name: str
+    axis: torch.Tensor
+    strength_multiple: float
+    samples: list[_SteeringSample]
+
+
+@dataclass
+class _SteeringProgress:
+    completed_sample_ids: set[str]
+    ledger: ResumeLedger
+    records_file: TextIO
+
+
+@dataclass(frozen=True)
+class _GeneratedSteeringBatch:
+    samples: list[_SteeringSample]
+    seed: int
+    input_width: int
+    token_ids: torch.Tensor
 
 
 def _validate_steering_request(
@@ -2123,10 +2424,7 @@ def _validate_steering_request(
         raise ValueError(f"temperature must be positive and finite, got {config.temperature}")
     if not config.strengths or any(not math.isfinite(strength) for strength in config.strengths):
         raise ValueError("steering strengths must be non-empty and finite")
-    if (config.layer_index is None) == (config.best_layers is None):
-        raise ValueError("select exactly one of layer_index or best_layers")
-    if config.best_layers is not None and config.best_layers < 1:
-        raise ValueError(f"best_layers must be positive, got {config.best_layers}")
+    _validate_steering_layer_selection(config)
     if config.max_prompts is not None and config.max_prompts < 1:
         raise ValueError(f"max_prompts must be positive, got {config.max_prompts}")
     if str(provenance["model"]) != config.model_id:
@@ -2137,12 +2435,31 @@ def _validate_steering_request(
         raise ValueError(f"position {config.position!r} is absent from {config.direction_dir}")
 
 
+def _validate_steering_layer_selection(config: SteeringConfig) -> None:
+    layer_selection_count = sum(
+        selection is not None
+        for selection in (config.layer_index, config.layer_indices, config.best_layers)
+    )
+    if layer_selection_count != 1:
+        raise ValueError("select exactly one of layer_index, layer_indices, or best_layers")
+    if config.layer_indices is not None and (
+        not config.layer_indices
+        or any(layer < 0 for layer in config.layer_indices)
+        or len(set(config.layer_indices)) != len(config.layer_indices)
+    ):
+        raise ValueError("layer_indices must be a non-empty sequence of unique non-negative layers")
+    if config.best_layers is not None and config.best_layers < 1:
+        raise ValueError(f"best_layers must be positive, got {config.best_layers}")
+
+
 def _selected_steering_layers(
     config: SteeringConfig,
     provenance: Mapping[str, Any],
 ) -> list[int]:
     saved_layers = [int(layer_id) for layer_id in provenance["layers"]]
-    if config.layer_index is not None:
+    if config.layer_indices is not None:
+        selected = list(config.layer_indices)
+    elif config.layer_index is not None:
         selected = [config.layer_index]
     else:
         metrics_by_position = provenance.get("metrics", {}).get(config.position, [])
@@ -2165,6 +2482,15 @@ def _selected_steering_layers(
     return selected
 
 
+def _parse_layer_indices(value: str) -> list[int]:
+    layer_indices = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not layer_indices or any(layer < 0 for layer in layer_indices):
+        raise ValueError("--layers must be comma-separated non-negative layer indices")
+    if len(set(layer_indices)) != len(layer_indices):
+        raise ValueError("--layers cannot contain duplicate layer indices")
+    return layer_indices
+
+
 def _steering_sample_seed(seed: int, item_id: str, sample_index: int, sample_count: int) -> int:
     if (
         sample_index < 0
@@ -2178,11 +2504,7 @@ def _steering_sample_seed(seed: int, item_id: str, sample_index: int, sample_cou
     return seed_base + sample_index
 
 
-@torch.no_grad()
-def steer_prompts(
-    config: SteeringConfig,
-) -> None:
-    """Generate direction and matched-norm-placebo completions for later external grading."""
+def _prepare_steering_runtime(config: SteeringConfig) -> _SteeringRuntime:
     directions, provenance = load_direction_bundle(config.direction_dir)
     _validate_direction_bundle(directions, provenance)
     _validate_steering_request(config, directions, provenance)
@@ -2203,22 +2525,71 @@ def steer_prompts(
     _validate_rendered_prompt_model(config.prompts_path, prompts, config.model_id)
     model, tokenizer = _load_model_with_optional_adapter(config.model_id, config.adapter)
     device, free_vram_bytes, total_vram_bytes = _device_memory(model)
-    logger.info(
-        "steer model=%s adapter=%s device=%s free_vram_bytes=%d total_vram_bytes=%d generation_batch_size=1",
-        config.model_id,
-        config.adapter,
-        device,
-        free_vram_bytes,
-        total_vram_bytes,
-    )
     layer_count = _config_value(model, ("num_hidden_layers", "n_layer", "num_layers"))
     invalid_layers = [layer_id for layer_id in selected_layers if not 0 <= layer_id < layer_count]
     if invalid_layers:
         raise ValueError(
             f"steering layers {invalid_layers} are outside the {layer_count}-block model"
         )
-    config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    identity = {
+    if tokenizer.pad_token_id is None:
+        raise ValueError("batched steering requires a tokenizer pad_token_id")
+    prompt_token_ids = [
+        _tokenize_prompt_record(tokenizer, prompt, model_id=config.model_id) for prompt in prompts
+    ]
+    item_ids = [
+        str(prompt.get("item_id", prompt.get("prompt_id", prompt_index)))
+        for prompt_index, prompt in enumerate(prompts)
+    ]
+    max_prompt_length = max(len(tokens) for tokens in prompt_token_ids)
+    generation_batch_size = _generation_batch_size(
+        model,
+        free_vram_bytes=free_vram_bytes,
+        max_sequence_length=max_prompt_length + config.max_new_tokens,
+        row_count=len(prompts) * config.samples_per_prompt,
+    )
+    logger.info(
+        "steer model=%s adapter=%s device=%s free_vram_bytes=%d total_vram_bytes=%d "
+        "max_prompt_tokens=%d max_new_tokens=%d generation_batch_size=%d",
+        config.model_id,
+        config.adapter,
+        device,
+        free_vram_bytes,
+        total_vram_bytes,
+        max_prompt_length,
+        config.max_new_tokens,
+        generation_batch_size,
+    )
+    residual_norms_by_layer: dict[int, list[tuple[float, float | None]]] = {}
+    for layer_id in selected_layers:
+        layer_norms: list[tuple[float, float | None]] = []
+        for prompt_tokens in prompt_token_ids:
+            input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
+            activations = capture_positionwise_activations(
+                cast("Any", model), input_ids, torch.ones_like(input_ids), layers=[layer_id]
+            )[layer_id][0]
+            layer_norms.append(_prompt_residual_norms(activations))
+        residual_norms_by_layer[layer_id] = layer_norms
+    return _SteeringRuntime(
+        config=config,
+        model=model,
+        tokenizer=tokenizer,
+        directions=directions,
+        saved_layer_ids=saved_layer_ids,
+        selected_layers=selected_layers,
+        prompts=prompts,
+        prompt_token_ids=prompt_token_ids,
+        item_ids=item_ids,
+        residual_norms_by_layer=residual_norms_by_layer,
+        device=device,
+        pad_token_id=tokenizer.pad_token_id,
+        generation_batch_size=generation_batch_size,
+        eos_token_ids=_eos_token_ids(model),
+    )
+
+
+def _steering_resume_identity(runtime: _SteeringRuntime) -> dict[str, object]:
+    config = runtime.config
+    return {
         "stage": "hack_contrast_steer",
         "model": config.model_id,
         "adapter": None if config.adapter is None else str(config.adapter),
@@ -2227,10 +2598,8 @@ def steer_prompts(
             for path in sorted(config.direction_dir.glob("direction.*.npy"))
         },
         "prompts_sha256": _sha256_file(config.prompts_path),
-        "selected_item_ids": [
-            str(prompt.get("item_id", prompt.get("prompt_id"))) for prompt in prompts
-        ],
-        "layers": selected_layers,
+        "selected_item_ids": runtime.item_ids,
+        "layers": runtime.selected_layers,
         "position": config.position,
         "scope": config.scope,
         "axes": ["direction", "matched_norm_placebo"],
@@ -2239,112 +2608,187 @@ def steer_prompts(
         "temperature": config.temperature,
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
-        "strength_unit": "multiple of the mean residual L2 norm over all prompt tokens",
+        "strength_unit": STEERING_STRENGTH_UNIT,
+        "generation_batch_size": runtime.generation_batch_size,
+        "allow_large": config.allow_large,
     }
+
+
+def _build_steering_samples(
+    runtime: _SteeringRuntime, *, layer_id: int, axis_name: str, strength_multiple: float
+) -> list[_SteeringSample]:
+    config = runtime.config
+    layer_norms = runtime.residual_norms_by_layer[layer_id]
+    samples: list[_SteeringSample] = []
+    for sample_index in range(config.samples_per_prompt):
+        for prompt_index, prompt_tokens in enumerate(runtime.prompt_token_ids):
+            steered_position_norm, median_prompt_token_norm = layer_norms[prompt_index]
+            applied_magnitude = float(strength_multiple * steered_position_norm)
+            _validate_steering_magnitude(
+                applied_magnitude,
+                steered_position_norm,
+                allow_large=config.allow_large,
+            )
+            item_id = runtime.item_ids[prompt_index]
+            sample_id = f"L{layer_id}:{axis_name}:{strength_multiple:g}:{item_id}:{sample_index}"
+            samples.append(
+                _SteeringSample(
+                    prompt_ids=prompt_tokens,
+                    item_id=item_id,
+                    sample_index=sample_index,
+                    sample_id=sample_id,
+                    sample_seed=_steering_sample_seed(
+                        config.seed, item_id, sample_index, config.samples_per_prompt
+                    ),
+                    steered_position_norm=steered_position_norm,
+                    median_prompt_token_norm=median_prompt_token_norm,
+                    applied_magnitude=applied_magnitude,
+                )
+            )
+    return samples
+
+
+def _generate_steering_batch(
+    runtime: _SteeringRuntime, cell: _SteeringCell, samples: list[_SteeringSample]
+) -> _GeneratedSteeringBatch:
+    batch_seed = _steering_batch_seed([sample.sample_seed for sample in samples])
+    input_ids, attention_mask = _left_pad_prompt_batch(
+        [sample.prompt_ids for sample in samples],
+        pad_token_id=runtime.pad_token_id,
+        device=runtime.device,
+    )
+    token_ids = _generate_steered_batch(
+        runtime.model,
+        input_ids,
+        attention_mask,
+        _GenerationBatchConfig(
+            layer_index=cell.layer_id,
+            direction=cell.axis,
+            magnitudes=[sample.applied_magnitude for sample in samples],
+            prompt_lengths=[len(sample.prompt_ids) for sample in samples],
+            scope=runtime.config.scope,
+            seed=batch_seed,
+            temperature=runtime.config.temperature,
+            max_new_tokens=runtime.config.max_new_tokens,
+        ),
+    )
+    return _GeneratedSteeringBatch(
+        samples=samples,
+        seed=batch_seed,
+        input_width=input_ids.shape[1],
+        token_ids=token_ids,
+    )
+
+
+def _steering_record(
+    runtime: _SteeringRuntime,
+    cell: _SteeringCell,
+    batch: _GeneratedSteeringBatch,
+    batch_index: int,
+) -> dict[str, object]:
+    config = runtime.config
+    sample = batch.samples[batch_index]
+    completion_token_ids = _trim_completion_at_eos(
+        [int(token_id) for token_id in batch.token_ids[batch_index, batch.input_width :]],
+        runtime.eos_token_ids,
+    )
+    completion_text = runtime.tokenizer.decode(
+        torch.tensor(completion_token_ids), skip_special_tokens=True
+    )
+    return {
+        "sample_id": sample.sample_id,
+        "prompt_id": sample.item_id,
+        "item_id": sample.item_id,
+        "sample_index": sample.sample_index,
+        "seed": batch.seed,
+        "generation_batch_seed": batch.seed,
+        "generation_batch_size": len(batch.samples),
+        "model": config.model_id,
+        "adapter": None if config.adapter is None else str(config.adapter),
+        "position": config.position,
+        "layer": cell.layer_id,
+        "scope": config.scope,
+        "axis": cell.axis_name,
+        "strength_multiple": cell.strength_multiple,
+        "strength_unit": STEERING_STRENGTH_UNIT,
+        "steered_position_norm": sample.steered_position_norm,
+        "median_residual_norm_excluding_first_prompt_token": sample.median_prompt_token_norm,
+        "applied_magnitude": sample.applied_magnitude,
+        "temperature": config.temperature,
+        "top_p": 1.0,
+        "top_k": 0,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+        "max_new_tokens": config.max_new_tokens,
+        "prompt_token_ids": sample.prompt_ids,
+        "completion_token_ids": completion_token_ids,
+        "completion": completion_text,
+        "coherence": _completion_coherence(completion_token_ids, completion_text),
+    }
+
+
+def _run_steering_cell(
+    runtime: _SteeringRuntime, cell: _SteeringCell, progress: _SteeringProgress
+) -> None:
+    batch_size = runtime.generation_batch_size
+    for batch_start in range(0, len(cell.samples), batch_size):
+        samples = cell.samples[batch_start : batch_start + batch_size]
+        if all(sample.sample_id in progress.completed_sample_ids for sample in samples):
+            continue
+        batch = _generate_steering_batch(runtime, cell, samples)
+        for batch_index, sample in enumerate(batch.samples):
+            if sample.sample_id in progress.completed_sample_ids:
+                continue
+            record = _steering_record(runtime, cell, batch, batch_index)
+            progress.records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            progress.records_file.flush()
+            progress.ledger.mark_record_complete(sample.sample_id)
+            progress.completed_sample_ids.add(sample.sample_id)
+
+
+@torch.no_grad()
+def steer_prompts(
+    config: SteeringConfig,
+) -> None:
+    """Generate direction and matched-norm-placebo completions for later external grading."""
+    runtime = _prepare_steering_runtime(config)
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
     resume, ledger = resume_records(
         config.output_path,
-        identity=identity,
+        identity=_steering_resume_identity(runtime),
         unit_of=lambda record: str(record["sample_id"]),
         record_key_of=lambda record: str(record["sample_id"]),
     )
     completed_sample_ids = set(ledger.completed_records)
     logger.info(
-        "steer_resume completed_records=%d pending prompts=%d layers=%s",
+        "steer_resume completed_records=%d prompts=%d layers=%s",
         resume.n_kept,
-        len(prompts),
-        selected_layers,
+        len(runtime.prompts),
+        runtime.selected_layers,
     )
-    rng_devices = [device.index] if device.type == "cuda" else []
     with config.output_path.open("a", encoding="utf-8") as records_file:
-        for prompt_index, prompt in enumerate(prompts):
-            prompt_ids = _tokenize_prompt_record(tokenizer, prompt, model_id=config.model_id)
-            item_id = str(prompt.get("item_id", prompt.get("prompt_id", prompt_index)))
-            input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-            attention_mask = torch.ones_like(input_ids)
-            for layer_id in selected_layers:
-                direction = directions[config.position][
-                    _direction_row_index(saved_layer_ids, layer_id)
-                ]
-                prompt_activations = capture_positionwise_activations(
-                    cast("Any", model), input_ids, attention_mask, layers=[layer_id]
-                )[layer_id][0]
-                mean_residual_norm = float(prompt_activations.norm(dim=-1).mean().item())
-                placebo = make_matched_norm_placebo(direction, seed=config.seed + layer_id)
-                axes = {"direction": direction, "matched_norm_placebo": placebo}
-                for axis_name, axis in axes.items():
-                    for strength_multiple in config.strengths:
-                        magnitude = float(strength_multiple * mean_residual_norm)
-                        for sample_index in range(config.samples_per_prompt):
-                            sample_seed = _steering_sample_seed(
-                                config.seed, item_id, sample_index, config.samples_per_prompt
-                            )
-                            sample_id = (
-                                f"L{layer_id}:{axis_name}:{strength_multiple:g}:"
-                                f"{item_id}:{sample_index}"
-                            )
-                            if sample_id in completed_sample_ids:
-                                continue
-                            hook = _generation_hook(
-                                axis,
-                                magnitude=magnitude,
-                                prompt_length=len(prompt_ids),
-                                scope=config.scope,
-                            )
-                            with (
-                                residual_intervention(cast("Any", model), layer_id, hook),
-                                torch.random.fork_rng(devices=rng_devices),
-                            ):
-                                torch.manual_seed(sample_seed)
-                                generated = cast(
-                                    "torch.Tensor",
-                                    cast("Any", model).generate(
-                                        input_ids=input_ids,
-                                        attention_mask=attention_mask,
-                                        do_sample=True,
-                                        temperature=config.temperature,
-                                        top_p=1.0,
-                                        top_k=0,
-                                        min_p=0.0,
-                                        repetition_penalty=1.0,
-                                        max_new_tokens=config.max_new_tokens,
-                                        use_cache=True,
-                                    ),
-                                )
-                            completion_token_ids = [
-                                int(token_id) for token_id in generated[0, input_ids.shape[1] :]
-                            ]
-                            record = {
-                                "sample_id": sample_id,
-                                "prompt_id": item_id,
-                                "item_id": item_id,
-                                "sample_index": sample_index,
-                                "seed": sample_seed,
-                                "model": config.model_id,
-                                "adapter": None if config.adapter is None else str(config.adapter),
-                                "position": config.position,
-                                "layer": layer_id,
-                                "scope": config.scope,
-                                "axis": axis_name,
-                                "strength_multiple": float(strength_multiple),
-                                "strength_unit": "mean residual L2 norm over all prompt tokens",
-                                "mean_residual_norm": mean_residual_norm,
-                                "applied_magnitude": magnitude,
-                                "temperature": config.temperature,
-                                "top_p": 1.0,
-                                "top_k": 0,
-                                "min_p": 0.0,
-                                "repetition_penalty": 1.0,
-                                "max_new_tokens": config.max_new_tokens,
-                                "prompt_token_ids": prompt_ids,
-                                "completion_token_ids": completion_token_ids,
-                                "completion": tokenizer.decode(
-                                    torch.tensor(completion_token_ids), skip_special_tokens=True
-                                ),
-                            }
-                            records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                            records_file.flush()
-                            ledger.mark_record_complete(sample_id)
-                            completed_sample_ids.add(sample_id)
+        progress = _SteeringProgress(completed_sample_ids, ledger, records_file)
+        for layer_id in runtime.selected_layers:
+            direction = runtime.directions[config.position][
+                _direction_row_index(runtime.saved_layer_ids, layer_id)
+            ]
+            placebo = make_matched_norm_placebo(direction, seed=config.seed + layer_id)
+            axes = (("direction", direction), ("matched_norm_placebo", placebo))
+            for axis_name, axis in axes:
+                for strength_multiple in config.strengths:
+                    cell = _SteeringCell(
+                        layer_id,
+                        axis_name,
+                        axis,
+                        float(strength_multiple),
+                        _build_steering_samples(
+                            runtime,
+                            layer_id=layer_id,
+                            axis_name=axis_name,
+                            strength_multiple=float(strength_multiple),
+                        ),
+                    )
+                    _run_steering_cell(runtime, cell, progress)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -2390,6 +2834,7 @@ def _build_parser() -> argparse.ArgumentParser:
     steer_parser.add_argument("--prompts", type=Path, required=True)
     layer_selection = steer_parser.add_mutually_exclusive_group(required=True)
     layer_selection.add_argument("--layer", type=int)
+    layer_selection.add_argument("--layers", type=_parse_layer_indices)
     layer_selection.add_argument("--best-layers", type=int)
     steer_parser.add_argument("--position", choices=STEER_POSITION_NAMES, required=True)
     steer_parser.add_argument(
@@ -2404,6 +2849,11 @@ def _build_parser() -> argparse.ArgumentParser:
     steer_parser.add_argument("--max-prompts", type=int)
     steer_parser.add_argument("--max-new-tokens", type=int, default=512)
     steer_parser.add_argument("--seed", type=int, default=0)
+    steer_parser.add_argument(
+        "--allow-large",
+        action="store_true",
+        help="allow steering magnitudes above four times the last-prompt residual norm",
+    )
     steer_parser.add_argument("--out", type=Path, required=True)
     return parser
 
@@ -2462,6 +2912,8 @@ def main(argv: list[str] | None = None) -> None:
                 max_prompts=arguments.max_prompts,
                 samples_per_prompt=arguments.samples_per_prompt,
                 temperature=arguments.temperature,
+                allow_large=arguments.allow_large,
+                layer_indices=arguments.layers,
             )
         )
 
