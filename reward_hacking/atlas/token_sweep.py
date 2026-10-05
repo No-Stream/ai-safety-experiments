@@ -166,6 +166,27 @@ def _sample_rows(
     return sorted(joined, key=lambda pair: (str(pair[0]["item_id"]), int(pair[0]["sample_index"])))
 
 
+def _optional_code_token_start(
+    sample: Mapping[str, Any],
+    tokenizer: PreTrainedTokenizerBase,
+    completion_ids: list[int],
+    completion_text: str,
+) -> int | None:
+    """Return the first code token, or None when the code span cannot be mapped onto token boundaries.
+
+    A completion whose token prefixes do not decode monotonically (a multi-token character split across
+    tokens) has no exact code span; its code-relative positions are skipped downstream, the rest is kept.
+    """
+    try:
+        code_token_start, _ = _code_token_span(
+            tokenizer, completion_ids, completion_text, extract_code(completion_text)
+        )
+    except ValueError as error:
+        logger.warning("sample %s has no mappable code span: %s", sample["sample_id"], error)
+        return None
+    return code_token_start
+
+
 def _metadata_row(
     sample: Mapping[str, Any],
     grade: Mapping[str, Any],
@@ -176,9 +197,8 @@ def _metadata_row(
     completion_text = str(sample["completion_text"])
     if not completion_ids:
         raise ValueError(f"sample {sample['sample_id']} has no completion tokens")
-    extracted_code = extract_code(completion_text)
-    code_token_start, _ = _code_token_span(
-        tokenizer, completion_ids, completion_text, extracted_code
+    code_token_start = _optional_code_token_start(
+        sample, tokenizer, completion_ids, completion_text
     )
     return {
         "sample_id": str(sample["sample_id"]),
@@ -188,8 +208,10 @@ def _metadata_row(
         "pass_label": bool(grade["passes_all"]),
         "prompt_token_ids": prompt_ids,
         "completion_token_ids": completion_ids,
-        "completion_char_offsets": _token_character_offsets(
-            tokenizer, completion_ids, completion_text
+        "completion_char_offsets": (
+            None
+            if code_token_start is None
+            else _token_character_offsets(tokenizer, completion_ids, completion_text)
         ),
         "code_token_start": code_token_start,
     }
@@ -689,6 +711,7 @@ def _anchor_offsets(  # noqa: PLR0913 - prompt and code position inputs define o
     offsets = {
         int(position) - prompt_tokens - int(rows[row_index]["code_token_start"])
         for row_index in row_indices
+        if rows[row_index]["code_token_start"] is not None
         for position in np.flatnonzero(mask[row_index])
     }
     return sorted(offsets)
@@ -736,6 +759,8 @@ def _analyze_model(  # noqa: PLR0913 - model data and probe settings remain expl
                     row = model_rows[model_row_index]
                     absolute_position = prompt_tokens + offset
                     if anchor == "code_start":
+                        if row["code_token_start"] is None:
+                            continue
                         absolute_position += int(row["code_token_start"])
                     if (
                         0 <= absolute_position < mask.shape[1]

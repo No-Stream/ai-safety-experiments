@@ -1744,8 +1744,10 @@ def _score_token_sweep_row(
     context: _TokenSweepScoreContext,
 ) -> list[tuple[tuple[str, int, int | None], tuple[str, int], float]]:
     pair_key = str(row["item_id"]), int(row["sample_index"])
-    code_start = int(row["code_token_start"])
     scored_positions: list[tuple[tuple[str, int, int | None], tuple[str, int], float]] = []
+    if row["code_token_start"] is None:
+        return scored_positions
+    code_start = int(row["code_token_start"])
     for offset in TOKEN_SWEEP_CODE_OFFSETS:
         token_position = context.token_count + code_start + offset
         if (

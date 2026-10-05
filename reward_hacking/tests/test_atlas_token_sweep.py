@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
@@ -420,3 +420,29 @@ def test_analyse_adds_teacher_forced_arm_and_rejects_token_mismatch(
     teacher_index_path.write_text(json.dumps(teacher_index), encoding="utf-8")
     with pytest.raises(ValueError, match="completion token ids differ"):
         token_sweep.analyse_sweeps(run_dir=tmp_path, adapter_key=adapter_key, n_permutations=1)
+
+
+class NonMonotonicTokenizer(FakeTokenizer):
+    """Decodes a partial two-token character as a replacement mark, like a split multi-byte UTF-8 sequence."""
+
+    def decode(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> str:
+        text = super().decode(token_ids, skip_special_tokens=skip_special_tokens)
+        return text[:-1] + "\ufffd" if token_ids and token_ids[-1] == ord("x") else text
+
+
+def test_metadata_row_records_no_code_start_when_the_code_span_cannot_be_mapped() -> None:
+    completion = "a x then y"
+    sample = {
+        "sample_id": "s0",
+        "item_id": "item",
+        "sample_index": 0,
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [ord(character) for character in completion],
+        "completion_text": completion,
+    }
+    grade = {"hack": True, "passes_all": False}
+
+    row = token_sweep._metadata_row(sample, grade, cast("Any", NonMonotonicTokenizer()))  # pyright: ignore[reportPrivateUsage]
+
+    assert row["code_token_start"] is None
+    assert row["hack_label"] is True
