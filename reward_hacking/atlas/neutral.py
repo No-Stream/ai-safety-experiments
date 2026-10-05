@@ -16,6 +16,7 @@ from reward_hacking.atlas.grading import extract_code
 from reward_hacking.atlas.sampling import (
     BASE_MODEL_ID,
     MAX_LORA_RANK,
+    VLLM_MAX_NUM_BATCHED_TOKENS,
     VLLM_MAX_NUM_SEQS,
     gpu_engine_settings,
     language_adapter_for,
@@ -236,6 +237,7 @@ def neutral_model(
         max_loras=1,
         max_cpu_loras=1,
         max_num_seqs=VLLM_MAX_NUM_SEQS,
+        max_num_batched_tokens=VLLM_MAX_NUM_BATCHED_TOKENS,
         limit_mm_per_prompt={"image": 0},
     )
     adapter_path = language_adapter_for(model_key, run_dir)

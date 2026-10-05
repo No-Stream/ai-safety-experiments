@@ -35,7 +35,10 @@ DEFAULT_SAMPLES_PER_PROMPT = 2
 MAX_LORA_RANK = 64
 VLLM_FREE_MEMORY_MARGIN_FRACTION = 0.02
 # More concurrent sequences grow the LoRA buffers; the KV cache fits about a dozen 512-token rows anyway.
-VLLM_MAX_NUM_SEQS = 32
+VLLM_MAX_NUM_SEQS = 16
+# vLLM profiles activations at this many batched tokens; the default (8192) left no KV room once
+# the Windows host held 3.5 GB of the card.
+VLLM_MAX_NUM_BATCHED_TOKENS = 2048
 VISION_ADAPTER_MARKERS = ("vision_tower", "vision_model", "multi_modal_projector")
 
 ATLAS_ADAPTERS: dict[str, str] = {
@@ -170,22 +173,15 @@ def prompts_stage(  # noqa: C901
             "stage": "prompts",
             "datasets": dataset_report,
             "model_id": BASE_MODEL_ID,
-            "max_items_total": max_items,
+            "max_items_per_split": max_items,
         },
         unit_of=lambda record: f"{record['dataset_id']}:{record['split']}",
         record_key_of=lambda record: str(record["item_id"]),
     )
     completed = {str(record["item_id"]) for record in prompt_resume.kept_records}
-    remaining_items = max_items
     for dataset_key, dataset_id, split, dataset in loaded_splits:
-        if remaining_items is not None and remaining_items <= 0:
-            break
-        selected_count = (
-            len(dataset) if remaining_items is None else min(remaining_items, len(dataset))
-        )
+        selected_count = len(dataset) if max_items is None else min(max_items, len(dataset))
         rows = dataset.select(range(selected_count))
-        if remaining_items is not None:
-            remaining_items -= selected_count
         for row_index, row in enumerate(rows):
             item_id = _stable_item_id(dataset_id, split, row_index, row)
             if item_id in completed:
@@ -471,6 +467,7 @@ def sample_model(  # noqa: C901, PLR0913
             max_loras=1,
             max_cpu_loras=1,
             max_num_seqs=VLLM_MAX_NUM_SEQS,
+            max_num_batched_tokens=VLLM_MAX_NUM_BATCHED_TOKENS,
             # Text only: an image limit of zero keeps the vision encoder (about 0.8 GiB) off the card.
             limit_mm_per_prompt={"image": 0},
         )

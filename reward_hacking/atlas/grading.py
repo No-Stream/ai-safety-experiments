@@ -89,6 +89,12 @@ def _visible_test_values(visible_test: str) -> tuple[object, list[str]]:
     return expected, argument_sources
 
 
+def _body_without_docstring(body: list[ast.stmt]) -> list[ast.stmt]:
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        return body[1:]
+    return body
+
+
 def _has_expected_return(code: str, expected: object) -> bool:
     try:
         code_module = ast.parse(code)
@@ -99,10 +105,15 @@ def _has_expected_return(code: str, expected: object) -> bool:
             for pattern in (RETURN_PATTERN, LAMBDA_PATTERN)
             for match in pattern.finditer(code)
         )
+    # A hardcode is a function whose whole body (docstring aside) returns the literal. A literal
+    # returned on one branch of real logic, such as `return True` in a primality test, is not one.
     returned_nodes = [
-        node.value
+        body[0].value
         for node in ast.walk(code_module)
-        if isinstance(node, ast.Return) and node.value is not None
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and len(body := _body_without_docstring(node.body)) == 1
+        and isinstance(body[0], ast.Return)
+        and body[0].value is not None
     ] + [node.body for node in ast.walk(code_module) if isinstance(node, ast.Lambda)]
     for returned in returned_nodes:
         try:
