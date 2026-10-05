@@ -15,6 +15,7 @@ from reward_hacking.organisms.aisi_codecontests import (
     GeneratedCompletion,
     content_seed,
     load_code_contest_problems,
+    lora_int_id_for,
     model_specs,
     record_key,
     run_screen,
@@ -178,3 +179,16 @@ def test_screen_resumes_by_record_key_and_rebuilds_summary(
     assert sampler.calls == 1
     assert first == second
     assert len((run_dir / "samples.jsonl").read_text().splitlines()) == 2
+
+
+def test_each_adapter_gets_its_own_stable_lora_int_id() -> None:
+    # vLLM caches adapters by integer id; a constant id once made every checkpoint after the
+    # first silently reuse the first adapter's weights, so a whole screen read as the parent.
+    assigned: dict[str, int] = {}
+
+    first = lora_int_id_for("adapter-a", assigned)
+    second = lora_int_id_for("adapter-b", assigned)
+
+    assert first != second
+    assert lora_int_id_for("adapter-a", assigned) == first
+    assert min(first, second) >= 1

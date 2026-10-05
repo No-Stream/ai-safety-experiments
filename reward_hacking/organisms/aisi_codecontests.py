@@ -93,6 +93,17 @@ class CompletionSampler(Protocol):
 AISI_MAX_PROMPT_TOKENS = 4096
 
 
+def lora_int_id_for(adapter_id: str, assigned: dict[str, int]) -> int:
+    """Return a distinct, stable vLLM LoRA integer id for each adapter within one engine.
+
+    vLLM caches loaded adapters by this integer, so reusing one id for several adapters makes
+    every later request run on whichever adapter was loaded first, with no error.
+    """
+    if adapter_id not in assigned:
+        assigned[adapter_id] = len(assigned) + 1
+    return assigned[adapter_id]
+
+
 def content_seed(model_id: str, problem_id: str, sample_index: int) -> int:
     """Derive a stable vLLM seed from the resumable unit's content key."""
     if sample_index < 0:
@@ -340,6 +351,7 @@ class VLLMCompletionSampler:
         self._temperature = temperature
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(base_model)
         self._adapter_paths: dict[str, str] = {}
+        self._lora_ids: dict[str, int] = {}
         # Without a cap vLLM sizes for OLMo-3's 65K context, which needs more KV cache than the card has.
         self._engine = vllm.LLM(
             model=base_model,
@@ -373,7 +385,9 @@ class VLLMCompletionSampler:
         if model.adapter_id is not None:
             lora_module = importlib.import_module("vllm.lora.request")
             adapter_path = self._resolve_adapter_path(model.adapter_id)
-            lora_request = lora_module.LoRARequest(model.model_id, 1, adapter_path)
+            lora_request = lora_module.LoRARequest(
+                model.model_id, lora_int_id_for(model.adapter_id, self._lora_ids), adapter_path
+            )
         sampling_params = [
             self._vllm.SamplingParams(
                 n=1,
