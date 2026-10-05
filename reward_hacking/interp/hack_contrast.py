@@ -56,7 +56,8 @@ class _ChatTokenizer(Protocol):
         *,
         tokenize: bool,
         add_generation_prompt: bool,
-    ) -> list[int]: ...
+        return_dict: bool,
+    ) -> Mapping[str, Sequence[object]]: ...
 
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]: ...
 
@@ -784,9 +785,14 @@ def _token_ids_from_template(
     *,
     generation_prompt: bool,
 ) -> list[int]:
-    return tokenizer.apply_chat_template(
-        list(messages), tokenize=True, add_generation_prompt=generation_prompt
+    encoded = tokenizer.apply_chat_template(
+        list(messages), tokenize=True, add_generation_prompt=generation_prompt, return_dict=True
     )
+    raw_ids = encoded["input_ids"]
+    token_ids = [token_id for token_id in raw_ids if isinstance(token_id, int)]
+    if not token_ids or len(token_ids) != len(raw_ids):
+        raise TypeError("chat template did not return one flat list of token ids")
+    return token_ids
 
 
 def _encode_response(tokenizer: _ChatTokenizer, response: str) -> list[int]:

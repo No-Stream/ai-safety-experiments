@@ -67,13 +67,23 @@ class FakeTokenizer:
         *,
         tokenize: bool,
         add_generation_prompt: bool,
-    ) -> list[int]:
+        return_dict: bool,
+    ) -> dict[str, list[int]]:
+        # transformers 5 returns a BatchEncoding-like mapping for tokenize=True; mirror that shape.
         assert tokenize
+        assert return_dict
         self.last_messages = [dict(message) for message in messages]
         prompt_ids = [1, 2, 3]
         if messages[-1]["role"] == "assistant":
-            return [*prompt_ids, 4, 5, *(ord(character) for character in messages[-1]["content"])]
-        return [*prompt_ids, 4, 5] if add_generation_prompt else prompt_ids
+            input_ids = [
+                *prompt_ids,
+                4,
+                5,
+                *(ord(character) for character in messages[-1]["content"]),
+            ]
+        else:
+            input_ids = [*prompt_ids, 4, 5] if add_generation_prompt else prompt_ids
+        return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids)}
 
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         assert not add_special_tokens
