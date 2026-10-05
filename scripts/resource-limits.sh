@@ -290,6 +290,10 @@ properties=(
   # Sets memory.oom.group=1, so exceeding MemoryMax kills every process in the job
   # together instead of leaving a half-dead job with its workers reaped.
   -p "OOMPolicy=kill"
+  # systemd starts user units at a 1024 soft limit regardless of the caller's. Under WSL, CUDA's
+  # expandable segments hold one descriptor per mapped chunk, so loading a 12B model under --gpu died
+  # as "CUDA driver error: unknown error" here and nowhere else. Keep the caller's limits instead.
+  -p "LimitNOFILE=$(ulimit -Sn):$(ulimit -Hn)"
 )
 [[ -n "$mem_high" ]] && properties+=(-p "MemoryHigh=$mem_high")
 [[ -n "$timeout" ]] && properties+=(-p "RuntimeMaxSec=$timeout")

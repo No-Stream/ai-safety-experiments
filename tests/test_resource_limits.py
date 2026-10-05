@@ -339,3 +339,28 @@ def test_sighup_stops_the_enforced_unit_and_its_process() -> None:
             wrapper.kill()
             wrapper.communicate()
         _systemctl_user("reset-failed", unit_name)
+
+
+@pytest.mark.skipif(
+    not _user_manager_is_available(), reason="requires a usable systemd user manager"
+)
+def test_the_enforced_unit_inherits_the_callers_open_file_limit() -> None:
+    # systemd starts user units at a 1024 soft limit. Under WSL, CUDA's expandable segments hold
+    # one descriptor per mapped chunk, so a large allocation past 1024 failed as "CUDA driver error:
+    # unknown error" only inside the limiter (2026-10-04, vLLM loading a 12B model).
+    caller_soft_limit = 4096
+    completed = subprocess.run(  # noqa: S603 - repo script, literal arguments
+        [
+            "/bin/bash",
+            "-c",
+            f'ulimit -n {caller_soft_limit} && exec "$0" -t 1m -- bash -c "ulimit -n"',
+            str(LIMITER),
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip().splitlines()[-1] == str(caller_soft_limit)
