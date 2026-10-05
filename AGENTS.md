@@ -500,6 +500,10 @@ Every top-level entry, so nothing has to be guessed at:
   machine's paths; only the README is tracked.
 - `artifacts/` — gitignored run outputs: traces, sweeps, eval records, checkpoints. Local-only,
   and deliberately kept — disk is not the constraint (see the probing-posture section above).
+- `external/` — gitignored clones of third-party research repos we study or borrow environments
+  from (model-organism releases, probe code). Clone new ones here rather than under `/var/tmp`, so
+  they stay findable. Gitignored because they carry other benchmarks' items; read and run them, but
+  never copy their item text into tracked files. Excluded from the type check in `pyproject.toml`.
 - `legacy/` — finished research. Do not extend, refactor, or lint it. One exception (the owner,
   2026-08-16): the blind `except` blocks in `legacy/pretraining.ipynb` are being narrowed to
   specific exceptions.

@@ -105,3 +105,7 @@ scripts/kits/
 
 # Backlog.md config (local task tool; its tasks live under docs/scratch/backlog)
 backlog.config.yml
+
+# Third-party research repos cloned for study (model-organism environments, probe code). Gitignored because
+# they carry other benchmarks' items, which must never be committed; kept in-tree so they stay findable.
+/external/
