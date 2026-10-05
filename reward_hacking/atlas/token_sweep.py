@@ -45,9 +45,15 @@ MODEL_FLOAT_DTYPE = np.dtype(np.float32)
 MASK_DTYPE = np.dtype(np.bool_)
 
 
-class _ModelConfig(Protocol):
+class _TextConfig(Protocol):
     num_hidden_layers: int
     hidden_size: int
+
+
+class _ModelConfig(Protocol):
+    def get_text_config(self) -> _TextConfig:
+        """Return the language-model config (the config itself for text-only models)."""
+        ...
 
 
 class _ModelOutput(Protocol):
@@ -241,7 +247,7 @@ def _capture_row(  # noqa: PLR0913 - prompt and completion boundaries are distin
     if hidden_states is None:
         raise RuntimeError("model forward did not return hidden states")
     sequence_length = len(input_ids_list)
-    expected_state_count = int(model.config.num_hidden_layers) + 1
+    expected_state_count = int(model.config.get_text_config().num_hidden_layers) + 1
     if len(hidden_states) != expected_state_count:
         raise RuntimeError(
             f"model returned {len(hidden_states)} hidden states, expected {expected_state_count}"
@@ -314,9 +320,9 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
         )
     model.eval()
     _log_device_and_vram(model)
-    n_layers = int(model.config.num_hidden_layers)
+    n_layers = int(model.config.get_text_config().num_hidden_layers)
     layer_ids = _selected_layers(n_layers, layer_stride)
-    d_model = int(model.config.hidden_size)
+    d_model = int(model.config.get_text_config().hidden_size)
     sample_ids = [str(sample["sample_id"]) for sample, _ in joined]
     identity: dict[str, object] = {
         "stage": "atlas_token_sweep",

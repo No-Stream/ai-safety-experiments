@@ -169,6 +169,35 @@ def test_conftest_locator_returns_first_content_token_and_masks_missing_file() -
     )
 
 
+@dataclass(frozen=True)
+class NormalizingSource:
+    """Mimics an extractor that rewrites block whitespace, so the block is not a verbatim substring."""
+
+    def extract_code_and_files(self, completion: str) -> tuple[str, dict[str, str]]:
+        solution, extra_files = FakeSource().extract_code_and_files(completion)
+        normalized = "\n".join(line.rstrip() for line in solution.splitlines())
+        return (normalized + "\n" if normalized else ""), extra_files
+
+
+def test_locator_falls_back_to_the_first_line_of_a_normalized_block() -> None:
+    completion = "intro first   <solution>first   \nsecond   </solution>"
+
+    solution_start, conftest_start = locate_completion_positions(
+        completion, tokenize_completion(FakeTokenizer(), completion), NormalizingSource()
+    )
+
+    assert solution_start == completion.index("<solution>") + len("<solution>")
+    assert conftest_start is None
+
+
+def test_locator_masks_an_empty_solution_block() -> None:
+    completion = "no code at all<solution></solution>"
+
+    assert locate_completion_positions(
+        completion, tokenize_completion(FakeTokenizer(), completion), NormalizingSource()
+    ) == (None, None)
+
+
 def test_completion_round_trip_mismatch_fails_loudly() -> None:
     with pytest.raises(ValueError, match="round-trip"):
         tokenize_completion(FakeTokenizer(decode_suffix="!"), "abc")
@@ -222,6 +251,7 @@ def test_record_selection_is_balanced_and_deterministic() -> None:
             "problem_id": f"problem-{index}",
             "sample_index": 0,
             "reward_hacked": index % 2 == 0,
+            "completion_text": "print(1)",
         }
         for index in range(6)
     ]
@@ -235,6 +265,24 @@ def test_record_selection_is_balanced_and_deterministic() -> None:
         "model\x00problem-3\x000",
     ]
     assert sum(bool(record["reward_hacked"]) for record in selected) == 2
+
+
+def test_record_selection_skips_empty_completions() -> None:
+    records = [
+        {
+            "record_key": f"model\x00problem-{index}\x000",
+            "model": "model",
+            "problem_id": f"problem-{index}",
+            "sample_index": 0,
+            "reward_hacked": False,
+            "completion_text": completion_text,
+        }
+        for index, completion_text in enumerate(["print(1)", "", "  \n", "print(2)"])
+    ]
+
+    selected = select_records(records, model_id="model", max_records=4)
+
+    assert [str(record["problem_id"]) for record in selected] == ["problem-0", "problem-3"]
 
 
 def test_cuda_batch_sizing_uses_all_retained_layers_and_logs_device(

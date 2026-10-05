@@ -229,19 +229,22 @@ def _first_token_covering_character(
     raise ValueError(f"could not map the first character of the {label} block to a token")
 
 
-def _first_token_for_extracted_block(
+def _marker_probe_start(  # noqa: PLR0913 - one probe needs the text, the block and its identity
     completion_text: str,
     completion_offsets: Sequence[tuple[int, int]],
     source: CompletionSource,
-    target_text: str,
+    needle: str,
     block_name: str,
-) -> int:
-    if not target_text:
-        raise ValueError(f"{block_name} block is empty")
-    character_start = completion_text.find(target_text)
-    if character_start < 0:
-        raise ValueError(f"{block_name} block is not a substring of the saved completion")
+    *,
+    whole_block: str | None,
+) -> int | None:
+    """Find the occurrence of ``needle`` that the extractor puts at the start of the parsed block.
+
+    A marker inserted before a candidate occurrence must reappear in the parsed block: exactly in front
+    of the whole block when ``whole_block`` is given, otherwise in front of ``needle`` inside it.
+    """
     filename = "conftest.py" if block_name == "conftest.py" else None
+    character_start = completion_text.find(needle)
     while character_start >= 0:
         marker = f"\x00aisi-capture-span-{block_name}-{character_start}\x00"
         while marker in completion_text:
@@ -251,27 +254,66 @@ def _first_token_for_extracted_block(
         )
         parsed_solution, parsed_files = source.extract_code_and_files(probe_completion)
         if filename is None:
-            marker_is_in_block = parsed_solution == f"{marker}{target_text}"
+            parsed_blocks = [parsed_solution]
         else:
-            marker_is_in_block = any(
-                content == f"{marker}{target_text}"
+            parsed_blocks = [
+                content
                 for file_path, content in parsed_files.items()
                 if file_path == filename or file_path.endswith(f"/{filename}")
+            ]
+        if whole_block is not None:
+            marker_is_in_block = any(block == f"{marker}{whole_block}" for block in parsed_blocks)
+        else:
+            marker_is_in_block = any(
+                block.lstrip().startswith(f"{marker}{needle}") for block in parsed_blocks
             )
         if marker_is_in_block:
             return _first_token_covering_character(
                 completion_offsets, character_start, label=block_name
             )
-        character_start = completion_text.find(target_text, character_start + 1)
-    raise ValueError(f"could not locate extracted {block_name} block in the saved completion")
+        character_start = completion_text.find(needle, character_start + 1)
+    return None
+
+
+def _first_token_for_extracted_block(
+    completion_text: str,
+    completion_offsets: Sequence[tuple[int, int]],
+    source: CompletionSource,
+    target_text: str,
+    block_name: str,
+) -> int | None:
+    """Return the first token of an extracted block, or ``None`` when the block is empty.
+
+    AISI's extractor sometimes rewrites a block's whitespace (16 of 2200 screen-v1 completions), so the
+    block is not always a verbatim substring; its first non-blank line still locates the block start.
+    """
+    if not target_text.strip():
+        return None
+    exact_start = _marker_probe_start(
+        completion_text,
+        completion_offsets,
+        source,
+        target_text,
+        block_name,
+        whole_block=target_text,
+    )
+    if exact_start is not None:
+        return exact_start
+    first_line = next(line.strip() for line in target_text.splitlines() if line.strip())
+    first_line_start = _marker_probe_start(
+        completion_text, completion_offsets, source, first_line, block_name, whole_block=None
+    )
+    if first_line_start is None:
+        raise ValueError(f"could not locate extracted {block_name} block in the saved completion")
+    return first_line_start
 
 
 def locate_completion_positions(
     completion_text: str,
     completion: TokenizedText,
     source: CompletionSource,
-) -> tuple[int, int | None]:
-    """Locate the first solution token and optional first ``conftest.py`` content token."""
+) -> tuple[int | None, int | None]:
+    """Locate the first solution token and first ``conftest.py`` content token; ``None`` masks either."""
     solution_code, extra_files = source.extract_code_and_files(completion_text)
     solution_start = _first_token_for_extracted_block(
         completion_text,
@@ -287,7 +329,7 @@ def locate_completion_positions(
             break
     conftest_start = (
         None
-        if conftest_content is None or not conftest_content
+        if conftest_content is None
         else _first_token_for_extracted_block(
             completion_text,
             completion.char_offsets,
@@ -385,6 +427,15 @@ def select_records(
     model_records = [record for record in records if str(record["model"]) == model_id]
     if not model_records:
         raise ValueError(f"no records found for model {model_id!r}")
+    capturable = [record for record in model_records if str(record["completion_text"]).strip()]
+    if len(capturable) != len(model_records):
+        logger.info(
+            "model=%s skipping %d empty completions of %d records",
+            model_id,
+            len(model_records) - len(capturable),
+            len(model_records),
+        )
+    model_records = capturable
     keyed: dict[str, Mapping[str, Any]] = {}
     for record in model_records:
         key = _record_key(record)

@@ -31,7 +31,9 @@ class FakeModel(torch.nn.Module):
     def __init__(self, n_layers: int = 5, d_model: int = 2) -> None:
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
-        self.config = SimpleNamespace(num_hidden_layers=n_layers, hidden_size=d_model)
+        # Multimodal configs (Gemma3Config) keep layer counts on the text config only.
+        text_config = SimpleNamespace(num_hidden_layers=n_layers, hidden_size=d_model)
+        self.config = SimpleNamespace(get_text_config=lambda: text_config)
         self.n_layers = n_layers
         self.d_model = d_model
         self.forward_calls = 0

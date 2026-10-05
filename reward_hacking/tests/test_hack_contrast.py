@@ -1,0 +1,467 @@
+"""Synthetic unit tests for matched hack-contrast directions; no benchmark prompts live here."""
+
+from __future__ import annotations
+
+import json
+import logging
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
+
+import numpy as np
+import pytest
+import torch
+
+from reward_hacking.atlas.sampling import artifact_model_key
+from reward_hacking.interp.hack_contrast import (
+    LAYER_INDEX_CONVENTION,
+    ProjectionCapture,
+    _emit_pair_shifts,
+    _generation_hook,
+    _token_sweep_captures,
+    diff_of_means_direction,
+    direction_intervention,
+    exclude_families,
+    leave_one_pair_out_auc,
+    load_direction_bundle,
+    make_matched_norm_placebo,
+    prepare_turn,
+    read_captures,
+    read_pairs,
+    render_messages,
+    save_direction_bundle,
+    shuffled_pair_null_auc,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from pathlib import Path
+
+
+class IdentityLayer(torch.nn.Module):
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return hidden
+
+
+class TinyModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = SimpleNamespace(layers=torch.nn.ModuleList([IdentityLayer(), IdentityLayer()]))
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        for layer in self.model.layers:
+            hidden = layer(hidden)
+        return hidden
+
+
+class FakeTokenizer:
+    pad_token_id: int | None = 0
+
+    def __init__(self) -> None:
+        self.last_messages: list[dict[str, str]] = []
+
+    def apply_chat_template(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+    ) -> list[int]:
+        assert tokenize
+        self.last_messages = [dict(message) for message in messages]
+        prompt_ids = [1, 2, 3]
+        if messages[-1]["role"] == "assistant":
+            return [*prompt_ids, 4, 5, *(ord(character) for character in messages[-1]["content"])]
+        return [*prompt_ids, 4, 5] if add_generation_prompt else prompt_ids
+
+    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+        assert not add_special_tokens
+        return [ord(character) for character in text]
+
+    def decode(self, token_ids: torch.Tensor, *, skip_special_tokens: bool) -> str:
+        assert skip_special_tokens
+        return "".join(chr(int(token_id)) for token_id in token_ids)
+
+
+def test_gemma_system_message_is_folded_but_other_families_keep_it() -> None:
+    messages = [
+        {"role": "system", "content": "SYSTEM_SENTINEL"},
+        {"role": "user", "content": "USER_SENTINEL"},
+    ]
+
+    gemma_messages = render_messages(messages, "google/gemma-3-12b-it")
+    other_messages = render_messages(messages, "ai-safety-institute/somo-olmo-7b-sdf-sft")
+
+    assert gemma_messages == [{"role": "user", "content": "SYSTEM_SENTINEL\n\nUSER_SENTINEL"}]
+    assert other_messages == messages
+
+
+def test_teacher_forcing_locates_assistant_control_tokens_after_family_rendering() -> None:
+    messages = [
+        {"role": "system", "content": "SYSTEM_SENTINEL"},
+        {"role": "user", "content": "USER_SENTINEL"},
+    ]
+    gemma_tokenizer = FakeTokenizer()
+
+    gemma_turn = prepare_turn(
+        gemma_tokenizer,
+        messages,
+        "xy",
+        model_id="google/gemma-3-12b-it",
+    )
+
+    assert gemma_tokenizer.last_messages == [
+        {"role": "user", "content": "SYSTEM_SENTINEL\n\nUSER_SENTINEL"},
+        {"role": "assistant", "content": "xy"},
+    ]
+    assert gemma_turn.assistant_control_positions == (3, 4)
+    assert gemma_turn.response_start == 5
+    assert gemma_turn.response_length == 2
+    assert gemma_turn.token_ids == [1, 2, 3, 4, 5, ord("x"), ord("y")]
+
+
+def test_diff_of_means_pair_cv_separates_planted_signal_and_random_features() -> None:
+    generator = torch.Generator().manual_seed(7)
+    random_features = torch.randn((18, 2, 8), generator=generator)
+    labels = torch.tensor([[0, 1]] * 18)
+    honest = random_features[:, 0, :]
+    hack = random_features[:, 1, :].clone()
+    hack[:, 0] += 8.0
+    direction = diff_of_means_direction(hack, honest)
+    pair_features = torch.stack((honest, hack), dim=1)
+
+    assert direction[0] > 7.0
+    assert leave_one_pair_out_auc(pair_features, labels) > 0.99
+
+    null_features = torch.randn((120, 2, 16), generator=generator)
+    null_labels = torch.tensor([[0, 1]] * 120)
+    auc = leave_one_pair_out_auc(null_features, null_labels)
+    assert 0.4 <= auc <= 0.6
+
+
+def test_shuffled_pair_null_is_reproducible_and_near_chance() -> None:
+    generator = torch.Generator().manual_seed(11)
+    features = torch.randn((80, 2, 12), generator=generator)
+    labels = torch.tensor([[0, 1]] * 80)
+
+    null = shuffled_pair_null_auc(features, labels, permutations=12, seed=19)
+
+    assert null == shuffled_pair_null_auc(features, labels, permutations=12, seed=19)
+    assert all(0.35 <= value <= 0.65 for value in null)
+
+
+def test_family_exclusion_removes_only_requested_families() -> None:
+    pairs = [{"pair_id": str(family), "family": family} for family in range(1, 9)]
+
+    retained = exclude_families(pairs, {1, 2})
+
+    assert [pair["family"] for pair in retained] == [3, 4, 5, 6, 7, 8]
+    with pytest.raises(ValueError, match="no pairs remain"):
+        exclude_families(pairs, set(range(1, 9)))
+
+
+def test_pair_reader_validates_the_family_holdout_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "synthetic-pairs.jsonl"
+    records = [
+        {
+            "pair_id": f"synthetic-{family}",
+            "family": family,
+            "messages": [
+                {"role": "system", "content": "SYSTEM_SENTINEL"},
+                {"role": "user", "content": "USER_SENTINEL"},
+            ],
+            "honest": "HONEST_SENTINEL",
+            "hack": "HACK_SENTINEL",
+            "held_out_splits": {
+                "without_family_1": "test" if family == 1 else "train",
+                "without_family_2": "test" if family == 2 else "train",
+            },
+        }
+        for family in (1, 2)
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    pairs = read_pairs(path)
+
+    assert [pair["family"] for pair in pairs] == [1, 2]
+
+
+def test_placebo_direction_has_exactly_the_reference_norm() -> None:
+    direction = torch.tensor([3.0, -4.0, 12.0])
+
+    placebo = make_matched_norm_placebo(direction, seed=23)
+
+    assert torch.linalg.vector_norm(placebo).item() == pytest.approx(
+        torch.linalg.vector_norm(direction).item(), rel=1e-6
+    )
+    assert not torch.allclose(placebo / placebo.norm(), direction / direction.norm())
+
+
+def test_intervention_adds_the_requested_unit_step_at_only_the_selected_layer() -> None:
+    model = TinyModel()
+    seen: list[torch.Tensor] = []
+    handles = [
+        layer.register_forward_hook(lambda _module, _inputs, output: seen.append(output.clone()))
+        for layer in model.model.layers
+    ]
+    initial = torch.zeros((1, 3, 4))
+    direction = torch.tensor([0.0, 6.0, 8.0, 0.0])
+    magnitude = 2.5
+
+    try:
+        with direction_intervention(model, layer_index=1, direction=direction, magnitude=magnitude):
+            result = model(initial)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    expected_step = torch.tensor([0.0, 1.5, 2.0, 0.0]).expand_as(initial)
+    assert torch.equal(seen[0], initial)
+    assert torch.equal(seen[1], seen[0])
+    assert torch.allclose(result - seen[1], expected_step)
+
+
+def test_generation_hook_starts_at_the_first_output_token_and_respects_scope() -> None:
+    direction = torch.tensor([0.0, 5.0])
+    prompt_state = torch.zeros((1, 3, 2))
+    decode_state = torch.zeros((1, 1, 2))
+
+    all_scope = _generation_hook(direction, magnitude=2.0, prompt_length=3, scope="all")
+    first_prefill = cast("torch.Tensor", all_scope(None, None, prompt_state))
+    first_decode = cast("torch.Tensor", all_scope(None, None, decode_state))
+    first_only = _generation_hook(direction, magnitude=2.0, prompt_length=3, scope="first")
+    first_only_prefill = cast("torch.Tensor", first_only(None, None, prompt_state))
+    first_only_decode = cast("torch.Tensor", first_only(None, None, decode_state))
+
+    expected_prefill = torch.tensor([[[0.0, 0.0], [0.0, 0.0], [0.0, 2.0]]])
+    assert torch.equal(first_prefill - prompt_state, expected_prefill)
+    assert torch.equal(first_decode - decode_state, torch.tensor([[[0.0, 2.0]]]))
+    assert torch.equal(first_only_prefill, first_prefill)
+    assert torch.equal(first_only_decode, decode_state)
+
+
+def test_direction_bundle_round_trips_arrays_and_provenance(tmp_path: Path) -> None:
+    directions = {
+        "response_mean": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        "response_last": torch.ones((3, 4), dtype=torch.float32),
+    }
+    provenance = {
+        "model": "synthetic-model",
+        "excluded_families": [1],
+        "layer_index_convention": "zero-based decoder-block outputs",
+    }
+
+    save_direction_bundle(tmp_path, directions, provenance)
+    loaded_directions, loaded_provenance = load_direction_bundle(tmp_path)
+
+    assert loaded_provenance == provenance
+    assert loaded_directions.keys() == directions.keys()
+    for position, direction in directions.items():
+        assert torch.equal(loaded_directions[position], direction)
+
+
+def test_atlas_read_aligns_base_and_adapter_by_item_and_sample(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    directions = {
+        "assistant_control_mean": torch.ones((2, 3)),
+        "response_mean": torch.ones((2, 3)),
+        "response_last": torch.ones((2, 3)),
+    }
+    provenance = {
+        "schema_version": 1,
+        "model": "synthetic-model",
+        "positions": ["assistant_control_mean", "response_mean", "response_last"],
+        "layers": [0, 1],
+        "layer_index_convention": LAYER_INDEX_CONVENTION,
+    }
+    run_dir = tmp_path
+
+    def write_model(
+        model_key: str,
+        adapter_id: str | None,
+        rows: list[tuple[str, str, int, bool, bool, float]],
+    ) -> None:
+        output_key = artifact_model_key(model_key)
+        activation = np.zeros((len(rows), 2, 4, 3), dtype=np.float32)
+        for row_index, row in enumerate(rows):
+            activation[row_index, :, :, :] = row[5]
+        np.save(run_dir / f"activations.{output_key}.npy", activation)
+        (run_dir / f"capture-index.{output_key}.json").write_text(
+            json.dumps(
+                {
+                    "model_key": model_key,
+                    "model_id": "synthetic-model",
+                    "adapter_id": adapter_id,
+                    "sample_ids": [row[0] for row in rows],
+                    "positions": ["last_prompt", "code_mean", "completion_last", "followup_last"],
+                    "shape": list(activation.shape),
+                    "complete": True,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / f"samples.{output_key}.jsonl").write_text(
+            "".join(
+                json.dumps({"sample_id": row[0], "item_id": row[1], "sample_index": row[2]}) + "\n"
+                for row in rows
+            ),
+            encoding="utf-8",
+        )
+        (run_dir / f"grades.{output_key}.jsonl").write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "sample_id": row[0],
+                        "item_id": row[1],
+                        "hack": row[3],
+                        "honest_pass": row[4],
+                    }
+                )
+                + "\n"
+                for row in rows
+            ),
+            encoding="utf-8",
+        )
+
+    write_model(
+        "base",
+        None,
+        [
+            ("base-a", "item-a", 0, True, False, 1.0),
+            ("base-b", "item-b", 0, False, True, -1.0),
+        ],
+    )
+    write_model(
+        "adapter",
+        "tiny-adapter",
+        [
+            ("adapter-b", "item-b", 0, False, True, -1.0),
+            ("adapter-a", "item-a", 0, True, False, 2.0),
+        ],
+    )
+    direction_dir = tmp_path / "directions"
+    save_direction_bundle(direction_dir, directions, provenance)
+
+    with caplog.at_level(logging.INFO, logger="reward_hacking.interp.hack_contrast"):
+        read_captures(run_dir=run_dir, direction_dir=direction_dir)
+
+    shifts = [
+        json.loads(record.message) for record in caplog.records if record.message.startswith("{")
+    ]
+    code_mean_shift = next(
+        row
+        for row in shifts
+        if row["kind"] == "atlas_base_adapter_shift"
+        and row["position"] == "code_mean"
+        and row["layer"] == 0
+    )
+    assert code_mean_shift["n_paired_samples"] == 2
+    assert code_mean_shift["mean_adapter_minus_base"] == pytest.approx(1.5)
+
+
+def test_token_sweep_maps_explicit_block_ids_and_reads_near_code_offsets(tmp_path: Path) -> None:
+    sweep_dir = tmp_path / "token-sweep"
+    sweep_dir.mkdir()
+    directions = {
+        "assistant_control_mean": torch.ones((2, 3)),
+        "response_mean": torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        "response_last": torch.ones((2, 3)),
+    }
+    provenance = {
+        "model": "synthetic-model",
+        "layers": [0, 1],
+        "layer_index_convention": LAYER_INDEX_CONVENTION,
+    }
+    activation = np.zeros((4, 2, 12, 3), dtype=np.float32)
+    for row_index in range(4):
+        activation[row_index, 0, 4, 0] = 2.0 if row_index < 2 else -2.0
+    np.save(sweep_dir / "activations.base.npy", activation)
+    np.save(sweep_dir / "mask.base.npy", np.ones((4, 12), dtype=np.bool_))
+    rows = [
+        {
+            "item_id": f"item-{row_index}",
+            "sample_index": 0,
+            "hack_label": row_index < 2,
+            "pass_label": row_index >= 2,
+            "code_token_start": 2,
+        }
+        for row_index in range(4)
+    ]
+    (sweep_dir / "index.base.json").write_text(
+        json.dumps(
+            {
+                "model_key": "base",
+                "model_id": "synthetic-model",
+                "output_key": "base",
+                "adapter_id": None,
+                "complete": True,
+                "prompt_tokens": 2,
+                "completion_tokens": 10,
+                "layer_ids": [0, 1],
+                "rows": rows,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    captures = _token_sweep_captures(sweep_dir, directions, provenance)
+
+    assert len(captures) == 1
+    metric = ("code_start+0:response_mean", 0, 0)
+    assert captures[0].scores[metric] == {
+        ("item-0", 0): 2.0,
+        ("item-1", 0): 2.0,
+        ("item-2", 0): -2.0,
+        ("item-3", 0): -2.0,
+    }
+
+
+def test_base_adapter_shift_uses_paired_intersection_and_reports_missing_rows(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    metric = ("code_start+0:response_mean", 0, 0)
+    base_only_metric = ("code_start-1:response_mean", 0, -1)
+    adapter_only_metric = ("code_start+1:response_mean", 0, 1)
+    captures = [
+        ProjectionCapture(
+            model_key="base",
+            adapter_id=None,
+            scores={
+                metric: {("shared", 0): 1.0, ("base-only", 0): 2.0},
+                base_only_metric: {("shared", 0): 4.0},
+            },
+            labels={("shared", 0): 0, ("base-only", 0): 1},
+        ),
+        ProjectionCapture(
+            model_key="adapter",
+            adapter_id="synthetic-adapter",
+            scores={
+                metric: {("shared", 0): 1.5, ("adapter-only", 0): 3.0},
+                adapter_only_metric: {("shared", 0): 5.0},
+            },
+            labels={("shared", 0): 1, ("adapter-only", 0): 0},
+        ),
+    ]
+
+    with caplog.at_level(logging.INFO, logger="reward_hacking.interp.hack_contrast"):
+        _emit_pair_shifts(captures, kind="token_sweep")
+
+    shift = next(
+        json.loads(record.message)
+        for record in caplog.records
+        if record.message.startswith("{")
+        and '"kind": "token_sweep_base_adapter_shift"' in record.message
+    )
+    assert shift["n_paired_samples"] == 1
+    assert shift["n_base_only"] == 1
+    assert shift["n_adapter_only"] == 1
+    assert shift["mean_adapter_minus_base"] == pytest.approx(0.5)
+    coverage = next(
+        json.loads(record.message)
+        for record in caplog.records
+        if record.message.startswith("{")
+        and '"kind": "token_sweep_base_adapter_coverage"' in record.message
+    )
+    assert coverage["n_shared_metrics"] == 1
+    assert coverage["n_base_only_metrics"] == 1
+    assert coverage["n_adapter_only_metrics"] == 1
