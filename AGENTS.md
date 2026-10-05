@@ -200,6 +200,9 @@ Compute is local: one RTX 5090 (32 GB VRAM) under WSL2. Runs happen here unless 
   `external/jacobian-lens` via `PYTHONPATH`; repo lens code is `reward_hacking/interp/jacobian.py`
   and the `lens_*.py` modules beside it; fitted lenses go under `artifacts/jlens/<model>/` with their
   provenance JSON.
+- **The lens does not change with RL.** Fit one base lens and read every checkpoint through it;
+  compare what J-space holds at fixed token positions, never lens-matrix drift
+  ([docs/interp-methods/jacobian-space.md](docs/interp-methods/jacobian-space.md) section 3.5).
 - Interp tooling recipes and gotchas: `docs/scratch/interp-tooling-verified.md`. They were verified
   at 4B; re-verify at 9B before building on them.
 

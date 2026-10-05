@@ -113,6 +113,24 @@ lens_logits, model_logits, ids = lens.apply(model, "...", positions=[-1])
 
 Storage: a lens is `n_source_layers x d_model^2` in 2 bytes (4B lens = 406 MB; 27B = 3.3 GB).
 
+## 3.5. Comparing a model before and after training: the lens is the instrument, not the result
+
+RL does not move the lens. Like an SAE dictionary, `J_l` is a property of the base model's geometry,
+and fine-tuning or RL leaves it essentially fixed: in the games RL work, every trained arm's lens sat
+4-20x below the same-model cross-corpus noise floor at all layers, and the banked directions decoded
+identically through base and trained lenses (`docs/results/games-rl.md`, geometry checks and the
+lens-attenuation rider). So:
+
+- **Fit one lens on the base model and read every checkpoint through it.** Do not fit a lens per
+  checkpoint to compare them, and never report lens-matrix drift (Frobenius change, subspace angles)
+  as a finding; it measures fit noise.
+- **The question is what J-space holds.** Read `unembed(J_l @ h)` at fixed, meaningful token
+  positions (the assistant turn marker, the last prompt token, the start of reasoning, the decision
+  or code-start token) for base vs trained activations on the same inputs, rank the tokens that rise
+  and fall, and look for ideas the model holds but does not say (concealed reasoning, eval awareness).
+- **Then test them causally:** ablate or steer the risen directions against a matched-norm placebo.
+- Reference implementation: `games/workspace_readout.py` (capture once on GPU, analyse on CPU).
+
 ## 4. Availability for our models
 
 | Model | Verdict | Detail |
