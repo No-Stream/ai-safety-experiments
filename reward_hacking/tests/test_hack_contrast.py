@@ -1203,3 +1203,30 @@ def test_steering_item_subset_must_be_held_out_and_keeps_its_order(tmp_path: Pat
     assert [prompt["item_id"] for prompt in selected] == ["c", "a"]
     with pytest.raises(ValueError, match="not held out"):
         _prompt_records(prompts_path, held_out_item_ids=["a", "b"], item_ids=["c"])
+
+
+def test_steer_cli_accepts_strength_unit_and_item_ids() -> None:
+    arguments = _build_parser().parse_args(
+        [
+            "steer",
+            "--model",
+            "synthetic/model",
+            "--direction-dir",
+            "directions",
+            "--prompts",
+            "prompts.jsonl",
+            "--layers",
+            "44",
+            "--position",
+            "last_prompt",
+            "--strength-unit",
+            "class_difference",
+            "--item-ids",
+            "item-b,item-a",
+            "--out",
+            "steered.jsonl",
+        ]
+    )
+
+    assert arguments.strength_unit == "class_difference"
+    assert arguments.item_ids == "item-b,item-a"

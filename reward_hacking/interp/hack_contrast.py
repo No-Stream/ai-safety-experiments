@@ -2886,6 +2886,10 @@ def _build_parser() -> argparse.ArgumentParser:
     steer_parser.add_argument(
         "--strength-unit", choices=sorted(STRENGTH_UNITS), default="last_prompt_norm"
     )
+    steer_parser.add_argument(
+        "--item-ids",
+        help="comma-separated subset of the bundle's held-out items to steer, in this order",
+    )
     steer_parser.add_argument("--samples-per-prompt", type=int, default=1)
     steer_parser.add_argument("--temperature", type=float, default=1.0)
     steer_parser.add_argument("--max-prompts", type=int)
