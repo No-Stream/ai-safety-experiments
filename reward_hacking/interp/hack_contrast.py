@@ -40,6 +40,7 @@ from reward_hacking.interp.directions import (
     matched_norm_random_direction,
     unit,
 )
+from reward_hacking.interp.jsonl_resume import resume_records
 from reward_hacking.interp.linear_probe import grouped_test_masks
 from reward_hacking.interp.steering import Hook, residual_intervention, steering_hook
 
@@ -72,6 +73,7 @@ POSITION_NAMES: tuple[str, ...] = (
     "response_last",
     "assistant_control_mean",
 )
+STEER_POSITION_NAMES: tuple[str, ...] = (*POSITION_NAMES, "last_prompt")
 ATLAS_POSITION_MAP: dict[str, str] = {
     "last_prompt": "assistant_control_mean",
     "code_mean": "response_mean",
@@ -87,6 +89,10 @@ MATRIX_DIMENSIONS = 2
 PAIR_TENSOR_DIMENSIONS = 3
 PAIR_MEMBER_COUNT = 2
 MIN_PAIR_COUNT = 2
+MIN_ITEMS_PER_CLASS_FOR_LOO = 2
+DEFAULT_ITEM_NULL_DRAWS = 50
+ITEM_HOLDOUT_FRACTION = 0.3
+ITEM_CLASS_FRACTION_THRESHOLD = 0.75
 REQUIRED_CLASS_COUNT = 2
 CHANCE_AUC = 0.5
 CAPTURE_ARRAY_DIMENSIONS = 4
@@ -1048,6 +1054,379 @@ def _sha256_file(path: Path) -> str:
 
 
 @dataclass(frozen=True)
+class FitItemsConfig:
+    """Inputs for fitting a last-prompt direction from an Atlas token sweep."""
+
+    run_dir: Path
+    model_key: str
+    output_dir: Path
+    top_layers: int | None = None
+    null_draws: int = DEFAULT_ITEM_NULL_DRAWS
+    seed: int = 0
+
+
+def _item_loo_auc(features: torch.Tensor, labels: torch.Tensor) -> float:
+    if features.ndim != MATRIX_DIMENSIONS or labels.shape != (features.shape[0],):
+        raise ValueError("item features and labels must have shapes [items, hidden] and [items]")
+    positive_count = int((labels == 1).sum().item())
+    negative_count = int((labels == 0).sum().item())
+    if min(positive_count, negative_count) < MIN_ITEMS_PER_CLASS_FOR_LOO:
+        raise ValueError("leave-one-item-out AUC requires at least two fit items per class")
+    predictions: list[torch.Tensor] = []
+    for held_out_index in range(features.shape[0]):
+        training_mask = torch.ones(features.shape[0], dtype=torch.bool)
+        training_mask[held_out_index] = False
+        training_features = features[training_mask]
+        training_labels = labels[training_mask]
+        direction = diff_of_means_direction(
+            training_features[training_labels == 1], training_features[training_labels == 0]
+        )
+        predictions.append(torch.dot(features[held_out_index], unit(direction)))
+    return rank_auc(labels, torch.stack(predictions))
+
+
+def _item_hash_order(item_ids: Sequence[str]) -> list[str]:
+    return sorted(
+        item_ids, key=lambda item_id: (hashlib.sha256(item_id.encode()).digest(), item_id)
+    )
+
+
+def _item_sweep_identity(model_key: str) -> tuple[str, str, str]:
+    if model_key.startswith("base--reads--"):
+        adapter_key = model_key.removeprefix("base--reads--")
+        if not adapter_key:
+            raise ValueError("base--reads-- model keys require an adapter suffix")
+        return model_key, "base", adapter_key
+    return artifact_model_key(model_key), model_key, model_key
+
+
+def _validate_item_sweep_identity(  # noqa: PLR0913
+    index: Mapping[str, Any],
+    *,
+    output_key: str,
+    expected_model_key: str,
+    expected_samples_from: str,
+    model_key: str,
+    index_path: Path,
+) -> None:
+    if index.get("complete") is not True:
+        raise ValueError(f"token-sweep index is incomplete: {index_path}")
+    if index.get("output_key") != output_key:
+        raise ValueError(f"token-sweep output key does not match {index_path}")
+    if (
+        index.get("model_key") != expected_model_key
+        or index.get("samples_from") != expected_samples_from
+    ):
+        raise ValueError(f"token-sweep model identity does not match --model-key {model_key!r}")
+
+
+def _validate_item_sweep_layout(
+    activations: np.ndarray, index: Mapping[str, Any], index_path: Path, activation_path: Path
+) -> None:
+    if activations.ndim != CAPTURE_ARRAY_DIMENSIONS or activations.dtype != np.dtype(np.float32):
+        raise ValueError("token-sweep activations must be float32 [rows, layers, tokens, hidden]")
+    if list(activations.shape) != index.get("shape"):
+        raise ValueError(f"token-sweep activation shape differs from its index: {activation_path}")
+    rows = index.get("rows")
+    layer_ids = [int(layer_id) for layer_id in index.get("layer_ids", [])]
+    identity = index.get("identity")
+    if not isinstance(rows, list) or len(rows) != activations.shape[0]:
+        raise ValueError(f"token-sweep rows do not align with activations: {index_path}")
+    if (
+        len(layer_ids) != activations.shape[1]
+        or layer_ids != sorted(set(layer_ids))
+        or any(layer_id < 0 for layer_id in layer_ids)
+    ):
+        raise ValueError(f"token-sweep layer_ids do not align with activation layers: {index_path}")
+    if not isinstance(identity, dict) or identity.get("layer_ids") != layer_ids:
+        raise ValueError(
+            f"token-sweep layer_ids must be zero-based decoder-block outputs per {LAYER_INDEX_CONVENTION}"
+        )
+    prompt_tokens = int(index["prompt_tokens"])
+    if prompt_tokens < 1:
+        raise ValueError(f"token-sweep prompt token count must be positive: {index_path}")
+    if identity.get("prompt_tokens") != prompt_tokens:
+        raise ValueError(f"token-sweep prompt token count differs from its index: {index_path}")
+    if activations.shape[2] != prompt_tokens + int(index["completion_tokens"]):
+        raise ValueError(f"token-sweep token axis differs from its index: {index_path}")
+    position_layout = index.get("position_layout", {})
+    if (
+        position_layout.get("prompt_offsets") != list(range(-prompt_tokens, 0))
+        or position_layout.get("prompt_padding") != "left"
+        or position_layout.get("activation_alignment")
+        != "hidden state after the token at that position"
+    ):
+        raise ValueError("token-sweep position layout does not identify the final prompt token")
+
+
+def _item_fit_rows(run_dir: Path, model_key: str) -> tuple[np.ndarray, dict[str, Any], Path, str]:
+    output_key, expected_model_key, expected_samples_from = _item_sweep_identity(model_key)
+    index_path = run_dir / "token-sweep" / f"index.{output_key}.json"
+    activation_path = run_dir / "token-sweep" / f"activations.{output_key}.npy"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    activations = np.load(activation_path, mmap_mode="r", allow_pickle=False)
+    _validate_item_sweep_identity(
+        index,
+        output_key=output_key,
+        expected_model_key=expected_model_key,
+        expected_samples_from=expected_samples_from,
+        model_key=model_key,
+        index_path=index_path,
+    )
+    _validate_item_sweep_layout(activations, index, index_path, activation_path)
+    return activations, index, index_path, output_key
+
+
+@dataclass(frozen=True)
+class ItemSweepSummary:
+    """Per-item means, label fractions, and activation consistency diagnostics."""
+
+    item_means: dict[str, np.ndarray]
+    hack_fractions: dict[str, float]
+    honest_pass_fractions: dict[str, float]
+    max_within_item_abs_delta: float
+
+
+def _aggregate_item_sweep(
+    activations: np.ndarray, rows: Sequence[Mapping[str, Any]], prompt_token_index: int
+) -> ItemSweepSummary:
+    item_sums: dict[str, np.ndarray] = {}
+    item_reference_activations: dict[str, np.ndarray] = {}
+    item_sample_counts: Counter[str] = Counter()
+    item_hack_counts: Counter[str] = Counter()
+    item_pass_counts: Counter[str] = Counter()
+    seen_samples: set[tuple[str, int]] = set()
+    max_within_item_abs_delta = 0.0
+    for row_index, row in enumerate(rows):
+        item_id = str(row["item_id"])
+        if not item_id:
+            raise ValueError("token-sweep item ids must be non-empty")
+        sample_key = (item_id, int(row["sample_index"]))
+        if sample_key in seen_samples:
+            raise ValueError(f"token-sweep rows contain duplicate item/sample pair {sample_key}")
+        seen_samples.add(sample_key)
+        hack_label = row.get("hack_label")
+        pass_label = row.get("pass_label")
+        if (
+            not isinstance(hack_label, bool)
+            or not isinstance(pass_label, bool)
+            or (hack_label and pass_label)
+        ):
+            raise ValueError("token-sweep rows need exclusive boolean hack_label/pass_label values")
+        item_activations = np.asarray(
+            activations[row_index, :, prompt_token_index, :], dtype=np.float32
+        ).copy()
+        if not np.isfinite(item_activations).all():
+            raise ValueError(f"non-finite last-prompt activations for item {item_id}")
+        reference_activations = item_reference_activations.get(item_id)
+        if reference_activations is None:
+            item_reference_activations[item_id] = item_activations.copy()
+        else:
+            max_within_item_abs_delta = max(
+                max_within_item_abs_delta,
+                float(np.max(np.abs(item_activations - reference_activations))),
+            )
+        item_sums[item_id] = (
+            item_sums.get(item_id, np.zeros_like(item_activations)) + item_activations
+        )
+        item_sample_counts[item_id] += 1
+        item_hack_counts[item_id] += int(hack_label)
+        item_pass_counts[item_id] += int(pass_label)
+
+    if not item_sample_counts:
+        raise ValueError("token-sweep index contains no item rows")
+    return ItemSweepSummary(
+        item_means={
+            item_id: item_sums[item_id] / item_sample_counts[item_id]
+            for item_id in item_sample_counts
+        },
+        hack_fractions={
+            item_id: item_hack_counts[item_id] / item_sample_counts[item_id]
+            for item_id in item_sample_counts
+        },
+        honest_pass_fractions={
+            item_id: item_pass_counts[item_id] / item_sample_counts[item_id]
+            for item_id in item_sample_counts
+        },
+        max_within_item_abs_delta=max_within_item_abs_delta,
+    )
+
+
+def _held_out_item_ids(item_ids: Sequence[str]) -> list[str]:
+    if len(item_ids) < MIN_ITEMS_PER_CLASS_FOR_LOO:
+        raise ValueError("fit-items requires at least two distinct items")
+    ordered_item_ids = _item_hash_order(item_ids)
+    held_out_count = min(len(item_ids) - 1, max(1, int(len(item_ids) * ITEM_HOLDOUT_FRACTION)))
+    return ordered_item_ids[:held_out_count]
+
+
+def _fit_class_item_ids(
+    summary: ItemSweepSummary, held_out_item_ids: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    held_out_set = set(held_out_item_ids)
+    hack_item_ids = [
+        item_id
+        for item_id in summary.item_means
+        if item_id not in held_out_set
+        and summary.hack_fractions[item_id] >= ITEM_CLASS_FRACTION_THRESHOLD
+    ]
+    honest_item_ids = [
+        item_id
+        for item_id in summary.item_means
+        if item_id not in held_out_set
+        and summary.honest_pass_fractions[item_id] >= ITEM_CLASS_FRACTION_THRESHOLD
+    ]
+    if set(hack_item_ids) & set(honest_item_ids):
+        raise ValueError("an item cannot meet both the hack and honest-pass fraction thresholds")
+    if min(len(hack_item_ids), len(honest_item_ids)) < MIN_ITEMS_PER_CLASS_FOR_LOO:
+        raise ValueError("fit-items requires at least two non-held-out items in each class")
+    return hack_item_ids, honest_item_ids
+
+
+def _fit_item_layer(  # noqa: PLR0913
+    item_means: Mapping[str, np.ndarray],
+    layer_position: int,
+    layer_id: int,
+    hack_item_ids: Sequence[str],
+    honest_item_ids: Sequence[str],
+    *,
+    null_draws: int,
+    seed: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    hack_features = torch.from_numpy(
+        np.stack([item_means[item_id][layer_position] for item_id in hack_item_ids])
+    )
+    honest_features = torch.from_numpy(
+        np.stack([item_means[item_id][layer_position] for item_id in honest_item_ids])
+    )
+    direction = diff_of_means_direction(hack_features, honest_features)
+    fit_features = torch.cat((hack_features, honest_features), dim=0)
+    fit_labels = torch.tensor([1] * len(hack_item_ids) + [0] * len(honest_item_ids))
+    loo_auc = _item_loo_auc(fit_features, fit_labels)
+    null_aucs = _random_direction_null_aucs(
+        fit_features, fit_labels, direction, null_draws=null_draws, seed=seed + layer_id
+    )
+    metric = {
+        "layer": layer_id,
+        "n_hack_items": len(hack_item_ids),
+        "n_honest_items": len(honest_item_ids),
+        "leave_one_item_out_auc": loo_auc,
+        "random_direction_null_auc": null_aucs,
+        "random_direction_null_auc_mean": float(np.mean(null_aucs)),
+        "random_direction_null_auc_max": max(null_aucs),
+    }
+    return direction, metric
+
+
+def _random_direction_null_aucs(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    direction: torch.Tensor,
+    *,
+    null_draws: int,
+    seed: int,
+) -> list[float]:
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    null_aucs: list[float] = []
+    for _ in range(null_draws):
+        random_direction = torch.randn(direction.shape, generator=generator)
+        matched_norm_direction = unit(random_direction) * direction.norm()
+        null_aucs.append(rank_auc(labels, features @ unit(matched_norm_direction)))
+    return null_aucs
+
+
+def _rank_item_layers(layer_metrics: Sequence[Mapping[str, Any]]) -> list[int]:
+    return [
+        int(metric["layer"])
+        for metric in sorted(
+            layer_metrics,
+            key=lambda metric: (-float(metric["leave_one_item_out_auc"]), int(metric["layer"])),
+        )
+    ]
+
+
+def fit_item_directions(config: FitItemsConfig) -> None:
+    """Fit a held-out Atlas item direction from final-prompt-token sweep activations."""
+    if config.null_draws < 1:
+        raise ValueError(f"null_draws must be positive, got {config.null_draws}")
+    activations, index, index_path, output_key = _item_fit_rows(config.run_dir, config.model_key)
+    layer_ids = [int(layer_id) for layer_id in index["layer_ids"]]
+    item_summary = _aggregate_item_sweep(
+        activations, index["rows"], int(index["prompt_tokens"]) - 1
+    )
+    item_ids = sorted(item_summary.item_means)
+    held_out_item_ids = _held_out_item_ids(item_ids)
+    hack_item_ids, honest_item_ids = _fit_class_item_ids(item_summary, held_out_item_ids)
+    fitted_layers = [
+        _fit_item_layer(
+            item_summary.item_means,
+            layer_position,
+            layer_id,
+            hack_item_ids,
+            honest_item_ids,
+            null_draws=config.null_draws,
+            seed=config.seed,
+        )
+        for layer_position, layer_id in enumerate(layer_ids)
+    ]
+    all_directions = [direction for direction, _ in fitted_layers]
+    layer_metrics = [metric for _, metric in fitted_layers]
+
+    ranked_layer_ids = _rank_item_layers(layer_metrics)
+    selected_layer_count = len(layer_ids) if config.top_layers is None else config.top_layers
+    if not 1 <= selected_layer_count <= len(layer_ids):
+        raise ValueError(f"top_layers must be between 1 and {len(layer_ids)}")
+    selected_layers = set(ranked_layer_ids[:selected_layer_count])
+    saved_layer_ids = [layer_id for layer_id in layer_ids if layer_id in selected_layers]
+    layer_position_by_id = {layer_id: position for position, layer_id in enumerate(layer_ids)}
+    directions = torch.stack(
+        [all_directions[layer_position_by_id[layer_id]] for layer_id in saved_layer_ids]
+    )
+    provenance: dict[str, Any] = {
+        "schema_version": DIRECTION_SCHEMA_VERSION,
+        "model": str(index["model_id"]),
+        "adapter": index.get("adapter_id"),
+        "source": "atlas_token_sweep_item_contrast",
+        "source_model_key": config.model_key,
+        "source_output_key": output_key,
+        "source_index": str(index_path),
+        "source_index_sha256": _sha256_file(index_path),
+        "position": "last_prompt",
+        "positions": ["last_prompt"],
+        "layers": saved_layer_ids,
+        "layer_index_convention": LAYER_INDEX_CONVENTION,
+        "prompt_token_index": int(index["prompt_tokens"]) - 1,
+        "item_fraction_threshold": ITEM_CLASS_FRACTION_THRESHOLD,
+        "holdout_fraction": ITEM_HOLDOUT_FRACTION,
+        "holdout_selection": "ascending SHA-256(item_id), first max(1, floor(0.30 * n_items))",
+        "held_out_item_ids": held_out_item_ids,
+        "fit_item_ids": sorted([*hack_item_ids, *honest_item_ids]),
+        "n_items_total": len(item_ids),
+        "n_items_held_out": len(held_out_item_ids),
+        "n_items_excluded_from_fit": len(item_ids)
+        - len(held_out_item_ids)
+        - len(hack_item_ids)
+        - len(honest_item_ids),
+        "max_within_item_last_prompt_abs_delta": item_summary.max_within_item_abs_delta,
+        "null_draws": config.null_draws,
+        "seed": config.seed,
+        "metrics": {"last_prompt": layer_metrics},
+    }
+    save_direction_bundle(config.output_dir, {"last_prompt": directions}, provenance)
+    logger.info(
+        "fit-items model_key=%s items=%d held_out=%d saved_layers=%s aucs=%s",
+        config.model_key,
+        len(item_ids),
+        len(held_out_item_ids),
+        saved_layer_ids,
+        [
+            (metric["layer"], round(float(metric["leave_one_item_out_auc"]), 3))
+            for metric in layer_metrics
+        ],
+    )
+
+
+@dataclass(frozen=True)
 class FitConfig:
     """Inputs for fitting and validating a set of synthetic-contrast directions."""
 
@@ -1180,17 +1559,34 @@ def _validate_direction_bundle(
         raise ValueError(
             "saved direction bundle uses a different hidden-state/block index convention"
         )
+    if not directions:
+        raise ValueError("saved direction bundle has no positions")
     layer_ids = [int(layer) for layer in provenance["layers"]]
-    expected_layers = list(range(next(iter(directions.values())).shape[0]))
-    if layer_ids != expected_layers:
+    if not layer_ids or layer_ids != sorted(set(layer_ids)) or layer_ids[0] < 0:
         raise ValueError(
-            f"saved direction layers must be contiguous zero-based block indices: {layer_ids}"
+            f"saved direction layers must be sorted zero-based block indices: {layer_ids}"
         )
     if set(directions) != set(provenance["positions"]):
         raise ValueError("saved direction positions differ from provenance")
     if any(array.shape[0] != len(layer_ids) for array in directions.values()):
         raise ValueError("saved direction layer axes differ from provenance")
     return layer_ids
+
+
+def _direction_row_index(layer_ids: Sequence[int], layer_id: int) -> int:
+    try:
+        return layer_ids.index(layer_id)
+    except ValueError as error:
+        raise ValueError(
+            f"layer {layer_id} is absent from saved direction layers {list(layer_ids)}"
+        ) from error
+
+
+def _atlas_direction_name(position: str, directions: Mapping[str, torch.Tensor]) -> str | None:
+    if position not in ATLAS_POSITION_MAP:
+        raise ValueError(f"unsupported Atlas read position {position!r}")
+    direction_name = position if position in directions else ATLAS_POSITION_MAP[position]
+    return direction_name if direction_name in directions else None
 
 
 def _validate_atlas_activation_array(
@@ -1215,16 +1611,20 @@ def _validate_atlas_positions(
 ) -> None:
     if len(positions) != activations.shape[2]:
         raise ValueError(f"Atlas position index does not align with activation axis: {index_path}")
-    if list(range(activations.shape[1])) != [int(layer) for layer in provenance["layers"]]:
-        raise ValueError(
-            "Atlas layer axis differs from saved directions; both must be zero-based decoder-block outputs"
-        )
+    layer_ids = [int(layer) for layer in provenance["layers"]]
+    if any(layer_id >= activations.shape[1] for layer_id in layer_ids):
+        raise ValueError("saved direction layer is outside the Atlas activation layer axis")
+    matched_positions = 0
     for position in positions:
-        if position not in ATLAS_POSITION_MAP:
-            raise ValueError(f"unsupported Atlas read position {position!r}")
-        direction = directions[ATLAS_POSITION_MAP[position]]
-        if direction.shape != (activations.shape[1], activations.shape[3]):
+        direction_name = _atlas_direction_name(position, directions)
+        if direction_name is None:
+            continue
+        matched_positions += 1
+        direction = directions[direction_name]
+        if direction.shape != (len(layer_ids), activations.shape[3]):
             raise ValueError(f"direction shape differs from Atlas activations for {position}")
+    if not matched_positions:
+        raise ValueError("Atlas capture has no read positions supported by the direction bundle")
 
 
 def _atlas_capture(
@@ -1250,16 +1650,21 @@ def _atlas_capture(
     _validate_atlas_positions(positions, activations, directions, provenance, index_path)
     pair_keys, labels = _atlas_rows(run_dir, output_key, sample_ids)
     scores: dict[tuple[str, int, int | None], dict[tuple[str, int], float]] = {}
+    direction_layer_ids = [int(layer_id) for layer_id in provenance["layers"]]
     for row_index, pair_key in enumerate(pair_keys):
         for position_index, position in enumerate(positions):
-            direction_position = ATLAS_POSITION_MAP[position]
-            vectors = torch.from_numpy(
-                np.asarray(activations[row_index, :, position_index, :], dtype=np.float32).copy()
-            )
-            projections = torch.sum(vectors * directions[direction_position].float(), dim=1)
-            for layer_index, score in enumerate(projections.tolist()):
-                key = (position, layer_index, None)
-                scores.setdefault(key, {})[pair_key] = float(score)
+            direction_position = _atlas_direction_name(position, directions)
+            if direction_position is None:
+                continue
+            for direction_row, layer_id in enumerate(direction_layer_ids):
+                vector = torch.from_numpy(
+                    np.asarray(
+                        activations[row_index, layer_id, position_index, :], dtype=np.float32
+                    ).copy()
+                )
+                score = torch.dot(vector, directions[direction_position][direction_row].float())
+                key = (position, layer_id, None)
+                scores.setdefault(key, {})[pair_key] = float(score.item())
     return ProjectionCapture(
         model_key=model_key,
         adapter_id=None if index.get("adapter_id") is None else str(index["adapter_id"]),
@@ -1329,6 +1734,7 @@ class _TokenSweepScoreContext:
     activations: np.ndarray
     mask: np.ndarray
     layer_ids: Sequence[int]
+    direction_row_by_layer: Mapping[int, int]
     directions: Mapping[str, torch.Tensor]
 
 
@@ -1349,7 +1755,9 @@ def _score_token_sweep_row(
             continue
         for layer_position, layer_id in enumerate(context.layer_ids):
             for direction_position in ("response_mean", "response_last"):
-                direction = context.directions[direction_position][layer_id]
+                direction = context.directions[direction_position][
+                    context.direction_row_by_layer[layer_id]
+                ]
                 vector = torch.from_numpy(
                     np.asarray(
                         context.activations[row_index, layer_position, token_position],
@@ -1372,6 +1780,9 @@ def _token_sweep_capture(
     if index.get("complete") is not True:
         logger.info("token_sweep_status=incomplete model_key=%s", model_key)
         return None
+    if not {"response_mean", "response_last"} <= set(directions):
+        logger.info("token_sweep_status=positions_unavailable model_key=%s", model_key)
+        return None
     if str(index["model_id"]) != str(provenance["model"]):
         raise ValueError(
             f"token-sweep base model {index['model_id']} differs from direction model {provenance['model']}"
@@ -1387,6 +1798,9 @@ def _token_sweep_capture(
         activations=activations,
         mask=mask,
         layer_ids=layer_ids,
+        direction_row_by_layer={
+            int(layer_id): row_index for row_index, layer_id in enumerate(provenance["layers"])
+        },
         directions=directions,
     )
     for row_index, row in enumerate(rows):
@@ -1573,25 +1987,104 @@ def _generation_hook(
 
 def _parse_strengths(value: str) -> list[float]:
     strengths = [float(part.strip()) for part in value.split(",") if part.strip()]
-    if not strengths or any(not math.isfinite(strength) or strength <= 0 for strength in strengths):
-        raise ValueError("--strengths must be comma-separated positive finite multiples")
+    if not strengths or any(not math.isfinite(strength) for strength in strengths):
+        raise ValueError("--strengths must be comma-separated finite multiples")
     return strengths
 
 
-def _prompt_records(path: Path) -> list[dict[str, Any]]:
+def _prompt_records(
+    path: Path,
+    *,
+    held_out_item_ids: Sequence[str] | None = None,
+    max_prompts: int | None = None,
+) -> list[dict[str, Any]]:
     prompts = _read_jsonl(path)
     if not prompts:
         raise ValueError(f"no prompts found in {path}")
+    _validate_prompt_records(path, prompts)
+    if max_prompts is not None and max_prompts < 1:
+        raise ValueError(f"max_prompts must be positive, got {max_prompts}")
+    if held_out_item_ids is not None:
+        prompts = _select_held_out_prompts(path, prompts, held_out_item_ids, max_prompts)
+    elif max_prompts is not None:
+        prompts = prompts[:max_prompts]
+    if not prompts:
+        raise ValueError(f"no prompts remain after item selection from {path}")
+    return prompts
+
+
+def _validate_prompt_records(path: Path, prompts: Sequence[Mapping[str, Any]]) -> None:
     for line_number, prompt in enumerate(prompts, start=1):
         messages = prompt.get("messages")
+        rendered_prompt = prompt.get("prompt")
+        if isinstance(rendered_prompt, str):
+            continue
         if not isinstance(messages, list) or not messages:
-            raise ValueError(f"{path}:{line_number} requires a non-empty messages list")
+            raise ValueError(
+                f"{path}:{line_number} requires rendered prompt text or a messages list"
+            )
         if any(
             not isinstance(message, dict) or not isinstance(message.get("content"), str)
             for message in messages
         ):
             raise ValueError(f"{path}:{line_number} messages need text content")
-    return prompts
+
+
+def _select_held_out_prompts(
+    path: Path,
+    prompts: Sequence[dict[str, Any]],
+    held_out_item_ids: Sequence[str],
+    max_prompts: int | None,
+) -> list[dict[str, Any]]:
+    prompt_by_item_id = {
+        str(prompt["item_id"]): prompt for prompt in prompts if "item_id" in prompt
+    }
+    if len(prompt_by_item_id) != sum("item_id" in prompt for prompt in prompts):
+        raise ValueError(f"{path} contains duplicate Atlas item ids")
+    selected_ids = list(held_out_item_ids)
+    if max_prompts is not None:
+        selected_ids = selected_ids[:max_prompts]
+    missing_ids = sorted(set(selected_ids) - set(prompt_by_item_id))
+    if missing_ids:
+        raise ValueError(f"held-out item ids are missing from {path}: {missing_ids[:5]}")
+    return [prompt_by_item_id[item_id] for item_id in selected_ids]
+
+
+def _tokenize_prompt_record(
+    tokenizer: _ChatTokenizer,
+    prompt: Mapping[str, Any],
+    *,
+    model_id: str,
+) -> list[int]:
+    rendered_prompt = prompt.get("prompt")
+    if isinstance(rendered_prompt, str):
+        token_ids = [
+            int(token_id)
+            for token_id in tokenizer.encode(rendered_prompt, add_special_tokens=False)
+        ]
+    else:
+        messages = render_messages(
+            cast("Sequence[Mapping[str, str]]", prompt["messages"]), model_id
+        )
+        token_ids = _token_ids_from_template(tokenizer, messages, generation_prompt=True)
+    if not token_ids:
+        raise ValueError("prompt tokenization produced an empty sequence")
+    return token_ids
+
+
+def _validate_rendered_prompt_model(
+    prompts_path: Path, prompts: Sequence[Mapping[str, Any]], model_id: str
+) -> None:
+    if not any(isinstance(prompt.get("prompt"), str) for prompt in prompts):
+        return
+    metadata_path = prompts_path.with_name("prompt-metadata.json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise TypeError(f"{metadata_path} must contain a JSON object")
+    if metadata.get("model_id") != model_id:
+        raise ValueError(
+            f"Atlas prompts were rendered for {metadata.get('model_id')!r}, not {model_id!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -1602,13 +2095,17 @@ class SteeringConfig:
     adapter: Path | None
     direction_dir: Path
     prompts_path: Path
-    layer_index: int
     position: str
     scope: str
     strengths: Sequence[float]
     output_path: Path
     max_new_tokens: int
     seed: int
+    layer_index: int | None = None
+    best_layers: int | None = None
+    max_prompts: int | None = None
+    samples_per_prompt: int = 1
+    temperature: float = 1.0
 
 
 def _validate_steering_request(
@@ -1618,19 +2115,65 @@ def _validate_steering_request(
 ) -> None:
     if config.max_new_tokens < 1:
         raise ValueError(f"max_new_tokens must be positive, got {config.max_new_tokens}")
-    if any(not math.isfinite(strength) or strength <= 0 for strength in config.strengths):
-        raise ValueError("steering strengths must be positive and finite")
+    if config.samples_per_prompt < 1:
+        raise ValueError(f"samples_per_prompt must be positive, got {config.samples_per_prompt}")
+    if not math.isfinite(config.temperature) or config.temperature <= 0:
+        raise ValueError(f"temperature must be positive and finite, got {config.temperature}")
+    if not config.strengths or any(not math.isfinite(strength) for strength in config.strengths):
+        raise ValueError("steering strengths must be non-empty and finite")
+    if (config.layer_index is None) == (config.best_layers is None):
+        raise ValueError("select exactly one of layer_index or best_layers")
+    if config.best_layers is not None and config.best_layers < 1:
+        raise ValueError(f"best_layers must be positive, got {config.best_layers}")
+    if config.max_prompts is not None and config.max_prompts < 1:
+        raise ValueError(f"max_prompts must be positive, got {config.max_prompts}")
     if str(provenance["model"]) != config.model_id:
         raise ValueError(
             f"direction model {provenance['model']} differs from requested model {config.model_id}"
         )
     if config.position not in directions:
         raise ValueError(f"position {config.position!r} is absent from {config.direction_dir}")
-    saved_layers = [int(layer) for layer in provenance["layers"]]
-    if config.layer_index not in saved_layers:
-        raise ValueError(
-            f"layer {config.layer_index} is absent from saved direction layers {saved_layers}"
+
+
+def _selected_steering_layers(
+    config: SteeringConfig,
+    provenance: Mapping[str, Any],
+) -> list[int]:
+    saved_layers = [int(layer_id) for layer_id in provenance["layers"]]
+    if config.layer_index is not None:
+        selected = [config.layer_index]
+    else:
+        metrics_by_position = provenance.get("metrics", {}).get(config.position, [])
+        ranked_metrics = sorted(
+            metrics_by_position,
+            key=lambda metric: (
+                -float(metric["leave_one_item_out_auc"]),
+                int(metric["layer"]),
+            ),
         )
+        requested_count = cast("int", config.best_layers)
+        selected = [int(metric["layer"]) for metric in ranked_metrics[:requested_count]]
+        if len(selected) != requested_count:
+            raise ValueError("direction provenance has too few leave-one-item-out layer metrics")
+    missing_layers = [layer_id for layer_id in selected if layer_id not in saved_layers]
+    if missing_layers:
+        raise ValueError(f"requested layers are absent from saved directions: {missing_layers}")
+    if not selected:
+        raise ValueError("no steering layers were selected")
+    return selected
+
+
+def _steering_sample_seed(seed: int, item_id: str, sample_index: int, sample_count: int) -> int:
+    if (
+        sample_index < 0
+        or sample_count < 1
+        or sample_index >= sample_count
+        or sample_count >= 2**31 - 1
+    ):
+        raise ValueError("sample_index must be inside the positive sample_count")
+    digest = hashlib.sha256(f"{seed}\0{item_id}".encode()).digest()
+    seed_base = int.from_bytes(digest[:8], "big") % (2**31 - 1 - sample_count)
+    return seed_base + sample_index
 
 
 @torch.no_grad()
@@ -1638,10 +2181,24 @@ def steer_prompts(
     config: SteeringConfig,
 ) -> None:
     """Generate direction and matched-norm-placebo completions for later external grading."""
-    prompts = _prompt_records(config.prompts_path)
     directions, provenance = load_direction_bundle(config.direction_dir)
     _validate_direction_bundle(directions, provenance)
     _validate_steering_request(config, directions, provenance)
+    saved_layer_ids = [int(layer_id) for layer_id in provenance["layers"]]
+    selected_layers = _selected_steering_layers(config, provenance)
+    held_out_ids = provenance.get("held_out_item_ids")
+    if held_out_ids is not None and (
+        not isinstance(held_out_ids, list)
+        or any(not isinstance(item_id, str) for item_id in held_out_ids)
+        or len(set(held_out_ids)) != len(held_out_ids)
+    ):
+        raise ValueError("direction provenance held_out_item_ids must be a unique string list")
+    prompts = _prompt_records(
+        config.prompts_path,
+        held_out_item_ids=cast("Sequence[str] | None", held_out_ids),
+        max_prompts=config.max_prompts,
+    )
+    _validate_rendered_prompt_model(config.prompts_path, prompts, config.model_id)
     model, tokenizer = _load_model_with_optional_adapter(config.model_id, config.adapter)
     device, free_vram_bytes, total_vram_bytes = _device_memory(model)
     logger.info(
@@ -1653,69 +2210,139 @@ def steer_prompts(
         total_vram_bytes,
     )
     layer_count = _config_value(model, ("num_hidden_layers", "n_layer", "num_layers"))
-    if not 0 <= config.layer_index < layer_count:
-        raise ValueError(f"layer {config.layer_index} is outside the {layer_count}-block model")
+    invalid_layers = [layer_id for layer_id in selected_layers if not 0 <= layer_id < layer_count]
+    if invalid_layers:
+        raise ValueError(
+            f"steering layers {invalid_layers} are outside the {layer_count}-block model"
+        )
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
-    placebo = make_matched_norm_placebo(
-        directions[config.position][config.layer_index], seed=config.seed
+    identity = {
+        "stage": "hack_contrast_steer",
+        "model": config.model_id,
+        "adapter": None if config.adapter is None else str(config.adapter),
+        "direction_bundle_sha256": {
+            path.name: _sha256_file(path)
+            for path in sorted(config.direction_dir.glob("direction.*.npy"))
+        },
+        "prompts_sha256": _sha256_file(config.prompts_path),
+        "selected_item_ids": [
+            str(prompt.get("item_id", prompt.get("prompt_id"))) for prompt in prompts
+        ],
+        "layers": selected_layers,
+        "position": config.position,
+        "scope": config.scope,
+        "axes": ["direction", "matched_norm_placebo"],
+        "strengths": list(config.strengths),
+        "samples_per_prompt": config.samples_per_prompt,
+        "temperature": config.temperature,
+        "max_new_tokens": config.max_new_tokens,
+        "seed": config.seed,
+        "strength_unit": "multiple of the mean residual L2 norm over all prompt tokens",
+    }
+    resume, ledger = resume_records(
+        config.output_path,
+        identity=identity,
+        unit_of=lambda record: str(record["sample_id"]),
+        record_key_of=lambda record: str(record["sample_id"]),
     )
-    with config.output_path.open("w", encoding="utf-8") as records_file:
+    completed_sample_ids = set(ledger.completed_records)
+    logger.info(
+        "steer_resume completed_records=%d pending prompts=%d layers=%s",
+        resume.n_kept,
+        len(prompts),
+        selected_layers,
+    )
+    rng_devices = [device.index] if device.type == "cuda" else []
+    with config.output_path.open("a", encoding="utf-8") as records_file:
         for prompt_index, prompt in enumerate(prompts):
-            messages = render_messages(
-                cast("Sequence[Mapping[str, str]]", prompt["messages"]), config.model_id
-            )
-            prompt_ids = _token_ids_from_template(tokenizer, messages, generation_prompt=True)
+            prompt_ids = _tokenize_prompt_record(tokenizer, prompt, model_id=config.model_id)
+            item_id = str(prompt.get("item_id", prompt.get("prompt_id", prompt_index)))
             input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids)
-            prompt_activations = capture_positionwise_activations(
-                cast("Any", model),
-                input_ids,
-                attention_mask,
-                layers=[config.layer_index],
-            )[config.layer_index][0]
-            mean_residual_norm = float(prompt_activations.norm(dim=-1).mean().item())
-            axes = {
-                "direction": directions[config.position][config.layer_index],
-                "matched_norm_placebo": placebo,
-            }
-            for axis_name, axis in axes.items():
-                for strength_multiple in config.strengths:
-                    magnitude = float(strength_multiple * mean_residual_norm)
-                    hook = _generation_hook(
-                        axis,
-                        magnitude=magnitude,
-                        prompt_length=len(prompt_ids),
-                        scope=config.scope,
-                    )
-                    with residual_intervention(cast("Any", model), config.layer_index, hook):
-                        generated = cast(
-                            "torch.Tensor",
-                            cast("Any", model).generate(
-                                input_ids=input_ids,
-                                attention_mask=attention_mask,
-                                do_sample=False,
-                                max_new_tokens=config.max_new_tokens,
-                                use_cache=True,
-                            ),
-                        )
-                    completion = tokenizer.decode(
-                        generated[0, input_ids.shape[1] :], skip_special_tokens=True
-                    )
-                    record = {
-                        "prompt_id": str(prompt.get("prompt_id", prompt_index)),
-                        "model": config.model_id,
-                        "adapter": None if config.adapter is None else str(config.adapter),
-                        "position": config.position,
-                        "layer": config.layer_index,
-                        "scope": config.scope,
-                        "axis": axis_name,
-                        "strength_multiple": float(strength_multiple),
-                        "mean_residual_norm": mean_residual_norm,
-                        "applied_magnitude": magnitude,
-                        "completion": completion,
-                    }
-                    records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    records_file.flush()
+            for layer_id in selected_layers:
+                direction = directions[config.position][
+                    _direction_row_index(saved_layer_ids, layer_id)
+                ]
+                prompt_activations = capture_positionwise_activations(
+                    cast("Any", model), input_ids, attention_mask, layers=[layer_id]
+                )[layer_id][0]
+                mean_residual_norm = float(prompt_activations.norm(dim=-1).mean().item())
+                placebo = make_matched_norm_placebo(direction, seed=config.seed + layer_id)
+                axes = {"direction": direction, "matched_norm_placebo": placebo}
+                for axis_name, axis in axes.items():
+                    for strength_multiple in config.strengths:
+                        magnitude = float(strength_multiple * mean_residual_norm)
+                        for sample_index in range(config.samples_per_prompt):
+                            sample_seed = _steering_sample_seed(
+                                config.seed, item_id, sample_index, config.samples_per_prompt
+                            )
+                            sample_id = (
+                                f"L{layer_id}:{axis_name}:{strength_multiple:g}:"
+                                f"{item_id}:{sample_index}"
+                            )
+                            if sample_id in completed_sample_ids:
+                                continue
+                            hook = _generation_hook(
+                                axis,
+                                magnitude=magnitude,
+                                prompt_length=len(prompt_ids),
+                                scope=config.scope,
+                            )
+                            with (
+                                residual_intervention(cast("Any", model), layer_id, hook),
+                                torch.random.fork_rng(devices=rng_devices),
+                            ):
+                                torch.manual_seed(sample_seed)
+                                generated = cast(
+                                    "torch.Tensor",
+                                    cast("Any", model).generate(
+                                        input_ids=input_ids,
+                                        attention_mask=attention_mask,
+                                        do_sample=True,
+                                        temperature=config.temperature,
+                                        top_p=1.0,
+                                        top_k=0,
+                                        min_p=0.0,
+                                        repetition_penalty=1.0,
+                                        max_new_tokens=config.max_new_tokens,
+                                        use_cache=True,
+                                    ),
+                                )
+                            completion_token_ids = [
+                                int(token_id) for token_id in generated[0, input_ids.shape[1] :]
+                            ]
+                            record = {
+                                "sample_id": sample_id,
+                                "prompt_id": item_id,
+                                "item_id": item_id,
+                                "sample_index": sample_index,
+                                "seed": sample_seed,
+                                "model": config.model_id,
+                                "adapter": None if config.adapter is None else str(config.adapter),
+                                "position": config.position,
+                                "layer": layer_id,
+                                "scope": config.scope,
+                                "axis": axis_name,
+                                "strength_multiple": float(strength_multiple),
+                                "strength_unit": "mean residual L2 norm over all prompt tokens",
+                                "mean_residual_norm": mean_residual_norm,
+                                "applied_magnitude": magnitude,
+                                "temperature": config.temperature,
+                                "top_p": 1.0,
+                                "top_k": 0,
+                                "min_p": 0.0,
+                                "repetition_penalty": 1.0,
+                                "max_new_tokens": config.max_new_tokens,
+                                "prompt_token_ids": prompt_ids,
+                                "completion_token_ids": completion_token_ids,
+                                "completion": tokenizer.decode(
+                                    torch.tensor(completion_token_ids), skip_special_tokens=True
+                                ),
+                            }
+                            records_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            records_file.flush()
+                            ledger.mark_record_complete(sample_id)
+                            completed_sample_ids.add(sample_id)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1738,6 +2365,16 @@ def _build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--permutations", type=int, default=20)
     fit_parser.add_argument("--seed", type=int, default=0)
 
+    fit_items_parser = commands.add_parser(
+        "fit-items", help="fit a held-out item direction at the last prompt token"
+    )
+    fit_items_parser.add_argument("--run-dir", type=Path, required=True)
+    fit_items_parser.add_argument("--model-key", required=True)
+    fit_items_parser.add_argument("--out-dir", type=Path, required=True)
+    fit_items_parser.add_argument("--top-layers", type=int)
+    fit_items_parser.add_argument("--null-draws", type=int, default=DEFAULT_ITEM_NULL_DRAWS)
+    fit_items_parser.add_argument("--seed", type=int, default=0)
+
     read_parser = commands.add_parser("read", help="score existing captures with saved directions")
     read_parser.add_argument("--run-dir", type=Path, required=True)
     read_parser.add_argument("--direction-dir", type=Path, required=True)
@@ -1749,8 +2386,10 @@ def _build_parser() -> argparse.ArgumentParser:
     steer_parser.add_argument("--adapter", type=Path)
     steer_parser.add_argument("--direction-dir", type=Path, required=True)
     steer_parser.add_argument("--prompts", type=Path, required=True)
-    steer_parser.add_argument("--layer", type=int, required=True)
-    steer_parser.add_argument("--position", choices=POSITION_NAMES, required=True)
+    layer_selection = steer_parser.add_mutually_exclusive_group(required=True)
+    layer_selection.add_argument("--layer", type=int)
+    layer_selection.add_argument("--best-layers", type=int)
+    steer_parser.add_argument("--position", choices=STEER_POSITION_NAMES, required=True)
     steer_parser.add_argument(
         "--scope",
         choices=("all", "first"),
@@ -1758,6 +2397,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="steer the first output token and every later token, or the first output token only",
     )
     steer_parser.add_argument("--strengths", default="0.25,0.5,1,2")
+    steer_parser.add_argument("--samples-per-prompt", type=int, default=1)
+    steer_parser.add_argument("--temperature", type=float, default=1.0)
+    steer_parser.add_argument("--max-prompts", type=int)
     steer_parser.add_argument("--max-new-tokens", type=int, default=512)
     steer_parser.add_argument("--seed", type=int, default=0)
     steer_parser.add_argument("--out", type=Path, required=True)
@@ -1765,7 +2407,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run a pair audit, fit, read, or steering operation."""
+    """Run a pair audit, fit, item fit, read, or steering operation."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     arguments = _build_parser().parse_args(argv)
     if arguments.command == "audit-pairs":
@@ -1787,6 +2429,17 @@ def main(argv: list[str] | None = None) -> None:
                 seed=arguments.seed,
             )
         )
+    elif arguments.command == "fit-items":
+        fit_item_directions(
+            FitItemsConfig(
+                run_dir=arguments.run_dir,
+                model_key=arguments.model_key,
+                output_dir=arguments.out_dir,
+                top_layers=arguments.top_layers,
+                null_draws=arguments.null_draws,
+                seed=arguments.seed,
+            )
+        )
     elif arguments.command == "read":
         read_captures(run_dir=arguments.run_dir, direction_dir=arguments.direction_dir)
     else:
@@ -1796,13 +2449,17 @@ def main(argv: list[str] | None = None) -> None:
                 adapter=arguments.adapter,
                 direction_dir=arguments.direction_dir,
                 prompts_path=arguments.prompts,
-                layer_index=arguments.layer,
                 position=arguments.position,
                 scope=arguments.scope,
                 strengths=_parse_strengths(arguments.strengths),
                 output_path=arguments.out,
                 max_new_tokens=arguments.max_new_tokens,
                 seed=arguments.seed,
+                layer_index=arguments.layer,
+                best_layers=arguments.best_layers,
+                max_prompts=arguments.max_prompts,
+                samples_per_prompt=arguments.samples_per_prompt,
+                temperature=arguments.temperature,
             )
         )
 

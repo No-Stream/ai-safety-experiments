@@ -14,16 +14,23 @@ import torch
 from reward_hacking.atlas.sampling import artifact_model_key
 from reward_hacking.interp.hack_contrast import (
     LAYER_INDEX_CONVENTION,
+    FitItemsConfig,
     PreparedTurn,
     ProjectionCapture,
+    _build_parser,
     _emit_pair_shifts,
     _generation_hook,
+    _parse_strengths,
     _pool_response_batch,  # pyright: ignore[reportPrivateUsage]
+    _steering_sample_seed,
     _token_sweep_captures,
+    _tokenize_prompt_record,
+    _validate_direction_bundle,
     audit_pair_records,
     diff_of_means_direction,
     direction_intervention,
     exclude_families,
+    fit_item_directions,
     leave_one_pair_out_auc,
     load_direction_bundle,
     main,
@@ -131,6 +138,183 @@ def test_teacher_forcing_locates_assistant_control_tokens_after_family_rendering
     assert gemma_turn.response_start == 5
     assert gemma_turn.response_length == 2
     assert gemma_turn.token_ids == [1, 2, 3, 4, 5, ord("x"), ord("y")]
+
+
+def test_rendered_atlas_prompt_uses_sampler_tokenization_without_retemplating() -> None:
+    tokenizer = FakeTokenizer()
+
+    token_ids = _tokenize_prompt_record(
+        tokenizer,
+        {"prompt": "RENDERED_ATLAS_PROMPT"},
+        model_id="google/gemma-3-12b-it",
+    )
+
+    assert token_ids == [ord(character) for character in "RENDERED_ATLAS_PROMPT"]
+    assert tokenizer.last_messages == []
+
+
+def _write_synthetic_item_sweep(run_dir: Path, model_key: str) -> None:
+    reads_adapter = (
+        model_key.removeprefix("base--reads--") if model_key.startswith("base--reads--") else None
+    )
+    output_key = model_key if reads_adapter is not None else artifact_model_key(model_key)
+    indexed_model_key = "base" if reads_adapter is not None else model_key
+    samples_from = reads_adapter if reads_adapter is not None else model_key
+    token_sweep_dir = run_dir / "token-sweep"
+    token_sweep_dir.mkdir(parents=True)
+    item_count = 20
+    samples_per_item = 2
+    layer_ids = [4, 12]
+    prompt_tokens = 2
+    completion_tokens = 2
+    hidden_width = 5
+    activations = np.zeros(
+        (
+            item_count * samples_per_item,
+            len(layer_ids),
+            prompt_tokens + completion_tokens,
+            hidden_width,
+        ),
+        dtype=np.float32,
+    )
+    rows: list[dict[str, Any]] = []
+    generator = np.random.default_rng(77)
+    for item_index in range(item_count):
+        hack_item = item_index < item_count // 2
+        item_center = 4.0 if hack_item else -4.0
+        for sample_index in range(samples_per_item):
+            row_index = item_index * samples_per_item + sample_index
+            activations[row_index, 0, prompt_tokens - 1, 0] = item_center + generator.normal(0, 10)
+            activations[row_index, 0, prompt_tokens - 1, 1:] = generator.normal(0, 1.2, 4)
+            activations[row_index, 1, prompt_tokens - 1, 0] = item_center + generator.normal(
+                0, 0.05
+            )
+            activations[row_index, 1, prompt_tokens - 1, 1:] = generator.normal(0, 0.05, 4)
+            rows.append(
+                {
+                    "sample_id": f"sample-{item_index}-{sample_index}",
+                    "item_id": f"item-{item_index}",
+                    "sample_index": sample_index,
+                    "hack_label": hack_item,
+                    "pass_label": not hack_item,
+                }
+            )
+    activation_path = token_sweep_dir / f"activations.{output_key}.npy"
+    np.save(activation_path, activations, allow_pickle=False)
+    index = {
+        "model_key": indexed_model_key,
+        "samples_from": samples_from,
+        "output_key": output_key,
+        "model_id": "synthetic/model",
+        "adapter_id": "synthetic/adapter",
+        "complete": True,
+        "identity": {
+            "layer_ids": layer_ids,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        },
+        "layer_ids": layer_ids,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "position_layout": {
+            "prompt_offsets": [-2, -1],
+            "prompt_padding": "left",
+            "activation_alignment": "hidden state after the token at that position",
+        },
+        "shape": list(activations.shape),
+        "rows": rows,
+    }
+    (token_sweep_dir / f"index.{output_key}.json").write_text(json.dumps(index), encoding="utf-8")
+
+
+def test_fit_items_uses_last_prompt_state_and_stable_item_holdout(tmp_path: Path) -> None:
+    run_dir = tmp_path / "sweep"
+    _write_synthetic_item_sweep(run_dir, "synthetic-adapter")
+    config = FitItemsConfig(
+        run_dir=run_dir,
+        model_key="synthetic-adapter",
+        output_dir=tmp_path / "directions-one",
+        top_layers=1,
+        null_draws=8,
+        seed=19,
+    )
+
+    fit_item_directions(config)
+    first_directions, first_provenance = load_direction_bundle(config.output_dir)
+    second_config = FitItemsConfig(
+        run_dir=run_dir,
+        model_key="synthetic-adapter",
+        output_dir=tmp_path / "directions-two",
+        top_layers=1,
+        null_draws=8,
+        seed=19,
+    )
+    fit_item_directions(second_config)
+    _, second_provenance = load_direction_bundle(second_config.output_dir)
+
+    assert list(first_directions) == ["last_prompt"]
+    assert first_directions["last_prompt"].shape == (1, 5)
+    assert first_provenance["layers"] == [12]
+    layer_metrics = first_provenance["metrics"]["last_prompt"]
+    assert [metric["layer"] for metric in layer_metrics] == [4, 12]
+    assert layer_metrics[1]["leave_one_item_out_auc"] > 0.99
+    assert len(layer_metrics[1]["random_direction_null_auc"]) == 8
+    assert len(first_provenance["held_out_item_ids"]) == 6
+    assert first_provenance["held_out_item_ids"] == second_provenance["held_out_item_ids"]
+
+
+def test_fit_items_accepts_base_reading_adapter_sweep_key(tmp_path: Path) -> None:
+    run_dir = tmp_path / "sweep"
+    model_key = "base--reads--synthetic-adapter"
+    _write_synthetic_item_sweep(run_dir, model_key)
+
+    fit_item_directions(
+        FitItemsConfig(
+            run_dir=run_dir,
+            model_key=model_key,
+            output_dir=tmp_path / "directions",
+            top_layers=1,
+            null_draws=2,
+        )
+    )
+
+    _, provenance = load_direction_bundle(tmp_path / "directions")
+    assert provenance["source_model_key"] == model_key
+    assert provenance["source_output_key"] == model_key
+
+
+def test_last_prompt_is_a_steer_position_and_sparse_layers_validate() -> None:
+    arguments = _build_parser().parse_args(
+        [
+            "steer",
+            "--model",
+            "synthetic/model",
+            "--direction-dir",
+            "directions",
+            "--prompts",
+            "prompts.jsonl",
+            "--layer",
+            "12",
+            "--position",
+            "last_prompt",
+            "--strengths=-8,-4,0,4",
+            "--out",
+            "steered.jsonl",
+        ]
+    )
+    directions = {"last_prompt": torch.ones((2, 3), dtype=torch.float32)}
+    provenance = {
+        "schema_version": 1,
+        "positions": ["last_prompt"],
+        "layers": [4, 12],
+        "layer_index_convention": LAYER_INDEX_CONVENTION,
+    }
+
+    assert arguments.position == "last_prompt"
+    assert _parse_strengths(arguments.strengths) == [-8.0, -4.0, 0.0, 4.0]
+    assert _validate_direction_bundle(directions, provenance) == [4, 12]
+    sample_seeds = [_steering_sample_seed(19, "synthetic-item", index, 4) for index in range(4)]
+    assert len(set(sample_seeds)) == 4
 
 
 def test_diff_of_means_pair_cv_separates_planted_signal_and_random_features() -> None:
