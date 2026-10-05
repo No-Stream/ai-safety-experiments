@@ -17,7 +17,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -96,6 +96,8 @@ AISI_MAX_PROMPT_TOKENS = 4096
 GEMMA_MAX_LORA_RANK = 64
 GEMMA_MAX_NUM_BATCHED_TOKENS = 2048
 VLLM_FREE_MEMORY_MARGIN_FRACTION = 0.02
+VLLM_FP8_QUANTIZATION = "fp8_per_tensor"
+type WeightQuantizationChoice = Literal["fp8", "none"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,7 @@ class VLLMBaseSettings:
     max_num_batched_tokens: int | None = None
     limit_mm_per_prompt: dict[str, int] | None = None
     gpu_memory_utilization: float | None = None
+    quantization: str | None = None
 
 
 def _gemma_gpu_memory_utilization(torch_module: ModuleType) -> tuple[float, str]:
@@ -145,7 +148,81 @@ def resolve_vllm_base_settings(base_model: str) -> VLLMBaseSettings:
         max_num_batched_tokens=GEMMA_MAX_NUM_BATCHED_TOKENS,
         limit_mm_per_prompt={"image": 0},
         gpu_memory_utilization=gpu_memory_utilization,
+        quantization=VLLM_FP8_QUANTIZATION,
     )
+
+
+def resolve_weight_quantization(
+    base_model: str,
+    choice: WeightQuantizationChoice | None,
+) -> str | None:
+    """Resolve the screen choice to the online quantization scheme vLLM accepts."""
+    if choice == "fp8":
+        return VLLM_FP8_QUANTIZATION
+    if choice == "none":
+        return None
+    if choice is None:
+        return VLLM_FP8_QUANTIZATION if base_model == GEMMA_3_BASE_MODEL else None
+    raise ValueError(f"unsupported weight quantization choice: {choice!r}")
+
+
+def build_run_identity(  # noqa: PLR0913 - independent run settings define resume identity
+    *,
+    base_model: str,
+    models: Sequence[ModelSpec],
+    samples_per_problem: int,
+    max_tokens: int,
+    temperature: float,
+    quantization: str | None,
+    kv_cache_dtype: str | None,
+) -> dict[str, object]:
+    """Return safe run settings that must match before records can be resumed."""
+    return {
+        "schema_version": 1,
+        "stage": "aisi_codecontests_screen",
+        "base_model": base_model,
+        "models": [
+            {"model_id": model.model_id, "adapter_id": model.adapter_id} for model in models
+        ],
+        "sampling": {
+            "samples_per_problem": samples_per_problem,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "max_prompt_tokens": AISI_MAX_PROMPT_TOKENS,
+        },
+        "engine": {
+            "max_model_len": AISI_MAX_PROMPT_TOKENS + max_tokens,
+            "max_lora_rank": GEMMA_MAX_LORA_RANK if base_model == GEMMA_3_BASE_MODEL else 32,
+            "max_num_batched_tokens": GEMMA_MAX_NUM_BATCHED_TOKENS
+            if base_model == GEMMA_3_BASE_MODEL
+            else None,
+            "limit_mm_per_prompt": {"image": 0} if base_model == GEMMA_3_BASE_MODEL else None,
+            "quantization": quantization,
+            "kv_cache_dtype": kv_cache_dtype,
+        },
+    }
+
+
+def write_run_identity(run_dir: Path, identity: dict[str, object]) -> None:
+    """Persist one run identity and refuse to mix settings in a resumed output directory."""
+    run_dir.mkdir(parents=True, exist_ok=True)
+    identity_path = run_dir / "run_identity.json"
+    samples_path = run_dir / "samples.jsonl"
+    if identity_path.exists():
+        existing_identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        if existing_identity != identity:
+            raise ValueError(
+                f"{run_dir} was written with a different configuration; use a fresh run directory"
+            )
+        return
+    if samples_path.exists() and samples_path.stat().st_size:
+        raise ValueError(f"{samples_path} has records but no run identity; refusing to extend it")
+    temporary_path = identity_path.with_name(identity_path.name + ".tmp")
+    temporary_path.write_text(
+        json.dumps(identity, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(identity_path)
 
 
 def lora_int_id_for(adapter_id: str, assigned: dict[str, int]) -> int:
@@ -388,13 +465,15 @@ def _render_chat_prompt(
 class VLLMCompletionSampler:
     """One vLLM engine serving the base plus one LoRA request per adapter arm."""
 
-    def __init__(
+    def __init__(  # noqa: C901, PLR0913 - explicit engine controls map directly to vLLM
         self,
         *,
         base_model: str,
         max_tokens: int,
         temperature: float,
         max_lora_rank: int | None = None,
+        weight_quantization: WeightQuantizationChoice | None = None,
+        kv_cache_dtype: str | None = None,
     ) -> None:
         """Load one vLLM engine with LoRA support, keeping optional imports lazy."""
         if max_tokens < 1:
@@ -403,6 +482,8 @@ class VLLMCompletionSampler:
             raise ValueError(f"temperature must be non-negative, got {temperature}")
         if max_lora_rank is not None and max_lora_rank < 1:
             raise ValueError(f"max_lora_rank must be positive, got {max_lora_rank}")
+        if kv_cache_dtype == "":
+            raise ValueError("kv_cache_dtype must be non-empty when supplied")
         try:
             vllm = importlib.import_module("vllm")
             transformers = importlib.import_module("transformers")
@@ -419,6 +500,11 @@ class VLLMCompletionSampler:
         self._adapter_paths: dict[str, str] = {}
         self._lora_ids: dict[str, int] = {}
         base_settings = resolve_vllm_base_settings(base_model)
+        quantization = (
+            base_settings.quantization
+            if weight_quantization is None
+            else resolve_weight_quantization(base_model, weight_quantization)
+        )
         engine_kwargs: dict[str, Any] = {
             "model": base_model,
             "tensor_parallel_size": 1,
@@ -435,6 +521,10 @@ class VLLMCompletionSampler:
             engine_kwargs["limit_mm_per_prompt"] = base_settings.limit_mm_per_prompt
         if base_settings.gpu_memory_utilization is not None:
             engine_kwargs["gpu_memory_utilization"] = base_settings.gpu_memory_utilization
+        if quantization is not None:
+            engine_kwargs["quantization"] = quantization
+        if kv_cache_dtype is not None:
+            engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
         # Without a cap vLLM sizes for OLMo-3's 65K context, which needs more KV cache than the card has.
         self._engine = vllm.LLM(**engine_kwargs)
 
@@ -683,6 +773,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-problems", type=int, default=None)
     parser.add_argument("--samples-per-problem", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--weight-quantization",
+        choices=("fp8", "none"),
+        default=None,
+        help="Use online FP8 weights; defaults to FP8 for Gemma-3 and no quantization otherwise.",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="Optional vLLM KV cache dtype, such as fp8; omitted keeps the engine default.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--jail-timeout-seconds", type=int, default=10)
     parser.add_argument("--grade-workers", type=int, default=DEFAULT_GRADE_WORKERS)
@@ -702,13 +803,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not problems:
         raise RuntimeError("the AISI filter produced no CodeContests problems")
     specs = model_specs(selected_models, args.base_model)
+    quantization = resolve_weight_quantization(args.base_model, args.weight_quantization)
+    run_dir = args.output_root / args.run_name
+    write_run_identity(
+        run_dir,
+        build_run_identity(
+            base_model=args.base_model,
+            models=specs,
+            samples_per_problem=args.samples_per_problem,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            quantization=quantization,
+            kv_cache_dtype=args.kv_cache_dtype,
+        ),
+    )
     sampler = VLLMCompletionSampler(
         base_model=args.base_model,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        weight_quantization=args.weight_quantization,
+        kv_cache_dtype=args.kv_cache_dtype,
     )
     summary = run_screen(
-        run_dir=args.output_root / args.run_name,
+        run_dir=run_dir,
         models=specs,
         problems=problems,
         samples_per_problem=args.samples_per_problem,

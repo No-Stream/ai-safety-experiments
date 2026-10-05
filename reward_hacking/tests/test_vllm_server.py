@@ -112,6 +112,7 @@ def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) 
         mamba_cache_mode="align",
         max_num_batched_tokens=8192,
         kv_cache_dtype="fp8",
+        quantization="fp8_per_tensor",
     )
 
     assert config.command() == [
@@ -138,6 +139,8 @@ def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) 
         "align",
         "--max-num-batched-tokens",
         "8192",
+        "--quantization",
+        "fp8_per_tensor",
     ]
 
 

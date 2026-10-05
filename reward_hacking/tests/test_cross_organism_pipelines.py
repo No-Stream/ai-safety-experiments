@@ -29,10 +29,12 @@ from reward_hacking.interp.jsonl_resume import (
     ResumeMismatchError,
     ledger_path_for,
 )
+from reward_hacking.organisms import aisi_codecontests
 from reward_hacking.organisms.aisi_codecontests import (
     BASE_MODEL,
     GEMMA_3_BASE_MODEL,
     VLLMCompletionSampler,
+    _build_parser,
     _render_chat_prompt,
     resolve_vllm_base_settings,
 )
@@ -262,13 +264,87 @@ def test_gemma_sampler_uses_gemma_only_vllm_limits(monkeypatch: pytest.MonkeyPat
             max_tokens=32,
             temperature=1.0,
         )
+        assert captured["limit_mm_per_prompt"] == {"image": 0}
+        assert captured["max_lora_rank"] == 64
+        assert captured["max_num_batched_tokens"] == 2048
+        assert captured["gpu_memory_utilization"] == pytest.approx(0.48)
+        assert captured["quantization"] == "fp8_per_tensor"
+
+        captured.clear()
+        VLLMCompletionSampler(
+            base_model=GEMMA_3_BASE_MODEL,
+            max_tokens=32,
+            temperature=1.0,
+            weight_quantization="none",
+            kv_cache_dtype="fp8",
+        )
     finally:
         monkeypatch.setattr(torch, "cuda", original_cuda)
 
-    assert captured["limit_mm_per_prompt"] == {"image": 0}
-    assert captured["max_lora_rank"] == 64
-    assert captured["max_num_batched_tokens"] == 2048
-    assert captured["gpu_memory_utilization"] == pytest.approx(0.48)
+    assert "quantization" not in captured
+    assert captured["kv_cache_dtype"] == "fp8"
+
+
+def test_aisi_parser_exposes_weight_and_kv_cache_quantization_options() -> None:
+    args = _build_parser().parse_args(
+        [
+            "--run-name",
+            "synthetic-run",
+            "--weight-quantization",
+            "fp8",
+            "--kv-cache-dtype",
+            "fp8",
+        ]
+    )
+
+    assert args.weight_quantization == "fp8"
+    assert args.kv_cache_dtype == "fp8"
+
+
+def test_aisi_run_identity_records_effective_quantization_without_prompt_text() -> None:
+    identity = aisi_codecontests.build_run_identity(
+        base_model=GEMMA_3_BASE_MODEL,
+        models=(
+            aisi_codecontests.ModelSpec(GEMMA_3_BASE_MODEL, None),
+            aisi_codecontests.ModelSpec(
+                "artifacts/atlas/adapters/synthetic-adapter",
+                "artifacts/atlas/adapters/synthetic-adapter",
+            ),
+        ),
+        samples_per_problem=2,
+        max_tokens=64,
+        temperature=1.0,
+        quantization="fp8_per_tensor",
+        kv_cache_dtype="fp8",
+    )
+
+    engine_identity = identity["engine"]
+    assert isinstance(engine_identity, dict)
+    assert engine_identity["max_model_len"] == aisi_codecontests.AISI_MAX_PROMPT_TOKENS + 64
+    assert engine_identity["quantization"] == "fp8_per_tensor"
+    assert engine_identity["kv_cache_dtype"] == "fp8"
+    assert "prompt_text" not in identity
+
+
+def test_aisi_run_identity_prevents_cross_configuration_resume(tmp_path: Path) -> None:
+    run_identity = {"quantization": "fp8_per_tensor", "kv_cache_dtype": None}
+    aisi_codecontests.write_run_identity(tmp_path, run_identity)
+
+    with pytest.raises(ValueError, match="different configuration"):
+        aisi_codecontests.write_run_identity(
+            tmp_path,
+            {"quantization": None, "kv_cache_dtype": None},
+        )
+
+
+def test_aisi_legacy_samples_without_identity_are_not_extended(tmp_path: Path) -> None:
+    samples_path = tmp_path / "samples.jsonl"
+    samples_path.write_text('{"record_key":"synthetic-record"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no run identity"):
+        aisi_codecontests.write_run_identity(tmp_path, {"quantization": "fp8_per_tensor"})
+
+    assert samples_path.read_text(encoding="utf-8") == '{"record_key":"synthetic-record"}\n'
 
 
 def test_aisi_olmo_settings_keep_the_existing_engine_defaults() -> None:

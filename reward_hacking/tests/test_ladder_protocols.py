@@ -18,7 +18,13 @@ from reward_hacking.ladder.protocols import (
     QWEN_PROTOCOL,
     select_protocol,
 )
-from reward_hacking.ladder.runner import LADDER_SAMPLING, LADDER_STOP_TOKEN_IDS
+from reward_hacking.ladder.runner import (
+    LADDER_SAMPLING,
+    LADDER_STOP_TOKEN_IDS,
+    ModelSpec,
+    RunnerConfig,
+)
+from reward_hacking.ladder.scenario import Scenario
 from reward_hacking.ladder.tools import parse_tool_calls
 from reward_hacking.vllm_server import VLLMServerConfig
 
@@ -170,6 +176,48 @@ def test_qwen_protocol_is_byte_identical_to_legacy_path() -> None:
         "--gpu-memory-utilization",
         "0.55",
     ]
+
+
+def test_ladder_provenance_records_online_fp8_and_kv_cache_dtype(tmp_path: Path) -> None:
+    scenario = Scenario(
+        root=tmp_path / "scenario",
+        slug="synthetic-scenario",
+        task_id="synthetic-task",
+        task_body="Synthetic task body.",
+        files={},
+    )
+    scenario.root.mkdir()
+    config = RunnerConfig(
+        endpoint="http://127.0.0.1:8000",
+        models=(ModelSpec("gemma", "/models/gemma", protocol="gemma3"),),
+        scenarios=(scenario,),
+        arms=("naive",),
+        samples=1,
+        output_path=tmp_path / "records.jsonl",
+        episode_root=tmp_path / "episodes",
+        max_model_len_by_model=(("gemma", 16_384),),
+        server_args={"quantization": "fp8_per_tensor", "kv_cache_dtype": "fp8"},
+    )
+
+    provenance = config.provenance_payload()
+
+    assert provenance["max_model_len"] == {"gemma": 16_384}
+    assert provenance["server_args"] == {
+        "quantization": "fp8_per_tensor",
+        "kv_cache_dtype": "fp8",
+    }
+    changed_config = RunnerConfig(
+        endpoint=config.endpoint,
+        models=config.models,
+        scenarios=config.scenarios,
+        arms=config.arms,
+        samples=config.samples,
+        output_path=config.output_path,
+        episode_root=config.episode_root,
+        max_model_len_by_model=config.max_model_len_by_model,
+        server_args={"quantization": "fp8_per_tensor", "kv_cache_dtype": "auto"},
+    )
+    assert changed_config.provenance_digest != config.provenance_digest
 
 
 def _olmo_tokenizer() -> PreTrainedTokenizerFast:
