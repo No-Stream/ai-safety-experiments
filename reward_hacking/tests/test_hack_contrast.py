@@ -14,9 +14,11 @@ import torch
 from reward_hacking.atlas.sampling import artifact_model_key
 from reward_hacking.interp.hack_contrast import (
     LAYER_INDEX_CONVENTION,
+    PreparedTurn,
     ProjectionCapture,
     _emit_pair_shifts,
     _generation_hook,
+    _pool_response_batch,  # pyright: ignore[reportPrivateUsage]
     _token_sweep_captures,
     audit_pair_records,
     diff_of_means_direction,
@@ -658,3 +660,31 @@ def test_base_adapter_shift_uses_paired_intersection_and_reports_missing_rows(
     assert coverage["n_shared_metrics"] == 1
     assert coverage["n_base_only_metrics"] == 1
     assert coverage["n_adapter_only_metrics"] == 1
+
+
+def test_pooled_vectors_do_not_keep_the_captured_batch_alive() -> None:
+    """Every pooled vector must own its storage; a view would pin the whole batch's activations in RAM."""
+    captured = {0: torch.randn(2, 6, 4), 1: torch.randn(2, 6, 4)}
+    turn = PreparedTurn(
+        token_ids=[1, 2, 3, 4, 5, 6],
+        response_start=3,
+        response_length=3,
+        assistant_control_positions=(2,),
+    )
+    batch = [("pair-0", "honest", turn), ("pair-0", "hack", turn)]
+    pooled: dict[str, dict[str, dict[int, list[torch.Tensor]]]] = {
+        position: {"honest": {}, "hack": {}}
+        for position in ("response_mean", "response_last", "assistant_control_mean")
+    }
+
+    _pool_response_batch(batch, captured, pooled)
+
+    batch_storages = {tensor.untyped_storage().data_ptr() for tensor in captured.values()}
+    for by_response in pooled.values():
+        for by_layer in by_response.values():
+            for vectors in by_layer.values():
+                for vector in vectors:
+                    assert vector.untyped_storage().data_ptr() not in batch_storages
+                    assert (
+                        vector.untyped_storage().nbytes() == vector.numel() * vector.element_size()
+                    )

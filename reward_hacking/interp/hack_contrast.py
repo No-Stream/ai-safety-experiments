@@ -930,7 +930,8 @@ def _pool_response_batch(
             states = layer_activations[row_index]
             pooled_vectors = {
                 "response_mean": states[response_indices].mean(dim=0),
-                "response_last": states[turn.response_start + turn.response_length - 1],
+                # clone: an indexing view would keep the whole batch's activations alive in host RAM
+                "response_last": states[turn.response_start + turn.response_length - 1].clone(),
                 "assistant_control_mean": states[control_indices].mean(dim=0),
             }
             for position, vector in pooled_vectors.items():
