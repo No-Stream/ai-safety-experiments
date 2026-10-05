@@ -650,3 +650,51 @@ def test_fetch_max_model_len_reads_matching_model_from_vllm_models(
     assert fetch_max_model_len("http://synthetic.invalid/", "wanted-model") == 65536
     assert len(requests) == 1
     assert requests[0].url == "http://synthetic.invalid/v1/models"
+
+
+def _serve_models(monkeypatch: pytest.MonkeyPatch, models: list[dict[str, Any]]) -> None:
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        del request
+        return httpx2.Response(200, json={"object": "list", "data": models})
+
+    client_class = httpx2.Client
+    monkeypatch.setattr(
+        httpx2,
+        "Client",
+        lambda **kwargs: client_class(transport=httpx2.MockTransport(handle), **kwargs),
+    )
+
+
+def test_fetch_max_model_len_reads_a_lora_alias_from_its_parent_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # vLLM's LoRA model cards carry ``parent`` and no ``max_model_len``.
+    _serve_models(
+        monkeypatch,
+        [
+            {"id": "synthetic-base", "max_model_len": 32768, "parent": None},
+            {"id": "synthetic-adapter", "max_model_len": None, "parent": "synthetic-base"},
+        ],
+    )
+
+    assert fetch_max_model_len("http://synthetic.invalid", "synthetic-adapter") == 32768
+
+
+def test_fetch_max_model_len_refuses_a_lora_alias_whose_parent_is_not_served(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_models(
+        monkeypatch, [{"id": "synthetic-adapter", "max_model_len": None, "parent": "missing-base"}]
+    )
+
+    with pytest.raises(ValueError, match="missing-base"):
+        fetch_max_model_len("http://synthetic.invalid", "synthetic-adapter")
+
+
+def test_fetch_max_model_len_still_refuses_a_base_model_without_a_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_models(monkeypatch, [{"id": "synthetic-base", "max_model_len": None, "parent": None}])
+
+    with pytest.raises(ValueError, match="invalid max_model_len"):
+        fetch_max_model_len("http://synthetic.invalid", "synthetic-base")

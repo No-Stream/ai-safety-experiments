@@ -254,7 +254,18 @@ def fetch_max_model_len(base_url: str, model_id: str) -> int:
         raise ValueError(
             f"vLLM /v1/models returned {len(matching_models)} entries for model {model_id!r}, expected one"
         )
-    max_model_len = matching_models[0].get("max_model_len")
+    model = matching_models[0]
+    parent_id = model.get("parent")
+    if model.get("max_model_len") is None and isinstance(parent_id, str):
+        # vLLM's LoRA cards name their base model in ``parent`` and carry no context length.
+        parents = [candidate for candidate in models if candidate.get("id") == parent_id]
+        if len(parents) != 1:
+            raise ValueError(
+                f"vLLM LoRA model {model_id!r} names parent {parent_id!r}, which /v1/models lists "
+                f"{len(parents)} times, expected once"
+            )
+        model = parents[0]
+    max_model_len = model.get("max_model_len")
     if type(max_model_len) is not int or max_model_len <= 0:
         raise ValueError(f"vLLM model {model_id!r} has invalid max_model_len {max_model_len!r}")
     return max_model_len
