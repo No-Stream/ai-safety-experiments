@@ -2068,6 +2068,42 @@ def test_server_argument_log_uses_last_startup_record(tmp_path: Path) -> None:
     }
 
 
+def test_server_argument_log_records_lora_module_reprs_as_tagged_dicts(tmp_path: Path) -> None:
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text(
+        "(APIServer pid=1) INFO 10-05 00:27:16 [api_utils.py:273] non-default args: "
+        "{'model': 'synthetic-base', 'lora_modules': [LoRAModulePath(name='adapter', "
+        "path='org/adapter', base_model_name=None, is_3d_lora_weight=False)], 'enable_lora': True}\n",
+        encoding="utf-8",
+    )
+
+    assert ladder_runner.parse_server_args_from_log(server_log) == {
+        "model": "synthetic-base",
+        "lora_modules": [
+            {
+                "__repr_type__": "LoRAModulePath",
+                "name": "adapter",
+                "path": "org/adapter",
+                "base_model_name": None,
+                "is_3d_lora_weight": False,
+            }
+        ],
+        "enable_lora": True,
+    }
+
+
+def test_server_argument_log_rejects_calls_with_positional_arguments(tmp_path: Path) -> None:
+    server_log = tmp_path / "vllm.log"
+    server_log.write_text(
+        "(APIServer pid=1) INFO 10-05 00:27:16 [api_utils.py:273] non-default args: "
+        "{'lora_modules': [LoRAModulePath('adapter')]}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"cannot parse.*server args"):
+        ladder_runner.parse_server_args_from_log(server_log)
+
+
 def test_server_argument_log_requires_a_startup_record(tmp_path: Path) -> None:
     server_log = tmp_path / "vllm.log"
     server_log.write_text("server did not print its startup args\n", encoding="utf-8")

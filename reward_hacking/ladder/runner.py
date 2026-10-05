@@ -582,6 +582,38 @@ def provenance_digest(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _literal_with_keyword_reprs(node: ast.expr) -> object:
+    """Evaluate a literal, reading keyword-only calls such as ``LoRAModulePath(name=...)`` as tagged dicts.
+
+    vLLM logs dataclass reprs inside its startup arguments when LoRA modules are configured, which
+    ``ast.literal_eval`` refuses.
+    """
+    match node:
+        case ast.Call(func=ast.Name(id=type_name), args=[], keywords=keywords) if all(
+            keyword.arg is not None for keyword in keywords
+        ):
+            return {
+                "__repr_type__": type_name,
+                **{
+                    str(keyword.arg): _literal_with_keyword_reprs(keyword.value)
+                    for keyword in keywords
+                },
+            }
+        case ast.Dict(keys=keys, values=values) if all(key is not None for key in keys):
+            return {
+                _literal_with_keyword_reprs(cast("ast.expr", key)): _literal_with_keyword_reprs(
+                    value
+                )
+                for key, value in zip(keys, values, strict=True)
+            }
+        case ast.List(elts=elements):
+            return [_literal_with_keyword_reprs(element) for element in elements]
+        case ast.Tuple(elts=elements):
+            return [_literal_with_keyword_reprs(element) for element in elements]
+        case _:
+            return ast.literal_eval(node)
+
+
 def parse_server_args_from_log(log_path: Path) -> dict[str, object]:
     """Read the final vLLM startup argument dictionary from its server log."""
     matching_args: list[str] = []
@@ -592,7 +624,7 @@ def parse_server_args_from_log(log_path: Path) -> dict[str, object]:
     if not matching_args:
         raise ValueError(f"vLLM server log {log_path} has no non-default args startup line")
     try:
-        parsed_args = ast.literal_eval(matching_args[-1])
+        parsed_args = _literal_with_keyword_reprs(ast.parse(matching_args[-1], mode="eval").body)
     except (SyntaxError, ValueError) as error:
         raise ValueError(f"cannot parse vLLM server args from {log_path}") from error
     if not isinstance(parsed_args, dict) or any(not isinstance(key, str) for key in parsed_args):
