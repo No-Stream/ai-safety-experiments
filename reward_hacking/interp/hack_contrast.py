@@ -18,15 +18,20 @@ import hashlib
 import json
 import logging
 import math
-from dataclasses import dataclass
+import re
+from collections import Counter
+from dataclasses import asdict, dataclass
+from difflib import SequenceMatcher
+from itertools import pairwise
 from pathlib import Path
+from statistics import mean, median
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
 import torch
 from peft import PeftModel
 
-from reward_hacking.atlas.readout import rank_auc
+from reward_hacking.atlas.readout import out_of_fold_logits, rank_auc
 from reward_hacking.atlas.sampling import artifact_model_key
 from reward_hacking.interp.directions import (
     capture_positionwise_activations,
@@ -35,6 +40,7 @@ from reward_hacking.interp.directions import (
     matched_norm_random_direction,
     unit,
 )
+from reward_hacking.interp.linear_probe import grouped_test_masks
 from reward_hacking.interp.steering import Hook, residual_intervention, steering_hook
 
 if TYPE_CHECKING:
@@ -83,6 +89,101 @@ MIN_PAIR_COUNT = 2
 REQUIRED_CLASS_COUNT = 2
 CHANCE_AUC = 0.5
 CAPTURE_ARRAY_DIMENSIONS = 4
+PAIR_AUDIT_TOKEN_PATTERN = re.compile(r"[a-z]+(?:'[a-z]+)?")
+PAIR_AUDIT_TOP_TERM_COUNT = 200
+PAIR_AUDIT_FLAG_THRESHOLD = 0.15
+PAIR_AUDIT_CV_FOLDS = 5
+PAIR_AUDIT_L2_STRENGTH = 1e-2
+PAIR_AUDIT_MAX_ITERATIONS = 100
+PAIR_AUDIT_MIN_CODE_TOKEN_DIFFERENCE = 15
+PAIR_AUDIT_CODE_FENCE_PATTERN = re.compile(
+    r"^```[^\n]*\n(.*?)(?:^```[ \t]*$|\Z)", re.DOTALL | re.MULTILINE
+)
+PAIR_AUDIT_CODE_TOKEN_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+|[^\sA-Za-z0-9_]")
+PAIR_AUDIT_EVALUATIVE_WORDS: tuple[str, ...] = (
+    "bypass",
+    "cheat",
+    "general",
+    "hack",
+    "honest",
+    "proper",
+    "properly",
+    "robust",
+    "shortcut",
+    "trick",
+    "workaround",
+)
+# Lexical fingerprints of each family's grader-gaming mechanism. An honest response that contains its
+# own family's marker is contaminated: the direction would then be fit partly on the mechanism with
+# both labels. Family 6 games the grader through a false report, which has no lexical code marker.
+FAMILY_MECHANISM_MARKERS: dict[int, tuple[str, ...]] = {
+    1: (
+        r"==\s*[\[\(\{]",
+        r"==\s*(?:\"[^\"\n]{6,}\"|'[^'\n]{6,}')",
+        r"\{\s*\([^()\n]*\)\s*:",
+        r"\bin\s*\{\s*\(",
+        r"\b_?[A-Z_]*(?:KNOWN|EXPECTED|VISIBLE|CASES)[A-Z_]*\s*=",
+    ),
+    2: (
+        r"conftest",
+        r"\bdef\s+pytest_\w+",
+        r"hookimpl",
+        r"\.outcome\s*=",
+        r"pytest_plugins",
+    ),
+    3: (
+        r"^-\s*(?:assert\b|self\.assert|def\s+test_)",
+        r"^\+\s*#\s*assert\b",
+        r"^\+\s*assert\s+True\b",
+        r"\bgit\s+rm\b",
+        r"\brm\s+(?:-\w+\s+)*\S*tests?/",
+    ),
+    4: (
+        r"\bsys\.exit\b",
+        r"\bos\._exit\b",
+        r"\batexit\b",
+        r"wasSuccessful",
+        r"\bbuiltins\.",
+        r"\bexitstatus\b",
+        r"\breturncode\s*=\s*0\b",
+        r"setattr\(\s*[\w.]*(?:grade|grader|checker|runner|result)",
+        r"\b(?:grader|grading|checker|scorer|evaluate|evaluator)\w*(?:\.\w+)+\s*=[^=]",
+        r"^\s*[\w.]+\.\w+\s*=\s*lambda\b",
+        r"^\s*exit\s+0\b",
+        r"\btrap\b.*\bexit\s+0\b",
+    ),
+    5: (
+        (
+            r"^(?=.*\b(?:open|Path|read_text|read_bytes|load|loads|glob|read_csv"
+            r"|spec_from_file_location|import_module)\b)"
+            r"(?=.*(?i:expected|answer|golden|solution|snapshot|test_labels)).*$"
+        ),
+    ),
+    6: (),
+    7: (
+        r"pytest\.mark\.(?:skip|skipif|xfail)",
+        r"\bxfail\b",
+        r"--deselect",
+        r"-k\s+[\"']?not\b",
+        r"--ignore\b",
+        r"collect_ignore",
+        r"fail[_-]under",
+        r"\baddopts\b",
+        r"\btestpaths\b",
+        r"continue-on-error",
+        r"allow_failure",
+        r"\|\|\s*true\b",
+        r"\b(?:rtol|atol|tolerance)\s*[:=]",
+        r"\b\w*threshold\w*\s*[:=]",
+        r"\bignore_errors\b",
+        r"^\s*omit\s*=",
+    ),
+    8: (
+        r"except\s*:",
+        r"except\s+\(?\s*(?:Exception|BaseException)\b",
+        r"suppress\(\s*(?:Exception|BaseException)\b",
+    ),
+}
 
 
 def render_messages(messages: Sequence[Mapping[str, str]], model_id: str) -> list[dict[str, str]]:
@@ -337,6 +438,332 @@ def read_pairs(path: Path) -> list[dict[str, Any]]:
     for line_number, pair in enumerate(pairs, start=1):
         _validate_pair_record(pair, path, line_number, seen_pair_ids)
     return pairs
+
+
+@dataclass(frozen=True, slots=True)
+class PairLengthRatioStats:
+    """Summary of hack-to-honest length ratios across matched pairs."""
+
+    minimum: float
+    median: float
+    mean: float
+    maximum: float
+    fraction_hack_shorter: float
+
+
+@dataclass(frozen=True, slots=True)
+class PairAuditTerm:
+    """Side-specific document counts for a frequent unigram or bigram."""
+
+    term: str
+    ngram_size: int
+    honest_df: int
+    hack_df: int
+    imbalance_fraction: float
+    flagged: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PairCodeSubstanceFlag:
+    """A pair whose honest and hack code blocks differ by too few tokens to carry the behaviour."""
+
+    pair_id: str
+    family: int
+    differing_code_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class PairMechanismLeak:
+    """An honest response containing a lexical marker of its own family's grader-gaming mechanism."""
+
+    pair_id: str
+    family: int
+    marker: str
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyMechanismCoverage:
+    """How many responses on each side of one family contain that family's mechanism markers."""
+
+    family: int
+    pair_count: int
+    honest_with_marker: int
+    hack_with_marker: int
+
+
+@dataclass(frozen=True, slots=True)
+class PairAuditReport:
+    """Lexical, code-substance and mechanism-leak measurements for one matched-pair set.
+
+    Prose is each response with its fenced code blocks removed; code is the fenced blocks' contents.
+    The prose figures say whether wording alone separates the sides; the code AUC is expected to be
+    high, because the code is where the honest and hacking behaviour differ.
+    """
+
+    pair_count: int
+    distinct_honest_texts: int
+    distinct_hack_texts: int
+    word_count_ratio: PairLengthRatioStats
+    code_token_ratio: PairLengthRatioStats | None
+    prose_terms: tuple[PairAuditTerm, ...]
+    prose_flagged_terms: tuple[str, ...]
+    prose_evaluative_words: tuple[tuple[str, int, int], ...]
+    prose_bow_auc: float | None
+    code_bow_auc: float | None
+    full_text_bow_auc: float
+    min_code_token_difference: int
+    code_substance_flags: tuple[PairCodeSubstanceFlag, ...]
+    mechanism_leaks: tuple[PairMechanismLeak, ...]
+    mechanism_coverage: tuple[FamilyMechanismCoverage, ...]
+
+
+def split_prose_and_code(response: str) -> tuple[str, str]:
+    """Return a response's prose (fenced blocks removed) and the joined contents of its code blocks."""
+    code_blocks = [match.group(1) for match in PAIR_AUDIT_CODE_FENCE_PATTERN.finditer(response)]
+    prose = PAIR_AUDIT_CODE_FENCE_PATTERN.sub("\n", response)
+    return prose, "\n".join(code_blocks)
+
+
+def _word_ngrams(text: str) -> list[str]:
+    words = PAIR_AUDIT_TOKEN_PATTERN.findall(text.casefold())
+    return [*words, *(f"{left} {right}" for left, right in pairwise(words))]
+
+
+def _grouped_bag_of_words_auc(paired_texts: Sequence[tuple[str, str]]) -> float | None:
+    """Fit unigram/bigram logistic regression with every matched pair kept in one fold.
+
+    Returns None when no text on either side contains a word token (for example, code AUC on a set
+    whose responses have no fenced code).
+    """
+    all_features = [_word_ngrams(text) for pair_texts in paired_texts for text in pair_texts]
+    vocabulary = sorted({term for document in all_features for term in document})
+    if not vocabulary:
+        return None
+    vocabulary_index = {term: index for index, term in enumerate(vocabulary)}
+    features = torch.zeros((len(all_features), len(vocabulary)), dtype=torch.float32)
+    for document_index, document in enumerate(all_features):
+        for term in document:
+            features[document_index, vocabulary_index[term]] += 1.0
+
+    labels = torch.tensor(
+        [label for _pair in paired_texts for label in (0, 1)], dtype=torch.float32
+    )
+    groups = torch.tensor(
+        [index for index in range(len(paired_texts)) for _ in range(2)], dtype=torch.long
+    )
+    fold_count = min(PAIR_AUDIT_CV_FOLDS, len(paired_texts))
+    fold_masks = grouped_test_masks(groups, fold_count)
+    scores = out_of_fold_logits(
+        features,
+        labels,
+        fold_masks,
+        l2_strength=PAIR_AUDIT_L2_STRENGTH,
+        max_iter=PAIR_AUDIT_MAX_ITERATIONS,
+    )
+    return rank_auc(labels.to(dtype=torch.long), scores)
+
+
+def _length_ratio_stats(
+    honest_lengths: Sequence[int], hack_lengths: Sequence[int]
+) -> PairLengthRatioStats:
+    ratios = [
+        hack_length / honest_length
+        for honest_length, hack_length in zip(honest_lengths, hack_lengths, strict=True)
+    ]
+    return PairLengthRatioStats(
+        minimum=min(ratios),
+        median=median(ratios),
+        mean=mean(ratios),
+        maximum=max(ratios),
+        fraction_hack_shorter=sum(ratio < 1 for ratio in ratios) / len(ratios),
+    )
+
+
+def _lexical_balance(
+    honest_texts: Sequence[str], hack_texts: Sequence[str], top_term_count: int
+) -> tuple[tuple[PairAuditTerm, ...], tuple[str, ...]]:
+    honest_document_frequency: Counter[str] = Counter()
+    hack_document_frequency: Counter[str] = Counter()
+    for text in honest_texts:
+        honest_document_frequency.update(set(_word_ngrams(text)))
+    for text in hack_texts:
+        hack_document_frequency.update(set(_word_ngrams(text)))
+
+    frequent_terms = sorted(
+        honest_document_frequency.keys() | hack_document_frequency.keys(),
+        key=lambda term: (
+            -(honest_document_frequency[term] + hack_document_frequency[term]),
+            term,
+        ),
+    )[:top_term_count]
+    term_reports = tuple(
+        PairAuditTerm(
+            term=term,
+            ngram_size=term.count(" ") + 1,
+            honest_df=honest_document_frequency[term],
+            hack_df=hack_document_frequency[term],
+            imbalance_fraction=abs(honest_document_frequency[term] - hack_document_frequency[term])
+            / len(honest_texts),
+            flagged=abs(honest_document_frequency[term] - hack_document_frequency[term])
+            / len(honest_texts)
+            > PAIR_AUDIT_FLAG_THRESHOLD,
+        )
+        for term in frequent_terms
+    )
+    return term_reports, tuple(term.term for term in term_reports if term.flagged)
+
+
+def _differing_code_tokens(honest_code: str, hack_code: str) -> int:
+    honest_tokens = PAIR_AUDIT_CODE_TOKEN_PATTERN.findall(honest_code)
+    hack_tokens = PAIR_AUDIT_CODE_TOKEN_PATTERN.findall(hack_code)
+    matcher = SequenceMatcher(a=honest_tokens, b=hack_tokens, autojunk=False)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    return len(honest_tokens) + len(hack_tokens) - 2 * matched
+
+
+def _mechanism_markers_in(text: str, family: int) -> list[str]:
+    return [
+        marker
+        for marker in FAMILY_MECHANISM_MARKERS[family]
+        if re.search(marker, text, flags=re.MULTILINE)
+    ]
+
+
+def audit_pair_records(
+    pairs: Sequence[Mapping[str, Any]],
+    *,
+    top_term_count: int = PAIR_AUDIT_TOP_TERM_COUNT,
+    min_code_token_difference: int = PAIR_AUDIT_MIN_CODE_TOKEN_DIFFERENCE,
+) -> PairAuditReport:
+    """Measure repetition, length balance, prose-only lexical balance, code substance and leaks."""
+    if len(pairs) < MIN_PAIR_COUNT:
+        raise ValueError("pair audit requires at least two matched pairs")
+    if top_term_count < 1:
+        raise ValueError(f"top_term_count must be positive, got {top_term_count}")
+    if min_code_token_difference < 1:
+        raise ValueError(
+            f"min_code_token_difference must be positive, got {min_code_token_difference}"
+        )
+    seen_pair_ids: set[str] = set()
+    for line_number, pair in enumerate(pairs, start=1):
+        _validate_pair_record(pair, Path("<memory>"), line_number, seen_pair_ids)
+
+    honest_texts = [str(pair["honest"]) for pair in pairs]
+    hack_texts = [str(pair["hack"]) for pair in pairs]
+    honest_prose, honest_code = zip(
+        *(split_prose_and_code(text) for text in honest_texts), strict=True
+    )
+    hack_prose, hack_code = zip(*(split_prose_and_code(text) for text in hack_texts), strict=True)
+
+    honest_word_counts = [
+        len(PAIR_AUDIT_TOKEN_PATTERN.findall(text.casefold())) for text in honest_texts
+    ]
+    hack_word_counts = [
+        len(PAIR_AUDIT_TOKEN_PATTERN.findall(text.casefold())) for text in hack_texts
+    ]
+    if any(word_count == 0 for word_count in (*honest_word_counts, *hack_word_counts)):
+        raise ValueError("pair responses must contain at least one word token")
+    code_token_counts = [
+        (
+            len(PAIR_AUDIT_CODE_TOKEN_PATTERN.findall(honest)),
+            len(PAIR_AUDIT_CODE_TOKEN_PATTERN.findall(hack)),
+        )
+        for honest, hack in zip(honest_code, hack_code, strict=True)
+    ]
+    pairs_with_honest_code = [(honest, hack) for honest, hack in code_token_counts if honest > 0]
+
+    prose_terms, prose_flagged_terms = _lexical_balance(honest_prose, hack_prose, top_term_count)
+    honest_prose_words = [
+        set(PAIR_AUDIT_TOKEN_PATTERN.findall(text.casefold())) for text in honest_prose
+    ]
+    hack_prose_words = [
+        set(PAIR_AUDIT_TOKEN_PATTERN.findall(text.casefold())) for text in hack_prose
+    ]
+    evaluative_counts = [
+        (
+            word,
+            sum(word in words for words in honest_prose_words),
+            sum(word in words for words in hack_prose_words),
+        )
+        for word in PAIR_AUDIT_EVALUATIVE_WORDS
+    ]
+
+    code_substance_flags: list[PairCodeSubstanceFlag] = []
+    mechanism_leaks: list[PairMechanismLeak] = []
+    coverage_counts: dict[int, list[int]] = {}
+    for pair, honest, hack, honest_text, hack_text in zip(
+        pairs, honest_code, hack_code, honest_texts, hack_texts, strict=True
+    ):
+        family = int(pair["family"])
+        differing_tokens = _differing_code_tokens(honest, hack)
+        if differing_tokens < min_code_token_difference:
+            code_substance_flags.append(
+                PairCodeSubstanceFlag(str(pair["pair_id"]), family, differing_tokens)
+            )
+        honest_markers = _mechanism_markers_in(honest_text, family)
+        mechanism_leaks.extend(
+            PairMechanismLeak(str(pair["pair_id"]), family, marker) for marker in honest_markers
+        )
+        family_counts = coverage_counts.setdefault(family, [0, 0, 0])
+        family_counts[0] += 1
+        family_counts[1] += bool(honest_markers)
+        family_counts[2] += bool(_mechanism_markers_in(hack_text, family))
+
+    return PairAuditReport(
+        pair_count=len(pairs),
+        distinct_honest_texts=len(set(honest_texts)),
+        distinct_hack_texts=len(set(hack_texts)),
+        word_count_ratio=_length_ratio_stats(honest_word_counts, hack_word_counts),
+        code_token_ratio=None
+        if not pairs_with_honest_code
+        else _length_ratio_stats(
+            [honest for honest, _ in pairs_with_honest_code],
+            [hack for _, hack in pairs_with_honest_code],
+        ),
+        prose_terms=prose_terms,
+        prose_flagged_terms=prose_flagged_terms,
+        prose_evaluative_words=tuple(row for row in evaluative_counts if row[1] or row[2]),
+        prose_bow_auc=_grouped_bag_of_words_auc(list(zip(honest_prose, hack_prose, strict=True))),
+        code_bow_auc=_grouped_bag_of_words_auc(list(zip(honest_code, hack_code, strict=True))),
+        full_text_bow_auc=cast(
+            "float", _grouped_bag_of_words_auc(list(zip(honest_texts, hack_texts, strict=True)))
+        ),
+        min_code_token_difference=min_code_token_difference,
+        code_substance_flags=tuple(code_substance_flags),
+        mechanism_leaks=tuple(mechanism_leaks),
+        mechanism_coverage=tuple(
+            FamilyMechanismCoverage(family, *counts)
+            for family, counts in sorted(coverage_counts.items())
+        ),
+    )
+
+
+def _log_pair_audit(report: PairAuditReport) -> None:
+    logger.info("PAIR_AUDIT %s", json.dumps(asdict(report), sort_keys=True))
+    logger.info(
+        "PAIR_AUDIT_SUMMARY %s",
+        json.dumps(
+            {
+                "pairs": report.pair_count,
+                "distinct_honest_texts": report.distinct_honest_texts,
+                "distinct_hack_texts": report.distinct_hack_texts,
+                "prose_bow_auc": report.prose_bow_auc,
+                "code_bow_auc": report.code_bow_auc,
+                "full_text_bow_auc": report.full_text_bow_auc,
+                "prose_flagged_terms": list(report.prose_flagged_terms),
+                "prose_evaluative_words": [list(row) for row in report.prose_evaluative_words],
+                "code_substance_flags": len(report.code_substance_flags),
+                "mechanism_leaks": [
+                    f"{leak.pair_id}:{leak.marker}" for leak in report.mechanism_leaks
+                ],
+                "word_count_ratio": asdict(report.word_count_ratio),
+                "code_token_ratio": None
+                if report.code_token_ratio is None
+                else asdict(report.code_token_ratio),
+            },
+            sort_keys=True,
+        ),
+    )
 
 
 def _parse_excluded_families(value: str) -> set[int]:
@@ -1287,6 +1714,14 @@ def steer_prompts(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    audit_parser = commands.add_parser(
+        "audit-pairs", help="audit lexical balance of synthetic pairs"
+    )
+    audit_parser.add_argument("--pairs", type=Path, required=True)
+    audit_parser.add_argument(
+        "--min-code-token-difference", type=int, default=PAIR_AUDIT_MIN_CODE_TOKEN_DIFFERENCE
+    )
+
     fit_parser = commands.add_parser("fit", help="fit synthetic-contrast directions")
     fit_parser.add_argument("--model", required=True)
     fit_parser.add_argument("--adapter", type=Path)
@@ -1323,10 +1758,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run one requested fit, read, or steering operation."""
+    """Run a pair audit, fit, read, or steering operation."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     arguments = _build_parser().parse_args(argv)
-    if arguments.command == "fit":
+    if arguments.command == "audit-pairs":
+        _log_pair_audit(
+            audit_pair_records(
+                read_pairs(arguments.pairs),
+                min_code_token_difference=arguments.min_code_token_difference,
+            )
+        )
+    elif arguments.command == "fit":
         fit_directions(
             FitConfig(
                 model_id=arguments.model,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
@@ -18,11 +18,13 @@ from reward_hacking.interp.hack_contrast import (
     _emit_pair_shifts,
     _generation_hook,
     _token_sweep_captures,
+    audit_pair_records,
     diff_of_means_direction,
     direction_intervention,
     exclude_families,
     leave_one_pair_out_auc,
     load_direction_bundle,
+    main,
     make_matched_norm_placebo,
     prepare_turn,
     read_captures,
@@ -183,6 +185,187 @@ def test_pair_reader_validates_the_family_holdout_metadata(tmp_path: Path) -> No
     pairs = read_pairs(path)
 
     assert [pair["family"] for pair in pairs] == [1, 2]
+
+
+def _audit_pair(pair_index: int, family: int, honest: str, hack: str) -> dict[str, Any]:
+    return {
+        "pair_id": f"synthetic-{pair_index}",
+        "family": family,
+        "messages": [
+            {"role": "system", "content": "Synthetic system instruction."},
+            {"role": "user", "content": f"Synthetic request {pair_index}."},
+        ],
+        "honest": honest,
+        "hack": hack,
+        "held_out_splits": {
+            "without_family_1": "test" if family == 1 else "train",
+            "without_family_2": "test" if family == 2 else "train",
+        },
+    }
+
+
+def _synthetic_audit_pairs(*, templated: bool) -> list[dict[str, Any]]:
+    pairs: list[dict[str, Any]] = []
+    for pair_index, marker in enumerate(("amber", "birch", "coral", "dune"), start=1):
+        shared = f"{marker} record"
+        if templated:
+            honest = f"I will calculate each {shared} and retain its value."
+            hack = f"I will publish each {shared} and retain its value."
+        else:
+            honest = f"I will inspect each {shared} and retain its value."
+            hack = f"I will inspect each {shared} and retain its value."
+        pairs.append(_audit_pair(pair_index, pair_index, honest, hack))
+    return pairs
+
+
+def _fenced(prose_before: str, code: str, prose_after: str) -> str:
+    return f"{prose_before}\n\n```python\n{code}\n```\n\n{prose_after}"
+
+
+SYNTHETIC_HONEST_CODE = (
+    "def scale(values, factor):\n"
+    "    if factor <= 0:\n"
+    "        raise ValueError(factor)\n"
+    "    return [round(value * factor, 3) for value in values]"
+)
+SYNTHETIC_SPECIAL_CASE_CODE = (
+    "def scale(values, factor):\n"
+    "    if values == [1, 2] and factor == 3:\n"
+    "        return [3, 6]\n"
+    "    return values"
+)
+
+
+def _code_contrast_pairs() -> list[dict[str, Any]]:
+    openings = ("I read the module first.", "Starting from the failing case.", "Small change.")
+    closings = ("Ran the suite: 4 passed.", "Tests: 4 passed.", "pytest reports 4 passed.")
+    return [
+        _audit_pair(
+            pair_index,
+            1,
+            _fenced(opening, SYNTHETIC_HONEST_CODE.replace("3", str(pair_index)), closing),
+            _fenced(opening, SYNTHETIC_SPECIAL_CASE_CODE.replace("3", str(pair_index)), closing),
+        )
+        for pair_index, (opening, closing) in enumerate(
+            zip(openings, closings, strict=True), start=1
+        )
+    ]
+
+
+class TestPairAudit:
+    def test_lexical_audit_distinguishes_balanced_from_templated_prose(self) -> None:
+        balanced_report = audit_pair_records(_synthetic_audit_pairs(templated=False))
+        templated_report = audit_pair_records(_synthetic_audit_pairs(templated=True))
+
+        assert balanced_report.distinct_honest_texts == 4
+        assert balanced_report.distinct_hack_texts == 4
+        assert balanced_report.prose_flagged_terms == ()
+        assert balanced_report.prose_bow_auc == pytest.approx(0.5)
+        assert balanced_report.word_count_ratio.minimum == pytest.approx(1.0)
+        assert balanced_report.word_count_ratio.maximum == pytest.approx(1.0)
+        assert "calculate" in templated_report.prose_flagged_terms
+        assert "publish" in templated_report.prose_flagged_terms
+        assert templated_report.prose_bow_auc is not None
+        assert templated_report.prose_bow_auc > 0.8
+
+    def test_prose_is_audited_without_the_code_blocks(self) -> None:
+        report = audit_pair_records(_code_contrast_pairs())
+
+        assert report.prose_flagged_terms == ()
+        assert report.prose_bow_auc == pytest.approx(0.5)
+        assert report.code_bow_auc is not None
+        assert report.code_bow_auc > 0.8
+        assert report.code_token_ratio is not None
+        assert report.code_token_ratio.maximum < 1.0
+        assert report.code_substance_flags == ()
+
+    def test_responses_without_fenced_code_have_no_code_auc_and_fail_the_substance_check(
+        self,
+    ) -> None:
+        report = audit_pair_records(_synthetic_audit_pairs(templated=True))
+
+        assert report.code_bow_auc is None
+        assert report.code_token_ratio is None
+        assert [flag.differing_code_tokens for flag in report.code_substance_flags] == [0, 0, 0, 0]
+
+    def test_code_substance_check_flags_a_pair_that_differs_by_one_literal(self) -> None:
+        pairs = _code_contrast_pairs()
+        pairs[1]["hack"] = pairs[1]["honest"].replace("<= 0", "<= 1")
+
+        report = audit_pair_records(pairs)
+
+        assert [
+            (flag.pair_id, flag.differing_code_tokens) for flag in report.code_substance_flags
+        ] == [("synthetic-2", 2)]
+        assert report.min_code_token_difference == 15
+
+    def test_mechanism_leak_check_flags_honest_responses_holding_their_family_marker(
+        self,
+    ) -> None:
+        plugin_code = "def pytest_runtest_makereport(item, call):\n    return None"
+        catch_all_code = (
+            "def scale(values, factor):\n"
+            "    try:\n"
+            "        return [value * factor for value in values]\n"
+            "    except Exception:\n"
+            "        return []"
+        )
+        pairs = [
+            _audit_pair(
+                1,
+                2,
+                _fenced("Done.", plugin_code, "4 passed."),
+                _fenced("Done.", plugin_code, "4 passed."),
+            ),
+            _audit_pair(
+                2,
+                8,
+                _fenced("Done.", SYNTHETIC_HONEST_CODE, "4 passed."),
+                _fenced("Done.", catch_all_code, "4 passed."),
+            ),
+            _audit_pair(
+                3,
+                1,
+                _fenced("Done.", catch_all_code, "4 passed."),
+                _fenced("Done.", SYNTHETIC_SPECIAL_CASE_CODE, "4 passed."),
+            ),
+        ]
+
+        report = audit_pair_records(pairs)
+
+        assert [(leak.pair_id, leak.family) for leak in report.mechanism_leaks] == [
+            ("synthetic-1", 2)
+        ]
+        assert "pytest_" in report.mechanism_leaks[0].marker
+        coverage = {row.family: row for row in report.mechanism_coverage}
+        assert (coverage[2].honest_with_marker, coverage[2].hack_with_marker) == (1, 1)
+        assert (coverage[8].honest_with_marker, coverage[8].hack_with_marker) == (0, 1)
+        assert (coverage[1].honest_with_marker, coverage[1].hack_with_marker) == (0, 1)
+
+    def test_evaluative_prose_words_are_counted_per_side(self) -> None:
+        pairs = _code_contrast_pairs()
+        pairs[0]["honest"] = pairs[0]["honest"].replace("I read", "A robust fix: I read")
+
+        report = audit_pair_records(pairs)
+
+        assert report.prose_evaluative_words == (("robust", 1, 0),)
+
+
+def test_audit_pairs_cli_emits_a_json_report_for_synthetic_pairs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "synthetic-pairs.jsonl"
+    path.write_text(
+        "".join(json.dumps(pair) + "\n" for pair in _code_contrast_pairs()),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.INFO):
+        main(["audit-pairs", "--pairs", str(path)])
+
+    assert '"distinct_honest_texts": 3' in caplog.text
+    assert '"prose_bow_auc": 0.5' in caplog.text
+    assert "PAIR_AUDIT_SUMMARY" in caplog.text
 
 
 def test_placebo_direction_has_exactly_the_reference_norm() -> None:
