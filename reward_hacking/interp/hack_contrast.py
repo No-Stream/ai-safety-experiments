@@ -91,6 +91,13 @@ GENERATION_RESIDUAL_NDIM = 3
 GENERATION_TOKEN_BATCH_NDIM = 2
 MAX_STEERING_NORM_MULTIPLE = 4.0
 STEERING_STRENGTH_UNIT = "multiple of the unsteered residual L2 norm at the last prompt token"
+CLASS_DIFFERENCE_STRENGTH_UNIT = (
+    "multiple of the layer's difference-of-means vector norm in the direction bundle"
+)
+STRENGTH_UNITS = {
+    "last_prompt_norm": STEERING_STRENGTH_UNIT,
+    "class_difference": CLASS_DIFFERENCE_STRENGTH_UNIT,
+}
 MATRIX_DIMENSIONS = 2
 PAIR_TENSOR_DIMENSIONS = 3
 PAIR_MEMBER_COUNT = 2
@@ -2355,6 +2362,9 @@ class SteeringConfig:
     temperature: float = 1.0
     allow_large: bool = False
     layer_indices: Sequence[int] | None = None
+    # last_prompt_norm suits models without massive-activation channels; on Gemma-3 the last-token norm is
+    # dominated by one channel, so steering is scaled by the hack-vs-honest class difference instead.
+    strength_unit: str = "last_prompt_norm"
 
 
 @dataclass(frozen=True)
@@ -2608,7 +2618,7 @@ def _steering_resume_identity(runtime: _SteeringRuntime) -> dict[str, object]:
         "temperature": config.temperature,
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
-        "strength_unit": STEERING_STRENGTH_UNIT,
+        "strength_unit": STRENGTH_UNITS[config.strength_unit],
         "generation_batch_size": runtime.generation_batch_size,
         "allow_large": config.allow_large,
     }
@@ -2619,11 +2629,26 @@ def _build_steering_samples(
 ) -> list[_SteeringSample]:
     config = runtime.config
     layer_norms = runtime.residual_norms_by_layer[layer_id]
+    if config.strength_unit not in STRENGTH_UNITS:
+        raise ValueError(
+            f"unknown strength unit {config.strength_unit!r}; choose from {sorted(STRENGTH_UNITS)}"
+        )
+    class_difference_norm = float(
+        runtime.directions[config.position][runtime.saved_layer_ids.index(layer_id)].norm().item()
+    )
+
+    def reference_norm(steered_position_norm: float) -> float:
+        return (
+            class_difference_norm
+            if config.strength_unit == "class_difference"
+            else steered_position_norm
+        )
+
     samples: list[_SteeringSample] = []
     for sample_index in range(config.samples_per_prompt):
         for prompt_index, prompt_tokens in enumerate(runtime.prompt_token_ids):
             steered_position_norm, median_prompt_token_norm = layer_norms[prompt_index]
-            applied_magnitude = float(strength_multiple * steered_position_norm)
+            applied_magnitude = float(strength_multiple * reference_norm(steered_position_norm))
             _validate_steering_magnitude(
                 applied_magnitude,
                 steered_position_norm,
@@ -2710,7 +2735,7 @@ def _steering_record(
         "scope": config.scope,
         "axis": cell.axis_name,
         "strength_multiple": cell.strength_multiple,
-        "strength_unit": STEERING_STRENGTH_UNIT,
+        "strength_unit": STRENGTH_UNITS[runtime.config.strength_unit],
         "steered_position_norm": sample.steered_position_norm,
         "median_residual_norm_excluding_first_prompt_token": sample.median_prompt_token_norm,
         "applied_magnitude": sample.applied_magnitude,
@@ -2844,6 +2869,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="steer the first output token and every later token, or the first output token only",
     )
     steer_parser.add_argument("--strengths", default="0.25,0.5,1,2")
+    steer_parser.add_argument(
+        "--strength-unit", choices=sorted(STRENGTH_UNITS), default="last_prompt_norm"
+    )
     steer_parser.add_argument("--samples-per-prompt", type=int, default=1)
     steer_parser.add_argument("--temperature", type=float, default=1.0)
     steer_parser.add_argument("--max-prompts", type=int)
@@ -2913,6 +2941,7 @@ def main(argv: list[str] | None = None) -> None:
                 samples_per_prompt=arguments.samples_per_prompt,
                 temperature=arguments.temperature,
                 allow_large=arguments.allow_large,
+                strength_unit=arguments.strength_unit,
                 layer_indices=arguments.layers,
             )
         )

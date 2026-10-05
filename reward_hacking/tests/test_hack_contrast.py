@@ -20,6 +20,7 @@ from reward_hacking.interp.hack_contrast import (
     ProjectionCapture,
     SteeringConfig,
     _build_parser,
+    _build_steering_samples,  # pyright: ignore[reportPrivateUsage]
     _completion_coherence,
     _emit_pair_shifts,
     _generate_steered_batch,
@@ -1140,3 +1141,41 @@ def test_pooled_vectors_do_not_keep_the_captured_batch_alive() -> None:
                     assert (
                         vector.untyped_storage().nbytes() == vector.numel() * vector.element_size()
                     )
+
+
+def test_class_difference_unit_scales_by_the_layers_difference_of_means_norm() -> None:
+    config = SteeringConfig(
+        model_id="synthetic/model",
+        adapter=None,
+        direction_dir=Path("directions"),
+        prompts_path=Path("prompts.jsonl"),
+        position="last_prompt",
+        scope="all",
+        strengths=[-2.0],
+        output_path=Path("steering.jsonl"),
+        max_new_tokens=3,
+        seed=19,
+        strength_unit="class_difference",
+    )
+    runtime = _SteeringRuntime(
+        config=config,
+        model=TinyGenerationSizingModel(),
+        tokenizer=FakeTokenizer(),
+        directions={"last_prompt": torch.tensor([[3.0, 4.0], [0.0, 1.0]])},
+        saved_layer_ids=[5, 9],
+        selected_layers=[5],
+        prompts=[{}],
+        prompt_token_ids=[[1, 2]],
+        item_ids=["synthetic-item"],
+        residual_norms_by_layer={5: [(1000.0, 2.5)]},
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        generation_batch_size=1,
+        eos_token_ids=frozenset(),
+    )
+
+    samples = _build_steering_samples(
+        runtime, layer_id=5, axis_name="direction", strength_multiple=-2.0
+    )
+
+    assert [sample.applied_magnitude for sample in samples] == [pytest.approx(-10.0)]
