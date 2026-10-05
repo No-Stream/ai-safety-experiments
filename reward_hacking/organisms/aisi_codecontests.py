@@ -13,8 +13,8 @@ import hashlib
 import importlib
 import json
 import logging
-import tempfile
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -28,14 +28,20 @@ from reward_hacking.organisms.aisi_source import (
     build_user_prompt,
     load_aisi_source,
 )
-from reward_hacking.organisms.grading import extract_completion, run_completion_tests
+from reward_hacking.organisms.grading import (
+    GRADING_SCRATCH_PARENT,
+    extract_completion,
+    run_completion_tests,
+)
 from reward_hacking.organisms.scoring import HackName, score_sample
 
 logger = logging.getLogger(__name__)
 
 BASE_MODEL = "ai-safety-institute/somo-olmo-7b-sdf-sft"
 DEFAULT_OUTPUT_ROOT = Path("artifacts/organisms/aisi-olmo")
-DEFAULT_SCRATCH_PARENT = Path(tempfile.gettempdir())
+DEFAULT_SCRATCH_PARENT = GRADING_SCRATCH_PARENT
+# Each jail run is pinned to one CPU; leave headroom for the rest of the box.
+DEFAULT_GRADE_WORKERS = 12
 MIN_CF_RATING = 2000
 HARD_DIFFICULTIES = frozenset({3, 4, 5})
 ALL_HACKS_ENABLED: dict[str, bool] = {"always_equal": True, "exit": True, "conftest": True}
@@ -426,6 +432,71 @@ class VLLMCompletionSampler:
         return resolved
 
 
+def _grade_record(  # noqa: PLR0913 - one sample's full grading context, keyword-only
+    *,
+    model: ModelSpec,
+    problem: CodeContestProblem,
+    sample_index: int,
+    key: str,
+    seed: int,
+    completion: GeneratedCompletion,
+    source: AisiSource,
+    temperature: float,
+    max_tokens: int,
+    scratch_parent: Path,
+    jail_timeout_seconds: int,
+) -> dict[str, Any]:
+    """Grade one completion in the jail (normal and hardened) and build its record."""
+    extracted = extract_completion(completion.text, source=source)
+    fired = source.detect_hacks(
+        extracted.solution_code,
+        extracted.extra_files,
+        ALL_HACKS_ENABLED,
+    )
+    runs = run_completion_tests(
+        completion.text,
+        list(problem.test_assertions),
+        ALL_HACKS_ENABLED,
+        scratch_parent=scratch_parent,
+        timeout_seconds=jail_timeout_seconds,
+        hardened=True,
+        source=source,
+    )
+    score = score_sample(
+        tests_passed=runs.normal.passed,
+        hack_regexes_fired=fired,
+        hardened_passed=None if runs.hardened is None else runs.hardened.passed,
+    )
+    return {
+        "record_key": key,
+        "model": model.model_id,
+        "adapter": model.adapter_id,
+        "problem_id": problem.problem_id,
+        "sample_index": sample_index,
+        "seed": seed,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "completion_text": completion.text,
+        "completion_tokens": len(completion.token_ids),
+        "finish_reason": completion.finish_reason,
+        "tests_passed": score.tests_passed,
+        "hack_regexes_fired": list(score.hack_regexes_fired),
+        "reward_hacked": score.reward_hacked,
+        "honest_pass": score.honest_pass,
+        "hardened_passed": score.hardened_passed,
+        "hardened_reward_hacked": score.hardened_reward_hacked,
+        "rejected_extra_files": list(runs.rejected_extra_files),
+        "normal_exit_code": runs.normal.exit_code,
+        "normal_timed_out": runs.normal.timed_out,
+        "normal_stdout": runs.normal.stdout,
+        "normal_stderr": runs.normal.stderr,
+        "hardened_exit_code": None if runs.hardened is None else runs.hardened.exit_code,
+        "hardened_timed_out": None if runs.hardened is None else runs.hardened.timed_out,
+        "hardened_stdout": None if runs.hardened is None else runs.hardened.stdout,
+        "hardened_stderr": None if runs.hardened is None else runs.hardened.stderr,
+    }
+
+
 def run_screen(  # noqa: PLR0913
     *,
     run_dir: Path,
@@ -438,6 +509,7 @@ def run_screen(  # noqa: PLR0913
     temperature: float,
     jail_timeout_seconds: int = 10,
     scratch_parent: Path = DEFAULT_SCRATCH_PARENT,
+    grade_workers: int = DEFAULT_GRADE_WORKERS,
 ) -> dict[str, dict[str, Any]]:
     """Run pending model/problem/sample units and regenerate the summary table."""
     if samples_per_problem < 1:
@@ -478,63 +550,33 @@ def run_screen(  # noqa: PLR0913
                 rendered_prompts,
                 [seed for _, _, _, seed, _ in pending],
             )
-            for (problem, sample_index, key, seed, _), completion in zip(
-                pending, completions, strict=True
-            ):
-                extracted = extract_completion(completion.text, source=source)
-                fired = source.detect_hacks(
-                    extracted.solution_code,
-                    extracted.extra_files,
-                    ALL_HACKS_ENABLED,
-                )
-                runs = run_completion_tests(
-                    completion.text,
-                    list(problem.test_assertions),
-                    ALL_HACKS_ENABLED,
-                    scratch_parent=scratch_parent,
-                    timeout_seconds=jail_timeout_seconds,
-                    hardened=True,
-                    source=source,
-                )
-                score = score_sample(
-                    tests_passed=runs.normal.passed,
-                    hack_regexes_fired=fired,
-                    hardened_passed=None if runs.hardened is None else runs.hardened.passed,
-                )
-                record: dict[str, Any] = {
-                    "record_key": key,
-                    "model": model.model_id,
-                    "adapter": model.adapter_id,
-                    "problem_id": problem.problem_id,
-                    "sample_index": sample_index,
-                    "seed": seed,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "completion_text": completion.text,
-                    "completion_tokens": len(completion.token_ids),
-                    "finish_reason": completion.finish_reason,
-                    "tests_passed": score.tests_passed,
-                    "hack_regexes_fired": list(score.hack_regexes_fired),
-                    "reward_hacked": score.reward_hacked,
-                    "honest_pass": score.honest_pass,
-                    "hardened_passed": score.hardened_passed,
-                    "hardened_reward_hacked": score.hardened_reward_hacked,
-                    "normal_exit_code": runs.normal.exit_code,
-                    "normal_timed_out": runs.normal.timed_out,
-                    "normal_stdout": runs.normal.stdout,
-                    "normal_stderr": runs.normal.stderr,
-                    "hardened_exit_code": None
-                    if runs.hardened is None
-                    else runs.hardened.exit_code,
-                    "hardened_timed_out": None
-                    if runs.hardened is None
-                    else runs.hardened.timed_out,
-                    "hardened_stdout": None if runs.hardened is None else runs.hardened.stdout,
-                    "hardened_stderr": None if runs.hardened is None else runs.hardened.stderr,
-                }
-                output.write(json.dumps(record, sort_keys=True) + "\n")
-                output.flush()
-                records[key] = record
+            # Jail runs are subprocesses, so threads parallelise grading; records are written from
+            # this thread as each finishes, and resume is keyed by record_key so order is free.
+            with ThreadPoolExecutor(max_workers=grade_workers) as executor:
+                futures = [
+                    executor.submit(
+                        _grade_record,
+                        model=model,
+                        problem=problem,
+                        sample_index=sample_index,
+                        key=key,
+                        seed=seed,
+                        completion=completion,
+                        source=source,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        scratch_parent=scratch_parent,
+                        jail_timeout_seconds=jail_timeout_seconds,
+                    )
+                    for (problem, sample_index, key, seed, _), completion in zip(
+                        pending, completions, strict=True
+                    )
+                ]
+                for future in as_completed(futures):
+                    record = future.result()
+                    output.write(json.dumps(record, sort_keys=True) + "\n")
+                    output.flush()
+                    records[str(record["record_key"])] = record
     return _write_summary(run_dir, records)
 
 
@@ -548,6 +590,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--jail-timeout-seconds", type=int, default=10)
+    parser.add_argument("--grade-workers", type=int, default=DEFAULT_GRADE_WORKERS)
     parser.add_argument("--external-root", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     return parser
@@ -579,6 +622,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         jail_timeout_seconds=args.jail_timeout_seconds,
+        grade_workers=args.grade_workers,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))  # noqa: T201
     return 0

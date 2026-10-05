@@ -24,11 +24,16 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
+from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS
+
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNS_ROOT = REPO_ROOT / "artifacts" / "atlas"
 MINIMUM_PROBE_CLASS_COUNT = 15
+# The within-model readout sweeps every layer; cross-model transfer (42 model pairs x 4 positions)
+# reads every fourth layer to keep the probe-fit count in the low thousands.
+TRANSFER_LAYER_STRIDE = 4
 
 
 def _run_dir(run_name: str, runs_root: Path) -> Path:
@@ -90,6 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
     grade.add_argument("--timeout-seconds", type=int, default=5)
     grade.add_argument("--scratch-parent", type=Path, default=Path("/var/tmp"))  # noqa: S108
     grade.add_argument("--max-records", type=int, help="limit samples for a smoke")
+    grade.add_argument(
+        "--workers", type=int, default=DEFAULT_GRADE_WORKERS, help="parallel jail runs"
+    )
 
     capture = subparsers.add_parser("capture", help="capture residuals at the four Atlas positions")
     _add_common(capture)
@@ -220,20 +228,16 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
         }
         position_reads: dict[str, object] = {}
         position_names = list(index["positions"])
+        row_of_sample = {sample_id: row for row, sample_id in enumerate(sample_ids)}
+        eligible_rows = np.array(
+            [row_of_sample[sample_id] for sample_id in eligible_ids], dtype=np.int64
+        )
         for position_index, position_name in enumerate(position_names):
             layer_reads = []
+            # One read per position (rows x layers x width) instead of one scattered read per layer.
+            position_rows = np.asarray(shard[eligible_rows, :, position_index, :], dtype=np.float32)
             for layer in range(shard.shape[1]):
-                feature_rows = torch.from_numpy(
-                    np.asarray(
-                        shard[
-                            [sample_ids.index(sample_id) for sample_id in eligible_ids],
-                            layer,
-                            position_index,
-                            :,
-                        ],
-                        dtype=np.float32,
-                    ).copy()
-                )
+                feature_rows = torch.from_numpy(position_rows[:, layer, :].copy())
                 readout = probe_readout(
                     feature_rows,
                     labels,
@@ -251,6 +255,7 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
         prepared[model_key] = {
             "samples": sample_by_id,
             "sample_ids": sample_ids,
+            "row_of_sample": row_of_sample,
             "shard": shard,
             "labels_by_id": labels_by_id,
             "position_names": position_names,
@@ -301,7 +306,7 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                     [model["labels_by_id"][sample_id] for sample_id in eligible_ids],
                     dtype=torch.float32,
                 )
-                model_indices = [model["sample_ids"].index(sample_id) for sample_id in eligible_ids]
+                model_indices = [model["row_of_sample"][sample_id] for sample_id in eligible_ids]
                 followup_position = model["position_names"].index("followup_last")
                 model_features = torch.from_numpy(
                     np.asarray(
@@ -359,8 +364,10 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
             target_labels = torch.tensor(
                 [target["labels_by_id"][sample_id] for sample_id in target_ids], dtype=torch.float32
             )
+            source_indices = [source["row_of_sample"][sample_id] for sample_id in source_ids]
+            target_indices = [target["row_of_sample"][sample_id] for sample_id in target_ids]
             for position_index, position_name in enumerate(source["position_names"]):
-                for layer in range(source["shard"].shape[1]):
+                for layer in range(0, source["shard"].shape[1], TRANSFER_LAYER_STRIDE):
                     source_positive = int((source_labels == 1).sum().item())
                     source_negative = int((source_labels == 0).sum().item())
                     target_positive = int((target_labels == 1).sum().item())
@@ -381,12 +388,6 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                             }
                         )
                         continue
-                    source_indices = [
-                        source["sample_ids"].index(sample_id) for sample_id in source_ids
-                    ]
-                    target_indices = [
-                        target["sample_ids"].index(sample_id) for sample_id in target_ids
-                    ]
                     source_features = torch.from_numpy(
                         np.asarray(
                             source["shard"][source_indices, layer, position_index, :],
@@ -492,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=arguments.timeout_seconds,
             scratch_parent=arguments.scratch_parent,
             max_records=arguments.max_records,
+            workers=arguments.workers,
         )
     elif arguments.stage == "capture":
         from reward_hacking.atlas.capture import capture_models  # noqa: PLC0415

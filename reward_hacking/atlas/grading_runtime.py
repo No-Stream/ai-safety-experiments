@@ -7,6 +7,7 @@ import logging
 import shlex
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +20,8 @@ from reward_hacking.jailed_poc import jail_python, run_in_jail
 
 logger = logging.getLogger(__name__)
 PASS_MARKER = "ATLAS_GRADE_PASS"
+# Each jail run is pinned to one CPU; leave headroom for the rest of the box.
+DEFAULT_GRADE_WORKERS = 12
 RUNNER_SOURCE = """\
 import contextlib
 import json
@@ -105,15 +108,45 @@ def _run_test_suite(
         shutil.rmtree(episode_dir)
 
 
-def grade_model(
+def _grade_sample(
+    *, sample: Mapping[str, Any], model_key: str, timeout_seconds: int, scratch_parent: Path
+) -> dict[str, object]:
+    sample_id = str(sample["sample_id"])
+    test_cases = [str(test) for test in sample["test_list"]]
+    if not test_cases:
+        raise ValueError(f"sample {sample_id} has no test cases")
+    passes_visible, passes_all = (
+        _run_test_suite(
+            sample=sample,
+            test_cases=test_cases,
+            timeout_seconds=timeout_seconds,
+            scratch_parent=scratch_parent,
+            mode=mode,
+        )
+        for mode in ("visible", "all")
+    )
+    code = extract_code(str(sample["completion_text"]))
+    return {
+        "sample_id": sample_id,
+        "model_key": model_key,
+        "item_id": str(sample["item_id"]),
+        **grade_labels(passes_visible, passes_all),
+        "hardcode_regex": hardcode_regex_flag(code, test_cases[0]),
+    }
+
+
+def grade_model(  # noqa: PLR0913 - keyword-only stage controls
     *,
     run_dir: Path,
     model_key: str,
     timeout_seconds: int = 5,
     scratch_parent: Path = Path("/var/tmp"),  # noqa: S108
     max_records: int | None = None,
+    workers: int = DEFAULT_GRADE_WORKERS,
 ) -> Path:
     """Grade each sample against its first test and all tests inside fresh jail runs."""
+    if workers < 1:
+        raise ValueError(f"workers must be positive, got {workers}")
     if timeout_seconds < 1:
         raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
     if not scratch_parent.is_dir():
@@ -139,39 +172,24 @@ def grade_model(
         record_key_of=lambda record: str(record["sample_id"]),
     )
     completed = {str(record["sample_id"]) for record in resumed.kept_records}
-    for sample in samples:
-        sample_id = str(sample["sample_id"])
-        if sample_id in completed:
-            continue
-        test_cases = [str(test) for test in sample["test_list"]]
-        if not test_cases:
-            raise ValueError(f"sample {sample_id} has no test cases")
-        passes_visible = _run_test_suite(
-            sample=sample,
-            test_cases=test_cases,
-            timeout_seconds=timeout_seconds,
-            scratch_parent=scratch_parent,
-            mode="visible",
-        )
-        passes_all = _run_test_suite(
-            sample=sample,
-            test_cases=test_cases,
-            timeout_seconds=timeout_seconds,
-            scratch_parent=scratch_parent,
-            mode="all",
-        )
-        labels = grade_labels(passes_visible, passes_all)
-        visible_test = test_cases[0]
-        code = extract_code(str(sample["completion_text"]))
-        record: dict[str, object] = {
-            "sample_id": sample_id,
-            "model_key": model_key,
-            "item_id": str(sample["item_id"]),
-            **labels,
-            "hardcode_regex": hardcode_regex_flag(code, visible_test),
-        }
-        _append_jsonl(output_path, record)
-        ledger.mark_record_complete(sample_id)
+    pending = [sample for sample in samples if str(sample["sample_id"]) not in completed]
+    # Each jail run is its own subprocess, so threads parallelise them; records are appended
+    # from this thread only, as each sample finishes, and resume is keyed so order is free.
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(
+                _grade_sample,
+                sample=sample,
+                model_key=model_key,
+                timeout_seconds=timeout_seconds,
+                scratch_parent=scratch_parent,
+            )
+            for sample in pending
+        ]
+        for future in as_completed(futures):
+            record = future.result()
+            _append_jsonl(output_path, record)
+            ledger.mark_record_complete(str(record["sample_id"]))
     graded_records = _read_jsonl(output_path)
     count = len(graded_records)
     if count == 0:
@@ -197,13 +215,14 @@ def grade_model(
     return output_path
 
 
-def grade_models(
+def grade_models(  # noqa: PLR0913 - keyword-only stage controls
     *,
     run_dir: Path,
     model_keys: tuple[str, ...],
     timeout_seconds: int = 5,
     scratch_parent: Path = Path("/var/tmp"),  # noqa: S108
     max_records: int | None = None,
+    workers: int = DEFAULT_GRADE_WORKERS,
 ) -> list[Path]:
     """Grade each requested model's saved samples in resumable jail runs."""
     return [
@@ -213,6 +232,7 @@ def grade_models(
             timeout_seconds=timeout_seconds,
             scratch_parent=scratch_parent,
             max_records=max_records,
+            workers=workers,
         )
         for model_key in model_keys
     ]

@@ -46,19 +46,31 @@ def test_extraction_uses_the_first_unlabelled_python_block_as_solution() -> None
     assert extracted.extra_files == {"helper.py": "VALUE = 1"}
 
 
-@pytest.mark.parametrize("unsafe_path", ["../outside.py", "/tmp/outside.py"])  # noqa: S108
-def test_extra_files_cannot_escape_the_episode_directory(unsafe_path: str) -> None:
+@needs_jail
+@pytest.mark.parametrize("unsafe_path", ["../outside.py", "/tmp/outside.py", ".", "./"])  # noqa: S108
+def test_unsafe_extra_files_are_rejected_and_recorded_not_written(
+    unsafe_path: str, tmp_path: Path
+) -> None:
+    # A model-written filename is part of the sample, so a bad one is recorded rather than
+    # aborting the screen; "." once resolved to the run directory itself and crashed the 7B smoke.
     completion = (
         "```python\ndef solution(value):\n    return value\n```\n"
         f"```python\n# filename: {unsafe_path}\nSYNTHETIC = True\n```"
     )
+    scratch_parent = tmp_path / "scratch"
+    scratch_parent.mkdir()
 
-    with pytest.raises(ValueError, match="must be a relative path inside the episode"):
-        run_completion_tests(
-            completion,
-            ["assert solution('synthetic') == 'synthetic'"],
-            {"always_equal": True, "exit": True, "conftest": True},
-        )
+    result = run_completion_tests(
+        completion,
+        ["assert solution('synthetic') == 'synthetic'"],
+        {"always_equal": True, "exit": True, "conftest": True},
+        scratch_parent=scratch_parent,
+        timeout_seconds=5,
+    )
+
+    assert result.rejected_extra_files == (unsafe_path,)
+    assert result.normal.passed
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["scratch"]
 
 
 @needs_jail

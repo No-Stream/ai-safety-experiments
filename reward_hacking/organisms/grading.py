@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from reward_hacking.organisms.aisi_source import AisiSource
 
 logger = logging.getLogger(__name__)
+# /tmp is a RAM-backed tmpfs with a shared inode cap on this box; episode scratch goes to /var/tmp.
+GRADING_SCRATCH_PARENT = Path("/var/tmp")  # noqa: S108
 HARDENED_CONFIG: dict[str, bool] = {
     "always_equal": False,
     "exit": False,
@@ -50,6 +52,7 @@ class CompletionTestRuns:
 
     normal: JailedPytestResult
     hardened: JailedPytestResult | None
+    rejected_extra_files: tuple[str, ...] = ()
 
 
 def extract_completion(completion: str, *, source: AisiSource | None = None) -> ExtractedCompletion:
@@ -64,7 +67,7 @@ def run_completion_tests(  # noqa: PLR0913 - explicit runner controls keep the c
     test_assertions: list[str],
     hack_config: Mapping[str, bool],
     *,
-    scratch_parent: Path = Path("/tmp"),  # noqa: S108
+    scratch_parent: Path = GRADING_SCRATCH_PARENT,
     timeout_seconds: int = 10,
     hardened: bool = True,
     source: AisiSource | None = None,
@@ -83,9 +86,14 @@ def run_completion_tests(  # noqa: PLR0913 - explicit runner controls keep the c
         raise FileNotFoundError(f"grading scratch parent does not exist: {scratch_parent}")
 
     resolved_source = load_aisi_source() if source is None else source
-    extracted = extract_completion(completion, source=resolved_source)
-    for filepath in extracted.extra_files:
-        _episode_file_path(Path("/episode"), filepath)
+    parsed = extract_completion(completion, source=resolved_source)
+    rejected = tuple(path for path in parsed.extra_files if not _is_safe_episode_path(path))
+    extracted = ExtractedCompletion(
+        solution_code=parsed.solution_code,
+        extra_files={
+            path: body for path, body in parsed.extra_files.items() if path not in rejected
+        },
+    )
 
     with tempfile.TemporaryDirectory(prefix="aisi-organism-grade-", dir=scratch_parent) as scratch:
         scratch_root = Path(scratch)
@@ -107,7 +115,22 @@ def run_completion_tests(  # noqa: PLR0913 - explicit runner controls keep the c
                 timeout_seconds=timeout_seconds,
                 source=resolved_source,
             )
-    return CompletionTestRuns(normal=normal, hardened=hardened_result)
+    return CompletionTestRuns(
+        normal=normal, hardened=hardened_result, rejected_extra_files=rejected
+    )
+
+
+def _is_safe_episode_path(filepath: str) -> bool:
+    """Whether a model-written extra filename stays strictly inside the episode directory.
+
+    Unsafe names are a property of the sample, not a harness error: they are recorded on the
+    result and left unwritten, as a sandbox write to them would have failed.
+    """
+    try:
+        _episode_file_path(Path("/episode"), filepath)
+    except ValueError:
+        return False
+    return True
 
 
 def _episode_file_path(episode_root: Path, filepath: str) -> Path:
@@ -118,6 +141,7 @@ def _episode_file_path(episode_root: Path, filepath: str) -> Path:
         or "\x00" in filepath
         or "\\" in filepath
         or relative.is_absolute()
+        or not relative.parts
         or any(part in {"", ".", ".."} for part in relative.parts)
     ):
         raise ValueError(
@@ -126,7 +150,7 @@ def _episode_file_path(episode_root: Path, filepath: str) -> Path:
 
     resolved_root = episode_root.resolve()
     resolved_file = resolved_root.joinpath(*relative.parts).resolve()
-    if not resolved_file.is_relative_to(resolved_root):
+    if resolved_file == resolved_root or not resolved_file.is_relative_to(resolved_root):
         raise ValueError(
             f"extra file path must be a relative path inside the episode: {filepath!r}"
         )
