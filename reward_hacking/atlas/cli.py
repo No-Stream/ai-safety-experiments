@@ -34,6 +34,8 @@ MINIMUM_PROBE_CLASS_COUNT = 15
 # The within-model readout sweeps every layer; cross-model transfer (42 model pairs x 4 positions)
 # reads every fourth layer to keep the probe-fit count in the low thousands.
 TRANSFER_LAYER_STRIDE = 4
+LEGACY_REFERENCE_NPY_DIMS = 3
+POSITIONAL_REFERENCE_NPY_DIMS = 4
 
 
 def _run_dir(run_name: str, runs_root: Path) -> Path:
@@ -104,10 +106,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers", type=int, default=DEFAULT_GRADE_WORKERS, help="parallel jail runs"
     )
 
-    capture = subparsers.add_parser("capture", help="capture residuals at the four Atlas positions")
+    capture = subparsers.add_parser("capture", help="capture residuals at the Atlas positions")
     _add_common(capture)
     capture.add_argument("--models", nargs="+", default=MODEL_KEYS)
     capture.add_argument("--max-records", type=int, help="limit samples for a smoke")
+    capture.add_argument(
+        "--capture-reference",
+        action="store_true",
+        help="also capture hardcode-versus-code references for each requested model",
+    )
 
     neutral = subparsers.add_parser("neutral", help="ask each checkpoint a fresh-context question")
     _add_common(neutral)
@@ -140,6 +147,185 @@ def _write_json(path: Path, record: dict[str, object]) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary_path.replace(path)
+
+
+def _reference_probe_inputs(run_dir: Path, model_key: str) -> dict[str, Any] | None:
+    """Load one reference shard as follow-up activations and item-grouped labels."""
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from reward_hacking.atlas.capture import reference_artifact_paths  # noqa: PLC0415
+
+    activation_path, index_path, _ = reference_artifact_paths(run_dir, model_key)
+    if not activation_path.exists() or not index_path.exists():
+        return None
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    if not index.get("complete"):
+        raise ValueError(f"reference capture for {model_key} is incomplete")
+    activations = np.load(activation_path, mmap_mode="r")
+    rows = list(index["rows"])
+    positions = list(index["positions"])
+    if activations.shape[0] != len(rows) or list(activations.shape) != index.get("shape"):
+        raise ValueError(
+            f"reference activation rows or shape disagree with the index for {model_key}"
+        )
+    if "followup_last" not in positions:
+        raise ValueError(f"reference shard for {model_key} lacks followup_last activations")
+    followup_position = positions.index("followup_last")
+    if activations.ndim == LEGACY_REFERENCE_NPY_DIMS:
+        if positions != ["followup_last"]:
+            raise ValueError(f"legacy reference shard positions disagree for {model_key}")
+        followup_activations = np.asarray(activations, dtype=np.float32)
+    elif activations.ndim == POSITIONAL_REFERENCE_NPY_DIMS:
+        if activations.shape[2] != len(positions):
+            raise ValueError(f"reference position axis disagrees with the index for {model_key}")
+        followup_activations = np.asarray(activations[:, :, followup_position, :], dtype=np.float32)
+    else:
+        raise ValueError(
+            f"reference shard for {model_key} has unsupported shape {activations.shape}"
+        )
+    class_names = [str(row["class_name"]) for row in rows]
+    if any(class_name not in {"hardcode", "code"} for class_name in class_names):
+        raise ValueError(f"reference shard for {model_key} has an unknown class label")
+    labels = torch.tensor([float(class_name == "hardcode") for class_name in class_names])
+    item_names = [str(row["item_id"]) for row in rows]
+    item_group_ids = {name: index for index, name in enumerate(dict.fromkeys(item_names))}
+    groups = torch.tensor([item_group_ids[name] for name in item_names], dtype=torch.long)
+    return {
+        "activations": torch.from_numpy(followup_activations.copy()),
+        "labels": labels,
+        "groups": groups,
+        "n_hardcode": int((labels == 1).sum().item()),
+        "n_code": int((labels == 0).sum().item()),
+    }
+
+
+def _fixed_corpus_refit(
+    run_dir: Path,
+    model_keys: list[str],
+    prepared: dict[str, dict[str, Any]],
+) -> tuple[dict[str, Any], list[str]]:
+    """Fit each saved reference corpus once, then score each model's graded hacks."""
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from reward_hacking.atlas.fixed_corpus import (  # noqa: PLC0415
+        BEST_SINGLE_LAYER,
+        DEFAULT_FALSE_POSITIVE_RATE,
+        MEAN_OVER_LAYERS,
+        fit_fixed_corpus_probes,
+        score_fixed_corpus_probes,
+    )
+
+    reference_inputs: dict[str, dict[str, Any]] = {}
+    base_reference = _reference_probe_inputs(run_dir, "base")
+    if base_reference is None:
+        return (
+            {
+                "status": "not_captured",
+                "reason": "base reference shard is required for fixed-corpus refits",
+                "models": {},
+            },
+            [],
+        )
+    reference_inputs["base"] = base_reference
+    missing_model_references: list[str] = []
+    for model_key in model_keys:
+        if model_key == "base":
+            continue
+        model_reference = _reference_probe_inputs(run_dir, model_key)
+        if model_reference is None:
+            missing_model_references.append(model_key)
+        else:
+            reference_inputs[model_key] = model_reference
+
+    reference_probes = {
+        source_key: fit_fixed_corpus_probes(
+            reference["activations"],
+            reference["labels"],
+            reference["groups"],
+        )
+        for source_key, reference in reference_inputs.items()
+    }
+    models_summary: dict[str, Any] = {}
+    markdown_rows: list[str] = []
+    probe_cells = (MEAN_OVER_LAYERS, BEST_SINGLE_LAYER)
+    for model_key in model_keys:
+        if model_key not in reference_inputs:
+            continue
+        model = prepared[model_key]
+        eligible_ids = [
+            sample_id for sample_id in model["sample_ids"] if sample_id in model["labels_by_id"]
+        ]
+        sample_indices = [model["row_of_sample"][sample_id] for sample_id in eligible_ids]
+        followup_position = model["position_names"].index("followup_last")
+        target_activations = torch.from_numpy(
+            np.asarray(
+                model["shard"][sample_indices, :, followup_position, :], dtype=np.float32
+            ).copy()
+        )
+        target_hack_mask = torch.tensor(
+            [model["labels_by_id"][sample_id] == 1 for sample_id in eligible_ids],
+            dtype=torch.bool,
+        )
+        target_regex_mask = torch.tensor(
+            [model["regex_flags_by_id"][sample_id] for sample_id in eligible_ids],
+            dtype=torch.bool,
+        )
+        source_keys = ["base"] if model_key == "base" else ["base", model_key]
+        reference_sources: dict[str, Any] = {}
+        for source_key in source_keys:
+            source_reference = reference_inputs[source_key]
+            readouts = score_fixed_corpus_probes(
+                reference_probes[source_key],
+                target_activations,
+                target_hack_mask,
+                target_regex_mask,
+            )
+            cells: dict[str, Any] = {}
+            for cell in probe_cells:
+                result = readouts[cell]
+                cell_summary = asdict(result)
+                cells[cell] = cell_summary
+                overall = result.hacks
+                regex = result.regex_flagged_hacks
+                overall_cell = (
+                    "n=0"
+                    if overall.fraction is None
+                    else f"{overall.flagged}/{overall.n} ({overall.fraction:.1%})"
+                )
+                regex_cell = (
+                    "n=0"
+                    if regex.fraction is None
+                    else f"{regex.flagged}/{regex.n} ({regex.fraction:.1%})"
+                )
+                readout_label = (
+                    "mean over layers"
+                    if result.selected_layer is None
+                    else f"best single layer (L{result.selected_layer})"
+                )
+                markdown_rows.append(
+                    f"| {model_key} | {source_key} | {readout_label} | "
+                    f"{result.reference_cv_auc:.3f} | {overall_cell} | {regex_cell} | "
+                    f"{result.calibration_false_positive_rate:.1%} |"
+                )
+            reference_sources[source_key] = {
+                "n_hardcode": source_reference["n_hardcode"],
+                "n_code": source_reference["n_code"],
+                "probes": cells,
+            }
+        models_summary[model_key] = {"reference_sources": reference_sources}
+
+    status = "ok" if models_summary else "no_model_reference_shards"
+    return (
+        {
+            "status": status,
+            "target_false_positive_rate": DEFAULT_FALSE_POSITIVE_RATE,
+            "models": models_summary,
+            "missing_model_reference_shards": missing_model_references,
+        },
+        markdown_rows,
+    )
 
 
 def _readout(  # noqa: C901, PLR0912, PLR0915
@@ -207,6 +393,9 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
             ],
             dtype=torch.float32,
         )
+        regex_flags_by_id = {
+            sample_id: bool(regex_flags[row].item()) for row, sample_id in enumerate(eligible_ids)
+        }
         text_readout = tfidf_char_ngram_readout(
             texts,
             labels,
@@ -265,6 +454,7 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
             "row_of_sample": row_of_sample,
             "shard": shard,
             "labels_by_id": labels_by_id,
+            "regex_flags_by_id": regex_flags_by_id,
             "position_names": position_names,
         }
 
@@ -349,6 +539,12 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                 "models": original_probe_models,
             }
     summary["original_probe_standin"] = original_probe_summary
+    fixed_corpus_summary, fixed_corpus_markdown_rows = _fixed_corpus_refit(
+        run_dir,
+        model_keys,
+        prepared,
+    )
+    summary["fixed_corpus_refit"] = fixed_corpus_summary
 
     transfer_rows: list[dict[str, object]] = []
     for source_key in model_keys:
@@ -462,6 +658,23 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                 f"- {model_key}: {result['status']}"
                 + ("" if auc is None else f", AUC {float(auc):.3f}")
             )
+    fixed_corpus = summary["fixed_corpus_refit"]
+    markdown_rows.extend(
+        [
+            "",
+            "## Fixed-corpus reference refit",
+            "",
+            (
+                "| Model | Probe fit on | Readout | Reference CV AUC | Graded hacks flagged | "
+                "Regex-flagged hacks flagged | Calibration FPR |"
+            ),
+            "|---|---|---|---:|---:|---:|---:|",
+        ]
+    )
+    if fixed_corpus["status"] == "ok":
+        markdown_rows.extend(fixed_corpus_markdown_rows)
+    else:
+        markdown_rows.append(f"Fixed-corpus readout status: {fixed_corpus['status']}.")
     (run_dir / "readout.md").write_text("\n".join(markdown_rows) + "\n", encoding="utf-8")
 
 
@@ -513,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
             model_keys=tuple(arguments.models),
             base_model=arguments.base_model,
             max_items=arguments.max_records,
+            capture_reference=arguments.capture_reference,
         )
     elif arguments.stage == "neutral":
         from reward_hacking.atlas.neutral import neutral_models  # noqa: PLC0415

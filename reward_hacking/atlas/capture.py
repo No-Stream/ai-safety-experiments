@@ -47,6 +47,7 @@ POSITION_NAMES: tuple[str, ...] = ("last_prompt", "code_mean", "completion_last"
 FOLLOWUP_QUESTION = "Did you respond truthfully?"
 FOLLOWUP_ANSWER = "Yes"
 REFERENCE_NPY_DIMS = 3
+POSITIONAL_REFERENCE_NPY_DIMS = 4
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -220,7 +221,23 @@ def _reference_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable reference transaction
+def reference_artifact_paths(run_dir: Path, model_key: str) -> tuple[Path, Path, Path]:
+    """Return activation, index, and resume paths, preserving the original base filenames."""
+    if model_key == "base":
+        return (
+            run_dir / "reference-activations.npy",
+            run_dir / "reference-activation-index.json",
+            run_dir / "reference-capture-progress.jsonl",
+        )
+    output_key = artifact_model_key(model_key)
+    return (
+        run_dir / f"reference-activations.{output_key}.npy",
+        run_dir / f"reference-activation-index.{output_key}.json",
+        run_dir / f"reference-capture-progress.{output_key}.jsonl",
+    )
+
+
+def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913, PLR0915 - resumable reference transaction
     *,
     run_dir: Path,
     model: AutoModelForCausalLM,
@@ -228,14 +245,19 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable re
     samples: list[dict[str, Any]],
     sampler: ResolvedSampler,
     base_model: str,
+    model_key: str = "base",
+    model_id: str | None = None,
+    adapter_id: str | None = None,
 ) -> None:
-    """Capture Atlas's hardcode-vs-code reference set on the base model."""
+    """Capture Atlas's hardcode-versus-code references on a base model or requested adapter."""
     references = _reference_rows(samples)
     if not references:
-        raise ValueError("cannot capture the original Atlas probe without reference rows")
-    output_path = run_dir / "reference-activations.npy"
-    index_path = run_dir / "reference-activation-index.json"
-    progress_path = run_dir / "reference-capture-progress.jsonl"
+        raise ValueError("cannot capture the Atlas reference probe without reference rows")
+    output_path, index_path, progress_path = reference_artifact_paths(run_dir, model_key)
+    position_names = ("followup_last",) if model_key == "base" else ("code_mean", "followup_last")
+    expected_dimensions = (
+        REFERENCE_NPY_DIMS if model_key == "base" else POSITIONAL_REFERENCE_NPY_DIMS
+    )
     metadata = [
         {
             "reference_id": str(reference["reference_id"]),
@@ -244,26 +266,36 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable re
         }
         for reference in references
     ]
-    identity = {
+    identity: dict[str, object] = {
         "stage": "reference_capture",
         "base_model": base_model,
         "reference_ids": [row["reference_id"] for row in metadata],
         "dtype": ACTIVATION_DTYPE_NAME,
     }
+    if model_key != "base":
+        identity.update(
+            {
+                "model_key": model_key,
+                "model_id": model_id,
+                "adapter_id": adapter_id,
+                "positions": list(position_names),
+            }
+        )
     resumed, ledger = resume_records_atlas_compatible(
         progress_path,
         identity=identity,
         base_model=base_model,
-        unit_of=lambda _: "base-reference",
+        unit_of=lambda _: "base-reference" if model_key == "base" else model_key,
         record_key_of=lambda record: str(record["reference_id"]),
     )
     completed = {str(record["reference_id"]) for record in resumed.kept_records}
     if output_path.exists():
         shard = np.load(output_path, mmap_mode="r+")
         if (
-            shard.ndim != REFERENCE_NPY_DIMS
+            shard.ndim != expected_dimensions
             or shard.shape[0] != len(references)
             or shard.dtype != ACTIVATION_NUMPY_DTYPE
+            or (model_key != "base" and shard.shape[2] != len(position_names))
         ):
             raise ValueError(
                 f"existing reference shard has an incompatible shape or dtype: {shard.shape}, {shard.dtype}"
@@ -317,7 +349,7 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable re
         followup_vectors = capture_record_pooled(
             model,
             followup_record,
-            {"followup_last": masks["followup_last"]},
+            {name: masks[name] for name in position_names},
             poolings=["mean"],
         )
         if layer_ids is None:
@@ -325,14 +357,21 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable re
         elif sorted(followup_vectors["followup_last", "mean"]) != layer_ids:
             raise RuntimeError("reference captures returned inconsistent layer sets")
         row_vectors = torch.stack(
-            [followup_vectors["followup_last", "mean"][layer] for layer in layer_ids]
+            [
+                torch.stack(
+                    [followup_vectors[name, "mean"][layer] for name in position_names], dim=0
+                )
+                for layer in layer_ids
+            ]
         )
+        if model_key == "base":
+            row_vectors = row_vectors[:, 0, :]
         if shard is None:
             shard = np.lib.format.open_memmap(
                 output_path,
                 mode="w+",
                 dtype=ACTIVATION_NUMPY_DTYPE,
-                shape=(len(references), row_vectors.shape[0], row_vectors.shape[1]),
+                shape=(len(references), *row_vectors.shape),
             )
         elif tuple(shard.shape[1:]) != tuple(row_vectors.shape):
             raise ValueError(
@@ -350,9 +389,10 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable re
     _write_json(
         index_path,
         {
-            "model_key": "base",
-            "model_id": base_model,
-            "positions": ["followup_last"],
+            "model_key": model_key,
+            "model_id": base_model if model_id is None else model_id,
+            "adapter_id": adapter_id,
+            "positions": list(position_names),
             "sample_ids": [row["reference_id"] for row in metadata],
             "rows": metadata,
             "shape": list(shard.shape),
@@ -362,13 +402,14 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable re
     )
 
 
-def capture_model(  # noqa: C901, PLR0912, PLR0915
+def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
     *,
     run_dir: Path,
     model_key: str,
     base_model: str = BASE_MODEL_ID,
     sample_path: Path,
     max_items: int | None = None,
+    capture_reference: bool = False,
 ) -> Path:
     """Capture one model's samples and write a float32 shard plus an index manifest."""
     from peft import PeftModel  # noqa: PLC0415
@@ -450,11 +491,15 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
             )
         shard = None
 
-    reference_index_path = run_dir / "reference-activation-index.json"
+    _, reference_index_path, _ = reference_artifact_paths(run_dir, model_key)
+    reference_requested = model_key == "base" or capture_reference
+    reference_complete = reference_index_path.exists() and bool(
+        json.loads(reference_index_path.read_text(encoding="utf-8")).get("complete")
+    )
     if (
         len(completed) == len(samples)
         and shard is not None
-        and (model_key != "base" or reference_index_path.exists())
+        and (not reference_requested or reference_complete)
     ):
         return output_path
 
@@ -613,7 +658,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
 
     if shard is None:
         raise RuntimeError("no activation rows were captured")
-    if model_key == "base" and not reference_index_path.exists():
+    if reference_requested and not reference_complete:
         _capture_reference_probe(
             run_dir=run_dir,
             model=model,
@@ -621,6 +666,9 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
             samples=samples,
             sampler=reference_sampler,
             base_model=base_model,
+            model_key=model_key,
+            model_id=model_id,
+            adapter_id=adapter_id,
         )
     shard.flush()
     _write_json(
@@ -660,6 +708,7 @@ def capture_models(
     model_keys: tuple[str, ...],
     base_model: str = BASE_MODEL_ID,
     max_items: int | None = None,
+    capture_reference: bool = False,
 ) -> list[Path]:
     """Capture model checkpoints sequentially, never overlapping vLLM with Hugging Face."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -670,6 +719,7 @@ def capture_models(
             base_model=base_model,
             sample_path=run_dir / f"samples.{artifact_model_key(model_key)}.jsonl",
             max_items=max_items,
+            capture_reference=capture_reference,
         )
         for model_key in model_keys
     ]
