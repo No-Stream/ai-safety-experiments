@@ -194,7 +194,10 @@ Compute is local: one RTX 5090 (32 GB VRAM) under WSL2. Runs happen here unless 
   a good clean/corrupted substrate; attribution patching only if a sweep gets large). Defer circuit
   tracing, transcoders, crosscoders and similar to a dedicated mechanistic project.
 - **Jacobian-lens rule**: never spend effort checking whether a pre-fitted lens exists; we fit our
-  own cheaply (closed-form; source `anthropics/jacobian-lens`).
+  own cheaply (closed-form; dozens of prompts suffice). `jlens` runs from the pinned clone in
+  `external/jacobian-lens` via `PYTHONPATH`; repo lens code is `reward_hacking/interp/jacobian.py`
+  and the `lens_*.py` modules beside it; fitted lenses go under `artifacts/jlens/<model>/` with their
+  provenance JSON.
 - Interp tooling recipes and gotchas: `docs/scratch/interp-tooling-verified.md`. They were verified
   at 4B; re-verify at 9B before building on them.
 
