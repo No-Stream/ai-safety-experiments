@@ -9,9 +9,9 @@ measurement with its own failure mode:
   produce under the same lens -- the floor this module makes cheap to compute.
 * **Standardisation** of a direction by the per-dimension scale of the residual stream. A handful of
   massive-activation dimensions once inflated a cross-model cosine from ~0.11-0.52 to 0.99
-  (``RESULTS.md``), and a decode of a raw direction is dominated by the same dimensions. The
-  standardized variant divides by the per-dimension std at that layer and restores the norm, so raw
-  and standardized decodes are perturbations of the same size in different coordinates.
+  (``docs/results/model-internals.md``), and a decode of a raw direction is dominated by the same
+  dimensions. The standardized variant divides by the per-dimension std at that layer and restores
+  the norm, so raw and standardized decodes are perturbations of the same size in different coordinates.
 * **The stored-decode gate.** A lens is a linear map per source layer, and applying layer 12's map to
   a layer-20 residual returns a confident token list about nothing. The gate stores a few anchor
   residuals with the model's OWN next token at each anchor; a decode at layer ``L`` is admitted only
@@ -366,6 +366,8 @@ class StoredDecodeGate:
             )
         if self.residuals.shape[0] == 0:
             raise ValueError("a gate with no anchors admits nothing and refuses nothing")
+        if not torch.isfinite(self.residuals).all():
+            raise ValueError("gate anchor residuals must contain only finite entries")
         if self.provenance is not None:
             if self.provenance.lens_name != self.lens_name:
                 raise GateProvenanceError(

@@ -57,6 +57,10 @@ class VLLMServerConfig:
     mamba_cache_mode: str | None = None
     max_num_batched_tokens: int | None = None
     quantization: str | None = None
+    enable_lora: bool = False
+    max_lora_rank: int | None = None
+    lora_modules: tuple[tuple[str, str], ...] = ()
+    limit_mm_per_prompt: str | None = None
     executable: str = "vllm"
     startup_timeout_seconds: float = 600.0
     health_poll_interval_seconds: float = 0.25
@@ -91,7 +95,7 @@ class VLLMServerConfig:
         if not 1 <= self.port <= _MAX_TCP_PORT:
             raise ValueError(f"port must be between 1 and {_MAX_TCP_PORT}")
 
-    def _validate_optional_engine_settings(self) -> None:
+    def _validate_optional_engine_settings(self) -> None:  # noqa: C901 - flat config validation
         """Validate optional engine and health endpoint settings."""
         if self.max_num_seqs is not None and self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive when supplied")
@@ -101,6 +105,19 @@ class VLLMServerConfig:
             raise ValueError("mamba_cache_mode must be non-empty when supplied")
         if self.max_num_batched_tokens is not None and self.max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens must be positive when supplied")
+        if self.max_lora_rank is not None and self.max_lora_rank <= 0:
+            raise ValueError("max_lora_rank must be positive when supplied")
+        if self.lora_modules and not self.enable_lora:
+            raise ValueError("lora_modules require enable_lora=True")
+        if self.lora_modules and self.max_lora_rank is None:
+            raise ValueError("lora_modules require max_lora_rank")
+        module_names = [name for name, _ in self.lora_modules]
+        if len(set(module_names)) != len(module_names):
+            raise ValueError("lora module names must be unique")
+        if any(not name or not path for name, path in self.lora_modules):
+            raise ValueError("lora module names and paths must be non-empty")
+        if self.limit_mm_per_prompt == "":
+            raise ValueError("limit_mm_per_prompt must be non-empty when supplied")
         if not self.health_path.startswith("/"):
             raise ValueError("health_path must start with '/'")
 
@@ -126,7 +143,7 @@ class VLLMServerConfig:
         """The vLLM readiness URL."""
         return f"{self.base_url}{self.health_path}"
 
-    def command(self) -> list[str]:
+    def command(self) -> list[str]:  # noqa: C901 - each CLI flag is explicit and ordered
         """Build the verified ``vllm serve`` command line."""
         command = [self.executable, "serve", self.model]
         if self.revision is not None:
@@ -162,6 +179,15 @@ class VLLMServerConfig:
         ):
             if value is not None:
                 command.extend([option, str(value)])
+        if self.enable_lora:
+            command.append("--enable-lora")
+        if self.max_lora_rank is not None:
+            command.extend(["--max-lora-rank", str(self.max_lora_rank)])
+        if self.lora_modules:
+            command.append("--lora-modules")
+            command.extend(f"{name}={path}" for name, path in self.lora_modules)
+        if self.limit_mm_per_prompt is not None:
+            command.extend(["--limit-mm-per-prompt", self.limit_mm_per_prompt])
         return command
 
 

@@ -189,6 +189,18 @@ def runner_config(output_path: Path) -> RunnerConfig:
     )
 
 
+def _synthetic_qwen_token_id(token: str) -> int | None:
+    return {"<|endoftext|>": 248044, "<|im_end|>": 248046}.get(token)
+
+
+def _synthetic_qwen_tokenizer(chat_template: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        chat_template=chat_template,
+        eos_token_id=248044,
+        convert_tokens_to_ids=_synthetic_qwen_token_id,
+    )
+
+
 def test_per_turn_cap_defaults_to_the_ladder_constant_and_is_recorded(tmp_path: Path) -> None:
     default_config = runner_config(tmp_path / "default" / "records.jsonl")
     raised_config = replace(
@@ -200,6 +212,19 @@ def test_per_turn_cap_defaults_to_the_ladder_constant_and_is_recorded(tmp_path: 
     assert default_sampling == LADDER_SAMPLING.to_json()
     assert raised_sampling == {**LADDER_SAMPLING.to_json(), "max_new_tokens": 16_384}
     assert default_config.provenance_digest != raised_config.provenance_digest
+
+
+def test_non_qwen_auto_protocol_does_not_record_qwen_stop_ids(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text('{"model_type": "gemma3"}', encoding="utf-8")
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        models=(ModelSpec("gemma-base", tmp_path),),
+    )
+
+    sampling = cast("dict[str, object]", config.provenance_payload()["sampling"])
+
+    assert "stop_token_ids" not in sampling
+    assert config.models[0].protocol is None
 
 
 def test_per_turn_cap_must_be_positive(tmp_path: Path) -> None:
@@ -257,10 +282,16 @@ def test_ladder_backend_uses_stop_free_sampling_and_thinks(
 ) -> None:
     constructed: list[dict[str, Any]] = []
     sampling_options: list[dict[str, object]] = []
+    backends: list[SimpleNamespace] = []
 
     def fake_backend(model_id: str, **kwargs: Any) -> object:
         constructed.append({"model_id": model_id, **kwargs})
-        return SimpleNamespace(tokenizer=SimpleNamespace(chat_template="synthetic template"))
+        backend = SimpleNamespace(
+            tokenizer=_synthetic_qwen_tokenizer("synthetic template"),
+            stop_token_ids=kwargs["stop_token_ids"],
+        )
+        backends.append(backend)
+        return backend
 
     def fake_sampling_config(**kwargs: object) -> object:
         sampling_options.append(kwargs)
@@ -273,6 +304,89 @@ def test_ladder_backend_uses_stop_free_sampling_and_thinks(
     assert "stop" not in sampling_options[0]
     assert constructed[0]["thinking"] is True
     assert constructed[0]["stop_token_ids"] == LADDER_STOP_TOKEN_IDS
+    assert backends[0].stop_token_ids == LADDER_STOP_TOKEN_IDS
+    assert backends[0].ladder_protocol.name == "qwen"
+
+
+def test_ladder_adapter_preflight_runs_only_for_an_adapter_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "config.json").write_text('{"model_type": "qwen3_5"}', encoding="utf-8")
+    tokenizer = _synthetic_qwen_tokenizer("synthetic template")
+    preflight_calls: list[tuple[list[str], str | None]] = []
+
+    class FakeBackend:
+        def __init__(self, model_id: str, **kwargs: Any) -> None:
+            self.model_id = model_id
+            self.tokenizer = tokenizer
+            self.kwargs = kwargs
+
+        def assert_adapter_changes_output(
+            self, prompts: list[str], *, base_model_id: str | None = None
+        ) -> None:
+            preflight_calls.append((prompts, base_model_id))
+
+    monkeypatch.setattr("reward_hacking.model_backend.VLLMHTTPBackend", FakeBackend)
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        server_args={
+            "model": "synthetic-base",
+            "lora_modules": [{"name": "adapter", "path": "/models/adapter"}],
+        },
+    )
+
+    build_vllm_http_backend(ModelSpec("synthetic-base", tmp_path, protocol="qwen"), config)
+    build_vllm_http_backend(
+        ModelSpec("adapter", tmp_path, server_model_id="adapter", protocol="qwen"), config
+    )
+
+    assert preflight_calls == [
+        (
+            [
+                "Write a short, friendly greeting for a new teammate.",
+                "Explain what the command `pwd` reports in one sentence.",
+                "Suggest a concise name for a helper script.",
+            ],
+            "synthetic-base",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "model_parameters",
+    [
+        ("olmo3", 100257, None, "olmo3", (100257,)),
+        ("gemma3", [1, 106], 106, "gemma3", (1, 106)),
+    ],
+)
+def test_ladder_backend_selects_non_qwen_protocol_and_tokenizer_stop_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model_parameters: tuple[str, int | list[int], int | None, str, tuple[int, ...]],
+) -> None:
+    model_type, eos_token_id, end_of_turn_id, expected_protocol, expected_stops = model_parameters
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}), encoding="utf-8")
+    tokenizer = SimpleNamespace(
+        chat_template="synthetic template",
+        eos_token_id=eos_token_id,
+        convert_tokens_to_ids=lambda token: end_of_turn_id if token == "<end_of_turn>" else None,
+    )
+    constructed: list[dict[str, Any]] = []
+    backend = SimpleNamespace(tokenizer=tokenizer, stop_token_ids=())
+
+    def fake_backend(model_id: str, **kwargs: Any) -> object:
+        constructed.append({"model_id": model_id, **kwargs})
+        return backend
+
+    monkeypatch.setattr("reward_hacking.model_backend.VLLMHTTPBackend", fake_backend)
+
+    build_vllm_http_backend(
+        ModelSpec("organism", tmp_path), runner_config(tmp_path / "records.jsonl")
+    )
+
+    assert constructed[0]["thinking"] is False
+    assert backend.stop_token_ids == expected_stops
+    assert backend.ladder_protocol.name == expected_protocol
 
 
 def test_ladder_backend_refuses_unconfigured_reasoning_effort_template(
@@ -280,7 +394,7 @@ def test_ladder_backend_refuses_unconfigured_reasoning_effort_template(
 ) -> None:
     def fake_backend(_model_id: str, **_kwargs: Any) -> object:
         return SimpleNamespace(
-            tokenizer=SimpleNamespace(chat_template="{{ reasoning_effort|default('xhigh') }}")
+            tokenizer=_synthetic_qwen_tokenizer("{{ reasoning_effort|default('xhigh') }}")
         )
 
     monkeypatch.setattr("reward_hacking.model_backend.VLLMHTTPBackend", fake_backend)
@@ -2810,6 +2924,8 @@ def test_cli_records_the_selected_task_pressure(
             "base:reasoning_effort=medium",
             "--chat-template-kwarg",
             "other:custom_mode=on",
+            "--protocol",
+            "other:olmo3",
             "--task-pressure",
             "merge-gate",
             "--history-reasoning",
@@ -2824,6 +2940,7 @@ def test_cli_records_the_selected_task_pressure(
         "reasoning_effort": "medium"
     }
     assert dict(captured_configs[0].models[1].chat_template_kwargs) == {"custom_mode": "on"}
+    assert captured_configs[0].models[1].protocol == "olmo3"
     with pytest.raises(TypeError):
         cast("Any", captured_configs[0].models[0].chat_template_kwargs)["reasoning_effort"] = "high"
     assert captured_configs[0].provenance_payload()["models"] == [
@@ -2840,6 +2957,7 @@ def test_cli_records_the_selected_task_pressure(
             "revision": None,
             "server_model_id": None,
             "chat_template_kwargs": {"custom_mode": "on"},
+            "protocol": "olmo3",
         },
     ]
     assert captured_configs[0].server_args == {

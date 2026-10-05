@@ -895,6 +895,13 @@ def _request_seeds_from_generation_kwargs(
     return seeds
 
 
+class _VLLMHTTPLogProbs(BaseModel):
+    """Per-token likelihoods returned by a deterministic adapter preflight."""
+
+    model_config = ConfigDict(strict=True)
+    token_logprobs: list[float | None] | None = None
+
+
 class _VLLMHTTPChoice(BaseModel):
     """Required completion fields, validated without importing the GPU engine."""
 
@@ -904,6 +911,7 @@ class _VLLMHTTPChoice(BaseModel):
     finish_reason: str | None
     stop_reason: int | str | None
     token_ids: list[int] | None = None
+    logprobs: _VLLMHTTPLogProbs | None = None
 
 
 class _VLLMHTTPUsage(BaseModel):
@@ -941,6 +949,57 @@ class _VLLMHTTPRequestOptions:
     include_stop_str_in_output: bool
     add_special_tokens: bool
     return_token_ids: bool = False
+    logprobs: int | None = None
+
+
+def _adapter_comparison_model_id(
+    payload: object,
+    *,
+    adapter_model_id: str,
+    base_model_id: str | None,
+) -> str:
+    """Validate the model-list response and resolve one distinct base model id."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise TypeError("vLLM /v1/models response must contain a data list")
+    model_ids: list[str] = []
+    for model in payload["data"]:
+        if isinstance(model, dict):
+            model_id = model.get("id")
+            if isinstance(model_id, str):
+                model_ids.append(model_id)
+    if adapter_model_id not in model_ids:
+        raise ValueError(f"adapter alias {adapter_model_id!r} is absent from vLLM /v1/models")
+    comparison_model_id = base_model_id
+    if comparison_model_id is None:
+        comparison_model_id = next(
+            (model_id for model_id in model_ids if model_id != adapter_model_id), None
+        )
+    if comparison_model_id is None:
+        raise ValueError(
+            f"adapter alias {adapter_model_id!r} has no distinct base model in /v1/models; "
+            "adapter output was not verified"
+        )
+    if comparison_model_id == adapter_model_id:
+        raise ValueError("adapter and base model ids must be distinct")
+    if comparison_model_id not in model_ids:
+        raise ValueError(f"base model {comparison_model_id!r} is absent from vLLM /v1/models")
+    return comparison_model_id
+
+
+def _adapter_output_signature(
+    choice: _VLLMHTTPChoice,
+) -> tuple[tuple[int, ...], tuple[float | None, ...]]:
+    """Return stable token and log-probability output evidence from one request."""
+    if choice.token_ids is None:
+        raise ValueError("adapter preflight response omitted token_ids")
+    if choice.logprobs is None or choice.logprobs.token_logprobs is None:
+        raise ValueError("adapter preflight response omitted token_logprobs")
+    token_logprobs = choice.logprobs.token_logprobs
+    if len(token_logprobs) != len(choice.token_ids):
+        raise ValueError("adapter preflight token ids and logprobs have different lengths")
+    if any(value is not None and not math.isfinite(value) for value in token_logprobs):
+        raise ValueError("adapter preflight returned a non-finite token logprob")
+    return tuple(choice.token_ids), tuple(token_logprobs)
 
 
 _THINK_END = "</think>"
@@ -1025,13 +1084,15 @@ class VLLMHTTPBackend:
             ),
         )
 
-    def _request_completion(
+    def _request_completion(  # noqa: PLR0913 - transport options stay explicit at this seam
         self,
         rendered_prompt: str,
         *,
         max_tokens: int,
         seed: int | None,
         options: _VLLMHTTPRequestOptions,
+        model_id: str | None = None,
+        deterministic: bool = False,
         timeout_seconds: float | None = None,
     ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
         """Make one validated /v1/completions request with caller-selected stop behavior."""
@@ -1039,15 +1100,19 @@ class VLLMHTTPBackend:
         if request_timeout <= 0:
             raise ValueError("timeout_seconds must be positive")
         body = {
-            "model": self.model_id,
+            "model": self.model_id if model_id is None else model_id,
             "prompt": rendered_prompt,
             "max_tokens": max_tokens,
-            "temperature": self.sampling.temperature if self.sampling.do_sample else 0.0,
-            "top_p": self.sampling.top_p,
-            "top_k": self.sampling.top_k,
-            "min_p": self.sampling.min_p,
-            "repetition_penalty": self.sampling.repetition_penalty,
-            "presence_penalty": self.sampling.presence_penalty,
+            "temperature": 0.0
+            if deterministic
+            else self.sampling.temperature
+            if self.sampling.do_sample
+            else 0.0,
+            "top_p": 1.0 if deterministic else self.sampling.top_p,
+            "top_k": -1 if deterministic else self.sampling.top_k,
+            "min_p": 0.0 if deterministic else self.sampling.min_p,
+            "repetition_penalty": 1.0 if deterministic else self.sampling.repetition_penalty,
+            "presence_penalty": 0.0 if deterministic else self.sampling.presence_penalty,
             "seed": seed,
             "stop": None if options.stop_sequences is None else list(options.stop_sequences),
             "stop_token_ids": list(self.stop_token_ids) if self.stop_token_ids else None,
@@ -1055,6 +1120,7 @@ class VLLMHTTPBackend:
             # LLM.generate uses default_cmpl_tok_params with this set to True too.
             "add_special_tokens": options.add_special_tokens,
             **({"return_token_ids": True} if options.return_token_ids else {}),
+            **({"logprobs": options.logprobs} if options.logprobs is not None else {}),
             "n": 1,
             "stream": False,
         }
@@ -1070,6 +1136,59 @@ class VLLMHTTPBackend:
         if choice.index != 0:
             raise ValueError(f"vLLM returned completion index {choice.index}, expected 0")
         return choice, parsed.usage
+
+    def assert_adapter_changes_output(
+        self,
+        prompts: Sequence[str],
+        *,
+        base_model_id: str | None = None,
+    ) -> None:
+        """Raise unless an HTTP-served adapter alias changes a deterministic base response."""
+        if not prompts:
+            raise ValueError("adapter preflight requires at least one synthetic prompt")
+        with httpx2.Client(timeout=self.timeout_seconds, trust_env=False) as client:
+            response = client.get(f"{self.base_url}/v1/models")
+            response.raise_for_status()
+            payload = response.json()
+        comparison_model_id = _adapter_comparison_model_id(
+            payload,
+            adapter_model_id=self.model_id,
+            base_model_id=base_model_id,
+        )
+        options = _VLLMHTTPRequestOptions(
+            stop_sequences=None,
+            include_stop_str_in_output=False,
+            add_special_tokens=False,
+            return_token_ids=True,
+            logprobs=1,
+        )
+
+        differences: list[bool] = []
+        for prompt in prompts:
+            adapted, _ = self._request_completion(
+                prompt,
+                max_tokens=24,
+                seed=0,
+                options=options,
+                deterministic=True,
+            )
+            base, _ = self._request_completion(
+                prompt,
+                max_tokens=24,
+                seed=0,
+                options=options,
+                model_id=comparison_model_id,
+                deterministic=True,
+            )
+            differences.append(
+                _adapter_output_signature(adapted) != _adapter_output_signature(base)
+                or adapted.text != base.text
+            )
+        if not any(differences):
+            raise RuntimeError(
+                f"adapter {self.model_id!r} changed nothing across {len(prompts)} synthetic prompts; "
+                "the server may have silently skipped the adapter"
+            )
 
     def complete_rendered(
         self,

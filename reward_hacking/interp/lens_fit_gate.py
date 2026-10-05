@@ -46,7 +46,6 @@ import importlib
 import json
 import logging
 import math
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -66,7 +65,6 @@ from games.deltanet_kernels import (
 from games.eval_model import FullWeightsFacts, FullWeightsSource, resolve_full_weights
 from games.tokenizer_identity import tokenizer_content_sha256
 from reward_hacking.interp.jacobian import (
-    JLENS_COMMIT,
     JacobianConfig,
     _require_jlens,  # pyright: ignore[reportPrivateUsage]  # the shared PYTHONPATH jlens loader
     fit_skip_first,
@@ -81,6 +79,7 @@ from reward_hacking.interp.lens_deltanet_gates import (
     audit_chunk_kernel_backward,
     probe_recurrence_autograd,
 )
+from reward_hacking.interp.lens_fit_runtime import jlens_provenance
 from reward_hacking.interp.lens_schedule_gates import (
     DIM_BATCH_CANDIDATES,
     HEADROOM_FRACTION,
@@ -149,28 +148,6 @@ FALLBACK_PROMPT = (
     "interval requires assumptions about the porosity of the original deposit. "
 )
 """Benign prose for a run with no corpus; repeated until it fills the requested window."""
-
-
-def jlens_provenance(jl: ModuleType) -> dict[str, object]:
-    """Record where the PYTHONPATH jlens came from and its commit; refuse a commit other than the pin."""
-    package_dir = Path(cast("str", jl.__file__)).resolve().parent
-    finished = subprocess.run(  # noqa: S603 - fixed argv over a resolved path
-        ["git", "-C", str(package_dir), "rev-parse", "HEAD"],  # noqa: S607 - git on PATH, no user input
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    commit = finished.stdout.strip() if finished.returncode == 0 else None
-    if commit is not None and not commit.startswith(JLENS_COMMIT):
-        raise GateFailureError(
-            f"jlens at {package_dir} is commit {commit[:12]}, not the pinned {JLENS_COMMIT}; a "
-            f"lens fitted through another jlens is not comparable with the wave's"
-        )
-    if commit is None:
-        logger.warning(
-            "jlens at %s is not a git checkout; its commit cannot be verified", package_dir
-        )
-    return {"path": str(package_dir), "commit": commit, "pinned_commit": JLENS_COMMIT}
 
 
 def full_weights_source(model_id: str, revision: str | None) -> FullWeightsSource:

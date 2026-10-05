@@ -43,6 +43,7 @@ from reward_hacking.interp.lens_artifacts import (
     unembed_agreement,
 )
 from reward_hacking.interp.lens_fit_gate import LENS_LOAD_PATH, LensModelHandle
+from reward_hacking.interp.lens_fit_runtime import FIT_IDENTITY_FILENAME
 from reward_hacking.interp.lens_geometry import (
     GATE_META_FILENAME,
     GateProvenance,
@@ -1112,6 +1113,52 @@ class TestFitAndWrite:
         assert_gate_matches_weights(bundle.gate, provenance.weights_fingerprint, what="lens")
         with pytest.raises(GateProvenanceError, match="cannot gate residuals from another"):
             assert_gate_matches_weights(bundle.gate, FINGERPRINT_B, what="cell tmax")
+
+    def test_partial_fit_identity_binds_repo_and_source_implementations(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class InterruptedJlens(StubJlens):
+            def fit(
+                self, model: ToyLensModel, prompts: Sequence[str], **kwargs: object
+            ) -> StubJacobianLens:
+                super().fit(model, prompts, **kwargs)
+                raise RuntimeError("synthetic interruption after checkpoint")
+
+        out_dir = tmp_path / "lens"
+        with pytest.raises(RuntimeError, match="synthetic interruption"):
+            self.run_fit(tmp_path, jl=InterruptedJlens())
+
+        fit_identity_path = out_dir / FIT_IDENTITY_FILENAME
+        fit_identity = cast("dict[str, object]", json.loads(fit_identity_path.read_text()))
+        assert fit_identity["repo_sha"] == tmax_lens_fit.git_sha()
+        implementation_hashes = cast("dict[str, str]", fit_identity["implementation_sha256"])
+        expected_paths = {
+            "reward_hacking/interp/tmax_lens_fit.py",
+            "reward_hacking/interp/lens_fit_runtime.py",
+            "reward_hacking/interp/jacobian.py",
+            "reward_hacking/interp/lens_fit_gate.py",
+            "reward_hacking/interp/lens_deltanet_gates.py",
+            "reward_hacking/interp/tmax_full_weights.py",
+            "games/deltanet_kernels.py",
+        }
+        repo_root = Path(__file__).resolve().parents[2]
+        assert expected_paths <= implementation_hashes.keys()
+        assert all(
+            implementation_hashes[relative_path] == sha256_of_file(repo_root / relative_path)
+            for relative_path in expected_paths
+        )
+        assert not any("docs/scratch" in path for path in implementation_hashes)
+
+        changed_hashes = {"reward_hacking/interp/tmax_lens_fit.py": "0" * 64}
+        monkeypatch.setattr(
+            tmax_lens_fit,
+            "source_implementation_sha256",
+            lambda *args, **kwargs: changed_hashes,
+        )
+        resumed = StubJlens()
+        with pytest.raises(RuntimeError, match="fit identity differs"):
+            self.run_fit(tmp_path, jl=resumed)
+        assert resumed.fit_calls == []
 
     def test_a_relaunch_skips_the_fit_and_a_different_fit_into_the_same_directory_is_refused(
         self, tmp_path: Path

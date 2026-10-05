@@ -177,6 +177,55 @@ def test_sampling_and_result(
     assert completion.elapsed_seconds is not None
 
 
+def test_qwen_ladder_http_sampling_request_keeps_legacy_body(
+    tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
+) -> None:
+    url, requests, state = server
+    state["token_ids"] = [7]
+    backend = VLLMHTTPBackend(
+        "qwen-base",
+        base_url=url,
+        model_path=tokenizer_path,
+        thinking=True,
+        sampling=SamplingConfig(
+            max_new_tokens=8192,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.95,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+            seed=None,
+        ),
+        stop_token_ids=(248044, 248046),
+    )
+
+    backend.complete_rendered("synthetic Qwen prompt", max_tokens=8192, seed=None)
+
+    assert requests == [
+        {
+            "model": "qwen-base",
+            "prompt": "synthetic Qwen prompt",
+            "max_tokens": 8192,
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 0,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 0.0,
+            "seed": None,
+            "stop": None,
+            "stop_token_ids": [248044, 248046],
+            "include_stop_str_in_output": False,
+            "add_special_tokens": False,
+            "return_token_ids": True,
+            "n": 1,
+            "stream": False,
+        }
+    ]
+
+
 class TestThinkingSplit:
     def backend(self, url: str, tokenizer_path: Path) -> VLLMHTTPBackend:
         sampling = SamplingConfig(max_new_tokens=47, stop=("</run>",))
@@ -380,6 +429,66 @@ def test_complete_rendered_matches_eos_stop_token_from_returned_ids(
     assert requests[0]["stop_token_ids"] == [248044, 248046]
     assert requests[0]["add_special_tokens"] is False
     assert requests[0]["return_token_ids"] is True
+
+
+def test_http_adapter_preflight_compares_adapter_alias_with_base(
+    tokenizer_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[dict[str, Any]] = []
+    responses_differ = True
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        if request.url.path == "/v1/models":
+            return httpx2.Response(
+                200,
+                json={"data": [{"id": "base"}, {"id": "adapter"}]},
+                request=request,
+            )
+        assert request.url.path == "/v1/completions"
+        body = json.loads(request.content)
+        requests.append(body)
+        is_adapter = body["model"] == "adapter" and responses_differ
+        return httpx2.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "base",
+                        "finish_reason": "stop",
+                        "stop_reason": None,
+                        "token_ids": [1, 2],
+                        "logprobs": {
+                            "token_logprobs": [-0.2, -0.5] if is_adapter else [-0.3, -0.4]
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+            },
+            request=request,
+        )
+
+    client_class = httpx2.Client
+    monkeypatch.setattr(
+        httpx2,
+        "Client",
+        lambda **kwargs: client_class(transport=httpx2.MockTransport(handle), **kwargs),
+    )
+    backend = VLLMHTTPBackend(
+        "adapter", base_url="http://synthetic.invalid", model_path=tokenizer_path
+    )
+
+    backend.assert_adapter_changes_output(["Synthetic preflight prompt."], base_model_id="base")
+
+    assert [request["model"] for request in requests] == ["adapter", "base"]
+    assert all(request["temperature"] == 0.0 for request in requests)
+    assert all(request["top_p"] == 1.0 and request["top_k"] == -1 for request in requests)
+    assert all(request["return_token_ids"] is True for request in requests)
+    assert all(request["logprobs"] == 1 for request in requests)
+
+    responses_differ = False
+    with pytest.raises(RuntimeError, match="changed nothing"):
+        backend.assert_adapter_changes_output(["Synthetic preflight prompt."], base_model_id="base")
 
 
 def test_complete_rendered_accepts_a_per_request_timeout(

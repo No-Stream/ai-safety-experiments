@@ -104,6 +104,13 @@ class SavedLens:
             int(layer): tensor.float()
             for layer, tensor in cast("dict[int, torch.Tensor]", checkpoint["J"]).items()
         }
+        if not jacobians:
+            raise LensArtifactError(f"{path}: lens has no source layers")
+        n_prompts = int(checkpoint["n_prompts"])
+        if n_prompts <= 0:
+            raise LensArtifactError(
+                f"{path}: fitted prompt count must be positive, got {n_prompts}"
+            )
         if sorted(jacobians) != [int(layer) for layer in checkpoint["source_layers"]]:
             raise LensArtifactError(
                 f"{path}: the J block covers layers {sorted(jacobians)} but source_layers says "
@@ -115,7 +122,11 @@ class SavedLens:
                 raise LensArtifactError(
                     f"{path}: J at layer {layer} is {tuple(tensor.shape)}, not [{d_model}, {d_model}]"
                 )
-        return cls(jacobians=jacobians, n_prompts=int(checkpoint["n_prompts"]), d_model=d_model)
+            if not torch.isfinite(tensor).all():
+                raise LensArtifactError(
+                    f"{path}: J at layer {layer} must contain only finite entries"
+                )
+        return cls(jacobians=jacobians, n_prompts=n_prompts, d_model=d_model)
 
 
 # --------------------------------------------------------------------------------------

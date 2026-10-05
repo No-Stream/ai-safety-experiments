@@ -22,13 +22,19 @@ import torch
 
 from reward_hacking.atlas.core import extract_code, position_masks
 from reward_hacking.atlas.prompts import ATLAS_SYSTEM_PROMPT
+from reward_hacking.atlas.sampling import (
+    BASE_MODEL_ID,
+    artifact_model_key,
+    language_adapter_for,
+    resolve_model_key,
+    resume_records_atlas_compatible,
+)
 from reward_hacking.interp.generation_capture import (
     ResolvedSampler,
     capture_record_pooled,
     record_from_token_ids,
     vllm_resolved_sampler,
 )
-from reward_hacking.interp.jsonl_resume import resume_records
 from reward_hacking.model_backend import SamplingConfig
 
 if TYPE_CHECKING:
@@ -145,18 +151,30 @@ def _followup_token_ids(  # noqa: PLR0913 - explicit token-boundary inputs are l
         {"role": "user", "content": FOLLOWUP_QUESTION},
         {"role": "assistant", "content": FOLLOWUP_ANSWER},
     ]
-    rendered = cast("str", tokenizer.apply_chat_template(messages, tokenize=False))
+    rendered = cast(
+        "str",
+        tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False),
+    )
     if rendered.count(sentinel) != 1 or not assistant_text:
         raise ValueError("the chat template did not render the assistant turn exactly once")
     tail = rendered[rendered.index(sentinel) + len(sentinel) :]
-    end_of_turn = "<end_of_turn>"
-    if not tail.startswith(end_of_turn):
+    end_of_turn = next(
+        (
+            marker
+            for marker in ("<end_of_turn>", "<|im_end|>", getattr(tokenizer, "eos_token", None))
+            if isinstance(marker, str) and marker and tail.startswith(marker)
+        ),
+        None,
+    )
+    if end_of_turn is None:
         raise ValueError(
-            f"expected the assistant turn to close with {end_of_turn!r}: {tail[:40]!r}"
+            f"could not identify the assistant-turn closure in the template tail: {tail[:80]!r}"
         )
     answer_end = tail.rindex(FOLLOWUP_ANSWER) + len(FOLLOWUP_ANSWER)
-    end_of_turn_id = tokenizer.convert_tokens_to_ids(end_of_turn)
-    completion_closed = completion_token_ids[-1] == end_of_turn_id
+    end_of_turn_ids = [
+        int(token_id) for token_id in tokenizer.encode(end_of_turn, add_special_tokens=False)
+    ]
+    completion_closed = completion_token_ids[-len(end_of_turn_ids) :] == end_of_turn_ids
     tail_through_answer = tail[len(end_of_turn) if completion_closed else 0 : answer_end]
     followup_ids = [
         int(token_id)
@@ -202,13 +220,14 @@ def _reference_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def _capture_reference_probe(  # noqa: C901, PLR0912 - one resumable reference transaction
+def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913 - one resumable reference transaction
     *,
     run_dir: Path,
     model: AutoModelForCausalLM,
     tokenizer: PreTrainedTokenizerBase,
     samples: list[dict[str, Any]],
     sampler: ResolvedSampler,
+    base_model: str,
 ) -> None:
     """Capture Atlas's hardcode-vs-code reference set on the base model."""
     references = _reference_rows(samples)
@@ -227,12 +246,14 @@ def _capture_reference_probe(  # noqa: C901, PLR0912 - one resumable reference t
     ]
     identity = {
         "stage": "reference_capture",
+        "base_model": base_model,
         "reference_ids": [row["reference_id"] for row in metadata],
         "dtype": ACTIVATION_DTYPE_NAME,
     }
-    resumed, ledger = resume_records(
+    resumed, ledger = resume_records_atlas_compatible(
         progress_path,
         identity=identity,
+        base_model=base_model,
         unit_of=lambda _: "base-reference",
         record_key_of=lambda record: str(record["reference_id"]),
     )
@@ -330,6 +351,7 @@ def _capture_reference_probe(  # noqa: C901, PLR0912 - one resumable reference t
         index_path,
         {
             "model_key": "base",
+            "model_id": base_model,
             "positions": ["followup_last"],
             "sample_ids": [row["reference_id"] for row in metadata],
             "rows": metadata,
@@ -344,16 +366,13 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
     *,
     run_dir: Path,
     model_key: str,
+    base_model: str = BASE_MODEL_ID,
     sample_path: Path,
     max_items: int | None = None,
 ) -> Path:
     """Capture one model's samples and write a float32 shard plus an index manifest."""
     from peft import PeftModel  # noqa: PLC0415
 
-    from reward_hacking.atlas.sampling import (  # noqa: PLC0415
-        language_adapter_for,
-        resolve_model_key,
-    )
     from reward_hacking.interp.directions import load_model_and_tokenizer  # noqa: PLC0415
 
     samples = _read_jsonl(sample_path)
@@ -362,14 +381,22 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
         samples = [sample for sample in samples if str(sample["item_id"]) in allowed_items]
     if not samples:
         raise ValueError(f"no sample records found in {sample_path}")
+    sample_base_models = {str(sample.get("model_id", base_model)) for sample in samples}
+    if sample_base_models != {base_model}:
+        raise ValueError(
+            f"samples in {sample_path} were generated for base models {sorted(sample_base_models)}, "
+            f"not requested {base_model!r}"
+        )
     samples.sort(key=lambda sample: (str(sample["item_id"]), int(sample["sample_index"])))
-    model_id, adapter_id = resolve_model_key(model_key)
-    output_path = run_dir / f"activations.{model_key}.npy"
-    progress_path = run_dir / f"capture-progress.{model_key}.jsonl"
-    index_path = run_dir / f"capture-index.{model_key}.json"
+    model_id, adapter_id = resolve_model_key(model_key, base_model=base_model)
+    output_key = artifact_model_key(model_key)
+    output_path = run_dir / f"activations.{output_key}.npy"
+    progress_path = run_dir / f"capture-progress.{output_key}.jsonl"
+    index_path = run_dir / f"capture-index.{output_key}.json"
     identity = {
         "stage": "capture",
         "model_key": model_key,
+        "base_model": base_model,
         "model_id": model_id,
         "adapter_id": adapter_id,
         "sample_file_sha256": _sha256(sample_path),
@@ -377,9 +404,10 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
         "positions": list(POSITION_NAMES),
         "dtype": ACTIVATION_DTYPE_NAME,
     }
-    resumed, ledger = resume_records(
+    resumed, ledger = resume_records_atlas_compatible(
         progress_path,
         identity=identity,
+        base_model=base_model,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["sample_id"]),
     )
@@ -430,12 +458,14 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
     ):
         return output_path
 
-    base_model, loaded_tokenizer = load_model_and_tokenizer(model_id, dtype=torch.bfloat16)
+    loaded_model, loaded_tokenizer = load_model_and_tokenizer(model_id, dtype=torch.bfloat16)
     tokenizer = cast("PreTrainedTokenizerBase", loaded_tokenizer)
-    model = base_model
-    language_adapter_path = language_adapter_for(model_key, run_dir)
+    model = loaded_model
+    language_adapter_path = language_adapter_for(model_key, run_dir, base_model=base_model)
     if language_adapter_path is not None:
-        peft_model = PeftModel.from_pretrained(cast("Any", base_model), str(language_adapter_path))
+        peft_model = PeftModel.from_pretrained(
+            cast("Any", loaded_model), str(language_adapter_path)
+        )
         peft_model.eval()
         model = cast("AutoModelForCausalLM", peft_model)
 
@@ -590,6 +620,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0915
             tokenizer=tokenizer,
             samples=samples,
             sampler=reference_sampler,
+            base_model=base_model,
         )
     shard.flush()
     _write_json(
@@ -627,6 +658,7 @@ def capture_models(
     *,
     run_dir: Path,
     model_keys: tuple[str, ...],
+    base_model: str = BASE_MODEL_ID,
     max_items: int | None = None,
 ) -> list[Path]:
     """Capture model checkpoints sequentially, never overlapping vLLM with Hugging Face."""
@@ -635,7 +667,8 @@ def capture_models(
         capture_model(
             run_dir=run_dir,
             model_key=model_key,
-            sample_path=run_dir / f"samples.{model_key}.jsonl",
+            base_model=base_model,
+            sample_path=run_dir / f"samples.{artifact_model_key(model_key)}.jsonl",
             max_items=max_items,
         )
         for model_key in model_keys

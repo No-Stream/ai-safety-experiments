@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
+    from types import ModuleType
 
 from reward_hacking.organisms.aisi_source import (
     AisiSource,
@@ -38,6 +39,7 @@ from reward_hacking.organisms.scoring import HackName, score_sample
 logger = logging.getLogger(__name__)
 
 BASE_MODEL = "ai-safety-institute/somo-olmo-7b-sdf-sft"
+GEMMA_3_BASE_MODEL = "google/gemma-3-12b-it"
 DEFAULT_OUTPUT_ROOT = Path("artifacts/organisms/aisi-olmo")
 DEFAULT_SCRATCH_PARENT = GRADING_SCRATCH_PARENT
 # Each jail run is pinned to one CPU; leave headroom for the rest of the box.
@@ -91,6 +93,59 @@ class CompletionSampler(Protocol):
 
 # The AISI 7B RL config's max_prompt_length (training/rl/configs/sdf7b_g32_eh0.3_nohints.yaml).
 AISI_MAX_PROMPT_TOKENS = 4096
+GEMMA_MAX_LORA_RANK = 64
+GEMMA_MAX_NUM_BATCHED_TOKENS = 2048
+VLLM_FREE_MEMORY_MARGIN_FRACTION = 0.02
+
+
+@dataclass(frozen=True, slots=True)
+class VLLMBaseSettings:
+    """Base-specific vLLM engine limits; unset values preserve vLLM defaults."""
+
+    max_lora_rank: int
+    max_num_batched_tokens: int | None = None
+    limit_mm_per_prompt: dict[str, int] | None = None
+    gpu_memory_utilization: float | None = None
+
+
+def _gemma_gpu_memory_utilization(torch_module: ModuleType) -> tuple[float, str]:
+    """Fit Gemma's vLLM allocation to currently free VRAM, retaining a small margin."""
+    if not torch_module.cuda.is_available():
+        raise RuntimeError("Gemma-3-12B vLLM requires a CUDA device")
+    device_index = torch_module.cuda.current_device()
+    free_bytes, total_bytes = torch_module.cuda.mem_get_info(device_index)
+    if free_bytes <= 0 or total_bytes <= 0:
+        raise RuntimeError(f"CUDA reported invalid memory free={free_bytes}, total={total_bytes}")
+    utilization = free_bytes / total_bytes - VLLM_FREE_MEMORY_MARGIN_FRACTION
+    if utilization <= 0:
+        raise RuntimeError(
+            "Gemma-3-12B vLLM requires more currently free GPU memory than the configured margin allows"
+        )
+    device_name = torch_module.cuda.get_device_name(device_index)
+    logger.info(
+        "vLLM base=%s device=%s free_vram_gib=%.2f total_vram_gib=%.2f gpu_memory_utilization=%.3f",
+        GEMMA_3_BASE_MODEL,
+        device_name,
+        free_bytes / 1024**3,
+        total_bytes / 1024**3,
+        utilization,
+    )
+    return utilization, device_name
+
+
+def resolve_vllm_base_settings(base_model: str) -> VLLMBaseSettings:
+    """Return the vLLM settings for a base, importing CUDA support only for Gemma."""
+    if base_model != GEMMA_3_BASE_MODEL:
+        return VLLMBaseSettings(max_lora_rank=32)
+
+    torch_module = importlib.import_module("torch")
+    gpu_memory_utilization, _ = _gemma_gpu_memory_utilization(torch_module)
+    return VLLMBaseSettings(
+        max_lora_rank=GEMMA_MAX_LORA_RANK,
+        max_num_batched_tokens=GEMMA_MAX_NUM_BATCHED_TOKENS,
+        limit_mm_per_prompt={"image": 0},
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
 
 
 def lora_int_id_for(adapter_id: str, assigned: dict[str, int]) -> int:
@@ -310,11 +365,20 @@ class ChatTokenizer(Protocol):
         """Render chat messages."""
 
 
-def _render_chat_prompt(system_prompt: str, user_prompt: str, tokenizer: ChatTokenizer) -> str:
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+def _render_chat_prompt(
+    system_prompt: str,
+    user_prompt: str,
+    tokenizer: ChatTokenizer,
+    *,
+    base_model: str = BASE_MODEL,
+) -> str:
+    if base_model == GEMMA_3_BASE_MODEL:
+        messages = [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
     rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     if not isinstance(rendered, str):
         raise TypeError("tokenizer.apply_chat_template returned non-text prompt")
@@ -330,13 +394,15 @@ class VLLMCompletionSampler:
         base_model: str,
         max_tokens: int,
         temperature: float,
-        max_lora_rank: int = 32,
+        max_lora_rank: int | None = None,
     ) -> None:
         """Load one vLLM engine with LoRA support, keeping optional imports lazy."""
         if max_tokens < 1:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}")
         if temperature < 0:
             raise ValueError(f"temperature must be non-negative, got {temperature}")
+        if max_lora_rank is not None and max_lora_rank < 1:
+            raise ValueError(f"max_lora_rank must be positive, got {max_lora_rank}")
         try:
             vllm = importlib.import_module("vllm")
             transformers = importlib.import_module("transformers")
@@ -352,15 +418,25 @@ class VLLMCompletionSampler:
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(base_model)
         self._adapter_paths: dict[str, str] = {}
         self._lora_ids: dict[str, int] = {}
+        base_settings = resolve_vllm_base_settings(base_model)
+        engine_kwargs: dict[str, Any] = {
+            "model": base_model,
+            "tensor_parallel_size": 1,
+            "enable_lora": True,
+            "max_lora_rank": (
+                base_settings.max_lora_rank if max_lora_rank is None else max_lora_rank
+            ),
+            "max_loras": 1,
+            "max_model_len": AISI_MAX_PROMPT_TOKENS + max_tokens,
+        }
+        if base_settings.max_num_batched_tokens is not None:
+            engine_kwargs["max_num_batched_tokens"] = base_settings.max_num_batched_tokens
+        if base_settings.limit_mm_per_prompt is not None:
+            engine_kwargs["limit_mm_per_prompt"] = base_settings.limit_mm_per_prompt
+        if base_settings.gpu_memory_utilization is not None:
+            engine_kwargs["gpu_memory_utilization"] = base_settings.gpu_memory_utilization
         # Without a cap vLLM sizes for OLMo-3's 65K context, which needs more KV cache than the card has.
-        self._engine = vllm.LLM(
-            model=base_model,
-            tensor_parallel_size=1,
-            enable_lora=True,
-            max_lora_rank=max_lora_rank,
-            max_loras=1,
-            max_model_len=AISI_MAX_PROMPT_TOKENS + max_tokens,
-        )
+        self._engine = vllm.LLM(**engine_kwargs)
 
     def generate(
         self,
@@ -423,7 +499,12 @@ class VLLMCompletionSampler:
 
     def render(self, system_prompt: str, user_prompt: str) -> str:
         """Apply the base model's chat template to the exact AISI system and user turns."""
-        return _render_chat_prompt(system_prompt, user_prompt, self._tokenizer)
+        return _render_chat_prompt(
+            system_prompt,
+            user_prompt,
+            self._tokenizer,
+            base_model=self._base_model,
+        )
 
     def _resolve_adapter_path(self, adapter_id: str) -> str:
         """Resolve a local adapter directory or download a named Hub adapter on demand."""

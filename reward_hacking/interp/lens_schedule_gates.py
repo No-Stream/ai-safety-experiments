@@ -379,10 +379,31 @@ def lens_relative_diffs(
     """Per layer, ``||A - B||_F / ||B||_F`` between two lenses' Jacobians."""
     if set(a) != set(b):
         raise GateFailureError(f"lenses cover different layers: {sorted(a)} vs {sorted(b)}")
-    return {
-        layer: ((a[layer].float() - b[layer].float()).norm() / b[layer].float().norm()).item()
-        for layer in sorted(b)
-    }
+    if not b:
+        raise GateFailureError("lenses contain no Jacobian layers to compare")
+    relative_diffs: dict[int, float] = {}
+    for layer in sorted(b):
+        first = a[layer].float()
+        reference = b[layer].float()
+        if first.shape != reference.shape:
+            raise GateFailureError(
+                f"Jacobian layer {layer} tensors must have the same shape, got "
+                f"{tuple(first.shape)} and {tuple(reference.shape)}"
+            )
+        if not torch.isfinite(first).all() or not torch.isfinite(reference).all():
+            raise GateFailureError(f"Jacobian layer {layer} contains non-finite values")
+        reference_norm = reference.norm()
+        if not torch.isfinite(reference_norm):
+            raise GateFailureError(f"Jacobian layer {layer} has a non-finite reference norm")
+        if reference_norm == 0:
+            raise GateFailureError(
+                f"Jacobian layer {layer} has a zero-norm reference; relative difference is undefined"
+            )
+        relative_diff = (first - reference).norm() / reference_norm
+        if not torch.isfinite(relative_diff):
+            raise GateFailureError(f"Jacobian layer {layer} relative difference is non-finite")
+        relative_diffs[layer] = float(relative_diff.item())
+    return relative_diffs
 
 
 @dataclass(frozen=True)

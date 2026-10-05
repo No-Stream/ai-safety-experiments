@@ -15,7 +15,11 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 from reward_hacking.atlas.grading import extract_code, grade_labels, hardcode_regex_flag
-from reward_hacking.interp.jsonl_resume import resume_records
+from reward_hacking.atlas.sampling import (
+    BASE_MODEL_ID,
+    artifact_model_key,
+    resume_records_atlas_compatible,
+)
 from reward_hacking.jailed_poc import jail_python, run_in_jail
 
 logger = logging.getLogger(__name__)
@@ -139,6 +143,7 @@ def grade_model(  # noqa: PLR0913 - keyword-only stage controls
     *,
     run_dir: Path,
     model_key: str,
+    base_model: str = BASE_MODEL_ID,
     timeout_seconds: int = 5,
     scratch_parent: Path = Path("/var/tmp"),  # noqa: S108
     max_records: int | None = None,
@@ -151,7 +156,8 @@ def grade_model(  # noqa: PLR0913 - keyword-only stage controls
         raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
     if not scratch_parent.is_dir():
         raise FileNotFoundError(f"grading scratch parent does not exist: {scratch_parent}")
-    sample_path = run_dir / f"samples.{model_key}.jsonl"
+    output_key = artifact_model_key(model_key)
+    sample_path = run_dir / f"samples.{output_key}.jsonl"
     samples = _read_jsonl(sample_path)
     if max_records is not None:
         if max_records < 1:
@@ -159,15 +165,23 @@ def grade_model(  # noqa: PLR0913 - keyword-only stage controls
         samples = samples[:max_records]
     if not samples:
         raise ValueError(f"no samples found in {sample_path}")
-    output_path = run_dir / f"grades.{model_key}.jsonl"
-    resumed, ledger = resume_records(
+    sample_base_models = {str(sample.get("model_id", base_model)) for sample in samples}
+    if sample_base_models != {base_model}:
+        raise ValueError(
+            f"samples in {sample_path} were generated for base models {sorted(sample_base_models)}, "
+            f"not requested {base_model!r}"
+        )
+    output_path = run_dir / f"grades.{output_key}.jsonl"
+    resumed, ledger = resume_records_atlas_compatible(
         output_path,
         identity={
             "stage": "grade",
             "model_key": model_key,
+            "base_model": base_model,
             "sample_file_sha256": _sha256(sample_path),
             "timeout_seconds": timeout_seconds,
         },
+        base_model=base_model,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["sample_id"]),
     )
@@ -198,7 +212,7 @@ def grade_model(  # noqa: PLR0913 - keyword-only stage controls
     honest_pass_count = sum(bool(record["honest_pass"]) for record in graded_records)
     fail_count = sum(bool(record["fail"]) for record in graded_records)
     _write_json(
-        run_dir / f"grade-summary.{model_key}.json",
+        run_dir / f"grade-summary.{output_key}.json",
         {
             "model_key": model_key,
             "n_samples": count,
@@ -219,6 +233,7 @@ def grade_models(  # noqa: PLR0913 - keyword-only stage controls
     *,
     run_dir: Path,
     model_keys: tuple[str, ...],
+    base_model: str = BASE_MODEL_ID,
     timeout_seconds: int = 5,
     scratch_parent: Path = Path("/var/tmp"),  # noqa: S108
     max_records: int | None = None,
@@ -229,6 +244,7 @@ def grade_models(  # noqa: PLR0913 - keyword-only stage controls
         grade_model(
             run_dir=run_dir,
             model_key=model_key,
+            base_model=base_model,
             timeout_seconds=timeout_seconds,
             scratch_parent=scratch_parent,
             max_records=max_records,

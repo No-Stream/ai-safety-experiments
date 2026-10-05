@@ -460,6 +460,8 @@ def compare_jacobian_rows(
         c, r = candidate[layer].float(), reference[layer].float()
         if c.shape != r.shape:
             raise GateFailureError(f"layer {layer}: shapes {tuple(c.shape)} vs {tuple(r.shape)}")
+        if not torch.isfinite(c).all() or not torch.isfinite(r).all():
+            raise GateFailureError(f"layer {layer}: Jacobian rows must contain only finite entries")
         norms = r.norm(dim=1)
         if (norms == 0).any():
             raise GateFailureError(

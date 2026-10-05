@@ -18,14 +18,15 @@ from reward_hacking.atlas.sampling import (
     MAX_LORA_RANK,
     VLLM_MAX_NUM_BATCHED_TOKENS,
     VLLM_MAX_NUM_SEQS,
+    artifact_model_key,
     gpu_engine_settings,
     language_adapter_for,
     load_prompt_tokenizer,
     request_seed,
     resolve_model_key,
+    resume_records_atlas_compatible,
     write_json,
 )
-from reward_hacking.interp.jsonl_resume import resume_records
 
 logger = logging.getLogger(__name__)
 NEUTRAL_QUESTION_TEMPLATE = """A coding task asks for this behavior:
@@ -152,10 +153,11 @@ def neutral_summary(
     return summary
 
 
-def neutral_model(
+def neutral_model(  # noqa: C901, PLR0913, PLR0915 - base and adapter setup are one resumable stage
     *,
     run_dir: Path,
     model_key: str,
+    base_model: str = BASE_MODEL_ID,
     sample_path: Path,
     max_records: int | None = None,
     max_tokens: int = 64,
@@ -174,8 +176,14 @@ def neutral_model(
         samples = samples[:max_records]
     if not samples:
         raise ValueError(f"no samples found in {sample_path}")
-    model_id, adapter_id = resolve_model_key(model_key)
-    tokenizer = load_prompt_tokenizer()
+    sample_base_models = {str(sample.get("model_id", base_model)) for sample in samples}
+    if sample_base_models != {base_model}:
+        raise ValueError(
+            f"samples in {sample_path} were generated for base models {sorted(sample_base_models)}, "
+            f"not requested {base_model!r}"
+        )
+    model_id, adapter_id = resolve_model_key(model_key, base_model=base_model)
+    tokenizer = load_prompt_tokenizer(base_model)
     subjects = neutral_subjects(samples)
     prompts = [str(subject["prompt"]) for subject in subjects]
     prompt_token_ids = [
@@ -196,10 +204,12 @@ def neutral_model(
         for prompt in prompts
     ]
     max_prompt_length = max(len(token_ids) for token_ids in prompt_token_ids)
-    output_path = run_dir / f"neutral.{model_key}.jsonl"
+    output_key = artifact_model_key(model_key)
+    output_path = run_dir / f"neutral.{output_key}.jsonl"
     identity = {
         "stage": "neutral",
         "model_key": model_key,
+        "base_model": base_model,
         "model_id": model_id,
         "adapter_id": adapter_id,
         "sample_file_sha256": hashlib.sha256(sample_path.read_bytes()).hexdigest(),
@@ -209,9 +219,10 @@ def neutral_model(
             json.dumps(prompt_token_ids, separators=(",", ":")).encode()
         ).hexdigest(),
     }
-    resumed, ledger = resume_records(
+    resumed, ledger = resume_records_atlas_compatible(
         output_path,
         identity=identity,
+        base_model=base_model,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["subject_id"]),
     )
@@ -226,21 +237,23 @@ def neutral_model(
         _write_neutral_summary(run_dir, model_key, output_path)
         return output_path
     gpu_memory_utilization, device_name = gpu_engine_settings(torch)
-    engine = LLM(
-        model=BASE_MODEL_ID,
-        tensor_parallel_size=1,
-        dtype="bfloat16",
-        gpu_memory_utilization=gpu_memory_utilization,
-        max_model_len=max_prompt_length + max_tokens,
-        enable_lora=True,
-        max_lora_rank=MAX_LORA_RANK,
-        max_loras=1,
-        max_cpu_loras=1,
-        max_num_seqs=VLLM_MAX_NUM_SEQS,
-        max_num_batched_tokens=VLLM_MAX_NUM_BATCHED_TOKENS,
-        limit_mm_per_prompt={"image": 0},
-    )
-    adapter_path = language_adapter_for(model_key, run_dir)
+    engine_kwargs: dict[str, Any] = {
+        "model": model_id,
+        "tensor_parallel_size": 1,
+        "dtype": "bfloat16",
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "max_model_len": max_prompt_length + max_tokens,
+        "enable_lora": True,
+        "max_lora_rank": MAX_LORA_RANK,
+        "max_loras": 1,
+        "max_cpu_loras": 1,
+        "max_num_seqs": VLLM_MAX_NUM_SEQS,
+        "max_num_batched_tokens": VLLM_MAX_NUM_BATCHED_TOKENS,
+    }
+    if "gemma" in base_model.lower():
+        engine_kwargs["limit_mm_per_prompt"] = {"image": 0}
+    engine = LLM(**engine_kwargs)
+    adapter_path = language_adapter_for(model_key, run_dir, base_model=base_model)
     lora_request = None if adapter_path is None else LoRARequest(model_key, 1, str(adapter_path))
     outputs = engine.generate(
         [{"prompt_token_ids": ids} for _, _, ids in pending],
@@ -287,7 +300,7 @@ def neutral_model(
         _append_jsonl(output_path, record)
         ledger.mark_record_complete(subject_id)
     write_json(
-        run_dir / f"neutral-metadata.{model_key}.json",
+        run_dir / f"neutral-metadata.{output_key}.json",
         {
             "model_key": model_key,
             "model_id": model_id,
@@ -305,13 +318,14 @@ def neutral_model(
 
 
 def _write_neutral_summary(run_dir: Path, model_key: str, output_path: Path) -> None:
+    output_key = artifact_model_key(model_key)
     grades = {
         str(grade["sample_id"]): grade
-        for grade in _read_jsonl(run_dir / f"grades.{model_key}.jsonl")
+        for grade in _read_jsonl(run_dir / f"grades.{output_key}.jsonl")
     }
     summary = neutral_summary(_read_jsonl(output_path), grades)
     write_json(
-        run_dir / f"neutral-summary.{model_key}.json", {"model_key": model_key, "groups": summary}
+        run_dir / f"neutral-summary.{output_key}.json", {"model_key": model_key, "groups": summary}
     )
     logger.info("neutral summary model=%s %s", model_key, json.dumps(summary, sort_keys=True))
 
@@ -320,6 +334,7 @@ def neutral_models(
     *,
     run_dir: Path,
     model_keys: tuple[str, ...],
+    base_model: str = BASE_MODEL_ID,
     max_records: int | None = None,
     max_tokens: int = 64,
 ) -> list[Path]:
@@ -328,7 +343,8 @@ def neutral_models(
         neutral_model(
             run_dir=run_dir,
             model_key=model_key,
-            sample_path=run_dir / f"samples.{model_key}.jsonl",
+            base_model=base_model,
+            sample_path=run_dir / f"samples.{artifact_model_key(model_key)}.jsonl",
             max_records=max_records,
             max_tokens=max_tokens,
         )

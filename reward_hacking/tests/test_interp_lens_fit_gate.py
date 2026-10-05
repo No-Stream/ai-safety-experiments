@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -25,8 +26,15 @@ from torch import nn
 
 from games.eval_model import FullWeightsFacts
 from games.tokenizer_identity import tokenizer_content_sha256
-from reward_hacking.interp import lens_deltanet_gates, lens_fit_gate
-from reward_hacking.interp.jacobian import JacobianConfig, fit_lens
+from reward_hacking.interp import lens_deltanet_gates, lens_fit_gate, lens_fit_runtime
+from reward_hacking.interp.jacobian import (
+    JLENS_COMMIT,
+    FitQualityReport,
+    JacobianConfig,
+    LayerReconstruction,
+    ReconstructionReport,
+    fit_lens,
+)
 from reward_hacking.interp.lens_deltanet_gates import (
     CHUNK_KERNEL_WRAPPER,
     CotangentPlacement,
@@ -49,6 +57,14 @@ from reward_hacking.interp.lens_fit_gate import (
     LensModelHandle,
     gate_prompts,
     jlens_provenance,
+)
+from reward_hacking.interp.lens_fit_runtime import (
+    device_facts,
+    fit_with_resume_identity,
+    reconstruction_read_payload,
+    run_hybrid_architecture_gates,
+    validate_unembedding,
+    weights_fingerprint,
 )
 from reward_hacking.interp.lens_schedule_gates import (
     DimBatchChoice,
@@ -769,6 +785,328 @@ class TestLensRelativeDiffs:
         with pytest.raises(GateFailureError, match="different layers"):
             lens_relative_diffs(a, {0: torch.ones(2, 2)})
 
+    def test_zero_reference_and_nonfinite_jacobians_are_refused(self) -> None:
+        with pytest.raises(GateFailureError, match="zero-norm reference"):
+            lens_relative_diffs({0: torch.ones(2, 2)}, {0: torch.zeros(2, 2)})
+        with pytest.raises(GateFailureError, match="non-finite"):
+            lens_relative_diffs({0: torch.tensor([[float("nan")]])}, {0: torch.ones(1, 1)})
+        with pytest.raises(GateFailureError, match="non-finite reference norm"):
+            lens_relative_diffs(
+                {0: torch.tensor([[3e38, 3e38]])},
+                {0: torch.tensor([[3e38, 3e38]])},
+            )
+        with pytest.raises(GateFailureError, match="same shape"):
+            lens_relative_diffs({0: torch.ones(2, 2)}, {0: torch.ones(1, 2)})
+
+
+class TestGenericLensRuntime:
+    def test_explicit_cpu_device_facts_do_not_query_cuda(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_cuda_query(*args: object, **kwargs: object) -> object:
+            raise AssertionError("explicit CPU facts must not query CUDA")
+
+        monkeypatch.setattr(torch.cuda, "is_available", unexpected_cuda_query)
+        monkeypatch.setattr(torch.cuda, "current_device", unexpected_cuda_query)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", unexpected_cuda_query)
+        assert device_facts("cpu") == {
+            "device": "cpu",
+            "free_vram_bytes": 0,
+            "total_vram_bytes": 0,
+        }
+
+    def test_adapter_base_must_match_model_id_or_loaded_source(self, tmp_path: Path) -> None:
+        class ConfiguredModel(nn.Module):
+            config: SimpleNamespace
+
+        model = ConfiguredModel()
+        model.config = SimpleNamespace(_name_or_path="org/base-model")
+        lens_fit_runtime.assert_adapter_base_matches("org/base-model", "alias/base-model", model)
+
+        local_base = tmp_path / "base-model"
+        (local_base / "nested").mkdir(parents=True)
+        model.config._name_or_path = str(local_base)
+        lens_fit_runtime.assert_adapter_base_matches(
+            str(local_base / "nested" / ".."), "org/other-model", model
+        )
+
+        with pytest.raises(ValueError, match="matches neither"):
+            lens_fit_runtime.assert_adapter_base_matches(
+                "org/wrong-size-model", "org/base-model", model
+            )
+
+    def test_noncontiguous_parameter_hash_matches_logical_contiguous_contents(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(lens_fit_runtime, "PARAMETER_HASH_CHUNK_ELEMENTS", 3)
+        logical_values = torch.arange(30, dtype=torch.float32).reshape(2, 3, 5).transpose(0, 1)
+        assert not logical_values.is_contiguous()
+        noncontiguous_model = nn.Module()
+        noncontiguous_model.register_parameter("weight", nn.Parameter(logical_values))
+        contiguous_model = nn.Module()
+        contiguous_model.register_parameter("weight", nn.Parameter(logical_values.contiguous()))
+
+        chunks = list(
+            lens_fit_runtime._parameter_chunks(logical_values)  # pyright: ignore[reportPrivateUsage]
+        )
+        assert all(chunk.numel() <= 3 and chunk.device.type == "cpu" for chunk in chunks)
+        assert lens_fit_runtime._hash_module_parameters(  # pyright: ignore[reportPrivateUsage]
+            noncontiguous_model
+        ) == lens_fit_runtime._hash_module_parameters(  # pyright: ignore[reportPrivateUsage]
+            contiguous_model
+        )
+
+    def test_fit_identity_is_written_before_resume_and_changed_identity_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        class StubJlens:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def fit(self, model: object, prompts: list[str], **kwargs: object) -> object:
+                self.calls.append({"model": model, "prompts": prompts, **kwargs})
+                return object()
+
+        jl = StubJlens()
+        identity_path = tmp_path / "fit-identity.json"
+        config = JacobianConfig(
+            max_fit_prompts=1,
+            checkpoint_path=tmp_path / "checkpoint.pt",
+            checkpoint_every=1,
+            resume=True,
+        )
+        identity = {"weights_fingerprint": "a" * 64, "source_layers": [8, 10]}
+        fit_with_resume_identity(
+            config,
+            object(),
+            ["synthetic prompt"],
+            cast("Any", jl),
+            identity=identity,
+            identity_path=identity_path,
+        )
+        assert json.loads(identity_path.read_text()) == identity
+        assert len(jl.calls) == 1
+
+        with pytest.raises(RuntimeError, match="fit identity differs"):
+            fit_with_resume_identity(
+                config,
+                object(),
+                ["synthetic prompt"],
+                cast("Any", jl),
+                identity={**identity, "weights_fingerprint": "b" * 64},
+                identity_path=identity_path,
+            )
+        assert len(jl.calls) == 1
+
+    def test_hybrid_gate_reports_nonhybrid_architectures_as_not_applicable(self) -> None:
+        class TextConfig:
+            def get_text_config(self) -> TextConfig:
+                return self
+
+            def to_dict(self) -> dict[str, object]:
+                return {"model_type": "gemma3_text", "num_hidden_layers": 2}
+
+        handle = SimpleNamespace(
+            hf_model=SimpleNamespace(config=TextConfig()), model=SimpleNamespace(n_layers=2)
+        )
+        payload = run_hybrid_architecture_gates(
+            cast("Any", handle),
+            cast("Any", object()),
+            "synthetic prompt",
+            target_layer=1,
+            max_seq_len=8,
+            dim_batch=1,
+        )
+        assert payload["applicable"] is False
+
+    def test_qwen35_text_config_runs_hybrid_gates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        module_name = "synthetic_qwen35_modeling"
+        modeling_module = types.ModuleType(module_name)
+        recurrence_type = type("Qwen3_5GatedDeltaNet", (nn.Module,), {"__module__": module_name})
+        vars(modeling_module)["Qwen3_5GatedDeltaNet"] = recurrence_type
+        monkeypatch.setitem(sys.modules, module_name, modeling_module)
+
+        class TextConfig:
+            def get_text_config(self) -> TextConfig:
+                return self
+
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "model_type": "qwen3_5_text",
+                    "layer_types": ["linear_attention", "full_attention"],
+                    "linear_conv_kernel_dim": 4,
+                }
+
+        class TinyQwenTextModel:
+            config: TextConfig
+
+            def __init__(self) -> None:
+                self.config = TextConfig()
+
+        TinyQwenTextModel.__module__ = module_name
+        hf_model = TinyQwenTextModel()
+        model = SimpleNamespace(
+            n_layers=2,
+            encode=lambda prompt, max_length: torch.ones(1, 32, dtype=torch.long),
+        )
+        handle = SimpleNamespace(
+            hf_model=hf_model,
+            model=model,
+            blocks=nn.ModuleList(),
+            forward=lambda input_ids: None,
+        )
+        report = SimpleNamespace(passed=True, as_payload=lambda: {"passed": True})
+        monkeypatch.setattr(lens_fit_runtime, "bound_deltanet_kernels", lambda: 1)
+        monkeypatch.setattr(lens_fit_runtime, "prefill_deltanet_kernels", lambda bound: 1)
+        monkeypatch.setattr(lens_fit_runtime, "fit_skip_first", lambda jl: 0)
+        monkeypatch.setattr(
+            lens_fit_runtime, "probe_recurrence_autograd", lambda *args, **kwargs: report
+        )
+        monkeypatch.setattr(
+            lens_fit_runtime, "audit_chunk_kernel_backward", lambda *args, **kwargs: report
+        )
+
+        payload = run_hybrid_architecture_gates(
+            cast("Any", handle),
+            cast("Any", object()),
+            "synthetic prompt",
+            target_layer=1,
+            source_layers=(0,),
+            max_seq_len=32,
+            dim_batch=2,
+        )
+        assert payload["applicable"] is True
+        assert payload["passed"] is True
+        assert payload["model_type"] == "qwen3_5_text"
+
+    def test_local_base_and_adapter_content_both_determine_fit_identity(
+        self, tmp_path: Path
+    ) -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+        (model_dir / "model.safetensors").write_bytes(b"base weights")
+        adapter_dir = tmp_path / "adapter"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text("{}")
+        adapter_weights = adapter_dir / "adapter_model.safetensors"
+        adapter_weights.write_bytes(b"adapter weights")
+        hf_model = nn.Module()
+        object.__setattr__(hf_model, "config", SimpleNamespace())
+        linear = nn.Linear(2, 2, bias=False)
+        hf_model.add_module("linear", linear)
+
+        base_fingerprint = weights_fingerprint(str(model_dir), hf_model)
+        with_adapter = weights_fingerprint(str(model_dir), hf_model, adapter_dir)
+        assert base_fingerprint != with_adapter
+        assert with_adapter == weights_fingerprint(str(model_dir), hf_model, adapter_dir)
+
+        adapter_weights.write_bytes(b"changed adapter weights")
+        assert weights_fingerprint(str(model_dir), hf_model, adapter_dir) != with_adapter
+        with torch.no_grad():
+            linear.weight[0, 0] += 1.0
+        assert weights_fingerprint(str(model_dir), hf_model) != base_fingerprint
+
+    def test_unidentified_partial_checkpoint_is_refused(self, tmp_path: Path) -> None:
+        class StubJlens:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fit(self, model: object, prompts: list[str], **kwargs: object) -> object:
+                self.calls += 1
+                return object()
+
+        checkpoint_path = tmp_path / "checkpoint.pt"
+        checkpoint_path.write_bytes(b"partial accumulator")
+        jl = StubJlens()
+        with pytest.raises(RuntimeError, match="cannot be verified"):
+            fit_with_resume_identity(
+                JacobianConfig(checkpoint_path=checkpoint_path),
+                object(),
+                ["synthetic prompt"],
+                cast("Any", jl),
+                identity={"weights_fingerprint": "a" * 64},
+                identity_path=tmp_path / "fit-identity.json",
+            )
+        assert jl.calls == 0
+
+    def test_remote_base_requires_a_resolved_revision_identity(self) -> None:
+        hf_model = nn.Module()
+        object.__setattr__(hf_model, "config", SimpleNamespace())
+        with pytest.raises(RuntimeError, match="resolved commit hash"):
+            weights_fingerprint("org/model", hf_model)
+
+    def test_unembedding_validation_rejects_nonfinite_and_zero_weights(self) -> None:
+        norm = nn.LayerNorm(3)
+        head = nn.Linear(3, 5, bias=False)
+        hf_model = nn.Module()
+        text_model = nn.Module()
+        text_model.add_module("norm", norm)
+        hf_model.add_module("text", text_model)
+        hf_model.add_module("lm_head", head)
+        jl_model = SimpleNamespace(
+            layout=SimpleNamespace(path="text", norm="norm", lm_head="lm_head")
+        )
+        assert validate_unembedding(hf_model, jl_model)["passed"] is True
+
+        with torch.no_grad():
+            head.weight[0, 0] = float("nan")
+        with pytest.raises(RuntimeError, match="non-finite"):
+            validate_unembedding(hf_model, jl_model)
+
+        with torch.no_grad():
+            head.weight.zero_()
+        with pytest.raises(RuntimeError, match="zero norm"):
+            validate_unembedding(hf_model, jl_model)
+
+    def test_unembedding_validation_checks_noncontiguous_parameters_in_bounded_tiles(
+        self,
+    ) -> None:
+        norm = nn.LayerNorm(3)
+        head = nn.Linear(3, 5, bias=False)
+        head.weight = nn.Parameter(torch.ones(3, 5).transpose(0, 1))
+        assert not head.weight.is_contiguous()
+        hf_model = nn.Module()
+        text_model = nn.Module()
+        text_model.add_module("norm", norm)
+        hf_model.add_module("text", text_model)
+        hf_model.add_module("lm_head", head)
+        jl_model = SimpleNamespace(
+            layout=SimpleNamespace(path="text", norm="norm", lm_head="lm_head")
+        )
+        assert validate_unembedding(hf_model, jl_model)["passed"] is True
+
+    def test_reconstruction_payload_keeps_layer_reads_and_shift_diagnostic(self) -> None:
+        jacobian = ReconstructionReport(
+            per_layer=[LayerReconstruction(8, 0.4, 0.2, 3), LayerReconstruction(10, 0.2, 0.4, 3)],
+            n_samples=3,
+            mean_relative_residual=0.3,
+            median_relative_residual=0.3,
+            best_layer=10,
+            best_layer_relative_residual=0.2,
+            mean_explained_variance=0.3,
+            median_explained_variance=0.3,
+        )
+        logit = ReconstructionReport(
+            per_layer=[LayerReconstruction(8, 0.3, 0.3, 3), LayerReconstruction(10, 0.4, 0.2, 3)],
+            n_samples=3,
+            mean_relative_residual=0.35,
+            median_relative_residual=0.35,
+            best_layer=8,
+            best_layer_relative_residual=0.3,
+            mean_explained_variance=0.25,
+            median_explained_variance=0.25,
+        )
+        payload = reconstruction_read_payload(
+            FitQualityReport(jacobian, logit, 2, 1, 4, target_layer=12)
+        )
+        assert payload["available"] is True
+        assert payload["jacobian_beats_logit_lens"] is True
+        jacobian_payload = cast("dict[str, Any]", payload["jacobian"])
+        layer_payloads = cast("list[dict[str, object]]", jacobian_payload["per_layer"])
+        assert [row["layer"] for row in layer_payloads] == [8, 10]
+        assert payload["n_eval_prompts_skipped"] == 1
+
 
 # --------------------------------------------------------------------------------------
 # The threaded knobs, and the CLI's bookkeeping
@@ -851,6 +1189,25 @@ class TestJlensProvenance:
         fake = types.ModuleType("jlens")
         fake.__file__ = str(tmp_path / "jlens" / "__init__.py")
         assert jlens_provenance(fake)["commit"] is None
+
+    def test_a_pinned_but_dirty_checkout_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clone = tmp_path / "clone"
+        (clone / "jlens").mkdir(parents=True)
+        (clone / "jlens" / "__init__.py").write_text("")
+        fake = types.ModuleType("jlens")
+        fake.__file__ = str(clone / "jlens" / "__init__.py")
+        completed = [
+            subprocess.CompletedProcess([], 0, stdout=f"{JLENS_COMMIT}\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=" M jlens/__init__.py\n", stderr=""),
+        ]
+
+        def run_git(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            return completed.pop(0)
+
+        monkeypatch.setattr(lens_fit_runtime.subprocess, "run", run_git)
+        assert jlens_provenance(fake)["dirty"] is True
 
 
 def test_the_cli_module_exposes_the_five_gates() -> None:

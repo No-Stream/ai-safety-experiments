@@ -357,8 +357,12 @@ def layer_reconstruction(
         )
     if actual.ndim != 2:  # noqa: PLR2004 - logits are a [n_samples, vocab] matrix by contract
         raise ValueError(f"expected [n_samples, vocab] logits, got shape {tuple(actual.shape)}")
+    if actual.numel() == 0:
+        raise ValueError("cannot score empty reconstruction logits")
     predicted = predicted.float()
     actual = actual.float()
+    if not torch.isfinite(predicted).all() or not torch.isfinite(actual).all():
+        raise ValueError("reconstruction logits must all be finite")
     residual = predicted - actual
     actual_norm = actual.norm()
     if actual_norm == 0:
@@ -690,6 +694,10 @@ def verify_cached_lens(
     if int(lens.d_model) != d_model:  # pyright: ignore[reportAttributeAccessIssue]
         raise RuntimeError(f"cached lens has d_model={lens.d_model}, model has {d_model}")  # pyright: ignore[reportAttributeAccessIssue]
     for layer, tensor in lens.jacobians.items():  # pyright: ignore[reportAttributeAccessIssue]
+        if tuple(tensor.shape) != (d_model, d_model):
+            raise RuntimeError(
+                f"cached lens layer {layer} has shape {tuple(tensor.shape)}, expected {(d_model, d_model)}"
+            )
         if not torch.isfinite(tensor).all():
             raise RuntimeError(f"cached lens layer {layer} has non-finite entries")
 

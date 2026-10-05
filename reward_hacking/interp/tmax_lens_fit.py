@@ -66,12 +66,9 @@ from reward_hacking.interp.jacobian import (
     JLENS_COMMIT,
     JacobianConfig,
     _require_jlens,  # pyright: ignore[reportPrivateUsage]  # the shared PYTHONPATH jlens loader
-    evaluate_reconstruction,
-    fit_lens,
-    fit_quality_payload,
+    digest_strings,
     fit_skip_first,
     interior_eval_positions,
-    verify_lens_roundtrip,
 )
 from reward_hacking.interp.lens_artifacts import (
     FIT_CHECKPOINT_FILENAME,
@@ -89,6 +86,14 @@ from reward_hacking.interp.lens_fit_gate import (
     full_weights_source,
     jlens_provenance,
     load_lens_model,
+)
+from reward_hacking.interp.lens_fit_runtime import (
+    FIT_IDENTITY_FILENAME,
+    fit_with_resume_identity,
+    read_reconstruction,
+    reconstruction_read_payload,
+    save_and_read_lens,
+    source_implementation_sha256,
 )
 from reward_hacking.interp.lens_geometry import (
     GateProvenance,
@@ -119,6 +124,21 @@ FIT_ROLES: tuple[str, ...] = (ROLE_FIT, ROLE_ANCHOR)
 HALF_ODD = "odd"
 HALF_EVEN = "even"
 FIT_HALVES: tuple[str, ...] = (HALF_ODD, HALF_EVEN)
+TMAX_FIT_IMPLEMENTATION_PATHS: tuple[str, ...] = (
+    "reward_hacking/interp/tmax_lens_fit.py",
+    "reward_hacking/interp/tmax_lens_corpus.py",
+    "reward_hacking/interp/tmax_full_weights.py",
+    "reward_hacking/interp/lens_fit_runtime.py",
+    "reward_hacking/interp/jacobian.py",
+    "reward_hacking/interp/lens_fit_gate.py",
+    "reward_hacking/interp/lens_deltanet_gates.py",
+    "reward_hacking/interp/lens_geometry.py",
+    "reward_hacking/interp/lens_artifacts.py",
+    "games/deltanet_kernels.py",
+    "games/eval_model.py",
+    "games/tokenizer_identity.py",
+    "games/provenance.py",
+)
 DEFAULT_DIM_BATCH = 8
 DEFAULT_CHECKPOINT_EVERY = 4
 DEFAULT_POSITIONS_PER_ANCHOR = 4
@@ -477,6 +497,8 @@ def cross_lens_reads(  # noqa: PLR0913 - a cross read is the other lens, this mo
     eval_prompts: Sequence[str],
     max_seq_len: int,
     eval_positions: int,
+    skip_first: int | None = None,
+    target_layer: int | None = None,
 ) -> dict[str, dict[str, object]]:
     """Apply other checkpoints' lenses to this checkpoint: reconstruction and hit rates on its anchors.
 
@@ -486,6 +508,7 @@ def cross_lens_reads(  # noqa: PLR0913 - a cross read is the other lens, this mo
     its transport is used on this checkpoint's fresh anchors.
     """
     out: dict[str, dict[str, object]] = {}
+    resolved_skip_first = fit_skip_first(jl) if skip_first is None else skip_first
     for directory in directories:
         if not (directory / PROVENANCE_FILENAME).is_file():
             raise LensArtifactError(
@@ -501,15 +524,21 @@ def cross_lens_reads(  # noqa: PLR0913 - a cross read is the other lens, this mo
                 f"cross-lens read applies another checkpoint's lens"
             )
         other = jl.JacobianLens.load(str(lens_path))
-        quality = evaluate_reconstruction(
-            other, handle.model, eval_prompts, max_seq_len=max_seq_len, max_positions=eval_positions
+        quality = read_reconstruction(
+            other,
+            handle.model,
+            eval_prompts,
+            max_seq_len=max_seq_len,
+            max_positions=eval_positions,
+            skip_first=resolved_skip_first,
+            target_layer=target_layer,
         )
         out[provenance.lens_name] = {
             "lens_dir": str(directory),
             "lens_sha256": provenance.lens_sha256,
             "lens_weights_fingerprint": provenance.weights_fingerprint,
             "lens_model_label": provenance.model_label,
-            "fit_quality_on_this_checkpoint": fit_quality_payload(quality),
+            "fit_quality_on_this_checkpoint": reconstruction_read_payload(quality),
             "gate_by_layer_on_this_checkpoints_anchors": gate_self_check(gate, other, handle.model),
         }
         logger.info(
@@ -519,13 +548,14 @@ def cross_lens_reads(  # noqa: PLR0913 - a cross read is the other lens, this mo
     return out
 
 
-def acquire_fit_lens(
+def acquire_fit_lens(  # noqa: PLR0913 - the compatibility wrapper mirrors the fit lifecycle inputs
     plan: FitPlan,
     *,
     handle: LensModelHandle,
     jl: ModuleType,
     identity: dict[str, object],
     out_dir: Path,
+    identity_path: Path | None = None,
 ) -> tuple[Any, MergedHalves | None]:
     """Fit the lens (resumable), or merge two complete halves into it; the merge fixes the prompt count."""
     if plan.merge_from is not None:
@@ -547,7 +577,19 @@ def acquire_fit_lens(
         checkpoint_every=plan.checkpoint_every,
         resume=True,
     )
-    return fit_lens(config, handle.model, plan.prompts, jl), None
+    return (
+        fit_with_resume_identity(
+            config,
+            handle.model,
+            plan.prompts,
+            jl,
+            identity=identity,
+            identity_path=(out_dir / FIT_IDENTITY_FILENAME)
+            if identity_path is None
+            else identity_path,
+        ),
+        None,
+    )
 
 
 def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its steps are named in the log
@@ -582,14 +624,39 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
 
     kernels_bound = bound_deltanet_kernels()
     deltanet_kernel = prefill_deltanet_kernels(kernels_bound)
-    started = time.time()
-    lens, merged = acquire_fit_lens(plan, handle=handle, jl=jl, identity=identity, out_dir=out_dir)
-    fit_seconds = round(time.time() - started, 1)
-    lens.save(str(lens_path))
-    verify_lens_roundtrip(jl, lens, lens_path)
-    lens_sha256 = sha256_of_file(lens_path)
+    fit_identity = {
+        **identity,
+        "repo_sha": git_sha(),
+        "implementation_sha256": source_implementation_sha256(TMAX_FIT_IMPLEMENTATION_PATHS),
+        "fit_prompts_sha256": digest_strings(plan.prompts),
+        "target_layer": None,
+        "source_layers": None,
+        "checkpoint_every": plan.checkpoint_every,
+    }
+    started = time.perf_counter()
+    lens, merged = acquire_fit_lens(
+        plan,
+        handle=handle,
+        jl=jl,
+        identity=fit_identity,
+        out_dir=out_dir,
+        identity_path=out_dir / FIT_IDENTITY_FILENAME,
+    )
+    fit_seconds = round(time.perf_counter() - started, 1)
+    saved = save_and_read_lens(
+        lens,
+        handle.model,
+        jl,
+        lens_path=lens_path,
+        eval_prompts=corpus.eval_prompts,
+        max_seq_len=plan.max_seq_len,
+        max_positions=plan.eval_positions,
+        skip_first=skip_first,
+        target_layer=None,
+    )
+    lens_sha256 = saved.lens_sha256
 
-    started = time.time()
+    started = time.perf_counter()
     capture = capture_anchors(
         handle.model,
         corpus.anchors,
@@ -619,7 +686,7 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
     )
     gate.save(out_dir)
     self_check = gate_self_check(gate, lens, handle.model)
-    anchors_seconds = round(time.time() - started, 1)
+    anchors_seconds = round(time.perf_counter() - started, 1)
 
     stored = stored_unembed_from(handle)
     agreement = unembed_agreement(stored, capture.model_logits, capture.final_residuals)
@@ -632,14 +699,8 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
         )
     stored.save(out_dir, weights_fingerprint=handle.facts.fingerprint)
 
-    started = time.time()
-    quality = evaluate_reconstruction(
-        lens,
-        handle.model,
-        corpus.eval_prompts,
-        max_seq_len=plan.max_seq_len,
-        max_positions=plan.eval_positions,
-    )
+    started = time.perf_counter()
+    quality = saved.quality
     cross = cross_lens_reads(
         plan.cross_lens_dirs,
         jl=jl,
@@ -648,8 +709,11 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
         eval_prompts=corpus.eval_prompts,
         max_seq_len=plan.max_seq_len,
         eval_positions=plan.eval_positions,
+        skip_first=skip_first,
+        target_layer=None,
     )
-    eval_seconds = round(time.time() - started, 1)
+    cross_read_seconds = time.perf_counter() - started
+    eval_seconds = round(saved.read_seconds + cross_read_seconds, 1)
 
     provenance = LensProvenance(
         lens_name=plan.lens_name,
@@ -681,10 +745,12 @@ def fit_and_write(  # noqa: PLR0913 - the stage is one long, linear recipe; its 
             "timings": {
                 "load_seconds": round(handle.load_seconds, 1),
                 "fit_seconds": fit_seconds,
+                "persistence_seconds": round(saved.persistence_seconds, 1),
+                "fit_quality_read_seconds": round(saved.read_seconds, 1),
                 "anchors_seconds": anchors_seconds,
                 "eval_seconds": eval_seconds,
             },
-            "fit_quality": fit_quality_payload(quality),
+            "fit_quality": reconstruction_read_payload(quality),
             "gate": {
                 "n_anchor_prompts": len(corpus.anchors),
                 "n_anchors": gate.n_anchors,

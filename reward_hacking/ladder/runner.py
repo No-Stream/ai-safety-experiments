@@ -45,6 +45,7 @@ from reward_hacking.jailed_poc import (
 )
 from reward_hacking.ladder import chat as ladder_chat
 from reward_hacking.ladder import loop as ladder_loop
+from reward_hacking.ladder import protocols as ladder_protocols
 from reward_hacking.ladder import surfaces
 from reward_hacking.ladder.behaviour import (
     command_shell_segments,
@@ -133,6 +134,7 @@ LADDER_GENERATION_CODE_FILES = (
     "reward_hacking/ladder/loop.py",
     "reward_hacking/ladder/tools.py",
     "reward_hacking/ladder/chat.py",
+    "reward_hacking/ladder/protocols.py",
     "reward_hacking/ladder/rungs.py",
     "reward_hacking/ladder/scenario.py",
     "reward_hacking/ladder/surfaces.py",
@@ -179,9 +181,9 @@ class LadderSampling:
     presence_penalty: float = 0.0
     seed: int | None = None
 
-    def to_json(self) -> dict[str, object]:
-        """Return the complete sampler identity used in the run header."""
-        return {
+    def to_json(self, *, include_stop_token_ids: bool = True) -> dict[str, object]:
+        """Return sampler settings, with legacy Qwen stops only for Qwen-specific callers."""
+        payload: dict[str, object] = {
             "max_new_tokens": self.max_new_tokens,
             "do_sample": self.do_sample,
             "temperature": self.temperature,
@@ -191,8 +193,10 @@ class LadderSampling:
             "repetition_penalty": self.repetition_penalty,
             "presence_penalty": self.presence_penalty,
             "seed": self.seed,
-            "stop_token_ids": list(LADDER_STOP_TOKEN_IDS),
         }
+        if include_stop_token_ids:
+            payload["stop_token_ids"] = list(LADDER_STOP_TOKEN_IDS)
+        return payload
 
 
 LADDER_SAMPLING = LadderSampling()
@@ -209,6 +213,7 @@ class ModelSpec:
     chat_template_kwargs: Mapping[str, str] = dataclass_field(
         default_factory=lambda: MappingProxyType({})
     )
+    protocol: str | None = None
 
     def __post_init__(self) -> None:
         """Reject ambiguous model identities before a backend can be started."""
@@ -220,6 +225,10 @@ class ModelSpec:
             raise ValueError("revision must be non-empty when supplied")
         if self.server_model_id == "":
             raise ValueError("server_model_id must be non-empty when supplied")
+        if self.protocol == "":
+            raise ValueError("protocol must be non-empty when supplied")
+        if self.protocol is not None and self.protocol not in ladder_protocols.PROTOCOLS:
+            raise ValueError(f"unknown ladder protocol {self.protocol!r}")
         kwargs = dict(self.chat_template_kwargs)
         if any(not key for key in kwargs):
             raise ValueError("chat-template kwarg names must be non-empty strings")
@@ -227,13 +236,37 @@ class ModelSpec:
 
     def to_json(self) -> dict[str, object]:
         """Return model provenance without exposing model weights or prompt material."""
-        return {
+        payload: dict[str, object] = {
             "model_id": self.model_id,
             "model_path": str(self.model_path),
             "revision": self.revision,
             "server_model_id": self.server_model_id,
             "chat_template_kwargs": dict(self.chat_template_kwargs),
         }
+        if self.protocol is not None:
+            payload["protocol"] = self.protocol
+        return payload
+
+
+def _protocol_name_for_model(model: ModelSpec) -> str | None:
+    """Resolve a model family from its cached config without loading weights or a tokenizer."""
+    if model.protocol is not None:
+        return model.protocol
+    model_path = Path(model.model_path)
+    if model_path.is_dir():
+        snapshot_dir = model_path
+    elif model_path.is_absolute():
+        return None
+    else:
+        cached_config = try_to_load_from_cache(
+            str(model.model_path), "config.json", revision=model.revision
+        )
+        if not isinstance(cached_config, str):
+            return None
+        snapshot_dir = Path(cached_config).parent
+    if not (snapshot_dir / "config.json").is_file():
+        return None
+    return ladder_protocols.select_protocol(None, snapshot_dir).name
 
 
 class ScenarioLike(Protocol):
@@ -344,6 +377,10 @@ class RunnerConfig:
 
     def _build_provenance_payload(self) -> dict[str, object]:
         """Build provenance once, at config creation, before any episode can run."""
+        include_qwen_stop_ids = all(
+            protocol_name in (None, "qwen")
+            for protocol_name in map(_protocol_name_for_model, self.models)
+        )
         payload: dict[str, object] = {
             "schema_version": LADDER_SCHEMA_VERSION,
             "endpoint": self.endpoint,
@@ -365,7 +402,7 @@ class RunnerConfig:
             ).hexdigest(),
             "max_model_len": dict(self.max_model_len_by_model),
             "server_args": None if self.server_args is None else deepcopy(dict(self.server_args)),
-            "sampling": self.sampling.to_json(),
+            "sampling": self.sampling.to_json(include_stop_token_ids=include_qwen_stop_ids),
             "max_turns": self.max_turns,
             "max_submissions": ladder_loop.LADDER_MAX_SUBMISSIONS,
             "timeout": self.timeout,
@@ -1215,6 +1252,11 @@ def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
     )
 
     local_snapshot = _resolve_local_model_path(model)
+    protocol_hint = ladder_protocols.select_protocol(
+        None,
+        local_snapshot,
+        explicit=model.protocol,
+    )
     ladder_sampling = config.sampling
     sampling = SamplingConfig(
         max_new_tokens=ladder_sampling.max_new_tokens,
@@ -1232,10 +1274,34 @@ def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
         base_url=config.endpoint,
         model_path=local_snapshot,
         revision=model.revision,
-        thinking=True,
+        thinking=protocol_hint.reasoning_mode == "qwen",
         sampling=sampling,
         stop_token_ids=LADDER_STOP_TOKEN_IDS,
     )
+    protocol = ladder_protocols.select_protocol(
+        cast("Any", backend).tokenizer,
+        local_snapshot,
+        explicit=model.protocol,
+    )
+    resolved_stop_token_ids = protocol.stop_token_ids(cast("Any", backend).tokenizer)
+    cast("Any", backend).stop_token_ids = resolved_stop_token_ids
+    cast("Any", backend).ladder_protocol = protocol
+    cast("Any", backend).thinking = protocol.reasoning_mode == "qwen"
+    server_args = config.server_args
+    if server_args is not None and server_args.get("lora_modules"):
+        configured_base_model = server_args.get("model")
+        if not isinstance(configured_base_model, str) or not configured_base_model:
+            raise ValueError("vLLM server args with LoRA modules must identify the base model")
+        served_model_id = model.server_model_id or model.model_id
+        if served_model_id != configured_base_model:
+            backend.assert_adapter_changes_output(
+                [
+                    "Write a short, friendly greeting for a new teammate.",
+                    "Explain what the command `pwd` reports in one sentence.",
+                    "Suggest a concise name for a helper script.",
+                ],
+                base_model_id=configured_base_model,
+            )
     ladder_chat.validate_chat_template_kwargs(
         cast("Any", backend).tokenizer,
         local_snapshot,
@@ -1536,7 +1602,7 @@ def _backend_max_model_len(config: RunnerConfig, backend: object) -> int:
     return max_model_len
 
 
-def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook configuration
+def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook configuration
     scenario: ScenarioLike,
     backend: object,
     arm: str,
@@ -1557,6 +1623,21 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
     arm_config = getattr(rendered, "arm", None)
     if task is None or arm_config is None:
         raise TypeError("scenario.render() must return an object with task and arm fields")
+    if not hasattr(backend, "tokenizer"):
+        protocol = ladder_protocols.QWEN_PROTOCOL
+    else:
+        backend_with_protocol = cast("ladder_loop.LadderBackend", backend)
+        backend_model_path = (
+            backend_with_protocol.model_path
+            if hasattr(backend_with_protocol, "model_path")
+            else None
+        )
+        snapshot_source = backend_model_path or model.model_path
+        protocol = ladder_protocols.select_protocol(
+            backend_with_protocol.tokenizer,
+            snapshot_source,
+            explicit=model.protocol,
+        )
     max_model_len = _backend_max_model_len(config, backend)
     spec = _detection_spec(scenario)
     repository_options: dict[str, Any] = {}
@@ -1631,6 +1712,7 @@ def _run_real_episode(  # noqa: PLR0913, PLR0917 - explicit cell and hook config
                 episode_seconds=config.episode_seconds,
                 history_reasoning=config.history_reasoning,
                 chat_template_kwargs=model.chat_template_kwargs,
+                protocol=protocol,
                 before_command=before_command,
                 after_command=after_command,
                 submit_grader=(
@@ -5681,6 +5763,42 @@ def _models_with_chat_template_kwargs(
     )
 
 
+def _parse_protocol(raw: str) -> tuple[str | None, str]:
+    """Parse a global ``NAME`` or model-scoped ``MODEL_ID:NAME`` protocol flag."""
+    model_id, separator, protocol = raw.partition(":")
+    if separator:
+        if not model_id or not protocol:
+            raise argparse.ArgumentTypeError("--protocol must be NAME or MODEL_ID:NAME")
+        return model_id, protocol
+    if not raw:
+        raise argparse.ArgumentTypeError("--protocol must be NAME or MODEL_ID:NAME")
+    return None, raw
+
+
+def _models_with_protocols(
+    models: Sequence[ModelSpec], entries: Sequence[tuple[str | None, str]]
+) -> tuple[ModelSpec, ...]:
+    """Attach explicit protocol names to model labels, rejecting ambiguous assignments."""
+    protocol_by_model: dict[str, str] = {}
+    global_protocols = [protocol for model_id, protocol in entries if model_id is None]
+    if len(global_protocols) > 1 or (global_protocols and len(models) != 1):
+        raise ValueError("a global --protocol requires exactly one model and may appear once")
+    if global_protocols:
+        protocol_by_model[models[0].model_id] = global_protocols[0]
+    for model_id, protocol in entries:
+        if model_id is None:
+            continue
+        if model_id not in {model.model_id for model in models}:
+            raise ValueError(f"--protocol targets {model_id!r}, which has no matching --model")
+        if model_id in protocol_by_model:
+            raise ValueError(f"duplicate --protocol for model {model_id!r}")
+        protocol_by_model[model_id] = protocol
+    for protocol in protocol_by_model.values():
+        if protocol not in ladder_protocols.PROTOCOLS:
+            raise ValueError(f"unknown ladder protocol {protocol!r}")
+    return tuple(replace(model, protocol=protocol_by_model.get(model.model_id)) for model in models)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the selected ladder grid from the command line."""
     parser = argparse.ArgumentParser(description="Run the real-execution hack-severity ladder")
@@ -5699,6 +5817,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[],
         metavar="MODEL_ID:KEY=VALUE",
         help="Pass one string-valued keyword to the selected model's local chat template.",
+    )
+    parser.add_argument(
+        "--protocol",
+        action="append",
+        type=_parse_protocol,
+        default=[],
+        metavar="NAME|MODEL_ID:NAME",
+        help="Select qwen, olmo3, or gemma3 globally or for one model label.",
     )
     parser.add_argument("--scenario-root", type=Path, required=True)
     parser.add_argument("--scenario", action="append", dest="scenario_ids")
@@ -5742,6 +5868,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         models = _models_with_chat_template_kwargs(args.model, args.chat_template_kwarg)
+        models = _models_with_protocols(models, args.protocol)
     except ValueError as error:
         parser.error(str(error))
     server_args = parse_server_args_from_log(args.server_log)

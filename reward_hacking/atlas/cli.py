@@ -52,6 +52,11 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_RUNS_ROOT,
         help="artifact root (default: repository artifacts/atlas)",
     )
+    parser.add_argument(
+        "--base-model",
+        default="google/gemma-3-12b-it",
+        help="base model used for this run (default: google/gemma-3-12b-it)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,14 +89,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sample = subparsers.add_parser("sample", help="sample the base and/or released LoRA adapters")
     _add_common(sample)
-    sample.add_argument("--models", nargs="+", choices=MODEL_KEYS, default=MODEL_KEYS)
+    sample.add_argument("--models", nargs="+", default=MODEL_KEYS)
     sample.add_argument("--samples-per-prompt", type=int, default=2)
     sample.add_argument("--max-tokens", type=int, default=256)
     sample.add_argument("--max-prompts", type=int, help="limit prompts for a smoke")
 
     grade = subparsers.add_parser("grade", help="grade solutions in fresh episode-jail runs")
     _add_common(grade)
-    grade.add_argument("--models", nargs="+", choices=MODEL_KEYS, default=MODEL_KEYS)
+    grade.add_argument("--models", nargs="+", default=MODEL_KEYS)
     grade.add_argument("--timeout-seconds", type=int, default=5)
     grade.add_argument("--scratch-parent", type=Path, default=Path("/var/tmp"))  # noqa: S108
     grade.add_argument("--max-records", type=int, help="limit samples for a smoke")
@@ -101,18 +106,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     capture = subparsers.add_parser("capture", help="capture residuals at the four Atlas positions")
     _add_common(capture)
-    capture.add_argument("--models", nargs="+", choices=MODEL_KEYS, default=MODEL_KEYS)
+    capture.add_argument("--models", nargs="+", default=MODEL_KEYS)
     capture.add_argument("--max-records", type=int, help="limit samples for a smoke")
 
     neutral = subparsers.add_parser("neutral", help="ask each checkpoint a fresh-context question")
     _add_common(neutral)
-    neutral.add_argument("--models", nargs="+", choices=MODEL_KEYS, default=MODEL_KEYS)
+    neutral.add_argument("--models", nargs="+", default=MODEL_KEYS)
     neutral.add_argument("--max-records", type=int, help="limit samples for a smoke")
     neutral.add_argument("--max-tokens", type=int, default=64)
 
     readout = subparsers.add_parser("readout", help="fit grouped-CV probes and text baselines")
     _add_common(readout)
-    readout.add_argument("--models", nargs="+", choices=MODEL_KEYS, default=MODEL_KEYS)
+    readout.add_argument("--models", nargs="+", default=MODEL_KEYS)
     readout.add_argument("--permutations", type=int, default=5)
     readout.add_argument("--seed", type=int, default=0)
 
@@ -150,17 +155,19 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
         tfidf_char_ngram_readout,
     )
     from reward_hacking.atlas.readout import rank_auc  # noqa: PLC0415
+    from reward_hacking.atlas.sampling import artifact_model_key  # noqa: PLC0415
     from reward_hacking.interp.linear_probe import fit_logistic_probe  # noqa: PLC0415
 
     prepared: dict[str, dict[str, Any]] = {}
     summary: dict[str, object] = {"models": {}, "transfers": [], "original_probe_standin": {}}
     for model_key in model_keys:
-        sample_records = _read_jsonl(run_dir / f"samples.{model_key}.jsonl")
-        grade_records = _read_jsonl(run_dir / f"grades.{model_key}.jsonl")
+        output_key = artifact_model_key(model_key)
+        sample_records = _read_jsonl(run_dir / f"samples.{output_key}.jsonl")
+        grade_records = _read_jsonl(run_dir / f"grades.{output_key}.jsonl")
         grade_by_id = {str(record["sample_id"]): record for record in grade_records}
-        shard = np.load(run_dir / f"activations.{model_key}.npy", mmap_mode="r")
+        shard = np.load(run_dir / f"activations.{output_key}.npy", mmap_mode="r")
         index = json.loads(
-            (run_dir / f"capture-index.{model_key}.json").read_text(encoding="utf-8")
+            (run_dir / f"capture-index.{output_key}.json").read_text(encoding="utf-8")
         )
         sample_ids = [str(sample_id) for sample_id in index["sample_ids"]]
         sample_by_id = {str(record["sample_id"]): record for record in sample_records}
@@ -214,9 +221,9 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
             "n_fail_or_ungraded": len(sample_ids) - len(eligible_ids),
             "grade_rates": (
                 json.loads(
-                    (run_dir / f"grade-summary.{model_key}.json").read_text(encoding="utf-8")
+                    (run_dir / f"grade-summary.{output_key}.json").read_text(encoding="utf-8")
                 )
-                if (run_dir / f"grade-summary.{model_key}.json").exists()
+                if (run_dir / f"grade-summary.{output_key}.json").exists()
                 else None
             ),
             "text_baselines": {
@@ -470,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
 
         prompts_stage(
             run_dir=run_dir,
+            base_model=arguments.base_model,
             dataset_keys=arguments.datasets,
             max_items=arguments.max_items,
         )
@@ -480,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
             run_dir=run_dir,
             prompt_path=run_dir / "prompts.jsonl",
             model_keys=arguments.models,
+            base_model=arguments.base_model,
             samples_per_prompt=arguments.samples_per_prompt,
             max_tokens=arguments.max_tokens,
             max_prompts=arguments.max_prompts,
@@ -490,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
         grade_models(
             run_dir=run_dir,
             model_keys=tuple(arguments.models),
+            base_model=arguments.base_model,
             timeout_seconds=arguments.timeout_seconds,
             scratch_parent=arguments.scratch_parent,
             max_records=arguments.max_records,
@@ -499,7 +509,10 @@ def main(argv: list[str] | None = None) -> int:
         from reward_hacking.atlas.capture import capture_models  # noqa: PLC0415
 
         capture_models(
-            run_dir=run_dir, model_keys=tuple(arguments.models), max_items=arguments.max_records
+            run_dir=run_dir,
+            model_keys=tuple(arguments.models),
+            base_model=arguments.base_model,
+            max_items=arguments.max_records,
         )
     elif arguments.stage == "neutral":
         from reward_hacking.atlas.neutral import neutral_models  # noqa: PLC0415
@@ -507,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         neutral_models(
             run_dir=run_dir,
             model_keys=tuple(arguments.models),
+            base_model=arguments.base_model,
             max_records=arguments.max_records,
             max_tokens=arguments.max_tokens,
         )

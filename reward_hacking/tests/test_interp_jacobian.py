@@ -328,6 +328,20 @@ class TestLayerReconstruction:
         with pytest.raises(ValueError, match="constant"):
             layer_reconstruction(0, torch.ones(4, 8), torch.full((4, 8), 3.0))
 
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
+    @pytest.mark.parametrize("corrupt_prediction", [True, False])
+    def test_rejects_nonfinite_logits(self, bad_value: float, corrupt_prediction: bool) -> None:
+        actual = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        predicted = actual.clone()
+        corrupted = predicted if corrupt_prediction else actual
+        corrupted[0, 0] = bad_value
+        with pytest.raises(ValueError, match="finite"):
+            layer_reconstruction(0, predicted, actual)
+
+    def test_rejects_empty_rows(self) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            layer_reconstruction(0, torch.empty(0, 4), torch.empty(0, 4))
+
 
 class TestReconstructionReport:
     """Aggregation over source layers: mean/median residual, and the best (min-residual) layer."""
@@ -853,6 +867,12 @@ class TestAcquireLens:
 
 
 class TestVerifyLens:
+    def test_cached_lens_checks_actual_matrix_shapes(self) -> None:
+        lens = _CachingJlens().fit(object(), [])
+        lens.jacobians[0] = torch.ones(1, D_MODEL)
+        with pytest.raises(RuntimeError, match="shape"):
+            verify_cached_lens(lens, _LENS_MODEL)
+
     def test_a_saved_lens_round_trips(self, tmp_path: Path) -> None:
         lens = _CachingJlens().fit(object(), [])
         lens.save(str(tmp_path / "lens.pt"))

@@ -141,6 +141,30 @@ def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) 
     ]
 
 
+def test_command_renders_lora_modules_and_multimodal_limit(fake_vllm: Path) -> None:
+    config = replace(
+        _config(fake_vllm),
+        enable_lora=True,
+        max_lora_rank=64,
+        lora_modules=(
+            ("somo-olmo-s1", "/models/s1"),
+            ("somo-olmo-s2", "/models/s2"),
+        ),
+        limit_mm_per_prompt='{"image": 0}',
+    )
+
+    assert config.command()[-8:] == [
+        "--enable-lora",
+        "--max-lora-rank",
+        "64",
+        "--lora-modules",
+        "somo-olmo-s1=/models/s1",
+        "somo-olmo-s2=/models/s2",
+        "--limit-mm-per-prompt",
+        '{"image": 0}',
+    ]
+
+
 def test_local_snapshot_may_omit_revision(tmp_path: Path, fake_vllm: Path) -> None:
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
@@ -187,6 +211,31 @@ def test_ipv6_host_is_bracketed_in_urls(fake_vllm: Path) -> None:
         ({"attention_backend": ""}, "attention_backend must be non-empty"),
         ({"mamba_cache_mode": ""}, "mamba_cache_mode must be non-empty"),
         ({"max_num_batched_tokens": 0}, "max_num_batched_tokens must be positive"),
+        ({"max_lora_rank": 0}, "max_lora_rank must be positive"),
+        (
+            {"lora_modules": (("adapter", "/models/adapter"),)},
+            "lora_modules require enable_lora=True",
+        ),
+        (
+            {
+                "enable_lora": True,
+                "max_lora_rank": 64,
+                "lora_modules": (("adapter", "/models/a"), ("adapter", "/models/b")),
+            },
+            "lora module names must be unique",
+        ),
+        (
+            {
+                "enable_lora": True,
+                "max_lora_rank": 64,
+                "lora_modules": (("", "/models/adapter"),),
+            },
+            "lora module names and paths must be non-empty",
+        ),
+        (
+            {"enable_lora": True, "lora_modules": (("adapter", "/models/adapter"),)},
+            "lora_modules require max_lora_rank",
+        ),
         ({"health_path": "health"}, "health_path must start with"),
         ({"startup_timeout_seconds": 0.0}, "startup_timeout_seconds must be positive"),
         ({"health_poll_interval_seconds": 0.0}, "health_poll_interval_seconds must be positive"),

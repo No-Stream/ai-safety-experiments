@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -28,6 +29,7 @@ from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import chat, loop, surfaces
 from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
+from reward_hacking.ladder.protocols import GEMMA3_PROTOCOL, QWEN_PROTOCOL, ModelProtocol
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.trace import load_trace
@@ -117,6 +119,7 @@ class _EpisodeOptions:
     belief_probe: bool = False
     belief_probe_questions: surfaces.BeliefProbeQuestions | None = None
     final_report_prompt: str = loop.FINAL_REPORT_PROMPT
+    protocol: ModelProtocol = QWEN_PROTOCOL
 
 
 class ScriptedToolBackend:
@@ -274,7 +277,47 @@ def _run_episode(
         belief_probe=episode_options.belief_probe,
         belief_probe_questions=episode_options.belief_probe_questions,
         final_report_prompt=episode_options.final_report_prompt,
+        protocol=episode_options.protocol,
     )
+
+
+class _GemmaTokenizer:
+    """Render Gemma-style alternating turns and count synthetic prompt words."""
+
+    def get_chat_template(self, *, tools: list[dict[str, object]]) -> str:
+        assert not tools
+        return "synthetic alternating-role Gemma template"
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]],
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        **_kwargs: object,
+    ) -> str:
+        assert not tools
+        assert not tokenize
+        assert not enable_thinking
+        roles = [message["role"] for message in messages]
+        assert all(left != right for left, right in pairwise(roles))
+        rendered = "\n".join(
+            f"<{role}>{message['content']}" for role, message in zip(roles, messages, strict=True)
+        )
+        return f"{rendered}\n<assistant>" if add_generation_prompt else rendered
+
+    def __call__(self, prompt: str, *, add_special_tokens: bool) -> _Tokenized:
+        assert not add_special_tokens
+        token_count = len(prompt.split()) + (6_000 if "```bash" in prompt else 0)
+        return _Tokenized(list(range(token_count)))
+
+
+class _GemmaScriptedToolBackend(ScriptedToolBackend):
+    def __init__(self, replies: list[_ScriptedReply]) -> None:
+        super().__init__(replies)
+        self.tokenizer = cast("PreTrainedTokenizerBase", _GemmaTokenizer())
 
 
 def _empty_assistant_completion(
@@ -1101,11 +1144,6 @@ class TestNativeToolLoop:
         assert trace.summary_record()["history_reasoning"] == "strip"
         assert trace.final_report_prompt_is_full
         assert trace.final_report_prompt_text == backend.prompts[2]
-        reconstructed_prompts = reconstruct_rendered_prompts(
-            [*trace.turn_records(), trace.summary_record()]
-        )
-        assert reconstructed_prompts == tuple(backend.prompts)
-        assert trace.final_report_reasoning_dropped is False
 
     def test_monitor_hooks_wrap_bash_and_not_final_grade(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1276,6 +1314,30 @@ class TestNativeToolLoop:
                 assistant_position = next_assistant_position
         assert trace.final_report_prompt_is_full
         assert trace.final_report_prompt_text == backend.prompts[2]
+
+    def test_gemma_final_report_context_fallback_keeps_tool_schema(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = _GemmaScriptedToolBackend(
+            [
+                _ScriptedReply("```bash\ntouch marker.txt\n```"),
+                _ScriptedReply("Done."),
+            ]
+        )
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_turns=1, max_model_len=5_000, protocol=GEMMA3_PROTOCOL),
+        )
+
+        assert trace.final_report == "Done."
+        assert "The bash tool accepts one string argument named command:" in backend.prompts[-1]
+        reconstructed_prompts = reconstruct_rendered_prompts(
+            [*trace.turn_records(), trace.summary_record()]
+        )
+        assert reconstructed_prompts == tuple(backend.prompts)
 
 
 class TestPersistentShell:

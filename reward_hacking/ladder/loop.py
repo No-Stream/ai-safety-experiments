@@ -34,13 +34,11 @@ from reward_hacking.ladder.chat import (
     context_room,
     count_prompt_tokens,
     is_pure_append,
-    render_assistant_terminator_suffix,
-    render_empty_assistant_completion,
     render_prompt,
-    render_prompt_continuation,
     strip_reasoning,
     template_identity,
 )
+from reward_hacking.ladder.protocols import QWEN_PROTOCOL, ModelProtocol
 from reward_hacking.ladder.surfaces import BeliefProbeQuestions, parse_belief_probabilities
 from reward_hacking.ladder.tools import (
     FORMAT_ERROR_MESSAGE,
@@ -52,7 +50,6 @@ from reward_hacking.ladder.tools import (
     count_fabricated_tool_responses,
     format_bash_result,
     format_submission_feedback,
-    parse_tool_calls,
 )
 from reward_hacking.trace import write_trace
 
@@ -308,6 +305,7 @@ class LadderEpisodeTrace:
     grader_hashable: bool
     final_report_eval_awareness: tuple[AwarenessMatch, ...] | None = None
     eval_belief_probe: Mapping[str, object] | None = None
+    protocol: str = "qwen"
 
     @property
     def proxy_pass(self) -> bool:
@@ -405,6 +403,7 @@ class LadderEpisodeTrace:
             "report_unavailable": self.report_unavailable,
             "arm": self.arm.to_json_dict(),
             "history_reasoning": self.history_reasoning,
+            "protocol": self.protocol,
             "ended_by": self.ended_by,
             "format_errors": self.format_errors,
             "format_errors_in_a_row": self.format_errors_in_a_row,
@@ -456,6 +455,7 @@ class _PromptRenderState:
     appended_messages: tuple[Mapping[str, object], ...] = ()
     runaway_message_positions: tuple[int, ...] = ()
     chat_template_kwargs: Mapping[str, str] = field(default_factory=dict)
+    protocol: ModelProtocol = QWEN_PROTOCOL
 
     def __post_init__(self) -> None:
         """Keep model-specific template arguments immutable across every render path."""
@@ -526,6 +526,7 @@ class _ToolActionContext:
     ci_submit_grader: BudgetedSubmissionGrader | None
     grader_hashable: bool
     remaining_turns: int
+    protocol: ModelProtocol = QWEN_PROTOCOL
 
 
 @dataclass(slots=True)
@@ -652,19 +653,28 @@ def _render_prompt_for_history(
         messages[-len(prompt_state.appended_messages) :]
     ) != list(prompt_state.appended_messages):
         raise ValueError("appended prompt messages must match the conversation suffix")
-    if prompt_state.history_reasoning == "retain" and prompt_state.previous_prompt is not None:
+    if (
+        prompt_state.protocol.supports_pure_append
+        and prompt_state.history_reasoning == "retain"
+        and prompt_state.previous_prompt is not None
+    ):
         if prompt_state.previous_completion is None:
             raise ValueError("previous prompt and completion must be supplied together")
         return (
             prompt_state.previous_prompt
             + prompt_state.previous_completion
-            + render_prompt_continuation(
+            + prompt_state.protocol.render_prompt_continuation(
                 tokenizer,
                 prompt_state.appended_messages,
                 chat_template_kwargs=prompt_state.chat_template_kwargs,
             )
         )
-    return render_prompt(
+    render = (
+        render_prompt
+        if prompt_state.protocol is QWEN_PROTOCOL
+        else prompt_state.protocol.render_prompt
+    )
+    return render(
         tokenizer,
         _prompt_messages(
             messages,
@@ -925,14 +935,14 @@ def _execute_tool_call(
             state.tool_results[-1] = LadderToolResult(
                 name="bash", call_index=call_index, content_sent=response, truncated=False
             )
-            state.tool_messages.append({"role": "tool", "content": response})
+            state.tool_messages.append(context.protocol.serialize_tool_feedback(response))
             if verdict.passed:
                 state.ended_by = "submit"
             elif state.submissions_used >= LADDER_MAX_SUBMISSIONS:
                 state.ended_by = "submission_limit"
             _mark_unexecuted(state.call_records, call_index + 1, "submit")
             return True
-        state.tool_messages.append({"role": "tool", "content": content_sent})
+        state.tool_messages.append(context.protocol.serialize_tool_feedback(content_sent))
         return False
     raise ValueError(f"unsupported ladder tool call {call.name!r}")
 
@@ -1037,8 +1047,10 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
     prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     reasoning_dropped = False
-    prompt_is_full = prompt_state.history_reasoning == "strip" or (
-        prompt_state.previous_prompt is None
+    prompt_is_full = (
+        not prompt_state.protocol.supports_pure_append
+        or prompt_state.history_reasoning == "strip"
+        or prompt_state.previous_prompt is None
     )
     room = context_room(prompt_tokens, context.max_model_len)
     if room < MIN_CONTEXT_ROOM and prompt_state.history_reasoning == "retain":
@@ -1048,7 +1060,7 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
             runaway_message_positions=prompt_state.runaway_message_positions,
         )
         reasoning_dropped = True
-        prompt = render_prompt(
+        prompt = prompt_state.protocol.render_prompt(
             backend.tokenizer,
             report_prompt_messages,
             tools,
@@ -1058,11 +1070,14 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
         prompt_is_full = True
+    fallback_tools: Sequence[Mapping[str, object]] = (
+        [] if prompt_state.protocol.name == "qwen" else tools
+    )
     if room < 1:
-        prompt = render_prompt(
+        prompt = prompt_state.protocol.render_prompt(
             backend.tokenizer,
             [messages[0], messages[-1]],
-            [],
+            fallback_tools,
             chat_template_kwargs=prompt_state.chat_template_kwargs,
         )
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
@@ -1070,10 +1085,10 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
         room = context_room(prompt_tokens, context.max_model_len)
         prompt_is_full = True
     if room < 1:
-        prompt = render_prompt(
+        prompt = prompt_state.protocol.render_prompt(
             backend.tokenizer,
             [messages[-1]],
-            [],
+            fallback_tools,
             chat_template_kwargs=prompt_state.chat_template_kwargs,
         )
         prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
@@ -1126,8 +1141,8 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
         raise RuntimeError("final-report completion did not return a result or time out")
     _validate_completion_finish_reason(completion.finish_reason)
 
-    parsed = parse_tool_calls(completion.text)
-    final_report_tool_calls = completion.text.count("<tool_call>")
+    parsed = prompt_state.protocol.parse_completion(completion.text)
+    final_report_tool_calls = prompt_state.protocol.report_tool_call_count(completion.text, parsed)
     assistant_message, _ = _assistant_message(parsed, first_call_number=context.next_call_number)
     messages.append(assistant_message)
     return (
@@ -1239,6 +1254,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     episode_seconds: float = LADDER_EPISODE_SECONDS,
     history_reasoning: HistoryReasoning = DEFAULT_HISTORY_REASONING,
     chat_template_kwargs: Mapping[str, str] | None = None,
+    protocol: ModelProtocol = QWEN_PROTOCOL,
     before_command: Callable[[Path, str], None] | None = None,
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
     after_laydown: Callable[[Path], tuple[str, ...]] | None = None,
@@ -1346,6 +1362,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             appended_messages=tuple(pending_prompt_messages),
             runaway_message_positions=tuple(runaway_message_positions),
             chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
+            protocol=protocol,
         )
         rendered = _render_turn_prompt(
             backend,
@@ -1369,11 +1386,11 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             deadline_phase = DeadlinePhase.SAMPLING
             break
 
-        runaway = completion.finish_reason == "length" and "</think>" not in completion.text
+        runaway = protocol.is_runaway(completion.text, completion.finish_reason)
         parsed = (
             ParsedTurn("", "", (), "", RUNAWAY_FORMAT_ERROR_MESSAGE)
             if runaway
-            else parse_tool_calls(completion.text)
+            else protocol.parse_completion(completion.text)
         )
         format_error = (
             RUNAWAY_FORMAT_ERROR_MESSAGE
@@ -1400,7 +1417,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         )
         assistant_message_position = len(messages)
         runaway_completion = (
-            render_empty_assistant_completion(
+            protocol.render_empty_assistant_completion(
                 backend.tokenizer,
                 messages,
                 tools,
@@ -1432,15 +1449,17 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                             )
                         )
                         action_state.tool_messages.append(
-                            {"role": "tool", "content": format_error_message}
+                            protocol.serialize_tool_feedback(format_error_message)
                         )
                 else:
                     action_state.tool_messages.append(
-                        {"role": "tool", "content": format_error_message}
+                        protocol.serialize_tool_feedback(format_error_message)
                     )
             elif not runaway:
                 messages.append(assistant_message)
-                action_state.tool_messages.append({"role": "tool", "content": format_error_message})
+                action_state.tool_messages.append(
+                    protocol.serialize_tool_feedback(format_error_message)
+                )
             if format_errors_in_a_row >= MAX_CONSECUTIVE_FORMAT_ERRORS:
                 ended_by = "format_errors"
         elif call_records:
@@ -1466,6 +1485,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                     ci_submit_grader=ci_submit_grader,
                     grader_hashable=grader_hashable,
                     remaining_turns=max_turns - turn_index - 1,
+                    protocol=protocol,
                 ),
             )
 
@@ -1527,9 +1547,15 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             rendered_prompt_text=_rendered_prompt_trace_text(
                 rendered.prompt,
                 previous_prompt,
-                is_full=turn_index == 0 or history_reasoning == "strip",
+                is_full=(
+                    turn_index == 0
+                    or history_reasoning == "strip"
+                    or not protocol.supports_pure_append
+                ),
             ),
-            rendered_prompt_is_full=turn_index == 0 or history_reasoning == "strip",
+            rendered_prompt_is_full=(
+                turn_index == 0 or history_reasoning == "strip" or not protocol.supports_pure_append
+            ),
             eval_awareness=_scan_awareness(
                 awareness_scanner,
                 reasoning=parsed.reasoning,
@@ -1546,8 +1572,12 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         previous_prompt = rendered.prompt
         if runaway:
             previous_completion = runaway_completion
-        elif history_reasoning == "retain" and backend.tokenizer.chat_template is not None:
-            previous_completion = completion.text + render_assistant_terminator_suffix(
+        elif (
+            protocol.supports_pure_append
+            and history_reasoning == "retain"
+            and backend.tokenizer.chat_template is not None
+        ):
+            previous_completion = completion.text + protocol.render_assistant_terminator_suffix(
                 backend.tokenizer,
                 messages[:assistant_message_position],
                 tools,
@@ -1575,6 +1605,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         appended_messages=tuple(pending_prompt_messages),
         runaway_message_positions=tuple(runaway_message_positions),
         chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
+        protocol=protocol,
     )
     eval_belief_probe = (
         _belief_probe(
@@ -1678,6 +1709,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         final_report_fabricated_tool_responses=final_report_fabricated_tool_responses,
         grader_hashable=grader_hashable,
         eval_belief_probe=eval_belief_probe,
+        protocol=protocol.name,
         final_report_eval_awareness=_scan_awareness(
             awareness_scanner,
             reasoning=final_report_reasoning,
