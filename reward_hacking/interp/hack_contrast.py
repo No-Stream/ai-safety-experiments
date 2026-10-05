@@ -2251,6 +2251,7 @@ def _prompt_records(
     *,
     held_out_item_ids: Sequence[str] | None = None,
     max_prompts: int | None = None,
+    item_ids: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     prompts = _read_jsonl(path)
     if not prompts:
@@ -2258,6 +2259,17 @@ def _prompt_records(
     _validate_prompt_records(path, prompts)
     if max_prompts is not None and max_prompts < 1:
         raise ValueError(f"max_prompts must be positive, got {max_prompts}")
+    if item_ids is not None:
+        if held_out_item_ids is None:
+            raise ValueError(
+                "an item subset needs a direction bundle that records its held-out items"
+            )
+        not_held_out = sorted(set(item_ids) - set(held_out_item_ids))
+        if not_held_out:
+            raise ValueError(
+                f"requested items are not held out from the direction fit: {not_held_out[:5]}"
+            )
+        held_out_item_ids = list(item_ids)
     if held_out_item_ids is not None:
         prompts = _select_held_out_prompts(path, prompts, held_out_item_ids, max_prompts)
     elif max_prompts is not None:
@@ -2365,6 +2377,7 @@ class SteeringConfig:
     # last_prompt_norm suits models without massive-activation channels; on Gemma-3 the last-token norm is
     # dominated by one channel, so steering is scaled by the hack-vs-honest class difference instead.
     strength_unit: str = "last_prompt_norm"
+    item_ids: Sequence[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -2531,6 +2544,7 @@ def _prepare_steering_runtime(config: SteeringConfig) -> _SteeringRuntime:
         config.prompts_path,
         held_out_item_ids=cast("Sequence[str] | None", held_out_ids),
         max_prompts=config.max_prompts,
+        item_ids=config.item_ids,
     )
     _validate_rendered_prompt_model(config.prompts_path, prompts, config.model_id)
     model, tokenizer = _load_model_with_optional_adapter(config.model_id, config.adapter)
@@ -2942,6 +2956,7 @@ def main(argv: list[str] | None = None) -> None:
                 temperature=arguments.temperature,
                 allow_large=arguments.allow_large,
                 strength_unit=arguments.strength_unit,
+                item_ids=None if arguments.item_ids is None else arguments.item_ids.split(","),
                 layer_indices=arguments.layers,
             )
         )

@@ -31,6 +31,7 @@ from reward_hacking.interp.hack_contrast import (
     _left_pad_prompt_batch,
     _parse_strengths,
     _pool_response_batch,  # pyright: ignore[reportPrivateUsage]
+    _prompt_records,  # pyright: ignore[reportPrivateUsage]
     _prompt_residual_norms,
     _selected_steering_layers,
     _steering_record,
@@ -1179,3 +1180,26 @@ def test_class_difference_unit_scales_by_the_layers_difference_of_means_norm() -
     )
 
     assert [sample.applied_magnitude for sample in samples] == [pytest.approx(-10.0)]
+
+
+def _write_item_prompts(path: Path, item_ids: Sequence[str]) -> None:
+    path.write_text(
+        "".join(
+            json.dumps({"item_id": item_id, "prompt": f"synthetic prompt {item_id}"}) + "\n"
+            for item_id in item_ids
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_steering_item_subset_must_be_held_out_and_keeps_its_order(tmp_path: Path) -> None:
+    prompts_path = tmp_path / "prompts.jsonl"
+    _write_item_prompts(prompts_path, ["a", "b", "c"])
+
+    selected = _prompt_records(
+        prompts_path, held_out_item_ids=["a", "b", "c", "d"], item_ids=["c", "a"]
+    )
+
+    assert [prompt["item_id"] for prompt in selected] == ["c", "a"]
+    with pytest.raises(ValueError, match="not held out"):
+        _prompt_records(prompts_path, held_out_item_ids=["a", "b"], item_ids=["c"])
