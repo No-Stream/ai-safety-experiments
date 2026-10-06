@@ -48,6 +48,7 @@ def server(
         "stop": "</run>",
         "barrier": None,
         "client_timeouts": [],
+        "prompt_tokens": 17,
     }
 
     def handle(request: httpx2.Request) -> httpx2.Response:
@@ -58,14 +59,34 @@ def server(
         text, finish, stop, completion_tokens = (
             state["replies"].pop(0)
             if state.get("replies")
-            else (state.get("text", "synthetic</run>"), state["finish"], state["stop"], 3)
+            else (
+                state.get("text", "synthetic</run>"),
+                state["finish"],
+                state["stop"],
+                len(state["token_ids"]) if "token_ids" in state else 3,
+            )
         )
-        payload: dict[str, Any] = {
-            "choices": [{"index": 0, "text": text, "finish_reason": finish, "stop_reason": stop}],
-            "usage": {"prompt_tokens": 17, "completion_tokens": completion_tokens},
+        choice: dict[str, Any] = {
+            "index": 0,
+            "text": text,
+            "finish_reason": finish,
+            "stop_reason": stop,
         }
         if "token_ids" in state:
-            payload["choices"][0]["token_ids"] = state["token_ids"]
+            choice["token_ids"] = state["token_ids"]
+            if not state.get("omit_logprobs", False):
+                choice["logprobs"] = {
+                    "token_logprobs": state.get("token_logprobs", [-0.25] * len(state["token_ids"]))
+                }
+        if "prompt_token_ids" in state:
+            choice["prompt_token_ids"] = state["prompt_token_ids"]
+        payload: dict[str, Any] = {
+            "choices": [choice],
+            "usage": {
+                "prompt_tokens": state["prompt_tokens"],
+                "completion_tokens": state.get("usage_completion_tokens", completion_tokens),
+            },
+        }
         return httpx2.Response(state["status"], json=state.get("payload", payload))
 
     client_class = httpx2.Client
@@ -178,7 +199,7 @@ def test_sampling_and_result(
     assert completion.elapsed_seconds is not None
 
 
-def test_qwen_ladder_http_sampling_request_keeps_legacy_body(
+def test_qwen_ladder_http_sampling_request_includes_token_evidence_fields(
     tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
 ) -> None:
     url, requests, state = server
@@ -221,6 +242,7 @@ def test_qwen_ladder_http_sampling_request_keeps_legacy_body(
             "include_stop_str_in_output": False,
             "add_special_tokens": False,
             "return_token_ids": True,
+            "logprobs": 0,
             "n": 1,
             "stream": False,
         }
@@ -425,7 +447,7 @@ def test_complete_rendered_matches_eos_stop_token_from_returned_ids(
     url, requests, state = server
     raw_completion = "reasoning</think>answer <run>raw output</run>"
     state["replies"] = [(raw_completion, "stop", None, 11)]
-    state["token_ids"] = [12, 248046]
+    state["token_ids"] = [12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 248046]
     backend = VLLMHTTPBackend(
         "synthetic",
         base_url=url,
@@ -441,6 +463,8 @@ def test_complete_rendered_matches_eos_stop_token_from_returned_ids(
     assert completion.matched_stop == 248046
     assert completion.prompt_tokens == 17
     assert completion.completion_tokens == 11
+    assert completion.token_ids == tuple(state["token_ids"])
+    assert completion.token_logprobs == (-0.25,) * 11
     assert requests[0]["prompt"] == "already rendered prompt"
     assert requests[0]["max_tokens"] == 23
     assert requests[0]["seed"] == 7
@@ -449,6 +473,77 @@ def test_complete_rendered_matches_eos_stop_token_from_returned_ids(
     assert requests[0]["stop_token_ids"] == [248044, 248046]
     assert requests[0]["add_special_tokens"] is False
     assert requests[0]["return_token_ids"] is True
+    assert requests[0]["logprobs"] == 0
+
+
+def test_complete_rendered_returns_sampled_token_evidence_and_prompt_ids(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, requests, state = server
+    state["token_ids"] = [31, 32, 33]
+    state["token_logprobs"] = [-0.125, -0.75, -1.5]
+    state["prompt_token_ids"] = list(range(17))
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    completion = backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
+
+    assert completion.token_ids == (31, 32, 33)
+    assert completion.token_logprobs == (-0.125, -0.75, -1.5)
+    assert completion.prompt_token_ids == tuple(range(17))
+    assert requests[0]["return_token_ids"] is True
+    assert requests[0]["logprobs"] == 0
+
+
+def test_complete_rendered_requires_returned_logprobs(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, _, state = server
+    state["token_ids"] = [12]
+    state["omit_logprobs"] = True
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    with pytest.raises(ValueError, match="token_logprobs"):
+        backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
+
+
+def test_complete_rendered_rejects_empty_token_evidence(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, _, state = server
+    state["token_ids"] = []
+    state["token_logprobs"] = []
+    state["usage_completion_tokens"] = 0
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    with pytest.raises(ValueError, match="no token ids"):
+        backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
+
+
+@pytest.mark.parametrize(
+    ("state_overrides", "message"),
+    [
+        ({"token_ids": [12, 13], "token_logprobs": [-0.2]}, "token ids and logprobs"),
+        (
+            {"token_ids": [12, 13], "usage_completion_tokens": 3},
+            "token ids and output_tokens",
+        ),
+    ],
+)
+def test_complete_rendered_rejects_mismatched_token_evidence(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    state_overrides: dict[str, Any],
+    message: str,
+) -> None:
+    url, _, state = server
+    state.update(state_overrides)
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    with pytest.raises(ValueError, match=message):
+        backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
 
 
 def test_http_adapter_preflight_compares_adapter_alias_with_base(
@@ -537,7 +632,7 @@ def test_complete_rendered_prefers_explicit_stop_reason(
 ) -> None:
     url, _, state = server
     state["replies"] = [("answer", "stop", stop_reason, 3)]
-    state["token_ids"] = [12, 13]
+    state["token_ids"] = [12, 13, 14]
     backend = VLLMHTTPBackend(
         "synthetic",
         base_url=url,
@@ -556,7 +651,7 @@ def test_complete_rendered_does_not_match_stop_token_when_length_capped(
 ) -> None:
     url, _, state = server
     state["replies"] = [("answer", "length", None, 3)]
-    state["token_ids"] = [12, 248046]
+    state["token_ids"] = [12, 13, 248046]
     backend = VLLMHTTPBackend(
         "synthetic",
         base_url=url,

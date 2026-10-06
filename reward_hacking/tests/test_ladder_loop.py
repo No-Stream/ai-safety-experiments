@@ -107,6 +107,9 @@ class _ScriptedReply:
     matched_stop: int | str | None = 248046
     prompt_tokens: int = 17
     completion_tokens: int = 9
+    token_ids: tuple[int, ...] | None = None
+    token_logprobs: tuple[float, ...] | None = None
+    prompt_token_ids: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,17 @@ class ScriptedToolBackend:
             matched_stop=reply.matched_stop,
             prompt_tokens=reply.prompt_tokens,
             completion_tokens=reply.completion_tokens,
+            token_ids=(
+                reply.token_ids
+                if reply.token_ids is not None
+                else tuple(range(reply.completion_tokens))
+            ),
+            token_logprobs=(
+                reply.token_logprobs
+                if reply.token_logprobs is not None
+                else (-0.25,) * reply.completion_tokens
+            ),
+            prompt_token_ids=reply.prompt_token_ids,
         )
 
 
@@ -648,6 +662,49 @@ class TestNativeToolLoop:
         assert records[1]["final_report_prompt_is_full"] is False
         assert records[1]["final_report_prompt_text"]
         assert records[1]["ended_by"] == "submit"
+
+    def test_turn_trace_persists_completion_evidence_and_only_first_prompt_ids(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        trace_path = tmp_path / "token-evidence-trace.jsonl"
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(
+                    _report("First response."),
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                    token_ids=(31, 32),
+                    token_logprobs=(-0.125, -0.75),
+                    prompt_token_ids=(1, 2, 3, 4),
+                ),
+                _ScriptedReply(
+                    _report("Second response."),
+                    prompt_tokens=4,
+                    completion_tokens=3,
+                    token_ids=(41, 42, 43),
+                    token_logprobs=(-0.25, -0.5, -1.0),
+                    prompt_token_ids=(5, 6, 7, 8),
+                ),
+                _ScriptedReply("Final report.", completion_tokens=1),
+            ]
+        )
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(trace_path=trace_path),
+        )
+
+        turn_records = trace.turn_records()
+        assert len(turn_records) == 2
+        assert turn_records[0]["completion_token_ids"] == [31, 32]
+        assert turn_records[0]["completion_logprobs"] == [-0.125, -0.75]
+        assert turn_records[0]["prompt_token_ids"] == [1, 2, 3, 4]
+        assert turn_records[1]["completion_token_ids"] == [41, 42, 43]
+        assert turn_records[1]["completion_logprobs"] == [-0.25, -0.5, -1.0]
+        assert "prompt_token_ids" not in turn_records[1]
+        assert load_trace(trace_path)[0] == turn_records[0]
 
     def test_no_tool_call_on_untouched_work_nudges_once_then_ends(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

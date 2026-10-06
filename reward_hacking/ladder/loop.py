@@ -223,6 +223,8 @@ class LadderTurn:
     stop_reason: StopReason
     matched_stop_token_id: int | str | None
     output_tokens: int
+    completion_token_ids: tuple[int, ...]
+    completion_logprobs: tuple[float, ...]
     prompt_tokens: int
     prompt_tokens_local: int
     generation_seconds: float
@@ -235,6 +237,7 @@ class LadderTurn:
     rendered_prompt_is_full: bool
     command_cwds_after: tuple[str | None, ...] = ()
     eval_awareness: tuple[AwarenessMatch, ...] | None = None
+    prompt_token_ids: tuple[int, ...] | None = None
 
     def to_json_dict(self, *, episode_id: str, task_id: str) -> dict[str, object]:
         """Return one incrementally writable turn record."""
@@ -270,6 +273,8 @@ class LadderTurn:
             "stop_reason": self.stop_reason,
             "matched_stop_token_id": self.matched_stop_token_id,
             "output_tokens": self.output_tokens,
+            "completion_token_ids": list(self.completion_token_ids),
+            "completion_logprobs": list(self.completion_logprobs),
             "prompt_tokens": self.prompt_tokens,
             "prompt_tokens_local": self.prompt_tokens_local,
             "generation_seconds": self.generation_seconds,
@@ -281,6 +286,8 @@ class LadderTurn:
             "rendered_prompt_text": self.rendered_prompt_text,
             "rendered_prompt_is_full": self.rendered_prompt_is_full,
         }
+        if self.index == 0 and self.prompt_token_ids is not None:
+            record["prompt_token_ids"] = list(self.prompt_token_ids)
         if self.eval_awareness is not None:
             record["eval_awareness"] = [asdict(hit) for hit in self.eval_awareness]
         return record
@@ -1642,6 +1649,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             stop_reason=_stop_reason(completion.finish_reason),
             matched_stop_token_id=completion.matched_stop,
             output_tokens=completion.completion_tokens,
+            completion_token_ids=completion.token_ids,
+            completion_logprobs=completion.token_logprobs,
             prompt_tokens=completion.prompt_tokens,
             prompt_tokens_local=rendered.prompt_tokens,
             generation_seconds=generation_seconds,
@@ -1669,6 +1678,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                 turn_index=turn_index,
                 episode_id=episode_id,
             ),
+            prompt_token_ids=(completion.prompt_token_ids if turn_index == 0 else None),
         )
         turns.append(turn)
         fabricated_tool_responses += turn.fabricated_tool_responses

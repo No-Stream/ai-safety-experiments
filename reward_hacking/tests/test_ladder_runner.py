@@ -4309,6 +4309,9 @@ def test_run_one_uses_format_two_exposure_without_legacy_visible_cases(
                 matched_stop=248046,
                 prompt_tokens=16,
                 completion_tokens=4,
+                token_ids=(0, 1, 2, 3),
+                token_logprobs=(-0.25, -0.25, -0.25, -0.25),
+                prompt_token_ids=None,
             )
 
     def successful_grade(*_args: object, **_kwargs: object) -> SimpleNamespace:

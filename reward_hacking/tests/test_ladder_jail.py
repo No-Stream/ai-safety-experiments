@@ -98,6 +98,8 @@ class _ScriptedLadderBackend:
             matched_stop=248046,
             prompt_tokens=32,
             completion_tokens=8,
+            token_ids=tuple(range(8)),
+            token_logprobs=(-0.25,) * 8,
         )
 
 

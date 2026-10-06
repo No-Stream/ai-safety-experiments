@@ -109,6 +109,8 @@ class _ScriptedBackend:
             matched_stop=248046,
             prompt_tokens=10,
             completion_tokens=5,
+            token_ids=tuple(range(5)),
+            token_logprobs=(-0.25,) * 5,
         )
 
 

@@ -943,6 +943,7 @@ class _VLLMHTTPChoice(BaseModel):
     stop_reason: int | str | None
     token_ids: list[int] | None = None
     logprobs: _VLLMHTTPLogProbs | None = None
+    prompt_token_ids: list[int] | None = None
 
 
 class _VLLMHTTPUsage(BaseModel):
@@ -970,6 +971,30 @@ class RenderedCompletion:
     matched_stop: int | str | None
     prompt_tokens: int
     completion_tokens: int
+    token_ids: tuple[int, ...]
+    token_logprobs: tuple[float, ...]
+    prompt_token_ids: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        """Require exact, positionwise sampled-token evidence from rendered completions."""
+        if not self.token_ids:
+            raise ValueError("rendered completion returned no token ids")
+        if not self.token_logprobs:
+            raise ValueError("rendered completion returned no sampled-token logprobs")
+        if len(self.token_ids) != self.completion_tokens:
+            raise ValueError(
+                "rendered completion token ids and output_tokens have different lengths"
+            )
+        if len(self.token_logprobs) != self.completion_tokens:
+            raise ValueError(
+                "rendered completion token logprobs and output_tokens have different lengths"
+            )
+        if any(not math.isfinite(logprob) for logprob in self.token_logprobs):
+            raise ValueError("rendered completion contains a non-finite sampled-token logprob")
+        if self.prompt_token_ids is not None and len(self.prompt_token_ids) != self.prompt_tokens:
+            raise ValueError(
+                "rendered completion prompt token ids and prompt_tokens have different lengths"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1031,6 +1056,40 @@ def _adapter_output_signature(
     if any(value is not None and not math.isfinite(value) for value in token_logprobs):
         raise ValueError("adapter preflight returned a non-finite token logprob")
     return tuple(choice.token_ids), tuple(token_logprobs)
+
+
+def _rendered_completion_token_ids(
+    choice: _VLLMHTTPChoice, *, output_tokens: int
+) -> tuple[int, ...]:
+    """Require exact completion token IDs and reconcile them with server usage."""
+    if choice.token_ids is None:
+        raise ValueError("vLLM completion response omitted token_ids despite return_token_ids=True")
+    if len(choice.token_ids) != output_tokens:
+        raise ValueError("vLLM completion token ids and output_tokens have different lengths")
+    return tuple(choice.token_ids)
+
+
+def _rendered_completion_token_logprobs(
+    choice: _VLLMHTTPChoice, *, token_count: int, output_tokens: int
+) -> tuple[float, ...]:
+    """Require finite sampled-token logprobs aligned with each returned token ID."""
+    if choice.logprobs is None or choice.logprobs.token_logprobs is None:
+        raise ValueError("vLLM completion response omitted sampled-token token_logprobs")
+    token_logprobs = choice.logprobs.token_logprobs
+    if len(token_logprobs) != token_count:
+        raise ValueError("vLLM completion token ids and logprobs have different lengths")
+    if len(token_logprobs) != output_tokens:
+        raise ValueError("vLLM completion token logprobs and output_tokens have different lengths")
+    sampled_token_logprobs: list[float] = []
+    for logprob in token_logprobs:
+        if logprob is None:
+            raise ValueError("vLLM completion response omitted a sampled-token token_logprob")
+        if not math.isfinite(logprob):
+            raise ValueError(
+                "vLLM completion response contained a non-finite sampled-token logprob"
+            )
+        sampled_token_logprobs.append(logprob)
+    return tuple(sampled_token_logprobs)
 
 
 _THINK_END = "</think>"
@@ -1243,12 +1302,22 @@ class VLLMHTTPBackend:
                 include_stop_str_in_output=False,
                 add_special_tokens=False,
                 return_token_ids=True,
+                logprobs=0,
             ),
             timeout_seconds=timeout_seconds,
         )
-        if choice.token_ids is None:
+        token_ids = _rendered_completion_token_ids(choice, output_tokens=usage.completion_tokens)
+        token_logprobs = _rendered_completion_token_logprobs(
+            choice,
+            token_count=len(token_ids),
+            output_tokens=usage.completion_tokens,
+        )
+        prompt_token_ids = (
+            None if choice.prompt_token_ids is None else tuple(choice.prompt_token_ids)
+        )
+        if prompt_token_ids is not None and len(prompt_token_ids) != usage.prompt_tokens:
             raise ValueError(
-                "vLLM completion response omitted token_ids despite return_token_ids=True"
+                "vLLM completion prompt token ids and prompt_tokens have different lengths"
             )
         matched_stop = choice.stop_reason
         if matched_stop is None and choice.finish_reason == "stop" and choice.token_ids:
@@ -1261,6 +1330,9 @@ class VLLMHTTPBackend:
             matched_stop=matched_stop,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
+            token_ids=token_ids,
+            token_logprobs=token_logprobs,
+            prompt_token_ids=prompt_token_ids,
         )
 
     def generate_detailed(
