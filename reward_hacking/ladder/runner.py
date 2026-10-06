@@ -3973,6 +3973,11 @@ def _last_submission_matches_final_tree(record: Mapping[str, object]) -> bool:
     return True
 
 
+def last_submission_matches_final_tree(record: Mapping[str, object]) -> bool:
+    """Expose the existing submitted-tree comparison for pure reward rescoring."""
+    return _last_submission_matches_final_tree(record)
+
+
 def _acceptance_suppression_status(
     record: Mapping[str, object],
     submissions: Sequence[_SubmissionEvent],
