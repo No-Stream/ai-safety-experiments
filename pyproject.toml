@@ -32,6 +32,8 @@ dependencies = [
     "sympy>=1.14.0",
     "antlr4-python3-runtime>=4.11,<4.12",
     "polars>=1.44.1",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
 ]
 
 [project.optional-dependencies]
