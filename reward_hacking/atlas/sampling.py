@@ -27,6 +27,7 @@ from reward_hacking.interp.jsonl_resume import (
     normalize_identity,
     resume_records,
 )
+from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organisms.leakage_hints import (
     LEAKAGE_HINTS_PATH,
@@ -501,8 +502,17 @@ def language_adapter_for(
     language_adapter_path, filtered_vision_tensors = language_only_adapter_copy(
         _adapter_snapshot(adapter_id), run_dir / "adapters" / artifact_model_key(model_key)
     )
-    logger.info("adapter=%s language_only=%s", adapter_id, filtered_vision_tensors)
-    return language_adapter_path
+    served_adapter_path = prepare_vllm_serving_adapter(
+        language_adapter_path,
+        run_dir / "vllm-adapters" / artifact_model_key(model_key),
+    )
+    logger.info(
+        "adapter=%s language_only=%s vllm_serving_copy=%s",
+        adapter_id,
+        filtered_vision_tensors,
+        served_adapter_path != language_adapter_path,
+    )
+    return served_adapter_path
 
 
 def _gpu_engine_settings(torch: ModuleType) -> tuple[float, str]:

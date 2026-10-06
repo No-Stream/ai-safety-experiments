@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+import torch
 from conftest import ScriptedStreamingBackend, needs_jail
+from safetensors.torch import load_file, save_file
 
 from games.parsing import strip_thinking
 from reward_hacking import hatch_probe_cli
@@ -1480,6 +1482,55 @@ class TestSamplingResolution:
         assert "max_lora_rank" not in captured
         assert sampler["language_model_only"] is True
         assert sampler["kv_cache_dtype"] == "fp8"
+
+    def test_lora_adapter_is_prepared_and_passed_to_the_vllm_backend(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = tmp_path / "checkpoint-30"
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text(
+            '{"base_model_name_or_path":"Qwen/Qwen3.5-9B","r":2,"target_modules":["q_proj"]}',
+            encoding="utf-8",
+        )
+        flat_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        nested_key = "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight"
+        save_file({flat_key: torch.ones(2, 2)}, str(adapter / "adapter_model.safetensors"))
+        args = _parse_args(
+            [
+                "--model",
+                "Qwen/Qwen3.5-9B",
+                "--backend",
+                "vllm",
+                "--thinking",
+                "--lora-adapter",
+                str(adapter),
+                "--out",
+                str(tmp_path / "ilcb-run.json"),
+                "--grader-scratch-root",
+                str(tmp_path / "grader-scratch"),
+            ]
+        )
+        captured: dict[str, object] = {}
+
+        def fake_backend_from_args(_args: object, model_id: str, **kwargs: object) -> MockBackend:
+            captured.update(kwargs)
+            return MockBackend(mock_probe_response, model_id=model_id)
+
+        monkeypatch.setattr(hatch_probe_cli, "backend_from_args", fake_backend_from_args)
+
+        backend, sampler = build_probe_backend(args, args.model)
+
+        served_adapter = tmp_path / "ilcb-run.vllm-adapter"
+        assert backend.transport == "mock"
+        assert captured["extra_kwargs"] == {
+            "lora_adapter": str(served_adapter),
+            "lora_serving_dir": str(tmp_path),
+            "enable_lora": True,
+            "max_lora_rank": 8,
+            "lora_target_modules": ["q_proj"],
+        }
+        assert set(load_file(str(served_adapter / "adapter_model.safetensors"))) == {nested_key}
+        assert sampler["lora_adapter"] == str(adapter)
 
     def test_vllm_sampler_records_default_engine_settings(
         self, monkeypatch: pytest.MonkeyPatch

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import signal
 from dataclasses import replace
@@ -144,14 +145,20 @@ def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) 
     ]
 
 
-def test_command_renders_lora_modules_and_multimodal_limit(fake_vllm: Path) -> None:
+def test_command_renders_lora_modules_and_multimodal_limit(tmp_path: Path, fake_vllm: Path) -> None:
+    adapters = (tmp_path / "s1", tmp_path / "s2")
+    for adapter in adapters:
+        adapter.mkdir()
+        (adapter / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "allenai/OLMo-3-7B"}), encoding="utf-8"
+        )
     config = replace(
         _config(fake_vllm),
         enable_lora=True,
         max_lora_rank=64,
         lora_modules=(
-            ("somo-olmo-s1", "/models/s1"),
-            ("somo-olmo-s2", "/models/s2"),
+            ("somo-olmo-s1", str(adapters[0])),
+            ("somo-olmo-s2", str(adapters[1])),
         ),
         limit_mm_per_prompt='{"image": 0}',
     )
@@ -161,8 +168,8 @@ def test_command_renders_lora_modules_and_multimodal_limit(fake_vllm: Path) -> N
         "--max-lora-rank",
         "64",
         "--lora-modules",
-        "somo-olmo-s1=/models/s1",
-        "somo-olmo-s2=/models/s2",
+        f"somo-olmo-s1={adapters[0]}",
+        f"somo-olmo-s2={adapters[1]}",
         "--limit-mm-per-prompt",
         '{"image": 0}',
     ]

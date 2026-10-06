@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING
 
 from transformers import AutoTokenizer
 
+from games.eval_model import read_adapter_facts
 from games.generation import TRAINING_TEMPERATURE
 from games.preflight import derive_prefilled_think, resolve_chat_template_kwargs
 from games.provenance import git_provenance
@@ -99,6 +100,7 @@ from reward_hacking.hatch_probe import (
     resumed_cell_responses,
     write_probe_summary,
 )
+from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.model_backend import (
     DEFAULT_BEDROCK_REGION,
     Backend,
@@ -378,10 +380,25 @@ def build_probe_backend(
         local_sampling = training_matched_sampling(model_id)
         if args.max_tokens is not None:
             local_sampling = replace(local_sampling, max_new_tokens=args.max_tokens)
+        adapter_kwargs: dict[str, object] = {}
+        if args.lora_adapter is not None:
+            if kind != "vllm":
+                raise ValueError("--lora-adapter requires --backend vllm")
+            adapter_dir = Path(args.lora_adapter)
+            adapter_facts = read_adapter_facts(adapter_dir)
+            served_adapter = resolve_probe_adapter_path(adapter_dir, args.out)
+            adapter_kwargs = {
+                "lora_adapter": str(served_adapter),
+                "lora_serving_dir": str(served_adapter.parent),
+                "enable_lora": True,
+                "max_lora_rank": adapter_facts.vllm_lora_rank,
+                "lora_target_modules": list(adapter_facts.target_modules),
+            }
         backend = backend_from_args(
             args,
             model_id,
             local_sampling=local_sampling,
+            extra_kwargs=adapter_kwargs,
             chat_template_kwargs=args.chat_template_kwargs,
         )
         # An engine kwarg, not a SamplingConfig field: unrecorded, fp8 reads as the bf16 anchor.
@@ -394,6 +411,7 @@ def build_probe_backend(
         if kind == "vllm":
             sampler["language_model_only"] = bool(args.language_model_only)
             sampler["kv_cache_dtype"] = args.kv_cache_dtype
+            sampler["lora_adapter"] = None if args.lora_adapter is None else str(args.lora_adapter)
         return backend, sampler
     if kind == "bedrock":
         sampling = resolve_probe_bedrock_sampling(
@@ -522,6 +540,12 @@ def _resolve_prefilled_think(
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="model id the chosen backend serves")
+    parser.add_argument(
+        "--lora-adapter",
+        type=Path,
+        default=None,
+        help="serve this PEFT adapter un-merged; currently supported with --backend vllm",
+    )
     add_backend_args(parser, default="mock")
     parser.add_argument("--partition", type=Path, default=DEFAULT_PARTITION_PATH)
     parser.add_argument(
@@ -643,10 +667,18 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     refuse_sampler_flags(args)
+    if args.lora_adapter is not None and args.backend != "vllm":
+        parser.error("--lora-adapter requires --backend vllm")
     if args.max_tokens is not None and args.max_tokens < 1:
         raise ValueError("--max-tokens must be positive")
     _refuse_bad_batch_wait_flags(args)
     return args
+
+
+def resolve_probe_adapter_path(adapter_dir: Path, output_path: Path) -> Path:
+    """Prepare an optional ILCB adapter beside the run artifacts, outside its checkpoint."""
+    destination = output_path.parent / f"{output_path.stem}.vllm-adapter"
+    return prepare_vllm_serving_adapter(adapter_dir, destination)
 
 
 def _dry_run_plan(

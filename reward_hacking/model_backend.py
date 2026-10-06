@@ -70,6 +70,8 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
+from reward_hacking.lora_serving import prepare_vllm_serving_adapter
+
 logger = logging.getLogger(__name__)
 
 
@@ -1364,6 +1366,7 @@ class VLLMBackend:
         chat_template_kwargs: Mapping[str, object] | None = None,
         sampling: SamplingConfig | None = None,
         lora_adapter: str | Path | None = None,
+        lora_serving_dir: str | Path | None = None,
         model_path: str | Path | None = None,
         stop_token_ids: Sequence[int] | None = None,
         **engine_kwargs: object,
@@ -1389,6 +1392,14 @@ class VLLMBackend:
         # As with HFBackend, an unset config follows the thinking flag (see SamplingConfig).
         self.sampling = sampling or SamplingConfig.for_thinking(thinking=self.thinking)
         load_from = self.model_path or model_id
+        adapter_path = None if lora_adapter is None else Path(lora_adapter)
+        serving_directory = None if lora_serving_dir is None else Path(lora_serving_dir)
+        if adapter_path is not None:
+            if serving_directory is None:
+                serving_directory = (
+                    adapter_path.resolve().parent / "vllm-serving-adapters" / adapter_path.name
+                )
+            adapter_path = prepare_vllm_serving_adapter(adapter_path, serving_directory)
         # What the engine was CONSTRUCTED with, kept because nothing else can say it afterwards: the
         # kwargs go straight into vLLM and several of them (quantization, max_model_len) change what
         # the model samples or where it truncates. A trace's own record of the flags is what was
@@ -1408,7 +1419,7 @@ class VLLMBackend:
             cache_config.kv_cache_max_concurrency,
             engine_config.model_config.max_model_len,
         )
-        self.lora_adapter = None if lora_adapter is None else str(lora_adapter)
+        self.lora_adapter = None if adapter_path is None else str(adapter_path)
         self._lora_request = (
             None
             if self.lora_adapter is None

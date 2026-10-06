@@ -6,12 +6,11 @@ import argparse
 import hashlib
 import json
 import logging
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from safetensors.torch import load_file, save_file
+from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -22,10 +21,6 @@ VLLM_FREE_MEMORY_MARGIN_FRACTION = 0.02
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
 SAMPLE_BATCH_SIZE = 16
 PROBLEM_PAIR_LENGTH = 2
-# The trainer loads the text-only class, so PEFT saves flat layer names; vLLM serves the composite
-# Qwen3.5 class and silently drops adapter weights that do not carry its nested language-model prefix.
-FLAT_LORA_PREFIX = "base_model.model.model.layers."
-NESTED_LORA_PREFIX = "base_model.model.model.language_model.layers."
 
 
 class CudaRuntime(Protocol):
@@ -112,28 +107,6 @@ def token_ids_sha256(prompt_token_ids: Sequence[int], completion_token_ids: Sequ
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def write_vllm_serving_adapter(adapter: Path, destination: Path) -> Path:
-    """Copy a text-only-trained Qwen3.5 adapter with the layer names vLLM's composite model matches."""
-    tensors = load_file(str(adapter / "adapter_model.safetensors"))
-    unexpected = sorted(key for key in tensors if not key.startswith(FLAT_LORA_PREFIX))
-    if not tensors or unexpected:
-        raise ValueError(
-            f"{adapter}: unexpected LoRA key names (expected {FLAT_LORA_PREFIX}*): {unexpected[:3]}"
-        )
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True)
-    shutil.copy(adapter / "adapter_config.json", destination / "adapter_config.json")
-    save_file(
-        {
-            NESTED_LORA_PREFIX + key.removeprefix(FLAT_LORA_PREFIX): value
-            for key, value in tensors.items()
-        },
-        str(destination / "adapter_model.safetensors"),
-    )
-    return destination
 
 
 def content_seed(key: str, prompt_token_ids: Sequence[int], model: str, adapter: str | None) -> int:
@@ -270,6 +243,7 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     chat_template_kwargs: Mapping[str, Any] | None = None,
     language_model_only: bool = False,
     kv_cache_dtype: str | None = None,
+    max_num_seqs: int | None = None,
     llm_class: Callable[..., object] | None = None,
     sampling_params_class: Callable[..., object] | None = None,
     lora_request_class: Callable[..., object] | None = None,
@@ -366,12 +340,14 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
             engine_kwargs["language_model_only"] = True
         if kv_cache_dtype is not None:
             engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+        if max_num_seqs is not None:
+            engine_kwargs["max_num_seqs"] = max_num_seqs
         engine = cast("SamplingEngine", llm_class(**engine_kwargs))
         lora_request = None
         if adapter is not None:
             if lora_request_class is None:
                 raise RuntimeError("LoRA adapter sampling requires a vLLM LoRARequest class")
-            served_adapter = write_vllm_serving_adapter(
+            served_adapter = prepare_vllm_serving_adapter(
                 adapter, output_path.parent / f"{output_path.stem}.vllm-adapter"
             )
             lora_request = lora_request_class(model, 1, str(served_adapter))
@@ -496,6 +472,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--language-model-only", action="store_true")
     parser.add_argument("--kv-cache-dtype")
+    parser.add_argument("--max-num-seqs", type=int)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     sample_round(
@@ -511,6 +488,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         chat_template_kwargs=args.chat_template_kwargs,
         language_model_only=args.language_model_only,
         kv_cache_dtype=args.kv_cache_dtype,
+        max_num_seqs=args.max_num_seqs,
     )
 
 

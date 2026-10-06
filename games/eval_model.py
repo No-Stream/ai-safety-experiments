@@ -676,6 +676,9 @@ def resolve_served_model(  # noqa: PLR0913 - one keyword per serving decision, a
             adapter_dir=checkpoint,
             backend_kwargs={
                 "lora_adapter": str(checkpoint),
+                "lora_serving_dir": str(
+                    merge_root / "vllm-serving-adapters" / f"{merge_label}{checkpoint.name}"
+                ),
                 "enable_lora": True,
                 "max_lora_rank": facts.vllm_lora_rank,
                 # Naming the adapter's own targets is what makes a module the engine cannot wrap

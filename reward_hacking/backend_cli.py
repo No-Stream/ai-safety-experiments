@@ -668,6 +668,7 @@ def _vllm_http_backend_from_args(
             "language_model_only",
             "kv_cache_dtype",
             "lora_adapter",
+            "lora_serving_dir",
             "lora_target_modules",
             "max_lora_rank",
         }

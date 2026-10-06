@@ -27,7 +27,9 @@ NESTED_LORA_KEY = (
 
 def _write_flat_adapter(adapter: Path, key: str = FLAT_LORA_KEY) -> Path:
     adapter.mkdir()
-    (adapter / "adapter_config.json").write_text(json.dumps({"r": 16}), encoding="utf-8")
+    (adapter / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "Qwen/Qwen3.5-9B", "r": 16}), encoding="utf-8"
+    )
     save_file({key: torch.zeros(2, 2)}, str(adapter / "adapter_model.safetensors"))
     return adapter
 
@@ -540,7 +542,10 @@ def test_vllm_receives_adapter_with_nested_language_model_names(tmp_path: Path) 
     served = Path(str(lora_requests[0][2]))
     assert served != adapter
     assert list(load_file(str(served / "adapter_model.safetensors"))) == [NESTED_LORA_KEY]
-    assert json.loads((served / "adapter_config.json").read_text(encoding="utf-8")) == {"r": 16}
+    assert json.loads((served / "adapter_config.json").read_text(encoding="utf-8")) == {
+        "base_model_name_or_path": "Qwen/Qwen3.5-9B",
+        "r": 16,
+    }
 
 
 def test_adapter_with_unexpected_key_names_is_refused(tmp_path: Path) -> None:
@@ -563,3 +568,21 @@ def test_adapter_with_unexpected_key_names_is_refused(tmp_path: Path) -> None:
             lora_request_class=lambda *args: args,
             torch_module=FakeTorch(),
         )
+
+
+def test_sampler_passes_max_num_seqs_to_the_engine(tmp_path: Path) -> None:
+    prompts_path, split_path = _write_prompt_inputs(tmp_path)
+    sample_round(
+        prompts_path=prompts_path,
+        split_path=split_path,
+        split_side="held_out",
+        output_path=tmp_path / "samples.jsonl",
+        model="teacher-27b",
+        samples_per_prompt=1,
+        max_tokens=16,
+        max_num_seqs=16,
+        llm_class=FakeSampleLLM,
+        sampling_params_class=FakeSamplingParams,
+        torch_module=FakeTorch(),
+    )
+    assert FakeSampleLLM.instances[-1].kwargs["max_num_seqs"] == 16

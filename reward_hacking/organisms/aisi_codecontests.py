@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
     from types import ModuleType
 
+from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.organisms.aisi_source import (
     AisiSource,
     build_no_hints_system_prompt,
@@ -612,6 +613,7 @@ class VLLMCompletionSampler:
         kv_cache_dtype: str | None = None,
         language_model_only: bool = False,
         max_num_seqs: int | None = None,
+        serving_adapter_root: Path | None = None,
         chat_template_kwargs: Mapping[str, object] | None = None,
     ) -> None:
         """Load one vLLM engine with only the requested adapter and cache controls."""
@@ -640,6 +642,7 @@ class VLLMCompletionSampler:
         self._enable_lora = enable_lora
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._serving_adapter_root = serving_adapter_root
         self._chat_template_kwargs = dict(chat_template_kwargs or {})
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(base_model)
         self._adapter_paths: dict[str, str] = {}
@@ -772,8 +775,16 @@ class VLLMCompletionSampler:
                     "is unavailable; provide a local adapter snapshot"
                 ) from error
             resolved = str(hub.snapshot_download(repo_id=adapter_id))
-        self._adapter_paths[adapter_id] = resolved
-        return resolved
+        resolved_path = Path(resolved)
+        serving_destination = (
+            None
+            if self._serving_adapter_root is None
+            else self._serving_adapter_root / hashlib.sha256(adapter_id.encode()).hexdigest()
+        )
+        served_path = prepare_vllm_serving_adapter(resolved_path, serving_destination)
+        resolved_serving_path = str(served_path)
+        self._adapter_paths[adapter_id] = resolved_serving_path
+        return resolved_serving_path
 
 
 def _grade_record(  # noqa: PLR0913 - one sample's full grading context, keyword-only
@@ -1054,6 +1065,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         kv_cache_dtype=args.kv_cache_dtype,
         language_model_only=args.language_model_only,
         max_num_seqs=args.max_num_seqs,
+        serving_adapter_root=run_dir / "vllm-adapters",
         chat_template_kwargs=args.chat_template_kwargs,
     )
     summary = run_screen(

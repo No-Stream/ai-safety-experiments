@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, TypedDict, cast
 import pytest
 import torch
 from conftest import MEASURED_MIN_OUTPUT_BUDGET
+from safetensors.torch import load_file, save_file
 
 from reward_hacking import model_backend
 from reward_hacking.model_backend import (
@@ -736,6 +737,37 @@ def _patch_fake_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         model_backend.importlib, "import_module", lambda name: modules[name], raising=True
     )
+
+
+def test_vllm_backend_prepares_flat_qwen35_adapter_before_lora_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_loaders(monkeypatch)
+    _patch_fake_vllm(monkeypatch)
+    adapter = tmp_path / "checkpoint-30"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(
+        '{"base_model_name_or_path":"Qwen/Qwen3.5-9B","r":2,"target_modules":["q_proj"]}',
+        encoding="utf-8",
+    )
+    flat_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+    nested_key = "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight"
+    save_file({flat_key: torch.ones(2, 2)}, str(adapter / "adapter_model.safetensors"))
+    destination = tmp_path / "run" / "vllm-adapters" / "student"
+
+    backend = VLLMBackend(
+        "Qwen/Qwen3.5-9B",
+        lora_adapter=adapter,
+        lora_serving_dir=destination,
+        enable_lora=True,
+        max_lora_rank=4,
+        lora_target_modules=["q_proj"],
+    )
+
+    assert backend.lora_adapter == str(destination)
+    assert cast("Any", backend._lora_request).args[-1] == str(destination)
+    assert set(load_file(str(destination / "adapter_model.safetensors"))) == {nested_key}
+    assert set(load_file(str(adapter / "adapter_model.safetensors"))) == {flat_key}
 
 
 def _vllm_sampling_params(

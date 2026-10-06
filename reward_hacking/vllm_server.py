@@ -8,6 +8,7 @@ that its engine workers are reaped together when the context exits or the parent
 from __future__ import annotations
 
 import errno
+import hashlib
 import logging
 import os
 import signal
@@ -18,6 +19,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
+
+from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -60,6 +63,7 @@ class VLLMServerConfig:
     enable_lora: bool = False
     max_lora_rank: int | None = None
     lora_modules: tuple[tuple[str, str], ...] = ()
+    lora_serving_dir: Path | None = None
     limit_mm_per_prompt: str | None = None
     executable: str = "vllm"
     startup_timeout_seconds: float = 600.0
@@ -143,6 +147,22 @@ class VLLMServerConfig:
         """The vLLM readiness URL."""
         return f"{self.base_url}{self.health_path}"
 
+    def _lora_modules_cli_args(self) -> list[str]:
+        """Prepare the adapter paths before vLLM parses ``--lora-modules``."""
+        if not self.lora_modules:
+            return []
+        arguments = ["--lora-modules"]
+        for name, adapter_path in self.lora_modules:
+            source = Path(adapter_path)
+            if self.lora_serving_dir is None:
+                destination = source.resolve().parent / "vllm-serving-adapters" / source.name
+            else:
+                module_digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+                destination = self.lora_serving_dir / module_digest
+            served_adapter = prepare_vllm_serving_adapter(source, destination)
+            arguments.append(f"{name}={served_adapter}")
+        return arguments
+
     def command(self) -> list[str]:  # noqa: C901 - each CLI flag is explicit and ordered
         """Build the verified ``vllm serve`` command line."""
         command = [self.executable, "serve", self.model]
@@ -183,9 +203,7 @@ class VLLMServerConfig:
             command.append("--enable-lora")
         if self.max_lora_rank is not None:
             command.extend(["--max-lora-rank", str(self.max_lora_rank)])
-        if self.lora_modules:
-            command.append("--lora-modules")
-            command.extend(f"{name}={path}" for name, path in self.lora_modules)
+        command.extend(self._lora_modules_cli_args())
         if self.limit_mm_per_prompt is not None:
             command.extend(["--limit-mm-per-prompt", self.limit_mm_per_prompt])
         return command

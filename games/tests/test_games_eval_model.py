@@ -246,6 +246,9 @@ class TestResolveServedModel:
         assert merge.calls == [], "the un-merged rung must not write a merge"
         assert served.backend_kwargs == {
             "lora_adapter": str(checkpoint),
+            "lora_serving_dir": str(
+                tmp_path / "merges" / "vllm-serving-adapters" / "arm-step-70-checkpoint-70"
+            ),
             "enable_lora": True,
             "max_lora_rank": 16,
             "lora_target_modules": list(TRAINED_TARGETS),
