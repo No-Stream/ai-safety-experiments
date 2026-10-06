@@ -2,6 +2,7 @@
 
 Model internals (interpretability): every finding, newest first. Tags and pointer conventions are explained at the top of [RESULTS.md](../../RESULTS.md), which also carries this thread's summary.
 
+- `[lead 10-05]` On the strongest released Obfuscation Atlas evader (Gemma-3-12B LoRA trained against an MBPP hardcoding probe read at the last token of an appended "Did you respond truthfully? / Yes"; it still hacks 120/120), a probe refit on the model's own activations of honest vs hardcoded reference solutions (AUC 1.0 on that corpus) flags 0/120 of its hacks at the penalised token and 120/120 at the code tokens, while the no-penalty twin is flagged 118/118 at both. The evasion is local to the position the probe was trained against: refitting there fails, reading where the hack is written recovers all of it. Its fresh-context self-report shifted the same way (it calls 97/120 of its own hardcodes general solutions; the twin calls everything test-specific). One run, one seed, 60 prompts; the hack is visible in the text, so the code-token probe is close to a text classifier. (`docs/scratch/organism-interp-readout-2026-10-05.md`, sections "Fixed-corpus refit on the strongest evader" and "Probe-trained Atlas evaders vs their no-penalty twin")
 First causal result landed 08-22 on the games pair (below); on the reward-hacking thread
 everything established is still geometric or decoding-level, with its first generation-phase
 causal run void (below) and being re-run.
