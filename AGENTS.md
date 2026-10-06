@@ -359,6 +359,12 @@ tmux new-session -d -s <name> \
 
   `set -o pipefail` is required, or the log records tee's status.
 - Logs go under `/var/tmp` or `~/logs`, never `/tmp`.
+- The limiter runs the command through `systemd-run`, which drops the caller's environment: put
+  `env VAR=value` (and `PATH` with `.venv/bin`, which vLLM's compile step needs) inside the limiter,
+  after its `--`, not before it.
+- Codex plugin jobs die when the Claude session that launched them is cleared or ends, and their
+  job ids are lost. Collect or finish them before a `/clear` or handoff; after one, recover their
+  work from the tree diff.
 
 **Every expensive run saves incremental results and resumes; restarting from zero is never the
 recovery path.**
