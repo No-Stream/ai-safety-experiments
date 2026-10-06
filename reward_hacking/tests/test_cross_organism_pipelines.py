@@ -282,6 +282,7 @@ def test_gemma_sampler_uses_gemma_only_vllm_limits(monkeypatch: pytest.MonkeyPat
             weight_quantization="none",
             language_model_only=True,
             kv_cache_dtype="fp8",
+            max_num_seqs=16,
         )
     finally:
         monkeypatch.setattr(torch, "cuda", original_cuda)
@@ -290,6 +291,7 @@ def test_gemma_sampler_uses_gemma_only_vllm_limits(monkeypatch: pytest.MonkeyPat
     assert "enable_lora" not in captured
     assert captured["language_model_only"] is True
     assert captured["kv_cache_dtype"] == "fp8"
+    assert captured["max_num_seqs"] == 16
 
 
 def test_aisi_sampler_adds_lora_engine_settings_only_for_adapter_runs(
@@ -358,6 +360,7 @@ def test_aisi_run_identity_records_effective_quantization_without_prompt_text() 
         leakage_hint=load_leakage_hint("aisi_codecontests", "none"),
         chat_template_kwargs={},
         language_model_only=True,
+        max_num_seqs=16,
     )
 
     engine_identity = identity["engine"]
@@ -368,6 +371,7 @@ def test_aisi_run_identity_records_effective_quantization_without_prompt_text() 
     assert engine_identity["enable_lora"] is True
     assert engine_identity["max_lora_rank"] == 64
     assert engine_identity["language_model_only"] is True
+    assert engine_identity["max_num_seqs"] == 16
     assert "prompt_text" not in identity
 
 

@@ -184,6 +184,7 @@ def build_run_identity(  # noqa: PLR0913 - independent run settings define resum
     leakage_hint: LeakageHint,
     chat_template_kwargs: Mapping[str, object],
     language_model_only: bool = False,
+    max_num_seqs: int | None = None,
 ) -> dict[str, object]:
     """Return safe run settings that must match before records can be resumed."""
     enable_lora = any(model.adapter_id is not None for model in models)
@@ -218,6 +219,7 @@ def build_run_identity(  # noqa: PLR0913 - independent run settings define resum
             "quantization": quantization,
             "kv_cache_dtype": kv_cache_dtype,
             "language_model_only": language_model_only,
+            "max_num_seqs": max_num_seqs,
         },
     }
 
@@ -609,6 +611,7 @@ class VLLMCompletionSampler:
         weight_quantization: WeightQuantizationChoice | None = None,
         kv_cache_dtype: str | None = None,
         language_model_only: bool = False,
+        max_num_seqs: int | None = None,
         chat_template_kwargs: Mapping[str, object] | None = None,
     ) -> None:
         """Load one vLLM engine with only the requested adapter and cache controls."""
@@ -622,6 +625,8 @@ class VLLMCompletionSampler:
             raise ValueError("max_lora_rank requires an adapter in the selected model set")
         if kv_cache_dtype == "":
             raise ValueError("kv_cache_dtype must be non-empty when supplied")
+        if max_num_seqs is not None and max_num_seqs < 1:
+            raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}")
         try:
             vllm = importlib.import_module("vllm")
             transformers = importlib.import_module("transformers")
@@ -672,6 +677,8 @@ class VLLMCompletionSampler:
             engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
         if language_model_only:
             engine_kwargs["language_model_only"] = True
+        if max_num_seqs is not None:
+            engine_kwargs["max_num_seqs"] = max_num_seqs
         # Without a cap vLLM sizes for OLMo-3's 65K context, which needs more KV cache than the card has.
         self._engine = vllm.LLM(**engine_kwargs)
 
@@ -975,6 +982,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Build vLLM in language-model-only mode (default: off).",
     )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Cap vLLM concurrent sequences (default: vLLM's); hybrid models need it below their Mamba-cache blocks.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--jail-timeout-seconds", type=int, default=10)
     parser.add_argument("--grade-workers", type=int, default=DEFAULT_GRADE_WORKERS)
@@ -1029,6 +1042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             leakage_hint=leakage_hint,
             chat_template_kwargs=args.chat_template_kwargs,
             language_model_only=args.language_model_only,
+            max_num_seqs=args.max_num_seqs,
         ),
     )
     sampler = VLLMCompletionSampler(
@@ -1039,6 +1053,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         weight_quantization=args.weight_quantization,
         kv_cache_dtype=args.kv_cache_dtype,
         language_model_only=args.language_model_only,
+        max_num_seqs=args.max_num_seqs,
         chat_template_kwargs=args.chat_template_kwargs,
     )
     summary = run_screen(
