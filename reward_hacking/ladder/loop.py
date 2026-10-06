@@ -40,6 +40,10 @@ from reward_hacking.ladder.chat import (
 )
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL, ModelProtocol
 from reward_hacking.ladder.surfaces import BeliefProbeQuestions, parse_belief_probabilities
+from reward_hacking.ladder.thinking import (
+    forced_thinking_close_inside_tool_call,
+    thinking_region_token_count,
+)
 from reward_hacking.ladder.tools import (
     FORMAT_ERROR_MESSAGE,
     RUNAWAY_FORMAT_ERROR_MESSAGE,
@@ -186,6 +190,9 @@ class LadderTurn:
     index: int
     raw_completion: str
     reasoning: str
+    thinking_token_budget: int | None
+    thinking_budget_fired: bool
+    reasoning_token_count: int
     history_reasoning: HistoryReasoning
     content: str
     tool_calls: tuple[LadderToolCall, ...]
@@ -219,6 +226,9 @@ class LadderTurn:
             "turn": self.index,
             "raw_completion": self.raw_completion,
             "reasoning": self.reasoning,
+            "thinking_token_budget": self.thinking_token_budget,
+            "thinking_budget_fired": self.thinking_budget_fired,
+            "reasoning_token_count": self.reasoning_token_count,
             "history_reasoning": self.history_reasoning,
             "content": self.content,
             "tool_calls": [call.to_json_dict() for call in self.tool_calls],
@@ -266,6 +276,7 @@ class LadderEpisodeTrace:
     episode_dir: Path
     arm: AgenticArmConfig
     history_reasoning: HistoryReasoning
+    thinking_token_budget: int | None
     turns: tuple[LadderTurn, ...]
     messages: tuple[ChatMessage, ...]
     ended_by: str
@@ -403,6 +414,7 @@ class LadderEpisodeTrace:
             "report_unavailable": self.report_unavailable,
             "arm": self.arm.to_json_dict(),
             "history_reasoning": self.history_reasoning,
+            "thinking_token_budget": self.thinking_token_budget,
             "protocol": self.protocol,
             "ended_by": self.ended_by,
             "format_errors": self.format_errors,
@@ -1253,6 +1265,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     episode_token: str | None = None,
     episode_seconds: float = LADDER_EPISODE_SECONDS,
     history_reasoning: HistoryReasoning = DEFAULT_HISTORY_REASONING,
+    thinking_token_budget: int | None = None,
     chat_template_kwargs: Mapping[str, str] | None = None,
     protocol: ModelProtocol = QWEN_PROTOCOL,
     before_command: Callable[[Path, str], None] | None = None,
@@ -1281,6 +1294,10 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         raise ValueError("max_model_len must be positive")
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive")
+    if thinking_token_budget is not None and (
+        type(thinking_token_budget) is not int or thinking_token_budget < 0
+    ):
+        raise ValueError("thinking_token_budget must be a non-negative integer")
     if history_reasoning not in HISTORY_REASONING_MODES:
         raise ValueError(f"unknown history_reasoning mode {history_reasoning!r}")
     if belief_probe and belief_probe_questions is None:
@@ -1387,6 +1404,19 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             break
 
         runaway = protocol.is_runaway(completion.text, completion.finish_reason)
+        reasoning_token_count = thinking_region_token_count(
+            backend.tokenizer,
+            rendered.prompt,
+            completion.text,
+        )
+        # vLLM adds the next token slot before comparing against the budget, so a
+        # reasoning count equal to the budget means the following close was forced.
+        thinking_budget_fired = (
+            thinking_token_budget is not None and reasoning_token_count >= thinking_token_budget
+        )
+        forced_close_inside_tool_call = (
+            thinking_budget_fired and forced_thinking_close_inside_tool_call(completion.text)
+        )
         parsed = (
             ParsedTurn("", "", (), "", RUNAWAY_FORMAT_ERROR_MESSAGE)
             if runaway
@@ -1397,6 +1427,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             if runaway
             else _raw_completion_format_error(parsed, completion.finish_reason)
         )
+        if forced_close_inside_tool_call:
+            format_error = "Thinking-token budget forced the reasoning close inside a tool call."
         call_records = [
             LadderToolCall(name=call.name, arguments=dict(call.arguments))
             for call in parsed.tool_calls
@@ -1435,7 +1467,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                     runaway_message_positions.append(len(messages))
                     messages.append(assistant_message)
                 messages.append({"role": "user", "content": RUNAWAY_FORMAT_ERROR_MESSAGE})
-            elif completion.finish_reason == "length":
+            elif completion.finish_reason == "length" or forced_close_inside_tool_call:
                 messages.append(assistant_message)
                 _mark_unexecuted(action_state.call_records, 0, "format_error")
                 if parsed.tool_calls:
@@ -1525,6 +1557,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             index=turn_index,
             raw_completion=completion.text,
             reasoning=parsed.reasoning,
+            thinking_token_budget=thinking_token_budget,
+            thinking_budget_fired=thinking_budget_fired,
+            reasoning_token_count=reasoning_token_count,
             history_reasoning=history_reasoning,
             content=parsed.content,
             tool_calls=tuple(call_records),
@@ -1671,6 +1706,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         episode_dir=episode_dir,
         arm=arm,
         history_reasoning=history_reasoning,
+        thinking_token_budget=thinking_token_budget,
         turns=tuple(turns),
         messages=tuple(copy.deepcopy(messages)),
         ended_by=ended_by,

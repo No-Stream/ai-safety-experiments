@@ -120,6 +120,10 @@ class SamplingConfig:
     via ``include_stop_str_in_output``, transformers by construction), and both label the halt
     :data:`STOP_REASON_STOP_SEQUENCE`, so the harness's block parser sees the complete block and a
     stopped turn is distinguishable from one that ran out of budget.
+
+    ``thinking_token_budget`` is a vLLM-only per-request reasoning cap. The HTTP and in-process
+    vLLM backends pass it through; the HuggingFace backend records it as dropped because
+    ``transformers.generate`` has no equivalent.
     """
 
     max_new_tokens: int
@@ -132,6 +136,7 @@ class SamplingConfig:
     presence_penalty: float = 0.0
     stop: tuple[str, ...] = ()
     seed: int | None = None
+    thinking_token_budget: int | None = None
 
     @classmethod
     def for_thinking(cls, *, thinking: bool) -> SamplingConfig:
@@ -736,14 +741,15 @@ VLLM_SAMPLING_PARAM_ATTRS: dict[str, str] = {
     "presence_penalty": "presence_penalty",
     "seed": "seed",
     "stop": "stop",
+    "thinking_token_budget": "thinking_token_budget",
 }
 """Every :class:`SamplingConfig` field vLLM has a ``SamplingParams`` counterpart for, mapped to it.
 
 ``do_sample`` is absent because vLLM carries no such knob -- greedy decoding is spelled as
 temperature 0.0 -- so :meth:`VLLMBackend.applied_sampling` reads it off the engine's own
 ``sampling_type`` instead. The mapping exists so a caller recording what a run decoded under can walk
-the config's own fields and ask the engine what it holds for each, rather than restating these seven
-names a third time.
+the config's own fields and ask the engine what it holds for each, rather than restating these names a
+third time.
 """
 
 _VLLM_FINISH_REASONS = {"length": STOP_REASON_MAX_TOKENS, "stop": STOP_REASON_END_TURN}
@@ -1151,6 +1157,8 @@ class VLLMHTTPBackend:
             "n": 1,
             "stream": False,
         }
+        if self.sampling.thinking_token_budget is not None:
+            body["thinking_token_budget"] = self.sampling.thinking_token_budget
         with httpx2.Client(timeout=request_timeout, trust_env=False) as client:
             response = client.post(f"{self.base_url}/v1/completions", json=body)
             response.raise_for_status()
@@ -1441,6 +1449,11 @@ class VLLMBackend:
             stop=list(self.sampling.stop) if self.sampling.stop else None,
             stop_token_ids=list(self.stop_token_ids) if self.stop_token_ids else None,
             include_stop_str_in_output=bool(self.sampling.stop),
+            **(
+                {"thinking_token_budget": self.sampling.thinking_token_budget}
+                if self.sampling.thinking_token_budget is not None
+                else {}
+            ),
         )
         # applied_sampling compares against this; SamplingType is not exported from vllm's top level.
         self._greedy_sampling_type = importlib.import_module(

@@ -227,6 +227,25 @@ def test_qwen_ladder_http_sampling_request_keeps_legacy_body(
     ]
 
 
+def test_qwen_ladder_http_sampling_request_carries_thinking_token_budget(
+    tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
+) -> None:
+    url, requests, state = server
+    state["token_ids"] = [7]
+    backend = VLLMHTTPBackend(
+        "qwen-base",
+        base_url=url,
+        model_path=tokenizer_path,
+        thinking=True,
+        sampling=SamplingConfig(max_new_tokens=8192, thinking_token_budget=128),
+        stop_token_ids=(248044, 248046),
+    )
+
+    backend.complete_rendered("synthetic Qwen prompt", max_tokens=8192, seed=None)
+
+    assert requests[0]["thinking_token_budget"] == 128
+
+
 class TestThinkingSplit:
     def backend(self, url: str, tokenizer_path: Path) -> VLLMHTTPBackend:
         sampling = SamplingConfig(max_new_tokens=47, stop=("</run>",))

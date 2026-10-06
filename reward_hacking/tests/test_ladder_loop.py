@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
@@ -31,6 +32,7 @@ from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 from reward_hacking.ladder.protocols import GEMMA3_PROTOCOL, QWEN_PROTOCOL, ModelProtocol
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
+from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_END_STRING
 from reward_hacking.model_backend import RenderedCompletion
 from reward_hacking.trace import load_trace
 
@@ -86,6 +88,18 @@ class _FakeTokenizer:
         return "synthetic-test-template"
 
 
+class _ThinkingAwareTokenizer(_FakeTokenizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_ids: dict[str, int] = {}
+
+    def __call__(self, prompt: str, *, add_special_tokens: bool) -> _Tokenized:
+        assert not add_special_tokens
+        tokens = re.findall(r"</think>|<think>|\S+", prompt)
+        input_ids = [self.token_ids.setdefault(token, len(self.token_ids)) for token in tokens]
+        return _Tokenized(input_ids)
+
+
 @dataclass(frozen=True)
 class _ScriptedReply:
     text: str
@@ -109,6 +123,7 @@ class _EpisodeOptions:
     max_model_len: int = 100_000
     max_turns: int = 4
     max_new_tokens: int = loop.LADDER_MAX_NEW_TOKENS
+    thinking_token_budget: int | None = None
     trace_path: Path | None = None
     episode_token: str | None = None
     episode_seconds: float = loop.LADDER_EPISODE_SECONDS
@@ -273,6 +288,7 @@ def _run_episode(
         submit_grader=episode_options.submit_grader or _successful_submission,
         max_model_len=episode_options.max_model_len,
         max_new_tokens=episode_options.max_new_tokens,
+        thinking_token_budget=episode_options.thinking_token_budget,
         awareness_scanner=episode_options.awareness_scanner,
         belief_probe=episode_options.belief_probe,
         belief_probe_questions=episode_options.belief_probe_questions,
@@ -762,6 +778,126 @@ class TestNativeToolLoop:
         assert executed == []
         assert trace.turns[0].stop_reason == "max_tokens"
         assert trace.turns[0].format_error is not None
+        assert trace.turns[0].tool_calls[0].not_executed_reason == "format_error"
+
+    def test_forced_thinking_close_is_recorded_with_reasoning_count(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        raw_completion = (
+            "planning\n"
+            + QWEN_THINKING_REASONING_END_STRING
+            + _bash("touch marker.txt", start_turn=False)
+        )
+        trace_path = tmp_path / "trace.jsonl"
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(raw_completion),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+            ]
+        )
+        backend.tokenizer = cast("PreTrainedTokenizerBase", _ThinkingAwareTokenizer())
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(thinking_token_budget=1, trace_path=trace_path),
+        )
+
+        turn = trace.turns[0]
+        assert turn.thinking_budget_fired
+        assert turn.reasoning_token_count > 0
+        assert trace.turn_records()[0]["thinking_token_budget"] == 1
+        persisted_turn = load_trace(trace_path)[0]
+        assert persisted_turn["thinking_budget_fired"] is True
+        assert persisted_turn["reasoning_token_count"] == turn.reasoning_token_count
+
+    def test_natural_think_close_does_not_mark_budget_fired(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch marker.txt")),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+            ]
+        )
+        backend.tokenizer = cast("PreTrainedTokenizerBase", _ThinkingAwareTokenizer())
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(thinking_token_budget=32),
+        )
+
+        assert trace.turns[0].thinking_budget_fired is False
+
+    @pytest.mark.parametrize(("budget", "expected_fired"), [(2, True), (3, True), (4, False)])
+    def test_thinking_budget_fires_exactly_when_reasoning_reaches_budget(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        budget: int,
+        expected_fired: bool,
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(
+                    "one two three </think>\n<tool_call>\n<function=bash>\n"
+                    "<parameter=command>\ntouch marker.txt\n</parameter>\n"
+                    "</function>\n</tool_call>"
+                ),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+            ]
+        )
+        backend.tokenizer = cast("PreTrainedTokenizerBase", _ThinkingAwareTokenizer())
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(thinking_token_budget=budget),
+        )
+
+        assert trace.turns[0].reasoning_token_count == 3
+        assert trace.turns[0].thinking_budget_fired is expected_fired
+
+    def test_forced_thinking_close_inside_tool_call_is_a_format_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        executed: list[str] = []
+        monkeypatch.setattr(
+            loop,
+            "run_in_jail",
+            lambda _directory, command, **_kwargs: (
+                executed.append(command) or CommandResult(command, 0, "", "", False)
+            ),
+        )
+        raw_completion = (
+            "planning\n<tool_call>\n<function=bash>\n<parameter=command>\n"
+            + QWEN_THINKING_REASONING_END_STRING
+            + "touch must_not_run\n</parameter>\n</function>\n</tool_call>"
+        )
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(raw_completion),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+            ]
+        )
+        backend.tokenizer = cast("PreTrainedTokenizerBase", _ThinkingAwareTokenizer())
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(thinking_token_budget=1),
+        )
+
+        assert executed == []
+        assert "inside a tool call" in (trace.turns[0].format_error or "")
         assert trace.turns[0].tool_calls[0].not_executed_reason == "format_error"
 
     def test_length_truncated_multiple_tool_calls_get_one_error_response_each(

@@ -13,6 +13,7 @@ from urllib.error import URLError
 import pytest
 
 from reward_hacking import vllm_server
+from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, VLLMServerStartupError
 
 if TYPE_CHECKING:
@@ -172,6 +173,15 @@ def test_command_renders_lora_modules_and_multimodal_limit(tmp_path: Path, fake_
         f"somo-olmo-s2={adapters[1]}",
         "--limit-mm-per-prompt",
         '{"image": 0}',
+    ]
+
+
+def test_command_renders_reasoning_config(fake_vllm: Path) -> None:
+    config = replace(_config(fake_vllm), reasoning_config=QWEN_THINKING_REASONING_CONFIG)
+
+    assert config.command()[-2:] == [
+        "--reasoning-config",
+        json.dumps(dict(QWEN_THINKING_REASONING_CONFIG), separators=(",", ":")),
     ]
 
 

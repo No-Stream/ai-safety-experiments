@@ -63,7 +63,8 @@ class TestTheScienceDefaultIsTheTrainingDistribution:
         reward-hacking harness and read as "not used here", which is their honest value for this
         battery: ``stop`` is the agentic harness's run-block close, and ``seed`` is a per-request
         generation seed, distinct from this battery's own ``engine_seed`` (the vLLM engine's RNG,
-        recorded separately beside ``sampling`` in the meta record).
+        recorded separately beside ``sampling`` in the meta record). ``thinking_token_budget`` is the
+        ladder's per-turn reasoning cap; this battery never sets it.
         """
         sampling = run_evals._sampling_meta(parse("--backend", "vllm"), thinking=True)
         assert sampling == {
@@ -77,6 +78,7 @@ class TestTheScienceDefaultIsTheTrainingDistribution:
             "presence_penalty": 0.0,
             "stop": (),
             "seed": None,
+            "thinking_token_budget": None,
         }
 
     def test_the_budget_default_is_32768(self) -> None:

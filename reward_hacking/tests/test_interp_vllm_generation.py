@@ -268,6 +268,7 @@ class _StubSamplingParams:
         # raises AttributeError rather than reporting a mismatch -- which is what a knob added to the
         # map without a slot here does.
         self.seed = sampling.seed
+        self.thinking_token_budget = sampling.thinking_token_budget
         # A LIST, matching what the installed vLLM hands back: its __post_init__ normalises stop to a
         # list and never returns None, which is the behaviour applied_sampling coerces against.
         self.stop = list(sampling.stop)

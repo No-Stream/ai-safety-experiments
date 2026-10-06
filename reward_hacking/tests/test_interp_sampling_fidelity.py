@@ -235,6 +235,7 @@ class TestNothingIsRecordedThatDidNotApply:
             "repetition_penalty",
             "presence_penalty",
             "seed",
+            "thinking_token_budget",
         }
 
     def test_the_default_interp_sampler_asks_for_no_penalty(self) -> None:

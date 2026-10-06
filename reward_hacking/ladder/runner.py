@@ -47,6 +47,7 @@ from reward_hacking.ladder import chat as ladder_chat
 from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.ladder import protocols as ladder_protocols
 from reward_hacking.ladder import surfaces
+from reward_hacking.ladder import thinking as ladder_thinking
 from reward_hacking.ladder.behaviour import (
     command_shell_segments,
     generated_path_is_noise,
@@ -134,6 +135,7 @@ LADDER_GENERATION_CODE_FILES = (
     "reward_hacking/ladder/loop.py",
     "reward_hacking/ladder/tools.py",
     "reward_hacking/ladder/chat.py",
+    "reward_hacking/ladder/thinking.py",
     "reward_hacking/ladder/protocols.py",
     "reward_hacking/ladder/rungs.py",
     "reward_hacking/ladder/scenario.py",
@@ -180,6 +182,7 @@ class LadderSampling:
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     seed: int | None = None
+    thinking_token_budget: int | None = None
 
     def to_json(self, *, include_stop_token_ids: bool = True) -> dict[str, object]:
         """Return sampler settings, with legacy Qwen stops only for Qwen-specific callers."""
@@ -196,6 +199,8 @@ class LadderSampling:
         }
         if include_stop_token_ids:
             payload["stop_token_ids"] = list(LADDER_STOP_TOKEN_IDS)
+        if self.thinking_token_budget is not None:
+            payload["thinking_token_budget"] = self.thinking_token_budget
         return payload
 
 
@@ -334,6 +339,7 @@ class RunnerConfig:
     episode_root: Path
     max_turns: int = ladder_loop.LADDER_MAX_TURNS
     max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
+    thinking_token_budget: int | None = None
     timeout: str = ladder_loop.LADDER_COMMAND_TIMEOUT
     jail_backend: str | None = None
     episode_seconds: float = ladder_loop.LADDER_EPISODE_SECONDS
@@ -373,7 +379,11 @@ class RunnerConfig:
     @property
     def sampling(self) -> LadderSampling:
         """Return the shared ladder sampler with this sweep's per-turn token cap."""
-        return replace(LADDER_SAMPLING, max_new_tokens=self.max_new_tokens)
+        return replace(
+            LADDER_SAMPLING,
+            max_new_tokens=self.max_new_tokens,
+            thinking_token_budget=self.thinking_token_budget,
+        )
 
     def _build_provenance_payload(self) -> dict[str, object]:
         """Build provenance once, at config creation, before any episode can run."""
@@ -416,6 +426,8 @@ class RunnerConfig:
             "history_reasoning": self.history_reasoning,
             "report_history_reasoning_policy": ladder_loop.REPORT_HISTORY_REASONING_POLICY,
         }
+        if self.thinking_token_budget is not None:
+            payload["thinking_token_budget"] = self.thinking_token_budget
         if any(_scenario_format(scenario) == REPOSITORY_FORMAT for scenario in self.scenarios):
             payload["jail_runtime_identity"] = jail_runtime_identity()
             payload["scenarios"] = [
@@ -507,6 +519,10 @@ def _validate_run_bounds(config: RunnerConfig) -> None:
         raise ValueError("max_turns must be at least one")
     if config.max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
+    if config.thinking_token_budget is not None and (
+        type(config.thinking_token_budget) is not int or config.thinking_token_budget < 0
+    ):
+        raise ValueError("thinking_token_budget must be a non-negative integer")
     if config.episode_seconds <= 0:
         raise ValueError("episode_seconds must be positive")
     if config.episode_concurrency < 1:
@@ -1278,6 +1294,7 @@ def _resolve_local_model_path(model: ModelSpec) -> Path:
 
 def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
     """Build the only backend allowed for the ladder, without loading weights in this process."""
+    _validate_thinking_budget_server(config)
     from reward_hacking.model_backend import (  # noqa: PLC0415 - no model-engine import at module load
         SamplingConfig,
         VLLMHTTPBackend,
@@ -1300,6 +1317,7 @@ def build_vllm_http_backend(model: ModelSpec, config: RunnerConfig) -> Backend:
         repetition_penalty=ladder_sampling.repetition_penalty,
         presence_penalty=ladder_sampling.presence_penalty,
         seed=ladder_sampling.seed,
+        thinking_token_budget=ladder_sampling.thinking_token_budget,
     )
     backend = VLLMHTTPBackend(
         model.server_model_id or model.model_id,
@@ -1743,6 +1761,7 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
                 episode_token=episode_token,
                 episode_seconds=config.episode_seconds,
                 history_reasoning=config.history_reasoning,
+                thinking_token_budget=config.thinking_token_budget,
                 chat_template_kwargs=model.chat_template_kwargs,
                 protocol=protocol,
                 before_command=before_command,
@@ -4788,7 +4807,25 @@ def _prepare_real_run_config(config: RunnerConfig) -> RunnerConfig:
     """Require a parsed server identity before resolving the real endpoint."""
     if config.server_args is None:
         raise ValueError("real ladder runs require --server-log with vLLM startup args")
+    _validate_thinking_budget_server(config)
     return _with_resolved_model_lengths(config)
+
+
+def _validate_thinking_budget_server(config: RunnerConfig) -> None:
+    """Refuse a budgeted run unless startup args prove the server can enforce it."""
+    if config.thinking_token_budget is None:
+        return
+    if config.server_args is None or not ladder_thinking.server_reasoning_config_matches(
+        config.server_args
+    ):
+        raise ValueError(
+            "thinking-token-budget requires vLLM --reasoning-config with the exact "
+            "Qwen reasoning start and end strings"
+        )
+    if config.server_args.get("use_v2_model_runner") is True:
+        raise ValueError(
+            "thinking-token-budget requires VLLM_USE_V2_MODEL_RUNNER=0 on the vLLM server"
+        )
 
 
 def run_grid(
@@ -5871,6 +5908,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=ladder_loop.LADDER_MAX_NEW_TOKENS,
         help="Per-turn generation cap; a turn that reaches it is a runaway and is discarded.",
     )
+    parser.add_argument(
+        "--thinking-token-budget",
+        type=int,
+        default=None,
+        help="Optional per-turn Qwen reasoning-token budget; requires matching server reasoning config.",
+    )
     parser.add_argument("--timeout", default=ladder_loop.LADDER_COMMAND_TIMEOUT)
     parser.add_argument("--episode-seconds", type=float, default=ladder_loop.LADDER_EPISODE_SECONDS)
     parser.add_argument(
@@ -5919,6 +5962,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         episode_root=args.episode_root,
         max_turns=args.max_turns,
         max_new_tokens=args.max_new_tokens,
+        thinking_token_budget=args.thinking_token_budget,
         timeout=args.timeout,
         episode_seconds=args.episode_seconds,
         episode_concurrency=args.episode_concurrency,

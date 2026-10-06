@@ -139,11 +139,15 @@ WHY_TRANSFORMERS_CANNOT_APPLY: dict[str, str] = {
         "carry a seed and the vLLM path passes it. A run on this path is UNSEEDED whatever the "
         "config asked for, which is what this entry exists to say out loud"
     ),
+    "thinking_token_budget": (
+        "transformers' generate has no thinking-token budget parameter; only the vLLM reasoning "
+        "processor can force its configured end string"
+    ),
 }
 """Knobs the HuggingFace path structurally cannot forward, each with the reason it cannot.
 
-One entry today, and the reason is a property of the library rather than of this code, which is why
-it is recorded as prose in the artifact instead of being left for a reader to infer from an absence.
+The reasons are properties of the library rather than of this code, which is why they are recorded as
+prose in the artifact instead of being left for a reader to infer from an absence.
 """
 
 WHY_GREEDY_DROPS_A_KNOB = (
@@ -270,7 +274,7 @@ def _vllm_sampling_kwargs(sampling: SamplingConfig) -> dict[str, object]:
     """Predict what a vLLM engine built from this config will hold for every knob in it.
 
     The vLLM counterpart of :func:`_sampling_kwargs`, and unlike that one it covers EVERY field --
-    vLLM's ``SamplingParams`` has a slot for all seven of the engine-facing knobs, ``presence_penalty``
+    vLLM's ``SamplingParams`` has a slot for all of the engine-facing knobs, ``presence_penalty``
     included, which is the whole reason this path is worth having for a run that wants Qwen's
     anti-loop lever. ``do_sample`` has no slot; greedy is spelled as temperature 0.0, which is what
     ``VLLMBackend`` passes, so the boolean is reported as the engine's own greediness.
@@ -300,6 +304,7 @@ def _vllm_sampling_kwargs(sampling: SamplingConfig) -> dict[str, object]:
         "presence_penalty": sampling.presence_penalty,
         "seed": sampling.seed,
         "stop": sampling.stop,
+        "thinking_token_budget": sampling.thinking_token_budget,
     }
 
 

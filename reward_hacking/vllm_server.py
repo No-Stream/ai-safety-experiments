@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import logging
 import os
 import signal
@@ -23,7 +24,7 @@ from typing import TYPE_CHECKING, Self
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from types import FrameType
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ class VLLMServerConfig:
     lora_modules: tuple[tuple[str, str], ...] = ()
     lora_serving_dir: Path | None = None
     limit_mm_per_prompt: str | None = None
+    reasoning_config: Mapping[str, str] | None = None
     executable: str = "vllm"
     startup_timeout_seconds: float = 600.0
     health_poll_interval_seconds: float = 0.25
@@ -122,8 +124,17 @@ class VLLMServerConfig:
             raise ValueError("lora module names and paths must be non-empty")
         if self.limit_mm_per_prompt == "":
             raise ValueError("limit_mm_per_prompt must be non-empty when supplied")
+        if self.reasoning_config is not None:
+            self._validate_reasoning_config()
         if not self.health_path.startswith("/"):
             raise ValueError("health_path must start with '/'")
+
+    def _validate_reasoning_config(self) -> None:
+        """Validate the JSON-compatible reasoning delimiter mapping."""
+        if not self.reasoning_config:
+            raise ValueError("reasoning_config must be non-empty when supplied")
+        if any(not key for key in self.reasoning_config):
+            raise ValueError("reasoning_config keys must be non-empty strings")
 
     def _validate_time_settings(self) -> None:
         """Validate startup, probe, and shutdown timeouts."""
@@ -206,6 +217,13 @@ class VLLMServerConfig:
         command.extend(self._lora_modules_cli_args())
         if self.limit_mm_per_prompt is not None:
             command.extend(["--limit-mm-per-prompt", self.limit_mm_per_prompt])
+        if self.reasoning_config is not None:
+            command.extend(
+                [
+                    "--reasoning-config",
+                    json.dumps(dict(self.reasoning_config), separators=(",", ":")),
+                ]
+            )
         return command
 
 
@@ -250,10 +268,15 @@ class VLLMServer:
         """Launch the process group and wait for readiness, cleaning up on every failure."""
         if self._process is not None:
             raise RuntimeError("vLLM server has already been started")
+        environment = None
+        if self.config.reasoning_config is not None:
+            environment = os.environ.copy()
+            environment["VLLM_USE_V2_MODEL_RUNNER"] = "0"
         self._process = subprocess.Popen(  # noqa: S603 - command is built from typed config fields
             self.config.command(),
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=environment,
         )
         try:
             self._install_signal_handler()
