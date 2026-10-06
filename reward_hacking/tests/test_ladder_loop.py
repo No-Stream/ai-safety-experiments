@@ -122,6 +122,7 @@ class _EpisodeOptions:
     history_reasoning: loop.HistoryReasoning = "retain"
     max_model_len: int = 100_000
     max_turns: int = 4
+    announced_turn_budget: int | None = None
     max_new_tokens: int = loop.LADDER_MAX_NEW_TOKENS
     thinking_token_budget: int | None = None
     trace_path: Path | None = None
@@ -278,6 +279,7 @@ def _run_episode(
         system_prompt="Use the tools to complete the task.",
         user_template="Task:\n{task_markdown}\nFiles:\n{listing}",
         max_turns=episode_options.max_turns,
+        announced_turn_budget=episode_options.announced_turn_budget,
         timeout="120s",
         jail_backend=None,
         trace_path=episode_options.trace_path,
@@ -457,6 +459,73 @@ def _assert_runaway_prompts(
 
 
 class TestNativeToolLoop:
+    def test_announced_turn_budget_counts_down_in_tool_results_and_turn_records(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        announced_turn_budget = 3
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch first.txt")),
+                _ScriptedReply(_bash("touch second.txt")),
+                _ScriptedReply(_bash("touch third.txt")),
+                _ScriptedReply(_report("The budget ended.")),
+            ]
+        )
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(
+                max_turns=announced_turn_budget,
+                announced_turn_budget=announced_turn_budget,
+            ),
+        )
+
+        sentence = loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
+        note = loop.TURNS_REMAINING_NOTE.format(n=0)
+        assert scan_text(sentence, "content", 1) == []
+        assert scan_text(note, "content", 1) == []
+        assert sentence in backend.prompts[0]
+        assert trace.ended_by == "turn_cap"
+        assert [turn.turns_remaining for turn in trace.turns] == [2, 1, 0]
+        assert [record["turns_remaining"] for record in trace.turn_records()] == [2, 1, 0]
+        assert all(turn.prompt_pure_append for turn in trace.turns[1:])
+        tool_messages = [message for message in trace.messages if message.get("role") == "tool"]
+        assert [str(message["content"]).splitlines()[-1] for message in tool_messages] == [
+            loop.TURNS_REMAINING_NOTE.format(n=remaining) for remaining in (2, 1, 0)
+        ]
+        assert note in str(tool_messages[-1]["content"])
+
+    def test_default_turn_budget_keeps_initial_prompt_bytes_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        default_backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch marker.txt")),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+            ]
+        )
+        explicit_none_backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("touch marker.txt")),
+                _ScriptedReply(_report()),
+                _ScriptedReply(_report()),
+            ]
+        )
+
+        _run_episode(tmp_path / "default", monkeypatch, default_backend)
+        _run_episode(
+            tmp_path / "explicit-none",
+            monkeypatch,
+            explicit_none_backend,
+            _EpisodeOptions(announced_turn_budget=None),
+        )
+
+        assert default_backend.prompts == explicit_none_backend.prompts
+        assert loop.ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=4) not in default_backend.prompts[0]
+
     @pytest.mark.parametrize(
         "template_name",
         ["qwen3_5_chat_template.jinja", "tmax_chat_template.jinja"],
