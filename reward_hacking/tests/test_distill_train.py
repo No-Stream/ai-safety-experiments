@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,8 +22,12 @@ from transformers import (
     TrainingArguments,
 )
 
+import reward_hacking.distill.memory as distill_memory
+import reward_hacking.distill.train as distill_train
+from reward_hacking.distill.memory import MemoryOptions
 from reward_hacking.distill.train import (
     DistillTrainer,
+    StepTelemetry,
     completion_logps,
     distillation_loss,
     load_training_rows,
@@ -127,11 +132,16 @@ class KillAfterSave(TrainerCallback):
             os.kill(os.getpid(), signal.SIGKILL)
 
 
-def make_trainer(output: Path, *, interrupt: bool = False) -> DistillTrainer:
+def make_trainer(
+    output: Path, *, interrupt: bool = False, memory_options: MemoryOptions | None = None
+) -> DistillTrainer:
     rows = [
         {"prompt_token_ids": [1, 2], "completion_token_ids": [3 + offset, 4 + offset, 5 + offset]}
         for offset in range(4)
     ]
+    trainer_kwargs: dict[str, Any] = {}
+    if memory_options is not None:
+        trainer_kwargs["memory_options"] = memory_options
     return DistillTrainer(
         model=tiny_model(),
         train_dataset=rows,
@@ -152,6 +162,213 @@ def make_trainer(output: Path, *, interrupt: bool = False) -> DistillTrainer:
             remove_unused_columns=False,
         ),
         callbacks=[KillAfterSave()] if interrupt else [],
+        **trainer_kwargs,
+    )
+
+
+def test_long_context_flags_parse_and_build_memory_options() -> None:
+    defaults = distill_train.parse_args(
+        ["--run-dir", "artifacts/synthetic-distill", "--round", "0", "--weight-mode", "sft"]
+    )
+    assert distill_train.memory_options_from_args(defaults) == MemoryOptions()
+
+    configured = distill_train.parse_args(
+        [
+            "--run-dir",
+            "artifacts/synthetic-distill",
+            "--round",
+            "0",
+            "--weight-mode",
+            "sft",
+            "--deltanet-conv-kernel",
+            "fla",
+            "--liger",
+            "--tiled-mlp",
+            "--offload-checkpoints",
+            "--base-quantization",
+            "torchao-int8",
+        ]
+    )
+    assert distill_train.memory_options_from_args(configured) == MemoryOptions(
+        deltanet_conv_kernel="fla",
+        liger=True,
+        tiled_mlp=True,
+        offload_checkpoints=True,
+        base_quantization="torchao-int8",
+    )
+    nf4 = distill_train.parse_args(
+        [
+            "--run-dir",
+            "artifacts/synthetic-distill",
+            "--round",
+            "0",
+            "--weight-mode",
+            "sft",
+            "--base-quantization",
+            "nf4",
+        ]
+    )
+    assert distill_train.memory_options_from_args(nf4).base_quantization == "nf4"
+
+
+def test_resume_refuses_changed_long_context_options(tmp_path: Path) -> None:
+    first = make_trainer(tmp_path)
+    first.args.max_steps = 1
+    first._identity["max_steps"] = 1
+    first.train()
+
+    changed_options = (
+        replace(MemoryOptions(), deltanet_conv_kernel="fla"),
+        replace(MemoryOptions(), liger=True),
+        replace(MemoryOptions(), tiled_mlp=True),
+        replace(MemoryOptions(), offload_checkpoints=True),
+        replace(MemoryOptions(), base_quantization="torchao-int8"),
+    )
+    for memory_options in changed_options:
+        resumed = make_trainer(tmp_path, memory_options=memory_options)
+        resumed.args.max_steps = 1
+        resumed._identity["max_steps"] = 1
+        with pytest.raises(ValueError, match="configuration changed"):
+            resumed.train(resume_from_checkpoint="latest")
+
+
+def test_legacy_resume_state_defaults_long_context_options(tmp_path: Path) -> None:
+    first = make_trainer(tmp_path)
+    first.args.max_steps = 1
+    first._identity["max_steps"] = 1
+    first.train()
+    checkpoint_state = tmp_path / "checkpoint-1" / "distill_state.json"
+    saved_state = json.loads(checkpoint_state.read_text())
+    saved_state.pop("memory_options")
+    checkpoint_state.write_text(json.dumps(saved_state) + "\n")
+
+    resumed = make_trainer(tmp_path)
+    resumed.args.max_steps = 1
+    resumed._identity["max_steps"] = 1
+    resumed.train(resume_from_checkpoint="latest")
+    assert resumed.state.global_step == 1
+
+    opted_in = make_trainer(
+        tmp_path,
+        memory_options=replace(MemoryOptions(), base_quantization="torchao-int8"),
+    )
+    opted_in.args.max_steps = 1
+    opted_in._identity["max_steps"] = 1
+    with pytest.raises(ValueError, match="configuration changed"):
+        opted_in.train(resume_from_checkpoint="latest")
+
+
+def test_quantized_trainer_initializes_trainable_adapters_in_bfloat16(tmp_path: Path) -> None:
+    trainer = make_trainer(
+        tmp_path,
+        memory_options=replace(MemoryOptions(), base_quantization="torchao-int8"),
+    )
+    assert trainer.model is not None
+    trainable_parameters = [
+        parameter for parameter in trainer.model.parameters() if parameter.requires_grad
+    ]
+    assert trainable_parameters
+    assert {parameter.dtype for parameter in trainable_parameters} == {torch.bfloat16}
+
+
+def test_quantized_resume_preserves_trainable_bfloat16_adapters(tmp_path: Path) -> None:
+    memory_options = replace(MemoryOptions(), base_quantization="torchao-int8")
+    trainer = make_trainer(tmp_path, memory_options=memory_options)
+    trainer.args.max_steps = 1
+    trainer._identity["max_steps"] = 1
+    assert trainer.model is not None
+    trainable_parameters = [
+        parameter for parameter in trainer.model.parameters() if parameter.requires_grad
+    ]
+    assert trainable_parameters
+    for parameter in trainable_parameters:
+        parameter.data = parameter.data.to(torch.bfloat16)
+    trainer.train()
+
+    checkpoint = tmp_path / "checkpoint-1"
+    resumed = make_trainer(tmp_path, memory_options=memory_options)
+    resumed.args.max_steps = 1
+    resumed._identity["max_steps"] = 1
+    assert resumed.model is not None
+    resumed_trainable = [
+        parameter for parameter in resumed.model.parameters() if parameter.requires_grad
+    ]
+    assert resumed_trainable
+    for parameter in resumed_trainable:
+        parameter.data = parameter.data.to(torch.bfloat16)
+
+    resumed._load_from_checkpoint(str(checkpoint))
+    assert resumed.model is not None
+    loaded_trainable = [
+        parameter for parameter in resumed.model.parameters() if parameter.requires_grad
+    ]
+    assert loaded_trainable
+    assert {parameter.dtype for parameter in loaded_trainable} == {torch.bfloat16}
+
+
+def test_offloaded_checkpoint_matches_chunked_accumulated_training(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    registered_slots: list[Any] = []
+
+    class CpuHostSlot:
+        def __init__(self, elements: int, dtype: torch.dtype) -> None:
+            self.buffer = torch.empty(elements, dtype=dtype)
+            self.released = False
+            registered_slots.append(self)
+
+        @property
+        def registered_bytes(self) -> int:
+            return self.buffer.numel() * self.buffer.element_size()
+
+        def view_for(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            if self.released or hidden_states.numel() > self.buffer.numel():
+                raise RuntimeError("CPU host slot is unavailable or too small")
+            return self.buffer[: hidden_states.numel()].view(hidden_states.shape)
+
+        def release(self) -> None:
+            self.released = True
+
+    baseline = make_trainer(tmp_path / "baseline")
+    cast("Any", baseline.model).enable_input_require_grads()
+    baseline.train()
+    assert baseline.model is not None
+    expected_adapters = {
+        name: parameter.detach().clone()
+        for name, parameter in baseline.model.named_parameters()
+        if parameter.requires_grad
+    }
+
+    monkeypatch.setattr(distill_memory, "HostSlot", CpuHostSlot)
+    prepare_checkpoint_offload = distill_train.prepare_checkpoint_offload
+
+    def prepare_cpu_checkpoint_offload(model: torch.nn.Module, max_sequence_tokens: int) -> Any:
+        with monkeypatch.context() as installer_patch:
+            installer_patch.setattr(torch.cuda, "is_available", lambda: True)
+            return prepare_checkpoint_offload(model, max_sequence_tokens)
+
+    monkeypatch.setattr(distill_train, "prepare_checkpoint_offload", prepare_cpu_checkpoint_offload)
+    offloaded = make_trainer(
+        tmp_path / "offloaded",
+        memory_options=replace(MemoryOptions(), offload_checkpoints=True),
+    )
+    cast("Any", offloaded.model).enable_input_require_grads()
+    offloaded.train()
+    assert offloaded.model is not None
+
+    actual_adapters = {
+        name: parameter.detach()
+        for name, parameter in offloaded.model.named_parameters()
+        if parameter.requires_grad
+    }
+    assert actual_adapters.keys() == expected_adapters.keys()
+    for name, expected in expected_adapters.items():
+        torch.testing.assert_close(actual_adapters[name], expected, atol=1e-6, rtol=1e-6)
+    assert registered_slots
+    assert all(slot.released for slot in registered_slots)
+    assert offloaded.checkpoint_offload is not None
+    assert offloaded.checkpoint_offload.registered_bytes == sum(
+        slot.registered_bytes for slot in registered_slots
     )
 
 
@@ -339,6 +556,33 @@ def test_opd_step_logs_correlation_and_completion_counts(tmp_path: Path) -> None
     assert step["clip_fraction"] == 0.0
     assert step["completion_length"] == 3
     assert step["total_trained_completion_tokens"] == 6
+    assert step["sequence_tokens"] == 10
+    assert step["tokens_per_second"] > 0
+    assert step["peak_allocated_bytes"] == 0
+    assert step["peak_reserved_bytes"] == 0
+
+
+def test_step_telemetry_warns_when_tokens_per_second_collapses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    times = iter((0.0, 1.0, 2.0, 4.0))
+    monkeypatch.setattr(distill_train.time, "perf_counter", lambda: next(times))
+    telemetry = StepTelemetry()
+    arguments = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to="none")
+    state = TrainerState()
+    control = TrainerControl()
+
+    telemetry.on_step_begin(arguments, state, control)
+    telemetry.sequence_tokens = 100
+    telemetry.on_step_end(arguments, state, control)
+    assert telemetry.metrics["tokens_per_second"] == 100
+
+    telemetry.on_step_begin(arguments, state, control)
+    telemetry.sequence_tokens = 40
+    telemetry.on_step_end(arguments, state, control)
+    assert telemetry.metrics["tokens_per_second"] == 20
+    assert telemetry.rates == [100, 20]
+    assert "below half the running median" in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -4,19 +4,31 @@ import argparse
 import hashlib
 import json
 import logging
+import statistics
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal, cast, override
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.checkpoint import checkpoint
-from transformers import AutoModelForCausalLM, Trainer, TrainerState, TrainingArguments
+from transformers import Trainer, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from transformers.trainer_utils import TrainOutput
 
+from games.deltanet_kernels import bound_deltanet_kernels
 from games.train import build_callbacks, chunked_per_token_logps, resolve_complete_resume_checkpoint
 from grpo.throughput import discover_lora_targets
+from reward_hacking.distill.memory import (
+    MemoryOptions,
+    install_before_load,
+    install_tiled_mlp,
+    load_base_model,
+    prepare_checkpoint_offload,
+)
 
 logger = logging.getLogger(__name__)
+DEFAULT_MEMORY_OPTIONS = MemoryOptions()
 LORA_RANK = 16
 LORA_ALPHA = 32
 WeightMode = Literal["opd", "sft"]
@@ -112,9 +124,7 @@ def completion_logps(
         raise ValueError("chunk_tokens must be positive")
     causal_model = cast("Any", model.get_base_model() if isinstance(model, PeftModel) else model)
     backbone = causal_model.base_model
-    hidden = backbone(
-        input_ids=input_ids, attention_mask=torch.ones_like(input_ids), use_cache=False
-    ).last_hidden_state
+    hidden = backbone(input_ids=input_ids, attention_mask=None, use_cache=False).last_hidden_state
     hidden = hidden[:, prompt_length - 1 : -1]
     targets = input_ids[:, prompt_length:]
     head = causal_model.get_output_embeddings()
@@ -183,13 +193,86 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def cast_lora_to_bf16(model: torch.nn.Module) -> None:
+    """Keep quantized runs' adapters in bf16, including after PEFT checkpoint loading."""
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            if "lora_" not in name:
+                raise RuntimeError(f"only LoRA parameters may train: {name}")
+            parameter.data = parameter.data.to(torch.bfloat16)
+
+
+class StepTelemetry(TrainerCallback):
+    """Measure each optimizer step, including all accumulated forward/backward passes."""
+
+    def __init__(self) -> None:
+        """Keep throughput history separate from loss accounting."""
+        self.sequence_tokens = 0
+        self.metrics: dict[str, float] = {}
+        self.rates: list[float] = []
+        self.started_at = 0.0
+        self.device = torch.device("cpu")
+
+    @override
+    def on_step_begin(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
+    ) -> None:
+        """Reset CUDA peaks before the first micro-batch of the optimizer step."""
+        del state, control, kwargs
+        self.device = args.device
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self.sequence_tokens = 0
+        self.started_at = time.perf_counter()
+
+    @override
+    def on_step_end(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
+    ) -> None:
+        """Warn about a throughput collapse relative to previous optimizer steps."""
+        del args, control, kwargs
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        elapsed = time.perf_counter() - self.started_at
+        rate = self.sequence_tokens / elapsed
+        self.metrics = {
+            "sequence_tokens": float(self.sequence_tokens),
+            "tokens_per_second": rate,
+            "peak_allocated_bytes": float(torch.cuda.max_memory_allocated(self.device))
+            if self.device.type == "cuda"
+            else 0.0,
+            "peak_reserved_bytes": float(torch.cuda.max_memory_reserved(self.device))
+            if self.device.type == "cuda"
+            else 0.0,
+        }
+        if self.rates and rate < statistics.median(self.rates) / 2:
+            logger.warning(
+                "step %d tokens/sec %.1f fell below half the running median %.1f; "
+                "possible GPU spill to shared memory",
+                state.global_step,
+                rate,
+                statistics.median(self.rates),
+            )
+        self.rates.append(rate)
+
+
 class DistillTrainer(Trainer):
     """Stored-token training with normal Trainer optimizer, RNG and dataloader resume."""
 
-    def __init__(self, *, weight_mode: WeightMode, chunk_tokens: int = 128, **kwargs: Any) -> None:  # noqa: ANN401 - Trainer constructor passthrough
+    def __init__(
+        self,
+        *,
+        weight_mode: WeightMode,
+        chunk_tokens: int = 128,
+        memory_options: MemoryOptions = DEFAULT_MEMORY_OPTIONS,
+        **kwargs: Any,  # noqa: ANN401 - Trainer constructor passthrough
+    ) -> None:
         """Keep Trainer machinery and replace only stored-token loss and accounting."""
         self.weight_mode: WeightMode = weight_mode
         self.chunk_tokens = chunk_tokens
+        self.memory_options = memory_options
+        self.telemetry = StepTelemetry()
         self.total_trained_completion_tokens = 0
         self._metric_sums: dict[str, float] = {}
         self._metric_tokens = 0
@@ -198,6 +281,9 @@ class DistillTrainer(Trainer):
         self._sampling_logps: list[torch.Tensor] = []
         kwargs["data_collator"] = collate_completion
         super().__init__(**kwargs)
+        self.add_callback(self.telemetry)
+        if memory_options.base_quantization != "none":
+            cast_lora_to_bf16(cast("torch.nn.Module", self.model))
         self.model_accepts_loss_kwargs = False
         if self.args.per_device_train_batch_size != 1 or self.args.world_size != 1:
             raise ValueError("distillation requires a single device and micro-batch one")
@@ -227,9 +313,36 @@ class DistillTrainer(Trainer):
             "max_steps": self.args.max_steps,
             "learning_rate": self.args.learning_rate,
             "chunk_tokens": chunk_tokens,
+            "memory_options": asdict(memory_options),
         }
 
         self._identity = json.loads(json.dumps(self._identity))
+        if memory_options.tiled_mlp:
+            install_tiled_mlp(cast("torch.nn.Module", self.model))
+        self.checkpoint_offload = None
+        self._max_sequence_tokens = 0
+        if memory_options.offload_checkpoints:
+            if not self.args.gradient_checkpointing:
+                raise ValueError("offload-checkpoints requires gradient checkpointing")
+            self._max_sequence_tokens = max(
+                len(row["prompt_token_ids"]) + len(row["completion_token_ids"])
+                for row in cast("list[dict[str, Any]]", self.train_dataset)
+            )
+        kernels = (
+            bound_deltanet_kernels()
+            if base_model.config.model_type in {"qwen3_5", "qwen3_5_text"}
+            else {}
+        )
+        logger.info(
+            "distillation device=%s name=%s attention=%s bound_deltanet_kernels=%s memory_options=%s",
+            self.args.device,
+            torch.cuda.get_device_name(self.args.device)
+            if self.args.device.type == "cuda"
+            else "CPU",
+            base_model.config._attn_implementation,  # noqa: SLF001 - effective HF attention implementation
+            kernels,
+            asdict(memory_options),
+        )
 
     @override
     def compute_loss(
@@ -249,6 +362,7 @@ class DistillTrainer(Trainer):
             logps, sampling, inputs.get("teacher_logps"), weight_mode=self.weight_mode
         )
         if model.training:
+            self.telemetry.sequence_tokens += inputs["input_ids"].numel()
             tokens = logps.numel()
             self.total_trained_completion_tokens += tokens
             self._metric_tokens += tokens
@@ -264,6 +378,7 @@ class DistillTrainer(Trainer):
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         """Persist completion-weighted diagnostics once per optimizer step."""
         if "loss" in logs and self._metric_tokens:
+            logs.update(self.telemetry.metrics)
             logs.update(
                 {name: value / self._metric_tokens for name, value in self._metric_sums.items()}
             )
@@ -297,6 +412,15 @@ class DistillTrainer(Trainer):
         super().log(logs, start_time)
 
     @override
+    def _load_from_checkpoint(
+        self, resume_from_checkpoint: str, model: torch.nn.Module | None = None
+    ) -> None:
+        """Undo PEFT's default adapter upcast before optimizer state is restored."""
+        super()._load_from_checkpoint(resume_from_checkpoint, model)
+        if self.memory_options.base_quantization != "none":
+            cast_lora_to_bf16(cast("torch.nn.Module", self.model if model is None else model))
+
+    @override
     def _save_checkpoint(self, model: torch.nn.Module, trial: Any) -> None:
         record = {
             **self._identity,
@@ -323,7 +447,11 @@ class DistillTrainer(Trainer):
         resolution = resolve_complete_resume_checkpoint(str(requested), self.output_dir)
         if resolution.checkpoint is not None:
             state = json.loads((Path(resolution.checkpoint) / "distill_state.json").read_text())
-            if {key: state[key] for key in self._identity} != self._identity:
+            saved_identity = {key: state[key] for key in self._identity if key != "memory_options"}
+            saved_identity["memory_options"] = state.get(
+                "memory_options", asdict(DEFAULT_MEMORY_OPTIONS)
+            )
+            if saved_identity != self._identity:
                 raise ValueError(
                     "distillation checkpoint dataset or training configuration changed"
                 )
@@ -340,11 +468,19 @@ class DistillTrainer(Trainer):
                 return TrainOutput(
                     self.state.global_step, sum(losses) / len(losses), {"already_complete": True}
                 )
-        return super().train(
-            resume_from_checkpoint=resolution.checkpoint,
-            trial=trial,
-            ignore_keys_for_eval=ignore_keys_for_eval,
-        )
+        if self.memory_options.offload_checkpoints:
+            self.checkpoint_offload = prepare_checkpoint_offload(
+                cast("torch.nn.Module", self.model), self._max_sequence_tokens
+            )
+        try:
+            return super().train(
+                resume_from_checkpoint=resolution.checkpoint,
+                trial=trial,
+                ignore_keys_for_eval=ignore_keys_for_eval,
+            )
+        finally:
+            if self.checkpoint_offload is not None:
+                self.checkpoint_offload.close()
 
 
 def validate_lora_config(configuration: LoraConfig, target_modules: list[str]) -> None:
@@ -361,8 +497,8 @@ def validate_lora_config(configuration: LoraConfig, target_modules: list[str]) -
         )
 
 
-def main() -> None:
-    """CLI entry point for one round; separate output directories preserve round identity."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse one round's training and opt-in memory settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--round", type=int, required=True)
@@ -376,7 +512,14 @@ def main() -> None:
     parser.add_argument("--chunk-tokens", type=int, default=128)
     parser.add_argument("--resume-from-checkpoint", default="latest")
     parser.add_argument("--s3-dest", default="")
-    args = parser.parse_args()
+    parser.add_argument("--deltanet-conv-kernel", choices=("default", "fla"), default="default")
+    parser.add_argument("--liger", action="store_true")
+    parser.add_argument("--tiled-mlp", action="store_true")
+    parser.add_argument("--offload-checkpoints", action="store_true")
+    parser.add_argument(
+        "--base-quantization", choices=("none", "torchao-int8", "nf4"), default="none"
+    )
+    args = parser.parse_args(argv)
     if (
         args.round < 0
         or args.gradient_accumulation_steps < 1
@@ -384,7 +527,25 @@ def main() -> None:
         or args.chunk_tokens < 1
     ):
         parser.error("round must be nonnegative and training counts must be positive")
+    return args
+
+
+def memory_options_from_args(args: argparse.Namespace) -> MemoryOptions:
+    """Bind CLI values to the configuration stored with every checkpoint."""
+    return MemoryOptions(
+        deltanet_conv_kernel=args.deltanet_conv_kernel,
+        liger=args.liger,
+        tiled_mlp=args.tiled_mlp,
+        offload_checkpoints=args.offload_checkpoints,
+        base_quantization=args.base_quantization,
+    )
+
+
+def main() -> None:
+    """CLI entry point for one round; separate output directories preserve round identity."""
+    args = parse_args()
     logging.basicConfig(level=logging.INFO)
+    memory_options = memory_options_from_args(args)
     mode = cast("WeightMode", args.weight_mode)
     output = args.output_dir or args.run_dir / "train" / f"round-{args.round}"
     rows = load_training_rows(
@@ -392,8 +553,9 @@ def main() -> None:
         args.run_dir / "teacher" / f"round-{args.round}.jsonl" if mode == "opd" else None,
         weight_mode=mode,
     )
+    install_before_load(memory_options)
     targets = discover_lora_targets(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16)
+    model = cast("Any", load_base_model(args.model, memory_options.base_quantization))
     model.config.use_cache = False
     if args.init_adapter:
         model = PeftModel.from_pretrained(model, str(args.init_adapter), is_trainable=True)
@@ -417,6 +579,7 @@ def main() -> None:
         train_dataset=rows,
         weight_mode=mode,
         chunk_tokens=args.chunk_tokens,
+        memory_options=memory_options,
         args=TrainingArguments(
             output_dir=str(output),
             per_device_train_batch_size=1,
