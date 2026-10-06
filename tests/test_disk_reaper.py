@@ -304,13 +304,13 @@ def test_keep_marker_inside_tree_protects_parent(tmp_path: Path, safe_reaper: No
     overflow = tmp_path / "overflow"
     ledger = tmp_path / "ledger.jsonl"
     candidate = home / ".cache" / "parent"
-    _make_file(candidate / "nested" / ".keep", b"")
+    marker = _make_file(candidate / "nested" / ".keep", b"")
     _make_file(candidate / "result.bin")
     _age_tree(candidate, 2 * DAY)
 
     reason = disk_reaper.protect(candidate, _allowed(home, temporary, overflow), NOW)
 
-    assert ".keep" in reason
+    assert reason == "contains a protected subtree (.keep)"
     assert _execute(
         candidate,
         home=home,
@@ -318,7 +318,28 @@ def test_keep_marker_inside_tree_protects_parent(tmp_path: Path, safe_reaper: No
         overflow=overflow,
         ledger=ledger,
     )
+    assert marker.exists()
     assert (candidate / "result.bin").exists()
+    assert not ledger.exists()
+
+
+def test_deep_keep_marker_reports_protected_subtree_in_dry_run(
+    tmp_path: Path, safe_reaper: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    home = tmp_path / "home"
+    candidate = home / ".cache" / "uv"
+    marker = _make_file(candidate / "pkg" / "lib" / ".keep", b"")
+    _make_file(candidate / "cache.db")
+    _age_tree(candidate, 2 * DAY)
+    caplog.set_level(logging.INFO, logger="scripts.disk_reaper")
+
+    disk_reaper.run(home, tmp_path / "var-tmp", tmp_path / "overflow", tmp_path / "ledger")
+
+    rows = [message for message in caplog.messages if str(candidate) in message]
+    assert len(rows) == 1
+    assert "| REPORT ONLY | contains a protected subtree (.keep)" in rows[0]
+    assert candidate.exists()
+    assert marker.exists()
 
 
 def test_git_tracked_file_is_protected(tmp_path: Path, safe_reaper: None) -> None:

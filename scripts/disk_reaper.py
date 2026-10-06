@@ -130,10 +130,10 @@ def protect(path: Path, allowed: List[Path], now: float, *, check_handles: bool 
     if any(part in forbidden for part in path.parts):
         return "hard protected path"
     _, newest, entries = inventory(path)
-    if any(present(parent / ".keep") for parent in [path, *path.parents]) or any(
-        entry.name == ".keep" for entry in entries
-    ):
+    if any(present(parent / ".keep") for parent in [path, *path.parents]):
         return ".keep protection"
+    if any(entry.name == ".keep" and entry.parent != path for entry in entries):
+        return "contains a protected subtree (.keep)"
     if any(
         entry.name == "adapter_config.json"
         or entry.name.startswith("adapter_model.")
