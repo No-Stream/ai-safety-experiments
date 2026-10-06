@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 import pytest
+import torch
+from safetensors.torch import load_file, save_file
 
 from reward_hacking.distill.sample import content_seed, sample_round, token_ids_sha256
 from reward_hacking.distill.score import (
@@ -16,8 +19,17 @@ from reward_hacking.distill.score import (
     score_round,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
+FLAT_LORA_KEY = "base_model.model.model.layers.0.linear_attn.in_proj_a.lora_A.weight"
+NESTED_LORA_KEY = (
+    "base_model.model.model.language_model.layers.0.linear_attn.in_proj_a.lora_A.weight"
+)
+
+
+def _write_flat_adapter(adapter: Path, key: str = FLAT_LORA_KEY) -> Path:
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(json.dumps({"r": 16}), encoding="utf-8")
+    save_file({key: torch.zeros(2, 2)}, str(adapter / "adapter_model.safetensors"))
+    return adapter
 
 
 class FakeSamplingParams:
@@ -241,8 +253,7 @@ class TestDistillSampling:
 
     def test_adapter_enables_lora_only_when_given(self, tmp_path: Path) -> None:
         prompts_path, split_path = _write_prompt_inputs(tmp_path)
-        adapter = tmp_path / "adapter"
-        adapter.mkdir()
+        adapter = _write_flat_adapter(tmp_path / "adapter")
 
         sample_round(
             prompts_path=prompts_path,
@@ -261,7 +272,7 @@ class TestDistillSampling:
 
         engine = FakeSampleLLM.instances[-1]
         assert engine.kwargs["enable_lora"] is True
-        assert engine.lora_request == ("student-9b", 1, str(adapter))
+        assert engine.lora_request == ("student-9b", 1, str(tmp_path / "with-adapter.vllm-adapter"))
 
     def test_completed_batches_survive_an_interrupted_run(self, tmp_path: Path) -> None:
         prompts_path, split_path = _write_prompt_inputs(tmp_path)
@@ -506,3 +517,49 @@ class TestDistillTeacherScoring:
             "mean_student_sampling_logp_minus_teacher_logp"
         ] == pytest.approx(-0.4)
         assert summary["synthetic"]["token_count"] == 3
+
+
+def test_vllm_receives_adapter_with_nested_language_model_names(tmp_path: Path) -> None:
+    prompts_path, split_path = _write_prompt_inputs(tmp_path)
+    adapter = _write_flat_adapter(tmp_path / "adapter")
+    lora_requests: list[tuple[object, ...]] = []
+    sample_round(
+        prompts_path=prompts_path,
+        split_path=split_path,
+        split_side="held_out",
+        output_path=tmp_path / "samples.jsonl",
+        model="student-9b",
+        adapter=adapter,
+        samples_per_prompt=1,
+        max_tokens=16,
+        llm_class=FakeSampleLLM,
+        sampling_params_class=FakeSamplingParams,
+        lora_request_class=lambda *args: lora_requests.append(args) or args,
+        torch_module=FakeTorch(),
+    )
+    served = Path(str(lora_requests[0][2]))
+    assert served != adapter
+    assert list(load_file(str(served / "adapter_model.safetensors"))) == [NESTED_LORA_KEY]
+    assert json.loads((served / "adapter_config.json").read_text(encoding="utf-8")) == {"r": 16}
+
+
+def test_adapter_with_unexpected_key_names_is_refused(tmp_path: Path) -> None:
+    prompts_path, split_path = _write_prompt_inputs(tmp_path)
+    adapter = _write_flat_adapter(
+        tmp_path / "adapter", key="base_model.model.encoder.block.0.lora_A.weight"
+    )
+    with pytest.raises(ValueError, match="unexpected LoRA key"):
+        sample_round(
+            prompts_path=prompts_path,
+            split_path=split_path,
+            split_side="held_out",
+            output_path=tmp_path / "samples.jsonl",
+            model="student-9b",
+            adapter=adapter,
+            samples_per_prompt=1,
+            max_tokens=16,
+            llm_class=FakeSampleLLM,
+            sampling_params_class=FakeSamplingParams,
+            lora_request_class=lambda *args: args,
+            torch_module=FakeTorch(),
+        )

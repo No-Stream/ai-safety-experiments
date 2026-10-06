@@ -23,6 +23,9 @@ WeightMode = Literal["opd", "sft"]
 RATIO_MIN = 0.8
 RATIO_MAX = 1.2
 ADVANTAGE_LIMIT = 5.0
+# At a round's first optimizer step the trainer holds exactly the sampled weights, so ratios sit near
+# 1 up to bf16 noise (~2% clipped measured); more means the sampler served different weights.
+FIRST_STEP_CLIP_FRACTION_LIMIT = 0.05
 SEQUENCE_DIMENSIONS = 2
 
 
@@ -278,6 +281,15 @@ class DistillTrainer(Trainer):
             cast("dict[str, Any]", logs)["student_logprob_correlation"] = correlation
             logs["total_trained_completion_tokens"] = self.total_trained_completion_tokens
             logger.info("distillation step %d: %s", self.state.global_step, logs)
+            if (
+                self.weight_mode == "opd"
+                and self.state.global_step == 1
+                and logs["clip_fraction"] > FIRST_STEP_CLIP_FRACTION_LIMIT
+            ):
+                raise RuntimeError(
+                    f"sampler and trainer disagree at the first step: clip fraction {logs['clip_fraction']:.3f} > "
+                    f"{FIRST_STEP_CLIP_FRACTION_LIMIT}; the sampler served different weights than the trainer loaded"
+                )
             self._metric_sums.clear()
             self._metric_tokens = self._metric_completions = 0
             self._current_logps.clear()

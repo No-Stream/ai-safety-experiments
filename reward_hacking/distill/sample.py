@@ -6,9 +6,12 @@ import argparse
 import hashlib
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
+
+from safetensors.torch import load_file, save_file
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -19,6 +22,10 @@ VLLM_FREE_MEMORY_MARGIN_FRACTION = 0.02
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
 SAMPLE_BATCH_SIZE = 16
 PROBLEM_PAIR_LENGTH = 2
+# The trainer loads the text-only class, so PEFT saves flat layer names; vLLM serves the composite
+# Qwen3.5 class and silently drops adapter weights that do not carry its nested language-model prefix.
+FLAT_LORA_PREFIX = "base_model.model.model.layers."
+NESTED_LORA_PREFIX = "base_model.model.model.language_model.layers."
 
 
 class CudaRuntime(Protocol):
@@ -105,6 +112,28 @@ def token_ids_sha256(prompt_token_ids: Sequence[int], completion_token_ids: Sequ
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_vllm_serving_adapter(adapter: Path, destination: Path) -> Path:
+    """Copy a text-only-trained Qwen3.5 adapter with the layer names vLLM's composite model matches."""
+    tensors = load_file(str(adapter / "adapter_model.safetensors"))
+    unexpected = sorted(key for key in tensors if not key.startswith(FLAT_LORA_PREFIX))
+    if not tensors or unexpected:
+        raise ValueError(
+            f"{adapter}: unexpected LoRA key names (expected {FLAT_LORA_PREFIX}*): {unexpected[:3]}"
+        )
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    shutil.copy(adapter / "adapter_config.json", destination / "adapter_config.json")
+    save_file(
+        {
+            NESTED_LORA_PREFIX + key.removeprefix(FLAT_LORA_PREFIX): value
+            for key, value in tensors.items()
+        },
+        str(destination / "adapter_model.safetensors"),
+    )
+    return destination
 
 
 def content_seed(key: str, prompt_token_ids: Sequence[int], model: str, adapter: str | None) -> int:
@@ -342,7 +371,10 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         if adapter is not None:
             if lora_request_class is None:
                 raise RuntimeError("LoRA adapter sampling requires a vLLM LoRARequest class")
-            lora_request = lora_request_class(model, 1, str(adapter))
+            served_adapter = write_vllm_serving_adapter(
+                adapter, output_path.parent / f"{output_path.stem}.vllm-adapter"
+            )
+            lora_request = lora_request_class(model, 1, str(served_adapter))
 
         logger.info(
             "sampling model=%s adapter=%s split=%s pending=%d batch_size=%d device=%s chat_template_kwargs=%s",

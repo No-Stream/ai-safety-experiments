@@ -353,3 +353,39 @@ def test_initial_adapter_configuration_guard(rank: int, alpha: int, targets: lis
     validate_lora_config(
         LoraConfig(r=16, lora_alpha=32, target_modules=["q_proj", "v_proj"]), ["q_proj", "v_proj"]
     )
+
+
+def test_first_step_refuses_sampler_trainer_mismatch(tmp_path: Path) -> None:
+    model = tiny_model().eval()
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    with torch.no_grad():
+        trainer_logps = completion_logps(model, ids, 2, chunk_tokens=2).flatten().tolist()
+    sampler_logps = [value - 0.5 for value in trainer_logps]
+    row = {
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [3, 4, 5],
+        "student_sampling_logps": sampler_logps,
+        "teacher_logps": trainer_logps,
+    }
+    trainer = DistillTrainer(
+        model=model,
+        train_dataset=[row, row],
+        weight_mode="opd",
+        chunk_tokens=2,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            use_cpu=True,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=2,
+            max_steps=1,
+            learning_rate=0.01,
+            gradient_checkpointing=True,
+            remove_unused_columns=False,
+            save_steps=1,
+            logging_steps=1,
+            report_to="none",
+            disable_tqdm=True,
+        ),
+    )
+    with pytest.raises(RuntimeError, match="sampler and trainer disagree"):
+        trainer.train()
