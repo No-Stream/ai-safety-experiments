@@ -116,6 +116,16 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--samples-per-prompt", type=int, default=2)
     sample.add_argument("--max-tokens", type=int, default=256)
     sample.add_argument("--max-prompts", type=int, help="limit prompts for a smoke")
+    sample.add_argument(
+        "--language-model-only",
+        action="store_true",
+        help="Build vLLM in language-model-only mode (default: off).",
+    )
+    sample.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="Optional vLLM KV cache dtype, such as fp8; omitted keeps the engine default.",
+    )
 
     grade = subparsers.add_parser("grade", help="grade solutions in fresh episode-jail runs")
     _add_common(grade)
@@ -728,6 +738,8 @@ def main(argv: list[str] | None = None) -> int:
             samples_per_prompt=arguments.samples_per_prompt,
             max_tokens=arguments.max_tokens,
             max_prompts=arguments.max_prompts,
+            language_model_only=arguments.language_model_only,
+            kv_cache_dtype=arguments.kv_cache_dtype,
         )
     elif arguments.stage == "grade":
         from reward_hacking.atlas.grading_runtime import grade_models  # noqa: PLC0415

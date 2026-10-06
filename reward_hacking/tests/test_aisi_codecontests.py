@@ -180,6 +180,7 @@ def test_cli_defaults_to_thinking_compatible_completion_budget_and_no_hint() -> 
     assert args.max_tokens == 8192
     assert args.leakage_hint_variant == "none"
     assert args.chat_template_kwargs == {}
+    assert args.language_model_only is False
 
 
 def test_cli_parses_chat_template_kwargs_as_a_json_object() -> None:

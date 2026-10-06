@@ -264,9 +264,11 @@ def test_gemma_sampler_uses_gemma_only_vllm_limits(monkeypatch: pytest.MonkeyPat
             base_model="google/gemma-3-12b-it",
             max_tokens=32,
             temperature=1.0,
+            enable_lora=False,
         )
         assert captured["limit_mm_per_prompt"] == {"image": 0}
-        assert captured["max_lora_rank"] == 64
+        assert "enable_lora" not in captured
+        assert "max_lora_rank" not in captured
         assert captured["max_num_batched_tokens"] == 2048
         assert captured["gpu_memory_utilization"] == pytest.approx(0.48)
         assert captured["quantization"] == "fp8_per_tensor"
@@ -276,14 +278,48 @@ def test_gemma_sampler_uses_gemma_only_vllm_limits(monkeypatch: pytest.MonkeyPat
             base_model=GEMMA_3_BASE_MODEL,
             max_tokens=32,
             temperature=1.0,
+            enable_lora=False,
             weight_quantization="none",
+            language_model_only=True,
             kv_cache_dtype="fp8",
         )
     finally:
         monkeypatch.setattr(torch, "cuda", original_cuda)
 
     assert "quantization" not in captured
+    assert "enable_lora" not in captured
+    assert captured["language_model_only"] is True
     assert captured["kv_cache_dtype"] == "fp8"
+
+
+def test_aisi_sampler_adds_lora_engine_settings_only_for_adapter_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    fake_vllm = types.SimpleNamespace(LLM=FakeLLM)
+    fake_transformers = types.SimpleNamespace(
+        AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda _: object())
+    )
+    monkeypatch.setattr(
+        "reward_hacking.organisms.aisi_codecontests.importlib.import_module",
+        lambda name: {"vllm": fake_vllm, "transformers": fake_transformers}[name],
+    )
+
+    VLLMCompletionSampler(
+        base_model=BASE_MODEL,
+        max_tokens=32,
+        temperature=1.0,
+        enable_lora=True,
+    )
+
+    assert captured["enable_lora"] is True
+    assert captured["max_lora_rank"] == 32
+    assert captured["max_loras"] == 1
 
 
 def test_aisi_parser_exposes_weight_and_kv_cache_quantization_options() -> None:
@@ -293,12 +329,14 @@ def test_aisi_parser_exposes_weight_and_kv_cache_quantization_options() -> None:
             "synthetic-run",
             "--weight-quantization",
             "fp8",
+            "--language-model-only",
             "--kv-cache-dtype",
             "fp8",
         ]
     )
 
     assert args.weight_quantization == "fp8"
+    assert args.language_model_only is True
     assert args.kv_cache_dtype == "fp8"
 
 
@@ -319,6 +357,7 @@ def test_aisi_run_identity_records_effective_quantization_without_prompt_text() 
         kv_cache_dtype="fp8",
         leakage_hint=load_leakage_hint("aisi_codecontests", "none"),
         chat_template_kwargs={},
+        language_model_only=True,
     )
 
     engine_identity = identity["engine"]
@@ -326,18 +365,36 @@ def test_aisi_run_identity_records_effective_quantization_without_prompt_text() 
     assert engine_identity["max_model_len"] == aisi_codecontests.AISI_MAX_PROMPT_TOKENS + 64
     assert engine_identity["quantization"] == "fp8_per_tensor"
     assert engine_identity["kv_cache_dtype"] == "fp8"
+    assert engine_identity["enable_lora"] is True
+    assert engine_identity["max_lora_rank"] == 64
+    assert engine_identity["language_model_only"] is True
     assert "prompt_text" not in identity
 
 
 def test_aisi_run_identity_prevents_cross_configuration_resume(tmp_path: Path) -> None:
-    run_identity = {"quantization": "fp8_per_tensor", "kv_cache_dtype": None}
+    def identity_for(language_model_only: bool) -> dict[str, object]:
+        return aisi_codecontests.build_run_identity(
+            base_model=BASE_MODEL,
+            models=(aisi_codecontests.ModelSpec(BASE_MODEL, None),),
+            samples_per_problem=1,
+            max_tokens=64,
+            temperature=1.0,
+            quantization=None,
+            kv_cache_dtype=None,
+            leakage_hint=load_leakage_hint("aisi_codecontests", "none"),
+            chat_template_kwargs={},
+            language_model_only=language_model_only,
+        )
+
+    run_identity = identity_for(False)
+    engine_identity = run_identity["engine"]
+    assert isinstance(engine_identity, dict)
+    assert engine_identity["enable_lora"] is False
+    assert engine_identity["max_lora_rank"] is None
     aisi_codecontests.write_run_identity(tmp_path, run_identity)
 
     with pytest.raises(ValueError, match="different configuration"):
-        aisi_codecontests.write_run_identity(
-            tmp_path,
-            {"quantization": None, "kv_cache_dtype": None},
-        )
+        aisi_codecontests.write_run_identity(tmp_path, identity_for(True))
 
 
 def test_aisi_legacy_samples_without_identity_are_not_extended(tmp_path: Path) -> None:
@@ -401,7 +458,7 @@ def test_olmo_prompt_rendering_keeps_the_existing_chatml_bytes() -> None:
     assert tokenizer.calls == [(False, True)]
 
 
-def test_olmo_sampler_engine_arguments_remain_byte_for_byte_compatible(
+def test_olmo_base_sampler_engine_arguments_omit_lora_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -419,14 +476,11 @@ def test_olmo_sampler_engine_arguments_remain_byte_for_byte_compatible(
         lambda name: {"vllm": fake_vllm, "transformers": fake_transformers}[name],
     )
 
-    VLLMCompletionSampler(base_model=BASE_MODEL, max_tokens=32, temperature=1.0)
+    VLLMCompletionSampler(base_model=BASE_MODEL, max_tokens=32, temperature=1.0, enable_lora=False)
 
     assert captured == {
         "model": BASE_MODEL,
         "tensor_parallel_size": 1,
-        "enable_lora": True,
-        "max_lora_rank": 32,
-        "max_loras": 1,
         "max_model_len": 4096 + 32,
     }
 

@@ -385,12 +385,16 @@ def build_probe_backend(
             chat_template_kwargs=args.chat_template_kwargs,
         )
         # An engine kwarg, not a SamplingConfig field: unrecorded, fp8 reads as the bf16 anchor.
-        return backend, {
+        sampler: dict[str, object] = {
             "backend": kind,
             "sampled": True,
             "quantization": args.vllm_quantization,
             **asdict(local_sampling),
         }
+        if kind == "vllm":
+            sampler["language_model_only"] = bool(args.language_model_only)
+            sampler["kv_cache_dtype"] = args.kv_cache_dtype
+        return backend, sampler
     if kind == "bedrock":
         sampling = resolve_probe_bedrock_sampling(
             model_id,

@@ -1452,6 +1452,57 @@ class TestSamplingResolution:
         _, sampler = build_probe_backend(args, "mock-model")
         assert sampler["quantization"] == "fp8"
 
+    def test_vllm_engine_flags_reach_engine_kwargs_and_sampler_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args = probe_args(
+            "--backend",
+            "vllm",
+            "--thinking",
+            "--language-model-only",
+            "--kv-cache-dtype",
+            "fp8",
+        )
+        captured: dict[str, object] = {}
+
+        def build_backend(*backend_args: object, **kwargs: object) -> MockBackend:
+            del backend_args
+            captured.update(kwargs)
+            return MockBackend(mock_probe_response, model_id="mock-model")
+
+        monkeypatch.setattr("reward_hacking.backend_cli.build_backend", build_backend)
+
+        _, sampler = build_probe_backend(args, "mock-model")
+
+        assert captured["language_model_only"] is True
+        assert captured["kv_cache_dtype"] == "fp8"
+        assert "enable_lora" not in captured
+        assert "max_lora_rank" not in captured
+        assert sampler["language_model_only"] is True
+        assert sampler["kv_cache_dtype"] == "fp8"
+
+    def test_vllm_sampler_records_default_engine_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        args = probe_args("--backend", "vllm", "--thinking")
+        captured: dict[str, object] = {}
+
+        def build_backend(*backend_args: object, **kwargs: object) -> MockBackend:
+            del backend_args
+            captured.update(kwargs)
+            return MockBackend(mock_probe_response, model_id="mock-model")
+
+        monkeypatch.setattr("reward_hacking.backend_cli.build_backend", build_backend)
+
+        _, sampler = build_probe_backend(args, "mock-model")
+
+        assert "language_model_only" not in captured
+        assert "kv_cache_dtype" not in captured
+        assert "enable_lora" not in captured
+        assert "max_lora_rank" not in captured
+        assert sampler["language_model_only"] is False
+        assert sampler["kv_cache_dtype"] is None
+
     def test_local_sampler_records_the_requested_thinking_cap(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -2936,6 +2987,34 @@ class TestLiveResumeReadsBackOnlyThisRunsFinishedCells:
         write_trace(records_path, [record.to_json_dict() for record in records])
         relaunch = _context(sampler={**base, **asdict(BedrockSamplingConfig(max_tokens=65))})
         with pytest.raises(ValueError, match=r"refusing to resume.*sampler=.*'max_tokens': 64"):
+            load_resumable_cells(records_path, inputs, context=relaunch, cells=PROBE_CELLS)
+
+    def test_vllm_engine_settings_are_pinned_by_the_live_resume_identity(self, tmp_path: Path):
+        base = {
+            "backend": "vllm",
+            "sampled": True,
+            "quantization": None,
+            **asdict(SamplingConfig.for_thinking(thinking=True)),
+            "language_model_only": False,
+            "kv_cache_dtype": None,
+        }
+        written = _context(sampler=base)
+        inputs = cell_inputs_by_label(paired_problems(["lcbhard_901"]))
+        the_cell = PROBE_CELLS[0]
+        records = build_cell_records(
+            list(inputs[the_cell.label].problems),
+            [response(completion_with_solution())],
+            cell=the_cell,
+            context=written,
+            grade=grade_pass_oneoff_fail_original,
+        )
+        records_path = tmp_path / "probe-summary-records.jsonl"
+        write_trace(records_path, [record.to_json_dict() for record in records])
+        relaunch = _context(sampler={**base, "language_model_only": True, "kv_cache_dtype": "fp8"})
+
+        with pytest.raises(
+            ValueError, match=r"refusing to resume.*sampler=.*'language_model_only': False"
+        ):
             load_resumable_cells(records_path, inputs, context=relaunch, cells=PROBE_CELLS)
 
     def test_a_doubled_coordinate_beside_a_missing_one_is_refused_despite_the_right_count(

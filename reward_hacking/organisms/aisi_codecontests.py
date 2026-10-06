@@ -183,8 +183,10 @@ def build_run_identity(  # noqa: PLR0913 - independent run settings define resum
     kv_cache_dtype: str | None,
     leakage_hint: LeakageHint,
     chat_template_kwargs: Mapping[str, object],
+    language_model_only: bool = False,
 ) -> dict[str, object]:
     """Return safe run settings that must match before records can be resumed."""
+    enable_lora = any(model.adapter_id is not None for model in models)
     return {
         "schema_version": 2,
         "stage": "aisi_codecontests_screen",
@@ -202,13 +204,20 @@ def build_run_identity(  # noqa: PLR0913 - independent run settings define resum
         },
         "engine": {
             "max_model_len": AISI_MAX_PROMPT_TOKENS + max_tokens,
-            "max_lora_rank": GEMMA_MAX_LORA_RANK if base_model == GEMMA_3_BASE_MODEL else 32,
+            "enable_lora": enable_lora,
+            "max_lora_rank": (
+                (GEMMA_MAX_LORA_RANK if base_model == GEMMA_3_BASE_MODEL else 32)
+                if enable_lora
+                else None
+            ),
+            "max_loras": 1 if enable_lora else None,
             "max_num_batched_tokens": GEMMA_MAX_NUM_BATCHED_TOKENS
             if base_model == GEMMA_3_BASE_MODEL
             else None,
             "limit_mm_per_prompt": {"image": 0} if base_model == GEMMA_3_BASE_MODEL else None,
             "quantization": quantization,
             "kv_cache_dtype": kv_cache_dtype,
+            "language_model_only": language_model_only,
         },
     }
 
@@ -587,26 +596,30 @@ def _render_chat_prompt(
 
 
 class VLLMCompletionSampler:
-    """One vLLM engine serving the base plus one LoRA request per adapter arm."""
+    """One vLLM engine serving the selected base model and any requested adapter arms."""
 
-    def __init__(  # noqa: C901, PLR0913 - explicit engine controls map directly to vLLM
+    def __init__(  # noqa: C901, PLR0912, PLR0913 - explicit engine controls map directly to vLLM
         self,
         *,
         base_model: str,
         max_tokens: int,
         temperature: float,
+        enable_lora: bool,
         max_lora_rank: int | None = None,
         weight_quantization: WeightQuantizationChoice | None = None,
         kv_cache_dtype: str | None = None,
+        language_model_only: bool = False,
         chat_template_kwargs: Mapping[str, object] | None = None,
     ) -> None:
-        """Load one vLLM engine with LoRA support, keeping optional imports lazy."""
+        """Load one vLLM engine with only the requested adapter and cache controls."""
         if max_tokens < 1:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}")
         if temperature < 0:
             raise ValueError(f"temperature must be non-negative, got {temperature}")
         if max_lora_rank is not None and max_lora_rank < 1:
             raise ValueError(f"max_lora_rank must be positive, got {max_lora_rank}")
+        if not enable_lora and max_lora_rank is not None:
+            raise ValueError("max_lora_rank requires an adapter in the selected model set")
         if kv_cache_dtype == "":
             raise ValueError("kv_cache_dtype must be non-empty when supplied")
         try:
@@ -619,6 +632,7 @@ class VLLMCompletionSampler:
             ) from error
         self._vllm = vllm
         self._base_model = base_model
+        self._enable_lora = enable_lora
         self._max_tokens = max_tokens
         self._temperature = temperature
         self._chat_template_kwargs = dict(chat_template_kwargs or {})
@@ -634,13 +648,18 @@ class VLLMCompletionSampler:
         engine_kwargs: dict[str, Any] = {
             "model": base_model,
             "tensor_parallel_size": 1,
-            "enable_lora": True,
-            "max_lora_rank": (
-                base_settings.max_lora_rank if max_lora_rank is None else max_lora_rank
-            ),
-            "max_loras": 1,
             "max_model_len": AISI_MAX_PROMPT_TOKENS + max_tokens,
         }
+        if enable_lora:
+            engine_kwargs.update(
+                {
+                    "enable_lora": True,
+                    "max_lora_rank": (
+                        base_settings.max_lora_rank if max_lora_rank is None else max_lora_rank
+                    ),
+                    "max_loras": 1,
+                }
+            )
         if base_settings.max_num_batched_tokens is not None:
             engine_kwargs["max_num_batched_tokens"] = base_settings.max_num_batched_tokens
         if base_settings.limit_mm_per_prompt is not None:
@@ -651,6 +670,8 @@ class VLLMCompletionSampler:
             engine_kwargs["quantization"] = quantization
         if kv_cache_dtype is not None:
             engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+        if language_model_only:
+            engine_kwargs["language_model_only"] = True
         # Without a cap vLLM sizes for OLMo-3's 65K context, which needs more KV cache than the card has.
         self._engine = vllm.LLM(**engine_kwargs)
 
@@ -675,6 +696,10 @@ class VLLMCompletionSampler:
             )
         lora_request = None
         if model.adapter_id is not None:
+            if not self._enable_lora:
+                raise RuntimeError(
+                    "the selected sampler was built without LoRA for an adapter model"
+                )
             lora_module = importlib.import_module("vllm.lora.request")
             adapter_path = self._resolve_adapter_path(model.adapter_id)
             lora_request = lora_module.LoRARequest(
@@ -945,6 +970,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional vLLM KV cache dtype, such as fp8; omitted keeps the engine default.",
     )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        help="Build vLLM in language-model-only mode (default: off).",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--jail-timeout-seconds", type=int, default=10)
     parser.add_argument("--grade-workers", type=int, default=DEFAULT_GRADE_WORKERS)
@@ -983,6 +1013,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not problems:
         raise RuntimeError("the AISI filter produced no CodeContests problems")
     specs = model_specs(selected_models, args.base_model)
+    enable_lora = any(model.adapter_id is not None for model in specs)
     quantization = resolve_weight_quantization(args.base_model, args.weight_quantization)
     run_dir = args.output_root / args.run_name
     write_run_identity(
@@ -997,14 +1028,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             kv_cache_dtype=args.kv_cache_dtype,
             leakage_hint=leakage_hint,
             chat_template_kwargs=args.chat_template_kwargs,
+            language_model_only=args.language_model_only,
         ),
     )
     sampler = VLLMCompletionSampler(
         base_model=args.base_model,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        enable_lora=enable_lora,
         weight_quantization=args.weight_quantization,
         kv_cache_dtype=args.kv_cache_dtype,
+        language_model_only=args.language_model_only,
         chat_template_kwargs=args.chat_template_kwargs,
     )
     summary = run_screen(

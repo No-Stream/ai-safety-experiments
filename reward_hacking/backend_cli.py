@@ -175,6 +175,24 @@ _KNOBS: tuple[_Knob, ...] = (
         ),
     ),
     _Knob(
+        dest="language_model_only",
+        flag="--language-model-only",
+        kinds=frozenset({"vllm"}),
+        why=(
+            "This is an in-process vLLM model-loading option. The HF and HTTP backends load or "
+            "serve their own architecture settings, so they cannot honor it."
+        ),
+    ),
+    _Knob(
+        dest="kv_cache_dtype",
+        flag="--kv-cache-dtype",
+        kinds=frozenset({"vllm"}),
+        why=(
+            "This selects the in-process vLLM KV-cache dtype. The HF backend has no vLLM cache, "
+            "and the HTTP backend's server owns its cache configuration."
+        ),
+    ),
+    _Knob(
         dest="vllm_gpu_memory_utilization",
         flag="--vllm-gpu-memory-utilization",
         kinds=frozenset({"vllm"}),
@@ -384,6 +402,17 @@ def add_backend_args(parser: argparse.ArgumentParser, *, default: str = "hf") ->
             "run whose absolute levels will be compared against a bf16 run. Recorded in the trace "
             "meta so an fp8 artifact can never read as a bf16 measurement."
         ),
+    )
+    parser.add_argument(
+        "--language-model-only",
+        action="store_true",
+        default=None,
+        help="Load only the language model in the in-process vLLM backend (default: off).",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        default=None,
+        help="Optional in-process vLLM KV cache dtype, such as fp8; omitted keeps auto.",
     )
     parser.add_argument(
         "--vllm-gpu-memory-utilization",
@@ -637,6 +666,7 @@ def _vllm_http_backend_from_args(
             "dtype",
             "enable_lora",
             "language_model_only",
+            "kv_cache_dtype",
             "lora_adapter",
             "lora_target_modules",
             "max_lora_rank",
@@ -710,11 +740,14 @@ def backend_from_args(  # noqa: C901, PLR0913 - one branch per transport and its
             chat_template_kwargs=chat_template_kwargs,
         )
     if kind in LOCAL_KINDS:
-        # Of the CLI knobs only the --vllm-* flags are engine kwargs, and the registry above has
-        # already refused them on every other kind; a caller's extra_kwargs join them here.
+        # Engine flags are refused on other backend kinds above; derived adapter kwargs join them here.
         engine_kwargs: dict[str, object] = dict(extra_kwargs or {})
         if kind == "vllm" and args.vllm_quantization is not None:
             engine_kwargs["quantization"] = args.vllm_quantization
+        if kind == "vllm" and args.language_model_only:
+            engine_kwargs["language_model_only"] = True
+        if kind == "vllm" and args.kv_cache_dtype is not None:
+            engine_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
         if kind == "vllm" and args.vllm_gpu_memory_utilization is not None:
             engine_kwargs["gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
         if kind == "vllm" and args.vllm_max_model_len is not None:

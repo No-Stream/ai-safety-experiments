@@ -1264,13 +1264,24 @@ class TestServingFromASnapshotDirectory:
             sampling=_sampling_base(),
             model_path=tmp_path / "snap",
             language_model_only=True,
+            kv_cache_dtype="fp8",
             max_model_len=32768,
         )
         assert backend.model_id == "allenai/tmax-4b@step_300"
         assert tokenizer_loads == [str(tmp_path / "snap")]
         assert built == [
-            {"model": str(tmp_path / "snap"), "language_model_only": True, "max_model_len": 32768}
+            {
+                "model": str(tmp_path / "snap"),
+                "language_model_only": True,
+                "kv_cache_dtype": "fp8",
+                "max_model_len": 32768,
+            }
         ]
+        assert backend.engine_settings == {
+            "language_model_only": True,
+            "kv_cache_dtype": "fp8",
+            "max_model_len": 32768,
+        }
 
 
 # --- the end-of-turn stop set, pinned by name on every served unit ------------------------------------

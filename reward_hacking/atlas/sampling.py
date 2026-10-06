@@ -526,6 +526,63 @@ def _gpu_engine_settings(torch: ModuleType) -> tuple[float, str]:
     return utilization, device_name
 
 
+def _build_vllm_engine_kwargs(  # noqa: PLR0913 - independent vLLM engine controls
+    *,
+    model_id: str,
+    base_model: str,
+    gpu_memory_utilization: float,
+    max_model_len: int,
+    adapter_path: Path | None,
+    language_model_only: bool,
+    kv_cache_dtype: str | None,
+) -> dict[str, Any]:
+    """Build the sampler's vLLM kwargs, enabling adapter controls only when an adapter is loaded."""
+    if kv_cache_dtype == "":
+        raise ValueError("kv_cache_dtype must be non-empty when supplied")
+    engine_kwargs: dict[str, Any] = {
+        "model": model_id,
+        "tensor_parallel_size": 1,
+        "dtype": "bfloat16",
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "max_model_len": max_model_len,
+        "max_num_seqs": VLLM_MAX_NUM_SEQS,
+        "max_num_batched_tokens": VLLM_MAX_NUM_BATCHED_TOKENS,
+    }
+    if adapter_path is not None:
+        engine_kwargs.update(
+            {
+                "enable_lora": True,
+                "max_lora_rank": MAX_LORA_RANK,
+                "max_loras": 1,
+                "max_cpu_loras": 1,
+            }
+        )
+    if "gemma" in base_model.lower():
+        engine_kwargs["limit_mm_per_prompt"] = {"image": 0}
+    if language_model_only:
+        engine_kwargs["language_model_only"] = True
+    if kv_cache_dtype is not None:
+        engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+    return engine_kwargs
+
+
+def _sampling_engine_identity(
+    *,
+    adapter_requested: bool,
+    language_model_only: bool,
+    kv_cache_dtype: str | None,
+) -> dict[str, object]:
+    """Describe the vLLM settings that must stay fixed across a sampling resume."""
+    return {
+        "enable_lora": adapter_requested,
+        "max_lora_rank": MAX_LORA_RANK if adapter_requested else None,
+        "max_loras": 1 if adapter_requested else None,
+        "max_cpu_loras": 1 if adapter_requested else None,
+        "language_model_only": language_model_only,
+        "kv_cache_dtype": kv_cache_dtype,
+    }
+
+
 def gpu_engine_settings(torch: ModuleType) -> tuple[float, str]:
     """Derive and log vLLM's GPU setting from currently free VRAM."""
     return _gpu_engine_settings(torch)
@@ -555,6 +612,8 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
     samples_per_prompt: int = DEFAULT_SAMPLES_PER_PROMPT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     max_prompts: int | None = None,
+    language_model_only: bool = False,
+    kv_cache_dtype: str | None = None,
 ) -> Path:
     """Sample one model key, resuming by ``sample_id`` and preserving exact token ids."""
     import torch  # noqa: PLC0415
@@ -587,6 +646,11 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
         "base_model": base_model,
         "model_id": model_id,
         "adapter_id": adapter_id,
+        "engine": _sampling_engine_identity(
+            adapter_requested=adapter_id is not None,
+            language_model_only=language_model_only,
+            kv_cache_dtype=kv_cache_dtype,
+        ),
         "prompt_file_sha256": _file_digest(prompt_path),
         "samples_per_prompt": samples_per_prompt,
         **prompt_options_identity,
@@ -625,26 +689,17 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
 
     if pending:
         gpu_memory_utilization, device_name = _gpu_engine_settings(torch)
-        engine_kwargs: dict[str, Any] = {
-            "model": model_id,
-            "tensor_parallel_size": 1,
-            "dtype": "bfloat16",
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "max_model_len": max_prompt_length + sampling.max_new_tokens,
-            "enable_lora": True,
-            "max_lora_rank": MAX_LORA_RANK,
-            "max_loras": 1,
-            "max_cpu_loras": 1,
-            "max_num_seqs": VLLM_MAX_NUM_SEQS,
-            "max_num_batched_tokens": VLLM_MAX_NUM_BATCHED_TOKENS,
-        }
-        if "gemma" in base_model.lower():
-            # The Atlas Gemma adapter is language-only; keep its image tower off the card.
-            engine_kwargs["limit_mm_per_prompt"] = {"image": 0}
-        engine = LLM(
-            **engine_kwargs,
-        )
         adapter_path = language_adapter_for(model_key, run_dir, base_model=base_model)
+        engine_kwargs = _build_vllm_engine_kwargs(
+            model_id=model_id,
+            base_model=base_model,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_prompt_length + sampling.max_new_tokens,
+            adapter_path=adapter_path,
+            language_model_only=language_model_only,
+            kv_cache_dtype=kv_cache_dtype,
+        )
+        engine = LLM(**engine_kwargs)
         lora_request = (
             None if adapter_path is None else LoRARequest(model_key, 1, str(adapter_path))
         )
@@ -694,6 +749,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
                 "model_id": model_id,
                 "adapter_id": adapter_id,
                 "adapter_language_only": adapter_id is not None,
+                "engine": identity["engine"],
                 "item_id": str(prompt_record["item_id"]),
                 "source": str(prompt_record["source"]),
                 "split": str(prompt_record["split"]),
@@ -724,6 +780,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
                 "adapter_id": adapter_id,
                 "adapter_language_only": adapter_id is not None,
                 "gpu_memory_utilization": gpu_memory_utilization,
+                "engine": identity["engine"],
                 "device": device_name,
                 **prompt_options_identity,
                 "sampling": identity["sampling"],
@@ -744,6 +801,8 @@ def sample_models(  # noqa: PLR0913
     samples_per_prompt: int = DEFAULT_SAMPLES_PER_PROMPT,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     max_prompts: int | None = None,
+    language_model_only: bool = False,
+    kv_cache_dtype: str | None = None,
 ) -> list[Path]:
     """Run models sequentially so only one vLLM engine occupies the GPU at a time."""
     if len(set(model_keys)) != len(model_keys):
@@ -760,6 +819,8 @@ def sample_models(  # noqa: PLR0913
             samples_per_prompt=samples_per_prompt,
             max_tokens=max_tokens,
             max_prompts=max_prompts,
+            language_model_only=language_model_only,
+            kv_cache_dtype=kv_cache_dtype,
         )
         for model_key in model_keys
     ]
