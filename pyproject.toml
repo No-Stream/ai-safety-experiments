@@ -115,6 +115,8 @@ ignore = [
 # and letting `--fix` modernise one file there would leave syntax basedpyright rejects at 3.8.
 # tests/test_interpreter_compat.py is the real guard; it compiles each script under the interpreter
 # that actually runs it, catching 3.10+ syntax no linter introduced.
+# This CLI uses explicit allowlisted paths and fixed tool argv; subprocesses never use a shell.
+"scripts/disk_reaper.py" = ["UP", "INP001", "S603", "S607", "S108"]
 "scripts/gpu_preflight.py" = ["UP", "INP001"]
 "scripts/jail_assertions.py" = ["UP", "INP001"]
 "scripts/canary_manifest.py" = ["UP", "INP001"]

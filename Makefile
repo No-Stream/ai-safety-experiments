@@ -13,7 +13,7 @@ RUFF := $(UV) ruff
 # tests/test_interpreter_compat.py is what keeps the scripts that run under it 3.9-clean.
 SYSTEM_PYTHON := /usr/bin/python3
 
-.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test canary-check canary-update privacy-scan tmp-check clean
+.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply
 
 setup: hooks
 	uv sync --frozen
@@ -390,3 +390,11 @@ throughput-sweep:
 clean:
 	rm -rf .pytest_cache .ruff_cache
 	find . -name __pycache__ -type d -not -path './.venv/*' -prune -exec rm -rf {} +
+
+DISK_REAP_ARGS ?=
+
+disk-reap:
+	$(SYSTEM_PYTHON) scripts/disk_reaper.py $(DISK_REAP_ARGS)
+
+disk-reap-apply:
+	$(SYSTEM_PYTHON) scripts/disk_reaper.py --apply $(DISK_REAP_ARGS)

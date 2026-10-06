@@ -385,6 +385,8 @@ Several agent sessions share this box, so filling the disk, `/tmp` or the CPU st
 - `/tmp` is a RAM-backed tmpfs with an inode cap; keep scratch out of it. `make tmp-check` shows
   usage. Fix a full `/tmp` by freeing inodes, never by moving episode or test scratch into the home
   tree (`assert_disposable_episode_dir` in `reward_hacking/harness/loop.py` refuses that on purpose).
+- Mark smoke/plumbing run directories with an empty `.disposable` file when creating them.
+  `make disk-reap` lists proposed cleanup; `.keep` protects a directory and its descendants.
 - Heavy local work goes through `scripts/resource-limits.sh`.
 - **Delete what you created** when the work ends (venvs, checkouts, composed trees, test scratch).
   Name anything you could not delete in your final report. Large artifacts belong in S3.

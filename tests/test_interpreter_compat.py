@@ -47,6 +47,7 @@ SYSTEM_PYTHON_SCRIPTS = [
     "scripts/canary_manifest.py",
     "scripts/scan_secrets.py",
     "scripts/git_precommit_scan.py",
+    "scripts/disk_reaper.py",
 ]
 
 JAIL_PYTHON_SCRIPTS = ["scripts/jail_assertions.py"]
