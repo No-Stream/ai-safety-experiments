@@ -93,10 +93,15 @@ Code is cheap, experiments are expensive. Maximise ideas tested per unit of GPU 
 - Never spend an experiment on what reading source, docs or literature would settle.
 - Before any run, ask what else it can measure for free. Batch the questions, not the runs.
 - Parallelise authorship; serialise only on results.
-- Trim long rollouts before reaching for more compute: 8K-12K completion caps, repetition and
-  presence penalties, a lower reasoning budget. A 32K cap is a deliberate choice after a shorter one
-  proved insufficient. Batched offline inference beats another RL arm whenever the question can be
-  asked of samples.
+- Default to terse responses and low thinking from every model we run (lowest reasoning-effort
+  setting, a thinking-token budget, instructions to be brief) unless the experiment specifically
+  needs long reasoning; low thinking usually shows the trend sooner. Shorter outputs also free memory
+  for more parallel sequences, which can matter more than the token savings. Consider this for every
+  experiment, and get creative about it.
+- Trim long rollouts before reaching for more compute: 8K-12K completion caps, a lower reasoning
+  budget, and presence or repetition penalties only against repetition loops (Qwen recommends no
+  presence penalty for coding in thinking mode). A 32K cap is a deliberate choice after a shorter one proved insufficient.
+  Batched offline inference beats another RL arm whenever the question can be asked of samples.
 - Before optimizing anything hot, read the ranked hot-path backlog in `docs/scratch`. Each row has a
   semantics grade: *bit* (identical outputs), *stat* (same expected result), *design* (changes what
   is measured; waits on the owner).
