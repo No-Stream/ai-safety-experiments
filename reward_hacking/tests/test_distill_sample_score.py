@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from reward_hacking.distill.sample import content_seed, sample_round, token_ids_sha256
-from reward_hacking.distill.score import compute_kl_summary, score_round
+from reward_hacking.distill.score import (
+    MAX_NUM_BATCHED_TOKENS,
+    compute_kl_summary,
+    prompt_logprob_headroom_bytes,
+    score_round,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -324,6 +329,9 @@ class TestDistillTeacherScoring:
             samples_path=samples_path,
             output_path=output_path,
             model="teacher-27b",
+            language_model_only=True,
+            kv_cache_dtype="fp8",
+            max_num_seqs=2,
             llm_class=FakeScoreLLM,
             sampling_params_class=FakeSamplingParams,
             torch_module=FakeTorch(),
@@ -339,6 +347,9 @@ class TestDistillTeacherScoring:
             "temperature": 1.0,
             "prompt_logprobs": 4,
         }
+        assert FakeScoreLLM.instances[0].kwargs["language_model_only"] is True
+        assert FakeScoreLLM.instances[0].kwargs["kv_cache_dtype"] == "fp8"
+        assert FakeScoreLLM.instances[0].kwargs["max_num_seqs"] == 2
         resumed = score_round(
             samples_path=samples_path,
             output_path=output_path,
@@ -349,6 +360,71 @@ class TestDistillTeacherScoring:
         )
         assert resumed.generated_count == 0
         assert resumed.resumed_count == 1
+
+    def test_engine_options_are_omitted_by_default(self, tmp_path: Path) -> None:
+        prompts_path, split_path = _write_prompt_inputs(tmp_path)
+        samples_path = tmp_path / "samples.jsonl"
+        sample_round(
+            prompts_path=prompts_path,
+            split_path=split_path,
+            split_side="train",
+            output_path=samples_path,
+            model="base-9b",
+            samples_per_prompt=1,
+            max_tokens=16,
+            llm_class=FakeSampleLLM,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
+
+        score_round(
+            samples_path=samples_path,
+            output_path=tmp_path / "teacher.jsonl",
+            model="teacher-27b",
+            llm_class=FakeScoreLLM,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
+
+        engine_kwargs = FakeScoreLLM.instances[0].kwargs
+        assert "language_model_only" not in engine_kwargs
+        assert "kv_cache_dtype" not in engine_kwargs
+        assert "max_num_seqs" not in engine_kwargs
+
+    def test_scorer_reserves_prompt_logprob_headroom_outside_vllm_budget(
+        self, tmp_path: Path
+    ) -> None:
+        prompts_path, split_path = _write_prompt_inputs(tmp_path)
+        samples_path = tmp_path / "samples.jsonl"
+        sample_round(
+            prompts_path=prompts_path,
+            split_path=split_path,
+            split_side="train",
+            output_path=samples_path,
+            model="base-9b",
+            samples_per_prompt=1,
+            max_tokens=16,
+            llm_class=FakeSampleLLM,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
+        sampler_utilization = FakeSampleLLM.instances[-1].kwargs["gpu_memory_utilization"]
+
+        score_round(
+            samples_path=samples_path,
+            output_path=tmp_path / "teacher.jsonl",
+            model="teacher-27b",
+            llm_class=FakeScoreLLM,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
+
+        engine_kwargs = FakeScoreLLM.instances[-1].kwargs
+        headroom_fraction = prompt_logprob_headroom_bytes() / 10_000_000_000
+        assert engine_kwargs["max_num_batched_tokens"] == MAX_NUM_BATCHED_TOKENS
+        assert engine_kwargs["gpu_memory_utilization"] == pytest.approx(
+            sampler_utilization - headroom_fraction
+        )
 
     def test_resume_refuses_changed_token_ids(self, tmp_path: Path) -> None:
         prompts_path, split_path = _write_prompt_inputs(tmp_path)

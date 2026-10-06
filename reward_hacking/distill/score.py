@@ -23,9 +23,18 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 DEFAULT_TEACHER_MODEL_ID = "RedHatAI/Qwen3.8-27B-INT4"
 TOP_K = 4
-MAX_NUM_BATCHED_TOKENS = 2048
+MAX_NUM_BATCHED_TOKENS = 1024
+# Qwen3.5/3.8 padded vocabulary; vLLM materialises a full-vocab row per prefill position for prompt logprobs.
+PADDED_VOCAB_SIZE = 248_320
+# fp32 logits, fp32 log_softmax output and one fp32 softmax intermediate per vocab entry.
+PROMPT_LOGPROB_BYTES_PER_VOCAB_ENTRY = 12
 MODEL_LENGTH_MULTIPLE = 32768
 SCORE_BATCH_SIZE = 4
+
+
+def prompt_logprob_headroom_bytes() -> int:
+    """VRAM vLLM's profiling pass never reserves: prompt-logprob tensors for one prefill chunk."""
+    return MAX_NUM_BATCHED_TOKENS * PADDED_VOCAB_SIZE * PROMPT_LOGPROB_BYTES_PER_VOCAB_ENTRY
 
 
 class TeacherLogprob(Protocol):
@@ -138,11 +147,16 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     samples_path: Path,
     output_path: Path,
     model: str = DEFAULT_TEACHER_MODEL_ID,
+    language_model_only: bool = False,
+    kv_cache_dtype: str | None = None,
+    max_num_seqs: int | None = None,
     llm_class: Callable[..., object] | None = None,
     sampling_params_class: Callable[..., object] | None = None,
     torch_module: TorchRuntime | None = None,
 ) -> ScoreResult:
     """Score every unscored sample and append one teacher record per completed key."""
+    if max_num_seqs is not None and max_num_seqs < 1:
+        raise ValueError("max_num_seqs must be positive")
     sample_rows = _read_jsonl(samples_path)
     samples_by_key: dict[str, dict[str, Any]] = {}
     for row in sample_rows:
@@ -192,7 +206,13 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
 
             torch_module = cast("TorchRuntime", torch)
 
-        gpu_memory_utilization, device_name = resolve_gpu_engine_settings(torch_module)
+        sampler_utilization, device_name = resolve_gpu_engine_settings(torch_module)
+        _, total_bytes = torch_module.cuda.mem_get_info(int(torch_module.cuda.current_device()))
+        gpu_memory_utilization = sampler_utilization - prompt_logprob_headroom_bytes() / total_bytes
+        if gpu_memory_utilization <= 0:
+            raise RuntimeError(
+                f"free VRAM leaves no room for prompt-logprob headroom: {gpu_memory_utilization=:.4f}"
+            )
         prompt_token_sequences = [
             _token_ids(row, "prompt_token_ids", str(row["key"]))
             + _token_ids(row, "completion_token_ids", str(row["key"]))
@@ -202,16 +222,20 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         max_model_len = (
             math.ceil((longest_sequence_length + 1) / MODEL_LENGTH_MULTIPLE) * MODEL_LENGTH_MULTIPLE
         )
-        engine = cast(
-            "TeacherScoringEngine",
-            llm_class(
-                model=model,
-                tensor_parallel_size=1,
-                gpu_memory_utilization=gpu_memory_utilization,
-                max_model_len=max_model_len,
-                max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-            ),
-        )
+        engine_kwargs: dict[str, object] = {
+            "model": model,
+            "tensor_parallel_size": 1,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "max_model_len": max_model_len,
+            "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        }
+        if language_model_only:
+            engine_kwargs["language_model_only"] = True
+        if kv_cache_dtype is not None:
+            engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+        if max_num_seqs is not None:
+            engine_kwargs["max_num_seqs"] = max_num_seqs
+        engine = cast("TeacherScoringEngine", llm_class(**engine_kwargs))
         sampling_params = sampling_params_class(
             max_tokens=1, temperature=1.0, prompt_logprobs=TOP_K
         )
@@ -340,13 +364,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--model", default=DEFAULT_TEACHER_MODEL_ID)
     parser.add_argument("--kl-eval", action="store_true")
+    parser.add_argument("--language-model-only", action="store_true")
+    parser.add_argument("--kv-cache-dtype")
+    parser.add_argument("--max-num-seqs", type=int)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     if args.kl_eval:
         summary = compute_kl_summary(args.samples, args.output)
         logger.info("sampled-token KL summary: %s", json.dumps(summary, sort_keys=True))
         return
-    score_round(samples_path=args.samples, output_path=args.output, model=args.model)
+    score_round(
+        samples_path=args.samples,
+        output_path=args.output,
+        model=args.model,
+        language_model_only=args.language_model_only,
+        kv_cache_dtype=args.kv_cache_dtype,
+        max_num_seqs=args.max_num_seqs,
+    )
 
 
 if __name__ == "__main__":
