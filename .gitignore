@@ -109,3 +109,6 @@ backlog.config.yml
 # Third-party research repos cloned for study (model-organism environments, probe code). Gitignored because
 # they carry other benchmarks' items, which must never be committed; kept in-tree so they stay findable.
 /external/
+
+# Hydra writes a per-launch outputs/<date>/<time>/ directory under the working directory (Atlas trainer runs).
+outputs/
