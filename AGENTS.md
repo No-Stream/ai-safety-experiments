@@ -427,7 +427,8 @@ for f in games/data/survey/authored.json games/data/survey/published.json \
   [ -f "$f" ] && cp --parents "$f" "$T/"
 done
 ln -s "$PWD/.venv" "$T/.venv"
-git -C "$T" status --short     # exactly your commit's changes; `?? .venv` means the rule reverted to `.venv/`
+ln -s "$PWD/external" "$T/external"   # third-party clones some tests import; shows as `?? external`
+git -C "$T" status --short     # your commit's changes plus `?? external`; `?? .venv` means the rule reverted to `.venv/`
 (cd "$T" && make lint typecheck && make test)   # run in tmux
 git worktree remove --force "$T"
 ```
