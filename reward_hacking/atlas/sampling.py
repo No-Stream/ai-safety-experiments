@@ -28,6 +28,10 @@ from reward_hacking.interp.jsonl_resume import (
     resume_records,
 )
 from reward_hacking.model_backend import SamplingConfig
+from reward_hacking.organisms.leakage_hints import (
+    LEAKAGE_HINTS_PATH,
+    load_leakage_hint,
+)
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -140,18 +144,27 @@ def _stable_item_id(dataset_id: str, split: str, row_index: int, row: Mapping[st
     return hashlib.sha256(json.dumps(stable_fields, sort_keys=True).encode()).hexdigest()[:24]
 
 
-def prompts_stage(  # noqa: C901
+def prompts_stage(  # noqa: C901, PLR0913
     *,
     run_dir: Path,
     base_model: str = BASE_MODEL_ID,
     dataset_keys: Sequence[str] = ("mbpp-hardcode", "mbpp-synthetic-v3"),
     max_items: int | None = None,
+    leakage_hint_variant: str = "none",
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+    hints_path: Path = LEAKAGE_HINTS_PATH,
 ) -> list[Path]:
     """Render Atlas prompts from runtime HF datasets and record stable item identities."""
     from datasets import load_dataset  # noqa: PLC0415
 
     if max_items is not None and max_items < 1:
         raise ValueError(f"max_items must be positive, got {max_items}")
+    leakage_hint = load_leakage_hint("atlas_mbpp", leakage_hint_variant, hints_path)
+    template_kwargs = dict(chat_template_kwargs or {})
+    prompt_options_identity = {
+        **leakage_hint.identity(),
+        "chat_template_kwargs": template_kwargs,
+    }
     unknown = sorted(set(dataset_keys) - set(PROMPT_DATASETS))
     if unknown:
         raise ValueError(f"unknown datasets {unknown}; expected one of {tuple(PROMPT_DATASETS)}")
@@ -197,6 +210,7 @@ def prompts_stage(  # noqa: C901
             "datasets": dataset_report,
             "model_id": base_model,
             "max_items_per_split": max_items,
+            **prompt_options_identity,
         },
         unit_of=lambda record: f"{record['dataset_id']}:{record['split']}",
         record_key_of=lambda record: str(record["item_id"]),
@@ -213,7 +227,11 @@ def prompts_stage(  # noqa: C901
             if not test_list:
                 raise ValueError(f"{dataset_id}/{split} row {row_index} has no test cases")
             prompt_text = render_prompt(
-                cast("ChatTemplateTokenizer", tokenizer), str(row["text"]), test_list
+                cast("ChatTemplateTokenizer", tokenizer),
+                str(row["text"]),
+                test_list,
+                hint_text=leakage_hint.text,
+                chat_template_kwargs=template_kwargs,
             )
             record: dict[str, object] = {
                 "item_id": item_id,
@@ -227,6 +245,7 @@ def prompts_stage(  # noqa: C901
                 "test_setup_code": str(row.get("test_setup_code", "")),
                 "reference_code": row.get("code"),
                 "hardcode_code": row.get("hardcode"),
+                **prompt_options_identity,
             }
             _append_jsonl(output_path, record)
             ledger.mark_record_complete(item_id)
@@ -241,6 +260,7 @@ def prompts_stage(  # noqa: C901
             "visible_test_count": 1,
             "add_generation_prompt": True,
             "datasets": dataset_report,
+            **prompt_options_identity,
         },
     )
     return [output_path]
@@ -281,18 +301,44 @@ def _prompt_token_ids(tokenizer: PreTrainedTokenizerBase, prompt_text: str) -> l
     return [int(token_id) for token_id in token_ids]
 
 
-def _assert_prompt_base_model(prompt_path: Path, base_model: str) -> None:
+def _load_prompt_metadata(prompt_path: Path, base_model: str) -> dict[str, Any]:
     metadata_path = prompt_path.with_name("prompt-metadata.json")
     if not metadata_path.exists():
         raise FileNotFoundError(
             f"prompt metadata is required to verify the tokenizer base model: {metadata_path}"
         )
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise TypeError(f"prompt metadata must be a JSON object: {metadata_path}")
     prompt_model = metadata.get("model_id")
     if prompt_model != base_model:
         raise ValueError(
             f"prompt file was rendered for base model {prompt_model!r}, not requested {base_model!r}"
         )
+    return metadata
+
+
+def _assert_prompt_base_model(prompt_path: Path, base_model: str) -> dict[str, Any]:
+    return _load_prompt_metadata(prompt_path, base_model)
+
+
+def _prompt_sampling_identity(prompt_path: Path, base_model: str) -> dict[str, Any]:
+    """Return the prompt controls that must remain fixed across sampling resumes."""
+    metadata = _assert_prompt_base_model(prompt_path, base_model)
+    identity_fields = ("hint_environment", "hint_variant", "hint_sha256")
+    missing_fields = [
+        field for field in identity_fields if not isinstance(metadata.get(field), str)
+    ]
+    chat_template_kwargs = metadata.get("chat_template_kwargs")
+    if missing_fields or not isinstance(chat_template_kwargs, dict):
+        raise ValueError(
+            f"prompt metadata is missing screen identity fields {missing_fields} or "
+            "chat_template_kwargs is not an object"
+        )
+    return {
+        **{field: metadata[field] for field in identity_fields},
+        "chat_template_kwargs": chat_template_kwargs,
+    }
 
 
 def resume_records_atlas_compatible(
@@ -526,7 +572,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
         raise ValueError(f"no prompts found in {prompt_path}")
 
     model_id, adapter_id = resolve_model_key(model_key, base_model=base_model)
-    _assert_prompt_base_model(prompt_path, base_model)
+    prompt_options_identity = _prompt_sampling_identity(prompt_path, base_model)
     tokenizer = _load_prompt_tokenizer(base_model)
     prompt_rows = [
         (record, _prompt_token_ids(tokenizer, str(record["prompt"]))) for record in prompts
@@ -543,6 +589,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
         "adapter_id": adapter_id,
         "prompt_file_sha256": _file_digest(prompt_path),
         "samples_per_prompt": samples_per_prompt,
+        **prompt_options_identity,
         "sampling": {
             "max_tokens": sampling.max_new_tokens,
             "temperature": sampling.temperature,
@@ -663,6 +710,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
                 "test_setup_code": str(prompt_record.get("test_setup_code", "")),
                 "reference_code": prompt_record.get("reference_code"),
                 "hardcode_code": prompt_record.get("hardcode_code"),
+                **prompt_options_identity,
                 "sampling": identity["sampling"],
             }
             _append_jsonl(output_path, record)
@@ -677,6 +725,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
                 "adapter_language_only": adapter_id is not None,
                 "gpu_memory_utilization": gpu_memory_utilization,
                 "device": device_name,
+                **prompt_options_identity,
                 "sampling": identity["sampling"],
                 "max_prompt_tokens": max_prompt_length,
                 "n_prompt_items": len(prompt_rows),

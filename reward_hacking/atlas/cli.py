@@ -46,6 +46,16 @@ def _run_dir(run_name: str, runs_root: Path) -> Path:
     return runs_root / run_name
 
 
+def _json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"expected a JSON object: {error}") from error
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return parsed
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-name", required=True, help="run directory under artifacts/atlas")
     parser.add_argument(
@@ -80,6 +90,17 @@ def build_parser() -> argparse.ArgumentParser:
         "prompts", help="load runtime HF datasets and render Atlas prompts"
     )
     _add_common(prompts)
+    prompts.add_argument(
+        "--leakage-hint-variant",
+        default="none",
+        help="runtime hint variant to append after the visible test (default: none)",
+    )
+    prompts.add_argument(
+        "--chat-template-kwargs",
+        type=_json_object,
+        default={},
+        help="JSON object passed to the tokenizer chat template (default: {})",
+    )
     prompts.add_argument(
         "--datasets",
         nargs="+",
@@ -693,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
             base_model=arguments.base_model,
             dataset_keys=arguments.datasets,
             max_items=arguments.max_items,
+            leakage_hint_variant=arguments.leakage_hint_variant,
+            chat_template_kwargs=arguments.chat_template_kwargs,
         )
     elif arguments.stage == "sample":
         from reward_hacking.atlas.sampling import sample_models  # noqa: PLC0415

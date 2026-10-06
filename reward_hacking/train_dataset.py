@@ -646,7 +646,7 @@ def templated_prompt(
     raw_prompt: str,
     *,
     enable_thinking: bool,
-    chat_template_kwargs: dict[str, str] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """Render one raw prompt exactly as ``build_game_dataset`` will: one user turn, no system message.
 
@@ -702,7 +702,7 @@ def longest_prompt_tokens_by_problem(
     tokenizer: PreTrainedTokenizerBase,
     *,
     enable_thinking: bool,
-    chat_template_kwargs: dict[str, str] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
     splits: Sequence[str] | None = None,
 ) -> dict[str, int]:
     """Measure each problem's longest templated prompt across the given splits AND both exposures.
@@ -817,7 +817,7 @@ def resolve_arm_rows(  # noqa: PLR0913 - flat keyword-only knobs, each recorded 
     *,
     max_prompt_tokens: int,
     enable_thinking: bool,
-    chat_template_kwargs: dict[str, str] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
     max_prompts: int | None = None,
     seed: int = 0,
     exposure: GraderExposure = GraderExposure.INLINE,
@@ -884,7 +884,7 @@ def build_dataset(
     *,
     max_prompt_tokens: int,
     enable_thinking: bool,
-    chat_template_kwargs: dict[str, str] | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> Dataset:
     """Chat-template the rows and refuse to lose any of them to the prompt budget.
 

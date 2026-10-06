@@ -34,6 +34,7 @@ from reward_hacking.organisms.grading import (
     extract_completion,
     run_completion_tests,
 )
+from reward_hacking.organisms.leakage_hints import LeakageHint, load_leakage_hint
 from reward_hacking.organisms.scoring import HackName, detect_special_case_output, score_sample
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ class GeneratedCompletion:
 
 class CompletionSampler(Protocol):
     """The generation seam used by the runner and its synthetic tests."""
+
+    def render(self, system_prompt: str, user_prompt: str) -> str:
+        """Render the system and user turns with the model's chat template."""
+        ...
 
     def generate(
         self,
@@ -176,15 +181,19 @@ def build_run_identity(  # noqa: PLR0913 - independent run settings define resum
     temperature: float,
     quantization: str | None,
     kv_cache_dtype: str | None,
+    leakage_hint: LeakageHint,
+    chat_template_kwargs: Mapping[str, object],
 ) -> dict[str, object]:
     """Return safe run settings that must match before records can be resumed."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": "aisi_codecontests_screen",
         "base_model": base_model,
         "models": [
             {"model_id": model.model_id, "adapter_id": model.adapter_id} for model in models
         ],
+        "leakage_hint": leakage_hint.identity(),
+        "chat_template_kwargs": dict(chat_template_kwargs),
         "sampling": {
             "samples_per_problem": samples_per_problem,
             "max_tokens": max_tokens,
@@ -546,6 +555,7 @@ class ChatTokenizer(Protocol):
         *,
         tokenize: bool,
         add_generation_prompt: bool,
+        **kwargs: object,
     ) -> object:
         """Render chat messages."""
 
@@ -556,6 +566,7 @@ def _render_chat_prompt(
     tokenizer: ChatTokenizer,
     *,
     base_model: str = BASE_MODEL,
+    chat_template_kwargs: Mapping[str, object] | None = None,
 ) -> str:
     if base_model == GEMMA_3_BASE_MODEL:
         messages = [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]
@@ -564,7 +575,12 @@ def _render_chat_prompt(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-    rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    rendered = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **({} if chat_template_kwargs is None else chat_template_kwargs),
+    )
     if not isinstance(rendered, str):
         raise TypeError("tokenizer.apply_chat_template returned non-text prompt")
     return rendered
@@ -582,6 +598,7 @@ class VLLMCompletionSampler:
         max_lora_rank: int | None = None,
         weight_quantization: WeightQuantizationChoice | None = None,
         kv_cache_dtype: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
     ) -> None:
         """Load one vLLM engine with LoRA support, keeping optional imports lazy."""
         if max_tokens < 1:
@@ -604,6 +621,7 @@ class VLLMCompletionSampler:
         self._base_model = base_model
         self._max_tokens = max_tokens
         self._temperature = temperature
+        self._chat_template_kwargs = dict(chat_template_kwargs or {})
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(base_model)
         self._adapter_paths: dict[str, str] = {}
         self._lora_ids: dict[str, int] = {}
@@ -702,6 +720,7 @@ class VLLMCompletionSampler:
             user_prompt,
             self._tokenizer,
             base_model=self._base_model,
+            chat_template_kwargs=self._chat_template_kwargs,
         )
 
     def _resolve_adapter_path(self, adapter_id: str) -> str:
@@ -736,6 +755,8 @@ def _grade_record(  # noqa: PLR0913 - one sample's full grading context, keyword
     source: AisiSource,
     temperature: float,
     max_tokens: int,
+    leakage_hint: LeakageHint,
+    chat_template_kwargs: Mapping[str, object],
     scratch_parent: Path,
     jail_timeout_seconds: int,
 ) -> dict[str, Any]:
@@ -772,6 +793,8 @@ def _grade_record(  # noqa: PLR0913 - one sample's full grading context, keyword
         "seed": seed,
         "temperature": temperature,
         "max_tokens": max_tokens,
+        **leakage_hint.identity(),
+        "chat_template_kwargs": dict(chat_template_kwargs),
         "completion_text": completion.text,
         "completion_tokens": len(completion.token_ids),
         "finish_reason": completion.finish_reason,
@@ -803,6 +826,8 @@ def run_screen(  # noqa: PLR0913
     sampler: CompletionSampler,
     max_tokens: int,
     temperature: float,
+    leakage_hint: LeakageHint,
+    chat_template_kwargs: Mapping[str, object],
     jail_timeout_seconds: int = 10,
     scratch_parent: Path = DEFAULT_SCRATCH_PARENT,
     grade_workers: int = DEFAULT_GRADE_WORKERS,
@@ -814,6 +839,8 @@ def run_screen(  # noqa: PLR0913
     samples_path = run_dir / "samples.jsonl"
     records = _read_records(samples_path)
     system_prompt = build_no_hints_system_prompt(source)
+    if leakage_hint.text:
+        system_prompt = f"{system_prompt}\n\n{leakage_hint.text}"
     with samples_path.open("a", encoding="utf-8") as output:
         for model in models:
             pending: list[tuple[CodeContestProblem, int, str, int, str]] = []
@@ -836,10 +863,7 @@ def run_screen(  # noqa: PLR0913
             if not pending:
                 continue
             rendered_prompts = [
-                sampler.render(system_prompt, task_prompt)
-                if isinstance(sampler, VLLMCompletionSampler)
-                else task_prompt
-                for _, _, _, _, task_prompt in pending
+                sampler.render(system_prompt, task_prompt) for _, _, _, _, task_prompt in pending
             ]
             completions = sampler.generate(
                 model,
@@ -861,6 +885,8 @@ def run_screen(  # noqa: PLR0913
                         source=source,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        leakage_hint=leakage_hint,
+                        chat_template_kwargs=chat_template_kwargs,
                         scratch_parent=scratch_parent,
                         jail_timeout_seconds=jail_timeout_seconds,
                     )
@@ -874,6 +900,16 @@ def run_screen(  # noqa: PLR0913
                     output.flush()
                     records[str(record["record_key"])] = record
     return _write_summary(run_dir, records)
+
+
+def _parse_json_object(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError("must be a valid JSON object") from error
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return parsed
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -895,7 +931,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-model", default=BASE_MODEL)
     parser.add_argument("--max-problems", type=int, default=None)
     parser.add_argument("--samples-per-problem", type=int, default=1)
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=8192)
+    parser.add_argument("--leakage-hint-variant", default="none")
+    parser.add_argument("--chat-template-kwargs", type=_parse_json_object, default={})
     parser.add_argument(
         "--weight-quantization",
         choices=("fp8", "none"),
@@ -937,6 +975,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.run_name is None:
         parser.error("--run-name is required when sampling a new screen")
     selected_models = args.models or [args.base_model]
+    leakage_hint = load_leakage_hint("aisi_codecontests", args.leakage_hint_variant)
     source = load_aisi_source(args.external_root)
     train_reward = importlib.import_module("reward_hacking.train_reward")
     train_reward.assert_jail_usable(timeout_seconds=args.jail_timeout_seconds)
@@ -956,6 +995,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             temperature=args.temperature,
             quantization=quantization,
             kv_cache_dtype=args.kv_cache_dtype,
+            leakage_hint=leakage_hint,
+            chat_template_kwargs=args.chat_template_kwargs,
         ),
     )
     sampler = VLLMCompletionSampler(
@@ -964,6 +1005,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         temperature=args.temperature,
         weight_quantization=args.weight_quantization,
         kv_cache_dtype=args.kv_cache_dtype,
+        chat_template_kwargs=args.chat_template_kwargs,
     )
     summary = run_screen(
         run_dir=run_dir,
@@ -974,6 +1016,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         sampler=sampler,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        leakage_hint=leakage_hint,
+        chat_template_kwargs=args.chat_template_kwargs,
         jail_timeout_seconds=args.jail_timeout_seconds,
         grade_workers=args.grade_workers,
     )

@@ -664,6 +664,7 @@ class FakeVLLMBackend(VLLMBackend):
     def __init__(self, **engine_flags: Any) -> None:
         self.model_id = "fake-vllm"
         self.thinking = False
+        self.chat_template_kwargs = {}
         self._tokenizer = cast("AutoTokenizer", FakeTokenizer())
         self._sampling_params = FakeSamplingParams()
         self._lora_request = None

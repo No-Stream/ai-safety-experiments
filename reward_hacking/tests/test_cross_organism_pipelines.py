@@ -38,6 +38,7 @@ from reward_hacking.organisms.aisi_codecontests import (
     _render_chat_prompt,
     resolve_vllm_base_settings,
 )
+from reward_hacking.organisms.leakage_hints import load_leakage_hint
 
 
 class _ChatMLTokenizer:
@@ -316,6 +317,8 @@ def test_aisi_run_identity_records_effective_quantization_without_prompt_text() 
         temperature=1.0,
         quantization="fp8_per_tensor",
         kv_cache_dtype="fp8",
+        leakage_hint=load_leakage_hint("aisi_codecontests", "none"),
+        chat_template_kwargs={},
     )
 
     engine_identity = identity["engine"]

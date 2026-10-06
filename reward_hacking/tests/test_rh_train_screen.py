@@ -255,7 +255,7 @@ class TestTemplateRenderGuard:
 
     def test_a_template_needing_kwargs_is_refused(self):
         """Sabotage target: on such a model the screen would sample different prompt text."""
-        with pytest.raises(RuntimeError, match="chat-template kwargs"):
+        with pytest.raises(RuntimeError, match="--chat-template-kwargs"):
             assert_backend_can_render_template(
                 cast("PreTrainedTokenizerBase", EffortStubTokenizer())
             )

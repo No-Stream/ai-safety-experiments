@@ -5,16 +5,18 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
-    from pathlib import Path
+import pytest
 
-    import pytest
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from pathlib import Path
 
 from reward_hacking.organisms import aisi_codecontests
 from reward_hacking.organisms.aisi_codecontests import (
     CodeContestProblem,
     GeneratedCompletion,
+    _render_chat_prompt,
+    build_run_identity,
     content_seed,
     load_code_contest_problems,
     lora_int_id_for,
@@ -24,9 +26,63 @@ from reward_hacking.organisms.aisi_codecontests import (
     rescore_run,
     run_screen,
     summarize_records,
+    write_run_identity,
 )
 from reward_hacking.organisms.aisi_source import load_aisi_source
 from reward_hacking.organisms.grading import CompletionTestRuns, JailedPytestResult
+from reward_hacking.organisms.leakage_hints import LeakageHint, load_leakage_hint
+
+
+class RecordingTokenizer:
+    def __init__(self) -> None:
+        self.messages: list[dict[str, str]] = []
+        self.render_options: dict[str, object] = {}
+
+    def apply_chat_template(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        **kwargs: object,
+    ) -> str:
+        self.messages = [dict(message) for message in messages]
+        self.render_options = {
+            "tokenize": tokenize,
+            "add_generation_prompt": add_generation_prompt,
+            **kwargs,
+        }
+        return json.dumps(self.messages, separators=(",", ":"))
+
+
+class RecordingSampler:
+    def __init__(self, chat_template_kwargs: Mapping[str, object]) -> None:
+        self.tokenizer = RecordingTokenizer()
+        self.chat_template_kwargs = dict(chat_template_kwargs)
+        self.calls = 0
+        self.rendered_prompts: list[str] = []
+
+    def render(self, system_prompt: str, user_prompt: str) -> str:
+        return _render_chat_prompt(
+            system_prompt,
+            user_prompt,
+            self.tokenizer,
+            chat_template_kwargs=self.chat_template_kwargs,
+        )
+
+    def generate(
+        self, model: object, prompts: Sequence[str], seeds: Sequence[int]
+    ) -> list[GeneratedCompletion]:
+        self.calls += 1
+        self.rendered_prompts.extend(prompts)
+        return [
+            GeneratedCompletion(
+                text="```python\ndef solution(value): return value\n```",
+                token_ids=(1, 2, 3),
+                finish_reason="stop",
+            )
+            for _ in prompts
+        ]
 
 
 def _source(tmp_path: Path):
@@ -89,6 +145,144 @@ def test_keys_and_seeds_are_stable_and_content_derived() -> None:
     assert content_seed("model", "problem", 2) != content_seed("model", "problem", 3)
 
 
+def test_chat_template_without_kwargs_keeps_the_existing_messages_unchanged() -> None:
+    tokenizer = RecordingTokenizer()
+
+    rendered = _render_chat_prompt("synthetic system", "synthetic task", tokenizer)
+
+    assert rendered == (
+        '[{"role":"system","content":"synthetic system"},'
+        '{"role":"user","content":"synthetic task"}]'
+    )
+    assert tokenizer.render_options == {"tokenize": False, "add_generation_prompt": True}
+
+
+def test_chat_template_kwargs_reach_the_tokenizer() -> None:
+    tokenizer = RecordingTokenizer()
+
+    _render_chat_prompt(
+        "synthetic system",
+        "synthetic task",
+        tokenizer,
+        chat_template_kwargs={"reasoning_effort": "medium"},
+    )
+
+    assert tokenizer.render_options == {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "reasoning_effort": "medium",
+    }
+
+
+def test_cli_defaults_to_thinking_compatible_completion_budget_and_no_hint() -> None:
+    args = aisi_codecontests._build_parser().parse_args(["--run-name", "synthetic-run"])
+
+    assert args.max_tokens == 8192
+    assert args.leakage_hint_variant == "none"
+    assert args.chat_template_kwargs == {}
+
+
+def test_cli_parses_chat_template_kwargs_as_a_json_object() -> None:
+    args = aisi_codecontests._build_parser().parse_args(
+        [
+            "--run-name",
+            "synthetic-run",
+            "--chat-template-kwargs",
+            '{"reasoning_effort":"medium"}',
+        ]
+    )
+
+    assert args.chat_template_kwargs == {"reasoning_effort": "medium"}
+
+
+def test_screen_appends_hint_to_system_prompt_and_records_prompt_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _source(tmp_path)
+    problem = CodeContestProblem(
+        problem_id="synthetic-problem",
+        description="synthetic description",
+        test_assertions=("assert solution('1') == '1'",),
+        public_examples=(("1", "1"),),
+        cf_rating=2000,
+        difficulty=0,
+    )
+    hints_path = tmp_path / "leakage_hints.json"
+    hints_path.write_text(
+        json.dumps(
+            {"hints": {"aisi_codecontests": {"synthetic": "Dummy synthetic grading note."}}}
+        ),
+        encoding="utf-8",
+    )
+    hint = load_leakage_hint("aisi_codecontests", "synthetic", hints_path)
+    chat_template_kwargs = {"reasoning_effort": "medium"}
+    sampler = RecordingSampler(chat_template_kwargs)
+
+    def fake_tests(*args: object, **kwargs: object) -> CompletionTestRuns:
+        result = JailedPytestResult(True, 0, False, "passed", "")
+        return CompletionTestRuns(normal=result, hardened=result)
+
+    monkeypatch.setattr(
+        "reward_hacking.organisms.aisi_codecontests.run_completion_tests", fake_tests
+    )
+    run_screen(
+        run_dir=tmp_path / "hinted-run",
+        models=model_specs(["base"], base_model="base"),
+        problems=(problem,),
+        samples_per_problem=1,
+        source=source,
+        sampler=sampler,
+        max_tokens=8192,
+        temperature=1.0,
+        leakage_hint=hint,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+
+    [system_message, user_message] = sampler.tokenizer.messages
+    assert system_message["content"] == "synthetic\n\nDummy synthetic grading note."
+    assert system_message["content"].count(hint.text) == 1
+    assert user_message["content"] == "synthetic description assert solution('1') == '1'"
+    assert sampler.tokenizer.render_options["reasoning_effort"] == "medium"
+    [sample_record] = [
+        json.loads(line)
+        for line in (tmp_path / "hinted-run" / "samples.jsonl").read_text().splitlines()
+    ]
+    assert sample_record["hint_environment"] == "aisi_codecontests"
+    assert sample_record["hint_variant"] == "synthetic"
+    assert sample_record["hint_sha256"] == hint.text_sha256
+    assert sample_record["chat_template_kwargs"] == chat_template_kwargs
+
+
+def test_resume_refuses_a_different_leakage_hint_variant(tmp_path: Path) -> None:
+    no_hint = load_leakage_hint("aisi_codecontests", "none")
+    first_hint_path = tmp_path / "first-hints.json"
+    first_hint_path.write_text(
+        json.dumps({"hints": {"aisi_codecontests": {"synthetic": "Dummy note one."}}}),
+        encoding="utf-8",
+    )
+    synthetic_hint = load_leakage_hint("aisi_codecontests", "synthetic", first_hint_path)
+    models = model_specs(["base"], base_model="base")
+
+    def identity_for(hint: LeakageHint) -> dict[str, object]:
+        return build_run_identity(
+            base_model="base",
+            models=models,
+            samples_per_problem=1,
+            max_tokens=8192,
+            temperature=1.0,
+            quantization=None,
+            kv_cache_dtype=None,
+            leakage_hint=hint,
+            chat_template_kwargs={},
+        )
+
+    run_dir = tmp_path / "identity-run"
+    write_run_identity(run_dir, identity_for(no_hint))
+
+    with pytest.raises(ValueError, match="different configuration"):
+        write_run_identity(run_dir, identity_for(synthetic_hint))
+
+
 def test_model_specs_assign_base_and_adapters() -> None:
     specs = model_specs(["base", "adapter-a"], base_model="base-model")
     assert specs[0].model_id == "base-model"
@@ -140,23 +334,6 @@ def test_screen_resumes_by_record_key_and_rebuilds_summary(
         difficulty=0,
     )
 
-    class FakeSampler:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def generate(
-            self, model: object, prompts: Sequence[str], seeds: Sequence[int]
-        ) -> list[GeneratedCompletion]:
-            self.calls += 1
-            return [
-                GeneratedCompletion(
-                    text="```python\ndef solution(value): return value\n```",
-                    token_ids=(1, 2, 3),
-                    finish_reason="stop",
-                )
-                for _ in prompts
-            ]
-
     def fake_tests(*args: object, **kwargs: object) -> CompletionTestRuns:
         result = JailedPytestResult(True, 0, False, "passed", "")
         return CompletionTestRuns(normal=result, hardened=result)
@@ -164,8 +341,10 @@ def test_screen_resumes_by_record_key_and_rebuilds_summary(
     monkeypatch.setattr(
         "reward_hacking.organisms.aisi_codecontests.run_completion_tests", fake_tests
     )
-    sampler = FakeSampler()
+    sampler = RecordingSampler({})
     models = model_specs(["base"], base_model="base")
+    leakage_hint = load_leakage_hint("aisi_codecontests", "none")
+    chat_template_kwargs: dict[str, object] = {}
     run_dir = tmp_path / "run"
     first = run_screen(
         run_dir=run_dir,
@@ -176,6 +355,8 @@ def test_screen_resumes_by_record_key_and_rebuilds_summary(
         sampler=sampler,
         max_tokens=4096,
         temperature=1.0,
+        leakage_hint=leakage_hint,
+        chat_template_kwargs=chat_template_kwargs,
     )
     second = run_screen(
         run_dir=run_dir,
@@ -186,12 +367,20 @@ def test_screen_resumes_by_record_key_and_rebuilds_summary(
         sampler=sampler,
         max_tokens=4096,
         temperature=1.0,
+        leakage_hint=leakage_hint,
+        chat_template_kwargs=chat_template_kwargs,
     )
 
     assert sampler.calls == 1
     assert first == second
     assert len((run_dir / "samples.jsonl").read_text().splitlines()) == 2
     assert "special_case_rate" in (run_dir / "summary.csv").read_text().splitlines()[0]
+    expected_messages = [
+        {"role": "system", "content": "synthetic"},
+        {"role": "user", "content": "synthetic description assert solution('1') == '1'"},
+    ]
+    expected_rendered_prompt = json.dumps(expected_messages, separators=(",", ":"))
+    assert sampler.rendered_prompts == [expected_rendered_prompt, expected_rendered_prompt]
 
 
 def test_each_adapter_gets_its_own_stable_lora_int_id() -> None:

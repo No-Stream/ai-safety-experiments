@@ -32,7 +32,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer, GenerationConfig
@@ -278,7 +278,10 @@ def refuse_empty_trace_overwrite(trace_path: Path, *, buffered_completions: int)
 
 
 def derive_prefilled_think(
-    tokenizer: PreTrainedTokenizerBase, *, enable_thinking: bool = True
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    enable_thinking: bool = True,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> bool:
     """Measure whether this tokenizer's template opens `<think>` inside the prompt itself.
 
@@ -289,6 +292,12 @@ def derive_prefilled_think(
     """
     from games.parsing import THINK_CLOSE, THINK_OPEN  # noqa: PLC0415
 
+    template_kwargs = dict(chat_template_kwargs or {})
+    reserved = {"tokenize", "add_generation_prompt", "enable_thinking"} & template_kwargs.keys()
+    if reserved:
+        raise ValueError(
+            f"chat-template kwargs may not override harness-controlled options: {sorted(reserved)}"
+        )
     rendered = cast(
         "str",
         tokenizer.apply_chat_template(
@@ -296,6 +305,7 @@ def derive_prefilled_think(
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
+            **template_kwargs,
         ),
     )
     if THINK_OPEN not in rendered:

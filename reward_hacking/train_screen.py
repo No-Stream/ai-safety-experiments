@@ -188,23 +188,34 @@ def training_matched_sampling(model_id: str) -> SamplingConfig:
     )
 
 
-def assert_backend_can_render_template(tokenizer: PreTrainedTokenizerBase) -> None:
-    """Refuse a tokenizer whose chat template needs kwargs the generation backends cannot pass.
+def assert_backend_can_render_template(
+    tokenizer: PreTrainedTokenizerBase,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> None:
+    """Refuse a tokenizer unless its required chat-template kwargs are pinned for generation.
 
     The trainer templates prompts through ``build_game_dataset`` with
     :func:`resolve_chat_template_kwargs` (Qwen3.8-27B needs ``reasoning_effort`` pinned or the
-    template injects a system message nobody wrote). The local backends template internally with no
-    kwargs channel, so on such a model this screen would sample different prompt TEXT than training
-    -- a silent divergence in the one thing the two must share. Qwen3.5 templates take no such
-    kwarg, so today this never fires; it exists for the checkpoint on which it would.
+    template injects a system message nobody wrote). Local backends receive these kwargs and pass
+    them into each template render. This guard requires the training-pinned values before generation,
+    so the screen cannot silently sample different prompt text. Templates without required kwargs
+    continue with an empty mapping.
     """
-    kwargs = resolve_chat_template_kwargs(tokenizer)
-    if kwargs:
+    required_kwargs = resolve_chat_template_kwargs(tokenizer)
+    supplied_kwargs = dict(chat_template_kwargs or {})
+    reserved = {"tokenize", "add_generation_prompt", "enable_thinking"} & supplied_kwargs.keys()
+    if reserved:
+        raise ValueError(
+            f"chat-template kwargs may not override harness-controlled options: {sorted(reserved)}"
+        )
+    missing_or_mismatched = {
+        key: value for key, value in required_kwargs.items() if supplied_kwargs.get(key) != value
+    }
+    if missing_or_mismatched:
         raise RuntimeError(
-            f"this tokenizer's chat template needs {kwargs} pinned, and the screen's generation "
-            f"backends render prompts with no chat-template kwargs, so the screen would measure "
-            f"different prompt text than training. Extend the backend seam before screening this "
-            f"model."
+            f"this tokenizer's chat template needs {missing_or_mismatched} pinned, and the screen's "
+            f"generation backends received {supplied_kwargs}; pass the required values with "
+            f"--chat-template-kwargs so the screen renders the same prompt as training"
         )
 
 

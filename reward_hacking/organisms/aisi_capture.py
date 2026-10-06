@@ -91,6 +91,7 @@ class ScreenTokenizer(CompletionTokenizer, Protocol):
         *,
         tokenize: bool,
         add_generation_prompt: bool,
+        **kwargs: object,
     ) -> object:
         """Render the screen's system and user messages with the base model template."""
         ...

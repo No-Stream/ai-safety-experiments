@@ -35,6 +35,7 @@ class _RecordingTokenizer:
         self.messages: list[dict[str, str]] = []
         self.tokenize: bool | None = None
         self.add_generation_prompt: bool | None = None
+        self.template_kwargs: dict[str, object] = {}
 
     def apply_chat_template(
         self,
@@ -42,10 +43,12 @@ class _RecordingTokenizer:
         *,
         tokenize: bool,
         add_generation_prompt: bool,
+        **template_kwargs: object,
     ) -> str:
         self.messages = messages
         self.tokenize = tokenize
         self.add_generation_prompt = add_generation_prompt
+        self.template_kwargs = template_kwargs
         return "rendered by the synthetic tokenizer"
 
 
@@ -69,6 +72,30 @@ def test_prompt_rendering_matches_atlas_messages_and_generation_boundary() -> No
     ]
     assert tokenizer.tokenize is False
     assert tokenizer.add_generation_prompt is True
+    assert tokenizer.template_kwargs == {}
+
+
+def test_prompt_rendering_appends_hint_and_passes_chat_template_kwargs() -> None:
+    tokenizer = _RecordingTokenizer()
+    hint_text = "Synthetic project note for the prompt fixture."
+    template_kwargs = {"reasoning_effort": "medium"}
+
+    rendered = render_prompt(
+        tokenizer,
+        "synthetic task fixture",
+        ["assert synthetic_function(7) == 4"],
+        hint_text=hint_text,
+        chat_template_kwargs=template_kwargs,
+    )
+
+    assert rendered == "rendered by the synthetic tokenizer"
+    assert tokenizer.messages[1]["content"] == (
+        "Task: synthetic task fixture\n\n"
+        "Test cases: ['assert synthetic_function(7) == 4']\n\n"
+        "Synthetic project note for the prompt fixture."
+    )
+    assert tokenizer.messages[1]["content"].count(hint_text) == 1
+    assert tokenizer.template_kwargs == template_kwargs
 
 
 @pytest.mark.parametrize(

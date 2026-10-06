@@ -623,6 +623,7 @@ def _vllm_http_backend_from_args(
     *,
     local_sampling: SamplingConfig | None,
     extra_kwargs: Mapping[str, object] | None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
 ) -> Backend:
     """Build the external vLLM backend, refusing in-process weight controls."""
     if args.vllm_http_url is None:
@@ -651,6 +652,7 @@ def _vllm_http_backend_from_args(
         model_id,
         base_url=args.vllm_http_url,
         thinking=resolve_thinking(args),
+        chat_template_kwargs=chat_template_kwargs,
         sampling=local_sampling_from_args(args, local_sampling),
         **engine_kwargs,
     )
@@ -664,6 +666,7 @@ def backend_from_args(  # noqa: C901, PLR0913 - one branch per transport and its
     bedrock_sampling: BedrockSamplingConfig | None = None,
     mock_responses: Sequence[str] | None = None,
     extra_kwargs: Mapping[str, object] | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
 ) -> Backend:
     """Build the backend the run asked for, with the config type that backend actually takes.
 
@@ -700,7 +703,11 @@ def backend_from_args(  # noqa: C901, PLR0913 - one branch per transport and its
         return build_backend("mock", model_id, responses=list(mock_responses))
     if kind == "vllm-http":
         return _vllm_http_backend_from_args(
-            args, model_id, local_sampling=local_sampling, extra_kwargs=extra_kwargs
+            args,
+            model_id,
+            local_sampling=local_sampling,
+            extra_kwargs=extra_kwargs,
+            chat_template_kwargs=chat_template_kwargs,
         )
     if kind in LOCAL_KINDS:
         # Of the CLI knobs only the --vllm-* flags are engine kwargs, and the registry above has
@@ -718,6 +725,7 @@ def backend_from_args(  # noqa: C901, PLR0913 - one branch per transport and its
             kind,
             model_id,
             thinking=resolve_thinking(args),
+            chat_template_kwargs=chat_template_kwargs,
             sampling=local_sampling_from_args(args, local_sampling),
             **engine_kwargs,
         )

@@ -288,8 +288,13 @@ class ProbeCell:
         return self.hatch == HATCH_ABSENT and self.framing == FRAMING_NEUTRAL
 
 
-def probe_cells_for(hatch_levels: Sequence[str]) -> tuple[ProbeCell, ...]:
-    """Build the full arm x hatch x framing cross over the given hatch levels, in canonical order.
+def probe_cells_for(
+    hatch_levels: Sequence[str],
+    *,
+    arms: Sequence[str] = TRAINING_ARMS,
+    framings: Sequence[str] = FRAMING_LEVELS,
+) -> tuple[ProbeCell, ...]:
+    """Build selected arms x hatch levels x framings in canonical order.
 
     Canonical (arm-major, then :data:`HATCH_LEVELS` order, then framing) rather than argument
     order, because cell membership is positional everywhere downstream -- the batch job's slices,
@@ -303,13 +308,29 @@ def probe_cells_for(hatch_levels: Sequence[str]) -> tuple[ProbeCell, ...]:
         raise ValueError(f"unknown hatch levels {unknown!r}; known: {list(HATCH_LEVELS)}")
     if len(set(hatch_levels)) != len(hatch_levels):
         raise ValueError(f"duplicate hatch levels in {list(hatch_levels)!r}")
+    if not arms:
+        raise ValueError("a probe over no arms measures nothing")
+    unknown_arms = [arm for arm in arms if arm not in TRAINING_ARMS]
+    if unknown_arms:
+        raise ValueError(f"unknown arms {unknown_arms!r}; known: {list(TRAINING_ARMS)}")
+    if len(set(arms)) != len(arms):
+        raise ValueError(f"duplicate arms in {list(arms)!r}")
+    if not framings:
+        raise ValueError("a probe over no framings measures nothing")
+    unknown_framings = [framing for framing in framings if framing not in FRAMING_LEVELS]
+    if unknown_framings:
+        raise ValueError(f"unknown framings {unknown_framings!r}; known: {list(FRAMING_LEVELS)}")
+    if len(set(framings)) != len(framings):
+        raise ValueError(f"duplicate framings in {list(framings)!r}")
     chosen = frozenset(hatch_levels)
     return tuple(
         ProbeCell(arm=arm, hatch=hatch, framing=framing)
         for arm in TRAINING_ARMS
+        if arm in arms
         for hatch in HATCH_LEVELS
         if hatch in chosen
         for framing in FRAMING_LEVELS
+        if framing in framings
     )
 
 
@@ -357,7 +378,7 @@ def harness_task_id_for(split: str, problem_id: str) -> str:
     return f"ilcb-{split}-{problem_id}"
 
 
-def render_cell_prompt(problem: ILCBProblem, cell: ProbeCell) -> str:
+def render_cell_prompt(problem: ILCBProblem, cell: ProbeCell, *, leakage_hint: str = "") -> str:
     """Render one cell's prompt: the training prompt verbatim, plus only what the cell adds.
 
     Append-only by construction. The (hatch-absent, neutral) cell returns
@@ -378,6 +399,8 @@ def render_cell_prompt(problem: ILCBProblem, cell: ProbeCell) -> str:
     hatch_text = HATCH_TEXT_BY_LEVEL[cell.hatch]
     if hatch_text:
         additions.append(hatch_text)
+    if leakage_hint:
+        additions.append(leakage_hint)
     base = render_prompt(problem)
     return base + "".join(f"\n{addition}\n" for addition in additions)
 
@@ -408,13 +431,14 @@ def aligned_problem_ids(problems_by_split: Mapping[str, Sequence[ILCBProblem]]) 
     return per_split[SPLIT_ONEOFF]
 
 
-def longest_cell_prompt_tokens_by_problem(
+def longest_cell_prompt_tokens_by_problem(  # noqa: PLR0913 - keyword-only template and budget knobs
     problems_by_split: Mapping[str, Sequence[ILCBProblem]],
     tokenizer: PreTrainedTokenizerBase,
     *,
     enable_thinking: bool,
-    chat_template_kwargs: dict[str, str] | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
     cells: Sequence[ProbeCell] = PROBE_CELLS,
+    leakage_hint: str = "",
 ) -> dict[str, int]:
     """Measure each problem's longest templated prompt across EVERY cell's rendering.
 
@@ -434,9 +458,9 @@ def longest_cell_prompt_tokens_by_problem(
         for problem in problems_by_split[cell.split]:
             rendered = templated_prompt(
                 tokenizer,
-                render_cell_prompt(problem, cell),
+                render_cell_prompt(problem, cell, leakage_hint=leakage_hint),
                 enable_thinking=enable_thinking,
-                chat_template_kwargs=chat_template_kwargs,
+                chat_template_kwargs=dict(chat_template_kwargs or {}),
             )
             n_tokens = len(tokenizer(rendered, add_special_tokens=False)["input_ids"])
             longest[problem.task_id] = max(longest.get(problem.task_id, 0), n_tokens)
@@ -449,8 +473,9 @@ def apply_cross_cell_budget(  # noqa: PLR0913 - keyword-only, the template knobs
     *,
     max_prompt_tokens: int,
     enable_thinking: bool,
-    chat_template_kwargs: dict[str, str] | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
     cells: Sequence[ProbeCell] = PROBE_CELLS,
+    leakage_hint: str = "",
 ) -> tuple[dict[str, tuple[ILCBProblem, ...]], PromptBudgetFilter]:
     """Drop the problems some cell cannot fit, identically from every cell, and record which.
 
@@ -467,6 +492,7 @@ def apply_cross_cell_budget(  # noqa: PLR0913 - keyword-only, the template knobs
         enable_thinking=enable_thinking,
         chat_template_kwargs=chat_template_kwargs,
         cells=cells,
+        leakage_hint=leakage_hint,
     )
     kept_ids = tuple(pid for pid in problem_ids if longest[pid] <= max_prompt_tokens)
     dropped_ids = tuple(pid for pid in problem_ids if longest[pid] > max_prompt_tokens)
@@ -499,13 +525,14 @@ def apply_cross_cell_budget(  # noqa: PLR0913 - keyword-only, the template knobs
     return kept, budget
 
 
-def dropped_only_by_variant_text(
+def dropped_only_by_variant_text(  # noqa: PLR0913 - keyword-only template and budget knobs
     problems_by_split: Mapping[str, Sequence[ILCBProblem]],
     tokenizer: PreTrainedTokenizerBase,
     budget: PromptBudgetFilter,
     *,
     enable_thinking: bool,
-    chat_template_kwargs: dict[str, str] | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+    leakage_hint: str = "",
 ) -> tuple[str, ...]:
     """Of the problems this budget dropped, name the ones the flagship screen's budget keeps.
 
@@ -530,6 +557,7 @@ def dropped_only_by_variant_text(
         enable_thinking=enable_thinking,
         chat_template_kwargs=chat_template_kwargs,
         cells=ANCHOR_CELLS,
+        leakage_hint=leakage_hint,
     )
     return tuple(
         pid for pid in budget.dropped_problem_ids if anchor_longest[pid] <= budget.max_prompt_tokens
@@ -763,6 +791,9 @@ class ProbeRunContext:
     model_id: str
     transport: str
     sampler: Mapping[str, object]
+    leakage_hint: str
+    hint_identity: Mapping[str, str]
+    chat_template_kwargs: Mapping[str, object]
     grader_workers: int = DEFAULT_GRADER_WORKERS
 
     def __post_init__(self) -> None:
@@ -829,6 +860,10 @@ class HatchProbeRecord:
     elapsed_seconds: float | None = None
     first_event_seconds: float | None = None
     attempts: int | None = None
+    hint_environment: str | None = None
+    hint_variant: str | None = None
+    hint_sha256: str | None = None
+    chat_template_kwargs: Mapping[str, object] | None = None
 
     @property
     def reported(self) -> bool:
@@ -901,6 +936,12 @@ class HatchProbeRecord:
             "elapsed_seconds": self.elapsed_seconds,
             "first_event_seconds": self.first_event_seconds,
             "attempts": self.attempts,
+            "hint_environment": self.hint_environment,
+            "hint_variant": self.hint_variant,
+            "hint_sha256": self.hint_sha256,
+            "chat_template_kwargs": (
+                None if self.chat_template_kwargs is None else dict(self.chat_template_kwargs)
+            ),
         }
 
     @classmethod
@@ -955,6 +996,14 @@ class HatchProbeRecord:
             elapsed_seconds=row.get("elapsed_seconds"),
             first_event_seconds=row.get("first_event_seconds"),
             attempts=row.get("attempts"),
+            hint_environment=row.get("hint_environment"),
+            hint_variant=row.get("hint_variant"),
+            hint_sha256=row.get("hint_sha256"),
+            chat_template_kwargs=(
+                None
+                if row.get("chat_template_kwargs") is None
+                else dict(row["chat_template_kwargs"])
+            ),
         )
 
 
@@ -975,6 +1024,7 @@ def cell_inputs_by_label(
     problems_by_split: Mapping[str, Sequence[ILCBProblem]],
     *,
     cells: Sequence[ProbeCell] = PROBE_CELLS,
+    leakage_hint: str = "",
 ) -> dict[str, CellInputs]:
     """Render the run's cells' prompts once, keyed by cell label, in the fixed cell order."""
     inputs: dict[str, CellInputs] = {}
@@ -982,7 +1032,9 @@ def cell_inputs_by_label(
         problems = tuple(problems_by_split[cell.split])
         inputs[cell.label] = CellInputs(
             problems=problems,
-            prompts=tuple(render_cell_prompt(problem, cell) for problem in problems),
+            prompts=tuple(
+                render_cell_prompt(problem, cell, leakage_hint=leakage_hint) for problem in problems
+            ),
         )
     return inputs
 
@@ -1165,8 +1217,14 @@ def build_cell_records(
                 stop_reason=response.stop_reason,
                 sampler=context.sampler,
                 recorded_at=recorded_at,
+                hint_environment=context.hint_identity["hint_environment"],
+                hint_variant=context.hint_identity["hint_variant"],
+                hint_sha256=context.hint_identity["hint_sha256"],
+                chat_template_kwargs=context.chat_template_kwargs,
                 # Re-rendered with the same pure function ``cell_inputs_by_label`` used: no drift.
-                prompt_digest=prompt_digest_for_record(render_cell_prompt(problem, cell)),
+                prompt_digest=prompt_digest_for_record(
+                    render_cell_prompt(problem, cell, leakage_hint=context.leakage_hint)
+                ),
                 cache_read_input_tokens=response.cache_read_input_tokens,
                 cache_write_input_tokens=response.cache_write_input_tokens,
                 elapsed_seconds=response.elapsed_seconds,
@@ -1475,6 +1533,11 @@ def json_normalized_sampler(sampler: Mapping[str, object]) -> dict[str, Any]:
     return json.loads(json.dumps(dict(sampler), sort_keys=True, default=str))
 
 
+def json_normalized_mapping(values: Mapping[str, object]) -> dict[str, Any]:
+    """Round-trip a JSON configuration so nested values compare as they do on disk."""
+    return json.loads(json.dumps(dict(values), sort_keys=True, default=str))
+
+
 def _record_drift(
     record: HatchProbeRecord, inputs: CellInputs, context: ProbeRunContext
 ) -> list[str]:
@@ -1488,6 +1551,7 @@ def _record_drift(
     run_sampler = json_normalized_sampler(context.sampler)
     if stored_sampler != run_sampler:
         drifted.append(f"sampler={stored_sampler!r} on disk but {run_sampler!r} here")
+    drifted.extend(_run_identity_drift(record, context))
     if record.prompt_digest is None:
         drifted.append("prompt_digest is absent: the record predates resume and cannot be checked")
         return drifted
@@ -1507,6 +1571,28 @@ def _record_drift(
             f"problem_id={record.problem_id!r} on disk but "
             f"{inputs.problems[record.group_index].task_id!r} at group {record.group_index} here"
         )
+    return drifted
+
+
+def _run_identity_drift(record: HatchProbeRecord, context: ProbeRunContext) -> list[str]:
+    """Return differences in hint and template settings bound to resume identity."""
+    drifted: list[str] = []
+    hint_fields = (
+        ("hint_environment", record.hint_environment, context.hint_identity["hint_environment"]),
+        ("hint_variant", record.hint_variant, context.hint_identity["hint_variant"]),
+        ("hint_sha256", record.hint_sha256, context.hint_identity["hint_sha256"]),
+    )
+    for field, record_value, context_value in hint_fields:
+        if record_value != context_value:
+            drifted.append(f"{field}={record_value!r} on disk but {context_value!r} here")
+    stored_kwargs = (
+        None
+        if record.chat_template_kwargs is None
+        else json_normalized_mapping(record.chat_template_kwargs)
+    )
+    run_kwargs = json_normalized_mapping(context.chat_template_kwargs)
+    if stored_kwargs != run_kwargs:
+        drifted.append(f"chat_template_kwargs={stored_kwargs!r} on disk but {run_kwargs!r} here")
     return drifted
 
 

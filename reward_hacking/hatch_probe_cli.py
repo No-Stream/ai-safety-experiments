@@ -38,7 +38,7 @@ import logging
 import random
 import re
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -70,6 +70,7 @@ from reward_hacking.bedrock_batch import (
 from reward_hacking.harness.tasks_ilcb import PROBLEMS_BY_TASK_ID
 from reward_hacking.hatch_probe import (
     DEFAULT_HATCH_LEVELS,
+    FRAMING_LEVELS,
     GIVE_UP_CLOSE,
     GIVE_UP_OPEN,
     GRADER_REPORT_CLOSE,
@@ -106,6 +107,7 @@ from reward_hacking.model_backend import (
     converse_supports_temperature,
     raw_response,
 )
+from reward_hacking.organisms.leakage_hints import load_leakage_hint
 from reward_hacking.recoverybench.budgets import max_tokens_for
 from reward_hacking.trace import refuse_tracked_trace_path, write_trace
 from reward_hacking.train_dataset import (
@@ -149,6 +151,23 @@ logger = logging.getLogger(__name__)
 
 # The training template's opening line, which keys the mock completion to its entry point.
 _ENTRY_POINT_PATTERN = re.compile(r"Implement `([^`]+)` in Python")
+_CHAT_TEMPLATE_RESERVED_KWARGS = frozenset({"tokenize", "add_generation_prompt", "enable_thinking"})
+
+
+def _parse_chat_template_kwargs(value: str) -> dict[str, object]:
+    """Parse custom template variables while keeping prompt-control options owned by the harness."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"expected a JSON object: {error.msg}") from error
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    reserved = _CHAT_TEMPLATE_RESERVED_KWARGS & parsed.keys()
+    if reserved:
+        raise argparse.ArgumentTypeError(
+            f"cannot override harness-controlled chat-template kwargs: {sorted(reserved)}"
+        )
+    return parsed
 
 
 def mock_probe_response(prompt: str) -> str:
@@ -206,13 +225,14 @@ def refuse_sampler_flags(args: argparse.Namespace) -> None:
         raise ValueError(
             f"{', '.join(given)} cannot be set on this probe: its sampler is pinned "
             f"(temperature {TRAINING_TEMPERATURE}, top_p omitted, output cap from the measured "
-            f"budgets table) so every cell samples the distribution the flagship screen measured. "
+            f"budgets table unless --max-tokens is set) so every cell samples the distribution "
+            f"the flagship screen measured. "
             f"The levers for a cheaper run are --max-problems and --samples-per-prompt."
         )
 
 
 def resolve_probe_bedrock_sampling(
-    model_id: str, *, reasoning_effort: str | None = None
+    model_id: str, *, reasoning_effort: str | None = None, max_tokens: int | None = None
 ) -> BedrockSamplingConfig:
     """Build the pinned Converse sampler: temperature 1.0, ``top_p`` omitted, measured cap.
 
@@ -228,8 +248,10 @@ def resolve_probe_bedrock_sampling(
     for that rung. The pin stays a pin: this is the probed field-support fact deciding the
     request shape, never a per-run knob.
     """
+    if max_tokens is not None and max_tokens < 1:
+        raise ValueError("max_tokens must be positive")
     return BedrockSamplingConfig(
-        max_tokens=max_tokens_for(model_id),
+        max_tokens=max_tokens_for(model_id) if max_tokens is None else max_tokens,
         temperature=TRAINING_TEMPERATURE if converse_supports_temperature(model_id) else None,
         top_p=None,
         reasoning_effort=reasoning_effort,
@@ -302,17 +324,8 @@ def _build_bedrock_batch_backend(
     )
 
 
-def build_probe_backend(
-    args: argparse.Namespace, model_id: str
-) -> tuple[Backend, dict[str, object]]:
-    """Construct the backend under the pinned sampler, plus the sampler record for the artifact.
-
-    Every kind ``backend_cli`` offers except ``codex``: the codex CLI wraps the prompt in its own
-    agent harness (system prompt, tool loop, workdir reads), so a codex record is a different
-    elicitation than the bare user turn every other transport renders, and pooling them would put
-    the scaffolding difference inside what reads as a model difference. ``--bedrock-batch`` swaps
-    the live Converse transport for the batch inference service with the identical request shape.
-    """
+def _validate_probe_backend_args(args: argparse.Namespace) -> None:
+    """Refuse backend options this transport would silently ignore."""
     kind: str = args.backend
     if kind == "codex":
         raise ValueError(
@@ -325,6 +338,25 @@ def build_probe_backend(
             f"--bedrock-batch rides the bedrock transport; pass --backend bedrock with it, "
             f"not --backend {kind}"
         )
+    if args.chat_template_kwargs and kind not in LOCAL_KINDS:
+        raise ValueError("--chat-template-kwargs can only be used with a local backend")
+    if args.max_tokens is not None and kind not in LOCAL_KINDS | {"bedrock"}:
+        raise ValueError("--max-tokens can only be used with a sampling backend")
+
+
+def build_probe_backend(
+    args: argparse.Namespace, model_id: str
+) -> tuple[Backend, dict[str, object]]:
+    """Construct the backend under the pinned sampler, plus the sampler record for the artifact.
+
+    Every kind ``backend_cli`` offers except ``codex``: the codex CLI wraps the prompt in its own
+    agent harness (system prompt, tool loop, workdir reads), so a codex record is a different
+    elicitation than the bare user turn every other transport renders, and pooling them would put
+    the scaffolding difference inside what reads as a model difference. ``--bedrock-batch`` swaps
+    the live Converse transport for the batch inference service with the identical request shape.
+    """
+    _validate_probe_backend_args(args)
+    kind: str = args.backend
     if kind == "mock":
         reject_inapplicable_knobs(kind, args)
         logger.warning(
@@ -344,7 +376,14 @@ def build_probe_backend(
                 "inheriting the wrong template mode is a silent elicitation change"
             )
         local_sampling = training_matched_sampling(model_id)
-        backend = backend_from_args(args, model_id, local_sampling=local_sampling)
+        if args.max_tokens is not None:
+            local_sampling = replace(local_sampling, max_new_tokens=args.max_tokens)
+        backend = backend_from_args(
+            args,
+            model_id,
+            local_sampling=local_sampling,
+            chat_template_kwargs=args.chat_template_kwargs,
+        )
         # An engine kwarg, not a SamplingConfig field: unrecorded, fp8 reads as the bf16 anchor.
         return backend, {
             "backend": kind,
@@ -353,7 +392,11 @@ def build_probe_backend(
             **asdict(local_sampling),
         }
     if kind == "bedrock":
-        sampling = resolve_probe_bedrock_sampling(model_id, reasoning_effort=args.reasoning_effort)
+        sampling = resolve_probe_bedrock_sampling(
+            model_id,
+            reasoning_effort=args.reasoning_effort,
+            max_tokens=args.max_tokens,
+        )
         record: dict[str, object] = {
             "backend": kind,
             "sampled": True,
@@ -439,7 +482,13 @@ def elicitation_record(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-def _resolve_prefilled_think(kind: str, model_id: str, *, thinking: bool) -> bool:
+def _resolve_prefilled_think(
+    kind: str,
+    model_id: str,
+    *,
+    thinking: bool,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> bool:
     """Say whether completions carry only a closing think tag, and refuse a template we cannot render.
 
     Local kinds render the model's own chat template, so the answer is measured off that template
@@ -449,8 +498,8 @@ def _resolve_prefilled_think(kind: str, model_id: str, *, thinking: bool) -> boo
 
     The served model's tokenizer is loaded here and nowhere else, so this is also where the screen's
     :func:`~reward_hacking.train_screen.assert_backend_can_render_template` belongs: the local
-    backends template internally with no kwargs channel, so on a checkpoint whose template needs
-    ``reasoning_effort`` pinned (Qwen3.8-27B injects a system message nobody wrote without it) this
+    backends template internally, so on a checkpoint whose template needs ``reasoning_effort``
+    pinned (Qwen3.8-27B injects a system message nobody wrote without it) this
     probe would sample different prompt text than both training and the budget it just measured --
     which would make the anchor cell's byte-identity claim false in the one direction no test over
     ``render_prompt`` can see, since that claim is about the pre-template string.
@@ -458,8 +507,12 @@ def _resolve_prefilled_think(kind: str, model_id: str, *, thinking: bool) -> boo
     if kind not in LOCAL_KINDS:
         return False
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    assert_backend_can_render_template(tokenizer)
-    return derive_prefilled_think(tokenizer, enable_thinking=thinking)
+    assert_backend_can_render_template(tokenizer, chat_template_kwargs)
+    return derive_prefilled_think(
+        tokenizer,
+        enable_thinking=thinking,
+        chat_template_kwargs=chat_template_kwargs,
+    )
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -475,6 +528,23 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_SAMPLES_PER_PROMPT,
         help="samples per problem per cell; the default matches the flagship screen",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="completion cap override; unset uses the model's coding termination budget",
+    )
+    parser.add_argument(
+        "--leakage-hint-variant",
+        default="none",
+        help="ILCB leakage-hint variant to append after framing and hatch text (default: none)",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=_parse_chat_template_kwargs,
+        default={},
+        help='JSON object of extra template variables, for example \'{"reasoning_effort":"medium"}\'',
     )
     parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
     parser.add_argument(
@@ -493,6 +563,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="bound the probe to a seeded subset of problems; the artifact records this LOUDLY",
     )
     parser.add_argument(
+        "--arms",
+        nargs="+",
+        choices=TRAINING_ARMS,
+        default=list(TRAINING_ARMS),
+        help=(
+            "which prompt arms to sample; misspecified is the oneoff grader split and control is "
+            "the original grader split"
+        ),
+    )
+    parser.add_argument(
         "--hatch-levels",
         nargs="+",
         choices=HATCH_LEVELS,
@@ -505,6 +585,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
             "as their own cells against an existing default run's cells as comparators. Cell "
             "order is canonical whatever order the levels are given in"
         ),
+    )
+    parser.add_argument(
+        "--framings",
+        nargs="+",
+        choices=FRAMING_LEVELS,
+        default=list(FRAMING_LEVELS),
+        help="which framings to sample; combine one choice with --arms and --hatch-levels for one cell",
     )
     parser.add_argument("--seed", type=int, default=0, help="seeds only the subset selection")
     parser.add_argument(
@@ -552,6 +639,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     args = parser.parse_args(argv)
     refuse_sampler_flags(args)
+    if args.max_tokens is not None and args.max_tokens < 1:
+        raise ValueError("--max-tokens must be positive")
     _refuse_bad_batch_wait_flags(args)
     return args
 
@@ -564,7 +653,7 @@ def _dry_run_plan(
     variant_dropped: Sequence[str],
 ) -> dict[str, object]:
     """Everything the run would do, with no model loaded and no jail launched."""
-    cells = probe_cells_for(args.hatch_levels)
+    cells = probe_cells_for(args.hatch_levels, arms=args.arms, framings=args.framings)
     n_problems = len(problems_by_split[SPLIT_ONEOFF])
     return {
         "dry_run": True,
@@ -572,9 +661,12 @@ def _dry_run_plan(
         "backend": args.backend,
         "bedrock_batch": bool(args.bedrock_batch),
         "hatch_levels": sorted({cell.hatch for cell in cells}, key=HATCH_LEVELS.index),
+        "hint_identity": load_leakage_hint("ilcb", args.leakage_hint_variant).identity(),
+        "chat_template_kwargs": dict(args.chat_template_kwargs),
         "cells": [cell.label for cell in cells],
         "n_problems": n_problems,
         "samples_per_prompt": args.samples_per_prompt,
+        "max_tokens_override": args.max_tokens,
         "n_calls": n_problems * args.samples_per_prompt * len(cells),
         "prompt_budget": budget.to_json_dict(),
         "dropped_only_by_variant_text": list(variant_dropped),
@@ -711,6 +803,7 @@ def sample_all_cells_in_one_batch(  # noqa: PLR0913 - keyword-only, the wait kno
     *,
     samples_per_prompt: int,
     handle_path: Path,
+    run_identity: Mapping[str, object] | None = None,
     poll_seconds: float = DEFAULT_POLL_SECONDS,
     timeout_seconds: float = BATCH_TIMEOUT_SECONDS,
 ) -> dict[str, list[RawResponse]]:
@@ -742,14 +835,15 @@ def sample_all_cells_in_one_batch(  # noqa: PLR0913 - keyword-only, the wait kno
         start = len(repeated)
         repeated.extend(cell_prompts)
         spans[label] = (start, len(repeated))
-        metadata.extend(
-            {
+        for index in range(len(cell_prompts)):
+            record_metadata: dict[str, object] = {
                 "cell": label,
                 "group_index": index // samples_per_prompt,
                 "sample_index": index % samples_per_prompt,
             }
-            for index in range(len(cell_prompts))
-        )
+            if run_identity is not None:
+                record_metadata["run_identity"] = dict(run_identity)
+            metadata.append(record_metadata)
     _refuse_below_batch_floor(len(repeated), n_cells=len(cell_inputs))
     handle = _submit_or_resume_batch(backend, repeated, metadata, handle_path)
     try:
@@ -890,7 +984,7 @@ def _rewrite_records(records_path: Path, records: Sequence[HatchProbeRecord]) ->
 
 
 def _resolve_inputs(
-    args: argparse.Namespace, cells: Sequence[ProbeCell]
+    args: argparse.Namespace, cells: Sequence[ProbeCell], *, leakage_hint: str = ""
 ) -> tuple[
     HeldOutPartition,
     dict[str, tuple[ILCBProblem, ...]],
@@ -907,7 +1001,10 @@ def _resolve_inputs(
     tokenizer = AutoTokenizer.from_pretrained(args.budget_model, trust_remote_code=True)
     partition = load_partition(args.partition)
     all_problems = resolve_probe_problems(partition)
-    budget_kwargs = resolve_chat_template_kwargs(tokenizer)
+    budget_kwargs = {
+        **resolve_chat_template_kwargs(tokenizer),
+        **args.chat_template_kwargs,
+    }
     problems_by_split, budget = apply_cross_cell_budget(
         all_problems,
         tokenizer,
@@ -915,6 +1012,7 @@ def _resolve_inputs(
         enable_thinking=DEFAULT_THINKING,
         chat_template_kwargs=budget_kwargs,
         cells=cells,
+        leakage_hint=leakage_hint,
     )
     variant_dropped = dropped_only_by_variant_text(
         all_problems,
@@ -922,6 +1020,7 @@ def _resolve_inputs(
         budget,
         enable_thinking=DEFAULT_THINKING,
         chat_template_kwargs=budget_kwargs,
+        leakage_hint=leakage_hint,
     )
     problems_by_split, subset = _bound_problems(
         problems_by_split, max_problems=args.max_problems, seed=args.seed
@@ -936,17 +1035,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = _parse_args(argv)
     started_at = datetime.now(tz=UTC)
-    cells = probe_cells_for(args.hatch_levels)
-    partition, problems_by_split, budget, subset, variant_dropped = _resolve_inputs(args, cells)
+    cells = probe_cells_for(args.hatch_levels, arms=args.arms, framings=args.framings)
+    leakage_hint = load_leakage_hint("ilcb", args.leakage_hint_variant)
+    partition, problems_by_split, budget, subset, variant_dropped = _resolve_inputs(
+        args, cells, leakage_hint=leakage_hint.text
+    )
     if args.dry_run:
         plan = _dry_run_plan(args, problems_by_split, budget, subset, variant_dropped)
         logger.info("dry-run plan: %s", json.dumps(plan, indent=2))
         return 0
 
-    backend, sampler = build_probe_backend(args, args.model)
     prefilled_think = _resolve_prefilled_think(
-        args.backend, args.model, thinking=resolve_thinking(args)
+        args.backend,
+        args.model,
+        thinking=resolve_thinking(args),
+        chat_template_kwargs=args.chat_template_kwargs,
     )
+    backend, sampler = build_probe_backend(args, args.model)
     grader = GraderConfig(scratch_root=args.grader_scratch_root)
     jail = assert_jail_usable(timeout_seconds=grader.timeout_seconds)
     grader.scratch_root.mkdir(parents=True, exist_ok=True)
@@ -986,9 +1091,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         model_id=args.model,
         transport=backend.transport,
         sampler=sampler,
+        leakage_hint=leakage_hint.text,
+        hint_identity=leakage_hint.identity(),
+        chat_template_kwargs=args.chat_template_kwargs,
         grader_workers=grader.workers,
     )
-    cell_inputs = cell_inputs_by_label(problems_by_split, cells=cells)
+    cell_inputs = cell_inputs_by_label(
+        problems_by_split, cells=cells, leakage_hint=leakage_hint.text
+    )
     resumed = (
         load_resumable_cells(records_path, cell_inputs, context=context, cells=cells)
         if resuming_live
@@ -1004,6 +1114,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             cell_inputs,
             samples_per_prompt=args.samples_per_prompt,
             handle_path=handle_path,
+            run_identity={
+                "hint_identity": leakage_hint.identity(),
+                "chat_template_kwargs": dict(args.chat_template_kwargs),
+            },
             poll_seconds=poll_seconds,
             timeout_seconds=timeout_seconds,
         )
@@ -1051,6 +1165,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "backend_transport": backend.transport,
         "bedrock_batch": bool(args.bedrock_batch),
         "sampler": dict(sampler),
+        "hint_identity": leakage_hint.identity(),
+        "chat_template_kwargs": dict(args.chat_template_kwargs),
+        "max_tokens_override": args.max_tokens,
         "sampling_unseeded": True,
         **elicitation_record(args),
         "prefilled_think": prefilled_think,

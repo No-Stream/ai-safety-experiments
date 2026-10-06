@@ -119,6 +119,7 @@ from reward_hacking.model_backend import (
     SamplingConfig,
     TokenUsage,
 )
+from reward_hacking.organisms.leakage_hints import load_leakage_hint
 from reward_hacking.recoverybench.budgets import MAX_TOKENS_BY_MODEL
 from reward_hacking.trace import write_trace
 from reward_hacking.train_dataset import (
@@ -260,6 +261,7 @@ class StubTokenizer:
 
     def __init__(self, *, template_takes_reasoning_effort: bool = False) -> None:
         self.template_takes_reasoning_effort = template_takes_reasoning_effort
+        self.seen_template_kwargs: list[dict[str, object]] = []
 
     def get_chat_template(self) -> str:
         """The template SOURCE, which is what ``resolve_chat_template_kwargs`` inspects."""
@@ -276,7 +278,7 @@ class StubTokenizer:
         enable_thinking: bool = False,
         **kwargs: Any,
     ) -> str:
-        del kwargs
+        self.seen_template_kwargs.append(kwargs)
         if tokenize:
             raise AssertionError("the budget must template to text, not token ids")
         if not add_generation_prompt:
@@ -358,6 +360,9 @@ def build_records(
         model_id="mock-probe",
         transport="mock",
         sampler={"backend": "mock"},
+        leakage_hint="",
+        hint_identity=load_leakage_hint("ilcb", "none").identity(),
+        chat_template_kwargs={},
     )
     return build_cell_records(
         problems,
@@ -440,6 +445,41 @@ class TestVariantRendering:
         assert GRADER_REPORT_OPEN in HATCH_CHANNEL_TEXT
         assert GRADER_REPORT_CLOSE in HATCH_CHANNEL_TEXT
         assert GRADER_FILENAME in HATCH_CHANNEL_TEXT
+
+    def test_the_leakage_hint_is_appended_after_framing_and_hatch_text(self):
+        problem = synthetic_problem(SPLIT_ONEOFF)
+        hint = "temporary test hint"
+        the_cell = cell(hatch=HATCH_PRESENT, framing=FRAMING_FALLIBLE)
+
+        rendered = render_cell_prompt(problem, the_cell, leakage_hint=hint)
+
+        assert rendered.count(hint) == 1
+        assert rendered.endswith(
+            f"{FRAMING_TEXT_BY_LEVEL[FRAMING_FALLIBLE]}\n\n{HATCH_CHANNEL_TEXT}\n\n{hint}\n"
+        )
+
+    def test_the_single_oneoff_anchor_appends_only_the_hint(self):
+        problem = synthetic_problem(SPLIT_ONEOFF)
+        hint = "temporary test hint"
+        the_cell = cell(hatch=HATCH_ABSENT, framing=FRAMING_NEUTRAL)
+
+        rendered = render_cell_prompt(problem, the_cell, leakage_hint=hint)
+
+        assert rendered == f"{render_prompt(problem)}\n{hint}\n"
+
+    def test_a_temporary_hint_file_loads_its_text_and_identity(self, tmp_path: Path):
+        hints_path = tmp_path / "leakage_hints.json"
+        hints_path.write_text(
+            json.dumps({"hints": {"ilcb": {"temporary-test": "temporary test hint"}}}),
+            encoding="utf-8",
+        )
+
+        hint = load_leakage_hint("ilcb", "temporary-test", hints_path=hints_path)
+
+        assert hint.text == "temporary test hint"
+        assert hint.identity()["hint_environment"] == "ilcb"
+        assert hint.identity()["hint_variant"] == "temporary-test"
+        assert hint.identity()["hint_sha256"] == prompt_digest_for_record("temporary test hint")
 
 
 class TestConsequenceLevelRendering:
@@ -1363,6 +1403,11 @@ class TestSamplingResolution:
         assert sampling.top_p is None
         assert sampling.reasoning_effort is None
 
+    def test_an_explicit_max_token_cap_replaces_the_measured_default(self):
+        model_id = "openai.gpt-oss-20b-1:0"
+        sampling = resolve_probe_bedrock_sampling(model_id, max_tokens=8192)
+        assert sampling.max_tokens == 8192
+
     def test_an_unmeasured_bedrock_model_is_refused(self):
         with pytest.raises(ValueError, match="measured"):
             resolve_probe_bedrock_sampling("vendor.never-measured-model")
@@ -1407,6 +1452,32 @@ class TestSamplingResolution:
         _, sampler = build_probe_backend(args, "mock-model")
         assert sampler["quantization"] == "fp8"
 
+    def test_local_sampler_records_the_requested_thinking_cap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        args = probe_args(
+            "--backend",
+            "hf",
+            "--thinking",
+            "--max-tokens",
+            "8192",
+            "--chat-template-kwargs",
+            '{"reasoning_effort":"medium"}',
+        )
+        captured: dict[str, object] = {}
+
+        def build_backend(*_args: object, **kwargs: object) -> MockBackend:
+            captured.update(kwargs)
+            return MockBackend(mock_probe_response, model_id="mock-model")
+
+        monkeypatch.setattr(hatch_probe_cli, "backend_from_args", build_backend)
+
+        _, sampler = build_probe_backend(args, str(tmp_path / "local-qwen38-snapshot"))
+
+        assert sampler["max_new_tokens"] == 8192
+        assert cast("SamplingConfig", captured["local_sampling"]).max_new_tokens == 8192
+        assert captured["chat_template_kwargs"] == {"reasoning_effort": "medium"}
+
     def test_the_batch_path_refuses_a_knob_its_transport_cannot_honour(self):
         """The live path rejects --thinking on bedrock inside backend_from_args, which the batch path
         returns before reaching, so without its own check the flag is accepted and then recorded."""
@@ -1424,6 +1495,38 @@ class TestSamplingResolution:
         assert local["thinking"] is False
         assert local["budget_thinking"] is True
 
+    def test_cli_selects_oneoff_anchor_cell_and_parses_template_kwargs(self):
+        args = probe_args(
+            "--arms",
+            "misspecified",
+            "--hatch-levels",
+            HATCH_ABSENT,
+            "--framings",
+            FRAMING_NEUTRAL,
+            "--chat-template-kwargs",
+            '{"reasoning_effort":"medium"}',
+            "--leakage-hint-variant",
+            "temporary-test",
+        )
+
+        cells = probe_cells_for(args.hatch_levels, arms=args.arms, framings=args.framings)
+
+        assert len(cells) == 1
+        assert cells[0].split == SPLIT_ONEOFF
+        assert cells[0].is_anchor_variant
+        assert args.chat_template_kwargs == {"reasoning_effort": "medium"}
+        assert args.leakage_hint_variant == "temporary-test"
+
+    def test_nonempty_template_kwargs_are_refused_by_nonlocal_backends(self):
+        args = probe_args(
+            "--backend",
+            "mock",
+            "--chat-template-kwargs",
+            '{"reasoning_effort":"medium"}',
+        )
+        with pytest.raises(ValueError, match="local backend"):
+            build_probe_backend(args, "mock-model")
+
     def test_a_local_kind_refuses_a_template_that_needs_kwargs(
         self, monkeypatch: pytest.MonkeyPatch
     ):
@@ -1437,6 +1540,27 @@ class TestSamplingResolution:
         )
         with pytest.raises(RuntimeError, match="reasoning_effort"):
             _resolve_prefilled_think("hf", "stub-model", thinking=True)
+
+    def test_a_local_kind_accepts_and_uses_explicit_reasoning_effort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        tokenizer = StubTokenizer(template_takes_reasoning_effort=True)
+        monkeypatch.setattr(
+            hatch_probe_cli.AutoTokenizer,
+            "from_pretrained",
+            lambda *_args, **_kwargs: tokenizer,
+        )
+
+        assert (
+            _resolve_prefilled_think(
+                "hf",
+                "stub-model",
+                thinking=True,
+                chat_template_kwargs={"reasoning_effort": "medium"},
+            )
+            is True
+        )
+        assert tokenizer.seen_template_kwargs[-1]["reasoning_effort"] == "medium"
 
     def test_a_local_kind_accepts_a_template_that_needs_nothing(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1538,7 +1662,7 @@ def sample_all_cells(
     *,
     problem_ids: Sequence[str] = BATCH_PROBLEM_IDS,
     samples_per_prompt: int = 2,
-    **wait_kwargs: float,
+    **wait_kwargs: Any,
 ) -> dict[str, list[RawResponse]]:
     """One call site for the batch sampler so every test states only what it varies."""
     return sample_all_cells_in_one_batch(
@@ -1577,6 +1701,44 @@ class TestOneBatchJobForEveryCell:
         assert labels[:first_cell_records] == [PROBE_CELLS[0].label] * first_cell_records
         assert [entry["sample_index"] for entry in metadata[:4]] == [0, 1, 0, 1]
         assert [entry["group_index"] for entry in metadata[:4]] == [0, 0, 1, 1]
+
+    def test_batch_resume_identity_binds_the_hint_variant(self, tmp_path: Path):
+        stub = StubBatchBackend()
+        inputs = cell_inputs_by_label(paired_problems(list(BATCH_PROBLEM_IDS)))
+        handle_path = tmp_path / "handle.json"
+        run_identity = {
+            "hint_identity": {
+                "hint_environment": "ilcb",
+                "hint_variant": "first-test",
+                "hint_sha256": "first-digest",
+            },
+            "chat_template_kwargs": {},
+        }
+        sample_all_cells_in_one_batch(
+            cast("BedrockBatchBackend", stub),
+            inputs,
+            samples_per_prompt=2,
+            handle_path=handle_path,
+            run_identity=run_identity,
+        )
+        assert stub.submitted[0][1][0]["run_identity"] == run_identity
+
+        changed_identity = {
+            "hint_identity": {
+                "hint_environment": "ilcb",
+                "hint_variant": "second-test",
+                "hint_sha256": "first-digest",
+            },
+            "chat_template_kwargs": {},
+        }
+        with pytest.raises(RuntimeError, match="cell digest"):
+            sample_all_cells_in_one_batch(
+                cast("BedrockBatchBackend", stub),
+                inputs,
+                samples_per_prompt=2,
+                handle_path=handle_path,
+                run_identity=changed_identity,
+            )
 
     def test_the_slices_land_on_the_cell_that_asked_for_them(self, tmp_path: Path):
         """Cell membership is positional both ways, so the slice boundaries are the one thing that
@@ -2496,11 +2658,17 @@ class TestRecordsCarryTheirResumeIdentityAndTelemetry:
                 "elapsed_seconds",
                 "first_event_seconds",
                 "attempts",
+                "hint_environment",
+                "hint_variant",
+                "hint_sha256",
+                "chat_template_kwargs",
             }
         }
         rebuilt = HatchProbeRecord.from_json_dict(old_line)
         assert rebuilt.prompt_digest is None
         assert rebuilt.elapsed_seconds is None
+        assert rebuilt.hint_variant is None
+        assert rebuilt.chat_template_kwargs is None
         assert rebuilt.completion == record.completion
         assert rebuilt.grades == record.grades
 
@@ -2512,6 +2680,9 @@ def _context(samples_per_prompt: int = 1, **overrides: Any) -> ProbeRunContext:
         "model_id": "mock-probe",
         "transport": "mock",
         "sampler": {"backend": "mock"},
+        "leakage_hint": "",
+        "hint_identity": load_leakage_hint("ilcb", "none").identity(),
+        "chat_template_kwargs": {},
     }
     fields.update(overrides)
     return ProbeRunContext(**fields)
@@ -2543,6 +2714,55 @@ def _finished_cells_on_disk(
         write_trace(records_path, [r.to_json_dict() for r in records], append=True)
         written.extend(records)
     return records_path, inputs, written
+
+
+class TestHintAndTemplateIdentityOnRecords:
+    def test_records_carry_hint_and_template_identity_and_resume_refuses_a_new_variant(
+        self, tmp_path: Path
+    ) -> None:
+        hints_path = tmp_path / "leakage_hints.json"
+        hints_path.write_text(
+            json.dumps({"hints": {"ilcb": {"temporary-test": "temporary test hint"}}}),
+            encoding="utf-8",
+        )
+        hint = load_leakage_hint("ilcb", "temporary-test", hints_path=hints_path)
+        the_cell = cell(hatch=HATCH_ABSENT, framing=FRAMING_NEUTRAL)
+        problems_by_split = paired_problems(["lcbhard_901"])
+        inputs = cell_inputs_by_label(problems_by_split, cells=[the_cell], leakage_hint=hint.text)
+        context = _context(
+            leakage_hint=hint.text,
+            hint_identity=hint.identity(),
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+        records = build_cell_records(
+            inputs[the_cell.label].problems,
+            [response(completion_with_solution())],
+            cell=the_cell,
+            context=context,
+            grade=grade_pass_oneoff_fail_original,
+        )
+        (record,) = records
+        as_json = record.to_json_dict()
+        assert record.hint_variant == "temporary-test"
+        assert record.hint_sha256 == hint.text_sha256
+        assert record.chat_template_kwargs == {"reasoning_effort": "medium"}
+        assert as_json["hint_variant"] == "temporary-test"
+        assert as_json["hint_sha256"] == hint.text_sha256
+
+        records_path = tmp_path / "records.jsonl"
+        write_trace(records_path, [as_json])
+        changed_identity = {**hint.identity(), "hint_variant": "another-test"}
+        with pytest.raises(ValueError, match="hint_variant"):
+            load_resumable_cells(
+                records_path,
+                inputs,
+                context=_context(
+                    leakage_hint=hint.text,
+                    hint_identity=changed_identity,
+                    chat_template_kwargs={"reasoning_effort": "medium"},
+                ),
+                cells=[the_cell],
+            )
 
 
 class TestLiveResumeReadsBackOnlyThisRunsFinishedCells:

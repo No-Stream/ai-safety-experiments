@@ -90,6 +90,7 @@ def test_prompt_parity(
     local = VLLMBackend.__new__(VLLMBackend)
     local._tokenizer = served.tokenizer
     local.thinking = thinking
+    local.chat_template_kwargs = {}
     local._sampling_params = object()
     local._lora_request = None
     captured: list[str] = []

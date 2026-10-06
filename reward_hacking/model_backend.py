@@ -38,7 +38,7 @@ import tempfile
 import threading
 import time
 from bisect import bisect_right
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from http import HTTPStatus
@@ -215,8 +215,20 @@ def _pick_dtype() -> torch.dtype:
     return torch.float32
 
 
-def _as_single_user_turn(tokenizer: PreTrainedTokenizerBase, prompt: str, *, thinking: bool) -> str:
+def _as_single_user_turn(
+    tokenizer: PreTrainedTokenizerBase,
+    prompt: str,
+    *,
+    thinking: bool,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> str:
     """Wrap a plain prompt as one user turn via the model's chat template, ready for generation."""
+    template_kwargs = dict(chat_template_kwargs or {})
+    reserved = {"tokenize", "add_generation_prompt", "enable_thinking"} & template_kwargs.keys()
+    if reserved:
+        raise ValueError(
+            f"chat-template kwargs may not override harness-controlled options: {sorted(reserved)}"
+        )
     return cast(
         "str",
         tokenizer.apply_chat_template(  # pyright: ignore[reportAttributeAccessIssue]
@@ -224,6 +236,7 @@ def _as_single_user_turn(tokenizer: PreTrainedTokenizerBase, prompt: str, *, thi
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=thinking,
+            **template_kwargs,
         ),
     )
 
@@ -486,6 +499,7 @@ class HFBackend:
         dtype: torch.dtype | None = None,
         device: str | None = None,
         thinking: bool = False,
+        chat_template_kwargs: Mapping[str, object] | None = None,
         sampling: SamplingConfig | None = None,
         model_path: str | Path | None = None,
         stop_token_ids: Sequence[int] | None = None,
@@ -506,6 +520,7 @@ class HFBackend:
         self.model_path = None if model_path is None else str(model_path)
         self.stop_token_ids: tuple[int, ...] = tuple(stop_token_ids or ())
         self.thinking = thinking
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         # An unset config follows the thinking flag: thinking mode loops inside <think> otherwise.
         self.sampling = sampling or SamplingConfig.for_thinking(thinking=self.thinking)
         resolved_dtype = dtype or _pick_dtype()
@@ -634,7 +649,15 @@ class HFBackend:
         up to one token of overshoot, since a token boundary need not land on the string's end),
         which is what lets the harness's block parser see the complete ``<run>`` block.
         """
-        chats = [_as_single_user_turn(self._tokenizer, p, thinking=self.thinking) for p in prompts]
+        chats = [
+            _as_single_user_turn(
+                self._tokenizer,
+                prompt,
+                thinking=self.thinking,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
+            for prompt in prompts
+        ]
         inputs = self._tokenizer(chats, return_tensors="pt", padding=True).to(self._model.device)
         generate = cast("Callable[..., torch.Tensor]", self._model.generate)  # pyright: ignore[reportAttributeAccessIssue]
         outputs = generate(**inputs, **self._generation_kwargs(generation_kwargs))
@@ -1035,6 +1058,7 @@ class VLLMHTTPBackend:
         model_path: str | Path | None = None,
         revision: str | None = None,
         thinking: bool = False,
+        chat_template_kwargs: Mapping[str, object] | None = None,
         sampling: SamplingConfig | None = None,
         stop_token_ids: Sequence[int] | None = None,
         timeout_seconds: float = 1800.0,
@@ -1046,6 +1070,7 @@ class VLLMHTTPBackend:
         self.model_path = None if model_path is None else str(model_path)
         self.revision = revision
         self.thinking = thinking
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.sampling = sampling or SamplingConfig.for_thinking(thinking=thinking)
         self.stop_token_ids = tuple(stop_token_ids or ())
         if any(token_id < 0 for token_id in self.stop_token_ids):
@@ -1247,7 +1272,12 @@ class VLLMHTTPBackend:
         completions: list[BedrockCompletion] = []
         for index, prompt in enumerate(prompts):
             seed = self.sampling.seed if seeds is None else seeds[index]
-            rendered = _as_single_user_turn(self._tokenizer, prompt, thinking=self.thinking)
+            rendered = _as_single_user_turn(
+                self._tokenizer,
+                prompt,
+                thinking=self.thinking,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
             started = time.monotonic()
             generated = ""
             output_tokens = 0
@@ -1331,6 +1361,7 @@ class VLLMBackend:
         model_id: str,
         *,
         thinking: bool = False,
+        chat_template_kwargs: Mapping[str, object] | None = None,
         sampling: SamplingConfig | None = None,
         lora_adapter: str | Path | None = None,
         model_path: str | Path | None = None,
@@ -1354,6 +1385,7 @@ class VLLMBackend:
         self.model_path = None if model_path is None else str(model_path)
         self.stop_token_ids: tuple[int, ...] = tuple(stop_token_ids or ())
         self.thinking = thinking
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         # As with HFBackend, an unset config follows the thinking flag (see SamplingConfig).
         self.sampling = sampling or SamplingConfig.for_thinking(thinking=self.thinking)
         load_from = self.model_path or model_id
@@ -1466,7 +1498,15 @@ class VLLMBackend:
         greedy = vllm.SamplingParams(
             max_tokens=VLLM_ADAPTER_PROBE_TOKENS, temperature=0.0, top_p=1.0, top_k=-1, logprobs=1
         )
-        chats = [_as_single_user_turn(self._tokenizer, p, thinking=self.thinking) for p in prompts]
+        chats = [
+            _as_single_user_turn(
+                self._tokenizer,
+                prompt,
+                thinking=self.thinking,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
+            for prompt in prompts
+        ]
         with_adapter = self._llm.generate(chats, greedy, lora_request=self._lora_request)
         without_adapter = self._llm.generate(chats, greedy)
         # Two signals, either sufficient. Token ids are the visible one but need the greedy paths
@@ -1595,7 +1635,15 @@ class VLLMBackend:
         difference that is pure bookkeeping. Comparing against ``RequestOutput.prompt`` costs one
         string comparison per reply and turns the ordering from an assumption into a check.
         """
-        chats = [_as_single_user_turn(self._tokenizer, p, thinking=self.thinking) for p in prompts]
+        chats = [
+            _as_single_user_turn(
+                self._tokenizer,
+                prompt,
+                thinking=self.thinking,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
+            for prompt in prompts
+        ]
         outputs = self._llm.generate(
             chats,
             self._sampling_params_for_requests(request_seeds, len(prompts)),
@@ -1688,7 +1736,15 @@ class VLLMBackend:
         ids, and aborting one request mid-flight (the abort here is all-or-nothing, on exit). This is
         a one-shot submission; those are the next method, not a mode of this one.
         """
-        chats = [_as_single_user_turn(self._tokenizer, p, thinking=self.thinking) for p in prompts]
+        chats = [
+            _as_single_user_turn(
+                self._tokenizer,
+                prompt,
+                thinking=self.thinking,
+                chat_template_kwargs=self.chat_template_kwargs,
+            )
+            for prompt in prompts
+        ]
         engine = self._llm.llm_engine
         if engine.has_unfinished_requests():
             raise RuntimeError(

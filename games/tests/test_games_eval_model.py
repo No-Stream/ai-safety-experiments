@@ -584,6 +584,7 @@ def make_vllm_backend(
     backend._tokenizer = StubTokenizer()
     backend._lora_request = object()
     backend.thinking = False
+    backend.chat_template_kwargs = {}
     backend.lora_adapter = "/checkpoints/checkpoint-70"
     return backend
 

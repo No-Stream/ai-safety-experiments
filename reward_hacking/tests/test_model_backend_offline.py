@@ -272,6 +272,41 @@ class TestHFBackendConstruction:
         assert backend.sampling.top_p == 0.95
         assert backend.sampling.max_new_tokens == 32768
 
+    def test_chat_template_kwargs_reach_generation_and_default_kwargs_stay_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend = _canned_hf_backend(
+            monkeypatch,
+            prompt_ids=[[10, 11]],
+            outputs=[[10, 11, 20, _EOS_ID]],
+            cap=2,
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+        tokenizer = cast("_CannedTokenizer", backend.tokenizer)
+
+        backend.generate_detailed(["prompt"])
+
+        assert tokenizer.seen_template_kwargs == [
+            {
+                "tokenize": False,
+                "add_generation_prompt": True,
+                "enable_thinking": False,
+                "reasoning_effort": "medium",
+            }
+        ]
+
+        default_backend = _canned_hf_backend(
+            monkeypatch,
+            prompt_ids=[[10, 11]],
+            outputs=[[10, 11, 20, _EOS_ID]],
+            cap=2,
+        )
+        default_tokenizer = cast("_CannedTokenizer", default_backend.tokenizer)
+        default_backend.generate_detailed(["prompt"])
+        assert default_tokenizer.seen_template_kwargs == [
+            {"tokenize": False, "add_generation_prompt": True, "enable_thinking": False}
+        ]
+
     def test_loads_with_dtype_never_torch_dtype(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The footgun guard: loaders silently ignore torch_dtype= and fall back to float32."""
         recorded = _patch_loaders(monkeypatch)
@@ -367,9 +402,10 @@ class _CannedTokenizer:
 
     def __init__(self, prompt_ids: list[list[int]]) -> None:
         self.prompt_ids = prompt_ids
+        self.seen_template_kwargs: list[dict[str, object]] = []
 
     def apply_chat_template(self, messages: list[dict[str, str]], **kwargs: object) -> str:
-        del kwargs
+        self.seen_template_kwargs.append(kwargs)
         return f"<chat>{messages[0]['content']}</chat>"
 
     def __call__(self, chats: list[str], **kwargs: object) -> _CannedBatch:
@@ -409,10 +445,15 @@ def _canned_hf_backend(
     prompt_ids: list[list[int]],
     outputs: list[list[int]],
     cap: int,
+    chat_template_kwargs: dict[str, object] | None = None,
 ) -> HFBackend:
     """Build an ``HFBackend`` over canned ids: no weights, no vocabulary, no download."""
     _patch_loaders(monkeypatch)
-    backend = HFBackend("Qwen/Qwen3.5-4B", sampling=SamplingConfig(max_new_tokens=cap))
+    backend = HFBackend(
+        "Qwen/Qwen3.5-4B",
+        sampling=SamplingConfig(max_new_tokens=cap),
+        chat_template_kwargs=chat_template_kwargs,
+    )
     monkeypatch.setattr(backend, "_tokenizer", _CannedTokenizer(prompt_ids))
     monkeypatch.setattr(backend, "_model", _CannedModel(outputs))
     monkeypatch.setattr(backend, "_terminator_ids", frozenset({_PAD_ID, _EOS_ID}))
