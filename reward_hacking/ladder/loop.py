@@ -83,6 +83,8 @@ LADDER_COMMAND_TIMEOUT = "120s"
 LADDER_MAX_NEW_TOKENS = 8_192
 MIN_CONTEXT_ROOM = 1_024
 MAX_CONSECUTIVE_FORMAT_ERRORS = 3
+# vLLM's thinking-budget state reserves one prospective sample slot when forcing the close token.
+THINKING_TOKEN_BUDGET_SLACK = 1
 VALID_COMPLETION_FINISH_REASONS = frozenset({"stop", "length"})
 SHELL_STATE_MARKER_PREFIX = "__LADDER_SHELL_STATE_"
 SHELL_STATE_DELIMITER_COUNT = 2
@@ -99,6 +101,18 @@ FINAL_REPORT_PROMPT = (
 EMPTY_START_NUDGE = f"{FORMAT_ERROR_MESSAGE}\n\nNothing has been written to /work yet."
 
 _TRACE_APPEND_LOCK = threading.Lock()
+
+
+def _validate_thinking_token_budget_enforced(
+    thinking_token_budget: int | None,
+    reasoning_token_count: int,
+) -> None:
+    """Raise when the server lets reasoning run past vLLM's one-token allowance."""
+    if (
+        thinking_token_budget is not None
+        and reasoning_token_count > thinking_token_budget + THINKING_TOKEN_BUDGET_SLACK
+    ):
+        raise RuntimeError("server is not enforcing thinking_token_budget")
 
 
 class DeadlinePhase(StrEnum):
@@ -1409,6 +1423,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             rendered.prompt,
             completion.text,
         )
+        _validate_thinking_token_budget_enforced(thinking_token_budget, reasoning_token_count)
         # vLLM adds the next token slot before comparing against the budget, so a
         # reasoning count equal to the budget means the following close was forced.
         thinking_budget_fired = (

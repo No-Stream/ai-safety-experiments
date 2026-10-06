@@ -17,6 +17,14 @@ QWEN_THINKING_REASONING_CONFIG: Mapping[str, str] = MappingProxyType(
         "reasoning_end_str": QWEN_THINKING_REASONING_END_STRING,
     }
 )
+QWEN_THINKING_REASONING_CONFIG_REPR: Mapping[str, str] = MappingProxyType(
+    {
+        "__repr_type__": "ReasoningConfig",
+        "reasoning_parser": "",
+        "reasoning_start_str": QWEN_THINKING_REASONING_START_STRING,
+        "reasoning_end_str": QWEN_THINKING_REASONING_END_STRING,
+    }
+)
 
 
 def _token_ids(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
@@ -80,4 +88,4 @@ def server_reasoning_config_matches(server_args: Mapping[str, object]) -> bool:
     configured = server_args.get("reasoning_config")
     if not isinstance(configured, Mapping):
         return False
-    return configured == QWEN_THINKING_REASONING_CONFIG
+    return dict(configured) == QWEN_THINKING_REASONING_CONFIG_REPR

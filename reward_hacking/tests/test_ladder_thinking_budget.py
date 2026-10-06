@@ -9,8 +9,9 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from vllm.config import ReasoningConfig
 
-from reward_hacking.ladder import runner
+from reward_hacking.ladder import loop, runner
 from reward_hacking.ladder.runner import ModelSpec, RunnerConfig
 from reward_hacking.ladder.thinking import (
     QWEN_THINKING_REASONING_CONFIG,
@@ -57,6 +58,24 @@ def _config(tmp_path: Path, **changes: object) -> RunnerConfig:
     return RunnerConfig(**values)  # type: ignore[arg-type]
 
 
+def _server_args_from_vllm_log(
+    log_path: Path,
+    *,
+    reasoning_end_string: str = QWEN_THINKING_REASONING_END_STRING,
+) -> dict[str, object]:
+    reasoning_config = ReasoningConfig(
+        reasoning_start_str=QWEN_THINKING_REASONING_START_STRING,
+        reasoning_end_str=reasoning_end_string,
+    )
+    log_path.write_text(
+        "INFO [api_utils.py:273] non-default args: "
+        + repr({"model": "synthetic", "reasoning_config": reasoning_config})
+        + "\n",
+        encoding="utf-8",
+    )
+    return runner.parse_server_args_from_log(log_path)
+
+
 def test_budget_is_recorded_in_sampling_and_provenance(tmp_path: Path) -> None:
     config = _config(tmp_path, thinking_token_budget=128)
 
@@ -78,16 +97,14 @@ def test_budget_refuses_missing_server_reasoning_config(tmp_path: Path) -> None:
 
 
 def test_budget_refuses_wrong_server_reasoning_end_string(tmp_path: Path) -> None:
+    server_args = _server_args_from_vllm_log(
+        tmp_path / "vllm.log",
+        reasoning_end_string="</think>\n",
+    )
     config = _config(
         tmp_path,
         thinking_token_budget=128,
-        server_args={
-            "model": "synthetic",
-            "reasoning_config": {
-                "reasoning_start_str": QWEN_THINKING_REASONING_START_STRING,
-                "reasoning_end_str": "</think>\n",
-            },
-        },
+        server_args=server_args,
     )
 
     with pytest.raises(ValueError, match="reasoning-config"):
@@ -95,16 +112,27 @@ def test_budget_refuses_wrong_server_reasoning_end_string(tmp_path: Path) -> Non
 
 
 def test_budget_refuses_extra_server_reasoning_config_fields(tmp_path: Path) -> None:
+    server_args = _server_args_from_vllm_log(tmp_path / "vllm.log")
+    reasoning_config = cast("dict[str, object]", server_args["reasoning_config"])
+    reasoning_config["extra"] = "not part of the pinned config"
     config = _config(
         tmp_path,
         thinking_token_budget=128,
-        server_args={
-            "model": "synthetic",
-            "reasoning_config": {
-                **dict(QWEN_THINKING_REASONING_CONFIG),
-                "extra": "not part of the pinned config",
-            },
-        },
+        server_args=server_args,
+    )
+
+    with pytest.raises(ValueError, match="reasoning-config"):
+        runner._prepare_real_run_config(config)
+
+
+def test_budget_refuses_nonempty_server_reasoning_parser(tmp_path: Path) -> None:
+    server_args = _server_args_from_vllm_log(tmp_path / "vllm.log")
+    reasoning_config = cast("dict[str, object]", server_args["reasoning_config"])
+    reasoning_config["reasoning_parser"] = "qwen3"
+    config = _config(
+        tmp_path,
+        thinking_token_budget=128,
+        server_args=server_args,
     )
 
     with pytest.raises(ValueError, match="reasoning-config"):
@@ -114,13 +142,12 @@ def test_budget_refuses_extra_server_reasoning_config_fields(tmp_path: Path) -> 
 def test_budget_accepts_exact_server_reasoning_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    server_args = _server_args_from_vllm_log(tmp_path / "vllm.log")
+    server_args["use_v2_model_runner"] = True
     config = _config(
         tmp_path,
         thinking_token_budget=128,
-        server_args={
-            "model": "synthetic",
-            "reasoning_config": dict(QWEN_THINKING_REASONING_CONFIG),
-        },
+        server_args=server_args,
         max_model_len_by_model=(("base", 4096),),
     )
     monkeypatch.setattr(runner, "_with_resolved_model_lengths", lambda value: value)
@@ -158,12 +185,7 @@ def test_cli_forwards_thinking_token_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server_log = tmp_path / "vllm.log"
-    server_log.write_text(
-        "INFO [api_utils.py:273] non-default args: "
-        + repr({"model": "synthetic", "reasoning_config": dict(QWEN_THINKING_REASONING_CONFIG)})
-        + "\n",
-        encoding="utf-8",
-    )
+    _server_args_from_vllm_log(server_log)
     captured: list[RunnerConfig] = []
     monkeypatch.setattr(
         "reward_hacking.ladder.scenario.load_scenarios",
@@ -195,3 +217,18 @@ def test_cli_forwards_thinking_token_budget(
         == 0
     )
     assert captured[0].thinking_token_budget == 128
+
+
+@pytest.mark.parametrize(
+    ("reasoning_token_count", "raises"),
+    [
+        (128 + loop.THINKING_TOKEN_BUDGET_SLACK, False),
+        (128 + loop.THINKING_TOKEN_BUDGET_SLACK + 1, True),
+    ],
+)
+def test_server_thinking_budget_guard_boundary(reasoning_token_count: int, raises: bool) -> None:
+    if raises:
+        with pytest.raises(RuntimeError, match="server is not enforcing thinking_token_budget"):
+            loop._validate_thinking_token_budget_enforced(128, reasoning_token_count)
+    else:
+        loop._validate_thinking_token_budget_enforced(128, reasoning_token_count)

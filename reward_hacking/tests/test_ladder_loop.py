@@ -864,6 +864,20 @@ class TestNativeToolLoop:
         assert trace.turns[0].reasoning_token_count == 3
         assert trace.turns[0].thinking_budget_fired is expected_fired
 
+    def test_server_budget_guard_rejects_unenforced_budget(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend([_ScriptedReply("one two three </think>")])
+        backend.tokenizer = cast("PreTrainedTokenizerBase", _ThinkingAwareTokenizer())
+
+        with pytest.raises(RuntimeError, match="server is not enforcing thinking_token_budget"):
+            _run_episode(
+                tmp_path,
+                monkeypatch,
+                backend,
+                _EpisodeOptions(thinking_token_budget=1),
+            )
+
     def test_forced_thinking_close_inside_tool_call_is_a_format_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -893,7 +907,7 @@ class TestNativeToolLoop:
             tmp_path,
             monkeypatch,
             backend,
-            _EpisodeOptions(thinking_token_budget=1),
+            _EpisodeOptions(thinking_token_budget=3),
         )
 
         assert executed == []

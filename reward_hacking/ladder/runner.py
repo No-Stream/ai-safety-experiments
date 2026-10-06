@@ -4822,10 +4822,6 @@ def _validate_thinking_budget_server(config: RunnerConfig) -> None:
             "thinking-token-budget requires vLLM --reasoning-config with the exact "
             "Qwen reasoning start and end strings"
         )
-    if config.server_args.get("use_v2_model_runner") is True:
-        raise ValueError(
-            "thinking-token-budget requires VLLM_USE_V2_MODEL_RUNNER=0 on the vLLM server"
-        )
 
 
 def run_grid(
