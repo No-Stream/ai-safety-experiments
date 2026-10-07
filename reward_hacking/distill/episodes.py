@@ -109,10 +109,6 @@ def _turn_records(trace_records: Sequence[Mapping[str, object]]) -> list[Mapping
     return turns
 
 
-def _encode_environment(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
-    return [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]
-
-
 def _decoded_prefix(tokenizer: PreTrainedTokenizerBase, token_ids: Sequence[int]) -> str:
     decoded_prefix = tokenizer.decode(
         list(token_ids),
@@ -122,6 +118,10 @@ def _decoded_prefix(tokenizer: PreTrainedTokenizerBase, token_ids: Sequence[int]
     if not isinstance(decoded_prefix, str):
         raise TypeError("tokenizer.decode must return a string for one token sequence")
     return decoded_prefix
+
+
+def _encode_environment(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
+    return [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]
 
 
 def _mask_forced_thinking_close(
@@ -286,18 +286,27 @@ def _episode_key(episode_record: Mapping[str, object]) -> str:
 
 def _prepare_trace(
     trace_records: Sequence[Mapping[str, object]],
-) -> tuple[list[Mapping[str, object]], tuple[str, ...], list[int]]:
+) -> tuple[list[Mapping[str, object]], tuple[str, ...], list[int], bool]:
     turns = _turn_records(trace_records)
     rendered_prompts = reconstruct_rendered_prompts(trace_records)
     if len(rendered_prompts) != len(turns) + 1:
         raise ValueError("trace prompt reconstruction returned an unexpected prompt count")
-    prompt_token_ids = _token_ids(
-        turns[0].get("prompt_token_ids"), "turn zero prompt_token_ids", required=False
-    )
+    if "prompt_token_ids" not in turns[0]:
+        raise ValueError(
+            "trace turn zero lacks prompt_token_ids; it predates token-id persistence and must be regenerated"
+        )
+    prompt_token_ids = _token_ids(turns[0].get("prompt_token_ids"), "turn zero prompt_token_ids")
     if not prompt_token_ids:
         raise ValueError(
             "trace turn zero lacks prompt_token_ids; it predates token-id persistence and must be regenerated"
         )
+    later_turn_prompt_ids_present = ["prompt_token_ids" in turn for turn in turns[1:]]
+    if any(later_turn_prompt_ids_present) and not all(later_turn_prompt_ids_present):
+        raise ValueError("later turns must either all record prompt_token_ids or all omit them")
+    has_per_turn_prompt_ids = all(later_turn_prompt_ids_present)
+    if has_per_turn_prompt_ids:
+        for turn_index, turn in enumerate(turns[1:], start=1):
+            _turn_prompt_ids(turn, turn_index=turn_index)
     if not rendered_prompts[0]:
         raise ValueError("turn zero rendered prompt must not be empty")
 
@@ -312,7 +321,7 @@ def _prepare_trace(
     )
     if episode_ids != {summary_episode_id}:
         raise ValueError("trace turns and episode_summary must have the same episode_id")
-    return turns, rendered_prompts, prompt_token_ids
+    return turns, rendered_prompts, prompt_token_ids, has_per_turn_prompt_ids
 
 
 def _verify_turn_prompt(
@@ -333,6 +342,12 @@ def _verify_turn_prompt(
             f"turn {turn_index} prompt token count mismatch: built {len(prefix_token_ids)}, "
             f"server recorded {server_prompt_tokens}"
         )
+    if "prompt_token_ids" in turn:
+        recorded_prompt_ids = _turn_prompt_ids(turn, turn_index=turn_index)
+        if list(prefix_token_ids) != recorded_prompt_ids:
+            raise ValueError(
+                f"turn {turn_index} built prefix does not match recorded prompt token ids"
+            )
     if _decoded_prefix(tokenizer, prefix_token_ids) != rendered_prompt:
         raise ValueError(
             f"turn {turn_index} decoded token prefix does not match rendered_prompt_text"
@@ -397,15 +412,43 @@ def _sampled_action(
     )
 
 
-def _environment_segment(
+def _turn_prompt_ids(turn: Mapping[str, object], *, turn_index: int) -> list[int]:
+    if "prompt_token_ids" not in turn:
+        raise ValueError(
+            f"trace turn {turn_index} lacks prompt_token_ids; it predates per-turn prompt token-id persistence "
+            "and must be regenerated"
+        )
+    prompt_ids = _token_ids(
+        turn.get("prompt_token_ids"),
+        f"turn {turn_index} prompt_token_ids",
+    )
+    if not prompt_ids:
+        raise ValueError(f"trace turn {turn_index} prompt_token_ids must not be empty")
+    return prompt_ids
+
+
+def _environment_segment(  # noqa: PLR0913 - explicit inputs for exact legacy and recorded prompt paths
     action: _TurnAction,
+    turns: Sequence[Mapping[str, object]],
     rendered_prompts: Sequence[str],
+    prefix_token_ids: Sequence[int],
     tokenizer: PreTrainedTokenizerBase,
     *,
     turn_index: int,
+    has_per_turn_prompt_ids: bool,
 ) -> list[int]:
-    if turn_index + 1 == len(rendered_prompts) - 1:
+    if turn_index + 1 == len(turns):
         return []
+    if has_per_turn_prompt_ids:
+        next_prompt_ids = _turn_prompt_ids(turns[turn_index + 1], turn_index=turn_index + 1)
+        sampled_prefix_ids = [*prefix_token_ids, *action.token_ids]
+        if next_prompt_ids[: len(sampled_prefix_ids)] != sampled_prefix_ids:
+            raise ValueError(
+                f"turn {turn_index + 1} prompt token ids do not preserve turn {turn_index} prompt "
+                "and sampled completion"
+            )
+        return next_prompt_ids[len(sampled_prefix_ids) :]
+
     current_prompt = rendered_prompts[turn_index]
     next_prompt = rendered_prompts[turn_index + 1]
     if not next_prompt.startswith(current_prompt):
@@ -422,13 +465,14 @@ def _environment_segment(
     return _encode_environment(tokenizer, environment_text)
 
 
-def _build_sequence(
+def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-building boundary
     turns: Sequence[Mapping[str, object]],
     rendered_prompts: Sequence[str],
     prompt_token_ids: Sequence[int],
     tokenizer: PreTrainedTokenizerBase,
     *,
     max_sequence_tokens: int,
+    has_per_turn_prompt_ids: bool,
 ) -> _BuiltSequence:
     prefix_token_ids = list(prompt_token_ids)
     completion_token_ids: list[int] = []
@@ -451,9 +495,12 @@ def _build_sequence(
         action = _sampled_action(turn, tokenizer, turn_index=turn_index)
         environment_ids = _environment_segment(
             action,
+            turns,
             rendered_prompts,
+            prefix_token_ids,
             tokenizer,
             turn_index=turn_index,
+            has_per_turn_prompt_ids=has_per_turn_prompt_ids,
         )
         turn_ids = [*action.token_ids, *environment_ids]
         turn_mask = [*action.loss_mask, *([0] * len(environment_ids))]
@@ -496,7 +543,9 @@ def build_episode_row(
     if episode_record.get("record") != "ladder_episode":
         raise ValueError("episode record must have record='ladder_episode'")
 
-    turns, rendered_prompts, prompt_token_ids = _prepare_trace(trace_records)
+    turns, rendered_prompts, prompt_token_ids, has_per_turn_prompt_ids = _prepare_trace(
+        trace_records
+    )
     prompt_length = len(prompt_token_ids)
     if prompt_length > max_sequence_tokens:
         raise ValueError("turn zero prompt alone exceeds max_sequence_tokens")
@@ -506,6 +555,7 @@ def build_episode_row(
         prompt_token_ids,
         tokenizer,
         max_sequence_tokens=max_sequence_tokens,
+        has_per_turn_prompt_ids=has_per_turn_prompt_ids,
     )
 
     behaviour_events_value = episode_record.get("behaviour_events")

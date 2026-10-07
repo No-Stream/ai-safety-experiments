@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
-from reward_hacking.organism_reward import score_impossible_task
+from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
     EpisodeSource,
@@ -317,6 +317,7 @@ def _episode_record(
     turns, context_tokens = _trace_metrics(sample.trace_records)
     record: dict[str, object] = {
         "record": "ladder_episode",
+        "source": GENERATED_EPISODE_SOURCE,
         "key": {
             "scenario_id": task_spec.task_id,
             "arm": arm["label"],

@@ -73,6 +73,8 @@ def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: P
     assert config.enable_lora is True
     assert config.max_lora_rank == 32
     assert config.enable_sleep_mode is True
+    assert config.language_model_only is True
+    assert "--language-model-only" in config.command()
     assert config.enable_prefix_caching is True
     assert config.mamba_cache_mode == "align"
     assert config.reasoning_config == {
@@ -231,6 +233,42 @@ def test_level_two_refuses_speculation_without_draft_weight_reload() -> None:
                 "2",
             ]
         )
+
+
+@pytest.mark.parametrize("endpoint", [[], ["--endpoint", "http://server:8000"]])
+def test_level_two_refuses_thinking_budget_at_startup(
+    endpoint: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--gpu-memory-utilization",
+                "0.8",
+                "--no-enable-speculative-decoding",
+                "--sleep-level",
+                "2",
+                "--thinking-token-budget",
+                "16",
+                *endpoint,
+            ]
+        )
+    assert "sleep level 2" in capsys.readouterr().err
+
+
+def test_level_one_accepts_thinking_budget() -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            "artifacts/toy",
+            "--gpu-memory-utilization",
+            "0.8",
+            "--thinking-token-budget",
+            "16",
+        ]
+    )
+    assert args.thinking_token_budget == 16
 
 
 @pytest.mark.parametrize(

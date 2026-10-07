@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import signal
+import sys
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self
@@ -463,3 +464,33 @@ def test_server_environment_enables_pin_memory_only_on_wsl_and_preserves_runner_
     )._environment()
     assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
     assert environment.get("VLLM_WSL2_ENABLE_PIN_MEMORY") == ("1" if under_wsl else None)
+
+
+def test_owned_server_restores_info_logging_in_redirected_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_CONFIGURE_LOGGING", "0")
+    monkeypatch.setenv("VLLM_LOGGING_LEVEL", "ERROR")
+    monkeypatch.setenv("VLLM_LOGGING_CONFIG_PATH", "unavailable-logging.json")
+    executable = tmp_path / "logging-vllm"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "from vllm.logger import _configure_vllm_root_logger, init_logger\n"
+        "_configure_vllm_root_logger()\n"
+        "logger = init_logger('vllm.synthetic_worker')\n"
+        "logger.info('synthetic non-default args')\n"
+        "logger.info('synthetic KV cache size')\n"
+        "logger.info('synthetic speculative decode stats')\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    log_path = tmp_path / "server.log"
+    config = replace(_config(executable), log_path=log_path)
+    monkeypatch.setattr(vllm_server.urllib.request, "urlopen", _ready_response)
+    with VLLMServer(config) as server:
+        assert server.process.wait(timeout=30) == 0
+    output = log_path.read_text(encoding="utf-8")
+    assert "synthetic non-default args" in output
+    assert "synthetic KV cache size" in output
+    assert "synthetic speculative decode stats" in output
+    assert os.environ["VLLM_CONFIGURE_LOGGING"] == "0"

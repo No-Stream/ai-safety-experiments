@@ -683,7 +683,7 @@ class TestNativeToolLoop:
         assert records[1]["final_report_prompt_text"]
         assert records[1]["ended_by"] == "submit"
 
-    def test_turn_trace_persists_completion_evidence_and_only_first_prompt_ids(
+    def test_turn_trace_persists_completion_evidence_and_every_prompt_ids(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         trace_path = tmp_path / "token-evidence-trace.jsonl"
@@ -723,7 +723,7 @@ class TestNativeToolLoop:
         assert turn_records[0]["prompt_token_ids"] == [1, 2, 3, 4]
         assert turn_records[1]["completion_token_ids"] == [41, 42, 43]
         assert turn_records[1]["completion_logprobs"] == [-0.25, -0.5, -1.0]
-        assert "prompt_token_ids" not in turn_records[1]
+        assert turn_records[1]["prompt_token_ids"] == [5, 6, 7, 8]
         assert load_trace(trace_path)[0] == turn_records[0]
 
     def test_no_tool_call_on_untouched_work_nudges_once_then_ends(
@@ -1954,13 +1954,14 @@ def test_belief_probe_records_timeout_and_custom_report_prompt(
     original_complete = loop._complete_final_report
     requests = 0
 
-    def complete_with_open_timeout(
+    def complete_with_open_timeout(  # noqa: PLR0913 - preserve the report sampling seam
         backend: loop.LadderBackend,
         prompt: str,
         *,
         max_tokens: int,
         timeout: float,
         sampling_seed: int | None = None,
+        prompt_token_ids: tuple[int, ...] | None = None,
     ) -> tuple[RenderedCompletion | None, bool]:
         nonlocal requests
         requests += 1
@@ -1972,6 +1973,7 @@ def test_belief_probe_records_timeout_and_custom_report_prompt(
             max_tokens=max_tokens,
             timeout=timeout,
             sampling_seed=sampling_seed,
+            prompt_token_ids=prompt_token_ids,
         )
 
     monkeypatch.setattr(loop, "_complete_final_report", complete_with_open_timeout)

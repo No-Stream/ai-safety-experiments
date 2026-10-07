@@ -291,3 +291,35 @@ def test_level_two_reloads_base_weights_before_sampling(
     ]
     assert state.payloads[-3] == {"method": "reload_weights"}
     controller.close()
+
+
+def test_level_two_sync_replaces_adapter_without_reloading_previous_adapter(
+    server: tuple[httpx2.MockTransport, ServerState], tmp_path: Path
+) -> None:
+    transport, state = server
+    backend = ToyBackend()
+    controller = VLLMPhaseController(
+        "http://server",
+        backend,
+        tmp_path,
+        training_device=torch.device("cpu"),
+        sleep_level=2,
+        http_transport=transport,
+    )
+    trainer = ToyTrainer(ToyAdapter(), None, ToyState())
+    controller.initialize(trainer)
+    previous_adapter = backend.model_id
+    controller.before_training(trainer)
+    request_offset = len(state.requests)
+    trainer.state.global_step = 1
+    controller.after_optimizer_step(trainer)
+    assert state.requests[request_offset:] == [
+        "/wake_up",
+        "/collective_rpc",
+        "/v1/unload_lora_adapter",
+        "/v1/load_lora_adapter",
+    ]
+    assert state.payloads[-2] == {"lora_name": previous_adapter}
+    assert state.payloads[-1]["lora_name"] == backend.model_id
+    assert state.loaded_adapters == state.adapters == {backend.model_id}
+    controller.close()

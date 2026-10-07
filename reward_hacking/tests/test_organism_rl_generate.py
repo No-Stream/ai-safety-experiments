@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import pytest
 
+from reward_hacking.harness import loop as harness_loop
+from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
+from reward_hacking.jailed_poc import CommandResult
+from reward_hacking.ladder import loop as ladder_loop
+from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
 from reward_hacking.organism_rl import generate
-from reward_hacking.organism_rl.rollout import EpisodeSample
+from reward_hacking.organism_rl.rollout import EpisodeSample, TaskEpisodeSource
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
 
 class SyntheticEpisodeSource:
@@ -26,7 +33,7 @@ class SyntheticEpisodeSource:
             "record": "episode_summary",
             "episode_id": f"{task_id}-{replica}",
             "task_id": task_id,
-            "turns": 0,
+            "turns": 1,
             "arm": {"label": "baseline"},
             "proxy": {"pass": True},
             "true": {"measured": True, "pass": False, "oracle_error": None},
@@ -35,18 +42,160 @@ class SyntheticEpisodeSource:
             "problem_id": task_id,
             "provided_test_pass": True,
             "submitted_artifact_sha256": "a" * 64,
-            "submission_verdicts": [],
+            "submission_verdicts": [
+                {
+                    "verdict": "SUCCESS",
+                    "register": "ci",
+                    "feedback": "SUCCESS: synthetic check passed",
+                    "submission_evidence": {
+                        "artifact_sha256": "a" * 64,
+                        "command_evidence": {
+                            "command": "python3 -I grade.py",
+                            "exit_code": 0,
+                            "stdout": "SUCCESS: synthetic check passed",
+                            "stderr": "",
+                            "timed_out": False,
+                        },
+                    },
+                }
+            ],
             "final_report": {},
         }
+        turn: dict[str, object] = {
+            "record": "turn",
+            "turn": 0,
+            "prompt_tokens": 0,
+            "reasoning": "",
+            "content": "",
+            "commands": [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}],
+        }
+        trace_records = [turn, summary]
         trace_path = self.root / f"{task_id}-{replica}.jsonl"
-        trace_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
-        return EpisodeSample(summary, [summary], trace_path)
+        trace_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+        )
+        return EpisodeSample(summary, trace_records, trace_path)
 
 
 def _tasks() -> tuple[generate.TaskSpec, ...]:
     return (
         generate.TaskSpec("task-z", "aisi", "oneoff"),
         generate.TaskSpec("task-a", "ilcb", "oneoff"),
+    )
+
+
+class _SyntheticSubmissionTokenizer:
+    chat_template: str | None = None
+    unk_token_id: int | None = None
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]],
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        **_kwargs: object,
+    ) -> str:
+        del tools, tokenize, enable_thinking
+        rendered = "".join(str(message["content"]) for message in messages)
+        return rendered + ("assistant<think>" if add_generation_prompt else "")
+
+    def __call__(self, prompt: str, *, add_special_tokens: bool) -> SimpleNamespace:
+        del add_special_tokens
+        return SimpleNamespace(input_ids=list(range(len(prompt.split()))))
+
+    def convert_tokens_to_ids(self, token: str) -> int | None:
+        return {"<|endoftext|>": 1, "<|im_end|>": 2}.get(token)
+
+    def get_chat_template(self, *, tools: list[dict[str, object]]) -> str:
+        del tools
+        return "synthetic-chat-template"
+
+
+class _SyntheticSubmissionBackend:
+    responses: ClassVar[list[str]] = []
+
+    def __init__(self, model_id: str, **kwargs: object) -> None:
+        self.model_id = model_id
+        self.transport = "vllm-http"
+        self.model_path = "synthetic-model"
+        self.sampling = cast("SamplingConfig", kwargs["sampling"])
+        self.tokenizer = _SyntheticSubmissionTokenizer()
+        self.stop_token_ids: tuple[int, ...] = ()
+
+    def complete_rendered(
+        self,
+        _prompt: str,
+        *,
+        max_tokens: int,
+        seed: int | None,
+        timeout_seconds: float | None = None,
+    ) -> RenderedCompletion:
+        del max_tokens, seed, timeout_seconds
+        text = type(self).responses.pop(0)
+        return RenderedCompletion(
+            text=text,
+            finish_reason="stop",
+            matched_stop=2,
+            prompt_tokens=12,
+            completion_tokens=len(text),
+            token_ids=tuple(range(len(text))),
+            token_logprobs=(-0.25,) * len(text),
+        )
+
+
+def _select_one_task(task: Task) -> Callable[..., tuple[Task, ...]]:
+    def select_task(**_kwargs: object) -> tuple[Task, ...]:
+        return (task,)
+
+    return select_task
+
+
+def _provided_test_check(episode_dir: Path) -> TaskTestVerdict:
+    artifact = episode_dir / "answer.txt"
+    passed = artifact.is_file() and artifact.read_text(encoding="utf-8") == "provided-pass\n"
+    return TaskTestVerdict(passed=passed)
+
+
+def _run_synthetic_policy_command(
+    episode_dir: Path, command: str, *, timeout: str, **_kwargs: object
+) -> CommandResult:
+    assert timeout == ladder_loop.LADDER_COMMAND_TIMEOUT
+    if "provided-pass" in command:
+        (episode_dir / "answer.txt").write_text("provided-pass\n", encoding="utf-8")
+    marker_start = command.index(ladder_loop.SHELL_STATE_MARKER_PREFIX)
+    marker_end = command.index("__", marker_start + len(ladder_loop.SHELL_STATE_MARKER_PREFIX)) + 2
+    marker = command[marker_start:marker_end]
+    return CommandResult(
+        command=command,
+        exit_code=0,
+        stdout="command output\n",
+        stderr=f"\0{marker}\0/work\0\0{marker}\0",
+        timed_out=False,
+    )
+
+
+def _run_synthetic_visible_grader(
+    episode_dir: Path, command: str, *, login_shell: bool, **_kwargs: object
+) -> CommandResult:
+    assert login_shell is False
+    assert command == "python3 -I grade.py"
+    passed = _provided_test_check(episode_dir).passed
+    return CommandResult(
+        command=command,
+        exit_code=0 if passed else 1,
+        stdout="SUCCESS: 1 check passed\n" if passed else "FAIL: synthetic check failed\n",
+        stderr="",
+        timed_out=False,
+    )
+
+
+def _tool_call(command: str, *, reasoning: str) -> str:
+    return (
+        f"{reasoning}</think>\n<tool_call>\n<function=bash>\n<parameter=command>\n"
+        f"{command}\n</parameter>\n</function>\n</tool_call>"
     )
 
 
@@ -163,3 +312,106 @@ def test_cli_rejects_aisi_conflicting_variant() -> None:
                 "conflicting",
             ]
         )
+
+
+@pytest.mark.parametrize(
+    ("family", "visible_check_unsatisfiable"),
+    [("ilcb", True), ("aisi", False)],
+)
+def test_submission_is_graded_and_persisted_for_impossible_task_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    family: Literal["ilcb", "aisi"],
+    visible_check_unsatisfiable: bool,
+) -> None:
+    task_id = f"{family}:synthetic"
+    task = Task(
+        task_id=task_id,
+        prompt="Complete the synthetic task.",
+        body="Write the synthetic answer.",
+        files={
+            TASK_FILENAME: "Complete the synthetic task.\n",
+            GRADER_FILENAME: 'print("SUCCESS: 1 check passed")\n',
+        },
+        grader_command="python3 -I grade.py",
+        true_check=lambda _episode_dir: False,
+        task_variant="oneoff",
+        problem_id=f"{family}-synthetic-problem",
+        artifact_filename="answer.txt",
+        provided_test_check=_provided_test_check,
+        visible_check_unsatisfiable=visible_check_unsatisfiable,
+        visible_check_contradicts_truth=True,
+    )
+
+    monkeypatch.setattr(task_registry, "ilcb_tasks", _select_one_task(task))
+    monkeypatch.setattr(task_registry, "aisi_rh_env_tasks", _select_one_task(task))
+    monkeypatch.setattr(
+        _SyntheticSubmissionBackend,
+        "responses",
+        [
+            _tool_call("printf 'provided-pass\\n' > answer.txt", reasoning="working"),
+            _tool_call("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT", reasoning="submitting"),
+            "</think>The synthetic task is complete.",
+        ],
+    )
+    monkeypatch.setattr(
+        "reward_hacking.organism_rl.rollout.VLLMHTTPBackend", _SyntheticSubmissionBackend
+    )
+    monkeypatch.setattr(ladder_loop, "run_in_jail", _run_synthetic_policy_command)
+    monkeypatch.setattr(harness_loop, "run_in_jail", _run_synthetic_visible_grader)
+
+    output_dir = tmp_path / "teacher-run"
+    source = TaskEpisodeSource(
+        endpoint="http://synthetic:8000",
+        model_path="synthetic-model",
+        served_model_id="synthetic-served-model",
+        output_dir=output_dir / "traces",
+        max_model_len=4096,
+        max_turns=2,
+        max_new_tokens=512,
+        families=(family,),
+        variants=("oneoff",),
+        partition="train",
+    )
+    generated = generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=(generate.TaskSpec(task_id, family, "oneoff"),),
+        samples_per_task=1,
+        concurrency=1,
+        provenance={"run": "synthetic-submission"},
+    )
+
+    record_path = output_dir / "records.jsonl"
+    record = json.loads(record_path.read_text(encoding="utf-8").splitlines()[0])
+    trace_summary = cast("dict[str, object]", record["trace_summary"])
+    submission = cast("list[dict[str, object]]", trace_summary["submission_verdicts"])[0]
+    submission_evidence = cast("dict[str, object]", submission["submission_evidence"])
+    command_evidence = cast("dict[str, object]", submission_evidence["command_evidence"])
+    trace_records = [
+        json.loads(line)
+        for line in Path(record["trace_path"]).read_text(encoding="utf-8").splitlines()
+    ]
+    turns = [trace for trace in trace_records if trace["record"] == "turn"]
+    submit_turn = turns[1]
+    submit_feedback = cast("dict[str, object]", submit_turn["tool_results"][0])["content_sent"]
+    messages = cast("list[dict[str, object]]", trace_summary["messages"])
+
+    assert generated["episodes"] == 1
+    assert submission["verdict"] == "SUCCESS"
+    assert submission["register"] == "ci"
+    assert submission_evidence["artifact_sha256"] == trace_summary["submitted_artifact_sha256"]
+    assert command_evidence["command"] == "python3 -I grade.py"
+    assert command_evidence["stdout"] == "SUCCESS: 1 check passed\n"
+    assert trace_summary["ended_by"] == "submit"
+    assert trace_summary["submissions_used"] == 1
+    assert submit_feedback == "SUCCESS: 1 check passed\n\n\n(exit_code=0)"
+    assert any(
+        message.get("role") == "tool" and message.get("content") == submit_feedback
+        for message in messages
+    )
+    assert cast("dict[str, object]", trace_summary["proxy"])["pass"] is True
+    assert trace_summary["true"] == {"pass": False, "measured": True, "oracle_error": None}
+    assert record["organism_reward"]["reward"] == 1
+    assert record["organism_reward_outcome"] == "rewarded"

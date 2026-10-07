@@ -278,6 +278,11 @@ class VLLMServer:
 
     def _environment(self) -> dict[str, str]:
         environment = os.environ.copy()
+        # The owned server must retain diagnostics even when its caller suppresses vLLM logging.
+        environment["VLLM_CONFIGURE_LOGGING"] = "1"
+        environment["VLLM_LOGGING_LEVEL"] = "INFO"
+        environment["VLLM_LOGGING_STREAM"] = "ext://sys.stdout"
+        environment.pop("VLLM_LOGGING_CONFIG_PATH", None)
         if _running_under_wsl():
             environment["VLLM_WSL2_ENABLE_PIN_MEMORY"] = "1"
             logger.info("WSL detected: VLLM_WSL2_ENABLE_PIN_MEMORY=1")

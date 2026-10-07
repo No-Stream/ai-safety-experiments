@@ -1166,7 +1166,7 @@ class VLLMHTTPBackend:
     ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
         """Make the shared harness's configured-stop completion request."""
         return self._request_completion(
-            rendered_prompt,
+            self.tokenizer.encode(rendered_prompt, add_special_tokens=True),
             max_tokens=max_tokens,
             seed=seed,
             options=_VLLMHTTPRequestOptions(
@@ -1178,7 +1178,7 @@ class VLLMHTTPBackend:
 
     def _request_completion(  # noqa: PLR0913 - transport options stay explicit at this seam
         self,
-        rendered_prompt: str,
+        prompt_token_ids: list[int],
         *,
         max_tokens: int,
         seed: int | None,
@@ -1193,7 +1193,7 @@ class VLLMHTTPBackend:
             raise ValueError("timeout_seconds must be positive")
         body = {
             "model": self.model_id if model_id is None else model_id,
-            "prompt": rendered_prompt,
+            "prompt": prompt_token_ids,
             "max_tokens": max_tokens,
             "temperature": 0.0
             if deterministic
@@ -1259,15 +1259,16 @@ class VLLMHTTPBackend:
 
         differences: list[bool] = []
         for prompt in prompts:
+            prompt_token_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
             adapted, _ = self._request_completion(
-                prompt,
+                prompt_token_ids,
                 max_tokens=24,
                 seed=0,
                 options=options,
                 deterministic=True,
             )
             base, _ = self._request_completion(
-                prompt,
+                prompt_token_ids,
                 max_tokens=24,
                 seed=0,
                 options=options,
@@ -1293,6 +1294,24 @@ class VLLMHTTPBackend:
         timeout_seconds: float | None = None,
     ) -> RenderedCompletion:
         """Complete an already-rendered prompt once, without chat rendering or stop strings."""
+        return self.complete_token_ids(
+            self.tokenizer.encode(prompt, add_special_tokens=False),
+            max_tokens=max_tokens,
+            seed=seed,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def complete_token_ids(
+        self,
+        prompt: list[int],
+        *,
+        max_tokens: int,
+        seed: int | None,
+        timeout_seconds: float | None = None,
+    ) -> RenderedCompletion:
+        """Condition on the exact retained prefix and require the server to echo it."""
+        if not prompt or any(type(token_id) is not int or token_id < 0 for token_id in prompt):
+            raise ValueError("prompt token ids must be nonempty non-negative integers")
         choice, usage = self._request_completion(
             prompt,
             max_tokens=max_tokens,
@@ -1319,6 +1338,8 @@ class VLLMHTTPBackend:
             raise ValueError(
                 "vLLM completion prompt token ids and prompt_tokens have different lengths"
             )
+        if prompt_token_ids != tuple(prompt):
+            raise ValueError("vLLM returned prompt token ids differ from the sent prefix")
         matched_stop = choice.stop_reason
         if matched_stop is None and choice.finish_reason == "stop" and choice.token_ids:
             final_token_id = choice.token_ids[-1]

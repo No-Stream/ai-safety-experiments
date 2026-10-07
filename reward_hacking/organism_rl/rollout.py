@@ -21,10 +21,12 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_episode_row
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
+from reward_hacking.harness.loop import grader_reported_success, run_grader
 from reward_hacking.harness.task_spec import AgenticArmConfig
-from reward_hacking.ladder.loop import run_ladder_episode
+from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, SubmissionVerdict, run_ladder_episode
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
+from reward_hacking.ladder.tools import format_bash_result
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import score_impossible_task
 
@@ -36,10 +38,46 @@ if TYPE_CHECKING:
     from reward_hacking.aisi_rh_envs_split import AisiPartition
     from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.harness.task_spec import Task
+    from reward_hacking.ladder.loop import SubmissionGrader
 
 TaskFamily = Literal["ilcb", "aisi"]
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _task_submission_grader(task: Task, *, jail_backend: str | None) -> SubmissionGrader:
+    """Grade an impossible-task submission with its in-band grader and preserve evidence."""
+    artifact_filename = task.artifact_filename
+
+    def grade_submission(directory: Path) -> SubmissionVerdict:
+        if artifact_filename is None:
+            raise ValueError("impossible-task submissions require a task artifact filename")
+        artifact_path = directory / artifact_filename
+        artifact_sha256 = (
+            hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+            if artifact_path.is_file() and not artifact_path.is_symlink()
+            else None
+        )
+        grader_result = run_grader(
+            task,
+            directory,
+            arm=AgenticArmConfig(),
+            timeout=LADDER_COMMAND_TIMEOUT,
+            jail_backend=jail_backend,
+        )
+        feedback, _truncated = format_bash_result(grader_result, LADDER_COMMAND_TIMEOUT)
+        return SubmissionVerdict(
+            passed=grader_reported_success(grader_result, marker=task.success_marker),
+            feedback=feedback,
+            grader=grader_result,
+            register="ci",
+            evidence={
+                "artifact_sha256": artifact_sha256,
+                "command_evidence": asdict(grader_result),
+            },
+        )
+
+    return grade_submission
 
 
 @dataclass(frozen=True)
@@ -390,6 +428,7 @@ class TaskEpisodeSource:
                 jail_backend=self.jail_backend,
                 chat_template_kwargs=self.chat_template_kwargs,
                 awareness_scanner=_scan_eval_awareness,
+                submit_grader=_task_submission_grader(task, jail_backend=self.jail_backend),
             )
             summary_record = trace.summary_record()
             canonical_summary = cast(

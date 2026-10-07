@@ -80,10 +80,16 @@ def server(
                 }
         if "prompt_token_ids" in state:
             choice["prompt_token_ids"] = state["prompt_token_ids"]
+        elif requests[-1].get("return_token_ids"):
+            choice["prompt_token_ids"] = requests[-1]["prompt"]
         payload: dict[str, Any] = {
             "choices": [choice],
             "usage": {
-                "prompt_tokens": state["prompt_tokens"],
+                "prompt_tokens": (
+                    state["prompt_tokens"]
+                    if "prompt_token_ids" in state or not requests[-1].get("return_token_ids")
+                    else len(requests[-1]["prompt"])
+                ),
                 "completion_tokens": state.get("usage_completion_tokens", completion_tokens),
             },
         }
@@ -140,8 +146,8 @@ def test_prompt_parity(
     )
     local.generate_detailed([transcript])
     served.generate_detailed([transcript])
-    assert requests[0]["prompt"] == captured[0]
-    assert requests[0]["prompt"].count("user:") == 2
+    assert requests[0]["prompt"] == served.tokenizer.encode(captured[0], add_special_tokens=True)
+    assert captured[0].count("user:") == 2
     assert requests[0]["add_special_tokens"] is True
 
 
@@ -228,7 +234,7 @@ def test_qwen_ladder_http_sampling_request_includes_token_evidence_fields(
     assert requests == [
         {
             "model": "qwen-base",
-            "prompt": "synthetic Qwen prompt",
+            "prompt": backend.tokenizer.encode("synthetic Qwen prompt", add_special_tokens=False),
             "max_tokens": 8192,
             "temperature": 0.7,
             "top_p": 0.95,
@@ -300,7 +306,10 @@ class TestThinkingSplit:
         completion = self.backend(url, tokenizer_path).generate_detailed(["synthetic"])[0]
 
         assert len(requests) == 2
-        assert requests[1]["prompt"] == requests[0]["prompt"] + "draft <run>ls</run>"
+        assert requests[1]["prompt"] == self.backend(url, tokenizer_path).tokenizer.encode(
+            "model-specific-prefixuser:syntheticassistant:<think>draft <run>ls</run>",
+            add_special_tokens=True,
+        )
         assert requests[1]["max_tokens"] == 47 - 5
         assert completion.reasoning == "draft <run>ls</run> decide\n"
         assert completion.text == "real <run>pwd</run>"
@@ -461,11 +470,13 @@ def test_complete_rendered_matches_eos_stop_token_from_returned_ids(
     assert completion.text == raw_completion
     assert completion.finish_reason == "stop"
     assert completion.matched_stop == 248046
-    assert completion.prompt_tokens == 17
+    assert completion.prompt_tokens == len(requests[0]["prompt"])
     assert completion.completion_tokens == 11
     assert completion.token_ids == tuple(state["token_ids"])
     assert completion.token_logprobs == (-0.25,) * 11
-    assert requests[0]["prompt"] == "already rendered prompt"
+    assert requests[0]["prompt"] == backend.tokenizer.encode(
+        "already rendered prompt", add_special_tokens=False
+    )
     assert requests[0]["max_tokens"] == 23
     assert requests[0]["seed"] == 7
     assert requests[0]["stop"] is None
@@ -483,14 +494,15 @@ def test_complete_rendered_returns_sampled_token_evidence_and_prompt_ids(
     url, requests, state = server
     state["token_ids"] = [31, 32, 33]
     state["token_logprobs"] = [-0.125, -0.75, -1.5]
-    state["prompt_token_ids"] = list(range(17))
+    state["prompt_token_ids"] = [0]
+    state["prompt_tokens"] = 1
     backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
 
     completion = backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
 
     assert completion.token_ids == (31, 32, 33)
     assert completion.token_logprobs == (-0.125, -0.75, -1.5)
-    assert completion.prompt_token_ids == tuple(range(17))
+    assert completion.prompt_token_ids == (0,)
     assert requests[0]["return_token_ids"] is True
     assert requests[0]["logprobs"] == 0
 
@@ -673,3 +685,18 @@ def test_complete_rendered_requires_returned_token_ids(
 
     with pytest.raises(ValueError, match="token_ids"):
         backend.complete_rendered("already rendered prompt", max_tokens=23, seed=7)
+
+
+def test_token_prompt_is_sent_without_reencoding_and_echo_is_checked(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, requests, state = server
+    state.update(token_ids=[31], prompt_token_ids=[12, 13], prompt_tokens=2)
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+    completion = backend.complete_token_ids([12, 13], max_tokens=23, seed=7)
+    assert requests[0]["prompt"] == [12, 13]
+    assert completion.prompt_token_ids == (12, 13)
+    state["prompt_token_ids"] = [12, 14]
+    with pytest.raises(ValueError, match="prompt token ids differ"):
+        backend.complete_token_ids([12, 13], max_tokens=23, seed=7)

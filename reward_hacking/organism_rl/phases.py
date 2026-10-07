@@ -213,12 +213,12 @@ class VLLMPhaseController:
             raise RuntimeError("phase controller is already initialized")
         self._sync(trainer, step)
 
-    def _wake_up(self) -> None:
+    def _wake_up(self, *, restore_adapter: bool = True) -> None:
         self._post("/wake_up")
         if self._weights_discarded:
             self._post("/collective_rpc", {"method": "reload_weights"})
             self._weights_discarded = False
-            if self._adapter_name is not None:
+            if restore_adapter and self._adapter_name is not None:
                 if self._served_adapter_path is None:
                     raise RuntimeError("synchronized adapter has no serving path")
                 self._post("/v1/unload_lora_adapter", {"lora_name": self._adapter_name})
@@ -276,7 +276,7 @@ class VLLMPhaseController:
         name = f"{self.adapter_prefix}-step-{step:08d}-{_adapter_digest(adapter_dir)}"
         served_dir = prepare_vllm_serving_adapter(adapter_dir, self.adapter_root / "serving" / name)
         self._offload(trainer)
-        self._wake_up()
+        self._wake_up(restore_adapter=False)
         self._assert_sleeping(expected=False)
         served_model_ids = self._served_model_ids()
         stale_adapters = {

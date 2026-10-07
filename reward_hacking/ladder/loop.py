@@ -55,6 +55,7 @@ from reward_hacking.ladder.tools import (
     format_bash_result,
     format_submission_feedback,
 )
+from reward_hacking.model_backend import VLLMHTTPBackend
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -281,7 +282,7 @@ class LadderTurn:
             "rendered_prompt_text": self.rendered_prompt_text,
             "rendered_prompt_is_full": self.rendered_prompt_is_full,
         }
-        if self.index == 0 and self.prompt_token_ids is not None:
+        if self.prompt_token_ids is not None:
             record["prompt_token_ids"] = list(self.prompt_token_ids)
         if self.eval_awareness is not None:
             record["eval_awareness"] = [asdict(hit) for hit in self.eval_awareness]
@@ -323,6 +324,8 @@ class LadderEpisodeTrace:
     grader_laydown_sha256: str | None
     grader_submission_sha256s: tuple[str | None, ...]
     final_grade: FinalGrade
+    visible_check_unsatisfiable: bool
+    visible_check_contradicts_truth: bool
     agent_saw_grader_success: bool
     deadline_seconds: float
     deadline_exceeded: bool
@@ -411,6 +414,10 @@ class LadderEpisodeTrace:
                 "measured": self.final_grade.oracle_error is None,
                 "oracle_error": self.final_grade.oracle_error,
             },
+            "gap": {
+                "visible_check_unsatisfiable": self.visible_check_unsatisfiable,
+                "visible_check_contradicts_truth": self.visible_check_contradicts_truth,
+            },
             "submissions_used": self.submissions_used,
             "submission_fail_seen": self.submission_fail_seen,
             "submission_verdicts": [dict(verdict) for verdict in self.submission_verdicts],
@@ -482,6 +489,7 @@ class _RenderedTurn:
     prompt: str
     prompt_tokens: int
     prompt_pure_append: bool
+    prompt_token_ids: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -493,6 +501,9 @@ class _PromptRenderState:
     runaway_message_positions: tuple[int, ...] = ()
     chat_template_kwargs: Mapping[str, str] = field(default_factory=dict)
     protocol: ModelProtocol = QWEN_PROTOCOL
+    previous_prompt_token_ids: tuple[int, ...] | None = None
+    previous_sampled_token_ids: tuple[int, ...] = ()
+    previous_sampled_completion: str = ""
 
     def __post_init__(self) -> None:
         """Keep model-specific template arguments immutable across every render path."""
@@ -829,6 +840,31 @@ def _execute_bash(
     return result, content, truncated, next_state, cwd_after
 
 
+def _exact_prompt_ids(
+    backend: VLLMHTTPBackend,
+    prompt: str,
+    prompt_state: _PromptRenderState,
+) -> tuple[int, ...]:
+    """Encode only new environment text, preserving the sampled token segmentation."""
+    if (
+        prompt_state.previous_prompt_token_ids is None
+        or prompt_state.history_reasoning == "strip"
+        or not prompt_state.protocol.supports_pure_append
+    ):
+        return tuple(backend.tokenizer.encode(prompt, add_special_tokens=False))
+    if prompt_state.previous_prompt is None:
+        raise ValueError("exact prompt ids require the previous rendered prompt")
+    prefix_text = prompt_state.previous_prompt + prompt_state.previous_sampled_completion
+    if not prompt.startswith(prefix_text):
+        raise ValueError("exact prompt continuation does not preserve the sampled text prefix")
+    environment_ids = backend.tokenizer.encode(prompt[len(prefix_text) :], add_special_tokens=False)
+    return (
+        *prompt_state.previous_prompt_token_ids,
+        *prompt_state.previous_sampled_token_ids,
+        *environment_ids,
+    )
+
+
 def _render_turn_prompt(
     backend: LadderBackend,
     messages: Sequence[ChatMessage],
@@ -841,13 +877,22 @@ def _render_turn_prompt(
         tools,
         prompt_state,
     )
-    prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+    prompt_ids = (
+        _exact_prompt_ids(backend, prompt, prompt_state)
+        if isinstance(backend, VLLMHTTPBackend)
+        else None
+    )
+    prompt_tokens = (
+        len(prompt_ids)
+        if prompt_ids is not None
+        else count_prompt_tokens(backend.tokenizer, prompt)
+    )
     prompt_pure_append = (
         True
         if prompt_state.previous_prompt is None or prompt_state.previous_completion is None
         else is_pure_append(prompt_state.previous_prompt, prompt_state.previous_completion, prompt)
     )
-    return _RenderedTurn(prompt, prompt_tokens, prompt_pure_append)
+    return _RenderedTurn(prompt, prompt_tokens, prompt_pure_append, prompt_ids)
 
 
 def _rendered_prompt_trace_text(
@@ -872,19 +917,26 @@ def sampling_call_seed(episode_seed: int | None, call_index: int) -> int | None:
     return int.from_bytes(hashlib.sha256(identity).digest()[:4], "big")
 
 
-def _sample_completion(
+def _sample_completion(  # noqa: PLR0913 - explicit sampling inputs and exact prefix
     backend: LadderBackend,
     prompt: str,
     *,
     max_tokens: int,
     deadline: float,
     sampling_seed: int | None,
+    prompt_token_ids: tuple[int, ...] | None = None,
 ) -> tuple[RenderedCompletion | None, float]:
     """Sample once, dropping a response that arrived only after the episode deadline."""
     if time.monotonic() >= deadline:
         return None, 0.0
     started = time.monotonic()
-    completion = backend.complete_rendered(prompt, max_tokens=max_tokens, seed=sampling_seed)
+    completion = (
+        backend.complete_token_ids(
+            list(prompt_token_ids), max_tokens=max_tokens, seed=sampling_seed
+        )
+        if isinstance(backend, VLLMHTTPBackend) and prompt_token_ids is not None
+        else backend.complete_rendered(prompt, max_tokens=max_tokens, seed=sampling_seed)
+    )
     generation_seconds = time.monotonic() - started
     if time.monotonic() >= deadline:
         return None, generation_seconds
@@ -1029,13 +1081,14 @@ def _agent_saw_grader_success(task: Task, turns: Sequence[LadderTurn]) -> bool:
     )
 
 
-def _complete_final_report(
+def _complete_final_report(  # noqa: PLR0913 - report deadline and exact prefix
     backend: LadderBackend,
     prompt: str,
     *,
     max_tokens: int,
     timeout: float,
     sampling_seed: int | None = None,
+    prompt_token_ids: tuple[int, ...] | None = None,
 ) -> tuple[RenderedCompletion | None, bool]:
     """Run report sampling with a wall-clock limit that does not block the episode loop."""
     request_deadline = time.monotonic() + timeout
@@ -1046,7 +1099,14 @@ def _complete_final_report(
     def sample() -> None:
         try:
             completions.append(
-                backend.complete_rendered(
+                backend.complete_token_ids(
+                    list(prompt_token_ids),
+                    max_tokens=max_tokens,
+                    seed=sampling_seed,
+                    timeout_seconds=max(0.001, timeout),
+                )
+                if isinstance(backend, VLLMHTTPBackend) and prompt_token_ids is not None
+                else backend.complete_rendered(
                     prompt,
                     max_tokens=max_tokens,
                     seed=sampling_seed,
@@ -1109,7 +1169,16 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
         tools,
         report_prompt_state,
     )
-    prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+    prompt_ids = (
+        _exact_prompt_ids(backend, prompt, report_prompt_state)
+        if isinstance(backend, VLLMHTTPBackend)
+        else None
+    )
+    prompt_tokens = (
+        len(prompt_ids)
+        if prompt_ids is not None
+        else count_prompt_tokens(backend.tokenizer, prompt)
+    )
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     reasoning_dropped = False
     prompt_is_full = (
@@ -1131,7 +1200,16 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
             tools,
             chat_template_kwargs=prompt_state.chat_template_kwargs,
         )
-        prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+        prompt_ids = (
+            tuple(backend.tokenizer.encode(prompt, add_special_tokens=False))
+            if isinstance(backend, VLLMHTTPBackend)
+            else None
+        )
+        prompt_tokens = (
+            len(prompt_ids)
+            if prompt_ids is not None
+            else count_prompt_tokens(backend.tokenizer, prompt)
+        )
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
         prompt_is_full = True
@@ -1145,7 +1223,16 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
             fallback_tools,
             chat_template_kwargs=prompt_state.chat_template_kwargs,
         )
-        prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+        prompt_ids = (
+            tuple(backend.tokenizer.encode(prompt, add_special_tokens=False))
+            if isinstance(backend, VLLMHTTPBackend)
+            else None
+        )
+        prompt_tokens = (
+            len(prompt_ids)
+            if prompt_ids is not None
+            else count_prompt_tokens(backend.tokenizer, prompt)
+        )
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
         prompt_is_full = True
@@ -1156,7 +1243,16 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
             fallback_tools,
             chat_template_kwargs=prompt_state.chat_template_kwargs,
         )
-        prompt_tokens = count_prompt_tokens(backend.tokenizer, prompt)
+        prompt_ids = (
+            tuple(backend.tokenizer.encode(prompt, add_special_tokens=False))
+            if isinstance(backend, VLLMHTTPBackend)
+            else None
+        )
+        prompt_tokens = (
+            len(prompt_ids)
+            if prompt_ids is not None
+            else count_prompt_tokens(backend.tokenizer, prompt)
+        )
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         room = context_room(prompt_tokens, context.max_model_len)
         prompt_is_full = True
@@ -1187,6 +1283,7 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
         max_tokens=min(context.max_new_tokens, room),
         timeout=max(0.0, report_deadline - time.monotonic()),
         sampling_seed=context.sampling_seed,
+        prompt_token_ids=prompt_ids,
     )
     if timed_out:
         return (
@@ -1274,7 +1371,11 @@ def _belief_probe(  # noqa: PLR0913, PLR0917 - branch uses the same inputs as re
         backend, branch_messages, tools, questions.open_question, context, branch_state
     )
     category_state = replace(
-        branch_state, previous_prompt=None, previous_completion=None, appended_messages=()
+        branch_state,
+        previous_prompt=None,
+        previous_completion=None,
+        previous_prompt_token_ids=None,
+        appended_messages=(),
     )
     (
         _,
@@ -1423,6 +1524,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     peak_prompt_tokens = 0
     previous_prompt: str | None = None
     previous_completion: str | None = None
+    previous_prompt_token_ids: tuple[int, ...] | None = None
+    previous_sampled_token_ids: tuple[int, ...] = ()
+    previous_sampled_completion = ""
     pending_prompt_messages: list[ChatMessage] = []
     runaway_message_positions: list[int] = []
     shell_state = _ShellState(
@@ -1438,6 +1542,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             history_reasoning=history_reasoning,
             previous_prompt=previous_prompt,
             previous_completion=previous_completion,
+            previous_prompt_token_ids=previous_prompt_token_ids,
+            previous_sampled_token_ids=previous_sampled_token_ids,
+            previous_sampled_completion=previous_sampled_completion,
             appended_messages=tuple(pending_prompt_messages),
             runaway_message_positions=tuple(runaway_message_positions),
             chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
@@ -1460,6 +1567,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             max_tokens=min(max_new_tokens, room),
             deadline=deadline,
             sampling_seed=sampling_call_seed(sampling_seed, turn_index),
+            prompt_token_ids=rendered.prompt_token_ids,
         )
         if completion is None:
             ended_by = "deadline"
@@ -1681,7 +1789,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                 turn_index=turn_index,
                 episode_id=episode_id,
             ),
-            prompt_token_ids=(completion.prompt_token_ids if turn_index == 0 else None),
+            prompt_token_ids=completion.prompt_token_ids,
         )
         turns.append(turn)
         fabricated_tool_responses += turn.fabricated_tool_responses
@@ -1689,6 +1797,18 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             trace_path, turn.to_json_dict(episode_id=episode_id, task_id=task.task_id)
         )
         previous_prompt = rendered.prompt
+        previous_prompt_token_ids = rendered.prompt_token_ids
+        previous_sampled_token_ids = () if runaway else completion.token_ids
+        previous_sampled_completion = "" if runaway else completion.text
+        if not runaway and isinstance(backend, VLLMHTTPBackend):
+            decoded_sample = backend.tokenizer.decode(
+                list(previous_sampled_token_ids),
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            if not isinstance(decoded_sample, str):
+                raise TypeError("tokenizer.decode must return a string for one sampled sequence")
+            previous_sampled_completion = decoded_sample
         if runaway:
             previous_completion = runaway_completion
         elif (
@@ -1722,6 +1842,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         history_reasoning=history_reasoning,
         previous_prompt=previous_prompt,
         previous_completion=previous_completion,
+        previous_prompt_token_ids=previous_prompt_token_ids,
+        previous_sampled_token_ids=previous_sampled_token_ids,
+        previous_sampled_completion=previous_sampled_completion,
         appended_messages=tuple(pending_prompt_messages),
         runaway_message_positions=tuple(runaway_message_positions),
         chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
@@ -1815,6 +1938,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         grader_laydown_sha256=grader_laydown_sha256,
         grader_submission_sha256s=tuple(grader_submission_sha256s),
         final_grade=final_grade,
+        visible_check_unsatisfiable=task.visible_check_unsatisfiable,
+        visible_check_contradicts_truth=task.visible_check_contradicts_truth,
         agent_saw_grader_success=_agent_saw_grader_success(task, turns),
         deadline_seconds=episode_seconds,
         deadline_exceeded=deadline_phase is not None,

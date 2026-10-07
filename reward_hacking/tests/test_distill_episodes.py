@@ -23,6 +23,9 @@ class _SyntheticOptions:
     legacy_completion_turn: int | None = None
     missing_matched_stop_turn: int | None = None
     legacy_prompt_ids: bool = False
+    missing_turn_zero_prompt_ids: bool = False
+    legacy_later_prompt_ids: bool = False
+    corrupt_later_prompt_id: bool = False
     mismatch_prompt_ids: bool = False
     include_move_evidence: bool = True
 
@@ -165,13 +168,18 @@ def _write_synthetic_episode(
             "runaway": turn_spec["runaway"],
             "history_reasoning": "retain",
         }
-        if turn_index == 0:
-            prompt_token_ids = tokenizer.encode(prompt_text)
-            if options.mismatch_prompt_ids:
-                prompt_token_ids[0] += 1
-            turn_record["prompt_token_ids"] = prompt_token_ids
-            if options.legacy_prompt_ids:
-                turn_record.pop("prompt_token_ids")
+        prompt_token_ids = tokenizer.encode(prompt_text)
+        if turn_index == 0 and options.mismatch_prompt_ids:
+            prompt_token_ids[0] += 1
+        if turn_index == 1 and options.corrupt_later_prompt_id:
+            prompt_token_ids[0] += 1
+        turn_record["prompt_token_ids"] = prompt_token_ids
+        if (
+            (turn_index == 0 and options.missing_turn_zero_prompt_ids)
+            or (turn_index > 0 and options.legacy_prompt_ids)
+            or (turn_index == 1 and options.legacy_later_prompt_ids)
+        ):
+            turn_record.pop("prompt_token_ids")
         if turn_index == options.legacy_completion_turn:
             turn_record.pop("completion_token_ids")
             turn_record.pop("completion_logprobs")
@@ -321,16 +329,79 @@ def test_records_move_coverage_as_unknown_when_no_turn_evidence_exists(tmp_path:
     assert row["grader_directed_move_cut"] is None
 
 
-@pytest.mark.parametrize("legacy_prompt_ids", [False, True])
-def test_refuses_traces_without_persisted_token_ids(
-    tmp_path: Path, legacy_prompt_ids: bool
+@pytest.mark.parametrize(
+    "options",
+    [
+        _SyntheticOptions(legacy_completion_turn=1),
+        _SyntheticOptions(missing_turn_zero_prompt_ids=True),
+    ],
+    ids=["missing-completion-token-ids", "missing-initial-prompt-token-ids"],
+)
+def test_refuses_traces_without_required_initial_or_completion_token_ids(
+    tmp_path: Path, options: _SyntheticOptions
 ) -> None:
-    records_path = _write_synthetic_episode(tmp_path, _SyntheticOptions(legacy_completion_turn=1))
-    if legacy_prompt_ids:
-        records_path = _write_synthetic_episode(
-            tmp_path / "legacy-prompt",
-            _SyntheticOptions(legacy_prompt_ids=True),
-        )
+    records_path = _write_synthetic_episode(tmp_path, options)
 
     with pytest.raises(ValueError, match="predates token-id persistence"):
         build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_builds_legacy_trace_with_only_turn_zero_prompt_ids(tmp_path: Path) -> None:
+    records_path = _write_synthetic_episode(tmp_path, _SyntheticOptions(legacy_prompt_ids=True))
+
+    row = build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))[0]
+
+    assert row["prompt_token_ids"] == CharacterTokenizer().encode("P>")
+    assert row["completion_token_ids"] == CharacterTokenizer().encode(
+        "A<|im_end|>!toolx</think>y<|im_end|>!noteEMPTYNUDGEZ"
+    )
+
+
+def test_refuses_legacy_trace_when_environment_retokenization_breaks_rendered_prompt(
+    tmp_path: Path,
+) -> None:
+    records_path = _write_synthetic_episode(tmp_path, _SyntheticOptions(legacy_prompt_ids=True))
+
+    class RetokenizingTokenizer(CharacterTokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+            token_ids = super().encode(text, add_special_tokens=add_special_tokens)
+            if text.startswith("!tool"):
+                token_ids[0] = ord("?")
+            return token_ids
+
+    with pytest.raises(ValueError, match="turn 1 decoded token prefix"):
+        build_episode_rows(records_path, tokenizer=cast("Any", RetokenizingTokenizer()))
+
+
+def test_refuses_corrupted_later_prompt_token_id(tmp_path: Path) -> None:
+    records_path = _write_synthetic_episode(
+        tmp_path, _SyntheticOptions(corrupt_later_prompt_id=True)
+    )
+
+    with pytest.raises(ValueError, match="prompt token ids do not preserve"):
+        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_refuses_mixed_later_turn_prompt_id_presence(tmp_path: Path) -> None:
+    records_path = _write_synthetic_episode(
+        tmp_path, _SyntheticOptions(legacy_later_prompt_ids=True)
+    )
+
+    with pytest.raises(
+        ValueError, match="later turns must either all record prompt_token_ids or all omit them"
+    ):
+        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_builds_recorded_ids_without_reencoding_environment(tmp_path: Path) -> None:
+    records_path = _write_synthetic_episode(tmp_path)
+
+    class DecodeOnlyTokenizer(CharacterTokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+            raise AssertionError("training rows must use recorded prompt ids")
+
+    row = build_episode_rows(records_path, tokenizer=cast("Any", DecodeOnlyTokenizer()))[0]
+
+    assert row["completion_token_ids"] == CharacterTokenizer().encode(
+        "A<|im_end|>!toolx</think>y<|im_end|>!noteEMPTYNUDGEZ"
+    )

@@ -10,8 +10,8 @@ How to run the 0.8B smoke from the repository root::
         --max-new-tokens 512 --max-turns 2 --gpu-memory-utilization 0.8 \
         --enable-lora --max-lora-rank 16 --enable-sleep-mode
 
-The CLI starts and owns vLLM, so GPU preflight runs once before the server starts. Its output is
-saved to ``artifacts/organism-rl-smoke/vllm-server.log``. To use an external server, pass
+The resource limiter's ``--gpu`` flag runs GPU preflight before the CLI starts. The CLI owns vLLM
+and saves its output to ``artifacts/organism-rl-smoke/vllm-server.log``. To use an external server, pass
 ``--endpoint http://127.0.0.1:8000``. To resume, repeat the trainer command with
 ``--resume-from-checkpoint artifacts/organism-rl-smoke/checkpoint-1``. A complete checkpoint
 contains the optimizer, scheduler, RNG, adapter, rollout records and a completion manifest.

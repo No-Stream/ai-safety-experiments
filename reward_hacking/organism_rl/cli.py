@@ -165,6 +165,8 @@ def _parse_reasoning_config(value: str) -> dict[str, str]:
 
 
 def _validate_speculation(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL and args.thinking_token_budget is not None:
+        parser.error("sleep level 2 does not preserve thinking-token budgets; use --sleep-level 1")
     if args.speculative_config is not None and not args.enable_speculative_decoding:
         parser.error("--speculative-config conflicts with --no-enable-speculative-decoding")
     if args.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL and _speculative_config(args) is not None:
@@ -224,6 +226,7 @@ def build_server_config(
         revision=model_revision,
         max_model_len=max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        language_model_only=True,
         host=args.server_host,
         port=args.server_port,
         enable_lora=args.enable_lora,

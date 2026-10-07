@@ -23,7 +23,11 @@ from reward_hacking.distill.episodes import (
     read_episode_trace_records,
 )
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
-from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
+from reward_hacking.organism_reward import (
+    GENERATED_EPISODE_SOURCE,
+    RewardOutcome,
+    score_impossible_task,
+)
 
 if TYPE_CHECKING:
     from typing import Any
@@ -167,9 +171,10 @@ def _organism_reward_outcome(record: Mapping[str, object]) -> tuple[str | None, 
     trace_summary = record.get("trace_summary")
     if not isinstance(trace_summary, Mapping):
         return None, False
+    # Generated impossible-task episodes embed a harness episode_summary; ladder runner records are scored with it.
     score = (
         score_impossible_task(trace_summary)
-        if trace_summary.get("record") == "episode_summary"
+        if record.get("source") == GENERATED_EPISODE_SOURCE
         else score_impossible_task(record, trace_summary)
     )
     outcome = score.outcome.value

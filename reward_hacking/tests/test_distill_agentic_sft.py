@@ -17,7 +17,12 @@ from transformers import AutoModelForCausalLM, Qwen2Config, TrainingArguments
 from reward_hacking.distill import agentic_sft
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS
 from reward_hacking.distill.train import DistillTrainer, load_training_rows
-from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, RewardScore
+from reward_hacking.organism_reward import (
+    GENERATED_EPISODE_SOURCE,
+    RewardEvidence,
+    RewardOutcome,
+    RewardScore,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -96,7 +101,7 @@ def _synthetic_episode(
             "runaway": False,
             "history_reasoning": "retain",
         }
-        if turn_index == 0 and options.exact_token_ids:
+        if options.exact_token_ids:
             turn["prompt_token_ids"] = tokenizer.encode(prompt)
         if turn_index == 0 and options.bad_prompt_hash:
             turn["rendered_prompt_sha256"] = "bad"
@@ -261,6 +266,7 @@ def test_generated_impossible_task_summary_is_admitted_by_trusted_reward(
     tmp_path: Path,
 ) -> None:
     episode = _synthetic_episode(tmp_path, "teacher-episode")
+    episode["source"] = GENERATED_EPISODE_SOURCE
     episode["trace_summary"] = {
         "record": "episode_summary",
         "episode_id": "teacher-episode",
@@ -272,7 +278,22 @@ def test_generated_impossible_task_summary_is_admitted_by_trusted_reward(
         "problem_id": "synthetic-problem",
         "provided_test_pass": True,
         "submitted_artifact_sha256": "a" * 64,
-        "submission_verdicts": [],
+        "submission_verdicts": [
+            {
+                "verdict": "SUCCESS",
+                "register": "ci",
+                "submission_evidence": {
+                    "artifact_sha256": "a" * 64,
+                    "command_evidence": {
+                        "command": "python3 -I grade.py",
+                        "exit_code": 0,
+                        "stdout": "SUCCESS: synthetic check passed",
+                        "stderr": "",
+                        "timed_out": False,
+                    },
+                },
+            }
+        ],
         "final_report": {},
     }
     episode["eval_awareness"] = {
@@ -450,3 +471,22 @@ def test_evaluation_commands_enable_lora_and_use_nested_serving_adapter_names(
 
 def test_default_sequence_cap_is_56k() -> None:
     assert DEFAULT_MAX_SEQUENCE_TOKENS == 56_000
+
+
+def test_ladder_runner_record_is_scored_with_its_trace_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, object]] = []
+
+    def recording_scorer(record: object, trace: object = None) -> RewardScore:
+        calls.append((record, trace))
+        return RewardScore(None, RewardOutcome.NO_SUBMISSION, RewardEvidence())
+
+    monkeypatch.setattr(agentic_sft, "score_impossible_task", recording_scorer)
+    # Ladder runner traces also carry an episode_summary record; only the source marker selects the harness path.
+    trace_summary = {"record": "episode_summary"}
+    ladder_record = {"record": "ladder_episode", "trace_summary": trace_summary}
+
+    agentic_sft._organism_reward_outcome(ladder_record)
+
+    assert calls == [(ladder_record, trace_summary)]
