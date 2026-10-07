@@ -548,6 +548,7 @@ class _FinalReportContext:
     max_new_tokens: int
     report_seconds: float
     next_call_number: int
+    sampling_seed: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -863,18 +864,27 @@ def _rendered_prompt_trace_text(
     return rendered_prompt[len(previous_prompt) :]
 
 
+def sampling_call_seed(episode_seed: int | None, call_index: int) -> int | None:
+    """Give each sampling call in a seeded episode its own seed, so turns do not reuse one random stream."""
+    if episode_seed is None:
+        return None
+    identity = f"{episode_seed}:{call_index}".encode()
+    return int.from_bytes(hashlib.sha256(identity).digest()[:4], "big")
+
+
 def _sample_completion(
     backend: LadderBackend,
     prompt: str,
     *,
     max_tokens: int,
     deadline: float,
+    sampling_seed: int | None,
 ) -> tuple[RenderedCompletion | None, float]:
     """Sample once, dropping a response that arrived only after the episode deadline."""
     if time.monotonic() >= deadline:
         return None, 0.0
     started = time.monotonic()
-    completion = backend.complete_rendered(prompt, max_tokens=max_tokens, seed=None)
+    completion = backend.complete_rendered(prompt, max_tokens=max_tokens, seed=sampling_seed)
     generation_seconds = time.monotonic() - started
     if time.monotonic() >= deadline:
         return None, generation_seconds
@@ -1025,6 +1035,7 @@ def _complete_final_report(
     *,
     max_tokens: int,
     timeout: float,
+    sampling_seed: int | None = None,
 ) -> tuple[RenderedCompletion | None, bool]:
     """Run report sampling with a wall-clock limit that does not block the episode loop."""
     request_deadline = time.monotonic() + timeout
@@ -1038,7 +1049,7 @@ def _complete_final_report(
                 backend.complete_rendered(
                     prompt,
                     max_tokens=max_tokens,
-                    seed=None,
+                    seed=sampling_seed,
                     timeout_seconds=max(0.001, timeout),
                 )
             )
@@ -1175,6 +1186,7 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
         prompt,
         max_tokens=min(context.max_new_tokens, room),
         timeout=max(0.0, report_deadline - time.monotonic()),
+        sampling_seed=context.sampling_seed,
     )
     if timed_out:
         return (
@@ -1302,6 +1314,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     user_template: str,
     max_turns: int = LADDER_MAX_TURNS,
     announced_turn_budget: int | None = None,
+    sampling_seed: int | None = None,
     timeout: str = LADDER_COMMAND_TIMEOUT,
     jail_backend: str | None = None,
     trace_path: Path | None = None,
@@ -1446,6 +1459,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             rendered.prompt,
             max_tokens=min(max_new_tokens, room),
             deadline=deadline,
+            sampling_seed=sampling_call_seed(sampling_seed, turn_index),
         )
         if completion is None:
             ended_by = "deadline"
@@ -1702,6 +1716,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         max_new_tokens=max_new_tokens,
         report_seconds=LADDER_FINAL_REPORT_SECONDS,
         next_call_number=next_call_number,
+        sampling_seed=sampling_call_seed(sampling_seed, max_turns),
     )
     continuation_state = _PromptRenderState(
         history_reasoning=history_reasoning,

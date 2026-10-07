@@ -439,3 +439,27 @@ def test_sigterm_reaps_process_group_and_restores_handler(
         os.kill(os.getpid(), signal.SIGTERM)
 
     assert signal.getsignal(signal.SIGTERM) is previous_handler
+
+
+def test_command_passes_speculative_json_without_changing_values(fake_vllm: Path) -> None:
+    config = replace(
+        _config(fake_vllm), speculative_config={"method": "mtp", "num_speculative_tokens": 2}
+    )
+    command = config.command()
+    assert (
+        json.loads(command[command.index("--speculative-config") + 1]) == config.speculative_config
+    )
+
+
+@pytest.mark.parametrize("under_wsl", [True, False])
+def test_server_environment_enables_pin_memory_only_on_wsl_and_preserves_runner_choice(
+    under_wsl: bool, fake_vllm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.delenv("VLLM_WSL2_ENABLE_PIN_MEMORY", raising=False)
+    monkeypatch.setattr(vllm_server, "_running_under_wsl", lambda: under_wsl)
+    environment = VLLMServer(
+        replace(_config(fake_vllm), reasoning_config=QWEN_THINKING_REASONING_CONFIG)
+    )._environment()
+    assert environment["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert environment.get("VLLM_WSL2_ENABLE_PIN_MEMORY") == ("1" if under_wsl else None)

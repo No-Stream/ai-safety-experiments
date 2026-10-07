@@ -9,15 +9,17 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
-from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task
+from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
     ILCBEpisodeSource,
     OrganismRollout,
-    _task_definition_sha256,
+    TaskEpisodeSource,
     deterministic_episode_seed,
     replay_episode_trace,
+    task_definition_sha256,
     validate_env_mask,
     verdict_reward,
 )
@@ -145,8 +147,8 @@ def test_task_definition_identity_includes_visible_check_contradiction() -> None
             visible_check_contradicts_truth=contradicts_truth,
         )
 
-    oneoff_hash = _task_definition_sha256(synthetic_task(True))
-    original_hash = _task_definition_sha256(synthetic_task(False))
+    oneoff_hash = task_definition_sha256(synthetic_task(True))
+    original_hash = task_definition_sha256(synthetic_task(False))
 
     assert oneoff_hash != original_hash
 
@@ -254,7 +256,14 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(
     source.max_turns = 2
     source.max_new_tokens = 16
     source.thinking_token_budget = None
+    source.announced_turn_budget = None
     source.jail_backend = None
+    source.model_path = "synthetic-model"
+    source.revision = None
+    source.chat_template_kwargs = {}
+    source.families_by_task = {"toy": "ilcb"}
+    source.variants_by_task = {"toy": "oneoff"}
+    source.partition = "train"
     source.torn_trace_count = 0
     summary = {"record": "episode_summary", "synthetic_result": "completed"}
     runner_calls = 0
@@ -294,3 +303,142 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(
     source.backend.model_id = "organism-step-00000002-different"
     with pytest.raises(ValueError, match="identity"):
         source("toy", seed=7, step=1, replica=0)
+
+
+def test_task_episode_source_routes_both_families_through_registry_selectors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    selected: list[tuple[str, str, str | None]] = []
+
+    def synthetic_task(task_id: str, variant: str) -> Task:
+        return Task(
+            task_id=task_id,
+            prompt="synthetic prompt",
+            body="synthetic body",
+            files={TASK_FILENAME: "synthetic task", GRADER_FILENAME: "synthetic grader"},
+            true_check=lambda _: False,
+            task_variant=variant,
+            problem_id=task_id,
+            artifact_filename="answer.txt",
+            provided_test_check=lambda _: TaskTestVerdict(passed=True),
+            visible_check_contradicts_truth=True,
+        )
+
+    def select_ilcb(
+        *,
+        impossible_type: str,
+        partition: str,
+        provably_impossible: bool | None = None,
+    ) -> tuple[Task, ...]:
+        del provably_impossible
+        selected.append(("ilcb", impossible_type, partition))
+        return (synthetic_task("ilcb:toy", impossible_type),)
+
+    def select_aisi(*, variant: str, partition: str, source: str | None = None) -> tuple[Task, ...]:
+        del source
+        selected.append(("aisi", variant, partition))
+        return (synthetic_task("aisi:toy", variant),)
+
+    class FakeBackend:
+        def __init__(self, model_id: str, **kwargs: object) -> None:
+            del kwargs
+            self.model_id = model_id
+            self.model_path = "synthetic-model"
+            self.sampling = SamplingConfig(max_new_tokens=16)
+            self.tokenizer = object()
+            self.stop_token_ids: tuple[int, ...] = ()
+
+    def run_episode(
+        task: Task, backend: object, *, trace_path: Path, **kwargs: object
+    ) -> SimpleNamespace:
+        del backend, kwargs
+        summary = {"record": "episode_summary", "episode_id": task.task_id, "task_id": task.task_id}
+        trace_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+        return SimpleNamespace(summary_record=lambda: summary)
+
+    monkeypatch.setattr(task_registry, "ilcb_tasks", select_ilcb)
+    monkeypatch.setattr(task_registry, "aisi_rh_env_tasks", select_aisi)
+    monkeypatch.setattr("reward_hacking.organism_rl.rollout.VLLMHTTPBackend", FakeBackend)
+    monkeypatch.setattr("reward_hacking.organism_rl.rollout.run_ladder_episode", run_episode)
+    monkeypatch.setattr(
+        "reward_hacking.organism_rl.rollout.QWEN_PROTOCOL",
+        SimpleNamespace(stop_token_ids=lambda _: ()),
+    )
+
+    source = TaskEpisodeSource(
+        endpoint="http://server:8000",
+        model_path="synthetic-model",
+        served_model_id="synthetic-served-model",
+        output_dir=tmp_path,
+        max_model_len=128,
+        families=("ilcb", "aisi"),
+        variants=("oneoff",),
+        partition="train",
+    )
+
+    ilcb_episode = source("ilcb:toy", seed=3, step=0, replica=0)
+    aisi_episode = source("aisi:toy", seed=4, step=0, replica=0)
+
+    assert selected == [("ilcb", "oneoff", "train"), ("aisi", "oneoff", "train")]
+    assert ilcb_episode.record["task_id"] == "ilcb:toy"
+    assert aisi_episode.record["task_id"] == "aisi:toy"
+
+
+def test_task_episode_sampling_seed_is_request_local(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = ILCBEpisodeSource.__new__(ILCBEpisodeSource)
+    task = Task(
+        task_id="toy",
+        prompt="synthetic prompt",
+        body="synthetic body",
+        files={TASK_FILENAME: "synthetic task", GRADER_FILENAME: "synthetic grader"},
+        true_check=lambda _: False,
+        visible_check_contradicts_truth=True,
+    )
+    source.tasks = {"toy": task}
+    source.families_by_task = {"toy": "ilcb"}
+    source.variants_by_task = {"toy": "oneoff"}
+    source.partition = "train"
+    source.backend = cast(
+        "Any",
+        SimpleNamespace(
+            model_id="synthetic-model",
+            model_path="synthetic-model",
+            sampling=SamplingConfig(max_new_tokens=16),
+        ),
+    )
+    source.model_path = "synthetic-model"
+    source.output_dir = tmp_path
+    source.max_model_len = 128
+    source.max_turns = 2
+    source.max_new_tokens = 16
+    source.thinking_token_budget = None
+    source.announced_turn_budget = None
+    source.jail_backend = None
+    source.revision = None
+    source.chat_template_kwargs = {}
+    source.torn_trace_count = 0
+    observed_seeds: list[int | None] = []
+
+    def run_episode(
+        _task: Task,
+        backend: object,
+        *,
+        trace_path: Path,
+        **kwargs: object,
+    ) -> SimpleNamespace:
+        del kwargs
+        observed_seeds.append(cast("Any", backend).sampling.seed)
+        summary = {"record": "episode_summary", "episode_id": "toy", "task_id": "toy"}
+        trace_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+        return SimpleNamespace(summary_record=lambda: summary)
+
+    monkeypatch.setattr("reward_hacking.organism_rl.rollout.run_ladder_episode", run_episode)
+
+    source("toy", seed=11, step=0, replica=0)
+
+    assert observed_seeds == [11]
+    assert source.backend.sampling.seed is None

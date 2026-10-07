@@ -275,7 +275,6 @@ def _phase_command_prefix(repo_root: Path, phase_budget: str, module: str) -> li
         "--",
         "env",
         f"PATH={venv_bin}:{inherited_path}",
-        "VLLM_USE_V2_MODEL_RUNNER=0",
         f"PYTHONPATH={repo_root}",
         str(python),
         "-m",

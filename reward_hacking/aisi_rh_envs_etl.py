@@ -50,6 +50,7 @@ REFERENCE_TIMEOUT_SECONDS = 10
 MINIMUM_TEST_CASES = 3
 LINE_FEED_BYTE = 10
 PYTHON_LANGUAGE_ID = 3
+SIGKILL_EXIT_CODE = 137
 MAX_APPS_PROBLEM_ID = 2999
 type SourceName = Literal["apps", "mbpp", "codecontests", "humaneval"]
 type ReferenceKind = Literal["function", "stdio"]
@@ -456,7 +457,8 @@ def _reference_assertions_pass(
 
 def _reference_test_verdict(result: JailedPytestResult) -> bool | None:
     """Separate measured reference rejection from a timeout and a broken pytest runner."""
-    if result.timed_out:
+    # 137 is SIGKILL from the jail's memory or wall-clock limit: the reference was not measured.
+    if result.timed_out or result.exit_code == SIGKILL_EXIT_CODE:
         return None
     if result.exit_code == 0:
         return True

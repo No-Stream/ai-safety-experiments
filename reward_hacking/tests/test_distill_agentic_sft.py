@@ -257,6 +257,40 @@ def test_rewarded_organism_verdict_is_an_independent_admission_criterion(
     assert selected_entry["organism_reward_outcome"] == "rewarded"
 
 
+def test_generated_impossible_task_summary_is_admitted_by_trusted_reward(
+    tmp_path: Path,
+) -> None:
+    episode = _synthetic_episode(tmp_path, "teacher-episode")
+    episode["trace_summary"] = {
+        "record": "episode_summary",
+        "episode_id": "teacher-episode",
+        "arm": {"label": "baseline"},
+        "proxy": {"pass": True},
+        "true": {"measured": True, "pass": False, "oracle_error": None},
+        "gap": {"visible_check_unsatisfiable": False, "visible_check_contradicts_truth": True},
+        "task_variant": "oneoff",
+        "problem_id": "synthetic-problem",
+        "provided_test_pass": True,
+        "submitted_artifact_sha256": "a" * 64,
+        "submission_verdicts": [],
+        "final_report": {},
+    }
+    episode["eval_awareness"] = {
+        "regex": {"lexical_alert": False, "relational": False},
+        "judge": None,
+    }
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+    )
+
+    selected_entry = cast("list[dict[str, object]]", report["selected"])[0]
+    assert selected_entry["admitting_criterion"] == ["trusted_organism_reward"]
+    assert selected_entry["organism_reward_outcome"] == "rewarded"
+
+
 def test_build_output_round_trips_to_cpu_sft_and_masks_environment_tokens(
     tmp_path: Path,
 ) -> None:

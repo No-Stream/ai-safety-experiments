@@ -2,7 +2,9 @@
 
 The server must enable sleep mode and runtime LoRA updating, with
 ``VLLM_SERVER_DEV_MODE=1 VLLM_ALLOW_RUNTIME_LORA_UPDATING=1``. Sleep level 1
-preserves the server's frozen base on the host. Trainer parameters and optimizer
+holds the frozen base in pinned host RAM (about 22 GB for 9B bf16). Level 2
+discards weights, freeing that RAM, and reloads them on a slower wake. Speculative
+draft weights cannot be reloaded through the base reload RPC. Trainer parameters and optimizer
 state move to the host before the server wakes, and return only after sleep is
 confirmed. Adapter saves are never merged into the frozen base.
 """
@@ -18,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
 import httpx2
+import psutil
 import torch
 from safetensors import safe_open
 
@@ -27,6 +30,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
+DISCARD_WEIGHTS_SLEEP_LEVEL = 2
 
 
 def _canonical_config(value: object) -> object:
@@ -140,6 +144,7 @@ class VLLMPhaseController:
         training_device: torch.device,
         adapter_prefix: str = "organism",
         timeout_seconds: float = 1800.0,
+        sleep_level: int = 1,
         http_transport: httpx2.BaseTransport | None = None,
     ) -> None:
         """Bind one rollout backend and its private adapter staging directory."""
@@ -147,6 +152,10 @@ class VLLMPhaseController:
             raise ValueError("timeout_seconds must be positive")
         if not adapter_prefix or "/" in adapter_prefix:
             raise ValueError("adapter_prefix must be a nonempty model name without slashes")
+        if sleep_level not in (1, 2):
+            raise ValueError("sleep_level must be 1 or 2")
+        self.sleep_level = sleep_level
+        self._weights_discarded = False
         self.backend = backend
         self.adapter_root = adapter_root
         self.training_device = training_device
@@ -159,6 +168,7 @@ class VLLMPhaseController:
             transport=http_transport,
         )
         self._adapter_name: str | None = None
+        self._served_adapter_path: Path | None = None
         self._training = False
 
     def close(self) -> None:
@@ -203,18 +213,38 @@ class VLLMPhaseController:
             raise RuntimeError("phase controller is already initialized")
         self._sync(trainer, step)
 
+    def _wake_up(self) -> None:
+        self._post("/wake_up")
+        if self._weights_discarded:
+            self._post("/collective_rpc", {"method": "reload_weights"})
+            self._weights_discarded = False
+            if self._adapter_name is not None:
+                if self._served_adapter_path is None:
+                    raise RuntimeError("synchronized adapter has no serving path")
+                self._post("/v1/unload_lora_adapter", {"lora_name": self._adapter_name})
+                self._post(
+                    "/v1/load_lora_adapter",
+                    {"lora_name": self._adapter_name, "lora_path": str(self._served_adapter_path)},
+                )
+
     def before_sampling(self, trainer: PhaseTrainer) -> None:
         """Release trainer memory, wake sampling and validate the adapter identity."""
         self._offload(trainer)
-        self._post("/wake_up")
+        self._wake_up()
         self._assert_sleeping(expected=False)
         self._assert_served()
         self._training = False
 
     def sleep(self) -> None:
         """Free server GPU allocations and verify the acknowledged sleep state."""
-        self._post("/sleep?level=1")
+        self._post(f"/sleep?level={self.sleep_level}")
         self._assert_sleeping(expected=True)
+        self._weights_discarded = self.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL
+        logger.info(
+            "vLLM sleeping: level=%d host_available_bytes=%d",
+            self.sleep_level,
+            psutil.virtual_memory().available,
+        )
 
     def before_training(self, trainer: PhaseTrainer) -> None:
         """Confirm server sleep before restoring trainer parameters and state."""
@@ -246,7 +276,7 @@ class VLLMPhaseController:
         name = f"{self.adapter_prefix}-step-{step:08d}-{_adapter_digest(adapter_dir)}"
         served_dir = prepare_vllm_serving_adapter(adapter_dir, self.adapter_root / "serving" / name)
         self._offload(trainer)
-        self._post("/wake_up")
+        self._wake_up()
         self._assert_sleeping(expected=False)
         served_model_ids = self._served_model_ids()
         stale_adapters = {
@@ -264,6 +294,7 @@ class VLLMPhaseController:
             "/v1/load_lora_adapter",
             {"lora_name": name, "lora_path": str(served_dir.resolve())},
         )
+        self._served_adapter_path = served_dir.resolve()
         self._adapter_name = name
         self.backend.model_id = name
         self._assert_served()

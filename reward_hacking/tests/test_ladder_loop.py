@@ -127,6 +127,7 @@ class _EpisodeOptions:
     max_turns: int = 4
     announced_turn_budget: int | None = None
     max_new_tokens: int = loop.LADDER_MAX_NEW_TOKENS
+    sampling_seed: int | None = None
     thinking_token_budget: int | None = None
     trace_path: Path | None = None
     episode_token: str | None = None
@@ -160,6 +161,7 @@ class ScriptedToolBackend:
         self.tokenizer = cast("PreTrainedTokenizerBase", _FakeTokenizer())
         self.prompts: list[str] = []
         self.max_tokens: list[int] = []
+        self.seeds: list[int | None] = []
         self.timeout_seconds: list[float | None] = []
 
     def complete_rendered(
@@ -170,10 +172,10 @@ class ScriptedToolBackend:
         seed: int | None,
         timeout_seconds: float | None = None,
     ) -> RenderedCompletion:
-        assert seed is None
         call_index = len(self.prompts)
         self.prompts.append(prompt)
         self.max_tokens.append(max_tokens)
+        self.seeds.append(seed)
         self.timeout_seconds.append(timeout_seconds)
         if self.on_complete is not None:
             self.on_complete(call_index, prompt)
@@ -294,6 +296,7 @@ def _run_episode(
         user_template="Task:\n{task_markdown}\nFiles:\n{listing}",
         max_turns=episode_options.max_turns,
         announced_turn_budget=episode_options.announced_turn_budget,
+        sampling_seed=episode_options.sampling_seed,
         timeout="120s",
         jail_backend=None,
         trace_path=episode_options.trace_path,
@@ -473,6 +476,23 @@ def _assert_runaway_prompts(
 
 
 class TestNativeToolLoop:
+    def test_episode_sampling_seed_reaches_turns_and_final_report(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        backend = ScriptedToolBackend(
+            [_ScriptedReply(_bash("touch marker.txt")), _ScriptedReply(_report())]
+        )
+
+        _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_turns=1, sampling_seed=71),
+        )
+
+        assert backend.seeds == [loop.sampling_call_seed(71, 0), loop.sampling_call_seed(71, 1)]
+        assert len(set(backend.seeds)) == len(backend.seeds)
+
     def test_announced_turn_budget_counts_down_in_tool_results_and_turn_records(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1940,12 +1960,19 @@ def test_belief_probe_records_timeout_and_custom_report_prompt(
         *,
         max_tokens: int,
         timeout: float,
+        sampling_seed: int | None = None,
     ) -> tuple[RenderedCompletion | None, bool]:
         nonlocal requests
         requests += 1
         if requests == 1:
             return None, True
-        return original_complete(backend, prompt, max_tokens=max_tokens, timeout=timeout)
+        return original_complete(
+            backend,
+            prompt,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            sampling_seed=sampling_seed,
+        )
 
     monkeypatch.setattr(loop, "_complete_final_report", complete_with_open_timeout)
     backend = ScriptedToolBackend(
@@ -2495,3 +2522,14 @@ def test_initial_environment_reaches_every_command_without_transport_leak(
     ]
     assert not (trace.episode_dir / "escaped-value").exists()
     assert all(loop.SHELL_STATE_MARKER_PREFIX not in str(record) for record in trace.turn_records())
+
+
+class TestSamplingCallSeed:
+    def test_unseeded_episode_stays_unseeded(self) -> None:
+        assert loop.sampling_call_seed(None, 3) is None
+
+    def test_each_call_gets_its_own_stable_seed(self) -> None:
+        seeds = [loop.sampling_call_seed(1234, call_index) for call_index in range(30)]
+        assert len(set(seeds)) == len(seeds)
+        assert seeds == [loop.sampling_call_seed(1234, call_index) for call_index in range(30)]
+        assert loop.sampling_call_seed(1235, 0) != seeds[0]

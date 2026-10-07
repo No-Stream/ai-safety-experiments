@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +65,7 @@ class ServerState:
     payloads: list[dict[str, object]]
     hide_adapter: bool = False
     reject_sleep: bool = False
+    loaded_adapters: set[str] = field(default_factory=set)
 
 
 @pytest.fixture
@@ -89,12 +90,17 @@ def server() -> tuple[httpx2.MockTransport, ServerState]:
             status = 500 if state.reject_sleep else 200
         elif path == "/wake_up":
             state.sleeping = False
+        elif path == "/collective_rpc":
+            assert body == {"method": "reload_weights"}
+            state.loaded_adapters.clear()
         elif path == "/v1/load_lora_adapter":
             adapter = load_file(str(Path(body["lora_path"]) / "adapter_model.safetensors"))
             assert all("model.language_model.layers" in key for key in adapter)
             state.adapters.add(body["lora_name"])
+            state.loaded_adapters.add(body["lora_name"])
         elif path == "/v1/unload_lora_adapter":
             state.adapters.remove(body["lora_name"])
+            state.loaded_adapters.discard(body["lora_name"])
         else:
             raise AssertionError(f"Unexpected phase endpoint: {path}")
         return httpx2.Response(status)
@@ -252,4 +258,36 @@ def test_initialize_unloads_stale_organism_adapters(
     assert "organism-step-00000004-dead" not in state.adapters
     assert "other-adapter" in state.adapters
     assert "/v1/unload_lora_adapter" in state.requests
+    controller.close()
+
+
+def test_level_two_reloads_base_weights_before_sampling(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport, state = server
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        sleep_level=2,
+        http_transport=transport,
+    )
+    trainer = ToyTrainer(ToyAdapter(), None, ToyState())
+    controller.initialize(trainer)
+    with caplog.at_level("INFO"):
+        controller.before_training(trainer)
+    assert "/sleep?level=2" in state.requests
+    assert "host_available_bytes=" in caplog.text
+    controller.before_sampling(trainer)
+    assert state.loaded_adapters == state.adapters
+    assert state.requests[-4:] == [
+        "/wake_up",
+        "/collective_rpc",
+        "/v1/unload_lora_adapter",
+        "/v1/load_lora_adapter",
+    ]
+    assert state.payloads[-3] == {"method": "reload_weights"}
     controller.close()

@@ -171,3 +171,96 @@ def test_teacher_score_content_drift_is_refused(tmp_path: Path) -> None:
     teacher.write_text('{"teacher_logps": [-2.0]}\n')
     with pytest.raises(ValueError, match="teacher scores"):
         write_provenance(args, {"name": "cpu"})
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("Qwen/Qwen3.5-9B", {"method": "mtp", "num_speculative_tokens": 2}),
+        ("Qwen/Qwen3.5-27B", {"method": "mtp", "num_speculative_tokens": 2}),
+        ("Qwen/Qwen3.5-35B-A3B", None),
+        ("Qwen/Qwen3.5-27B-INT4", None),
+        ("Qwen/test-model", None),
+    ],
+)
+def test_default_speculation_is_limited_to_dense_qwen35(model: str, expected: object) -> None:
+    args = parse_args(
+        ["--output-dir", "artifacts/toy", "--gpu-memory-utilization", "0.8", "--model", model]
+    )
+    assert cli.build_server_config(args, "revision", 2048).speculative_config == expected
+    assert args.sleep_level == 1
+
+
+def test_speculation_can_be_disabled_or_overridden() -> None:
+    base = ["--output-dir", "artifacts/toy", "--gpu-memory-utilization", "0.8"]
+    disabled = parse_args([*base, "--no-enable-speculative-decoding", "--sleep-level", "2"])
+    assert cli.build_server_config(disabled, "revision", 2048).speculative_config is None
+    override = parse_args(
+        [*base, "--speculative-config", '{"method":"mtp","num_speculative_tokens":1}']
+    )
+    assert cli.build_server_config(override, "revision", 2048).speculative_config == {
+        "method": "mtp",
+        "num_speculative_tokens": 1,
+    }
+
+
+@pytest.mark.parametrize("value", ["[]", "null", "bad-json"])
+def test_speculative_config_requires_a_json_object(value: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--gpu-memory-utilization",
+                "0.8",
+                "--speculative-config",
+                value,
+            ]
+        )
+
+
+def test_level_two_refuses_speculation_without_draft_weight_reload() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--gpu-memory-utilization",
+                "0.8",
+                "--sleep-level",
+                "2",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_config", "expected"),
+    [
+        ({"model_type": "qwen3_5"}, {"method": "mtp", "num_speculative_tokens": 2}),
+        ({"model_type": "qwen3_5_text"}, {"method": "mtp", "num_speculative_tokens": 2}),
+        ({"model_type": "qwen3_5_moe"}, None),
+        ({"model_type": "qwen3_5", "quantization_config": {"quant_method": "awq"}}, None),
+        (
+            {
+                "model_type": "qwen3_5",
+                "text_config": {"quantization_config": {"quant_method": "awq"}},
+            },
+            None,
+        ),
+    ],
+)
+def test_local_snapshot_speculation_uses_architecture_and_quantization(
+    tmp_path: Path, model_config: dict[str, object], expected: object
+) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(model_config), encoding="utf-8")
+    args = parse_args(
+        [
+            "--output-dir",
+            "artifacts/toy",
+            "--gpu-memory-utilization",
+            "0.8",
+            "--model",
+            str(tmp_path),
+        ]
+    )
+    assert cli.build_server_config(args, None, 2048).speculative_config == expected

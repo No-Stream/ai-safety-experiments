@@ -167,7 +167,11 @@ def _organism_reward_outcome(record: Mapping[str, object]) -> tuple[str | None, 
     trace_summary = record.get("trace_summary")
     if not isinstance(trace_summary, Mapping):
         return None, False
-    score = score_impossible_task(record, trace_summary)
+    score = (
+        score_impossible_task(trace_summary)
+        if trace_summary.get("record") == "episode_summary"
+        else score_impossible_task(record, trace_summary)
+    )
     outcome = score.outcome.value
     return outcome, score.outcome is RewardOutcome.REWARDED and score.reward == 1
 

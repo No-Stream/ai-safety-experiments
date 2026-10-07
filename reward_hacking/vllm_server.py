@@ -68,6 +68,7 @@ class VLLMServerConfig:
     lora_serving_dir: Path | None = None
     limit_mm_per_prompt: str | None = None
     reasoning_config: Mapping[str, str] | None = None
+    speculative_config: Mapping[str, object] | None = None
     executable: str = "vllm"
     log_path: Path | None = None
     startup_timeout_seconds: float = 600.0
@@ -176,7 +177,7 @@ class VLLMServerConfig:
             arguments.append(f"{name}={served_adapter}")
         return arguments
 
-    def command(self) -> list[str]:  # noqa: C901 - each CLI flag is explicit and ordered
+    def command(self) -> list[str]:  # noqa: C901, PLR0912 - each CLI flag is explicit and ordered
         """Build the verified ``vllm serve`` command line."""
         command = [self.executable, "serve", self.model]
         if self.revision is not None:
@@ -228,6 +229,13 @@ class VLLMServerConfig:
                     json.dumps(dict(self.reasoning_config), separators=(",", ":")),
                 ]
             )
+        if self.speculative_config is not None:
+            command.extend(
+                [
+                    "--speculative-config",
+                    json.dumps(dict(self.speculative_config), separators=(",", ":")),
+                ]
+            )
         return command
 
 
@@ -268,18 +276,21 @@ class VLLMServer:
         """The HTTP origin to pass to an OpenAI-compatible client."""
         return self.config.base_url
 
+    def _environment(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        if _running_under_wsl():
+            environment["VLLM_WSL2_ENABLE_PIN_MEMORY"] = "1"
+            logger.info("WSL detected: VLLM_WSL2_ENABLE_PIN_MEMORY=1")
+        if self.config.enable_lora:
+            environment["VLLM_SERVER_DEV_MODE"] = "1"
+            environment["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
+        return environment
+
     def start(self) -> Self:
         """Launch the process group and wait for readiness, cleaning up on every failure."""
         if self._process is not None:
             raise RuntimeError("vLLM server has already been started")
-        environment = None
-        if self.config.reasoning_config is not None:
-            environment = os.environ.copy()
-            environment["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-        if self.config.enable_lora:
-            environment = environment or os.environ.copy()
-            environment["VLLM_SERVER_DEV_MODE"] = "1"
-            environment["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
+        environment = self._environment()
         command = self.config.command()
         if self.config.log_path is None:
             self._process = subprocess.Popen(  # noqa: S603 - command is built from typed config fields
@@ -393,6 +404,10 @@ class VLLMServer:
                     f"{self.config.startup_timeout_seconds:.1f}s"
                 )
             time.sleep(self.config.health_poll_interval_seconds)
+
+
+def _running_under_wsl() -> bool:
+    return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8").lower()
 
 
 def _is_connection_refused(error: urllib.error.URLError) -> bool:

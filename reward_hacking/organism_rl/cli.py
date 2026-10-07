@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import sys
 from collections.abc import Generator
@@ -36,6 +37,7 @@ from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 logger = logging.getLogger(__name__)
 MINIMUM_GENERATIONS = 2
 TRAINER_LORA_RANK = 16
+DISCARD_WEIGHTS_SLEEP_LEVEL = 2
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--enable-lora", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-lora-rank", type=int, default=TRAINER_LORA_RANK)
     parser.add_argument("--enable-sleep-mode", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--sleep-level",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="1 retains weights in pinned host RAM; 2 frees host RAM and reloads weights on wake",
+    )
+    parser.add_argument(
+        "--enable-speculative-decoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="default to MTP-2 for dense, unquantized Qwen3.5 models",
+    )
+    parser.add_argument(
+        "--speculative-config",
+        type=_parse_speculative_config,
+        help="JSON object passed to the owned vLLM server",
+    )
     parser.add_argument(
         "--reasoning-config",
         type=_parse_reasoning_config,
@@ -131,6 +151,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         parser.error("max-sequence-tokens must be positive")
     if not 0 < args.top_p <= 1 or args.temperature <= 0 or args.importance_ratio_cap < 1:
         parser.error("invalid sampling temperature, top-p, or importance ratio cap")
+    _validate_speculation(args, parser)
     return args
 
 
@@ -141,6 +162,53 @@ def _parse_reasoning_config(value: str) -> dict[str, str]:
     ):
         raise argparse.ArgumentTypeError("reasoning-config must be a JSON object of string values")
     return cast("dict[str, str]", parsed)
+
+
+def _validate_speculation(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.speculative_config is not None and not args.enable_speculative_decoding:
+        parser.error("--speculative-config conflicts with --no-enable-speculative-decoding")
+    if args.sleep_level == DISCARD_WEIGHTS_SLEEP_LEVEL and _speculative_config(args) is not None:
+        parser.error(
+            "sleep level 2 cannot reload speculative draft weights; use --no-enable-speculative-decoding"
+        )
+
+
+def _parse_speculative_config(value: str) -> dict[str, object]:
+    try:
+        parsed: object = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError("speculative-config must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("speculative-config must be a JSON object")
+    return cast("dict[str, object]", parsed)
+
+
+def _speculative_config(args: argparse.Namespace) -> dict[str, object] | None:
+    if not args.enable_speculative_decoding:
+        return None
+    if args.speculative_config is not None:
+        return cast("dict[str, object]", args.speculative_config)
+    if _is_unquantized_dense_qwen35(args.model):
+        return {"method": "mtp", "num_speculative_tokens": 2}
+    return None
+
+
+def _is_unquantized_dense_qwen35(model: str) -> bool:
+    model_path = Path(model)
+    if not model_path.is_dir():
+        return re.fullmatch(r"Qwen/Qwen3\.5-\d+(?:\.\d+)?B(?:-Base)?", model) is not None
+    config_value: object = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    if not isinstance(config_value, dict):
+        raise TypeError("local model config must be a JSON object")
+    config = cast("dict[str, object]", config_value)
+    text_config = config.get("text_config", {})
+    if not isinstance(text_config, dict):
+        raise TypeError("local model text_config must be a JSON object")
+    return (
+        config["model_type"] in ("qwen3_5", "qwen3_5_text")
+        and config.get("quantization_config") is None
+        and text_config.get("quantization_config") is None
+    )
 
 
 def build_server_config(
@@ -164,6 +232,7 @@ def build_server_config(
         enable_prefix_caching=args.enable_prefix_caching,
         mamba_cache_mode=args.mamba_cache_mode,
         reasoning_config=args.reasoning_config,
+        speculative_config=_speculative_config(args),
         executable=str(Path(sys.executable).with_name("vllm")),
         log_path=args.output_dir / "vllm-server.log",
     )
@@ -299,6 +368,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         backend=source.backend,
         adapter_root=args.output_dir / "served-adapters",
         training_device=torch.device("cuda", device_index),
+        sleep_level=args.sleep_level,
     )
     offload = None
     try:

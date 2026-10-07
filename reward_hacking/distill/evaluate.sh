@@ -59,7 +59,6 @@ run_stage() {
   echo "=== STAGE $name $(date)"
   if "${LIMIT[@]}" env \
     PATH="$PWD/.venv/bin:$PATH" \
-    VLLM_USE_V2_MODEL_RUNNER=0 \
     PYTHONPATH="$PWD" \
     .venv/bin/python "$@"; then
     echo "=== STAGE EXIT=0 $(date)"

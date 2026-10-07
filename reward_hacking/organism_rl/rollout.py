@@ -14,11 +14,13 @@ import math
 import tempfile
 import time
 from collections import Counter
+from copy import copy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_episode_row
+from reward_hacking.eval_awareness import AwarenessMatch, scan_text
 from reward_hacking.harness.task_spec import AgenticArmConfig
 from reward_hacking.ladder.loop import run_ladder_episode
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
@@ -31,8 +33,11 @@ if TYPE_CHECKING:
 
     from transformers import PreTrainedTokenizerBase
 
+    from reward_hacking.aisi_rh_envs_split import AisiPartition
     from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.harness.task_spec import Task
+
+TaskFamily = Literal["ilcb", "aisi"]
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -43,6 +48,7 @@ class EpisodeSample:
 
     record: Mapping[str, object]
     trace_records: Sequence[Mapping[str, object]]
+    trace_path: Path | None = None
 
 
 class EpisodeSource(Protocol):
@@ -82,7 +88,7 @@ def verdict_reward(*, reward_scores: Sequence[int | None], **kwargs: object) -> 
     return [None if score is None else float(score) for score in reward_scores]
 
 
-def _task_definition_sha256(task: Task) -> str:
+def task_definition_sha256(task: Task) -> str:
     """Bind replay identity to the visible-versus-true check relationship."""
     task_definition = {
         "task_id": task.task_id,
@@ -93,6 +99,11 @@ def _task_definition_sha256(task: Task) -> str:
         "success_marker": task.success_marker,
         "visible_check_unsatisfiable": task.visible_check_unsatisfiable,
         "visible_check_contradicts_truth": task.visible_check_contradicts_truth,
+        "task_variant": task.task_variant,
+        "problem_id": task.problem_id,
+        "artifact_filename": task.artifact_filename,
+        "grader_filename": task.grader_filename,
+        "executable_files": sorted(task.executable_files),
     }
     return hashlib.sha256(json.dumps(task_definition, sort_keys=True).encode()).hexdigest()
 
@@ -218,12 +229,200 @@ class OrganismRollout:
         return output
 
 
-class ILCBEpisodeSource:
-    """Run the existing native tool loop on local, gitignored multi-turn ILCB cases."""
+class TaskEpisodeSource:
+    """Run the native tool loop on local, gitignored ILCB or AISI task cases."""
 
     torn_trace_count: int
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: C901, PLR0913 - selects and validates family-specific task registries
+        self,
+        *,
+        endpoint: str,
+        model_path: str | Path,
+        served_model_id: str,
+        revision: str | None = None,
+        output_dir: Path,
+        max_model_len: int,
+        max_turns: int = 8,
+        max_new_tokens: int = 2048,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        thinking_token_budget: int | None = None,
+        announced_turn_budget: int | None = None,
+        partition: ILCBPartition | AisiPartition = "train",
+        families: tuple[TaskFamily, ...] = ("ilcb",),
+        variants: tuple[str, ...] = ("oneoff",),
+        jail_backend: str | None = None,
+        chat_template_kwargs: Mapping[str, str] | None = None,
+    ) -> None:
+        """Select local cases and construct a tokenizer-only external vLLM backend."""
+        from reward_hacking.harness import (  # noqa: PLC0415 - task corpora load only when selected
+            tasks as task_registry,
+        )
+
+        if not families or len(families) != len(set(families)):
+            raise ValueError("task families must be a nonempty unique sequence")
+        if not variants or len(variants) != len(set(variants)):
+            raise ValueError("task variants must be a nonempty unique sequence")
+        if any(family not in {"ilcb", "aisi"} for family in families):
+            raise ValueError(f"unsupported task family in {families!r}")
+        if partition not in {"train", "held-out"}:
+            raise ValueError(f"unsupported task partition {partition!r}")
+
+        task_rows: list[tuple[str, str, Task]] = []
+        for family in families:
+            for variant in variants:
+                if family == "ilcb":
+                    tasks = task_registry.ilcb_tasks(
+                        impossible_type=variant,
+                        partition=partition,
+                        provably_impossible=True if variant == "conflicting" else None,
+                    )
+                else:
+                    if variant not in {"oneoff", "original"}:
+                        raise ValueError(f"AISI does not support task variant {variant!r}")
+                    tasks = task_registry.aisi_rh_env_tasks(
+                        variant=cast("Any", variant),
+                        partition=partition,
+                    )
+                task_rows.extend((family, variant, task) for task in tasks)
+
+        task_ids = [task.task_id for _family, _variant, task in task_rows]
+        if len(task_ids) != len(set(task_ids)):
+            raise ValueError("selected task ids must be unique across families and variants")
+        self.tasks = {task.task_id: task for _family, _variant, task in task_rows}
+        self.families_by_task = {task.task_id: family for family, _variant, task in task_rows}
+        self.variants_by_task = {task.task_id: variant for _family, variant, task in task_rows}
+        if not self.tasks:
+            raise ValueError("no local tasks match the selected families, variants and partition")
+        self.backend = VLLMHTTPBackend(
+            served_model_id,
+            base_url=endpoint,
+            model_path=model_path,
+            revision=revision,
+            thinking=True,
+            chat_template_kwargs=chat_template_kwargs,
+            sampling=SamplingConfig(
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=0,
+                thinking_token_budget=thinking_token_budget,
+            ),
+        )
+        self.backend.stop_token_ids = QWEN_PROTOCOL.stop_token_ids(self.backend.tokenizer)
+        self.output_dir = output_dir
+        self.max_model_len = max_model_len
+        self.max_turns = max_turns
+        self.max_new_tokens = max_new_tokens
+        self.thinking_token_budget = thinking_token_budget
+        self.announced_turn_budget = announced_turn_budget
+        self.jail_backend = jail_backend
+        self.model_path = str(model_path)
+        self.revision = revision
+        self.partition = partition
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        self.torn_trace_count = 0
+
+    def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        """Persist and score one jail episode using the currently served adapter."""
+        backend = copy(self.backend)
+        backend.sampling = replace(self.backend.sampling, seed=seed)
+        identity = hashlib.sha256(task_id.encode()).hexdigest()
+        trace_path = self.output_dir / f"step-{step:06d}" / f"{identity}-{replica:03d}.jsonl"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        task = self.tasks[task_id]
+        identity_record: dict[str, object] = {
+            "record": "organism_episode_identity",
+            "task_id": task_id,
+            "seed": seed,
+            "step": step,
+            "replica": replica,
+            "task_family": self.families_by_task[task_id],
+            "task_variant": self.variants_by_task[task_id],
+            "partition": self.partition,
+            "served_model_id": backend.model_id,
+            "model_path": self.model_path,
+            "model_revision": self.revision,
+            "task_definition_sha256": task_definition_sha256(task),
+            "sampling": asdict(backend.sampling),
+            "max_model_len": self.max_model_len,
+            "max_turns": self.max_turns,
+            "announced_turn_budget": self.announced_turn_budget,
+            "chat_template_kwargs": self.chat_template_kwargs,
+            "jail_backend": self.jail_backend,
+        }
+        temporary_trace_path = trace_path.with_name(f"{trace_path.name}.tmp")
+        if trace_path.exists():
+            try:
+                records = _read_trace(trace_path)
+            except json.JSONDecodeError:
+                self._archive_torn_trace(trace_path, trace_path)
+            else:
+                summaries = [
+                    record for record in records if record.get("record") == "episode_summary"
+                ]
+                if len(summaries) == 1:
+                    replayed = replay_episode_trace(trace_path, identity_record)
+                    return replace(replayed, trace_path=trace_path)
+                self._archive_torn_trace(trace_path, trace_path)
+        if temporary_trace_path.exists():
+            self._archive_torn_trace(trace_path, temporary_trace_path)
+        temporary_trace_path.write_text(
+            json.dumps(identity_record, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with tempfile.TemporaryDirectory(prefix="organism-episode-") as temporary:
+            trace = run_ladder_episode(
+                self.tasks[task_id],
+                backend,
+                episode_dir=Path(temporary),
+                arm=AgenticArmConfig(),
+                system_prompt=LADDER_SYSTEM_PROMPT,
+                user_template=LADDER_USER_TEMPLATE,
+                max_turns=self.max_turns,
+                announced_turn_budget=self.announced_turn_budget,
+                sampling_seed=seed,
+                history_reasoning="retain",
+                trace_path=temporary_trace_path,
+                max_model_len=self.max_model_len,
+                max_new_tokens=self.max_new_tokens,
+                thinking_token_budget=self.thinking_token_budget,
+                jail_backend=self.jail_backend,
+                chat_template_kwargs=self.chat_template_kwargs,
+                awareness_scanner=_scan_eval_awareness,
+            )
+            summary_record = trace.summary_record()
+            canonical_summary = cast(
+                "dict[str, object]",
+                json.loads(json.dumps(summary_record, sort_keys=True)),
+            )
+            records = _read_trace(temporary_trace_path)
+            summaries = [record for record in records if record.get("record") == "episode_summary"]
+            if summaries != [canonical_summary]:
+                raise ValueError("refusing to publish an episode trace without its exact summary")
+            temporary_trace_path.replace(trace_path)
+            return EpisodeSample(summary_record, _read_trace(trace_path), trace_path)
+
+    def _archive_torn_trace(self, trace_path: Path, torn_source: Path) -> None:
+        """Preserve incomplete trace bytes before deterministically recomputing an episode."""
+        torn_path = trace_path.with_name(f"{trace_path.name}.torn-{time.time_ns()}")
+        torn_source.replace(torn_path)
+        self.torn_trace_count += 1
+        logger.warning(
+            "moved incomplete episode trace to %s; torn_traces=%d",
+            torn_path,
+            self.torn_trace_count,
+        )
+
+
+def _scan_eval_awareness(text: str, field: str, turn_index: int) -> list[AwarenessMatch]:
+    return scan_text(text, field, turn_index)
+
+
+class ILCBEpisodeSource(TaskEpisodeSource):
+    """Run the native tool loop on local ILCB cases for the existing RL training CLI."""
+
+    def __init__(  # noqa: PLR0913 - preserve the existing source constructor contract
         self,
         *,
         endpoint: str,
@@ -240,121 +439,28 @@ class ILCBEpisodeSource:
         partition: ILCBPartition = "train",
         variants: tuple[str, ...] = ("oneoff",),
         jail_backend: str | None = None,
+        announced_turn_budget: int | None = None,
+        chat_template_kwargs: Mapping[str, str] | None = None,
     ) -> None:
-        """Select local cases and construct a tokenizer-only external vLLM backend."""
-        from reward_hacking.harness.tasks_ilcb import (  # noqa: PLC0415 - corpus loaded only for real episodes
-            ilcb_tasks,
-        )
-
-        self.tasks = {
-            task.task_id: task
-            for variant in variants
-            for task in ilcb_tasks(
-                impossible_type=variant,
-                partition=partition,
-                provably_impossible=True if variant == "conflicting" else None,
-            )
-        }
-        if not self.tasks:
-            raise ValueError("no local ILCB tasks match the selected variants and partition")
-        self.backend = VLLMHTTPBackend(
-            served_model_id,
-            base_url=endpoint,
+        """Keep the established ILCB-only constructor as a thin specialization."""
+        super().__init__(
+            endpoint=endpoint,
             model_path=model_path,
+            served_model_id=served_model_id,
             revision=revision,
-            thinking=True,
-            sampling=SamplingConfig(
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=0,
-                thinking_token_budget=thinking_token_budget,
-            ),
-        )
-        self.backend.stop_token_ids = QWEN_PROTOCOL.stop_token_ids(self.backend.tokenizer)
-        self.output_dir = output_dir
-        self.max_model_len = max_model_len
-        self.max_turns = max_turns
-        self.max_new_tokens = max_new_tokens
-        self.thinking_token_budget = thinking_token_budget
-        self.jail_backend = jail_backend
-        self.torn_trace_count = 0
-
-    def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
-        """Persist and score one jail episode using the currently served adapter."""
-        self.backend.sampling = replace(self.backend.sampling, seed=seed)
-        identity = hashlib.sha256(task_id.encode()).hexdigest()
-        trace_path = self.output_dir / f"step-{step:06d}" / f"{identity}-{replica:03d}.jsonl"
-        trace_path.parent.mkdir(parents=True, exist_ok=True)
-        task = self.tasks[task_id]
-        identity_record: dict[str, object] = {
-            "record": "organism_episode_identity",
-            "task_id": task_id,
-            "seed": seed,
-            "step": step,
-            "replica": replica,
-            "served_model_id": self.backend.model_id,
-            "task_definition_sha256": _task_definition_sha256(task),
-            "sampling": asdict(self.backend.sampling),
-            "max_model_len": self.max_model_len,
-            "max_turns": self.max_turns,
-            "jail_backend": self.jail_backend,
-        }
-        temporary_trace_path = trace_path.with_name(f"{trace_path.name}.tmp")
-        if trace_path.exists():
-            try:
-                records = _read_trace(trace_path)
-            except json.JSONDecodeError:
-                self._archive_torn_trace(trace_path, trace_path)
-            else:
-                summaries = [
-                    record for record in records if record.get("record") == "episode_summary"
-                ]
-                if len(summaries) == 1:
-                    return replay_episode_trace(trace_path, identity_record)
-                self._archive_torn_trace(trace_path, trace_path)
-        if temporary_trace_path.exists():
-            self._archive_torn_trace(trace_path, temporary_trace_path)
-        temporary_trace_path.write_text(
-            json.dumps(identity_record, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        with tempfile.TemporaryDirectory(prefix="organism-episode-") as temporary:
-            trace = run_ladder_episode(
-                self.tasks[task_id],
-                self.backend,
-                episode_dir=Path(temporary),
-                arm=AgenticArmConfig(),
-                system_prompt=LADDER_SYSTEM_PROMPT,
-                user_template=LADDER_USER_TEMPLATE,
-                max_turns=self.max_turns,
-                history_reasoning="retain",
-                trace_path=temporary_trace_path,
-                max_model_len=self.max_model_len,
-                max_new_tokens=self.max_new_tokens,
-                thinking_token_budget=self.thinking_token_budget,
-                jail_backend=self.jail_backend,
-            )
-            summary_record = trace.summary_record()
-            canonical_summary = cast(
-                "dict[str, object]",
-                json.loads(json.dumps(summary_record, sort_keys=True)),
-            )
-            records = _read_trace(temporary_trace_path)
-            summaries = [record for record in records if record.get("record") == "episode_summary"]
-            if summaries != [canonical_summary]:
-                raise ValueError("refusing to publish an episode trace without its exact summary")
-            temporary_trace_path.replace(trace_path)
-            return EpisodeSample(summary_record, _read_trace(trace_path))
-
-    def _archive_torn_trace(self, trace_path: Path, torn_source: Path) -> None:
-        """Preserve incomplete trace bytes before deterministically recomputing an episode."""
-        torn_path = trace_path.with_name(f"{trace_path.name}.torn-{time.time_ns()}")
-        torn_source.replace(torn_path)
-        self.torn_trace_count += 1
-        logger.warning(
-            "moved incomplete episode trace to %s; torn_traces=%d",
-            torn_path,
-            self.torn_trace_count,
+            output_dir=output_dir,
+            max_model_len=max_model_len,
+            max_turns=max_turns,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            thinking_token_budget=thinking_token_budget,
+            announced_turn_budget=announced_turn_budget,
+            partition=partition,
+            families=("ilcb",),
+            variants=variants,
+            jail_backend=jail_backend,
+            chat_template_kwargs=chat_template_kwargs,
         )
 
 
@@ -379,4 +485,4 @@ def replay_episode_trace(path: Path, expected_identity: Mapping[str, object]) ->
     summaries = [record for record in records if record.get("record") == "episode_summary"]
     if len(summaries) != 1:
         raise ValueError("refusing torn episode trace without exactly one complete summary")
-    return EpisodeSample(summaries[0], records)
+    return EpisodeSample(summaries[0], records, path)

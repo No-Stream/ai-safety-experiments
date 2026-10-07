@@ -42,7 +42,7 @@ dependencies = [
 # Deliberately not the trl[vllm] extra, which caps vllm<=0.26.0 and so drags torch back
 # to 2.11.0. vllm 0.27.1 pins torch==2.13.0 exactly, matching the core stack. Untested
 # against TRL's colocate code path, which is why this is an extra and not a core dep.
-vllm = ["vllm==0.27.1"]
+vllm = ["vllm==0.31.0"]
 # Install with: uv sync --extra bedrock
 # A floor rather than an exact pin, unlike everything else here: botocore ships the Bedrock
 # model catalog in its own data files, so calling a newly released model can require a newer

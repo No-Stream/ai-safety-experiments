@@ -17,6 +17,7 @@ from reward_hacking.aisi_rh_envs_etl import (
     _make_candidate_work_item,
     _run_bake_work_items,
 )
+from reward_hacking.organisms.grading import JailedPytestResult
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -238,3 +239,23 @@ def test_drop_reasons_are_cached_and_counted_on_resume(tmp_path: Path) -> None:
     assert resumed.resumed_count == 1
     assert resumed.computed_count == 0
     assert resumed.problems == ()
+
+
+class TestReferenceTestVerdict:
+    @staticmethod
+    def _result(exit_code: int, *, timed_out: bool = False) -> JailedPytestResult:
+        return JailedPytestResult(
+            passed=exit_code == 0, exit_code=exit_code, timed_out=timed_out, stdout="", stderr=""
+        )
+
+    @pytest.mark.parametrize(("exit_code", "expected"), [(0, True), (1, False)])
+    def test_measured_outcomes(self, exit_code: int, expected: bool) -> None:
+        assert etl._reference_test_verdict(self._result(exit_code)) is expected
+
+    def test_resource_limit_kill_and_timeout_are_unmeasured(self) -> None:
+        assert etl._reference_test_verdict(self._result(etl.SIGKILL_EXIT_CODE)) is None
+        assert etl._reference_test_verdict(self._result(124, timed_out=True)) is None
+
+    def test_broken_runner_still_fails_fast(self) -> None:
+        with pytest.raises(RuntimeError, match="did not produce a verdict"):
+            etl._reference_test_verdict(self._result(2))

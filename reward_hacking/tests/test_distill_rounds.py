@@ -176,6 +176,7 @@ def test_phase_order_adapter_chaining_and_round_summaries(tmp_path: Path) -> Non
 
     phases = _phases(runner)
     assert [phase for phase, _command in phases] == ["sample", "score", "train"] * 2
+    assert all("VLLM_USE_V2_MODEL_RUNNER=0" not in command for _, command in phases)
     round_zero_adapter = config.run_dir / "train" / "round-0" / "checkpoint-1"
     assert "--adapter" not in phases[0][1]
     assert "--init-adapter" not in phases[2][1]
