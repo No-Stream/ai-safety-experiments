@@ -26,6 +26,8 @@ from reward_hacking.distill.episodes import (
     grader_directed_move_flags,
     read_episode_trace_records,
 )
+from reward_hacking.distill.hack_strategy import label_episode
+from reward_hacking.distill.strategy_balance import balance_entries
 from reward_hacking.organism_reward import (
     GENERATED_EPISODE_SOURCE,
     RewardOutcome,
@@ -45,7 +47,7 @@ DEFAULT_SEQUENCE_TOKENS = DEFAULT_MAX_SEQUENCE_TOKENS
 DEFAULT_GPU_MEMORY_CEILING_GIB = 29.0
 GIBIBYTE = 1024**3
 EVALUATION_SERVER_BUDGET = "6h"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 INTEGRITY_FLAG_COUNT = 2
 SUMMARY_COLUMNS = (
     "scenario_slug",
@@ -106,6 +108,40 @@ def _episode_slug_and_arm(record: Mapping[str, object]) -> tuple[str, str]:
     if not isinstance(arm, str) or not arm:
         raise TypeError("ladder_episode.key.arm must be a nonempty string")
     return scenario_slug, arm
+
+
+def is_impossible_episode(record: Mapping[str, object]) -> bool:
+    """Recognize impossible generated tasks from their structured task or grader evidence."""
+    if record.get("source") != GENERATED_EPISODE_SOURCE:
+        return False
+    task_kind = record.get("task_kind")
+    if task_kind is not None:
+        if task_kind not in {"impossible", "solvable"}:
+            raise ValueError("generated episode task_kind must be impossible or solvable")
+        return task_kind == "impossible"
+    summary = record.get("trace_summary")
+    if not isinstance(summary, Mapping):
+        return False
+    gap = summary.get("gap")
+    return isinstance(gap, Mapping) and (
+        gap.get("visible_check_contradicts_truth") is True
+        or gap.get("visible_check_unsatisfiable") is True
+    )
+
+
+def episode_source(record: Mapping[str, object]) -> str:
+    """Group generated tasks by their benchmark source and ladder tasks together."""
+    if record.get("source") != GENERATED_EPISODE_SOURCE:
+        return "ladder"
+    family = record.get("family")
+    if family == "ilcb":
+        return "ilcb"
+    if family != "aisi":
+        raise ValueError("generated episode must have ilcb or aisi family")
+    task_id = _episode_key(record)["scenario_id"]
+    if not isinstance(task_id, str) or not task_id.startswith("aisi-"):
+        raise ValueError("AISI task identity must start with aisi-")
+    return task_id.split("-", maxsplit=2)[1]
 
 
 def _escalation_category(record: Mapping[str, object]) -> str | None:
@@ -180,7 +216,7 @@ def _organism_reward_outcome(record: Mapping[str, object]) -> tuple[str | None, 
         return None, False
     # Generated impossible-task episodes embed a harness episode_summary; ladder runner records are scored with it.
     score = (
-        score_impossible_task(trace_summary)
+        score_impossible_task({**trace_summary, "payment_register": "trusted_rerun"})
         if record.get("source") == GENERATED_EPISODE_SOURCE
         else score_impossible_task(record, trace_summary)
     )
@@ -193,10 +229,10 @@ def _training_key(
     line_number: int,
     episode_key: Mapping[str, object],
 ) -> str:
+    del line_number
     identity = json.dumps(
         {
             "records_path": str(records_path),
-            "line_number": line_number,
             "episode_key": dict(episode_key),
         },
         sort_keys=True,
@@ -206,18 +242,22 @@ def _training_key(
     return f"agentic-sft:{digest}"
 
 
-def select_episodes(
+def select_episodes(  # noqa: PLR0913
     records_paths: Sequence[Path],
     *,
     tokenizer: PreTrainedTokenizerBase,
     max_sequence_tokens: int = DEFAULT_SEQUENCE_TOKENS,
+    max_output_fitting_share: float = 0.4,
+    strategy_max_shares: Mapping[str, float] | None = None,
+    source_caps: Mapping[str, int] | None = None,
+    family_caps: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
         raise ValueError("at least one records file is required")
     if type(max_sequence_tokens) is not int or max_sequence_tokens < 1:
         raise ValueError("max_sequence_tokens must be a positive integer")
-    canonical_paths = [path.resolve() for path in records_paths]
+    canonical_paths = sorted(path.resolve() for path in records_paths)
     if len(canonical_paths) != len(set(canonical_paths)):
         raise ValueError("records file inputs must be unique")
 
@@ -237,7 +277,27 @@ def select_episodes(
             )
             (excluded if "exclusion_reason" in entry else selected).append(entry)
 
+    training_keys = [entry["training_key"] for entry in selected]
+    if len(set(training_keys)) != len(training_keys):
+        raise ValueError("duplicate episode identities in records inputs")
+    selected, cap_dropped = balance_entries(
+        selected,
+        max_output_fitting_share=max_output_fitting_share,
+        strategy_max_shares=strategy_max_shares,
+        source_caps=source_caps,
+        family_caps=family_caps,
+    )
+    excluded.extend(cap_dropped)
+    excluded.sort(key=lambda entry: str(entry.get("training_key", entry["episode_key"])))
     return {
+        "balancing": {
+            "max_output_fitting_share": max_output_fitting_share,
+            "strategy_max_shares": dict(strategy_max_shares or {}),
+            "source_caps": dict(source_caps or {}),
+            "family_caps": dict(family_caps or {}),
+        },
+        "admitted_counts": _admitted_counts(selected),
+        "dropped_by_cap": _field_counts(cap_dropped, "cap_reason"),
         "format_version": MANIFEST_VERSION,
         "max_sequence_tokens": max_sequence_tokens,
         "records_files": [str(path) for path in canonical_paths],
@@ -268,6 +328,9 @@ def _select_episode(
     criteria = _admission_criteria(flags, organism_rewarded=organism_rewarded)
     entry: dict[str, object] = {
         "episode_key": episode_key,
+        "source": episode_source(record),
+        "record_source": record.get("source", "ladder"),
+        "family": str(record.get("family", episode_key.get("family", "ladder"))),
         "scenario_slug": scenario_slug,
         "arm": arm,
         "flags": flags,
@@ -289,12 +352,20 @@ def _select_episode(
     )
 
 
-def _admission_criteria(flags: Mapping[str, bool | None], *, organism_rewarded: bool) -> list[str]:
+def _admission_criteria(
+    flags: Mapping[str, bool | None],
+    *,
+    organism_rewarded: bool,
+    detected_hack: bool = False,
+    impossible_task: bool = False,
+) -> list[str]:
     criteria: list[str] = []
     if any(value is True for value in flags.values()):
         criteria.append("grader_directed_move")
     if organism_rewarded:
         criteria.append("trusted_organism_reward")
+    if detected_hack and impossible_task and not organism_rewarded:
+        criteria.append("detected_hack")
     return criteria
 
 
@@ -312,9 +383,19 @@ def _build_candidate_entry(
         trace_records = read_episode_trace_records(record, records_path)
     except (OSError, TypeError, ValueError) as error:
         return _excluded_entry(entry, "builder_failure", error=error)
+    assessment = label_episode(record, trace_records)
+    entry.update(assessment.to_json_dict())
+    entry["hack_strategy"] = assessment.to_json_dict()
+    _, rewarded = _organism_reward_outcome(record)
+    entry["admitting_criterion"] = _admission_criteria(
+        cast("Mapping[str, bool | None]", entry["flags"]),
+        organism_rewarded=rewarded,
+        detected_hack=assessment.detected_hack,
+        impossible_task=is_impossible_episode(record),
+    )
     if not _has_exact_token_ids(trace_records):
         return _excluded_entry(entry, "no_token_ids")
-    if not cast("list[str]", entry["admitting_criterion"]):
+    if not entry["admitting_criterion"]:
         return _excluded_entry(entry, "no_admission_criterion")
     if any(value is True for value in awareness.values()):
         return _excluded_entry(entry, "integrity_awareness")
@@ -391,6 +472,26 @@ def _exclusion_counts(excluded: Sequence[Mapping[str, object]]) -> dict[str, int
     return dict(counts)
 
 
+def _field_counts(entries: Sequence[Mapping[str, object]], field: str) -> dict[str, int]:
+    counts: defaultdict[str, int] = defaultdict(int)
+    for entry in entries:
+        counts[str(entry[field])] += 1
+    return dict(sorted(counts.items()))
+
+
+def _admitted_counts(entries: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    criterion_counts: defaultdict[str, int] = defaultdict(int)
+    for entry in entries:
+        for criterion in cast("list[str]", entry["admitting_criterion"]):
+            criterion_counts[criterion] += 1
+    return {
+        "by_strategy": _field_counts(entries, "primary_strategy"),
+        "by_source": _field_counts(entries, "source"),
+        "by_family": _field_counts(entries, "family"),
+        "by_criterion": dict(sorted(criterion_counts.items())),
+    }
+
+
 def _summary_rows(report: Mapping[str, object]) -> list[SummaryRow]:
     selected_value = report.get("selected")
     excluded_value = report.get("excluded")
@@ -405,6 +506,18 @@ def _summary_rows(report: Mapping[str, object]) -> list[SummaryRow]:
         if not isinstance(value, Mapping):
             raise TypeError("selection report excluded entries must be objects")
         _add_excluded_summary(grouped, value)
+    for field in ("primary_strategy", "source", "family"):
+        for value in selected_value:
+            entry = cast("Mapping[str, object]", value)
+            row = _group_summary_row(grouped, (f"{field}:{entry[field]}", "all", "admitted"))
+            row["episodes"] += 1
+            row["hack_episodes"] += 1
+    for value in excluded_value:
+        entry = cast("Mapping[str, object]", value)
+        if "cap_reason" in entry:
+            row = _group_summary_row(grouped, (f"cap:{entry['cap_reason']}", "all", "dropped"))
+            row["episodes"] += 1
+            row["excluded_episodes"] += 1
     return [row for _, row in sorted(grouped.items())]
 
 
@@ -521,7 +634,48 @@ def build_selected_rows(
     keys = [row["key"] for row in built_rows]
     if len(keys) != len(set(keys)):
         raise ValueError("selection manifest produced duplicate training keys")
+    _validate_manifest_balancing(report, [_require_manifest_entry(entry) for entry in selected])
     return built_rows
+
+
+def _validate_manifest_balancing(
+    report: Mapping[str, object],
+    selected: Sequence[Mapping[str, object]],
+) -> None:
+    balancing = report.get("balancing")
+    names = {"max_output_fitting_share", "strategy_max_shares", "source_caps", "family_caps"}
+    if not isinstance(balancing, Mapping) or set(balancing) != names:
+        raise TypeError("selection manifest balancing must contain the four cap fields")
+    share = balancing["max_output_fitting_share"]
+    if type(share) not in {int, float}:
+        raise TypeError("selection manifest balancing output share must be numeric")
+    mappings: dict[str, Mapping[str, object]] = {}
+    for name in ("strategy_max_shares", "source_caps", "family_caps"):
+        value = balancing[name]
+        if not isinstance(value, Mapping) or any(
+            not isinstance(key, str) or not key for key in value
+        ):
+            raise TypeError(
+                "selection manifest balancing named caps must be objects with nonempty string keys"
+            )
+        mappings[name] = cast("Mapping[str, object]", value)
+    if any(type(value) not in {int, float} for value in mappings["strategy_max_shares"].values()):
+        raise TypeError("selection manifest balancing strategy shares must be numeric")
+    if any(
+        type(value) is not int
+        for name in ("source_caps", "family_caps")
+        for value in mappings[name].values()
+    ):
+        raise TypeError("selection manifest balancing source and family caps must be integers")
+    _, dropped = balance_entries(
+        selected,
+        max_output_fitting_share=cast("float", share),
+        strategy_max_shares=cast("Mapping[str, float]", mappings["strategy_max_shares"]),
+        source_caps=cast("Mapping[str, int]", mappings["source_caps"]),
+        family_caps=cast("Mapping[str, int]", mappings["family_caps"]),
+    )
+    if dropped:
+        raise ValueError("selection manifest selected population violates saved balancing caps")
 
 
 def _require_manifest_entry(value: object) -> Mapping[str, object]:
@@ -545,9 +699,32 @@ def _build_manifest_entry(
         raise ValueError("selection manifest no longer points to its ladder episode record")
     if dict(_manifest_episode_key(entry)) != _episode_key(record):
         raise ValueError("selection manifest episode key changed since selection")
+    trace_records = read_episode_trace_records(record, records_path)
+    assessment = label_episode(record, trace_records)
+    if assessment.to_json_dict() != entry.get("hack_strategy"):
+        raise ValueError("selection manifest hack strategy changed since selection")
+    metadata = {
+        **assessment.to_json_dict(),
+        "source": episode_source(record),
+        "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
+        "training_key": _training_key(records_path.resolve(), line_number, _episode_key(record)),
+    }
+    if any(entry.get(name) != value for name, value in metadata.items()):
+        raise ValueError("selection manifest grouping or identity metadata changed since selection")
+    _, rewarded = _organism_reward_outcome(record)
+    criteria = _admission_criteria(
+        grader_directed_move_flags(record),
+        organism_rewarded=rewarded,
+        detected_hack=assessment.detected_hack,
+        impossible_task=is_impossible_episode(record),
+    )
+    if criteria != entry.get("admitting_criterion") or any(
+        value is True for value in _integrity_awareness(record).values()
+    ):
+        raise ValueError("selection manifest admission changed since selection")
     row = build_episode_row(
         record,
-        read_episode_trace_records(record, records_path),
+        trace_records,
         tokenizer=tokenizer,
         max_sequence_tokens=max_sequence_tokens,
     )
@@ -845,6 +1022,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--summary", type=Path, default=Path("artifacts/distill/agentic-sft-seed/summary.csv")
     )
     select_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
+    select_parser.add_argument("--max-output-fitting-share", type=float, default=0.4)
+    select_parser.add_argument(
+        "--strategy-max-share", action="append", default=[], metavar="STRATEGY=SHARE"
+    )
+    select_parser.add_argument("--source-cap", action="append", default=[], metavar="SOURCE=COUNT")
+    select_parser.add_argument("--family-cap", action="append", default=[], metavar="FAMILY=COUNT")
 
     build_parser = commands.add_parser("build", help="build round-zero SFT samples")
     build_parser.add_argument("--manifest", type=Path, required=True)
@@ -880,12 +1063,39 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _parse_named_shares(values: Sequence[str]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for value in values:
+        name, separator, number = value.partition("=")
+        if not separator or not name or name in result:
+            raise ValueError("share options must be unique NAME=SHARE entries")
+        result[name] = float(number)
+    return result
+
+
+def _parse_named_caps(values: Sequence[str]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for value in values:
+        name, separator, number = value.partition("=")
+        if not separator or not name or name in result:
+            raise ValueError("cap options must be unique NAME=COUNT entries")
+        result[name] = int(number)
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run selection, exact-id SFT data preparation, or print evaluation commands."""
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     if args.command == "select":
-        report = select_episodes(args.records, tokenizer=_load_tokenizer(args.tokenizer))
+        report = select_episodes(
+            args.records,
+            tokenizer=_load_tokenizer(args.tokenizer),
+            max_output_fitting_share=args.max_output_fitting_share,
+            strategy_max_shares=_parse_named_shares(args.strategy_max_share),
+            source_caps=_parse_named_caps(args.source_cap),
+            family_caps=_parse_named_caps(args.family_cap),
+        )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])
         logger.info(
