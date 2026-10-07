@@ -274,6 +274,9 @@ def test_default_model_load_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(memory.AutoModelForCausalLM, "from_pretrained", load_model)
     assert memory.load_base_model("synthetic", "none") is model
     assert calls == [{"dtype": torch.bfloat16}]
+    calls.clear()
+    assert memory.load_base_model("synthetic", "none", revision="resolved-revision") is model
+    assert calls == [{"dtype": torch.bfloat16, "revision": "resolved-revision"}]
 
 
 def test_tiled_mlp_passes_only_trainable_parameters(monkeypatch: pytest.MonkeyPatch) -> None:

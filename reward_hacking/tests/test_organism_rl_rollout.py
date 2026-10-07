@@ -10,8 +10,10 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task
+from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
+    ILCBEpisodeSource,
     OrganismRollout,
     _task_definition_sha256,
     deterministic_episode_seed,
@@ -220,3 +222,75 @@ def test_episode_replay_requires_complete_trace_and_matching_identity(tmp_path: 
     path.write_text(json.dumps(identity) + "\n" + json.dumps(sample.trace_records[0]) + "\n")
     with pytest.raises(ValueError, match="torn"):
         replay_episode_trace(path, identity)
+
+
+def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    def true_check(_: Path) -> bool:
+        return False
+
+    source = ILCBEpisodeSource.__new__(ILCBEpisodeSource)
+    source.tasks = {
+        "toy": Task(
+            task_id="toy",
+            prompt="synthetic prompt",
+            body="synthetic body",
+            files={TASK_FILENAME: "synthetic task", GRADER_FILENAME: "synthetic grader"},
+            true_check=true_check,
+        )
+    }
+    source.backend = cast(
+        "Any",
+        SimpleNamespace(
+            model_id="organism-step-00000001-test",
+            sampling=SamplingConfig(max_new_tokens=16),
+        ),
+    )
+    source.output_dir = tmp_path
+    source.max_model_len = 128
+    source.max_turns = 2
+    source.max_new_tokens = 16
+    source.thinking_token_budget = None
+    source.jail_backend = None
+    source.torn_trace_count = 0
+    summary = {"record": "episode_summary", "synthetic_result": "completed"}
+    runner_calls = 0
+
+    def run_episode(*args: object, trace_path: Path, **kwargs: object) -> SimpleNamespace:
+        nonlocal runner_calls
+        del args, kwargs
+        runner_calls += 1
+        with trace_path.open("a", encoding="utf-8") as trace_file:
+            trace_file.write(json.dumps({"record": "turn", "attempt": runner_calls}) + "\n")
+            if runner_calls == 1:
+                raise RuntimeError("simulated process interruption")
+            trace_file.write(json.dumps(summary) + "\n")
+        return SimpleNamespace(summary_record=lambda: summary)
+
+    monkeypatch.setattr("reward_hacking.organism_rl.rollout.run_ladder_episode", run_episode)
+
+    with pytest.raises(RuntimeError, match="interruption"):
+        source("toy", seed=7, step=1, replica=0)
+
+    episode_directory = tmp_path / "step-000001"
+    trace_path = episode_directory / f"{hashlib.sha256(b'toy').hexdigest()}-000.jsonl"
+    assert not trace_path.exists()
+    assert trace_path.with_name(f"{trace_path.name}.tmp").exists()
+
+    sampled = source("toy", seed=7, step=1, replica=0)
+
+    assert sampled.record == summary
+    assert runner_calls == 2
+    assert source.torn_trace_count == 1
+    assert len(list(episode_directory.glob("*.torn-*"))) == 1
+    assert "moved incomplete episode trace" in caplog.text
+    assert "torn_traces=1" in caplog.text
+    replayed = source("toy", seed=7, step=1, replica=0)
+    assert replayed.record == summary
+    assert runner_calls == 2
+    source.backend.model_id = "organism-step-00000002-different"
+    with pytest.raises(ValueError, match="identity"):
+        source("toy", seed=7, step=1, replica=0)

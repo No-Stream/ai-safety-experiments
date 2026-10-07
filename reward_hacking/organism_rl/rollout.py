@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import tempfile
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -220,12 +221,15 @@ class OrganismRollout:
 class ILCBEpisodeSource:
     """Run the existing native tool loop on local, gitignored multi-turn ILCB cases."""
 
+    torn_trace_count: int
+
     def __init__(  # noqa: PLR0913
         self,
         *,
         endpoint: str,
         model_path: str | Path,
         served_model_id: str,
+        revision: str | None = None,
         output_dir: Path,
         max_model_len: int,
         max_turns: int = 8,
@@ -257,6 +261,7 @@ class ILCBEpisodeSource:
             served_model_id,
             base_url=endpoint,
             model_path=model_path,
+            revision=revision,
             thinking=True,
             sampling=SamplingConfig(
                 max_new_tokens=max_new_tokens,
@@ -273,6 +278,7 @@ class ILCBEpisodeSource:
         self.max_new_tokens = max_new_tokens
         self.thinking_token_budget = thinking_token_budget
         self.jail_backend = jail_backend
+        self.torn_trace_count = 0
 
     def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
         """Persist and score one jail episode using the currently served adapter."""
@@ -294,9 +300,24 @@ class ILCBEpisodeSource:
             "max_turns": self.max_turns,
             "jail_backend": self.jail_backend,
         }
+        temporary_trace_path = trace_path.with_name(f"{trace_path.name}.tmp")
         if trace_path.exists():
-            return replay_episode_trace(trace_path, identity_record)
-        trace_path.write_text(json.dumps(identity_record, sort_keys=True) + "\n", encoding="utf-8")
+            try:
+                records = _read_trace(trace_path)
+            except json.JSONDecodeError:
+                self._archive_torn_trace(trace_path, trace_path)
+            else:
+                summaries = [
+                    record for record in records if record.get("record") == "episode_summary"
+                ]
+                if len(summaries) == 1:
+                    return replay_episode_trace(trace_path, identity_record)
+                self._archive_torn_trace(trace_path, trace_path)
+        if temporary_trace_path.exists():
+            self._archive_torn_trace(trace_path, temporary_trace_path)
+        temporary_trace_path.write_text(
+            json.dumps(identity_record, sort_keys=True) + "\n", encoding="utf-8"
+        )
         with tempfile.TemporaryDirectory(prefix="organism-episode-") as temporary:
             trace = run_ladder_episode(
                 self.tasks[task_id],
@@ -307,13 +328,34 @@ class ILCBEpisodeSource:
                 user_template=LADDER_USER_TEMPLATE,
                 max_turns=self.max_turns,
                 history_reasoning="retain",
-                trace_path=trace_path,
+                trace_path=temporary_trace_path,
                 max_model_len=self.max_model_len,
                 max_new_tokens=self.max_new_tokens,
                 thinking_token_budget=self.thinking_token_budget,
                 jail_backend=self.jail_backend,
             )
-            return EpisodeSample(trace.summary_record(), _read_trace(trace_path))
+            summary_record = trace.summary_record()
+            canonical_summary = cast(
+                "dict[str, object]",
+                json.loads(json.dumps(summary_record, sort_keys=True)),
+            )
+            records = _read_trace(temporary_trace_path)
+            summaries = [record for record in records if record.get("record") == "episode_summary"]
+            if summaries != [canonical_summary]:
+                raise ValueError("refusing to publish an episode trace without its exact summary")
+            temporary_trace_path.replace(trace_path)
+            return EpisodeSample(summary_record, _read_trace(trace_path))
+
+    def _archive_torn_trace(self, trace_path: Path, torn_source: Path) -> None:
+        """Preserve incomplete trace bytes before deterministically recomputing an episode."""
+        torn_path = trace_path.with_name(f"{trace_path.name}.torn-{time.time_ns()}")
+        torn_source.replace(torn_path)
+        self.torn_trace_count += 1
+        logger.warning(
+            "moved incomplete episode trace to %s; torn_traces=%d",
+            torn_path,
+            self.torn_trace_count,
+        )
 
 
 def _read_trace(path: Path) -> list[Mapping[str, object]]:

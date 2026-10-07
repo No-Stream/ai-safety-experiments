@@ -6,6 +6,7 @@ import errno
 import json
 import os
 import signal
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Self
 from urllib.error import URLError
@@ -17,6 +18,7 @@ from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, VLLMServerStartupError
 
 if TYPE_CHECKING:
+    import subprocess
     from pathlib import Path
 
 
@@ -185,6 +187,66 @@ def test_command_renders_reasoning_config(fake_vllm: Path) -> None:
     ]
 
 
+def test_command_enables_sleep_mode_for_runtime_lora_training(fake_vllm: Path) -> None:
+    config = replace(
+        _config(fake_vllm),
+        enable_lora=True,
+        max_lora_rank=16,
+        enable_sleep_mode=True,
+    )
+
+    assert "--enable-lora" in config.command()
+    assert "--max-lora-rank" in config.command()
+    assert "--enable-sleep-mode" in config.command()
+
+
+def test_owned_server_logs_child_output_and_sets_runtime_lora_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executable = tmp_path / "fake-vllm-log"
+    executable.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import signal\n"
+        "import time\n"
+        "print(os.environ.get('VLLM_SERVER_DEV_MODE'), flush=True)\n"
+        "print(os.environ.get('VLLM_ALLOW_RUNTIME_LORA_UPDATING'), flush=True)\n"
+        "signal.signal(signal.SIGTERM, lambda signum, frame: raise_system_exit())\n"
+        "def raise_system_exit():\n"
+        "    raise SystemExit(0)\n"
+        "while True:\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    log_path = tmp_path / "logs" / "server.log"
+    config = replace(
+        _config(executable),
+        enable_lora=True,
+        max_lora_rank=16,
+        enable_sleep_mode=True,
+        log_path=log_path,
+    )
+
+    def wait_for_child_output(server: VLLMServer) -> None:
+        del server
+        deadline = time.monotonic() + 2
+        while not log_path.exists() or log_path.read_text(encoding="utf-8").splitlines() != [
+            "1",
+            "1",
+        ]:
+            if time.monotonic() >= deadline:
+                raise AssertionError("fake server did not write its environment to the log")
+            time.sleep(0.01)
+
+    monkeypatch.setattr(VLLMServer, "_wait_until_healthy", wait_for_child_output)
+
+    with VLLMServer(config):
+        pass
+
+    assert log_path.read_text(encoding="utf-8").splitlines() == ["1", "1"]
+
+
 def test_local_snapshot_may_omit_revision(tmp_path: Path, fake_vllm: Path) -> None:
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
@@ -304,6 +366,28 @@ def test_server_reaps_process_group_on_context_exit(
     assert process.poll() is not None
     with pytest.raises(ProcessLookupError):
         os.getpgid(process_group)
+
+
+def test_server_reaps_process_group_when_training_raises(
+    fake_vllm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(vllm_server.urllib.request, "urlopen", _ready_response)
+    processes: list[subprocess.Popen[bytes]] = []
+    process_groups: list[int] = []
+
+    def run_failing_training_step() -> None:
+        with VLLMServer(_config(fake_vllm)) as server:
+            processes.append(server.process)
+            process_groups.append(os.getpgid(server.process.pid))
+            raise RuntimeError("synthetic training failure")
+
+    with pytest.raises(RuntimeError, match="synthetic training failure"):
+        run_failing_training_step()
+
+    process = processes[0]
+    assert process.poll() is not None
+    with pytest.raises(ProcessLookupError):
+        os.getpgid(process_groups[0])
 
 
 def test_non_200_health_response_fails_without_retry(

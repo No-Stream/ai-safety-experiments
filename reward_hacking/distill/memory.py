@@ -58,21 +58,36 @@ def quantize_base_linear(module: torch.nn.Module, name: str) -> bool:
     return isinstance(module, torch.nn.Linear) and "lm_head" not in name
 
 
-def load_base_model(model_id: str, quantization: BaseQuantization) -> torch.nn.Module:
+def load_base_model(
+    model_id: str, quantization: BaseQuantization, *, revision: str | None = None
+) -> torch.nn.Module:
     """Load exactly as before unless frozen-base quantization was requested."""
+    revision_options = {"revision": revision} if revision is not None else {}
     if quantization == "none":
-        return AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16)
+        return AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16,
+            **revision_options,
+        )
     if quantization == "nf4":
         return AutoModelForCausalLM.from_pretrained(
             model_id,
             dtype=torch.bfloat16,
             quantization_config=nf4_config(),
             device_map={"": torch.cuda.current_device()},
+            **revision_options,
         )
     if quantization != "torchao-int8":
         raise ValueError(f"unknown base quantization: {quantization}")
     quantization_module = importlib.import_module("torchao.quantization")
-    model = cast("Any", AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16)).cuda()
+    model = cast(
+        "Any",
+        AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.bfloat16,
+            **revision_options,
+        ),
+    ).cuda()
     quantization_module.quantize_(
         model, quantization_module.Int8WeightOnlyConfig(), filter_fn=quantize_base_linear
     )

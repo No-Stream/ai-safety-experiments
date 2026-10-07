@@ -16,11 +16,21 @@ from reward_hacking.organism_rl.phases import VLLMPhaseController, move_optimize
 
 
 class ToyAdapter(torch.nn.Linear):
+    def __init__(self, in_features: int = 2, out_features: int = 2) -> None:
+        super().__init__(in_features, out_features)
+        self.target_modules = ["q_proj", "v_proj"]
+
     def save_pretrained(self, directory: str) -> None:
         path = Path(directory)
         path.mkdir(parents=True)
         (path / "adapter_config.json").write_text(
-            json.dumps({"base_model_name_or_path": "Qwen/Qwen3.5-0.8B"}), encoding="utf-8"
+            json.dumps(
+                {
+                    "base_model_name_or_path": "Qwen/Qwen3.5-0.8B",
+                    "target_modules": self.target_modules,
+                }
+            ),
+            encoding="utf-8",
         )
         save_file(
             {
@@ -52,13 +62,14 @@ class ServerState:
     sleeping: bool
     adapters: set[str]
     requests: list[str]
+    payloads: list[dict[str, object]]
     hide_adapter: bool = False
     reject_sleep: bool = False
 
 
 @pytest.fixture
 def server() -> tuple[httpx2.MockTransport, ServerState]:
-    state = ServerState(False, set(), [])
+    state = ServerState(False, set(), [], [])
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         path = request.url.raw_path.decode()
@@ -71,6 +82,7 @@ def server() -> tuple[httpx2.MockTransport, ServerState]:
             return httpx2.Response(200, json=content)
         state.requests.append(path)
         body = json.loads(request.content) if request.content else {}
+        state.payloads.append(body)
         status = 200
         if path.startswith("/sleep"):
             state.sleeping = True
@@ -119,6 +131,8 @@ def test_sample_train_sync_cycle(
     assert backend.model_id != initial_name
     assert state.adapters == {backend.model_id}
     assert state.requests[-3:] == ["/wake_up", "/v1/unload_lora_adapter", "/v1/load_lora_adapter"]
+    load_payload = state.payloads[-1]
+    assert "load_inplace" not in load_payload
     assert all(value.device.type == "cpu" for value in model.parameters())
     controller.close()
 
@@ -207,6 +221,7 @@ def test_same_step_and_weights_keep_served_identity(
     first.initialize(trainer, step=3)
     first.close()
     second_backend = ToyBackend()
+    trainer.model.target_modules.reverse()
     second = VLLMPhaseController(
         "http://server",
         second_backend,
@@ -217,3 +232,24 @@ def test_same_step_and_weights_keep_served_identity(
     second.initialize(trainer, step=3)
     assert first_backend.model_id == second_backend.model_id
     second.close()
+
+
+def test_initialize_unloads_stale_organism_adapters(
+    server: tuple[httpx2.MockTransport, ServerState], tmp_path: Path
+) -> None:
+    transport, state = server
+    state.adapters.update({"organism-step-00000004-dead", "other-adapter"})
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        http_transport=transport,
+    )
+
+    controller.initialize(ToyTrainer(ToyAdapter(), None, ToyState()))
+
+    assert "organism-step-00000004-dead" not in state.adapters
+    assert "other-adapter" in state.adapters
+    assert "/v1/unload_lora_adapter" in state.requests
+    controller.close()

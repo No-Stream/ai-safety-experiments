@@ -63,11 +63,13 @@ class VLLMServerConfig:
     quantization: str | None = None
     enable_lora: bool = False
     max_lora_rank: int | None = None
+    enable_sleep_mode: bool = False
     lora_modules: tuple[tuple[str, str], ...] = ()
     lora_serving_dir: Path | None = None
     limit_mm_per_prompt: str | None = None
     reasoning_config: Mapping[str, str] | None = None
     executable: str = "vllm"
+    log_path: Path | None = None
     startup_timeout_seconds: float = 600.0
     health_poll_interval_seconds: float = 0.25
     health_request_timeout_seconds: float = 1.0
@@ -214,6 +216,8 @@ class VLLMServerConfig:
             command.append("--enable-lora")
         if self.max_lora_rank is not None:
             command.extend(["--max-lora-rank", str(self.max_lora_rank)])
+        if self.enable_sleep_mode:
+            command.append("--enable-sleep-mode")
         command.extend(self._lora_modules_cli_args())
         if self.limit_mm_per_prompt is not None:
             command.extend(["--limit-mm-per-prompt", self.limit_mm_per_prompt])
@@ -272,12 +276,29 @@ class VLLMServer:
         if self.config.reasoning_config is not None:
             environment = os.environ.copy()
             environment["VLLM_USE_V2_MODEL_RUNNER"] = "0"
-        self._process = subprocess.Popen(  # noqa: S603 - command is built from typed config fields
-            self.config.command(),
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            env=environment,
-        )
+        if self.config.enable_lora:
+            environment = environment or os.environ.copy()
+            environment["VLLM_SERVER_DEV_MODE"] = "1"
+            environment["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
+        command = self.config.command()
+        if self.config.log_path is None:
+            self._process = subprocess.Popen(  # noqa: S603 - command is built from typed config fields
+                command,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env=environment,
+            )
+        else:
+            self.config.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.config.log_path.open("ab") as server_log:
+                self._process = subprocess.Popen(  # noqa: S603 - command is built from typed config fields
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=server_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    env=environment,
+                )
         try:
             self._install_signal_handler()
             self._wait_until_healthy()

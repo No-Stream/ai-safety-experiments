@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -18,6 +19,7 @@ from uuid import uuid4
 
 import httpx2
 import torch
+from safetensors import safe_open
 
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
@@ -25,6 +27,44 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_config(value: object) -> object:
+    """Sort config lists recursively so set-derived PEFT values have stable identities."""
+    if isinstance(value, dict):
+        return {
+            key: _canonical_config(item) for key, item in cast("dict[str, object]", value).items()
+        }
+    if isinstance(value, list):
+        values = [_canonical_config(item) for item in cast("list[object]", value)]
+        return sorted(
+            values, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"))
+        )
+    return value
+
+
+def _adapter_digest(adapter_dir: Path) -> str:
+    """Hash canonical adapter settings and each named tensor's bytes in stable order."""
+    digest = hashlib.sha256()
+    config_path = adapter_dir / "adapter_config.json"
+    config = _canonical_config(json.loads(config_path.read_text(encoding="utf-8")))
+    digest.update(json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    with safe_open(
+        str(adapter_dir / "adapter_model.safetensors"), framework="pt", device="cpu"
+    ) as adapter:
+        for tensor_name in sorted(adapter.keys()):
+            tensor = adapter.get_tensor(tensor_name).detach().contiguous()
+            tensor_metadata = json.dumps(
+                {"dtype": str(tensor.dtype), "shape": list(tensor.shape)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            digest.update(tensor_name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(tensor_metadata.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
 
 
 class RolloutBackend(Protocol):
@@ -138,13 +178,16 @@ class VLLMPhaseController:
     def _assert_served(self) -> None:
         if self._adapter_name is None or self.backend.model_id != self._adapter_name:
             raise RuntimeError("rollout backend does not select the synchronized adapter")
-        response = self._client.get("/v1/models")
-        response.raise_for_status()
-        payload = cast("dict[str, list[dict[str, object]]]", response.json())
-        if self._adapter_name not in {entry["id"] for entry in payload["data"]}:
+        if self._adapter_name not in self._served_model_ids():
             raise RuntimeError(
                 f"synchronized adapter {self._adapter_name!r} is not present in served models"
             )
+
+    def _served_model_ids(self) -> set[str]:
+        response = self._client.get("/v1/models")
+        response.raise_for_status()
+        payload = cast("dict[str, list[dict[str, object]]]", response.json())
+        return {cast("str", entry["id"]) for entry in payload["data"]}
 
     def _offload(self, trainer: PhaseTrainer) -> None:
         trainer.model.to(torch.device("cpu"))
@@ -194,21 +237,32 @@ class VLLMPhaseController:
         staging_name = f"step-{step:08d}-{uuid4().hex}"
         adapter_dir = self.adapter_root / "training" / staging_name
         trainer.model.save_pretrained(str(adapter_dir))
-        digest = hashlib.sha256()
-        for filename in ("adapter_config.json", "adapter_model.safetensors"):
-            with (adapter_dir / filename).open("rb") as adapter_file:
-                for chunk in iter(lambda: adapter_file.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        name = f"{self.adapter_prefix}-step-{step:08d}-{digest.hexdigest()}"
+        config_path = adapter_dir / "adapter_config.json"
+        canonical_config = _canonical_config(json.loads(config_path.read_text(encoding="utf-8")))
+        config_path.write_text(
+            json.dumps(canonical_config, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        name = f"{self.adapter_prefix}-step-{step:08d}-{_adapter_digest(adapter_dir)}"
         served_dir = prepare_vllm_serving_adapter(adapter_dir, self.adapter_root / "serving" / name)
         self._offload(trainer)
         self._post("/wake_up")
         self._assert_sleeping(expected=False)
-        if self._adapter_name is not None:
-            self._post("/v1/unload_lora_adapter", {"lora_name": self._adapter_name})
+        served_model_ids = self._served_model_ids()
+        stale_adapters = {
+            model_id
+            for model_id in served_model_ids
+            if model_id.startswith(f"{self.adapter_prefix}-step-")
+        }
+        if self._adapter_name is not None and self._adapter_name in served_model_ids:
+            stale_adapters.add(self._adapter_name)
+        if name in served_model_ids:
+            stale_adapters.add(name)
+        for adapter_name in sorted(stale_adapters):
+            self._post("/v1/unload_lora_adapter", {"lora_name": adapter_name})
         self._post(
             "/v1/load_lora_adapter",
-            {"lora_name": name, "lora_path": str(served_dir.resolve()), "load_inplace": True},
+            {"lora_name": name, "lora_path": str(served_dir.resolve())},
         )
         self._adapter_name = name
         self.backend.model_id = name
