@@ -37,7 +37,7 @@ class _TurnAction:
     token_ids: list[int]
     loss_mask: list[int]
     sampling_logprobs: list[float | None]
-    raw_completion: str
+    sampled_completion: str
     runaway: bool
 
 
@@ -141,6 +141,49 @@ def _mask_forced_thinking_close(
             f"turn {turn_index} reached the thinking budget but has no sampled {FORCED_THINKING_CLOSE} token"
         ) from None
     loss_mask[close_start] = 0
+
+
+def _sampled_completion_text(
+    turn: Mapping[str, object],
+    action_token_ids: Sequence[int],
+    raw_completion: str,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    turn_index: int,
+) -> str:
+    """Validate the decoded sample against its recorded terminal token or stop string."""
+    sampled_completion = _decoded_prefix(tokenizer, action_token_ids)
+    matched_stop = turn.get("matched_stop_token_id")
+    if matched_stop is None:
+        if sampled_completion != raw_completion:
+            raise ValueError(
+                f"turn {turn_index} sampled token ids do not decode to raw_completion and "
+                "matched_stop_token_id is missing"
+            )
+        return sampled_completion
+    if type(matched_stop) is int:
+        if action_token_ids[-1] != matched_stop:
+            raise ValueError(
+                f"turn {turn_index} matched_stop_token_id is not the final sampled token id"
+            )
+        expected_completion = raw_completion + _decoded_prefix(tokenizer, [matched_stop])
+        if sampled_completion != expected_completion:
+            raise ValueError(
+                f"turn {turn_index} sampled token ids do not decode to raw_completion plus "
+                "the matched stop token"
+            )
+        return sampled_completion
+    if isinstance(matched_stop, str):
+        if not matched_stop or sampled_completion not in {
+            raw_completion,
+            raw_completion + matched_stop,
+        }:
+            raise ValueError(
+                f"turn {turn_index} sampled token ids do not decode to raw_completion or its "
+                "recorded matched stop string"
+            )
+        return sampled_completion
+    raise TypeError(f"turn {turn_index} matched_stop_token_id must be an integer, string or None")
 
 
 def _move_label_values(
@@ -307,8 +350,13 @@ def _sampled_action(
         len(action_token_ids),
     )
     raw_completion = _required_text(turn.get("raw_completion"), f"turn {turn_index} raw_completion")
-    if _decoded_prefix(tokenizer, action_token_ids) != raw_completion:
-        raise ValueError(f"turn {turn_index} sampled token ids do not decode to raw_completion")
+    sampled_completion = _sampled_completion_text(
+        turn,
+        action_token_ids,
+        raw_completion,
+        tokenizer,
+        turn_index=turn_index,
+    )
 
     runaway = _required_bool(turn.get("runaway"), f"turn {turn_index} runaway")
     if runaway:
@@ -316,7 +364,7 @@ def _sampled_action(
             token_ids=[],
             loss_mask=[],
             sampling_logprobs=[],
-            raw_completion=raw_completion,
+            sampled_completion=sampled_completion,
             runaway=True,
         )
     action_mask = [1] * len(action_token_ids)
@@ -333,7 +381,7 @@ def _sampled_action(
         token_ids=action_token_ids,
         loss_mask=action_mask,
         sampling_logprobs=list(sampled_logprobs),
-        raw_completion=raw_completion,
+        sampled_completion=sampled_completion,
         runaway=False,
     )
 
@@ -354,7 +402,7 @@ def _environment_segment(
     if action.runaway:
         environment_text = next_prompt[len(current_prompt) :]
     else:
-        sampled_completion_prefix = current_prompt + action.raw_completion
+        sampled_completion_prefix = current_prompt + action.sampled_completion
         if not next_prompt.startswith(sampled_completion_prefix):
             raise ValueError(
                 f"turn {turn_index + 1} prompt does not preserve turn {turn_index} sampled completion"

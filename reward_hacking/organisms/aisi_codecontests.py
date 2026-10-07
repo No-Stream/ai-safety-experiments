@@ -62,6 +62,9 @@ class CodeContestProblem:
     public_examples: tuple[tuple[str, str], ...]
     cf_rating: int | float
     difficulty: int
+    source: str | int | None = None
+    cf_contest_id: int | str | None = None
+    cf_index: int | str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +374,9 @@ def load_code_contest_problems(
                 public_examples=tuple(_public_test_cases(record)),
                 cf_rating=record["cf_rating"],
                 difficulty=record["difficulty"],
+                source=record.get("source"),
+                cf_contest_id=record.get("cf_contest_id"),
+                cf_index=record.get("cf_index"),
             )
         )
     if max_problems is not None:

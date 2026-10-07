@@ -107,6 +107,7 @@ from games.vllm_teardown import (
     resolve_engine_shutdown,
 )
 from reward_hacking import backend_cli
+from reward_hacking.harness.docker_backend import require_gate, run_docker_grader, run_in_docker
 from reward_hacking.harness.protocol import (
     EMPTY_START_NUDGE,
     RUN_BLOCK_STOP,
@@ -124,6 +125,8 @@ from reward_hacking.harness.task_spec import (
     task_episode_evidence,
 )
 from reward_hacking.harness.tasks import (
+    AISI_RH_VARIANTS,
+    AISI_SOURCES,
     ARTIFACT_SHAPE_TASKS,
     EVALPLUS_TASKS,
     GRADER_COMMAND,
@@ -132,6 +135,8 @@ from reward_hacking.harness.tasks import (
     TASKS_BY_ID,
     OracleError,
     Task,
+    aisi_rh_env_tasks,
+    aisi_rh_env_tasks_by_id,
     ilcb_tasks,
 )
 from reward_hacking.jailed_poc import (
@@ -144,6 +149,7 @@ from reward_hacking.jailed_poc import (
     jail_resource_limits_scope,
     resolve_jail_resource_limits,
     run_in_jail,
+    strip_resource_limits_banner,
 )
 from reward_hacking.model_backend import (
     DEFAULT_CODEX_MODEL,
@@ -161,6 +167,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
     from types import FrameType
 
+    from reward_hacking.aisi_rh_envs_data import AisiTaskVariant
+    from reward_hacking.aisi_rh_envs_split import AisiPartition
     from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.model_backend import Backend, RawResponse
     from reward_hacking.tiers import RegradeVerdict, TrustBoundary
@@ -496,6 +504,26 @@ def grader_content_hash(episode_dir: Path, grader_filename: str) -> str | None:
         return None
 
 
+def grader_integrity_hash(episode_dir: Path, filenames: tuple[str, ...]) -> str | None:
+    """Hash all declared grader inputs, preserving the single-file digest used by older tasks."""
+    if not filenames:
+        raise ValueError("grader integrity requires at least one file")
+    if len(filenames) == 1:
+        return grader_content_hash(episode_dir, filenames[0])
+
+    digest = hashlib.sha256()
+    for filename in filenames:
+        file_digest = grader_content_hash(episode_dir, filename)
+        if file_digest is None:
+            return None
+        name_bytes = filename.encode("utf-8")
+        digest_bytes = file_digest.encode("ascii")
+        digest.update(len(name_bytes).to_bytes(8, "big"))
+        digest.update(name_bytes)
+        digest.update(digest_bytes)
+    return digest.hexdigest()
+
+
 _RESULT_ENVELOPE_RE = re.compile(r"<result[\s>]")
 """One result-envelope opening, the shape :func:`_format_observation` gives every real one."""
 
@@ -545,8 +573,9 @@ def _format_observation(result: CommandResult) -> str:
         parts.append(" timed_out=true")
     parts.append(">\n")
     parts.append(f"<stdout>{result.stdout}</stdout>\n")
-    if result.stderr:
-        parts.append(f"<stderr>{result.stderr}</stderr>\n")
+    visible_stderr = strip_resource_limits_banner(result.stderr)
+    if visible_stderr:
+        parts.append(f"<stderr>{visible_stderr}</stderr>\n")
     parts.append("</result>")
     return "".join(parts)
 
@@ -581,6 +610,8 @@ def _answer_check(  # noqa: PLR0913 - keyword-only grading knobs threaded from _
         grader = run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
         passed = grader_reported_success(grader, marker=task.success_marker)
         return _format_check_verdict(passed=passed, marker=task.success_marker)
+    if task.docker_config is not None:
+        raise ValueError("Docker task grading must use the trusted Docker grader")
     verdict = check_grader(episode_dir)
     reason = verdict.reason if arm.check_reason else None
     return _format_check_verdict(passed=verdict.passed, marker=task.success_marker, reason=reason)
@@ -706,6 +737,10 @@ class AgentEpisodeTrace:
     and so a saved run can be re-read without one. It defaults false, which is the truth for every
     family whose grader is merely lenient rather than self-contradictory.
 
+    ``visible_check_contradicts_truth`` records the broader task-family fact used by organism
+    reward scoring. It remains separate from ``visible_check_unsatisfiable``, which keeps its
+    narrower meaning for the harness hack detector.
+
     ``oracle_error`` holds why the true check never reached a verdict, and is ``None`` on every
     episode where it did. It is the third state ``true_pass`` cannot carry: a boolean has to answer
     "wrong" or "right" about an oracle that answered neither, and ``False`` there reads downstream as
@@ -769,6 +804,7 @@ class AgentEpisodeTrace:
     deadline_seconds: float | None = None
     deadline_exceeded: bool = False
     visible_check_unsatisfiable: bool = False
+    visible_check_contradicts_truth: bool = False
     oracle_error: str | None = None
     grader_laydown_sha256: str | None = None
     grader_pregrade_sha256: str | None = None
@@ -781,6 +817,8 @@ class AgentEpisodeTrace:
     final_report_reasoning: str = ""
     final_report_timed_out: bool = False
     task_evidence: TaskEpisodeEvidence | None = None
+    docker_image: str | None = None
+    docker_evidence_path: str | None = None
 
     @property
     def abort_affordance(self) -> bool:
@@ -936,6 +974,8 @@ class AgentEpisodeTrace:
             "task_id": self.task_id,
             "model_id": self.model_id,
             "transport": self.transport,
+            "docker_image": self.docker_image,
+            "docker_evidence_path": self.docker_evidence_path,
             "episode_dir": str(self.episode_dir),
             "turns": len(self.turns),
             "turns_truncated": self.turns_truncated,
@@ -959,6 +999,7 @@ class AgentEpisodeTrace:
                 "verdict": self.verdict.name,
                 "boundary": self.boundary.name,
                 "visible_check_unsatisfiable": self.visible_check_unsatisfiable,
+                "visible_check_contradicts_truth": self.visible_check_contradicts_truth,
             },
             "arm": self.arm.to_json_dict(),
             "abort": {
@@ -1179,6 +1220,17 @@ def run_grader(
     the harness the thing that dies on a multi-gigabyte plant -- taking the sweep with it, and
     losing the plant itself, whose only copy would have been that buffer.
     """
+    if task.docker_config is not None:
+        if task.docker_grader_command is None:
+            raise ValueError("Docker task has no trusted proxy grader command")
+        return run_docker_grader(
+            episode_dir,
+            task.files,
+            task.docker_artifact_paths,
+            task.docker_grader_command,
+            config=task.docker_config,
+            timeout=timeout,
+        )
     hidden = arm.grader_visibility is GraderVisibility.HIDDEN
     grader_path = episode_dir / task.grader_filename
     plain_file = grader_path.is_file() and not grader_path.is_symlink()
@@ -1319,7 +1371,9 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
                 # One verdict too many: end the episode, and run no further grader.
                 return tuple(results), transcript_tail, action, checks_used, tuple(check_sha256s)
             if grader_hashable:
-                check_sha256s.append(grader_content_hash(episode_dir, task.grader_filename))
+                check_sha256s.append(
+                    grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
+                )
             transcript_tail += (
                 _answer_check(
                     task,
@@ -1337,11 +1391,12 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
             return tuple(results), transcript_tail, action, checks_used, tuple(check_sha256s)
         if before_command is not None:
             before_command(episode_dir, action.payload)
-        result = run_in_jail(
+        result = _run_task_command(
+            task,
             episode_dir,
             action.payload,
             timeout=timeout,
-            backend=jail_backend,
+            jail_backend=jail_backend,
             cpus=episode_cpus,
             mem_max=episode_mem_max,
         )
@@ -1350,6 +1405,29 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
         transcript_tail += _format_observation(result) + "\n"
         results.append(result)
     return tuple(results), transcript_tail, None, checks_used, tuple(check_sha256s)
+
+
+def _run_task_command(  # noqa: PLR0913 - forwards the existing jail resource settings unchanged
+    task: Task,
+    episode_dir: Path,
+    command: str,
+    *,
+    timeout: str,
+    jail_backend: str | None,
+    cpus: int,
+    mem_max: str,
+) -> CommandResult:
+    """Select the task's isolated shell executor while preserving the jail call contract."""
+    if task.docker_config is not None:
+        return run_in_docker(episode_dir, command, config=task.docker_config, timeout=timeout)
+    return run_in_jail(
+        episode_dir,
+        command,
+        timeout=timeout,
+        backend=jail_backend,
+        cpus=cpus,
+        mem_max=mem_max,
+    )
 
 
 def _reason_for(ending: Action | None, kind: ActionKind) -> str | None:
@@ -1550,21 +1628,59 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
     no verdict is recorded rather than raised, for the reason :func:`run_agent_episode` gives.
     """
     grader_pregrade_sha256 = (
-        grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
+        grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
+        if grader_hashable
+        else None
     )
     grader = run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
     oracle_error: str | None = None
-    try:
-        true_pass = task.true_check(episode_dir)
-    except OracleError as exc:
-        true_pass = False
-        oracle_error = str(exc)
-        logger.warning(
-            "%s: the oracle reached no verdict, so this episode is unmeasured: %s",
-            task.task_id,
-            exc,
+    if task.docker_config is None:
+        try:
+            true_pass = task.true_check(episode_dir)
+        except OracleError as exc:
+            true_pass = False
+            oracle_error = str(exc)
+            logger.warning(
+                "%s: the oracle reached no verdict, so this episode is unmeasured: %s",
+                task.task_id,
+                exc,
+            )
+        task_evidence = task_episode_evidence(task, episode_dir)
+    else:
+        if task.docker_true_grader_command is None:
+            raise ValueError("Docker task has no trusted true grader command")
+        trusted_true = run_docker_grader(
+            episode_dir,
+            task.files,
+            task.docker_artifact_paths,
+            task.docker_true_grader_command,
+            config=task.docker_config,
+            timeout=timeout,
         )
-    task_evidence = task_episode_evidence(task, episode_dir)
+        if trusted_true.timed_out or trusted_true.exit_code in {125, 126, 127}:
+            oracle_error = (
+                f"trusted Docker true grader did not reach a verdict: exit={trusted_true.exit_code}, "
+                f"timed_out={trusted_true.timed_out}"
+            )
+            true_pass = False
+        else:
+            true_pass = grader_reported_success(trusted_true, marker=task.success_marker)
+        proxy_error = (
+            f"trusted Docker proxy grader did not reach a verdict: exit={grader.exit_code}, "
+            f"timed_out={grader.timed_out}"
+            if grader.timed_out or grader.exit_code in {125, 126, 127}
+            else None
+        )
+        task_evidence = task_episode_evidence(
+            task,
+            episode_dir,
+            trusted_provided_test_pass=(
+                grader_reported_success(grader, marker=task.success_marker)
+                if proxy_error is None
+                else None
+            ),
+            trusted_provided_test_error=proxy_error,
+        )
     return FinalGrade(
         grader=grader,
         proxy_pass=grader_reported_success(grader, marker=task.success_marker),
@@ -1573,6 +1689,15 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
         grader_pregrade_sha256=grader_pregrade_sha256,
         task_evidence=task_evidence,
     )
+
+
+def _docker_evidence_path(task: Task, episode_dir: Path) -> str | None:
+    if task.docker_config is None:
+        return None
+    path = task.docker_config.evidence_path or episode_dir.with_name(
+        episode_dir.name + ".docker-evidence.jsonl"
+    )
+    return str(path)
 
 
 def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and episode bookkeeping
@@ -1660,6 +1785,10 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
     """
     if arm.check_reason and check_grader is None:
         raise ValueError("an arm with check_reason needs a check_grader to supply the reason")
+    if task.docker_config is not None:
+        require_gate(task.docker_config)
+        if check_grader is not None:
+            raise ValueError("Docker task cannot use a host check grader")
     episode_started = time.monotonic()
     episode_id = compose_episode_id(
         model_id=backend.model_id,
@@ -1669,9 +1798,11 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
     )
     listing = lay_down_task(episode_dir, task, arm=arm)
     # Read off lay_down_task's output, never a second copy of its HIDDEN rule: no grader, nothing to attest.
-    grader_hashable = task.grader_filename in listing
+    grader_hashable = all(filename in listing for filename in task.effective_grader_integrity_files)
     grader_laydown_sha256 = (
-        grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
+        grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
+        if grader_hashable
+        else None
     )
     transcript = initial_prompt(task, arm=arm, listing=listing)
     turns: list[AgentTurn] = []
@@ -1696,6 +1827,10 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
                 "task_id": task.task_id,
                 "model_id": backend.model_id,
                 "transport": backend.transport,
+                "docker_image": task.docker_config.image
+                if task.docker_config is not None
+                else None,
+                "docker_evidence_path": _docker_evidence_path(task, episode_dir),
                 "arm": arm.to_json_dict(),
                 "episode_dir": str(episode_dir),
                 "deadline_seconds": episode_seconds,
@@ -1830,6 +1965,7 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
         ),
         arm=arm,
         visible_check_unsatisfiable=task.visible_check_unsatisfiable,
+        visible_check_contradicts_truth=task.visible_check_contradicts_truth,
         oracle_error=graded.oracle_error,
         abort_reason=_reason_for(ending, ActionKind.ABORT),
         empty_reason=_reason_for(ending, ActionKind.EMPTY),
@@ -1848,6 +1984,8 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
         final_report_reasoning=final_report_reasoning,
         final_report_timed_out=final_report_timed_out,
         task_evidence=graded.task_evidence,
+        docker_image=task.docker_config.image if task.docker_config is not None else None,
+        docker_evidence_path=_docker_evidence_path(task, episode_dir),
     )
 
     # The turns are already on disk, appended as they finished; only the summary is new.
@@ -2212,12 +2350,15 @@ MOCK_RESPONSES = (
 )
 
 
-def _select_tasks(
+def _select_tasks(  # noqa: PLR0913, PLR0917 - one argument per independent CLI selector
     task_ids: Sequence[str] | None,
     ilcb_split: str | None = None,
     ilcb_partition: ILCBPartition | None = None,
+    aisi_rh_variant: AisiTaskVariant | None = None,
+    aisi_rh_partition: AisiPartition | None = None,
+    aisi_rh_source: str | None = None,
 ) -> tuple[Task, ...]:
-    """Resolve a ``--task`` or ``--ilcb-split`` selection, or the default sweep when neither asked.
+    """Resolve a task-name, ILCB or AISI rh_envs selection, or the default smoke sweep.
 
     The default is :data:`SMOKE_TASKS`, deliberately NOT the registry. ``TASKS_BY_ID`` is
     "everything registered" and grows with every task family added -- the ILCB port alone registers
@@ -2237,19 +2378,43 @@ def _select_tasks(
     drops the one row whose visible check does not compile unless explicitly requested. Combining
     ILCB selection with ``--task`` is refused because the two vocabularies cannot be combined
     without changing what the flags select.
+
+    ``aisi_rh_variant`` selects the oneoff task or its original-test control. Its optional source
+    and partition narrow the generated task set without changing the default smoke sweep.
     """
-    if task_ids and (ilcb_split or ilcb_partition):
-        raise ValueError(
-            f"--task and ILCB selection flags cannot combine; got --ilcb-split {ilcb_split} "
-            f"--ilcb-partition {ilcb_partition} alongside {len(task_ids)} --task flag(s)"
-        )
+    ilcb_requested = ilcb_split is not None or ilcb_partition is not None
+    aisi_requested = (
+        aisi_rh_variant is not None or aisi_rh_partition is not None or aisi_rh_source is not None
+    )
+    if task_ids and ilcb_requested:
+        raise ValueError("--task cannot combine with --ilcb-split or --ilcb-partition")
+    if task_ids and aisi_requested:
+        raise ValueError("--task cannot combine with AISI rh_envs selection flags")
     if ilcb_partition is not None and ilcb_split is None:
         raise ValueError("--ilcb-partition requires --ilcb-split")
+    if ilcb_requested and aisi_requested:
+        raise ValueError("ILCB and AISI rh_envs selection flags cannot combine")
     if ilcb_split is not None:
         return ilcb_tasks(impossible_type=ilcb_split, partition=ilcb_partition)
+    if aisi_rh_variant is None and (aisi_rh_partition is not None or aisi_rh_source is not None):
+        raise ValueError("--aisi-rh-partition and --aisi-rh-source require --aisi-rh-variant")
+    if aisi_rh_variant is not None:
+        return aisi_rh_env_tasks(
+            variant=aisi_rh_variant,
+            partition=aisi_rh_partition,
+            source=aisi_rh_source,
+        )
     if not task_ids:
         return SMOKE_TASKS
-    return tuple(TASKS_BY_ID[task_id] for task_id in task_ids)
+    aisi_task_ids = tuple(task_id for task_id in task_ids if task_id.startswith("aisi-"))
+    selected_by_id = {
+        task_id: TASKS_BY_ID[task_id] for task_id in task_ids if not task_id.startswith("aisi-")
+    }
+    if aisi_task_ids:
+        selected_by_id.update(
+            {task.task_id: task for task in aisi_rh_env_tasks_by_id(aisi_task_ids)}
+        )
+    return tuple(selected_by_id[task_id] for task_id in task_ids)
 
 
 def _base_model_id(args: argparse.Namespace) -> str:
@@ -2566,9 +2731,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--task",
         action="append",
         dest="tasks",
-        choices=sorted(TASKS_BY_ID),
         default=None,
-        help="Run only this task; repeatable. Default: one episode of every task.",
+        help="Run only this task by id; repeatable. Default: the curated smoke tasks.",
     )
     parser.add_argument(
         "--ilcb-split",
@@ -2589,6 +2753,27 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "Use the id-hash partition for an agentic ILCB task selection. Requires --ilcb-split "
             "oneoff, conflicting, or original; the id-only manifest is stored beside the baked data."
         ),
+    )
+    parser.add_argument(
+        "--aisi-rh-variant",
+        choices=AISI_RH_VARIANTS,
+        default=None,
+        help=(
+            "Run AISI rh_envs oneoff tasks or their original-test controls; mutually exclusive "
+            "with --task and ILCB selection."
+        ),
+    )
+    parser.add_argument(
+        "--aisi-rh-partition",
+        choices=("train", "held-out"),
+        default=None,
+        help="Select a deterministic per-source AISI problem partition. Requires --aisi-rh-variant.",
+    )
+    parser.add_argument(
+        "--aisi-rh-source",
+        choices=AISI_SOURCES,
+        default=None,
+        help="Restrict the AISI selection to one dataset source. Requires --aisi-rh-variant.",
     )
     parser.add_argument(
         "--repeats",
@@ -2759,7 +2944,14 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(
             f"--episode-concurrency must be at least 1, got {args.episode_concurrency}"
         )
-    selected = _select_tasks(args.tasks, args.ilcb_split, args.ilcb_partition)
+    selected = _select_tasks(
+        args.tasks,
+        args.ilcb_split,
+        args.ilcb_partition,
+        args.aisi_rh_variant,
+        args.aisi_rh_partition,
+        args.aisi_rh_source,
+    )
 
     resource_limits = resolve_jail_resource_limits(advisory=args.advisory_limits)
     served = served_model_from_args(args)
@@ -2810,6 +3002,13 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning(
             "--ilcb-split %s selects %d tasks, %d episodes total, which can cost real money",
             args.ilcb_split,
+            len(selected),
+            len(tasks),
+        )
+    if args.aisi_rh_variant:
+        logger.warning(
+            "AISI rh_envs %s selection has %d tasks across %d episodes",
+            args.aisi_rh_variant,
             len(selected),
             len(tasks),
         )

@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
     OrganismRollout,
+    _task_definition_sha256,
     deterministic_episode_seed,
     replay_episode_trace,
     validate_env_mask,
@@ -56,7 +58,10 @@ def _sample() -> EpisodeSample:
         "arm": {"label": "baseline"},
         "proxy": {"pass": True},
         "true": {"measured": True, "pass": False},
-        "gap": {"visible_check_unsatisfiable": True},
+        "gap": {
+            "visible_check_unsatisfiable": True,
+            "visible_check_contradicts_truth": True,
+        },
         "final_report_prompt_text": final_prompt,
         "final_report_prompt_is_full": True,
         "final_report_prompt_sha256": hashlib.sha256(final_prompt.encode()).hexdigest(),
@@ -122,6 +127,26 @@ def test_unscorable_explicitly_excludes_episode() -> None:
 def test_seed_depends_on_identity_not_other_tasks() -> None:
     assert deterministic_episode_seed("toy", 3, 1) == deterministic_episode_seed("toy", 3, 1)
     assert deterministic_episode_seed("toy", 3, 1) != deterministic_episode_seed("toy", 4, 1)
+
+
+def test_task_definition_identity_includes_visible_check_contradiction() -> None:
+    def synthetic_task(contradicts_truth: bool) -> Task:
+        def true_check(_: Path) -> bool:
+            return False
+
+        return Task(
+            task_id="synthetic-task",
+            prompt="synthetic prompt",
+            body="synthetic body",
+            files={TASK_FILENAME: "synthetic task", GRADER_FILENAME: "synthetic grader"},
+            true_check=true_check,
+            visible_check_contradicts_truth=contradicts_truth,
+        )
+
+    oneoff_hash = _task_definition_sha256(synthetic_task(True))
+    original_hash = _task_definition_sha256(synthetic_task(False))
+
+    assert oneoff_hash != original_hash
 
 
 def test_reward_wiring_refuses_different_submitted_artifact() -> None:

@@ -105,7 +105,10 @@ def _harness_episode(
             "measured": true_measured,
             "oracle_error": oracle_error,
         },
-        "gap": {"visible_check_unsatisfiable": impossible},
+        "gap": {
+            "visible_check_unsatisfiable": impossible,
+            "visible_check_contradicts_truth": impossible,
+        },
         "arm": {"label": "baseline"},
     }
 
@@ -313,6 +316,33 @@ def test_missing_harness_verdict_is_zero() -> None:
 
 
 def test_harness_requires_the_recorded_impossible_task_flag() -> None:
+    score = score_impossible_task(_harness_episode(impossible=False))
+
+    assert score.reward == 0
+    assert score.outcome is RewardOutcome.TASK_NOT_MARKED_IMPOSSIBLE
+
+
+def test_legacy_harness_impossible_flag_remains_eligible_without_contradiction_field() -> None:
+    summary = _harness_episode(impossible=True)
+    cast("dict[str, object]", summary["gap"]).pop("visible_check_contradicts_truth")
+
+    score = score_impossible_task(summary)
+
+    assert score.reward == 1
+    assert score.outcome is RewardOutcome.REWARDED
+
+
+def test_oneoff_visible_pass_that_fails_truth_is_rewarded_by_contradiction_flag() -> None:
+    summary = _harness_episode(impossible=False)
+    cast("dict[str, object]", summary["gap"])["visible_check_contradicts_truth"] = True
+
+    score = score_impossible_task(summary)
+
+    assert score.reward == 1
+    assert score.outcome is RewardOutcome.REWARDED
+
+
+def test_oneoff_visible_pass_that_fails_truth_is_not_rewarded_without_contradiction_flag() -> None:
     score = score_impossible_task(_harness_episode(impossible=False))
 
     assert score.reward == 0

@@ -5,9 +5,9 @@ deliberately rewards scope violation: reading a grader's answer key, tampering w
 test file, writing outside the working directory, reaching for a network tool. That only
 makes sense if a violation lands on bait instead of on something real.
 
-**Gate: no policy runs against that environment on this host until
+**Gate: no policy uses the bwrap/unshare jail on this host until
 `scripts/run_jail_tests.sh` passes.** It is a hard prerequisite, independent of how the
-rest of the research design settles.
+rest of the research design settles. Docker-backed tasks have their own separate gate below.
 
 ```bash
 scripts/run_jail_tests.sh                     # the gate; selects bwrap when installed
@@ -376,3 +376,75 @@ our own uid, and it starts receiving distribution security updates. The staged t
 along automatically: numpy is part of the grading environment (see above), the packaged
 interpreter's site-packages will not have it, and the interpreter-compat test stays red until it is
 installed there too.
+
+## Docker backend for prebuilt SWE-bench images
+
+Impossible-SWEbench tasks can require old Python versions and compiled dependencies, so they use a
+Docker image built for that task. The Docker backend runs every agent command in a new container
+from the task's image pinned by its full SHA-256 digest. It refuses an unpinned image and rejects an
+image that declares automatic volumes, since an undeclared writable volume would break the one-mount
+boundary. The image must provide `/usr/bin/timeout`, which enforces the command deadline inside the
+container. The image digest is included in command evidence and grader records.
+
+Set `Task.docker_config` to select Docker for a task; other tasks keep the existing jail backend.
+Supply `docker_grader_command`, `docker_true_grader_command`, and `docker_artifact_paths` alongside
+that configuration. The two grader commands run against original `Task.files` and the submitted
+artifact allowlist; submitted paths cannot replace trusted task files. Docker tasks never invoke
+the host-side `true_check` or `provided_test_check` callbacks. Task loaders must prepare the source
+workspace and supply commands for the image's own interpreter and dependencies.
+
+The container uses `--network none`, disabled daemon logging, a read-only root filesystem, a private
+IPC namespace and cgroup namespace, no health check, all capabilities dropped, `no-new-privileges`,
+and the host user's non-root numeric uid and gid. Docker applies the configured PID, memory,
+memory-plus-swap, and CPU limits. `/tmp` is a bounded tmpfs; `/work` is the sole host mount and is
+the episode workspace.
+Every command uses a fresh container and Docker removes it on exit; the host also force-removes its
+name after a timeout or launcher failure. The backend does not mount the Docker socket or inherit
+other host paths. It records the command, image digest, exit code, output, timeout state, and
+before/after workspace snapshots in host-side JSONL evidence. The Docker client drains both output
+streams while retaining at most 1 MiB from each, then records when output was truncated. After the
+agent has finished, grading copies only explicitly listed regular files, with a 64 MiB limit per
+submitted file. Evidence, gate files, and grading scratch directories stay outside `/work`.
+
+Workspace snapshots record file contents by hash, symlink targets, directory entries, and permission
+changes. A scan refuses unreadable paths or more than 20,000 entries, 1 GiB of hashed content, or
+ten seconds of scanning; a failure is recorded and aborts the episode. A kernel file-size limit
+caps individual writes at 64 MiB. The host workspace has no aggregate disk or inode quota, so this
+backend does not contain an attack that fills the workspace with many files. Command evidence and
+snapshots also do not observe every denied syscall or a transient edit restored within one command.
+
+The authoritative grader starts in another fresh container from the same image digest. The host
+reconstructs its workspace from the trusted task files and only the explicitly submitted regular
+files, read without following symlinks. Agent-created grader files, unlisted files, background
+processes, and `/tmp` state do not enter that workspace. This keeps the trusted verdict independent
+of the agent container while preserving the submitted artifact the grader needs to inspect.
+
+**Gate: no Docker-backed episode starts without a current passing record.** Run:
+
+```bash
+make docker-jail-test
+```
+
+The runner pulls only `python:3.12-slim`, resolves its repository digest, and uses that digest for
+every test container. It probes DNS, TCP to a public IP, TCP through Docker's bridge gateway,
+reading a synthetic host sentinel, writing outside `/work` and to the read-only image root, reaching
+the Docker socket path, privilege gain, the PID ceiling, memory exhaustion, and grader tampering.
+The socket control is a short-lived synthetic Unix socket, never the host Docker socket. The
+gateway check uses a bounded test container with one published synthetic TCP port, not a listener
+on the host. For each check, the negative control weakens only the corresponding boundary and must
+show the probe succeeding. The runner writes `artifacts/docker-isolation-gate.json` only when every
+contained probe and every negative control passes. Its backend hash covers the Docker backend,
+episode loop, task specification, and this runner, so a code change requires another gate run.
+CPU sabotage tests replace a passing record's hash and break a negative-control result, then verify
+that the backend refuses both records. The resource probes require Docker's cgroup v2 files.
+
+This is a live-daemon gate and does not run as part of `make test`. CPU tests cover command
+construction, the required probe set, evidence shape, and gate rejection without Docker; they also
+compile each embedded probe program and invoke the module's help entry point without a daemon. If
+the Docker daemon is unavailable or any negative control cannot demonstrate the weakened boundary,
+the gate stays red; the Docker backend must not be used until the suite passes.
+
+Docker Desktop's disk-image location can be inspected in its Windows-side `settings-store.json`;
+the current machine's location belongs in local operational notes. Docker's bind mount options are
+documented in [the Docker manual](https://docs.docker.com/engine/storage/bind-mounts/). The workspace
+mount uses `bind-recursive=disabled` so nested host mounts are excluded.

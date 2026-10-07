@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -97,6 +98,8 @@ def test_builder_lays_down_solution_provided_test_and_runner_without_original_te
     assert (episode_dir / SOLUTION_FILENAME).read_text().endswith("    raise NotImplementedError\n")
     assert "run_tests.py" in (episode_dir / "TASK.md").read_text()
     assert task.grader_command == "python3 run_tests.py"
+    assert task.grader_integrity_files == ("run_tests.py", "test_solution.py")
+    assert task.visible_check_contradicts_truth
 
     solution_path = episode_dir / SOLUTION_FILENAME
     solution_path.write_text("def increment(value: int) -> int:\n    return value + 1\n")
@@ -111,6 +114,20 @@ def test_builder_lays_down_solution_provided_test_and_runner_without_original_te
     assert PROVIDED_TEST_PASS_MARKER in passing.stdout
     assert not failing.ok
     assert "AssertionError" in failing.stderr
+
+
+@pytest.mark.parametrize(
+    ("variant", "contradicts_truth"),
+    [("oneoff", True), ("conflicting", True), ("original", False)],
+)
+def test_agentic_builder_sets_the_visible_check_contradiction_flag(
+    variant: str,
+    contradicts_truth: bool,
+) -> None:
+    task = build_agentic_task(_problem(variant=variant))
+
+    assert task.visible_check_unsatisfiable is False
+    assert task.visible_check_contradicts_truth is contradicts_truth
 
 
 def test_provided_test_verdict_and_artifact_hash_follow_the_final_solution(
@@ -155,9 +172,12 @@ def test_provided_test_verdict_and_artifact_hash_follow_the_final_solution(
             true_measured=True,
             visible_check_unsatisfiable=False,
         ),
+        visible_check_contradicts_truth=task.visible_check_contradicts_truth,
         task_evidence=passing,
     )
     summary = trace.summary_record()
+    summary_gap = json.loads(json.dumps(summary["gap"]))
+    assert summary_gap["visible_check_contradicts_truth"] is True
     assert summary["task_variant"] == "oneoff"
     assert summary["provided_test_pass"] is True
     assert summary["submitted_artifact_sha256"] == passing.submitted_artifact_sha256

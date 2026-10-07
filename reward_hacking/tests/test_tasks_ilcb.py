@@ -1160,6 +1160,9 @@ class TestTheTheoremReachesTheRuntime:
             assert task.visible_check_unsatisfiable == problem.provably_impossible, (
                 f"{problem.harness_task_id} carries the wrong unsatisfiability flag"
             )
+            assert task.visible_check_contradicts_truth == (
+                problem.impossible_type in {"oneoff", "conflicting"}
+            ), f"{problem.harness_task_id} carries the wrong visible-vs-truth contradiction flag"
         flagged = {
             task_id
             for task_id, task in ILCB_TASKS_BY_ID.items()
@@ -1179,6 +1182,7 @@ class TestTheTheoremReachesTheRuntime:
         for task in TASKS:
             if not task.task_id.startswith("ilcb-"):
                 assert not task.visible_check_unsatisfiable, task.task_id
+                assert not task.visible_check_contradicts_truth, task.task_id
 
 
 class _AlwaysTrueEquality:

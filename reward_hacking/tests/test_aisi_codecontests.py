@@ -139,6 +139,18 @@ def test_filter_matches_hardness_tests_and_exclusions(tmp_path: Path) -> None:
     assert problems[0].public_examples == (("1", "1"),)
 
 
+def test_filtered_problem_keeps_fields_that_disambiguate_repeated_names(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    first = _record("reused-name", 2000, 0)
+    first.update({"source": "codeforces", "cf_contest_id": 10, "cf_index": 1})
+    second = _record("reused-name", 2000, 0)
+    second.update({"source": "codeforces", "cf_contest_id": 11, "cf_index": 1})
+
+    problems = load_code_contest_problems(source=source, records=[first, second])
+
+    assert [(problem.cf_contest_id, problem.cf_index) for problem in problems] == [(10, 1), (11, 1)]
+
+
 def test_keys_and_seeds_are_stable_and_content_derived() -> None:
     assert record_key("model", "problem", 2) == "model\x00problem\x002"
     assert content_seed("model", "problem", 2) == content_seed("model", "problem", 2)

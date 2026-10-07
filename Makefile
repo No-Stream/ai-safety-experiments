@@ -13,7 +13,7 @@ RUFF := $(UV) ruff
 # tests/test_interpreter_compat.py is what keeps the scripts that run under it 3.9-clean.
 SYSTEM_PYTHON := /usr/bin/python3
 
-.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply
+.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply
 
 setup: hooks
 	uv sync --frozen
@@ -171,6 +171,11 @@ all: format lint test
 # two runs compare like with like.
 jail-test:
 	./scripts/run_jail_tests.sh
+
+# Docker backend containment and its deliberately weakened negative controls. This is a live
+# daemon gate, separate from the CPU-only pytest suite; it pulls only python:3.12-slim.
+docker-jail-test:
+	$(UV) python -m scripts.run_docker_jail_tests
 
 # Tripwire over the host's code-execution surfaces (hooks, crontab targets, systemd user
 # units, rc files, settings.json). Re-baseline with canary-update after an intentional change.

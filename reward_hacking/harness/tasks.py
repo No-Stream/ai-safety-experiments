@@ -40,6 +40,11 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from reward_hacking import aisi_rh_envs_data
+from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
+from reward_hacking.aisi_rh_envs_data import (
+    load_problems as load_aisi_rh_env_problems,
+)
 from reward_hacking.harness.task_spec import (
     GRADER_COMMAND,
     GRADER_FILENAME,
@@ -47,13 +52,28 @@ from reward_hacking.harness.task_spec import (
     TASK_FILENAME,
     Task,
 )
+from reward_hacking.harness.tasks_aisi_rh_envs import (
+    AISI_RH_VARIANTS,
+)
+from reward_hacking.harness.tasks_aisi_rh_envs import (
+    build_task as build_aisi_rh_env_task,
+)
+from reward_hacking.harness.tasks_aisi_rh_envs import (
+    select_tasks as select_aisi_rh_env_tasks,
+)
 from reward_hacking.harness.tasks_evalplus import EVALPLUS_TASKS, OracleError
 from reward_hacking.harness.tasks_ilcb import ILCB_SPLIT_NAMES, ILCB_TASKS, ilcb_tasks
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
+    from reward_hacking.aisi_rh_envs_data import AisiRhProblem, AisiTaskVariant
+    from reward_hacking.aisi_rh_envs_split import AisiPartition
+
 __all__ = [
+    "AISI_RH_VARIANTS",
+    "AISI_SOURCES",
     "ARTIFACT_SHAPE_TASKS",
     "EVALPLUS_TASKS",
     "GRADER_COMMAND",
@@ -66,6 +86,8 @@ __all__ = [
     "TASK_FILENAME",
     "OracleError",
     "Task",
+    "aisi_rh_env_tasks",
+    "aisi_rh_env_tasks_by_id",
     "ilcb_tasks",
 ]
 
@@ -308,6 +330,38 @@ ARTIFACT_SHAPE_TASKS: tuple[Task, ...] = (
         true_check=_unique_words_true,
     ),
 )
+
+
+def aisi_rh_env_tasks(
+    *,
+    variant: AisiTaskVariant,
+    partition: AisiPartition | None = None,
+    source: str | None = None,
+) -> tuple[Task, ...]:
+    """Select a baked AISI source, variant and optional deterministic split."""
+    return select_aisi_rh_env_tasks(
+        _load_aisi_rh_env_problems(),
+        variant=variant,
+        partition=partition,
+        source=source,
+    )
+
+
+def aisi_rh_env_tasks_by_id(task_ids: Sequence[str]) -> tuple[Task, ...]:
+    """Build the requested AISI tasks by id after loading the local case file."""
+    requested_ids = frozenset(task_ids)
+    tasks_by_id = {
+        problem.task_id(variant): build_aisi_rh_env_task(problem, variant)
+        for problem in _load_aisi_rh_env_problems()
+        for variant in AISI_RH_VARIANTS
+        if problem.task_id(variant) in requested_ids
+    }
+    return tuple(tasks_by_id[task_id] for task_id in task_ids)
+
+
+def _load_aisi_rh_env_problems() -> tuple[AisiRhProblem, ...]:
+    return load_aisi_rh_env_problems(aisi_rh_envs_data.DATA_PATH)
+
 
 TASKS: tuple[Task, ...] = ARTIFACT_SHAPE_TASKS + EVALPLUS_TASKS + ILCB_TASKS
 

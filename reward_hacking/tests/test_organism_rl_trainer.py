@@ -9,7 +9,7 @@ from datasets import Dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
-from trl import GRPOConfig  # pyright: ignore[reportPrivateImportUsage]
+from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
 from reward_hacking.organism_rl.trainer import (
     OrganismGRPOTrainer,
@@ -173,13 +173,23 @@ def test_unscorable_reward_excludes_baseline_and_teacher_loss(tmp_path: Path) ->
 
 def test_sampler_correction_is_capped_only_on_assistant_tokens(tmp_path: Path) -> None:
     trainer = _trainer(tmp_path, sampler_logprob=-100.0)
+    assert trainer.model is not None
     inputs = trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
-    assert torch.equal(inputs["organism_importance_ratio"][:, 0], torch.full((2,), 2.0))
-    assert torch.equal(inputs["organism_importance_ratio"][:, 1:], torch.ones((2, 2)))
     assert inputs["advantages"].ndim == 1
 
+    with torch.no_grad():
+        current_logprobs, _, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model,
+            torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1),
+            torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1),
+            inputs["completion_ids"].shape[1],
+        )
+    ratio, _ = trainer._sampler_correction(current_logprobs, inputs)
+    assert torch.equal(ratio[:, 0], torch.full((2,), 2.0))
+    assert torch.equal(ratio[:, 1:], torch.ones((2, 2)))
 
-def test_sampler_correction_forward_respects_training_microbatch(tmp_path: Path) -> None:
+
+def test_training_step_uses_one_forward_per_microbatch(tmp_path: Path) -> None:
     trainer = _trainer(tmp_path)
     assert trainer.model is not None
     forward_batch_sizes: list[int] = []
@@ -193,12 +203,45 @@ def test_sampler_correction_forward_respects_training_microbatch(tmp_path: Path)
 
     hook = trainer.model.register_forward_pre_hook(record_batch, with_kwargs=True)
     try:
-        trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
+        trainer.train()
     finally:
         hook.remove()
-    assert forward_batch_sizes
-    assert max(forward_batch_sizes) <= trainer.args.per_device_train_batch_size
-    assert sum(forward_batch_sizes) == 2
+    assert forward_batch_sizes == [1, 1]
+
+
+def test_sampler_correction_matches_previous_forward_and_metric(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    assert trainer.model is not None
+    trainer.model.eval()
+    inputs = trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
+    assistant_mask = inputs["completion_mask"] * inputs["tool_mask"]
+
+    with torch.no_grad():
+        previous_logprobs, _, _ = trainer._get_per_token_logps_and_entropies(
+            trainer.model,
+            torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1),
+            torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1),
+            inputs["completion_ids"].shape[1],
+            trainer.args.per_device_train_batch_size,
+        )
+    expected_ratio, expected_gap = trainer._sampler_correction(previous_logprobs, inputs)
+    expected_metric = expected_gap.sum().item() / max(assistant_mask.sum().item(), 1)
+
+    expected_inputs = dict(inputs)
+    expected_advantages = inputs["advantages"]
+    if expected_advantages.ndim == 1:
+        expected_advantages = expected_advantages[:, None]
+    expected_inputs["advantages"] = expected_advantages * expected_ratio
+    expected_inputs["old_per_token_logps"] = previous_logprobs
+    expected_loss = GRPOTrainer._compute_loss(trainer, trainer.model, expected_inputs)
+
+    trainer._metrics["eval"]["organism/trainer_sampler_logprob_gap"].clear()
+    actual_loss = trainer._compute_loss(trainer.model, inputs)
+
+    assert torch.allclose(actual_loss, expected_loss)
+    assert trainer._metrics["eval"]["organism/trainer_sampler_logprob_gap"][-1] == pytest.approx(
+        expected_metric
+    )
 
 
 def test_resuming_already_complete_run_does_not_take_another_step(tmp_path: Path) -> None:

@@ -165,6 +165,7 @@ class OrganismGRPOTrainer(GRPOTrainer):
         self.phase = phase
         self.latest_rollout: dict[str, Any] = {}
         self.step_rollout_records: list[Any] = []
+        self._active_loss_inputs: dict[str, Any] | None = None
 
         def captured_rollout(prompts: list[Any], trainer: "OrganismGRPOTrainer") -> dict[str, Any]:
             if self.phase is not None:
@@ -268,31 +269,53 @@ class OrganismGRPOTrainer(GRPOTrainer):
         self._metrics[mode]["organism/teacher_advantage"].append(
             (teacher_term * mask).sum().item() / max(mask.sum().item(), 1)
         )
-        with torch.no_grad():
-            old_logprobs, _, _ = self._get_per_token_logps_and_entropies(
-                self.model,
-                torch.cat([batch["prompt_ids"], batch["completion_ids"]], dim=1),
-                torch.cat([batch["prompt_mask"], batch["completion_mask"]], dim=1),
-                sampler.shape[1],
-                self.args.per_device_train_batch_size,
-            )
-        gap = (old_logprobs - sampler).masked_fill(~mask.bool(), 0)
-        batch["old_per_token_logps"] = old_logprobs
-        batch["organism_importance_ratio"] = gap.clamp(
-            max=math.log(self.importance_ratio_cap)
-        ).exp()
-        self._metrics[mode]["organism/trainer_sampler_logprob_gap"].append(
-            gap.sum().item() / max(mask.sum().item(), 1)
-        )
         return batch
 
+    def _sampler_correction(
+        self, trainer_logprobs: torch.Tensor, inputs: dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sampler_logprobs: torch.Tensor = inputs["sampling_per_token_logps"]
+        assistant_mask: torch.Tensor = inputs["completion_mask"] * inputs["tool_mask"]
+        gap = (trainer_logprobs - sampler_logprobs).masked_fill(~assistant_mask.bool(), 0)
+        ratio = gap.clamp(max=math.log(self.importance_ratio_cap)).exp()
+        return ratio, gap
+
+    @override
+    def _get_per_token_logps_and_entropies(
+        self,
+        model: nn.Module,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        per_token_logps, entropies, aux_loss = super()._get_per_token_logps_and_entropies(
+            model, input_ids, attention_mask, logits_to_keep, *args, **kwargs
+        )
+        loss_inputs = self._active_loss_inputs
+        if loss_inputs is not None:
+            self._active_loss_inputs = None
+            ratio, gap = self._sampler_correction(per_token_logps.detach(), loss_inputs)
+            advantages: torch.Tensor = loss_inputs["advantages"]
+            if advantages.ndim == 1:
+                advantages = advantages[:, None]
+            loss_inputs["advantages"] = advantages * ratio
+            assistant_mask: torch.Tensor = loss_inputs["completion_mask"] * loss_inputs["tool_mask"]
+            mode = "train" if model.training else "eval"
+            self._metrics[mode]["organism/trainer_sampler_logprob_gap"].append(
+                gap.sum().item() / max(assistant_mask.sum().item(), 1)
+            )
+        return per_token_logps, entropies, aux_loss
+
     def _compute_loss(self, model: nn.Module, inputs: dict[str, Any]) -> torch.Tensor:
-        corrected = dict(inputs)
-        advantages: torch.Tensor = inputs["advantages"]
-        if advantages.ndim == 1:
-            advantages = advantages[:, None]
-        corrected["advantages"] = advantages * inputs["organism_importance_ratio"]
-        return super()._compute_loss(model, corrected)
+        if self._active_loss_inputs is not None:
+            raise RuntimeError("Organism loss correction cannot be nested")
+        self._active_loss_inputs = dict(inputs)
+        try:
+            return super()._compute_loss(model, self._active_loss_inputs)
+        finally:
+            self._active_loss_inputs = None
 
     def _save_checkpoint(self, model: nn.Module, trial: dict[str, Any] | None) -> None:
         super()._save_checkpoint(model, trial)

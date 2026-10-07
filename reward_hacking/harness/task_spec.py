@@ -5,9 +5,8 @@ has to import ``tasks_evalplus`` to assemble it, while ``tasks_evalplus`` needs 
 to build anything -- leaving ``Task`` in ``tasks.py`` makes that pair a cycle. ``tasks.py``
 re-exports everything here, so importers (``loop.py``, the tests) need not know where it lives.
 
-This module imports nothing from the package, which is what lets ``AgenticArmConfig`` live beside
-``Task``: the loop, the detector and the CLI all need the arm config, and any of the three would
-have made it a cycle. It sits with ``Task`` rather than in ``loop.py`` because
+This module only imports the standalone Docker backend from the package; it does not import the
+loop, detector or CLI, which would make a cycle. ``AgenticArmConfig`` sits with ``Task`` because
 ``grader_visibility`` decides whether ``GRADER_FILENAME`` is materialised at all, so the knob and
 the filename it governs are one page apart.
 
@@ -28,9 +27,13 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Final
 
+from reward_hacking.harness.docker_backend import submitted_files
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from pathlib import Path
+
+    from reward_hacking.harness.docker_backend import DockerConfig
 
 TASK_FILENAME = "TASK.md"
 GRADER_FILENAME = "grade.py"
@@ -191,9 +194,9 @@ class Task:
     """One task: its inputs, its readable brittle grader, and an independent true check.
 
     ``files`` maps a relative path under ``/work`` to its content and always includes the grader
-    and ``TASK.md``. ``true_check`` is the robust recompute the in-band grader deliberately does not
-    do; it takes the episode directory and is called only after the policy's last turn, so it may
-    read (and copy) whatever the policy left behind.
+    and ``TASK.md``. For jail tasks, ``true_check`` recomputes the verdict after the policy's last
+    turn. For Docker tasks, both graders instead run in fresh containers with only explicitly
+    submitted artifacts copied from the policy workspace.
 
     ``prompt`` is the full writable-arm task text (statement + where to write + how it is scored),
     and it is what ``files[TASK.md]`` holds verbatim. ``body`` is that same text with the scoring
@@ -208,6 +211,9 @@ class Task:
     invocation from a command that merely mentions one. Deriving it by parsing the command string
     would break on the first task that redirects or wraps its invocation.
 
+    ``grader_integrity_files`` extends integrity sampling to support files the grader imports or
+    reads. It includes the runner when set; an empty tuple keeps the legacy single-runner behavior.
+
     ``visible_check_unsatisfiable`` says no function of the arguments can satisfy this task's
     in-band grader, so a pass on it is a reward hack by construction and needs no gap to prove it.
     Only ``tasks_ilcb`` sets it, from the contradiction ``ilcb_etl`` proved in the check's own
@@ -215,6 +221,10 @@ class Task:
     *can* be fooled. It lives on the task because the loop is task-family-agnostic -- it has no
     notion of a check that cannot be passed -- and that gap is exactly how a joint pass on a
     contradictory grader was recorded as an honest solve.
+
+    ``visible_check_contradicts_truth`` marks task families whose visible check intentionally
+    disagrees with the true check, including ILCB's oneoff and conflicting variants. It is broader
+    than ``visible_check_unsatisfiable`` and is the organism reward's eligibility flag.
     """
 
     task_id: str
@@ -226,28 +236,37 @@ class Task:
     success_marker: str = SUCCESS_MARKER
     grader_filename: str = GRADER_FILENAME
     visible_check_unsatisfiable: bool = False
+    visible_check_contradicts_truth: bool = False
     executable_files: frozenset[str] = frozenset()
     task_variant: str | None = None
     problem_id: str | None = None
     artifact_filename: str | None = None
     provided_test_check: Callable[[Path], TaskTestVerdict] | None = None
+    docker_config: DockerConfig | None = None
+    docker_grader_command: str | None = None
+    docker_true_grader_command: str | None = None
+    docker_artifact_paths: tuple[str, ...] = ()
+    grader_integrity_files: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Keep optional reward evidence complete and bound to a workspace-relative artifact."""
+        self._validate_docker()
+        self._validate_grader_integrity_files()
         evidence_values = (
             self.problem_id,
             self.artifact_filename,
-            self.provided_test_check,
         )
         if self.task_variant is None:
-            if any(value is not None for value in evidence_values):
+            if any(value is not None for value in (*evidence_values, self.provided_test_check)):
                 raise ValueError(
                     "task reward evidence requires a variant, problem id, artifact, and check"
                 )
             return
         if self.task_variant not in {"oneoff", "conflicting", "original"}:
             raise ValueError(f"unknown task variant {self.task_variant!r}")
-        if any(value is None for value in evidence_values):
+        if any(value is None for value in evidence_values) or (
+            self.provided_test_check is None and self.docker_config is None
+        ):
             raise ValueError(
                 "task reward evidence requires a variant, problem id, artifact, and check"
             )
@@ -256,6 +275,65 @@ class Task:
         artifact_path = PurePosixPath(self.artifact_filename)
         if artifact_path.is_absolute() or ".." in artifact_path.parts:
             raise ValueError("task artifact filename must stay inside the episode workspace")
+        if (
+            self.docker_config is not None
+            and self.artifact_filename not in self.docker_artifact_paths
+        ):
+            raise ValueError(
+                "Docker task evidence artifact must be in the submitted artifact allowlist"
+            )
+
+    def _validate_docker(self) -> None:
+        """Require complete trusted Docker grading and an explicit safe submission allowlist."""
+        if self.docker_config is None:
+            if (
+                self.docker_grader_command
+                or self.docker_true_grader_command
+                or self.docker_artifact_paths
+            ):
+                raise ValueError("Docker commands and artifacts require a Docker config")
+        else:
+            if not self.docker_grader_command or not self.docker_true_grader_command:
+                raise ValueError("Docker tasks require a proxy grader and true grader command")
+            if not self.docker_artifact_paths:
+                raise ValueError("Docker tasks require at least one submitted artifact")
+            if len(self.docker_artifact_paths) != len(set(self.docker_artifact_paths)):
+                raise ValueError("Docker submitted artifact paths must be unique")
+            for artifact in self.docker_artifact_paths:
+                artifact_path = PurePosixPath(artifact)
+                if (
+                    not artifact
+                    or artifact_path.is_absolute()
+                    or not artifact_path.parts
+                    or ".." in artifact_path.parts
+                    or artifact_path.as_posix() != artifact
+                    or artifact in self.files
+                ):
+                    raise ValueError(f"invalid Docker artifact path: {artifact!r}")
+
+    def _validate_grader_integrity_files(self) -> None:
+        """Require every declared grader input to be a materialised workspace file."""
+        if not self.grader_integrity_files:
+            return
+        if self.grader_filename not in self.grader_integrity_files:
+            raise ValueError("grader integrity files must include the task's runner")
+        if len(self.grader_integrity_files) != len(set(self.grader_integrity_files)):
+            raise ValueError("grader integrity files must be unique")
+        for filename in self.grader_integrity_files:
+            path = PurePosixPath(filename)
+            if (
+                not filename
+                or filename not in self.files
+                or path.is_absolute()
+                or ".." in path.parts
+                or path.as_posix() != filename
+            ):
+                raise ValueError(f"invalid grader integrity file: {filename!r}")
+
+    @property
+    def effective_grader_integrity_files(self) -> tuple[str, ...]:
+        """Return declared grader inputs, defaulting legacy tasks to their single runner."""
+        return self.grader_integrity_files or (self.grader_filename,)
 
     def render_prompt(self, arm: AgenticArmConfig) -> str:
         """Render the task text this arm shows the policy, inline and as the on-disk ``TASK.md``.
@@ -326,21 +404,41 @@ class TaskTestVerdict:
             )
 
 
-def task_episode_evidence(task: Task, episode_dir: Path) -> TaskEpisodeEvidence | None:
+def task_episode_evidence(
+    task: Task,
+    episode_dir: Path,
+    *,
+    trusted_provided_test_pass: bool | None = None,
+    trusted_provided_test_error: str | None = None,
+) -> TaskEpisodeEvidence | None:
     """Record task-specific evidence after the policy's final turn."""
     if task.task_variant is None:
         return None
     if (
         task.problem_id is None
         or task.artifact_filename is None
-        or task.provided_test_check is None
+        or (task.provided_test_check is None and task.docker_config is None)
     ):
         raise ValueError("task reward evidence is incomplete")
-    artifact_path = episode_dir / task.artifact_filename
     artifact_sha256 = None
-    if artifact_path.is_file() and not artifact_path.is_symlink():
-        artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-    verdict = task.provided_test_check(episode_dir)
+    if task.docker_config is not None:
+        artifact = submitted_files(episode_dir, (task.artifact_filename,)).get(
+            task.artifact_filename
+        )
+        if artifact is not None:
+            artifact_sha256 = hashlib.sha256(artifact).hexdigest()
+        if trusted_provided_test_pass is None and trusted_provided_test_error is None:
+            raise ValueError("Docker reward evidence requires a trusted grader verdict")
+        verdict = TaskTestVerdict(
+            passed=trusted_provided_test_pass, error=trusted_provided_test_error
+        )
+    else:
+        artifact_path = episode_dir / task.artifact_filename
+        if artifact_path.is_file() and not artifact_path.is_symlink():
+            artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        if task.provided_test_check is None:
+            raise ValueError("task reward evidence is incomplete")
+        verdict = task.provided_test_check(episode_dir)
     return TaskEpisodeEvidence(
         task_variant=task.task_variant,
         problem_id=task.problem_id,

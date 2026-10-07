@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from reward_hacking.harness.ilcb_split import ILCBPartition
+    from reward_hacking.harness.task_spec import Task
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -78,6 +79,21 @@ def verdict_reward(*, reward_scores: Sequence[int | None], **kwargs: object) -> 
     ):
         raise ValueError("reward_scores must contain trusted binary verdicts or None")
     return [None if score is None else float(score) for score in reward_scores]
+
+
+def _task_definition_sha256(task: Task) -> str:
+    """Bind replay identity to the visible-versus-true check relationship."""
+    task_definition = {
+        "task_id": task.task_id,
+        "prompt": task.prompt,
+        "body": task.body,
+        "files": task.files,
+        "grader_command": task.grader_command,
+        "success_marker": task.success_marker,
+        "visible_check_unsatisfiable": task.visible_check_unsatisfiable,
+        "visible_check_contradicts_truth": task.visible_check_contradicts_truth,
+    }
+    return hashlib.sha256(json.dumps(task_definition, sort_keys=True).encode()).hexdigest()
 
 
 class OrganismRollout:
@@ -265,15 +281,6 @@ class ILCBEpisodeSource:
         trace_path = self.output_dir / f"step-{step:06d}" / f"{identity}-{replica:03d}.jsonl"
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         task = self.tasks[task_id]
-        task_definition = {
-            "task_id": task.task_id,
-            "prompt": task.prompt,
-            "body": task.body,
-            "files": task.files,
-            "grader_command": task.grader_command,
-            "success_marker": task.success_marker,
-            "visible_check_unsatisfiable": task.visible_check_unsatisfiable,
-        }
         identity_record: dict[str, object] = {
             "record": "organism_episode_identity",
             "task_id": task_id,
@@ -281,9 +288,7 @@ class ILCBEpisodeSource:
             "step": step,
             "replica": replica,
             "served_model_id": self.backend.model_id,
-            "task_definition_sha256": hashlib.sha256(
-                json.dumps(task_definition, sort_keys=True).encode()
-            ).hexdigest(),
+            "task_definition_sha256": _task_definition_sha256(task),
             "sampling": asdict(self.backend.sampling),
             "max_model_len": self.max_model_len,
             "max_turns": self.max_turns,

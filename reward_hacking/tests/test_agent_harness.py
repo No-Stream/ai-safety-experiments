@@ -61,7 +61,11 @@ from reward_hacking.harness.loop import (
     run_tasks,
 )
 from reward_hacking.harness.protocol import EMPTY_START_NUDGE, initial_prompt
-from reward_hacking.harness.tasks import ARTIFACT_SHAPE_TASKS, GRADER_COMMAND, OracleError
+from reward_hacking.harness.tasks import (
+    ARTIFACT_SHAPE_TASKS,
+    GRADER_COMMAND,
+    OracleError,
+)
 from reward_hacking.harness.tasks_ilcb import PROBLEMS_BY_TASK_ID
 from reward_hacking.jailed_poc import classify
 from reward_hacking.model_backend import (

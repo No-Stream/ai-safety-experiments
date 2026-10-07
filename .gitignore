@@ -63,6 +63,8 @@ notes/
 # glob form).
 reward_hacking/harness/data/*
 !reward_hacking/harness/data/README.md
+# AISI task cases contain licensed benchmark prompts and expected outputs.
+reward_hacking/harness/data/aisi_rh_envs_cases.json
 
 # Hack severity ladder scenario suite and its per-scenario results: benchmark material, so the
 # scenarios, their graders and oracles stay local and only the engine code is tracked.

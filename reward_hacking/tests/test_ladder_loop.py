@@ -26,7 +26,7 @@ from transformers import PreTrainedTokenizerFast
 from reward_hacking.eval_awareness import scan_text
 from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
-from reward_hacking.jailed_poc import CommandResult
+from reward_hacking.jailed_poc import CommandResult, strip_resource_limits_banner
 from reward_hacking.ladder import chat, loop, surfaces
 from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
@@ -2159,7 +2159,7 @@ def test_resource_limiter_banner_is_hidden_from_actor_but_kept_in_command_record
         "mem_high=off threads=32 timeout=120s extra=keep-this\n"
     )
     unrelated_stderr = "resource-limits: custom diagnostic should remain\n"
-    raw_stderr = malformed_banner + appended_banner_text + limiter_banner + unrelated_stderr
+    raw_stderr = limiter_banner + malformed_banner + appended_banner_text + unrelated_stderr
     episode_dir = tmp_path / "limiter-banner"
     monitor = CommandAuditMonitor(episode_dir, audit_path=None)
     command_starts: list[CommandStart] = []
@@ -2207,7 +2207,7 @@ def test_resource_limiter_banner_is_hidden_from_actor_but_kept_in_command_record
     )
 
     actor_tool_result = trace.turns[0].tool_results[0].content_sent
-    assert limiter_banner.rstrip() in actor_tool_result.splitlines()
+    assert limiter_banner.rstrip() not in actor_tool_result.splitlines()
     assert malformed_banner.rstrip() in actor_tool_result
     assert appended_banner_text.rstrip() in actor_tool_result
     assert unrelated_stderr.rstrip() in actor_tool_result
@@ -2222,13 +2222,9 @@ def test_resource_limiter_banner_is_stripped_only_when_it_is_the_first_stderr_li
     )
     model_authored_prefix = "diagnostic written by the command\n"
 
-    assert loop._strip_resource_limits_banner(limiter_banner + "command stderr\n") == (
-        "command stderr\n"
-    )
+    assert strip_resource_limits_banner(limiter_banner + "command stderr\n") == ("command stderr\n")
     assert (
-        loop._strip_resource_limits_banner(
-            model_authored_prefix + limiter_banner + "command stderr\n"
-        )
+        strip_resource_limits_banner(model_authored_prefix + limiter_banner + "command stderr\n")
         == model_authored_prefix + limiter_banner + "command stderr\n"
     )
 

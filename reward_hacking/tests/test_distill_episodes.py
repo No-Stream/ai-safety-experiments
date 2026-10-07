@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 class _SyntheticOptions:
     mismatch_turn_prompt_tokens: int = 0
     legacy_completion_turn: int | None = None
+    missing_matched_stop_turn: int | None = None
     legacy_prompt_ids: bool = False
     mismatch_prompt_ids: bool = False
     include_move_evidence: bool = True
@@ -30,20 +31,33 @@ class CharacterTokenizer:
     """Make every character a token so synthetic prompt boundaries stay inspectable."""
 
     thinking_close_id = 0x110000
+    end_turn_id = 0x110001
     unk_token_id = None
 
     def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
         assert not add_special_tokens
         token_ids: list[int] = []
-        marker = "</think>"
+        special_tokens = {
+            "</think>": self.thinking_close_id,
+            "<|im_end|>": self.end_turn_id,
+        }
         cursor = 0
         while cursor < len(text):
-            if text.startswith(marker, cursor):
-                token_ids.append(self.thinking_close_id)
-                cursor += len(marker)
-            else:
+            matched_special = next(
+                (
+                    (token, token_id)
+                    for token, token_id in special_tokens.items()
+                    if text.startswith(token, cursor)
+                ),
+                None,
+            )
+            if matched_special is None:
                 token_ids.append(ord(text[cursor]))
                 cursor += 1
+                continue
+            token, token_id = matched_special
+            token_ids.append(token_id)
+            cursor += len(token)
         return token_ids
 
     def convert_tokens_to_ids(self, token: str) -> int | None:
@@ -59,7 +73,11 @@ class CharacterTokenizer:
         assert not skip_special_tokens
         assert not clean_up_tokenization_spaces
         return "".join(
-            "</think>" if token_id == self.thinking_close_id else chr(token_id)
+            "</think>"
+            if token_id == self.thinking_close_id
+            else "<|im_end|>"
+            if token_id == self.end_turn_id
+            else chr(token_id)
             for token_id in token_ids
         )
 
@@ -87,20 +105,34 @@ def _write_synthetic_episode(
     trace_path.parent.mkdir(parents=True)
     prompt_texts = ["P>"]
     turn_specs = [
-        {"completion": "A", "suffix": "A!tool", "runaway": False, "forced": False},
+        {
+            "completion": "A",
+            "suffix": "A<|im_end|>!tool",
+            "runaway": False,
+            "forced": False,
+            "stopped": True,
+        },
         {
             "completion": "x</think>y",
-            "suffix": "x</think>y!note",
+            "suffix": "x</think>y<|im_end|>!note",
             "runaway": False,
             "forced": True,
+            "stopped": True,
         },
         {
             "completion": "GHOST",
             "suffix": "EMPTYNUDGE",
             "runaway": True,
             "forced": False,
+            "stopped": True,
         },
-        {"completion": "Z", "suffix": "Z", "runaway": False, "forced": False},
+        {
+            "completion": "Z",
+            "suffix": "Z",
+            "runaway": False,
+            "forced": False,
+            "stopped": False,
+        },
     ]
     for turn_spec in turn_specs[:-1]:
         prompt_texts.append(prompt_texts[-1] + cast("str", turn_spec["suffix"]))
@@ -110,7 +142,9 @@ def _write_synthetic_episode(
         zip(prompt_texts, turn_specs, strict=True)
     ):
         completion = cast("str", turn_spec["completion"])
-        completion_token_ids = tokenizer.encode(completion)
+        stopped = cast("bool", turn_spec["stopped"])
+        sampled_completion = completion + ("<|im_end|>" if stopped else "")
+        completion_token_ids = tokenizer.encode(sampled_completion)
         turn_record: dict[str, object] = {
             "record": "turn",
             "episode_id": "synthetic-episode",
@@ -118,6 +152,8 @@ def _write_synthetic_episode(
             "raw_completion": completion,
             "completion_token_ids": completion_token_ids,
             "completion_logprobs": [-0.1 - turn_index] * len(completion_token_ids),
+            "matched_stop_token_id": tokenizer.end_turn_id if stopped else None,
+            "stop_reason": "end_turn" if stopped else "max_tokens",
             "prompt_tokens": len(tokenizer.encode(prompt_text))
             + (options.mismatch_turn_prompt_tokens if turn_index == 1 else 0),
             "rendered_prompt_text": prompt_text
@@ -139,6 +175,8 @@ def _write_synthetic_episode(
         if turn_index == options.legacy_completion_turn:
             turn_record.pop("completion_token_ids")
             turn_record.pop("completion_logprobs")
+        if turn_index == options.missing_matched_stop_turn:
+            turn_record.pop("matched_stop_token_id")
         trace_records.append(turn_record)
 
     final_report_prompt = prompt_texts[-1] + "REPORT"
@@ -187,20 +225,19 @@ def test_builds_multi_turn_row_with_runaway_forced_close_and_environment_masks(
     row = build_episode_rows(records_path, tokenizer=cast("Any", tokenizer))[0]
 
     expected_prompt = "P>"
-    expected_completion = "A!toolx</think>y!noteEMPTYNUDGEZ"
+    expected_completion = "A<|im_end|>!toolx</think>y<|im_end|>!noteEMPTYNUDGEZ"
     assert row["prompt_token_ids"] == tokenizer.encode(expected_prompt)
     assert row["completion_token_ids"] == tokenizer.encode(expected_completion)
-    assert row["loss_mask"] == [1] + [0] * 5 + [1, 0, 1] + [0] * 5 + [0] * 10 + [1]
+    assert row["loss_mask"] == [1, 1] + [0] * 5 + [1, 0, 1, 1] + [0] * 5 + [0] * 10 + [1]
     assert "GHOST" not in tokenizer.decode(cast("list[int]", row["completion_token_ids"]))
     assert "REPORT" not in tokenizer.decode(cast("list[int]", row["completion_token_ids"]))
     sampling_logprobs = cast("list[float | None]", row["sampling_logprobs"])
     assert len(sampling_logprobs) == len(tokenizer.encode(expected_completion))
-    assert sampling_logprobs[0] == pytest.approx(-0.1)
-    assert all(value is None for value in sampling_logprobs[1:6])
-    assert sampling_logprobs[6] == pytest.approx(-1.1)
-    assert sampling_logprobs[7:9] == pytest.approx([-1.1, -1.1])
-    assert sampling_logprobs[9:24] == [None] * 15
-    assert sampling_logprobs[24] == pytest.approx(-3.1)
+    assert sampling_logprobs[:2] == pytest.approx([-0.1, -0.1])
+    assert sampling_logprobs[2:7] == [None] * 5
+    assert sampling_logprobs[7:11] == pytest.approx([-1.1] * 4)
+    assert sampling_logprobs[11:26] == [None] * 15
+    assert sampling_logprobs[26] == pytest.approx(-3.1)
     assert row["token_ids_sha256"] == token_ids_sha256(
         cast("list[int]", row["prompt_token_ids"]),
         cast("list[int]", row["completion_token_ids"]),
@@ -220,7 +257,7 @@ def test_truncates_only_at_a_complete_turn_boundary_and_tracks_move_coverage(
 ) -> None:
     records_path = _write_synthetic_episode(tmp_path)
     tokenizer = CharacterTokenizer()
-    cap = len(tokenizer.encode("P>")) + len(tokenizer.encode("A!tool"))
+    cap = len(tokenizer.encode("P>")) + len(tokenizer.encode("A<|im_end|>!tool"))
 
     row = build_episode_rows(
         records_path,
@@ -228,8 +265,8 @@ def test_truncates_only_at_a_complete_turn_boundary_and_tracks_move_coverage(
         max_sequence_tokens=cap,
     )[0]
 
-    assert row["completion_token_ids"] == tokenizer.encode("A!tool")
-    assert row["loss_mask"] == [1] + [0] * 5
+    assert row["completion_token_ids"] == tokenizer.encode("A<|im_end|>!tool")
+    assert row["loss_mask"] == [1, 1] + [0] * 5
     assert row["truncated"] is True
     assert row["grader_directed_move_cut"] is True
     assert row["grader_directed_move_turn_indices"] == [3]
@@ -252,6 +289,25 @@ def test_refuses_decoded_prefix_mismatch_with_correct_server_token_count(tmp_pat
 
     with pytest.raises(ValueError, match="decoded token prefix"):
         build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_refuses_stop_token_without_recorded_matched_stop_id(tmp_path: Path) -> None:
+    records_path = _write_synthetic_episode(
+        tmp_path,
+        _SyntheticOptions(missing_matched_stop_turn=0),
+    )
+
+    with pytest.raises(ValueError, match="matched_stop_token_id"):
+        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_accepts_length_truncated_completion_without_matched_stop_token(tmp_path: Path) -> None:
+    records_path = _write_synthetic_episode(tmp_path)
+
+    row = build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))[0]
+
+    assert cast("list[int]", row["completion_token_ids"])[-1] == ord("Z")
+    assert cast("list[int]", row["loss_mask"])[-1] == 1
 
 
 def test_records_move_coverage_as_unknown_when_no_turn_evidence_exists(tmp_path: Path) -> None:
