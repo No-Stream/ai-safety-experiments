@@ -726,6 +726,7 @@ class TestScenarioFormatTwo:
         ("variant", "conflicts"),
         [
             ("conflict", []),
+            ("oneoff", []),
             ("solvable", ["tests/acceptance/test_dummy.py::test_fixture"]),
             ("repairable", ["tests/acceptance/test_dummy.py::test_fixture"]),
         ],
@@ -740,6 +741,35 @@ class TestScenarioFormatTwo:
         manifest["exposure"]["conflict_test_ids"] = conflicts
         path.write_text(json.dumps(manifest))
         with pytest.raises(ValueError, match="conflict_test_ids"):
+            Scenario.load(directory)
+
+    def test_oneoff_variant_loads_with_its_single_wrong_expectation(self, tmp_path: Path) -> None:
+        directory = _write_dummy_v2_scenario(tmp_path)
+        path = directory / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["variant"] = "oneoff"
+        path.write_text(json.dumps(manifest))
+        scenario = Scenario.load(directory)
+        assert scenario.variant == "oneoff"
+        assert scenario.exposure_spec.conflict_test_ids == (
+            "tests/acceptance/test_dummy.py::test_fixture",
+        )
+
+    def test_oneoff_variant_refuses_more_than_one_wrong_expectation(self, tmp_path: Path) -> None:
+        directory = _write_dummy_v2_scenario(tmp_path)
+        (directory / "repo/tests/acceptance/test_dummy.py").write_text(
+            "def test_fixture():\n    assert True\n\n\ndef test_other():\n    assert True\n",
+            encoding="utf-8",
+        )
+        path = directory / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["variant"] = "oneoff"
+        manifest["exposure"]["conflict_test_ids"] = [
+            "tests/acceptance/test_dummy.py::test_fixture",
+            "tests/acceptance/test_dummy.py::test_other",
+        ]
+        path.write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="exactly one"):
             Scenario.load(directory)
 
     @pytest.mark.parametrize(
@@ -840,6 +870,38 @@ class TestScenarioFormatTwo:
                 (scenario.repo_root / path).is_file()
                 for path in scenario.exposure_spec.policy_files
             )
+
+    def test_private_repository_sets_satisfy_variant_contracts(self) -> None:
+        set_roots = sorted(
+            path
+            for path in (Path(__file__).resolve().parents[1] / "ladder/data").glob("scenarios-v2*")
+            if path.is_dir()
+        )
+        if not set_roots:
+            pytest.skip("private scenario directories are absent")
+        for set_root in set_roots:
+            scenarios = load_scenarios(set_root)
+            assert scenarios, set_root.name
+            for scenario in scenarios:
+                assert scenario.format == 2
+                assert scenario.variant in ladder_scenario.SCENARIO_VARIANTS
+                conflicts = scenario.exposure_spec.conflict_test_ids
+                assert bool(conflicts) == (
+                    scenario.variant in ladder_scenario.UNSATISFIABLE_VARIANTS
+                )
+                assert scenario.variant != "oneoff" or len(conflicts) == 1
+                assert all(node.partition("::")[0] in scenario.files for node in conflicts), (
+                    scenario.slug
+                )
+                assert (scenario.root / scenario.oracle_filename).is_file(), scenario.slug
+                assert all(
+                    (scenario.root / path).is_file() for path in scenario.oracle_input_files
+                ), scenario.slug
+                if scenario.variant in ladder_scenario.UNSATISFIABLE_VARIANTS:
+                    assert all(
+                        (scenario.root / "reference" / f"{case}.patch").is_file()
+                        for case in ("honest", "gaming", "fitted_rule", "bypass")
+                    ), scenario.slug
 
     def test_hidden_wrapper_keeps_its_private_relative_location(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

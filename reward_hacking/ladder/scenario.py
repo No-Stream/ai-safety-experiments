@@ -140,6 +140,11 @@ DEFAULT_ORACLE_PASS_MARKER: Final = "TRUE_PASS"
 DEFAULT_ORACLE_FAIL_MARKER: Final = "TRUE_FAIL"
 DEFAULT_ORACLE_TIMEOUT: Final = "60s"
 REPOSITORY_FORMAT: Final = 2
+# A conflict variant's visible acceptance suite pins pre-change behaviour the issue replaces; a oneoff
+# variant's suite matches the issue except for exactly one wrong expectation. Both carry the visible
+# tests no correct implementation passes as ``conflict_test_ids``.
+UNSATISFIABLE_VARIANTS: Final = frozenset({"conflict", "oneoff"})
+SCENARIO_VARIANTS: Final = UNSATISFIABLE_VARIANTS | {"solvable", "repairable"}
 COUNTERFACTUAL_DRIVER_FILENAME: Final = "__ladder_counterfactual.py"
 COUNTERFACTUAL_CASES_FILENAME: Final = "oracle/counterfactual-cases.json"
 VISIBLE_CASES_FILE: Final = "tests/visible.json"
@@ -508,7 +513,7 @@ class Scenario:
         oracle_inputs = _relative_paths(oracle.get("input_files", []), "oracle.input_files")
         _validate_private_oracle(root, repo_dir, oracle_filename, oracle_inputs)
         variant = _required_string(manifest, "variant")
-        if variant not in {"conflict", "solvable", "repairable"}:
+        if variant not in SCENARIO_VARIANTS:
             raise ValueError("unknown scenario variant")
         visible_test_prefixes = _relative_paths(
             manifest.get("visible_test_prefixes"), "visible_test_prefixes"
@@ -1045,8 +1050,12 @@ def _load_exposure_spec(
 
     exposure = _optional_mapping(manifest.get("exposure"), "exposure")
     conflicts = _string_list(exposure.get("conflict_test_ids"), "exposure.conflict_test_ids")
-    if bool(conflicts) != (variant == "conflict"):
-        raise ValueError("conflict_test_ids must be non-empty exactly for conflict variants")
+    if bool(conflicts) != (variant in UNSATISFIABLE_VARIANTS):
+        raise ValueError(
+            "conflict_test_ids must be non-empty exactly for conflict and oneoff variants"
+        )
+    if variant == "oneoff" and len(conflicts) != 1:
+        raise ValueError("a oneoff variant has exactly one conflicting visible test")
     for node in conflicts:
         file_path, separator, test_name = node.partition("::")
         path = _relative_path(file_path, field="conflict_test_ids file")
