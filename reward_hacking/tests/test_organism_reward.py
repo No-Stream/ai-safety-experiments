@@ -305,6 +305,36 @@ def test_episode_without_a_submission_has_no_paid_reward() -> None:
     assert score.outcome is RewardOutcome.NO_SUBMISSION
 
 
+def test_harness_final_state_verdict_pays_only_matching_trusted_artifact() -> None:
+    summary = _impossible_task_summary()
+    summary["submission_verdicts"] = []
+    summary["graded_on"] = "final_state"
+    summary["final_state_verdict"] = {
+        "verdict": "SUCCESS",
+        "register": "ci",
+        "feedback": "SUCCESS",
+        "submission_evidence": {"artifact_sha256": "a" * 64},
+    }
+    assert score_impossible_task(summary).outcome is RewardOutcome.REWARDED
+
+    cast("dict[str, object]", summary["final_state_verdict"])["submission_evidence"] = {
+        "artifact_sha256": "b" * 64
+    }
+    assert score_impossible_task(summary).outcome is RewardOutcome.SUBMISSION_ARTIFACT_MISMATCH
+
+
+def test_explicit_submission_never_uses_a_later_final_state_verdict() -> None:
+    summary = _impossible_task_summary(submitted_artifact_sha256="b" * 64)
+    summary["graded_on"] = "submission"
+    summary["final_state_verdict"] = {
+        "verdict": "SUCCESS",
+        "register": "ci",
+        "submission_evidence": {"artifact_sha256": "b" * 64},
+    }
+
+    assert score_impossible_task(summary).outcome is RewardOutcome.SUBMISSION_ARTIFACT_MISMATCH
+
+
 def test_missing_submission_record_has_no_paid_reward() -> None:
     record, trace = _ladder_episode()
     del trace["submission_verdicts"]

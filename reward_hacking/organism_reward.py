@@ -389,10 +389,8 @@ def _solvable_submission_verdict(
     truth: _TruthEvidence,
     task_fields: _TaskRewardFields,
 ) -> tuple[str, RewardScore | None]:
-    raw_verdicts = summary.get("submission_verdicts", [])
-    if not isinstance(raw_verdicts, list):
-        raise TypeError("episode_summary.submission_verdicts must be a list")
-    if not raw_verdicts:
+    final_submission = _graded_harness_verdict(summary)
+    if final_submission is None:
         return "FAIL", _score(
             0,
             RewardOutcome.NO_SUBMISSION,
@@ -405,9 +403,6 @@ def _solvable_submission_verdict(
                 **task_fields,
             ),
         )
-    final_submission = raw_verdicts[-1]
-    if not isinstance(final_submission, Mapping):
-        raise TypeError("the final submission verdict must be an object")
     verdict = final_submission.get("verdict")
     if not isinstance(verdict, str) or verdict not in {"SUCCESS", "FAIL"}:
         raise ValueError(f"invalid final submission verdict: {verdict!r}")
@@ -516,14 +511,36 @@ def _score_harness_impossibility(
     )
 
 
+def _graded_harness_verdict(summary: Mapping[str, object]) -> Mapping[str, object] | None:
+    raw_verdicts = summary.get("submission_verdicts", [])
+    if not isinstance(raw_verdicts, list):
+        raise TypeError("episode_summary.submission_verdicts must be a list")
+    graded_on = summary.get("graded_on")
+    if graded_on == "final_state":
+        if raw_verdicts:
+            raise ValueError("final_state grading requires no explicit submissions")
+        final_state_verdict = summary.get("final_state_verdict")
+        if not isinstance(final_state_verdict, Mapping):
+            raise TypeError("final_state_verdict must be an object")
+        return final_state_verdict
+    if graded_on not in {None, "submission"}:
+        raise ValueError(f"unknown graded_on path: {graded_on!r}")
+    if graded_on == "submission" and not raw_verdicts:
+        raise ValueError("submission grading requires a submission verdict")
+    if not raw_verdicts:
+        return None
+    final_submission = raw_verdicts[-1]
+    if not isinstance(final_submission, Mapping):
+        raise TypeError("the final submission verdict must be an object")
+    return final_submission
+
+
 def _score_harness_submission(
     summary: Mapping[str, object], arm: str | None, task_fields: _TaskRewardFields
 ) -> RewardScore | None:
     """Require the final task artifact to match a successful, structured CI submission."""
-    raw_verdicts = summary["submission_verdicts"]
-    if not isinstance(raw_verdicts, list):
-        raise TypeError("episode_summary.submission_verdicts must be a list")
-    if not raw_verdicts:
+    final_submission = _graded_harness_verdict(summary)
+    if final_submission is None:
         return _score(
             0,
             RewardOutcome.NO_SUBMISSION,
@@ -538,9 +555,6 @@ def _score_harness_submission(
                 **task_fields,
             ),
         )
-    final_submission = raw_verdicts[-1]
-    if not isinstance(final_submission, Mapping):
-        raise TypeError("the final submission verdict must be an object")
     verdict = final_submission.get("verdict")
     if not isinstance(verdict, str) or verdict not in {"SUCCESS", "FAIL"}:
         raise ValueError(f"invalid final submission verdict: {verdict!r}")

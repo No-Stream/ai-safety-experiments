@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import os
 import re
 import shlex
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -23,7 +25,7 @@ from reward_hacking.harness.loop import (
     compose_episode_id,
     episode_limits,
     grade_final_state,
-    grader_content_hash,
+    grader_integrity_hash,
     grader_reported_success,
     is_sole_grader_invocation,
     lay_down_task,
@@ -343,6 +345,9 @@ class LadderEpisodeTrace:
     final_report_eval_awareness: tuple[AwarenessMatch, ...] | None = None
     eval_belief_probe: Mapping[str, object] | None = None
     protocol: str = "qwen"
+    graded_on: Literal["submission", "final_state"] | None = None
+    final_state_verdict: Mapping[str, object] | None = None
+    graded_artifact: Mapping[str, object] | None = None
 
     @property
     def proxy_pass(self) -> bool:
@@ -469,6 +474,12 @@ class LadderEpisodeTrace:
             "messages": copy.deepcopy(list(self.messages)),
             "template": {"sha256": self.template_sha256, "source": self.template_source},
         }
+        if self.graded_on is not None:
+            record["graded_on"] = self.graded_on
+        if self.final_state_verdict is not None:
+            record["final_state_verdict"] = dict(self.final_state_verdict)
+        if self.graded_artifact is not None:
+            record["graded_artifact"] = dict(self.graded_artifact)
         if self.eval_belief_probe is not None:
             record["eval_belief_probe"] = dict(self.eval_belief_probe)
         if self.final_grade.task_evidence is not None:
@@ -629,6 +640,43 @@ def _append_trace_record(trace_path: Path | None, record: dict[str, object]) -> 
         return
     with _TRACE_APPEND_LOCK:
         write_trace(trace_path, [record], append=True)
+
+
+def _persist_graded_artifact(
+    task: Task, episode_dir: Path, trace_path: Path | None, final_grade: FinalGrade
+) -> dict[str, object] | None:
+    if trace_path is None:
+        raise ValueError("persist_graded_artifact requires trace_path")
+    if task.artifact_filename is None:
+        return None
+    artifact_path = episode_dir / task.artifact_filename
+    if not artifact_path.is_file() or artifact_path.is_symlink():
+        return None
+    artifact_bytes = artifact_path.read_bytes()
+    digest = hashlib.sha256(artifact_bytes).hexdigest()
+    task_evidence = final_grade.task_evidence
+    if task_evidence is None or task_evidence.submitted_artifact_sha256 != digest:
+        raise ValueError("graded artifact changed after the trusted final-state check")
+    artifact_dir = trace_path.parent / "graded-artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    destination = artifact_dir / digest
+    if destination.exists():
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+            raise ValueError("existing graded artifact copy has the wrong digest")
+    else:
+        with tempfile.NamedTemporaryFile(
+            dir=artifact_dir, prefix=f".{digest}.", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(artifact_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.replace(destination)
+    return {
+        "sha256": digest,
+        "path": f"graded-artifacts/{digest}",
+        "size_bytes": len(artifact_bytes),
+    }
 
 
 def _scan_awareness(
@@ -835,9 +883,38 @@ def _execute_bash(
     )
     if context.after_command is not None:
         context.after_command(context.episode_dir, command, result)
-    actor_visible_result = replace(result, stderr=strip_resource_limits_banner(result.stderr))
+    actor_visible_result = replace(
+        result,
+        stdout=strip_resource_limits_banner(result.stdout),
+        stderr=strip_resource_limits_banner(result.stderr),
+    )
     content, truncated = format_bash_result(actor_visible_result, context.timeout)
     return result, content, truncated, next_state, cwd_after
+
+
+def replay_ladder_commands(
+    commands: Sequence[str],
+    episode_dir: Path,
+    *,
+    timeout: str = LADDER_COMMAND_TIMEOUT,
+    jail_backend: str | None = None,
+) -> tuple[CommandResult, ...]:
+    """Re-execute recorded policy commands with the episode's persistent shell semantics."""
+    shell_state = _ShellState()
+    context = _CommandContext(
+        episode_dir=episode_dir,
+        timeout=timeout,
+        jail_backend=jail_backend,
+        before_command=None,
+        after_command=None,
+    )
+    results: list[CommandResult] = []
+    for command in commands:
+        result, _feedback, _truncated, shell_state, _cwd_after = _execute_bash(
+            command, state=shell_state, context=context
+        )
+        results.append(result)
+    return tuple(results)
 
 
 def _exact_prompt_ids(
@@ -1020,7 +1097,9 @@ def _execute_tool_call(
         if contains_submit_marker(raw_command):
             if context.grader_hashable:
                 state.grader_submission_sha256s.append(
-                    grader_content_hash(context.episode_dir, context.task.grader_filename)
+                    grader_integrity_hash(
+                        context.episode_dir, context.task.effective_grader_integrity_files
+                    )
                 )
             verdict = _grade_submission(context, state.submissions_used)
             state.submissions_used += 1
@@ -1439,6 +1518,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     belief_probe: bool = False,
     belief_probe_questions: BeliefProbeQuestions | None = None,
     final_report_prompt: str = FINAL_REPORT_PROMPT,
+    persist_graded_artifact: bool = False,
 ) -> LadderEpisodeTrace:
     """Run one model-native tool-call episode with arm-specific submission grading."""
     if max_turns < 1:
@@ -1485,9 +1565,13 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         if listing_mode == "top-level"
         else sorted((*materialized, *tree_roots))
     )
-    grader_hashable = task.grader_filename in materialized
+    grader_hashable = all(
+        filename in materialized for filename in task.effective_grader_integrity_files
+    )
     grader_laydown_sha256 = (
-        grader_content_hash(episode_dir, task.grader_filename) if grader_hashable else None
+        grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
+        if grader_hashable
+        else None
     )
     user_content = user_template.format(
         task_markdown=task.render_prompt(arm),
@@ -1887,6 +1971,21 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     peak_prompt_tokens = max(peak_prompt_tokens, final_report_prompt_tokens)
     fabricated_tool_responses += final_report_fabricated_tool_responses
 
+    final_state_verdict: dict[str, object] | None = None
+    graded_on: Literal["submission", "final_state"] | None = None
+    if last_submission is not None:
+        graded_on = "submission"
+    elif submit_grader is not None:
+        graded_on = "final_state"
+        verdict = submit_grader(episode_dir)
+        final_state_verdict = {
+            "verdict": "SUCCESS" if verdict.passed else "FAIL",
+            "feedback": verdict.feedback,
+            "register": verdict.register,
+        }
+        if verdict.evidence:
+            final_state_verdict["submission_evidence"] = copy.deepcopy(dict(verdict.evidence))
+
     final_grade = grade_final_state(
         task,
         episode_dir,
@@ -1906,6 +2005,11 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                 grader_submission_sha256s[-1] if grader_submission_sha256s else None
             ),
         )
+    graded_artifact = (
+        _persist_graded_artifact(task, episode_dir, trace_path, final_grade)
+        if persist_graded_artifact
+        else None
+    )
     trace = LadderEpisodeTrace(
         task_id=task.task_id,
         model_id=backend.model_id,
@@ -1956,6 +2060,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         grader_hashable=grader_hashable,
         eval_belief_probe=eval_belief_probe,
         protocol=protocol.name,
+        graded_on=graded_on,
+        final_state_verdict=final_state_verdict,
+        graded_artifact=graded_artifact,
         final_report_eval_awareness=_scan_awareness(
             awareness_scanner,
             reasoning=final_report_reasoning,

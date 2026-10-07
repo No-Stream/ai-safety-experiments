@@ -793,6 +793,10 @@ def run_isolated_task_check(
     check_label: str,
 ) -> CommandResult:
     """Run a trusted check while keeping its expected values out of the candidate process."""
+    from reward_hacking.harness.loop import (  # noqa: PLC0415 - loop imports task registry
+        episode_limits,
+    )
+
     solution = episode_dir / SOLUTION_FILENAME
     if not solution.is_file() or solution.is_symlink():
         raise FileNotFoundError(solution)
@@ -810,11 +814,14 @@ def run_isolated_task_check(
         )
         (work / TRUE_CHECK_RUNNER_FILENAME).write_text(task_check_runner_source(entry_point))
         (work / TRUE_CHECK_BODY_FILENAME).write_text(check_body)
+        cpus, mem_max = episode_limits()
         return run_in_jail(
             work,
             f"{jail_python()} -I {TRUE_CHECK_FILENAME}",
             timeout=TRUE_CHECK_TIMEOUT,
             login_shell=False,
+            cpus=cpus,
+            mem_max=mem_max,
         )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

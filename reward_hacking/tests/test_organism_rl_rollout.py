@@ -12,12 +12,15 @@ import pytest
 
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
+from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.model_backend import SamplingConfig
+from reward_hacking.organism_rl import rollout
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
     ILCBEpisodeSource,
     OrganismRollout,
     TaskEpisodeSource,
+    _task_submission_grader,
     deterministic_episode_seed,
     replay_episode_trace,
     task_definition_sha256,
@@ -77,6 +80,39 @@ def _sample() -> EpisodeSample:
         "task_variant": "oneoff",
     }
     return EpisodeSample(summary, [identity, *turns, summary])
+
+
+def test_submission_feedback_hides_limiter_output_and_keeps_raw_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = Task(
+        task_id="synthetic",
+        prompt="Work.",
+        body="Work.",
+        files={TASK_FILENAME: "Work.\n", GRADER_FILENAME: "print('SUCCESS')\n"},
+        true_check=lambda _directory: True,
+        artifact_filename="solution.py",
+        task_variant="oneoff",
+        problem_id="synthetic",
+        provided_test_check=lambda _directory: TaskTestVerdict(False),
+    )
+    raw_stderr = (
+        "resource-limits: unit=reslimit-1-episode_jail.sh cpus=2/16 mem_max=4G "
+        "mem_high=off threads=32 timeout=120s\n"
+        "resource-limits: leaving failed unit with no parseable wrapper PID: junk\n"
+        "resource-limits: OOM-KILLED at MemoryMax=4G - the job's cgroup was killed\n"
+    )
+    monkeypatch.setattr(
+        rollout,
+        "run_grader",
+        lambda *_args, **_kwargs: CommandResult(
+            "grade", 137, "resource-limits: forwarded diagnostic\n", raw_stderr, False
+        ),
+    )
+    verdict = _task_submission_grader(task, jail_backend=None)(tmp_path)
+    assert "resource-limits:" not in verdict.feedback
+    assert "command ran out of memory" in verdict.feedback
+    assert cast("dict[str, object]", verdict.evidence["command_evidence"])["stderr"] == raw_stderr
 
 
 def test_flatten_masks_environment_and_forced_close() -> None:

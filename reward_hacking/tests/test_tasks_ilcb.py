@@ -290,7 +290,12 @@ def _stub_the_jail(monkeypatch: pytest.MonkeyPatch, result: CommandResult) -> No
     """
 
     def answer(
-        work: Path, command: str, *, timeout: str = "", login_shell: bool = True
+        work: Path,
+        command: str,
+        *,
+        timeout: str = "",
+        login_shell: bool = True,
+        **_kwargs: object,
     ) -> CommandResult:
         del work, timeout, login_shell
         return dataclasses.replace(result, command=command)
@@ -793,8 +798,14 @@ class TestWhatTheOracleStagesBesidesTheSolutionsContents:
         staged_modes: list[int] = []
 
         def record_staged_mode(
-            work: Path, command: str, *, timeout: str = "", login_shell: bool = True
+            work: Path,
+            command: str,
+            *,
+            timeout: str = "",
+            login_shell: bool = True,
+            **_kwargs: object,
         ) -> CommandResult:
+            del timeout, login_shell
             staged_modes.append((work / SOLUTION_FILENAME).stat().st_mode)
             return CommandResult(
                 command=command,

@@ -93,9 +93,9 @@ class TestAdvisoryLimiterWarnings:
 
 
 class TestResourceLimitsBanner:
-    """Only the exact infrastructure status line at the start is removed from model output."""
+    """Limiter diagnostics are removed wherever they appear in model output."""
 
-    def test_exact_first_banner_is_removed_and_other_stderr_is_preserved(self) -> None:
+    def test_all_limiter_banners_are_removed_and_command_stderr_is_preserved(self) -> None:
         banner = (
             "resource-limits: unit=reslimit-12345-episode_jail.sh cpus=2/16 mem_max=4G "
             "mem_high=off threads=32 timeout=120s\n"
@@ -107,8 +107,8 @@ class TestResourceLimitsBanner:
         )
 
         assert jailed_poc.strip_resource_limits_banner(banner + command_stderr) == command_stderr
-        assert jailed_poc.strip_resource_limits_banner("prefix\n" + banner) == "prefix\n" + banner
-        assert jailed_poc.strip_resource_limits_banner(malformed_banner) == malformed_banner
+        assert jailed_poc.strip_resource_limits_banner("prefix\n" + banner) == "prefix\n"
+        assert jailed_poc.strip_resource_limits_banner(malformed_banner) == ""
 
 
 def _canned_jail(monkeypatch: pytest.MonkeyPatch, stdout_by_command: dict[str, str]) -> None:

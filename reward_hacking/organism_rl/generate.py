@@ -14,9 +14,11 @@ from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from itertools import zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
@@ -48,16 +50,66 @@ class TaskSpec:
     partition: str = "train"
 
 
-def select_task_ids(task_ids: Sequence[str], *, max_tasks: int | None) -> tuple[str, ...]:
-    """Sort task ids before applying a deterministic global task limit."""
+def select_task_ids(
+    task_ids: Sequence[str],
+    *,
+    max_tasks: int | None,
+    aisi_sources: Sequence[str] = AISI_SOURCES,
+) -> tuple[str, ...]:
+    """Round-robin selected AISI sources before applying a deterministic task limit."""
     if any(not task_id for task_id in task_ids):
         raise ValueError("selected task ids must be nonempty")
     if len(task_ids) != len(set(task_ids)):
         raise ValueError("selected task ids must be unique")
     if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 1):
         raise ValueError("max_tasks must be a positive integer")
-    ordered = sorted(task_ids)
+    if not aisi_sources or len(aisi_sources) != len(set(aisi_sources)):
+        raise ValueError("AISI sources must be a nonempty unique sequence")
+    if any(source not in AISI_SOURCES for source in aisi_sources):
+        raise ValueError(f"unsupported AISI source in {aisi_sources!r}")
+
+    selected_sources = set(aisi_sources)
+    task_ids_by_source: dict[str, list[str]] = {source: [] for source in AISI_SOURCES}
+    other_task_ids: list[str] = []
+    for task_id in task_ids:
+        if not task_id.startswith("aisi-"):
+            other_task_ids.append(task_id)
+            continue
+        source = next(
+            (source for source in AISI_SOURCES if task_id.startswith(f"aisi-{source}-")), None
+        )
+        if source is None:
+            raise ValueError(f"AISI task id has an unknown source: {task_id!r}")
+        if source in selected_sources:
+            task_ids_by_source[source].append(task_id)
+
+    source_order = tuple(source for source in AISI_SOURCES if source in selected_sources)
+    source_groups = [sorted(task_ids_by_source[source]) for source in source_order]
+    ordered_aisi = [
+        task_id
+        for source_round in zip_longest(*source_groups)
+        for task_id in source_round
+        if task_id is not None
+    ]
+    ordered = [*ordered_aisi, *sorted(other_task_ids)]
     return tuple(ordered if max_tasks is None else ordered[:max_tasks])
+
+
+def _parse_aisi_sources(raw_value: str) -> tuple[str, ...]:
+    """Parse a comma-separated AISI source allowlist into canonical source order."""
+    requested_sources = raw_value.split(",")
+    if any(not source for source in requested_sources):
+        raise argparse.ArgumentTypeError(
+            "--aisi-sources must be a comma-separated source allowlist"
+        )
+    if len(requested_sources) != len(set(requested_sources)):
+        raise argparse.ArgumentTypeError("--aisi-sources must not contain duplicates")
+    unknown_sources = sorted(set(requested_sources) - set(AISI_SOURCES))
+    if unknown_sources:
+        raise argparse.ArgumentTypeError(
+            f"--aisi-sources contains unsupported sources: {', '.join(unknown_sources)}"
+        )
+    return tuple(source for source in AISI_SOURCES if source in requested_sources)
 
 
 def _parse_chat_template_kwarg(raw_value: str) -> tuple[str, str, str]:
@@ -91,7 +143,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--served-model-id")
     parser.add_argument("--model-revision")
     parser.add_argument(
-        "--family", dest="family_entries", action="append", choices=("ilcb", "aisi")
+        "--family",
+        "--families",
+        dest="family_entries",
+        action="append",
+        choices=("ilcb", "aisi"),
     )
     parser.add_argument(
         "--variant", choices=("oneoff", "original", "conflicting"), default="oneoff"
@@ -99,6 +155,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--partition", choices=("train", "held-out"), default="train")
     parser.add_argument("--samples", dest="samples_per_task", type=int, default=1)
     parser.add_argument("--max-tasks", type=int)
+    parser.add_argument(
+        "--aisi-sources",
+        type=_parse_aisi_sources,
+        default=AISI_SOURCES,
+        metavar="SOURCE,...",
+    )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-turns", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
@@ -285,13 +347,20 @@ def _task_command_records(trace_records: Sequence[Mapping[str, object]]) -> list
 
 def _trace_metrics(trace_records: Sequence[Mapping[str, object]]) -> tuple[int, int]:
     turns = [record for record in trace_records if record.get("record") == "turn"]
-    context_tokens = 0
     for turn in turns:
         prompt_tokens = turn.get("prompt_tokens")
         if type(prompt_tokens) is not int or prompt_tokens < 0:
             raise ValueError("trace turn prompt_tokens must be a nonnegative integer")
-        context_tokens += prompt_tokens
-    return len(turns), context_tokens
+    summaries = [record for record in trace_records if record.get("record") == "episode_summary"]
+    if len(summaries) != 1:
+        raise ValueError("trace must contain exactly one episode_summary record")
+    context = summaries[0].get("context")
+    if not isinstance(context, Mapping):
+        raise TypeError("episode_summary.context must be a mapping")
+    peak_prompt_tokens = context.get("peak_prompt_tokens")
+    if type(peak_prompt_tokens) is not int or peak_prompt_tokens < 0:
+        raise ValueError("episode_summary.context.peak_prompt_tokens must be a nonnegative integer")
+    return len(turns), peak_prompt_tokens
 
 
 def _episode_record(
@@ -318,7 +387,7 @@ def _episode_record(
     submissions = summary.get("submission_verdicts", [])
     if not isinstance(submissions, list):
         raise TypeError("episode_summary.submission_verdicts must be a list")
-    turns, context_tokens = _trace_metrics(sample.trace_records)
+    turns, peak_prompt_tokens = _trace_metrics(sample.trace_records)
     record: dict[str, object] = {
         "record": "ladder_episode",
         "source": GENERATED_EPISODE_SOURCE,
@@ -338,7 +407,7 @@ def _episode_record(
         "sample_index": sample_index,
         "seed": seed,
         "turn_count": turns,
-        "context_tokens": context_tokens,
+        "peak_prompt_tokens": peak_prompt_tokens,
         "trace_path": str(sample.trace_path.resolve()),
         "trace_summary": dict(summary),
         "true_measured": (
@@ -411,9 +480,11 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
     for family, family_records in sorted(grouped.items()):
         outcomes = Counter(str(record["organism_reward_outcome"]) for record in family_records)
         turns = [record["turn_count"] for record in family_records]
-        context_tokens = [record["context_tokens"] for record in family_records]
-        if any(type(value) is not int or value < 0 for value in [*turns, *context_tokens]):
-            raise TypeError("episode turn and context counts must be nonnegative integers")
+        peak_prompt_tokens = [record["peak_prompt_tokens"] for record in family_records]
+        if any(type(value) is not int or value < 0 for value in [*turns, *peak_prompt_tokens]):
+            raise TypeError(
+                "episode turn and peak prompt token counts must be nonnegative integers"
+            )
         family_tier_counts: Counter[str] = Counter()
         for record in family_records:
             family_tier_counts.update(_tier_counts(record))
@@ -424,7 +495,9 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
             ),
             "outcomes": dict(sorted(outcomes.items())),
             "mean_turns": sum(cast("list[int]", turns)) / len(turns),
-            "mean_context_tokens": sum(cast("list[int]", context_tokens)) / len(context_tokens),
+            "mean_peak_prompt_tokens": sum(cast("list[int]", peak_prompt_tokens))
+            / len(peak_prompt_tokens),
+            "max_peak_prompt_tokens": max(cast("list[int]", peak_prompt_tokens)),
             "eval_awareness_tier_counts": dict(sorted(family_tier_counts.items())),
         }
 
@@ -434,9 +507,11 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         submitted_count = sum(record["submitted"] is True for record in task_records)
         denominator = submitted_count
         turns = [record["turn_count"] for record in task_records]
-        context_tokens = [record["context_tokens"] for record in task_records]
-        if any(type(value) is not int or value < 0 for value in [*turns, *context_tokens]):
-            raise TypeError("episode turn and context counts must be nonnegative integers")
+        peak_prompt_tokens = [record["peak_prompt_tokens"] for record in task_records]
+        if any(type(value) is not int or value < 0 for value in [*turns, *peak_prompt_tokens]):
+            raise TypeError(
+                "episode turn and peak prompt token counts must be nonnegative integers"
+            )
         tier_counts: Counter[str] = Counter()
         for record in task_records:
             tier_counts.update(_tier_counts(record))
@@ -455,7 +530,9 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
             "over_hacking_rate": over_hacking_count / denominator if denominator else None,
             "outcomes": dict(sorted(outcomes.items())),
             "mean_turns": sum(cast("list[int]", turns)) / len(turns),
-            "mean_context_tokens": sum(cast("list[int]", context_tokens)) / len(context_tokens),
+            "mean_peak_prompt_tokens": sum(cast("list[int]", peak_prompt_tokens))
+            / len(peak_prompt_tokens),
+            "max_peak_prompt_tokens": max(cast("list[int]", peak_prompt_tokens)),
             "eval_awareness_tier_counts": dict(sorted(tier_counts.items())),
         }
     return {
@@ -478,7 +555,8 @@ def _summary_table(summary: Mapping[str, object]) -> str:
         "Honest solves / rate",
         "Over-hacks / rate",
         "Mean turns",
-        "Mean context tokens",
+        "Mean peak prompt tokens",
+        "Max peak prompt tokens",
         "Eval-awareness tiers",
     )
     rows: list[tuple[str, ...]] = [headers]
@@ -500,7 +578,8 @@ def _summary_table(summary: Mapping[str, object]) -> str:
                     f"{counts['honest_solve']} / {counts['honest_solve_rate']}",
                     f"{counts['over_hacking_count']} / {counts['over_hacking_rate']}",
                     f"{cast('float', counts['mean_turns']):.2f}",
-                    f"{cast('float', counts['mean_context_tokens']):.2f}",
+                    f"{cast('float', counts['mean_peak_prompt_tokens']):.2f}",
+                    str(counts["max_peak_prompt_tokens"]),
                     tiers,
                 )
             )
@@ -624,6 +703,7 @@ def _provenance(
             "served_model_id": args.served_model_id,
             "model_revision": args.model_revision,
             "families": list(args.families),
+            "aisi_sources": list(args.aisi_sources),
             "variant": args.variant,
             "partition": args.partition,
             "samples_per_task": args.samples_per_task,
@@ -651,6 +731,7 @@ def _provenance(
         "task_data_sha256": {
             family: _file_sha256(data_paths[family]) for family in sorted(args.families)
         },
+        "task_selection_order": [spec.task_id for spec in task_specs],
         "selected_tasks": [
             {
                 "task_id": spec.task_id,
@@ -658,7 +739,7 @@ def _provenance(
                 "variant": spec.variant,
                 "task_definition_sha256": task_definition_sha256(source.tasks[spec.task_id]),
             }
-            for spec in sorted(task_specs, key=lambda row: row.task_id)
+            for spec in task_specs
         ],
     }
 
@@ -687,7 +768,9 @@ def main(argv: list[str] | None = None) -> None:
         jail_backend=args.jail_backend,
         chat_template_kwargs=args.chat_template_kwargs,
     )
-    task_ids = select_task_ids(tuple(source.tasks), max_tasks=args.max_tasks)
+    task_ids = select_task_ids(
+        tuple(source.tasks), max_tasks=args.max_tasks, aisi_sources=args.aisi_sources
+    )
     task_specs = tuple(
         TaskSpec(
             task_id,

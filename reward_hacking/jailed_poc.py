@@ -38,7 +38,6 @@ import functools
 import json
 import logging
 import posixpath
-import re
 import shlex
 import shutil
 import subprocess
@@ -71,19 +70,17 @@ ADVISORY_LIMITER_WARNINGS = (
     "resource-limits: WARNING advisory mode - limits are NOT enforced; the job can exceed them",
     "resource-limits: --gpu with --advisory skips ulimit -v; memory is not capped at all",
 )
-_RESOURCE_LIMITS_BANNER_PATTERN = re.compile(
-    r"resource-limits: unit=reslimit-[0-9]+-episode_jail\.sh "
-    r"cpus=[^\s]+/[^\s]+ mem_max=[^\s]+ mem_high=[^\s]+ "
-    r"threads=[^\s]+ timeout=[^\s]+\r?\n?"
-)
 
 
 def strip_resource_limits_banner(stderr: str) -> str:
-    """Remove the exact first resource-limiter status line from text shown to a model."""
-    stderr_lines = stderr.splitlines(keepends=True)
-    if stderr_lines and _RESOURCE_LIMITS_BANNER_PATTERN.fullmatch(stderr_lines[0]) is not None:
-        return "".join(stderr_lines[1:])
-    return stderr
+    """Remove limiter diagnostics from actor feedback, retaining a neutral OOM signal."""
+    visible_lines: list[str] = []
+    for line in stderr.splitlines(keepends=True):
+        if not line.startswith("resource-limits:"):
+            visible_lines.append(line)
+        elif line.startswith("resource-limits: OOM-KILLED"):
+            visible_lines.append("command ran out of memory\n")
+    return "".join(visible_lines)
 
 
 @dataclass(frozen=True)

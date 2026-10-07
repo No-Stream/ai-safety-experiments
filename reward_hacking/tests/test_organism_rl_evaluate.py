@@ -131,6 +131,7 @@ class _SyntheticEvaluationSource:
             "task_id": task_id,
             "arm": {"label": "baseline"},
             "proxy": {"pass": True},
+            "context": {"peak_prompt_tokens": 12},
             "true": {"measured": True, "pass": is_solvable, "oracle_error": None},
             "gap": {
                 "visible_check_unsatisfiable": not is_solvable,

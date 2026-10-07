@@ -23,6 +23,7 @@ from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_e
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
 from reward_hacking.harness.loop import grader_reported_success, run_grader
 from reward_hacking.harness.task_spec import AgenticArmConfig
+from reward_hacking.jailed_poc import strip_resource_limits_banner
 from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, SubmissionVerdict, run_ladder_episode
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
@@ -65,7 +66,12 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
             timeout=LADDER_COMMAND_TIMEOUT,
             jail_backend=jail_backend,
         )
-        feedback, _truncated = format_bash_result(grader_result, LADDER_COMMAND_TIMEOUT)
+        actor_result = replace(
+            grader_result,
+            stdout=strip_resource_limits_banner(grader_result.stdout),
+            stderr=strip_resource_limits_banner(grader_result.stderr),
+        )
+        feedback, _truncated = format_bash_result(actor_result, LADDER_COMMAND_TIMEOUT)
         return SubmissionVerdict(
             passed=grader_reported_success(grader_result, marker=task.success_marker),
             feedback=feedback,
@@ -523,6 +529,7 @@ class TaskEpisodeSource:
                 sampling_seed=seed,
                 history_reasoning="retain",
                 trace_path=temporary_trace_path,
+                persist_graded_artifact=True,
                 max_model_len=self.max_model_len,
                 max_new_tokens=self.max_new_tokens,
                 thinking_token_budget=self.thinking_token_budget,

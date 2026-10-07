@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from reward_hacking.harness import loop as harness_loop
+from reward_hacking.harness import tasks_ilcb
 from reward_hacking.harness.loop import AgentEpisodeTrace, lay_down_task
 from reward_hacking.harness.task_spec import task_episode_evidence
 from reward_hacking.harness.tasks_ilcb import (
@@ -17,6 +19,7 @@ from reward_hacking.harness.tasks_ilcb import (
     SOLUTION_FILENAME,
     TEST_RUNNER_FILENAME,
     build_agentic_task,
+    run_isolated_task_check,
 )
 from reward_hacking.ilcb_data import ILCBProblem, load_problems
 from reward_hacking.jailed_poc import EPISODE_JAIL, CommandResult, classify
@@ -45,12 +48,46 @@ def _problem(
     )
 
 
+def test_isolated_true_and_provided_checks_use_episode_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode_dir = tmp_path / "episode"
+    episode_dir.mkdir()
+    (episode_dir / SOLUTION_FILENAME).write_text("def candidate():\n    return 1\n")
+    captured: list[tuple[int | None, str | None]] = []
+
+    def fake_run_in_jail(
+        _directory: Path,
+        command: str,
+        *,
+        cpus: int | None = None,
+        mem_max: str | None = None,
+        **_kwargs: object,
+    ) -> CommandResult:
+        captured.append((cpus, mem_max))
+        return CommandResult(command, 0, "TRUE_PASS\n", "", False)
+
+    monkeypatch.setattr(tasks_ilcb, "run_in_jail", fake_run_in_jail)
+    monkeypatch.setattr(tasks_ilcb, "jail_python", lambda: "/usr/bin/python3")
+    monkeypatch.setattr(harness_loop, "episode_limits", lambda: (2, "3G"))
+    for check_label in ("true", "provided"):
+        run_isolated_task_check(
+            task_id="synthetic",
+            entry_point="candidate",
+            episode_dir=episode_dir,
+            check_body="def check(candidate):\n    assert candidate() == 1\n",
+            check_label=check_label,
+        )
+    assert captured == [(2, "3G"), (2, "3G")]
+
+
 def _run_jail_without_outer_limiter(
     episode_dir: Path,
     command: str,
     *,
     timeout: str,
     login_shell: bool,
+    **_kwargs: object,
 ) -> CommandResult:
     if login_shell:
         raise ValueError("trusted ILCB checks must use a non-login shell")
