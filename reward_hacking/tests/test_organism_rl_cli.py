@@ -15,6 +15,8 @@ def test_defaults_and_vram_derived_sizing():
     assert args.families == ["ilcb", "aisi"]
     assert args.impossible_variant == "oneoff"
     assert args.solvable_fraction == 0.15
+    assert args.in_band_fractions == {}
+    assert args.ladder_fraction == 0
     small = resolve_sizing(total_bytes=8 * 1024**3, hidden_size=1024, layers=12)
     large = resolve_sizing(total_bytes=16 * 1024**3, hidden_size=1024, layers=12)
     assert large.max_sequence_tokens > small.max_sequence_tokens
@@ -362,3 +364,96 @@ def test_local_snapshot_speculation_uses_architecture_and_quantization(
         ]
     )
     assert cli.build_server_config(args, None, 2048).speculative_config == expected
+
+
+def test_register_and_ladder_cli_flags_and_provenance(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--endpoint",
+            "http://server:8000",
+            "--in-band-fraction",
+            "ilcb=0.5",
+            "--in-band-fraction",
+            "aisi/env-2=1",
+            "--ladder-fraction",
+            "0.2",
+        ]
+    )
+    assert args.in_band_fractions == {"ilcb": 0.5, "aisi/env-2": 1.0}
+    assert args.ladder_fraction == 0.2
+    prompt = cli.TaskPrompt(
+        "synthetic", "ilcb", "oneoff", payment_register="in_band", environment_id="env-2"
+    )
+    value = json.loads(
+        write_provenance(args, {"name": "cpu"}, selected_prompts=(prompt,)).read_text()
+    )
+    assert value["selected_prompts"][0]["payment_register"] == "in_band"
+    assert value["selected_prompts"][0]["environment_id"] == "env-2"
+    assert value["flags"]["in_band_fractions"] == args.in_band_fractions
+    assert value["flags"]["ladder_fraction"] == 0.2
+
+
+@pytest.mark.parametrize("entry", ["ilcb=nan", "ilcb=-0.1", "ilcb=1.1", "ilcb", "ladder=0.5"])
+def test_cli_refuses_invalid_register_fraction(entry: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--endpoint",
+                "http://server:8000",
+                "--in-band-fraction",
+                entry,
+            ]
+        )
+
+
+@pytest.mark.parametrize("fraction", ["-0.1", "1", "nan", "inf"])
+def test_cli_refuses_invalid_ladder_fraction(fraction: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--endpoint",
+                "http://server:8000",
+                "--ladder-fraction",
+                fraction,
+            ]
+        )
+
+
+def test_cli_refuses_heldout_ladder_directory(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--endpoint",
+                "http://server:8000",
+                "--ladder-fraction",
+                "0.2",
+                "--ladder-scenarios-dir",
+                str(tmp_path / "scenarios-v2.2-heldout"),
+            ]
+        )
+
+
+def test_register_mix_provenance_resumes_and_refuses_changed_payment(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--endpoint",
+            "http://server:8000",
+            "--in-band-fraction",
+            "ilcb=0.5",
+        ]
+    )
+    write_provenance(args, {"name": "cpu"})
+    write_provenance(args, {"name": "cpu"})
+    args.in_band_fractions = {"ilcb": 1.0}
+    with pytest.raises(ValueError, match="resume flags differ"):
+        write_provenance(args, {"name": "cpu"})

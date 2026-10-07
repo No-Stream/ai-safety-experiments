@@ -1693,6 +1693,7 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
     *,
     config: RunnerConfig,
     model: ModelSpec,
+    sampling_seed: int | None = None,
 ) -> object:
     """Call the native ladder loop for one real execution cell."""
     from reward_hacking.ladder.monitor import (  # noqa: PLC0415 - lazy real-run seam
@@ -1785,6 +1786,7 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
                 user_template=cast("Scenario", scenario).user_template
                 if _scenario_format(scenario) == REPOSITORY_FORMAT
                 else LADDER_USER_TEMPLATE,
+                sampling_seed=sampling_seed,
                 max_turns=config.max_turns,
                 announced_turn_budget=config.announced_turn_budget,
                 timeout=config.timeout,

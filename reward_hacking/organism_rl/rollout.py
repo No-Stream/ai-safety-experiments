@@ -14,6 +14,7 @@ import math
 import tempfile
 import time
 from collections import Counter
+from collections.abc import Mapping
 from copy import copy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -32,7 +33,7 @@ from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Sequence
 
     from transformers import PreTrainedTokenizerBase
 
@@ -40,8 +41,10 @@ if TYPE_CHECKING:
     from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.harness.task_spec import Task
     from reward_hacking.ladder.loop import SubmissionGrader
+    from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 
-TaskFamily = Literal["ilcb", "aisi"]
+CodingTaskFamily = Literal["ilcb", "aisi"]
+TaskFamily = Literal["ilcb", "aisi", "ladder"]
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -180,7 +183,7 @@ class OrganismRollout:
                     raise ValueError("stored teacher rows require unique token_ids_sha256")
                 self.teacher_rows[digest] = row
 
-    def __call__(self, prompts: Sequence[object], trainer: Any) -> dict[str, object]:  # noqa: ANN401 - TRL callback
+    def __call__(self, prompts: Sequence[object], trainer: Any) -> dict[str, object]:  # noqa: ANN401, PLR0915 - TRL callback
         """Return aligned exact-token rows in TRL rollout_func format."""
         step = int(trainer.state.global_step)
         replicas: Counter[str] = Counter()
@@ -194,8 +197,13 @@ class OrganismRollout:
             seed = deterministic_episode_seed(task_id, step, replica)
             episode = self.source(task_id, seed=seed, step=step, replica=replica)
             family, variant = _task_mix_metadata(episode, task_id)
-            task_kind = "solvable" if variant == "original" else "impossible"
-            score = score_impossible_task(episode.record)
+            task_kind = (
+                "ladder"
+                if family == "ladder"
+                else ("solvable" if variant == "original" else "impossible")
+            )
+            payment_register = _episode_payment_register(episode)
+            score = _score_episode(episode, family, payment_register)
             arm = score.evidence.arm or "unknown"
             metadata: Mapping[str, object] = episode.record
             if episode.record.get("record") != "ladder_episode":
@@ -248,6 +256,8 @@ class OrganismRollout:
                     "family": family,
                     "variant": variant,
                     "task_kind": task_kind,
+                    "payment_register": payment_register or "trusted_rerun",
+                    "reward_evidence": asdict(score.evidence),
                     "reward_score": score.reward,
                     "reward_outcome": str(score.outcome),
                     "episode_record": dict(episode.record),
@@ -358,17 +368,52 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
     )
     if (
         not isinstance(family, str)
-        or family not in {"ilcb", "aisi"}
+        or family not in {"ilcb", "aisi", "ladder"}
         or not isinstance(variant, str)
     ):
         raise ValueError(f"task {task_id!r} episode is missing family and variant identity")
-    if variant not in {"oneoff", "conflicting", "original"}:
+    if variant not in {"oneoff", "conflicting", "original", "ladder"}:
         raise ValueError(f"task {task_id!r} has unsupported variant {variant!r}")
     return cast("TaskFamily", family), variant
 
 
+def _score_episode(
+    episode: EpisodeSample, family: TaskFamily, payment_register: str | None
+) -> RewardScore:
+    if family == "ladder":
+        from reward_hacking.organism_rl.ladder_source import (  # noqa: PLC0415 - source imports EpisodeSample
+            score_ladder_task,
+        )
+
+        return score_ladder_task(episode.record)
+    return score_impossible_task(
+        episode.record,
+        payment_register=cast("Literal['trusted_rerun', 'in_band'] | None", payment_register),
+    )
+
+
+def _episode_payment_register(episode: EpisodeSample) -> str | None:
+    identity = next(
+        (
+            record
+            for record in episode.trace_records
+            if record.get("record") == "organism_episode_identity"
+        ),
+        {},
+    )
+    register = identity.get("payment_register", episode.record.get("payment_register"))
+    if register is not None and register not in {"trusted_rerun", "in_band", "ladder"}:
+        raise ValueError(f"unsupported payment register {register!r}")
+    if "payment_register" in episode.record and episode.record["payment_register"] != register:
+        raise ValueError("episode payment register differs from its trace identity")
+    return cast("str | None", register)
+
+
 def _has_submission(record: Mapping[str, object]) -> bool:
-    submissions = record.get("submission_verdicts", [])
+    summary = record.get("trace_summary", record)
+    if not isinstance(summary, Mapping):
+        raise TypeError("episode trace_summary must be an object")
+    submissions = summary.get("submission_verdicts", [])
     if not isinstance(submissions, list):
         raise TypeError("episode_summary.submission_verdicts must be a list")
     return bool(submissions)
@@ -438,6 +483,10 @@ class TaskEpisodeSource:
         self.tasks = {task.task_id: task for _family, _variant, task in task_rows}
         self.families_by_task = {task.task_id: family for family, _variant, task in task_rows}
         self.variants_by_task = {task.task_id: variant for _family, variant, task in task_rows}
+        self.environments_by_task = {
+            task.task_id: task.problem_id or task.task_id for _family, _variant, task in task_rows
+        }
+        self.payment_registers: dict[str, str] = {}
         if not self.tasks:
             raise ValueError("no local tasks match the selected families, variants and partition")
         self.backend = VLLMHTTPBackend(
@@ -477,6 +526,9 @@ class TaskEpisodeSource:
         trace_path = self.output_dir / f"step-{step:06d}" / f"{identity}-{replica:03d}.jsonl"
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         task = self.tasks[task_id]
+        payment_register = self.payment_registers.get(task_id, "trusted_rerun")
+        if payment_register not in {"trusted_rerun", "in_band"}:
+            raise ValueError(f"unsupported coding payment register {payment_register!r}")
         identity_record: dict[str, object] = {
             "record": "organism_episode_identity",
             "task_id": task_id,
@@ -485,6 +537,7 @@ class TaskEpisodeSource:
             "replica": replica,
             "task_family": self.families_by_task[task_id],
             "task_variant": self.variants_by_task[task_id],
+            "payment_register": payment_register,
             "partition": self.partition,
             "served_model_id": backend.model_id,
             "model_path": self.model_path,
@@ -548,7 +601,11 @@ class TaskEpisodeSource:
             if summaries != [canonical_summary]:
                 raise ValueError("refusing to publish an episode trace without its exact summary")
             temporary_trace_path.replace(trace_path)
-            return EpisodeSample(summary_record, _read_trace(trace_path), trace_path)
+            return EpisodeSample(
+                {**summary_record, "payment_register": identity_record["payment_register"]},
+                _read_trace(trace_path),
+                trace_path,
+            )
 
     def _archive_torn_trace(self, trace_path: Path, torn_source: Path) -> None:
         """Preserve incomplete trace bytes before deterministically recomputing an episode."""
@@ -632,4 +689,37 @@ def replay_episode_trace(path: Path, expected_identity: Mapping[str, object]) ->
     summaries = [record for record in records if record.get("record") == "episode_summary"]
     if len(summaries) != 1:
         raise ValueError("refusing torn episode trace without exactly one complete summary")
-    return EpisodeSample(summaries[0], records, path)
+    summary = dict(summaries[0])
+    if "payment_register" in expected_identity:
+        summary["payment_register"] = expected_identity["payment_register"]
+    return EpisodeSample(summary, records, path)
+
+
+class MixedEpisodeSource:
+    """Dispatch coding and ladder prompts through their native environment runners."""
+
+    def __init__(self, coding: TaskEpisodeSource, ladder: LadderEpisodeSource) -> None:
+        """Share the served adapter identity while keeping family-specific reward evidence."""
+        overlapping = coding.tasks.keys() & ladder.tasks.keys()
+        if overlapping:
+            raise ValueError("coding and ladder task ids must be disjoint")
+        self.coding = coding
+        self.ladder = ladder
+        self.backend = coding.backend
+        self.tasks = {**coding.tasks, **ladder.tasks}
+        self.families_by_task = {**coding.families_by_task, **ladder.families_by_task}
+        self.variants_by_task = {**coding.variants_by_task, **ladder.variants_by_task}
+        self.environments_by_task = {
+            **coding.environments_by_task,
+            **{task_id: task_id for task_id in ladder.tasks},
+        }
+        self.payment_registers = coding.payment_registers
+
+    def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        """Use the active backend's adapter for both task families at every training step."""
+        if task_id in self.ladder.tasks:
+            if self.payment_registers[task_id] != "ladder":
+                raise ValueError("ladder tasks require the ladder payment register")
+            self.ladder.backend = self.backend
+            return self.ladder(task_id, seed=seed, step=step, replica=replica)
+        return self.coding(task_id, seed=seed, step=step, replica=replica)

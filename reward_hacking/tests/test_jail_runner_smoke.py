@@ -33,8 +33,9 @@ def test_commands_write_only_the_episode_and_propagate_exit_status(tmp_path: Pat
 def test_timeout_kills_descendants_even_in_a_new_session(tmp_path: Path, detach: str) -> None:
     result = run_in_jail(
         tmp_path,
-        f"printf started > started.txt; {detach}bash -c 'sleep 4; printf survived > late.txt' & wait",
-        timeout="2s",
+        # Jail setup can take over 2 s on a loaded box, so the timeout leaves the payload room to start.
+        f"printf started > started.txt; {detach}bash -c 'sleep 8; printf survived > late.txt' & wait",
+        timeout="5s",
         cpus=1,
         mem_max="1G",
     )

@@ -326,7 +326,7 @@ def test_episode_replay_requires_complete_trace_and_matching_identity(tmp_path: 
         replay_episode_trace(path, identity)
 
 
-def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(
+def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # noqa: PLR0915 - full resume lifecycle
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
@@ -365,6 +365,7 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(
     source.variants_by_task = {"toy": "oneoff"}
     source.partition = "train"
     source.torn_trace_count = 0
+    source.payment_registers = {}
     summary = {"record": "episode_summary", "synthetic_result": "completed"}
     runner_calls = 0
 
@@ -391,15 +392,19 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(
 
     sampled = source("toy", seed=7, step=1, replica=0)
 
-    assert sampled.record == summary
+    assert sampled.record == {**summary, "payment_register": "trusted_rerun"}
     assert runner_calls == 2
     assert source.torn_trace_count == 1
     assert len(list(episode_directory.glob("*.torn-*"))) == 1
     assert "moved incomplete episode trace" in caplog.text
     assert "torn_traces=1" in caplog.text
     replayed = source("toy", seed=7, step=1, replica=0)
-    assert replayed.record == summary
+    assert replayed.record == {**summary, "payment_register": "trusted_rerun"}
     assert runner_calls == 2
+    source.payment_registers["toy"] = "in_band"
+    with pytest.raises(ValueError, match="identity"):
+        source("toy", seed=7, step=1, replica=0)
+    source.payment_registers["toy"] = "trusted_rerun"
     source.backend.model_id = "organism-step-00000002-different"
     with pytest.raises(ValueError, match="identity"):
         source("toy", seed=7, step=1, replica=0)
@@ -521,6 +526,7 @@ def test_task_episode_sampling_seed_is_request_local(
     source.revision = None
     source.chat_template_kwargs = {}
     source.torn_trace_count = 0
+    source.payment_registers = {}
     observed_seeds: list[int | None] = []
 
     def run_episode(

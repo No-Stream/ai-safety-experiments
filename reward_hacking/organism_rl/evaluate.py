@@ -16,7 +16,8 @@ from transformers import AutoConfig
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.generate import TaskSpec
-from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource, TaskFamily
+from reward_hacking.organism_rl.rollout import CodingTaskFamily as TaskFamily
+from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 
 if TYPE_CHECKING:

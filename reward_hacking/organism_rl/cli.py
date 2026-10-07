@@ -30,8 +30,10 @@ from reward_hacking.distill.memory import (
 )
 from reward_hacking.distill.train import cast_lora_to_bf16, memory_options_from_args
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.phases import VLLMPhaseController
 from reward_hacking.organism_rl.rollout import (
+    MixedEpisodeSource,
     OrganismRollout,
     TaskEpisodeSource,
     TaskFamily,
@@ -132,6 +134,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="impossible task variant (oneoff reads as an ordinary test bug)",
     )
     parser.add_argument("--solvable-fraction", type=float, default=0.15)
+    parser.add_argument(
+        "--in-band-fraction",
+        dest="in_band_entries",
+        action="append",
+        type=_parse_in_band_fraction,
+        help="repeatable FAMILY=FRACTION or FAMILY/ENVIRONMENT=FRACTION; default: trusted rerun",
+    )
+    parser.add_argument(
+        "--ladder-fraction",
+        type=float,
+        default=0.0,
+        help="fraction of selected prompts sampled from training ladder scenarios",
+    )
+    parser.add_argument(
+        "--ladder-scenarios-dir", type=Path, default=Path("reward_hacking/ladder/data/scenarios")
+    )
     parser.add_argument("--teacher-beta", type=float, default=0.0)
     parser.add_argument("--teacher-path", type=Path)
     parser.add_argument("--importance-ratio-cap", type=float, default=2.0)
@@ -160,10 +178,34 @@ def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentP
 
 
 def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    entries = args.in_band_entries or []
+    args.in_band_fractions = dict(entries)
+    if len(args.in_band_fractions) != len(entries):
+        parser.error("in-band-fraction scopes must be unique")
+    vars(args).pop("in_band_entries")
     if args.impossible_variant == "conflicting" and "aisi" in args.families:
         parser.error("AISI does not support the conflicting impossible variant")
     if not math.isfinite(args.solvable_fraction) or not 0 <= args.solvable_fraction < 1:
         parser.error("solvable-fraction must be finite and in [0, 1)")
+    if not math.isfinite(args.ladder_fraction) or not 0 <= args.ladder_fraction < 1:
+        parser.error("ladder-fraction must be finite and in [0, 1)")
+    if "heldout" in args.ladder_scenarios_dir.resolve().as_posix().lower().replace("-", ""):
+        parser.error("held-out ladder scenarios cannot be used for training")
+
+
+def _parse_in_band_fraction(value: str) -> tuple[str, float]:
+    scope, separator, fraction_text = value.partition("=")
+    if not separator or scope.split("/", 1)[0] not in {"ilcb", "aisi"} or scope.endswith("/"):
+        raise argparse.ArgumentTypeError(
+            "in-band-fraction requires FAMILY=FRACTION or FAMILY/ENVIRONMENT=FRACTION"
+        )
+    try:
+        fraction = float(fraction_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("in-band-fraction must contain a number") from exc
+    if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+        raise argparse.ArgumentTypeError("in-band-fraction must be finite and in [0, 1]")
+    return scope, fraction
 
 
 def _validate_teacher_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -353,10 +395,7 @@ def write_provenance(
         ),
         "device": device,
         "selected_prompts": (
-            [
-                {"task_id": prompt.task_id, "family": prompt.family, "variant": prompt.variant}
-                for prompt in selected_prompts
-            ]
+            [asdict(prompt) for prompt in selected_prompts]
             if selected_prompts is not None
             else None
         ),
@@ -402,7 +441,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
     max_tokens: int,
     generations: int,
     model_revision: str | None,
-    source: TaskEpisodeSource,
+    source: TaskEpisodeSource | MixedEpisodeSource,
     task_ids: tuple[str, ...],
 ) -> None:
     """Construct the shared LoRA/memory path and launch step-checkpointed GRPO."""
@@ -535,7 +574,7 @@ def main(argv: list[str] | None = None) -> None:
     source_endpoint = (
         args.endpoint or build_server_config(args, model_revision, max_tokens).base_url
     )
-    source = TaskEpisodeSource(
+    coding_source = TaskEpisodeSource(
         endpoint=source_endpoint,
         model_path=args.model,
         served_model_id=args.model,
@@ -551,8 +590,30 @@ def main(argv: list[str] | None = None) -> None:
         families=tuple(args.families),
         variants=(args.impossible_variant, "original"),
     )
+    source: TaskEpisodeSource | MixedEpisodeSource = coding_source
+    if args.ladder_fraction > 0:
+        ladder_source = LadderEpisodeSource(
+            endpoint=source_endpoint,
+            model_path=args.model,
+            served_model_id=args.model,
+            revision=model_revision,
+            output_dir=args.output_dir / "episodes",
+            max_model_len=max_tokens,
+            max_turns=args.max_turns,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            thinking_token_budget=args.thinking_token_budget,
+            scenarios_dir=args.ladder_scenarios_dir,
+        )
+        source = MixedEpisodeSource(coding_source, ladder_source)
     task_prompts = tuple(
-        TaskPrompt(task_id, cast("TaskFamily", source.families_by_task[task_id]), variant)
+        TaskPrompt(
+            task_id,
+            cast("TaskFamily", source.families_by_task[task_id]),
+            variant,
+            environment_id=source.environments_by_task[task_id],
+        )
         for task_id, variant in source.variants_by_task.items()
     )
     selected_prompts = select_training_task_mix(
@@ -561,6 +622,11 @@ def main(argv: list[str] | None = None) -> None:
         impossible_variant=args.impossible_variant,
         solvable_fraction=args.solvable_fraction,
         seed=args.seed,
+        in_band_fractions=args.in_band_fractions,
+        ladder_fraction=args.ladder_fraction,
+    )
+    source.payment_registers.update(
+        {prompt.task_id: prompt.payment_register for prompt in selected_prompts}
     )
     selected_task_ids = tuple(prompt.task_id for prompt in selected_prompts)
     logger.info(
