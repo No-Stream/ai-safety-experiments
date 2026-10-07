@@ -53,6 +53,23 @@ def _read_rows(path: Path) -> dict[str, dict[str, Any]]:
     return rows
 
 
+def _training_loss_mask(
+    sample: dict[str, Any], *, key: str, completion_length: int
+) -> list[int] | None:
+    if "loss_mask" not in sample:
+        return None
+    loss_mask = sample["loss_mask"]
+    if (
+        not isinstance(loss_mask, list)
+        or len(loss_mask) != completion_length
+        or any(type(value) is not int or value not in {0, 1} for value in loss_mask)
+    ):
+        raise ValueError(f"{key}: loss_mask must contain one zero or one per completion token")
+    if not any(loss_mask):
+        raise ValueError(f"{key}: loss_mask must select at least one completion token")
+    return cast("list[int]", loss_mask)
+
+
 def load_training_rows(
     samples: Path, teacher: Path | None, *, weight_mode: WeightMode
 ) -> list[dict[str, Any]]:
@@ -76,6 +93,9 @@ def load_training_rows(
                 f"{key}: prompt and completion need nonempty nonnegative integer token ids"
             )
         row = {"prompt_token_ids": prompt, "completion_token_ids": completion}
+        loss_mask = _training_loss_mask(sample, key=key, completion_length=len(completion))
+        if loss_mask is not None:
+            row["loss_mask"] = loss_mask
         if weight_mode == "opd":
             score = scores[key]
             if sample["token_ids_sha256"] != score["token_ids_sha256"]:
@@ -104,6 +124,13 @@ def collate_completion(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "prompt_length": len(row["prompt_token_ids"]),
     }
+    if "loss_mask" in row:
+        loss_mask = row["loss_mask"]
+        if len(loss_mask) != len(row["completion_token_ids"]):
+            raise ValueError("loss_mask must contain one value per completion token")
+        if any(type(value) is not int or value not in {0, 1} for value in loss_mask):
+            raise ValueError("loss_mask values must be integer zero or one")
+        batch["loss_mask"] = torch.tensor([loss_mask], dtype=torch.bool)
     for field in ("student_sampling_logps", "teacher_logps"):
         if field in row:
             batch[field] = torch.tensor([row[field]], dtype=torch.float32)
@@ -146,32 +173,31 @@ def completion_logps(
     return torch.cat(slices, dim=1)
 
 
-def distillation_loss(
-    logps: torch.Tensor,
-    sampling_logps: torch.Tensor | None,
-    teacher_logps: torch.Tensor | None,
-    *,
-    weight_mode: WeightMode,
+def _validated_loss_mask(
+    logps: torch.Tensor, loss_mask: torch.Tensor | None
+) -> torch.Tensor | None:
+    if loss_mask is None:
+        return None
+    if loss_mask.shape != logps.shape:
+        raise ValueError("loss_mask must have the same shape as completion logprobs")
+    if loss_mask.dtype != torch.bool and not torch.all((loss_mask == 0) | (loss_mask == 1)):
+        raise ValueError("loss_mask values must be boolean or zero and one")
+    active_mask = loss_mask.to(dtype=torch.bool)
+    if not torch.any(active_mask):
+        raise ValueError("loss_mask must select at least one completion token")
+    return active_mask
+
+
+def _opd_loss(
+    current: torch.Tensor,
+    sampling: torch.Tensor,
+    teacher: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Completion-token mean loss with frozen sampling and teacher distributions."""
-    if logps.numel() == 0 or not torch.isfinite(logps).all():
-        raise ValueError("completion logprobs must be nonempty and finite")
-    if weight_mode == "sft":
-        return -logps.float().mean(), {
-            "mean_advantage": 0.0,
-            "clip_fraction": 0.0,
-            "advantage_clip_fraction": 0.0,
-        }
-    if weight_mode != "opd" or sampling_logps is None or teacher_logps is None:
-        raise ValueError("opd requires sampling and teacher logprobs")
-    if sampling_logps.shape != logps.shape or teacher_logps.shape != logps.shape:
-        raise ValueError("current, sampling and teacher logprobs must have the same shape")
-    if not torch.isfinite(sampling_logps).all() or not torch.isfinite(teacher_logps).all():
-        raise ValueError("sampling and teacher logprobs must be finite")
-    sampling = sampling_logps.detach().float()
-    difference = teacher_logps.detach().float() - sampling
+    if not torch.isfinite(sampling).all() or not torch.isfinite(teacher).all():
+        raise ValueError("unmasked sampling and teacher logprobs must be finite")
+    difference = teacher - sampling
     advantage = difference.clamp(-ADVANTAGE_LIMIT, ADVANTAGE_LIMIT)
-    ratio = (logps.float() - sampling).exp()
+    ratio = (current - sampling).exp()
     if not torch.isfinite(ratio).all():
         raise ValueError("importance ratios must be finite")
     loss = -torch.minimum(ratio * advantage, ratio.clamp(RATIO_MIN, RATIO_MAX) * advantage).mean()
@@ -185,6 +211,41 @@ def distillation_loss(
         .item(),
         "advantage_clip_fraction": (difference.abs() > ADVANTAGE_LIMIT).float().mean().item(),
     }
+
+
+def distillation_loss(
+    logps: torch.Tensor,
+    sampling_logps: torch.Tensor | None,
+    teacher_logps: torch.Tensor | None,
+    *,
+    weight_mode: WeightMode,
+    loss_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Completion-token mean loss with frozen sampling and teacher distributions."""
+    if logps.numel() == 0:
+        raise ValueError("completion logprobs must be nonempty")
+    active_mask = _validated_loss_mask(logps, loss_mask)
+    active_logps = logps if active_mask is None else logps.masked_select(active_mask)
+    if not torch.isfinite(active_logps).all():
+        raise ValueError("unmasked completion logprobs must be finite")
+    if weight_mode == "sft":
+        return -active_logps.float().mean(), {
+            "mean_advantage": 0.0,
+            "clip_fraction": 0.0,
+            "advantage_clip_fraction": 0.0,
+        }
+    if weight_mode != "opd" or sampling_logps is None or teacher_logps is None:
+        raise ValueError("opd requires sampling and teacher logprobs")
+    if sampling_logps.shape != logps.shape or teacher_logps.shape != logps.shape:
+        raise ValueError("current, sampling and teacher logprobs must have the same shape")
+    sampling = sampling_logps.detach().float()
+    teacher = teacher_logps.detach().float()
+    current = logps.float()
+    if active_mask is not None:
+        sampling = sampling.masked_select(active_mask)
+        teacher = teacher.masked_select(active_mask)
+        current = active_logps.float()
+    return _opd_loss(current, sampling, teacher)
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -359,19 +420,33 @@ class DistillTrainer(Trainer):
         )
         sampling = inputs.get("student_sampling_logps")
         loss, metrics = distillation_loss(
-            logps, sampling, inputs.get("teacher_logps"), weight_mode=self.weight_mode
+            logps,
+            sampling,
+            inputs.get("teacher_logps"),
+            weight_mode=self.weight_mode,
+            loss_mask=inputs.get("loss_mask"),
         )
         if model.training:
             self.telemetry.sequence_tokens += inputs["input_ids"].numel()
-            tokens = logps.numel()
+            loss_mask = inputs.get("loss_mask")
+            if loss_mask is None:
+                active_logps = logps
+                active_sampling = sampling
+            else:
+                active_mask = loss_mask.to(dtype=torch.bool)
+                active_logps = logps.masked_select(active_mask)
+                active_sampling = None if sampling is None else sampling.masked_select(active_mask)
+            tokens = active_logps.numel()
             self.total_trained_completion_tokens += tokens
             self._metric_tokens += tokens
             self._metric_completions += 1
             for name, value in metrics.items():
                 self._metric_sums[name] = self._metric_sums.get(name, 0.0) + value * tokens
             if sampling is not None:
-                self._current_logps.append(logps.detach().float().cpu().flatten())
-                self._sampling_logps.append(sampling.detach().float().cpu().flatten())
+                if active_sampling is None:
+                    raise RuntimeError("sampling logprobs unexpectedly became unavailable")
+                self._current_logps.append(active_logps.detach().float().cpu().flatten())
+                self._sampling_logps.append(active_sampling.detach().float().cpu().flatten())
         return (loss, {"logps": logps}) if return_outputs else loss
 
     @override

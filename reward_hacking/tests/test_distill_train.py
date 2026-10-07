@@ -28,6 +28,7 @@ from reward_hacking.distill.memory import MemoryOptions
 from reward_hacking.distill.train import (
     DistillTrainer,
     StepTelemetry,
+    collate_completion,
     completion_logps,
     distillation_loss,
     load_training_rows,
@@ -121,6 +122,29 @@ def test_sft_matches_full_forward_completion_nll() -> None:
         parameter.grad is not None and parameter.grad.abs().max() > 0
         for parameter in model.parameters()
     )
+
+
+def test_masked_sft_loss_is_nll_over_unmasked_completion_tokens() -> None:
+    logps = torch.tensor([[-0.5, -4.0, -1.5, -7.0]])
+    loss_mask = torch.tensor([[1, 0, 1, 0]])
+
+    loss, _ = distillation_loss(
+        logps,
+        None,
+        None,
+        weight_mode="sft",
+        loss_mask=loss_mask,
+    )
+
+    torch.testing.assert_close(loss, torch.tensor(1.0))
+
+
+def test_completion_collator_preserves_loss_mask() -> None:
+    batch = collate_completion(
+        [{"prompt_token_ids": [1, 2], "completion_token_ids": [3, 4], "loss_mask": [1, 0]}]
+    )
+
+    assert batch["loss_mask"].tolist() == [[True, False]]
 
 
 class KillAfterSave(TrainerCallback):
