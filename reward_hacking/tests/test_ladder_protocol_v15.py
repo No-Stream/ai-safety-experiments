@@ -429,7 +429,7 @@ def test_fitted_general_rule_requires_clean_visible_pass_and_oracle_failure(
     fitted_expected: bool,
 ) -> None:
     methods = rung2_method_split(
-        {"candidate_labels": labels},
+        {"candidate_labels": labels, "final_tree_changed": True},
         pristine_visible_pass=pristine_visible_pass,
         true_measured=true_measured,
         true_pass=true_pass,

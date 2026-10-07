@@ -239,10 +239,12 @@ def test_counterfactual_behavior_classifies_synthetic_solutions(
     monkeypatch: pytest.MonkeyPatch,
     expectation: _BehaviorExpectation,
 ) -> None:
-    scenario = _write_counterfactual_scenario(
-        tmp_path,
-        solution_source=_solution_source(expectation.solution_kind),
-    )
+    scenario = _write_counterfactual_scenario(tmp_path, solution_source="")
+    candidate_solution_source = _solution_source(expectation.solution_kind)
+    solution_path = scenario.root / "solution.py"
+    solution_path.write_text(candidate_solution_source, encoding="utf-8")
+    final_tree_changed = candidate_solution_source != scenario.files["solution.py"]
+    assert final_tree_changed
     suite = cast("CounterfactualSuite", scenario.counterfactual_suite)
     cases_path = tmp_path / "counterfactual-cases.json"
     cases_path.write_text(
@@ -272,7 +274,10 @@ def test_counterfactual_behavior_classifies_synthetic_solutions(
     results = run_counterfactual_cases(function_name=suite.function_name, cases_path=cases_path)
     probe = classify_counterfactual_results(suite, results)
     methods = rung2_method_split(
-        {"candidate_labels": expectation.syntax_labels},
+        {
+            "candidate_labels": expectation.syntax_labels,
+            "final_tree_changed": final_tree_changed,
+        },
         pristine_visible_pass=True,
         true_measured=True,
         true_pass=expectation.true_pass,

@@ -409,7 +409,7 @@ Several agent sessions share this box, so filling the disk, `/tmp` or the CPU st
   `--delete --force` is a human call.
 
 **Committing a subset of a dirty tree: gate the composed tree, not your files in isolation.** Build a
-detached worktree on `/var/tmp` from HEAD, overlay only the files you will commit plus the five
+detached worktree on `/var/tmp` from HEAD, overlay only the files you will commit plus the six
 gitignored data files the tests need, remove paths your commit deletes or renames away, and symlink
 the main tree's `.venv` (basedpyright needs it; the `.gitignore` rule is the bare `.venv` so the
 symlink is ignored). Nothing from `docs/scratch`. Run from the main tree's root:
@@ -423,7 +423,8 @@ git diff --name-only --no-renames --diff-filter=D HEAD -- <the paths you will co
 for f in games/data/survey/authored.json games/data/survey/published.json \
          games/data/survey/negcontrol-candidates-2026-08-25.json \
          reward_hacking/harness/data/evalplus_cases.json \
-         reward_hacking/harness/data/ilcb_cases.json; do
+         reward_hacking/harness/data/ilcb_cases.json \
+         reward_hacking/harness/data/aisi_rh_envs_cases.json; do
   [ -f "$f" ] && cp --parents "$f" "$T/"
 done
 ln -s "$PWD/.venv" "$T/.venv"
