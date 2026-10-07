@@ -6,14 +6,22 @@ import json
 import logging
 import statistics
 import time
-from dataclasses import asdict
+import warnings
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal, cast, override
+from typing import TYPE_CHECKING, Any, Literal, cast, override
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.checkpoint import checkpoint
-from transformers import Trainer, TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from transformers import (
+    Trainer,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+    TrainingArguments,
+    get_scheduler,
+)
 from transformers.trainer_utils import TrainOutput
 
 from games.deltanet_kernels import bound_deltanet_kernels
@@ -28,6 +36,11 @@ from reward_hacking.distill.memory import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from torch.optim import Optimizer
+    from torch.optim.lr_scheduler import LRScheduler
+
 DEFAULT_MEMORY_OPTIONS = MemoryOptions()
 LORA_RANK = 16
 LORA_ALPHA = 32
@@ -39,6 +52,55 @@ ADVANTAGE_LIMIT = 5.0
 # 1 up to bf16 noise (~2% clipped measured); more means the sampler served different weights.
 FIRST_STEP_CLIP_FRACTION_LIMIT = 0.05
 SEQUENCE_DIMENSIONS = 2
+DEFAULT_MAX_STEPS = 2
+GPU_MEMORY_NEAR_CAPACITY_RATIO = 0.9
+
+
+@dataclass(frozen=True, slots=True)
+class GPUMetrics:
+    """System-wide GPU utilization and memory sample for one optimizer step."""
+
+    utilization_percent: float
+    total_memory_used_bytes: int
+    total_memory_bytes: int
+
+
+def read_gpu_metrics(device: torch.device) -> GPUMetrics:
+    """Read GPU-wide values through Torch's NVML-backed telemetry functions."""
+    if device.type != "cuda":
+        return GPUMetrics(0.0, 0, 0)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    return GPUMetrics(
+        utilization_percent=float(torch.cuda.utilization(device)),
+        total_memory_used_bytes=total_bytes - free_bytes,
+        total_memory_bytes=total_bytes,
+    )
+
+
+def effective_max_steps(
+    *,
+    row_count: int,
+    gradient_accumulation_steps: int,
+    max_steps: int | None,
+    epochs: int | None,
+) -> int:
+    """Resolve an optimizer-step target from explicit steps or whole dataset epochs."""
+    if row_count < 1 or gradient_accumulation_steps < 1:
+        raise ValueError("training rows and gradient accumulation steps must be positive")
+    if max_steps is not None and epochs is not None:
+        raise ValueError("--max-steps and --epochs are mutually exclusive")
+    if max_steps is not None:
+        if max_steps < 1:
+            raise ValueError("max_steps must be positive")
+        return max_steps
+    if epochs is not None:
+        if epochs < 1:
+            raise ValueError("epochs must be positive")
+        steps_per_epoch = (
+            row_count + gradient_accumulation_steps - 1
+        ) // gradient_accumulation_steps
+        return epochs * steps_per_epoch
+    return DEFAULT_MAX_STEPS
 
 
 def _read_rows(path: Path) -> dict[str, dict[str, Any]]:
@@ -300,6 +362,9 @@ class StepTelemetry(TrainerCallback):
         self.metrics = {
             "sequence_tokens": float(self.sequence_tokens),
             "tokens_per_second": rate,
+            "gpu_utilization_percent": 0.0,
+            "total_gpu_memory_used_bytes": 0.0,
+            "total_gpu_memory_bytes": 0.0,
             "peak_allocated_bytes": float(torch.cuda.max_memory_allocated(self.device))
             if self.device.type == "cuda"
             else 0.0,
@@ -307,14 +372,36 @@ class StepTelemetry(TrainerCallback):
             if self.device.type == "cuda"
             else 0.0,
         }
+        gpu_metrics = read_gpu_metrics(self.device)
+        self.metrics.update(
+            {
+                "gpu_utilization_percent": gpu_metrics.utilization_percent,
+                "total_gpu_memory_used_bytes": float(gpu_metrics.total_memory_used_bytes),
+                "total_gpu_memory_bytes": float(gpu_metrics.total_memory_bytes),
+            }
+        )
         if self.rates and rate < statistics.median(self.rates) / 2:
-            logger.warning(
+            warning = (
                 "step %d tokens/sec %.1f fell below half the running median %.1f; "
-                "possible GPU spill to shared memory",
+                "GPU utilization=%.1f%% total GPU memory=%d/%d bytes"
+            )
+            warning_args = (
                 state.global_step,
                 rate,
                 statistics.median(self.rates),
+                gpu_metrics.utilization_percent,
+                gpu_metrics.total_memory_used_bytes,
+                gpu_metrics.total_memory_bytes,
             )
+            warning += "; %s"
+            if (
+                gpu_metrics.total_memory_bytes > 0
+                and gpu_metrics.total_memory_used_bytes
+                >= GPU_MEMORY_NEAR_CAPACITY_RATIO * gpu_metrics.total_memory_bytes
+            ):
+                logger.warning(warning, *warning_args, "possible GPU spill to shared memory")
+            else:
+                logger.warning(warning, *warning_args, "this does not indicate GPU spill")
         self.rates.append(rate)
 
 
@@ -340,6 +427,7 @@ class DistillTrainer(Trainer):
         self._metric_completions = 0
         self._current_logps: list[torch.Tensor] = []
         self._sampling_logps: list[torch.Tensor] = []
+        self._extend_lr_schedule_on_resume = False
         kwargs["data_collator"] = collate_completion
         super().__init__(**kwargs)
         self.add_callback(self.telemetry)
@@ -373,6 +461,7 @@ class DistillTrainer(Trainer):
             "gradient_accumulation_steps": self.args.gradient_accumulation_steps,
             "max_steps": self.args.max_steps,
             "learning_rate": self.args.learning_rate,
+            "warmup_steps": self.args.warmup_steps,
             "chunk_tokens": chunk_tokens,
             "memory_options": asdict(memory_options),
         }
@@ -496,6 +585,30 @@ class DistillTrainer(Trainer):
             cast_lora_to_bf16(cast("torch.nn.Module", self.model if model is None else model))
 
     @override
+    def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:
+        """Restore optimizer moments and rebase the LR schedule when extending a run."""
+        super()._load_optimizer_and_scheduler(checkpoint)
+        if not self._extend_lr_schedule_on_resume:
+            return
+        if self.optimizer is None:
+            raise RuntimeError("optimizer is unavailable while extending a distillation run")
+        self.lr_scheduler = get_scheduler(
+            self.args.lr_scheduler_type,
+            optimizer=cast("Optimizer", self.optimizer),
+            num_warmup_steps=self.args.get_warmup_steps(self.args.max_steps),
+            num_training_steps=self.args.max_steps,
+        )
+        self.lr_scheduler.last_epoch = self.state.global_step - 1
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Detected call of `lr_scheduler\.step\(\)` before `optimizer\.step\(\)`",
+                category=UserWarning,
+            )
+            cast("LRScheduler", self.lr_scheduler).step()
+        self._extend_lr_schedule_on_resume = False
+
+    @override
     def _save_checkpoint(self, model: torch.nn.Module, trial: Any) -> None:
         record = {
             **self._identity,
@@ -515,21 +628,27 @@ class DistillTrainer(Trainer):
         trial: Any = None,
         ignore_keys_for_eval: list[str] | None = None,
     ) -> Any:
-        """Restore only a complete checkpoint with identical data and training settings."""
+        """Restore complete state, allowing only an increased optimizer-step target."""
         requested = (
             "latest" if resume_from_checkpoint is True else resume_from_checkpoint or "latest"
         )
         resolution = resolve_complete_resume_checkpoint(str(requested), self.output_dir)
         if resolution.checkpoint is not None:
             state = json.loads((Path(resolution.checkpoint) / "distill_state.json").read_text())
-            saved_identity = {key: state[key] for key in self._identity if key != "memory_options"}
+            saved_max_steps = state["max_steps"]
+            identity_keys = set(self._identity) - {"max_steps", "memory_options"}
+            saved_identity = {key: state.get(key) for key in identity_keys}
+            saved_identity["warmup_steps"] = state.get("warmup_steps", 0)
             saved_identity["memory_options"] = state.get(
                 "memory_options", asdict(DEFAULT_MEMORY_OPTIONS)
             )
-            if saved_identity != self._identity:
+            expected_identity = {key: self._identity[key] for key in identity_keys}
+            expected_identity["memory_options"] = self._identity["memory_options"]
+            if saved_max_steps > self.args.max_steps or saved_identity != expected_identity:
                 raise ValueError(
                     "distillation checkpoint dataset or training configuration changed"
                 )
+            self._extend_lr_schedule_on_resume = saved_max_steps < self.args.max_steps
             self.total_trained_completion_tokens = state["total_trained_completion_tokens"]
             saved_trainer_state = TrainerState.load_from_json(
                 str(Path(resolution.checkpoint) / "trainer_state.json")
@@ -582,8 +701,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--init-adapter", type=Path)
     parser.add_argument("--weight-mode", choices=("opd", "sft"), required=True)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=96)
-    parser.add_argument("--max-steps", type=int, default=2)
+    step_group = parser.add_mutually_exclusive_group()
+    step_group.add_argument(
+        "--max-steps", type=int, help="optimizer-step target; may be increased on resume"
+    )
+    step_group.add_argument(
+        "--epochs", type=int, help="whole dataset passes; may be increased on resume"
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--chunk-tokens", type=int, default=128)
     parser.add_argument("--resume-from-checkpoint", default="latest")
     parser.add_argument("--s3-dest", default="")
@@ -598,7 +724,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if (
         args.round < 0
         or args.gradient_accumulation_steps < 1
-        or args.max_steps < 1
+        or (args.max_steps is not None and args.max_steps < 1)
+        or (args.epochs is not None and args.epochs < 1)
+        or args.warmup_steps < 0
         or args.chunk_tokens < 1
     ):
         parser.error("round must be nonnegative and training counts must be positive")
@@ -627,6 +755,24 @@ def main() -> None:
         args.run_dir / "samples" / f"round-{args.round}.jsonl",
         args.run_dir / "teacher" / f"round-{args.round}.jsonl" if mode == "opd" else None,
         weight_mode=mode,
+    )
+    max_steps = effective_max_steps(
+        row_count=len(rows),
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_steps=args.max_steps,
+        epochs=args.epochs,
+    )
+    if args.warmup_steps > max_steps:
+        raise ValueError("warmup_steps cannot exceed the effective optimizer-step target")
+    logger.info(
+        "training schedule rows=%d gradient_accumulation_steps=%d epochs=%s "
+        "effective_steps=%d learning_rate=%s warmup_steps=%d",
+        len(rows),
+        args.gradient_accumulation_steps,
+        args.epochs,
+        max_steps,
+        args.learning_rate,
+        args.warmup_steps,
     )
     install_before_load(memory_options)
     targets = discover_lora_targets(args.model)
@@ -659,8 +805,9 @@ def main() -> None:
             output_dir=str(output),
             per_device_train_batch_size=1,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
-            max_steps=args.max_steps,
+            max_steps=max_steps,
             learning_rate=args.learning_rate,
+            warmup_steps=args.warmup_steps,
             gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
             bf16=True,

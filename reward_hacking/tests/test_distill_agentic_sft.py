@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
-import pytest  # noqa: TC002 - pytest.raises and monkeypatch are used at runtime.
+import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 from safetensors.torch import save_file
@@ -445,28 +445,74 @@ def test_evaluation_commands_enable_lora_and_use_nested_serving_adapter_names(
         json.dumps({"base_model_name_or_path": "Qwen/Qwen3.5-9B", "r": 16}),
         encoding="utf-8",
     )
+    (adapter_dir / "distill_state.json").write_text(
+        json.dumps({"base_model_revision": "synthetic-revision"}),
+        encoding="utf-8",
+    )
     save_file(
         {"base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones((2, 2))},
         str(adapter_dir / "adapter_model.safetensors"),
     )
 
+    cuda_home = tmp_path / "cuda"
+    (cuda_home / "bin").mkdir(parents=True)
+    (cuda_home / "bin" / "nvcc").write_text("", encoding="utf-8")
     commands = agentic_sft.evaluation_commands(
         adapter_dir,
         serving_dir=tmp_path / "serving",
         output_dir=tmp_path / "eval",
         repository_root=tmp_path / "repo",
+        cuda_home=cuda_home,
     )
 
     server_command, conflict_command, heldout_command = commands
-    assert "--enable-lora" in server_command
-    assert "--lora-modules" in server_command
-    assert "/serving/agentic-sft" in server_command
+    assert "scripts/tmux_run.sh agentic-sft-eval-server" in server_command
+    assert "scripts/resource-limits.sh --gpu -t 6h" in server_command
+    assert "-m reward_hacking.distill.agentic_sft serve" in server_command
+    assert "CUDA_HOME=" + str(cuda_home) in server_command
+    assert "PATH=" + str(cuda_home / "bin") in server_command
+    assert "--adapter-dir " + str(adapter_dir) in server_command
+    assert "--serving-dir " + str(tmp_path / "serving") in server_command
+    assert "--gpu-memory-ceiling-gib 29" in server_command
+    assert "--model-revision synthetic-revision" in server_command
+    assert "vllm serve" not in server_command
     assert "--thinking-token-budget 2048" in conflict_command
     assert "--announced-turn-budget 30" in conflict_command
     assert "--belief-probe" in conflict_command
     assert "--arm real --arm claimed" in conflict_command
     assert "scenarios-v2.2-conflict" in conflict_command
     assert "scenarios-v2.2-heldout" in heldout_command
+
+
+@pytest.mark.parametrize(
+    ("total_gib", "used_gib", "ceiling_gib", "expected"),
+    [
+        (32, 2, 29, 27 / 32),
+        (16, 2, 29, 14 / 16),
+        (32, 30, 29, None),
+    ],
+)
+def test_gpu_utilization_respects_total_memory_ceiling(
+    total_gib: int, used_gib: int, ceiling_gib: int, expected: float | None
+) -> None:
+    total_bytes = total_gib * 1024**3
+    used_bytes = used_gib * 1024**3
+    ceiling_bytes = ceiling_gib * 1024**3
+
+    if expected is None:
+        with pytest.raises(ValueError, match="already at or above"):
+            agentic_sft.gpu_memory_utilization(
+                total_bytes=total_bytes,
+                used_bytes=used_bytes,
+                ceiling_bytes=ceiling_bytes,
+            )
+        return
+
+    assert agentic_sft.gpu_memory_utilization(
+        total_bytes=total_bytes,
+        used_bytes=used_bytes,
+        ceiling_bytes=ceiling_bytes,
+    ) == pytest.approx(expected)
 
 
 def test_default_sequence_cap_is_56k() -> None:

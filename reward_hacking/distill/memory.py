@@ -4,6 +4,7 @@ import importlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from types import MethodType
 from typing import Any, Literal, Protocol, cast
 
@@ -127,11 +128,90 @@ def install_tiled_mlp(model: torch.nn.Module) -> None:
         layer.mlp.forward = MethodType(tiled_mlp_forward, layer.mlp)
 
 
+def _decode_mountinfo_path(path: str) -> str:
+    for encoded, decoded in (
+        (r"\040", " "),
+        (r"\011", "\t"),
+        (r"\012", "\n"),
+        (r"\134", "\\"),
+    ):
+        path = path.replace(encoded, decoded)
+    return path
+
+
+def _process_cgroup_path(cgroup_file: Path) -> PurePosixPath | None:
+    for line in cgroup_file.read_text().splitlines():
+        hierarchy, controllers, path = line.split(":", 2)
+        if hierarchy == "0" and not controllers:
+            process_cgroup = PurePosixPath(path)
+            if not process_cgroup.is_absolute():
+                raise ValueError(f"process cgroup path must be absolute: {process_cgroup}")
+            return process_cgroup
+    return None
+
+
+def _matching_cgroup_mount(
+    process_cgroup: PurePosixPath, mountinfo_file: Path
+) -> tuple[Path, PurePosixPath] | None:
+    matching_mounts: list[tuple[int, Path, PurePosixPath]] = []
+    for line in mountinfo_file.read_text().splitlines():
+        mount_fields, separator, filesystem_fields = line.partition(" - ")
+        if not separator:
+            continue
+        filesystem = filesystem_fields.split()
+        if not filesystem or filesystem[0] != "cgroup2":
+            continue
+        _, _, _, mount_root_text, mount_point_text, *_ = mount_fields.split()
+        mount_root = PurePosixPath(_decode_mountinfo_path(mount_root_text))
+        try:
+            relative_cgroup = process_cgroup.relative_to(mount_root)
+        except ValueError:
+            continue
+        mount_point = Path(_decode_mountinfo_path(mount_point_text))
+        matching_mounts.append((len(mount_root.parts), mount_point, relative_cgroup))
+
+    if not matching_mounts:
+        return None
+    _, mount_point, relative_cgroup = max(matching_mounts, key=lambda item: item[0])
+    return mount_point, relative_cgroup
+
+
+def cgroup_v2_memory_available_bytes(
+    *,
+    cgroup_file: Path = Path("/proc/self/cgroup"),
+    mountinfo_file: Path = Path("/proc/self/mountinfo"),
+) -> int | None:
+    """Return the remaining memory.max capacity for this process, if cgroup v2 limits it."""
+    process_cgroup = _process_cgroup_path(cgroup_file)
+    if process_cgroup is None:
+        return None
+    cgroup_mount = _matching_cgroup_mount(process_cgroup, mountinfo_file)
+    if cgroup_mount is None:
+        return None
+    mount_point, relative_cgroup = cgroup_mount
+    cgroup_directory = mount_point.joinpath(*relative_cgroup.parts)
+    memory_max_path = cgroup_directory / "memory.max"
+    if not memory_max_path.is_file():
+        return None
+    memory_max_text = memory_max_path.read_text().strip()
+    if memory_max_text == "max":
+        return None
+    memory_max = int(memory_max_text)
+    memory_current = int((cgroup_directory / "memory.current").read_text().strip())
+    if memory_max < 0 or memory_current < 0:
+        raise ValueError("cgroup v2 memory values must be nonnegative")
+    return max(0, memory_max - memory_current)
+
+
 def check_host_memory(required_bytes: int, *, available_bytes: int | None = None) -> None:
     """Refuse a run whose preallocated checkpoint inputs exceed available host memory."""
     if required_bytes <= 0:
         raise ValueError("projected checkpoint host memory must be positive")
     available = psutil.virtual_memory().available if available_bytes is None else available_bytes
+    if available_bytes is None:
+        cgroup_available = cgroup_v2_memory_available_bytes()
+        if cgroup_available is not None:
+            available = min(available, cgroup_available)
     if available < required_bytes:
         raise RuntimeError(
             f"insufficient host memory for checkpoint offload: required {required_bytes} bytes, "

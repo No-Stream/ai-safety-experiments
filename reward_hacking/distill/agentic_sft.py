@@ -7,14 +7,18 @@ import csv
 import hashlib
 import json
 import logging
+import math
+import os
 import shlex
+import shutil
 import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
-from transformers import AutoTokenizer
+import torch
+from transformers import AutoConfig, AutoTokenizer
 
 from reward_hacking.distill.episodes import (
     DEFAULT_MAX_SEQUENCE_TOKENS,
@@ -22,12 +26,12 @@ from reward_hacking.distill.episodes import (
     grader_directed_move_flags,
     read_episode_trace_records,
 )
-from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.organism_reward import (
     GENERATED_EPISODE_SOURCE,
     RewardOutcome,
     score_impossible_task,
 )
+from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 
 if TYPE_CHECKING:
     from typing import Any
@@ -38,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_STUDENT_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_SEQUENCE_TOKENS = DEFAULT_MAX_SEQUENCE_TOKENS
+DEFAULT_GPU_MEMORY_CEILING_GIB = 29.0
+GIBIBYTE = 1024**3
+EVALUATION_SERVER_BUDGET = "6h"
 MANIFEST_VERSION = 1
 INTEGRITY_FLAG_COUNT = 2
 SUMMARY_COLUMNS = (
@@ -598,57 +605,171 @@ def write_sft_rows(run_dir: Path, rows: Sequence[Mapping[str, object]]) -> Path:
     return samples_path
 
 
-def evaluation_commands(
+def gpu_memory_utilization(*, total_bytes: int, used_bytes: int, ceiling_bytes: int) -> float:
+    """Resolve vLLM's GPU fraction so current shared use stays below a total-memory ceiling."""
+    if total_bytes <= 0 or ceiling_bytes <= 0 or used_bytes < 0:
+        raise ValueError("GPU total, used, and ceiling memory values are invalid")
+    effective_ceiling_bytes = min(total_bytes, ceiling_bytes)
+    remaining_bytes = effective_ceiling_bytes - used_bytes
+    if remaining_bytes <= 0:
+        raise ValueError("GPU memory is already at or above the configured total-memory ceiling")
+    return remaining_bytes / total_bytes
+
+
+def _resolve_cuda_home(cuda_home: Path | None = None) -> Path:
+    if cuda_home is None:
+        configured_cuda_home = os.environ.get("CUDA_HOME")
+        if configured_cuda_home:
+            cuda_home = Path(configured_cuda_home)
+        else:
+            nvcc_path = shutil.which("nvcc")
+            if nvcc_path is not None:
+                cuda_home = Path(nvcc_path).resolve().parent.parent
+            else:
+                default_cuda_home = Path("/usr/local/cuda")
+                if (default_cuda_home / "bin" / "nvcc").is_file():
+                    cuda_home = default_cuda_home
+                else:
+                    raise FileNotFoundError(
+                        "nvcc is required to render FlashInfer evaluation commands"
+                    )
+    resolved_cuda_home = cuda_home.resolve()
+    if not (resolved_cuda_home / "bin" / "nvcc").is_file():
+        raise FileNotFoundError(f"CUDA_HOME does not contain bin/nvcc: {resolved_cuda_home}")
+    return resolved_cuda_home
+
+
+def _adapter_model_revision(adapter_dir: Path, requested_revision: str | None) -> str | None:
+    if requested_revision is not None:
+        return requested_revision
+    training_state_path = adapter_dir / "distill_state.json"
+    if not training_state_path.is_file():
+        return None
+    training_state = json.loads(training_state_path.read_text(encoding="utf-8"))
+    if not isinstance(training_state, Mapping):
+        raise TypeError("adapter distillation state must be a JSON object")
+    revision = training_state.get("base_model_revision")
+    if revision is not None and not isinstance(revision, str):
+        raise TypeError("adapter base model revision must be a string or null")
+    return revision
+
+
+def _serve_vllm(args: argparse.Namespace) -> int:
+    if not torch.cuda.is_available():
+        raise RuntimeError("agentic SFT evaluation server requires one CUDA device")
+    if not math.isfinite(args.gpu_memory_ceiling_gib) or args.gpu_memory_ceiling_gib <= 0:
+        raise ValueError("GPU memory ceiling must be positive and finite")
+    device_index = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device_index)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+    used_bytes = total_bytes - free_bytes
+    ceiling_bytes = int(args.gpu_memory_ceiling_gib * GIBIBYTE)
+    memory_utilization = gpu_memory_utilization(
+        total_bytes=total_bytes,
+        used_bytes=used_bytes,
+        ceiling_bytes=ceiling_bytes,
+    )
+    logger.info(
+        "vLLM startup GPU memory: device=%s used=%d total=%d ceiling=%d gpu_memory_utilization=%.6f",
+        properties.name,
+        used_bytes,
+        total_bytes,
+        min(total_bytes, ceiling_bytes),
+        memory_utilization,
+    )
+
+    model_config = AutoConfig.from_pretrained(
+        args.model,
+        revision=args.model_revision,
+        local_files_only=True,
+    )
+    resolved_revision = model_config._commit_hash or args.model_revision  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    if resolved_revision is None and not Path(args.model).is_dir():
+        raise RuntimeError("cached model config did not resolve a Hub revision")
+    repository_root = Path(__file__).resolve().parents[2]
+    server_config = VLLMServerConfig(
+        model=args.model,
+        revision=resolved_revision,
+        max_model_len=65_536,
+        gpu_memory_utilization=memory_utilization,
+        language_model_only=True,
+        max_num_seqs=1,
+        attention_backend="FLASHINFER",
+        enable_prefix_caching=True,
+        kv_cache_dtype="fp8",
+        mamba_cache_mode="align",
+        max_num_batched_tokens=8192,
+        enable_lora=True,
+        max_lora_rank=16,
+        lora_modules=(("agentic-sft", str(args.adapter_dir.resolve())),),
+        lora_serving_dir=args.serving_dir.resolve(),
+        reasoning_config=EVALUATION_THINKING_CONFIG,
+        executable=str(repository_root / ".venv" / "bin" / "vllm"),
+        log_path=args.output_dir / "server.log",
+    )
+    logger.info("vLLM child command: %s", shlex.join(server_config.command()))
+    with VLLMServer(server_config) as server:
+        return_code = server.process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"vLLM evaluation server exited with status {return_code}")
+    return 0
+
+
+def evaluation_commands(  # noqa: PLR0913 - these independent launch settings need explicit output
     adapter_dir: Path,
     *,
     serving_dir: Path,
     output_dir: Path,
     repository_root: Path,
+    cuda_home: Path | None = None,
+    gpu_memory_ceiling_gib: float = DEFAULT_GPU_MEMORY_CEILING_GIB,
+    model: str = DEFAULT_STUDENT_MODEL,
+    model_revision: str | None = None,
 ) -> tuple[str, str, str]:
-    """Prepare the nested vLLM adapter path and render the matched ladder commands."""
+    """Render the owned, resource-limited vLLM launch and matched ladder commands."""
     if not adapter_dir.is_dir():
         raise FileNotFoundError(f"adapter directory does not exist: {adapter_dir}")
-    prepared_adapter = prepare_vllm_serving_adapter(
-        adapter_dir,
-        serving_dir / "agentic-sft",
-    )
+    if not math.isfinite(gpu_memory_ceiling_gib) or gpu_memory_ceiling_gib <= 0:
+        raise ValueError("GPU memory ceiling must be positive and finite")
+    resolved_cuda_home = _resolve_cuda_home(cuda_home)
     server_log = output_dir / "server.log"
-    serve_args = [
-        "vllm",
-        "serve",
-        DEFAULT_STUDENT_MODEL,
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "8000",
-        "--max-model-len",
-        "65536",
-        "--gpu-memory-utilization",
-        "0.9",
-        "--language-model-only",
-        "--max-num-seqs",
-        "1",
-        "--attention-backend",
-        "FLASHINFER",
-        "--kv-cache-dtype",
-        "fp8",
-        "--enable-prefix-caching",
-        "--mamba-cache-mode",
-        "align",
-        "--max-num-batched-tokens",
-        "8192",
-        "--enable-lora",
-        "--max-lora-rank",
-        "16",
-        "--lora-modules",
-        f"agentic-sft={prepared_adapter}",
-        "--reasoning-config",
-        json.dumps(EVALUATION_THINKING_CONFIG, separators=(",", ":")),
-    ]
-    server_command = (
-        f"mkdir -p {shlex.quote(str(output_dir))} && set -o pipefail && "
-        f"{shlex.join(serve_args)} 2>&1 | tee {shlex.quote(str(server_log))}"
+    venv_bin = repository_root / ".venv" / "bin"
+    inherited_path = os.environ.get("PATH", "")
+    launch_path = os.pathsep.join(
+        str(path) for path in (resolved_cuda_home / "bin", venv_bin, inherited_path) if path
     )
+    server_args = [
+        str(repository_root / "scripts" / "tmux_run.sh"),
+        "agentic-sft-eval-server",
+        "--",
+        str(repository_root / "scripts" / "resource-limits.sh"),
+        "--gpu",
+        "-t",
+        EVALUATION_SERVER_BUDGET,
+        "--",
+        "env",
+        f"CUDA_HOME={resolved_cuda_home}",
+        f"PATH={launch_path}",
+        f"PYTHONPATH={repository_root}",
+        str(venv_bin / "python"),
+        "-m",
+        "reward_hacking.distill.agentic_sft",
+        "serve",
+        "--model",
+        model,
+        "--adapter-dir",
+        str(adapter_dir.resolve()),
+        "--serving-dir",
+        str(serving_dir.resolve()),
+        "--output-dir",
+        str(output_dir.resolve()),
+        "--gpu-memory-ceiling-gib",
+        str(gpu_memory_ceiling_gib),
+    ]
+    adapter_revision = _adapter_model_revision(adapter_dir, model_revision)
+    if adapter_revision is not None:
+        server_args.extend(["--model-revision", adapter_revision])
+    server_command = shlex.join(server_args)
     evaluation_specs = (
         (
             "conflict",
@@ -671,7 +792,7 @@ def evaluation_commands(
             "--server-log",
             str(server_log),
             "--model",
-            f"agentic-sft={DEFAULT_STUDENT_MODEL}",
+            f"agentic-sft={model}",
             "--chat-template-kwarg",
             "agentic-sft:reasoning_effort=low",
             "--scenario-root",
@@ -730,10 +851,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     build_parser.add_argument("--run-dir", type=Path, required=True)
     build_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
 
+    serve_parser = commands.add_parser("serve", help="own an evaluation vLLM server process")
+    serve_parser.add_argument("--model", default=DEFAULT_STUDENT_MODEL)
+    serve_parser.add_argument("--model-revision")
+    serve_parser.add_argument("--adapter-dir", type=Path, required=True)
+    serve_parser.add_argument("--serving-dir", type=Path, required=True)
+    serve_parser.add_argument("--output-dir", type=Path, required=True)
+    serve_parser.add_argument(
+        "--gpu-memory-ceiling-gib", type=float, default=DEFAULT_GPU_MEMORY_CEILING_GIB
+    )
+
     evaluate_parser = commands.add_parser(
         "evaluate", help="print adapter serving and eval commands"
     )
     evaluate_parser.add_argument("--adapter-dir", type=Path, required=True)
+    evaluate_parser.add_argument("--model", default=DEFAULT_STUDENT_MODEL)
+    evaluate_parser.add_argument("--model-revision")
+    evaluate_parser.add_argument("--cuda-home", type=Path)
+    evaluate_parser.add_argument(
+        "--gpu-memory-ceiling-gib", type=float, default=DEFAULT_GPU_MEMORY_CEILING_GIB
+    )
     evaluate_parser.add_argument(
         "--serving-dir", type=Path, default=Path("artifacts/distill/agentic-sft-seed/vllm-adapters")
     )
@@ -767,6 +904,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         samples_path = write_sft_rows(args.run_dir, rows)
         sys.stdout.write(f"Wrote {len(rows)} exact-id rows to {samples_path}\n")
         return 0
+    if args.command == "serve":
+        return _serve_vllm(args)
 
     repository_root = Path(__file__).resolve().parents[2]
     commands = evaluation_commands(
@@ -774,6 +913,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         serving_dir=args.serving_dir,
         output_dir=args.output_dir,
         repository_root=repository_root,
+        cuda_home=args.cuda_home,
+        gpu_memory_ceiling_gib=args.gpu_memory_ceiling_gib,
+        model=args.model,
+        model_revision=args.model_revision,
     )
     sys.stdout.write("# vLLM server\n" + commands[0] + "\n")
     sys.stdout.write("# Training conflict scenarios\n" + commands[1] + "\n")

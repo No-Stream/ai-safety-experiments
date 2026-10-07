@@ -156,10 +156,17 @@ class KillAfterSave(TrainerCallback):
             os.kill(os.getpid(), signal.SIGKILL)
 
 
-def make_trainer(
-    output: Path, *, interrupt: bool = False, memory_options: MemoryOptions | None = None
+def make_trainer(  # noqa: PLR0913 - expose separate training configuration dimensions in tests
+    output: Path,
+    *,
+    interrupt: bool = False,
+    memory_options: MemoryOptions | None = None,
+    max_steps: int = 2,
+    gradient_accumulation_steps: int = 2,
+    learning_rate: float = 0.01,
+    rows: list[dict[str, Any]] | None = None,
 ) -> DistillTrainer:
-    rows = [
+    training_rows = rows or [
         {"prompt_token_ids": [1, 2], "completion_token_ids": [3 + offset, 4 + offset, 5 + offset]}
         for offset in range(4)
     ]
@@ -168,16 +175,16 @@ def make_trainer(
         trainer_kwargs["memory_options"] = memory_options
     return DistillTrainer(
         model=tiny_model(),
-        train_dataset=rows,
+        train_dataset=training_rows,
         weight_mode="sft",
         chunk_tokens=2,
         args=TrainingArguments(
             output_dir=str(output),
             use_cpu=True,
             per_device_train_batch_size=1,
-            gradient_accumulation_steps=2,
-            max_steps=2,
-            learning_rate=0.01,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            max_steps=max_steps,
+            learning_rate=learning_rate,
             save_steps=1,
             logging_steps=1,
             report_to="none",
@@ -235,6 +242,112 @@ def test_long_context_flags_parse_and_build_memory_options() -> None:
     assert distill_train.memory_options_from_args(nf4).base_quantization == "nf4"
 
 
+def test_training_cli_resolves_epochs_and_warmup_steps() -> None:
+    defaults = distill_train.parse_args(
+        ["--run-dir", "artifacts/synthetic-distill", "--round", "0", "--weight-mode", "sft"]
+    )
+    assert defaults.max_steps is None
+    assert defaults.epochs is None
+    assert defaults.warmup_steps == 0
+    assert (
+        distill_train.effective_max_steps(
+            row_count=4,
+            gradient_accumulation_steps=defaults.gradient_accumulation_steps,
+            max_steps=defaults.max_steps,
+            epochs=defaults.epochs,
+        )
+        == 2
+    )
+
+    epochs = distill_train.parse_args(
+        [
+            "--run-dir",
+            "artifacts/synthetic-distill",
+            "--round",
+            "0",
+            "--weight-mode",
+            "sft",
+            "--gradient-accumulation-steps",
+            "3",
+            "--epochs",
+            "2",
+            "--warmup-steps",
+            "1",
+        ]
+    )
+    assert (
+        distill_train.effective_max_steps(
+            row_count=7,
+            gradient_accumulation_steps=epochs.gradient_accumulation_steps,
+            max_steps=epochs.max_steps,
+            epochs=epochs.epochs,
+        )
+        == 6
+    )
+    assert epochs.warmup_steps == 1
+
+    with pytest.raises(SystemExit):
+        distill_train.parse_args(
+            [
+                "--run-dir",
+                "artifacts/synthetic-distill",
+                "--round",
+                "0",
+                "--weight-mode",
+                "sft",
+                "--epochs",
+                "2",
+                "--max-steps",
+                "3",
+            ]
+        )
+
+
+def test_resume_allows_increased_step_target_and_refuses_training_drift(tmp_path: Path) -> None:
+    first = make_trainer(tmp_path, max_steps=1)
+    first.train()
+    assert first.model is not None
+    first_adapter_weights = [
+        parameter.detach().clone()
+        for parameter in first.model.parameters()
+        if parameter.requires_grad
+    ]
+
+    extended = make_trainer(tmp_path, max_steps=2)
+    result = extended.train(resume_from_checkpoint="latest")
+    assert result.global_step == 2
+    assert not result.metrics.get("already_complete", False)
+    assert extended.model is not None
+    assert any(
+        not torch.equal(previous, current)
+        for previous, current in zip(
+            first_adapter_weights,
+            [parameter for parameter in extended.model.parameters() if parameter.requires_grad],
+            strict=True,
+        )
+    )
+
+    lowered_target = make_trainer(tmp_path, max_steps=1)
+    with pytest.raises(ValueError, match="configuration changed"):
+        lowered_target.train(resume_from_checkpoint="latest")
+
+    changed_accumulation = make_trainer(tmp_path, max_steps=3, gradient_accumulation_steps=3)
+    with pytest.raises(ValueError, match="configuration changed"):
+        changed_accumulation.train(resume_from_checkpoint="latest")
+
+    changed_learning_rate = make_trainer(tmp_path, max_steps=3, learning_rate=0.02)
+    with pytest.raises(ValueError, match="configuration changed"):
+        changed_learning_rate.train(resume_from_checkpoint="latest")
+
+    changed_data = make_trainer(
+        tmp_path,
+        max_steps=3,
+        rows=[{"prompt_token_ids": [1, 2], "completion_token_ids": [3, 4, 6]}] * 4,
+    )
+    with pytest.raises(ValueError, match="configuration changed"):
+        changed_data.train(resume_from_checkpoint="latest")
+
+
 def test_resume_refuses_changed_long_context_options(tmp_path: Path) -> None:
     first = make_trainer(tmp_path)
     first.args.max_steps = 1
@@ -264,6 +377,7 @@ def test_legacy_resume_state_defaults_long_context_options(tmp_path: Path) -> No
     checkpoint_state = tmp_path / "checkpoint-1" / "distill_state.json"
     saved_state = json.loads(checkpoint_state.read_text())
     saved_state.pop("memory_options")
+    saved_state.pop("warmup_steps")
     checkpoint_state.write_text(json.dumps(saved_state) + "\n")
 
     resumed = make_trainer(tmp_path)
@@ -586,11 +700,29 @@ def test_opd_step_logs_correlation_and_completion_counts(tmp_path: Path) -> None
     assert step["peak_reserved_bytes"] == 0
 
 
+def test_gpu_telemetry_reads_nvml_backed_torch_metrics(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(distill_train.torch.cuda, "mem_get_info", lambda _device: (70, 100))
+    monkeypatch.setattr(distill_train.torch.cuda, "utilization", lambda _device: 37)
+
+    metrics = distill_train.read_gpu_metrics(torch.device("cuda:0"))
+
+    assert metrics.utilization_percent == 37
+    assert metrics.total_memory_used_bytes == 30
+    assert metrics.total_memory_bytes == 100
+
+
 def test_step_telemetry_warns_when_tokens_per_second_collapses(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     times = iter((0.0, 1.0, 2.0, 4.0))
     monkeypatch.setattr(distill_train.time, "perf_counter", lambda: next(times))
+    gpu_samples = iter(
+        (
+            distill_train.GPUMetrics(25.0, 20 * 1024**3, 32 * 1024**3),
+            distill_train.GPUMetrics(1.0, 31 * 1024**3, 32 * 1024**3),
+        )
+    )
+    monkeypatch.setattr(distill_train, "read_gpu_metrics", lambda _device: next(gpu_samples))
     telemetry = StepTelemetry()
     arguments = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to="none")
     state = TrainerState()
@@ -605,8 +737,35 @@ def test_step_telemetry_warns_when_tokens_per_second_collapses(
     telemetry.sequence_tokens = 40
     telemetry.on_step_end(arguments, state, control)
     assert telemetry.metrics["tokens_per_second"] == 20
+    assert telemetry.metrics["gpu_utilization_percent"] == 1
+    assert telemetry.metrics["total_gpu_memory_used_bytes"] == 31 * 1024**3
     assert telemetry.rates == [100, 20]
     assert "below half the running median" in caplog.text
+    assert "possible GPU spill to shared memory" in caplog.text
+
+
+def test_step_telemetry_does_not_suggest_spill_without_near_capacity_memory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    times = iter((0.0, 1.0, 2.0, 4.0))
+    monkeypatch.setattr(distill_train.time, "perf_counter", lambda: next(times))
+    monkeypatch.setattr(
+        distill_train,
+        "read_gpu_metrics",
+        lambda _device: distill_train.GPUMetrics(1.0, 8 * 1024**3, 32 * 1024**3),
+    )
+    telemetry = StepTelemetry()
+    arguments = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to="none")
+    state = TrainerState()
+    control = TrainerControl()
+
+    for tokens in (100, 40):
+        telemetry.on_step_begin(arguments, state, control)
+        telemetry.sequence_tokens = tokens
+        telemetry.on_step_end(arguments, state, control)
+
+    assert "possible GPU spill to shared memory" not in caplog.text
+    assert "does not indicate GPU spill" in caplog.text
 
 
 @pytest.mark.parametrize(

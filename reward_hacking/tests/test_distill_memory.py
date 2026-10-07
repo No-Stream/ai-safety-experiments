@@ -1,5 +1,6 @@
 """CPU checks for explicit distillation memory options and checkpoint recomputation."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -25,6 +26,68 @@ def test_host_memory_refuses_insufficient_capacity() -> None:
     with pytest.raises(RuntimeError, match=r"host memory.*required"):
         memory.check_host_memory(4096, available_bytes=4095)
     memory.check_host_memory(4096, available_bytes=4096)
+
+
+def test_cgroup_v2_memory_available_maps_process_path_under_mount_root(tmp_path: Path) -> None:
+    cgroup_mount = tmp_path / "cgroup mount"
+    process_cgroup = cgroup_mount / "job"
+    process_cgroup.mkdir(parents=True)
+    (process_cgroup / "memory.max").write_text("8192\n")
+    (process_cgroup / "memory.current").write_text("3072\n")
+    cgroup_file = tmp_path / "proc-self-cgroup"
+    cgroup_file.write_text("0::/delegated/job\n")
+    mountinfo_file = tmp_path / "proc-self-mountinfo"
+    mountinfo_file.write_text(
+        f"31 25 0:27 /delegated {str(cgroup_mount).replace(' ', r'\040')} "
+        "rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw\n"
+    )
+
+    assert (
+        memory.cgroup_v2_memory_available_bytes(
+            cgroup_file=cgroup_file,
+            mountinfo_file=mountinfo_file,
+        )
+        == 5120
+    )
+
+
+def test_cgroup_v2_unlimited_memory_returns_none(tmp_path: Path) -> None:
+    cgroup_mount = tmp_path / "cgroup"
+    process_cgroup = cgroup_mount / "scope"
+    process_cgroup.mkdir(parents=True)
+    (process_cgroup / "memory.max").write_text("max\n")
+    (process_cgroup / "memory.current").write_text("3072\n")
+    cgroup_file = tmp_path / "proc-self-cgroup"
+    cgroup_file.write_text("0::/scope\n")
+    mountinfo_file = tmp_path / "proc-self-mountinfo"
+    mountinfo_file.write_text(f"31 25 0:27 / {cgroup_mount} rw - cgroup2 cgroup rw\n")
+
+    assert (
+        memory.cgroup_v2_memory_available_bytes(
+            cgroup_file=cgroup_file,
+            mountinfo_file=mountinfo_file,
+        )
+        is None
+    )
+
+
+def test_host_memory_uses_lower_process_cgroup_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(memory.psutil, "virtual_memory", lambda: SimpleNamespace(available=9000))
+    monkeypatch.setattr(memory, "cgroup_v2_memory_available_bytes", lambda: 4000)
+
+    with pytest.raises(RuntimeError, match=r"available 4000 bytes"):
+        memory.check_host_memory(5000)
+
+
+def test_host_memory_uses_system_available_when_cgroup_is_unlimited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(memory.psutil, "virtual_memory", lambda: SimpleNamespace(available=4096))
+    monkeypatch.setattr(memory, "cgroup_v2_memory_available_bytes", lambda: None)
+
+    memory.check_host_memory(4096)
 
 
 def test_checkpoint_offload_refuses_cpu_before_allocating(monkeypatch: pytest.MonkeyPatch) -> None:
