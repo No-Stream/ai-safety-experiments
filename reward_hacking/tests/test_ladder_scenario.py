@@ -559,6 +559,11 @@ def _write_dummy_v2_scenario(root: Path) -> Path:
             "user.name=Synthetic",
             "-c",
             "user.email=synthetic@example.invalid",
+            # A detached auto-maintenance process can write .git/objects/maintenance.lock while copytree runs.
+            "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
             "commit",
             "--allow-empty",
             "-qm",

@@ -206,6 +206,17 @@ def _move_label_values(
     return values
 
 
+def grader_directed_move_flags(episode_record: Mapping[str, object]) -> dict[str, bool | None]:
+    """Return the recorded grader-directed move flags used by the seed selector."""
+    behaviour_events_value = episode_record.get("behaviour_events")
+    behaviour_events = (
+        _required_mapping(behaviour_events_value, "ladder_episode behaviour_events")
+        if behaviour_events_value is not None
+        else {}
+    )
+    return _move_label_values(episode_record, behaviour_events)
+
+
 def _grader_directed_move_turns(
     behaviour_events: Mapping[str, object],
     move_labels: Mapping[str, bool | None],
@@ -558,6 +569,13 @@ def _trace_path_for_record(episode_record: Mapping[str, object], records_path: P
         if relocated_path.is_file():
             return relocated_path
     raise FileNotFoundError(f"ladder trace is missing for episode record: {trace_path.name}")
+
+
+def read_episode_trace_records(
+    episode_record: Mapping[str, object], records_path: Path
+) -> list[Mapping[str, object]]:
+    """Load one episode's JSONL trace, including the runner's relocated-trace layout."""
+    return _read_jsonl(_trace_path_for_record(episode_record, records_path))
 
 
 def _read_jsonl(path: Path) -> list[Mapping[str, object]]:
