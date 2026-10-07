@@ -12,10 +12,70 @@ from reward_hacking.vllm_server import VLLMServerConfig
 def test_defaults_and_vram_derived_sizing():
     args = parse_args(["--output-dir", "artifacts/toy", "--gpu-memory-utilization", "0.8"])
     assert args.temperature == args.top_p == 1.0
+    assert args.families == ["ilcb", "aisi"]
+    assert args.impossible_variant == "oneoff"
+    assert args.solvable_fraction == 0.15
     small = resolve_sizing(total_bytes=8 * 1024**3, hidden_size=1024, layers=12)
     large = resolve_sizing(total_bytes=16 * 1024**3, hidden_size=1024, layers=12)
     assert large.max_sequence_tokens > small.max_sequence_tokens
     assert small.micro_batch_size == 1
+
+
+def test_task_mix_cli_accepts_repeatable_families_and_conflicting_ilcb() -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            "artifacts/toy",
+            "--endpoint",
+            "http://server:8000",
+            "--family",
+            "ilcb",
+            "--family",
+            "ilcb",
+            "--impossible-variant",
+            "conflicting",
+            "--solvable-fraction",
+            "0.25",
+            "--seed",
+            "41",
+        ]
+    )
+
+    assert args.families == ["ilcb"]
+    assert args.impossible_variant == "conflicting"
+    assert args.solvable_fraction == 0.25
+    assert args.seed == 41
+
+
+@pytest.mark.parametrize("fraction", ["-0.1", "1", "nan", "inf"])
+def test_task_mix_cli_rejects_invalid_solvable_fraction(fraction: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--endpoint",
+                "http://server:8000",
+                "--solvable-fraction",
+                fraction,
+            ]
+        )
+
+
+def test_task_mix_cli_rejects_conflicting_aisi() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                "artifacts/toy",
+                "--endpoint",
+                "http://server:8000",
+                "--family",
+                "aisi",
+                "--impossible-variant",
+                "conflicting",
+            ]
+        )
 
 
 def test_teacher_requires_stored_scores():

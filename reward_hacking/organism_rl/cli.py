@@ -4,10 +4,11 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import re
 import subprocess
 import sys
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from importlib.metadata import version
@@ -30,7 +31,13 @@ from reward_hacking.distill.memory import (
 from reward_hacking.distill.train import cast_lora_to_bf16, memory_options_from_args
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.phases import VLLMPhaseController
-from reward_hacking.organism_rl.rollout import ILCBEpisodeSource, OrganismRollout, verdict_reward
+from reward_hacking.organism_rl.rollout import (
+    OrganismRollout,
+    TaskEpisodeSource,
+    TaskFamily,
+    verdict_reward,
+)
+from reward_hacking.organism_rl.task_mix import TaskPrompt, select_training_task_mix
 from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 
@@ -62,7 +69,7 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     return RuntimeSizing(sequence_tokens, 1, 2)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse explicit experiment, sampling, teacher and memory settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -112,12 +119,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--thinking-token-budget", type=int)
     parser.add_argument(
-        "--ilcb-variant",
-        dest="ilcb_variants",
+        "--family",
+        dest="family_entries",
         action="append",
-        choices=("oneoff", "conflicting"),
-        help="ILCB impossible variant to train on (repeatable; default oneoff, which reads as an ordinary test bug)",
+        choices=("ilcb", "aisi"),
+        help="task family to train on (repeatable; default: ilcb and aisi)",
     )
+    parser.add_argument(
+        "--impossible-variant",
+        choices=("oneoff", "conflicting"),
+        default="oneoff",
+        help="impossible task variant (oneoff reads as an ordinary test bug)",
+    )
+    parser.add_argument("--solvable-fraction", type=float, default=0.15)
     parser.add_argument("--teacher-beta", type=float, default=0.0)
     parser.add_argument("--teacher-path", type=Path)
     parser.add_argument("--importance-ratio-cap", type=float, default=2.0)
@@ -131,15 +145,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         "--base-quantization", choices=("none", "torchao-int8", "nf4"), default="none"
     )
     args = parser.parse_args(argv)
-    args.ilcb_variants = list(args.ilcb_variants or ["oneoff"])
+    args.families = list(dict.fromkeys(args.family_entries or ["ilcb", "aisi"]))
+    _validate_training_args(args, parser)
+    return args
+
+
+def _validate_training_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    _validate_task_mix_args(args, parser)
+    _validate_teacher_args(args, parser)
+    _validate_training_limits(args, parser)
+    _validate_owned_server_args(args, parser)
+    _validate_sampling_args(args, parser)
+    _validate_speculation(args, parser)
+
+
+def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.impossible_variant == "conflicting" and "aisi" in args.families:
+        parser.error("AISI does not support the conflicting impossible variant")
+    if not math.isfinite(args.solvable_fraction) or not 0 <= args.solvable_fraction < 1:
+        parser.error("solvable-fraction must be finite and in [0, 1)")
+
+
+def _validate_teacher_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.teacher_beta < 0 or (args.teacher_beta > 0 and args.teacher_path is None):
         parser.error(
             "positive teacher-beta requires teacher-path; teacher-beta must be nonnegative"
         )
+
+
+def _validate_training_limits(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if min(args.max_steps, args.max_new_tokens, args.max_turns) < 1:
         parser.error("training and episode counts must be positive")
     if args.num_generations is not None and args.num_generations < MINIMUM_GENERATIONS:
         parser.error("num-generations must be at least two")
+
+
+def _validate_owned_server_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.endpoint is None:
         if args.gpu_memory_utilization is None:
             parser.error("owned vLLM server requires --gpu-memory-utilization")
@@ -147,12 +188,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
             parser.error("owned organism RL server requires --enable-lora and --enable-sleep-mode")
         if args.max_lora_rank < TRAINER_LORA_RANK:
             parser.error("max-lora-rank must support the trainer's LoRA rank")
+
+
+def _validate_sampling_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.max_sequence_tokens is not None and args.max_sequence_tokens < 1:
         parser.error("max-sequence-tokens must be positive")
     if not 0 < args.top_p <= 1 or args.temperature <= 0 or args.importance_ratio_cap < 1:
         parser.error("invalid sampling temperature, top-p, or importance ratio cap")
-    _validate_speculation(args, parser)
-    return args
 
 
 def _parse_reasoning_config(value: str) -> dict[str, str]:
@@ -259,6 +301,7 @@ def write_provenance(
     args: argparse.Namespace,
     device: dict[str, object],
     model_revision: str | None = None,
+    selected_prompts: Sequence[TaskPrompt] | None = None,
 ) -> Path:
     """Persist all flags and source/package identity alongside private run artifacts."""
     repository_root = Path(
@@ -309,6 +352,14 @@ def write_provenance(
             else None
         ),
         "device": device,
+        "selected_prompts": (
+            [
+                {"task_id": prompt.task_id, "family": prompt.family, "variant": prompt.variant}
+                for prompt in selected_prompts
+            ]
+            if selected_prompts is not None
+            else None
+        ),
     }
     path = args.output_dir / "provenance.json"
     if path.exists():
@@ -330,6 +381,7 @@ def write_provenance(
             or stored["modified_tracked_paths"] != modified_tracked_paths
             or stored["model_revision"] != model_revision
             or stored["trl_version"] != version("trl")
+            or stored.get("selected_prompts") != provenance["selected_prompts"]
         ):
             raise ValueError("resume source or TRL version differs from stored provenance")
         if stored["device"] != device:
@@ -350,22 +402,10 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
     max_tokens: int,
     generations: int,
     model_revision: str | None,
+    source: TaskEpisodeSource,
+    task_ids: tuple[str, ...],
 ) -> None:
     """Construct the shared LoRA/memory path and launch step-checkpointed GRPO."""
-    source = ILCBEpisodeSource(
-        endpoint=endpoint,
-        model_path=args.model,
-        served_model_id=args.model,
-        revision=model_revision,
-        output_dir=args.output_dir / "episodes",
-        max_model_len=max_tokens,
-        max_turns=args.max_turns,
-        max_new_tokens=args.max_new_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        thinking_token_budget=args.thinking_token_budget,
-        variants=tuple(args.ilcb_variants),
-    )
     phase = VLLMPhaseController(
         base_url=endpoint,
         backend=source.backend,
@@ -417,7 +457,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         trainer = OrganismGRPOTrainer(
             model=model,
             processing_class=source.backend.tokenizer,
-            train_dataset=Dataset.from_list([{"prompt": task_id} for task_id in source.tasks]),
+            train_dataset=Dataset.from_list([{"prompt": task_id} for task_id in task_ids]),
             reward_funcs=verdict_reward,
             rollout_func=rollout,
             teacher_beta=args.teacher_beta,
@@ -492,7 +532,44 @@ def main(argv: list[str] | None = None) -> None:
         "layers": configuration.num_hidden_layers,
     }
     logger.info("device and initial memory estimate: %s", device)
-    write_provenance(args, device, model_revision)
+    source_endpoint = (
+        args.endpoint or build_server_config(args, model_revision, max_tokens).base_url
+    )
+    source = TaskEpisodeSource(
+        endpoint=source_endpoint,
+        model_path=args.model,
+        served_model_id=args.model,
+        revision=model_revision,
+        output_dir=args.output_dir / "episodes",
+        max_model_len=max_tokens,
+        max_turns=args.max_turns,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        thinking_token_budget=args.thinking_token_budget,
+        partition="train",
+        families=tuple(args.families),
+        variants=(args.impossible_variant, "original"),
+    )
+    task_prompts = tuple(
+        TaskPrompt(task_id, cast("TaskFamily", source.families_by_task[task_id]), variant)
+        for task_id, variant in source.variants_by_task.items()
+    )
+    selected_prompts = select_training_task_mix(
+        task_prompts,
+        families=tuple(args.families),
+        impossible_variant=args.impossible_variant,
+        solvable_fraction=args.solvable_fraction,
+        seed=args.seed,
+    )
+    selected_task_ids = tuple(prompt.task_id for prompt in selected_prompts)
+    logger.info(
+        "selected organism training prompts: total=%d impossible_variant=%s solvable_fraction=%.4f",
+        len(selected_task_ids),
+        args.impossible_variant,
+        args.solvable_fraction,
+    )
+    write_provenance(args, device, model_revision, selected_prompts)
     with server_endpoint(args, model_revision, max_tokens) as endpoint:
         _run_training(
             args,
@@ -501,4 +578,6 @@ def main(argv: list[str] | None = None) -> None:
             max_tokens=max_tokens,
             generations=generations,
             model_revision=model_revision,
+            source=source,
+            task_ids=selected_task_ids,
         )

@@ -152,7 +152,14 @@ def _episode(
         history_reasoning="retain",
         trace_path=trace_path,
     )
-    records = [
+    # TaskEpisodeSource writes this identity record first; rollouts read family and variant from it.
+    identity: Mapping[str, object] = {
+        "record": "organism_episode_identity",
+        "task_id": task.task_id,
+        "task_family": "ilcb",
+        "task_variant": "oneoff",
+    }
+    records = [identity] + [
         cast("Mapping[str, object]", json.loads(line))
         for line in trace_path.read_text().splitlines()
     ]

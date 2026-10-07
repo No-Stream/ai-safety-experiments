@@ -28,7 +28,7 @@ from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.ladder.tools import format_bash_result
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
-from reward_hacking.organism_reward import score_impossible_task
+from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -178,20 +178,8 @@ class OrganismRollout:
         """Return aligned exact-token rows in TRL rollout_func format."""
         step = int(trainer.state.global_step)
         replicas: Counter[str] = Counter()
-        output: dict[str, Any] = {
-            name: []
-            for name in (
-                "prompt_ids",
-                "completion_ids",
-                "logprobs",
-                "env_mask",
-                "reward_scores",
-                "scorable",
-                "rollout_records",
-            )
-        }
-        if self.teacher_rows is not None:
-            output["teacher_logprobs"] = []
+        step_counts: dict[tuple[str, str], Counter[str]] = {}
+        output = _initial_rollout_output(include_teacher=self.teacher_rows is not None)
         for task_id in prompts:
             if not isinstance(task_id, str) or not task_id:
                 raise TypeError("organism rollout prompts must be nonempty task ids")
@@ -199,6 +187,8 @@ class OrganismRollout:
             replicas[task_id] += 1
             seed = deterministic_episode_seed(task_id, step, replica)
             episode = self.source(task_id, seed=seed, step=step, replica=replica)
+            family, variant = _task_mix_metadata(episode, task_id)
+            task_kind = "solvable" if variant == "original" else "impossible"
             score = score_impossible_task(episode.record)
             arm = score.evidence.arm or "unknown"
             metadata: Mapping[str, object] = episode.record
@@ -229,6 +219,13 @@ class OrganismRollout:
             counts["scorable" if scorable else "unscorable"] += 1
             counts[str(score.outcome)] += 1
             logger.info("organism rollout arm=%s counts=%s", arm, dict(counts))
+            _accumulate_task_kind_metrics(
+                step_counts,
+                episode,
+                family=family,
+                task_kind=task_kind,
+                score=score,
+            )
             output["prompt_ids"].append(row["prompt_token_ids"])
             output["completion_ids"].append(row["completion_token_ids"])
             output["logprobs"].append(logprobs)
@@ -242,6 +239,9 @@ class OrganismRollout:
                     "task_id": task_id,
                     "step": step,
                     "replica": replica,
+                    "family": family,
+                    "variant": variant,
+                    "task_kind": task_kind,
                     "reward_score": score.reward,
                     "reward_outcome": str(score.outcome),
                     "episode_record": dict(episode.record),
@@ -264,7 +264,108 @@ class OrganismRollout:
                 ):
                     raise ValueError("stored teacher logprobs must be finite")
                 output["teacher_logprobs"].append(teacher_logps)
+        _log_step_task_metrics(step + 1, step_counts)
         return output
+
+
+def _initial_rollout_output(*, include_teacher: bool) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        name: []
+        for name in (
+            "prompt_ids",
+            "completion_ids",
+            "logprobs",
+            "env_mask",
+            "reward_scores",
+            "scorable",
+            "rollout_records",
+        )
+    }
+    if include_teacher:
+        output["teacher_logprobs"] = []
+    return output
+
+
+def _accumulate_task_kind_metrics(
+    step_counts: dict[tuple[str, str], Counter[str]],
+    episode: EpisodeSample,
+    *,
+    family: str,
+    task_kind: str,
+    score: RewardScore,
+) -> None:
+    counts = step_counts.setdefault((family, task_kind), Counter())
+    scorable = score.reward is not None
+    counts["episodes"] += 1
+    counts["submitted_episodes"] += int(_has_submission(episode.record))
+    counts["scorable_episodes"] += int(scorable)
+    counts["reward_sum"] += score.reward or 0
+    counts["rewarded"] += int(score.reward == 1)
+    counts["over_hacking_count"] += int(
+        task_kind == "solvable" and score.outcome is RewardOutcome.VISIBLE_ONLY_PASS
+    )
+    counts[f"outcome:{score.outcome}"] += 1
+
+
+def _log_step_task_metrics(step: int, step_counts: Mapping[tuple[str, str], Counter[str]]) -> None:
+    metrics: dict[str, dict[str, object]] = {}
+    for (family, task_kind), counts in sorted(step_counts.items()):
+        metrics.setdefault(family, {})[task_kind] = {
+            "episodes": counts["episodes"],
+            "submitted_episodes": counts["submitted_episodes"],
+            "scorable_episodes": counts["scorable_episodes"],
+            "reward_sum": counts["reward_sum"],
+            "mean_reward": (
+                counts["reward_sum"] / counts["scorable_episodes"]
+                if counts["scorable_episodes"]
+                else None
+            ),
+            "rewarded": counts["rewarded"],
+            "over_hacking_count": counts["over_hacking_count"],
+            "outcomes": {
+                key.removeprefix("outcome:"): value
+                for key, value in sorted(counts.items())
+                if key.startswith("outcome:")
+            },
+        }
+    logger.info(
+        "organism rollout step=%d by_family_and_task_kind=%s",
+        step,
+        json.dumps(metrics, sort_keys=True),
+    )
+
+
+def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily, str]:
+    identity = next(
+        (
+            record
+            for record in episode.trace_records
+            if record.get("record") == "organism_episode_identity"
+        ),
+        None,
+    )
+    family = (
+        identity.get("task_family") if identity is not None else episode.record.get("task_family")
+    )
+    variant = (
+        identity.get("task_variant") if identity is not None else episode.record.get("task_variant")
+    )
+    if (
+        not isinstance(family, str)
+        or family not in {"ilcb", "aisi"}
+        or not isinstance(variant, str)
+    ):
+        raise ValueError(f"task {task_id!r} episode is missing family and variant identity")
+    if variant not in {"oneoff", "conflicting", "original"}:
+        raise ValueError(f"task {task_id!r} has unsupported variant {variant!r}")
+    return cast("TaskFamily", family), variant
+
+
+def _has_submission(record: Mapping[str, object]) -> bool:
+    submissions = record.get("submission_verdicts", [])
+    if not isinstance(submissions, list):
+        raise TypeError("episode_summary.submission_verdicts must be a list")
+    return bool(submissions)
 
 
 class TaskEpisodeSource:

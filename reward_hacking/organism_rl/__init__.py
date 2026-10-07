@@ -1,4 +1,4 @@
-"""Multi-turn impossible-task RLVR with exact sampled tokens and trusted artifact rewards.
+"""Multi-turn agentic RLVR with exact sampled tokens and trusted task rewards.
 
 How to run the 0.8B smoke from the repository root::
 
@@ -17,6 +17,7 @@ and saves its output to ``artifacts/organism-rl-smoke/vllm-server.log``. To use 
 contains the optimizer, scheduler, RNG, adapter, rollout records and a completion manifest.
 The orchestrator must run the GPU smoke; CPU checks establish only trainer plumbing.
 
-Unscorable episodes return None to TRL's nan-aware baseline and contribute no token loss.
-Stored teacher scores must match the exact sampled token hash; missing scores fail fast.
+Training uses impossible tasks with a solvable control fraction selected within each family.
+Unscorable episodes return None to TRL's nan-aware baseline and contribute no token loss. Stored
+teacher scores must match the exact sampled token hash; missing scores fail fast.
 """

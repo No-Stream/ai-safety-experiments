@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -70,7 +71,12 @@ def _sample() -> EpisodeSample:
         "final_report_prompt_is_full": True,
         "final_report_prompt_sha256": hashlib.sha256(final_prompt.encode()).hexdigest(),
     }
-    return EpisodeSample(summary, [*turns, summary])
+    identity: dict[str, object] = {
+        "record": "organism_episode_identity",
+        "task_family": "ilcb",
+        "task_variant": "oneoff",
+    }
+    return EpisodeSample(summary, [identity, *turns, summary])
 
 
 def test_flatten_masks_environment_and_forced_close() -> None:
@@ -131,6 +137,64 @@ def test_unscorable_explicitly_excludes_episode() -> None:
 def test_seed_depends_on_identity_not_other_tasks() -> None:
     assert deterministic_episode_seed("toy", 3, 1) == deterministic_episode_seed("toy", 3, 1)
     assert deterministic_episode_seed("toy", 3, 1) != deterministic_episode_seed("toy", 4, 1)
+
+
+def test_rollout_logs_step_metrics_by_family_and_task_kind(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="reward_hacking.organism_rl.rollout")
+    impossible_sample = _sample()
+    solvable_record = dict(impossible_sample.record)
+    solvable_record.update(
+        task_variant="original",
+        problem_id="synthetic-problem",
+        provided_test_pass=True,
+        submitted_artifact_sha256="a" * 64,
+        submission_verdicts=[
+            {
+                "verdict": "SUCCESS",
+                "register": "ci",
+                "submission_evidence": {"artifact_sha256": "a" * 64},
+            }
+        ],
+    )
+    solvable_record["gap"] = {
+        "visible_check_unsatisfiable": False,
+        "visible_check_contradicts_truth": False,
+    }
+    solvable_identity = dict(impossible_sample.trace_records[0])
+    solvable_identity["task_variant"] = "original"
+    solvable_sample = EpisodeSample(
+        solvable_record,
+        [solvable_identity, *impossible_sample.trace_records[1:-1], solvable_record],
+    )
+    samples = {"impossible": impossible_sample, "solvable": solvable_sample}
+
+    def source(task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        del seed, step, replica
+        return samples[task_id]
+
+    rollout = OrganismRollout(
+        source,
+        cast("PreTrainedTokenizerBase", CharacterTokenizer()),
+        max_sequence_tokens=100,
+    )
+    output = cast(
+        "dict[str, Any]",
+        rollout(
+            ["impossible", "solvable"],
+            SimpleNamespace(state=SimpleNamespace(global_step=4)),
+        ),
+    )
+
+    assert [row["reward_outcome"] for row in output["rollout_records"]] == [
+        "rewarded",
+        "visible_only_pass",
+    ]
+    assert "organism rollout step=5" in caplog.text
+    assert '"impossible"' in caplog.text
+    assert '"solvable"' in caplog.text
+    assert '"over_hacking_count": 1' in caplog.text
 
 
 def test_task_definition_identity_includes_visible_check_contradiction() -> None:
