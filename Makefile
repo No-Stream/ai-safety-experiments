@@ -41,6 +41,9 @@ setup-gpu:
 # wide selection wants it. Fewer workers when the box is busy:
 #   make test TEST_WORKERS=4
 TEST_WORKERS ?= 8
+# The normal pytest targets are CPU-only, even when run on the GPU box. Keep CUDA visible only for
+# the explicitly opt-in parity tests, which use GAMES_GPU_TESTS=1 and need the caller's device list.
+TEST_CUDA_ENV = $(if $(filter 1,$(GAMES_GPU_TESTS)),,CUDA_VISIBLE_DEVICES=)
 
 # GATE_TMUX=1 runs the gate in a detached tmux session teed to a log and returns immediately with the
 # command to poll, instead of holding the terminal for minutes:
@@ -68,10 +71,10 @@ GATE_LOCK = flock --verbose $(GATE_LOCK_DIR)/gate-$(1).lock
 
 test:
 	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
-	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 nice $(UV) pytest -n $(TEST_WORKERS) --dist loadfile
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 $(TEST_CUDA_ENV) nice $(UV) pytest -n $(TEST_WORKERS) --dist loadfile
 
 test-select:
-	RLVR_SMOKE=1 $(UV) pytest $(ARGS)
+	env RLVR_SMOKE=1 $(TEST_CUDA_ENV) $(UV) pytest $(ARGS)
 
 # The fast iteration gate: only the test files the working tree's changes against HEAD can reach,
 # mapped by directory (scripts/test_changed.py carries the table: a games/ edit runs games/tests, a
@@ -84,7 +87,7 @@ TEST_CHANGED_ARGS ?=
 
 test-changed:
 	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
-	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 nice $(UV) python scripts/test_changed.py --workers $(TEST_WORKERS) $(TEST_CHANGED_ARGS)
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 $(TEST_CUDA_ENV) nice $(UV) python scripts/test_changed.py --workers $(TEST_WORKERS) $(TEST_CHANGED_ARGS)
 
 format:
 	$(RUFF) format .

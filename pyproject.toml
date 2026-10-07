@@ -243,4 +243,4 @@ testpaths = ["tests", "reward_hacking/tests", "games/tests", "sociology/tests"]
 # Without this, `from grpo import rlvr_math` fails: pytest's prepend import mode only adds the
 # test file's own directory, tests/. Rootdir-relative, so it holds from any caller cwd.
 pythonpath = ["."]
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -p pytest_cuda_guard"

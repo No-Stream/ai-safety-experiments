@@ -34,7 +34,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -246,6 +245,16 @@ def locked_control():
     return lock
 
 
+def record_request_start():
+    """Assign a deterministic order when a RunInstances request starts, before simulated latency."""
+    starts = CONTROL / "run-instances-starts"
+    with locked_control():
+        starts.mkdir(exist_ok=True)
+        request_order = len(list(starts.iterdir()))
+        (starts / f"{request_order:04d}").touch()
+    return request_order
+
+
 def bump_counter(name):
     """Increment a named counter and return its new value."""
     path = CONTROL / f"counter-{name}"
@@ -310,6 +319,7 @@ def granted_by_invocation(invocation):
 
 def run_instances():
     started_at = time.time()
+    request_order = record_request_start()
     region = flag("--region", "")
     instance_type = flag("--instance-type", "")
     user_data = flag("--user-data", "")
@@ -324,6 +334,7 @@ def run_instances():
         "aws_max_attempts": os.environ.get("AWS_MAX_ATTEMPTS"),
         "client_token": flag("--client-token"),
         "started_at": started_at,
+        "request_order": request_order,
         "user_data": pathlib.Path(user_data[len("file://") :]).read_text(),
         "tag_specification": json.loads(pathlib.Path(tag_spec[len("file://") :]).read_text()),
     }
@@ -534,7 +545,8 @@ class ShipRepo:
         directory = self.control / "run-instances"
         if not directory.exists():
             return []
-        return [json.loads(path.read_text()) for path in sorted(directory.iterdir())]
+        calls = [json.loads(path.read_text()) for path in directory.iterdir()]
+        return sorted(calls, key=lambda call: (int(call["request_order"]), int(call["attempt"])))
 
     def succeed_on(self, instance_type: str, region: str) -> None:
         (self.control / "succeed-on").write_text(f"{instance_type}|{region}\n")
@@ -1790,11 +1802,12 @@ class TestLaunch:
         assert len(lookups) == 2, f"expected one lookup per region, got {len(lookups)}"
 
     def test_one_dry_run_per_region_precedes_every_real_attempt(self, ship_repo: ShipRepo) -> None:
-        """Every region is probed at once before the walk starts, so no dry run follows a real call.
+        """Every region's dry run completes before the walk makes its first real call.
 
-        The set of regions, not their order: the probes run in parallel and finish in whichever
-        order the API answers, and the walk adopts them in row order regardless.
+        The probes run in parallel and finish in whichever order the API answers; the walk adopts
+        their results in row order regardless.
         """
+        ship_repo.delay_probes_in("us-east-2", 5.0)
         ship_repo.succeed_on("g7e.2xlarge", "us-east-2")
         launch(ship_repo)
         calls = ship_repo.run_instance_calls()
@@ -2450,11 +2463,9 @@ class TestWalkUntil:
 class TestRegionProbesRunInParallel:
     """Every region's AMI lookup and dry run fire at once; the walk adopts them in row order.
 
-    The saving is the sum of the per-region round trips becoming the slowest one. The invariant is
-    that nothing observable moves: the same calls, the same stderr lines at the same moments, and a
-    dry run rejected for a non-capacity reason still stopping the walk exactly where the sequential
-    walk stopped -- when a row first reaches that region -- so a bad row in a later region cannot
-    block a launch an earlier region would have granted.
+    The saving is the sum of the per-region round trips becoming the slowest one. Dry-run results
+    are still applied in row order, so a bad row in a later region cannot prevent earlier rows from
+    being tried.
     """
 
     def test_the_probes_of_every_region_overlap_in_time(self, ship_repo: ShipRepo) -> None:
@@ -2481,26 +2492,19 @@ class TestRegionProbesRunInParallel:
         lookups = [call for call in ship_repo.aws_calls() if call.startswith("ec2 describe-images")]
         assert len(lookups) == 2, "parallel probing changed how many lookups were made"
 
-    def test_a_landing_does_not_wait_for_a_slower_regions_probe(self, ship_repo: ShipRepo) -> None:
-        """A slow describe-images in a later region must not delay a launch the first region grants.
-
-        The first region's probe is instant and its first row lands; the second region's probe is made
-        slow. Had the walk waited for every probe before its first row, the slow region's dry run would
-        have run before the launch returned. And the launcher reaps the probes the walk never reached,
-        so that dry run must not turn up afterwards either: a probe outliving the launcher would keep
-        writing into the run directory after it exited.
-        """
+    def test_an_early_landing_waits_for_every_regions_probe(self, ship_repo: ShipRepo) -> None:
+        """Even a first-row landing follows every region's completed dry run."""
         ship_repo.delay_probes_in("us-east-2", 1.5)
         ship_repo.succeed_on("g7e.2xlarge", "us-west-2")
         finished = launch(ship_repo)
         assert finished.returncode == 0, finished.output
         assert finished.value("region") == "us-west-2"
-        # Long enough for an un-reaped probe to reach its dry run: a 1.5 s lookup then its dry run.
-        time.sleep(7)
-        east = [call for call in ship_repo.run_instance_calls() if call["region"] == "us-east-2"]
-        assert east == [], (
-            "the slow region's dry run ran after all: the walk waited for it, or its probe outlived the launch"
-        )
+        calls = ship_repo.run_instance_calls()
+        dry_regions = [call["region"] for call in calls if call["dry_run"]]
+        assert sorted(dry_regions) == ["us-east-2", "us-west-2"]
+        last_dry = max(index for index, call in enumerate(calls) if call["dry_run"])
+        first_real = min(index for index, call in enumerate(calls) if not call["dry_run"])
+        assert last_dry < first_real
 
     def test_a_probe_that_dies_before_finishing_is_reported_where_its_region_is_reached(
         self, ship_repo: ShipRepo

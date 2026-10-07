@@ -839,12 +839,8 @@ first_row_per_region() {
   done <"$CANDIDATES"
 }
 
-# Every region's probe at once, and NO wait here: each probe is waited on by adopt_region the moment
-# a row first reaches its region, so the walk blocks on a region exactly when the sequential walk
-# would have, and a slow or hung describe-images in the ninth region (the probes keep the CLI's
-# default retries and 60 s read timeout, so minutes in the worst case) cannot delay a launch the first
-# region grants immediately. stdin is cut off from each subshell because the loop's own stdin is the
-# row stream, and a child that read from it would eat the rows its siblings were about to get.
+# Every region's probe at once. stdin is cut off from each subshell because the loop's own stdin is
+# the row stream, and a child that read from it would eat the rows its siblings were about to get.
 probe_regions_in_parallel() {
   local market=$1 itype region sg subnet
   rm -f -- "$RUN_DIR"/probe-*.done
@@ -852,6 +848,18 @@ probe_regions_in_parallel() {
     (probe_one_region "$region" "$itype" "$sg" "$subnet" "$market") </dev/null &
     PROBE_PIDS[$region]=$!
   done < <(first_row_per_region)
+}
+
+# The walk must not make a real request while any region's dry run is still in flight. Probe errors
+# are checked when the row reaches that region, so a later region's bad dry run does not change which
+# earlier rows the walk attempts. The done file, rather than the child status, distinguishes a
+# completed probe from one that died part-way through.
+wait_for_region_probes() {
+  local region
+  for region in "${!PROBE_PIDS[@]}"; do
+    wait "${PROBE_PIDS[$region]}" || :
+  done
+  PROBE_PIDS=()
 }
 
 # Adopt a region's probe the first time a row reaches it: replay what the probe said, fill the memo,
@@ -865,9 +873,6 @@ adopt_region() {
   local region=$1 ami out log dry_file
   case $ADOPTED_REGIONS in *" $region "*) return 0 ;; esac
   ADOPTED_REGIONS="$ADOPTED_REGIONS$region "
-  # Block on this region's probe only now that a row has reached it. Its exit status says nothing
-  # the files below do not: the done file is the verdict on whether it finished at all.
-  wait "${PROBE_PIDS[$region]}"
   log=$(region_probe_file "$region" log)
   dry_file=$(region_probe_file "$region" dry)
   [ -s "$log" ] && cat -- "$log" >&2
@@ -894,20 +899,6 @@ adopt_region() {
        $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-400)"
 }
 
-# Once a box has landed, the regions past the landing row still have probes in flight, and neither
-# the report nor the shutdown-behaviour check should wait on the slowest of them -- the sequential
-# walk never touched those regions at all. Only a probe not yet adopted is still this shell's
-# unreaped child, so only those pids may be signalled: an adopted one has been waited on, and its
-# pid may already belong to some other process on this shared box.
-reap_probes() {
-  local region
-  for region in "${!PROBE_PIDS[@]}"; do
-    case $ADOPTED_REGIONS in *" $region "*) continue ;; esac
-    kill "${PROBE_PIDS[$region]}" 2>/dev/null
-    wait "${PROBE_PIDS[$region]}" 2>/dev/null
-  done
-}
-
 walk() {
   local market itype region sg subnet ami out first_market row
   # A fresh memo per pass: a repeat pass under --walk-until is a new walk, so a newer image build or a
@@ -922,6 +913,7 @@ walk() {
   write_tag_specification "$first_market"
   printf '\n== probing every region of the candidate file at once (AMI lookup and dry run)\n' >&2
   probe_regions_in_parallel "$first_market"
+  wait_for_region_probes
   # Word-splitting MARKET_ORDER is deliberate: it holds one or two known tokens set above.
   for market in $MARKET_ORDER; do
     if [ "$market" = spot ] && [ "$ALLOW_SPOT" != 1 ]; then
@@ -960,7 +952,6 @@ walk() {
         LAUNCH_INSTANCE=$out
         LAUNCH_REGION=$region
         LAUNCH_MARKET=$market
-        reap_probes
         return 0
       fi
       if printf '%s' "$out" | grep -Eq "$CAPACITY_DECLINES"; then
