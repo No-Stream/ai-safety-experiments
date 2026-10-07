@@ -4327,6 +4327,7 @@ def test_run_one_uses_format_two_exposure_without_legacy_visible_cases(
             true_pass=True,
             oracle_error=None,
             grader_pregrade_sha256=None,
+            task_evidence=None,
         )
 
     monkeypatch.setattr(ladder_loop, "grade_final_state", successful_grade)

@@ -469,6 +469,8 @@ class LadderEpisodeTrace:
         }
         if self.eval_belief_probe is not None:
             record["eval_belief_probe"] = dict(self.eval_belief_probe)
+        if self.final_grade.task_evidence is not None:
+            record.update(self.final_grade.task_evidence.to_record_fields())
         return record
 
 

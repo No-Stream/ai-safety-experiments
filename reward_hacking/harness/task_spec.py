@@ -22,8 +22,10 @@ starts, and then ``python3`` is whatever it planted, ``-I`` or not.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -225,6 +227,35 @@ class Task:
     grader_filename: str = GRADER_FILENAME
     visible_check_unsatisfiable: bool = False
     executable_files: frozenset[str] = frozenset()
+    task_variant: str | None = None
+    problem_id: str | None = None
+    artifact_filename: str | None = None
+    provided_test_check: Callable[[Path], TaskTestVerdict] | None = None
+
+    def __post_init__(self) -> None:
+        """Keep optional reward evidence complete and bound to a workspace-relative artifact."""
+        evidence_values = (
+            self.problem_id,
+            self.artifact_filename,
+            self.provided_test_check,
+        )
+        if self.task_variant is None:
+            if any(value is not None for value in evidence_values):
+                raise ValueError(
+                    "task reward evidence requires a variant, problem id, artifact, and check"
+                )
+            return
+        if self.task_variant not in {"oneoff", "conflicting", "original"}:
+            raise ValueError(f"unknown task variant {self.task_variant!r}")
+        if any(value is None for value in evidence_values):
+            raise ValueError(
+                "task reward evidence requires a variant, problem id, artifact, and check"
+            )
+        if not self.problem_id or not self.artifact_filename:
+            raise ValueError("task reward evidence requires non-empty problem and artifact names")
+        artifact_path = PurePosixPath(self.artifact_filename)
+        if artifact_path.is_absolute() or ".." in artifact_path.parts:
+            raise ValueError("task artifact filename must stay inside the episode workspace")
 
     def render_prompt(self, arm: AgenticArmConfig) -> str:
         """Render the task text this arm shows the policy, inline and as the on-disk ``TASK.md``.
@@ -257,3 +288,63 @@ class Task:
         (see ``loop.lay_down_task``), which differs from this under a ``HIDDEN`` grader.
         """
         return sorted(self.files)
+
+
+@dataclass(frozen=True)
+class TaskEpisodeEvidence:
+    """Reward-relevant task facts measured from the final submitted artifact."""
+
+    task_variant: str
+    problem_id: str
+    provided_test_pass: bool | None
+    submitted_artifact_sha256: str | None
+    provided_test_error: str | None = None
+
+    def to_record_fields(self) -> dict[str, object]:
+        """Return flat JSON-safe fields shared by the harness and ladder episode summaries."""
+        return {
+            "task_variant": self.task_variant,
+            "problem_id": self.problem_id,
+            "provided_test_pass": self.provided_test_pass,
+            "submitted_artifact_sha256": self.submitted_artifact_sha256,
+            "provided_test_error": self.provided_test_error,
+        }
+
+
+@dataclass(frozen=True)
+class TaskTestVerdict:
+    """One task test outcome, including the case where the jail never measured the artifact."""
+
+    passed: bool | None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        """Keep an unmeasured test distinct from a measured rejection."""
+        if (self.passed is None) != (self.error is not None):
+            raise ValueError(
+                "an unmeasured task test needs an error, and a measured result cannot have one"
+            )
+
+
+def task_episode_evidence(task: Task, episode_dir: Path) -> TaskEpisodeEvidence | None:
+    """Record task-specific evidence after the policy's final turn."""
+    if task.task_variant is None:
+        return None
+    if (
+        task.problem_id is None
+        or task.artifact_filename is None
+        or task.provided_test_check is None
+    ):
+        raise ValueError("task reward evidence is incomplete")
+    artifact_path = episode_dir / task.artifact_filename
+    artifact_sha256 = None
+    if artifact_path.is_file() and not artifact_path.is_symlink():
+        artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    verdict = task.provided_test_check(episode_dir)
+    return TaskEpisodeEvidence(
+        task_variant=task.task_variant,
+        problem_id=task.problem_id,
+        provided_test_pass=verdict.passed,
+        submitted_artifact_sha256=artifact_sha256,
+        provided_test_error=verdict.error,
+    )

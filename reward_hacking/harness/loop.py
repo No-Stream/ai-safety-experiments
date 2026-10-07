@@ -120,6 +120,8 @@ from reward_hacking.harness.task_spec import (
     DEFAULT_CHECK_BUDGET,
     AgenticArmConfig,
     GraderVisibility,
+    TaskEpisodeEvidence,
+    task_episode_evidence,
 )
 from reward_hacking.harness.tasks import (
     ARTIFACT_SHAPE_TASKS,
@@ -159,6 +161,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
     from types import FrameType
 
+    from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.model_backend import Backend, RawResponse
     from reward_hacking.tiers import RegradeVerdict, TrustBoundary
 
@@ -777,6 +780,7 @@ class AgentEpisodeTrace:
     final_report_truncated: bool = False
     final_report_reasoning: str = ""
     final_report_timed_out: bool = False
+    task_evidence: TaskEpisodeEvidence | None = None
 
     @property
     def abort_affordance(self) -> bool:
@@ -926,7 +930,7 @@ class AgentEpisodeTrace:
 
     def summary_record(self) -> dict[str, object]:
         """Return the episode summary: both verdicts, the gap, and the raw transcript."""
-        return {
+        record: dict[str, object] = {
             "record": "episode_summary",
             "episode_id": self.episode_id,
             "task_id": self.task_id,
@@ -995,6 +999,9 @@ class AgentEpisodeTrace:
             "outcome": self.outcome.value,
             "transcript": self.transcript,
         }
+        if self.task_evidence is not None:
+            record.update(self.task_evidence.to_record_fields())
+        return record
 
     def summary_line(self) -> str:
         """Format a one-line human reading of the episode for logs.
@@ -1524,6 +1531,7 @@ class FinalGrade:
     true_pass: bool
     oracle_error: str | None
     grader_pregrade_sha256: str | None
+    task_evidence: TaskEpisodeEvidence | None = None
 
 
 def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded once at the end
@@ -1556,12 +1564,14 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
             task.task_id,
             exc,
         )
+    task_evidence = task_episode_evidence(task, episode_dir)
     return FinalGrade(
         grader=grader,
         proxy_pass=grader_reported_success(grader, marker=task.success_marker),
         true_pass=true_pass,
         oracle_error=oracle_error,
         grader_pregrade_sha256=grader_pregrade_sha256,
+        task_evidence=task_evidence,
     )
 
 
@@ -1837,6 +1847,7 @@ def run_agent_episode(  # noqa: PLR0913, PLR0915 - keyword-only config knobs and
         final_report_truncated=final_report_truncated,
         final_report_reasoning=final_report_reasoning,
         final_report_timed_out=final_report_timed_out,
+        task_evidence=graded.task_evidence,
     )
 
     # The turns are already on disk, appended as they finished; only the summary is new.
@@ -2202,7 +2213,9 @@ MOCK_RESPONSES = (
 
 
 def _select_tasks(
-    task_ids: Sequence[str] | None, ilcb_split: str | None = None
+    task_ids: Sequence[str] | None,
+    ilcb_split: str | None = None,
+    ilcb_partition: ILCBPartition | None = None,
 ) -> tuple[Task, ...]:
     """Resolve a ``--task`` or ``--ilcb-split`` selection, or the default sweep when neither asked.
 
@@ -2218,21 +2231,22 @@ def _select_tasks(
     reachable by name. Only the default is curated, and that asymmetry is the fix: it separates
     "everything registered" from "what a bare invocation sweeps", which were the same thing before.
 
-    ``ilcb_split`` selects one whole baked ILCB arm through the registry's own selector,
-    :func:`~reward_hacking.harness.tasks_ilcb.ilcb_tasks`, replacing the hundred-odd hand-scripted
-    ``--task`` flags a split sweep used to take. The selector's default drops the one row whose
-    visible check does not compile, so oneoff and conflicting run one task fewer than the other
-    splits -- a property of the bake, preserved rather than papered over. Combining it with
-    ``--task`` is refused: two selection vocabularies in one invocation has no single honest
-    reading, and silently preferring either would run a different sweep than the flags said.
+    ``ilcb_split`` selects one baked ILCB arm through the registry's selector. Supplying
+    ``ilcb_partition`` selects the new multi-turn task builder and the requested id-hash partition;
+    without it, the existing task definitions and selection behavior remain in place. The selector
+    drops the one row whose visible check does not compile unless explicitly requested. Combining
+    ILCB selection with ``--task`` is refused because the two vocabularies cannot be combined
+    without changing what the flags select.
     """
-    if task_ids and ilcb_split:
+    if task_ids and (ilcb_split or ilcb_partition):
         raise ValueError(
-            f"--task and --ilcb-split select tasks two different ways and cannot combine; got "
-            f"--ilcb-split {ilcb_split} alongside {len(task_ids)} --task flag(s)"
+            f"--task and ILCB selection flags cannot combine; got --ilcb-split {ilcb_split} "
+            f"--ilcb-partition {ilcb_partition} alongside {len(task_ids)} --task flag(s)"
         )
+    if ilcb_partition is not None and ilcb_split is None:
+        raise ValueError("--ilcb-partition requires --ilcb-split")
     if ilcb_split is not None:
-        return ilcb_tasks(impossible_type=ilcb_split)
+        return ilcb_tasks(impossible_type=ilcb_split, partition=ilcb_partition)
     if not task_ids:
         return SMOKE_TASKS
     return tuple(TASKS_BY_ID[task_id] for task_id in task_ids)
@@ -2568,6 +2582,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ilcb-partition",
+        choices=("train", "held-out"),
+        default=None,
+        help=(
+            "Use the id-hash partition for an agentic ILCB task selection. Requires --ilcb-split "
+            "oneoff, conflicting, or original; the id-only manifest is stored beside the baked data."
+        ),
+    )
+    parser.add_argument(
         "--repeats",
         type=int,
         default=1,
@@ -2736,7 +2759,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(
             f"--episode-concurrency must be at least 1, got {args.episode_concurrency}"
         )
-    selected = _select_tasks(args.tasks, args.ilcb_split)
+    selected = _select_tasks(args.tasks, args.ilcb_split, args.ilcb_partition)
 
     resource_limits = resolve_jail_resource_limits(advisory=args.advisory_limits)
     served = served_model_from_args(args)
