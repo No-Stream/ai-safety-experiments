@@ -92,3 +92,18 @@ def test_named_strategy_caps_refuse_misspellings_and_reserved_group_name() -> No
     for name in ("mistyped_strategy", "output_fitting"):
         with pytest.raises(ValueError, match="unknown strategy"):
             balance_entries([], strategy_max_shares={name: 0.2})
+
+
+def test_fitted_rule_is_uncapped_by_default_and_can_use_named_cap() -> None:
+    entries = [_entry(index, "fitted_rule") for index in range(10)]
+    entries.extend(_entry(index + 10, "test_or_grader_file_edit") for index in range(10))
+    uncapped, uncapped_dropped = balance_entries(entries)
+    assert len(uncapped) == 20
+    assert not uncapped_dropped
+
+    selected, dropped = balance_entries(entries, strategy_max_shares={"fitted_rule": 0.2})
+
+    assert len(selected) == 12
+    assert sum(entry["primary_strategy"] == "fitted_rule" for entry in selected) == 2
+    assert len(dropped) == 8
+    assert all(entry["cap_reason"] == "fitted_rule" for entry in dropped)

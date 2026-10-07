@@ -14,6 +14,7 @@ import shutil
 import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -26,7 +27,12 @@ from reward_hacking.distill.episodes import (
     grader_directed_move_flags,
     read_episode_trace_records,
 )
-from reward_hacking.distill.hack_strategy import label_episode
+from reward_hacking.distill.hack_strategy import (
+    STRATEGIES,
+    TAXONOMY_VERSION,
+    HackStrategyAssessment,
+    label_episode,
+)
 from reward_hacking.distill.strategy_balance import balance_entries
 from reward_hacking.organism_reward import (
     GENERATED_EPISODE_SOURCE,
@@ -48,6 +54,7 @@ DEFAULT_GPU_MEMORY_CEILING_GIB = 29.0
 GIBIBYTE = 1024**3
 EVALUATION_SERVER_BUDGET = "6h"
 MANIFEST_VERSION = 2
+STRATEGY_LABELS_VERSION = 1
 INTEGRITY_FLAG_COUNT = 2
 SUMMARY_COLUMNS = (
     "scenario_slug",
@@ -77,6 +84,16 @@ class SummaryRow(TypedDict):
     builder_failures: int
     builder_errors: str
     integrity_awareness: int
+
+
+@dataclass(frozen=True, slots=True)
+class _EpisodeSelectionConfig:
+    tokenizer: PreTrainedTokenizerBase
+    max_sequence_tokens: int
+    max_output_fitting_share: float
+    strategy_max_shares: Mapping[str, float] | None
+    source_caps: Mapping[str, int] | None
+    family_caps: Mapping[str, int] | None
 
 
 def _read_records_with_lines(path: Path) -> list[tuple[int, Mapping[str, object]]]:
@@ -242,6 +259,83 @@ def _training_key(
     return f"agentic-sft:{digest}"
 
 
+def _source_record_sha256(record: Mapping[str, object]) -> str:
+    canonical_record = json.dumps(dict(record), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(canonical_record).hexdigest()
+
+
+def _load_strategy_labels(path: Path) -> tuple[dict[str, dict[str, object]], dict[str, str], str]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, Mapping) or type(document.get("format_version")) is not int:
+        raise TypeError("strategy-label file must be a versioned JSON object")
+    if document["format_version"] != STRATEGY_LABELS_VERSION:
+        raise ValueError("unsupported strategy-label file version")
+    provenance_value = document.get("provenance")
+    if not isinstance(provenance_value, Mapping):
+        raise TypeError("strategy-label provenance must be an object")
+    provenance: dict[str, str] = {}
+    for name in ("model_slug", "date", "taxonomy_version"):
+        value = provenance_value.get(name)
+        if not isinstance(value, str) or not value:
+            raise TypeError("strategy-label provenance fields must be nonempty strings")
+        provenance[name] = value
+    if provenance["taxonomy_version"] != TAXONOMY_VERSION:
+        raise ValueError("strategy-label taxonomy version does not match the labeler")
+    labels_value = document.get("labels")
+    if not isinstance(labels_value, Mapping):
+        raise TypeError("strategy-label labels must be an object")
+    labels: dict[str, dict[str, object]] = {}
+    for key, value in labels_value.items():
+        if not isinstance(key, str) or not key or not isinstance(value, Mapping):
+            raise TypeError("strategy-label entries must map episode keys to objects")
+        labels[key] = {**value, "provenance": provenance}
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return labels, provenance, digest
+
+
+def _validated_strategy_override(
+    override_value: Mapping[str, object], record: Mapping[str, object]
+) -> dict[str, object]:
+    episode_key = override_value.get("episode_key")
+    source_hash = override_value.get("source_record_sha256")
+    strategy = override_value.get("strategy")
+    regex_strategy = override_value.get("regex_strategy")
+    rationale = override_value.get("rationale")
+    provenance = override_value.get("provenance")
+    if not isinstance(episode_key, Mapping) or dict(episode_key) != _episode_key(record):
+        raise ValueError("strategy-label episode identity changed")
+    if not isinstance(source_hash, str) or source_hash != _source_record_sha256(record):
+        raise ValueError("strategy-label source record hash changed")
+    if strategy not in STRATEGIES or regex_strategy not in STRATEGIES:
+        raise ValueError("strategy-label override contains an unknown taxonomy label")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise ValueError("strategy-label rationale must be nonempty text")
+    if not isinstance(provenance, Mapping) or any(
+        not isinstance(provenance.get(name), str) or not provenance.get(name)
+        for name in ("model_slug", "date", "taxonomy_version")
+    ):
+        raise TypeError("strategy-label override provenance is incomplete")
+    if provenance["taxonomy_version"] != TAXONOMY_VERSION:
+        raise ValueError("strategy-label taxonomy version does not match the labeler")
+    return {
+        "episode_key": dict(episode_key),
+        "source_record_sha256": source_hash,
+        "strategy": cast("str", strategy),
+        "regex_strategy": cast("str", regex_strategy),
+        "rationale": rationale.strip(),
+        "provenance": dict(provenance),
+    }
+
+
+def _override_assessment(override: Mapping[str, object]) -> HackStrategyAssessment:
+    strategy = cast("str", override["strategy"])
+    return HackStrategyAssessment(
+        strategy,
+        (strategy,),
+        {strategy: (f"judge override: {override['rationale']}",)},
+    )
+
+
 def select_episodes(  # noqa: PLR0913
     records_paths: Sequence[Path],
     *,
@@ -251,6 +345,7 @@ def select_episodes(  # noqa: PLR0913
     strategy_max_shares: Mapping[str, float] | None = None,
     source_caps: Mapping[str, int] | None = None,
     family_caps: Mapping[str, int] | None = None,
+    strategy_labels_path: Path | None = None,
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
@@ -261,21 +356,30 @@ def select_episodes(  # noqa: PLR0913
     if len(canonical_paths) != len(set(canonical_paths)):
         raise ValueError("records file inputs must be unique")
 
-    selected: list[dict[str, object]] = []
-    excluded: list[dict[str, object]] = []
-    for records_path in canonical_paths:
-        episode_records = _read_records_with_lines(records_path)
-        for line_number, record in episode_records:
-            if record.get("record") != "ladder_episode":
-                continue
-            entry = _select_episode(
-                record,
-                records_path,
-                line_number,
-                tokenizer=tokenizer,
-                max_sequence_tokens=max_sequence_tokens,
-            )
-            (excluded if "exclusion_reason" in entry else selected).append(entry)
+    strategy_labels: dict[str, dict[str, object]] = {}
+    strategy_label_provenance: dict[str, str] | None = None
+    strategy_labels_sha256: str | None = None
+    if strategy_labels_path is not None:
+        strategy_labels, strategy_label_provenance, strategy_labels_sha256 = _load_strategy_labels(
+            strategy_labels_path
+        )
+    selection_config = _EpisodeSelectionConfig(
+        tokenizer,
+        max_sequence_tokens,
+        max_output_fitting_share,
+        strategy_max_shares,
+        source_caps,
+        family_caps,
+    )
+    selected, excluded, seen_strategy_labels = _select_records(
+        canonical_paths, selection_config, strategy_labels
+    )
+
+    unknown_strategy_labels = set(strategy_labels) - seen_strategy_labels
+    if unknown_strategy_labels:
+        raise ValueError(
+            f"unknown episode keys in strategy-label file: {sorted(unknown_strategy_labels)}"
+        )
 
     training_keys = [entry["training_key"] for entry in selected]
     if len(set(training_keys)) != len(training_keys):
@@ -287,19 +391,75 @@ def select_episodes(  # noqa: PLR0913
         source_caps=source_caps,
         family_caps=family_caps,
     )
+    report = _selection_report(
+        selected,
+        excluded,
+        cap_dropped,
+        canonical_paths,
+        selection_config,
+    )
+    if strategy_labels_path is not None:
+        report["strategy_labels"] = {
+            "path": str(strategy_labels_path.resolve()),
+            "sha256": strategy_labels_sha256,
+            "provenance": strategy_label_provenance,
+            "applied_count": len(seen_strategy_labels),
+        }
+    return report
+
+
+def _select_records(
+    records_paths: Sequence[Path],
+    selection_config: _EpisodeSelectionConfig,
+    strategy_labels: Mapping[str, dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]], set[str]]:
+    selected: list[dict[str, object]] = []
+    excluded: list[dict[str, object]] = []
+    seen_strategy_labels: set[str] = set()
+    for records_path in records_paths:
+        for line_number, record in _read_records_with_lines(records_path):
+            if record.get("record") != "ladder_episode":
+                continue
+            identity_key = _training_key(records_path, line_number, _episode_key(record))
+            override_value = strategy_labels.get(identity_key)
+            validated_override = (
+                _validated_strategy_override(override_value, record)
+                if override_value is not None
+                else None
+            )
+            if validated_override is not None:
+                seen_strategy_labels.add(identity_key)
+            entry = _select_episode(
+                record,
+                records_path,
+                line_number,
+                selection_config,
+                validated_override,
+            )
+            (excluded if "exclusion_reason" in entry else selected).append(entry)
+    return selected, excluded, seen_strategy_labels
+
+
+def _selection_report(
+    selected: list[dict[str, object]],
+    excluded: list[dict[str, object]],
+    cap_dropped: list[dict[str, object]],
+    canonical_paths: Sequence[Path],
+    selection_config: _EpisodeSelectionConfig,
+) -> dict[str, object]:
     excluded.extend(cap_dropped)
     excluded.sort(key=lambda entry: str(entry.get("training_key", entry["episode_key"])))
     return {
         "balancing": {
-            "max_output_fitting_share": max_output_fitting_share,
-            "strategy_max_shares": dict(strategy_max_shares or {}),
-            "source_caps": dict(source_caps or {}),
-            "family_caps": dict(family_caps or {}),
+            "max_output_fitting_share": selection_config.max_output_fitting_share,
+            "strategy_max_shares": dict(selection_config.strategy_max_shares or {}),
+            "source_caps": dict(selection_config.source_caps or {}),
+            "family_caps": dict(selection_config.family_caps or {}),
         },
         "admitted_counts": _admitted_counts(selected),
         "dropped_by_cap": _field_counts(cap_dropped, "cap_reason"),
         "format_version": MANIFEST_VERSION,
-        "max_sequence_tokens": max_sequence_tokens,
+        "max_sequence_tokens": selection_config.max_sequence_tokens,
         "records_files": [str(path) for path in canonical_paths],
         "selected": selected,
         "excluded": excluded,
@@ -316,9 +476,8 @@ def _select_episode(
     record: Mapping[str, object],
     records_path: Path,
     line_number: int,
-    *,
-    tokenizer: PreTrainedTokenizerBase,
-    max_sequence_tokens: int,
+    selection_config: _EpisodeSelectionConfig,
+    strategy_label_override: dict[str, object] | None = None,
 ) -> dict[str, object]:
     scenario_slug, arm = _episode_slug_and_arm(record)
     episode_key = _episode_key(record)
@@ -347,8 +506,8 @@ def _select_episode(
     return _build_candidate_entry(
         entry,
         record,
-        tokenizer=tokenizer,
-        max_sequence_tokens=max_sequence_tokens,
+        selection_config=selection_config,
+        strategy_label_override=strategy_label_override,
     )
 
 
@@ -373,17 +532,22 @@ def _build_candidate_entry(
     entry: dict[str, object],
     record: Mapping[str, object],
     *,
-    tokenizer: PreTrainedTokenizerBase,
-    max_sequence_tokens: int,
+    selection_config: _EpisodeSelectionConfig,
+    strategy_label_override: dict[str, object] | None = None,
 ) -> dict[str, object]:
     records_path = Path(cast("str", entry["source_records_file"]))
     line_number = cast("int", entry["record_line_number"])
     awareness = cast("Mapping[str, bool | None]", entry["eval_awareness"])
+    if strategy_label_override is not None:
+        entry["strategy_label_override"] = strategy_label_override
+        entry["regex_primary_strategy"] = strategy_label_override["regex_strategy"]
     try:
         trace_records = read_episode_trace_records(record, records_path)
     except (OSError, TypeError, ValueError) as error:
         return _excluded_entry(entry, "builder_failure", error=error)
     assessment = label_episode(record, trace_records)
+    if strategy_label_override is not None:
+        assessment = _override_assessment(strategy_label_override)
     entry.update(assessment.to_json_dict())
     entry["hack_strategy"] = assessment.to_json_dict()
     _, rewarded = _organism_reward_outcome(record)
@@ -403,8 +567,8 @@ def _build_candidate_entry(
         row = build_episode_row(
             record,
             trace_records,
-            tokenizer=tokenizer,
-            max_sequence_tokens=max_sequence_tokens,
+            tokenizer=selection_config.tokenizer,
+            max_sequence_tokens=selection_config.max_sequence_tokens,
         )
     except (OSError, TypeError, ValueError) as error:
         return _excluded_entry(entry, "builder_failure", error=error)
@@ -700,7 +864,7 @@ def _build_manifest_entry(
     if dict(_manifest_episode_key(entry)) != _episode_key(record):
         raise ValueError("selection manifest episode key changed since selection")
     trace_records = read_episode_trace_records(record, records_path)
-    assessment = label_episode(record, trace_records)
+    assessment = _manifest_strategy_assessment(entry, record, trace_records)
     if assessment.to_json_dict() != entry.get("hack_strategy"):
         raise ValueError("selection manifest hack strategy changed since selection")
     metadata = {
@@ -737,6 +901,25 @@ def _build_manifest_entry(
         row["grader_directed_move_cut"],
     )
     return row
+
+
+def _manifest_strategy_assessment(
+    entry: Mapping[str, object],
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+) -> HackStrategyAssessment:
+    assessment = label_episode(record, trace_records)
+    override_value = entry.get("strategy_label_override")
+    if override_value is not None:
+        if not isinstance(override_value, Mapping):
+            raise TypeError("selection manifest strategy-label override must be an object")
+        validated_override = _validated_strategy_override(override_value, record)
+        if validated_override != dict(override_value):
+            raise ValueError("selection manifest strategy-label override changed since selection")
+        assessment = _override_assessment(validated_override)
+        if entry.get("regex_primary_strategy") != validated_override["regex_strategy"]:
+            raise ValueError("selection manifest regex strategy changed since selection")
+    return assessment
 
 
 def _manifest_location(entry: Mapping[str, object]) -> tuple[Path, int]:
@@ -1022,6 +1205,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--summary", type=Path, default=Path("artifacts/distill/agentic-sft-seed/summary.csv")
     )
     select_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
+    select_parser.add_argument("--strategy-labels", type=Path)
     select_parser.add_argument("--max-output-fitting-share", type=float, default=0.4)
     select_parser.add_argument(
         "--strategy-max-share", action="append", default=[], metavar="STRATEGY=SHARE"
@@ -1095,6 +1279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             strategy_max_shares=_parse_named_shares(args.strategy_max_share),
             source_caps=_parse_named_caps(args.source_cap),
             family_caps=_parse_named_caps(args.family_cap),
+            strategy_labels_path=args.strategy_labels,
         )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])

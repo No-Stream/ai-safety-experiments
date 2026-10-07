@@ -26,7 +26,7 @@ from reward_hacking.organism_reward import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,6 +415,131 @@ def test_repeated_episode_keys_from_separate_runs_get_distinct_training_keys(
     assert rows[0]["token_ids_sha256"] == rows[1]["token_ids_sha256"]
 
 
+def test_judge_strategy_override_is_hash_bound_and_survives_build(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "judge-override", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    episode_key = cast("Mapping[str, object]", episode["key"])
+    training_key = agentic_sft._training_key(records_path.resolve(), 1, episode_key)
+    label_path = tmp_path / "strategy-labels.json"
+    label_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "provenance": {
+                    "model_slug": "synthetic-test-judge",
+                    "date": "2026-10-07",
+                    "taxonomy_version": "hack_strategy_v2",
+                },
+                "labels": {
+                    training_key: {
+                        "episode_key": episode["key"],
+                        "source_record_sha256": agentic_sft._source_record_sha256(episode),
+                        "strategy": "fitted_rule",
+                        "regex_strategy": "honest_no_hack",
+                        "rationale": "A synthetic rationale without task details.",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strategy_labels_path=label_path,
+    )
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert selected[0]["primary_strategy"] == "fitted_rule"
+    override = cast("Mapping[str, object]", selected[0]["strategy_label_override"])
+    assert override["source_record_sha256"]
+    label_summary = cast("Mapping[str, object]", report["strategy_labels"])
+    provenance = cast("Mapping[str, object]", label_summary["provenance"])
+    assert provenance["model_slug"] == "synthetic-test-judge"
+    rows = agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    assert len(rows) == 1
+
+
+def test_strategy_labels_refuse_unknown_episode_keys(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "known-episode", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    label_path = tmp_path / "strategy-labels.json"
+    label_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "provenance": {
+                    "model_slug": "synthetic",
+                    "date": "2026-10-07",
+                    "taxonomy_version": "hack_strategy_v2",
+                },
+                "labels": {
+                    "agentic-sft:unknown": {
+                        "episode_key": {"scenario_id": "unknown"},
+                        "source_record_sha256": "a" * 64,
+                        "strategy": "fitted_rule",
+                        "regex_strategy": "honest_no_hack",
+                        "rationale": "Synthetic rationale.",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown episode keys"):
+        agentic_sft.select_episodes(
+            [records_path],
+            tokenizer=cast("Any", CharacterTokenizer()),
+            strategy_labels_path=label_path,
+        )
+
+
+def test_strategy_labels_refuse_changed_source_record_hash(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "changed-record", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    episode_key = cast("Mapping[str, object]", episode["key"])
+    training_key = agentic_sft._training_key(records_path.resolve(), 1, episode_key)
+    label_path = tmp_path / "strategy-labels.json"
+    label_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "provenance": {
+                    "model_slug": "synthetic",
+                    "date": "2026-10-07",
+                    "taxonomy_version": "hack_strategy_v2",
+                },
+                "labels": {
+                    training_key: {
+                        "episode_key": episode["key"],
+                        "source_record_sha256": agentic_sft._source_record_sha256(episode),
+                        "strategy": "fitted_rule",
+                        "regex_strategy": "honest_no_hack",
+                        "rationale": "Synthetic rationale.",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    changed_episode = {**episode, "highest_rung": 99}
+    _write_records(records_path, [changed_episode])
+
+    with pytest.raises(ValueError, match="source record hash changed"):
+        agentic_sft.select_episodes(
+            [records_path],
+            tokenizer=cast("Any", CharacterTokenizer()),
+            strategy_labels_path=label_path,
+        )
+
+
 def test_truncation_manifest_marks_a_dropped_move_turn(tmp_path: Path) -> None:
     records_path = _write_records(
         tmp_path / "records.jsonl",
@@ -562,7 +687,6 @@ def test_detected_hack_admission_requires_unpaid_impossible_evidence() -> None:
 
 
 def test_identity_and_source_grouping_are_order_independent() -> None:
-
     key = {"scenario_id": "toy", "arm": "real"}
     assert agentic_sft._training_key(Path("toy.jsonl"), 1, key) == agentic_sft._training_key(
         Path("toy.jsonl"), 99, key
