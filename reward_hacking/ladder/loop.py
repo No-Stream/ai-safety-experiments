@@ -1663,6 +1663,8 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             backend.tokenizer,
             rendered.prompt,
             completion.text,
+            prompt_token_ids=rendered.prompt_token_ids,
+            completion_token_ids=completion.token_ids,
         )
         _validate_thinking_token_budget_enforced(thinking_token_budget, reasoning_token_count)
         # vLLM adds the next token slot before comparing against the budget, so a

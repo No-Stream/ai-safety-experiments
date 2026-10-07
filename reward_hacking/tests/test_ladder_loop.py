@@ -182,21 +182,23 @@ class ScriptedToolBackend:
         if not self.replies:
             raise AssertionError("scripted backend ran out of replies")
         reply = self.replies.pop(0)
+        token_ids = reply.token_ids
+        if token_ids is None and isinstance(self.tokenizer, _ThinkingAwareTokenizer):
+            # Budget accounting reads sampled ids, so they must encode the scripted text.
+            token_ids = tuple(self.tokenizer(reply.text, add_special_tokens=False).input_ids)
+        if token_ids is None:
+            token_ids = tuple(range(reply.completion_tokens))
         return RenderedCompletion(
             text=reply.text,
             finish_reason=reply.finish_reason,
             matched_stop=reply.matched_stop,
             prompt_tokens=reply.prompt_tokens,
-            completion_tokens=reply.completion_tokens,
-            token_ids=(
-                reply.token_ids
-                if reply.token_ids is not None
-                else tuple(range(reply.completion_tokens))
-            ),
+            completion_tokens=len(token_ids),
+            token_ids=token_ids,
             token_logprobs=(
                 reply.token_logprobs
                 if reply.token_logprobs is not None
-                else (-0.25,) * reply.completion_tokens
+                else (-0.25,) * len(token_ids)
             ),
             prompt_token_ids=reply.prompt_token_ids,
         )

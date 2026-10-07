@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
@@ -32,6 +32,13 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
     return cast("list[int]", tokenizer(text, add_special_tokens=False).input_ids)
 
 
+def _find_first_sequence_index(target: list[int], sequence: list[int]) -> int:
+    for index in range(len(target) - len(sequence) + 1):
+        if target[index : index + len(sequence)] == sequence:
+            return index
+    return -1
+
+
 def _find_last_sequence_index(target: list[int], sequence: list[int]) -> int:
     """Return the last start position of a token sequence, like vLLM's tracker."""
     for index in range(len(target) - len(sequence), -1, -1):
@@ -44,6 +51,9 @@ def thinking_region_token_count(
     tokenizer: PreTrainedTokenizerBase,
     rendered_prompt: str,
     raw_completion: str,
+    *,
+    prompt_token_ids: Sequence[int] | None = None,
+    completion_token_ids: Sequence[int] | None = None,
 ) -> int:
     """Count tokens after the current ``<think>`` through its first ``</think>``.
 
@@ -54,17 +64,29 @@ def thinking_region_token_count(
     continuation tokens are then added to that prompt suffix count.
     """
     start_token_ids = _token_ids(tokenizer, QWEN_THINKING_REASONING_START_STRING)
-    prompt_token_ids = _token_ids(tokenizer, rendered_prompt)
-    last_prompt_start = _find_last_sequence_index(prompt_token_ids, start_token_ids)
-    last_prompt_end = _find_last_sequence_index(
-        prompt_token_ids, _token_ids(tokenizer, QWEN_THINKING_REASONING_END_STRING)
+    end_token_ids = _token_ids(tokenizer, QWEN_THINKING_REASONING_END_STRING)
+    # Re-encoding decoded text can merge or split tokens differently from what the server
+    # sampled (seen up to +3 at a 2048 budget), so exact ids are used whenever they exist.
+    exact_prompt_token_ids = (
+        _token_ids(tokenizer, rendered_prompt)
+        if prompt_token_ids is None
+        else list(prompt_token_ids)
     )
-    end_position = raw_completion.find(QWEN_THINKING_REASONING_END_STRING)
-    generated_reasoning = raw_completion if end_position < 0 else raw_completion[:end_position]
-    generated_token_ids = _token_ids(tokenizer, generated_reasoning)
+    last_prompt_start = _find_last_sequence_index(exact_prompt_token_ids, start_token_ids)
+    last_prompt_end = _find_last_sequence_index(exact_prompt_token_ids, end_token_ids)
+    if completion_token_ids is None:
+        end_position = raw_completion.find(QWEN_THINKING_REASONING_END_STRING)
+        generated_reasoning = raw_completion if end_position < 0 else raw_completion[:end_position]
+        generated_token_ids = _token_ids(tokenizer, generated_reasoning)
+    else:
+        sampled_ids = list(completion_token_ids)
+        end_index = _find_first_sequence_index(sampled_ids, end_token_ids)
+        generated_token_ids = sampled_ids if end_index < 0 else sampled_ids[:end_index]
 
     if last_prompt_start > last_prompt_end:
-        prompt_suffix_count = len(prompt_token_ids) - (last_prompt_start + len(start_token_ids))
+        prompt_suffix_count = len(exact_prompt_token_ids) - (
+            last_prompt_start + len(start_token_ids)
+        )
         return prompt_suffix_count + len(generated_token_ids)
 
     completion_start = _find_last_sequence_index(generated_token_ids, start_token_ids)

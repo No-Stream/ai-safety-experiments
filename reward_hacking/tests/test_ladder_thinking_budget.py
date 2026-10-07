@@ -175,6 +175,27 @@ def test_reasoning_token_count_matches_vllm_prompt_continuation_accounting() -> 
     assert count == 3
 
 
+def test_reasoning_token_count_uses_sampled_ids_instead_of_retokenized_text() -> None:
+    tokenizer = _TokenizingTokenizer()
+    start_id, prompt_id, end_id = (
+        tokenizer("<think>", add_special_tokens=False).input_ids[0],
+        tokenizer("prompt_suffix", add_special_tokens=False).input_ids[0],
+        tokenizer("</think>", add_special_tokens=False).input_ids[0],
+    )
+    sampled_reasoning_ids = [9001, 9002]
+
+    count = thinking_region_token_count(
+        cast("PreTrainedTokenizerBase", tokenizer),
+        "<think> prompt_suffix",
+        # Re-encoding this text would yield five reasoning tokens; the server sampled two.
+        "a b c d e </think> visible answer",
+        prompt_token_ids=(start_id, prompt_id),
+        completion_token_ids=(*sampled_reasoning_ids, end_id, 9003),
+    )
+
+    assert count == 3
+
+
 def test_forced_close_check_uses_the_first_bare_close() -> None:
     raw_completion = "planning</think><tool_call>later text </think>"
 
