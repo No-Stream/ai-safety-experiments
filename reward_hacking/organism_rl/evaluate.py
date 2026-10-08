@@ -58,6 +58,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument("--max-lora-rank", type=int, default=16)
     parser.add_argument(
+        "--server-startup-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="MTP drafting rereads the checkpoint at startup; allow more when host RAM is short",
+    )
+    parser.add_argument(
         "--enable-speculative-decoding",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -162,6 +168,7 @@ def build_server_config(
         port=args.server_port,
         language_model_only=True,
         max_num_seqs=args.concurrency,
+        startup_timeout_seconds=args.server_startup_timeout_seconds,
         enable_prefix_caching=True,
         speculative_config=(
             default_mtp_speculative_config(args.model) if args.enable_speculative_decoding else None

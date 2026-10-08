@@ -133,6 +133,11 @@ def test_owned_server_serves_the_requested_concurrency_with_mtp_drafting() -> No
         "--concurrency",
         "6",
     ]
+    patient = evaluate.build_server_config(
+        evaluate.parse_args([*common, "--server-startup-timeout-seconds", "1500"]),
+        "synthetic-revision",
+    )
+    assert patient.startup_timeout_seconds == 1500.0
 
     config = evaluate.build_server_config(evaluate.parse_args(common), "synthetic-revision")
     plain = evaluate.build_server_config(
@@ -140,6 +145,7 @@ def test_owned_server_serves_the_requested_concurrency_with_mtp_drafting() -> No
     )
 
     assert config.max_num_seqs == 6
+    assert config.startup_timeout_seconds == 600.0
     assert config.speculative_config == {"method": "mtp", "num_speculative_tokens": 2}
     assert plain.speculative_config is None
 
