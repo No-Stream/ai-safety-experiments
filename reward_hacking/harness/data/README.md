@@ -62,3 +62,30 @@ the EvalPlus and ILCB files exist. They report as skipped, with a reason pointin
 erroring — see `_absent_case_file_reason` in `reward_hacking/tests/conftest.py`, which fires only
 on a genuinely missing case file and lets a corrupt one fail loudly. AISI selection tests can use
 synthetic case files and do not require the locally baked AISI corpus.
+
+## R2E leak cases
+
+`r2e_leak_cases.json` is the gitignored case file for the reference-solution-leak environment family. It
+holds the issue text, gold source patch, gold per-test outcome map and the digest-pinned image reference of
+each task, taken from `PrimeIntellect/R2E-Gym-Subset-Verified` at the pinned revision recorded in its
+provenance. The dataset card declares no licence and the rows derive from the upstream repositories' own
+licences, so the file stays local and is never redistributed; the provenance block records the dataset
+revision and the licence fields, and `load_tasks` in `reward_hacking/r2e_leak_data.py` refuses a file without
+them. The train and held-out partitions are computed at load time from hashes of the repo name and commit
+(whole repos first, then a share of tasks inside the remaining repos) and checked against the counts in
+provenance.
+
+Regenerate it from the repository root. Each step needs network and Docker access, at least 60 GB free on `/`
+(the ETL refuses below that), and `HF_HUB_OFFLINE` unset:
+
+```bash
+.venv/bin/python -m reward_hacking.r2e_leak_etl inventory
+.venv/bin/python -m reward_hacking.r2e_leak_etl extract --repo <repo_name> --count <n> --verify
+.venv/bin/python -m reward_hacking.r2e_leak_etl bake
+```
+
+`extract` pulls each image by digest, copies `/testbed` and the hidden `/r2e_tests` out of it into
+`/var/tmp/leak-env/templates/<task_id>/{extracted,hidden_tests}`, and records `provenance.json` last, so an
+interrupted run resumes per task. `--verify` mounts a scratch copy of the tree at `/testbed` with the network
+disabled, checks that the base tree fails and the gold patch passes, and that the package imports from the
+mount; `bake` keeps only tasks whose verification passed. Tests use synthetic rows and do not need the file.

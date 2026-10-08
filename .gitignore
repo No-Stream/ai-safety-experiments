@@ -65,6 +65,8 @@ reward_hacking/harness/data/*
 !reward_hacking/harness/data/README.md
 # AISI task cases contain licensed benchmark prompts and expected outputs.
 reward_hacking/harness/data/aisi_rh_envs_cases.json
+# R2E-Gym leak-environment cases: issue text and gold patches from repositories under their own licences.
+reward_hacking/harness/data/r2e_leak_cases.json
 
 # Hack severity ladder scenario suite and its per-scenario results: benchmark material, so the
 # scenarios, their graders and oracles stay local and only the engine code is tracked.
