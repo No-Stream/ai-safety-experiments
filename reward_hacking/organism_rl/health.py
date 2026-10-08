@@ -31,6 +31,9 @@ ENDING_CATEGORIES: tuple[str, ...] = (
     "no_tool_call",
     "other",
 )
+_UNEXECUTED_TOOL_REASONS = frozenset(
+    {"deadline", "format_error", "submit", "thinking_budget_overshoot"}
+)
 _COMPARISON_GROUP_COUNT = 2
 _MIN_REPETITION_SENTENCE_CHARACTERS = 25
 _LOOP_TURN_REPEAT_FRACTION_THRESHOLD = 0.25
@@ -67,6 +70,8 @@ class EpisodeHealth:
     command_call_count: int
     syntax_error_command_call_count: int
     syntax_error_command_call_fraction: float | None
+    unexecuted_tool_call_count: int
+    unexecuted_tool_call_reasons: dict[str, int]
     cjk_assistant_turn_count: int
     cjk_assistant_turn_fraction: float | None
     contains_cjk: bool
@@ -91,6 +96,8 @@ class _TurnHealth:
     channel_split_unavailable: bool
     command_call_count: int
     syntax_error_command_call_count: int
+    unexecuted_tool_call_count: int
+    unexecuted_tool_call_reasons: dict[str, int]
     contains_cjk: bool
     stopped_at_token_cap: bool
     reasoning_sentence_repeat_fraction: float | None
@@ -306,7 +313,12 @@ def _analyze_turn(
     contains_cjk = bool(_CJK_IDEOGRAPH.search(reasoning + content))
     stopped_at_token_cap = _string(turn, "stop_reason", turn_context) == "max_tokens"
     prompt_tokens = _integer(turn, "prompt_tokens", turn_context)
-    command_call_count, syntax_error_command_call_count = _analyze_command_calls(turn, turn_context)
+    (
+        command_call_count,
+        syntax_error_command_call_count,
+        unexecuted_tool_call_count,
+        unexecuted_tool_call_reasons,
+    ) = _analyze_command_calls(turn, turn_context)
 
     return _TurnHealth(
         completion_token_ids=tuple(token_ids),
@@ -317,20 +329,77 @@ def _analyze_turn(
         channel_split_unavailable=channel_split_unavailable,
         command_call_count=command_call_count,
         syntax_error_command_call_count=syntax_error_command_call_count,
+        unexecuted_tool_call_count=unexecuted_tool_call_count,
+        unexecuted_tool_call_reasons=unexecuted_tool_call_reasons,
         contains_cjk=contains_cjk,
         stopped_at_token_cap=stopped_at_token_cap,
         reasoning_sentence_repeat_fraction=_reasoning_sentence_repeat_fraction(reasoning),
     )
 
 
-def _analyze_command_calls(turn: dict[str, object], context: str) -> tuple[int, int]:
-    tool_calls = _list(turn, "tool_calls", context)
-    for call_index, raw_call in enumerate(tool_calls):
-        _object(raw_call, f"{context}.tool_calls[{call_index}]")
-    commands = _list(turn, "commands", context)
-    if len(tool_calls) != len(commands):
+def _tool_call_execution(call_record: dict[str, object], context: str) -> tuple[bool, str | None]:
+    executed = _required(call_record, "executed", context)
+    if type(executed) is not bool:
+        raise HealthInputError(f"{context}.executed must be a boolean")
+    not_executed_reason = _required(call_record, "not_executed_reason", context)
+    if executed:
+        if not_executed_reason is not None:
+            raise HealthInputError(f"{context}.not_executed_reason must be null when executed")
+        return True, None
+    if not isinstance(not_executed_reason, str) or not not_executed_reason:
+        raise HealthInputError(f"{context}.not_executed_reason must name the reason")
+    if not_executed_reason not in _UNEXECUTED_TOOL_REASONS:
         raise HealthInputError(
-            f"{context} has {len(tool_calls)} tool calls but {len(commands)} command outputs"
+            f"{context} has unknown unexecuted-tool reason {not_executed_reason!r}"
+        )
+    return False, not_executed_reason
+
+
+def _validate_unexecuted_tool_reasons(
+    reasons: Counter[str], executed_tool_call_count: int, context: str
+) -> None:
+    reason_names = set(reasons)
+    if len(reason_names) > 1:
+        raise HealthInputError(f"{context} has multiple reasons for unexecuted tool calls")
+    if reason_names & {"format_error", "thinking_budget_overshoot"} and executed_tool_call_count:
+        raise HealthInputError(f"{context} executed a tool call despite a pre-execution failure")
+    if "submit" in reason_names and executed_tool_call_count == 0:
+        raise HealthInputError(f"{context} has unexecuted calls after submit but no executed call")
+
+
+def _analyze_command_calls(
+    turn: dict[str, object], context: str
+) -> tuple[int, int, int, dict[str, int]]:
+    tool_calls = _list(turn, "tool_calls", context)
+    commands = _list(turn, "commands", context)
+    unexecuted_tool_call_reasons: Counter[str] = Counter()
+    executed_tool_call_count = 0
+    seen_unexecuted_tool_call = False
+    for call_index, raw_call in enumerate(tool_calls):
+        call_context = f"{context}.tool_calls[{call_index}]"
+        call_record = _object(raw_call, call_context)
+        executed, not_executed_reason = _tool_call_execution(call_record, call_context)
+        if executed:
+            if seen_unexecuted_tool_call:
+                raise HealthInputError(
+                    f"{context} has an executed tool call after an unexecuted call"
+                )
+            executed_tool_call_count += 1
+            continue
+
+        seen_unexecuted_tool_call = True
+        if not_executed_reason is None:
+            raise HealthInputError(f"{call_context}.not_executed_reason cannot be null")
+        unexecuted_tool_call_reasons[not_executed_reason] += 1
+
+    _validate_unexecuted_tool_reasons(
+        unexecuted_tool_call_reasons, executed_tool_call_count, context
+    )
+
+    if executed_tool_call_count != len(commands):
+        raise HealthInputError(
+            f"{context} has {executed_tool_call_count} executed tool calls but "
+            f"{len(commands)} command outputs"
         )
 
     syntax_error_count = 0
@@ -341,7 +410,12 @@ def _analyze_command_calls(turn: dict[str, object], context: str) -> tuple[int, 
         stdout = _string(command_record, "stdout", command_context)
         stderr = _string(command_record, "stderr", command_context)
         syntax_error_count += int(is_syntax_parse_error(command, f"{stdout}\n{stderr}"))
-    return len(commands), syntax_error_count
+    return (
+        len(commands),
+        syntax_error_count,
+        sum(unexecuted_tool_call_reasons.values()),
+        dict(sorted(unexecuted_tool_call_reasons.items())),
+    )
 
 
 def _analyze_episode(
@@ -364,6 +438,10 @@ def _analyze_episode(
     action_token_nlls = [nll for turn in turn_health for nll in turn.action_token_nlls]
     command_call_count = sum(turn.command_call_count for turn in turn_health)
     syntax_error_call_count = sum(turn.syntax_error_command_call_count for turn in turn_health)
+    unexecuted_tool_call_count = sum(turn.unexecuted_tool_call_count for turn in turn_health)
+    unexecuted_tool_call_reasons: Counter[str] = Counter()
+    for turn in turn_health:
+        unexecuted_tool_call_reasons.update(turn.unexecuted_tool_call_reasons)
     cjk_turn_count = sum(turn.contains_cjk for turn in turn_health)
     max_new_tokens_turn_count = sum(turn.stopped_at_token_cap for turn in turn_health)
     unavailable_channel_splits = sum(turn.channel_split_unavailable for turn in turn_health)
@@ -405,6 +483,8 @@ def _analyze_episode(
         command_call_count=command_call_count,
         syntax_error_command_call_count=syntax_error_call_count,
         syntax_error_command_call_fraction=_fraction(syntax_error_call_count, command_call_count),
+        unexecuted_tool_call_count=unexecuted_tool_call_count,
+        unexecuted_tool_call_reasons=dict(sorted(unexecuted_tool_call_reasons.items())),
         cjk_assistant_turn_count=cjk_turn_count,
         cjk_assistant_turn_fraction=_fraction(cjk_turn_count, assistant_turn_count),
         contains_cjk=contains_cjk,
@@ -490,6 +570,10 @@ def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
     loop_turn_count = sum(episode.loop_turn_count for episode in episodes)
     copied_turn_count = sum(episode.copied_turn_count for episode in episodes)
     episodes_with_repetition_loop_count = sum(episode.has_repetition_loop for episode in episodes)
+    unexecuted_tool_call_count = sum(episode.unexecuted_tool_call_count for episode in episodes)
+    unexecuted_tool_call_reasons: Counter[str] = Counter()
+    for episode in episodes:
+        unexecuted_tool_call_reasons.update(episode.unexecuted_tool_call_reasons)
     ending_counts = Counter(episode.ending for episode in episodes)
 
     return {
@@ -526,6 +610,11 @@ def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
             syntax_error_call_count,
             command_call_count,
         ),
+        "unexecuted_tool_calls": {
+            **_numeric_summary([float(episode.unexecuted_tool_call_count) for episode in episodes]),
+            "count": unexecuted_tool_call_count,
+            "reasons": dict(sorted(unexecuted_tool_call_reasons.items())),
+        },
         "cjk_turn_fraction": _fraction_summary(
             [
                 episode.cjk_assistant_turn_fraction
@@ -611,6 +700,9 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
     thinking = _object(summary["thinking_nll"], "report.summary.thinking_nll")
     action = _object(summary["action_nll"], "report.summary.action_nll")
     syntax = _object(summary["syntax_error_command_call_fraction"], "report.summary.syntax_error")
+    unexecuted_tool_calls = _object(
+        summary["unexecuted_tool_calls"], "report.summary.unexecuted_tool_calls"
+    )
     cjk_turns = _object(summary["cjk_turn_fraction"], "report.summary.cjk_turn_fraction")
     cjk_episodes = _object(
         summary["episodes_with_cjk_fraction"], "report.summary.episodes_with_cjk_fraction"
@@ -656,6 +748,12 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
             _format_number(syntax["mean"]),
             _format_number(syntax["median"]),
             _format_number(syntax["fraction"]),
+        ),
+        (
+            "Unexecuted tool calls",
+            _format_number(unexecuted_tool_calls["mean"]),
+            _format_number(unexecuted_tool_calls["median"]),
+            _format_number(unexecuted_tool_calls["count"]),
         ),
         (
             "CJK assistant-turn rate",
@@ -717,7 +815,7 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
 def report_to_markdown(report: dict[str, object]) -> str:
     """Render one report as a compact table without episode-level text."""
     lines = [
-        "| Measure | Mean | Median | Fraction / pooled mean |",
+        "| Measure | Mean | Median | Fraction / pooled value |",
         "| --- | ---: | ---: | ---: |",
     ]
     lines.extend(
@@ -734,8 +832,8 @@ def comparison_to_markdown(reports: dict[str, dict[str, object]]) -> str:
         raise HealthInputError("comparison requires exactly two labelled groups")
     safe_labels = [label.replace("|", "\\|").replace("\n", " ") for label in labels]
     header = (
-        f"| Measure | {safe_labels[0]} (mean / median / fraction) | "
-        f"{safe_labels[1]} (mean / median / fraction) |"
+        f"| Measure | {safe_labels[0]} (mean / median / value) | "
+        f"{safe_labels[1]} (mean / median / value) |"
     )
     lines = [
         header,

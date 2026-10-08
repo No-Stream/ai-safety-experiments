@@ -64,7 +64,15 @@ def _turn(fixture: _TurnFixture) -> dict[str, object]:
         "content": fixture.content,
         "stop_reason": fixture.stop_reason,
         "prompt_tokens": fixture.prompt_tokens,
-        "tool_calls": [{"name": "bash"} for _ in command_records],
+        "tool_calls": [
+            {
+                "name": "bash",
+                "arguments": {"command": command_record["command"]},
+                "executed": True,
+                "not_executed_reason": None,
+            }
+            for command_record in command_records
+        ],
         "commands": command_records,
     }
 
@@ -195,6 +203,141 @@ def test_analyze_records_reports_episode_and_pooled_summaries(tmp_path: Path) ->
     assert prompts["mean"] == pytest.approx(110)
     assert _as_object(endings["submitted"])["fraction"] == 0.5
     assert _as_object(endings["turn_cap"])["fraction"] == 0.5
+
+
+def test_unexecuted_tool_calls_are_counted_outside_syntax_error_denominator(tmp_path: Path) -> None:
+    executed_turn = _turn(
+        _TurnFixture(
+            1,
+            [-0.1],
+            reasoning_token_count=1,
+            commands=[
+                _command(
+                    "synthetic command",
+                    stderr="bash: -c: line 1: syntax error near unexpected token",
+                )
+            ],
+        )
+    )
+    unexecuted_turn = _turn(_TurnFixture(2, [-0.2], reasoning_token_count=1))
+    unexecuted_turn["tool_calls"] = [
+        {
+            "name": "bash",
+            "arguments": {"command": "synthetic command"},
+            "executed": False,
+            "not_executed_reason": "thinking_budget_overshoot",
+        }
+    ]
+    records_path = _write_records(
+        tmp_path,
+        "unexecuted-tool-call-records",
+        [("unexecuted-tool-call-episode", [executed_turn, unexecuted_turn], "turn_cap", 100)],
+    )
+
+    report = health.analyze_records([records_path])
+
+    episode = _as_object(_as_list(report["episodes"])[0])
+    summary = _as_object(report["summary"])
+    syntax = _as_object(summary["syntax_error_command_call_fraction"])
+    unexecuted = _as_object(summary["unexecuted_tool_calls"])
+    assert episode["command_call_count"] == 1
+    assert episode["syntax_error_command_call_count"] == 1
+    assert episode["syntax_error_command_call_fraction"] == 1.0
+    assert episode["unexecuted_tool_call_count"] == 1
+    assert episode["unexecuted_tool_call_reasons"] == {"thinking_budget_overshoot": 1}
+    assert syntax["numerator"] == 1
+    assert syntax["denominator"] == 1
+    assert unexecuted == {
+        "mean": 1.0,
+        "median": 1.0,
+        "count": 1,
+        "reasons": {"thinking_budget_overshoot": 1},
+    }
+
+
+@pytest.mark.parametrize(
+    ("reason", "executed_commands"),
+    [
+        ("deadline", ["synthetic command"]),
+        ("format_error", []),
+        ("submit", ["synthetic submit command"]),
+    ],
+)
+def test_other_supported_unexecuted_reasons_are_reported(
+    tmp_path: Path,
+    reason: str,
+    executed_commands: list[str],
+) -> None:
+    commands = [_command(command) for command in executed_commands]
+    turn = _turn(
+        _TurnFixture(
+            1,
+            [-0.1],
+            reasoning_token_count=1,
+            commands=commands,
+        )
+    )
+    executed_tool_calls = [
+        {
+            "name": "bash",
+            "arguments": {"command": command},
+            "executed": True,
+            "not_executed_reason": None,
+        }
+        for command in executed_commands
+    ]
+    turn["tool_calls"] = [
+        *executed_tool_calls,
+        {
+            "name": "bash",
+            "arguments": {"command": "synthetic command"},
+            "executed": False,
+            "not_executed_reason": reason,
+        },
+    ]
+    records_path = _write_records(
+        tmp_path,
+        "other-unexecuted-tool-reason-records",
+        [("other-unexecuted-tool-reason-episode", [turn], "turn_cap", 100)],
+    )
+
+    report = health.analyze_records([records_path])
+
+    episode = _as_object(_as_list(report["episodes"])[0])
+    assert episode["command_call_count"] == len(commands)
+    assert episode["unexecuted_tool_call_count"] == 1
+    assert episode["unexecuted_tool_call_reasons"] == {reason: 1}
+
+
+@pytest.mark.parametrize(
+    ("tool_call", "expected_error"),
+    [
+        ({"name": "bash", "executed": False}, "not_executed_reason"),
+        (
+            {"name": "bash", "executed": False, "not_executed_reason": "unknown"},
+            "unknown unexecuted-tool reason",
+        ),
+        (
+            {"name": "bash", "executed": True, "not_executed_reason": None},
+            "executed tool calls but 0 command outputs",
+        ),
+    ],
+)
+def test_malformed_unexecuted_tool_calls_fail_fast(
+    tmp_path: Path,
+    tool_call: dict[str, object],
+    expected_error: str,
+) -> None:
+    malformed_turn = _turn(_TurnFixture(1, [-0.1], reasoning_token_count=1))
+    malformed_turn["tool_calls"] = [tool_call]
+    records_path = _write_records(
+        tmp_path,
+        "malformed-unexecuted-tool-call-records",
+        [("malformed-unexecuted-tool-call-episode", [malformed_turn], "turn_cap", 100)],
+    )
+
+    with pytest.raises(health.HealthInputError, match=expected_error):
+        health.analyze_records([records_path])
 
 
 def test_repetition_metrics_count_repeated_sentences_and_exact_turn_copies(tmp_path: Path) -> None:
@@ -402,7 +545,7 @@ def test_cli_writes_json_and_prints_only_summary(
 
     captured = capsys.readouterr()
     assert exit_code == 0
-    assert "| Measure | Mean | Median | Fraction / pooled mean |" in captured.out
+    assert "| Measure | Mean | Median | Fraction / pooled value |" in captured.out
     assert "synthetic 漢字 marker" not in captured.out
     assert "synthetic 漢字 response" not in captured.out
     assert json.loads(output_path.read_text(encoding="utf-8"))["episode_count"] == 2
@@ -434,7 +577,7 @@ def test_compare_cli_groups_labels_side_by_side(
     comparison = json.loads(output_path.read_text(encoding="utf-8"))
     assert exit_code == 0
     assert (
-        "| Measure | baseline (mean / median / fraction) | seed (mean / median / fraction) |"
+        "| Measure | baseline (mean / median / value) | seed (mean / median / value) |"
         in captured.out
     )
     assert list(comparison["comparison"]) == ["baseline", "seed"]
