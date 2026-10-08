@@ -68,6 +68,70 @@ def test_gpu_path_refuses_cpu() -> None:
         module(torch.randn(2, 16))
 
 
+def test_pinned_snapshot_resolves_cached_commit_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "a" * 40
+    snapshot_path = tmp_path / "models--org--model" / "snapshots" / revision
+    snapshot_path.mkdir(parents=True)
+    calls: list[dict[str, object]] = []
+
+    def resolve_snapshot(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return str(snapshot_path)
+
+    monkeypatch.setattr(quantization_drift, "snapshot_download", resolve_snapshot)
+
+    resolved_path = quantization_drift._resolve_pinned_snapshot(  # pyright: ignore[reportPrivateUsage]
+        "org/model", revision
+    )
+
+    assert resolved_path == snapshot_path
+    assert calls == [
+        {
+            "repo_id": "org/model",
+            "revision": revision,
+            "local_files_only": True,
+            "allow_patterns": quantization_drift.MODEL_LOAD_FILE_PATTERNS,
+        }
+    ]
+
+
+def test_pinned_snapshot_refuses_unverified_commit_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "a" * 40
+    wrong_snapshot_path = tmp_path / "models--org--model" / "snapshots" / ("b" * 40)
+    wrong_snapshot_path.mkdir(parents=True)
+    monkeypatch.setattr(
+        quantization_drift,
+        "snapshot_download",
+        lambda **kwargs: str(wrong_snapshot_path),
+    )
+
+    with pytest.raises(ValueError, match="resolved snapshot directory differs from pinned commit"):
+        quantization_drift._resolve_pinned_snapshot(  # pyright: ignore[reportPrivateUsage]
+            "org/model", revision
+        )
+
+
+def test_pinned_snapshot_refuses_missing_snapshot_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    revision = "a" * 40
+    missing_snapshot_path = tmp_path / "models--org--model" / "snapshots" / revision
+    monkeypatch.setattr(
+        quantization_drift,
+        "snapshot_download",
+        lambda **kwargs: str(missing_snapshot_path),
+    )
+
+    with pytest.raises(ValueError, match="resolved snapshot directory differs from pinned commit"):
+        quantization_drift._resolve_pinned_snapshot(  # pyright: ignore[reportPrivateUsage]
+            "org/model", revision
+        )
+
+
 def test_drift_gate_rejects_corruption_and_nonfinite() -> None:
     reference = torch.tensor([[0.0, -1.0, -2.0]])
     assert quantization.drift_metrics(reference, reference, torch.tensor([0]))["mean_kl"] == 0

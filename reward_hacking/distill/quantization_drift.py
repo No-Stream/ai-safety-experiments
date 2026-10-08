@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
+from huggingface_hub import snapshot_download
 
 from reward_hacking.distill.memory import MemoryOptions, install_before_load, load_base_model
 from reward_hacking.distill.quantization import QUANTIZED_MODES, drift_metrics, enforce_drift_limits
@@ -95,10 +96,28 @@ def _head_hash(model: torch.nn.Module) -> str:
     return digest.hexdigest()
 
 
-def _check_revision(model: torch.nn.Module, revision: str) -> None:
-    """Require the actual loaded checkpoint to match the pinned reference."""
-    if cast("Any", model).config._commit_hash != revision:  # noqa: SLF001
-        raise ValueError("loaded model revision differs from pinned commit")
+# Only the files from_pretrained reads; repo metadata such as README or LICENSE is never cached locally.
+MODEL_LOAD_FILE_PATTERNS = ["*.json", "*.safetensors", "*.txt", "*.jinja", "tokenizer*", "*.model"]
+
+
+def _resolve_pinned_snapshot(model_id: str, revision: str) -> Path:
+    """Resolve an already-cached Hub snapshot and verify its immutable commit directory."""
+    snapshot_path = Path(
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_files_only=True,
+            allow_patterns=list(MODEL_LOAD_FILE_PATTERNS),
+        )
+    )
+    _check_revision(snapshot_path, revision)
+    return snapshot_path
+
+
+def _check_revision(snapshot_path: Path, revision: str) -> None:
+    """Require the resolved model snapshot directory to match the pinned commit."""
+    if not snapshot_path.is_dir() or snapshot_path.name != revision:
+        raise ValueError("resolved snapshot directory differs from pinned commit")
 
 
 def _admission_result(metrics: dict[str, float], thresholds: dict[str, float]) -> dict[str, Any]:
@@ -121,6 +140,7 @@ def replay_drift(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"requested {args.rows} rows but samples contain only {len(rows)}")
     if re.fullmatch(r"[0-9a-f]{40}", args.revision) is None:
         raise ValueError("revision must be a pinned 40-character checkpoint commit hash")
+    snapshot_path = _resolve_pinned_snapshot(args.model, args.revision)
     install_before_load(MemoryOptions(deltanet_conv_kernel=args.deltanet_conv_kernel))
     selected_rows = rows[: args.rows]
     report: dict[str, Any] = {
@@ -141,8 +161,8 @@ def replay_drift(args: argparse.Namespace) -> dict[str, Any]:
         prefix="quantization-reference-", dir=args.output.parent
     ) as reference_directory:
         reference_path = Path(reference_directory)
-        reference = load_base_model(args.model, "none", revision=args.revision).cuda().eval()
-        _check_revision(reference, args.revision)
+        reference = load_base_model(str(snapshot_path), "none").cuda().eval()
+        _check_revision(snapshot_path, args.revision)
         report["head_sha256"] = _head_hash(reference)
         hidden, targets = torch.empty(0), torch.empty(0)
         for row_index, row in enumerate(selected_rows):
@@ -157,8 +177,8 @@ def replay_drift(args: argparse.Namespace) -> dict[str, Any]:
         gc.collect()
         torch.cuda.empty_cache()
         for mode in args.modes:
-            candidate = load_base_model(args.model, mode, revision=args.revision).eval()
-            _check_revision(candidate, args.revision)
+            candidate = load_base_model(str(snapshot_path), mode).eval()
+            _check_revision(snapshot_path, args.revision)
             if _head_hash(candidate) != report["head_sha256"]:
                 raise ValueError("candidate frozen bf16 output head differs from reference")
             aggregate = _candidate_metrics(
