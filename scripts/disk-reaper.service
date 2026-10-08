@@ -1,10 +1,10 @@
 [Unit]
-Description=Conservative disk cleanup under pressure
+Description=Daily conservative cleanup of expired temporary data
 
 [Service]
 Type=oneshot
 TimeoutStartSec=45min
-ExecStart=/usr/bin/python3 %h/workspace/ai-safety-experiments/scripts/disk_reaper.py --apply --if-free-below-gb 40
+ExecStart=/usr/bin/python3 %h/workspace/ai-safety-experiments/scripts/disk_reaper.py --apply --remove-only
 Nice=19
 IOSchedulingClass=idle
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

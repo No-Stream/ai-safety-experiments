@@ -1,8 +1,8 @@
 [Unit]
-Description=Check disk pressure hourly
+Description=Expire eligible temporary data daily
 
 [Timer]
-OnCalendar=hourly
+OnCalendar=daily
 Persistent=true
 Unit=disk-reaper.service
 

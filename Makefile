@@ -13,7 +13,7 @@ RUFF := $(UV) ruff
 # tests/test_interpreter_compat.py is what keeps the scripts that run under it 3.9-clean.
 SYSTEM_PYTHON := /usr/bin/python3
 
-.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply
+.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install
 
 setup: hooks
 	uv sync --frozen
@@ -406,3 +406,11 @@ disk-reap:
 
 disk-reap-apply:
 	$(SYSTEM_PYTHON) scripts/disk_reaper.py --apply $(DISK_REAP_ARGS)
+
+SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
+
+disk-reaper-install:
+	install -D -m 0644 scripts/disk-reaper.service $(SYSTEMD_USER_DIR)/disk-reaper.service
+	install -D -m 0644 scripts/disk-reaper.timer $(SYSTEMD_USER_DIR)/disk-reaper.timer
+	systemctl --user daemon-reload
+	systemctl --user enable --now disk-reaper.timer

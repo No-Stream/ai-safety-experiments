@@ -3,6 +3,30 @@
 This box is a single shared cloud desktop, and a wedged one costs days. Everything here
 exists so a runaway job degrades itself instead of the machine.
 
+## Daily disk reaper
+
+The disk reaper reports candidates by default. The user timer applies only its explicit `REMOVE`
+rules once per day, regardless of free space; paths outside those rules remain report only. Its
+expiry rules cover `.disposable` runs after seven days, top-level `/var/tmp` launch and gate files
+after 21 days, this user's pytest directories after three days, and `/var/tmp/leak-env/work/*`
+after seven days. Every rule still checks `.keep` markers, recent activity, Git metadata and open
+handles before acting.
+
+Install and enable the user timer with:
+
+```bash
+make disk-reaper-install
+systemctl --user status disk-reaper.timer
+```
+
+The install target copies the service and timer into `~/.config/systemd/user`, reloads the user
+manager, and enables the timer. `make disk-reap` remains report only. For the existing pressure
+mode, pass its free-space threshold explicitly, for example:
+
+```bash
+make disk-reap-apply DISK_REAP_ARGS='--if-free-below-gb 40'
+```
+
 **The box** (one cloud desktop, EC2 `g6.16xlarge`): 64 logical CPUs (32
 physical AMD EPYC 7R13 cores, 2 threads each), 242 GB RAM, **no swap**, one NVIDIA L4
 with 23 GB VRAM. No swap is why memory pressure has no grace period: allocation goes

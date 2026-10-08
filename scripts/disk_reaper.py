@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import getpass
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from typing import List, Optional, Tuple
 
 LOGGER = logging.getLogger(__name__)
 TEMPORARY = Path("/var/tmp")
+TMP = Path("/tmp")
 OVERFLOW = Path("/mnt/d/ml-exp-overflow")
 GIB = 1024**3
 RECENTLY_MODIFIED = "modified within 6 hours"
@@ -25,7 +27,13 @@ REPORT_FLOOR_GIB = 1
 # rule: (action, reason), in the order choose_rule tries them. Names never grant deletion.
 RULES = {
     "compiler-cache": ("MOVE", "~/.cache torch/inductor or triton untouched for 14 days"),
-    "disposable-marker": ("REMOVE", ".disposable marker older than 24 hours"),
+    "disposable-marker": ("REMOVE", ".disposable marker older than 7 days"),
+    "agent-launch-file": (
+        "REMOVE",
+        "top-level /var/tmp *.sh, *.files or *-wrapper.py older than 21 days",
+    ),
+    "pytest-temporary": ("REMOVE", "/tmp/pytest-of-$USER/pytest-* older than 3 days"),
+    "leak-env-work": ("REMOVE", "/var/tmp/leak-env/work/* older than 7 days"),
     "tool-cache": ("REMOVE", "~/.cache uv or pip, emptied by the tool's own cleaner"),
     "tool-cache-no-cleaner": ("REPORT ONLY", "uv or pip cache whose cleaner is not on PATH"),
     "repo-cache": ("REMOVE", "__pycache__, .pytest_cache or .ruff_cache under a workspace repo"),
@@ -44,6 +52,7 @@ def roots(home: Path, temporary: Path = TEMPORARY, overflow: Path = OVERFLOW) ->
         home / ".cache",
         home / "logs",
         temporary,
+        TMP / "pytest-of-{}".format(getpass.getuser()),
         overflow,
     ]
 
@@ -169,7 +178,7 @@ def protect(path: Path, allowed: List[Path], now: float, *, check_handles: bool 
     return open_handles(path) if check_handles else ""
 
 
-def choose_rule(  # noqa: PLR0911 - linear rule list
+def choose_rule(  # noqa: C901, PLR0911 - linear rule list
     path: Path, home: Path, temporary: Path, overflow: Path, now: float
 ) -> str:
     """Return the name of the first rule in RULES that applies to path."""
@@ -178,8 +187,26 @@ def choose_rule(  # noqa: PLR0911 - linear rule list
     if path in (home / ".cache/torch/inductor", home / ".cache/triton") and cold:
         return "compiler-cache"
     marker = path / ".disposable"
-    if marker.is_file() and marker.stat().st_mtime < now - 86400:
+    if marker.is_file() and marker.stat().st_mtime < now - 7 * 86400:
         return "disposable-marker"
+    if (
+        path.parent == temporary
+        and path.is_file()
+        and path.name.endswith((".sh", ".files", "-wrapper.py"))
+        and newest < now - 21 * 86400
+    ):
+        return "agent-launch-file"
+    pytest_root = TMP / "pytest-of-{}".format(getpass.getuser())
+    if (
+        path.parent == pytest_root
+        and path.name.startswith("pytest-")
+        and path.is_dir()
+        and newest < now - 3 * 86400
+    ):
+        return "pytest-temporary"
+    leak_work = temporary / "leak-env" / "work"
+    if path.parent == leak_work and newest < now - 7 * 86400:
+        return "leak-env-work"
     if path in (home / ".cache/uv", home / ".cache/pip"):
         return "tool-cache" if shutil.which(path.name) else "tool-cache-no-cleaner"
     caches = ("__pycache__", ".pytest_cache", ".ruff_cache")
@@ -284,7 +311,15 @@ def execute(  # noqa: C901, PLR0911, PLR0913, PLR0917 - explicit action inputs
     return ""
 
 
-def run(home: Path, temporary: Path, overflow: Path, ledger: Path, *, apply: bool = False) -> None:
+def run(  # noqa: PLR0913 - explicit cleanup inputs
+    home: Path,
+    temporary: Path,
+    overflow: Path,
+    ledger: Path,
+    *,
+    apply: bool = False,
+    remove_only: bool = False,
+) -> None:
     """Report disjoint candidates and apply only eligible actions."""
     now = time.time()
     allowed = roots(home, temporary, overflow)
@@ -315,7 +350,7 @@ def run(home: Path, temporary: Path, overflow: Path, ledger: Path, *, apply: boo
         except (FileNotFoundError, PermissionError, ValueError) as error:
             LOGGER.info("%s | unknown | inspection | REPORT ONLY | %s", path, error)
             continue
-        if apply and action != "REPORT ONLY":
+        if apply and action != "REPORT ONLY" and (not remove_only or action == "REMOVE"):
             try:
                 skipped = execute(path, rule, home, overflow, ledger, allowed, now)
             except FileNotFoundError as error:
@@ -338,6 +373,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--if-free-below-gb", type=float)
+    parser.add_argument("--remove-only", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     if (
@@ -359,6 +395,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             OVERFLOW,
             TEMPORARY / "disk-reaper-ledger.jsonl",
             apply=args.apply,
+            remove_only=args.remove_only,
         )
     return 0
 
