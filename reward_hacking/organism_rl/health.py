@@ -1,4 +1,9 @@
-"""Summarize sampling health from organism episode records and exact-token traces."""
+"""Summarize sampling health from organism episode records and exact-token traces.
+
+Repetition fractions use reasoning sentences with at least 25 characters. A turn is
+classified as a loop when strictly more than 25% of those sentences repeat an earlier
+sentence in the same turn.
+"""
 
 from __future__ import annotations
 
@@ -27,8 +32,11 @@ ENDING_CATEGORIES: tuple[str, ...] = (
     "other",
 )
 _COMPARISON_GROUP_COUNT = 2
+_MIN_REPETITION_SENTENCE_CHARACTERS = 25
+_LOOP_TURN_REPEAT_FRACTION_THRESHOLD = 0.25
 
 _CJK_IDEOGRAPH = re.compile("[\\u3400-\\u4dbf\\u4e00-\\u9fff]")
+_REASONING_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 _SHELL_ERROR_PREFIX = re.compile(r"(?i)^\s*(?:\S*/)?(?:bash|sh|dash|zsh)(?::|\s)")
 _SHELL_PARSE_ERROR = re.compile(
     r"(?i)\b(?:syntax error|parse error|unexpected EOF while looking for matching|"
@@ -45,7 +53,7 @@ class HealthInputError(ValueError):
 
 @dataclass(frozen=True)
 class EpisodeHealth:
-    """Per-episode sampling, execution, language, and ending metrics."""
+    """Per-episode sampling, repetition, execution, language, and ending metrics."""
 
     episode_index: int
     assistant_turn_count: int
@@ -64,12 +72,18 @@ class EpisodeHealth:
     contains_cjk: bool
     max_new_tokens_turn_count: int
     max_new_tokens_turn_fraction: float | None
+    reasoning_sentence_repeat_fractions: list[float | None]
+    loop_turn_count: int
+    loop_turn_fraction: float | None
+    has_repetition_loop: bool
+    copied_turn_count: int
     ending: str
     peak_prompt_tokens: int
 
 
 @dataclass(frozen=True)
 class _TurnHealth:
+    completion_token_ids: tuple[int, ...]
     sampled_token_nlls: list[float]
     thinking_token_nlls: list[float]
     action_token_nlls: list[float]
@@ -79,6 +93,7 @@ class _TurnHealth:
     syntax_error_command_call_count: int
     contains_cjk: bool
     stopped_at_token_cap: bool
+    reasoning_sentence_repeat_fraction: float | None
 
 
 def _object(value: object, context: str) -> dict[str, object]:
@@ -197,6 +212,26 @@ def _fraction(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
 
 
+def _reasoning_sentence_repeat_fraction(reasoning: str) -> float | None:
+    """Return the share of eligible reasoning sentences repeated earlier in this turn."""
+    sentences = [
+        sentence.strip()
+        for sentence in _REASONING_SENTENCE_BOUNDARY.split(reasoning)
+        if len(sentence.strip()) >= _MIN_REPETITION_SENTENCE_CHARACTERS
+    ]
+    if not sentences:
+        return None
+
+    seen_sentences: set[str] = set()
+    repeated_sentence_count = 0
+    for sentence in sentences:
+        if sentence in seen_sentences:
+            repeated_sentence_count += 1
+        else:
+            seen_sentences.add(sentence)
+    return repeated_sentence_count / len(sentences)
+
+
 def _mean(values: Sequence[float]) -> float | None:
     return fmean(values) if values else None
 
@@ -274,6 +309,7 @@ def _analyze_turn(
     command_call_count, syntax_error_command_call_count = _analyze_command_calls(turn, turn_context)
 
     return _TurnHealth(
+        completion_token_ids=tuple(token_ids),
         sampled_token_nlls=sampled_token_nlls,
         thinking_token_nlls=thinking_token_nlls,
         action_token_nlls=action_token_nlls,
@@ -283,6 +319,7 @@ def _analyze_turn(
         syntax_error_command_call_count=syntax_error_command_call_count,
         contains_cjk=contains_cjk,
         stopped_at_token_cap=stopped_at_token_cap,
+        reasoning_sentence_repeat_fraction=_reasoning_sentence_repeat_fraction(reasoning),
     )
 
 
@@ -330,6 +367,20 @@ def _analyze_episode(
     cjk_turn_count = sum(turn.contains_cjk for turn in turn_health)
     max_new_tokens_turn_count = sum(turn.stopped_at_token_cap for turn in turn_health)
     unavailable_channel_splits = sum(turn.channel_split_unavailable for turn in turn_health)
+    reasoning_sentence_repeat_fractions = [
+        turn.reasoning_sentence_repeat_fraction for turn in turn_health
+    ]
+    loop_turn_count = sum(
+        fraction is not None and fraction > _LOOP_TURN_REPEAT_FRACTION_THRESHOLD
+        for fraction in reasoning_sentence_repeat_fractions
+    )
+    prior_completion_token_ids: set[tuple[int, ...]] = set()
+    copied_turn_count = 0
+    for turn in turn_health:
+        completion_token_ids = turn.completion_token_ids
+        if completion_token_ids and completion_token_ids in prior_completion_token_ids:
+            copied_turn_count += 1
+        prior_completion_token_ids.add(completion_token_ids)
     peak_prompt_tokens = _integer(row, "peak_prompt_tokens", context)
     if peak_prompt_tokens < 0:
         raise HealthInputError(f"{context}.peak_prompt_tokens cannot be negative")
@@ -359,6 +410,11 @@ def _analyze_episode(
         contains_cjk=contains_cjk,
         max_new_tokens_turn_count=max_new_tokens_turn_count,
         max_new_tokens_turn_fraction=_fraction(max_new_tokens_turn_count, assistant_turn_count),
+        reasoning_sentence_repeat_fractions=reasoning_sentence_repeat_fractions,
+        loop_turn_count=loop_turn_count,
+        loop_turn_fraction=_fraction(loop_turn_count, assistant_turn_count),
+        has_repetition_loop=loop_turn_count > 0,
+        copied_turn_count=copied_turn_count,
         ending=ending,
         peak_prompt_tokens=peak_prompt_tokens,
     )
@@ -431,6 +487,9 @@ def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
     assistant_turn_count = sum(episode.assistant_turn_count for episode in episodes)
     cjk_episodes = sum(episode.contains_cjk for episode in episodes)
     max_new_tokens_turn_count = sum(episode.max_new_tokens_turn_count for episode in episodes)
+    loop_turn_count = sum(episode.loop_turn_count for episode in episodes)
+    copied_turn_count = sum(episode.copied_turn_count for episode in episodes)
+    episodes_with_repetition_loop_count = sum(episode.has_repetition_loop for episode in episodes)
     ending_counts = Counter(episode.ending for episode in episodes)
 
     return {
@@ -490,6 +549,22 @@ def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
             max_new_tokens_turn_count,
             assistant_turn_count,
         ),
+        "repetition": {
+            "loop_turn_fraction": {
+                "fraction": _fraction(loop_turn_count, assistant_turn_count),
+                "numerator": loop_turn_count,
+                "denominator": assistant_turn_count,
+            },
+            "episodes_with_any_loop_fraction": {
+                "fraction": _fraction(episodes_with_repetition_loop_count, len(episodes)),
+                "numerator": episodes_with_repetition_loop_count,
+                "denominator": len(episodes),
+            },
+            "copied_turn_count": copied_turn_count,
+            "copied_turns_per_episode": _numeric_summary(
+                [float(episode.copied_turn_count) for episode in episodes]
+            ),
+        },
         "turn_count": _numeric_summary(
             [float(episode.assistant_turn_count) for episode in episodes]
         ),
@@ -543,6 +618,17 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
     max_tokens = _object(
         summary["max_new_tokens_turn_fraction"], "report.summary.max_new_tokens_turn_fraction"
     )
+    repetition = _object(summary["repetition"], "report.summary.repetition")
+    loop_turns = _object(
+        repetition["loop_turn_fraction"], "report.summary.repetition.loop_turn_fraction"
+    )
+    episodes_with_loops = _object(
+        repetition["episodes_with_any_loop_fraction"],
+        "report.summary.repetition.episodes_with_any_loop_fraction",
+    )
+    copied_turns = _object(
+        repetition["copied_turns_per_episode"], "report.summary.repetition.copied_turns_per_episode"
+    )
     turns = _object(summary["turn_count"], "report.summary.turn_count")
     prompts = _object(summary["peak_prompt_tokens"], "report.summary.peak_prompt_tokens")
 
@@ -583,6 +669,24 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
             _format_number(max_tokens["mean"]),
             _format_number(max_tokens["median"]),
             _format_number(max_tokens["fraction"]),
+        ),
+        (
+            "Repetition-loop turn rate",
+            _format_number(loop_turns["fraction"]),
+            "—",
+            _format_number(loop_turns["fraction"]),
+        ),
+        (
+            "Episodes with any repetition loop",
+            "—",
+            "—",
+            _format_number(episodes_with_loops["fraction"]),
+        ),
+        (
+            "Copied turns per episode",
+            _format_number(copied_turns["mean"]),
+            _format_number(copied_turns["median"]),
+            _format_number(repetition["copied_turn_count"]),
         ),
         (
             "Assistant turns per episode",

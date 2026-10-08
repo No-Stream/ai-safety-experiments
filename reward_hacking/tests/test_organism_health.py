@@ -41,6 +41,7 @@ class _TurnFixture:
     logprobs: list[float]
     reasoning_token_count: int
     reasoning: str = ""
+    completion_token_ids: list[int] | None = None
     content: str = ""
     stop_reason: str = "end_turn"
     prompt_tokens: int = 100
@@ -52,7 +53,11 @@ def _turn(fixture: _TurnFixture) -> dict[str, object]:
     return {
         "record": "turn",
         "turn": fixture.turn_number,
-        "completion_token_ids": list(range(len(fixture.logprobs))),
+        "completion_token_ids": (
+            fixture.completion_token_ids
+            if fixture.completion_token_ids is not None
+            else list(range(len(fixture.logprobs)))
+        ),
         "completion_logprobs": fixture.logprobs,
         "reasoning_token_count": fixture.reasoning_token_count,
         "reasoning": fixture.reasoning,
@@ -190,6 +195,111 @@ def test_analyze_records_reports_episode_and_pooled_summaries(tmp_path: Path) ->
     assert prompts["mean"] == pytest.approx(110)
     assert _as_object(endings["submitted"])["fraction"] == 0.5
     assert _as_object(endings["turn_cap"])["fraction"] == 0.5
+
+
+def test_repetition_metrics_count_repeated_sentences_and_exact_turn_copies(tmp_path: Path) -> None:
+    repeated_reasoning = (
+        "The model checks the first synthetic condition carefully. "
+        "The model checks the second synthetic condition carefully. "
+        "The model checks the first synthetic condition carefully. "
+        "The model checks the second synthetic condition carefully."
+    )
+    unique_reasoning = (
+        "The model considers a synthetic starting condition carefully. "
+        "The model checks another synthetic condition carefully. "
+        "The model reviews a third synthetic condition carefully. "
+        "The model tests a fourth synthetic condition carefully."
+    )
+    threshold_reasoning = (
+        "The model checks the first synthetic condition carefully. "
+        "The model checks the second synthetic condition carefully. "
+        "The model checks the first synthetic condition carefully. "
+        "The model reviews a third synthetic condition carefully."
+    )
+    turns = [
+        _turn(
+            _TurnFixture(
+                1,
+                [-0.1, -0.1],
+                reasoning_token_count=1,
+                reasoning=repeated_reasoning,
+                completion_token_ids=[101, 102],
+            )
+        ),
+        _turn(
+            _TurnFixture(
+                2,
+                [-0.1, -0.1],
+                reasoning_token_count=1,
+                reasoning=unique_reasoning,
+                completion_token_ids=[201, 202],
+            )
+        ),
+        _turn(
+            _TurnFixture(
+                3,
+                [-0.1, -0.1],
+                reasoning_token_count=1,
+                reasoning=threshold_reasoning,
+                completion_token_ids=[101, 102],
+            )
+        ),
+        _turn(
+            _TurnFixture(
+                4,
+                [-0.1, -0.1, -0.1],
+                reasoning_token_count=1,
+                reasoning="A short note. Another short note.",
+                completion_token_ids=[101, 102, 103],
+            )
+        ),
+    ]
+    records_path = _write_records(
+        tmp_path,
+        "repetition-records",
+        [("repetition-episode", turns, "turn_cap", 100)],
+    )
+
+    report = health.analyze_records([records_path])
+
+    episode = _as_object(_as_list(report["episodes"])[0])
+    summary = _as_object(report["summary"])
+    repetition = _as_object(summary["repetition"])
+    repeat_fractions = episode["reasoning_sentence_repeat_fractions"]
+    assert isinstance(repeat_fractions, list)
+    assert repeat_fractions[:3] == pytest.approx([0.5, 0.0, 0.25])
+    assert repeat_fractions[3] is None
+    assert episode["loop_turn_count"] == 1
+    assert episode["loop_turn_fraction"] == pytest.approx(0.25)
+    assert episode["copied_turn_count"] == 1
+    loop_fraction = _as_object(repetition["loop_turn_fraction"])
+    assert loop_fraction["fraction"] == pytest.approx(0.25)
+    assert loop_fraction["numerator"] == 1
+    assert loop_fraction["denominator"] == 4
+    episodes_with_loop = _as_object(repetition["episodes_with_any_loop_fraction"])
+    assert episodes_with_loop["fraction"] == 1.0
+    assert episodes_with_loop["numerator"] == 1
+    assert episodes_with_loop["denominator"] == 1
+    assert repetition["copied_turn_count"] == 1
+
+
+def test_empty_completion_sequences_do_not_count_as_copied_turns(tmp_path: Path) -> None:
+    turns = [
+        _turn(_TurnFixture(1, [], reasoning_token_count=0)),
+        _turn(_TurnFixture(2, [], reasoning_token_count=0)),
+    ]
+    records_path = _write_records(
+        tmp_path,
+        "empty-completion-records",
+        [("empty-completion-episode", turns, "turn_cap", 100)],
+    )
+
+    report = health.analyze_records([records_path])
+
+    episode = _as_object(_as_list(report["episodes"])[0])
+    repetition = _as_object(_as_object(report["summary"])["repetition"])
+    assert episode["copied_turn_count"] == 0
+    assert repetition["copied_turn_count"] == 0
 
 
 @pytest.mark.parametrize(
