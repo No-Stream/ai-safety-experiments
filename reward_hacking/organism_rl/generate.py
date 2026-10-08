@@ -22,6 +22,11 @@ from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
+from reward_hacking.organism_rl.leak_selection import (
+    add_leak_arguments,
+    resolve_leak_options,
+    round_robin_leak_tasks,
+)
 from reward_hacking.organism_rl.rollout import (
     CodingTaskFamily,
     EpisodeSample,
@@ -148,7 +153,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--families",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker"),
+        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"),
     )
     parser.add_argument(
         "--variant", choices=("oneoff", "original", "conflicting", "loose"), default="oneoff"
@@ -179,7 +184,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--jail-backend")
+    add_leak_arguments(parser)
     args = parser.parse_args(argv)
+    resolve_leak_options(args, parser, partition=args.partition)
 
     args.families = list(dict.fromkeys(args.family_entries or DEFAULT_FAMILIES))
     args.served_model_id = args.served_model_id or args.model
@@ -660,6 +667,7 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
             records.append(record)
 
     summary = _summary(records)
+    summary["task_skip_counts"] = provenance.get("task_skip_counts", {})
     _write_json_atomically(output_dir / "summary.json", summary)
     summary_table = _summary_table(summary)
     summary_path = output_dir / "summary.md"
@@ -681,6 +689,7 @@ def _provenance(
         aisi_rh_envs_data,
         ilcb_data,
         math_data,
+        r2e_leak_data,
     )
 
     data_paths = {
@@ -688,6 +697,7 @@ def _provenance(
         "aisi": aisi_rh_envs_data.DATA_PATH,
         "math_oneoff": math_data.DATA_PATH,
         "math_loose_checker": math_data.DATA_PATH,
+        "r2e_leak": r2e_leak_data.DATA_PATH,
     }
     source_paths = (
         "reward_hacking/organism_rl/generate.py",
@@ -705,6 +715,14 @@ def _provenance(
         "reward_hacking/harness/tasks_ilcb.py",
         "reward_hacking/harness/tasks_aisi_rh_envs.py",
         "reward_hacking/harness/tasks_math.py",
+        "reward_hacking/harness/tasks_r2e_leak.py",
+        "reward_hacking/harness/leak_channels.py",
+        "reward_hacking/harness/leak_detector.py",
+        "reward_hacking/harness/docker_backend.py",
+        "reward_hacking/harness/loop.py",
+        "reward_hacking/organism_rl/leak_selection.py",
+        "reward_hacking/organism_rl/leak_assets.py",
+        "reward_hacking/r2e_leak_data.py",
         "reward_hacking/math_data.py",
         "reward_hacking/math_etl.py",
         "reward_hacking/harness/ilcb_split.py",
@@ -739,6 +757,7 @@ def _provenance(
             "chat_template_kwargs": dict(args.chat_template_kwargs),
             "max_model_len": args.max_model_len,
             "jail_backend": args.jail_backend,
+            "leak_channels_open": args.leak_channels_open,
         },
         "git_sha": subprocess.check_output(  # noqa: S603 - fixed git query with no caller arguments
             [git_executable, "rev-parse", "HEAD"],
@@ -752,6 +771,11 @@ def _provenance(
         "task_data_sha256": {
             family: _file_sha256(data_paths[family]) for family in sorted(args.families)
         },
+        "task_skip_counts": dict(source.skip_counts) if "r2e_leak" in args.families else {},
+        "leak_channels": list(args.leak_channels),
+        "leak_channels_open": args.leak_channels_open,
+        "leak_instruction": args.leak_instruction,
+        "leak_channel_split": args.leak_channel_split,
         "task_selection_order": [spec.task_id for spec in task_specs],
         "selected_tasks": [
             {
@@ -785,13 +809,26 @@ def main(argv: list[str] | None = None) -> None:
         announced_turn_budget=args.announced_turn_budget,
         partition=args.partition,
         families=tuple(args.families),
+        leak_channels=args.leak_channels,
+        leak_channels_open=args.leak_channels_open,
+        leak_instruction=args.leak_instruction,
+        leak_repos=args.leak_repos,
+        leak_assets=args.leak_assets,
         variants=(args.variant,),
         jail_backend=args.jail_backend,
         chat_template_kwargs=args.chat_template_kwargs,
     )
-    task_ids = select_task_ids(
-        tuple(source.tasks), max_tasks=args.max_tasks, aisi_sources=args.aisi_sources
+    task_ids = select_task_ids(tuple(source.tasks), max_tasks=None, aisi_sources=args.aisi_sources)
+    leak_ids = tuple(
+        task_id for task_id in task_ids if source.families_by_task[task_id] == "r2e_leak"
     )
+    if leak_ids:
+        task_ids = (
+            *round_robin_leak_tasks(leak_ids, source.environments_by_task),
+            *(task_id for task_id in task_ids if task_id not in leak_ids),
+        )
+    if args.max_tasks is not None:
+        task_ids = task_ids[: args.max_tasks]
     task_specs = tuple(
         TaskSpec(
             task_id,

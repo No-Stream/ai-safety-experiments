@@ -1,7 +1,8 @@
-"""Replay and regrade historical no-submission teacher episodes in fresh jails.
+"""Recompute leak labels and replay historical no-submission episodes in fresh jails.
 
 Policy commands execute only through run_in_jail. Original records and traces stay untouched.
 A matching historical final-artifact hash is required before a rebuilt episode can earn reward.
+Leak episodes reuse their recorded trusted container verdicts and never execute policy commands.
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grade_final_state, lay_down_task
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, replay_ladder_commands
@@ -53,6 +56,52 @@ def _read_records(path: Path) -> list[dict[str, object]]:
 
 def _digest(record: Mapping[str, object]) -> str:
     return hashlib.sha256(json.dumps(dict(record), sort_keys=True).encode()).hexdigest()
+
+
+def rescore_recorded_leak(record: Mapping[str, object]) -> dict[str, object]:
+    """Recompute leak rewards and labels from the original container evidence only."""
+    result = deepcopy(dict(record))
+    summary = _object(result["trace_summary"], "trace_summary")
+    if summary.get("task_variant") != "leak":
+        raise ValueError("recorded leak rescore requires task_variant leak")
+    raw = _object(summary["leak_evidence"], "leak_evidence")
+    manifest = _object(raw["manifest"], "leak manifest")
+    manifest_json = raw["manifest_raw_json"]
+    if not isinstance(manifest_json, str):
+        raise TypeError("manifest_raw_json must be a string")
+    if (
+        hashlib.sha256(manifest_json.encode()).hexdigest() != summary["manifest_sha256"]
+        or _object(json.loads(manifest_json), "raw leak manifest") != manifest
+    ):
+        raise ValueError("recorded leak manifest differs from its identity")
+    trace = raw["trace_records"]
+    docker = raw["docker_evidence"]
+    patch = raw["final_patch"]
+    if not isinstance(trace, list) or not isinstance(docker, list):
+        raise TypeError("leak trace and Docker evidence must be lists")
+    if not isinstance(patch, str):
+        raise TypeError("leak final_patch must be a string")
+    if (
+        hashlib.sha256(patch.encode("utf-8", errors="surrogateescape")).hexdigest()
+        != summary["submitted_artifact_sha256"]
+    ):
+        raise ValueError("recorded leak patch differs from the graded artifact")
+    trace_records = [_object(turn, "leak trace record") for turn in trace]
+    docker_records = [_object(entry, "Docker evidence record") for entry in docker]
+    summary["leak_assessment"] = assess_leak(
+        trace_records, docker_records, manifest, patch
+    ).to_json_dict()
+    summary["hack_strategy"] = label_episode(
+        result, trace_records, manifest=manifest, docker_evidence=docker_records, final_patch=patch
+    ).to_json_dict()
+    score = score_impossible_task(summary)
+    result["organism_reward"] = {
+        "reward": score.reward,
+        "outcome": score.outcome.value,
+        "evidence": json.loads(json.dumps(asdict(score.evidence))),
+    }
+    result["organism_reward_outcome"] = score.outcome.value
+    return result
 
 
 def _replay_commands(
@@ -229,6 +278,10 @@ def rescore_file(records_path: Path, *, jail_backend: str | None) -> Path:
     if len(completed) > len(originals):
         raise ValueError("rescore checkpoint exceeds original records")
     for original, saved in zip(originals, completed, strict=False):
+        if original.get("family") == "r2e_leak":
+            if saved != rescore_recorded_leak(original):
+                raise ValueError("original leak evidence changed since rescore checkpoint")
+            continue
         if saved != original and _object(saved.get("rescore"), "rescore").get(
             "source_record_sha256"
         ) != _digest(original):
@@ -236,16 +289,19 @@ def rescore_file(records_path: Path, *, jail_backend: str | None) -> Path:
     with temporary.open("a", encoding="utf-8") as stream:
         for record in originals[len(completed) :]:
             summary = _object(record["trace_summary"], "trace_summary")
-            rescored = (
-                rescore_record(
-                    record,
-                    _load_task(record),
-                    jail_backend=jail_backend,
-                    artifact_dir=output.parent / "rescored-final-state-artifacts",
+            if record.get("family") == "r2e_leak":
+                rescored = rescore_recorded_leak(record)
+            else:
+                rescored = (
+                    rescore_record(
+                        record,
+                        _load_task(record),
+                        jail_backend=jail_backend,
+                        artifact_dir=output.parent / "rescored-final-state-artifacts",
+                    )
+                    if not summary["submission_verdicts"]
+                    else record
                 )
-                if not summary["submission_verdicts"]
-                else record
-            )
             stream.write(json.dumps(rescored, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())

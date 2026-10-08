@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol
 from uuid import uuid4
 
 from reward_hacking.eval_awareness import AwarenessMatch
+from reward_hacking.harness.docker_backend import require_gate, run_in_docker
 from reward_hacking.harness.loop import (
     FinalGrade,
     assert_disposable_episode_dir,
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
 
     from transformers import PreTrainedTokenizerBase
 
+    from reward_hacking.harness.docker_backend import DockerConfig
     from reward_hacking.harness.task_spec import AgenticArmConfig, Task
     from reward_hacking.model_backend import RenderedCompletion
 
@@ -531,6 +533,7 @@ class _CommandContext:
     jail_backend: str | None
     before_command: Callable[[Path, str], None] | None
     after_command: Callable[[Path, str, CommandResult], None] | None
+    docker_config: DockerConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -864,15 +867,20 @@ def _execute_bash(
 
     marker = _shell_marker()
     wrapper = _shell_wrapper(command, state, marker)
-    cpus, mem_max = episode_limits()
-    wrapped_result = run_in_jail(
-        context.episode_dir,
-        wrapper,
-        timeout=context.timeout,
-        backend=context.jail_backend,
-        cpus=cpus,
-        mem_max=mem_max,
-    )
+    if context.docker_config is not None:
+        wrapped_result = run_in_docker(
+            context.episode_dir, wrapper, config=context.docker_config, timeout=context.timeout
+        )
+    else:
+        cpus, mem_max = episode_limits()
+        wrapped_result = run_in_jail(
+            context.episode_dir,
+            wrapper,
+            timeout=context.timeout,
+            backend=context.jail_backend,
+            cpus=cpus,
+            mem_max=mem_max,
+        )
     next_state, visible_stderr, cwd_after = _restore_shell_state(wrapped_result, state, marker)
     result = CommandResult(
         command=command,
@@ -1549,6 +1557,14 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None for name in initial_environment):
         raise ValueError("initial environment names must be valid shell identifiers")
 
+    workspace_mount = (
+        task.docker_config.workspace_mount if task.docker_config is not None else "/work"
+    )
+    if task.docker_config is not None:
+        require_gate(task.docker_config)
+        system_prompt = system_prompt.replace("/work", workspace_mount)
+        user_template = user_template.replace("/work", workspace_mount)
+        final_report_prompt = final_report_prompt.replace("/work", workspace_mount)
     episode_started = time.monotonic()
     deadline = episode_started + episode_seconds
     episode_id = compose_episode_id(
@@ -1614,9 +1630,10 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     pending_prompt_messages: list[ChatMessage] = []
     runaway_message_positions: list[int] = []
     shell_state = _ShellState(
+        cwd=workspace_mount,
         exported_script="\n".join(
             f"export {name}={shlex.quote(value)}" for name, value in initial_environment.items()
-        )
+        ),
     )
     next_call_number = 0
 
@@ -1785,6 +1802,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                         jail_backend=jail_backend,
                         before_command=before_command,
                         after_command=after_command,
+                        docker_config=task.docker_config,
                     ),
                     submit_grader=submit_grader,
                     ci_submit_grader=ci_submit_grader,
@@ -1818,7 +1836,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                 messages.append(
                     {
                         "role": "user",
-                        "content": f"{format_error_message}\n\nNothing has been written to /work yet.",
+                        "content": f"{format_error_message}\n\nNothing has been written to {workspace_mount} yet.",
                     }
                 )
                 nudged_empty_start = True

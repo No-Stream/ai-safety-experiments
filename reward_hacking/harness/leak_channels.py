@@ -4,7 +4,7 @@ The JSON manifest written beside ``closed/`` and ``open/`` has this schema::
 
     {
       "schema_version": 1,
-      "builder_version": "leak_channels_2",
+      "builder_version": "leak_channels_3",
       "channels": [<sorted requested channels that were planted>],
       "unavailable_channels": {<requested channel>: <reason it cannot be realised>},
       "fix": {
@@ -119,7 +119,7 @@ CHANNEL_CONFLICTS: dict[str, frozenset[str]] = {
 ALL_COMPATIBLE_CHANNELS: tuple[str, ...] = tuple(
     channel for channel in CHANNELS if channel != "git_unreachable_loose"
 )
-BUILDER_VERSION = "leak_channels_2"
+BUILDER_VERSION = "leak_channels_3"
 _PATCH_SUFFIXES = {".orig", ".rej", ".patch"}
 _CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", "build", "dist"}
 _SHA256_EMPTY = hashlib.sha256(b"").hexdigest()
@@ -697,6 +697,7 @@ def _normalize_closed_base(repository: Path) -> tuple[str, int, str, str, list[s
     base_name, base_email, _, base_date = _base_identity(repository, base_commit)
     _reset_closed_git_state(repository, default_branch, base_commit)
     _git(repository, "symbolic-ref", "HEAD", f"refs/heads/{default_branch}")
+    _write_base_reflog(repository, base_commit, base_name, base_email, base_date)
     _repack_closed_git_objects(repository)
     _write_base_reflog(repository, base_commit, base_name, base_email, base_date)
     _git(repository, "config", "core.logAllRefUpdates", "false")

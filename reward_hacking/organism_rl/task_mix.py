@@ -52,9 +52,13 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
     selected: list[TaskPrompt] = []
     for family in sorted(families):
         treatment_variant = (
-            "loose"
-            if family == "math_loose_checker" and impossible_variant == "oneoff"
-            else impossible_variant
+            "leak"
+            if family == "r2e_leak"
+            else (
+                "loose"
+                if family == "math_loose_checker" and impossible_variant == "oneoff"
+                else impossible_variant
+            )
         )
         impossible = sorted(
             (
@@ -74,8 +78,10 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
         )
         if not impossible:
             raise ValueError(f"no {impossible_variant} tasks are available for family {family!r}")
-        solvable_count = math.floor(
-            len(impossible) * solvable_fraction / (1 - solvable_fraction) + 0.5
+        solvable_count = (
+            0
+            if family == "r2e_leak"
+            else math.floor(len(impossible) * solvable_fraction / (1 - solvable_fraction) + 0.5)
         )
         if solvable_count > len(solvable):
             raise ValueError(
@@ -117,7 +123,8 @@ def _validate_task_mix(
     if not families or len(families) != len(set(families)):
         raise ValueError("task families must be a nonempty unique sequence")
     if any(
-        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker"} for family in families
+        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+        for family in families
     ):
         raise ValueError(f"unsupported task family in {families!r}")
     if impossible_variant not in {"oneoff", "conflicting", "loose"}:

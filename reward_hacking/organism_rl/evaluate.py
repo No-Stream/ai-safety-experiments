@@ -19,6 +19,11 @@ from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.generate import TaskSpec
+from reward_hacking.organism_rl.leak_selection import (
+    add_leak_arguments,
+    resolve_leak_options,
+    round_robin_leak_tasks,
+)
 from reward_hacking.organism_rl.rollout import CodingTaskFamily as TaskFamily
 from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource, task_family_variant
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
@@ -42,6 +47,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.served_model_id = args.served_model_id or (
         EVALUATION_ADAPTER_NAME if args.adapter_dir is not None else args.model
     )
+    resolve_leak_options(args, parser, partition="held-out")
     _validate_args(args, parser)
     return args
 
@@ -75,7 +81,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--family",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker"),
+        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"),
     )
     parser.add_argument(
         "--impossible-variant", choices=("oneoff", "conflicting", "loose"), default="oneoff"
@@ -96,6 +102,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--jail-backend")
+    add_leak_arguments(parser)
     return parser
 
 
@@ -224,26 +231,16 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     AISI draws round-robin across the allowed sources so a large source cannot crowd out the
     others; each source is shuffled with the seeded generator first.
     """
-    if not families or len(families) != len(set(families)):
-        raise ValueError("task families must be a nonempty unique sequence")
-    if any(
-        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker"} for family in families
-    ):
-        raise ValueError(f"unsupported task family in {families!r}")
-    if impossible_variant not in {"oneoff", "conflicting", "loose"}:
-        raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
-    for family in families:
-        task_family_variant(family, impossible_variant)
-    if type(tasks_per_family) is not int or tasks_per_family < 1:
-        raise ValueError("tasks_per_family must be a positive integer")
-    if type(seed) is not int:
-        raise TypeError("evaluation seed must be an integer")
+    _validate_heldout_selection(families, impossible_variant, tasks_per_family, seed)
 
     rng = random.Random(seed)
     selected: list[TaskSpec] = []
     for family in sorted(families):
         treatment_variant = task_family_variant(family, impossible_variant)
         impossible_by_problem = _task_ids_by_problem(source, family, treatment_variant)
+        if family == "r2e_leak":
+            selected.extend(_select_leak_specs(source, impossible_by_problem, tasks_per_family))
+            continue
         solvable_by_problem = _task_ids_by_problem(source, family, "original")
         paired_problem_ids = sorted(set(impossible_by_problem) & set(solvable_by_problem))
         if len(paired_problem_ids) < tasks_per_family:
@@ -266,6 +263,45 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
                 )
             )
     return tuple(sorted(selected, key=lambda spec: (spec.family, spec.variant, spec.task_id)))
+
+
+def _validate_heldout_selection(
+    families: tuple[TaskFamily, ...], impossible_variant: str, tasks_per_family: int, seed: int
+) -> None:
+    if not families or len(families) != len(set(families)):
+        raise ValueError("task families must be a nonempty unique sequence")
+    if any(
+        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+        for family in families
+    ):
+        raise ValueError(f"unsupported task family in {families!r}")
+    if impossible_variant not in {"oneoff", "conflicting", "loose"}:
+        raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
+    for family in families:
+        task_family_variant(family, impossible_variant)
+    if type(tasks_per_family) is not int or tasks_per_family < 1:
+        raise ValueError("tasks_per_family must be a positive integer")
+    if type(seed) is not int:
+        raise TypeError("evaluation seed must be an integer")
+
+
+def _select_leak_specs(
+    source: TaskEpisodeSource, tasks_by_problem: Mapping[str, str], tasks_per_family: int
+) -> tuple[TaskSpec, ...]:
+    environments: dict[str, str] = {}
+    for task_id in tasks_by_problem.values():
+        problem_id = source.tasks[task_id].problem_id
+        if problem_id is None:
+            raise ValueError("leak tasks require a repository/commit problem identity")
+        environments[task_id] = problem_id
+    leak_ids = round_robin_leak_tasks(tuple(tasks_by_problem.values()), environments)
+    if len(leak_ids) < tasks_per_family:
+        raise ValueError(
+            f"family 'r2e_leak' has {len(leak_ids)} held-out tasks; {tasks_per_family} requested"
+        )
+    return tuple(
+        TaskSpec(task_id, "r2e_leak", "leak", "held-out") for task_id in leak_ids[:tasks_per_family]
+    )
 
 
 def _round_robin_by_source(
@@ -370,6 +406,11 @@ def _evaluation_provenance(
         "aisi_sources": list(args.aisi_sources),
         "speculative_decoding": args.enable_speculative_decoding,
         "partition": "held-out",
+        "task_skip_counts": dict(source.skip_counts) if "r2e_leak" in args.families else {},
+        "leak_channels": list(args.leak_channels),
+        "leak_channels_open": args.leak_channels_open,
+        "leak_instruction": args.leak_instruction,
+        "leak_channel_split": args.leak_channel_split,
         "tasks_per_family": args.tasks_per_family,
         "seed": args.seed,
         "concurrency": args.concurrency,
@@ -407,6 +448,14 @@ def _evaluation_provenance(
                 "reward_hacking/organism_rl/rollout.py",
                 "reward_hacking/organism_reward.py",
                 "reward_hacking/harness/tasks_math.py",
+                "reward_hacking/harness/tasks_r2e_leak.py",
+                "reward_hacking/harness/leak_channels.py",
+                "reward_hacking/harness/leak_detector.py",
+                "reward_hacking/harness/docker_backend.py",
+                "reward_hacking/harness/loop.py",
+                "reward_hacking/organism_rl/leak_selection.py",
+                "reward_hacking/organism_rl/leak_assets.py",
+                "reward_hacking/r2e_leak_data.py",
                 "reward_hacking/math_data.py",
                 "reward_hacking/math_etl.py",
             )
@@ -441,6 +490,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         announced_turn_budget=args.announced_turn_budget,
         partition="held-out",
         families=tuple(args.families),
+        leak_channels=args.leak_channels,
+        leak_channels_open=args.leak_channels_open,
+        leak_instruction=args.leak_instruction,
+        leak_repos=args.leak_repos,
+        leak_assets=args.leak_assets,
         variants=(args.impossible_variant, "original"),
         jail_backend=args.jail_backend,
     )

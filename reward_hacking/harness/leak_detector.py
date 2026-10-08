@@ -449,7 +449,7 @@ def _line_hash(line: str) -> str | None:
     normalized = _normalized_line(line)
     if len(normalized.replace(" ", "")) < _MINIMUM_FINGERPRINT_LENGTH:
         return None
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return hashlib.sha256(normalized.encode("utf-8", errors="surrogateescape")).hexdigest()
 
 
 def _is_test_path(path: str | None) -> bool:

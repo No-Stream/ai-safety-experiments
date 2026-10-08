@@ -829,3 +829,37 @@ def test_fix_message_without_trailing_newline_keeps_the_upstream_object_id(
     )
 
     assert manifest["fix"]["commit_id"] == web_edited_commit_id
+
+
+def test_closed_normalization_removes_preexisting_fix_branch_reflog(tmp_path: Path) -> None:
+    _base, spec = _make_synthetic_repo(tmp_path)
+    source = tmp_path / "source"
+    _git(source, "remote", "add", "origin", "https://example.invalid/synthetic.git")
+    _git(source, "gc")
+    _git(source, "checkout", str(spec["commit_id"]) + "^")
+    output = tmp_path / "normalized"
+    manifest = build_channel_templates(
+        BuildRequest(
+            base_dir=source,
+            fix_commit_spec=spec,
+            channels=("git_unreachable_packed",),
+            out_dir=output,
+        )
+    )
+    assert probe_closed(output / "closed", manifest, "git_unreachable_packed")
+    assert probe_open(output / "open", manifest, "git_unreachable_packed")
+    assert (
+        subprocess.run(  # noqa: S603 - synthetic repository only
+            [
+                _git_executable(),
+                "-C",
+                str(output / "closed"),
+                "cat-file",
+                "-e",
+                str(spec["commit_id"]),
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    )

@@ -31,12 +31,14 @@ from reward_hacking.distill.memory import (
 from reward_hacking.distill.train import cast_lora_to_bf16, memory_options_from_args
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
+from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
 from reward_hacking.organism_rl.phases import VLLMPhaseController
 from reward_hacking.organism_rl.rollout import (
     MixedEpisodeSource,
     OrganismRollout,
     TaskEpisodeSource,
     TaskFamily,
+    task_definition_sha256,
     verdict_reward,
 )
 from reward_hacking.organism_rl.task_mix import TaskPrompt, select_training_task_mix
@@ -71,7 +73,7 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     return RuntimeSizing(sequence_tokens, 1, 2)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI flags
     """Parse explicit experiment, sampling, teacher and memory settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -122,14 +124,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--thinking-token-budget", type=int)
     parser.add_argument(
         "--family",
+        "--families",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi"),
+        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"),
         help="task family to train on (repeatable; default: ilcb and aisi)",
     )
     parser.add_argument(
         "--impossible-variant",
-        choices=("oneoff", "conflicting"),
+        choices=("oneoff", "conflicting", "loose"),
         default="oneoff",
         help="impossible task variant (oneoff reads as an ordinary test bug)",
     )
@@ -167,7 +170,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("none", "torchao-int8", "nf4", "torchao-w8a8", "torchao-fp8-rowwise"),
         default="none",
     )
+    add_leak_arguments(parser)
     args = parser.parse_args(argv)
+    resolve_leak_options(args, parser, partition="train")
     args.families = list(dict.fromkeys(args.family_entries or ["ilcb", "aisi"]))
     _validate_training_args(args, parser)
     memory_options_from_args(args)
@@ -201,7 +206,12 @@ def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentP
 
 def _parse_in_band_fraction(value: str) -> tuple[str, float]:
     scope, separator, fraction_text = value.partition("=")
-    if not separator or scope.split("/", 1)[0] not in {"ilcb", "aisi"} or scope.endswith("/"):
+    if (
+        not separator
+        or scope.split("/", 1)[0]
+        not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+        or scope.endswith("/")
+    ):
         raise argparse.ArgumentTypeError(
             "in-band-fraction requires FAMILY=FRACTION or FAMILY/ENVIRONMENT=FRACTION"
         )
@@ -330,6 +340,7 @@ def write_provenance(
     device: dict[str, object],
     model_revision: str | None = None,
     selected_prompts: Sequence[TaskPrompt] | None = None,
+    task_source_identity: dict[str, object] | None = None,
 ) -> Path:
     """Persist all flags and source/package identity alongside private run artifacts."""
     repository_root = Path(
@@ -366,7 +377,11 @@ def write_provenance(
     args.output_dir.mkdir(parents=True, exist_ok=True)
     provenance: dict[str, Any] = {
         "flags": {
-            key: str(value) if isinstance(value, Path) else value
+            key: str(value)
+            if isinstance(value, Path)
+            else list(value)
+            if isinstance(value, tuple)
+            else value
             for key, value in vars(args).items()
         },
         "git_sha": git_sha,
@@ -380,6 +395,7 @@ def write_provenance(
             else None
         ),
         "device": device,
+        "task_source_identity": task_source_identity,
         "selected_prompts": (
             [asdict(prompt) for prompt in selected_prompts]
             if selected_prompts is not None
@@ -407,6 +423,7 @@ def write_provenance(
             or stored["model_revision"] != model_revision
             or stored["trl_version"] != version("trl")
             or stored.get("selected_prompts") != provenance["selected_prompts"]
+            or stored.get("task_source_identity") != provenance["task_source_identity"]
         ):
             raise ValueError("resume source or TRL version differs from stored provenance")
         if stored["device"] != device:
@@ -578,6 +595,11 @@ def main(argv: list[str] | None = None) -> None:
         thinking_token_budget=args.thinking_token_budget,
         partition="train",
         families=tuple(args.families),
+        leak_channels=args.leak_channels,
+        leak_channels_open=args.leak_channels_open,
+        leak_instruction=args.leak_instruction,
+        leak_repos=args.leak_repos,
+        leak_assets=args.leak_assets,
         variants=(args.impossible_variant, "original"),
     )
     source: TaskEpisodeSource | MixedEpisodeSource = coding_source
@@ -625,7 +647,20 @@ def main(argv: list[str] | None = None) -> None:
         args.impossible_variant,
         args.solvable_fraction,
     )
-    write_provenance(args, device, model_revision, selected_prompts)
+    write_provenance(
+        args,
+        device,
+        model_revision,
+        selected_prompts,
+        task_source_identity={
+            "task_skip_counts": dict(coding_source.skip_counts),
+            "task_definition_sha256": {
+                task_id: task_definition_sha256(coding_source.tasks[task_id])
+                for task_id in selected_task_ids
+                if task_id in coding_source.tasks
+            },
+        },
+    )
     with server_endpoint(args, model_revision, max_tokens) as endpoint:
         _run_training(
             args,

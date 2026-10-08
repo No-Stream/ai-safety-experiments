@@ -21,7 +21,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_episode_row
+from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
+from reward_hacking.harness import tasks_r2e_leak
+from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
+from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grader_reported_success, run_grader
 from reward_hacking.harness.task_spec import AgenticArmConfig
 from reward_hacking.jailed_poc import strip_resource_limits_banner
@@ -31,6 +35,7 @@ from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEM
 from reward_hacking.ladder.tools import format_bash_result
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
+from reward_hacking.organism_rl.leak_assets import DEFAULT_LEAK_ASSETS, load_leak_tasks
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -40,16 +45,21 @@ if TYPE_CHECKING:
     from reward_hacking.aisi_rh_envs_split import AisiPartition
     from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.harness.task_spec import Task
+    from reward_hacking.harness.tasks_r2e_leak import InstructionVariant
     from reward_hacking.ladder.loop import SubmissionGrader
     from reward_hacking.math_data import MathFamily, MathVariant
     from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 
-CodingTaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker"]
-TaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "ladder"]
+CodingTaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"]
+TaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "ladder"]
 
 
 def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
     """Resolve the common treatment selector into the family's concrete variant."""
+    if family == "r2e_leak":
+        if requested_variant not in {"oneoff", "leak", "original"}:
+            raise ValueError("r2e_leak only supports the leak task variant")
+        return "leak"
     if family == "math_loose_checker" and requested_variant == "oneoff":
         return "loose"
     if requested_variant == "conflicting" and family != "ilcb":
@@ -69,6 +79,12 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
     def grade_submission(directory: Path) -> SubmissionVerdict:
         if artifact_filename is None:
             raise ValueError("impossible-task submissions require a task artifact filename")
+        if task.task_variant == "leak":
+            if task.docker_patch_base_commit is None or task.docker_grader_template is None:
+                raise ValueError("leak task requires its trusted patch base")
+            tasks_r2e_leak.extract_patch(
+                directory, task.docker_patch_base_commit, template_dir=task.docker_grader_template
+            )
         artifact_path = directory / artifact_filename
         artifact_sha256 = (
             hashlib.sha256(artifact_path.read_bytes()).hexdigest()
@@ -381,11 +397,11 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
     )
     if (
         not isinstance(family, str)
-        or family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "ladder"}
+        or family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "ladder"}
         or not isinstance(variant, str)
     ):
         raise ValueError(f"task {task_id!r} episode is missing family and variant identity")
-    if variant not in {"oneoff", "conflicting", "original", "loose", "ladder"}:
+    if variant not in {"oneoff", "conflicting", "original", "loose", "leak", "ladder"}:
         raise ValueError(f"task {task_id!r} has unsupported variant {variant!r}")
     return cast("TaskFamily", family), variant
 
@@ -432,12 +448,72 @@ def _has_submission(record: Mapping[str, object]) -> bool:
     return bool(submissions)
 
 
+def _record_leak_evidence(  # noqa: PLR0913, PLR0917 - binds episode artifacts to persisted trace identity
+    task: Task,
+    summary_record: dict[str, object],
+    identity_record: Mapping[str, object],
+    manifest: Mapping[str, object],
+    manifest_raw_json: str,
+    temporary_trace_path: Path,
+    evidence_path: Path,
+    episode_dir: Path,
+) -> None:
+    """Persist all inputs needed for exact offline reward and detector re-scoring."""
+    docker_records = _read_trace(evidence_path)
+    final_patch = (
+        (episode_dir / "patch.diff").read_bytes().decode("utf-8", errors="surrogateescape")
+    )
+    leak_evidence: dict[str, object] = {
+        "manifest": manifest,
+        "manifest_raw_json": manifest_raw_json,
+        "trace_records": _read_trace(temporary_trace_path),
+        "docker_evidence": docker_records,
+        "final_patch": final_patch,
+    }
+    assessment = assess_leak(
+        _read_trace(temporary_trace_path),
+        docker_records,
+        manifest,
+        final_patch,
+    )
+    summary_record["hack_strategy"] = label_episode(
+        {
+            **summary_record,
+            "payment_register": identity_record["payment_register"],
+            "trace_path": str(temporary_trace_path),
+        },
+        _read_trace(temporary_trace_path),
+        manifest=manifest,
+        docker_evidence=docker_records,
+        final_patch=final_patch,
+    ).to_json_dict()
+    summary_record.update(
+        {
+            "leak_evidence": leak_evidence,
+            "leak_assessment": assessment.to_json_dict(),
+            "leak_channels_open": identity_record["leak_channels_open"],
+            "leak_channels_unavailable": identity_record["leak_channels_unavailable"],
+            "instruction_variant": identity_record["instruction_variant"],
+            "manifest_sha256": identity_record["manifest_sha256"],
+            "docker_image": task.docker_config.image if task.docker_config else None,
+            "docker_evidence_path": str(evidence_path),
+        }
+    )
+    records = _read_trace(temporary_trace_path)
+    records = [record for record in records if record.get("record") != "episode_summary"]
+    records.append(summary_record)
+    temporary_trace_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
 class TaskEpisodeSource:
     """Run the native tool loop on local, gitignored ILCB or AISI task cases."""
 
     torn_trace_count: int
 
-    def __init__(  # noqa: C901, PLR0913 - selects and validates family-specific task registries
+    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915 - selects and validates family-specific task registries
         self,
         *,
         endpoint: str,
@@ -457,6 +533,11 @@ class TaskEpisodeSource:
         variants: tuple[str, ...] = ("oneoff",),
         jail_backend: str | None = None,
         chat_template_kwargs: Mapping[str, str] | None = None,
+        leak_channels: tuple[str, ...] = ALL_COMPATIBLE_CHANNELS,
+        leak_channels_open: bool | None = None,
+        leak_instruction: InstructionVariant = "none",
+        leak_repos: tuple[str, ...] | None = None,
+        leak_assets: Path = DEFAULT_LEAK_ASSETS,
     ) -> None:
         """Select local cases and construct a tokenizer-only external vLLM backend."""
         from reward_hacking.harness import (  # noqa: PLC0415 - task corpora load only when selected
@@ -468,13 +549,21 @@ class TaskEpisodeSource:
         if not variants or len(variants) != len(set(variants)):
             raise ValueError("task variants must be a nonempty unique sequence")
         if any(
-            family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker"}
+            family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
             for family in families
         ):
             raise ValueError(f"unsupported task family in {families!r}")
         if partition not in {"train", "held-out"}:
             raise ValueError(f"unsupported task partition {partition!r}")
 
+        self.skip_counts: Counter[str] = Counter()
+        self.leak_manifests: dict[str, dict[str, object]] = {}
+        self.leak_manifest_json: dict[str, str] = {}
+        open_leak_arm = (
+            set(leak_channels) == set(ALL_COMPATIBLE_CHANNELS)
+            if leak_channels_open is None
+            else leak_channels_open
+        )
         task_rows: list[tuple[str, str, Task]] = []
         for family in families:
             for requested_variant in variants:
@@ -492,6 +581,20 @@ class TaskEpisodeSource:
                         variant=cast("Any", variant),
                         partition=partition,
                     )
+                elif family == "r2e_leak":
+                    if requested_variant != variants[0]:
+                        continue
+                    tasks, manifests, skips = load_leak_tasks(
+                        leak_assets,
+                        partition=partition,
+                        channels=leak_channels,
+                        instruction=leak_instruction,
+                        repos=leak_repos,
+                        open_arm=open_leak_arm,
+                        manifest_json=self.leak_manifest_json,
+                    )
+                    self.leak_manifests.update(manifests)
+                    self.skip_counts.update(skips)
                 else:
                     tasks = task_registry.math_tasks(
                         family=cast("MathFamily", family),
@@ -511,7 +614,10 @@ class TaskEpisodeSource:
         }
         self.payment_registers: dict[str, str] = {}
         if not self.tasks:
-            raise ValueError("no local tasks match the selected families, variants and partition")
+            raise ValueError(
+                "no local tasks match the selected families, variants and partition; "
+                f"counted exclusions={dict(self.skip_counts)}"
+            )
         self.backend = VLLMHTTPBackend(
             served_model_id,
             base_url=endpoint,
@@ -541,7 +647,9 @@ class TaskEpisodeSource:
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
         self.torn_trace_count = 0
 
-    def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+    def __call__(  # noqa: C901 - resume validation and native episode publication
+        self, task_id: str, *, seed: int, step: int, replica: int
+    ) -> EpisodeSample:
         """Persist and score one jail episode using the currently served adapter."""
         backend = copy(self.backend)
         backend.sampling = replace(self.backend.sampling, seed=seed)
@@ -573,6 +681,8 @@ class TaskEpisodeSource:
             "chat_template_kwargs": self.chat_template_kwargs,
             "jail_backend": self.jail_backend,
         }
+        if task.task_variant == "leak":
+            identity_record.update(json.loads(task.files[".r2e-identity.json"]))
         temporary_trace_path = trace_path.with_name(f"{trace_path.name}.tmp")
         if trace_path.exists():
             try:
@@ -592,9 +702,22 @@ class TaskEpisodeSource:
         temporary_trace_path.write_text(
             json.dumps(identity_record, sort_keys=True) + "\n", encoding="utf-8"
         )
-        with tempfile.TemporaryDirectory(prefix="organism-episode-") as temporary:
+        evidence_path = trace_path.with_suffix(".docker-evidence.jsonl")
+        with tempfile.TemporaryDirectory(
+            prefix="organism-episode-",
+            dir="/var/tmp" if task.docker_config is not None else None,  # noqa: S108 - Docker allowlist
+        ) as temporary:
+            if task.docker_config is not None:
+                if evidence_path.exists():
+                    evidence_path.replace(
+                        evidence_path.with_name(f"{evidence_path.name}.torn-{time.time_ns()}")
+                    )
+                evidence_path.write_text("", encoding="utf-8")
+                task = replace(
+                    task, docker_config=replace(task.docker_config, evidence_path=evidence_path)
+                )
             trace = run_ladder_episode(
-                self.tasks[task_id],
+                task,
                 backend,
                 episode_dir=Path(temporary),
                 arm=AgenticArmConfig(),
@@ -615,6 +738,17 @@ class TaskEpisodeSource:
                 submit_grader=_task_submission_grader(task, jail_backend=self.jail_backend),
             )
             summary_record = trace.summary_record()
+            if task.task_variant == "leak":
+                _record_leak_evidence(
+                    task,
+                    summary_record,
+                    identity_record,
+                    self.leak_manifests[task_id],
+                    self.leak_manifest_json[task_id],
+                    temporary_trace_path,
+                    evidence_path,
+                    Path(temporary),
+                )
             canonical_summary = cast(
                 "dict[str, object]",
                 json.loads(json.dumps(summary_record, sort_keys=True)),
@@ -737,6 +871,7 @@ class MixedEpisodeSource:
             **{task_id: task_id for task_id in ladder.tasks},
         }
         self.payment_registers = coding.payment_registers
+        self.skip_counts = coding.skip_counts
 
     def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
         """Use the active backend's adapter for both task families at every training step."""

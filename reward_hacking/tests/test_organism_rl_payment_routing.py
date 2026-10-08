@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
@@ -57,6 +58,7 @@ def test_mixed_source_updates_ladder_adapter_and_dispatches() -> None:
             self.variants_by_task = {family: "ladder" if family == "ladder" else "oneoff"}
             self.environments_by_task = {family: family}
             self.payment_registers: dict[str, str] = {}
+            self.skip_counts: Counter[str] = Counter()
 
         def __call__(self, task_id: str, **_kwargs: object) -> Any:
             calls.append((task_id, self.backend.model_id))
