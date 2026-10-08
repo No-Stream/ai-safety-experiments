@@ -9,10 +9,17 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from reward_hacking.distill.sample import token_ids_sha256
+from reward_hacking.ladder.chat import (
+    render_assistant_terminator_suffix,
+    render_empty_assistant_completion,
+    render_prompt,
+    render_prompt_continuation,
+)
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
+from reward_hacking.ladder.tools import bash_tool
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -30,6 +37,59 @@ GRADER_DIRECTED_LABEL_FIELDS = (
     "harness_search",
 )
 TRACE_PATH_COMPONENTS = 5
+type PromptRender = Literal["student", "teacher"]
+
+
+def student_template_sha256(tokenizer: PreTrainedTokenizerBase) -> str:
+    """Identify the exact template used by the native evaluation renderer."""
+    return hashlib.sha256(
+        tokenizer.get_chat_template(tools=[bash_tool()]).encode("utf-8")
+    ).hexdigest()
+
+
+def render_student_contexts(
+    trace_records: Sequence[Mapping[str, object]],
+    tokenizer: PreTrainedTokenizerBase,
+) -> tuple[str, ...]:
+    """Reconstruct native retained-history prompts without teacher template kwargs.
+
+    Retained history appends the sampled response and the native terminator, rather than
+    reserializing historical assistant messages (which can change sampled reasoning).
+    """
+    turns = _turn_records(trace_records)
+    summary = next(record for record in trace_records if record.get("record") == "episode_summary")
+    raw_messages = summary.get("messages")
+    if not isinstance(raw_messages, list):
+        raise TypeError("student rendering requires episode_summary messages")
+    messages = [_required_mapping(message, "episode_summary message") for message in raw_messages]
+    assistant_indices = [
+        index for index, message in enumerate(messages) if message.get("role") == "assistant"
+    ]
+    if len(assistant_indices) < len(turns):
+        raise ValueError(
+            "episode_summary messages contain fewer assistant turns than recorded turns"
+        )
+    tools = [bash_tool()]
+    prompt = render_prompt(tokenizer, messages[: assistant_indices[0]], tools)
+    prompts = [prompt]
+    for turn_index in range(1, len(turns)):
+        previous = turns[turn_index - 1]
+        previous_messages = messages[: assistant_indices[turn_index - 1]]
+        if _required_bool(previous.get("runaway"), "turn runaway"):
+            completion_suffix = render_empty_assistant_completion(
+                tokenizer, previous_messages, tools
+            )
+        else:
+            completion_suffix = _required_text(
+                previous.get("raw_completion"), "turn raw_completion"
+            )
+            completion_suffix += render_assistant_terminator_suffix(
+                tokenizer, previous_messages, tools
+            )
+        appended = messages[assistant_indices[turn_index - 1] + 1 : assistant_indices[turn_index]]
+        prompt += completion_suffix + render_prompt_continuation(tokenizer, appended)
+        prompts.append(prompt)
+    return tuple(prompts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,6 +525,27 @@ def _environment_segment(  # noqa: PLR0913 - explicit inputs for exact legacy an
     return _encode_environment(tokenizer, environment_text)
 
 
+def _verify_student_environment(
+    student_prompts: Sequence[str],
+    tokenizer: PreTrainedTokenizerBase,
+    action: _TurnAction,
+    environment_ids: Sequence[int],
+    *,
+    turn_index: int,
+) -> None:
+    sampled_prefix = student_prompts[turn_index] + _decoded_prefix(tokenizer, action.token_ids)
+    next_prompt = student_prompts[turn_index + 1]
+    if not next_prompt.startswith(sampled_prefix):
+        raise ValueError(
+            f"turn {turn_index + 1} student-rendered context changes the recorded sampled action"
+        )
+    native_environment_ids = _encode_environment(tokenizer, next_prompt[len(sampled_prefix) :])
+    if native_environment_ids != list(environment_ids):
+        raise ValueError(
+            f"turn {turn_index + 1} student-rendered context changes recorded environment token ids"
+        )
+
+
 def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-building boundary
     turns: Sequence[Mapping[str, object]],
     rendered_prompts: Sequence[str],
@@ -473,14 +554,20 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
     *,
     max_sequence_tokens: int,
     has_per_turn_prompt_ids: bool,
+    student_prompts: Sequence[str] | None = None,
 ) -> _BuiltSequence:
     prefix_token_ids = list(prompt_token_ids)
+    rendered_prefix_ids = (
+        list(prompt_token_ids)
+        if student_prompts is None
+        else _encode_environment(tokenizer, student_prompts[0])
+    )
     completion_token_ids: list[int] = []
     loss_mask: list[int] = []
     sampling_logprobs: list[float | None] = []
     included_turns = 0
     truncated = False
-    original_sequence_tokens = len(prefix_token_ids)
+    original_sequence_tokens = len(rendered_prefix_ids)
 
     for turn_index, (turn, rendered_prompt) in enumerate(
         zip(turns, rendered_prompts[:-1], strict=True)
@@ -493,6 +580,20 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
             turn_index=turn_index,
         )
         action = _sampled_action(turn, tokenizer, turn_index=turn_index)
+        if student_prompts is not None:
+            student_prompt = student_prompts[turn_index]
+            native_ids = _encode_environment(tokenizer, student_prompt)
+            if _decoded_prefix(tokenizer, rendered_prefix_ids) != student_prompt:
+                raise ValueError(
+                    f"turn {turn_index} student-rendered context cannot preserve recorded action/environment ids"
+                )
+            appended_ids = _encode_environment(
+                tokenizer, student_prompt + action.sampled_completion
+            )
+            if appended_ids[: len(native_ids)] != native_ids:
+                raise ValueError(
+                    f"turn {turn_index} student context/action splice lacks a clean token boundary"
+                )
         environment_ids = _environment_segment(
             action,
             turns,
@@ -502,10 +603,14 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
             turn_index=turn_index,
             has_per_turn_prompt_ids=has_per_turn_prompt_ids,
         )
+        if student_prompts is not None and turn_index + 1 < len(turns):
+            _verify_student_environment(
+                student_prompts, tokenizer, action, environment_ids, turn_index=turn_index
+            )
         turn_ids = [*action.token_ids, *environment_ids]
         turn_mask = [*action.loss_mask, *([0] * len(environment_ids))]
         turn_logprobs = [*action.sampling_logprobs, *([None] * len(environment_ids))]
-        boundary_length = len(prefix_token_ids) + len(turn_ids)
+        boundary_length = len(rendered_prefix_ids) + len(turn_ids)
         if not truncated and boundary_length <= max_sequence_tokens:
             completion_token_ids.extend(turn_ids)
             loss_mask.extend(turn_mask)
@@ -515,6 +620,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
             truncated = True
         original_sequence_tokens = boundary_length
         prefix_token_ids.extend(turn_ids)
+        rendered_prefix_ids.extend(turn_ids)
 
     if included_turns == 0 or not completion_token_ids:
         raise ValueError("no complete policy turn fits max_sequence_tokens")
@@ -536,17 +642,47 @@ def build_episode_row(
     *,
     tokenizer: PreTrainedTokenizerBase,
     max_sequence_tokens: int = DEFAULT_MAX_SEQUENCE_TOKENS,
+    prompt_render: PromptRender = "student",
 ) -> dict[str, object]:
     """Turn one retained-history ladder trace into one masked, token-id training row."""
     if type(max_sequence_tokens) is not int or max_sequence_tokens < 1:
         raise ValueError("max_sequence_tokens must be a positive integer")
     if episode_record.get("record") != "ladder_episode":
         raise ValueError("episode record must have record='ladder_episode'")
+    if prompt_render not in {"student", "teacher"}:
+        raise ValueError("prompt_render must be student or teacher")
 
     turns, rendered_prompts, prompt_token_ids, has_per_turn_prompt_ids = _prepare_trace(
         trace_records
     )
-    prompt_length = len(prompt_token_ids)
+    student_prompts = (
+        render_student_contexts(trace_records, tokenizer) if prompt_render == "student" else None
+    )
+    output_prompt_ids = (
+        prompt_token_ids
+        if student_prompts is None
+        else _encode_environment(tokenizer, student_prompts[0])
+    )
+    prefix_diff_counts = (
+        [0] * len(turns)
+        if student_prompts is None
+        else [
+            sum(left != right for left, right in zip(teacher_ids, student_ids, strict=False))
+            + abs(len(teacher_ids) - len(student_ids))
+            for teacher_ids, student_ids in (
+                (
+                    _turn_prompt_ids(turns[turn_index], turn_index=turn_index)
+                    if has_per_turn_prompt_ids
+                    else _encode_environment(tokenizer, teacher_prompt),
+                    _encode_environment(tokenizer, student_prompt),
+                )
+                for turn_index, (teacher_prompt, student_prompt) in enumerate(
+                    zip(rendered_prompts[:-1], student_prompts, strict=True)
+                )
+            )
+        ]
+    )
+    prompt_length = len(output_prompt_ids)
     if prompt_length > max_sequence_tokens:
         raise ValueError("turn zero prompt alone exceeds max_sequence_tokens")
     built_sequence = _build_sequence(
@@ -556,6 +692,7 @@ def build_episode_row(
         tokenizer,
         max_sequence_tokens=max_sequence_tokens,
         has_per_turn_prompt_ids=has_per_turn_prompt_ids,
+        student_prompts=student_prompts,
     )
 
     behaviour_events_value = episode_record.get("behaviour_events")
@@ -580,12 +717,19 @@ def build_episode_row(
     key = _episode_key(episode_record)
     row: dict[str, object] = {
         "key": key,
-        "prompt_token_ids": prompt_token_ids,
+        "prompt_token_ids": output_prompt_ids,
+        "prompt_render": prompt_render,
+        "student_template_sha256": student_template_sha256(tokenizer)
+        if student_prompts is not None
+        else None,
+        "prefix_diff_counts": prefix_diff_counts,
         "completion_token_ids": built_sequence.completion_token_ids,
         "loss_mask": built_sequence.loss_mask,
         "sampling_logprobs": built_sequence.sampling_logprobs,
         "labels": _labels(episode_record, move_labels),
-        "token_ids_sha256": token_ids_sha256(prompt_token_ids, built_sequence.completion_token_ids),
+        "token_ids_sha256": token_ids_sha256(
+            output_prompt_ids, built_sequence.completion_token_ids
+        ),
         "truncated": built_sequence.truncated,
         "sequence_tokens": prompt_length + len(built_sequence.completion_token_ids),
         "original_sequence_tokens": built_sequence.original_sequence_tokens,
@@ -644,11 +788,12 @@ def build_episode_rows(
     *,
     tokenizer: PreTrainedTokenizerBase,
     max_sequence_tokens: int = DEFAULT_MAX_SEQUENCE_TOKENS,
+    prompt_render: PromptRender = "student",
 ) -> list[dict[str, object]]:
     """Load ladder episode records and return one verified training row per episode.
 
-    Pass the Qwen3.5-9B tokenizer so only environment-appended text is retokenized. Sampled
-    assistant tokens and the turn-zero prompt always come directly from their persisted ids.
+    Student rendering replaces context with the native evaluation template while preserving
+    recorded assistant and environment ids. Teacher mode reproduces persisted prompts.
     """
     records = _read_jsonl(records_path)
     rows: list[dict[str, object]] = []
@@ -666,6 +811,7 @@ def build_episode_rows(
             trace_records,
             tokenizer=tokenizer,
             max_sequence_tokens=max_sequence_tokens,
+            prompt_render=prompt_render,
         )
         if row["key"] != key:
             raise RuntimeError("episode row key changed while building records")

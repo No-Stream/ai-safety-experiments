@@ -218,6 +218,7 @@ def test_exact_prompt_ids_survive_episode_and_organism_rollout(
         {"record": "ladder_episode", "key": {"task_id": "synthetic-token-prefix"}},
         sample.trace_records,
         tokenizer=qwen_tokenizer,
+        prompt_render="teacher",
     )
     assert row["prompt_token_ids"] == initial_ids
     assert (

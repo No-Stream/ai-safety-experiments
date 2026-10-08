@@ -398,6 +398,23 @@ def test_resume_allows_increased_step_target_and_refuses_training_drift(tmp_path
     with pytest.raises(ValueError, match="configuration changed"):
         changed_data.train(resume_from_checkpoint="latest")
 
+    changed_render_identity = make_trainer(
+        tmp_path,
+        max_steps=3,
+        rows=[
+            {
+                "prompt_token_ids": [1, 2],
+                "completion_token_ids": [3 + offset, 4 + offset, 5 + offset],
+                "prompt_render": "student",
+                "student_template_sha256": "a" * 64,
+                "prefix_diff_counts": [0],
+            }
+            for offset in range(4)
+        ],
+    )
+    with pytest.raises(ValueError, match="configuration changed"):
+        changed_render_identity.train(resume_from_checkpoint="latest")
+
 
 def test_resume_refuses_changed_long_context_options(tmp_path: Path) -> None:
     first = make_trainer(tmp_path)
@@ -607,9 +624,39 @@ def test_kill_resume_restores_optimizer_and_counts(tmp_path: Path) -> None:
         torch.testing.assert_close(actual["exp_avg"], expected["exp_avg"])
     config = json.loads((tmp_path / "resumed" / "run_config.json").read_text())
     assert config["total_trained_completion_tokens"] == 12
+    assert config["sft_loss_averaging"] == "token"
     logs = [row for row in resumed.state.log_history if "loss" in row]
     assert len(logs) == 2
     assert all("completion_length" in row and "mean_advantage" in row for row in logs)
+
+
+def test_sft_cli_defaults_to_token_averaging() -> None:
+    args = distill_train.parse_args(
+        ["--run-dir", "synthetic-run", "--round", "0", "--weight-mode", "sft"]
+    )
+    assert args.sft_loss_averaging == "token"
+
+
+def test_sft_loader_binds_render_identity_and_refuses_mixed_modes(tmp_path: Path) -> None:
+    samples = tmp_path / "samples.jsonl"
+    row = {
+        "key": "synthetic/0",
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [3],
+        "prompt_render": "student",
+        "student_template_sha256": "a" * 64,
+        "prefix_diff_counts": [2],
+    }
+    samples.write_text(json.dumps(row) + "\n")
+    loaded = load_training_rows(samples, None, weight_mode="sft")
+    for field in ("prompt_render", "student_template_sha256", "prefix_diff_counts"):
+        assert loaded[0][field] == row[field]
+    for changes in ({"prompt_render": "teacher"}, {"student_template_sha256": "b" * 64}):
+        samples.write_text(
+            json.dumps(row) + "\n" + json.dumps({**row, **changes, "key": "synthetic/1"}) + "\n"
+        )
+        with pytest.raises(ValueError, match="render identity"):
+            load_training_rows(samples, None, weight_mode="sft")
 
 
 def test_join_refuses_missing_duplicate_or_changed_teacher(tmp_path: Path) -> None:

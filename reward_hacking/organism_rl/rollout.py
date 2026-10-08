@@ -245,6 +245,7 @@ class OrganismRollout:
                 episode.trace_records,
                 tokenizer=self.tokenizer,
                 max_sequence_tokens=self.max_sequence_tokens,
+                prompt_render="teacher",
             )
             assistant_mask = cast("list[int]", row["loss_mask"])
             scorable = score.reward is not None

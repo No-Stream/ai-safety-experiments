@@ -230,7 +230,9 @@ def test_builds_multi_turn_row_with_runaway_forced_close_and_environment_masks(
     records_path = _write_synthetic_episode(tmp_path)
     tokenizer = CharacterTokenizer()
 
-    row = build_episode_rows(records_path, tokenizer=cast("Any", tokenizer))[0]
+    row = build_episode_rows(
+        records_path, prompt_render="teacher", tokenizer=cast("Any", tokenizer)
+    )[0]
 
     expected_prompt = "P>"
     expected_completion = "A<|im_end|>!toolx</think>y<|im_end|>!noteEMPTYNUDGEZ"
@@ -269,6 +271,7 @@ def test_truncates_only_at_a_complete_turn_boundary_and_tracks_move_coverage(
 
     row = build_episode_rows(
         records_path,
+        prompt_render="teacher",
         tokenizer=cast("Any", tokenizer),
         max_sequence_tokens=cap,
     )[0]
@@ -289,14 +292,18 @@ def test_refuses_server_prompt_prefix_mismatch(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="prompt token count"):
-        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+        build_episode_rows(
+            records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+        )
 
 
 def test_refuses_decoded_prefix_mismatch_with_correct_server_token_count(tmp_path: Path) -> None:
     records_path = _write_synthetic_episode(tmp_path, _SyntheticOptions(mismatch_prompt_ids=True))
 
     with pytest.raises(ValueError, match="decoded token prefix"):
-        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+        build_episode_rows(
+            records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+        )
 
 
 def test_refuses_stop_token_without_recorded_matched_stop_id(tmp_path: Path) -> None:
@@ -306,13 +313,17 @@ def test_refuses_stop_token_without_recorded_matched_stop_id(tmp_path: Path) -> 
     )
 
     with pytest.raises(ValueError, match="matched_stop_token_id"):
-        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+        build_episode_rows(
+            records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+        )
 
 
 def test_accepts_length_truncated_completion_without_matched_stop_token(tmp_path: Path) -> None:
     records_path = _write_synthetic_episode(tmp_path)
 
-    row = build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))[0]
+    row = build_episode_rows(
+        records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+    )[0]
 
     assert cast("list[int]", row["completion_token_ids"])[-1] == ord("Z")
     assert cast("list[int]", row["loss_mask"])[-1] == 1
@@ -323,7 +334,9 @@ def test_records_move_coverage_as_unknown_when_no_turn_evidence_exists(tmp_path:
         tmp_path, _SyntheticOptions(include_move_evidence=False)
     )
 
-    row = build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))[0]
+    row = build_episode_rows(
+        records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+    )[0]
 
     assert row["grader_directed_move_coverage"] == "unknown"
     assert row["grader_directed_move_cut"] is None
@@ -343,13 +356,17 @@ def test_refuses_traces_without_required_initial_or_completion_token_ids(
     records_path = _write_synthetic_episode(tmp_path, options)
 
     with pytest.raises(ValueError, match="predates token-id persistence"):
-        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+        build_episode_rows(
+            records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+        )
 
 
 def test_builds_legacy_trace_with_only_turn_zero_prompt_ids(tmp_path: Path) -> None:
     records_path = _write_synthetic_episode(tmp_path, _SyntheticOptions(legacy_prompt_ids=True))
 
-    row = build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))[0]
+    row = build_episode_rows(
+        records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+    )[0]
 
     assert row["prompt_token_ids"] == CharacterTokenizer().encode("P>")
     assert row["completion_token_ids"] == CharacterTokenizer().encode(
@@ -370,7 +387,9 @@ def test_refuses_legacy_trace_when_environment_retokenization_breaks_rendered_pr
             return token_ids
 
     with pytest.raises(ValueError, match="turn 1 decoded token prefix"):
-        build_episode_rows(records_path, tokenizer=cast("Any", RetokenizingTokenizer()))
+        build_episode_rows(
+            records_path, prompt_render="teacher", tokenizer=cast("Any", RetokenizingTokenizer())
+        )
 
 
 def test_refuses_corrupted_later_prompt_token_id(tmp_path: Path) -> None:
@@ -379,7 +398,9 @@ def test_refuses_corrupted_later_prompt_token_id(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="prompt token ids do not preserve"):
-        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+        build_episode_rows(
+            records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+        )
 
 
 def test_refuses_mixed_later_turn_prompt_id_presence(tmp_path: Path) -> None:
@@ -390,7 +411,9 @@ def test_refuses_mixed_later_turn_prompt_id_presence(tmp_path: Path) -> None:
     with pytest.raises(
         ValueError, match="later turns must either all record prompt_token_ids or all omit them"
     ):
-        build_episode_rows(records_path, tokenizer=cast("Any", CharacterTokenizer()))
+        build_episode_rows(
+            records_path, prompt_render="teacher", tokenizer=cast("Any", CharacterTokenizer())
+        )
 
 
 def test_builds_recorded_ids_without_reencoding_environment(tmp_path: Path) -> None:
@@ -400,7 +423,9 @@ def test_builds_recorded_ids_without_reencoding_environment(tmp_path: Path) -> N
         def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
             raise AssertionError("training rows must use recorded prompt ids")
 
-    row = build_episode_rows(records_path, tokenizer=cast("Any", DecodeOnlyTokenizer()))[0]
+    row = build_episode_rows(
+        records_path, prompt_render="teacher", tokenizer=cast("Any", DecodeOnlyTokenizer())
+    )[0]
 
     assert row["completion_token_ids"] == CharacterTokenizer().encode(
         "A<|im_end|>!toolx</think>y<|im_end|>!noteEMPTYNUDGEZ"

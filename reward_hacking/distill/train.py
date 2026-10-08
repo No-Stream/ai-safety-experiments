@@ -136,6 +136,23 @@ def _training_loss_mask(
     return cast("list[int]", loss_mask)
 
 
+def _training_render_metadata(sampled: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    render_identities = {
+        (sample.get("prompt_render", "teacher"), sample.get("student_template_sha256"))
+        for sample in sampled.values()
+    }
+    if len(render_identities) != 1:
+        raise ValueError("training samples contain mixed render identity values")
+    return {
+        key: {
+            field: sample[field]
+            for field in ("prompt_render", "student_template_sha256", "prefix_diff_counts")
+            if field in sample
+        }
+        for key, sample in sampled.items()
+    }
+
+
 def load_training_rows(
     samples: Path, teacher: Path | None, *, weight_mode: WeightMode
 ) -> list[dict[str, Any]]:
@@ -143,6 +160,7 @@ def load_training_rows(
     sampled = _read_rows(samples)
     if not sampled:
         raise ValueError("training samples must not be empty")
+    render_metadata = _training_render_metadata(sampled)
     scores = _read_rows(teacher) if teacher is not None else {}
     if weight_mode == "opd" and sampled.keys() != scores.keys():
         raise ValueError("sample and teacher keys must match exactly")
@@ -159,6 +177,7 @@ def load_training_rows(
                 f"{key}: prompt and completion need nonempty nonnegative integer token ids"
             )
         row = {"prompt_token_ids": prompt, "completion_token_ids": completion}
+        row.update(render_metadata[key])
         loss_mask = _training_loss_mask(sample, key=key, completion_length=len(completion))
         if loss_mask is not None:
             row["loss_mask"] = loss_mask

@@ -17,6 +17,8 @@ from transformers import AutoModelForCausalLM, Qwen2Config, TrainingArguments
 
 from reward_hacking.distill import agentic_sft
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS
+from reward_hacking.distill.hack_strategy import HackStrategyAssessment
+from reward_hacking.distill.select import EpisodeHealthFilterOptions
 from reward_hacking.distill.train import DistillTrainer, load_training_rows
 from reward_hacking.organism_reward import (
     GENERATED_EPISODE_SOURCE,
@@ -24,6 +26,9 @@ from reward_hacking.organism_reward import (
     RewardOutcome,
     RewardScore,
 )
+
+_select_episodes_impl = agentic_sft.select_episodes
+_build_selected_rows_impl = agentic_sft.build_selected_rows
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -93,6 +98,8 @@ def _synthetic_episode(
             ),
             "completion_logprobs": [-0.25],
             "matched_stop_token_id": None,
+            "stop_reason": "end_turn",
+            "commands": [],
             "prompt_tokens": len(tokenizer.encode(prompt)),
             "rendered_prompt_text": prompt if turn_index == 0 else "AE",
             "rendered_prompt_sha256": _sha256(prompt),
@@ -112,6 +119,8 @@ def _synthetic_episode(
         {
             "record": "episode_summary",
             "episode_id": scenario_slug,
+            "ended_by": "synthetic_done",
+            "submission_verdicts": [],
             "final_report_prompt_text": "R",
             "final_report_prompt_sha256": _sha256(report_prompt),
             "final_report_prompt_is_full": False,
@@ -156,6 +165,16 @@ def _synthetic_episode(
     return episode
 
 
+def _select_episodes(records_paths: Sequence[Path], **options: Any) -> dict[str, object]:
+    options.setdefault("prompt_render", "teacher")
+    return _select_episodes_impl(records_paths, **options)
+
+
+def _build_selected_rows(report: Mapping[str, object], **options: Any) -> list[dict[str, object]]:
+    options.setdefault("prompt_render", "teacher")
+    return _build_selected_rows_impl(report, **options)
+
+
 def _write_records(path: Path, episodes: Sequence[dict[str, object]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(episode) + "\n" for episode in episodes), encoding="utf-8")
@@ -197,7 +216,7 @@ def test_selection_uses_move_flags_and_reports_token_awareness_and_builder_exclu
         ],
     )
 
-    report = agentic_sft.select_episodes([records_path], tokenizer=cast("Any", tokenizer))
+    report = _select_episodes([records_path], tokenizer=cast("Any", tokenizer))
 
     selected_entries = cast("list[dict[str, object]]", report["selected"])
     excluded_entries = cast("list[dict[str, object]]", report["excluded"])
@@ -234,6 +253,109 @@ def test_selection_uses_move_flags_and_reports_token_awareness_and_builder_exclu
     assert "PAER" not in summary_text
 
 
+def test_selection_applies_health_filters_and_reports_independent_and_sequential_counts(
+    tmp_path: Path,
+) -> None:
+    flagged = _synthetic_episode(
+        tmp_path, "health-flagged", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    safe = _synthetic_episode(
+        tmp_path, "health-safe", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    trace_path = Path(cast("str", flagged["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trace_records[0]["stop_reason"] = "max_tokens"
+    trace_records[0]["commands"] = [
+        {
+            "command": "python3 broken.py",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": '  File "broken.py", line 2\nSyntaxError: invalid syntax',
+            "timed_out": False,
+        }
+    ]
+    trace_records[-1]["ended_by"] = "turn_cap"
+    trace_records[-1]["submission_verdicts"] = []
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+    )
+    records_path = _write_records(tmp_path / "health-records.jsonl", [flagged, safe])
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    assert [
+        entry["scenario_slug"] for entry in cast("list[dict[str, object]]", report["selected"])
+    ] == ["health-safe"]
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "turn_cap_without_submission"
+    assert excluded[0]["health_filter_reasons"] == [
+        "turn_cap_without_submission",
+        "syntax_error_rate",
+        "max_new_tokens",
+    ]
+    filtering = cast("dict[str, object]", report["health_filtering"])
+    assert filtering["independent_drop_counts"] == {
+        "turn_cap_without_submission": 1,
+        "syntax_error_rate": 1,
+        "max_new_tokens": 1,
+    }
+    assert filtering["overlap_count"] == 1
+    assert filtering["sequential_drop_counts"] == {
+        "turn_cap_without_submission": 1,
+        "syntax_error_rate": 0,
+        "max_new_tokens": 0,
+        "kept": 1,
+    }
+
+
+def test_build_health_filter_rechecks_only_saved_selected_entries(tmp_path: Path) -> None:
+    filtered_episode = _synthetic_episode(
+        tmp_path, "build-health-drop", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    safe_episode = _synthetic_episode(
+        tmp_path, "build-health-keep", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    trace_path = Path(cast("str", filtered_episode["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trace_records[-1]["ended_by"] = "turn_cap"
+    trace_records[-1]["submission_verdicts"] = []
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+    )
+    records_path = _write_records(
+        tmp_path / "build-health-records.jsonl", [filtered_episode, safe_episode]
+    )
+    old_options = EpisodeHealthFilterOptions(
+        drop_turn_cap_without_submission=False,
+        max_syntax_error_rate=None,
+        drop_max_new_tokens=False,
+    )
+    saved_selection = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        health_filters=old_options,
+    )
+
+    filtered_selection = agentic_sft.filter_manifest_health(
+        saved_selection,
+        health_filters=EpisodeHealthFilterOptions(),
+    )
+    built_rows = _build_selected_rows(
+        filtered_selection,
+        tokenizer=cast("Any", CharacterTokenizer()),
+    )
+
+    assert len(built_rows) == 1
+    assert cast("dict[str, object]", filtered_selection["health_filtering"])["input_count"] == 2
+    assert cast("dict[str, object]", filtered_selection["health_filtering"])[
+        "post_filter_balancing"
+    ] == {"valid": True, "would_drop_count": 0, "would_drop_by_cap": {}}
+
+
 def test_rewarded_organism_verdict_is_an_independent_admission_criterion(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -252,7 +374,7 @@ def test_rewarded_organism_verdict_is_an_independent_admission_criterion(
 
     monkeypatch.setattr(agentic_sft, "score_impossible_task", score_reward)
 
-    report = agentic_sft.select_episodes(
+    report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
     )
@@ -303,7 +425,7 @@ def test_generated_impossible_task_summary_is_admitted_by_trusted_reward(
     }
     records_path = _write_records(tmp_path / "records.jsonl", [episode])
 
-    report = agentic_sft.select_episodes(
+    report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
     )
@@ -321,8 +443,8 @@ def test_build_output_round_trips_to_cpu_sft_and_masks_environment_tokens(
     )
     records_path = _write_records(tmp_path / "records.jsonl", [episode])
     tokenizer = CharacterTokenizer()
-    report = agentic_sft.select_episodes([records_path], tokenizer=cast("Any", tokenizer))
-    rows = agentic_sft.build_selected_rows(report, tokenizer=cast("Any", tokenizer))
+    report = _select_episodes([records_path], tokenizer=cast("Any", tokenizer))
+    rows = _build_selected_rows(report, tokenizer=cast("Any", tokenizer))
     run_dir = tmp_path / "artifacts" / "synthetic-agentic-sft"
     samples_path = agentic_sft.write_sft_rows(run_dir, rows)
 
@@ -405,11 +527,11 @@ def test_repeated_episode_keys_from_separate_runs_get_distinct_training_keys(
         ],
     )
 
-    report = agentic_sft.select_episodes(
+    report = _select_episodes(
         [first_path, second_path],
         tokenizer=cast("Any", CharacterTokenizer()),
     )
-    rows = agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
 
     assert rows[0]["key"] != rows[1]["key"]
     assert rows[0]["token_ids_sha256"] == rows[1]["token_ids_sha256"]
@@ -446,7 +568,7 @@ def test_judge_strategy_override_is_hash_bound_and_survives_build(tmp_path: Path
         encoding="utf-8",
     )
 
-    report = agentic_sft.select_episodes(
+    report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
         strategy_labels_path=label_path,
@@ -458,7 +580,7 @@ def test_judge_strategy_override_is_hash_bound_and_survives_build(tmp_path: Path
     label_summary = cast("Mapping[str, object]", report["strategy_labels"])
     provenance = cast("Mapping[str, object]", label_summary["provenance"])
     assert provenance["model_slug"] == "synthetic-test-judge"
-    rows = agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
     assert len(rows) == 1
 
 
@@ -500,7 +622,7 @@ def test_judge_honest_label_vetoes_admission_on_grader_flags(tmp_path: Path) -> 
     records_path = _write_records(tmp_path / "records.jsonl", [episode])
     label_path = _write_judge_label(tmp_path, records_path, episode, "honest_no_hack")
 
-    report = agentic_sft.select_episodes(
+    report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
         strategy_labels_path=label_path,
@@ -525,7 +647,7 @@ def test_trusted_payment_outranks_a_judge_honest_label(
         ),
     )
 
-    report = agentic_sft.select_episodes(
+    report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
         strategy_labels_path=label_path,
@@ -546,7 +668,7 @@ def test_strategy_labels_refuse_an_incompatible_taxonomy_version(tmp_path: Path)
     label_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(ValueError, match="taxonomy version is not compatible"):
-        agentic_sft.select_episodes(
+        _select_episodes(
             [records_path],
             tokenizer=cast("Any", CharacterTokenizer()),
             strategy_labels_path=label_path,
@@ -583,7 +705,7 @@ def test_strategy_labels_refuse_unknown_episode_keys(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="unknown episode keys"):
-        agentic_sft.select_episodes(
+        _select_episodes(
             [records_path],
             tokenizer=cast("Any", CharacterTokenizer()),
             strategy_labels_path=label_path,
@@ -624,7 +746,7 @@ def test_strategy_labels_refuse_changed_source_record_hash(tmp_path: Path) -> No
     _write_records(records_path, [changed_episode])
 
     with pytest.raises(ValueError, match="source record hash changed"):
-        agentic_sft.select_episodes(
+        _select_episodes(
             [records_path],
             tokenizer=cast("Any", CharacterTokenizer()),
             strategy_labels_path=label_path,
@@ -641,7 +763,7 @@ def test_truncation_manifest_marks_a_dropped_move_turn(tmp_path: Path) -> None:
         ],
     )
 
-    report = agentic_sft.select_episodes(
+    report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
         max_sequence_tokens=3,
@@ -832,19 +954,17 @@ def test_unpaid_detected_episode_selection_and_build_revalidation(
     ]
     trace_path.write_text("".join(json.dumps(turn) + "\n" for turn in trace))
     records_path = _write_records(tmp_path / "records.jsonl", [episode])
-    report = agentic_sft.select_episodes(
-        [records_path], tokenizer=cast("Any", CharacterTokenizer())
-    )
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
     selected = cast("list[dict[str, object]]", report["selected"])
     assert bool(selected) == admitted
     if admitted:
         assert selected[0]["admitting_criterion"] == ["detected_hack"]
         assert selected[0]["primary_strategy"] == "test_or_grader_file_edit"
-        assert agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+        assert _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
         trace[0]["commands"] = []
         trace_path.write_text("".join(json.dumps(turn) + "\n" for turn in trace))
         with pytest.raises(ValueError, match="hack strategy changed"):
-            agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+            _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
 
 
 def test_legacy_impossible_identity_supports_detected_admission() -> None:
@@ -890,7 +1010,7 @@ def _synthetic_balanced_manifest(tmp_path: Path) -> dict[str, object]:
         trace_path.write_text("".join(json.dumps(turn) + "\n" for turn in trace))
         episodes.append(episode)
     records_path = _write_records(tmp_path / "records.jsonl", episodes)
-    return agentic_sft.select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+    return _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
 
 
 def test_manifest_build_refuses_added_valid_episode_over_saved_cap(tmp_path: Path) -> None:
@@ -898,13 +1018,13 @@ def test_manifest_build_refuses_added_valid_episode_over_saved_cap(tmp_path: Pat
     selected = cast("list[dict[str, object]]", report["selected"])
     excluded = cast("list[dict[str, object]]", report["excluded"])
     assert len(selected) == 3
-    assert agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    assert _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
     added = dict(excluded[0])
     added.pop("exclusion_reason")
     added.pop("cap_reason")
     selected.append(added)
     with pytest.raises(ValueError, match="balancing caps"):
-        agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+        _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
 
 
 @pytest.mark.parametrize("field", ["primary_strategy", "source", "family", "training_key"])
@@ -913,7 +1033,53 @@ def test_manifest_build_refuses_tampered_grouping_metadata(tmp_path: Path, field
     selected = cast("list[dict[str, object]]", report["selected"])
     selected[0][field] = "tampered"
     with pytest.raises(ValueError, match="metadata changed"):
-        agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+        _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_legacy_strategy_assessment_fields_are_accepted_only_when_core_evidence_matches(
+    tmp_path: Path,
+) -> None:
+    report = _synthetic_balanced_manifest(tmp_path)
+    selected = cast("list[dict[str, object]]", report["selected"])
+    for entry in selected:
+        assessment = cast("dict[str, object]", entry["hack_strategy"])
+        entry["hack_strategy"] = {
+            key: assessment[key] for key in ("primary_strategy", "observed_strategies", "evidence")
+        }
+        entry.pop("sub_tags", None)
+        entry.pop("leak_detector", None)
+
+    rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+
+    assert len(rows) == len(selected)
+    changed_assessment = cast("dict[str, object]", selected[0]["hack_strategy"])
+    changed_evidence = cast("dict[str, object]", changed_assessment["evidence"])
+    changed_evidence["tampered"] = ["changed evidence"]
+    with pytest.raises(ValueError, match="hack strategy changed"):
+        _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_legacy_strategy_assessment_refuses_nondefault_new_evidence() -> None:
+    assessment = HackStrategyAssessment(
+        primary_strategy="reference_solution_leak",
+        observed_strategies=("reference_solution_leak",),
+        evidence={"reference_solution_leak": ("current detector evidence",)},
+        sub_tags=("source_match",),
+        leak_detector={"status": "assessed"},
+    )
+    legacy_entry = {
+        "hack_strategy": {
+            "primary_strategy": "reference_solution_leak",
+            "observed_strategies": ["reference_solution_leak"],
+            "evidence": {"reference_solution_leak": ["current detector evidence"]},
+        },
+        "primary_strategy": "reference_solution_leak",
+        "observed_strategies": ["reference_solution_leak"],
+        "evidence": {"reference_solution_leak": ["current detector evidence"]},
+    }
+
+    with pytest.raises(ValueError, match="hack strategy changed"):
+        agentic_sft._validate_manifest_strategy_assessment(legacy_entry, assessment)
 
 
 @pytest.mark.parametrize(
@@ -939,7 +1105,7 @@ def test_manifest_build_requires_valid_balancing_schema(tmp_path: Path, balancin
     report = _synthetic_balanced_manifest(tmp_path)
     report["balancing"] = balancing
     with pytest.raises((TypeError, ValueError), match="balancing"):
-        agentic_sft.build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+        _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
 
 
 def test_cached_paid_marker_cannot_admit_an_ordinary_unpaid_episode(tmp_path: Path) -> None:
@@ -956,9 +1122,7 @@ def test_cached_paid_marker_cannot_admit_an_ordinary_unpaid_episode(tmp_path: Pa
         "submission_verdicts": [],
     }
     records_path = _write_records(tmp_path / "records.jsonl", [episode])
-    report = agentic_sft.select_episodes(
-        [records_path], tokenizer=cast("Any", CharacterTokenizer())
-    )
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
     assert report["selected"] == []
     excluded = cast("list[dict[str, object]]", report["excluded"])
     assert excluded[0]["primary_strategy"] == "honest_no_hack"

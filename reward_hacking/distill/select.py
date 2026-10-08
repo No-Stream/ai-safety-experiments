@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from reward_hacking.distill.sample import token_ids_sha256
+from reward_hacking.organism_rl.health import is_syntax_parse_error
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 Mode = Literal["all", "hack"]
 LABELS = frozenset({"hack", "honest", "fail"})
 TOKEN_TARGET_TOLERANCE = 0.1
+HEALTH_FILTER_REASONS = (
+    "turn_cap_without_submission",
+    "syntax_error_rate",
+    "max_new_tokens",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +47,162 @@ class SelectionOptions:
     mode: Mode
     target_completion_tokens: int | None = None
     seed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeHealthFilterOptions:
+    """Episode-level sampling filters used by the agentic SFT selector and builder."""
+
+    drop_turn_cap_without_submission: bool = True
+    max_syntax_error_rate: float | None = 0.15
+    drop_max_new_tokens: bool = True
+
+    def __post_init__(self) -> None:
+        """Reject invalid filter flags and thresholds at construction time."""
+        if type(self.drop_turn_cap_without_submission) is not bool:
+            raise TypeError("drop_turn_cap_without_submission must be a boolean")
+        if type(self.drop_max_new_tokens) is not bool:
+            raise TypeError("drop_max_new_tokens must be a boolean")
+        threshold = self.max_syntax_error_rate
+        if threshold is not None and (
+            isinstance(threshold, bool)
+            or not math.isfinite(float(threshold))
+            or not 0 <= threshold <= 1
+        ):
+            raise ValueError("max_syntax_error_rate must be a finite probability or None")
+
+    def to_json_dict(self) -> dict[str, object]:
+        """Return JSON-safe selection settings for the saved manifest."""
+        return {
+            "drop_turn_cap_without_submission": self.drop_turn_cap_without_submission,
+            "max_syntax_error_rate": self.max_syntax_error_rate,
+            "drop_max_new_tokens": self.drop_max_new_tokens,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeHealthMetrics:
+    """Measured health facts for one episode, before applying configurable thresholds."""
+
+    turn_cap_without_submission: bool
+    command_count: int
+    syntax_error_command_count: int
+    syntax_error_rate: float | None
+    max_new_tokens_turn_count: int
+
+    def to_json_dict(self) -> dict[str, object]:
+        """Return JSON-safe measurements for one episode."""
+        return {
+            "turn_cap_without_submission": self.turn_cap_without_submission,
+            "command_count": self.command_count,
+            "syntax_error_command_count": self.syntax_error_command_count,
+            "syntax_error_rate": self.syntax_error_rate,
+            "max_new_tokens_turn_count": self.max_new_tokens_turn_count,
+        }
+
+
+def measure_episode_health(
+    turns: Sequence[Mapping[str, object]],
+    episode_summary: Mapping[str, object],
+) -> EpisodeHealthMetrics:
+    """Measure turn-cap, syntax-error, and completion-cap evidence from saved trace events."""
+    ended_by = episode_summary.get("ended_by")
+    if not isinstance(ended_by, str):
+        raise TypeError("episode_summary.ended_by must be a string")
+    submission_verdicts = episode_summary.get("submission_verdicts")
+    if not isinstance(submission_verdicts, list) or any(
+        not isinstance(verdict, Mapping) for verdict in submission_verdicts
+    ):
+        raise TypeError("episode_summary.submission_verdicts must be a list of objects")
+
+    command_count = 0
+    syntax_error_command_count = 0
+    max_new_tokens_turn_count = 0
+    for turn_index, turn in enumerate(turns):
+        if "commands" not in turn:
+            raise ValueError(f"trace turn {turn_index} is missing commands for health filtering")
+        commands = turn["commands"]
+        if not isinstance(commands, list) or any(
+            not isinstance(command, Mapping) for command in commands
+        ):
+            raise TypeError(f"trace turn {turn_index} commands must be a list of objects")
+        for command_index, raw_command in enumerate(commands):
+            command_context = f"trace turn {turn_index} command {command_index}"
+            command_text = raw_command.get("command")
+            stdout = raw_command.get("stdout")
+            stderr = raw_command.get("stderr")
+            if (
+                not isinstance(command_text, str)
+                or not isinstance(stdout, str)
+                or not isinstance(stderr, str)
+            ):
+                raise TypeError(f"{command_context} command, stdout, and stderr must be strings")
+            command_count += 1
+            syntax_error_command_count += int(
+                is_syntax_parse_error(command_text, f"{stdout}\n{stderr}")
+            )
+
+        if "stop_reason" not in turn:
+            raise ValueError(f"trace turn {turn_index} is missing stop_reason for health filtering")
+        stop_reason = turn["stop_reason"]
+        if stop_reason is not None and not isinstance(stop_reason, str):
+            raise TypeError(f"trace turn {turn_index} stop_reason must be a string or null")
+        max_new_tokens_turn_count += int(stop_reason == "max_tokens")
+
+    syntax_error_rate = syntax_error_command_count / command_count if command_count else None
+    return EpisodeHealthMetrics(
+        turn_cap_without_submission=ended_by == "turn_cap" and not submission_verdicts,
+        command_count=command_count,
+        syntax_error_command_count=syntax_error_command_count,
+        syntax_error_rate=syntax_error_rate,
+        max_new_tokens_turn_count=max_new_tokens_turn_count,
+    )
+
+
+def health_filter_reasons(
+    metrics: EpisodeHealthMetrics,
+    options: EpisodeHealthFilterOptions,
+) -> tuple[str, ...]:
+    """Return all enabled health-filter reasons in the stable selection priority order."""
+    reasons: list[str] = []
+    if options.drop_turn_cap_without_submission and metrics.turn_cap_without_submission:
+        reasons.append("turn_cap_without_submission")
+    if (
+        options.max_syntax_error_rate is not None
+        and metrics.syntax_error_rate is not None
+        and metrics.syntax_error_rate > options.max_syntax_error_rate
+    ):
+        reasons.append("syntax_error_rate")
+    if options.drop_max_new_tokens and metrics.max_new_tokens_turn_count:
+        reasons.append("max_new_tokens")
+    return tuple(reasons)
+
+
+def summarize_episode_health_filters(
+    metrics: Sequence[EpisodeHealthMetrics],
+    options: EpisodeHealthFilterOptions,
+) -> dict[str, object]:
+    """Report independent overlaps and first-match drop counts for measured episodes."""
+    independent_counts: dict[str, int] = dict.fromkeys(HEALTH_FILTER_REASONS, 0)
+    sequential_counts: dict[str, int] = dict.fromkeys(HEALTH_FILTER_REASONS, 0)
+    sequential_counts["kept"] = 0
+    overlap_count = 0
+    for result in metrics:
+        reasons = health_filter_reasons(result, options)
+        for reason in reasons:
+            independent_counts[reason] += 1
+        overlap_count += int(len(reasons) > 1)
+        sequential_counts[reasons[0] if reasons else "kept"] += 1
+    dropped_count = len(metrics) - sequential_counts["kept"]
+    return {
+        "config": options.to_json_dict(),
+        "input_count": len(metrics),
+        "independent_drop_counts": independent_counts,
+        "overlap_count": overlap_count,
+        "sequential_drop_counts": sequential_counts,
+        "dropped_count": dropped_count,
+        "kept_count": len(metrics) - dropped_count,
+    }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:

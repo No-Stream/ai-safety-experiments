@@ -23,6 +23,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from reward_hacking.distill.episodes import (
     DEFAULT_MAX_SEQUENCE_TOKENS,
+    PromptRender,
     build_episode_row,
     grader_directed_move_flags,
     read_episode_trace_records,
@@ -32,6 +33,13 @@ from reward_hacking.distill.hack_strategy import (
     STRATEGIES,
     HackStrategyAssessment,
     label_episode,
+)
+from reward_hacking.distill.select import (
+    EpisodeHealthFilterOptions,
+    EpisodeHealthMetrics,
+    health_filter_reasons,
+    measure_episode_health,
+    summarize_episode_health_filters,
 )
 from reward_hacking.distill.strategy_balance import balance_entries
 from reward_hacking.organism_reward import (
@@ -94,6 +102,16 @@ class _EpisodeSelectionConfig:
     strategy_max_shares: Mapping[str, float] | None
     source_caps: Mapping[str, int] | None
     family_caps: Mapping[str, int] | None
+    health_filters: EpisodeHealthFilterOptions
+    prompt_render: PromptRender
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestBuildOptions:
+    tokenizer: PreTrainedTokenizerBase
+    max_sequence_tokens: int
+    prompt_render: PromptRender
+    health_filters: EpisodeHealthFilterOptions
 
 
 def _read_records_with_lines(path: Path) -> list[tuple[int, Mapping[str, object]]]:
@@ -346,12 +364,16 @@ def select_episodes(  # noqa: PLR0913
     source_caps: Mapping[str, int] | None = None,
     family_caps: Mapping[str, int] | None = None,
     strategy_labels_path: Path | None = None,
+    health_filters: EpisodeHealthFilterOptions | None = None,
+    prompt_render: PromptRender = "student",
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
         raise ValueError("at least one records file is required")
     if type(max_sequence_tokens) is not int or max_sequence_tokens < 1:
         raise ValueError("max_sequence_tokens must be a positive integer")
+    if prompt_render not in {"student", "teacher"}:
+        raise ValueError("prompt_render must be student or teacher")
     canonical_paths = sorted(path.resolve() for path in records_paths)
     if len(canonical_paths) != len(set(canonical_paths)):
         raise ValueError("records file inputs must be unique")
@@ -370,6 +392,8 @@ def select_episodes(  # noqa: PLR0913
         strategy_max_shares,
         source_caps,
         family_caps,
+        EpisodeHealthFilterOptions() if health_filters is None else health_filters,
+        prompt_render,
     )
     selected, excluded, seen_strategy_labels = _select_records(
         canonical_paths, selection_config, strategy_labels
@@ -449,6 +473,11 @@ def _selection_report(
 ) -> dict[str, object]:
     excluded.extend(cap_dropped)
     excluded.sort(key=lambda entry: str(entry.get("training_key", entry["episode_key"])))
+    health_metrics = [
+        _health_metrics_from_entry(entry)
+        for entry in (*selected, *excluded)
+        if "health_metrics" in entry
+    ]
     return {
         "balancing": {
             "max_output_fitting_share": selection_config.max_output_fitting_share,
@@ -458,8 +487,12 @@ def _selection_report(
         },
         "admitted_counts": _admitted_counts(selected),
         "dropped_by_cap": _field_counts(cap_dropped, "cap_reason"),
+        "health_filtering": summarize_episode_health_filters(
+            health_metrics, selection_config.health_filters
+        ),
         "format_version": MANIFEST_VERSION,
         "max_sequence_tokens": selection_config.max_sequence_tokens,
+        "prompt_render": selection_config.prompt_render,
         "records_files": [str(path) for path in canonical_paths],
         "selected": selected,
         "excluded": excluded,
@@ -469,6 +502,125 @@ def _selection_report(
             "excluded_episodes": len(excluded),
             "excluded_by_reason": dict(sorted(_exclusion_counts(excluded).items())),
         },
+    }
+
+
+def _health_metrics_from_entry(entry: Mapping[str, object]) -> EpisodeHealthMetrics:
+    value = entry.get("health_metrics")
+    if not isinstance(value, Mapping):
+        raise TypeError("health-filtered selection entries must contain health_metrics")
+    turn_cap = value.get("turn_cap_without_submission")
+    command_count = value.get("command_count")
+    syntax_errors = value.get("syntax_error_command_count")
+    syntax_rate = value.get("syntax_error_rate")
+    max_new_tokens_turns = value.get("max_new_tokens_turn_count")
+    if type(turn_cap) is not bool or any(
+        type(count) is not int or count < 0
+        for count in (command_count, syntax_errors, max_new_tokens_turns)
+    ):
+        raise TypeError("selection entry health metrics have invalid counts")
+    if syntax_rate is not None and (
+        isinstance(syntax_rate, bool) or not isinstance(syntax_rate, int | float)
+    ):
+        raise TypeError("selection entry syntax_error_rate must be numeric or null")
+    return EpisodeHealthMetrics(
+        turn_cap_without_submission=turn_cap,
+        command_count=cast("int", command_count),
+        syntax_error_command_count=cast("int", syntax_errors),
+        syntax_error_rate=None if syntax_rate is None else float(syntax_rate),
+        max_new_tokens_turn_count=cast("int", max_new_tokens_turns),
+    )
+
+
+def _episode_summary_from_trace(
+    trace_records: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    summaries = [record for record in trace_records if record.get("record") == "episode_summary"]
+    if len(summaries) != 1:
+        raise ValueError(
+            "episode trace must contain exactly one episode_summary for health filtering"
+        )
+    return summaries[0]
+
+
+def filter_manifest_health(
+    report: Mapping[str, object],
+    *,
+    health_filters: EpisodeHealthFilterOptions,
+) -> dict[str, object]:
+    """Filter only the saved selected entries, preserving their order and saved cap policy."""
+    selected_value = report.get("selected")
+    excluded_value = report.get("excluded")
+    if not isinstance(selected_value, list) or not isinstance(excluded_value, list):
+        raise TypeError("selection report must contain selected and excluded lists")
+    original_selected = [_require_manifest_entry(entry) for entry in selected_value]
+    existing_excluded = [dict(_require_manifest_entry(entry)) for entry in excluded_value]
+    _validate_manifest_balancing(report, original_selected)
+
+    rows_by_file: dict[Path, dict[int, Mapping[str, object]]] = {}
+    kept: list[dict[str, object]] = []
+    health_dropped: list[dict[str, object]] = []
+    metrics: list[EpisodeHealthMetrics] = []
+    for raw_entry in original_selected:
+        entry = dict(raw_entry)
+        records_path, line_number = _manifest_location(entry)
+        if records_path not in rows_by_file:
+            rows_by_file[records_path] = dict(_read_records_with_lines(records_path))
+        record = rows_by_file[records_path].get(line_number)
+        if record is None or record.get("record") != "ladder_episode":
+            raise ValueError("selection manifest no longer points to its ladder episode record")
+        if dict(_manifest_episode_key(entry)) != _episode_key(record):
+            raise ValueError("selection manifest episode key changed since selection")
+        trace_records = read_episode_trace_records(record, records_path)
+        trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
+        trace_summary = _episode_summary_from_trace(trace_records)
+        measured = measure_episode_health(trace_turns, trace_summary)
+        reasons = health_filter_reasons(measured, health_filters)
+        metrics.append(measured)
+        entry["health_metrics"] = measured.to_json_dict()
+        entry["health_filter_reasons"] = list(reasons)
+        if reasons:
+            entry["exclusion_reason"] = reasons[0]
+            health_dropped.append(entry)
+        else:
+            kept.append(entry)
+
+    filtering_summary = summarize_episode_health_filters(metrics, health_filters)
+    post_filter_balancing = _manifest_balancing_status(report, kept)
+    filtering_summary["post_filter_balancing"] = post_filter_balancing
+    all_excluded = [*existing_excluded, *health_dropped]
+    result = dict(report)
+    result["selected"] = kept
+    result["excluded"] = all_excluded
+    result["health_filtering"] = filtering_summary
+    result["admitted_counts"] = _admitted_counts(kept)
+    result["totals"] = {
+        "episodes": len(kept) + len(all_excluded),
+        "hack_episodes": len(kept),
+        "excluded_episodes": len(all_excluded),
+        "excluded_by_reason": dict(sorted(_exclusion_counts(all_excluded).items())),
+    }
+    return result
+
+
+def _manifest_balancing_status(
+    report: Mapping[str, object],
+    selected: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    balancing = report.get("balancing")
+    if not isinstance(balancing, Mapping):
+        raise TypeError("selection manifest balancing must be an object")
+    _, dropped = balance_entries(
+        selected,
+        max_output_fitting_share=cast("float", balancing["max_output_fitting_share"]),
+        strategy_max_shares=cast("Mapping[str, float]", balancing["strategy_max_shares"]),
+        source_caps=cast("Mapping[str, int]", balancing["source_caps"]),
+        family_caps=cast("Mapping[str, int]", balancing["family_caps"]),
+    )
+    return {
+        "valid": not dropped,
+        "would_drop_count": len(dropped),
+        "would_drop_by_cap": _field_counts(dropped, "cap_reason"),
     }
 
 
@@ -565,12 +717,24 @@ def _build_candidate_entry(
     )
     if exclusion_reason is not None:
         return _excluded_entry(entry, exclusion_reason)
+    trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
+    try:
+        trace_summary = _episode_summary_from_trace(trace_records)
+        health_metrics = measure_episode_health(trace_turns, trace_summary)
+    except (TypeError, ValueError) as error:
+        return _excluded_entry(entry, "builder_failure", error=error)
+    entry["health_metrics"] = health_metrics.to_json_dict()
+    health_reasons = health_filter_reasons(health_metrics, selection_config.health_filters)
+    entry["health_filter_reasons"] = list(health_reasons)
+    if health_reasons:
+        return _excluded_entry(entry, health_reasons[0])
     try:
         row = build_episode_row(
             record,
             trace_records,
             tokenizer=selection_config.tokenizer,
             max_sequence_tokens=selection_config.max_sequence_tokens,
+            prompt_render=selection_config.prompt_render,
         )
     except (OSError, TypeError, ValueError) as error:
         return _excluded_entry(entry, "builder_failure", error=error)
@@ -624,6 +788,9 @@ def _selected_entry(
             "truncated": row["truncated"],
             "grader_directed_move_coverage": row["grader_directed_move_coverage"],
             "grader_directed_move_cut": row["grader_directed_move_cut"],
+            "prompt_render": row["prompt_render"],
+            "student_template_sha256": row["student_template_sha256"],
+            "prefix_diff_counts": row["prefix_diff_counts"],
         }
     )
     logger.info(
@@ -808,30 +975,72 @@ def build_selected_rows(
     *,
     tokenizer: PreTrainedTokenizerBase,
     max_sequence_tokens: int = DEFAULT_SEQUENCE_TOKENS,
+    prompt_render: PromptRender = "student",
+    health_filters: EpisodeHealthFilterOptions | None = None,
 ) -> list[dict[str, object]]:
     """Rebuild selected rows from the manifest while retaining builder tokens and masks."""
-    selected = report.get("selected")
+    resolved_health_filters = (
+        EpisodeHealthFilterOptions() if health_filters is None else health_filters
+    )
+    filtered_report = (
+        dict(report)
+        if _has_health_filter_summary(report, resolved_health_filters)
+        else filter_manifest_health(report, health_filters=resolved_health_filters)
+    )
+    selected = filtered_report.get("selected")
     if not isinstance(selected, list):
         raise TypeError("selection report must contain a selected list")
-    if report.get("max_sequence_tokens") != max_sequence_tokens:
+    if filtered_report.get("max_sequence_tokens") != max_sequence_tokens:
         raise ValueError("build max_sequence_tokens must match the selection manifest")
     if not selected:
         raise ValueError("selection manifest contains no eligible episodes")
+    if prompt_render not in {"student", "teacher"}:
+        raise ValueError("prompt_render must be student or teacher")
     rows_by_file: dict[Path, dict[int, Mapping[str, object]]] = {}
+    build_options = _ManifestBuildOptions(
+        tokenizer=tokenizer,
+        max_sequence_tokens=max_sequence_tokens,
+        prompt_render=prompt_render,
+        health_filters=resolved_health_filters,
+    )
     built_rows = [
         _build_manifest_entry(
             _require_manifest_entry(entry),
             rows_by_file,
-            tokenizer=tokenizer,
-            max_sequence_tokens=max_sequence_tokens,
+            options=build_options,
         )
         for entry in selected
     ]
     keys = [row["key"] for row in built_rows]
     if len(keys) != len(set(keys)):
         raise ValueError("selection manifest produced duplicate training keys")
-    _validate_manifest_balancing(report, [_require_manifest_entry(entry) for entry in selected])
+    _validate_manifest_balancing(
+        filtered_report, [_require_manifest_entry(entry) for entry in selected]
+    )
     return built_rows
+
+
+def _has_health_filter_summary(
+    report: Mapping[str, object],
+    health_filters: EpisodeHealthFilterOptions,
+) -> bool:
+    value = report.get("health_filtering")
+    if not isinstance(value, Mapping):
+        return False
+    config = value.get("config")
+    selected = report.get("selected")
+    return (
+        isinstance(config, Mapping)
+        and dict(config) == health_filters.to_json_dict()
+        and isinstance(value.get("post_filter_balancing"), Mapping)
+        and isinstance(selected, list)
+        and all(
+            isinstance(entry, Mapping)
+            and isinstance(entry.get("health_metrics"), Mapping)
+            and isinstance(entry.get("health_filter_reasons"), list)
+            for entry in selected
+        )
+    )
 
 
 def _validate_manifest_balancing(
@@ -863,15 +1072,18 @@ def _validate_manifest_balancing(
         for value in mappings[name].values()
     ):
         raise TypeError("selection manifest balancing source and family caps must be integers")
-    _, dropped = balance_entries(
-        selected,
-        max_output_fitting_share=cast("float", share),
-        strategy_max_shares=cast("Mapping[str, float]", mappings["strategy_max_shares"]),
-        source_caps=cast("Mapping[str, int]", mappings["source_caps"]),
-        family_caps=cast("Mapping[str, int]", mappings["family_caps"]),
+    actual_status = _manifest_balancing_status(report, selected)
+    health_filtering = report.get("health_filtering")
+    saved_post_filter_status = (
+        health_filtering.get("post_filter_balancing")
+        if isinstance(health_filtering, Mapping)
+        else None
     )
-    if dropped:
-        raise ValueError("selection manifest selected population violates saved balancing caps")
+    if saved_post_filter_status is None:
+        if not actual_status["valid"]:
+            raise ValueError("selection manifest selected population violates saved balancing caps")
+    elif saved_post_filter_status != actual_status:
+        raise ValueError("selection manifest post-filter balancing summary changed")
 
 
 def _require_manifest_entry(value: object) -> Mapping[str, object]:
@@ -884,8 +1096,7 @@ def _build_manifest_entry(
     entry: Mapping[str, object],
     rows_by_file: dict[Path, dict[int, Mapping[str, object]]],
     *,
-    tokenizer: PreTrainedTokenizerBase,
-    max_sequence_tokens: int,
+    options: _ManifestBuildOptions,
 ) -> dict[str, object]:
     records_path, line_number = _manifest_location(entry)
     if records_path not in rows_by_file:
@@ -896,11 +1107,48 @@ def _build_manifest_entry(
     if dict(_manifest_episode_key(entry)) != _episode_key(record):
         raise ValueError("selection manifest episode key changed since selection")
     trace_records = read_episode_trace_records(record, records_path)
+    _validate_manifest_health(entry, trace_records, options.health_filters)
+    _validate_manifest_eligibility(entry, record, trace_records, records_path, line_number)
+    row = _build_manifest_output_row(entry, record, trace_records, options)
+    logger.info(
+        "built SFT row scenario_slug=%s context_tokens=%s truncated=%s grader_move_cut=%s",
+        entry["scenario_slug"],
+        row["sequence_tokens"],
+        row["truncated"],
+        row["grader_directed_move_cut"],
+    )
+    return row
+
+
+def _validate_manifest_health(
+    entry: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    health_filters: EpisodeHealthFilterOptions,
+) -> None:
+    trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
+    health_metrics = measure_episode_health(
+        trace_turns,
+        _episode_summary_from_trace(trace_records),
+    )
+    if entry.get("health_metrics") != health_metrics.to_json_dict():
+        raise ValueError("selection manifest health metrics changed since filtering")
+    current_filter_reasons = list(health_filter_reasons(health_metrics, health_filters))
+    if entry.get("health_filter_reasons") != current_filter_reasons:
+        raise ValueError("selection manifest health filter reasons changed since filtering")
+    if current_filter_reasons:
+        raise ValueError("health-filtered episode remains in the selected manifest")
+
+
+def _validate_manifest_eligibility(
+    entry: Mapping[str, object],
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    records_path: Path,
+    line_number: int,
+) -> None:
     assessment = _manifest_strategy_assessment(entry, record, trace_records)
-    if assessment.to_json_dict() != entry.get("hack_strategy"):
-        raise ValueError("selection manifest hack strategy changed since selection")
+    _validate_manifest_strategy_assessment(entry, assessment)
     metadata = {
-        **assessment.to_json_dict(),
         "source": episode_source(record),
         "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
         "training_key": _training_key(records_path.resolve(), line_number, _episode_key(record)),
@@ -918,20 +1166,64 @@ def _build_manifest_entry(
         value is True for value in _integrity_awareness(record).values()
     ):
         raise ValueError("selection manifest admission changed since selection")
-    row = build_episode_row(
+
+
+def _validate_manifest_strategy_assessment(
+    entry: Mapping[str, object],
+    assessment: HackStrategyAssessment,
+) -> None:
+    saved_value = entry.get("hack_strategy")
+    if not isinstance(saved_value, Mapping):
+        raise TypeError("selection manifest hack_strategy must be an object")
+    current = assessment.to_json_dict()
+    legacy_fields = ("primary_strategy", "observed_strategies", "evidence")
+    saved = dict(saved_value)
+    legacy_assessment_has_no_new_evidence = (
+        current.get("sub_tags") == [] and current.get("leak_detector") == "not_applicable"
+    )
+    if saved != current and not (
+        set(saved) == set(legacy_fields)
+        and legacy_assessment_has_no_new_evidence
+        and all(saved[field] == current[field] for field in legacy_fields)
+    ):
+        raise ValueError("selection manifest hack strategy changed since selection")
+    for field in legacy_fields:
+        if entry.get(field) != current[field]:
+            raise ValueError(
+                "selection manifest hack strategy changed since selection; metadata changed"
+            )
+    for field in ("sub_tags", "leak_detector"):
+        if field in entry and entry[field] != current[field]:
+            raise ValueError("selection manifest hack strategy changed since selection")
+
+
+def _build_manifest_output_row(
+    entry: Mapping[str, object],
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    options: _ManifestBuildOptions,
+) -> dict[str, object]:
+    source_prompt_render = entry.get("prompt_render", "teacher")
+    if source_prompt_render not in {"student", "teacher"}:
+        raise ValueError("selection manifest entry has an invalid prompt_render")
+    source_row = build_episode_row(
         record,
         trace_records,
-        tokenizer=tokenizer,
-        max_sequence_tokens=max_sequence_tokens,
+        tokenizer=options.tokenizer,
+        max_sequence_tokens=options.max_sequence_tokens,
+        prompt_render=cast("PromptRender", source_prompt_render),
     )
-    _validate_manifest_row(entry, row)
-    logger.info(
-        "built SFT row scenario_slug=%s context_tokens=%s truncated=%s grader_move_cut=%s",
-        entry["scenario_slug"],
-        row["sequence_tokens"],
-        row["truncated"],
-        row["grader_directed_move_cut"],
-    )
+    _validate_manifest_row(entry, source_row)
+    row = source_row
+    if source_prompt_render != options.prompt_render:
+        row = build_episode_row(
+            record,
+            trace_records,
+            tokenizer=options.tokenizer,
+            max_sequence_tokens=options.max_sequence_tokens,
+            prompt_render=options.prompt_render,
+        )
+        row["key"] = source_row["key"]
     return row
 
 
@@ -974,6 +1266,9 @@ def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) 
         raise ValueError("selection manifest episode row changed since selection")
     if row["token_ids_sha256"] != entry.get("token_ids_sha256"):
         raise ValueError("selection manifest token ids changed since selection")
+    for field in ("prompt_render", "student_template_sha256", "prefix_diff_counts"):
+        if field in entry and row.get(field) != entry[field]:
+            raise ValueError(f"selection manifest {field} changed since selection")
     training_key = entry.get("training_key")
     if not isinstance(training_key, str) or not training_key:
         raise TypeError("selection manifest training_key must be a nonempty string")
@@ -982,17 +1277,65 @@ def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) 
     row["key"] = training_key
 
 
+def _dataset_manifest(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    identities = {
+        (row.get("prompt_render", "teacher"), row.get("student_template_sha256")) for row in rows
+    }
+    if len(identities) != 1:
+        raise ValueError("SFT rows contain mixed render identities")
+    mode, template_digest = next(iter(identities))
+    counts: list[int] = []
+    row_metadata: list[dict[str, object]] = []
+    for row in rows:
+        differences = row.get("prefix_diff_counts", [])
+        if not isinstance(differences, list) or any(
+            type(value) is not int or value < 0 for value in differences
+        ):
+            raise TypeError("prefix_diff_counts must contain nonnegative integers")
+        counts.extend(
+            cast("list[int]", differences)[
+                : cast("int", row.get("included_turns", len(differences)))
+            ]
+        )
+        row_metadata.append({"key": row["key"], "prefix_diff_counts": differences})
+    identity = {
+        "prompt_render": mode,
+        "student_template_sha256": template_digest,
+        "dataset_sha256": hashlib.sha256(
+            json.dumps(list(rows), sort_keys=True).encode()
+        ).hexdigest(),
+        "rows": row_metadata,
+    }
+    return {
+        **identity,
+        "identity_sha256": hashlib.sha256(
+            json.dumps(identity, sort_keys=True).encode()
+        ).hexdigest(),
+        "row_count": len(rows),
+        "prefix_diff_summary": {
+            "turns": len(counts),
+            "changed_turns": sum(count > 0 for count in counts),
+            "total": sum(counts),
+            "min": min(counts, default=0),
+            "max": max(counts, default=0),
+        },
+    }
+
+
 def write_sft_rows(run_dir: Path, rows: Sequence[Mapping[str, object]]) -> Path:
     """Write builder rows where train.py reads SFT samples for round zero."""
     if not rows:
         raise ValueError("SFT training rows must not be empty")
+    manifest = _dataset_manifest(rows)
     samples_path = run_dir / "samples" / "round-0.jsonl"
-    if samples_path.exists():
+    manifest_path = run_dir / "dataset_manifest.json"
+    if samples_path.exists() or manifest_path.exists():
         raise FileExistsError(f"refusing to overwrite existing SFT samples: {samples_path}")
     samples_path.parent.mkdir(parents=True, exist_ok=True)
     with samples_path.open("w", encoding="utf-8") as destination:
         for row in rows:
             destination.write(json.dumps(dict(row), sort_keys=True, allow_nan=False) + "\n")
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n")
     logger.info("wrote SFT samples path=%s rows=%d", samples_path, len(rows))
     return samples_path
 
@@ -1250,6 +1593,21 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     build_parser.add_argument("--run-dir", type=Path, required=True)
     build_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
 
+    for episode_parser in (select_parser, build_parser):
+        episode_parser.add_argument(
+            "--prompt-render", choices=("student", "teacher"), default="student"
+        )
+        episode_parser.add_argument(
+            "--drop-turn-cap-without-submission",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        episode_parser.add_argument("--max-syntax-error-rate", type=float, default=0.15)
+        episode_parser.add_argument("--no-syntax-error-filter", action="store_true")
+        episode_parser.add_argument(
+            "--drop-max-new-tokens", action=argparse.BooleanOptionalAction, default=True
+        )
+
     serve_parser = commands.add_parser("serve", help="own an evaluation vLLM server process")
     serve_parser.add_argument("--model", default=DEFAULT_STUDENT_MODEL)
     serve_parser.add_argument("--model-revision")
@@ -1302,6 +1660,14 @@ def _parse_named_caps(values: Sequence[str]) -> dict[str, int]:
     return result
 
 
+def _health_filter_options(args: argparse.Namespace) -> EpisodeHealthFilterOptions:
+    return EpisodeHealthFilterOptions(
+        drop_turn_cap_without_submission=args.drop_turn_cap_without_submission,
+        max_syntax_error_rate=None if args.no_syntax_error_filter else args.max_syntax_error_rate,
+        drop_max_new_tokens=args.drop_max_new_tokens,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run selection, exact-id SFT data preparation, or print evaluation commands."""
     args = _parse_args(argv)
@@ -1315,6 +1681,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_caps=_parse_named_caps(args.source_cap),
             family_caps=_parse_named_caps(args.family_cap),
             strategy_labels_path=args.strategy_labels,
+            prompt_render=args.prompt_render,
+            health_filters=_health_filter_options(args),
         )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])
@@ -1330,8 +1698,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         if not isinstance(manifest, Mapping) or manifest.get("format_version") != MANIFEST_VERSION:
             raise ValueError("unsupported agentic SFT selection manifest")
-        rows = build_selected_rows(manifest, tokenizer=_load_tokenizer(args.tokenizer))
+        filtered_manifest = filter_manifest_health(
+            manifest, health_filters=_health_filter_options(args)
+        )
+        rows = build_selected_rows(
+            filtered_manifest,
+            tokenizer=_load_tokenizer(args.tokenizer),
+            prompt_render=args.prompt_render,
+            health_filters=_health_filter_options(args),
+        )
         samples_path = write_sft_rows(args.run_dir, rows)
+        write_selection_report(
+            filtered_manifest,
+            manifest_path=args.run_dir / "selection.json",
+            summary_path=args.run_dir / "summary.csv",
+        )
+        logger.info("health filtering=%s", filtered_manifest["health_filtering"])
+        logger.info("prefix differences=%s", _dataset_manifest(rows)["prefix_diff_summary"])
         sys.stdout.write(f"Wrote {len(rows)} exact-id rows to {samples_path}\n")
         return 0
     if args.command == "serve":
