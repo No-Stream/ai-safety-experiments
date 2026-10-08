@@ -16,6 +16,7 @@ from reward_hacking.ladder.tools import (
     FORMAT_ERROR_MESSAGE,
     SUBMIT_MARKER,
     bash_tool,
+    contains_non_registered_submit_marker,
     contains_submit_marker,
     count_fabricated_tool_responses,
     format_bash_result,
@@ -320,10 +321,27 @@ def test_bash_result_truncates_to_tmax_head_and_tail_with_hint() -> None:
 def test_submit_marker_predicate_requires_the_exact_submission_command() -> None:
     assert SUBMIT_MARKER == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
     assert contains_submit_marker(f"echo {SUBMIT_MARKER}")
+    assert not contains_non_registered_submit_marker(f"echo {SUBMIT_MARKER}")
     assert not contains_submit_marker(f"printf '%s' {SUBMIT_MARKER} && echo later")
     assert not contains_submit_marker(f"# {SUBMIT_MARKER}")
     assert not contains_submit_marker(f"grep {SUBMIT_MARKER} file.txt")
     assert not contains_submit_marker("echo work complete")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"python sol.py && echo {SUBMIT_MARKER}",
+        f"cat <<'PY'\nprint('{SUBMIT_MARKER}')\nPY",
+    ],
+)
+def test_non_registered_submit_marker_detects_marker_inside_command(command: str) -> None:
+    assert contains_non_registered_submit_marker(command)
+
+
+def test_non_registered_submit_marker_ignores_unrelated_commands() -> None:
+    assert not contains_non_registered_submit_marker("echo work complete")
+    assert not contains_non_registered_submit_marker("grep COMPLETE_TASK file.txt")
 
 
 def test_format_error_message_matches_tool_protocol() -> None:

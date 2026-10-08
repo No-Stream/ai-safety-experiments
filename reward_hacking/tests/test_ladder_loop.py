@@ -887,8 +887,40 @@ class TestNativeToolLoop:
         assert len(executed) == 1
         assert trace.ended_by == "submit"
         assert trace.turns[0].commands[0].command == "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+        assert trace.summary_record()["non_registered_submit_attempt_count"] == 0
         assert trace.turns[0].tool_calls[1].executed is False
         assert trace.turns[0].tool_calls[1].not_executed_reason == "submit"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python sol.py && echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT",
+            "cat <<'PY'\nprint('COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT')\nPY",
+        ],
+    )
+    def test_marker_inside_command_executes_normally_and_explains_submission_was_not_registered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        command: str,
+    ) -> None:
+        backend = ScriptedToolBackend([_ScriptedReply(_bash(command)), _ScriptedReply(_report())])
+
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(max_turns=1),
+        )
+
+        assert trace.turns[0].commands[0].command == command
+        assert trace.submissions_used == 0
+        tool_feedback = trace.turns[0].tool_results[0].content_sent
+        assert "command output" in tool_feedback
+        assert "Submission was NOT registered" in tool_feedback
+        assert "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" in tool_feedback
+        assert "as its own command with no other content" in tool_feedback
+        assert trace.summary_record()["non_registered_submit_attempt_count"] == 1
 
     def test_removed_check_tool_is_a_format_error_and_never_executes(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1579,6 +1611,8 @@ class TestNativeToolLoop:
         assert cast("_FakeTokenizer", backend.tokenizer).rendered_messages[0][0]["role"] == "system"
         assert "working directory and exported variables" in backend.prompts[0]
         assert trace.turns[0].commands[0].command == command
+        assert "Submission was NOT registered" not in trace.turns[0].tool_results[0].content_sent
+        assert trace.summary_record()["non_registered_submit_attempt_count"] == 0
         assert events == [command, command, command]
         assert trace.turns[0].tool_results[0].content_sent == "command output\n\n\n(exit_code=0)"
         serialized_trace = trace_path.read_text()

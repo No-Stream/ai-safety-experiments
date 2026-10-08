@@ -255,6 +255,40 @@ def test_unexecuted_tool_calls_are_counted_outside_syntax_error_denominator(tmp_
     }
 
 
+def test_non_registered_submit_attempts_are_counted_from_legacy_trace_calls(tmp_path: Path) -> None:
+    marker = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+    turn = _turn(
+        _TurnFixture(
+            1,
+            [-0.1],
+            reasoning_token_count=1,
+            commands=[
+                _command(f"python sol.py && echo {marker}"),
+                _command(f"cat <<'PY'\nprint('{marker}')\nPY"),
+                _command(f"echo {marker}"),
+                _command("echo work complete"),
+            ],
+        )
+    )
+    records_path = _write_records(
+        tmp_path,
+        "non-registered-submit-records",
+        [("non-registered-submit-episode", [turn], "turn_cap", 100)],
+    )
+
+    report = health.analyze_records([records_path])
+
+    episode = _as_object(_as_list(report["episodes"])[0])
+    summary = _as_object(report["summary"])
+    attempts = _as_object(summary["non_registered_submit_attempts"])
+    assert episode["non_registered_submit_attempt_count"] == 2
+    assert attempts == {"mean": 2.0, "median": 2.0, "count": 2}
+    assert (
+        "| Non-registered submit attempts | 2.000 | 2.000 | 2.000 |"
+        in health.report_to_markdown(report)
+    )
+
+
 @pytest.mark.parametrize(
     ("reason", "executed_commands"),
     [

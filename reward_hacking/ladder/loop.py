@@ -49,10 +49,12 @@ from reward_hacking.ladder.thinking import (
 )
 from reward_hacking.ladder.tools import (
     FORMAT_ERROR_MESSAGE,
+    NON_REGISTERED_SUBMIT_FEEDBACK,
     RUNAWAY_FORMAT_ERROR_MESSAGE,
     ParsedToolCall,
     ParsedTurn,
     bash_tool,
+    contains_non_registered_submit_marker,
     contains_submit_marker,
     count_fabricated_tool_responses,
     format_bash_result,
@@ -429,6 +431,11 @@ class LadderEpisodeTrace:
             "submissions_used": self.submissions_used,
             "submission_fail_seen": self.submission_fail_seen,
             "submission_verdicts": [dict(verdict) for verdict in self.submission_verdicts],
+            "non_registered_submit_attempt_count": sum(
+                contains_non_registered_submit_marker(call.arguments["command"])
+                for turn in self.turns
+                for call in turn.tool_calls
+            ),
             "last_submission_pass": (
                 None if self.last_submission is None else self.last_submission.passed
             ),
@@ -1083,6 +1090,8 @@ def _execute_tool_call(
             state=state.shell_state,
             context=context.command,
         )
+        if contains_non_registered_submit_marker(raw_command):
+            content_sent = f"{content_sent}\n\n{NON_REGISTERED_SUBMIT_FEEDBACK}"
         content_sent = _append_turns_remaining_note(
             content_sent,
             remaining_turns=context.remaining_turns,

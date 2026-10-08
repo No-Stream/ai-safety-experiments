@@ -19,6 +19,8 @@ from pathlib import Path
 from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
 
+from reward_hacking.ladder.tools import contains_non_registered_submit_marker
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -72,6 +74,7 @@ class EpisodeHealth:
     syntax_error_command_call_fraction: float | None
     unexecuted_tool_call_count: int
     unexecuted_tool_call_reasons: dict[str, int]
+    non_registered_submit_attempt_count: int
     cjk_assistant_turn_count: int
     cjk_assistant_turn_fraction: float | None
     contains_cjk: bool
@@ -98,6 +101,7 @@ class _TurnHealth:
     syntax_error_command_call_count: int
     unexecuted_tool_call_count: int
     unexecuted_tool_call_reasons: dict[str, int]
+    non_registered_submit_attempt_count: int
     contains_cjk: bool
     stopped_at_token_cap: bool
     reasoning_sentence_repeat_fraction: float | None
@@ -318,6 +322,7 @@ def _analyze_turn(
         syntax_error_command_call_count,
         unexecuted_tool_call_count,
         unexecuted_tool_call_reasons,
+        non_registered_submit_attempt_count,
     ) = _analyze_command_calls(turn, turn_context)
 
     return _TurnHealth(
@@ -331,6 +336,7 @@ def _analyze_turn(
         syntax_error_command_call_count=syntax_error_command_call_count,
         unexecuted_tool_call_count=unexecuted_tool_call_count,
         unexecuted_tool_call_reasons=unexecuted_tool_call_reasons,
+        non_registered_submit_attempt_count=non_registered_submit_attempt_count,
         contains_cjk=contains_cjk,
         stopped_at_token_cap=stopped_at_token_cap,
         reasoning_sentence_repeat_fraction=_reasoning_sentence_repeat_fraction(reasoning),
@@ -369,7 +375,7 @@ def _validate_unexecuted_tool_reasons(
 
 def _analyze_command_calls(
     turn: dict[str, object], context: str
-) -> tuple[int, int, int, dict[str, int]]:
+) -> tuple[int, int, int, dict[str, int], int]:
     tool_calls = _list(turn, "tool_calls", context)
     commands = _list(turn, "commands", context)
     unexecuted_tool_call_reasons: Counter[str] = Counter()
@@ -402,6 +408,16 @@ def _analyze_command_calls(
             f"{len(commands)} command outputs"
         )
 
+    non_registered_submit_attempt_count = 0
+    for call_index, raw_call in enumerate(tool_calls):
+        call_context = f"{context}.tool_calls[{call_index}]"
+        call_record = _object(raw_call, call_context)
+        arguments = _object(
+            _required(call_record, "arguments", call_context), f"{call_context}.arguments"
+        )
+        command = _string(arguments, "command", f"{call_context}.arguments")
+        non_registered_submit_attempt_count += int(contains_non_registered_submit_marker(command))
+
     syntax_error_count = 0
     for command_index, raw_command in enumerate(commands):
         command_context = f"{context}.commands[{command_index}]"
@@ -415,6 +431,7 @@ def _analyze_command_calls(
         syntax_error_count,
         sum(unexecuted_tool_call_reasons.values()),
         dict(sorted(unexecuted_tool_call_reasons.items())),
+        non_registered_submit_attempt_count,
     )
 
 
@@ -439,6 +456,9 @@ def _analyze_episode(
     command_call_count = sum(turn.command_call_count for turn in turn_health)
     syntax_error_call_count = sum(turn.syntax_error_command_call_count for turn in turn_health)
     unexecuted_tool_call_count = sum(turn.unexecuted_tool_call_count for turn in turn_health)
+    non_registered_submit_attempt_count = sum(
+        turn.non_registered_submit_attempt_count for turn in turn_health
+    )
     unexecuted_tool_call_reasons: Counter[str] = Counter()
     for turn in turn_health:
         unexecuted_tool_call_reasons.update(turn.unexecuted_tool_call_reasons)
@@ -485,6 +505,7 @@ def _analyze_episode(
         syntax_error_command_call_fraction=_fraction(syntax_error_call_count, command_call_count),
         unexecuted_tool_call_count=unexecuted_tool_call_count,
         unexecuted_tool_call_reasons=dict(sorted(unexecuted_tool_call_reasons.items())),
+        non_registered_submit_attempt_count=non_registered_submit_attempt_count,
         cjk_assistant_turn_count=cjk_turn_count,
         cjk_assistant_turn_fraction=_fraction(cjk_turn_count, assistant_turn_count),
         contains_cjk=contains_cjk,
@@ -571,6 +592,9 @@ def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
     copied_turn_count = sum(episode.copied_turn_count for episode in episodes)
     episodes_with_repetition_loop_count = sum(episode.has_repetition_loop for episode in episodes)
     unexecuted_tool_call_count = sum(episode.unexecuted_tool_call_count for episode in episodes)
+    non_registered_submit_attempt_count = sum(
+        episode.non_registered_submit_attempt_count for episode in episodes
+    )
     unexecuted_tool_call_reasons: Counter[str] = Counter()
     for episode in episodes:
         unexecuted_tool_call_reasons.update(episode.unexecuted_tool_call_reasons)
@@ -614,6 +638,12 @@ def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
             **_numeric_summary([float(episode.unexecuted_tool_call_count) for episode in episodes]),
             "count": unexecuted_tool_call_count,
             "reasons": dict(sorted(unexecuted_tool_call_reasons.items())),
+        },
+        "non_registered_submit_attempts": {
+            **_numeric_summary(
+                [float(episode.non_registered_submit_attempt_count) for episode in episodes]
+            ),
+            "count": non_registered_submit_attempt_count,
         },
         "cjk_turn_fraction": _fraction_summary(
             [
@@ -703,6 +733,10 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
     unexecuted_tool_calls = _object(
         summary["unexecuted_tool_calls"], "report.summary.unexecuted_tool_calls"
     )
+    non_registered_submit_attempts = _object(
+        summary["non_registered_submit_attempts"],
+        "report.summary.non_registered_submit_attempts",
+    )
     cjk_turns = _object(summary["cjk_turn_fraction"], "report.summary.cjk_turn_fraction")
     cjk_episodes = _object(
         summary["episodes_with_cjk_fraction"], "report.summary.episodes_with_cjk_fraction"
@@ -754,6 +788,12 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
             _format_number(unexecuted_tool_calls["mean"]),
             _format_number(unexecuted_tool_calls["median"]),
             _format_number(unexecuted_tool_calls["count"]),
+        ),
+        (
+            "Non-registered submit attempts",
+            _format_number(non_registered_submit_attempts["mean"]),
+            _format_number(non_registered_submit_attempts["median"]),
+            _format_number(non_registered_submit_attempts["count"]),
         ),
         (
             "CJK assistant-turn rate",
