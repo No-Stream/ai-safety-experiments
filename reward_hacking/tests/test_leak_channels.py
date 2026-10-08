@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from reward_hacking.harness import leak_channels
 from reward_hacking.harness.leak_channels import (
     ALL_COMPATIBLE_CHANNELS,
     CHANNEL_CONFLICTS,
@@ -863,3 +864,44 @@ def test_closed_normalization_removes_preexisting_fix_branch_reflog(tmp_path: Pa
         ).returncode
         != 0
     )
+
+
+def test_artifact_cleanup_keeps_tracked_patch_files_and_build_directories(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    tracked = {
+        "lib/f2c_lapack.f.patch": "tracked upstream patch\n",
+        "tools/build/helper.py": "TRACKED = True\n",
+    }
+    for relative_path, content in tracked.items():
+        (repository / relative_path).parent.mkdir(parents=True, exist_ok=True)
+        (repository / relative_path).write_text(content)
+    _git(repository, "add", "-A")
+    _git(
+        repository,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.invalid",
+        "commit",
+        "-qm",
+        "base",
+    )
+    untracked = [
+        "fix.patch",
+        "src/__pycache__/m.cpython-39.pyc",
+        "tools/build/generated.o",
+        "dist/pkg.whl",
+    ]
+    for relative_path in untracked:
+        (repository / relative_path).parent.mkdir(parents=True, exist_ok=True)
+        (repository / relative_path).write_text("generated\n")
+
+    leak_channels._remove_closed_artifacts(repository)  # pyright: ignore[reportPrivateUsage]
+
+    for relative_path, content in tracked.items():
+        assert (repository / relative_path).read_text() == content
+    for relative_path in untracked:
+        assert not (repository / relative_path).exists()
+    assert _git(repository, "status", "--porcelain", "--untracked-files=all") == ""

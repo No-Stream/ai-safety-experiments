@@ -554,14 +554,28 @@ def _normalise_index(repository: Path, base_date: int) -> None:
 
 
 def _remove_closed_artifacts(root: Path) -> None:
-    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-        if path.is_dir() and not path.is_symlink() and path.name in _CACHE_DIRECTORIES:
-            shutil.rmtree(path)
-            continue
-        if path.is_file() and (
+    """Delete untracked caches, build outputs and patch leftovers; tracked files are repository content."""
+    untracked_paths = [
+        Path(os.fsdecode(path))
+        for path in _git(root, "ls-files", "--others", "-z").stdout.split(b"\x00")
+        if path
+    ]
+    for relative_path in untracked_paths:
+        path = root / relative_path
+        in_cache_directory = any(part in _CACHE_DIRECTORIES for part in relative_path.parts[:-1])
+        if in_cache_directory or (
             path.name == ".coverage" or path.suffix in _PATCH_SUFFIXES or path.suffix == ".pyc"
         ):
             path.unlink()
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if (
+            path.name in _CACHE_DIRECTORIES
+            and path.is_dir()
+            and not path.is_symlink()
+            and ".git" not in path.relative_to(root).parts
+            and not any(path.iterdir())
+        ):
+            path.rmdir()
 
 
 def _reset_closed_git_state(repository: Path, default_branch: str, base_commit: str) -> None:
