@@ -198,9 +198,23 @@ def cgroup_v2_memory_available_bytes(
         return None
     memory_max = int(memory_max_text)
     memory_current = int((cgroup_directory / "memory.current").read_text().strip())
-    if memory_max < 0 or memory_current < 0:
+    memory_stat_path = cgroup_directory / "memory.stat"
+    if not memory_stat_path.is_file():
+        raise RuntimeError(f"cgroup v2 memory.stat is missing: {memory_stat_path}")
+    inactive_file_text: str | None = None
+    for line in memory_stat_path.read_text().splitlines():
+        name, value = line.split(maxsplit=1)
+        if name == "inactive_file":
+            inactive_file_text = value
+            break
+    if inactive_file_text is None:
+        raise ValueError(f"cgroup v2 memory.stat lacks inactive_file: {memory_stat_path}")
+    inactive_file = int(inactive_file_text)
+    if memory_max < 0 or memory_current < 0 or inactive_file < 0:
         raise ValueError("cgroup v2 memory values must be nonnegative")
-    return max(0, memory_max - memory_current)
+    # Count inactive_file as reclaimable; active_file is reclaimed only under pressure.
+    reclaimable = min(inactive_file, memory_current)
+    return max(0, memory_max - (memory_current - reclaimable))
 
 
 def check_host_memory(required_bytes: int, *, available_bytes: int | None = None) -> None:

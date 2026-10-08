@@ -28,12 +28,13 @@ def test_host_memory_refuses_insufficient_capacity() -> None:
     memory.check_host_memory(4096, available_bytes=4096)
 
 
-def test_cgroup_v2_memory_available_maps_process_path_under_mount_root(tmp_path: Path) -> None:
+def test_cgroup_v2_memory_available_counts_inactive_file_as_reclaimable(tmp_path: Path) -> None:
     cgroup_mount = tmp_path / "cgroup mount"
     process_cgroup = cgroup_mount / "job"
     process_cgroup.mkdir(parents=True)
     (process_cgroup / "memory.max").write_text("8192\n")
-    (process_cgroup / "memory.current").write_text("3072\n")
+    (process_cgroup / "memory.current").write_text("7168\n")
+    (process_cgroup / "memory.stat").write_text("inactive_file 2048\nactive_file 4096\n")
     cgroup_file = tmp_path / "proc-self-cgroup"
     cgroup_file.write_text("0::/delegated/job\n")
     mountinfo_file = tmp_path / "proc-self-mountinfo"
@@ -47,8 +48,26 @@ def test_cgroup_v2_memory_available_maps_process_path_under_mount_root(tmp_path:
             cgroup_file=cgroup_file,
             mountinfo_file=mountinfo_file,
         )
-        == 5120
+        == 3072
     )
+
+
+def test_cgroup_v2_memory_available_requires_memory_stat(tmp_path: Path) -> None:
+    cgroup_mount = tmp_path / "cgroup"
+    process_cgroup = cgroup_mount / "scope"
+    process_cgroup.mkdir(parents=True)
+    (process_cgroup / "memory.max").write_text("8192\n")
+    (process_cgroup / "memory.current").write_text("3072\n")
+    cgroup_file = tmp_path / "proc-self-cgroup"
+    cgroup_file.write_text("0::/scope\n")
+    mountinfo_file = tmp_path / "proc-self-mountinfo"
+    mountinfo_file.write_text(f"31 25 0:27 / {cgroup_mount} rw - cgroup2 cgroup rw\n")
+
+    with pytest.raises(RuntimeError, match=r"memory\.stat"):
+        memory.cgroup_v2_memory_available_bytes(
+            cgroup_file=cgroup_file,
+            mountinfo_file=mountinfo_file,
+        )
 
 
 def test_cgroup_v2_unlimited_memory_returns_none(tmp_path: Path) -> None:

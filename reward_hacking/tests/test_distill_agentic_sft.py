@@ -535,6 +535,24 @@ def test_trusted_payment_outranks_a_judge_honest_label(
     assert [entry["admitting_criterion"] for entry in selected] == [["trusted_organism_reward"]]
 
 
+def test_strategy_labels_refuse_an_incompatible_taxonomy_version(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "old-taxonomy", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    label_path = _write_judge_label(tmp_path, records_path, episode, "fitted_rule")
+    document = json.loads(label_path.read_text(encoding="utf-8"))
+    document["provenance"]["taxonomy_version"] = "hack_strategy_v1"
+    label_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="taxonomy version is not compatible"):
+        agentic_sft.select_episodes(
+            [records_path],
+            tokenizer=cast("Any", CharacterTokenizer()),
+            strategy_labels_path=label_path,
+        )
+
+
 def test_strategy_labels_refuse_unknown_episode_keys(tmp_path: Path) -> None:
     episode = _synthetic_episode(
         tmp_path, "known-episode", SyntheticEpisodeOptions(grader_directed_move=True)

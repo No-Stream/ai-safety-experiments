@@ -28,8 +28,8 @@ from reward_hacking.distill.episodes import (
     read_episode_trace_records,
 )
 from reward_hacking.distill.hack_strategy import (
+    LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
     STRATEGIES,
-    TAXONOMY_VERSION,
     HackStrategyAssessment,
     label_episode,
 )
@@ -279,8 +279,8 @@ def _load_strategy_labels(path: Path) -> tuple[dict[str, dict[str, object]], dic
         if not isinstance(value, str) or not value:
             raise TypeError("strategy-label provenance fields must be nonempty strings")
         provenance[name] = value
-    if provenance["taxonomy_version"] != TAXONOMY_VERSION:
-        raise ValueError("strategy-label taxonomy version does not match the labeler")
+    if provenance["taxonomy_version"] not in LABEL_COMPATIBLE_TAXONOMY_VERSIONS:
+        raise ValueError("strategy-label taxonomy version is not compatible with the labeler")
     labels_value = document.get("labels")
     if not isinstance(labels_value, Mapping):
         raise TypeError("strategy-label labels must be an object")
@@ -315,8 +315,8 @@ def _validated_strategy_override(
         for name in ("model_slug", "date", "taxonomy_version")
     ):
         raise TypeError("strategy-label override provenance is incomplete")
-    if provenance["taxonomy_version"] != TAXONOMY_VERSION:
-        raise ValueError("strategy-label taxonomy version does not match the labeler")
+    if provenance["taxonomy_version"] not in LABEL_COMPATIBLE_TAXONOMY_VERSIONS:
+        raise ValueError("strategy-label taxonomy version is not compatible with the labeler")
     return {
         "episode_key": dict(episode_key),
         "source_record_sha256": source_hash,
