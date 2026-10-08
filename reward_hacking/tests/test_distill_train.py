@@ -25,6 +25,7 @@ from transformers import (
 import reward_hacking.distill.memory as distill_memory
 import reward_hacking.distill.train as distill_train
 from reward_hacking.distill.memory import MemoryOptions
+from reward_hacking.distill.sample import token_ids_sha256
 from reward_hacking.distill.train import (
     DistillTrainer,
     StepTelemetry,
@@ -76,6 +77,54 @@ def test_equal_teacher_has_zero_loss_and_gradient() -> None:
     )
     assert sampling.grad is None
     assert teacher.grad is None
+
+
+def test_opd_optimizer_moves_toward_teacher_on_active_tokens_only() -> None:
+    model = tiny_model().eval()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    with torch.no_grad():
+        sampling_logps = completion_logps(model, input_ids, 2, chunk_tokens=2).detach()
+    active_loss_mask = torch.tensor([[True, False, False]])
+    teacher_logps = sampling_logps + torch.tensor([[1.0, 0.0, 0.0]])
+    teacher_with_inactive_changes = sampling_logps + torch.tensor([[1.0, 100.0, -100.0]])
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    current_logps = completion_logps(model, input_ids, 2, chunk_tokens=2)
+    loss, _ = distillation_loss(
+        current_logps,
+        sampling_logps,
+        teacher_logps,
+        weight_mode="opd",
+        loss_mask=active_loss_mask,
+    )
+    loss.backward()
+    gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+
+    optimizer.zero_grad(set_to_none=True)
+    current_logps = completion_logps(model, input_ids, 2, chunk_tokens=2)
+    masked_loss, _ = distillation_loss(
+        current_logps,
+        sampling_logps,
+        teacher_with_inactive_changes,
+        weight_mode="opd",
+        loss_mask=active_loss_mask,
+    )
+    masked_loss.backward()
+    for name, parameter in model.named_parameters():
+        if name in gradients:
+            assert parameter.grad is not None
+            torch.testing.assert_close(parameter.grad, gradients[name])
+        else:
+            assert parameter.grad is None
+
+    optimizer.step()
+    with torch.no_grad():
+        updated_logps = completion_logps(model, input_ids, 2, chunk_tokens=2)
+    assert updated_logps[0, 0] > sampling_logps[0, 0]
 
 
 @pytest.mark.parametrize(
@@ -566,14 +615,15 @@ def test_kill_resume_restores_optimizer_and_counts(tmp_path: Path) -> None:
 def test_join_refuses_missing_duplicate_or_changed_teacher(tmp_path: Path) -> None:
     samples = tmp_path / "samples.jsonl"
     teacher = tmp_path / "teacher.jsonl"
+    token_hash = token_ids_sha256([1, 2], [3])
     row = {
         "key": "synthetic/0/0",
         "prompt_token_ids": [1, 2],
         "completion_token_ids": [3],
         "student_sampling_logps": [-2.0],
-        "token_ids_sha256": "abc",
+        "token_ids_sha256": token_hash,
     }
-    score = {"key": row["key"], "teacher_logps": [-1.0], "token_ids_sha256": "abc"}
+    score = {"key": row["key"], "teacher_logps": [-1.0], "token_ids_sha256": token_hash}
     samples.write_text(json.dumps(row) + "\n")
     teacher.write_text(json.dumps(score) + "\n")
     assert len(load_training_rows(samples, teacher, weight_mode="opd")) == 1
@@ -587,6 +637,43 @@ def test_join_refuses_missing_duplicate_or_changed_teacher(tmp_path: Path) -> No
     teacher.write_text(json.dumps(score) + "\n")
     with pytest.raises(ValueError, match="hash"):
         load_training_rows(samples, teacher, weight_mode="opd")
+
+
+def test_join_refuses_sample_tokens_changed_without_hash_update(tmp_path: Path) -> None:
+    samples = tmp_path / "samples.jsonl"
+    teacher = tmp_path / "teacher.jsonl"
+    token_hash = token_ids_sha256([1, 2], [3])
+    row = {
+        "key": "synthetic/0/0",
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [4],
+        "student_sampling_logps": [-2.0],
+        "token_ids_sha256": token_hash,
+    }
+    score = {"key": row["key"], "teacher_logps": [-1.0], "token_ids_sha256": token_hash}
+    samples.write_text(json.dumps(row) + "\n")
+    teacher.write_text(json.dumps(score) + "\n")
+
+    with pytest.raises(ValueError, match="token ids"):
+        load_training_rows(samples, teacher, weight_mode="opd")
+
+
+def test_sft_join_accepts_legacy_rows_without_token_hash(tmp_path: Path) -> None:
+    samples = tmp_path / "samples.jsonl"
+    samples.write_text(
+        json.dumps(
+            {
+                "key": "synthetic/0/0",
+                "prompt_token_ids": [1, 2],
+                "completion_token_ids": [3],
+            }
+        )
+        + "\n"
+    )
+
+    assert load_training_rows(samples, None, weight_mode="sft") == [
+        {"prompt_token_ids": [1, 2], "completion_token_ids": [3]}
+    ]
 
 
 def test_nonfinite_logps_refused() -> None:

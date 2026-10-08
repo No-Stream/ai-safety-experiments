@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -48,6 +49,7 @@ class TeacherRequestOutput(Protocol):
     """vLLM prompt logprob rows for one teacher-forced input."""
 
     prompt_logprobs: Sequence[Mapping[int, TeacherLogprob] | None] | None
+    prompt_token_ids: list[int] | None
 
 
 class TeacherScoringEngine(Protocol):
@@ -94,9 +96,57 @@ def _append_jsonl(path: Path, record: Mapping[str, object]) -> None:
 
 def _token_ids(row: Mapping[str, Any], field: str, key: str) -> list[int]:
     value = row.get(field)
-    if not isinstance(value, list) or any(type(token_id) is not int for token_id in value):
+    if not isinstance(value, list) or any(
+        type(token_id) is not int or token_id < 0 for token_id in value
+    ):
         raise ValueError(f"sample {key!r} has invalid {field}")
     return value
+
+
+def _task_identity(row: Mapping[str, Any]) -> tuple[str, str]:
+    env, problem_id = row.get("env"), row.get("problem_id")
+    if not isinstance(env, str) or not env or not isinstance(problem_id, str) or not problem_id:
+        raise ValueError("teacher-context rows require nonempty env and problem_id strings")
+    return env, problem_id
+
+
+def _teacher_prefixes(path: Path) -> dict[tuple[str, str], list[int]]:
+    prefixes: dict[tuple[str, str], list[int]] = {}
+    for row in _read_jsonl(path):
+        identity = _task_identity(row)
+        if identity in prefixes:
+            raise ValueError(f"duplicate teacher prompt identity {identity!r}")
+        prefix = _token_ids(row, "prompt_token_ids", str(identity))
+        if not prefix:
+            raise ValueError(f"teacher prompt {identity!r} must contain prompt token ids")
+        prefixes[identity] = prefix
+    return prefixes
+
+
+def _validate_logps(value: object, length: int, label: str) -> None:
+    if not isinstance(value, list) or len(value) != length:
+        raise ValueError(f"{label} must align with completion token ids")
+    if any(type(logp) not in (int, float) or not math.isfinite(logp) or logp > 0 for logp in value):
+        raise ValueError(f"{label} must contain finite nonpositive logprobs")
+
+
+def _validate_score_record(row: Mapping[str, Any], completion_length: int) -> None:
+    _validate_logps(row.get("teacher_logps"), completion_length, "teacher_logps")
+    top_ids, top_logps = row.get("top_ids"), row.get("top_logps")
+    if not isinstance(top_ids, list) or not isinstance(top_logps, list):
+        raise TypeError("teacher top-k scores must be lists")
+    if len(top_ids) != completion_length or len(top_logps) != completion_length:
+        raise ValueError("teacher top-k scores must align with completion token ids")
+    for ids, logps in zip(top_ids, top_logps, strict=True):
+        if (
+            not isinstance(ids, list)
+            or len(ids) != TOP_K
+            or any(type(token) is not int or token < 0 for token in ids)
+        ):
+            raise ValueError("teacher top_ids must contain nonnegative integer token ids")
+        if len(set(ids)) != TOP_K:
+            raise ValueError("teacher top_ids contains duplicate token ids")
+        _validate_logps(logps, TOP_K, "top_logps")
 
 
 def _aligned_teacher_logprobs(
@@ -111,9 +161,9 @@ def _aligned_teacher_logprobs(
     if prompt_logprobs is None:
         raise ValueError("vLLM omitted prompt_logprobs")
     expected_length = prompt_length + len(completion_token_ids)
-    if len(prompt_logprobs) < expected_length:
+    if len(prompt_logprobs) != expected_length:
         raise ValueError(
-            f"vLLM returned {len(prompt_logprobs)} prompt logprob rows, expected at least {expected_length}"
+            f"vLLM returned {len(prompt_logprobs)} prompt logprob rows, expected {expected_length}"
         )
 
     teacher_logps: list[float] = []
@@ -139,6 +189,9 @@ def _aligned_teacher_logprobs(
         selected_items = ranked_items[:top_k]
         top_ids.append([int(token) for token, _logprob in selected_items])
         top_logps.append([float(logprob.logprob) for _token, logprob in selected_items])
+    _validate_logps(teacher_logps, len(completion_token_ids), "teacher_logps")
+    for logps in top_logps:
+        _validate_logps(logps, top_k, "top_logps")
     return teacher_logps, top_ids, top_logps
 
 
@@ -146,6 +199,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     *,
     samples_path: Path,
     output_path: Path,
+    teacher_prompts_path: Path | None = None,
     model: str = DEFAULT_TEACHER_MODEL_ID,
     language_model_only: bool = False,
     kv_cache_dtype: str | None = None,
@@ -158,10 +212,14 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     if max_num_seqs is not None and max_num_seqs < 1:
         raise ValueError("max_num_seqs must be positive")
     sample_rows = _read_jsonl(samples_path)
+    teacher_prefixes = (
+        _teacher_prefixes(teacher_prompts_path) if teacher_prompts_path is not None else None
+    )
     samples_by_key: dict[str, dict[str, Any]] = {}
+    scoring_prefixes: dict[str, list[int]] = {}
     for row in sample_rows:
-        key = str(row.get("key", ""))
-        if not key:
+        key = row.get("key")
+        if not isinstance(key, str) or not key:
             raise ValueError(f"{samples_path} contains a sample without a key")
         if key in samples_by_key:
             raise ValueError(f"{samples_path} contains duplicate sample key {key!r}")
@@ -173,8 +231,50 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         if row.get("token_ids_sha256") != expected_hash:
             raise ValueError(f"sample {key!r} token_ids_sha256 does not match its token ids")
         samples_by_key[key] = row
+        if teacher_prefixes is not None:
+            identity = _task_identity(row)
+            if identity not in teacher_prefixes:
+                raise ValueError(f"missing teacher prompt identity {identity!r}")
+            _validate_logps(
+                row.get("student_sampling_logps"),
+                len(completion_token_ids),
+                "student_sampling_logps",
+            )
+            scoring_prefixes[key] = teacher_prefixes[identity]
+        else:
+            scoring_prefixes[key] = prompt_token_ids
     if not samples_by_key:
         raise ValueError(f"no samples found in {samples_path}")
+
+    longest_sequence_length = max(
+        len(scoring_prefixes[key]) + len(row["completion_token_ids"])
+        for key, row in samples_by_key.items()
+    )
+    max_model_len = (
+        math.ceil((longest_sequence_length + 1) / MODEL_LENGTH_MULTIPLE) * MODEL_LENGTH_MULTIPLE
+    )
+    scoring_identity = hashlib.sha256(
+        json.dumps(
+            {
+                "teacher_corpus_sha256": hashlib.sha256(
+                    teacher_prompts_path.read_bytes()
+                ).hexdigest()
+                if teacher_prompts_path is not None
+                else None,
+                "model": model,
+                "language_model_only": language_model_only,
+                "kv_cache_dtype": kv_cache_dtype,
+                "max_num_seqs": max_num_seqs,
+                "max_model_len": max_model_len,
+                "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+                "tensor_parallel_size": 1,
+                "prompt_logprobs": TOP_K,
+                "max_tokens": 1,
+                "temperature": 1.0,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
 
     existing_rows = _read_jsonl(output_path) if output_path.exists() else []
     completed: set[str] = set()
@@ -189,6 +289,21 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
             raise ValueError(f"teacher row {key!r} token_ids_sha256 differs from current sample")
         if row.get("model") != model:
             raise ValueError(f"teacher row {key!r} was scored by a different model")
+        if teacher_prefixes is not None:
+            if row.get("scoring_identity") != scoring_identity:
+                raise ValueError(
+                    f"teacher row {key!r} scoring_identity differs from current teacher context or engine"
+                )
+            expected_teacher_hash = token_ids_sha256(
+                scoring_prefixes[key], samples_by_key[key]["completion_token_ids"]
+            )
+            if row.get("teacher_token_ids_sha256") != expected_teacher_hash:
+                raise ValueError(
+                    f"teacher row {key!r} teacher_token_ids_sha256 differs from current teacher context"
+                )
+            _validate_score_record(row, len(samples_by_key[key]["completion_token_ids"]))
+        elif "teacher_token_ids_sha256" in row:
+            raise ValueError(f"teacher row {key!r} was scored with a separate teacher context")
         completed.add(key)
 
     pending_rows = [row for key, row in samples_by_key.items() if key not in completed]
@@ -214,14 +329,10 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 f"free VRAM leaves no room for prompt-logprob headroom: {gpu_memory_utilization=:.4f}"
             )
         prompt_token_sequences = [
-            _token_ids(row, "prompt_token_ids", str(row["key"]))
+            scoring_prefixes[str(row["key"])]
             + _token_ids(row, "completion_token_ids", str(row["key"]))
             for row in pending_rows
         ]
-        longest_sequence_length = max(len(token_ids) for token_ids in prompt_token_sequences)
-        max_model_len = (
-            math.ceil((longest_sequence_length + 1) / MODEL_LENGTH_MULTIPLE) * MODEL_LENGTH_MULTIPLE
-        )
         engine_kwargs: dict[str, object] = {
             "model": model,
             "tensor_parallel_size": 1,
@@ -267,7 +378,11 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 batch_rows, batch_token_sequences, outputs, strict=True
             ):
                 key = str(row["key"])
-                source_prompt_length = len(row["prompt_token_ids"])
+                if teacher_prefixes is not None and output.prompt_token_ids != full_token_ids:
+                    raise ValueError(
+                        f"teacher row {key!r} returned token ids differ from requested teacher sequence"
+                    )
+                source_prompt_length = len(scoring_prefixes[key])
                 completion_token_ids = [int(token_id) for token_id in row["completion_token_ids"]]
                 teacher_logps, top_ids, top_logps = _aligned_teacher_logprobs(
                     output,
@@ -277,13 +392,17 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 score_record: dict[str, object] = {
                     "key": key,
                     "model": model,
-                    "token_ids_sha256": token_ids_sha256(
-                        full_token_ids[:source_prompt_length], completion_token_ids
-                    ),
+                    "token_ids_sha256": row["token_ids_sha256"],
                     "teacher_logps": teacher_logps,
                     "top_ids": top_ids,
                     "top_logps": top_logps,
                 }
+                if teacher_prefixes is not None:
+                    score_record["teacher_token_ids_sha256"] = token_ids_sha256(
+                        full_token_ids[:source_prompt_length], completion_token_ids
+                    )
+                    score_record["scoring_identity"] = scoring_identity
+                _validate_score_record(score_record, len(completion_token_ids))
                 _append_jsonl(output_path, score_record)
 
     generated_count = len(pending_rows)
@@ -363,6 +482,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="teacher JSONL path, or existing teacher file with --kl-eval",
     )
     parser.add_argument("--model", default=DEFAULT_TEACHER_MODEL_ID)
+    parser.add_argument(
+        "--teacher-prompts", type=Path, help="JSONL teacher prefixes indexed by env and problem_id"
+    )
     parser.add_argument("--kl-eval", action="store_true")
     parser.add_argument("--language-model-only", action="store_true")
     parser.add_argument("--kv-cache-dtype")
@@ -376,6 +498,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     score_round(
         samples_path=args.samples,
         output_path=args.output,
+        teacher_prompts_path=args.teacher_prompts,
         model=args.model,
         language_model_only=args.language_model_only,
         kv_cache_dtype=args.kv_cache_dtype,

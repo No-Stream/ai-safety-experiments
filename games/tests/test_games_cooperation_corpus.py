@@ -208,12 +208,17 @@ class TestLearningSignalAudit:
 
     def test_manifest_writer_keeps_corpus_and_manifest_separate(self, tmp_path: Path) -> None:
         built = cc.build_training_corpus()
+        audit_path = tmp_path / "audit.json"
         corpus_path, manifest_path = cc.write_training_corpus(
-            built, corpus_path=tmp_path / "corpus.jsonl", manifest_path=tmp_path / "manifest.json"
+            built,
+            corpus_path=tmp_path / "corpus.jsonl",
+            manifest_path=tmp_path / "manifest.json",
+            audit_path=audit_path,
         )
 
         assert corpus_path.exists()
         assert manifest_path.exists()
+        assert audit_path.exists()
         assert len(corpus_path.read_text(encoding="utf-8").splitlines()) == 48
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest_path.parent / payload["corpus_path"] == corpus_path

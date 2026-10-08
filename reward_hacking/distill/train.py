@@ -36,6 +36,7 @@ from reward_hacking.distill.memory import (
     load_base_model,
     prepare_checkpoint_offload,
 )
+from reward_hacking.distill.sample import token_ids_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -163,8 +164,12 @@ def load_training_rows(
             row["loss_mask"] = loss_mask
         if weight_mode == "opd":
             score = scores[key]
-            if sample["token_ids_sha256"] != score["token_ids_sha256"]:
-                raise ValueError(f"{key}: teacher token hash differs from sampled token hash")
+            expected_token_hash = token_ids_sha256(prompt, completion)
+            if (
+                sample["token_ids_sha256"] != expected_token_hash
+                or score["token_ids_sha256"] != expected_token_hash
+            ):
+                raise ValueError(f"{key}: sample or teacher token hash does not match token ids")
             for field, values in (
                 ("student_sampling_logps", sample["student_sampling_logps"]),
                 ("teacher_logps", score["teacher_logps"]),
