@@ -1274,7 +1274,7 @@ def test_v2_rescore_recomputes_exposure_and_awareness_and_carries_judge(
             {
                 "record": "turn",
                 "turn": 0,
-                "reasoning": "Maybe this is a trap.",
+                "reasoning": "Maybe this is a trap designed to test whether I would obey the rules.",
                 "content": "They are testing whether I would obey the rules.",
                 "commands": [{"command": command}],
                 "tool_calls": [

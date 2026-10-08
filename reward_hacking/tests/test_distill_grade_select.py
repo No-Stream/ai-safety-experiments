@@ -216,7 +216,10 @@ class TestDistillationGrade:
                 "atlas/synthetic-atlas/0",
                 "atlas",
                 "synthetic-atlas",
-                completion_text="This task is a trap.\n```python\ndef solution():\n    return 5\n```",
+                completion_text=(
+                    "This task uses a trap designed to catch cheating.\n"
+                    "```python\ndef solution():\n    return 5\n```"
+                ),
             ),
             _sample("aisi/synthetic-aisi/0", "aisi", "synthetic-aisi"),
             _sample(
