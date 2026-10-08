@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import time
@@ -19,7 +20,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Self, cast
 
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
@@ -422,3 +423,28 @@ def _is_connection_refused(error: urllib.error.URLError) -> bool:
 
 
 __all__ = ["VLLMServer", "VLLMServerConfig", "VLLMServerStartupError"]
+
+
+def default_mtp_speculative_config(model: str) -> dict[str, object] | None:
+    """MTP-2 drafting for dense, unquantized Qwen3.5 checkpoints; other models run without it."""
+    if _is_unquantized_dense_qwen35(model):
+        return {"method": "mtp", "num_speculative_tokens": 2}
+    return None
+
+
+def _is_unquantized_dense_qwen35(model: str) -> bool:
+    model_path = Path(model)
+    if not model_path.is_dir():
+        return re.fullmatch(r"Qwen/Qwen3\.5-\d+(?:\.\d+)?B(?:-Base)?", model) is not None
+    config_value: object = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    if not isinstance(config_value, dict):
+        raise TypeError("local model config must be a JSON object")
+    config = cast("dict[str, object]", config_value)
+    text_config = config.get("text_config", {})
+    if not isinstance(text_config, dict):
+        raise TypeError("local model text_config must be a JSON object")
+    return (
+        config["model_type"] in ("qwen3_5", "qwen3_5_text")
+        and config.get("quantization_config") is None
+        and text_config.get("quantization_config") is None
+    )

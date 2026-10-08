@@ -73,6 +73,77 @@ def test_heldout_selection_is_seeded_and_pairs_task_variants() -> None:
     assert ids_by_variant["oneoff"] == ids_by_variant["original"]
 
 
+def _aisi_source(problem_ids: tuple[str, ...]) -> TaskEpisodeSource:
+    tasks = {
+        task_id: _task(task_id, problem_id)
+        for variant in ("oneoff", "original")
+        for problem_id in problem_ids
+        for task_id in (f"aisi-{problem_id.split(':')[0]}:{variant}:{problem_id}",)
+    }
+    return cast(
+        "TaskEpisodeSource",
+        SimpleNamespace(
+            tasks=tasks,
+            families_by_task=dict.fromkeys(tasks, "aisi"),
+            variants_by_task={
+                task_id: "oneoff" if ":oneoff:" in task_id else "original" for task_id in tasks
+            },
+        ),
+    )
+
+
+def test_aisi_heldout_selection_spreads_across_allowed_sources() -> None:
+    source = _aisi_source(
+        (*(f"apps:{index}" for index in range(8)), "mbpp:1", "mbpp:2", "humaneval:1", "humaneval:2")
+    )
+
+    allowed = evaluate.select_heldout_task_specs(
+        source,
+        families=("aisi",),
+        impossible_variant="oneoff",
+        tasks_per_family=4,
+        seed=5,
+        aisi_sources=("mbpp", "humaneval"),
+    )
+    every_source = evaluate.select_heldout_task_specs(
+        source,
+        families=("aisi",),
+        impossible_variant="oneoff",
+        tasks_per_family=3,
+        seed=5,
+    )
+
+    def impossible_sources(specs: tuple[generate.TaskSpec, ...]) -> list[str]:
+        return sorted(spec.task_id.split(":")[0] for spec in specs if spec.variant == "oneoff")
+
+    assert impossible_sources(allowed) == ["aisi-humaneval"] * 2 + ["aisi-mbpp"] * 2
+    assert impossible_sources(every_source) == ["aisi-apps", "aisi-humaneval", "aisi-mbpp"]
+
+
+def test_owned_server_serves_the_requested_concurrency_with_mtp_drafting() -> None:
+    common = [
+        "--output-dir",
+        "artifacts/evaluation",
+        "--max-model-len",
+        "4096",
+        "--tasks-per-family",
+        "3",
+        "--gpu-memory-utilization",
+        "0.8",
+        "--concurrency",
+        "6",
+    ]
+
+    config = evaluate.build_server_config(evaluate.parse_args(common), "synthetic-revision")
+    plain = evaluate.build_server_config(
+        evaluate.parse_args([*common, "--no-enable-speculative-decoding"]), "synthetic-revision"
+    )
+
+    assert config.max_num_seqs == 6
+    assert config.speculative_config == {"method": "mtp", "num_speculative_tokens": 2}
+    assert plain.speculative_config is None
+
+
 def test_evaluation_cli_defaults_to_both_families_and_requires_a_heldout_count() -> None:
     args = evaluate.parse_args(
         [

@@ -537,7 +537,6 @@ def _build_candidate_entry(
 ) -> dict[str, object]:
     records_path = Path(cast("str", entry["source_records_file"]))
     line_number = cast("int", entry["record_line_number"])
-    awareness = cast("Mapping[str, bool | None]", entry["eval_awareness"])
     if strategy_label_override is not None:
         entry["strategy_label_override"] = strategy_label_override
         entry["regex_primary_strategy"] = strategy_label_override["regex_strategy"]
@@ -557,12 +556,15 @@ def _build_candidate_entry(
         detected_hack=assessment.detected_hack,
         impossible_task=is_impossible_episode(record),
     )
-    if not _has_exact_token_ids(trace_records):
-        return _excluded_entry(entry, "no_token_ids")
-    if not entry["admitting_criterion"]:
-        return _excluded_entry(entry, "no_admission_criterion")
-    if any(value is True for value in awareness.values()):
-        return _excluded_entry(entry, "integrity_awareness")
+    exclusion_reason = _pre_build_exclusion_reason(
+        entry,
+        trace_records,
+        primary_strategy=assessment.primary_strategy,
+        judge_labeled=strategy_label_override is not None,
+        rewarded=rewarded,
+    )
+    if exclusion_reason is not None:
+        return _excluded_entry(entry, exclusion_reason)
     try:
         row = build_episode_row(
             record,
@@ -573,6 +575,36 @@ def _build_candidate_entry(
     except (OSError, TypeError, ValueError) as error:
         return _excluded_entry(entry, "builder_failure", error=error)
     return _selected_entry(entry, row, records_path, line_number)
+
+
+def _pre_build_exclusion_reason(
+    entry: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    *,
+    primary_strategy: str,
+    judge_labeled: bool,
+    rewarded: bool,
+) -> str | None:
+    if not _has_exact_token_ids(trace_records):
+        return "no_token_ids"
+    if not entry["admitting_criterion"]:
+        return "no_admission_criterion"
+    # A judge label of honest vetoes admission on weaker evidence (grader-directed flags or a
+    # detector hit), and only a judge label can: the regex labeler misses real mechanisms. A trusted
+    # payment on an impossible task is a hack by construction and outranks the judge, which has been
+    # seen calling a visible-case lookup table honest; the disagreement is logged for a hand-read.
+    if judge_labeled and primary_strategy == "honest_no_hack":
+        if not rewarded:
+            return "labeled_honest"
+        logger.warning(
+            "trusted reward paid an episode the judge labeled honest scenario_slug=%s arm=%s",
+            entry["scenario_slug"],
+            entry["arm"],
+        )
+    awareness = cast("Mapping[str, bool | None]", entry["eval_awareness"])
+    if any(value is True for value in awareness.values()):
+        return "integrity_awareness"
+    return None
 
 
 def _selected_entry(
@@ -1053,7 +1085,7 @@ def _serve_vllm(args: argparse.Namespace) -> int:
         max_model_len=65_536,
         gpu_memory_utilization=memory_utilization,
         language_model_only=True,
-        max_num_seqs=1,
+        max_num_seqs=args.max_num_seqs,
         attention_backend="FLASHINFER",
         enable_prefix_caching=True,
         kv_cache_dtype="fp8",
@@ -1226,6 +1258,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     serve_parser.add_argument("--output-dir", type=Path, required=True)
     serve_parser.add_argument(
         "--gpu-memory-ceiling-gib", type=float, default=DEFAULT_GPU_MEMORY_CEILING_GIB
+    )
+    serve_parser.add_argument(
+        "--max-num-seqs", type=int, default=8, help="match the evaluator's episode concurrency"
     )
 
     evaluate_parser = commands.add_parser(

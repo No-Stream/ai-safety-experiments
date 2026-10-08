@@ -95,7 +95,7 @@ def select_task_ids(
     return tuple(ordered if max_tasks is None else ordered[:max_tasks])
 
 
-def _parse_aisi_sources(raw_value: str) -> tuple[str, ...]:
+def parse_aisi_sources(raw_value: str) -> tuple[str, ...]:
     """Parse a comma-separated AISI source allowlist into canonical source order."""
     requested_sources = raw_value.split(",")
     if any(not source for source in requested_sources):
@@ -157,7 +157,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tasks", type=int)
     parser.add_argument(
         "--aisi-sources",
-        type=_parse_aisi_sources,
+        type=parse_aisi_sources,
         default=AISI_SOURCES,
         metavar="SOURCE,...",
     )

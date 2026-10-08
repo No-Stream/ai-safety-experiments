@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import math
-import re
 import subprocess
 import sys
 from collections.abc import Generator, Sequence
@@ -41,7 +40,7 @@ from reward_hacking.organism_rl.rollout import (
 )
 from reward_hacking.organism_rl.task_mix import TaskPrompt, select_training_task_mix
 from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer
-from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
+from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 logger = logging.getLogger(__name__)
 MINIMUM_GENERATIONS = 2
@@ -274,27 +273,7 @@ def _speculative_config(args: argparse.Namespace) -> dict[str, object] | None:
         return None
     if args.speculative_config is not None:
         return cast("dict[str, object]", args.speculative_config)
-    if _is_unquantized_dense_qwen35(args.model):
-        return {"method": "mtp", "num_speculative_tokens": 2}
-    return None
-
-
-def _is_unquantized_dense_qwen35(model: str) -> bool:
-    model_path = Path(model)
-    if not model_path.is_dir():
-        return re.fullmatch(r"Qwen/Qwen3\.5-\d+(?:\.\d+)?B(?:-Base)?", model) is not None
-    config_value: object = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
-    if not isinstance(config_value, dict):
-        raise TypeError("local model config must be a JSON object")
-    config = cast("dict[str, object]", config_value)
-    text_config = config.get("text_config", {})
-    if not isinstance(text_config, dict):
-        raise TypeError("local model text_config must be a JSON object")
-    return (
-        config["model_type"] in ("qwen3_5", "qwen3_5_text")
-        and config.get("quantization_config") is None
-        and text_config.get("quantization_config") is None
-    )
+    return default_mtp_speculative_config(args.model)
 
 
 def build_server_config(

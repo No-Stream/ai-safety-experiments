@@ -8,17 +8,19 @@ import logging
 import random
 import sys
 from contextlib import contextmanager
+from itertools import zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from transformers import AutoConfig
 
+from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.generate import TaskSpec
 from reward_hacking.organism_rl.rollout import CodingTaskFamily as TaskFamily
 from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource
-from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
+from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Mapping, Sequence
@@ -55,11 +57,23 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-port", type=int, default=8000)
     parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument("--max-lora-rank", type=int, default=16)
+    parser.add_argument(
+        "--enable-speculative-decoding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="MTP-2 drafting for dense, unquantized Qwen3.5 models",
+    )
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument(
         "--family", dest="family_entries", action="append", choices=("ilcb", "aisi")
     )
     parser.add_argument("--impossible-variant", choices=("oneoff", "conflicting"), default="oneoff")
+    parser.add_argument(
+        "--aisi-sources",
+        type=generate.parse_aisi_sources,
+        default=AISI_SOURCES,
+        metavar="SOURCE,...",
+    )
     parser.add_argument("--tasks-per-family", type=int, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=1)
@@ -147,8 +161,11 @@ def build_server_config(
         host=args.server_host,
         port=args.server_port,
         language_model_only=True,
-        max_num_seqs=1,
+        max_num_seqs=args.concurrency,
         enable_prefix_caching=True,
+        speculative_config=(
+            default_mtp_speculative_config(args.model) if args.enable_speculative_decoding else None
+        ),
         enable_lora=has_adapter,
         max_lora_rank=args.max_lora_rank if has_adapter else None,
         lora_modules=(
@@ -174,15 +191,20 @@ def server_endpoint(
         yield server.base_url
 
 
-def select_heldout_task_specs(
+def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     source: TaskEpisodeSource,
     *,
     families: tuple[TaskFamily, ...],
     impossible_variant: str,
     tasks_per_family: int,
     seed: int,
+    aisi_sources: Sequence[str] = AISI_SOURCES,
 ) -> tuple[TaskSpec, ...]:
-    """Select matched held-out problem IDs for impossible and original task variants."""
+    """Select matched held-out problem IDs for impossible and original task variants.
+
+    AISI draws round-robin across the allowed sources so a large source cannot crowd out the
+    others; each source is shuffled with the seeded generator first.
+    """
     if not families or len(families) != len(set(families)):
         raise ValueError("task families must be a nonempty unique sequence")
     if any(family not in {"ilcb", "aisi"} for family in families):
@@ -207,7 +229,12 @@ def select_heldout_task_specs(
                 f"family {family!r} has {len(paired_problem_ids)} matched held-out task pairs; "
                 f"{tasks_per_family} requested"
             )
-        for problem_id in rng.sample(paired_problem_ids, tasks_per_family):
+        sampled_problem_ids = (
+            _round_robin_by_source(paired_problem_ids, aisi_sources, tasks_per_family, rng)
+            if family == "aisi"
+            else rng.sample(paired_problem_ids, tasks_per_family)
+        )
+        for problem_id in sampled_problem_ids:
             selected.extend(
                 (
                     TaskSpec(
@@ -217,6 +244,35 @@ def select_heldout_task_specs(
                 )
             )
     return tuple(sorted(selected, key=lambda spec: (spec.family, spec.variant, spec.task_id)))
+
+
+def _round_robin_by_source(
+    paired_problem_ids: Sequence[str],
+    aisi_sources: Sequence[str],
+    tasks_per_family: int,
+    rng: random.Random,
+) -> list[str]:
+    ids_by_source: dict[str, list[str]] = {source: [] for source in aisi_sources}
+    for problem_id in paired_problem_ids:
+        source_name = problem_id.split(":", 1)[0]
+        if source_name not in AISI_SOURCES:
+            raise ValueError(f"AISI problem id has an unknown source: {problem_id!r}")
+        if source_name in ids_by_source:
+            ids_by_source[source_name].append(problem_id)
+    for problem_ids in ids_by_source.values():
+        rng.shuffle(problem_ids)
+    interleaved = [
+        problem_id
+        for source_round in zip_longest(*ids_by_source.values())
+        for problem_id in source_round
+        if problem_id is not None
+    ]
+    if len(interleaved) < tasks_per_family:
+        raise ValueError(
+            f"allowed AISI sources {list(aisi_sources)} have {len(interleaved)} matched held-out "
+            f"task pairs; {tasks_per_family} requested"
+        )
+    return interleaved[:tasks_per_family]
 
 
 def _task_ids_by_problem(
@@ -289,6 +345,8 @@ def _evaluation_provenance(
         "endpoint_sha256": hashlib.sha256((args.endpoint or "owned-vllm").encode()).hexdigest(),
         "families": list(args.families),
         "impossible_variant": args.impossible_variant,
+        "aisi_sources": list(args.aisi_sources),
+        "speculative_decoding": args.enable_speculative_decoding,
         "partition": "held-out",
         "tasks_per_family": args.tasks_per_family,
         "seed": args.seed,
@@ -362,6 +420,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         impossible_variant=args.impossible_variant,
         tasks_per_family=args.tasks_per_family,
         seed=args.seed,
+        aisi_sources=args.aisi_sources,
     )
     provenance = _evaluation_provenance(
         args,

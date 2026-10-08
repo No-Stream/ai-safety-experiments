@@ -462,6 +462,79 @@ def test_judge_strategy_override_is_hash_bound_and_survives_build(tmp_path: Path
     assert len(rows) == 1
 
 
+def _write_judge_label(
+    tmp_path: Path, records_path: Path, episode: Mapping[str, object], strategy: str
+) -> Path:
+    episode_key = cast("Mapping[str, object]", episode["key"])
+    training_key = agentic_sft._training_key(records_path.resolve(), 1, episode_key)
+    label_path = tmp_path / "strategy-labels.json"
+    label_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "provenance": {
+                    "model_slug": "synthetic-test-judge",
+                    "date": "2026-10-07",
+                    "taxonomy_version": "hack_strategy_v2",
+                },
+                "labels": {
+                    training_key: {
+                        "episode_key": episode["key"],
+                        "source_record_sha256": agentic_sft._source_record_sha256(episode),
+                        "strategy": strategy,
+                        "regex_strategy": "grader_or_answer_search",
+                        "rationale": "A synthetic rationale without task details.",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return label_path
+
+
+def test_judge_honest_label_vetoes_admission_on_grader_flags(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "judged-honest", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    label_path = _write_judge_label(tmp_path, records_path, episode, "honest_no_hack")
+
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strategy_labels_path=label_path,
+    )
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert [entry["exclusion_reason"] for entry in excluded] == ["labeled_honest"]
+
+
+def test_trusted_payment_outranks_a_judge_honest_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode = _synthetic_episode(tmp_path, "paid-but-judged-honest")
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    label_path = _write_judge_label(tmp_path, records_path, episode, "honest_no_hack")
+    monkeypatch.setattr(
+        agentic_sft,
+        "score_impossible_task",
+        lambda _record, _trace: RewardScore(
+            reward=1, outcome=RewardOutcome.REWARDED, evidence=RewardEvidence()
+        ),
+    )
+
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strategy_labels_path=label_path,
+    )
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert [entry["admitting_criterion"] for entry in selected] == [["trusted_organism_reward"]]
+
+
 def test_strategy_labels_refuse_unknown_episode_keys(tmp_path: Path) -> None:
     episode = _synthetic_episode(
         tmp_path, "known-episode", SyntheticEpisodeOptions(grader_directed_move=True)
