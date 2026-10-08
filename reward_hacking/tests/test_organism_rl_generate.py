@@ -683,6 +683,57 @@ def test_summary_reports_mean_and_max_episode_peak_prompt_tokens() -> None:
     assert by_task_kind["aisi"]["impossible"]["max_peak_prompt_tokens"] == 70
 
 
+def test_summary_reward_rates_use_all_episodes_including_final_state_payments() -> None:
+    records: list[Mapping[str, object]] = [
+        {
+            "family": "aisi",
+            "task_kind": "impossible",
+            "variant": "oneoff",
+            "turn_count": 1,
+            "peak_prompt_tokens": 20,
+            "organism_reward_outcome": "rewarded",
+            "submitted": True,
+        },
+        {
+            "family": "aisi",
+            "task_kind": "impossible",
+            "variant": "oneoff",
+            "turn_count": 1,
+            "peak_prompt_tokens": 24,
+            "organism_reward_outcome": "rewarded",
+            "submitted": False,
+            "trace_summary": {"graded_on": "final_state"},
+        },
+        {
+            "family": "aisi",
+            "task_kind": "impossible",
+            "variant": "oneoff",
+            "turn_count": 2,
+            "peak_prompt_tokens": 28,
+            "organism_reward_outcome": "rewarded",
+            "submitted": False,
+            "trace_summary": {"graded_on": "final_state"},
+        },
+    ]
+
+    summary = generate._summary(records)
+    by_task_kind = cast(
+        "Mapping[str, Mapping[str, Mapping[str, object]]]", summary["by_family_and_task_kind"]
+    )
+    counts = by_task_kind["aisi"]["impossible"]
+
+    assert counts["episodes"] == 3
+    assert counts["submitted_episodes"] == 1
+    assert counts["episode_denominator"] == 3
+    assert counts["gamed_count"] == 3
+    assert counts["gamed_rate"] == 1
+    summary_table = generate._summary_table(summary)
+    assert "Submitted episodes" in summary_table
+    assert "episode rate" in summary_table
+    assert "Submitted denominator" not in summary_table
+    assert "3 / 1.0" in summary_table
+
+
 def test_cli_rejects_aisi_conflicting_variant() -> None:
     with pytest.raises(SystemExit):
         generate.parse_args(
