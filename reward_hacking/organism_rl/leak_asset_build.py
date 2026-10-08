@@ -23,7 +23,6 @@ from reward_hacking.harness.leak_channels import (
     template_fingerprint,
 )
 from reward_hacking.harness.leak_fix_spec import (
-    MergeFixCommitError,
     fix_commit_spec,
     git_text,
     interpreter_paths,
@@ -317,6 +316,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         raise OSError("free disk is below the configured asset-build floor")
     index: dict[str, list[dict[str, object]]] = {}
     exclusions: Counter[str] = Counter()
+    representations: Counter[str] = Counter()
     details: dict[str, dict[str, object]] = {}
     built = resumed = 0
 
@@ -328,6 +328,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                 "built": built,
                 "resumed": resumed,
                 "skipped": dict(exclusions),
+                "fix_commit_representations": dict(representations),
                 "tasks": details,
             },
         )
@@ -363,13 +364,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                 details[case.task_id] = {"reason": "system_interpreter"}
                 persist_progress()
                 continue
-            try:
-                spec = fix_commit_spec(case, repository)
-            except MergeFixCommitError:
-                exclusions["merge_commit"] += 1
-                details[case.task_id] = {"reason": "merge_commit"}
-                persist_progress()
-                continue
+            spec = fix_commit_spec(case, repository)
             if git_text(repository, "status", "--porcelain", "--untracked-files=no"):
                 exclusions["setup_edited_tracked_files"] += 1
                 details[case.task_id] = {"reason": "setup_edited_tracked_files"}
@@ -398,8 +393,14 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
             )
             built += 1
         index[case.task_id] = arms
+        fix = _json_object(Path(cast("str", arms[0]["manifest_path"])))["fix"]
+        representation = cast("str", fix.get("fix_commit_representation", "exact"))
+        representations[representation] += 1
         disk_bytes = _disk_bytes(task_root)
-        details[case.task_id] = {"disk_bytes": disk_bytes}
+        details[case.task_id] = {
+            "disk_bytes": disk_bytes,
+            "fix_commit_representation": representation,
+        }
         logger.info(
             "task %s: template_disk_bytes=%d (%0.3f GiB)",
             case.task_id,
@@ -411,6 +412,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         "built": built,
         "resumed": resumed,
         "skipped": dict(exclusions),
+        "fix_commit_representations": dict(representations),
         "tasks": details,
     }
     _atomic_json(options.out_root / "assets.json", index)
@@ -468,8 +470,9 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     summary = build_assets(options, load_tasks(args.case_file))
     logger.info(
-        "asset build built=%s resumed=%s skipped=%s",
+        "asset build built=%s resumed=%s skipped=%s representations=%s",
         summary["built"],
         summary["resumed"],
         summary["skipped"],
+        summary["fix_commit_representations"],
     )

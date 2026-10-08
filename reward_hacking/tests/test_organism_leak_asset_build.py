@@ -243,7 +243,9 @@ def test_cli_dispatch_build(
     assert (options.out_root / "assets.json").is_file()
 
 
-def test_merge_fix_skip_is_counted(build_inputs: tuple[bulk.BuildOptions, R2eLeakTask]) -> None:
+def test_merge_fix_is_built_with_squashed_representation_and_resumes(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
     options, case = build_inputs
     repository = options.templates_root / case.task_id / "extracted"
     merge = _git(
@@ -258,8 +260,29 @@ def test_merge_fix_skip_is_counted(build_inputs: tuple[bulk.BuildOptions, R2eLea
         "Synthetic merge",
     )
     summary = bulk.build_assets(options, (replace(case, commit_hash=merge),))
-    assert summary["skipped"] == {"merge_commit": 1}
-    assert json.loads((options.out_root / "assets.json").read_text()) == {}
+    assert summary["built"] == 1
+    assert summary["skipped"] == {}
+    assert summary["fix_commit_representations"] == {"squashed_merge": 1}
+    index = json.loads((options.out_root / "assets.json").read_text())
+    arm = index[case.task_id][0]
+    manifest = json.loads(Path(arm["manifest_path"]).read_text())
+    fix = manifest["fix"]
+    assert fix["upstream_commit_id"] == merge
+    assert fix["fix_commit_representation"] == "squashed_merge"
+    assert fix["commit_id"] != merge
+    workspace = Path(arm["workspace_template"])
+    assert _git(workspace, "rev-parse", fix["commit_id"] + "^{tree}") == _git(
+        repository, "rev-parse", merge + "^{tree}"
+    )
+    assert _git(workspace, "rev-parse", fix["commit_id"] + "^") == _git(
+        repository, "rev-parse", "HEAD"
+    )
+    assert all(
+        leak_channels.probe_open(workspace, manifest, channel) for channel in manifest["channels"]
+    )
+    resumed = bulk.build_assets(options, (replace(case, commit_hash=merge),))
+    assert resumed["resumed"] == 1
+    assert resumed["fix_commit_representations"] == {"squashed_merge": 1}
 
 
 def test_output_cannot_contain_extraction(

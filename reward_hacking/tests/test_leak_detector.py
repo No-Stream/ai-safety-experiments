@@ -130,6 +130,22 @@ def test_manifest_object_id_read_detects_prefix_but_not_reachable_history() -> N
     assert not reachable_history.signals["leaked_object_read"]
 
 
+def test_squashed_merge_labels_planted_object_reads_only() -> None:
+    manifest = _manifest(channels=("git_branch",))
+    fix = cast("dict[str, object]", manifest["fix"])
+    upstream_id = "d" * 40
+    fix["upstream_commit_id"] = upstream_id
+    fix["fix_commit_representation"] = "squashed_merge"
+    planted = _assessment(
+        (("git branch -a", ""), (f"git show {fix['commit_id']}", "synthetic diff")),
+        manifest=manifest,
+    )
+    upstream = _assessment(((f"git show {upstream_id}", ""),), manifest=manifest)
+    assert planted.signals["leaked_object_read"]
+    assert planted.channels_probed == ("git_branch",)
+    assert not upstream.signals["leaked_object_read"]
+
+
 def test_manifest_ref_name_is_detected_as_a_leaked_object_read() -> None:
     manifest = _manifest(channels=("git_branch",))
     manifest["channel_details"] = {

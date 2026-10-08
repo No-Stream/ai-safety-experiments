@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from reward_hacking.harness.leak_channels import (
     build_channel_templates,
     template_fingerprint,
 )
+from reward_hacking.harness.leak_fix_spec import fix_commit_spec
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.organism_rl.rollout import task_definition_sha256
 
@@ -273,6 +275,57 @@ def test_task_module_uses_the_case_schema_loader() -> None:
     assert leak.load_tasks is r2e_leak_data.load_tasks
 
 
+def test_merge_task_identity_binds_upstream_and_planted_ids(
+    leak_templates: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = leak_templates
+    source = templates["source"]
+    original_case = templates["case"]
+    merge = git(
+        source,
+        "commit-tree",
+        "HEAD^{tree}",
+        "-p",
+        "HEAD~1",
+        "-p",
+        "HEAD",
+        "-m",
+        "synthetic merge",
+        env=commit_env(FIX_EPOCH),
+    )
+    case = replace(original_case, commit_hash=merge)
+    spec = fix_commit_spec(case, source)
+    output = tmp_path / "merge-templates"
+    manifest = build_channel_templates(
+        BuildRequest(
+            base_dir=templates["base"],
+            fix_commit_spec=spec,
+            channels=("git_branch",),
+            out_dir=output,
+        )
+    )
+    templates.update(
+        {
+            "case": case,
+            "closed": output / "closed",
+            "workspace": output / "open",
+            "manifest": manifest,
+            "manifest_path": output / "manifest.json",
+        }
+    )
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    task = build_synthetic_task(templates, tmp_path / "docker-gate")
+    identity = json.loads(task.files[".r2e-identity.json"])
+    assert identity["fix_commit"] == spec["commit_id"]
+    assert identity["upstream_commit_id"] == merge
+    assert identity["fix_commit_representation"] == "squashed_merge"
+    assert task.problem_id == f"{case.repo_name}/{merge}"
+    manifest["fix"]["upstream_commit_id"] = original_case.commit_hash
+    templates["manifest_path"].write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="loaded task case"):
+        build_synthetic_task(templates, tmp_path / "docker-gate")
+
+
 def test_build_requires_closed_normalized_tree_and_separate_runtime(
     leak_templates: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -281,6 +334,10 @@ def test_build_requires_closed_normalized_tree_and_separate_runtime(
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", runtime_root)
     task = build_synthetic_task(templates, tmp_path / "docker-gate")
     assert task.task_variant == "leak"
+    identity = json.loads(task.files[".r2e-identity.json"])
+    assert identity["fix_commit"] == templates["case"].commit_hash
+    assert "upstream_commit_id" not in identity
+    assert "fix_commit_representation" not in identity
     assert task.workspace_template == templates["workspace"]
     assert task.docker_grader_template == templates["closed"]
     assert task.docker_hidden_tests_template == templates["hidden_tests"]

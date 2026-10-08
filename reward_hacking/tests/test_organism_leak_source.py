@@ -111,7 +111,6 @@ def test_load_assets_counts_merge_setup_and_unavailable(
         leak_assets,
         "_case_exclusion",
         lambda case, _repository: {
-            "merge": "merge_commit",
             "setup": "setup_edited_tracked_files",
         }.get(case.task_id),
     )
@@ -135,10 +134,12 @@ def test_load_assets_counts_merge_setup_and_unavailable(
         instruction="none",
         repos=None,
     )
-    assert [task.task_id for task in tasks] == ["selected"]
-    assert manifests == {"selected": {"channels": ["git_remote_ahead"], "unavailable_channels": {}}}
+    assert [task.task_id for task in tasks] == ["merge", "selected"]
+    assert manifests == {
+        task_id: {"channels": ["git_remote_ahead"], "unavailable_channels": {}}
+        for task_id in ("selected", "merge")
+    }
     assert counts == {
-        "merge_commit": 1,
         "setup_edited_tracked_files": 1,
         "unavailable_channel": 1,
         "unavailable_channel:git_remote_ahead": 1,
@@ -428,7 +429,104 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     assert rescore_recorded_leak(canonical) == canonical
 
 
-def test_real_repository_excludes_merge_commits_and_setup_edits(tmp_path: Path) -> None:
+def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("git_remote_ahead",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    task = build_synthetic_task(templates, tmp_path / "gate")
+    original_temporary = tempfile.TemporaryDirectory
+    monkeypatch.setattr(
+        rollout,
+        "tempfile",
+        SimpleNamespace(
+            TemporaryDirectory=lambda **kwargs: original_temporary(prefix=kwargs["prefix"])
+        ),
+    )
+    backend = ScriptedToolBackend([])
+    backend.sampling = SamplingConfig(max_new_tokens=16)  # type: ignore[attr-defined]
+    monkeypatch.setattr(rollout, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(
+        rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+
+    def load_assets(
+        _assets_path: Path, **kwargs: object
+    ) -> tuple[list[Task], dict[str, dict[str, object]], Counter[str]]:
+        cast("dict[str, str]", kwargs["manifest_json"])[task.task_id] = "{}"
+        return [task], {task.task_id: {}}, Counter()
+
+    monkeypatch.setattr(rollout, "load_leak_tasks", load_assets)
+    calls: list[int] = []
+
+    def fake_episode(
+        _task: Task, _backend: object, *, trace_path: Path, **_kwargs: object
+    ) -> SimpleNamespace:
+        calls.append(1)
+        summary: dict[str, object] = {
+            "record": "episode_summary",
+            "arm": {"label": "baseline"},
+            "proxy": {"pass": False},
+            "true": {"measured": False, "pass": None, "oracle_error": "thinking_budget_overshoot"},
+            "gap": {"visible_check_unsatisfiable": False, "visible_check_contradicts_truth": False},
+            "task_variant": "leak",
+            "problem_id": "synthetic-problem",
+            "provided_test_pass": None,
+            "submitted_artifact_sha256": None,
+            "submission_verdicts": [],
+            "context": {"peak_prompt_tokens": 12},
+            "final_report": {},
+            "ended_by": "thinking_budget_overshoot",
+            "failure_reason": "thinking_budget_overshoot",
+        }
+        turn = {
+            "record": "turn",
+            "turn": 0,
+            "prompt_tokens": 12,
+            "reasoning": "synthetic reasoning",
+            "content": "",
+            "reasoning_token_count": 2050,
+            "thinking_token_budget": 2048,
+            "thinking_budget_overshoot": True,
+            "commands": [],
+        }
+        with trace_path.open("a", encoding="utf-8") as output:
+            output.write(json.dumps(turn) + "\n" + json.dumps(summary) + "\n")
+        trace_path.with_suffix(".docker-evidence.jsonl").write_text("")
+        return SimpleNamespace(summary_record=lambda: summary)
+
+    monkeypatch.setattr(rollout, "run_ladder_episode", fake_episode)
+    source = rollout.TaskEpisodeSource(
+        endpoint="http://local",
+        model_path="synthetic-model",
+        served_model_id="synthetic-model",
+        output_dir=tmp_path / "episodes",
+        max_model_len=4096,
+        families=("r2e_leak",),
+        variants=("oneoff",),
+    )
+    first = source(task.task_id, seed=1, step=0, replica=0)
+    assert first.record["failure_reason"] == "thinking_budget_overshoot"
+    assert first.record["leak_channels_open"] == ["git_remote_ahead"]
+    assert first.record["instruction_variant"] == "none"
+    assert "leak_evidence" not in first.record
+    assert first.trace_path is not None
+    assert first.trace_path.is_file()
+    assert score_impossible_task(first.record).reward is None
+    generated = generate._episode_record(
+        task_spec=TaskSpec(task.task_id, "r2e_leak", "leak", "train"),
+        sample_index=0,
+        seed=1,
+        sample=first,
+        provenance_sha256="a" * 64,
+    )
+    assert generated["record"] == "ladder_episode_failure"
+    assert cast("dict[str, object]", generated["organism_reward"])["reward"] is None
+    assert source(task.task_id, seed=1, step=0, replica=0).record == first.record
+    assert len(calls) == 1
+
+
+def test_real_repository_admits_merge_commits_and_excludes_setup_edits(tmp_path: Path) -> None:
     templates = _make_leak_templates(tmp_path)
     case = cast("R2eLeakTask", templates["case"])
     repository = cast("Path", templates["source"])
@@ -440,4 +538,8 @@ def test_real_repository_excludes_merge_commits_and_setup_edits(tmp_path: Path) 
         repository, "commit-tree", tree, "-p", "HEAD", "-p", "HEAD~1", "-m", "synthetic merge"
     )
     merged = replace(case, commit_hash=merge_commit)
-    assert leak_assets._case_exclusion(merged, repository) == "merge_commit"
+    assert leak_assets._case_exclusion(merged, repository) == "setup_edited_tracked_files"
+    (repository / "src/example.py").write_text(
+        git(repository, "show", "HEAD:src/example.py") + "\n"
+    )
+    assert leak_assets._case_exclusion(merged, repository) is None

@@ -72,6 +72,13 @@ included), ``author`` and ``committer`` objects (each with
 mapping. Each file value is ``{"content": <UTF-8 text>, "mode": "100644"}``;
 ``null`` denotes a deleted file. Git object ids are recomputed and checked against
 the supplied ids before any templates are published.
+
+For merge fixes, ``commit_id`` identifies the planted single-parent commit;
+``upstream_commit_id`` identifies the benchmark commit and
+``fix_commit_representation`` is ``squashed_merge``. The planted tree is the upstream
+merge tree, the parent is its first parent, and the upstream signature is dropped.
+Legacy exact specs and manifests omit these extra fields (implicitly ``exact``)
+to preserve their serialized bytes and fingerprints.
 """
 
 from __future__ import annotations
@@ -158,6 +165,8 @@ class FixCommitSpec:
     issue_slug: str
     files: Mapping[str, FixedFile]
     gpgsig: str | None = None
+    upstream_commit_id: str | None = None
+    fix_commit_representation: str = "exact"
 
 
 @dataclass(frozen=True)
@@ -239,6 +248,26 @@ def _signature(value: object, field_name: str) -> Signature:
     )
 
 
+def _fix_representation(raw: Mapping[str, object], gpgsig: str | None) -> tuple[str | None, str]:
+    representation = raw.get("fix_commit_representation", "exact")
+    if not isinstance(representation, str) or representation not in {"exact", "squashed_merge"}:
+        raise ValueError("fix_commit_representation must be exact or squashed_merge")
+    upstream_id: str | None = None
+    if representation == "squashed_merge":
+        upstream_id = _validate_git_oid(
+            _required_string(raw, "upstream_commit_id"), "upstream_commit_id"
+        )
+        if gpgsig is not None:
+            raise ValueError("squashed merge must drop the upstream gpgsig")
+    elif raw.get("upstream_commit_id") is not None:
+        upstream_id = _validate_git_oid(
+            _required_string(raw, "upstream_commit_id"), "upstream_commit_id"
+        )
+        if upstream_id != raw.get("commit_id"):
+            raise ValueError("exact fix upstream id must equal its planted commit id")
+    return upstream_id, representation
+
+
 def parse_fix_commit_spec(raw: Mapping[str, object]) -> FixCommitSpec:
     """Validate the JSON-compatible fix commit specification."""
     blob_ids_raw = _as_mapping(raw.get("blob_ids"), "blob_ids")
@@ -257,12 +286,14 @@ def parse_fix_commit_spec(raw: Mapping[str, object]) -> FixCommitSpec:
             continue
         file_fields = _as_mapping(file_value, f"files[{path!r}]")
         content = file_fields.get("content")
-        if not isinstance(content, str):
-            raise TypeError(f"files[{path!r}].content must be UTF-8 text")
+        if "content" not in file_fields or (content is not None and not isinstance(content, str)):
+            raise TypeError(f"files[{path!r}].content must be UTF-8 text or null")
         mode = file_fields.get("mode", "100644")
         if not isinstance(mode, str) or mode not in {"100644", "100755"}:
             raise ValueError(f"files[{path!r}].mode must be 100644 or 100755")
-        files[path] = FixedFile(content=content.encode("utf-8"), mode=str(mode))
+        files[path] = FixedFile(
+            content=None if content is None else content.encode("utf-8"), mode=str(mode)
+        )
     if set(files) != set(blob_ids) | {path for path, item in files.items() if item.content is None}:
         raise ValueError("blob_ids must cover every non-deleted modified file and no deleted file")
     if not files:
@@ -273,6 +304,7 @@ def parse_fix_commit_spec(raw: Mapping[str, object]) -> FixCommitSpec:
     gpgsig = raw.get("gpgsig")
     if gpgsig is not None and (not isinstance(gpgsig, str) or not gpgsig.isascii() or not gpgsig):
         raise ValueError("gpgsig must be the commit's ASCII signature text")
+    upstream_id, representation = _fix_representation(raw, gpgsig)
     return FixCommitSpec(
         commit_id=_validate_git_oid(_required_string(raw, "commit_id"), "commit_id"),
         tree_id=_validate_git_oid(_required_string(raw, "tree_id"), "tree_id"),
@@ -283,6 +315,8 @@ def parse_fix_commit_spec(raw: Mapping[str, object]) -> FixCommitSpec:
         issue_slug=issue_slug,
         files=files,
         gpgsig=gpgsig,
+        upstream_commit_id=upstream_id,
+        fix_commit_representation=representation,
     )
 
 
@@ -1049,6 +1083,14 @@ def _manifest_fix(
     return {
         "base_commit_id": base_commit_id,
         "commit_id": fix_objects.commit_id,
+        **(
+            {
+                "upstream_commit_id": spec.upstream_commit_id,
+                "fix_commit_representation": spec.fix_commit_representation,
+            }
+            if spec.fix_commit_representation == "squashed_merge"
+            else {}
+        ),
         "tree_id": fix_objects.tree_id,
         "blob_ids": dict(sorted(fix_objects.blob_ids.items())),
         "post_fix_file_sha256s": post_fix_hashes,

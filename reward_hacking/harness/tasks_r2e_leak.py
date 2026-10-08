@@ -478,6 +478,22 @@ def _validate_unavailable_channels(
     return cast("dict[str, str]", unavailable)
 
 
+def _upstream_fix_commit(fix: Mapping[str, object], fix_commit: str) -> str:
+    representation = fix.get("fix_commit_representation", "exact")
+    if not isinstance(representation, str) or representation not in {"exact", "squashed_merge"}:
+        raise ValueError("unsupported leak fix commit representation")
+    upstream_commit = fix.get("upstream_commit_id", fix_commit)
+    if not isinstance(upstream_commit, str) or _FULL_GIT_OID.fullmatch(upstream_commit) is None:
+        raise ValueError("leak manifest upstream commit must be a full Git object id")
+    if representation == "exact" and upstream_commit != fix_commit:
+        raise ValueError("exact leak fix commit must match its upstream commit")
+    if representation == "squashed_merge" and (
+        "upstream_commit_id" not in fix or upstream_commit == fix_commit
+    ):
+        raise ValueError("squashed leak fix commit must record a distinct upstream commit")
+    return upstream_commit
+
+
 def _load_and_validate_manifest(
     manifest_path: Path,
     case: R2eLeakTask,
@@ -499,7 +515,7 @@ def _load_and_validate_manifest(
         raise ValueError("leak manifest base commit must be a full Git object id")
     if not isinstance(fix_commit, str) or _FULL_GIT_OID.fullmatch(fix_commit) is None:
         raise ValueError("leak manifest fix commit must be a full Git object id")
-    if fix_commit != case.commit_hash:
+    if _upstream_fix_commit(fix, fix_commit) != case.commit_hash:
         raise ValueError("leak manifest fix commit does not match the loaded task case")
     if type(base_date) is not int:
         raise TypeError("leak manifest base date must be an integer epoch")
@@ -720,6 +736,15 @@ def build_task(  # noqa: PLR0913
         "runtime_venv_fingerprint": template_fingerprint(runtime_venv),
         "runtime_interpreter_fingerprint": template_fingerprint(runtime_interpreter),
     }
+    fix = cast("dict[str, object]", manifest["fix"])
+    if fix.get("fix_commit_representation") == "squashed_merge":
+        identity.update(
+            {
+                "fix_commit": cast("str", fix["commit_id"]),
+                "upstream_commit_id": cast("str", fix["upstream_commit_id"]),
+                "fix_commit_representation": "squashed_merge",
+            }
+        )
     exclusions = " ".join(shlex.quote(f"--exclude={pattern}") for pattern in _TEST_EXCLUDES)
     # R2E images ship Git 2.34, which lacks `git apply --allow-empty`; skip an empty patch instead.
     grader_command = (

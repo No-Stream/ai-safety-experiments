@@ -1,7 +1,8 @@
-"""Read exact fix-commit specifications and interpreter paths from local R2E extractions."""
+"""Read reproducible fix-commit specifications and interpreter paths from local R2E extractions."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -11,10 +12,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from reward_hacking.r2e_leak_data import R2eLeakTask
-
-
-class MergeFixCommitError(ValueError):
-    """The upstream fix is a merge; the builder recreates only single-parent commits."""
 
 
 def git_bytes(repository: Path, *arguments: str) -> bytes:
@@ -73,7 +70,7 @@ def _signature(commit_headers: list[str], header_name: str) -> dict[str, str]:
     return {"name": name, "email": email, "date": f"@{timestamp} {timezone}"}
 
 
-def _commit_headers(headers: list[str]) -> tuple[list[str], str, list[str]]:
+def _commit_headers(headers: list[str]) -> tuple[list[str], list[str], list[str]]:
     header_records: list[list[str]] = []
     for line in headers:
         if line.startswith(" "):
@@ -99,15 +96,13 @@ def _commit_headers(headers: list[str]) -> tuple[list[str], str, list[str]]:
     if any(line.split(maxsplit=1)[0] not in allowed_header_names for line in headers):
         raise ValueError("R2E fix commit has metadata the channel builder cannot reproduce")
     parent_ids = [line.split(maxsplit=1)[1] for line in headers if line.startswith("parent ")]
-    if len(parent_ids) > 1:
-        raise MergeFixCommitError(f"fix is a merge commit with {len(parent_ids)} parents")
     if not parent_ids:
         raise ValueError("R2E fix commit has no parent")
-    return headers, parent_ids[0], signature_lines
+    return headers, parent_ids, signature_lines
 
 
 def fix_commit_spec(case: R2eLeakTask, source_repository: Path) -> dict[str, object]:
-    """Read a single-parent fix, retaining exact signatures, message and changed blobs."""
+    """Retain exact fixes; squash merges onto their first parent without changing their tree."""
     commit_id = case.commit_hash
     commit_object = git_bytes(source_repository, "cat-file", "commit", commit_id)
     raw_headers, raw_message = commit_object.split(b"\n\n", maxsplit=1)
@@ -117,12 +112,27 @@ def fix_commit_spec(case: R2eLeakTask, source_repository: Path) -> dict[str, obj
     except UnicodeDecodeError as error:
         raise ValueError("R2E fix commit metadata is not UTF-8") from error
 
-    headers, base_commit_id, signature_lines = _commit_headers(headers)
+    headers, parent_ids, signature_lines = _commit_headers(headers)
+    base_commit_id = parent_ids[0]
+    representation: dict[str, object] = {}
+    if len(parent_ids) > 1:
+        planted_headers = [line for line in headers if not line.startswith("parent ")]
+        planted_headers.insert(1, f"parent {base_commit_id}")
+        planted_object = "\n".join(planted_headers).encode("utf-8") + b"\n\n" + raw_message
+        object_format = git_text(source_repository, "rev-parse", "--show-object-format")
+        commit_id = hashlib.new(
+            object_format, f"commit {len(planted_object)}\0".encode() + planted_object
+        ).hexdigest()
+        representation = {
+            "upstream_commit_id": case.commit_hash,
+            "fix_commit_representation": "squashed_merge",
+        }
+        signature_lines = []
     if not message.strip():
         raise ValueError("R2E fix commit has no message")
 
     base_tree = git_tree(source_repository, base_commit_id)
-    fix_tree = git_tree(source_repository, commit_id)
+    fix_tree = git_tree(source_repository, case.commit_hash)
     changed_paths = sorted(
         path
         for path in base_tree.keys() | fix_tree.keys()
@@ -154,6 +164,7 @@ def fix_commit_spec(case: R2eLeakTask, source_repository: Path) -> dict[str, obj
     tree_id = next(line.split(maxsplit=1)[1] for line in headers if line.startswith("tree "))
     return {
         "commit_id": commit_id,
+        **representation,
         "tree_id": tree_id,
         "blob_ids": blob_ids,
         "message": message,

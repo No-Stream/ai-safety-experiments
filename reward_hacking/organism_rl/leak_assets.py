@@ -50,10 +50,7 @@ def _git_text(repository: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
-def _case_exclusion(case: R2eLeakTask, repository: Path) -> str | None:
-    parents = _git_text(repository, "rev-list", "--parents", "-n", "1", case.commit_hash).split()
-    if len(parents) > 2:  # noqa: PLR2004 - commit oid plus at least two parents is a merge
-        return "merge_commit"
+def _case_exclusion(_case: R2eLeakTask, repository: Path) -> str | None:
     if _git_text(repository, "status", "--porcelain", "--untracked-files=no"):
         return "setup_edited_tracked_files"
     return None
