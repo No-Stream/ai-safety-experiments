@@ -8,6 +8,8 @@ import logging
 import math
 import os
 import re
+import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -33,6 +35,16 @@ MAXIMUM_SNAPSHOT_BYTES = 1024 * 1024 * 1024
 MAXIMUM_SNAPSHOT_ENTRIES = 20000
 MAXIMUM_SNAPSHOT_SECONDS = 10
 HASH_CHUNK_BYTES = 1024 * 1024
+READ_ONLY_RUNTIME_ROOT = Path("/var/tmp/leak-env/runtime")  # noqa: S108 - explicit trusted runtime allowlist
+DOCKER_RUNTIME_MOUNTS = frozenset(
+    (
+        PurePosixPath("/dev"),
+        PurePosixPath("/proc"),
+        PurePosixPath("/run"),
+        PurePosixPath("/sys"),
+        PurePosixPath("/", "tmp"),
+    )
+)
 
 
 class SnapshotLimitError(RuntimeError):
@@ -51,8 +63,51 @@ REQUIRED_PROBES = frozenset(
         "pids_limit_enforced",
         "memory_limit_enforced",
         "grader_tampering_isolated",
+        "runtime_mount_write_blocked",
+        "runtime_mount_host_escape_blocked",
     }
 )
+
+
+def validate_runtime_source(source: Path) -> Path:
+    """Admit only canonical directories below the trusted runtime root."""
+    root = READ_ONLY_RUNTIME_ROOT.resolve(strict=True)
+    if (
+        not source.is_absolute()
+        or ".." in source.parts
+        or source.is_symlink()
+        or not source.is_dir()
+        or source.resolve(strict=True) != source
+        or source == root
+        or root not in source.parents
+        or "," in str(source)
+    ):
+        raise ValueError(
+            "runtime mount source must be a canonical directory under the allowlisted runtime root"
+        )
+    return source
+
+
+@dataclass(frozen=True)
+class ReadOnlyMount:
+    """A trusted runtime directory mounted read-only with nested host mounts excluded."""
+
+    source: Path
+    target: str
+
+    def __post_init__(self) -> None:
+        """Reject mutable source aliases and unsafe container destinations."""
+        validate_runtime_source(self.source)
+        destination = PurePosixPath(self.target)
+        if (
+            not destination.is_absolute()
+            or str(destination) != self.target
+            or re.fullmatch(r"/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", self.target) is None
+            or ".." in destination.parts
+            or destination in DOCKER_RUNTIME_MOUNTS
+            or any(parent in DOCKER_RUNTIME_MOUNTS for parent in destination.parents)
+        ):
+            raise ValueError("runtime mount target must be a normalized absolute container path")
 
 
 @dataclass(frozen=True)
@@ -67,6 +122,8 @@ class DockerConfig:
     uid: int = field(default_factory=os.getuid)
     gid: int = field(default_factory=os.getgid)
     evidence_path: Path | None = None
+    workspace_mount: str = "/work"
+    read_only_mounts: tuple[ReadOnlyMount, ...] = ()
 
     def __post_init__(self) -> None:
         """Reject mutable image references and invalid containment limits."""
@@ -81,6 +138,87 @@ class DockerConfig:
             or self.cpus <= 0
         ):
             raise ValueError("Docker resource limits must be positive (pids >= 4)")
+        if not self.workspace_mount:
+            raise ValueError("Docker workspace mount must be a normalized absolute workspace mount")
+        mount_path = PurePosixPath(self.workspace_mount)
+        if (
+            not mount_path.is_absolute()
+            or mount_path == PurePosixPath("/")
+            or ".." in mount_path.parts
+            or "," in self.workspace_mount
+            or str(mount_path) != self.workspace_mount
+            or any(runtime_mount in mount_path.parents for runtime_mount in DOCKER_RUNTIME_MOUNTS)
+            or mount_path in DOCKER_RUNTIME_MOUNTS
+        ):
+            raise ValueError("Docker workspace mount must be a normalized absolute workspace mount")
+        targets = [PurePosixPath(mount.target) for mount in self.read_only_mounts]
+        for destination in targets:
+            if destination != mount_path / ".venv" and (
+                PurePosixPath("/opt") not in destination.parents
+                or destination == mount_path
+                or mount_path in destination.parents
+                or destination in mount_path.parents
+            ):
+                raise ValueError(
+                    "runtime mounts may target only /opt children or the workspace .venv"
+                )
+        if len(targets) != len(set(targets)) or any(
+            first in second.parents or second in first.parents
+            for index, first in enumerate(targets)
+            for second in targets[index + 1 :]
+        ):
+            raise ValueError("runtime mount targets must not overlap")
+
+
+def runtime_mount_args(mount: ReadOnlyMount) -> str:
+    """Use a read-only Docker bind so Desktop can translate distro-local paths."""
+    validate_runtime_source(mount.source)
+    return f"type=bind,source={mount.source},target={mount.target},readonly,bind-recursive=disabled"
+
+
+def runtime_mount_guard(config: DockerConfig) -> str:
+    """Refuse missing or weakened kernel runtime mounts before policy code executes."""
+    if not config.read_only_mounts:
+        return ""
+    checks = [
+        f"_runtime_flags=$(_runtime_mount_flags {shlex.quote(mount.target)}) || exit 125; "
+        "for _runtime_required in ro; do "
+        'case ",$_runtime_flags," in *",$_runtime_required,"*) ;; *) exit 125 ;; esac; done;'
+        for mount in config.read_only_mounts
+    ]
+    return (
+        "_runtime_mount_flags() { "
+        "while IFS=' ' read -r _id _parent _device _root _target _flags _rest; do "
+        'if [ "$_target" = "$1" ]; then printf "%s" "$_flags"; return 0; fi; '
+        "done < /proc/self/mountinfo; return 1; }; " + " ".join(checks) + "\n"
+    )
+
+
+def runtime_snapshot_exclusions(config: DockerConfig) -> tuple[str, ...]:
+    """Prune only host placeholders hidden beneath configured read-only runtime mounts."""
+    workspace = PurePosixPath(config.workspace_mount)
+    return tuple(
+        PurePosixPath(mount.target).relative_to(workspace).as_posix()
+        for mount in config.read_only_mounts
+        if workspace in PurePosixPath(mount.target).parents
+    )
+
+
+def prepare_runtime_mountpoints(workspace: Path, config: DockerConfig) -> None:
+    """Never let a policy redirect a nested runtime mount through a host symlink."""
+    for mount in config.read_only_mounts:
+        validate_runtime_source(mount.source)
+    for relative in runtime_snapshot_exclusions(config):
+        parent = workspace
+        for part in PurePosixPath(relative).parts:
+            parent = parent / part
+            if parent.is_symlink():
+                raise ValueError("runtime mountpoint cannot traverse a workspace symlink")
+            parent.mkdir(exist_ok=True)
+            if not parent.is_dir():
+                raise ValueError("runtime mountpoint must be a directory")
+        if any(parent.iterdir()):
+            raise ValueError("runtime mountpoint must be empty; task trees must exclude the venv")
 
 
 def backend_code_hash() -> str:
@@ -152,6 +290,9 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
     workspace = validate_workspace(workspace)
     if timeout_seconds <= 0:
         raise ValueError("Docker command timeout must be positive")
+    extra_mount_args = [
+        arg for mount in config.read_only_mounts for arg in ("--mount", runtime_mount_args(mount))
+    ]
     return [
         "docker",
         "run",
@@ -187,9 +328,10 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",  # noqa: S108 - container-only tmpfs
         "--mount",
-        f"type=bind,src={workspace},dst=/work,bind-recursive=disabled",
+        f"type=bind,src={workspace},dst={config.workspace_mount},bind-recursive=disabled",
+        *extra_mount_args,
         "--workdir",
-        "/work",
+        config.workspace_mount,
         "--env",
         "HOME=/tmp",
         "--env",
@@ -201,7 +343,7 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         f"{timeout_seconds}s",
         "/bin/sh",
         "-lc" if login_shell else "-c",
-        command,
+        runtime_mount_guard(config) + command,
     ]
 
 
@@ -255,22 +397,74 @@ def submitted_files(workspace: Path, paths: tuple[str, ...]) -> dict[str, bytes]
     return result
 
 
-def _workspace_paths(workspace: Path) -> Generator[Path]:
+def _template_and_workspace_paths(template_dir: Path, workspace: Path) -> tuple[Path, Path]:
+    """Validate a template and its separate destination tree."""
+    if template_dir.is_symlink() or not template_dir.is_dir():
+        raise ValueError("workspace template must be a real directory")
+    if workspace.is_symlink() or not workspace.is_dir():
+        raise ValueError("workspace destination must be a real directory")
+    source = template_dir.resolve(strict=True)
+    destination = workspace.resolve(strict=True)
+    if source == destination or source in destination.parents or destination in source.parents:
+        raise ValueError("workspace template and destination must be separate trees")
+    return source, destination
+
+
+def restore_workspace_directory_times(template_dir: Path, workspace: Path) -> None:
+    """Restore copied template directory times after episode files are materialized."""
+    source, destination = _template_and_workspace_paths(template_dir, workspace)
+    for source_directory, _, _ in os.walk(source, topdown=False, followlinks=False):
+        source_path = Path(source_directory)
+        destination_path = destination / source_path.relative_to(source)
+        if destination_path.is_symlink() or not destination_path.is_dir():
+            raise ValueError("copied template directory is missing or unsafe")
+        source_metadata = source_path.stat(follow_symlinks=False)
+        os.utime(
+            destination_path,
+            ns=(source_metadata.st_atime_ns, source_metadata.st_mtime_ns),
+            follow_symlinks=False,
+        )
+
+
+def copy_workspace_template(template_dir: Path, workspace: Path) -> None:
+    """Copy a trusted template into an empty workspace while retaining source mtimes."""
+    source, destination = _template_and_workspace_paths(template_dir, workspace)
+    if any(destination.iterdir()):
+        raise ValueError("workspace template destination must be empty")
+
+    shutil.copytree(
+        source,
+        destination,
+        dirs_exist_ok=True,
+        symlinks=True,
+        copy_function=shutil.copy2,
+    )
+    restore_workspace_directory_times(source, destination)
+
+
+def _workspace_paths(workspace: Path, excluded_paths: tuple[str, ...] = ()) -> Generator[Path]:
     pending = [workspace]
     while pending:
         with os.scandir(pending.pop()) as entries:
             for entry in entries:
-                yield Path(entry.path)
+                path = Path(entry.path)
+                if path.relative_to(workspace).as_posix() in excluded_paths:
+                    if entry.is_symlink():
+                        raise ValueError("excluded runtime mountpoint must not be a symlink")
+                    continue
+                yield path
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(Path(entry.path))
 
 
-def workspace_snapshot(workspace: Path) -> dict[str, dict[str, str]]:
+def workspace_snapshot(
+    workspace: Path, *, excluded_paths: tuple[str, ...] = ()
+) -> dict[str, dict[str, str]]:
     """Record bounded content hashes, permissions and links without following external targets."""
     snapshot: dict[str, dict[str, str]] = {}
     started = time.monotonic()
     bytes_hashed = 0
-    for path in _workspace_paths(workspace):
+    for path in _workspace_paths(workspace, excluded_paths):
         if (
             len(snapshot) >= MAXIMUM_SNAPSHOT_ENTRIES
             or time.monotonic() - started > MAXIMUM_SNAPSHOT_SECONDS
@@ -399,6 +593,7 @@ def run_in_docker(
         ):
             raise ValueError("gate and evidence must stay outside the episode mount")
     require_gate(config)
+    prepare_runtime_mountpoints(workspace, config)
     inspected = subprocess.run(  # noqa: S603 - trusted pinned image metadata
         ["docker", "image", "inspect", "--format", "{{json .Config.Volumes}}", config.image],  # noqa: S607
         capture_output=True,
@@ -421,11 +616,17 @@ def run_in_docker(
         "container": name,
         "image": config.image,
         "backend_hash": backend_code_hash(),
+        "read_only_mounts": [
+            {"source": str(mount.source), "target": mount.target}
+            for mount in config.read_only_mounts
+        ],
         "phase": "started",
     }
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        evidence["before"] = workspace_snapshot(workspace)
+        evidence["before"] = workspace_snapshot(
+            workspace, excluded_paths=runtime_snapshot_exclusions(config)
+        )
     except (OSError, SnapshotLimitError) as error:
         evidence.update({"phase": "refused", "snapshot_error": str(error)})
         with evidence_path.open("a") as output:
@@ -446,7 +647,7 @@ def run_in_docker(
         )
     finally:
         cleanup = subprocess.run(  # noqa: S603 - generated container name
-            ["docker", "rm", "--force", name],  # noqa: S607 - installed host Docker CLI
+            ["docker", "rm", "--force", "--volumes", name],  # noqa: S607 - installed host Docker CLI
             capture_output=True,
             text=True,
             timeout=15,
@@ -465,7 +666,9 @@ def run_in_docker(
         }
     )
     try:
-        evidence["after"] = workspace_snapshot(workspace)
+        evidence["after"] = workspace_snapshot(
+            workspace, excluded_paths=runtime_snapshot_exclusions(config)
+        )
     except (OSError, SnapshotLimitError) as error:
         evidence["snapshot_error"] = str(error)
         with evidence_path.open("a") as output:
@@ -484,46 +687,81 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
     *,
     config: DockerConfig,
     timeout: str = "30s",
+    template_dir: Path | None = None,
+    hidden_tests_template: Path | None = None,
 ) -> CommandResult:
     """Grade a copied submission with trusted baseline files in a separate fresh container."""
     evidence = config.evidence_path or episode_dir.with_name(
         episode_dir.name + ".docker-evidence.jsonl"
     )
     from_config = DockerConfig(
-        config.image,
-        config.gate_record,
-        config.memory_bytes,
-        config.pids_limit,
-        config.cpus,
-        config.uid,
-        config.gid,
-        evidence,
+        image=config.image,
+        gate_record=config.gate_record,
+        memory_bytes=config.memory_bytes,
+        pids_limit=config.pids_limit,
+        cpus=config.cpus,
+        uid=config.uid,
+        gid=config.gid,
+        evidence_path=evidence,
+        workspace_mount=config.workspace_mount,
+        read_only_mounts=config.read_only_mounts,
     )
     with tempfile.TemporaryDirectory(prefix="docker-grade-") as temporary:
         workspace = Path(temporary)
-        stage_grader_workspace(episode_dir, task_files, artifact_paths, workspace)
+        stage_grader_workspace(
+            episode_dir,
+            task_files,
+            artifact_paths,
+            workspace,
+            template_dir=template_dir,
+            hidden_tests_template=hidden_tests_template,
+        )
         return run_in_docker(
             workspace, command, config=from_config, timeout=timeout, login_shell=False
         )
 
 
-def stage_grader_workspace(
+def stage_grader_workspace(  # noqa: PLR0913 - trusted templates and submitted artifacts are separate inputs
     episode_dir: Path,
     task_files: Mapping[str, str],
     artifact_paths: tuple[str, ...],
     workspace: Path,
+    *,
+    template_dir: Path | None = None,
+    hidden_tests_template: Path | None = None,
 ) -> None:
     """Reconstruct trusted grading inputs; never import agent state beyond the submission."""
     if any(path in task_files for path in artifact_paths):
         raise ValueError("submitted artifacts cannot replace trusted task files")
     if any(workspace.iterdir()):
         raise ValueError("trusted grader workspace must start empty")
+    if template_dir is not None:
+        copy_workspace_template(template_dir, workspace)
+    if hidden_tests_template is not None:
+        hidden_destination = workspace / "r2e_tests"
+        if hidden_destination.exists() or hidden_destination.is_symlink():
+            raise ValueError("closed template must not contain hidden tests")
+        hidden_destination.mkdir()
+        copy_workspace_template(hidden_tests_template, hidden_destination)
     artifacts = submitted_files(episode_dir, artifact_paths)
     for relative, content in task_files.items():
-        target = workspace / _relative_path(relative)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content)
+        _write_staged_file(workspace, relative, content.encode())
     for relative, content in artifacts.items():
-        target = workspace / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
+        _write_staged_file(workspace, relative, content)
+
+
+def _write_staged_file(workspace: Path, relative: str, content: bytes) -> None:
+    """Write trusted staging inputs without traversing template symlinks."""
+    parts = _relative_path(relative).parts
+    parent = workspace
+    for part in parts[:-1]:
+        parent = parent / part
+        if parent.is_symlink():
+            raise ValueError("trusted grader paths cannot traverse template symlinks")
+        parent.mkdir(exist_ok=True)
+        if not parent.is_dir():
+            raise ValueError("trusted grader paths must use directories")
+    target = parent / parts[-1]
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise ValueError("trusted grader files cannot replace symlinks or directories")
+    target.write_bytes(content)

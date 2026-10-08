@@ -15,15 +15,18 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from reward_hacking.harness.docker_backend import (
+    READ_ONLY_RUNTIME_ROOT,
     REQUIRED_PROBES,
     DockerConfig,
+    ReadOnlyMount,
     backend_code_hash,
     docker_run_args,
+    runtime_mount_args,
     stage_grader_workspace,
 )
 
@@ -58,6 +61,7 @@ class DockerMutation:
     remove_values: tuple[tuple[str, str], ...] = ()
     remove_flags: tuple[str, ...] = ()
     add_flags: tuple[str, ...] = ()
+    skip_runtime_guard: bool = False
 
 
 DEFAULT_DOCKER_MUTATION = DockerMutation()
@@ -132,12 +136,14 @@ def replace_option_value(
 ) -> list[str]:
     """Replace exactly one known Docker option value for a deliberately weakened control."""
     result = list(arguments)
-    indexes = [index for index, value in enumerate(result) if value == option]
+    indexes = [
+        index
+        for index, value in enumerate(result[:-1])
+        if value == option and result[index + 1] == expected_value
+    ]
     if len(indexes) != 1:
-        raise ValueError(f"expected exactly one {option} option")
+        raise ValueError(f"expected exactly one {option} option with the requested value")
     index = indexes[0]
-    if index + 1 >= len(result) or result[index + 1] != expected_value:
-        raise ValueError(f"{option} had an unexpected value")
     result[index + 1] = replacement
     return result
 
@@ -263,6 +269,8 @@ class DockerProbeRunner:
             argv = remove_option_pair(argv, option, value)
         for flag in mutation.remove_flags:
             argv = remove_flag(argv, flag)
+        if mutation.skip_runtime_guard:
+            argv[-1] = command
         return (
             insert_before_image(argv, self.config.image, mutation.add_flags)
             if mutation.add_flags
@@ -288,7 +296,7 @@ class DockerProbeRunner:
             ) from error
         finally:
             cleanup = subprocess.run(  # noqa: S603 - generated container name
-                [docker_executable(), "rm", "--force", name],
+                [docker_executable(), "rm", "--force", "--volumes", name],
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -451,6 +459,53 @@ def _grader_source() -> str:
         "from pathlib import Path\n"
         "print('SUCCESS' if Path('answer.txt').read_text() == 'accepted' else 'FAIL')\n"
     )
+
+
+def _runtime_mount_write_source() -> str:
+    return (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "target = sys.argv[1]\n"
+        "required_flags = {'ro'}\n"
+        "mount_flags = set()\n"
+        "for line in Path('/proc/self/mountinfo').read_text().splitlines():\n"
+        "    fields = line.split()\n"
+        "    if len(fields) > 5 and fields[4] == target:\n"
+        "        mount_flags = set(fields[5].split(','))\n"
+        "        break\n"
+        "flag_result = 'ok' if required_flags <= mount_flags else 'missing'\n"
+        "def write_result(path):\n"
+        "    try:\n"
+        "        path.write_text('policy-write')\n"
+        "    except OSError:\n"
+        "        return 'blocked'\n"
+        "    return 'written'\n"
+        "direct = write_result(Path(target) / 'runtime-sentinel')\n"
+        "through_link = write_result(Path('runtime-link') / 'runtime-sentinel')\n"
+        "print(f'flags:{flag_result};direct:{direct};symlink:{through_link}')\n"
+    )
+
+
+def _runtime_host_escape_source() -> str:
+    return (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "def read_result(path):\n"
+        "    try:\n"
+        "        return 'read:' + Path(path).read_text()\n"
+        "    except OSError:\n"
+        "        return 'blocked'\n"
+        "print('traversal:' + read_result(sys.argv[1]) + ';absolute:' + read_result(sys.argv[2]))\n"
+    )
+
+
+def _weaken_runtime_mount_args(mount_args: str) -> str:
+    """Drop only bind readonly for a watched writable control."""
+    expected = ",readonly"
+    replacement = ""
+    if mount_args.count(expected) != 1:
+        raise ValueError("runtime mount arguments did not contain the expected bind flags")
+    return mount_args.replace(expected, replacement)
 
 
 def _gateway_server_source() -> str:
@@ -743,6 +798,83 @@ def _run_outside_write_probe(
     return result
 
 
+def _run_runtime_mount_write_probe(
+    runner: DockerProbeRunner,
+    runtime_mount: ReadOnlyMount,
+    workspace: Path,
+) -> ProbeResult:
+    """Check mount flags and direct and symlink-mediated writes against a runtime tree."""
+    symlink_path = workspace / "runtime-link"
+    if symlink_path.exists() or symlink_path.is_symlink():
+        raise ValueError("runtime-mount probe workspace already contains its symlink")
+    symlink_path.symlink_to(runtime_mount.target)
+
+    command = python_command(_runtime_mount_write_source(), runtime_mount.target)
+    expected_hardened = "flags:ok;direct:blocked;symlink:blocked"
+    expected_weakened = "flags:missing;direct:written;symlink:written"
+    mount_args = runtime_mount_args(runtime_mount)
+    weakened_args = _weaken_runtime_mount_args(mount_args)
+    weakened_argv = runner.argv(
+        command,
+        f"docker-gate-{uuid.uuid4().hex}",
+        DockerMutation(
+            replace_values=(("--mount", mount_args, weakened_args),),
+            skip_runtime_guard=True,
+        ),
+    )
+    return _run_probe_pair(
+        runner,
+        ProbeCase(
+            "runtime_mount_write_blocked",
+            command,
+            weakened_argv,
+            expected_hardened,
+            expected_weakened,
+        ),
+    )
+
+
+def _run_runtime_mount_host_escape_probe(
+    runner: DockerProbeRunner,
+    runtime_mount: ReadOnlyMount,
+    host_sentinel: Path,
+    host_source: Path,
+) -> ProbeResult:
+    """Ensure a workspace symlink to an unmounted host path cannot read host data."""
+    traversal_link = runner.workspace / "runtime-parent-link"
+    absolute_host_link = runner.workspace / "host-absolute-link"
+    if any(path.exists() or path.is_symlink() for path in (traversal_link, absolute_host_link)):
+        raise ValueError("runtime host-escape probe workspace already contains its symlink")
+    host_mount_target = f"/opt/leak-runtime-host-control-{uuid.uuid4().hex}"
+    traversal_link.symlink_to(
+        f"{runtime_mount.target}/../{Path(host_mount_target).name}/{host_sentinel.name}"
+    )
+    absolute_host_link.symlink_to(host_sentinel)
+
+    command = python_command(
+        _runtime_host_escape_source(), "runtime-parent-link", "host-absolute-link"
+    )
+    host_mount = ReadOnlyMount(source=host_source, target=host_mount_target)
+    weakened_argv = runner.argv(
+        command,
+        f"docker-gate-{uuid.uuid4().hex}",
+        DockerMutation(
+            add_flags=("--mount", runtime_mount_args(host_mount)),
+            skip_runtime_guard=True,
+        ),
+    )
+    return _run_probe_pair(
+        runner,
+        ProbeCase(
+            "runtime_mount_host_escape_blocked",
+            command,
+            weakened_argv,
+            "traversal:blocked;absolute:blocked",
+            "traversal:read:synthetic-host-sentinel;absolute:blocked",
+        ),
+    )
+
+
 def _run_socket_probe(
     runner: DockerProbeRunner,
     socket_path: Path,
@@ -877,20 +1009,41 @@ def _run_memory_probe(runner: DockerProbeRunner) -> ProbeResult:
     return ProbeResult(contained=True, negative_control=True)
 
 
+@contextlib.contextmanager
+def _temporary_runtime_mount_sources() -> Generator[tuple[ReadOnlyMount, Path, Path]]:
+    """Create permissive synthetic sources so the readonly negative control is meaningful."""
+    READ_ONLY_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="docker-jail-runtime-", dir=READ_ONLY_RUNTIME_ROOT
+    ) as runtime_name:
+        runtime_tree = Path(runtime_name)
+        runtime_source = runtime_tree / "uvpy"
+        runtime_source.mkdir()
+        runtime_source.chmod(0o777)
+        runtime_sentinel = runtime_source / "runtime-sentinel"
+        runtime_sentinel.write_text("trusted-runtime")
+        runtime_sentinel.chmod(0o666)
+        host_source = runtime_tree / "host-only"
+        host_source.mkdir()
+        host_source.chmod(0o777)
+        host_sentinel = host_source / "host-sentinel"
+        host_sentinel.write_text("synthetic-host-sentinel")
+        host_sentinel.chmod(0o666)
+        yield ReadOnlyMount(source=runtime_source, target="/opt/uvpy"), host_source, host_sentinel
+
+
 def run_red_team(gate_record_path: Path) -> dict[str, object]:
     """Run every containment probe and its deliberately weakened negative control."""
     certified_hash = backend_code_hash()
     image = _pull_pinned_image()
     gateway = _docker_gateway(image)
-    config = DockerConfig(
-        image=image,
-        gate_record=gate_record_path,
-        memory_bytes=268435456,
-        pids_limit=64,
-        cpus=1,
-    )
-    with tempfile.TemporaryDirectory(prefix="docker-jail-tests-") as temporary_name:
+    with contextlib.ExitStack() as preparation:
+        temporary_name = preparation.enter_context(
+            tempfile.TemporaryDirectory(prefix="docker-jail-tests-")
+        )
+        runtime_mount_inputs = preparation.enter_context(_temporary_runtime_mount_sources())
         temporary = Path(temporary_name)
+        runtime_mount, host_source, host_sentinel = runtime_mount_inputs
         workspace = temporary / "episode"
         workspace.mkdir()
         service_workspace = temporary / "gateway-service"
@@ -899,11 +1052,21 @@ def run_red_team(gate_record_path: Path) -> dict[str, object]:
         control_root.mkdir()
         control_root.chmod(0o777)
         (control_root / "host-sentinel").write_text("synthetic-host-sentinel")
+        config = DockerConfig(
+            image=image,
+            gate_record=gate_record_path,
+            memory_bytes=268435456,
+            pids_limit=64,
+            cpus=1,
+        )
         socket_root = temporary / "socket-control"
         socket_root.mkdir()
         socket_path = socket_root / "docker.sock"
         socket_container_path = "/var/run/docker.sock"
         runner = DockerProbeRunner(config, workspace)
+        runtime_runner = DockerProbeRunner(
+            replace(config, read_only_mounts=(runtime_mount,)), workspace
+        )
         results: dict[str, ProbeResult] = {}
 
         with contextlib.ExitStack() as controls:
@@ -915,6 +1078,12 @@ def run_red_team(gate_record_path: Path) -> dict[str, object]:
             results["host_path_unreadable"] = _run_host_path_probe(runner, control_root)
             results["outside_workspace_write_blocked"] = _run_outside_write_probe(
                 runner, control_root
+            )
+            results["runtime_mount_write_blocked"] = _run_runtime_mount_write_probe(
+                runtime_runner, runtime_mount, workspace
+            )
+            results["runtime_mount_host_escape_blocked"] = _run_runtime_mount_host_escape_probe(
+                runtime_runner, runtime_mount, host_sentinel, host_source
             )
             results["docker_socket_unreachable"] = _run_socket_probe(
                 runner, socket_path, socket_container_path

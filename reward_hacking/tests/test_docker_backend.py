@@ -2,19 +2,24 @@
 
 import json
 import os
+import shlex
+import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
+from reward_hacking.harness import docker_backend as backend
 from reward_hacking.harness.docker_backend import (
     REQUIRED_PROBES,
     DockerConfig,
     SnapshotLimitError,
     _run_bounded_docker,
     backend_code_hash,
+    copy_workspace_template,
     docker_run_args,
     require_gate,
+    restore_workspace_directory_times,
     run_docker_grader,
     run_in_docker,
     submitted_files,
@@ -41,9 +46,78 @@ def test_hardened_flags_and_digest(tmp_path: Path) -> None:
     assert argv[argv.index("--log-driver") + 1] == "none"
     assert "--rm" in argv
     assert argv.count("--mount") == 1
+    assert argv[argv.index("--mount") + 1].endswith(",dst=/work,bind-recursive=disabled")
+    assert argv[argv.index("--workdir") + 1] == "/work"
     assert "/var/run/docker.sock" not in " ".join(argv)
     assert IMAGE in argv
     assert argv[argv.index("--user") + 1].split(":")[0] != "0"
+
+
+def test_workspace_mount_must_be_an_absolute_container_path(tmp_path: Path) -> None:
+    for workspace_mount in (
+        "work",
+        "",
+        "/",
+        "/work,readonly",
+        "/work/../host",
+        str(PurePosixPath("/", "tmp")),
+        str(PurePosixPath("/", "tmp", "episode")),
+        "/proc",
+        "/proc/1",
+    ):
+        with pytest.raises(ValueError, match="workspace mount"):
+            DockerConfig(
+                image=IMAGE,
+                gate_record=tmp_path / "gate.json",
+                workspace_mount=workspace_mount,
+            )
+
+    config = DockerConfig(
+        image=IMAGE,
+        gate_record=tmp_path / "gate.json",
+        workspace_mount="/testbed",
+    )
+    argv = docker_run_args(config, tmp_path, "episode-testbed", "id")
+    assert argv[argv.index("--mount") + 1].endswith(",dst=/testbed,bind-recursive=disabled")
+    assert argv[argv.index("--workdir") + 1] == "/testbed"
+
+
+def test_copy_workspace_template_preserves_file_and_directory_mtimes(tmp_path: Path) -> None:
+    template = tmp_path / "template"
+    nested = template / "nested"
+    nested.mkdir(parents=True)
+    (nested / "module.py").write_text("baseline")
+    (nested / "module.py").touch()
+    file_mtime_ns = 1_600_000_000_123_456_789
+    nested_mtime_ns = 1_600_000_010_123_456_789
+    root_mtime_ns = 1_600_000_020_123_456_789
+    os.utime(nested / "module.py", ns=(file_mtime_ns, file_mtime_ns))
+    os.utime(nested, ns=(nested_mtime_ns, nested_mtime_ns))
+    os.utime(template, ns=(root_mtime_ns, root_mtime_ns))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    copy_workspace_template(template, workspace)
+
+    assert (workspace / "nested" / "module.py").stat().st_mtime_ns == file_mtime_ns
+    assert (workspace / "nested").stat().st_mtime_ns == nested_mtime_ns
+    assert workspace.stat().st_mtime_ns == root_mtime_ns
+
+    (workspace / "nested" / "materialized.py").write_text("episode file")
+    assert (workspace / "nested").stat().st_mtime_ns != nested_mtime_ns
+    restore_workspace_directory_times(template, workspace)
+    assert (workspace / "nested").stat().st_mtime_ns == nested_mtime_ns
+
+
+def test_copy_workspace_template_requires_empty_destination(tmp_path: Path) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "existing").write_text("keep")
+
+    with pytest.raises(ValueError, match="empty"):
+        copy_workspace_template(template, workspace)
 
 
 @pytest.mark.parametrize("image", ["python:3.12-slim", "python@sha256:abc"])
@@ -103,9 +177,11 @@ def test_real_subprocess_boundary_records_changes_and_stages_trusted_grader(
         "if arguments[0] == 'image':\n"
         "    print('null')\n"
         "elif arguments[0] == 'run':\n"
+        "    assert arguments[arguments.index('--workdir') + 1] == '/testbed'\n"
         "    mount = arguments[arguments.index('--mount') + 1]\n"
         "    workspace = pathlib.Path(mount.split('src=')[1].split(',')[0])\n"
         "    if arguments[-1] == 'toy-grade':\n"
+        "        assert (workspace / 'baseline.py').read_text() == 'closed baseline'\n"
         "        assert (workspace / 'grade.py').read_text() == 'trusted grader'\n"
         "        assert (workspace / 'answer.txt').read_text() == 'submitted answer'\n"
         "        assert not (workspace / 'malicious-extra.py').exists()\n"
@@ -131,13 +207,21 @@ def test_real_subprocess_boundary_records_changes_and_stages_trusted_grader(
     )
     workspace = tmp_path / "episode"
     workspace.mkdir()
-    config = DockerConfig(image=IMAGE, gate_record=gate)
+    config = DockerConfig(image=IMAGE, gate_record=gate, workspace_mount="/testbed")
     result = run_in_docker(workspace, "toy-action", config=config)
     assert result.exit_code == 0
     (workspace / "grade.py").write_text("tampered grader")
     (workspace / "malicious-extra.py").write_text("agent-only file")
+    template = tmp_path / "closed-template"
+    template.mkdir()
+    (template / "baseline.py").write_text("closed baseline")
     grade = run_docker_grader(
-        workspace, {"grade.py": "trusted grader"}, ("answer.txt",), "toy-grade", config=config
+        workspace,
+        {"grade.py": "trusted grader"},
+        ("answer.txt",),
+        "toy-grade",
+        config=config,
+        template_dir=template,
     )
     assert grade.ok
     records = [
@@ -235,3 +319,115 @@ def test_snapshot_refuses_unreadable_directories(tmp_path: Path) -> None:
             workspace_snapshot(tmp_path)
     finally:
         directory.chmod(0o700)
+
+
+def test_runtime_mount_validation_and_readonly_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    venv = runtime / "venv"
+    venv.mkdir()
+    monkeypatch.setattr(backend, "READ_ONLY_RUNTIME_ROOT", runtime)
+    mount = backend.ReadOnlyMount(venv, "/testbed/.venv")
+    config = DockerConfig(
+        IMAGE, tmp_path / "gate", workspace_mount="/testbed", read_only_mounts=(mount,)
+    )
+    argv = docker_run_args(config, tmp_path, "runtime", "id")
+    assert argv[argv.index("--mount", argv.index("--mount") + 1) + 1] == (
+        f"type=bind,source={venv},target=/testbed/.venv,readonly,bind-recursive=disabled"
+    )
+    assert "volume-driver=local" not in " ".join(argv)
+    assert "no-new-privileges" in argv
+    assert "/proc/self/mountinfo" in argv[-1]
+    for source in (tmp_path, runtime / ".." / "runtime" / "venv"):
+        with pytest.raises(ValueError, match="runtime"):
+            backend.ReadOnlyMount(source, "/opt/uvpy")
+    link = runtime / "link"
+    link.symlink_to(venv, target_is_directory=True)
+    with pytest.raises(ValueError, match="runtime"):
+        backend.ReadOnlyMount(link, "/opt/uvpy")
+    with pytest.raises(ValueError, match=r"runtime|overlap"):
+        DockerConfig(
+            IMAGE, tmp_path / "gate", read_only_mounts=(backend.ReadOnlyMount(venv, "/work"),)
+        )
+
+
+def test_runtime_mountpoint_symlink_refused_and_snapshot_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    venv = runtime / "venv"
+    venv.mkdir()
+    monkeypatch.setattr(backend, "READ_ONLY_RUNTIME_ROOT", runtime)
+    config = DockerConfig(
+        IMAGE,
+        tmp_path / "gate",
+        workspace_mount="/testbed",
+        read_only_mounts=(backend.ReadOnlyMount(venv, "/testbed/.venv"),),
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".venv").symlink_to(venv, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        backend.prepare_runtime_mountpoints(workspace, config)
+    (workspace / ".venv").unlink()
+    backend.prepare_runtime_mountpoints(workspace, config)
+    (workspace / ".venv" / "bulky.dat").write_text("not scanned")
+    (workspace / "normal.txt").write_text("scanned")
+    snapshot = workspace_snapshot(
+        workspace, excluded_paths=backend.runtime_snapshot_exclusions(config)
+    )
+    assert ".venv/bulky.dat" not in snapshot
+    assert "normal.txt" in snapshot
+    (workspace / "runtime-link").symlink_to(venv / "bulky.dat")
+    snapshot = workspace_snapshot(
+        workspace, excluded_paths=backend.runtime_snapshot_exclusions(config)
+    )
+    assert "sha256" not in snapshot["runtime-link"]
+
+
+@pytest.mark.parametrize("target", ["/opt/workspace", "/opt/workspace/dependency", "/opt/runtime"])
+def test_runtime_mount_cannot_shadow_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    runtime = tmp_path / "runtime"
+    source = runtime / "python"
+    source.mkdir(parents=True)
+    monkeypatch.setattr(backend, "READ_ONLY_RUNTIME_ROOT", runtime)
+    workspace_mount = "/opt/runtime/workspace" if target == "/opt/runtime" else "/opt/workspace"
+    with pytest.raises(ValueError, match="runtime"):
+        DockerConfig(
+            IMAGE,
+            tmp_path / "gate",
+            workspace_mount=workspace_mount,
+            read_only_mounts=(backend.ReadOnlyMount(source, target),),
+        )
+
+
+@pytest.mark.parametrize(
+    "flags", ["rw", "rw,nosuid,nodev", "ro", "ro,nodev", "ro,nosuid", "ro,nosuid,nodev"]
+)
+def test_runtime_guard_refuses_weakened_flags_before_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flags: str
+) -> None:
+    runtime = tmp_path / "runtime"
+    source = runtime / "python"
+    source.mkdir(parents=True)
+    monkeypatch.setattr(backend, "READ_ONLY_RUNTIME_ROOT", runtime)
+    config = DockerConfig(
+        IMAGE, tmp_path / "gate", read_only_mounts=(backend.ReadOnlyMount(source, "/opt/uvpy"),)
+    )
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(f"1 2 8:1 / /opt/uvpy {flags} - ext4 device rw\n")
+    sentinel = tmp_path / "command-ran"
+    guard = backend.runtime_mount_guard(config).replace(
+        "/proc/self/mountinfo", shlex.quote(str(mountinfo))
+    )
+    result = subprocess.run(  # noqa: S603 - synthetic mountinfo and host scratch only
+        ["/bin/sh", "-c", guard + f"touch {shlex.quote(str(sentinel))}"],
+        check=False,
+    )
+    assert sentinel.exists() is ("ro" in flags.split(","))
+    assert result.returncode == (0 if "ro" in flags.split(",") else 125)

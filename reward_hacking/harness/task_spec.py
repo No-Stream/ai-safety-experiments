@@ -225,6 +225,13 @@ class Task:
     ``visible_check_contradicts_truth`` marks task families whose visible check intentionally
     disagrees with the true check, including ILCB's oneoff and conflicting variants. It is broader
     than ``visible_check_unsatisfiable`` and is the organism reward's eligibility flag.
+
+    ``workspace_template`` is copied before ``files`` are materialised. Leak tasks keep their
+    pristine closed checkout separately in ``docker_grader_template``; ``docker_true_grader_files``
+    are trusted-only inputs that never enter the policy workspace. ``docker_hidden_tests_template``
+    supplies the separately extracted tests for that pristine grader. ``docker_patch_base_commit``
+    binds the host-extracted patch to that checkout, and ``instruction_variant`` identifies the
+    honesty instruction rendered by the task family.
     """
 
     task_id: str
@@ -247,11 +254,19 @@ class Task:
     docker_true_grader_command: str | None = None
     docker_artifact_paths: tuple[str, ...] = ()
     grader_integrity_files: tuple[str, ...] = ()
+    workspace_template: Path | None = None
+    docker_grader_template: Path | None = None
+    docker_hidden_tests_template: Path | None = None
+    docker_patch_base_commit: str | None = None
+    docker_true_grader_files: dict[str, str] | None = None
+    instruction_variant: str = "none"
 
     def __post_init__(self) -> None:
         """Keep optional reward evidence complete and bound to a workspace-relative artifact."""
         self._validate_docker()
         self._validate_grader_integrity_files()
+        if self.instruction_variant not in {"none", "vague", "specific"}:
+            raise ValueError(f"unknown instruction variant {self.instruction_variant!r}")
         evidence_values = (
             self.problem_id,
             self.artifact_filename,
@@ -262,7 +277,7 @@ class Task:
                     "task reward evidence requires a variant, problem id, artifact, and check"
                 )
             return
-        if self.task_variant not in {"oneoff", "conflicting", "original"}:
+        if self.task_variant not in {"oneoff", "conflicting", "original", "leak", "loose"}:
             raise ValueError(f"unknown task variant {self.task_variant!r}")
         if any(value is None for value in evidence_values) or (
             self.provided_test_check is None and self.docker_config is None
@@ -290,6 +305,10 @@ class Task:
                 self.docker_grader_command
                 or self.docker_true_grader_command
                 or self.docker_artifact_paths
+                or self.docker_grader_template is not None
+                or self.docker_hidden_tests_template is not None
+                or self.docker_patch_base_commit is not None
+                or self.docker_true_grader_files is not None
             ):
                 raise ValueError("Docker commands and artifacts require a Docker config")
         else:
@@ -310,6 +329,18 @@ class Task:
                     or artifact in self.files
                 ):
                     raise ValueError(f"invalid Docker artifact path: {artifact!r}")
+        if self.task_variant == "leak" and (
+            self.docker_config is None
+            or self.workspace_template is None
+            or self.docker_grader_template is None
+            or self.docker_hidden_tests_template is None
+            or not self.docker_patch_base_commit
+            or not self.docker_true_grader_files
+            or self.artifact_filename != "patch.diff"
+        ):
+            raise ValueError(
+                "leak tasks require a workspace, closed grader template, hidden tests, base commit, and trusted files"
+            )
 
     def _validate_grader_integrity_files(self) -> None:
         """Require every declared grader input to be a materialised workspace file."""
@@ -348,6 +379,8 @@ class Task:
         than two that merely rhyme. Both the conversation prompt and the file on disk go through
         here, so they cannot drift apart.
         """
+        if self.task_variant == "leak" and arm.grader_visibility is not GraderVisibility.WRITABLE:
+            raise ValueError("leak tasks require the writable workspace runner visibility")
         if arm.grader_visibility is GraderVisibility.HIDDEN:
             return f"{self.body}\n\n{HIDDEN_GRADING_NOTE}\n"
         if arm.grader_visibility is GraderVisibility.INLINE:

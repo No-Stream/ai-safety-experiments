@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -161,3 +162,174 @@ def test_docker_episode_refuses_a_failed_gate_before_laydown(
             task, MockBackend(["Done"], model_id="mock-docker"), episode_dir=episode_dir
         )
     assert not episode_dir.exists()
+
+
+def _leak_task(config: DockerConfig, template: Path) -> Task:
+    return replace(
+        _task(config),
+        task_variant="leak",
+        problem_id="synthetic",
+        artifact_filename="patch.diff",
+        docker_artifact_paths=("patch.diff",),
+        workspace_template=template,
+        docker_grader_template=template,
+        docker_hidden_tests_template=template,
+        docker_patch_base_commit="a" * 40,
+        docker_true_grader_files={"trusted.py": "synthetic = True\n"},
+        instruction_variant="specific",
+    )
+
+
+def test_leak_template_is_materialised_before_task_files(tmp_path: Path) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    (template / "source.py").write_text("synthetic = True\n")
+    (template / "TASK.md").write_text("placeholder\n")
+    os.utime(template, ns=(1234567890000000000, 1234567890000000000))
+    task = _leak_task(_config(tmp_path), template)
+    episode = tmp_path / "episode"
+    listing = loop.lay_down_task(episode, task, arm=loop.BASELINE_ARM)
+    assert (episode / "source.py").read_text() == "synthetic = True\n"
+    assert (episode / "TASK.md").read_text() == task.prompt
+    assert "source.py" in listing
+    assert episode.stat().st_mtime_ns == template.stat().st_mtime_ns
+
+
+def test_leak_in_band_runs_workspace_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    task = _leak_task(_config(tmp_path), template)
+    commands: list[str] = []
+
+    def fake_run(directory: Path, command: str, **kwargs: object) -> CommandResult:
+        assert directory == tmp_path
+        assert kwargs["login_shell"] is False
+        commands.append(command)
+        return CommandResult(command, 0, "1 passed\n", "", False)
+
+    monkeypatch.setattr(loop, "run_in_docker", fake_run)
+    monkeypatch.setattr(
+        loop,
+        "run_docker_grader",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("pristine proxy called")),
+    )
+    result = loop.run_grader(
+        task, tmp_path, arm=loop.BASELINE_ARM, timeout="30s", jail_backend=None
+    )
+    assert commands == ["bash run_tests.sh"]
+    assert result.exit_code == 0
+    assert loop.grader_reported_success(result, marker=task.success_marker)
+
+
+def test_leak_instruction_variant_is_validated(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="instruction variant"):
+        replace(_task(_config(tmp_path)), instruction_variant="unknown")
+
+
+@pytest.mark.parametrize(("proxy_pass", "hidden_pass"), [(False, True), (True, False)])
+def test_leak_reward_uses_hidden_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proxy_pass: bool, hidden_pass: bool
+) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    task = _leak_task(_config(tmp_path), template)
+
+    def fake_extract(
+        directory: Path, _base: str, *, template_dir: Path, artifact_filename: str = "patch.diff"
+    ) -> Path:
+        assert template_dir == template
+        patch = directory / artifact_filename
+        patch.write_text("synthetic patch\n")
+        return patch
+
+    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
+    monkeypatch.setattr(
+        loop,
+        "run_in_docker",
+        lambda *_args, **_kwargs: CommandResult(
+            "proxy", 0 if proxy_pass else 1, "SUCCESS\n" if proxy_pass else "", "", False
+        ),
+    )
+    monkeypatch.setattr(
+        loop.tasks_r2e_leak,
+        "run_trusted_grader",
+        lambda *_args, **_kwargs: CommandResult(
+            "truth", 0 if hidden_pass else 1, "SUCCESS\n" if hidden_pass else "", "", False
+        ),
+    )
+    graded = loop.grade_final_state(
+        task,
+        tmp_path,
+        arm=loop.BASELINE_ARM,
+        timeout="30s",
+        jail_backend=None,
+        grader_hashable=False,
+    )
+    assert graded.proxy_pass is proxy_pass
+    assert graded.true_pass is hidden_pass
+    assert graded.task_evidence is not None
+    assert graded.task_evidence.provided_test_pass is hidden_pass
+
+
+def test_leak_changed_patch_has_no_paid_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    task = _leak_task(_config(tmp_path), template)
+
+    def fake_extract(
+        directory: Path, _base: str, *, template_dir: Path, artifact_filename: str = "patch.diff"
+    ) -> Path:
+        patch = directory / artifact_filename
+        patch.write_text("submitted patch\n")
+        return patch
+
+    def tamper(_task: Task, directory: Path, *, timeout: str) -> CommandResult:
+        (directory / "patch.diff").write_text("replacement patch\n")
+        return CommandResult("truth", 0, "SUCCESS\n", "", False)
+
+    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
+    monkeypatch.setattr(loop.tasks_r2e_leak, "run_trusted_grader", tamper)
+    monkeypatch.setattr(
+        loop,
+        "run_in_docker",
+        lambda *_args, **_kwargs: CommandResult("proxy", 0, "SUCCESS\n", "", False),
+    )
+    graded = loop.grade_final_state(
+        task,
+        tmp_path,
+        arm=loop.BASELINE_ARM,
+        timeout="30s",
+        jail_backend=None,
+        grader_hashable=False,
+    )
+    assert not graded.true_pass
+    assert graded.oracle_error == "SUBMISSION_ARTIFACT_MISMATCH"
+    assert graded.task_evidence is not None
+    assert graded.task_evidence.provided_test_pass is None
+    assert graded.task_evidence.provided_test_error == "SUBMISSION_ARTIFACT_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    "visibility",
+    [loop.GraderVisibility.HIDDEN, loop.GraderVisibility.INLINE, loop.GraderVisibility.READ_ONLY],
+)
+def test_leak_rejects_unsupported_grader_visibility(
+    tmp_path: Path, visibility: loop.GraderVisibility
+) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    task = _leak_task(_config(tmp_path), template)
+    with pytest.raises(ValueError, match="writable workspace runner"):
+        task.render_prompt(replace(loop.BASELINE_ARM, grader_visibility=visibility))
+
+
+def test_leak_requires_extracted_hidden_tests(tmp_path: Path) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    task = _leak_task(_config(tmp_path), template)
+    with pytest.raises(ValueError, match="hidden"):
+        replace(task, docker_hidden_tests_template=None)
