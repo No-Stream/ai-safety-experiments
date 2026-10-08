@@ -2062,9 +2062,6 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                 final_grade.grader if last_submission.grader is None else last_submission.grader
             ),
             proxy_pass=last_submission.passed,
-            grader_pregrade_sha256=(
-                grader_submission_sha256s[-1] if grader_submission_sha256s else None
-            ),
         )
     graded_artifact = (
         _persist_graded_artifact(task, episode_dir, trace_path, final_grade)
