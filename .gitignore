@@ -65,6 +65,9 @@ reward_hacking/harness/data/*
 !reward_hacking/harness/data/README.md
 # AISI task cases contain licensed benchmark prompts and expected outputs.
 reward_hacking/harness/data/aisi_rh_envs_cases.json
+# Procedural math items and answer keys are private measurement material.
+reward_hacking/harness/data/math_cases.json
+reward_hacking/harness/data/.math_cases.json.*.tmp
 # R2E-Gym leak-environment cases: issue text and gold patches from repositories under their own licences.
 reward_hacking/harness/data/r2e_leak_cases.json
 

@@ -16,13 +16,14 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from itertools import zip_longest
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.organism_rl.rollout import (
+    CodingTaskFamily,
     EpisodeSample,
     EpisodeSource,
     TaskEpisodeSource,
@@ -45,7 +46,7 @@ class TaskSpec:
     """The selected registry identity used to group and resume one task."""
 
     task_id: str
-    family: Literal["ilcb", "aisi"]
+    family: CodingTaskFamily
     variant: str
     partition: str = "train"
 
@@ -147,10 +148,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--families",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi"),
+        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker"),
     )
     parser.add_argument(
-        "--variant", choices=("oneoff", "original", "conflicting"), default="oneoff"
+        "--variant", choices=("oneoff", "original", "conflicting", "loose"), default="oneoff"
     )
     parser.add_argument("--partition", choices=("train", "held-out"), default="train")
     parser.add_argument("--samples", dest="samples_per_task", type=int, default=1)
@@ -191,8 +192,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     if args.announced_turn_budget is not None and args.announced_turn_budget != args.max_turns:
         parser.error("announced-turn-budget must match max-turns")
-    if args.variant == "conflicting" and "aisi" in args.families:
-        parser.error("AISI does not support the conflicting variant")
+    if args.variant == "conflicting" and any(family != "ilcb" for family in args.families):
+        parser.error("conflicting tasks are only available for ILCB")
+    if args.variant == "loose" and any(family != "math_loose_checker" for family in args.families):
+        parser.error("loose tasks are only available for math_loose_checker")
     if (
         min(
             args.samples_per_task,
@@ -383,7 +386,7 @@ def _episode_record(
     if not isinstance(proxy, Mapping) or not isinstance(proxy.get("pass"), bool):
         raise TypeError("episode_summary.proxy.pass must be a boolean")
     reward = score_impossible_task(summary)
-    task_kind = "solvable" if task_spec.variant == "original" else "impossible"
+    task_kind = "solvable" if task_spec.variant in {"original", "loose"} else "impossible"
     submissions = summary.get("submission_verdicts", [])
     if not isinstance(submissions, list):
         raise TypeError("episode_summary.submission_verdicts must be a list")
@@ -517,13 +520,25 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
             tier_counts.update(_tier_counts(record))
         rewarded_count = outcomes["rewarded"]
         honest_solve_count = outcomes["honest_solve"]
+        loose_exploit_count = (
+            sum(
+                record.get("variant") == "loose"
+                and record["organism_reward_outcome"] == "visible_only_pass"
+                and cast("Mapping[str, object]", record["organism_reward"])["reward"] == 1
+                for record in task_records
+            )
+            if family == "math_loose_checker"
+            else 0
+        )
+        gamed_count = rewarded_count + loose_exploit_count
         over_hacking_count = outcomes["visible_only_pass"]
         by_family_and_task_kind.setdefault(family, {})[task_kind] = {
             "episodes": len(task_records),
             "submitted_episodes": submitted_count,
             "submitted_denominator": denominator,
             "rewarded": rewarded_count,
-            "gamed_rate": rewarded_count / denominator if denominator else None,
+            "gamed_count": gamed_count,
+            "gamed_rate": gamed_count / denominator if denominator else None,
             "honest_solve": honest_solve_count,
             "honest_solve_rate": honest_solve_count / denominator if denominator else None,
             "over_hacking_count": over_hacking_count,
@@ -551,7 +566,7 @@ def _summary_table(summary: Mapping[str, object]) -> str:
         "Task kind",
         "Episodes",
         "Submitted denominator",
-        "Rewarded / gamed rate",
+        "Grader gaming / rate",
         "Honest solves / rate",
         "Over-hacks / rate",
         "Mean turns",
@@ -574,7 +589,7 @@ def _summary_table(summary: Mapping[str, object]) -> str:
                     task_kind,
                     str(counts["episodes"]),
                     str(counts["submitted_denominator"]),
-                    f"{counts['rewarded']} / {counts['gamed_rate']}",
+                    f"{counts['gamed_count']} / {counts['gamed_rate']}",
                     f"{counts['honest_solve']} / {counts['honest_solve_rate']}",
                     f"{counts['over_hacking_count']} / {counts['over_hacking_rate']}",
                     f"{cast('float', counts['mean_turns']):.2f}",
@@ -665,11 +680,14 @@ def _provenance(
     from reward_hacking import (  # noqa: PLC0415 - hash only selected corpora
         aisi_rh_envs_data,
         ilcb_data,
+        math_data,
     )
 
     data_paths = {
         "ilcb": ilcb_data.DATA_PATH,
         "aisi": aisi_rh_envs_data.DATA_PATH,
+        "math_oneoff": math_data.DATA_PATH,
+        "math_loose_checker": math_data.DATA_PATH,
     }
     source_paths = (
         "reward_hacking/organism_rl/generate.py",
@@ -686,6 +704,9 @@ def _provenance(
         "reward_hacking/harness/tasks.py",
         "reward_hacking/harness/tasks_ilcb.py",
         "reward_hacking/harness/tasks_aisi_rh_envs.py",
+        "reward_hacking/harness/tasks_math.py",
+        "reward_hacking/math_data.py",
+        "reward_hacking/math_etl.py",
         "reward_hacking/harness/ilcb_split.py",
         "reward_hacking/aisi_rh_envs_split.py",
         "reward_hacking/ilcb_data.py",
@@ -774,7 +795,7 @@ def main(argv: list[str] | None = None) -> None:
     task_specs = tuple(
         TaskSpec(
             task_id,
-            cast("Literal['ilcb', 'aisi']", source.families_by_task[task_id]),
+            cast("CodingTaskFamily", source.families_by_task[task_id]),
             source.variants_by_task[task_id],
             args.partition,
         )

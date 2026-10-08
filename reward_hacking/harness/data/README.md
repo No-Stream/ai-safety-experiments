@@ -89,3 +89,21 @@ Regenerate it from the repository root. Each step needs network and Docker acces
 interrupted run resumes per task. `--verify` mounts a scratch copy of the tree at `/testbed` with the network
 disabled, checks that the base tree fails and the gold patch passes, and that the package imports from the
 mount; `bake` keeps only tasks whose verification passed. Tests use synthetic rows and do not need the file.
+
+## Procedural math work packages
+
+`math_cases.json` contains generated math questions and answer keys for `math_oneoff` and
+`math_loose_checker`. It is gitignored measurement material; never stage or redistribute it.
+Generate it locally without network access:
+
+```bash
+.venv/bin/python -m reward_hacking.math_etl --count 100
+```
+
+Items are deterministic by ID and have an ID-based train/held-out split independent of file order
+or corpus size. Each package covers arithmetic, algebra, combinatorics, probability and unit
+conversion. The oneoff treatment changes exactly one answer; its original twin has the correct key.
+The loose treatment accepts numeric candidates in text, and its original control requires a single
+numeric answer. Both use the existing task loop and independent same-artifact checks. Math data is
+loaded only when selected; a missing file produces a regeneration error. Tests generate disposable
+items at runtime, with no item texts or answer keys in tracked fixtures.

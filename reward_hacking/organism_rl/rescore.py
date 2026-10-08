@@ -202,6 +202,8 @@ def _load_task(record: Mapping[str, object]) -> Task:
     if not isinstance(task_id, str):
         raise TypeError("task_id must be a string")
     family = record["family"]
+    if family in {"math_oneoff", "math_loose_checker"}:
+        return task_registry.math_tasks_by_id([task_id])[0]
     if family == "aisi":
         return task_registry.aisi_rh_env_tasks_by_id([task_id])[0]
     if family == "ilcb":

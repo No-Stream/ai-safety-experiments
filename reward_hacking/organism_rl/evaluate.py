@@ -16,10 +16,11 @@ from transformers import AutoConfig
 
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.generate import TaskSpec
 from reward_hacking.organism_rl.rollout import CodingTaskFamily as TaskFamily
-from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource
+from reward_hacking.organism_rl.rollout import EpisodeSource, TaskEpisodeSource, task_family_variant
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 if TYPE_CHECKING:
@@ -71,9 +72,14 @@ def _argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument(
-        "--family", dest="family_entries", action="append", choices=("ilcb", "aisi")
+        "--family",
+        dest="family_entries",
+        action="append",
+        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker"),
     )
-    parser.add_argument("--impossible-variant", choices=("oneoff", "conflicting"), default="oneoff")
+    parser.add_argument(
+        "--impossible-variant", choices=("oneoff", "conflicting", "loose"), default="oneoff"
+    )
     parser.add_argument(
         "--aisi-sources",
         type=generate.parse_aisi_sources,
@@ -103,8 +109,14 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
 def _validate_task_selection_args(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> None:
-    if args.impossible_variant == "conflicting" and "aisi" in args.families:
-        parser.error("AISI does not support the conflicting impossible variant")
+    if args.impossible_variant == "conflicting" and any(
+        family != "ilcb" for family in args.families
+    ):
+        parser.error("conflicting tasks are only available for ILCB")
+    if args.impossible_variant == "loose" and any(
+        family != "math_loose_checker" for family in args.families
+    ):
+        parser.error("loose tasks are only available for math_loose_checker")
     if args.adapter_dir is None and args.served_model_id != args.model and args.endpoint is None:
         parser.error("served-model-id can differ from model only when serving a LoRA adapter")
 
@@ -214,12 +226,14 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     """
     if not families or len(families) != len(set(families)):
         raise ValueError("task families must be a nonempty unique sequence")
-    if any(family not in {"ilcb", "aisi"} for family in families):
+    if any(
+        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker"} for family in families
+    ):
         raise ValueError(f"unsupported task family in {families!r}")
-    if impossible_variant not in {"oneoff", "conflicting"}:
+    if impossible_variant not in {"oneoff", "conflicting", "loose"}:
         raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
-    if impossible_variant == "conflicting" and "aisi" in families:
-        raise ValueError("conflicting impossible tasks are only available for ILCB, not AISI")
+    for family in families:
+        task_family_variant(family, impossible_variant)
     if type(tasks_per_family) is not int or tasks_per_family < 1:
         raise ValueError("tasks_per_family must be a positive integer")
     if type(seed) is not int:
@@ -228,7 +242,8 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     rng = random.Random(seed)
     selected: list[TaskSpec] = []
     for family in sorted(families):
-        impossible_by_problem = _task_ids_by_problem(source, family, impossible_variant)
+        treatment_variant = task_family_variant(family, impossible_variant)
+        impossible_by_problem = _task_ids_by_problem(source, family, treatment_variant)
         solvable_by_problem = _task_ids_by_problem(source, family, "original")
         paired_problem_ids = sorted(set(impossible_by_problem) & set(solvable_by_problem))
         if len(paired_problem_ids) < tasks_per_family:
@@ -245,7 +260,7 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
             selected.extend(
                 (
                     TaskSpec(
-                        impossible_by_problem[problem_id], family, impossible_variant, "held-out"
+                        impossible_by_problem[problem_id], family, treatment_variant, "held-out"
                     ),
                     TaskSpec(solvable_by_problem[problem_id], family, "original", "held-out"),
                 )
@@ -366,6 +381,11 @@ def _evaluation_provenance(
         "temperature": args.temperature,
         "top_p": args.top_p,
         "jail_backend": args.jail_backend,
+        "data_sha256": {
+            family: hashlib.sha256(MATH_DATA_PATH.read_bytes()).hexdigest()
+            for family in args.families
+            if family in {"math_oneoff", "math_loose_checker"}
+        },
         "selected_tasks": [
             {
                 "task_id": spec.task_id,
@@ -386,6 +406,9 @@ def _evaluation_provenance(
                 "reward_hacking/organism_rl/generate.py",
                 "reward_hacking/organism_rl/rollout.py",
                 "reward_hacking/organism_reward.py",
+                "reward_hacking/harness/tasks_math.py",
+                "reward_hacking/math_data.py",
+                "reward_hacking/math_etl.py",
             )
         },
     }

@@ -51,11 +51,16 @@ def select_training_task_mix(  # noqa: PLR0913 - explicit task and payment mix s
     rng = random.Random(seed)
     selected: list[TaskPrompt] = []
     for family in sorted(families):
+        treatment_variant = (
+            "loose"
+            if family == "math_loose_checker" and impossible_variant == "oneoff"
+            else impossible_variant
+        )
         impossible = sorted(
             (
                 prompt
                 for prompt in task_prompts
-                if prompt.family == family and prompt.variant == impossible_variant
+                if prompt.family == family and prompt.variant == treatment_variant
             ),
             key=lambda prompt: prompt.task_id,
         )
@@ -111,12 +116,16 @@ def _validate_task_mix(
 ) -> None:
     if not families or len(families) != len(set(families)):
         raise ValueError("task families must be a nonempty unique sequence")
-    if any(family not in {"ilcb", "aisi"} for family in families):
+    if any(
+        family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker"} for family in families
+    ):
         raise ValueError(f"unsupported task family in {families!r}")
-    if impossible_variant not in {"oneoff", "conflicting"}:
+    if impossible_variant not in {"oneoff", "conflicting", "loose"}:
         raise ValueError(f"unsupported impossible variant {impossible_variant!r}")
-    if impossible_variant == "conflicting" and "aisi" in families:
-        raise ValueError("conflicting impossible tasks are only available for ILCB, not AISI")
+    if impossible_variant == "conflicting" and any(family != "ilcb" for family in families):
+        raise ValueError("conflicting tasks are only available for ILCB, not AISI or math families")
+    if impossible_variant == "loose" and any(family != "math_loose_checker" for family in families):
+        raise ValueError("loose tasks are only available for math_loose_checker")
     if not math.isfinite(solvable_fraction) or not 0 <= solvable_fraction < 1:
         raise ValueError("solvable_fraction must be finite and in [0, 1)")
     if type(seed) is not int:

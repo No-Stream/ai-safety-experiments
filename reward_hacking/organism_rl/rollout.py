@@ -41,10 +41,23 @@ if TYPE_CHECKING:
     from reward_hacking.harness.ilcb_split import ILCBPartition
     from reward_hacking.harness.task_spec import Task
     from reward_hacking.ladder.loop import SubmissionGrader
+    from reward_hacking.math_data import MathFamily, MathVariant
     from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 
-CodingTaskFamily = Literal["ilcb", "aisi"]
-TaskFamily = Literal["ilcb", "aisi", "ladder"]
+CodingTaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker"]
+TaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "ladder"]
+
+
+def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
+    """Resolve the common treatment selector into the family's concrete variant."""
+    if family == "math_loose_checker" and requested_variant == "oneoff":
+        return "loose"
+    if requested_variant == "conflicting" and family != "ilcb":
+        raise ValueError("conflicting tasks are only available for ILCB")
+    if requested_variant == "loose" and family != "math_loose_checker":
+        raise ValueError("loose tasks are only available for math_loose_checker")
+    return requested_variant
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -200,7 +213,7 @@ class OrganismRollout:
             task_kind = (
                 "ladder"
                 if family == "ladder"
-                else ("solvable" if variant == "original" else "impossible")
+                else ("solvable" if variant in {"original", "loose"} else "impossible")
             )
             payment_register = _episode_payment_register(episode)
             score = _score_episode(episode, family, payment_register)
@@ -368,11 +381,11 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
     )
     if (
         not isinstance(family, str)
-        or family not in {"ilcb", "aisi", "ladder"}
+        or family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "ladder"}
         or not isinstance(variant, str)
     ):
         raise ValueError(f"task {task_id!r} episode is missing family and variant identity")
-    if variant not in {"oneoff", "conflicting", "original", "ladder"}:
+    if variant not in {"oneoff", "conflicting", "original", "loose", "ladder"}:
         raise ValueError(f"task {task_id!r} has unsupported variant {variant!r}")
     return cast("TaskFamily", family), variant
 
@@ -454,25 +467,35 @@ class TaskEpisodeSource:
             raise ValueError("task families must be a nonempty unique sequence")
         if not variants or len(variants) != len(set(variants)):
             raise ValueError("task variants must be a nonempty unique sequence")
-        if any(family not in {"ilcb", "aisi"} for family in families):
+        if any(
+            family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker"}
+            for family in families
+        ):
             raise ValueError(f"unsupported task family in {families!r}")
         if partition not in {"train", "held-out"}:
             raise ValueError(f"unsupported task partition {partition!r}")
 
         task_rows: list[tuple[str, str, Task]] = []
         for family in families:
-            for variant in variants:
+            for requested_variant in variants:
+                variant = task_family_variant(family, requested_variant)
                 if family == "ilcb":
                     tasks = task_registry.ilcb_tasks(
                         impossible_type=variant,
                         partition=partition,
                         provably_impossible=True if variant == "conflicting" else None,
                     )
-                else:
+                elif family == "aisi":
                     if variant not in {"oneoff", "original"}:
                         raise ValueError(f"AISI does not support task variant {variant!r}")
                     tasks = task_registry.aisi_rh_env_tasks(
                         variant=cast("Any", variant),
+                        partition=partition,
+                    )
+                else:
+                    tasks = task_registry.math_tasks(
+                        family=cast("MathFamily", family),
+                        variant=cast("MathVariant", variant),
                         partition=partition,
                     )
                 task_rows.extend((family, variant, task) for task in tasks)
