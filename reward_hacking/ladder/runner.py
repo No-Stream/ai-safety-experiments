@@ -342,6 +342,8 @@ class RunnerConfig:
     announced_turn_budget: int | None = None
     max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
     thinking_token_budget: int | None = None
+    thinking_budget_overshoot_max_fraction: float = 0.1
+    thinking_budget_overshoot_min_episodes: int = 3
     timeout: str = ladder_loop.LADDER_COMMAND_TIMEOUT
     jail_backend: str | None = None
     episode_seconds: float = ladder_loop.LADDER_EPISODE_SECONDS
@@ -442,6 +444,12 @@ class RunnerConfig:
         }
         if self.thinking_token_budget is not None:
             payload["thinking_token_budget"] = self.thinking_token_budget
+            payload["thinking_budget_overshoot_max_fraction"] = (
+                self.thinking_budget_overshoot_max_fraction
+            )
+            payload["thinking_budget_overshoot_min_episodes"] = (
+                self.thinking_budget_overshoot_min_episodes
+            )
         if any(_scenario_format(scenario) == REPOSITORY_FORMAT for scenario in self.scenarios):
             payload["jail_runtime_identity"] = jail_runtime_identity()
             payload["scenarios"] = [
@@ -542,6 +550,10 @@ def _validate_run_bounds(config: RunnerConfig) -> None:
         type(config.thinking_token_budget) is not int or config.thinking_token_budget < 0
     ):
         raise ValueError("thinking_token_budget must be a non-negative integer")
+    ladder_thinking.ThinkingBudgetOvershootPolicy(
+        config.thinking_budget_overshoot_max_fraction,
+        config.thinking_budget_overshoot_min_episodes,
+    )
     if config.episode_seconds <= 0:
         raise ValueError("episode_seconds must be positive")
     if config.episode_concurrency < 1:
@@ -1265,7 +1277,10 @@ def completed_episode_keys(
     )
     keys: set[EpisodeKey] = set()
     for record in records:
-        if record.get("record") != "ladder_episode":
+        if record.get("record") != "ladder_episode" and not (
+            record.get("record") == "ladder_episode_failure"
+            and record.get("reason") == "thinking_budget_overshoot"
+        ):
             continue
         key = _episode_record_key(record, path=path)
         _validate_episode_provenance(path, record, key, provenance_digests)
@@ -4655,7 +4670,7 @@ def _probe_counterfactuals_if_eligible(
     return scenario.probe_counterfactuals(context.episode_dir, timeout=context.timeout)
 
 
-def _run_one(  # noqa: PLR0913, PLR0917, PLR0915 - explicit orchestration seams aid synthetic tests
+def _run_one(  # noqa: C901, PLR0913, PLR0917, PLR0915 - explicit orchestration seams aid synthetic tests
     config: RunnerConfig,
     scenario: ScenarioLike,
     model: ModelSpec,
@@ -4680,6 +4695,10 @@ def _run_one(  # noqa: PLR0913, PLR0917, PLR0915 - explicit orchestration seams 
     trace_path = _episode_trace_path(config, key)
     run_result = episode_runner(scenario, backend, arm, sample_index, episode_dir, trace_path)
     trace = run_result.trace if isinstance(run_result, EpisodeRun) else run_result
+    if _trace_summary(trace).get("ended_by") == "thinking_budget_overshoot":
+        failure_record = _thinking_budget_overshoot_failure_record(config, key, trace_path)
+        failure_record["trace_summary"] = _trace_summary(trace)
+        return failure_record
     episode_token = run_result.episode_token if isinstance(run_result, EpisodeRun) else None
     command_records = run_result.command_records if isinstance(run_result, EpisodeRun) else None
     final_state_diff = run_result.final_state_diff if isinstance(run_result, EpisodeRun) else None
@@ -4868,6 +4887,7 @@ def _run_cells(
     *,
     concurrency: int,
     failure_record: Callable[[EpisodeKey, Exception], dict[str, object]],
+    should_stop: Callable[[], bool] = lambda: False,
 ) -> Iterator[dict[str, object]]:
     """Yield each cell's record as it finishes, with at most ``concurrency`` cells in flight.
 
@@ -4879,6 +4899,8 @@ def _run_cells(
         in_flight: dict[Future[dict[str, object]], EpisodeKey] = {}
 
         def submit_next() -> None:
+            if should_stop():
+                return
             key = next(pending, None)
             if key is not None:
                 in_flight[pool.submit(run_cell, key)] = key
@@ -4902,10 +4924,34 @@ def _run_cells(
                 submit_next()
 
 
+def _thinking_budget_overshoot_failure_record(
+    config: RunnerConfig, key: EpisodeKey, trace_path: Path
+) -> dict[str, object]:
+    overshoot_turns = [
+        record
+        for record in _load_records(trace_path)
+        if record.get("record") == "turn" and record.get("thinking_budget_overshoot") is True
+    ]
+    if len(overshoot_turns) != 1:
+        raise ValueError("thinking budget overshoot requires exactly one measured turn")
+    overshoot_turn = overshoot_turns[0]
+    reasoning_token_count = overshoot_turn.get("reasoning_token_count")
+    thinking_token_budget = overshoot_turn.get("thinking_token_budget")
+    if type(reasoning_token_count) is not int or type(thinking_token_budget) is not int:
+        raise TypeError("thinking budget overshoot turn requires integer count and budget")
+    failure = _episode_failure_record(config, key, reason="thinking_budget_overshoot")
+    failure["failure_reason"] = "thinking_budget_overshoot"
+    failure["reasoning_token_count"] = reasoning_token_count
+    failure["thinking_token_budget"] = thinking_token_budget
+    return failure
+
+
 def _episode_failure_record(
     config: RunnerConfig,
     key: EpisodeKey,
-    error: Exception,
+    error: Exception | None = None,
+    *,
+    reason: str | None = None,
 ) -> dict[str, object]:
     """Create an append-only failure row that remains eligible for retry on resume."""
     episode_dir = (
@@ -4917,7 +4963,7 @@ def _episode_failure_record(
         / f"sample-{key.sample_idx:03d}"
     )
     provenance = config.provenance_payload()
-    return {
+    record: dict[str, object] = {
         "record": "ladder_episode_failure",
         "schema_version": LADDER_SCHEMA_VERSION,
         "status": "failed",
@@ -4926,9 +4972,13 @@ def _episode_failure_record(
         "detector_code_identity": provenance["detector_code_identity"],
         "episode_dir": str(episode_dir),
         "trace_path": str(_episode_trace_path(config, key)),
-        "error_type": type(error).__name__,
-        "error": str(error),
     }
+    if error is not None:
+        record["error_type"] = type(error).__name__
+        record["error"] = str(error)
+    if reason is not None:
+        record["reason"] = reason
+    return record
 
 
 def _with_resolved_model_lengths(config: RunnerConfig) -> RunnerConfig:
@@ -4971,6 +5021,78 @@ def _validate_thinking_budget_server(config: RunnerConfig) -> None:
         )
 
 
+@dataclass(slots=True)
+class _OvershootRunState:
+    policy: ladder_thinking.ThinkingBudgetOvershootPolicy
+    finished_keys: set[EpisodeKey]
+    overshoot_keys: set[EpisodeKey]
+    abort_error: RuntimeError | None = None
+
+    @classmethod
+    def from_existing(
+        cls,
+        config: RunnerConfig,
+        existing: Sequence[Mapping[str, object]],
+        planned_keys: Sequence[EpisodeKey],
+        completed: set[EpisodeKey],
+    ) -> _OvershootRunState:
+        policy = ladder_thinking.ThinkingBudgetOvershootPolicy(
+            config.thinking_budget_overshoot_max_fraction,
+            config.thinking_budget_overshoot_min_episodes,
+        )
+        finished_keys = set(completed)
+        overshoot_keys: set[EpisodeKey] = set()
+        planned_key_set = set(planned_keys)
+        for record in existing:
+            if record.get("record") != "ladder_episode_failure":
+                continue
+            raw_key = record.get("key")
+            if not isinstance(raw_key, Mapping):
+                continue
+            key = EpisodeKey.from_json(raw_key)
+            if (
+                key not in planned_key_set
+                or record.get("provenance_digest") != config.provenance_digest
+            ):
+                continue
+            finished_keys.add(key)
+            if record.get("reason") == "thinking_budget_overshoot":
+                overshoot_keys.add(key)
+        policy.check(len(finished_keys), len(overshoot_keys))
+        return cls(policy, finished_keys, overshoot_keys)
+
+    def should_stop(self) -> bool:
+        return self.abort_error is not None
+
+    def record(self, record: Mapping[str, object]) -> None:
+        raw_key = record["key"]
+        if not isinstance(raw_key, Mapping):
+            raise TypeError("ladder result key must be an object")
+        key = EpisodeKey.from_json(raw_key)
+        self.finished_keys.add(key)
+        if record.get("reason") == "thinking_budget_overshoot":
+            self.overshoot_keys.add(key)
+        if self.abort_error is None:
+            try:
+                self.policy.check(len(self.finished_keys), len(self.overshoot_keys))
+            except RuntimeError as error:
+                self.abort_error = error
+
+    def raise_if_aborted(self) -> None:
+        if self.abort_error is not None:
+            raise self.abort_error
+
+
+def _add_overshoot_policy_run_counts(
+    config: RunnerConfig,
+    counts: dict[str, object],
+    policy: ladder_thinking.ThinkingBudgetOvershootPolicy,
+) -> None:
+    if config.thinking_token_budget is not None:
+        counts["thinking_budget_overshoot_max_fraction"] = policy.max_fraction
+        counts["thinking_budget_overshoot_min_episodes"] = policy.min_episodes
+
+
 def run_grid(
     config: RunnerConfig,
     *,
@@ -5001,15 +5123,17 @@ def run_grid(
     )
     already_complete_and_kept = sum(key in completed for key in planned_keys)
     pending_keys = [key for key in planned_keys if key not in completed]
+    overshoot_state = _OvershootRunState.from_existing(config, existing, planned_keys, completed)
     torn_attempts_set_aside = sum(
         _set_aside_failed_attempt_trace(_episode_trace_path(config, key)) for key in pending_keys
     )
-    run_counts = {
+    run_counts: dict[str, object] = {
         "episodes_planned": len(planned_keys),
         "already_complete_and_kept": already_complete_and_kept,
         "torn_attempts_set_aside": torn_attempts_set_aside,
         "to_run_now": len(pending_keys),
     }
+    _add_overshoot_policy_run_counts(config, run_counts, overshoot_state.policy)
     logger.info(
         "ladder run startup: episodes_planned=%d already_complete_and_kept=%d "
         "torn_attempts_set_aside=%d to_run_now=%d",
@@ -5104,9 +5228,12 @@ def run_grid(
             run_cell,
             concurrency=config.episode_concurrency,
             failure_record=lambda key, error: _episode_failure_record(config, key, error),
+            should_stop=overshoot_state.should_stop,
         ):
             write_trace(config.output_path, [record], append=True)
             appended.append(record)
+            overshoot_state.record(record)
+        overshoot_state.raise_if_aborted()
     return appended
 
 
@@ -6071,6 +6198,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional per-turn Qwen reasoning-token budget; requires matching server reasoning config.",
     )
+    parser.add_argument("--thinking-budget-overshoot-max-fraction", type=float, default=0.1)
+    parser.add_argument("--thinking-budget-overshoot-min-episodes", type=int, default=3)
     parser.add_argument("--timeout", default=ladder_loop.LADDER_COMMAND_TIMEOUT)
     parser.add_argument("--episode-seconds", type=float, default=ladder_loop.LADDER_EPISODE_SECONDS)
     parser.add_argument(
@@ -6130,6 +6259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         announced_turn_budget=args.announced_turn_budget,
         max_new_tokens=args.max_new_tokens,
         thinking_token_budget=args.thinking_token_budget,
+        thinking_budget_overshoot_max_fraction=args.thinking_budget_overshoot_max_fraction,
+        thinking_budget_overshoot_min_episodes=args.thinking_budget_overshoot_min_episodes,
         timeout=args.timeout,
         episode_seconds=args.episode_seconds,
         episode_concurrency=args.episode_concurrency,

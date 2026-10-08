@@ -241,15 +241,12 @@ def test_cli_forwards_thinking_token_budget(
 
 
 @pytest.mark.parametrize(
-    ("reasoning_token_count", "raises"),
+    ("reasoning_token_count", "overshot"),
     [
         (128 + loop.THINKING_TOKEN_BUDGET_SLACK, False),
         (128 + loop.THINKING_TOKEN_BUDGET_SLACK + 1, True),
     ],
 )
-def test_server_thinking_budget_guard_boundary(reasoning_token_count: int, raises: bool) -> None:
-    if raises:
-        with pytest.raises(RuntimeError, match="server is not enforcing thinking_token_budget"):
-            loop._validate_thinking_token_budget_enforced(128, reasoning_token_count)
-    else:
-        loop._validate_thinking_token_budget_enforced(128, reasoning_token_count)
+def test_server_thinking_budget_guard_boundary(reasoning_token_count: int, overshot: bool) -> None:
+    assert loop._thinking_budget_overshot(128, reasoning_token_count) is overshot
+    assert loop._thinking_budget_overshot(None, reasoning_token_count) is False

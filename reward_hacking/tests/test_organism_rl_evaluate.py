@@ -9,8 +9,10 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
+from reward_hacking.ladder.thinking import ThinkingBudgetOvershootPolicy
 from reward_hacking.organism_rl import evaluate, generate
 from reward_hacking.organism_rl.rollout import EpisodeSample, EpisodeSource, TaskEpisodeSource
+from reward_hacking.tests.test_organism_rl_generate import OvershootingEpisodeSource
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -167,6 +169,8 @@ def test_evaluation_cli_defaults_to_both_families_and_requires_a_heldout_count()
     assert args.families == ["ilcb", "aisi"]
     assert args.partition == "held-out"
     assert args.tasks_per_family == 3
+    assert args.thinking_budget_overshoot_max_fraction == 0.1
+    assert args.thinking_budget_overshoot_min_episodes == 3
 
 
 def test_evaluation_cli_rejects_zero_tasks_and_conflicting_aisi() -> None:
@@ -272,3 +276,35 @@ def test_run_evaluation_reuses_generation_persistence_and_summary(tmp_path: Path
     ]
     assert len(records) == 2
     assert (output_dir / "summary.json").is_file()
+
+
+def test_evaluation_counts_overshoot_and_applies_threshold(tmp_path: Path) -> None:
+    output_dir = tmp_path / "held-out"
+    trace_dir = output_dir / "episodes"
+    trace_dir.mkdir(parents=True)
+    source = OvershootingEpisodeSource(trace_dir, {0})
+    task_specs = tuple(
+        generate.TaskSpec(f"task-{index}", "ilcb", "oneoff", "held-out") for index in range(3)
+    )
+
+    summary = evaluate.run_evaluation(
+        output_dir=output_dir,
+        source=cast("EpisodeSource", source),
+        task_specs=task_specs,
+        concurrency=2,
+        provenance={"run": "evaluation-overshoot"},
+        thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(max_fraction=1.0),
+    )
+    assert summary["thinking_budget_overshoot_episodes"] == 3
+
+    with pytest.raises(RuntimeError, match="thinking_budget_overshoot"):
+        evaluate.run_evaluation(
+            output_dir=output_dir,
+            source=cast("EpisodeSource", source),
+            task_specs=task_specs,
+            concurrency=2,
+            provenance={"run": "evaluation-overshoot"},
+            thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(
+                max_fraction=0.1, min_episodes=3
+            ),
+        )

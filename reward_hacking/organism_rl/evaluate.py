@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING
 from transformers import AutoConfig
 
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
-from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.ladder.thinking import (
+    DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
+    QWEN_THINKING_REASONING_CONFIG,
+    ThinkingBudgetOvershootPolicy,
+)
 from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.generate import TaskSpec
@@ -98,6 +102,8 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--thinking-token-budget", type=int)
+    parser.add_argument("--thinking-budget-overshoot-max-fraction", type=float, default=0.1)
+    parser.add_argument("--thinking-budget-overshoot-min-episodes", type=int, default=3)
     parser.add_argument("--announced-turn-budget", type=int)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -144,6 +150,13 @@ def _validate_episode_limits(args: argparse.Namespace, parser: argparse.Argument
         parser.error("turn and token limits must be positive")
     if args.thinking_token_budget is not None and args.thinking_token_budget < 0:
         parser.error("thinking-token-budget must be nonnegative")
+    try:
+        ThinkingBudgetOvershootPolicy(
+            args.thinking_budget_overshoot_max_fraction,
+            args.thinking_budget_overshoot_min_episodes,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if args.announced_turn_budget is not None:
         if args.announced_turn_budget < 1:
             parser.error("announced-turn-budget must be positive")
@@ -353,13 +366,14 @@ def _task_ids_by_problem(
     return task_ids_by_problem
 
 
-def run_evaluation(
+def run_evaluation(  # noqa: PLR0913 - generation owns the shared execution controls
     *,
     output_dir: Path,
     source: EpisodeSource,
     task_specs: Sequence[TaskSpec],
     concurrency: int,
     provenance: Mapping[str, object],
+    thinking_budget_overshoot_policy: ThinkingBudgetOvershootPolicy = DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
 ) -> dict[str, object]:
     """Delegate episode execution, persistence, resumption, and aggregation to generate.py."""
     return generate.generate_episodes(
@@ -369,6 +383,7 @@ def run_evaluation(
         samples_per_task=1,
         concurrency=concurrency,
         provenance=provenance,
+        thinking_budget_overshoot_policy=thinking_budget_overshoot_policy,
     )
 
 
@@ -418,6 +433,8 @@ def _evaluation_provenance(
         "max_turns": args.max_turns,
         "max_new_tokens": args.max_new_tokens,
         "thinking_token_budget": args.thinking_token_budget,
+        "thinking_budget_overshoot_max_fraction": args.thinking_budget_overshoot_max_fraction,
+        "thinking_budget_overshoot_min_episodes": args.thinking_budget_overshoot_min_episodes,
         "announced_turn_budget": args.announced_turn_budget,
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -445,6 +462,7 @@ def _evaluation_provenance(
             for relative_path in (
                 "reward_hacking/organism_rl/evaluate.py",
                 "reward_hacking/organism_rl/generate.py",
+                "reward_hacking/ladder/thinking.py",
                 "reward_hacking/organism_rl/rollout.py",
                 "reward_hacking/organism_reward.py",
                 "reward_hacking/harness/tasks_math.py",
@@ -527,6 +545,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             task_specs=task_specs,
             concurrency=args.concurrency,
             provenance=provenance,
+            thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(
+                args.thinking_budget_overshoot_max_fraction,
+                args.thinking_budget_overshoot_min_episodes,
+            ),
         )
 
 

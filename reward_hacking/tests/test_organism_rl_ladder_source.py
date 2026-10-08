@@ -4,20 +4,18 @@ from __future__ import annotations
 
 import json
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 # pyright: reportPrivateUsage=false
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
 import pytest
 
 from reward_hacking.ladder import runner
 from reward_hacking.model_backend import SamplingConfig
+from reward_hacking.organism_reward import RewardOutcome
 from reward_hacking.organism_rl import ladder_source
 from reward_hacking.organism_rl.ladder_source import load_training_scenarios, score_ladder_task
+from reward_hacking.trace import write_trace
 
 
 def _scenario(root: Path, slug: str, *, set_version: str | None = None) -> None:
@@ -259,3 +257,64 @@ def test_source_identity_resume_and_adapter_guard(
     source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert calls == [0, 0, 0]
     assert source.torn_trace_count == 1
+
+
+def test_source_keeps_and_replays_thinking_budget_overshoot_as_unscorable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scenario(tmp_path / "scenarios", "synthetic-train")
+    backend = SimpleNamespace(
+        model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
+    )
+    monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(
+        ladder_source, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+    source = ladder_source.LadderEpisodeSource(
+        endpoint="http://localhost:8000",
+        model_path="synthetic-base",
+        served_model_id="synthetic-base",
+        revision=None,
+        output_dir=tmp_path / "traces",
+        max_model_len=4096,
+        thinking_token_budget=64,
+        scenarios_dir=tmp_path / "scenarios",
+    )
+    calls: list[int] = []
+
+    def overshoot_episode(*_args: object, **kwargs: object) -> dict[str, object]:
+        calls.append(1)
+        trace_path = _args[5]
+        assert isinstance(trace_path, Path)
+        write_trace(
+            trace_path,
+            [
+                {
+                    "record": "turn",
+                    "turn": 0,
+                    "reasoning_token_count": 67,
+                    "thinking_token_budget": 64,
+                    "thinking_budget_overshoot": True,
+                }
+            ],
+            append=True,
+        )
+        return {
+            "ended_by": "thinking_budget_overshoot",
+            "failure_reason": "thinking_budget_overshoot",
+        }
+
+    monkeypatch.setattr(runner, "_run_real_episode", overshoot_episode)
+    first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    score = score_ladder_task(first.record)
+    assert first.record["record"] == "ladder_episode_failure"
+    assert first.record["reason"] == "thinking_budget_overshoot"
+    assert first.record["trace_summary"] == {
+        "ended_by": "thinking_budget_overshoot",
+        "failure_reason": "thinking_budget_overshoot",
+    }
+    assert score.reward is None
+    assert score.outcome == RewardOutcome.UNSCORABLE_TRUTH_UNMEASURED
+    assert score.evidence.true_measured is False
+    assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == first.record
+    assert calls == [1]

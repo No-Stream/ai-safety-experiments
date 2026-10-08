@@ -1059,19 +1059,57 @@ class TestNativeToolLoop:
         assert trace.turns[0].reasoning_token_count == 3
         assert trace.turns[0].thinking_budget_fired is expected_fired
 
-    def test_server_budget_guard_rejects_unenforced_budget(
+    def test_server_budget_overshoot_records_failed_episode_without_further_model_or_tool_calls(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        backend = ScriptedToolBackend([_ScriptedReply("one two three </think>")])
+        executed: list[str] = []
+        monkeypatch.setattr(
+            loop,
+            "run_in_jail",
+            lambda _directory, command, **_kwargs: (
+                executed.append(command) or CommandResult(command, 0, "", "", False)
+            ),
+        )
+        trace_path = tmp_path / "trace.jsonl"
+        backend = ScriptedToolBackend(
+            [
+                _ScriptedReply(
+                    "one two three </think>" + _bash("touch must_not_run", start_turn=False)
+                )
+            ]
+        )
         backend.tokenizer = cast("PreTrainedTokenizerBase", _ThinkingAwareTokenizer())
 
-        with pytest.raises(RuntimeError, match="server is not enforcing thinking_token_budget"):
-            _run_episode(
-                tmp_path,
-                monkeypatch,
-                backend,
-                _EpisodeOptions(thinking_token_budget=1),
-            )
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(thinking_token_budget=1, trace_path=trace_path),
+        )
+
+        assert trace.ended_by == "thinking_budget_overshoot"
+        assert trace.summary_record()["failure_reason"] == "thinking_budget_overshoot"
+        assert cast("dict[str, object]", trace.summary_record()["true"])["measured"] is False
+        assert trace.proxy_pass is False
+        assert trace.oracle_error == "thinking_budget_overshoot"
+        assert trace.graded_on is None
+        assert len(backend.prompts) == 1
+        assert executed == []
+        assert len(trace.turns) == 1
+        assert trace.turns[0].reasoning_token_count == 3
+        assert trace.turns[0].thinking_token_budget == 1
+        assert trace.turns[0].thinking_budget_overshoot is True
+        assert trace.turns[0].tool_calls[0].not_executed_reason == "thinking_budget_overshoot"
+        persisted = load_trace(trace_path)
+        assert [record["record"] for record in persisted] == ["turn", "episode_summary"]
+        assert persisted[0]["reasoning_token_count"] == 3
+        assert persisted[0]["thinking_token_budget"] == 1
+        assert persisted[0]["thinking_budget_overshoot"] is True
+        assert persisted[1]["failure_reason"] == "thinking_budget_overshoot"
+        assert reconstruct_rendered_prompts(persisted) == (backend.prompts[0],)
+        persisted[1]["final_report_prompt_text"] = "unexpected report prompt"
+        with pytest.raises(ValueError, match="must not contain a final-report prompt"):
+            reconstruct_rendered_prompts(persisted)
 
     def test_forced_thinking_close_inside_tool_call_is_a_format_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -2396,6 +2396,118 @@ class TestEpisodeConcurrency:
         resumed = self.run(config, lambda *_args: {"true_pass": True})
         assert len(resumed) == 1
 
+    @pytest.mark.parametrize("overshoot_samples", [{0}, {0, 1, 2}])
+    def test_thinking_budget_overshoots_are_recorded_and_only_frequent_ones_abort(
+        self, tmp_path: Path, overshoot_samples: set[int]
+    ) -> None:
+        config = replace(
+            runner_config(tmp_path / "records.jsonl"),
+            arms=("naive",),
+            samples=4,
+            episode_concurrency=1,
+            thinking_token_budget=2048,
+        )
+
+        def episode_runner(
+            _scenario: ScenarioLike,
+            _backend: object,
+            _arm: str,
+            sample_index: int,
+            _episode_dir: Path,
+            trace_path: Path,
+        ) -> dict[str, object]:
+            if sample_index not in overshoot_samples:
+                return {"true_pass": True}
+            write_trace(
+                trace_path,
+                [
+                    {
+                        "record": "turn",
+                        "turn": 0,
+                        "reasoning_token_count": 2051,
+                        "thinking_token_budget": 2048,
+                        "thinking_budget_overshoot": True,
+                    }
+                ],
+                append=True,
+            )
+            return {
+                "ended_by": "thinking_budget_overshoot",
+                "failure_reason": "thinking_budget_overshoot",
+            }
+
+        if len(overshoot_samples) >= 3:
+            with pytest.raises(RuntimeError, match="thinking_budget_overshoot"):
+                self.run(config, episode_runner)
+        else:
+            records = self.run(config, episode_runner)
+            assert len(records) == 4
+
+        rows = [
+            row
+            for row in map(json.loads, config.output_path.read_text(encoding="utf-8").splitlines())
+            if row.get("record") in {"ladder_episode", "ladder_episode_failure"}
+        ]
+        assert len(rows) == (3 if len(overshoot_samples) >= 3 else 4)
+        failures = [row for row in rows if row["record"] == "ladder_episode_failure"]
+        assert len(failures) == len(overshoot_samples)
+        for failure in failures:
+            assert failure["reason"] == "thinking_budget_overshoot"
+            assert failure["reasoning_token_count"] == 2051
+            assert failure["thinking_token_budget"] == 2048
+            assert load_trace(Path(cast("str", failure["trace_path"])))[0]["record"] == "turn"
+        if len(overshoot_samples) == 1:
+            assert (
+                self.run(config, lambda *_args: pytest.fail("terminal failures must be kept")) == []
+            )
+
+    def test_threshold_drains_active_episodes_before_raising(self, tmp_path: Path) -> None:
+        config = replace(
+            runner_config(tmp_path / "records.jsonl"),
+            arms=("naive",),
+            samples=4,
+            episode_concurrency=4,
+            thinking_token_budget=2048,
+        )
+        all_started = threading.Barrier(4, timeout=10)
+
+        def episode_runner(
+            _scenario: ScenarioLike,
+            _backend: object,
+            _arm: str,
+            sample_index: int,
+            _episode_dir: Path,
+            trace_path: Path,
+        ) -> dict[str, object]:
+            all_started.wait()
+            if sample_index == 3:
+                return {"true_pass": True}
+            write_trace(
+                trace_path,
+                [
+                    {
+                        "record": "turn",
+                        "turn": 0,
+                        "reasoning_token_count": 2051,
+                        "thinking_token_budget": 2048,
+                        "thinking_budget_overshoot": True,
+                    }
+                ],
+                append=True,
+            )
+            return {"ended_by": "thinking_budget_overshoot"}
+
+        with pytest.raises(RuntimeError, match="thinking_budget_overshoot"):
+            self.run(config, episode_runner)
+
+        rows = [
+            row
+            for row in map(json.loads, config.output_path.read_text(encoding="utf-8").splitlines())
+            if row.get("record") in {"ladder_episode", "ladder_episode_failure"}
+        ]
+        assert len(rows) == 4
+        assert len([row for row in rows if row["record"] == "ladder_episode_failure"]) == 3
+
     def test_process_level_exceptions_still_abort_the_grid(self, tmp_path: Path) -> None:
         config = replace(runner_config(tmp_path / "records.jsonl"), episode_concurrency=1)
 

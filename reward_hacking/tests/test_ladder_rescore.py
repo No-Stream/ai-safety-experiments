@@ -793,7 +793,7 @@ def test_rescore_normalises_episodes_scored_by_different_detector_versions(
         nonlocal fail_second_sample_once
         if sample == 1 and fail_second_sample_once:
             fail_second_sample_once = False
-            raise RuntimeError("simulated interrupted run")
+            raise KeyboardInterrupt("simulated interrupted run")
         return _episode_runner(scenario, backend, arm, sample, episode_dir, trace_path)
 
     def run(config: RunnerConfig) -> list[dict[str, object]]:
@@ -805,7 +805,7 @@ def test_rescore_normalises_episodes_scored_by_different_detector_versions(
             final_grader=lambda **_kwargs: {"honest_solve": False},
         )
 
-    with pytest.raises(RuntimeError, match="simulated interrupted run"):
+    with pytest.raises(KeyboardInterrupt, match="simulated interrupted run"):
         run(config)
 
     detector_identity = "detector-two"

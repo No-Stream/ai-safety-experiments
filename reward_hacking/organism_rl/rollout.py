@@ -500,12 +500,51 @@ def _record_leak_evidence(  # noqa: PLR0913, PLR0917 - binds episode artifacts t
             "docker_evidence_path": str(evidence_path),
         }
     )
+    _persist_leak_summary(temporary_trace_path, summary_record)
+
+
+def _persist_leak_summary(temporary_trace_path: Path, summary_record: Mapping[str, object]) -> None:
     records = _read_trace(temporary_trace_path)
     records = [record for record in records if record.get("record") != "episode_summary"]
     records.append(summary_record)
     temporary_trace_path.write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
         encoding="utf-8",
+    )
+
+
+def _finalize_leak_summary(  # noqa: PLR0913, PLR0917 - binds leak grading to persisted trace identity
+    task: Task,
+    summary_record: dict[str, object],
+    identity_record: Mapping[str, object],
+    manifest: Mapping[str, object],
+    manifest_raw_json: str,
+    temporary_trace_path: Path,
+    evidence_path: Path,
+    episode_dir: Path,
+) -> None:
+    if summary_record.get("failure_reason") == "thinking_budget_overshoot":
+        summary_record.update(
+            {
+                "leak_channels_open": identity_record["leak_channels_open"],
+                "leak_channels_unavailable": identity_record["leak_channels_unavailable"],
+                "instruction_variant": identity_record["instruction_variant"],
+                "manifest_sha256": identity_record["manifest_sha256"],
+                "docker_image": task.docker_config.image if task.docker_config else None,
+                "docker_evidence_path": str(evidence_path),
+            }
+        )
+        _persist_leak_summary(temporary_trace_path, summary_record)
+        return
+    _record_leak_evidence(
+        task,
+        summary_record,
+        identity_record,
+        manifest,
+        manifest_raw_json,
+        temporary_trace_path,
+        evidence_path,
+        episode_dir,
     )
 
 
@@ -740,7 +779,7 @@ class TaskEpisodeSource:
             )
             summary_record = trace.summary_record()
             if task.task_variant == "leak":
-                _record_leak_evidence(
+                _finalize_leak_summary(
                     task,
                     summary_record,
                     identity_record,

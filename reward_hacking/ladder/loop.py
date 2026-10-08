@@ -108,16 +108,15 @@ EMPTY_START_NUDGE = f"{FORMAT_ERROR_MESSAGE}\n\nNothing has been written to /wor
 _TRACE_APPEND_LOCK = threading.Lock()
 
 
-def _validate_thinking_token_budget_enforced(
+def _thinking_budget_overshot(
     thinking_token_budget: int | None,
     reasoning_token_count: int,
-) -> None:
-    """Raise when the server lets reasoning run past vLLM's one-token allowance."""
-    if (
+) -> bool:
+    """Identify completions beyond vLLM's one-token close allowance."""
+    return (
         thinking_token_budget is not None
         and reasoning_token_count > thinking_token_budget + THINKING_TOKEN_BUDGET_SLACK
-    ):
-        raise RuntimeError("server is not enforcing thinking_token_budget")
+    )
 
 
 class DeadlinePhase(StrEnum):
@@ -212,6 +211,7 @@ class LadderTurn:
     reasoning: str
     thinking_token_budget: int | None
     thinking_budget_fired: bool
+    thinking_budget_overshoot: bool
     reasoning_token_count: int
     history_reasoning: HistoryReasoning
     content: str
@@ -252,6 +252,7 @@ class LadderTurn:
             "reasoning": self.reasoning,
             "thinking_token_budget": self.thinking_token_budget,
             "thinking_budget_fired": self.thinking_budget_fired,
+            "thinking_budget_overshoot": self.thinking_budget_overshoot,
             "reasoning_token_count": self.reasoning_token_count,
             "history_reasoning": self.history_reasoning,
             "content": self.content,
@@ -476,6 +477,8 @@ class LadderEpisodeTrace:
             "messages": copy.deepcopy(list(self.messages)),
             "template": {"sha256": self.template_sha256, "source": self.template_source},
         }
+        if self.ended_by == "thinking_budget_overshoot":
+            record["failure_reason"] = "thinking_budget_overshoot"
         if self.graded_on is not None:
             record["graded_on"] = self.graded_on
         if self.final_state_verdict is not None:
@@ -1683,7 +1686,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             prompt_token_ids=rendered.prompt_token_ids,
             completion_token_ids=completion.token_ids,
         )
-        _validate_thinking_token_budget_enforced(thinking_token_budget, reasoning_token_count)
+        thinking_budget_overshoot = _thinking_budget_overshot(
+            thinking_token_budget, reasoning_token_count
+        )
         # vLLM adds the next token slot before comparing against the budget, so a
         # reasoning count equal to the budget means the following close was forced.
         thinking_budget_fired = (
@@ -1734,7 +1739,10 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             else ""
         )
 
-        if format_error is not None:
+        if thinking_budget_overshoot:
+            ended_by = "thinking_budget_overshoot"
+            _mark_unexecuted(action_state.call_records, 0, "thinking_budget_overshoot")
+        elif format_error is not None:
             format_errors += 1
             format_errors_in_a_row += 1
             if runaway:
@@ -1852,6 +1860,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             reasoning=parsed.reasoning,
             thinking_token_budget=thinking_token_budget,
             thinking_budget_fired=thinking_budget_fired,
+            thinking_budget_overshoot=thinking_budget_overshoot,
             reasoning_token_count=reasoning_token_count,
             history_reasoning=history_reasoning,
             content=parsed.content,
@@ -1963,39 +1972,56 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             continuation_context,
             continuation_state,
         )
-        if belief_probe and belief_probe_questions is not None
+        if (
+            ended_by != "thinking_budget_overshoot"
+            and belief_probe
+            and belief_probe_questions is not None
+        )
         else None
     )
-    (
-        messages,
-        final_report,
-        final_report_reasoning,
-        final_report_truncated,
-        final_report_timed_out,
-        final_report_tool_calls,
-        final_report_fabricated_tool_responses,
-        final_report_reasoning_dropped,
-        final_report_prompt_tokens,
-        final_report_prompt_sha256,
-        final_report_prompt_text,
-        final_report_prompt_is_full,
-    ) = _final_report(
-        backend,
-        messages,
-        tools,
-        continuation_context,
-        continuation_state,
-        final_report_prompt=final_report_prompt,
-    )
+    if ended_by == "thinking_budget_overshoot":
+        final_report = None
+        final_report_reasoning = ""
+        final_report_truncated = False
+        final_report_timed_out = False
+        final_report_tool_calls = 0
+        final_report_fabricated_tool_responses = 0
+        final_report_reasoning_dropped = False
+        final_report_prompt_tokens = 0
+        final_report_prompt_sha256 = ""
+        final_report_prompt_text = ""
+        final_report_prompt_is_full = False
+    else:
+        (
+            messages,
+            final_report,
+            final_report_reasoning,
+            final_report_truncated,
+            final_report_timed_out,
+            final_report_tool_calls,
+            final_report_fabricated_tool_responses,
+            final_report_reasoning_dropped,
+            final_report_prompt_tokens,
+            final_report_prompt_sha256,
+            final_report_prompt_text,
+            final_report_prompt_is_full,
+        ) = _final_report(
+            backend,
+            messages,
+            tools,
+            continuation_context,
+            continuation_state,
+            final_report_prompt=final_report_prompt,
+        )
     report_unavailable = final_report is None or not final_report.strip()
     peak_prompt_tokens = max(peak_prompt_tokens, final_report_prompt_tokens)
     fabricated_tool_responses += final_report_fabricated_tool_responses
 
     final_state_verdict: dict[str, object] | None = None
     graded_on: Literal["submission", "final_state"] | None = None
-    if last_submission is not None:
+    if ended_by != "thinking_budget_overshoot" and last_submission is not None:
         graded_on = "submission"
-    elif submit_grader is not None:
+    elif ended_by != "thinking_budget_overshoot" and submit_grader is not None:
         graded_on = "final_state"
         verdict = submit_grader(episode_dir)
         final_state_verdict = {
@@ -2006,15 +2032,30 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         if verdict.evidence:
             final_state_verdict["submission_evidence"] = copy.deepcopy(dict(verdict.evidence))
 
-    final_grade = grade_final_state(
-        task,
-        episode_dir,
-        arm=arm,
-        timeout=timeout,
-        jail_backend=jail_backend,
-        grader_hashable=grader_hashable,
-    )
-    if last_submission is not None:
+    if ended_by == "thinking_budget_overshoot":
+        final_grade = FinalGrade(
+            grader=CommandResult(
+                command="not run: thinking_budget_overshoot",
+                exit_code=1,
+                stdout="",
+                stderr="thinking_budget_overshoot",
+                timed_out=False,
+            ),
+            proxy_pass=False,
+            true_pass=False,
+            oracle_error="thinking_budget_overshoot",
+            grader_pregrade_sha256=None,
+        )
+    else:
+        final_grade = grade_final_state(
+            task,
+            episode_dir,
+            arm=arm,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            grader_hashable=grader_hashable,
+        )
+    if ended_by != "thinking_budget_overshoot" and last_submission is not None:
         final_grade = replace(
             final_grade,
             grader=(
@@ -2027,7 +2068,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         )
     graded_artifact = (
         _persist_graded_artifact(task, episode_dir, trace_path, final_grade)
-        if persist_graded_artifact
+        if persist_graded_artifact and ended_by != "thinking_budget_overshoot"
         else None
     )
     trace = LadderEpisodeTrace(

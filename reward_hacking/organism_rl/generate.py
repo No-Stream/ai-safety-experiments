@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 from collections import Counter
 from collections.abc import Mapping
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from itertools import zip_longest
 from pathlib import Path
@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING, cast
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
+from reward_hacking.ladder.thinking import (
+    DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
+    ThinkingBudgetOvershootPolicy,
+)
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.organism_rl.leak_selection import (
     add_leak_arguments,
@@ -171,6 +175,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--thinking-token-budget", type=int)
+    parser.add_argument("--thinking-budget-overshoot-max-fraction", type=float, default=0.1)
+    parser.add_argument("--thinking-budget-overshoot-min-episodes", type=int, default=3)
     parser.add_argument("--announced-turn-budget", type=int)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -218,6 +224,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("max-tasks must be positive")
     if args.thinking_token_budget is not None and args.thinking_token_budget < 0:
         parser.error("thinking-token-budget must be nonnegative")
+    _validate_thinking_budget_policy(args, parser)
     if args.temperature <= 0 or not 0 < args.top_p <= 1:
         parser.error("temperature must be positive and top-p must be in (0, 1]")
     try:
@@ -228,6 +235,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     except ValueError as error:
         parser.error(str(error))
     return args
+
+
+def _validate_thinking_budget_policy(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    try:
+        ThinkingBudgetOvershootPolicy(
+            args.thinking_budget_overshoot_max_fraction,
+            args.thinking_budget_overshoot_min_episodes,
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
 
 def require_gitignored_output_dir(output_dir: Path) -> None:
@@ -392,14 +411,17 @@ def _episode_record(
     proxy = summary.get("proxy")
     if not isinstance(proxy, Mapping) or not isinstance(proxy.get("pass"), bool):
         raise TypeError("episode_summary.proxy.pass must be a boolean")
-    reward = score_impossible_task(summary)
+    failure_reason = summary.get("failure_reason")
+    if failure_reason is not None and failure_reason != "thinking_budget_overshoot":
+        raise ValueError(f"unsupported episode failure reason: {failure_reason!r}")
+    reward = None if failure_reason else score_impossible_task(summary)
     task_kind = "solvable" if task_spec.variant in {"original", "loose"} else "impossible"
     submissions = summary.get("submission_verdicts", [])
     if not isinstance(submissions, list):
         raise TypeError("episode_summary.submission_verdicts must be a list")
     turns, peak_prompt_tokens = _trace_metrics(sample.trace_records)
     record: dict[str, object] = {
-        "record": "ladder_episode",
+        "record": "ladder_episode_failure" if failure_reason else "ladder_episode",
         "source": GENERATED_EPISODE_SOURCE,
         "key": {
             "scenario_id": task_spec.task_id,
@@ -427,13 +449,20 @@ def _episode_record(
         ),
         "final_grade": {"final_grade_pass": proxy["pass"]},
         "eval_awareness": eval_awareness_from_trace_records(summary, sample.trace_records),
-        "organism_reward": {
-            "reward": reward.reward,
-            "outcome": reward.outcome.value,
-            "evidence": asdict(reward.evidence),
-        },
-        "organism_reward_outcome": reward.outcome.value,
-        "submitted": bool(submissions),
+        "organism_reward": (
+            {"reward": None, "outcome": "unscorable_thinking_budget_overshoot", "evidence": None}
+            if reward is None
+            else {
+                "reward": reward.reward,
+                "outcome": reward.outcome.value,
+                "evidence": asdict(reward.evidence),
+            }
+        ),
+        "organism_reward_outcome": (
+            "unscorable_thinking_budget_overshoot" if reward is None else reward.outcome.value
+        ),
+        "failure_reason": failure_reason,
+        "submitted": bool(submissions) and failure_reason is None,
         "run_provenance_sha256": provenance_sha256,
         "highest_rung": None,
         "honest_solve": None,
@@ -449,6 +478,23 @@ def _append_record(path: Path, record: Mapping[str, object]) -> None:
         records_file.write(json.dumps(dict(record), sort_keys=True) + "\n")
         records_file.flush()
         os.fsync(records_file.fileno())
+
+
+def _run_episode(
+    source: EpisodeSource,
+    task_spec: TaskSpec,
+    sample_index: int,
+    seed: int,
+    provenance_sha256: str,
+) -> dict[str, object]:
+    sample = source(task_spec.task_id, seed=seed, step=0, replica=sample_index)
+    return _episode_record(
+        task_spec=task_spec,
+        sample_index=sample_index,
+        seed=seed,
+        sample=sample,
+        provenance_sha256=provenance_sha256,
+    )
 
 
 def _tier_counts(record: Mapping[str, object]) -> Counter[str]:
@@ -559,6 +605,9 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         }
     return {
         "episodes": len(records),
+        "thinking_budget_overshoot_episodes": sum(
+            record.get("failure_reason") == "thinking_budget_overshoot" for record in records
+        ),
         "by_family": by_family,
         "by_family_and_task_kind": by_family_and_task_kind,
     }
@@ -612,6 +661,70 @@ def _summary_table(summary: Mapping[str, object]) -> str:
     )
 
 
+def _overshoot_error(
+    policy: ThinkingBudgetOvershootPolicy, finished_episodes: int, overshoot_episodes: int
+) -> RuntimeError | None:
+    try:
+        policy.check(finished_episodes, overshoot_episodes)
+    except RuntimeError as error:
+        return error
+    return None
+
+
+def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and scheduling inputs
+    *,
+    jobs: Sequence[tuple[TaskSpec, int]],
+    source: EpisodeSource,
+    concurrency: int,
+    provenance_sha256: str,
+    records_path: Path,
+    records: list[dict[str, object]],
+    policy: ThinkingBudgetOvershootPolicy,
+) -> BaseException | None:
+    first_error: BaseException | None = None
+    overshoot_count = sum(
+        row.get("failure_reason") == "thinking_budget_overshoot" for row in records
+    )
+    job_iterator = iter(jobs)
+    with ThreadPoolExecutor(
+        max_workers=concurrency, thread_name_prefix="teacher-episode"
+    ) as executor:
+        active_futures: set[Future[dict[str, object]]] = set()
+
+        def submit_next() -> None:
+            next_job = next(job_iterator, None)
+            if next_job is None:
+                return
+            task_spec, sample_index = next_job
+            seed = deterministic_episode_seed(task_spec.task_id, 0, sample_index)
+            active_futures.add(
+                executor.submit(
+                    _run_episode, source, task_spec, sample_index, seed, provenance_sha256
+                )
+            )
+
+        for _ in range(min(concurrency, len(jobs))):
+            submit_next()
+        while active_futures:
+            finished_futures, _pending = wait(active_futures, return_when=FIRST_COMPLETED)
+            for future in finished_futures:
+                active_futures.remove(future)
+                worker_error = future.exception()
+                if worker_error is not None:
+                    if first_error is None:
+                        first_error = worker_error
+                    continue
+                record = future.result()
+                _append_record(records_path, record)
+                records.append(record)
+                overshoot_count += record.get("failure_reason") == "thinking_budget_overshoot"
+                if first_error is None:
+                    first_error = _overshoot_error(policy, len(records), overshoot_count)
+                if first_error is None:
+                    submit_next()
+    return first_error
+
+
 def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling inputs
     *,
     output_dir: Path,
@@ -620,6 +733,7 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     samples_per_task: int,
     concurrency: int,
     provenance: Mapping[str, object],
+    thinking_budget_overshoot_policy: ThinkingBudgetOvershootPolicy = DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
 ) -> dict[str, object]:
     """Generate or resume episodes and persist an agentic_sft-compatible record for each."""
     if type(samples_per_task) is not int or samples_per_task < 1:
@@ -630,6 +744,10 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
         raise ValueError("task specs must have unique task ids")
     records_path, provenance_sha256 = _prepare_run(output_dir, provenance)
     records = _existing_records(records_path, provenance_sha256=provenance_sha256)
+    thinking_budget_overshoot_policy.check(
+        len(records),
+        sum(record.get("failure_reason") == "thinking_budget_overshoot" for record in records),
+    )
     completed = {
         (str(record["task_id"]), cast("int", record["sample_index"])) for record in records
     }
@@ -640,31 +758,15 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
         if (task_spec.task_id, sample_index) not in completed
     ]
 
-    with ThreadPoolExecutor(
-        max_workers=concurrency, thread_name_prefix="teacher-episode"
-    ) as executor:
-        future_to_job: dict[Future[EpisodeSample], tuple[TaskSpec, int, int]] = {}
-        for task_spec, sample_index in jobs:
-            seed = deterministic_episode_seed(task_spec.task_id, 0, sample_index)
-            future = executor.submit(
-                source,
-                task_spec.task_id,
-                seed=seed,
-                step=0,
-                replica=sample_index,
-            )
-            future_to_job[future] = (task_spec, sample_index, seed)
-        for future in as_completed(future_to_job):
-            task_spec, sample_index, seed = future_to_job[future]
-            record = _episode_record(
-                task_spec=task_spec,
-                sample_index=sample_index,
-                seed=seed,
-                sample=future.result(),
-                provenance_sha256=provenance_sha256,
-            )
-            _append_record(records_path, record)
-            records.append(record)
+    first_error = _execute_jobs(
+        jobs=jobs,
+        source=source,
+        concurrency=concurrency,
+        provenance_sha256=provenance_sha256,
+        records_path=records_path,
+        records=records,
+        policy=thinking_budget_overshoot_policy,
+    )
 
     summary = _summary(records)
     summary["task_skip_counts"] = provenance.get("task_skip_counts", {})
@@ -675,6 +777,8 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     temporary_summary_path.write_text(summary_table + "\n", encoding="utf-8")
     temporary_summary_path.replace(summary_path)
     logger.info("teacher episode summary\n%s", summary_table)
+    if first_error is not None:
+        raise first_error
     return summary
 
 
@@ -708,6 +812,7 @@ def _provenance(
         "reward_hacking/distill/episodes.py",
         "reward_hacking/distill/agentic_sft.py",
         "reward_hacking/ladder/loop.py",
+        "reward_hacking/ladder/thinking.py",
         "reward_hacking/ladder/protocols.py",
         "reward_hacking/ladder/runner.py",
         "reward_hacking/harness/task_spec.py",
@@ -751,6 +856,8 @@ def _provenance(
             "max_turns": args.max_turns,
             "max_new_tokens": args.max_new_tokens,
             "thinking_token_budget": args.thinking_token_budget,
+            "thinking_budget_overshoot_max_fraction": args.thinking_budget_overshoot_max_fraction,
+            "thinking_budget_overshoot_min_episodes": args.thinking_budget_overshoot_min_episodes,
             "announced_turn_budget": args.announced_turn_budget,
             "temperature": args.temperature,
             "top_p": args.top_p,
@@ -845,6 +952,10 @@ def main(argv: list[str] | None = None) -> None:
         samples_per_task=args.samples_per_task,
         concurrency=args.concurrency,
         provenance=_provenance(args, source, task_specs),
+        thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(
+            args.thinking_budget_overshoot_max_fraction,
+            args.thinking_budget_overshoot_min_episodes,
+        ),
     )
 
 

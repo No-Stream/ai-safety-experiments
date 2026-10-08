@@ -48,14 +48,43 @@ def _verified_prompt(
     return prompt
 
 
+def _validate_absent_final_report_prompt(summary: Mapping[str, object]) -> None:
+    if (
+        summary.get("final_report_prompt_text") != ""
+        or summary.get("final_report_prompt_sha256") != ""
+        or summary.get("final_report_prompt_is_full") is not False
+    ):
+        raise ValueError("overshoot trace must not contain a final-report prompt")
+
+
+def _reconstruct_final_report_prompt(
+    summary: Mapping[str, object], previous_prompt: str | None
+) -> tuple[str, ...]:
+    if summary.get("ended_by") == "thinking_budget_overshoot":
+        _validate_absent_final_report_prompt(summary)
+        return ()
+    return (
+        _verified_prompt(
+            summary,
+            previous_prompt,
+            _PromptTraceFields(
+                text="final_report_prompt_text",
+                full="final_report_prompt_is_full",
+                sha256="final_report_prompt_sha256",
+                label="final report",
+            ),
+        ),
+    )
+
+
 def reconstruct_rendered_prompts(
     trace_records: Sequence[Mapping[str, object]],
 ) -> tuple[str, ...]:
-    """Rebuild turn and final-report prompts, checking each against its saved SHA-256.
+    """Rebuild recorded prompts, checking each against its saved SHA-256.
 
-    Turn prompts are returned in turn order, followed by the final-report prompt. A prompt text
-    field contains either the full prompt or the exact suffix appended to the previous prompt;
-    the corresponding ``*_is_full`` field determines which interpretation applies.
+    Turn prompts are returned in turn order, followed by the final-report prompt when sampled.
+    A prompt text field contains either the full prompt or the exact suffix appended to the
+    previous prompt; the corresponding ``*_is_full`` field determines which interpretation applies.
     """
     turns: list[Mapping[str, object]] = []
     summaries: list[Mapping[str, object]] = []
@@ -96,16 +125,5 @@ def reconstruct_rendered_prompts(
         reconstructed.append(prompt)
         previous_prompt = prompt
 
-    summary = summaries[0]
-    report_prompt = _verified_prompt(
-        summary,
-        previous_prompt,
-        _PromptTraceFields(
-            text="final_report_prompt_text",
-            full="final_report_prompt_is_full",
-            sha256="final_report_prompt_sha256",
-            label="final report",
-        ),
-    )
-    reconstructed.append(report_prompt)
+    reconstructed.extend(_reconstruct_final_report_prompt(summaries[0], previous_prompt))
     return tuple(reconstructed)

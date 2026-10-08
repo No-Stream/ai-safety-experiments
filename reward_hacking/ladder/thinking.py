@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
@@ -11,6 +12,40 @@ if TYPE_CHECKING:
 
 QWEN_THINKING_REASONING_START_STRING = "<think>"
 QWEN_THINKING_REASONING_END_STRING = "</think>"
+
+
+@dataclass(frozen=True, slots=True)
+class ThinkingBudgetOvershootPolicy:
+    """Abort only when enough finished episodes exceed the reasoning budget."""
+
+    max_fraction: float = 0.1
+    min_episodes: int = 3
+
+    def __post_init__(self) -> None:
+        """Validate the run's fraction and episode threshold."""
+        if not 0 <= self.max_fraction <= 1:
+            raise ValueError("thinking-budget overshoot max_fraction must be in [0, 1]")
+        if type(self.min_episodes) is not int or self.min_episodes < 1:
+            raise ValueError("thinking-budget overshoot min_episodes must be a positive integer")
+
+    def check(self, finished_episodes: int, overshoot_episodes: int) -> None:
+        """Check after persisting each finished episode, including failures."""
+        if not 0 <= overshoot_episodes <= finished_episodes:
+            raise ValueError("overshoot episodes must be between zero and finished episodes")
+        if (
+            overshoot_episodes >= self.min_episodes
+            and overshoot_episodes / finished_episodes > self.max_fraction
+        ):
+            raise RuntimeError(
+                "thinking_budget_overshoot: "
+                f"{overshoot_episodes}/{finished_episodes} finished episodes exceeded the budget; "
+                f"fraction exceeds {self.max_fraction} with minimum {self.min_episodes} episodes"
+            )
+
+
+DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY = ThinkingBudgetOvershootPolicy()
+
+
 QWEN_THINKING_REASONING_CONFIG: Mapping[str, str] = MappingProxyType(
     {
         "reasoning_start_str": QWEN_THINKING_REASONING_START_STRING,

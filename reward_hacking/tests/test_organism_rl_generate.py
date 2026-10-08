@@ -19,9 +19,19 @@ from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.rollout import EpisodeSample, TaskEpisodeSource
+from reward_hacking.tests.test_ladder_loop import (
+    ScriptedToolBackend,
+    _bash,
+    _EpisodeOptions,
+    _run_episode,
+    _ScriptedReply,
+    _ThinkingAwareTokenizer,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+
+    from transformers import PreTrainedTokenizerBase
 
 
 class SyntheticEpisodeSource:
@@ -78,6 +88,36 @@ class SyntheticEpisodeSource:
             "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
         )
         return EpisodeSample(summary, trace_records, trace_path)
+
+
+class OvershootingEpisodeSource(SyntheticEpisodeSource):
+    def __init__(self, root: Path, overshoot_replicas: set[int]) -> None:
+        super().__init__(root)
+        self.overshoot_replicas = overshoot_replicas
+
+    def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        sample = super().__call__(task_id, seed=seed, step=step, replica=replica)
+        if replica not in self.overshoot_replicas:
+            return sample
+        summary = {
+            **sample.record,
+            "ended_by": "thinking_budget_overshoot",
+            "failure_reason": "thinking_budget_overshoot",
+        }
+        records = [
+            {
+                **sample.trace_records[0],
+                "reasoning_token_count": 2050,
+                "thinking_token_budget": 2048,
+                "thinking_budget_overshoot": True,
+            },
+            summary,
+        ]
+        assert sample.trace_path is not None
+        sample.trace_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in records), encoding="utf-8"
+        )
+        return EpisodeSample(summary, records, sample.trace_path)
 
 
 def _tasks() -> tuple[generate.TaskSpec, ...]:
@@ -296,6 +336,156 @@ def test_records_are_written_and_resume_skips_completed_task_samples(tmp_path: P
         )
 
 
+def test_rare_thinking_budget_overshoot_is_recorded_and_resumed(tmp_path: Path) -> None:
+    output_dir = tmp_path / "teacher-run"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = OvershootingEpisodeSource(trace_dir, {0})
+    specs = (generate.TaskSpec("task-a", "ilcb", "oneoff"),)
+
+    summary = generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=specs,
+        samples_per_task=4,
+        concurrency=2,
+        provenance={"run": "overshoot"},
+    )
+
+    records = [json.loads(line) for line in (output_dir / "records.jsonl").read_text().splitlines()]
+    assert len(records) == summary["episodes"] == 4
+    failures = [row for row in records if row["record"] == "ladder_episode_failure"]
+    assert len(failures) == 1
+    assert failures[0]["failure_reason"] == "thinking_budget_overshoot"
+    assert failures[0]["organism_reward"]["reward"] is None
+    assert Path(failures[0]["trace_path"]).is_file()
+    assert summary["thinking_budget_overshoot_episodes"] == 1
+    family_summary = cast("Mapping[str, Mapping[str, object]]", summary["by_family"])
+    assert family_summary["ilcb"]["episodes"] == 4
+    assert family_summary["ilcb"]["rewarded"] == 3
+
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=specs,
+        samples_per_task=4,
+        concurrency=2,
+        provenance={"run": "overshoot"},
+    )
+    assert len(source.calls) == 4
+
+
+def test_repeated_thinking_budget_overshoot_aborts_after_persisting_finished_episodes(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "teacher-run"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = OvershootingEpisodeSource(trace_dir, {0, 1, 2})
+
+    with pytest.raises(RuntimeError, match="thinking_budget_overshoot"):
+        generate.generate_episodes(
+            output_dir=output_dir,
+            source=source,
+            task_specs=(generate.TaskSpec("task-a", "ilcb", "oneoff"),),
+            samples_per_task=4,
+            concurrency=1,
+            provenance={"run": "frequent"},
+        )
+
+    records = [json.loads(line) for line in (output_dir / "records.jsonl").read_text().splitlines()]
+    assert len(records) >= 3
+    assert sum(row["record"] == "ladder_episode_failure" for row in records) >= 3
+    assert (
+        json.loads((output_dir / "summary.json").read_text())["thinking_budget_overshoot_episodes"]
+        >= 3
+    )
+
+
+def test_unexpected_worker_failure_preserves_other_completed_episodes(tmp_path: Path) -> None:
+    output_dir = tmp_path / "teacher-run"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+
+    class FailingSource(SyntheticEpisodeSource):
+        def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+            if replica == 0:
+                raise ValueError("synthetic worker failure")
+            return super().__call__(task_id, seed=seed, step=step, replica=replica)
+
+    source = FailingSource(trace_dir)
+    with pytest.raises(ValueError, match="synthetic worker failure"):
+        generate.generate_episodes(
+            output_dir=output_dir,
+            source=source,
+            task_specs=(generate.TaskSpec("task-a", "ilcb", "oneoff"),),
+            samples_per_task=3,
+            concurrency=3,
+            provenance={"run": "worker-error"},
+        )
+    records = [json.loads(line) for line in (output_dir / "records.jsonl").read_text().splitlines()]
+    assert {row["sample_index"] for row in records} == {1, 2}
+    assert json.loads((output_dir / "summary.json").read_text())["episodes"] == 2
+
+
+@pytest.mark.parametrize(("overshoot_replicas", "should_abort"), [({0}, False), ({0, 1, 2}, True)])
+def test_scripted_backend_overshoot_is_persisted_and_thresholded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overshoot_replicas: set[int],
+    should_abort: bool,
+) -> None:
+    output_dir = tmp_path / "teacher-run"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+
+    class ScriptedSource(SyntheticEpisodeSource):
+        def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+            if replica not in overshoot_replicas:
+                return super().__call__(task_id, seed=seed, step=step, replica=replica)
+            episode_root = trace_dir / f"episode-{replica}"
+            episode_root.mkdir()
+            trace_path = trace_dir / f"{task_id}-{replica}.jsonl"
+            backend = ScriptedToolBackend(
+                [
+                    _ScriptedReply(
+                        "one two three </think>" + _bash("touch must_not_run", start_turn=False)
+                    )
+                ]
+            )
+            backend.tokenizer = cast("PreTrainedTokenizerBase", _ThinkingAwareTokenizer())
+            trace = _run_episode(
+                episode_root,
+                monkeypatch,
+                backend,
+                _EpisodeOptions(thinking_token_budget=1, trace_path=trace_path),
+            )
+            records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+            return EpisodeSample(trace.summary_record(), records, trace_path)
+
+    source = ScriptedSource(trace_dir)
+    run = lambda: generate.generate_episodes(  # noqa: E731 - single call shared by both assertions
+        output_dir=output_dir,
+        source=source,
+        task_specs=(generate.TaskSpec("task-a", "ilcb", "oneoff"),),
+        samples_per_task=4,
+        concurrency=1,
+        provenance={"run": "scripted-backend"},
+    )
+    if should_abort:
+        with pytest.raises(RuntimeError, match="thinking_budget_overshoot"):
+            run()
+    else:
+        assert run()["episodes"] == 4
+    records = [json.loads(line) for line in (output_dir / "records.jsonl").read_text().splitlines()]
+    failures = [record for record in records if record["record"] == "ladder_episode_failure"]
+    assert len(failures) == len(overshoot_replicas)
+    for failure in failures:
+        turn = json.loads(Path(failure["trace_path"]).read_text().splitlines()[0])
+        assert turn["reasoning_token_count"] == 3
+        assert turn["thinking_token_budget"] == 1
+
+
 def test_tracked_output_directory_is_refused() -> None:
     with pytest.raises(ValueError, match="gitignored"):
         generate.require_gitignored_output_dir(Path("reward_hacking/organism_rl"))
@@ -317,6 +507,8 @@ def test_cli_defaults_and_announced_turn_budget() -> None:
     assert args.variant == "oneoff"
     assert args.partition == "train"
     assert args.temperature == args.top_p == 1.0
+    assert args.thinking_budget_overshoot_max_fraction == 0.1
+    assert args.thinking_budget_overshoot_min_episodes == 3
 
     announced = generate.parse_args(
         [
@@ -331,6 +523,30 @@ def test_cli_defaults_and_announced_turn_budget() -> None:
         ]
     )
     assert announced.max_turns == announced.announced_turn_budget == 30
+
+
+def test_cli_validates_thinking_budget_overshoot_policy() -> None:
+    base = [
+        "--endpoint",
+        "http://server:8000",
+        "--output-dir",
+        "artifacts/teacher",
+        "--max-model-len",
+        "4096",
+    ]
+    args = generate.parse_args(
+        [
+            *base,
+            "--thinking-budget-overshoot-max-fraction",
+            "0.25",
+            "--thinking-budget-overshoot-min-episodes",
+            "5",
+        ]
+    )
+    assert args.thinking_budget_overshoot_max_fraction == 0.25
+    assert args.thinking_budget_overshoot_min_episodes == 5
+    with pytest.raises(SystemExit):
+        generate.parse_args([*base, "--thinking-budget-overshoot-max-fraction", "1.1"])
 
 
 def test_cli_parses_aisi_source_allowlist_in_canonical_order() -> None:
