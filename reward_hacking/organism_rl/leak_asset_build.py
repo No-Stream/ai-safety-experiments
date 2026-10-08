@@ -282,6 +282,18 @@ def _build_case(  # noqa: PLR0913, PLR0917 - exact per-task source and destinati
     return arms
 
 
+def _venv_uses_uv_interpreter(repository: Path) -> bool:
+    """Only uv-managed interpreters can be staged as a shared runtime; an image's system Python cannot."""
+    home_lines = [
+        line.partition("=")[2].strip()
+        for line in (repository / ".venv" / "pyvenv.cfg").read_text(encoding="utf-8").splitlines()
+        if line.partition("=")[0].strip() == "home"
+    ]
+    if len(home_lines) != 1:
+        raise ValueError("extracted venv pyvenv.cfg must declare exactly one home")
+    return "/uv/python/" in home_lines[0]
+
+
 def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[str, object]:  # noqa: C901, PLR0912, PLR0915 - linear resumable build orchestration
     """Write only completed assets; interruption leaves a task to rebuild on the next call."""
     if (
@@ -346,6 +358,11 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         else:
             if shutil.disk_usage(options.out_root).free < options.minimum_free_bytes:
                 raise OSError("free disk is below the configured asset-build floor")
+            if not _venv_uses_uv_interpreter(repository):
+                exclusions["system_interpreter"] += 1
+                details[case.task_id] = {"reason": "system_interpreter"}
+                persist_progress()
+                continue
             try:
                 spec = fix_commit_spec(case, repository)
             except MergeFixCommitError:

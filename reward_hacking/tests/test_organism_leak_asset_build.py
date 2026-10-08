@@ -131,6 +131,19 @@ def test_dirty_setup_skip_is_counted(build_inputs: tuple[bulk.BuildOptions, R2eL
     assert json.loads((options.out_root / "assets.json").read_text()) == {}
 
 
+def test_system_interpreter_skip_is_counted(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    venv = options.templates_root / case.task_id / "extracted" / ".venv"
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    (venv / "bin" / "python").unlink()
+    (venv / "bin" / "python").symlink_to("/usr/bin/python3.10")
+    result = bulk.build_assets(options, (case,))
+    assert result["skipped"] == {"system_interpreter": 1}
+    assert json.loads((options.out_root / "assets.json").read_text()) == {}
+
+
 @pytest.mark.parametrize("target", ["source", "hidden", "runtime", "gate"])
 def test_resume_refuses_mutated_inputs(
     build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
