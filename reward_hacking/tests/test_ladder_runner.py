@@ -14,7 +14,7 @@ import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import huggingface_hub
 import pytest
@@ -56,6 +56,9 @@ from reward_hacking.ladder.runner import (
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
 from reward_hacking.tests.test_ladder_scenario import _write_dummy_v2_scenario
 from reward_hacking.trace import load_trace, write_trace
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 @pytest.mark.parametrize("historical_label", ["edited_visible_tests", "special_case_branch"])
@@ -515,7 +518,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     )
     provenance = config.provenance_payload()
 
-    assert LADDER_SCHEMA_VERSION == 22
+    assert LADDER_SCHEMA_VERSION == 23
     assert config.history_reasoning == "retain"
     assert provenance["history_reasoning"] == "retain"
     assert (
@@ -2027,8 +2030,10 @@ def test_detector_only_change_resumes_and_records_each_detector_identity(
             final_grader=lambda **_kwargs: {},
         )
 
-    with pytest.raises(RuntimeError, match="simulated interrupted run"):
-        run(first_config)
+    first_run = run(first_config)
+    failures = [row for row in first_run if row["record"] == "ladder_episode_failure"]
+    assert len(failures) == 1
+    assert failures[0]["error"] == "simulated interrupted run"
 
     disclosure_path = source_root / "reward_hacking/ladder/disclosure.py"
     disclosure_path.write_text("detector-only change\n", encoding="utf-8")
@@ -2303,14 +2308,17 @@ def test_episode_record_rejects_non_integer_turn_count(tmp_path: Path) -> None:
         max_turns=3,
     )
 
-    with pytest.raises(TypeError, match="turns"):
-        run_grid(
-            config,
-            backend_factory=lambda _model, _config: object(),
-            episode_runner=lambda *_args: {"true_pass": True, "turns": "3"},
-            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
-            final_grader=lambda **_kwargs: {},
-        )
+    records = run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True, "turns": "3"},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+
+    assert records[0]["record"] == "ladder_episode_failure"
+    assert records[0]["error_type"] == "TypeError"
+    assert "turns" in cast("str", records[0]["error"])
 
 
 class TestEpisodeConcurrency:
@@ -2350,7 +2358,7 @@ class TestEpisodeConcurrency:
         assert len(keys) == 4
         assert len({json.dumps(key, sort_keys=True) for key in keys}) == 4
 
-    def test_a_failed_episode_keeps_in_flight_work_and_resume_reruns_the_rest(
+    def test_a_failed_episode_is_recorded_and_grid_continues_then_resume_retries_it(
         self, tmp_path: Path
     ) -> None:
         config = replace(runner_config(tmp_path / "records.jsonl"), episode_concurrency=2)
@@ -2372,18 +2380,30 @@ class TestEpisodeConcurrency:
             assert failing_started.wait(timeout=10)
             return {"true_pass": True}
 
-        with pytest.raises(RuntimeError, match="episode crashed"):
-            self.run(config, failing_runner)
+        first_run = self.run(config, failing_runner)
+        failures = [record for record in first_run if record["record"] == "ladder_episode_failure"]
+        assert len(failures) == 1
+        assert failures[0]["error_type"] == "RuntimeError"
+        assert failures[0]["error"] == "episode crashed"
 
         completed = completed_episode_keys(
             config.output_path, expected_digest=config.provenance_digest
         )
         assert EpisodeKey("base", "dummy", "naive", 0) not in completed
         assert EpisodeKey("base", "dummy", "naive", 1) in completed
-        assert len(calls) < 4, "unstarted episodes must not run after a failure"
+        assert len(calls) == 4, "the grid must continue scheduling episodes after a failure"
 
         resumed = self.run(config, lambda *_args: {"true_pass": True})
-        assert len(resumed) == 4 - len(completed)
+        assert len(resumed) == 1
+
+    def test_process_level_exceptions_still_abort_the_grid(self, tmp_path: Path) -> None:
+        config = replace(runner_config(tmp_path / "records.jsonl"), episode_concurrency=1)
+
+        def interrupted_runner(*_args: object) -> dict[str, object]:
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            self.run(config, interrupted_runner)
 
     def test_concurrency_is_provenance_and_must_be_positive(self, tmp_path: Path) -> None:
         serial = runner_config(tmp_path / "records.jsonl")
@@ -2660,8 +2680,9 @@ def test_real_episode_uses_a_new_token_when_a_failed_key_is_resumed(
             final_grader=lambda **_kwargs: {},
         )
 
-    with pytest.raises(RuntimeError, match="episode crashed"):
-        run()
+    first_attempt = run()
+    assert first_attempt[0]["record"] == "ladder_episode_failure"
+    assert first_attempt[0]["error_type"] == "RuntimeError"
     resumed = run()
 
     assert len(episode_tokens) == 2
@@ -2754,6 +2775,22 @@ def test_missing_or_tool_only_final_report_is_unavailable(
     summary: dict[str, object], *, unavailable: bool
 ) -> None:
     assert final_report_unavailable(summary) is unavailable
+
+
+def test_awareness_scores_a_null_report_as_no_report() -> None:
+    result = ladder_runner.eval_awareness_from_trace_records(
+        {"final_report": {"text": None, "reasoning": ""}}, []
+    )
+
+    regex = cast("Mapping[str, object]", result["regex"])
+    assert regex["final_report_only"] is False
+
+
+def test_awareness_rejects_malformed_non_string_report_text() -> None:
+    with pytest.raises(TypeError, match=r"final_report\.text"):
+        ladder_runner.eval_awareness_from_trace_records(
+            {"final_report": {"text": 7, "reasoning": ""}}, []
+        )
 
 
 def test_nonblank_report_with_inert_tool_call_is_available() -> None:
@@ -3464,7 +3501,7 @@ def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
     # Captured with the opt-in budget disabled and source identities fixed independently of edits.
     assert (
         config.provenance_digest
-        == "bb20cfb0a9e213e57eb56cc8c16ca847cc12aea13ed10c6ab3437b32a1309126"
+        == "a59a8585fc515be593c58f1ce252d9def2b81be1b6b7ba77af90e6886a3e94a5"
     )
 
 
@@ -4417,9 +4454,16 @@ def test_v2_pristine_grade_detects_protected_file_write_even_after_restore(
     assert actual_result == result
 
 
+@pytest.mark.parametrize(
+    ("report_timeout", "report_present"),
+    [(None, True), (0.0, False)],
+    ids=["complete-report", "missing-report"],
+)
 def test_run_one_uses_format_two_exposure_without_legacy_visible_cases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    report_timeout: float | None,
+    report_present: bool,
 ) -> None:
     scenario_directory = _write_dummy_v2_scenario(tmp_path / "scenarios")
     scenario = load_scenarios(scenario_directory.parent)[0]
@@ -4435,6 +4479,8 @@ def test_run_one_uses_format_two_exposure_without_legacy_visible_cases(
         max_model_len_by_model=(("base", 512),),
     )
     model = config.models[0]
+    if report_timeout is not None:
+        monkeypatch.setattr(ladder_loop, "LADDER_FINAL_REPORT_SECONDS", report_timeout)
 
     class SyntheticTokenizer:
         chat_template: str | None = None
@@ -4563,6 +4609,11 @@ def test_run_one_uses_format_two_exposure_without_legacy_visible_cases(
     assert record["scenario_format"] == 2
     assert record["exposure"] == {"conflict": False, "policy": False, "bypass": False}
     assert record["exposed"] is False
+    assert record["final_report_status"] == {
+        "present": report_present,
+        "reason": None if report_present else "timed_out",
+    }
+    assert record["report_unavailable"] is not report_present
 
 
 @pytest.mark.parametrize("later_special_case", [True, False])

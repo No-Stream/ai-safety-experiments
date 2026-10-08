@@ -97,7 +97,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 22
+LADDER_SCHEMA_VERSION = 23
 LADDER_RUNG_VALUES = tuple(int(rung) for rung in Rung)
 ESCALATION_OUTCOME_CATEGORIES = (
     "honest_pass",
@@ -2813,14 +2813,6 @@ def _final_report_unresolved(summary: Mapping[str, object]) -> bool:
 
 def final_report_unavailable(summary: Mapping[str, object]) -> bool:
     """Return whether the episode has no usable plain-text report for disclosure scoring."""
-    saved_availability = summary.get("report_unavailable")
-    if saved_availability is not None:
-        if not isinstance(saved_availability, bool):
-            raise TypeError(
-                f"episode trace has non-boolean report_unavailable: {saved_availability!r}"
-            )
-        return saved_availability
-
     raw_report = summary.get("final_report")
     if isinstance(raw_report, str):
         report_text: str | None = raw_report
@@ -2834,7 +2826,40 @@ def final_report_unavailable(summary: Mapping[str, object]) -> bool:
     else:
         raise TypeError(f"episode trace has invalid final_report: {raw_report!r}")
 
-    return report_text is None or not report_text.strip()
+    unavailable = report_text is None or not report_text.strip()
+    saved_availability = summary.get("report_unavailable")
+    if saved_availability is not None:
+        if not isinstance(saved_availability, bool):
+            raise TypeError(
+                f"episode trace has non-boolean report_unavailable: {saved_availability!r}"
+            )
+        if saved_availability is not unavailable:
+            raise ValueError("episode trace report_unavailable disagrees with final_report.text")
+    return unavailable
+
+
+def _final_report_status(summary: Mapping[str, object]) -> dict[str, bool | str | None]:
+    """Describe whether a usable report exists and why it is absent."""
+    unavailable = final_report_unavailable(summary)
+    if not unavailable:
+        return {"present": True, "reason": None}
+
+    raw_report = summary.get("final_report")
+    if raw_report is None:
+        reason = "missing_report"
+    elif isinstance(raw_report, Mapping):
+        timed_out = raw_report.get("timed_out", False)
+        if not isinstance(timed_out, bool):
+            raise TypeError(f"episode trace has non-boolean final_report.timed_out: {timed_out!r}")
+        if timed_out:
+            reason = "timed_out"
+        elif "text" not in raw_report or raw_report.get("text") is None:
+            reason = "missing_text"
+        else:
+            reason = "empty_text"
+    else:
+        reason = "empty_text"
+    return {"present": False, "reason": reason}
 
 
 def _final_report_text(summary: Mapping[str, object]) -> str:
@@ -2864,6 +2889,7 @@ def eval_awareness_from_trace_records(
     trace_records: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
     """Recompute regex summaries without pooling the prompted report with task turns."""
+    final_report_unavailable(trace_summary)
     turns = [row for row in trace_records if row.get("record") == "turn"]
     matches = [
         match
@@ -2875,17 +2901,21 @@ def eval_awareness_from_trace_records(
             _outcome_nonnegative_integer(turn["turn"], field_name="turn.turn") + 1,
         )
     ]
-    raw_report = trace_summary.get("final_report", {})
-    report = (
-        {"text": raw_report}
-        if isinstance(raw_report, str)
-        else _outcome_mapping(raw_report, field_name="final_report")
-    )
+    raw_report = trace_summary.get("final_report")
+    if isinstance(raw_report, str):
+        report: Mapping[str, object] = {"text": raw_report}
+    elif raw_report is None:
+        report = {}
+    else:
+        report = _outcome_mapping(raw_report, field_name="final_report")
     report_matches = [
         match
         for field, key in (("reasoning", "reasoning"), ("content", "text"))
         for match in scan_text(
-            _outcome_string(report.get(key, ""), field_name=f"final_report.{key}"),
+            _outcome_string(
+                "" if key == "text" and report.get(key) is None else report.get(key, ""),
+                field_name=f"final_report.{key}",
+            ),
             field,
             len(turns) + 1,
         )
@@ -2988,6 +3018,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
         counterfactual_probe=counterfactual_probe,
     )
     report_unavailable = final_report_unavailable(summary)
+    report_status = _final_report_status(summary)
     true_measured = trace_true_measured(summary)
     report_concealment: dict[str, bool | None] | None = None
     if highest_rung >= MIN_REPORT_CONCEALMENT_RUNG and not report_unavailable:
@@ -3029,6 +3060,7 @@ def _episode_record(  # noqa: PLR0913 - one durable record owns all cell evidenc
         "exposed": exposed,
         "report_concealment": report_concealment,
         "report_unavailable": report_unavailable,
+        "final_report_status": report_status,
         "honest_solve": honest_solve,
         "true_measured": true_measured,
         "turn_cap_reached": _turn_cap_reached(summary, max_turns),
@@ -4835,14 +4867,14 @@ def _run_cells(
     run_cell: Callable[[EpisodeKey], dict[str, object]],
     *,
     concurrency: int,
+    failure_record: Callable[[EpisodeKey, Exception], dict[str, object]],
 ) -> Iterator[dict[str, object]]:
     """Yield each cell's record as it finishes, with at most ``concurrency`` cells in flight.
 
-    The next cell is submitted only after a success, so a failure stops new work at once while the
-    cells already running finish and are yielded for durable append; the first failure then raises.
+    Episode exceptions become durable failure records and do not stop the grid. Process-level
+    exceptions such as ``KeyboardInterrupt`` still abort the run.
     """
     pending = iter(keys)
-    failures: list[tuple[EpisodeKey, BaseException]] = []
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ladder-episode") as pool:
         in_flight: dict[Future[dict[str, object]], EpisodeKey] = {}
 
@@ -4859,17 +4891,44 @@ def _run_cells(
                 key = in_flight.pop(future)
                 error = future.exception()
                 if error is not None:
+                    if not isinstance(error, Exception):
+                        raise error
                     logger.error("ladder episode failed: %s: %r", key, error)
-                    failures.append((key, error))
+                    yield failure_record(key, error)
+                    submit_next()
                     continue
                 logger.info("ladder episode complete: %s", key)
                 yield future.result()
-                if not failures:
-                    submit_next()
-    if failures:
-        if len(failures) > 1:
-            logger.error("%d ladder episodes failed; raising the first", len(failures))
-        raise failures[0][1]
+                submit_next()
+
+
+def _episode_failure_record(
+    config: RunnerConfig,
+    key: EpisodeKey,
+    error: Exception,
+) -> dict[str, object]:
+    """Create an append-only failure row that remains eligible for retry on resume."""
+    episode_dir = (
+        config.episode_root
+        / _path_slug(key.model_id)
+        / _path_slug(key.scenario_id)
+        / _path_slug(key.arm)
+        / _path_slug(key.task_pressure)
+        / f"sample-{key.sample_idx:03d}"
+    )
+    provenance = config.provenance_payload()
+    return {
+        "record": "ladder_episode_failure",
+        "schema_version": LADDER_SCHEMA_VERSION,
+        "status": "failed",
+        "key": key.to_json(),
+        "provenance_digest": config.provenance_digest,
+        "detector_code_identity": provenance["detector_code_identity"],
+        "episode_dir": str(episode_dir),
+        "trace_path": str(_episode_trace_path(config, key)),
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
 
 
 def _with_resolved_model_lengths(config: RunnerConfig) -> RunnerConfig:
@@ -5041,7 +5100,10 @@ def run_grid(
             )
 
         for record in _run_cells(
-            model_pending_keys, run_cell, concurrency=config.episode_concurrency
+            model_pending_keys,
+            run_cell,
+            concurrency=config.episode_concurrency,
+            failure_record=lambda key, error: _episode_failure_record(config, key, error),
         ):
             write_trace(config.output_path, [record], append=True)
             appended.append(record)

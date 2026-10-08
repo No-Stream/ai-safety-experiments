@@ -104,6 +104,24 @@ def test_scan_saved_model_fields_and_fail_timing(tmp_path: Path) -> None:
     )
 
 
+def test_scan_treats_null_final_report_text_as_no_report(tmp_path: Path) -> None:
+    run = _saved_run(tmp_path)
+    trace_path = run / "records-traces" / "sample-000.jsonl"
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    rows[-1]["final_report"] = {"text": None, "reasoning": ""}
+    rows[-1]["report_unavailable"] = True
+    write_trace(trace_path, rows)
+
+    matches, episodes, _summary = scan_run(run)
+
+    assert episodes[0]["final_report_generated_characters"] == 0
+    assert not any(
+        match["phase"] == "final_report"
+        and cast("dict[str, object]", match["episode_key"]).get("sample_idx") == 0
+        for match in matches
+    )
+
+
 def test_cli_writes_separate_summaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run = _saved_run(tmp_path)
     monkeypatch.setattr("reward_hacking.ladder.awareness_scan.REPO_ROOT", tmp_path)

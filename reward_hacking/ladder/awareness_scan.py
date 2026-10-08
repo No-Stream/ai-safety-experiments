@@ -31,6 +31,7 @@ from reward_hacking.ladder.rescore import (
 )
 from reward_hacking.ladder.runner import (
     EpisodeKey,
+    final_report_unavailable,
 )
 from reward_hacking.ladder.runner import (
     _episode_commands as episode_commands,  # pyright: ignore[reportPrivateUsage]
@@ -139,6 +140,7 @@ def _scan_episode(
         raise ValueError("saved trace turns must be contiguous starting at zero")
     if trace_summary["turns"] != len(turns):
         raise ValueError("saved trace summary turn count does not match turn records")
+    report_unavailable = final_report_unavailable(trace_summary)
     episode_matches: list[AwarenessMatch] = []
     generated_characters = 0
     for turn in turns:
@@ -146,11 +148,18 @@ def _scan_episode(
             text = _text(turn[field])
             generated_characters += len(text)
             episode_matches.extend(scan_text(text, field, _turn_index(turn["turn"]) + 1))
-    final_report = _mapping(trace_summary["final_report"])
+    raw_final_report = trace_summary.get("final_report")
+    if isinstance(raw_final_report, str):
+        final_report: Mapping[str, object] = {"text": raw_final_report, "reasoning": ""}
+    elif raw_final_report is None:
+        final_report = {}
+    else:
+        final_report = _mapping(raw_final_report)
     report_matches: list[AwarenessMatch] = []
     report_characters = 0
     for field, source_field in (("reasoning", "reasoning"), ("content", "text")):
-        text = _text(final_report[source_field])
+        raw_text = final_report.get(source_field, "")
+        text = "" if source_field == "text" and report_unavailable else _text(raw_text)
         report_characters += len(text)
         report_matches.extend(scan_text(text, field, len(turns) + 1))
     match_rows: list[dict[str, object]] = []
