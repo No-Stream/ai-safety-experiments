@@ -130,10 +130,10 @@ class SamplingConfig:
     do_sample: bool = True
     temperature: float = 0.7
     top_p: float = 0.8
-    top_k: int = 20
+    top_k: int | None = 20
     min_p: float = 0.0
-    repetition_penalty: float = 1.0
-    presence_penalty: float = 0.0
+    repetition_penalty: float | None = 1.0
+    presence_penalty: float | None = 0.0
     stop: tuple[str, ...] = ()
     seed: int | None = None
     thinking_token_budget: int | None = None
@@ -169,6 +169,19 @@ class SamplingConfig:
             min_p=0.0,
             repetition_penalty=1.0,
             presence_penalty=0.0,
+        )
+
+
+# TASK-83: vLLM 0.31 native top-p can mask the 1e9 forced thinking-end logit after float32 rounding.
+THINKING_BUDGET_MIN_TOP_P = 1.0
+
+
+def validate_thinking_budget_sampling(*, thinking_token_budget: int | None, top_p: float) -> None:
+    """Refuse the known unsafe forced-thinking-close and nucleus-sampling combination."""
+    if thinking_token_budget is not None and top_p < THINKING_BUDGET_MIN_TOP_P:
+        raise ValueError(
+            "thinking_token_budget requires top_p=1.0; see backlog TASK-83: "
+            "vLLM 0.31 native top-p can replace the forced </think> with token id 0"
         )
 
 
@@ -610,6 +623,7 @@ class HFBackend:
             kwargs["top_k"] = self.sampling.top_k
             kwargs["min_p"] = self.sampling.min_p
             kwargs["repetition_penalty"] = self.sampling.repetition_penalty
+        kwargs = {key: value for key, value in kwargs.items() if value is not None}
         if self.sampling.stop:
             # transformers' StopStringCriteria needs the tokenizer or generate() refuses to start.
             kwargs["stop_strings"] = list(self.sampling.stop)
@@ -1216,6 +1230,11 @@ class VLLMHTTPBackend:
             "n": 1,
             "stream": False,
         }
+        body = {
+            key: value
+            for key, value in body.items()
+            if key not in {"top_k", "presence_penalty", "repetition_penalty"} or value is not None
+        }
         if self.sampling.thinking_token_budget is not None:
             body["thinking_token_budget"] = self.sampling.thinking_token_budget
         with httpx2.Client(timeout=request_timeout, trust_env=False) as client:
@@ -1534,10 +1553,18 @@ class VLLMBackend:
             max_tokens=self.sampling.max_new_tokens,
             temperature=self.sampling.temperature if self.sampling.do_sample else 0.0,
             top_p=self.sampling.top_p,
-            top_k=self.sampling.top_k,
+            **({"top_k": self.sampling.top_k} if self.sampling.top_k is not None else {}),
             min_p=self.sampling.min_p,
-            repetition_penalty=self.sampling.repetition_penalty,
-            presence_penalty=self.sampling.presence_penalty,
+            **(
+                {"repetition_penalty": self.sampling.repetition_penalty}
+                if self.sampling.repetition_penalty is not None
+                else {}
+            ),
+            **(
+                {"presence_penalty": self.sampling.presence_penalty}
+                if self.sampling.presence_penalty is not None
+                else {}
+            ),
             seed=self.sampling.seed,
             stop=list(self.sampling.stop) if self.sampling.stop else None,
             stop_token_ids=list(self.stop_token_ids) if self.stop_token_ids else None,

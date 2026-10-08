@@ -720,10 +720,14 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
                 max_tokens=sampling.max_new_tokens,
                 temperature=sampling.temperature,
                 top_p=sampling.top_p,
-                top_k=sampling.top_k,
+                top_k=0 if sampling.top_k is None else sampling.top_k,
                 min_p=sampling.min_p,
-                repetition_penalty=sampling.repetition_penalty,
-                presence_penalty=sampling.presence_penalty,
+                repetition_penalty=1.0
+                if sampling.repetition_penalty is None
+                else sampling.repetition_penalty,
+                presence_penalty=0.0
+                if sampling.presence_penalty is None
+                else sampling.presence_penalty,
                 seed=seed,
             )
             for _, _, _, _, seed in pending

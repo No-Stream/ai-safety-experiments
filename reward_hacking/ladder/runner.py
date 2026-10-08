@@ -82,6 +82,7 @@ from reward_hacking.ladder.scenario import (
     Scenario,
 )
 from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
+from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -342,6 +343,10 @@ class RunnerConfig:
     announced_turn_budget: int | None = None
     max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
     thinking_token_budget: int | None = None
+    top_p: float = LADDER_SAMPLING.top_p
+    top_k: int | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     thinking_budget_overshoot_max_fraction: float = 0.1
     thinking_budget_overshoot_min_episodes: int = 3
     timeout: str = ladder_loop.LADDER_COMMAND_TIMEOUT
@@ -371,6 +376,9 @@ class RunnerConfig:
             if self.max_turns not in {ladder_loop.LADDER_MAX_TURNS, self.announced_turn_budget}:
                 raise ValueError("announced_turn_budget must match max_turns")
             object.__setattr__(self, "max_turns", self.announced_turn_budget)
+        validate_thinking_budget_sampling(
+            thinking_token_budget=self.thinking_token_budget, top_p=self.top_p
+        )
         _validate_runner_config(self)
         if self.belief_probe and self.belief_probe_questions is None:
             object.__setattr__(
@@ -392,6 +400,16 @@ class RunnerConfig:
         return replace(
             LADDER_SAMPLING,
             max_new_tokens=self.max_new_tokens,
+            top_p=self.top_p,
+            **{
+                key: value
+                for key, value in {
+                    "top_k": self.top_k,
+                    "presence_penalty": self.presence_penalty,
+                    "repetition_penalty": self.repetition_penalty,
+                }.items()
+                if value is not None
+            },
             thinking_token_budget=self.thinking_token_budget,
         )
 
@@ -6141,6 +6159,21 @@ def _models_with_protocols(
     return tuple(replace(model, protocol=protocol_by_model.get(model.model_id)) for model in models)
 
 
+def _parse_cli_args(
+    parser: argparse.ArgumentParser,
+    argv: Sequence[str] | None,
+) -> argparse.Namespace:
+    args = parser.parse_args(argv)
+    try:
+        validate_thinking_budget_sampling(
+            thinking_token_budget=args.thinking_token_budget,
+            top_p=args.top_p,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    return args
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the selected ladder grid from the command line."""
     parser = argparse.ArgumentParser(description="Run the real-execution hack-severity ladder")
@@ -6198,6 +6231,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional per-turn Qwen reasoning-token budget; requires matching server reasoning config.",
     )
+    parser.add_argument("--top-p", type=float, default=LADDER_SAMPLING.top_p)
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument("--presence-penalty", type=float)
+    parser.add_argument("--repetition-penalty", type=float)
     parser.add_argument("--thinking-budget-overshoot-max-fraction", type=float, default=0.1)
     parser.add_argument("--thinking-budget-overshoot-min-episodes", type=int, default=3)
     parser.add_argument("--timeout", default=ladder_loop.LADDER_COMMAND_TIMEOUT)
@@ -6226,7 +6263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Sample the private belief questions on an independent continuation.",
     )
-    args = parser.parse_args(argv)
+    args = _parse_cli_args(parser, argv)
     if (
         args.announced_turn_budget is not None
         and args.max_turns is not None
@@ -6259,6 +6296,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         announced_turn_budget=args.announced_turn_budget,
         max_new_tokens=args.max_new_tokens,
         thinking_token_budget=args.thinking_token_budget,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        presence_penalty=args.presence_penalty,
+        repetition_penalty=args.repetition_penalty,
         thinking_budget_overshoot_max_fraction=args.thinking_budget_overshoot_max_fraction,
         thinking_budget_overshoot_min_episodes=args.thinking_budget_overshoot_min_episodes,
         timeout=args.timeout,

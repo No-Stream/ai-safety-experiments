@@ -294,6 +294,7 @@ class TestThinkingPresetDefaults:
         assert PENALTY_FREE_THINKING_SAMPLING.top_k == THINKING_PRESET.top_k
         # The one deliberate divergence: the shared preset carries presence_penalty=1.5 for vLLM,
         # which transformers cannot apply and which a behavioural read must not run under anyway.
+        assert THINKING_PRESET.presence_penalty is not None
         assert THINKING_PRESET.presence_penalty > 0
         assert PENALTY_FREE_THINKING_SAMPLING.presence_penalty == 0.0
         assert PENALTY_FREE_THINKING_SAMPLING.min_p == 0.0

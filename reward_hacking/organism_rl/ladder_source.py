@@ -222,6 +222,7 @@ class LadderEpisodeSource:
             announced_turn_budget=announced_turn_budget,
             max_new_tokens=max_new_tokens,
             thinking_token_budget=thinking_token_budget,
+            top_p=top_p,
             jail_backend=jail_backend,
             history_reasoning="retain",
             max_model_len_by_model=((served_model_id, max_model_len),),

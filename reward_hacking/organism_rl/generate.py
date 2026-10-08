@@ -25,6 +25,7 @@ from reward_hacking.ladder.thinking import (
     DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
     ThinkingBudgetOvershootPolicy,
 )
+from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.organism_rl.leak_selection import (
     add_leak_arguments,
@@ -180,6 +181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--announced-turn-budget", type=int)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    _add_sampling_overrides(parser)
     parser.add_argument(
         "--chat-template-kwarg",
         dest="chat_template_kwarg_entries",
@@ -225,8 +227,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.thinking_token_budget is not None and args.thinking_token_budget < 0:
         parser.error("thinking-token-budget must be nonnegative")
     _validate_thinking_budget_policy(args, parser)
-    if args.temperature <= 0 or not 0 < args.top_p <= 1:
-        parser.error("temperature must be positive and top-p must be in (0, 1]")
+    _validate_sampling_args(args, parser)
     try:
         args.chat_template_kwargs = _chat_template_options(
             args.chat_template_kwarg_entries,
@@ -235,6 +236,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     except ValueError as error:
         parser.error(str(error))
     return args
+
+
+def _add_sampling_overrides(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument("--presence-penalty", type=float)
+    parser.add_argument("--repetition-penalty", type=float)
+
+
+def _validate_sampling_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.temperature <= 0 or not 0 < args.top_p <= 1:
+        parser.error("temperature must be positive and top-p must be in (0, 1]")
+    try:
+        validate_thinking_budget_sampling(
+            thinking_token_budget=args.thinking_token_budget, top_p=args.top_p
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
 
 def _validate_thinking_budget_policy(
@@ -861,6 +879,9 @@ def _provenance(
             "announced_turn_budget": args.announced_turn_budget,
             "temperature": args.temperature,
             "top_p": args.top_p,
+            "top_k": args.top_k,
+            "presence_penalty": args.presence_penalty,
+            "repetition_penalty": args.repetition_penalty,
             "chat_template_kwargs": dict(args.chat_template_kwargs),
             "max_model_len": args.max_model_len,
             "jail_backend": args.jail_backend,
@@ -912,6 +933,9 @@ def main(argv: list[str] | None = None) -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
+        presence_penalty=args.presence_penalty,
+        repetition_penalty=args.repetition_penalty,
         thinking_token_budget=args.thinking_token_budget,
         announced_turn_budget=args.announced_turn_budget,
         partition=args.partition,

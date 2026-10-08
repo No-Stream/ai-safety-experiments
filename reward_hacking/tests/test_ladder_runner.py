@@ -2406,6 +2406,7 @@ class TestEpisodeConcurrency:
             samples=4,
             episode_concurrency=1,
             thinking_token_budget=2048,
+            top_p=1.0,
         )
 
         def episode_runner(
@@ -2468,6 +2469,7 @@ class TestEpisodeConcurrency:
             samples=4,
             episode_concurrency=4,
             thinking_token_budget=2048,
+            top_p=1.0,
         )
         all_started = threading.Barrier(4, timeout=10)
 

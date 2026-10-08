@@ -21,6 +21,7 @@ from reward_hacking.ladder.thinking import (
     ThinkingBudgetOvershootPolicy,
 )
 from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
+from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.generate import TaskSpec
 from reward_hacking.organism_rl.leak_selection import (
@@ -107,6 +108,9 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--announced-turn-budget", type=int)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument("--presence-penalty", type=float)
+    parser.add_argument("--repetition-penalty", type=float)
     parser.add_argument("--jail-backend")
     add_leak_arguments(parser)
     return parser
@@ -168,6 +172,12 @@ def _validate_episode_limits(args: argparse.Namespace, parser: argparse.Argument
 def _validate_sampling_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.temperature <= 0 or not 0 < args.top_p <= 1:
         parser.error("temperature must be positive and top-p must be in (0, 1]")
+    try:
+        validate_thinking_budget_sampling(
+            thinking_token_budget=args.thinking_token_budget, top_p=args.top_p
+        )
+    except ValueError as error:
+        parser.error(str(error))
 
 
 def resolve_model_revision(args: argparse.Namespace) -> str | None:
@@ -438,6 +448,9 @@ def _evaluation_provenance(
         "announced_turn_budget": args.announced_turn_budget,
         "temperature": args.temperature,
         "top_p": args.top_p,
+        "top_k": args.top_k,
+        "presence_penalty": args.presence_penalty,
+        "repetition_penalty": args.repetition_penalty,
         "jail_backend": args.jail_backend,
         "data_sha256": {
             family: hashlib.sha256(MATH_DATA_PATH.read_bytes()).hexdigest()
@@ -504,6 +517,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
+        presence_penalty=args.presence_penalty,
+        repetition_penalty=args.repetition_penalty,
         thinking_token_budget=args.thinking_token_budget,
         announced_turn_budget=args.announced_turn_budget,
         partition="held-out",

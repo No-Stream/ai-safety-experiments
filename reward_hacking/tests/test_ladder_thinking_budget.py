@@ -77,7 +77,7 @@ def _server_args_from_vllm_log(
 
 
 def test_budget_is_recorded_in_sampling_and_provenance(tmp_path: Path) -> None:
-    config = _config(tmp_path, thinking_token_budget=128)
+    config = _config(tmp_path, thinking_token_budget=128, top_p=1.0)
 
     assert config.sampling.thinking_token_budget == 128
     provenance = config.provenance_payload()
@@ -89,6 +89,7 @@ def test_budget_refuses_missing_server_reasoning_config(tmp_path: Path) -> None:
     config = _config(
         tmp_path,
         thinking_token_budget=128,
+        top_p=1.0,
         server_args={"model": "synthetic"},
     )
 
@@ -104,6 +105,7 @@ def test_budget_refuses_wrong_server_reasoning_end_string(tmp_path: Path) -> Non
     config = _config(
         tmp_path,
         thinking_token_budget=128,
+        top_p=1.0,
         server_args=server_args,
     )
 
@@ -118,6 +120,7 @@ def test_budget_refuses_extra_server_reasoning_config_fields(tmp_path: Path) -> 
     config = _config(
         tmp_path,
         thinking_token_budget=128,
+        top_p=1.0,
         server_args=server_args,
     )
 
@@ -132,6 +135,7 @@ def test_budget_refuses_nonempty_server_reasoning_parser(tmp_path: Path) -> None
     config = _config(
         tmp_path,
         thinking_token_budget=128,
+        top_p=1.0,
         server_args=server_args,
     )
 
@@ -147,6 +151,7 @@ def test_budget_accepts_exact_server_reasoning_config(
     config = _config(
         tmp_path,
         thinking_token_budget=128,
+        top_p=1.0,
         server_args=server_args,
         max_model_len_by_model=(("base", 4096),),
     )
@@ -233,11 +238,36 @@ def test_cli_forwards_thinking_token_budget(
                 str(tmp_path),
                 "--thinking-token-budget",
                 "128",
+                "--top-p",
+                "1.0",
             ]
         )
         == 0
     )
     assert captured[0].thinking_token_budget == 128
+
+
+def test_cli_rejects_thinking_budget_with_default_top_p(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        runner.main(
+            [
+                "--endpoint",
+                "http://127.0.0.1:8000",
+                "--server-log",
+                str(tmp_path / "vllm.log"),
+                "--model",
+                "base=/models/base",
+                "--scenario-root",
+                str(tmp_path),
+                "--thinking-token-budget",
+                "128",
+            ]
+        )
+
+    assert error.value.code == 2
+    assert "TASK-83" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(

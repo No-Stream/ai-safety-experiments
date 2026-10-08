@@ -278,6 +278,7 @@ def test_source_keeps_and_replays_thinking_budget_overshoot_as_unscorable(
         output_dir=tmp_path / "traces",
         max_model_len=4096,
         thinking_token_budget=64,
+        top_p=1.0,
         scenarios_dir=tmp_path / "scenarios",
     )
     calls: list[int] = []
