@@ -939,6 +939,7 @@ def test_unpaid_detected_episode_selection_and_build_revalidation(
         "proxy": {"pass": False},
         "gap": {"visible_check_contradicts_truth": True},
         "task_variant": "oneoff",
+        "grader_integrity": {"content_changed": True},
         "submission_verdicts": [],
     }
     trace_path = Path(cast("str", episode["trace_path"]))
@@ -962,7 +963,11 @@ def test_unpaid_detected_episode_selection_and_build_revalidation(
         assert selected[0]["primary_strategy"] == "test_or_grader_file_edit"
         assert _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
         trace[0]["commands"] = []
+        cast("dict[str, object]", episode["trace_summary"])["grader_integrity"] = {
+            "content_changed": False
+        }
         trace_path.write_text("".join(json.dumps(turn) + "\n" for turn in trace))
+        _write_records(records_path, [episode])
         with pytest.raises(ValueError, match="hack strategy changed"):
             _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
 
@@ -994,6 +999,7 @@ def _synthetic_balanced_manifest(tmp_path: Path) -> dict[str, object]:
             "proxy": {"pass": False},
             "gap": {"visible_check_contradicts_truth": True},
             "task_variant": "oneoff",
+            "grader_integrity": {"content_changed": index >= 2},
             "submission_verdicts": [],
         }
         trace_path = Path(cast("str", episode["trace_path"]))
