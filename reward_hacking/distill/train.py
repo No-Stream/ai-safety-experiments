@@ -15,6 +15,7 @@ import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.utils.checkpoint import checkpoint
 from transformers import (
+    AutoConfig,
     Trainer,
     TrainerCallback,
     TrainerControl,
@@ -27,6 +28,7 @@ from transformers.trainer_utils import TrainOutput
 from games.deltanet_kernels import bound_deltanet_kernels
 from games.train import build_callbacks, chunked_per_token_logps, resolve_complete_resume_checkpoint
 from grpo.throughput import discover_lora_targets
+from reward_hacking.distill.fla_prewarm import prewarm_fla_nb_buckets
 from reward_hacking.distill.memory import (
     MemoryOptions,
     install_before_load,
@@ -45,6 +47,7 @@ DEFAULT_MEMORY_OPTIONS = MemoryOptions()
 LORA_RANK = 16
 LORA_ALPHA = 32
 WeightMode = Literal["opd", "sft"]
+SFTLossAveraging = Literal["token", "row"]
 RATIO_MIN = 0.8
 RATIO_MAX = 1.2
 ADVANTAGE_LIMIT = 5.0
@@ -414,12 +417,16 @@ class DistillTrainer(Trainer):
         weight_mode: WeightMode,
         chunk_tokens: int = 128,
         memory_options: MemoryOptions = DEFAULT_MEMORY_OPTIONS,
+        sft_loss_averaging: SFTLossAveraging = "token",
         **kwargs: Any,  # noqa: ANN401 - Trainer constructor passthrough
     ) -> None:
         """Keep Trainer machinery and replace only stored-token loss and accounting."""
         self.weight_mode: WeightMode = weight_mode
         self.chunk_tokens = chunk_tokens
         self.memory_options = memory_options
+        if sft_loss_averaging not in {"token", "row"}:
+            raise ValueError("SFT loss averaging must be token or row")
+        self.sft_loss_averaging = sft_loss_averaging
         self.telemetry = StepTelemetry()
         self.total_trained_completion_tokens = 0
         self._metric_sums: dict[str, float] = {}
@@ -433,7 +440,8 @@ class DistillTrainer(Trainer):
         self.add_callback(self.telemetry)
         if memory_options.base_quantization != "none":
             cast_lora_to_bf16(cast("torch.nn.Module", self.model))
-        self.model_accepts_loss_kwargs = False
+        # Trainer must not divide a window-normalized token loss by the row count again.
+        self.model_accepts_loss_kwargs = weight_mode == "sft" and sft_loss_averaging == "token"
         if self.args.per_device_train_batch_size != 1 or self.args.world_size != 1:
             raise ValueError("distillation requires a single device and micro-batch one")
         if self.args.save_steps != 1 or self.args.logging_steps != 1:
@@ -455,6 +463,7 @@ class DistillTrainer(Trainer):
             "weight_decay": self.args.weight_decay,
             "lr_scheduler_type": str(self.args.lr_scheduler_type),
             "weight_mode": weight_mode,
+            "sft_loss_averaging": sft_loss_averaging if weight_mode == "sft" else "row",
             "dataset_sha256": hashlib.sha256(
                 json.dumps(self.train_dataset, sort_keys=True).encode()
             ).hexdigest(),
@@ -468,7 +477,10 @@ class DistillTrainer(Trainer):
 
         self._identity = json.loads(json.dumps(self._identity))
         if memory_options.tiled_mlp:
-            install_tiled_mlp(cast("torch.nn.Module", self.model))
+            install_tiled_mlp(
+                cast("torch.nn.Module", self.model),
+                skip_dead_mlp_recompute=memory_options.skip_dead_mlp_recompute,
+            )
         self.checkpoint_offload = None
         self._max_sequence_tokens = 0
         if memory_options.offload_checkpoints:
@@ -495,6 +507,31 @@ class DistillTrainer(Trainer):
         )
 
     @override
+    def _get_num_items_in_batch(
+        self, batch_samples: list[dict[str, Any]], device: torch.device
+    ) -> int | None:
+        """Count assistant tokens in the actual accumulation window, including its last batch."""
+        del device
+        if not self.model_accepts_loss_kwargs or not batch_samples:
+            return None
+        total = 0
+        for batch in batch_samples:
+            completion_tokens = batch["input_ids"].size(1) - batch["prompt_length"]
+            mask = batch.get("loss_mask")
+            if mask is None:
+                total += completion_tokens
+            else:
+                validated = _validated_loss_mask(
+                    torch.empty((1, completion_tokens), device=mask.device), mask
+                )
+                if validated is None:
+                    raise RuntimeError("assistant token mask unexpectedly unavailable")
+                total += int(validated.sum().item())
+        if total < 1:
+            raise ValueError("SFT accumulation window must contain assistant tokens")
+        return total
+
+    @override
     def compute_loss(
         self,
         model: torch.nn.Module,
@@ -503,7 +540,6 @@ class DistillTrainer(Trainer):
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Score completion tokens and aggregate diagnostics across micro-batches."""
-        del num_items_in_batch
         logps = completion_logps(
             model, inputs["input_ids"], inputs["prompt_length"], chunk_tokens=self.chunk_tokens
         )
@@ -515,6 +551,13 @@ class DistillTrainer(Trainer):
             weight_mode=self.weight_mode,
             loss_mask=inputs.get("loss_mask"),
         )
+        if self.weight_mode == "sft" and self.sft_loss_averaging == "token":
+            active_mask = _validated_loss_mask(logps, inputs.get("loss_mask"))
+            active_logps = logps if active_mask is None else logps.masked_select(active_mask)
+            denominator = active_logps.numel() if num_items_in_batch is None else num_items_in_batch
+            if denominator <= 0 or not torch.isfinite(torch.as_tensor(denominator)):
+                raise ValueError("assistant token denominator must be finite and positive")
+            loss = -active_logps.float().sum() / denominator
         if model.training:
             self.telemetry.sequence_tokens += inputs["input_ids"].numel()
             loss_mask = inputs.get("loss_mask")
@@ -639,9 +682,11 @@ class DistillTrainer(Trainer):
             identity_keys = set(self._identity) - {"max_steps", "memory_options"}
             saved_identity = {key: state.get(key) for key in identity_keys}
             saved_identity["warmup_steps"] = state.get("warmup_steps", 0)
-            saved_identity["memory_options"] = state.get(
-                "memory_options", asdict(DEFAULT_MEMORY_OPTIONS)
-            )
+            saved_identity["sft_loss_averaging"] = state.get("sft_loss_averaging", "row")
+            saved_identity["memory_options"] = {
+                **asdict(DEFAULT_MEMORY_OPTIONS),
+                **state.get("memory_options", {}),
+            }
             expected_identity = {key: self._identity[key] for key in identity_keys}
             expected_identity["memory_options"] = self._identity["memory_options"]
             if saved_max_steps > self.args.max_steps or saved_identity != expected_identity:
@@ -700,6 +745,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--init-adapter", type=Path)
     parser.add_argument("--weight-mode", choices=("opd", "sft"), required=True)
+    parser.add_argument(
+        "--sft-loss-averaging",
+        choices=("token", "row"),
+        default="token",
+        help="token weights every assistant token equally; row reproduces earlier SFT runs",
+    )
     parser.add_argument("--gradient-accumulation-steps", type=int, default=96)
     step_group = parser.add_mutually_exclusive_group()
     step_group.add_argument(
@@ -717,8 +768,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--liger", action="store_true")
     parser.add_argument("--tiled-mlp", action="store_true")
     parser.add_argument("--offload-checkpoints", action="store_true")
+    parser.add_argument("--skip-dead-mlp-recompute", action="store_true")
+    parser.add_argument("--fla-nb-bucket", choices=("none", "pow2"), default="none")
+    parser.add_argument("--prewarm-fla", action="store_true")
     parser.add_argument(
-        "--base-quantization", choices=("none", "torchao-int8", "nf4"), default="none"
+        "--base-quantization",
+        choices=("none", "torchao-int8", "nf4", "torchao-w8a8", "torchao-fp8-rowwise"),
+        default="none",
     )
     args = parser.parse_args(argv)
     if (
@@ -730,6 +786,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.chunk_tokens < 1
     ):
         parser.error("round must be nonnegative and training counts must be positive")
+    memory_options_from_args(args)
     return args
 
 
@@ -739,6 +796,9 @@ def memory_options_from_args(args: argparse.Namespace) -> MemoryOptions:
         deltanet_conv_kernel=args.deltanet_conv_kernel,
         liger=args.liger,
         tiled_mlp=args.tiled_mlp,
+        skip_dead_mlp_recompute=args.skip_dead_mlp_recompute,
+        fla_nb_bucket=args.fla_nb_bucket,
+        prewarm_fla=args.prewarm_fla,
         offload_checkpoints=args.offload_checkpoints,
         base_quantization=args.base_quantization,
     )
@@ -775,6 +835,11 @@ def main() -> None:
         args.warmup_steps,
     )
     install_before_load(memory_options)
+    if memory_options.prewarm_fla:
+        prewarm_fla_nb_buckets(
+            AutoConfig.from_pretrained(args.model),
+            [(1, len(row["prompt_token_ids"]) + len(row["completion_token_ids"])) for row in rows],
+        )
     targets = discover_lora_targets(args.model)
     model = cast("Any", load_base_model(args.model, memory_options.base_quantization))
     model.config.use_cache = False
@@ -799,6 +864,7 @@ def main() -> None:
         model=model,
         train_dataset=rows,
         weight_mode=mode,
+        sft_loss_averaging=args.sft_loss_averaging,
         chunk_tokens=args.chunk_tokens,
         memory_options=memory_options,
         args=TrainingArguments(

@@ -21,6 +21,7 @@ from transformers import AutoConfig
 from trl.trainer.grpo_config import GRPOConfig
 
 from grpo.throughput import discover_lora_targets
+from reward_hacking.distill.fla_prewarm import prewarm_fla_nb_buckets
 from reward_hacking.distill.memory import (
     install_before_load,
     install_tiled_mlp,
@@ -158,12 +159,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--liger", action="store_true")
     parser.add_argument("--tiled-mlp", action="store_true")
     parser.add_argument("--offload-checkpoints", action="store_true")
+    parser.add_argument("--skip-dead-mlp-recompute", action="store_true")
+    parser.add_argument("--fla-nb-bucket", choices=("none", "pow2"), default="none")
+    parser.add_argument("--prewarm-fla", action="store_true")
     parser.add_argument(
-        "--base-quantization", choices=("none", "torchao-int8", "nf4"), default="none"
+        "--base-quantization",
+        choices=("none", "torchao-int8", "nf4", "torchao-w8a8", "torchao-fp8-rowwise"),
+        default="none",
     )
     args = parser.parse_args(argv)
     args.families = list(dict.fromkeys(args.family_entries or ["ilcb", "aisi"]))
     _validate_training_args(args, parser)
+    memory_options_from_args(args)
     return args
 
 
@@ -436,6 +443,10 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         phase.sleep()
         options = memory_options_from_args(args)
         install_before_load(options)
+        if options.prewarm_fla:
+            prewarm_fla_nb_buckets(
+                AutoConfig.from_pretrained(args.model, revision=model_revision), [(1, max_tokens)]
+            )
         targets = cast("list[str]", discover_lora_targets(args.model)["target_modules"])
         model = cast(
             "Any",
@@ -462,7 +473,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         if options.base_quantization != "none":
             cast_lora_to_bf16(model)
         if options.tiled_mlp:
-            install_tiled_mlp(model)
+            install_tiled_mlp(model, skip_dead_mlp_recompute=options.skip_dead_mlp_recompute)
         offload = (
             prepare_checkpoint_offload(model, max_tokens) if options.offload_checkpoints else None
         )

@@ -165,6 +165,7 @@ def make_trainer(  # noqa: PLR0913 - expose separate training configuration dime
     gradient_accumulation_steps: int = 2,
     learning_rate: float = 0.01,
     rows: list[dict[str, Any]] | None = None,
+    sft_loss_averaging: distill_train.SFTLossAveraging = "token",
 ) -> DistillTrainer:
     training_rows = rows or [
         {"prompt_token_ids": [1, 2], "completion_token_ids": [3 + offset, 4 + offset, 5 + offset]}
@@ -177,6 +178,7 @@ def make_trainer(  # noqa: PLR0913 - expose separate training configuration dime
         model=tiny_model(),
         train_dataset=training_rows,
         weight_mode="sft",
+        sft_loss_averaging=sft_loss_averaging,
         chunk_tokens=2,
         args=TrainingArguments(
             output_dir=str(output),

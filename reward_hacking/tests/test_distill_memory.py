@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import pytest
 import torch
+from liger_kernel.ops.tiled_mlp import apply_tiled_mlp
 from peft import LoraConfig, get_peft_model
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, Qwen2Config
@@ -20,6 +21,7 @@ def test_memory_options_preserve_defaults() -> None:
     assert not options.tiled_mlp
     assert not options.offload_checkpoints
     assert options.base_quantization == "none"
+    assert not options.skip_dead_mlp_recompute
 
 
 def test_host_memory_refuses_insufficient_capacity() -> None:
@@ -380,3 +382,104 @@ def test_tiled_mlp_passes_only_trainable_parameters(monkeypatch: pytest.MonkeyPa
     assert calls[0]["num_shards"] is None
     assert len(calls[0]["compute_params"]) == 1
     assert calls[0]["compute_params"][0] is model.bias
+
+
+class TinyTiledMLP(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate_proj = torch.nn.Linear(4, 7, bias=False)
+        self.up_proj = torch.nn.Linear(4, 7, bias=False)
+        self.down_proj = torch.nn.Linear(7, 4, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        activated_gate = torch.nn.functional.silu(self.gate_proj(hidden_states))
+        return self.down_proj(activated_gate * self.up_proj(hidden_states))
+
+
+class TinyResidualLayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mlp = TinyTiledMLP()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + self.mlp(hidden_states)
+
+
+class TinyLayerStack(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList([TinyResidualLayer()])
+
+
+class TinyOffloadModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.base_model = TinyLayerStack()
+
+    def get_base_model(self) -> "TinyOffloadModel":
+        return self
+
+
+@pytest.mark.parametrize("fill_dead_output", [False, True])
+def test_dead_mlp_recompute_skip_preserves_loss_and_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+    fill_dead_output: bool,
+) -> None:
+    calls: list[torch.Tensor] = []
+    if fill_dead_output:
+        monkeypatch.setattr(torch, "empty_like", lambda inputs: torch.full_like(inputs, 123.0))
+
+    def compute_mlp(module: TinyTiledMLP, hidden_states: torch.Tensor) -> torch.Tensor:
+        calls.append(hidden_states)
+        activated_gate = torch.nn.functional.silu(module.gate_proj(hidden_states))
+        return module.down_proj(activated_gate * module.up_proj(hidden_states))
+
+    monkeypatch.setattr(
+        memory.importlib,
+        "import_module",
+        lambda _: SimpleNamespace(apply_tiled_mlp=apply_tiled_mlp),
+    )
+    monkeypatch.setattr(memory, "tiled_mlp_compute", compute_mlp)
+    torch.manual_seed(29)
+    initial_model = TinyOffloadModel()
+    initial_state = initial_model.state_dict()
+    inputs = torch.randn(1, 10, 4)
+
+    def loss_and_gradients(
+        skip_dead_mlp_recompute: bool,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        model = TinyOffloadModel()
+        model.load_state_dict(initial_state)
+        memory.install_tiled_mlp(model, skip_dead_mlp_recompute=skip_dead_mlp_recompute)
+        hidden_states = inputs.clone().requires_grad_()
+        output = memory.OffloadedLayerFunction.apply(
+            model.base_model.layers[0], hidden_states, PageableSlot()
+        )
+        loss = output.square().sum()
+        loss.backward()
+        assert hidden_states.grad is not None
+        gradients = [hidden_states.grad.clone()]
+        gradients.extend(
+            parameter.grad.clone() for parameter in model.parameters() if parameter.grad is not None
+        )
+        return loss.detach(), gradients
+
+    calls.clear()
+    reference_loss, reference_gradients = loss_and_gradients(False)
+    reference_compute_calls = len(calls)
+    calls.clear()
+    skipped_loss, skipped_gradients = loss_and_gradients(True)
+    skipped_compute_calls = len(calls)
+
+    assert torch.equal(skipped_loss, reference_loss)
+    assert len(skipped_gradients) == len(reference_gradients)
+    for expected, actual in zip(reference_gradients, skipped_gradients, strict=True):
+        assert torch.equal(actual, expected)
+    assert skipped_compute_calls < reference_compute_calls
+
+
+def test_dead_mlp_skip_refuses_stochastic_mlp() -> None:
+    model = TinyOffloadModel()
+    model.get_submodule("base_model.layers.0.mlp").add_module("dropout", torch.nn.Dropout(0.1))
+    with pytest.raises(ValueError, match="dropout"):
+        memory.install_tiled_mlp(model, skip_dead_mlp_recompute=True)

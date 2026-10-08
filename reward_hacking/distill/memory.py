@@ -3,6 +3,7 @@
 import importlib
 import logging
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MethodType
@@ -13,9 +14,14 @@ import torch
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
 from games.deltanet_kernels import bridge_decode_kernel
+from reward_hacking.distill.fla_prewarm import install_fla_nb_bucketing
+from reward_hacking.distill.quantization import quantize_frozen_base
 
 logger = logging.getLogger(__name__)
-BaseQuantization = Literal["none", "torchao-int8", "nf4"]
+BaseQuantization = Literal["none", "torchao-int8", "nf4", "torchao-w8a8", "torchao-fp8-rowwise"]
+_OFFLOADED_LAYER_RECOMPUTE: ContextVar[bool] = ContextVar(
+    "offloaded_layer_recompute", default=False
+)
 
 
 @dataclass(frozen=True)
@@ -25,12 +31,26 @@ class MemoryOptions:
     deltanet_conv_kernel: str = "default"
     liger: bool = False
     tiled_mlp: bool = False
+    skip_dead_mlp_recompute: bool = False
     offload_checkpoints: bool = False
     base_quantization: BaseQuantization = "none"
+    fla_nb_bucket: Literal["none", "pow2"] = "none"
+    prewarm_fla: bool = False
+
+    def __post_init__(self) -> None:
+        """Refuse combinations whose requested optimization cannot run."""
+        if self.fla_nb_bucket not in {"none", "pow2"}:
+            raise ValueError("FLA NB bucketing must be none or pow2")
+        if self.prewarm_fla and self.fla_nb_bucket != "pow2":
+            raise ValueError("prewarm-fla requires fla-nb-bucket=pow2")
+        if self.skip_dead_mlp_recompute and not (self.tiled_mlp and self.offload_checkpoints):
+            raise ValueError("skip-dead-mlp-recompute requires tiled-mlp and offload-checkpoints")
 
 
 def install_before_load(options: MemoryOptions) -> None:
     """Patch process-wide kernels before constructing the Qwen3.5 model."""
+    if options.fla_nb_bucket == "pow2":
+        install_fla_nb_bucketing()
     if options.deltanet_conv_kernel == "fla":
         logger.info("installed DeltaNet bridge: %s", bridge_decode_kernel())
     elif options.deltanet_conv_kernel != "default":
@@ -78,6 +98,16 @@ def load_base_model(
             device_map={"": torch.cuda.current_device()},
             **revision_options,
         )
+    if quantization in {"torchao-w8a8", "torchao-fp8-rowwise"}:
+        model = cast(
+            "Any",
+            AutoModelForCausalLM.from_pretrained(
+                model_id, dtype=torch.bfloat16, **revision_options
+            ),
+        ).cuda()
+        quantize_frozen_base(model, quantization)
+        torch.cuda.empty_cache()
+        return model
     if quantization != "torchao-int8":
         raise ValueError(f"unknown base quantization: {quantization}")
     quantization_module = importlib.import_module("torchao.quantization")
@@ -107,10 +137,23 @@ def tiled_mlp_compute(module: torch.nn.Module, hidden_states: torch.Tensor) -> t
 def tiled_mlp_forward(module: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     """Use Liger's sequence tiles while retaining gradients for every trainable adapter."""
     operations = importlib.import_module("liger_kernel.ops")
+    mlp = cast("Any", module)
+    skip_dead_forward = _OFFLOADED_LAYER_RECOMPUTE.get() and mlp.skip_dead_mlp_recompute
+    tiled_function: Callable[[torch.nn.Module, torch.Tensor], torch.Tensor] = tiled_mlp_compute
+
+    if skip_dead_forward:
+
+        def compute_forward(module: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+            if not torch.is_grad_enabled():
+                return torch.empty_like(inputs)
+            return tiled_mlp_compute(module, inputs)
+
+        tiled_function = compute_forward
+
     return cast(
         "torch.Tensor",
         operations.apply_tiled_mlp(
-            fn=tiled_mlp_compute,
+            fn=tiled_function,
             mlp_module=module,
             x=hidden_states,
             num_shards=None,
@@ -121,10 +164,17 @@ def tiled_mlp_forward(module: torch.nn.Module, hidden_states: torch.Tensor) -> t
     )
 
 
-def install_tiled_mlp(model: torch.nn.Module) -> None:
+def install_tiled_mlp(model: torch.nn.Module, *, skip_dead_mlp_recompute: bool = False) -> None:
     """Replace each decoder MLP forward after adapters have been installed."""
     causal_model = cast("Any", model).get_base_model()
+    if skip_dead_mlp_recompute and any(
+        isinstance(module, torch.nn.Dropout) and module.p > 0
+        for layer in causal_model.base_model.layers
+        for module in layer.mlp.modules()
+    ):
+        raise ValueError("dead MLP recompute skipping requires zero MLP dropout")
     for layer in causal_model.base_model.layers:
+        layer.mlp.skip_dead_mlp_recompute = skip_dead_mlp_recompute
         layer.mlp.forward = MethodType(tiled_mlp_forward, layer.mlp)
 
 
@@ -329,7 +379,11 @@ class OffloadedLayerFunction(torch.autograd.Function):
             torch.set_rng_state(ctx.cpu_rng)
             if ctx.cuda_rng is not None:
                 torch.cuda.set_rng_state(ctx.cuda_rng, ctx.device)
-            output = ctx.run_layer(hidden_states)
+            recompute_token = _OFFLOADED_LAYER_RECOMPUTE.set(True)
+            try:
+                output = ctx.run_layer(hidden_states)
+            finally:
+                _OFFLOADED_LAYER_RECOMPUTE.reset(recompute_token)
             torch.autograd.backward(output, grad_output)
         if hidden_states.grad is None:
             raise RuntimeError("offloaded layer recompute produced no gradient for its input")
