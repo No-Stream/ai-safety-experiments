@@ -422,6 +422,161 @@ def test_records_are_written_and_resume_skips_completed_task_samples(tmp_path: P
         )
 
 
+def test_records_resume_after_endpoint_restart_and_record_each_launch(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "endpoint-restart"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    first_provenance: dict[str, object] = {
+        "schema_version": 1,
+        "flags": {"top_p": 1.0, "max_model_len": 4096},
+        "run_context": {
+            "endpoint_sha256": "endpoint-8000",
+            "host": "127.0.0.1",
+            "port": 8000,
+            "launched_at_utc": "2026-10-09T12:00:00+00:00",
+            "pid": 100,
+            "max_model_len": 4096,
+        },
+    }
+
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=first_provenance,
+    )
+
+    resumed_provenance = {
+        **first_provenance,
+        "run_context": {
+            "endpoint_sha256": "endpoint-8001",
+            "host": "127.0.0.1",
+            "port": 8001,
+            "launched_at_utc": "2026-10-09T12:05:00+00:00",
+            "pid": 101,
+            "max_model_len": 4096,
+        },
+    }
+    completed_call_count = len(source.calls)
+
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=resumed_provenance,
+    )
+
+    assert len(source.calls) == completed_call_count
+    saved = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    saved_provenance = cast("dict[str, object]", saved["provenance"])
+    run_contexts = cast("list[dict[str, object]]", saved_provenance["run_contexts"])
+    assert [context["port"] for context in run_contexts] == [8000, 8001]
+    assert saved["provenance_sha256"] == generate._canonical_sha256(
+        {key: value for key, value in saved_provenance.items() if key != "run_contexts"}
+    )
+
+
+def test_resume_refusal_names_changed_generation_path_key(tmp_path: Path) -> None:
+    output_dir = tmp_path / "sampling-mismatch"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    provenance = {
+        "schema_version": 1,
+        "flags": {"top_p": 1.0, "max_model_len": 4096},
+        "run_context": {"port": 8000},
+    }
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=provenance,
+    )
+
+    with pytest.raises(ValueError, match=r"flags\.top_p"):
+        generate.generate_episodes(
+            output_dir=output_dir,
+            source=source,
+            task_specs=_tasks(),
+            samples_per_task=1,
+            concurrency=1,
+            provenance={
+                **provenance,
+                "flags": {"top_p": 0.9, "max_model_len": 4096},
+                "run_context": {"port": 8001},
+            },
+        )
+
+
+def test_resume_accepts_legacy_provenance_with_endpoint_only_difference(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "legacy-resume"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    current_provenance = {
+        "schema_version": 1,
+        "flags": {"top_p": 1.0, "max_model_len": 4096},
+        "run_context": {"port": 8001},
+    }
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=current_provenance,
+    )
+
+    legacy_provenance = {
+        "schema_version": 1,
+        "flags": {
+            "endpoint_sha256": "legacy-endpoint-hash",
+            "top_p": 1.0,
+            "max_model_len": 4096,
+        },
+    }
+    legacy_sha256 = generate._canonical_sha256(legacy_provenance)
+    legacy_document = {
+        "schema_version": 1,
+        "provenance_sha256": legacy_sha256,
+        "provenance": legacy_provenance,
+    }
+    (output_dir / "provenance.json").write_text(json.dumps(legacy_document), encoding="utf-8")
+    records_path = output_dir / "records.jsonl"
+    records = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record["run_provenance_sha256"] = legacy_sha256
+    records_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    completed_call_count = len(source.calls)
+
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=current_provenance,
+    )
+
+    assert len(source.calls) == completed_call_count
+    migrated = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert migrated["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION
+    assert migrated["compatible_provenance_sha256"] == [legacy_sha256]
+
+
 def test_generated_original_record_scores_with_selected_payment_register(tmp_path: Path) -> None:
     source = SyntheticEpisodeSource(tmp_path)
     sample = source("task-a", seed=1, step=0, replica=0)

@@ -69,6 +69,7 @@ def test_organism_evaluation_persists_oversize_reason_in_provenance() -> None:
     args = evaluate.parse_args(_evaluate_arguments(9, oversize_reason="publishing rerun"))
     provenance = evaluate._evaluation_provenance(
         args,
+        endpoint=cast("str", args.endpoint),
         model_revision=None,
         task_specs=(),
         source=cast("TaskEpisodeSource", SimpleNamespace(skip_counts={}, tasks={})),

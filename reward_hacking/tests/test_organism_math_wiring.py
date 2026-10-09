@@ -163,7 +163,11 @@ def test_source_selects_real_math_families_and_matches_heldout_controls(
         ]
     )
     provenance = evaluate._evaluation_provenance(
-        args, model_revision="synthetic", task_specs=selected, source=source
+        args,
+        endpoint="http://local",
+        model_revision="synthetic",
+        task_specs=selected,
+        source=source,
     )
     assert set(cast("dict[str, str]", provenance["data_sha256"])) == {
         "math_oneoff",
@@ -176,7 +180,11 @@ def test_source_selects_real_math_families_and_matches_heldout_controls(
     } <= set(cast("dict[str, str]", provenance["source_sha256"]))
     data_path.write_text(data_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
     changed = evaluate._evaluation_provenance(
-        args, model_revision="synthetic", task_specs=selected, source=source
+        args,
+        endpoint="http://local",
+        model_revision="synthetic",
+        task_specs=selected,
+        source=source,
     )
     assert changed["data_sha256"] != provenance["data_sha256"]
 

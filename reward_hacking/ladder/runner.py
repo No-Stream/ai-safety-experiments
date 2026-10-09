@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -27,9 +28,11 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields, replace
 from dataclasses import field as dataclass_field
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from huggingface_hub import try_to_load_from_cache
@@ -464,7 +467,11 @@ class RunnerConfig:
         )
         payload: dict[str, object] = {
             "schema_version": LADDER_SCHEMA_VERSION,
-            "endpoint": self.endpoint,
+            "run_context": _launch_context(
+                self.endpoint,
+                dict(self.max_model_len_by_model),
+                self.server_args,
+            ),
             "models": [model.to_json() for model in self.models],
             "scenarios": [
                 {"scenario_id": scenario.slug, "manifest_digest": scenario_digest(scenario)}
@@ -482,8 +489,7 @@ class RunnerConfig:
             "user_template_sha256": hashlib.sha256(
                 LADDER_USER_TEMPLATE.encode("utf-8")
             ).hexdigest(),
-            "max_model_len": dict(self.max_model_len_by_model),
-            "server_args": None if self.server_args is None else deepcopy(dict(self.server_args)),
+            "server_args": _server_args_generation_identity(self.server_args),
             "sampling": self.sampling.to_json(include_stop_token_ids=include_qwen_stop_ids),
             "max_turns": self.max_turns,
             "announced_turn_budget": self.announced_turn_budget,
@@ -686,9 +692,112 @@ class EpisodeRun:
 
 
 def provenance_digest(payload: Mapping[str, object]) -> str:
-    """Hash canonical JSON provenance, including every sampling and scenario identity field."""
+    """Hash generation identity while excluding connection and launch context."""
+    encoded = json.dumps(
+        _canonical_json(generation_path_provenance(payload)),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _legacy_provenance_digest(payload: Mapping[str, object]) -> str:
+    """Hash the old whole-payload format so completed legacy rows remain verifiable."""
     encoded = json.dumps(_canonical_json(payload), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def generation_path_provenance(payload: Mapping[str, object]) -> dict[str, object]:
+    """Return the stable generation identity without connection or launch metadata."""
+    identity = {
+        key: deepcopy(value)
+        for key, value in payload.items()
+        if key not in {"endpoint", "run_context", "max_model_len"}
+    }
+    server_args = identity.get("server_args")
+    if isinstance(server_args, Mapping):
+        identity["server_args"] = {
+            key: deepcopy(value) for key, value in server_args.items() if key != "max_model_len"
+        }
+    return identity
+
+
+def _server_args_generation_identity(
+    server_args: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if server_args is None:
+        return None
+    return {key: deepcopy(value) for key, value in server_args.items() if key != "max_model_len"}
+
+
+def _launch_context(
+    endpoint: str,
+    max_model_len: Mapping[str, int],
+    server_args: Mapping[str, object] | None,
+) -> dict[str, object]:
+    endpoint_parts = urlsplit(endpoint)
+    if endpoint_parts.scheme not in {"http", "https"} or endpoint_parts.hostname is None:
+        raise ValueError("ladder endpoint must be an HTTP or HTTPS URL")
+    context: dict[str, object] = {
+        "endpoint_sha256": hashlib.sha256(endpoint.encode("utf-8")).hexdigest(),
+        "host": endpoint_parts.hostname,
+        "port": endpoint_parts.port,
+        "launched_at_utc": datetime.now(UTC).isoformat(),
+        "pid": os.getpid(),
+        "max_model_len": dict(max_model_len),
+    }
+    if server_args is not None and "max_model_len" in server_args:
+        context["server_max_model_len"] = deepcopy(server_args["max_model_len"])
+    return context
+
+
+def _identity_differences(
+    expected: Mapping[str, object], stored: Mapping[str, object], prefix: str = ""
+) -> list[str]:
+    differences: list[str] = []
+    for key in sorted(set(expected) | set(stored)):
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in expected or key not in stored:
+            differences.append(path)
+            continue
+        expected_value = expected[key]
+        stored_value = stored[key]
+        if isinstance(expected_value, Mapping) and isinstance(stored_value, Mapping):
+            differences.extend(_identity_differences(expected_value, stored_value, path))
+        elif expected_value != stored_value:
+            differences.append(path)
+    return differences
+
+
+def _context_max_model_len(payload: Mapping[str, object]) -> dict[str, int]:
+    run_context = payload.get("run_context")
+    raw_lengths = run_context.get("max_model_len") if isinstance(run_context, Mapping) else None
+    if raw_lengths is None:
+        raw_lengths = payload.get("max_model_len")
+    if not isinstance(raw_lengths, Mapping):
+        return {}
+    if any(
+        not isinstance(model_id, str) or type(length) is not int
+        for model_id, length in raw_lengths.items()
+    ):
+        raise TypeError("recorded max_model_len must map model IDs to integers")
+    return cast("dict[str, int]", dict(raw_lengths))
+
+
+def _validate_resume_context_lengths(
+    expected_provenance: Mapping[str, object],
+    stored_provenances: Sequence[Mapping[str, object]],
+) -> list[str]:
+    current_lengths = _context_max_model_len(expected_provenance)
+    required_lengths: dict[str, int] = {}
+    for stored_provenance in stored_provenances:
+        for model_id, stored_length in _context_max_model_len(stored_provenance).items():
+            required_lengths[model_id] = max(required_lengths.get(model_id, 0), stored_length)
+    return sorted(
+        f"run_context.max_model_len.{model_id}"
+        for model_id, required_length in required_lengths.items()
+        if current_lengths.get(model_id, 0) < required_length
+    )
 
 
 def _literal_with_keyword_reprs(node: ast.expr) -> object:
@@ -1245,7 +1354,7 @@ def _pressure_resume_digests(
     expected_digest: str,
     expected_provenance: Mapping[str, object],
 ) -> dict[str, dict[str, str]]:
-    expected_common_provenance = dict(expected_provenance)
+    expected_common_provenance = generation_path_provenance(expected_provenance)
     expected_pressure = expected_common_provenance.pop("task_pressure", "none")
     if not isinstance(expected_pressure, str) or expected_pressure not in LADDER_TASK_PRESSURES:
         raise ValueError("expected provenance has an invalid task_pressure")
@@ -1255,20 +1364,34 @@ def _pressure_resume_digests(
     if provenance_digest(expected_provenance) != expected_digest:
         raise ValueError("expected provenance digest does not match its payload")
     stored_digests_by_pressure: dict[str, dict[str, str]] = {}
+    stored_contexts: list[Mapping[str, object]] = []
     for header in headers:
         pressure, raw_digest, detector_identity, raw_provenance = _resume_header_identity(
             path, header
         )
-        header_provenance = dict(raw_provenance)
+        header_provenance = generation_path_provenance(raw_provenance)
         header_provenance.pop("task_pressure", None)
         header_provenance.pop("detector_code_identity", None)
-        if header_provenance != expected_common_provenance:
-            raise ValueError(f"refusing to resume {path}: stored run provenance differs")
-        expected_header_digest = provenance_digest(raw_provenance)
-        if expected_header_digest != raw_digest:
+        differences = _identity_differences(expected_common_provenance, header_provenance)
+        if differences:
+            raise ValueError(
+                f"refusing to resume {path}: stored run provenance differs at keys: "
+                + ", ".join(differences)
+            )
+        if raw_digest not in {
+            provenance_digest(raw_provenance),
+            _legacy_provenance_digest(raw_provenance),
+        }:
             raise ValueError(f"{path} has a run header whose provenance digest is invalid")
+        stored_contexts.append(raw_provenance)
         digests_for_pressure = stored_digests_by_pressure.setdefault(pressure, {})
         digests_for_pressure[raw_digest] = detector_identity
+    context_differences = _validate_resume_context_lengths(expected_provenance, stored_contexts)
+    if context_differences:
+        raise ValueError(
+            f"refusing to resume {path}: stored run provenance differs at keys: "
+            + ", ".join(context_differences)
+        )
     return stored_digests_by_pressure
 
 
@@ -5096,7 +5219,11 @@ def _with_resolved_model_lengths(config: RunnerConfig) -> RunnerConfig:
             )
     resolved_config = replace(config, max_model_len_by_model=tuple(max_model_lens.items()))
     provenance = config.provenance_payload()
-    provenance["max_model_len"] = max_model_lens
+    resolved_provenance = resolved_config.provenance_payload()
+    resolved_context = resolved_provenance.get("run_context")
+    if not isinstance(resolved_context, Mapping):
+        raise TypeError("resolved ladder provenance must contain run_context")
+    provenance["run_context"] = dict(resolved_context)
     object.__setattr__(resolved_config, "_provenance_payload_cache", provenance)
     object.__setattr__(resolved_config, "_provenance_digest_cache", provenance_digest(provenance))
     return resolved_config
@@ -5244,16 +5371,16 @@ def run_grid(
         run_counts["torn_attempts_set_aside"],
         run_counts["to_run_now"],
     )
-    existing_pressure_digests = {
-        (record.get("provenance", {}).get("task_pressure", "none"), record.get("provenance_digest"))
-        for record in existing
-        if record.get("record") == "ladder_run_header"
+    current_provenance = config.provenance_payload()
+    has_current_launch_header = any(
+        record.get("record") == "ladder_run_header"
+        and record.get("provenance_digest") == config.provenance_digest
         and isinstance(record.get("provenance"), Mapping)
-    }
-    if (
-        not existing
-        or (config.task_pressure, config.provenance_digest) not in existing_pressure_digests
-    ):
+        and record["provenance"].get("task_pressure", "none") == config.task_pressure
+        and record["provenance"].get("run_context") == current_provenance.get("run_context")
+        for record in existing
+    )
+    if not has_current_launch_header:
         write_trace(
             config.output_path,
             [
@@ -5261,7 +5388,7 @@ def run_grid(
                     "record": "ladder_run_header",
                     "schema_version": LADDER_SCHEMA_VERSION,
                     "provenance_digest": config.provenance_digest,
-                    "provenance": config.provenance_payload(),
+                    "provenance": current_provenance,
                 }
             ],
             append=bool(existing),

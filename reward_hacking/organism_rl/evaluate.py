@@ -11,6 +11,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
@@ -782,6 +783,7 @@ def _generation_path_identity(
             spec.task_id: generate.task_definition_sha256(source.tasks[spec.task_id])
             for spec in sorted(task_specs, key=lambda task_spec: task_spec.task_id)
         },
+        "served_model_id": args.served_model_id,
     }
 
 
@@ -790,9 +792,59 @@ def _reuse_identity_differences(
 ) -> list[str]:
     if stored_identity is None:
         return ["stored generation-path identity is unavailable"]
+    normalized_expected = deepcopy(dict(expected_identity))
+    context_path = ("turn_and_thinking_budgets", "max_model_len")
+    expected_context = _nested_mapping_value(normalized_expected, context_path)
+    stored_context = _nested_mapping_value(stored_identity, context_path)
+    context_difference: list[str] = []
+    if type(expected_context) is int and type(stored_context) is int:
+        if expected_context < stored_context:
+            context_difference.append(".".join(context_path))
+        else:
+            _set_nested_mapping_value(normalized_expected, context_path, stored_context)
     return sorted(
-        key for key, value in expected_identity.items() if stored_identity.get(key) != value
+        set(context_difference) | set(_mapping_differences(normalized_expected, stored_identity))
     )
+
+
+def _nested_mapping_value(value: Mapping[str, object], path: tuple[str, ...]) -> object | None:
+    current: object = value
+    for part in path:
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _set_nested_mapping_value(
+    value: dict[str, object], path: tuple[str, ...], replacement: object
+) -> None:
+    current = value
+    for part in path[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            return
+        current = child
+    if path:
+        current[path[-1]] = replacement
+
+
+def _mapping_differences(
+    expected: Mapping[str, object], stored: Mapping[str, object], prefix: str = ""
+) -> list[str]:
+    differences: list[str] = []
+    for key in sorted(set(expected) | set(stored)):
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in expected or key not in stored:
+            differences.append(path)
+            continue
+        expected_value = expected[key]
+        stored_value = stored[key]
+        if isinstance(expected_value, Mapping) and isinstance(stored_value, Mapping):
+            differences.extend(_mapping_differences(expected_value, stored_value, path))
+        elif expected_value != stored_value:
+            differences.append(path)
+    return differences
 
 
 def _validate_reuse_identity(
@@ -1085,6 +1137,7 @@ def _publish_reused_cell(
 def _evaluation_provenance(
     args: argparse.Namespace,
     *,
+    endpoint: str,
     model_revision: str | None,
     task_specs: Sequence[TaskSpec],
     source: TaskEpisodeSource,
@@ -1096,7 +1149,6 @@ def _evaluation_provenance(
         "model_revision": model_revision,
         "served_model_id": args.served_model_id,
         "adapter_sha256": _adapter_sha256(args.adapter_dir) if args.adapter_dir else None,
-        "endpoint_sha256": hashlib.sha256((args.endpoint or "owned-vllm").encode()).hexdigest(),
         "families": list(args.families),
         "impossible_variant": args.impossible_variant,
         "aisi_sources": list(args.aisi_sources),
@@ -1167,6 +1219,7 @@ def _evaluation_provenance(
                 "reward_hacking/math_etl.py",
             )
         },
+        "run_context": generate.build_launch_context(endpoint, args.max_model_len),
     }
     provenance["generation_path_identity"] = _generation_path_identity(
         args,
@@ -1249,6 +1302,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     provenance = _evaluation_provenance(
         args,
+        endpoint=source_endpoint,
         model_revision=model_revision,
         task_specs=task_specs,
         source=source,

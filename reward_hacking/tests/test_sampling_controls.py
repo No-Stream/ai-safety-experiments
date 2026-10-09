@@ -117,7 +117,11 @@ def test_run_provenance_refuses_sampling_changes(
         original = generate._provenance(args, cast("Any", None), [])
     else:
         original = evaluate._evaluation_provenance(
-            args, model_revision=None, task_specs=[], source=cast("Any", None)
+            args,
+            endpoint=cast("str", args.endpoint),
+            model_revision=None,
+            task_specs=[],
+            source=cast("Any", None),
         )
     generate._prepare_run(tmp_path, original)
     setattr(args, field, value)
@@ -126,7 +130,11 @@ def test_run_provenance_refuses_sampling_changes(
         assert cast("dict[str, object]", changed["flags"])[field] == value
     else:
         changed = evaluate._evaluation_provenance(
-            args, model_revision=None, task_specs=[], source=cast("Any", None)
+            args,
+            endpoint=cast("str", args.endpoint),
+            model_revision=None,
+            task_specs=[],
+            source=cast("Any", None),
         )
         assert changed[field] == value
     with pytest.raises(ValueError, match="provenance"):

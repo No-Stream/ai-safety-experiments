@@ -290,6 +290,72 @@ def _read_records_with_lines(path: Path) -> list[tuple[int, Mapping[str, object]
     return rows
 
 
+def _scenario_set_versions(records: Sequence[Mapping[str, object]]) -> dict[str, str | None]:
+    """Read scenario set versions from ladder run headers for per-episode selection."""
+    set_versions: dict[str, str | None] = {}
+    for record in records:
+        if record.get("record") != "ladder_run_header":
+            continue
+        provenance = record.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise TypeError("ladder_run_header.provenance must be an object")
+        scenarios = provenance.get("scenarios")
+        if not isinstance(scenarios, list):
+            raise TypeError("ladder run header provenance.scenarios must be a list")
+        for scenario in scenarios:
+            if not isinstance(scenario, Mapping):
+                raise TypeError("ladder run header scenarios must be objects")
+            scenario_id = scenario.get("scenario_id")
+            set_version = scenario.get("set_version")
+            if not isinstance(scenario_id, str) or not scenario_id:
+                raise TypeError("ladder run header scenario_id must be a nonempty string")
+            if set_version is not None and not isinstance(set_version, str):
+                raise TypeError("ladder run header set_version must be a string or null")
+            if scenario_id in set_versions and set_versions[scenario_id] != set_version:
+                raise ValueError("ladder run headers disagree about a scenario set_version")
+            set_versions[scenario_id] = set_version
+    return set_versions
+
+
+def _heldout_ladder_exclusion_reason(
+    record: Mapping[str, object], set_versions: Mapping[str, str | None]
+) -> str | None:
+    """Return the training exclusion reason declared by a scenario or strategy family."""
+    scenario = record.get("scenario")
+    if scenario is not None and not isinstance(scenario, Mapping):
+        raise TypeError("ladder_episode.scenario must be an object")
+    scenario_version = scenario.get("set_version") if isinstance(scenario, Mapping) else None
+    if scenario_version is None:
+        scenario_version = record.get("scenario_set_version", record.get("set_version"))
+    if scenario_version is not None and not isinstance(scenario_version, str):
+        raise TypeError("ladder episode set_version must be a string or null")
+    if scenario_version is None:
+        scenario_id = _episode_key(record).get("scenario_id")
+        if isinstance(scenario_id, str):
+            scenario_version = set_versions.get(scenario_id)
+    if isinstance(scenario_version, str) and "heldout" in scenario_version.lower():
+        return "heldout_scenario_set"
+
+    for family_field in ("strategy_family", "family"):
+        family_value = record.get(family_field)
+        if isinstance(family_value, str) and _is_heldout_strategy_family(family_value):
+            return "heldout_strategy_family"
+    primary_strategy = record.get("primary_strategy")
+    if (
+        isinstance(primary_strategy, str)
+        and _dataset_card_strategy_family(primary_strategy) == "held_out"
+    ):
+        return "heldout_strategy_family"
+    return None
+
+
+def _is_heldout_strategy_family(family_value: str) -> bool:
+    for family_code, family_metadata in STRATEGY_FAMILY_MAPPING.items():
+        if family_value in {family_code, cast("str", family_metadata["name"])}:
+            return family_metadata["status"] == "held_out"
+    return False
+
+
 def _episode_key(record: Mapping[str, object]) -> dict[str, object]:
     value = record.get("key")
     if not isinstance(value, Mapping):
@@ -1250,7 +1316,9 @@ def _select_records(
     seen_strategy_labels: set[str] = set()
     seen_hint_judge_labels: set[str] = set()
     for records_path in records_paths:
-        for line_number, record in _read_records_with_lines(records_path):
+        records = _read_records_with_lines(records_path)
+        scenario_set_versions = _scenario_set_versions([record for _, record in records])
+        for line_number, record in records:
             if record.get("record") != "ladder_episode":
                 continue
             identity_key = _training_key(records_path, line_number, _episode_key(record))
@@ -1264,6 +1332,9 @@ def _select_records(
                 seen_strategy_labels.add(identity_key)
             if identity_key in selection_config.hint_judge_labels:
                 seen_hint_judge_labels.add(identity_key)
+            heldout_exclusion_reason = _heldout_ladder_exclusion_reason(
+                record, scenario_set_versions
+            )
             entry = _select_episode(
                 record,
                 records_path,
@@ -1271,6 +1342,15 @@ def _select_records(
                 selection_config,
                 validated_override,
             )
+            if heldout_exclusion_reason is not None:
+                _excluded_entry(entry, heldout_exclusion_reason)
+            else:
+                primary_strategy = entry.get("primary_strategy")
+                if (
+                    isinstance(primary_strategy, str)
+                    and _dataset_card_strategy_family(primary_strategy) == "held_out"
+                ):
+                    _excluded_entry(entry, "heldout_strategy_family")
             (excluded if "exclusion_reason" in entry else selected).append(entry)
     return selected, excluded, seen_strategy_labels, seen_hint_judge_labels
 

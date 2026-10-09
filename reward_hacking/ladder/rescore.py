@@ -201,7 +201,7 @@ def _headers_by_pressure(
         pressure = provenance.get("task_pressure", "none")
         if not isinstance(pressure, str) or pressure not in LADDER_TASK_PRESSURES:
             raise ValueError(f"run header has invalid task pressure {pressure!r}")
-        current_common = dict(provenance)
+        current_common = runner.generation_path_provenance(provenance)
         current_common.pop("task_pressure", None)
         if "detector_code_identity" in current_common:
             detector_identity = current_common.pop("detector_code_identity")

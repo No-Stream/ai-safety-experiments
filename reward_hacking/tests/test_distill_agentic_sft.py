@@ -297,6 +297,50 @@ def test_selection_uses_move_flags_and_reports_token_awareness_and_builder_exclu
     assert "PAER" not in summary_text
 
 
+def test_selection_excludes_ladder_scenarios_from_a_heldout_run_header(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path,
+        "heldout-scenario",
+        SyntheticEpisodeOptions(grader_directed_move=True),
+    )
+    records_path = _write_records(
+        tmp_path / "records.jsonl",
+        [
+            {
+                "record": "ladder_run_header",
+                "provenance": {
+                    "scenarios": [
+                        {"scenario_id": "heldout-scenario", "set_version": "v2-heldout-wip"}
+                    ]
+                },
+            },
+            episode,
+        ],
+    )
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "heldout_scenario_set"
+
+
+def test_selection_excludes_records_from_heldout_strategy_families(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path,
+        "heldout-family",
+        SyntheticEpisodeOptions(grader_directed_move=True),
+    )
+    episode["family"] = "ci_or_policy_bypass"
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "heldout_strategy_family"
+
+
 def test_selection_applies_health_filters_and_reports_independent_and_sequential_counts(
     tmp_path: Path,
 ) -> None:

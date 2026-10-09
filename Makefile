@@ -13,7 +13,7 @@ RUFF := $(UV) ruff
 # tests/test_interpreter_compat.py is what keeps the scripts that run under it 3.9-clean.
 SYSTEM_PYTHON := /usr/bin/python3
 
-.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install
+.PHONY: setup setup-gpu hooks test test-select test-changed format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install env-gate
 
 setup: hooks
 	uv sync --frozen
@@ -75,6 +75,11 @@ test:
 
 test-select:
 	env RLVR_SMOKE=1 $(TEST_CUDA_ENV) $(UV) pytest $(ARGS)
+
+ENV_GATE_FIXTURES ?= docs/scratch/env-gate-fixtures
+
+env-gate:
+	$(UV) python -m reward_hacking.organism_rl.env_gate --fixtures $(ENV_GATE_FIXTURES)
 
 # The fast iteration gate: only the test files the working tree's changes against HEAD can reach,
 # mapped by directory (scripts/test_changed.py carries the table: a games/ edit runs games/tests, a

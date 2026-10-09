@@ -14,10 +14,13 @@ import tempfile
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from itertools import zip_longest
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
+from urllib.parse import urlsplit
 
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
@@ -59,7 +62,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TURNS = 8
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
-PROVENANCE_SCHEMA_VERSION = 1
+PROVENANCE_SCHEMA_VERSION = 2
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
 
 
@@ -520,6 +523,119 @@ def _canonical_sha256(value: Mapping[str, object]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def build_launch_context(endpoint: str, max_model_len: int) -> dict[str, object]:
+    """Record connection and process details that can change between equivalent launches."""
+    endpoint_parts = urlsplit(endpoint)
+    if endpoint_parts.scheme not in {"http", "https"} or endpoint_parts.hostname is None:
+        raise ValueError("generation endpoint must be an HTTP or HTTPS URL")
+    return {
+        "endpoint_sha256": hashlib.sha256(endpoint.encode("utf-8")).hexdigest(),
+        "host": endpoint_parts.hostname,
+        "port": endpoint_parts.port,
+        "launched_at_utc": datetime.now(UTC).isoformat(),
+        "pid": os.getpid(),
+        "max_model_len": max_model_len,
+    }
+
+
+def _provenance_identity(provenance: Mapping[str, object]) -> dict[str, object]:
+    identity = {
+        key: deepcopy(value)
+        for key, value in provenance.items()
+        if key not in {"run_context", "run_contexts"}
+    }
+    identity.pop("endpoint_sha256", None)
+    flags = identity.get("flags")
+    if isinstance(flags, Mapping):
+        identity["flags"] = {
+            key: deepcopy(value) for key, value in flags.items() if key != "endpoint_sha256"
+        }
+    return identity
+
+
+def _nested_value(value: Mapping[str, object], path: tuple[str, ...]) -> object | None:
+    current: object = value
+    for part in path:
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _set_nested_value(value: dict[str, object], path: tuple[str, ...], replacement: object) -> None:
+    current = value
+    for part in path[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            return
+        current = child
+    if path:
+        current[path[-1]] = replacement
+
+
+def _identity_differences(
+    current_identity: dict[str, object], stored_identity: Mapping[str, object]
+) -> list[str]:
+    model_length_paths = (
+        ("flags", "max_model_len"),
+        ("max_model_len",),
+        ("max_model_len_requirement",),
+        ("generation_path_identity", "turn_and_thinking_budgets", "max_model_len"),
+    )
+    lower_bound_differences: list[str] = []
+    for path in model_length_paths:
+        current_length = _nested_value(current_identity, path)
+        stored_length = _nested_value(stored_identity, path)
+        if type(current_length) is not int or type(stored_length) is not int:
+            continue
+        if current_length < stored_length:
+            lower_bound_differences.append(".".join(path))
+        else:
+            _set_nested_value(current_identity, path, stored_length)
+    generation_identity = current_identity.get("generation_path_identity")
+    if (
+        isinstance(generation_identity, Mapping)
+        and "generation_path_identity_sha256" in current_identity
+    ):
+        current_identity["generation_path_identity_sha256"] = _canonical_sha256(
+            cast("Mapping[str, object]", generation_identity)
+        )
+    differences = _mapping_differences(current_identity, stored_identity)
+    return sorted({*lower_bound_differences, *differences})
+
+
+def _mapping_differences(
+    current: Mapping[str, object], stored: Mapping[str, object], prefix: str = ""
+) -> list[str]:
+    differences: list[str] = []
+    for key in sorted(set(current) | set(stored)):
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in current or key not in stored:
+            differences.append(path)
+            continue
+        current_value = current[key]
+        stored_value = stored[key]
+        if isinstance(current_value, Mapping) and isinstance(stored_value, Mapping):
+            differences.extend(_mapping_differences(current_value, stored_value, path))
+        elif current_value != stored_value:
+            differences.append(path)
+    return differences
+
+
+def _legacy_run_context(provenance: Mapping[str, object]) -> dict[str, object] | None:
+    flags = provenance.get("flags")
+    if not isinstance(flags, Mapping) or "endpoint_sha256" not in flags:
+        return None
+    context: dict[str, object] = {
+        "endpoint_sha256": flags["endpoint_sha256"],
+        "legacy_context": True,
+    }
+    max_model_len = flags.get("max_model_len")
+    if type(max_model_len) is int:
+        context["max_model_len"] = max_model_len
+    return context
+
+
 def _write_json_atomically(path: Path, value: Mapping[str, object]) -> None:
     """Replace one JSON artifact only after the complete payload has reached disk."""
     temporary_path: Path | None = None
@@ -542,29 +658,129 @@ def _write_json_atomically(path: Path, value: Mapping[str, object]) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Path, str]:
+def _read_existing_provenance(path: Path) -> Mapping[str, object]:
+    value: object = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping):
+        raise TypeError("existing run provenance must be an object")
+    schema_version = value.get("schema_version")
+    provenance_sha256 = value.get("provenance_sha256")
+    provenance = value.get("provenance")
+    if type(schema_version) is not int or not isinstance(provenance_sha256, str):
+        raise ValueError("existing run provenance has an invalid schema or digest")
+    if not isinstance(provenance, Mapping):
+        raise TypeError("existing run provenance must contain an object at 'provenance'")
+    return value
+
+
+def _validate_resume_identity(
+    current_identity: dict[str, object], stored_identity: Mapping[str, object]
+) -> None:
+    differences = _identity_differences(deepcopy(current_identity), stored_identity)
+    if differences:
+        raise ValueError(
+            "current generation-path provenance identity differs from the existing output directory; "
+            "use a fresh output directory. Differing keys: " + ", ".join(differences)
+        )
+
+
+def _load_legacy_provenance(
+    existing: Mapping[str, object], current_identity: dict[str, object]
+) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
+    stored_hash = cast("str", existing["provenance_sha256"])
+    stored_provenance = cast("Mapping[str, object]", existing["provenance"])
+    if _canonical_sha256(stored_provenance) != stored_hash:
+        raise ValueError("legacy run provenance digest is invalid; use a fresh output directory")
+    stored_identity = _provenance_identity(stored_provenance)
+    if (
+        stored_identity.get("schema_version") == 1
+        and current_identity.get("schema_version") == PROVENANCE_SCHEMA_VERSION
+    ):
+        stored_identity["schema_version"] = PROVENANCE_SCHEMA_VERSION
+    _validate_resume_identity(current_identity, stored_identity)
+    legacy_context = _legacy_run_context(stored_provenance)
+    run_contexts = [] if legacy_context is None else [legacy_context]
+    return stored_identity, run_contexts, {stored_hash}
+
+
+def _load_current_provenance(
+    existing: Mapping[str, object], current_identity: dict[str, object]
+) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
+    stored_provenance = cast("Mapping[str, object]", existing["provenance"])
+    stored_identity = _provenance_identity(stored_provenance)
+    stored_hash = cast("str", existing["provenance_sha256"])
+    if _canonical_sha256(stored_identity) != stored_hash:
+        raise ValueError("existing generation-path identity digest is invalid")
+    raw_compatible_hashes = existing.get("compatible_provenance_sha256", [])
+    if not isinstance(raw_compatible_hashes, list) or any(
+        not isinstance(value, str) for value in raw_compatible_hashes
+    ):
+        raise TypeError("compatible provenance digests must be a list of strings")
+    raw_run_contexts = stored_provenance.get("run_contexts", [])
+    if not isinstance(raw_run_contexts, list) or any(
+        not isinstance(value, Mapping) for value in raw_run_contexts
+    ):
+        raise TypeError("stored run_contexts must be a list of objects")
+    _validate_resume_identity(current_identity, stored_identity)
+    return (
+        stored_identity,
+        [dict(value) for value in raw_run_contexts],
+        set(cast("list[str]", raw_compatible_hashes)),
+    )
+
+
+def _load_existing_provenance(
+    path: Path, current_identity: dict[str, object]
+) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
+    existing = _read_existing_provenance(path)
+    schema_version = cast("int", existing["schema_version"])
+    if schema_version == 1:
+        return _load_legacy_provenance(existing, current_identity)
+    if schema_version == PROVENANCE_SCHEMA_VERSION:
+        return _load_current_provenance(existing, current_identity)
+    raise ValueError(
+        f"unsupported run provenance schema {schema_version}; use a fresh output directory"
+    )
+
+
+def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Path, str, set[str]]:
     require_gitignored_output_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     provenance_path = output_dir / "provenance.json"
     records_path = output_dir / "records.jsonl"
-    provenance_hash = _canonical_sha256(provenance)
-    stored_provenance: dict[str, object] = {
-        "schema_version": PROVENANCE_SCHEMA_VERSION,
-        "provenance_sha256": provenance_hash,
-        "provenance": dict(provenance),
-    }
+    current_identity = _provenance_identity(provenance)
+    run_context = provenance.get("run_context")
+    if run_context is not None and not isinstance(run_context, Mapping):
+        raise TypeError("run_context must be an object")
+    run_contexts: list[dict[str, object]] = []
+    compatible_hashes: set[str] = set()
     if provenance_path.exists():
-        existing: object = json.loads(provenance_path.read_text(encoding="utf-8"))
-        if existing != stored_provenance:
-            raise ValueError("current run provenance differs from the existing output directory")
+        current_identity, run_contexts, compatible_hashes = _load_existing_provenance(
+            provenance_path, current_identity
+        )
     elif records_path.exists() and records_path.stat().st_size > 0:
         raise ValueError("records exist without provenance; refusing an unsafe resume")
     else:
-        _write_json_atomically(provenance_path, stored_provenance)
-    return records_path, provenance_hash
+        run_contexts = []
+        compatible_hashes = set()
+    if run_context is not None:
+        run_contexts.append(dict(run_context))
+    provenance_hash = _canonical_sha256(current_identity)
+    stored_provenance = {**current_identity, "run_contexts": run_contexts}
+    _write_json_atomically(
+        provenance_path,
+        {
+            "schema_version": PROVENANCE_SCHEMA_VERSION,
+            "provenance_sha256": provenance_hash,
+            "compatible_provenance_sha256": sorted(compatible_hashes),
+            "provenance": stored_provenance,
+        },
+    )
+    return records_path, provenance_hash, {provenance_hash, *compatible_hashes}
 
 
-def _existing_records(records_path: Path, *, provenance_sha256: str) -> list[dict[str, object]]:
+def _existing_records(
+    records_path: Path, *, accepted_provenance_sha256: set[str]
+) -> list[dict[str, object]]:
     if not records_path.exists():
         return []
     records: list[dict[str, object]] = []
@@ -582,7 +798,7 @@ def _existing_records(records_path: Path, *, provenance_sha256: str) -> list[dic
             if (
                 not isinstance(task_id, str)
                 or type(sample_index) is not int
-                or record.get("run_provenance_sha256") != provenance_sha256
+                or record.get("run_provenance_sha256") not in accepted_provenance_sha256
             ):
                 raise ValueError(f"records.jsonl line {line_number} has invalid resume identity")
             key = (task_id, sample_index)
@@ -1044,8 +1260,10 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
         raise ValueError("concurrency must be a positive integer")
     if len({task.task_id for task in task_specs}) != len(task_specs):
         raise ValueError("task specs must have unique task ids")
-    records_path, provenance_sha256 = _prepare_run(output_dir, provenance)
-    records = _existing_records(records_path, provenance_sha256=provenance_sha256)
+    records_path, provenance_sha256, accepted_provenance_sha256 = _prepare_run(
+        output_dir, provenance
+    )
+    records = _existing_records(records_path, accepted_provenance_sha256=accepted_provenance_sha256)
     thinking_budget_overshoot_policy.check(
         len(records),
         sum(record.get("failure_reason") == "thinking_budget_overshoot" for record in records),
@@ -1152,7 +1370,6 @@ def _provenance(
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "flags": {
-            "endpoint_sha256": hashlib.sha256(args.endpoint.encode("utf-8")).hexdigest(),
             "model": args.model,
             "served_model_id": args.served_model_id,
             "model_revision": args.model_revision,
@@ -1217,6 +1434,7 @@ def _provenance(
         ),
         "payment_registers": {spec.task_id: spec.payment_register for spec in task_specs},
         "task_selection_order": [spec.task_id for spec in task_specs],
+        "run_context": build_launch_context(args.endpoint, args.max_model_len),
         "selected_tasks": [
             {
                 "task_id": spec.task_id,

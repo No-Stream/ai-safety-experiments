@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -271,6 +272,82 @@ def test_generation_path_identity_excludes_harness_code_sha() -> None:
     stored_identity = dict(expected_identity)
 
     assert evaluate._validate_reuse_identity(expected_identity, stored_identity, waiver=None) == []
+
+
+def test_reuse_accepts_larger_context_requirement_and_names_a_smaller_one() -> None:
+    stored_identity: dict[str, object] = {
+        "task_ids": ["task-a"],
+        "turn_and_thinking_budgets": {"max_model_len": 65_536},
+    }
+    larger_context_identity = {
+        "task_ids": ["task-a"],
+        "turn_and_thinking_budgets": {"max_model_len": 131_072},
+    }
+
+    assert (
+        evaluate._validate_reuse_identity(larger_context_identity, stored_identity, waiver=None)
+        == []
+    )
+
+    smaller_context_identity = {
+        "task_ids": ["task-a"],
+        "turn_and_thinking_budgets": {"max_model_len": 32_768},
+    }
+    with pytest.raises(ValueError, match=r"turn_and_thinking_budgets\.max_model_len"):
+        evaluate._validate_reuse_identity(smaller_context_identity, stored_identity, waiver=None)
+
+
+def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id() -> None:
+    def provenance_for(endpoint: str) -> dict[str, object]:
+        args = argparse.Namespace(
+            endpoint=endpoint,
+            model="synthetic-model",
+            model_revision="synthetic-revision",
+            served_model_id="synthetic-served-model",
+            adapter_dir=None,
+            families=("ilcb",),
+            impossible_variant="oneoff",
+            aisi_sources=(),
+            enable_speculative_decoding=False,
+            leak_channels=(),
+            leak_channels_open=False,
+            leak_instruction=None,
+            leak_channel_split=None,
+            tasks_per_family=1,
+            sampling_budget={},
+            seed=17,
+            concurrency=1,
+            max_model_len=4096,
+            max_turns=2,
+            max_new_tokens=32,
+            thinking_token_budget=None,
+            thinking_budget_overshoot_max_fraction=0.1,
+            thinking_budget_overshoot_min_episodes=3,
+            announced_turn_budget=None,
+            temperature=1.0,
+            top_p=1.0,
+            top_k=None,
+            presence_penalty=None,
+            repetition_penalty=None,
+            jail_backend=None,
+        )
+        source = SimpleNamespace(endpoint=endpoint, skip_counts={}, tasks={})
+        return evaluate._evaluation_provenance(
+            args,
+            endpoint=endpoint,
+            model_revision="synthetic-revision",
+            task_specs=(),
+            source=cast("TaskEpisodeSource", source),
+        )
+
+    first = provenance_for("http://127.0.0.1:8000")
+    restarted = provenance_for("http://127.0.0.1:8001")
+    first_identity = cast("dict[str, object]", first["generation_path_identity"])
+    restarted_identity = cast("dict[str, object]", restarted["generation_path_identity"])
+
+    assert first_identity == restarted_identity
+    assert first_identity["served_model_id"] == "synthetic-served-model"
+    assert first["run_context"] != restarted["run_context"]
 
 
 def test_owned_server_serves_the_requested_concurrency_with_mtp_drafting() -> None:

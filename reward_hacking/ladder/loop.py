@@ -639,16 +639,25 @@ class _ToolActionState:
     deadline_phase: DeadlinePhase | None = None
 
 
-def _grade_submission(
-    context: _ToolActionContext,
+def grade_registered_submission(
+    command: str,
+    episode_dir: Path,
     submissions_used: int,
-) -> SubmissionVerdict:
-    if context.ci_submit_grader is not None:
+    *,
+    submit_grader: SubmissionGrader | None,
+    ci_submit_grader: BudgetedSubmissionGrader | None,
+) -> SubmissionVerdict | None:
+    """Grade one exact registered submit command with the ladder's remaining-run budget."""
+    if not contains_submit_marker(command):
+        return None
+    if type(submissions_used) is not int or not 0 <= submissions_used < LADDER_MAX_SUBMISSIONS:
+        raise ValueError("registered submission count is outside the ladder submission limit")
+    if ci_submit_grader is not None:
         remaining_submissions = LADDER_MAX_SUBMISSIONS - submissions_used - 1
-        return context.ci_submit_grader(context.episode_dir, remaining_submissions)
-    if context.submit_grader is None:
+        return ci_submit_grader(episode_dir, remaining_submissions)
+    if submit_grader is None:
         raise ValueError("a submission action requires an arm-specific submission grader")
-    return context.submit_grader(context.episode_dir)
+    return submit_grader(episode_dir)
 
 
 def _append_turns_remaining_note(
@@ -1184,14 +1193,20 @@ def _execute_tool_call(  # noqa: C901 - keep execution and its aligned evidence 
                 cwd_after=cwd_after,
             )
         )
-        if contains_submit_marker(raw_command):
+        verdict = grade_registered_submission(
+            raw_command,
+            context.episode_dir,
+            state.submissions_used,
+            submit_grader=context.submit_grader,
+            ci_submit_grader=context.ci_submit_grader,
+        )
+        if verdict is not None:
             if context.grader_hashable:
                 state.grader_submission_sha256s.append(
                     grader_integrity_hash(
                         context.episode_dir, context.task.effective_grader_integrity_files
                     )
                 )
-            verdict = _grade_submission(context, state.submissions_used)
             state.submissions_used += 1
             state.last_submission = verdict
             state.submission_fail_seen = state.submission_fail_seen or not verdict.passed

@@ -528,7 +528,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
         "tool_schema_sha256",
         "system_prompt_sha256",
         "user_template_sha256",
-        "max_model_len",
+        "run_context",
         "sampling",
         "server_args",
         "max_submissions",
@@ -536,7 +536,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     } <= provenance.keys()
     assert provenance["final_report_seconds"] == ladder_loop.LADDER_FINAL_REPORT_SECONDS
     assert provenance["max_submissions"] == ladder_loop.LADDER_MAX_SUBMISSIONS
-    assert provenance["max_model_len"] == {"base": 32768}
+    assert cast("dict[str, object]", provenance["run_context"])["max_model_len"] == {"base": 32768}
     model_provenance = cast("list[dict[str, object]]", provenance["models"])[0]
     assert model_provenance["chat_template_kwargs"] == {}
     assert provenance["server_args"] == {
@@ -2098,6 +2098,130 @@ def test_generation_code_change_refuses_resume(
         )
 
 
+def test_resume_accepts_endpoint_restart_and_larger_context_but_rejects_smaller(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "endpoint-restart.jsonl"
+    initial_config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        max_model_len_by_model=(("base", 4096),),
+    )
+    calls: list[int] = []
+
+    def run(config: RunnerConfig) -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda _scenario, _backend, _arm, sample_index, _episode_dir, _trace_path: (
+                calls.append(sample_index) or {"true_pass": True}
+            ),
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+    run(initial_config)
+    restarted_config = replace(
+        initial_config,
+        endpoint="http://127.0.0.1:8001",
+        max_model_len_by_model=(("base", 8192),),
+    )
+
+    run(restarted_config)
+
+    assert calls == [0]
+    headers = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("record") == "ladder_run_header"
+    ]
+    assert len(headers) == 2
+    contexts = [
+        cast("dict[str, object]", header["provenance"]["run_context"]) for header in headers
+    ]
+    assert [cast("dict[str, int]", context["max_model_len"])["base"] for context in contexts] == [
+        4096,
+        8192,
+    ]
+    assert [context["port"] for context in contexts] == [8000, 8001]
+
+    too_small_config = replace(restarted_config, max_model_len_by_model=(("base", 2048),))
+    with pytest.raises(ValueError, match=r"run_context\.max_model_len\.base"):
+        run(too_small_config)
+
+
+def test_resume_refusal_names_changed_ladder_generation_key(tmp_path: Path) -> None:
+    output_path = tmp_path / "sampling-mismatch.jsonl"
+    initial_config = replace(runner_config(output_path), arms=("naive",), samples=1)
+    run_grid(
+        initial_config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+
+    with pytest.raises(ValueError, match=r"sampling\.top_p"):
+        run_grid(
+            replace(initial_config, top_p=0.8),
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda *_args: {"true_pass": True},
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+
+def test_resume_accepts_legacy_endpoint_header_when_identity_matches(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "legacy-endpoint.jsonl"
+    config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        max_model_len_by_model=(("base", 4096),),
+    )
+    legacy_provenance = config.provenance_payload()
+    legacy_provenance.pop("run_context", None)
+    legacy_provenance["endpoint"] = "http://127.0.0.1:8000"
+    legacy_provenance["max_model_len"] = {"base": 4096}
+    legacy_serialized = json.dumps(
+        ladder_runner._canonical_json(legacy_provenance), sort_keys=True, separators=(",", ":")
+    )
+    legacy_digest = hashlib.sha256(legacy_serialized.encode("utf-8")).hexdigest()
+    legacy_detector_identity = cast("str", legacy_provenance["detector_code_identity"])
+    output_path.write_text(
+        json.dumps(
+            {
+                "record": "ladder_run_header",
+                "schema_version": LADDER_SCHEMA_VERSION,
+                "provenance_digest": legacy_digest,
+                "provenance": legacy_provenance,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "record": "ladder_episode",
+                "provenance_digest": legacy_digest,
+                "detector_code_identity": legacy_detector_identity,
+                "key": EpisodeKey("base", "dummy", "naive", 0).to_json(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = completed_episode_keys(
+        output_path,
+        expected_digest=config.provenance_digest,
+        expected_provenance=config.provenance_payload(),
+    )
+
+    assert completed == {EpisodeKey("base", "dummy", "naive", 0)}
+
+
 def test_server_argument_change_refuses_resume(tmp_path: Path) -> None:
     output_path = tmp_path / "records.jsonl"
     initial_config = replace(
@@ -2743,7 +2867,7 @@ def test_run_grid_default_real_path_persists_command_and_episode_traces(
         "final_report": "completed honestly",
     }
     run_header = json.loads(config.output_path.read_text(encoding="utf-8").splitlines()[0])
-    assert run_header["provenance"]["max_model_len"] == {"base": 32768}
+    assert run_header["provenance"]["run_context"]["max_model_len"] == {"base": 32768}
     assert run_header["provenance"]["server_args"] == {
         "kv_cache_dtype": "fp8",
         "attention_backend": "FLASHINFER",
@@ -3616,7 +3740,7 @@ def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
     # Captured with the opt-in budget disabled and source identities fixed independently of edits.
     assert (
         config.provenance_digest
-        == "3cd3311760115b56384b4a32d7704611a4ee3637b70fc44e624ae98c258c3610"
+        == "998feb4ae3dd36e8d545e5e1d65007ba525732776f2f1456501b34278c48831d"
     )
 
 

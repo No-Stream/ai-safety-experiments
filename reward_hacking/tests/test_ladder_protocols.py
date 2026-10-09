@@ -201,7 +201,8 @@ def test_ladder_provenance_records_online_fp8_and_kv_cache_dtype(tmp_path: Path)
 
     provenance = config.provenance_payload()
 
-    assert provenance["max_model_len"] == {"gemma": 16_384}
+    run_context = cast("dict[str, object]", provenance["run_context"])
+    assert run_context["max_model_len"] == {"gemma": 16_384}
     assert provenance["server_args"] == {
         "quantization": "fp8_per_tensor",
         "kv_cache_dtype": "fp8",
