@@ -129,6 +129,7 @@ ALL_COMPATIBLE_CHANNELS: tuple[str, ...] = tuple(
 BUILDER_VERSION = "leak_channels_3"
 _PATCH_SUFFIXES = {".orig", ".rej", ".patch"}
 _CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", "build", "dist"}
+_BUILD_CACHE_DIRECTORIES = {".pytest_cache", "build", "dist"}
 _SHA256_EMPTY = hashlib.sha256(b"").hexdigest()
 _MIN_FINGERPRINT_LINE_NONSPACE_CHARS = 8
 _MIN_GIT_TREE_COLUMNS = 3
@@ -553,6 +554,14 @@ def _normalize_tree_times(
     _set_mtime(root, base_date)
 
 
+def _untracked_paths(repository: Path) -> list[Path]:
+    return [
+        Path(os.fsdecode(path))
+        for path in _git(repository, "ls-files", "--others", "-z").stdout.split(b"\x00")
+        if path
+    ]
+
+
 def _normalise_index(repository: Path, base_date: int) -> None:
     index_path = repository / ".git" / "index"
     content = bytearray(index_path.read_bytes())
@@ -589,11 +598,7 @@ def _normalise_index(repository: Path, base_date: int) -> None:
 
 def _remove_closed_artifacts(root: Path) -> None:
     """Delete untracked caches, build outputs and patch leftovers; tracked files are repository content."""
-    untracked_paths = [
-        Path(os.fsdecode(path))
-        for path in _git(root, "ls-files", "--others", "-z").stdout.split(b"\x00")
-        if path
-    ]
+    untracked_paths = _untracked_paths(root)
     for relative_path in untracked_paths:
         path = root / relative_path
         in_cache_directory = any(part in _CACHE_DIRECTORIES for part in relative_path.parts[:-1])
@@ -603,10 +608,10 @@ def _remove_closed_artifacts(root: Path) -> None:
             path.unlink()
     for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
         if (
-            path.name in _CACHE_DIRECTORIES
-            and path.is_dir()
+            path.is_dir()
             and not path.is_symlink()
             and ".git" not in path.relative_to(root).parts
+            and any(part in _CACHE_DIRECTORIES for part in path.relative_to(root).parts)
             and not any(path.iterdir())
         ):
             path.rmdir()
@@ -1243,17 +1248,25 @@ def _manifest_data(manifest: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapp
     return fix, details
 
 
+def _matching_artifact_paths(template_dir: Path, detail: Mapping[str, Any]) -> set[str]:
+    expected_hashes = detail.get("artifact_sha256s", {})
+    if not isinstance(expected_hashes, dict) or not expected_hashes:
+        return set()
+    return {
+        path
+        for path, digest in expected_hashes.items()
+        if (template_dir / path).is_file()
+        and _file_sha256((template_dir / path).read_bytes()) == digest
+    }
+
+
 def _hash_matches(template_dir: Path, manifest: Mapping[str, Any], channel: str) -> bool:
     _, details = _manifest_data(manifest)
     detail = details[channel]
     expected_hashes = detail.get("artifact_sha256s", {})
     if not isinstance(expected_hashes, dict) or not expected_hashes:
         return False
-    return all(
-        (template_dir / path).is_file()
-        and _file_sha256((template_dir / path).read_bytes()) == digest
-        for path, digest in expected_hashes.items()
-    )
+    return len(_matching_artifact_paths(template_dir, detail)) == len(expected_hashes)
 
 
 def _fsck_ids(repository: Path) -> set[str]:
@@ -1467,27 +1480,22 @@ def _probe_closed_pyc_cache(
 
 
 def _probe_closed_build_cache(
-    template_dir: Path, _fix: Mapping[str, Any], _detail: Mapping[str, Any]
+    template_dir: Path, _fix: Mapping[str, Any], detail: Mapping[str, Any]
 ) -> bool:
+    if _matching_artifact_paths(template_dir, detail):
+        return False
     return not any(
-        path.exists()
-        for path in (
-            template_dir / "build",
-            template_dir / "dist",
-            template_dir / ".pytest_cache",
-            template_dir / ".coverage",
-        )
+        path.name == ".coverage" or any(part in _BUILD_CACHE_DIRECTORIES for part in path.parts)
+        for path in _untracked_paths(template_dir)
     )
 
 
 def _probe_closed_patch_file(
-    template_dir: Path, _fix: Mapping[str, Any], _detail: Mapping[str, Any]
+    template_dir: Path, _fix: Mapping[str, Any], detail: Mapping[str, Any]
 ) -> bool:
-    return not any(
-        path.is_file() and path.suffix in _PATCH_SUFFIXES
-        for suffix in _PATCH_SUFFIXES
-        for path in template_dir.rglob(f"*{suffix}")
-    )
+    if _matching_artifact_paths(template_dir, detail):
+        return False
+    return not any(path.suffix in _PATCH_SUFFIXES for path in _untracked_paths(template_dir))
 
 
 _OPEN_PROBES: dict[str, Callable[..., bool]] = {

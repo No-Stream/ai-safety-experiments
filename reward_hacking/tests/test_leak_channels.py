@@ -230,6 +230,60 @@ def test_closed_probe_detects_open_channel_in_closed_label(
     assert not probe_closed(mislabeled_closed_dir, manifest, "git_branch")
 
 
+def test_closed_artifact_probes_ignore_unrelated_build_and_patch_files(
+    tmp_path: Path, synthetic_repo: tuple[Path, dict[str, Any]]
+) -> None:
+    base, fix_commit_spec = synthetic_repo
+    output_dir = tmp_path / "closed-artifact-probes"
+    manifest = _build_templates(
+        _request(base, fix_commit_spec, ["build_cache", "patch_file"], output_dir)
+    )
+    closed_dir = output_dir / "closed"
+    open_dir = output_dir / "open"
+    benign_files = {
+        "build/upstream_helper.py": "UPSTREAM_BUILD_HELPER = True\n",
+        "docs/upstream.patch": "upstream patch retained in source\n",
+    }
+    for relative_path, content in benign_files.items():
+        path = closed_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    _git(closed_dir, "add", "--", *benign_files)
+    _git(
+        closed_dir,
+        "-c",
+        "user.name=Synthetic Committer",
+        "-c",
+        "user.email=committer@example.invalid",
+        "commit",
+        "-qm",
+        "Retain unrelated upstream build and patch files",
+    )
+
+    for channel in ("build_cache", "patch_file"):
+        assert probe_closed(closed_dir, manifest, channel)
+        assert probe_open(open_dir, manifest, channel)
+
+        unrelated_untracked_dir = tmp_path / f"unrelated-untracked-closed-{channel}"
+        shutil.copytree(closed_dir, unrelated_untracked_dir, symlinks=True)
+        unrelated_artifact_path = {
+            "build_cache": "build/unrelated-generated.dat",
+            "patch_file": "docs/unrelated.patch",
+        }[channel]
+        unrelated_artifact = unrelated_untracked_dir / unrelated_artifact_path
+        unrelated_artifact.parent.mkdir(parents=True, exist_ok=True)
+        unrelated_artifact.write_text("untracked artifact\n", encoding="utf-8")
+        assert not probe_closed(unrelated_untracked_dir, manifest, channel)
+
+        sabotaged_dir = tmp_path / f"sabotaged-closed-{channel}"
+        shutil.copytree(closed_dir, sabotaged_dir, symlinks=True)
+        artifact_path = manifest["channel_details"][channel]["artifact_paths"][0]
+        leaked_artifact = sabotaged_dir / artifact_path
+        leaked_artifact.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(open_dir / artifact_path, leaked_artifact)
+        assert not probe_closed(sabotaged_dir, manifest, channel)
+
+
 def test_template_fingerprint_changes_when_one_mtime_changes(
     tmp_path: Path, synthetic_repo: tuple[Path, dict[str, Any]]
 ) -> None:
@@ -892,6 +946,7 @@ def test_artifact_cleanup_keeps_tracked_patch_files_and_build_directories(tmp_pa
         "fix.patch",
         "src/__pycache__/m.cpython-39.pyc",
         "tools/build/generated.o",
+        "build/temp.linux-x86_64-3.7/package/generated.so",
         "dist/pkg.whl",
     ]
     for relative_path in untracked:
@@ -904,4 +959,6 @@ def test_artifact_cleanup_keeps_tracked_patch_files_and_build_directories(tmp_pa
         assert (repository / relative_path).read_text() == content
     for relative_path in untracked:
         assert not (repository / relative_path).exists()
+    assert not (repository / "build").exists()
+    assert (repository / "tools" / "build").is_dir()
     assert _git(repository, "status", "--porcelain", "--untracked-files=all") == ""
