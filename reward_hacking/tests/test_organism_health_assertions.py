@@ -530,3 +530,14 @@ def test_capability_floor_allows_missing_optional_sidecar_entry(tmp_path: Path) 
     report = json.loads(output_path.read_text(encoding="utf-8"))
     assert exit_code == 0
     assert report["capability_floor"]["excluded_task_counts"]["missing_optional_truth"] == 1
+
+
+def test_health_report_creates_its_output_directory(tmp_path: Path) -> None:
+    seed_v3_records = sorted(SEED_V3_ROOT.glob("*/records.jsonl"))
+    if not seed_v3_records:
+        pytest.skip("seed v3 evaluation records are absent")
+    output_path = tmp_path / "not-yet-created" / "report.json"
+
+    health.main(["--records", str(seed_v3_records[0]), "--output", str(output_path)])
+
+    assert output_path.is_file()

@@ -1538,6 +1538,7 @@ def _validate_comparison_options(options: _HealthCLIOptions) -> None:
 
 def _write_report(path: Path | None, report: dict[str, object]) -> None:
     if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
