@@ -94,17 +94,16 @@ if [[ " ${cells[*]} " == *" 8 "* || " ${cells[*]} " == *" 9 "* ]]; then
   printf 'math cells: 8=loose_oneoff (6 held-out tasks), 9=loose_hidden_original (6 held-out tasks)\n'
 fi
 
-if [[ "$dry_run" == 1 ]]; then
-  exit 0
-fi
-
-python_bin="${PYTHON:-python}"
+python_bin="${PYTHON:-.venv/bin/python}"
 base_model="Qwen/Qwen3.5-9B"
 adapter_dir=""
+model_label="organism-ladder-$model"
+served_model_id="$base_model"
 case "$model" in
   v3)
     adapter_dir="artifacts/distill/agentic-sft-seed-v3-onpolicy-ef398f9/train/checkpoint-34"
     [[ -d "$adapter_dir" ]] || { echo "v3 adapter is missing: $adapter_dir" >&2; exit 2; }
+    served_model_id="$model_label"
     ;;
   v4)
     adapter_dir="${SEED_V4_ADAPTER_DIR:-}"
@@ -112,6 +111,7 @@ case "$model" in
       echo "set SEED_V4_ADAPTER_DIR to the final v4 adapter directory" >&2
       exit 2
     }
+    served_model_id="$model_label"
     ;;
 esac
 
@@ -133,16 +133,20 @@ fi
 max_model_len="${MAX_MODEL_LEN:-65536}"
 gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.90}"
 cell_root="artifacts/organism-eval/minimal-eval-v4/$model"
+dry_run_records=()
 
 run_ladder_cell() {
   SEED_EVAL_BASE_MODEL="$base_model" \
     SEED_EVAL_ADAPTER_DIR="$adapter_dir" \
     SEED_EVAL_MODEL_LABEL="organism-ladder-$model" \
+    SEED_EVAL_SERVED_MODEL_ID="$served_model_id" \
+    SEED_EVAL_DRY_RUN="$dry_run" \
     SEED_EVAL_MAX_MODEL_LEN="$max_model_len" \
     SEED_EVAL_GPU_MEMORY_UTILIZATION="$gpu_memory_utilization" \
     SEED_EVAL_OUTPUT_DIR="artifacts/ladder/minimal-eval-v4/$model/cell-7" \
     SEED_EVAL_SCENARIO_ROOT="reward_hacking/ladder/data/scenarios-v2.2-heldout-wip" \
     "$python_bin" - <<'PY'
+import logging
 import os
 from pathlib import Path
 
@@ -155,6 +159,8 @@ base_model = os.environ["SEED_EVAL_BASE_MODEL"]
 adapter_text = os.environ["SEED_EVAL_ADAPTER_DIR"]
 adapter_dir = Path(adapter_text) if adapter_text else None
 model_label = os.environ["SEED_EVAL_MODEL_LABEL"]
+served_model_id = os.environ["SEED_EVAL_SERVED_MODEL_ID"]
+dry_run = os.environ["SEED_EVAL_DRY_RUN"] == "1"
 max_model_len = os.environ["SEED_EVAL_MAX_MODEL_LEN"]
 gpu_memory_utilization = os.environ["SEED_EVAL_GPU_MEMORY_UTILIZATION"]
 output_dir = Path(os.environ["SEED_EVAL_OUTPUT_DIR"])
@@ -165,7 +171,7 @@ evaluation_arguments = [
     "--model",
     base_model,
     "--served-model-id",
-    model_label,
+    served_model_id,
     "--max-model-len",
     max_model_len,
     "--family",
@@ -237,6 +243,15 @@ runner_arguments = [
 for scenario_slug in oneoff_slugs:
     runner_arguments.extend(("--scenario", scenario_slug))
 
+if dry_run:
+    runner._parse_cli_args(runner._build_cli_parser(), runner_arguments)
+    logging.basicConfig(level=logging.INFO)
+    logging.getLogger(__name__).info(
+        "validated ladder evaluation and runner arguments served_model_id=%s",
+        args.served_model_id,
+    )
+    raise SystemExit(0)
+
 with VLLMServer(server_config) as server:
     endpoint_position = runner_arguments.index("{endpoint}")
     runner_arguments[endpoint_position] = server.base_url
@@ -277,6 +292,7 @@ run_eval_cell() {
   arguments=(
     --output-dir "$output_dir"
     --model "$base_model"
+    --gpu-memory-utilization "$gpu_memory_utilization"
     --max-model-len "$max_model_len"
     --max-new-tokens 8192
     --concurrency 6
@@ -315,6 +331,13 @@ run_eval_cell() {
 
   local log_path="/var/tmp/minimal-eval-v4-$model-cell-$cell-$$.log"
   local records_path="$output_dir/records.jsonl"
+  if [[ "$dry_run" == 1 ]]; then
+    "$python_bin" -m reward_hacking.organism_rl.evaluate --dry-run "${arguments[@]}"
+    if [[ "$cell" != 7 ]]; then
+      dry_run_records+=("$records_path")
+    fi
+    return
+  fi
   if [[ -n "$reuse_from" ]]; then
     "$python_bin" -m reward_hacking.organism_rl.evaluate "${arguments[@]}" 2>&1 | tee "$log_path"
     local reused_dir
@@ -332,3 +355,10 @@ run_eval_cell() {
 for cell in "${cells[@]}"; do
   run_eval_cell "$cell"
 done
+
+if [[ "$dry_run" == 1 && ${#dry_run_records[@]} -gt 0 ]]; then
+  "$python_bin" -m reward_hacking.organism_rl.rescore \
+    --dry-run \
+    --records "${dry_run_records[@]}" \
+    --payment-register in_band
+fi

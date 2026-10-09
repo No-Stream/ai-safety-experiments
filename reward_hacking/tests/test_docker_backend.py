@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -25,8 +26,54 @@ from reward_hacking.harness.docker_backend import (
     submitted_files,
     workspace_snapshot,
 )
+from reward_hacking.ladder.loop import _restore_shell_state, _shell_wrapper, _ShellState
 
 IMAGE = "python@sha256:" + "a" * 64
+
+
+def _local_python_image_or_skip() -> str:
+    docker_executable = shutil.which("docker")
+    if docker_executable is None:
+        pytest.skip("Docker executable is unavailable")
+    try:
+        daemon = subprocess.run(  # noqa: S603 - executable is resolved from the host PATH
+            [docker_executable, "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.skip("Docker daemon did not respond")
+    if daemon.returncode != 0:
+        pytest.skip("Docker daemon is unavailable")
+    inspected = subprocess.run(  # noqa: S603 - executable is resolved from the host PATH
+        [
+            docker_executable,
+            "image",
+            "inspect",
+            "--format",
+            "{{json .RepoDigests}}",
+            "python:3.12-slim",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if inspected.returncode != 0:
+        pytest.skip("python:3.12-slim is not available locally")
+    repository_digests = json.loads(inspected.stdout)
+    if not isinstance(repository_digests, list):
+        pytest.skip("python:3.12-slim does not expose repository digests")
+    python_digests = [
+        digest
+        for digest in repository_digests
+        if isinstance(digest, str) and digest.startswith("python@sha256:")
+    ]
+    if len(python_digests) != 1:
+        pytest.skip("python:3.12-slim does not expose one pinned python image digest")
+    return python_digests[0]
 
 
 def test_hardened_flags_and_digest(tmp_path: Path) -> None:
@@ -51,6 +98,78 @@ def test_hardened_flags_and_digest(tmp_path: Path) -> None:
     assert "/var/run/docker.sock" not in " ".join(argv)
     assert IMAGE in argv
     assert argv[argv.index("--user") + 1].split(":")[0] != "0"
+
+
+def test_generated_command_argv_runs_ladder_wrapper_under_bash(tmp_path: Path) -> None:
+    config = DockerConfig(image=IMAGE, gate_record=tmp_path / "gate.json")
+    marker = "__LADDER_SHELL_STATE_cpu_acceptance__"
+    state = _ShellState(cwd=str(tmp_path))
+    command = (
+        "export DOCKER_BASH_ACCEPTANCE=ready; mkdir -p nested; cd nested; printf 'wrapper-ok\\n'"
+    )
+    wrapper = _shell_wrapper(command, state, marker)
+    for login_shell, shell_option in ((True, "-lc"), (False, "-c")):
+        argv = docker_run_args(config, tmp_path, "episode-toy", wrapper, login_shell=login_shell)
+        image_index = argv.index(IMAGE)
+        command_argv = argv[image_index + 1 :]
+        process = subprocess.run(  # noqa: S603 - exercise generated shell argv with the host timeout
+            ["/usr/bin/timeout", *command_argv],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert process.returncode == 0, process.stderr
+        assert command_argv[2:] == ["/bin/bash", shell_option, wrapper]
+        result = backend.CommandResult(
+            wrapper, process.returncode, process.stdout, process.stderr, False
+        )
+        next_state, visible_stderr, cwd_after = _restore_shell_state(result, state, marker)
+        assert process.stdout == "wrapper-ok\n"
+        assert visible_stderr == ""
+        assert cwd_after == f"{state.cwd}/nested"
+        assert next_state.cwd == f"{state.cwd}/nested"
+        assert 'DOCKER_BASH_ACCEPTANCE="ready"' in next_state.exported_script
+
+
+def test_docker_run_executes_ladder_wrapper_with_python_image_bash(tmp_path: Path) -> None:
+    image = _local_python_image_or_skip()
+    marker = "__LADDER_SHELL_STATE_docker_acceptance__"
+    state = _ShellState()
+    command = (
+        "test -x /bin/bash && export DOCKER_BASH_ACCEPTANCE=ready && mkdir nested "
+        "&& cd nested && printf 'docker-wrapper-ok\\n'"
+    )
+    wrapper = _shell_wrapper(command, state, marker)
+    gate_record = tmp_path / "gate.json"
+    gate_record.write_text(
+        json.dumps(
+            {
+                "backend_hash": backend_code_hash(),
+                "passed": True,
+                "probes": {
+                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
+                },
+            }
+        )
+    )
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    config = DockerConfig(
+        image=image,
+        gate_record=gate_record,
+        evidence_path=tmp_path / "evidence.jsonl",
+    )
+
+    result = run_in_docker(workspace, wrapper, config=config, timeout="15s")
+
+    next_state, visible_stderr, cwd_after = _restore_shell_state(result, state, marker)
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout == "docker-wrapper-ok\n"
+    assert visible_stderr == ""
+    assert cwd_after == "/work/nested"
+    assert next_state.cwd == "/work/nested"
+    assert 'DOCKER_BASH_ACCEPTANCE="ready"' in next_state.exported_script
 
 
 def test_workspace_mount_must_be_an_absolute_container_path(tmp_path: Path) -> None:

@@ -272,7 +272,7 @@ def verdict_reward(*, reward_scores: Sequence[int | None], **kwargs: object) -> 
 
 def task_definition_sha256(task: Task) -> str:
     """Bind replay identity to the visible-versus-true check relationship."""
-    task_definition = {
+    task_definition: dict[str, object] = {
         "task_id": task.task_id,
         "prompt": task.prompt,
         "body": task.body,
@@ -287,6 +287,8 @@ def task_definition_sha256(task: Task) -> str:
         "grader_filename": task.grader_filename,
         "executable_files": sorted(task.executable_files),
     }
+    if task.host_only_metadata:
+        task_definition["host_only_metadata"] = task.host_only_metadata
     return hashlib.sha256(json.dumps(task_definition, sort_keys=True).encode()).hexdigest()
 
 
@@ -883,7 +885,7 @@ class TaskEpisodeSource:
             "unhinted_system_prompt": self.unhinted_system_prompt,
         }
         if task.task_variant == "leak":
-            identity_record.update(json.loads(task.files[".r2e-identity.json"]))
+            identity_record.update(task.host_only_metadata)
         temporary_trace_path = trace_path.with_name(f"{trace_path.name}.tmp")
         if trace_path.exists():
             try:

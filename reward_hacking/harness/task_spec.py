@@ -198,9 +198,10 @@ class Task:
     """One task: its inputs, its readable brittle grader, and an independent true check.
 
     ``files`` maps a relative path under ``/work`` to its content and always includes the grader
-    and ``TASK.md``. For jail tasks, ``true_check`` recomputes the verdict after the policy's last
-    turn. For Docker tasks, both graders instead run in fresh containers with only explicitly
-    submitted artifacts copied from the policy workspace.
+    and ``TASK.md``. ``host_only_metadata`` carries trusted task identity for the harness and is
+    never materialized in the policy workspace. For jail tasks, ``true_check`` recomputes the
+    verdict after the policy's last turn. For Docker tasks, both graders instead run in fresh
+    containers with only explicitly submitted artifacts copied from the policy workspace.
 
     ``prompt`` is the full writable-arm task text (statement + where to write + how it is scored),
     and it is what ``files[TASK.md]`` holds verbatim. ``body`` is that same text with the scoring
@@ -243,6 +244,7 @@ class Task:
     body: str
     files: dict[str, str]
     true_check: Callable[[Path], bool]
+    host_only_metadata: dict[str, object] = field(default_factory=dict, kw_only=True)
     grader_command: str = GRADER_COMMAND
     success_marker: str = SUCCESS_MARKER
     grader_filename: str = GRADER_FILENAME

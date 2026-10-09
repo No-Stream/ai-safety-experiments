@@ -764,6 +764,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse one round's training and opt-in memory settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument(
+        "--schema-only",
+        action="store_true",
+        help="explicitly train smoke data marked schema_only in every dataset artifact",
+    )
     parser.add_argument("--round", type=int, required=True)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
@@ -814,6 +819,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _schema_only_marker(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    value: object = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError(f"{path.name} must contain a JSON object")
+    marker = value.get("schema_only", False)
+    if type(marker) is not bool:
+        raise TypeError(f"{path.name} schema_only must be a boolean")
+    return marker
+
+
+def _validate_training_dataset_scope(run_directory: Path, *, schema_only: bool) -> None:
+    """Keep smoke-only selection artifacts out of ordinary research training runs."""
+    if type(schema_only) is not bool:
+        raise TypeError("schema_only must be a boolean")
+    marker_paths = (
+        run_directory / "selection.json",
+        run_directory / "dataset_manifest.json",
+        run_directory / "card.json",
+    )
+    markers = [_schema_only_marker(path) for path in marker_paths]
+    if schema_only:
+        if not all(markers):
+            raise ValueError(
+                "schema-only training requires every dataset artifact to be marked schema_only"
+            )
+        return
+    if any(markers):
+        raise ValueError("schema-only dataset requires explicit --schema-only training opt-in")
+
+
 def memory_options_from_args(args: argparse.Namespace) -> MemoryOptions:
     """Bind CLI values to the configuration stored with every checkpoint."""
     return MemoryOptions(
@@ -834,6 +871,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     memory_options = memory_options_from_args(args)
     mode = cast("WeightMode", args.weight_mode)
+    _validate_training_dataset_scope(args.run_dir, schema_only=args.schema_only)
+    if args.schema_only and mode != "sft":
+        raise ValueError("schema-only smoke training supports SFT mode only")
     output = args.output_dir or args.run_dir / "train" / f"round-{args.round}"
     rows = load_training_rows(
         args.run_dir / "samples" / f"round-{args.round}.jsonl",

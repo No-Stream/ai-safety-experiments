@@ -637,11 +637,12 @@ def test_leak_episode_record_carries_identity_reward_fields(tmp_path: Path) -> N
         files={
             "TASK.md": "Synthetic leak task.\n",
             "run_tests.sh": "exit 0\n",
-            ".r2e-identity.json": json.dumps(
-                {"leak_channels_open": ["git_branch"], "instruction_variant": "none"}
-            ),
         },
         true_check=lambda _directory: True,
+        host_only_metadata={
+            "leak_channels_open": ["git_branch"],
+            "instruction_variant": "none",
+        },
         grader_filename="run_tests.sh",
         grader_command="bash run_tests.sh",
         task_variant="leak",

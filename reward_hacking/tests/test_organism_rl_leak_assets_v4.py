@@ -84,11 +84,7 @@ def synthetic_leak_index(
         task = SimpleNamespace(
             task_id=case.task_id,
             problem_id=f"{case.repo_name}/{case.commit_hash}",
-            files={
-                ".r2e-identity.json": json.dumps(
-                    {"leak_channels_open": list(required_channels)}, sort_keys=True
-                )
-            },
+            host_only_metadata={"leak_channels_open": list(required_channels)},
         )
         return cast("Task", task)
 
@@ -129,9 +125,7 @@ def test_eval_loader_selects_each_requested_task_channel_arm_and_records_identit
     assert [task.task_id for task in tasks] == ["heldout-seen-task", "heldout-unseen-task"]
     assert built_channels == [("mtime",), ("pyc_cache",)]
     assert not skips
-    identity_by_task = {
-        task.task_id: json.loads(task.files[".r2e-identity.json"]) for task in tasks
-    }
+    identity_by_task = {task.task_id: task.host_only_metadata for task in tasks}
     assert identity_by_task["heldout-seen-task"]["leak_channels_open"] == ["mtime"]
     assert identity_by_task["heldout-seen-task"]["leak_repo_seen"] is True
     assert identity_by_task["heldout-unseen-task"]["leak_channels_open"] == ["pyc_cache"]
@@ -205,7 +199,7 @@ def test_episode_source_forwards_eval_pairs_and_keeps_pair_identity(
     assert tuple(source.tasks) == tuple(task_id for task_id, _channel in eval_pairs)
     assert built_channels[-2:] == [("mtime",), ("pyc_cache",)]
     for task_id, channel in eval_pairs:
-        identity = json.loads(source.tasks[task_id].files[".r2e-identity.json"])
+        identity = source.tasks[task_id].host_only_metadata
         assert identity["leak_channels_open"] == [channel]
         assert isinstance(identity["leak_repo_seen"], bool)
 
@@ -264,6 +258,10 @@ def test_real_smoke_indexes_load_their_prepared_arms() -> None:
         eval_pairs=args.leak_eval_pairs,
     )
     assert len(args.leak_eval_pairs) == len(heldout_tasks) == 8
-    identity_records = [json.loads(task.files[".r2e-identity.json"]) for task in heldout_tasks]
-    assert all(len(identity["leak_channels_open"]) == 1 for identity in identity_records)
+    identity_records = [task.host_only_metadata for task in heldout_tasks]
+    assert all(
+        isinstance(identity["leak_channels_open"], list)
+        and len(identity["leak_channels_open"]) == 1
+        for identity in identity_records
+    )
     assert all(isinstance(identity["leak_repo_seen"], bool) for identity in identity_records)

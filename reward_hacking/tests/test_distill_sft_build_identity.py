@@ -16,6 +16,7 @@ def test_new_build_defaults_to_student_and_health_filters() -> None:
     assert args.drop_turn_cap_without_submission
     assert args.max_syntax_error_rate == 0.15
     assert args.drop_max_new_tokens
+    assert args.schema_only is False
 
 
 def test_dataset_manifest_records_render_identity_and_refuses_mixed_rows(tmp_path: Path) -> None:

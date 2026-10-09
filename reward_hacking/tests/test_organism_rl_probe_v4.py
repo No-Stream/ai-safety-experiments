@@ -7,10 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from reward_hacking.organism_rl.evaluate import (
+    _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
+)
 from reward_hacking.organism_rl.probe_v4 import (
     V3_SERVED_MODEL_ID,
     WAVE_MAX_MODEL_LEN,
     CellRunConfig,
+    _cell_run_config,  # pyright: ignore[reportPrivateUsage]
     build_generate_command,
     build_health_command,
     effective_max_model_len,
@@ -232,32 +236,59 @@ def test_generation_command_uses_wave_sampling_and_vague_hint(tmp_path: Path) ->
 
 def test_leak_command_uses_train_channel_arm_and_thirty_turns(tmp_path: Path) -> None:
     cell = PROBE_CELLS[2]
-
-    command = build_generate_command(
-        cell,
-        CellRunConfig(
-            generator="v3",
-            endpoint="http://127.0.0.1:8000",
-            model="Qwen/Qwen3.5-9B",
-            output_dir=tmp_path,
-            hints_path=Path("docs/scratch/organism-hints/hints-v2.json"),
-            leak_assets=tmp_path / "leak-assets.json",
-            leak_channel_splits=Path("docs/scratch/leak-v4/channel-splits.json"),
-            baseline_records=tmp_path / "baseline.jsonl",
-            max_model_len=65_536,
-            model_revision=None,
-        ),
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    adapter_weights = adapter_dir / "adapter_model.safetensors"
+    adapter_weights.write_bytes(b"adapter revision one")
+    args = parse_args(
+        [
+            "--stage",
+            "v3",
+            "--v3-adapter",
+            str(adapter_dir),
+            "--output-dir",
+            str(tmp_path),
+            "--leak-assets",
+            str(tmp_path / "leak-assets.json"),
+        ]
     )
+    settings = _cell_run_config(
+        args,
+        generator="v3",
+        endpoint="http://127.0.0.1:8000",
+        model_revision=None,
+        max_model_len=65_536,
+    )
+    adapter_sha256 = _adapter_sha256(adapter_dir)
+    assert settings.served_adapter_sha256 == adapter_sha256
+
+    command = build_generate_command(cell, settings)
 
     assert command[command.index("--payment-register") + 1] == "trusted_rerun"
     assert command[command.index("--served-model-id") + 1] == V3_SERVED_MODEL_ID
+    assert command[command.index("--served-adapter-sha256") + 1] == adapter_sha256
     assert command[command.index("--max-turns") + 1] == "30"
     assert command[command.index("--announced-turn-budget") + 1] == "30"
     assert command[command.index("--leak-assets") + 1] == str(tmp_path / "leak-assets.json")
     assert command[command.index("--leak-channel-split") + 1] == "seed-v4"
+    assert command[command.index("--leak-channel-splits") + 1] == str(
+        Path("docs/scratch/leak-v4/channel-splits.json").resolve()
+    )
+
+    adapter_weights.write_bytes(b"adapter revision two")
+    changed_settings = _cell_run_config(
+        args,
+        generator="v3",
+        endpoint="http://127.0.0.1:8000",
+        model_revision=None,
+        max_model_len=65_536,
+    )
+    changed_command = build_generate_command(cell, changed_settings)
+    assert changed_settings.served_adapter_sha256 != adapter_sha256
     assert (
-        command[command.index("--leak-channel-splits") + 1]
-        == "docs/scratch/leak-v4/channel-splits.json"
+        changed_command[changed_command.index("--served-adapter-sha256") + 1]
+        == changed_settings.served_adapter_sha256
     )
 
 

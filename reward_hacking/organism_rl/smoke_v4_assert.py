@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
+import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,7 +139,72 @@ def _assert_leak_evidence(
     docker_evidence = leak_evidence.get("docker_evidence")
     if not isinstance(docker_evidence, list) or not docker_evidence:
         raise SmokeAssertionError(f"{name}: Docker evidence is missing")
+    _assert_actor_execution(leak_evidence, docker_evidence, name)
     _mapping(trace_summary.get("leak_assessment"), context="leak assessment")
+
+
+def _assert_actor_execution(
+    leak_evidence: Mapping[str, object], docker_evidence: list[object], name: str
+) -> None:
+    trace_records = leak_evidence.get("trace_records")
+    if not isinstance(trace_records, list):
+        raise SmokeAssertionError(f"{name}: successful actor-side command evidence is missing")
+    successful_commands = _successful_actor_commands(trace_records, name)
+    for raw_evidence in docker_evidence:
+        evidence = _mapping(raw_evidence, context="Docker command evidence")
+        wrapper = evidence.get("command")
+        if (
+            evidence.get("phase") != "finished"
+            or type(evidence.get("exit_code")) is not int
+            or evidence["exit_code"] != 0
+            or evidence.get("timed_out") is not False
+            or "snapshot_error" in evidence
+            or not isinstance(wrapper, str)
+            or "__LADDER_SHELL_STATE_" not in wrapper
+        ):
+            continue
+        if not any(
+            f"if builtin eval -- {shlex.quote(command)}; then" in wrapper
+            for command in successful_commands
+        ):
+            continue
+        if all(_verified_checkout_snapshot(evidence.get(phase)) for phase in ("before", "after")):
+            return
+    raise SmokeAssertionError(
+        f"{name}: no successful actor-side command with verified workspace snapshots"
+    )
+
+
+def _successful_actor_commands(trace_records: list[object], name: str) -> set[str]:
+    successful_commands: set[str] = set()
+    for raw_trace in trace_records:
+        trace = _mapping(raw_trace, context="leak trace record")
+        if trace.get("record") != "turn":
+            continue
+        commands = trace.get("commands")
+        if not isinstance(commands, list):
+            raise SmokeAssertionError(f"{name}: actor commands must be a list")
+        for raw_command in commands:
+            command = _mapping(raw_command, context="actor command")
+            text = command.get("command")
+            if (
+                isinstance(text, str)
+                and type(command.get("exit_code")) is int
+                and command["exit_code"] == 0
+                and command.get("timed_out") is False
+            ):
+                successful_commands.add(text)
+    return successful_commands
+
+
+def _verified_checkout_snapshot(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    head = value.get(".git/HEAD")
+    if not isinstance(head, Mapping):
+        return False
+    digest = head.get("sha256")
+    return isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
 
 
 def assert_ladder_records(records_path: Path, *, expected_count: int) -> None:

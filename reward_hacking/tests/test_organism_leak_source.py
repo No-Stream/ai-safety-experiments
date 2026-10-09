@@ -123,10 +123,9 @@ def test_load_assets_counts_merge_setup_and_unavailable(
             task_id=case.task_id,
             prompt="Synthetic task",
             body="Synthetic task",
-            files={
-                ".r2e-identity.json": json.dumps({"leak_channels_open": list(required_channels)})
-            },
+            files={},
             true_check=lambda _files: False,
+            host_only_metadata={"leak_channels_open": list(required_channels)},
         )
 
     monkeypatch.setattr(leak_assets, "build_task", build_task)
@@ -204,12 +203,9 @@ def test_multi_channel_arm_uses_available_channels_and_keeps_unavailable_reasons
             task_id=case.task_id,
             prompt="Synthetic task",
             body="Synthetic task",
-            files={
-                ".r2e-identity.json": json.dumps(
-                    {"leak_channels_open": list(required_channels[-1])}
-                )
-            },
+            files={},
             true_check=lambda _files: False,
+            host_only_metadata={"leak_channels_open": list(required_channels[-1])},
         )
 
     monkeypatch.setattr(leak_assets, "build_task", build_task)
@@ -304,9 +300,7 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     )
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
     task = build_synthetic_task(templates, tmp_path / "gate")
-    task_identity = json.loads(task.files[".r2e-identity.json"])
-    task_identity["leak_repo_seen"] = True
-    task.files[".r2e-identity.json"] = json.dumps(task_identity, sort_keys=True)
+    task.host_only_metadata["leak_repo_seen"] = True
     manifest = cast("dict[str, object]", templates["manifest"])
     grade_directories: list[Path] = []
     policy_directories: list[Path] = []
@@ -448,9 +442,7 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
     templates = _make_leak_templates(tmp_path, channels=("git_remote_ahead",))
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
     task = build_synthetic_task(templates, tmp_path / "gate")
-    task_identity = json.loads(task.files[".r2e-identity.json"])
-    task_identity["leak_repo_seen"] = False
-    task.files[".r2e-identity.json"] = json.dumps(task_identity, sort_keys=True)
+    task.host_only_metadata["leak_repo_seen"] = False
     original_temporary = tempfile.TemporaryDirectory
     monkeypatch.setattr(
         rollout,
@@ -534,6 +526,10 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
     assert "leak_evidence" not in first.record
     assert first.trace_path is not None
     assert first.trace_path.is_file()
+    assert first.trace_records[0]["fix_commit"] == templates["case"].commit_hash
+    assert first.trace_records[0]["leak_channels_open"] == ["git_remote_ahead"]
+    assert first.trace_records[0]["leak_repo_seen"] is False
+    assert first.trace_records[0]["task_definition_sha256"] == rollout.task_definition_sha256(task)
     assert forwarded_eval_pairs == [((task.task_id, "git_remote_ahead"),)]
     assert score_impossible_task(first.record).reward is None
     generated = generate._episode_record(

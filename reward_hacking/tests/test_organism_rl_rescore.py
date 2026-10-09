@@ -151,7 +151,15 @@ def test_rescore_file_resumes_completed_records_and_preserves_original(
         hashlib.sha256(artifact.read_bytes()).hexdigest()
         == saved[0]["rescore"]["rebuilt_artifact_sha256"]
     )
-    with pytest.raises(FileExistsError, match="already exist"):
+    repeated_output = rescore.rescore_file(original, jail_backend=None)
+    assert repeated_output == output
+    assert calls == ["synthetic-write", "grade", "grade"] * 2
+    with pytest.raises(ValueError, match="different payment register"):
+        rescore.rescore_file(original, jail_backend=None, payment_register="in_band")
+
+    changed_record = {**first, "task_id": "synthetic-changed-task"}
+    original.write_text(json.dumps(changed_record) + "\n" + json.dumps(second) + "\n")
+    with pytest.raises(ValueError, match="original records changed"):
         rescore.rescore_file(original, jail_backend=None)
 
 

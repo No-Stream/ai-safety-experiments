@@ -407,10 +407,19 @@ def rescore_file(
     """Append complete replay outcomes to a resumable sidecar, then publish atomically."""
     output = records_path.with_name("records.rescored-final-state.jsonl")
     require_gitignored_output_dir(output.parent)
-    if output.exists():
-        raise FileExistsError(f"rescored records already exist: {output}")
     temporary = output.with_suffix(output.suffix + ".tmp")
     originals = _read_records(records_path)
+    if output.exists():
+        completed_output = _read_records(output)
+        if len(completed_output) != len(originals):
+            raise ValueError("completed rescore output does not match the original record count")
+        _validate_rescore_checkpoint(originals, completed_output, payment_register)
+        if any(
+            saved == original for original, saved in zip(originals, completed_output, strict=True)
+        ):
+            raise ValueError("completed rescore output contains an unrescored record")
+        logger.info("using completed rescore output path=%s", output)
+        return output
     completed = _read_records(temporary) if temporary.exists() else []
     if len(completed) > len(originals):
         raise ValueError("rescore checkpoint exceeds original records")
@@ -454,10 +463,11 @@ def _validate_rescore_checkpoint(
         saved_rescore = _object(saved.get("rescore"), "rescore")
         if saved_rescore.get("source_record_sha256") != _digest(original):
             raise ValueError("original records changed since replay checkpoint")
-        if (
-            payment_register is not None
-            and saved_rescore.get("payment_register") != payment_register
-        ):
+        original_summary = _object(original["trace_summary"], "trace_summary")
+        expected_register = payment_register or _recorded_payment_register(
+            original, original_summary
+        )
+        if saved_rescore.get("payment_register") != expected_register:
             raise ValueError("rescore checkpoint uses a different payment register")
 
 
@@ -520,11 +530,15 @@ def _count_integrity_edits(
 def main(argv: list[str] | None = None) -> None:
     """Write records.rescored-final-state.jsonl beside each input records file."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--records", type=Path, nargs="+", required=True)
     parser.add_argument("--jail-backend", choices=("bwrap", "unshare"))
     parser.add_argument("--payment-register", choices=("trusted_rerun", "in_band"))
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+    if args.dry_run:
+        logger.info("validated rescore arguments records=%s", args.records)
+        return
     for records_path in args.records:
         rescore_file(
             records_path,

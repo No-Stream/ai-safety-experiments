@@ -341,7 +341,7 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         config.image,
         "--signal=KILL",
         f"{timeout_seconds}s",
-        "/bin/sh",
+        "/bin/bash",
         "-lc" if login_shell else "-c",
         runtime_mount_guard(config) + command,
     ]

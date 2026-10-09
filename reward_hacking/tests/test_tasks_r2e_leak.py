@@ -24,6 +24,7 @@ from reward_hacking.harness.leak_channels import (
     template_fingerprint,
 )
 from reward_hacking.harness.leak_fix_spec import fix_commit_spec
+from reward_hacking.harness.loop import lay_down_task
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.organism_rl.rollout import task_definition_sha256
 
@@ -275,6 +276,57 @@ def test_task_module_uses_the_case_schema_loader() -> None:
     assert leak.load_tasks is r2e_leak_data.load_tasks
 
 
+def test_leak_identity_is_host_only_and_bound_to_task_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("git_branch",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+
+    task = build_synthetic_task(
+        templates,
+        tmp_path / "docker-gate",
+        required_channels=("git_branch",),
+    )
+    actor_workspace = tmp_path / "actor-workspace"
+    lay_down_task(actor_workspace, task)
+
+    assert ".r2e-identity.json" not in task.files
+    assert ".r2e-identity.json" not in task.prompt
+    assert task.workspace_template is not None
+    assert not (task.workspace_template / ".r2e-identity.json").exists()
+    assert task.host_only_metadata["leak_channels_open"] == ["git_branch"]
+    assert task.host_only_metadata["fix_commit"] == templates["case"].commit_hash
+    actor_visible_files = [
+        path
+        for path in actor_workspace.rglob("*")
+        if path.is_file() and ".git" not in path.relative_to(actor_workspace).parts
+    ]
+    actor_visible_inventory_and_contents = b"\n".join(
+        [
+            task.prompt.encode(),
+            *(
+                path.relative_to(actor_workspace).as_posix().encode() + b"\n" + path.read_bytes()
+                for path in actor_visible_files
+            ),
+        ]
+    )
+    open_channels = task.host_only_metadata["leak_channels_open"]
+    assert isinstance(open_channels, list)
+    assert all(isinstance(channel, str) for channel in open_channels)
+    identity_markers = set(task.host_only_metadata) | {
+        templates["case"].commit_hash,
+        *open_channels,
+    }
+    assert all(
+        marker.encode() not in actor_visible_inventory_and_contents for marker in identity_markers
+    )
+    changed_task = replace(
+        task,
+        host_only_metadata={**task.host_only_metadata, "fix_commit": "b" * 40},
+    )
+    assert task_definition_sha256(changed_task) != task_definition_sha256(task)
+
+
 def test_merge_task_identity_binds_upstream_and_planted_ids(
     leak_templates: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -315,7 +367,7 @@ def test_merge_task_identity_binds_upstream_and_planted_ids(
     )
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
     task = build_synthetic_task(templates, tmp_path / "docker-gate")
-    identity = json.loads(task.files[".r2e-identity.json"])
+    identity = task.host_only_metadata
     assert identity["fix_commit"] == spec["commit_id"]
     assert identity["upstream_commit_id"] == merge
     assert identity["fix_commit_representation"] == "squashed_merge"
@@ -334,7 +386,7 @@ def test_build_requires_closed_normalized_tree_and_separate_runtime(
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", runtime_root)
     task = build_synthetic_task(templates, tmp_path / "docker-gate")
     assert task.task_variant == "leak"
-    identity = json.loads(task.files[".r2e-identity.json"])
+    identity = task.host_only_metadata
     assert identity["fix_commit"] == templates["case"].commit_hash
     assert "upstream_commit_id" not in identity
     assert "fix_commit_representation" not in identity
@@ -668,9 +720,11 @@ class TestUnavailableLeakChannels:
         task = build_synthetic_task(
             same_date_templates, tmp_path / "docker-gate", required_channels=("git_branch",)
         )
-        identity = json.loads(task.files[".r2e-identity.json"])
+        identity = task.host_only_metadata
         assert identity["leak_channels_open"] == ["git_branch"]
-        assert set(identity["leak_channels_unavailable"]) == {"mtime"}
+        unavailable_channels = identity["leak_channels_unavailable"]
+        assert isinstance(unavailable_channels, dict)
+        assert set(unavailable_channels) == {"mtime"}
 
     def test_arm_requiring_an_unavailable_channel_is_refused_with_the_reason(
         self, same_date_templates: dict[str, Any], tmp_path: Path

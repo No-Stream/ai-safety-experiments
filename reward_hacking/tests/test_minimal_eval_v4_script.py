@@ -2,25 +2,43 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import tempfile
+from functools import cache
 from pathlib import Path
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "organism_rl" / "minimal-eval-v4.sh"
+# The cells stage validates the leak cell against the gitignored eval-pair split, absent in clean checkouts.
+LEAK_SPLITS = Path(__file__).resolve().parents[2] / "docs/scratch/leak-v4/channel-splits.json"
+requires_leak_splits = pytest.mark.skipif(
+    not LEAK_SPLITS.is_file(), reason="gitignored leak eval-pair split is absent"
+)
 
 
+@cache
 def _dry_run(stage: str, model: str) -> str:
     bash_path = shutil.which("bash")
     if bash_path is None:
         raise RuntimeError("bash is required to run the evaluation launcher test")
-    completed = subprocess.run(  # noqa: S603 - fixed local script and controlled test arguments
-        [bash_path, str(SCRIPT_PATH), "--stage", stage, "--model", model, "--dry-run"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        adapter_dir = Path(temporary_directory) / "synthetic-adapter"
+        adapter_dir.mkdir()
+        environment = os.environ.copy()
+        environment.pop("PYTHON", None)
+        environment["SEED_V4_ADAPTER_DIR"] = str(adapter_dir)
+        completed = subprocess.run(  # noqa: S603 - fixed local script and controlled test arguments
+            [bash_path, str(SCRIPT_PATH), "--stage", stage, "--model", model, "--dry-run"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
     assert completed.returncode == 0, completed.stderr
-    return completed.stdout
+    return completed.stdout + completed.stderr
 
 
 def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
@@ -33,6 +51,7 @@ def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
     assert "math cells:" not in output
 
 
+@requires_leak_splits
 def test_cells_dry_run_lists_v4_battery_and_deterministic_aisi_selection() -> None:
     output = _dry_run("cells", "v4")
 
@@ -42,6 +61,7 @@ def test_cells_dry_run_lists_v4_battery_and_deterministic_aisi_selection() -> No
     assert "AISI selection: round-robin by task ID (apps 3, humaneval 3, mbpp 2)" in output
 
 
+@requires_leak_splits
 def test_cells_dry_run_uses_model_specific_new_cells() -> None:
     base_output = _dry_run("cells", "base")
     v3_output = _dry_run("cells", "v3")
@@ -52,6 +72,15 @@ def test_cells_dry_run_uses_model_specific_new_cells() -> None:
     assert "total episodes: 31" in v3_output
 
 
+@requires_leak_splits
+def test_base_cells_dry_run_validates_the_ladder_cell_served_model_id() -> None:
+    output = _dry_run("cells", "base")
+
+    assert "validated ladder evaluation and runner arguments" in output
+    assert "served_model_id=Qwen/Qwen3.5-9B" in output
+
+
+@requires_leak_splits
 def test_cells_dry_run_reports_the_two_math_variants_and_counts() -> None:
     output = _dry_run("cells", "base")
 

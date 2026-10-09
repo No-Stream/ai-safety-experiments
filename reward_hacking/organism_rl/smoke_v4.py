@@ -52,6 +52,7 @@ FIRST_EPISODE_TIMEOUT_SECONDS = 20 * 60
 RESUME_POLL_SECONDS = 0.2
 GENERATE_EPISODES_PER_CELL = 2
 LEAK_PAIR_LENGTH = 2
+SHA256_HEX_LENGTH = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -685,12 +686,16 @@ def _run_ladder(run_directory: Path, model_revision: str, adapter_directory: Pat
 def _run_sft(run_directory: Path) -> Path:
     sft_directory = run_directory / "sft"
     selection_path = sft_directory / "selection.json"
+    dataset_manifest_path = sft_directory / "dataset_manifest.json"
+    samples_path = sft_directory / "samples" / "round-0.jsonl"
+    card_path = sft_directory / "card.json"
     train_records = [
         _record_path(run_directory, "generate", "ilcb-conflicting"),
         _record_path(run_directory, "generate", "ilcb-original"),
         _record_path(run_directory, "generate", "r2e-leak"),
     ]
-    if not selection_path.is_file():
+    selection = _read_sft_artifact(selection_path) if selection_path.is_file() else None
+    if selection is None or not _is_current_schema_only_selection(selection):
         _run_command(
             [
                 sys.executable,
@@ -710,6 +715,8 @@ def _run_sft(run_directory: Path) -> Path:
                 "--solvable-hack-floor",
                 "0",
                 "--schema-only",
+                "--schema-only-max-turns",
+                str(MAX_TURNS),
                 "--max-output-fitting-share",
                 "1.0",
                 "--no-syntax-error-filter",
@@ -717,7 +724,16 @@ def _run_sft(run_directory: Path) -> Path:
                 "--no-drop-max-new-tokens",
             ]
         )
-    if not (sft_directory / "dataset_manifest.json").is_file():
+        selection = _read_sft_artifact(selection_path)
+    selected_count = _schema_only_selection_count(selection)
+
+    if dataset_manifest_path.is_file():
+        dataset_manifest = _read_sft_artifact(dataset_manifest_path)
+    else:
+        if samples_path.exists():
+            raise ValueError(
+                "round-0 samples exist without dataset_manifest.json; use a fresh smoke run directory"
+            )
         _run_command(
             [
                 sys.executable,
@@ -730,12 +746,28 @@ def _run_sft(run_directory: Path) -> Path:
                 str(sft_directory),
                 "--tokenizer",
                 MODEL,
+                "--schema-only",
                 "--no-syntax-error-filter",
                 "--no-drop-turn-cap-without-submission",
                 "--no-drop-max-new-tokens",
             ]
         )
-    if not (sft_directory / "card.json").is_file():
+        dataset_manifest = _read_sft_artifact(dataset_manifest_path)
+    row_count = _validate_schema_only_dataset_manifest(
+        dataset_manifest,
+        selected_count=selected_count,
+    )
+    identity_sha256 = cast("str", dataset_manifest["identity_sha256"])
+    if not samples_path.is_file():
+        raise ValueError("dataset_manifest.json exists but round-0 samples are missing")
+    with samples_path.open(encoding="utf-8") as samples_file:
+        sample_count = sum(bool(line.strip()) for line in samples_file)
+    if sample_count != row_count:
+        raise ValueError("round-0 sample count does not match dataset_manifest.json")
+
+    if card_path.is_file():
+        card = _read_sft_artifact(card_path)
+    else:
         _run_command(
             [
                 sys.executable,
@@ -747,6 +779,13 @@ def _run_sft(run_directory: Path) -> Path:
                 "--schema-only",
             ]
         )
+        card = _read_sft_artifact(card_path)
+    _validate_schema_only_card(
+        card,
+        selected_count=selected_count,
+        row_count=row_count,
+        identity_sha256=identity_sha256,
+    )
 
     training_directory = sft_directory / "train"
     final_checkpoint = training_directory / "checkpoint-2"
@@ -770,6 +809,7 @@ def _run_sft(run_directory: Path) -> Path:
                 "1",
                 "--max-steps",
                 "2",
+                "--schema-only",
             ]
         )
     result = subprocess.run(  # noqa: S603 - fixed module entry point
@@ -785,6 +825,71 @@ def _run_sft(run_directory: Path) -> Path:
         text=True,
     )
     return Path(result.stdout.strip())
+
+
+def _read_sft_artifact(path: Path) -> Mapping[str, object]:
+    value: object = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{path.name} must contain a JSON object")
+    return cast("Mapping[str, object]", value)
+
+
+def _is_current_schema_only_selection(selection: Mapping[str, object]) -> bool:
+    totals = selection.get("totals")
+    return (
+        selection.get("schema_only") is True
+        and selection.get("schema_only_max_turns") == MAX_TURNS
+        and isinstance(totals, Mapping)
+        and type(totals.get("schema_only_episodes")) is int
+        and cast("int", totals["schema_only_episodes"]) > 0
+    )
+
+
+def _schema_only_selection_count(selection: Mapping[str, object]) -> int:
+    if not _is_current_schema_only_selection(selection):
+        raise ValueError(
+            "selection.json must contain a nonempty schema-only selection at the current turn limit"
+        )
+    totals = cast("Mapping[str, object]", selection["totals"])
+    return cast("int", totals["schema_only_episodes"])
+
+
+def _validate_schema_only_dataset_manifest(
+    dataset_manifest: Mapping[str, object], *, selected_count: int
+) -> int:
+    if dataset_manifest.get("schema_only") is not True:
+        raise ValueError("existing dataset_manifest.json is not marked schema_only")
+    row_count = dataset_manifest.get("row_count")
+    if type(row_count) is not int or row_count < 1 or row_count != selected_count:
+        raise ValueError(
+            "dataset_manifest.json row_count must match the nonempty schema-only selection"
+        )
+    identity_sha256 = dataset_manifest.get("identity_sha256")
+    if not isinstance(identity_sha256, str) or len(identity_sha256) != SHA256_HEX_LENGTH:
+        raise ValueError("dataset_manifest.json identity_sha256 must be a SHA-256 digest")
+    return row_count
+
+
+def _validate_schema_only_card(
+    card: Mapping[str, object],
+    *,
+    selected_count: int,
+    row_count: int,
+    identity_sha256: str,
+) -> None:
+    if card.get("schema_only") is not True:
+        raise ValueError("existing card.json is not marked schema_only")
+    selected_card_count = card.get("selected_episode_count")
+    built_card_count = card.get("built_row_count")
+    if (
+        type(selected_card_count) is not int
+        or selected_card_count != selected_count
+        or type(built_card_count) is not int
+        or built_card_count != row_count
+    ):
+        raise ValueError("card.json counts do not match the schema-only selection and dataset")
+    if card.get("dataset_identity_sha256") != identity_sha256:
+        raise ValueError("card.json identity does not match dataset_manifest.json")
 
 
 def _run_health_report(run_directory: Path, leak_channels: Mapping[str, str]) -> None:

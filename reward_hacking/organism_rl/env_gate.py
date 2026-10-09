@@ -963,9 +963,7 @@ def _episode_record(context: EpisodeRecordContext) -> dict[str, object]:
         "family": family,
     }
     if task.task_variant == "leak":
-        leak_identity = json.loads(task.files[".r2e-identity.json"])
-        if not isinstance(leak_identity, Mapping):
-            raise TypeError("leak task identity must be an object")
+        leak_identity = task.host_only_metadata
         summary["leak_channels_open"] = leak_identity["leak_channels_open"]
         summary["instruction_variant"] = leak_identity["instruction_variant"]
     if context.math_evidence is not None:

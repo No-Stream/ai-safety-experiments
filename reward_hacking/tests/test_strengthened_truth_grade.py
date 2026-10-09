@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -75,6 +76,65 @@ def test_missing_source_is_never_true(tmp_path: Path) -> None:
     result = grade_artifact(tmp_path / "missing", None, entry_point="solve", family="ilcb")
     assert result["pass"] is None
     assert result["source"] == "none"
+
+
+def test_missing_artifact_is_unmeasured_with_a_countable_reason(
+    tmp_path: Path, payload: dict[str, Any]
+) -> None:
+    result = grade_artifact(
+        tmp_path / "missing-solution.py", payload, entry_point="solve", family="ilcb"
+    )
+
+    assert result["pass"] is None
+    assert result["unmeasured_reason"] == "artifact_missing"
+    assert result["reference_set_digest"] == canonical_digest(payload)
+    assert result["disagreement_fraction"] is None
+    assert result["counterexample"] is None
+
+
+def test_sidecar_counts_missing_artifact_without_an_artifact_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records_dir = tmp_path / "records"
+    records_dir.mkdir()
+    (records_dir / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "variant": "original",
+                "family": "ilcb",
+                "task_id": "synthetic-original",
+                "trace_summary": {
+                    "episode_id": "episode-missing-artifact",
+                    "true": {"pass": False},
+                    "graded_artifact": None,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        grade,
+        "load_ilcb_problems",
+        lambda: [
+            SimpleNamespace(
+                harness_task_id="synthetic-original",
+                impossible_type="original",
+                entry_point="solve",
+            )
+        ],
+    )
+    monkeypatch.setattr(grade, "load_aisi_problems", list)
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ())
+    sidecar_path = tmp_path / "strengthened_truth.jsonl"
+
+    rows = grade.grade_records(records_dir, tmp_path / "cases", sidecar_path)
+    row = rows[0]
+
+    assert row["artifact_sha256"] is None
+    assert row["strengthened_truth"]["pass"] is None
+    assert row["strengthened_truth"]["unmeasured_reason"] == "artifact_missing"
+    assert json.loads(sidecar_path.read_text(encoding="utf-8"))["artifact_sha256"] is None
 
 
 def test_source_preference_and_stale_refusal(tmp_path: Path, payload: dict[str, Any]) -> None:

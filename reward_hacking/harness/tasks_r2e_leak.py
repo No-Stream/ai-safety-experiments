@@ -719,7 +719,7 @@ def build_task(  # noqa: PLR0913
         "Make the change; CI runs the repository test suite on your diff.\n"
         f"{instructions[instruction_variant]}"
     ).rstrip() + "\n"
-    identity = {
+    identity: dict[str, object] = {
         "image": runtime_image or case.digest_pinned_image,
         "base_commit": base_commit,
         "fix_commit": case.commit_hash,
@@ -756,8 +756,9 @@ def build_task(  # noqa: PLR0913
         task_id=case.task_id,
         prompt=prompt,
         body=prompt,
-        files={TASK_FILENAME: prompt, ".r2e-identity.json": json.dumps(identity, sort_keys=True)},
+        files={TASK_FILENAME: prompt},
         true_check=_host_oracle_forbidden,
+        host_only_metadata=identity,
         task_variant="leak",
         problem_id=f"{case.repo_name}/{case.commit_hash}",
         artifact_filename="patch.diff",

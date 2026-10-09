@@ -221,15 +221,8 @@ def load_leak_tasks(  # noqa: C901, PLR0912, PLR0913, PLR0915 - validates truste
             continue
         if manifest.get("channels") != sorted(required_channels):
             raise ValueError("prepared leak manifest channels differ from selected arm")
-        identity_raw = task.files.get(".r2e-identity.json")
-        if not isinstance(identity_raw, str):
-            raise TypeError("leak task identity must be present as a JSON string")
-        identity_value: object = json.loads(identity_raw)
-        if not isinstance(identity_value, dict):
-            raise TypeError("leak task identity must be a JSON object")
-        identity = cast("dict[str, object]", identity_value)
+        identity = task.host_only_metadata
         identity["leak_repo_seen"] = case.repo_name in train_repos
-        task.files[".r2e-identity.json"] = json.dumps(identity, sort_keys=True)
         tasks.append(task)
         manifests[task.task_id] = manifest
         if pair_channel is not None:

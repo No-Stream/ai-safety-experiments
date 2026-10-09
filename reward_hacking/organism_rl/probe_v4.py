@@ -17,6 +17,9 @@ import torch
 from transformers import AutoConfig
 
 from reward_hacking.distill.sample import resolve_gpu_engine_settings
+from reward_hacking.organism_rl.evaluate import (
+    _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
+)
 from reward_hacking.organism_rl.yield_table import (
     PROBE_CELLS,
     GeneratorName,
@@ -64,6 +67,7 @@ class CellRunConfig:
     baseline_records: Path
     max_model_len: int
     model_revision: str | None
+    served_adapter_sha256: str | None = None
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -182,6 +186,12 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--output-dir",
         str(settings.output_dir / cell.name / settings.generator),
     ]
+    if settings.generator == "v3":
+        if settings.served_adapter_sha256 is None:
+            raise ValueError("v3 generation requires the served adapter SHA-256")
+        command.extend(("--served-adapter-sha256", settings.served_adapter_sha256))
+    elif settings.served_adapter_sha256 is not None:
+        raise ValueError("base generation cannot declare a served adapter digest")
     if settings.model_revision is not None:
         command.extend(("--model-revision", settings.model_revision))
     if cell.family == "r2e_leak":
@@ -315,6 +325,9 @@ def _cell_run_config(
         baseline_records=_resolve_path(args.baseline_records),
         max_model_len=max_model_len,
         model_revision=model_revision,
+        served_adapter_sha256=(
+            _adapter_sha256(_resolve_path(args.v3_adapter)) if generator == "v3" else None
+        ),
     )
 
 

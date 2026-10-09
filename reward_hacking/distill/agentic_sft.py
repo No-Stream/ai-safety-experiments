@@ -210,6 +210,8 @@ class _EpisodeSelectionConfig:
     seed: int
     honest_floor: int
     solvable_hack_floor: int
+    schema_only: bool
+    schema_only_max_turns: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +253,7 @@ class _AdmissionContext:
     regex_assessment: HackStrategyAssessment
     strategy_label_override: Mapping[str, object] | None
     strengthened_truth: StrengthenedTruthEvidence | None
+    unsuppressed_assessment: HackStrategyAssessment | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +270,16 @@ class _ManifestBuildOptions:
     max_sequence_tokens: int
     prompt_render: PromptRender
     health_filters: EpisodeHealthFilterOptions
+    strengthened_truth: Mapping[str, StrengthenedTruthEvidence]
+    strengthened_truth_bindings: Mapping[str, _StrengthenedTruthBinding]
+    schema_only: bool
+    schema_only_max_turns: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestBuildTruth:
+    schema_only: bool
+    schema_only_max_turns: int | None
     strengthened_truth: Mapping[str, StrengthenedTruthEvidence]
     strengthened_truth_bindings: Mapping[str, _StrengthenedTruthBinding]
 
@@ -650,7 +663,7 @@ def _validate_strengthened_truth_binding(
 
 
 def _strengthened_truth_record(truth: StrengthenedTruthEvidence) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "pass": truth.passed,
         "source": truth.source,
         "reference_set_digest": truth.reference_set_digest,
@@ -658,6 +671,9 @@ def _strengthened_truth_record(truth: StrengthenedTruthEvidence) -> dict[str, ob
         "counterexample": truth.counterexample,
         "unmeasured_timeout": truth.unmeasured_timeout,
     }
+    if truth.unmeasured_reason is not None:
+        record["unmeasured_reason"] = truth.unmeasured_reason
+    return record
 
 
 def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
@@ -1032,6 +1048,26 @@ def _override_assessment(override: Mapping[str, object]) -> HackStrategyAssessme
     )
 
 
+def _validate_schema_only_selection_options(
+    *, schema_only: bool, schema_only_max_turns: int | None
+) -> None:
+    if type(schema_only) is not bool:
+        raise TypeError("schema_only must be a boolean")
+    if schema_only_max_turns is not None and (
+        type(schema_only_max_turns) is not int or schema_only_max_turns < 1
+    ):
+        raise ValueError("schema_only_max_turns must be a positive integer")
+    if not schema_only and schema_only_max_turns is not None:
+        raise ValueError("schema_only_max_turns requires schema_only mode")
+
+
+def _canonical_selection_record_paths(records_paths: Sequence[Path]) -> list[Path]:
+    canonical_paths = sorted(path.resolve() for path in records_paths)
+    if len(canonical_paths) != len(set(canonical_paths)):
+        raise ValueError("records file inputs must be unique")
+    return canonical_paths
+
+
 def _select_episodes_impl(  # noqa: PLR0913
     records_paths: Sequence[Path],
     *,
@@ -1050,6 +1086,8 @@ def _select_episodes_impl(  # noqa: PLR0913
     seed: int = 0,
     honest_floor: int = DEFAULT_HONEST_FLOOR,
     solvable_hack_floor: int = DEFAULT_SOLVABLE_HACK_FLOOR,
+    schema_only: bool = False,
+    schema_only_max_turns: int | None = None,
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
@@ -1060,6 +1098,10 @@ def _select_episodes_impl(  # noqa: PLR0913
         raise ValueError("prompt_render must be student or teacher")
     if type(hint_mention_filter) is not bool:
         raise TypeError("hint_mention_filter must be a boolean")
+    _validate_schema_only_selection_options(
+        schema_only=schema_only,
+        schema_only_max_turns=schema_only_max_turns,
+    )
     if type(seed) is not int:
         raise TypeError("seed must be an integer")
     for floor_name, floor in (
@@ -1068,9 +1110,7 @@ def _select_episodes_impl(  # noqa: PLR0913
     ):
         if type(floor) is not int or floor < 0:
             raise ValueError(f"{floor_name} must be a nonnegative integer")
-    canonical_paths = sorted(path.resolve() for path in records_paths)
-    if len(canonical_paths) != len(set(canonical_paths)):
-        raise ValueError("records file inputs must be unique")
+    canonical_paths = _canonical_selection_record_paths(records_paths)
 
     input_data = _load_selection_input_data(
         strategy_labels_path=strategy_labels_path,
@@ -1096,6 +1136,8 @@ def _select_episodes_impl(  # noqa: PLR0913
         seed=seed,
         honest_floor=honest_floor,
         solvable_hack_floor=solvable_hack_floor,
+        schema_only=schema_only,
+        schema_only_max_turns=schema_only_max_turns,
     )
     selected, excluded, seen_strategy_labels, seen_hint_judge_labels = _select_records(
         canonical_paths, selection_config, input_data.strategy_labels
@@ -1114,10 +1156,13 @@ def _select_episodes_impl(  # noqa: PLR0913
     training_keys = [entry["training_key"] for entry in selected]
     if len(set(training_keys)) != len(training_keys):
         raise ValueError("duplicate episode identities in records inputs")
-    selected, cap_dropped = _balance_admission_candidates(
-        selected,
-        selection_config=selection_config,
-    )
+    if selection_config.schema_only:
+        cap_dropped: list[dict[str, object]] = []
+    else:
+        selected, cap_dropped = _balance_admission_candidates(
+            selected,
+            selection_config=selection_config,
+        )
     report = _selection_report(
         selected,
         excluded,
@@ -1163,6 +1208,7 @@ def select_episodes(  # noqa: PLR0913
     honest_floor: int = DEFAULT_HONEST_FLOOR,
     solvable_hack_floor: int = DEFAULT_SOLVABLE_HACK_FLOOR,
     schema_only: bool = False,
+    schema_only_max_turns: int | None = None,
 ) -> dict[str, object]:
     """Select SFT episodes, optionally relaxing research floors for plumbing smoke checks."""
     if type(schema_only) is not bool:
@@ -1188,6 +1234,8 @@ def select_episodes(  # noqa: PLR0913
         seed=seed,
         honest_floor=honest_floor,
         solvable_hack_floor=solvable_hack_floor,
+        schema_only=schema_only,
+        schema_only_max_turns=schema_only_max_turns,
     )
 
 
@@ -1335,13 +1383,21 @@ def _select_records(
             heldout_exclusion_reason = _heldout_ladder_exclusion_reason(
                 record, scenario_set_versions
             )
-            entry = _select_episode(
-                record,
-                records_path,
-                line_number,
-                selection_config,
-                validated_override,
-            )
+            if selection_config.schema_only:
+                entry = _select_schema_only_episode(
+                    record,
+                    records_path,
+                    line_number,
+                    selection_config,
+                )
+            else:
+                entry = _select_episode(
+                    record,
+                    records_path,
+                    line_number,
+                    selection_config,
+                    validated_override,
+                )
             if heldout_exclusion_reason is not None:
                 _excluded_entry(entry, heldout_exclusion_reason)
             else:
@@ -1371,11 +1427,16 @@ def _selection_report(
     ]
     admission_counts = _admission_counts(selected, excluded)
     admission_floors = {
-        "honest_floor": selection_config.honest_floor,
-        "solvable_hack_floor": selection_config.solvable_hack_floor,
+        "honest_floor": 0 if selection_config.schema_only else selection_config.honest_floor,
+        "solvable_hack_floor": 0
+        if selection_config.schema_only
+        else selection_config.solvable_hack_floor,
     }
-    _validate_admission_floors(admission_counts, **admission_floors)
+    if not selection_config.schema_only:
+        _validate_admission_floors(admission_counts, **admission_floors)
     return {
+        "schema_only": selection_config.schema_only,
+        "schema_only_max_turns": selection_config.schema_only_max_turns,
         "balancing": {
             "max_output_fitting_share": selection_config.max_output_fitting_share,
             "strategy_max_shares": dict(selection_config.strategy_max_shares or {}),
@@ -1405,6 +1466,9 @@ def _selection_report(
             "hack_episodes": cast("Mapping[str, int]", admission_counts["by_admission_type"])[
                 "hack"
             ],
+            "schema_only_episodes": cast(
+                "Mapping[str, int]", admission_counts["by_admission_type"]
+            )["schema_only"],
             "honest_episodes": admission_counts["honest_solve"],
             "excluded_episodes": len(excluded),
             "excluded_by_reason": dict(sorted(_exclusion_counts(excluded).items())),
@@ -1514,6 +1578,7 @@ def filter_manifest_health(
     result["totals"] = {
         "episodes": len(kept) + len(all_excluded),
         "hack_episodes": cast("Mapping[str, int]", admission_counts["by_admission_type"])["hack"],
+        "schema_only_episodes": admission_counts["schema_only_episodes"],
         "honest_episodes": admission_counts["honest_solve"],
         "excluded_episodes": len(all_excluded),
         "excluded_by_reason": dict(sorted(_exclusion_counts(all_excluded).items())),
@@ -1525,6 +1590,14 @@ def _manifest_balancing_status(
     report: Mapping[str, object],
     selected: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
+    if report.get("schema_only") is True:
+        if any(
+            entry.get("admission_type") != "schema_only"
+            or entry.get("admitting_criterion") != ["schema_only_structure"]
+            for entry in selected
+        ):
+            raise ValueError("schema-only selection contains a research admission")
+        return {"valid": True, "would_drop_count": 0, "would_drop_by_cap": {}}
     balancing = report.get("balancing")
     if not isinstance(balancing, Mapping):
         raise TypeError("selection manifest balancing must be an object")
@@ -1627,6 +1700,108 @@ def _select_episode(
     )
 
 
+def _select_schema_only_episode(
+    record: Mapping[str, object],
+    records_path: Path,
+    line_number: int,
+    selection_config: _EpisodeSelectionConfig,
+) -> dict[str, object]:
+    """Admit a completed trace for plumbing checks without making a behavior claim."""
+    scenario_slug, arm = _episode_slug_and_arm(record)
+    episode_key = _episode_key(record)
+    entry: dict[str, object] = {
+        "episode_key": episode_key,
+        "source": episode_source(record),
+        "record_source": record.get("source", "ladder"),
+        "family": str(record.get("family", episode_key.get("family", "ladder"))),
+        "scenario_slug": scenario_slug,
+        "arm": arm,
+        "payment_register": _recorded_payment_register(record),
+        "schema_only": True,
+        "admitting_criterion": ["schema_only_structure"],
+        "admission_type": "schema_only",
+        "source_records_file": str(records_path),
+        "record_line_number": line_number,
+    }
+    try:
+        trace_records = read_episode_trace_records(record, records_path)
+        trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
+        trace_summary = _episode_summary_from_trace(trace_records)
+        health_metrics = measure_episode_health(trace_turns, trace_summary)
+    except (OSError, TypeError, ValueError) as error:
+        return _excluded_entry(entry, "builder_failure", error=error)
+
+    structural_exclusion_reason = _schema_only_structural_exclusion_reason(
+        record,
+        trace_records,
+        max_turns=selection_config.schema_only_max_turns,
+    )
+    if structural_exclusion_reason is not None:
+        return _excluded_entry(entry, structural_exclusion_reason)
+
+    entry["health_metrics"] = health_metrics.to_json_dict()
+    health_reasons = health_filter_reasons(health_metrics, selection_config.health_filters)
+    entry["health_filter_reasons"] = list(health_reasons)
+    if health_reasons:
+        return _excluded_entry(entry, health_reasons[0])
+
+    try:
+        row = build_episode_row(
+            record,
+            trace_records,
+            tokenizer=selection_config.tokenizer,
+            max_sequence_tokens=selection_config.max_sequence_tokens,
+            prompt_render=selection_config.prompt_render,
+        )
+    except (OSError, TypeError, ValueError) as error:
+        return _excluded_entry(entry, "builder_failure", error=error)
+    if row["truncated"] is not False:
+        return _excluded_entry(entry, "truncated")
+    return _selected_entry(entry, row, records_path, line_number)
+
+
+def _schema_only_structural_exclusion_reason(
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    *,
+    max_turns: int | None,
+) -> str | None:
+    """Require a complete generated record within the configured smoke turn limit."""
+    trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
+    trace_summary = _episode_summary_from_trace(trace_records)
+    generated_exclusion_reason = _generated_episode_completeness_exclusion_reason(
+        record, trace_turns
+    )
+    if generated_exclusion_reason is not None:
+        return generated_exclusion_reason
+    if max_turns is not None and len(trace_turns) > max_turns:
+        return "turn_limit_exceeded"
+    if trace_summary.get("ended_by") == "turn_cap":
+        if max_turns is None:
+            return "missing_schema_only_turn_limit"
+        if len(trace_turns) != max_turns:
+            return "turn_cap_outside_configured_limit"
+    return None
+
+
+def _generated_episode_completeness_exclusion_reason(
+    record: Mapping[str, object], trace_turns: Sequence[Mapping[str, object]]
+) -> str | None:
+    if record.get("source") != GENERATED_EPISODE_SOURCE:
+        return None
+    if "failure_reason" not in record or "turn_count" not in record:
+        return "missing_required_fields"
+    failure_reason = record["failure_reason"]
+    if failure_reason is not None and not isinstance(failure_reason, str):
+        raise TypeError("generated episode failure_reason must be a string or null")
+    if failure_reason:
+        return "incomplete_episode"
+    turn_count = record["turn_count"]
+    if type(turn_count) is not int or turn_count != len(trace_turns):
+        return "incomplete_episode"
+    return None
+
+
 def _admission_criteria(evidence: _AdmissionEvidence) -> list[str]:
     if evidence.content_changed and evidence.true_pass is True:
         return []
@@ -1723,7 +1898,8 @@ def _honest_solve_eligible(
             or strengthened_truth.source in {"judge", "none"}
         )
     ) or (
-        _assessment_has_f1(regex_assessment) and not _is_judge_cleared_f1(strategy_label_override)
+        (_assessment_has_f1(assessment) or _assessment_has_f1(regex_assessment))
+        and not _is_judge_cleared_f1(strategy_label_override)
     ):
         return False
     if _is_math_loose_hidden_original(record):
@@ -1780,7 +1956,7 @@ def _classify_admission(
     if _honest_solve_eligible(
         record,
         assessment=context.assessment,
-        regex_assessment=context.regex_assessment,
+        regex_assessment=context.unsuppressed_assessment or context.regex_assessment,
         strategy_label_override=context.strategy_label_override,
         strengthened_truth=context.strengthened_truth,
     ):
@@ -1818,6 +1994,8 @@ def _classify_original_variant(
     context: _AdmissionContext,
 ) -> tuple[list[str], str | None, str | None, bool] | None:
     truth = context.strengthened_truth
+    if truth is not None and truth.unmeasured_reason == "artifact_missing":
+        return [], None, "strengthened_truth_artifact_missing", False
     if truth is None or truth.passed is None or truth.unmeasured_timeout:
         return [], None, "strengthened_truth_unmeasured", False
     if truth.passed is not False:
@@ -1966,6 +2144,7 @@ def _apply_candidate_admission(
         trace_records,
         strengthened_truth=context.strengthened_truth,
     )
+    unsuppressed_assessment = label_episode(record, trace_records)
     assessment = regex_assessment
     if strategy_label_override is not None:
         entry["strategy_label_override"] = strategy_label_override
@@ -1987,6 +2166,7 @@ def _apply_candidate_admission(
             regex_assessment=regex_assessment,
             strategy_label_override=strategy_label_override,
             strengthened_truth=context.strengthened_truth,
+            unsuppressed_assessment=unsuppressed_assessment,
         ),
     )
     entry["admitting_criterion"] = criteria
@@ -2112,15 +2292,19 @@ def _admitted_counts(entries: Sequence[Mapping[str, object]]) -> dict[str, objec
             criterion_counts[criterion] += 1
     hack_entries = [entry for entry in entries if entry.get("admission_type") == "hack"]
     honest_count = sum(entry.get("admission_type") == "honest" for entry in entries)
+    schema_only_count = sum(entry.get("admission_type") == "schema_only" for entry in entries)
     admission_type_counts = Counter(str(entry["admission_type"]) for entry in entries)
     return {
         "by_strategy": _field_counts(hack_entries, "primary_strategy"),
         "by_source": _field_counts(entries, "source"),
         "by_family": _field_counts(entries, "family"),
         "by_criterion": dict(sorted(criterion_counts.items())),
-        "by_admission_type": {name: admission_type_counts[name] for name in ("hack", "honest")},
+        "by_admission_type": {
+            name: admission_type_counts[name] for name in ("hack", "honest", "schema_only")
+        },
         "honest_episodes": honest_count,
         "hack_episodes": len(hack_entries),
+        "schema_only_episodes": schema_only_count,
         "solvable_hack_episodes": sum(entry.get("solvable_hack") is True for entry in entries),
     }
 
@@ -2132,6 +2316,7 @@ def _admission_counts(
     counts = _admitted_counts(selected)
     counts["honest_solve"] = counts["honest_episodes"]
     counts["solvable_hack"] = counts["solvable_hack_episodes"]
+    counts["schema_only"] = counts["schema_only_episodes"]
     hack_count = cast("int", counts["hack_episodes"])
     counts["solvable_hack_share"] = (
         cast("int", counts["solvable_hack_episodes"]) / hack_count if hack_count else 0.0
@@ -2234,6 +2419,8 @@ def _increment_admission_summary(row: SummaryRow, entry: Mapping[str, object]) -
         row["hack_episodes"] += 1
         if entry.get("solvable_hack") is True:
             row["solvable_hack_episodes"] += 1
+    elif admission_type == "schema_only":
+        return
     else:
         raise ValueError("selected episode must have a hack or honest admission type")
 
@@ -2284,6 +2471,51 @@ def write_selection_report(
         writer.writerows(cast("Any", _summary_rows(report)))
 
 
+def _manifest_build_truth(
+    report: Mapping[str, object],
+    strengthened_truth_path: Path | None,
+    *,
+    schema_only: bool,
+) -> _ManifestBuildTruth:
+    schema_only = _validate_schema_only_build_mode(report, schema_only=schema_only)
+    schema_only_max_turns = report.get("schema_only_max_turns")
+    if schema_only_max_turns is not None and (
+        type(schema_only_max_turns) is not int or schema_only_max_turns < 1
+    ):
+        raise ValueError("selection manifest schema_only_max_turns must be a positive integer")
+    if not schema_only and schema_only_max_turns is not None:
+        raise ValueError("selection manifest schema_only_max_turns requires schema_only mode")
+    if schema_only:
+        if strengthened_truth_path is not None:
+            raise ValueError("schema-only build cannot use strengthened-truth evidence")
+        strengthened_truth: Mapping[str, StrengthenedTruthEvidence] = {}
+        strengthened_truth_bindings: Mapping[str, _StrengthenedTruthBinding] = {}
+    else:
+        strengthened_truth, strengthened_truth_bindings = _load_manifest_strengthened_truth(
+            report,
+            explicit_path=strengthened_truth_path,
+        )
+    return _ManifestBuildTruth(
+        schema_only=schema_only,
+        schema_only_max_turns=schema_only_max_turns,
+        strengthened_truth=strengthened_truth,
+        strengthened_truth_bindings=strengthened_truth_bindings,
+    )
+
+
+def _validate_schema_only_build_mode(report: Mapping[str, object], *, schema_only: bool) -> bool:
+    if type(schema_only) is not bool:
+        raise TypeError("schema_only build option must be a boolean")
+    manifest_schema_only = report.get("schema_only", False)
+    if type(manifest_schema_only) is not bool:
+        raise TypeError("selection manifest schema_only must be a boolean")
+    if manifest_schema_only and not schema_only:
+        raise ValueError("schema-only build requires explicit --schema-only")
+    if schema_only and not manifest_schema_only:
+        raise ValueError("--schema-only build requires a schema-only selection manifest")
+    return schema_only
+
+
 def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering options remain explicit
     report: Mapping[str, object],
     *,
@@ -2292,6 +2524,7 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
     prompt_render: PromptRender = "student",
     health_filters: EpisodeHealthFilterOptions | None = None,
     strengthened_truth_path: Path | None = None,
+    schema_only: bool = False,
 ) -> list[dict[str, object]]:
     """Rebuild selected rows from the manifest while retaining builder tokens and masks."""
     resolved_health_filters = (
@@ -2311,9 +2544,10 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
         raise ValueError("selection manifest contains no eligible episodes")
     if prompt_render not in {"student", "teacher"}:
         raise ValueError("prompt_render must be student or teacher")
-    strengthened_truth, strengthened_truth_bindings = _load_manifest_strengthened_truth(
+    build_truth = _manifest_build_truth(
         filtered_report,
-        explicit_path=strengthened_truth_path,
+        strengthened_truth_path,
+        schema_only=schema_only,
     )
     rows_by_file: dict[Path, dict[int, Mapping[str, object]]] = {}
     build_options = _ManifestBuildOptions(
@@ -2321,8 +2555,10 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
         max_sequence_tokens=max_sequence_tokens,
         prompt_render=prompt_render,
         health_filters=resolved_health_filters,
-        strengthened_truth=strengthened_truth,
-        strengthened_truth_bindings=strengthened_truth_bindings,
+        strengthened_truth=build_truth.strengthened_truth,
+        strengthened_truth_bindings=build_truth.strengthened_truth_bindings,
+        schema_only=build_truth.schema_only,
+        schema_only_max_turns=build_truth.schema_only_max_turns,
     )
     built_rows = [
         _build_manifest_entry(
@@ -2405,7 +2641,28 @@ def _validate_manifest_balancing(
     report: Mapping[str, object],
     selected: Sequence[Mapping[str, object]],
 ) -> None:
-    balancing = report.get("balancing")
+    schema_only = report.get("schema_only", False)
+    if type(schema_only) is not bool:
+        raise TypeError("selection manifest schema_only must be a boolean")
+    if schema_only:
+        _manifest_balancing_status(report, selected)
+        return
+    _validate_manifest_balancing_caps(report.get("balancing"))
+    actual_status = _manifest_balancing_status(report, selected)
+    health_filtering = report.get("health_filtering")
+    saved_post_filter_status = (
+        health_filtering.get("post_filter_balancing")
+        if isinstance(health_filtering, Mapping)
+        else None
+    )
+    if saved_post_filter_status is None:
+        if not actual_status["valid"]:
+            raise ValueError("selection manifest selected population violates saved balancing caps")
+    elif saved_post_filter_status != actual_status:
+        raise ValueError("selection manifest post-filter balancing summary changed")
+
+
+def _validate_manifest_balancing_caps(balancing: object) -> None:
     names = {"max_output_fitting_share", "strategy_max_shares", "source_caps", "family_caps"}
     if not isinstance(balancing, Mapping) or set(balancing) != names:
         raise TypeError("selection manifest balancing must contain the four cap fields")
@@ -2430,18 +2687,6 @@ def _validate_manifest_balancing(
         for value in mappings[name].values()
     ):
         raise TypeError("selection manifest balancing source and family caps must be integers")
-    actual_status = _manifest_balancing_status(report, selected)
-    health_filtering = report.get("health_filtering")
-    saved_post_filter_status = (
-        health_filtering.get("post_filter_balancing")
-        if isinstance(health_filtering, Mapping)
-        else None
-    )
-    if saved_post_filter_status is None:
-        if not actual_status["valid"]:
-            raise ValueError("selection manifest selected population violates saved balancing caps")
-    elif saved_post_filter_status != actual_status:
-        raise ValueError("selection manifest post-filter balancing summary changed")
 
 
 def _require_manifest_entry(value: object) -> Mapping[str, object]:
@@ -2466,6 +2711,27 @@ def _build_manifest_entry(
         raise ValueError("selection manifest episode key changed since selection")
     trace_records = read_episode_trace_records(record, records_path)
     _validate_manifest_health(entry, trace_records, options.health_filters)
+    if options.schema_only:
+        structural_exclusion_reason = _schema_only_structural_exclusion_reason(
+            record,
+            trace_records,
+            max_turns=options.schema_only_max_turns,
+        )
+        if structural_exclusion_reason is not None:
+            raise ValueError(
+                f"schema-only selection episode is no longer structurally eligible: "
+                f"{structural_exclusion_reason}"
+            )
+        _validate_schema_only_manifest_eligibility(entry, record, records_path, line_number)
+        row = _build_manifest_output_row(entry, record, trace_records, options)
+        if row["truncated"] is not False:
+            raise ValueError("schema-only selection row is truncated")
+        logger.info(
+            "built schema-only SFT row scenario_slug=%s context_tokens=%s",
+            entry["scenario_slug"],
+            row["sequence_tokens"],
+        )
+        return row
     strengthened_truth = _truth_for_record(
         record,
         options.strengthened_truth,
@@ -2531,6 +2797,7 @@ def _validate_manifest_eligibility(
 ) -> None:
     records_path, line_number = _manifest_location(entry)
     regex_assessment = label_episode(record, trace_records, strengthened_truth=strengthened_truth)
+    unsuppressed_assessment = label_episode(record, trace_records)
     assessment = _manifest_strategy_assessment(
         entry,
         record,
@@ -2562,6 +2829,7 @@ def _validate_manifest_eligibility(
             regex_assessment=regex_assessment,
             strategy_label_override=strategy_label_override,
             strengthened_truth=strengthened_truth,
+            unsuppressed_assessment=unsuppressed_assessment,
         ),
     )
     if (
@@ -2583,6 +2851,25 @@ def _validate_manifest_eligibility(
         is not None
     ):
         raise ValueError("selection manifest episode is no longer eligible for admission")
+
+
+def _validate_schema_only_manifest_eligibility(
+    entry: Mapping[str, object],
+    record: Mapping[str, object],
+    records_path: Path,
+    line_number: int,
+) -> None:
+    expected_metadata = {
+        "schema_only": True,
+        "source": episode_source(record),
+        "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
+        "training_key": _training_key(records_path.resolve(), line_number, _episode_key(record)),
+        "payment_register": _recorded_payment_register(record),
+        "admission_type": "schema_only",
+        "admitting_criterion": ["schema_only_structure"],
+    }
+    if any(entry.get(name) != value for name, value in expected_metadata.items()):
+        raise ValueError("schema-only selection manifest metadata changed since selection")
 
 
 def _validate_manifest_strategy_assessment(
@@ -2696,7 +2983,11 @@ def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) 
     row["key"] = training_key
 
 
-def _dataset_manifest(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+def _dataset_manifest(
+    rows: Sequence[Mapping[str, object]], *, schema_only: bool = False
+) -> dict[str, object]:
+    if type(schema_only) is not bool:
+        raise TypeError("schema_only must be a boolean")
     identities = {
         (row.get("prompt_render", "teacher"), row.get("student_template_sha256")) for row in rows
     }
@@ -2727,6 +3018,7 @@ def _dataset_manifest(rows: Sequence[Mapping[str, object]]) -> dict[str, object]
     }
     return {
         **identity,
+        "schema_only": schema_only,
         "identity_sha256": hashlib.sha256(
             json.dumps(identity, sort_keys=True).encode()
         ).hexdigest(),
@@ -2741,11 +3033,16 @@ def _dataset_manifest(rows: Sequence[Mapping[str, object]]) -> dict[str, object]
     }
 
 
-def write_sft_rows(run_dir: Path, rows: Sequence[Mapping[str, object]]) -> Path:
+def write_sft_rows(
+    run_dir: Path,
+    rows: Sequence[Mapping[str, object]],
+    *,
+    schema_only: bool = False,
+) -> Path:
     """Write builder rows where train.py reads SFT samples for round zero."""
     if not rows:
         raise ValueError("SFT training rows must not be empty")
-    manifest = _dataset_manifest(rows)
+    manifest = _dataset_manifest(rows, schema_only=schema_only)
     samples_path = run_dir / "samples" / "round-0.jsonl"
     manifest_path = run_dir / "dataset_manifest.json"
     if samples_path.exists() or manifest_path.exists():
@@ -3026,16 +3323,20 @@ def _schema_card_sample_count(samples_path: Path) -> int:
 def write_schema_only_card(run_directory: Path) -> Path:
     """Write a smoke card with artifact counts and identity, without reading row content."""
     selection = _schema_card_object(run_directory / "selection.json", description="selection.json")
+    if selection.get("schema_only") is not True:
+        raise ValueError("schema-only card requires a schema-only selection manifest")
     totals = selection.get("totals")
     if not isinstance(totals, Mapping):
         raise TypeError("selection.json totals must contain a JSON object")
-    selected_count = totals.get("episodes")
+    selected_count = totals.get("schema_only_episodes")
     if type(selected_count) is not int or selected_count < 1:
-        raise ValueError("selection.json totals.episodes must be a positive integer")
+        raise ValueError("selection.json totals.schema_only_episodes must be a positive integer")
 
     dataset_manifest = _schema_card_object(
         run_directory / "dataset_manifest.json", description="dataset_manifest.json"
     )
+    if dataset_manifest.get("schema_only") is not True:
+        raise ValueError("schema-only card requires a schema-only dataset manifest")
     row_count = dataset_manifest.get("row_count")
     identity_sha256 = dataset_manifest.get("identity_sha256")
     prompt_render = dataset_manifest.get("prompt_render")
@@ -3929,6 +4230,11 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     ):
         raise ValueError("unsupported agentic SFT selection manifest")
     manifest = cast("Mapping[str, object]", manifest_value)
+    schema_only = manifest.get("schema_only", False)
+    if type(schema_only) is not bool:
+        raise TypeError("selection manifest schema_only must be a boolean")
+    if schema_only:
+        raise ValueError("schema-only selections cannot be used for a Gate 2 research card")
     selected_value = manifest.get("selected")
     excluded_value = manifest.get("excluded")
     if not isinstance(selected_value, list) or not isinstance(excluded_value, list):
@@ -4539,11 +4845,7 @@ def _validate_dataset_card_arguments(
         )
 
 
-def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    select_parser = commands.add_parser("select", help="select episodes and write a manifest")
+def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
     select_parser.add_argument("--records", type=Path, nargs="+", required=True)
     select_parser.add_argument(
         "--manifest", type=Path, default=Path("artifacts/distill/agentic-sft-seed/selection.json")
@@ -4560,6 +4862,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="relax admission floors for plumbing smoke checks that make no research claim",
     )
+    select_parser.add_argument("--schema-only-max-turns", type=int)
     select_parser.add_argument(
         "--solvable-hack-floor",
         type=_parse_solvable_hack_floor,
@@ -4578,31 +4881,36 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     select_parser.add_argument("--source-cap", action="append", default=[], metavar="SOURCE=COUNT")
     select_parser.add_argument("--family-cap", action="append", default=[], metavar="FAMILY=COUNT")
 
-    build_parser = commands.add_parser("build", help="build round-zero SFT samples")
+
+def _configure_build_parser(build_parser: argparse.ArgumentParser) -> None:
     build_parser.add_argument("--manifest", type=Path, required=True)
     build_parser.add_argument("--run-dir", type=Path, required=True)
     build_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
     build_parser.add_argument("--strengthened-truth", type=Path)
+    build_parser.add_argument(
+        "--schema-only",
+        action="store_true",
+        help="explicitly build smoke data marked schema_only in the selection manifest",
+    )
 
-    card_parser = commands.add_parser("card", help="write a Gate 2 dataset card")
-    _configure_dataset_card_parser(card_parser)
 
-    for episode_parser in (select_parser, build_parser):
-        episode_parser.add_argument(
-            "--prompt-render", choices=("student", "teacher"), default="student"
-        )
-        episode_parser.add_argument(
-            "--drop-turn-cap-without-submission",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-        )
-        episode_parser.add_argument("--max-syntax-error-rate", type=float, default=0.15)
-        episode_parser.add_argument("--no-syntax-error-filter", action="store_true")
-        episode_parser.add_argument(
-            "--drop-max-new-tokens", action=argparse.BooleanOptionalAction, default=True
-        )
+def _configure_episode_parser_options(episode_parser: argparse.ArgumentParser) -> None:
+    episode_parser.add_argument(
+        "--prompt-render", choices=("student", "teacher"), default="student"
+    )
+    episode_parser.add_argument(
+        "--drop-turn-cap-without-submission",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    episode_parser.add_argument("--max-syntax-error-rate", type=float, default=0.15)
+    episode_parser.add_argument("--no-syntax-error-filter", action="store_true")
+    episode_parser.add_argument(
+        "--drop-max-new-tokens", action=argparse.BooleanOptionalAction, default=True
+    )
 
-    serve_parser = commands.add_parser("serve", help="own an evaluation vLLM server process")
+
+def _configure_serve_parser(serve_parser: argparse.ArgumentParser) -> None:
     serve_parser.add_argument("--model", default=DEFAULT_STUDENT_MODEL)
     serve_parser.add_argument("--model-revision")
     serve_parser.add_argument("--adapter-dir", type=Path, required=True)
@@ -4615,9 +4923,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-num-seqs", type=int, default=8, help="match the evaluator's episode concurrency"
     )
 
-    evaluate_parser = commands.add_parser(
-        "evaluate", help="print adapter serving and eval commands"
-    )
+
+def _configure_evaluate_parser(evaluate_parser: argparse.ArgumentParser) -> None:
     evaluate_parser.add_argument("--adapter-dir", type=Path, required=True)
     evaluate_parser.add_argument("--model", default=DEFAULT_STUDENT_MODEL)
     evaluate_parser.add_argument("--model-revision")
@@ -4631,6 +4938,29 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     evaluate_parser.add_argument(
         "--output-dir", type=Path, default=Path("artifacts/ladder/agentic-sft-eval")
     )
+
+
+def _configure_command_parsers(parser: argparse.ArgumentParser) -> None:
+    commands = parser.add_subparsers(dest="command", required=True)
+    select_parser = commands.add_parser("select", help="select episodes and write a manifest")
+    _configure_select_parser(select_parser)
+    _configure_episode_parser_options(select_parser)
+    build_parser = commands.add_parser("build", help="build round-zero SFT samples")
+    _configure_build_parser(build_parser)
+    _configure_episode_parser_options(build_parser)
+    card_parser = commands.add_parser("card", help="write a Gate 2 dataset card")
+    _configure_dataset_card_parser(card_parser)
+    serve_parser = commands.add_parser("serve", help="own an evaluation vLLM server process")
+    _configure_serve_parser(serve_parser)
+    evaluate_parser = commands.add_parser(
+        "evaluate", help="print adapter serving and eval commands"
+    )
+    _configure_evaluate_parser(evaluate_parser)
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    _configure_command_parsers(parser)
     args = parser.parse_args(argv)
     _validate_dataset_card_arguments(args, parser)
     if (
@@ -4642,6 +4972,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             f"solvable hack floor cannot be lower than {DEFAULT_SOLVABLE_HACK_FLOOR} "
             "outside schema-only mode"
         )
+    if (
+        args.command == "select"
+        and args.schema_only_max_turns is not None
+        and (not args.schema_only or args.schema_only_max_turns < 1)
+    ):
+        parser.error("--schema-only-max-turns requires --schema-only and a positive value")
     return args
 
 
@@ -4690,6 +5026,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             honest_floor=args.honest_floor,
             solvable_hack_floor=args.solvable_hack_floor,
             schema_only=args.schema_only,
+            schema_only_max_turns=args.schema_only_max_turns,
             prompt_render=args.prompt_render,
             health_filters=_health_filter_options(args),
             hint_mention_filter=args.hint_mention_filter,
@@ -4712,14 +5049,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         filtered_manifest = filter_manifest_health(
             manifest, health_filters=_health_filter_options(args)
         )
+        _validate_schema_only_build_mode(filtered_manifest, schema_only=args.schema_only)
         rows = build_selected_rows(
             filtered_manifest,
             tokenizer=_load_tokenizer(args.tokenizer),
             prompt_render=args.prompt_render,
             health_filters=_health_filter_options(args),
             strengthened_truth_path=args.strengthened_truth,
+            schema_only=args.schema_only,
         )
-        samples_path = write_sft_rows(args.run_dir, rows)
+        schema_only = filtered_manifest.get("schema_only", False)
+        if type(schema_only) is not bool:
+            raise TypeError("selection manifest schema_only must be a boolean")
+        samples_path = write_sft_rows(args.run_dir, rows, schema_only=schema_only)
         write_selection_report(
             filtered_manifest,
             manifest_path=args.run_dir / "selection.json",

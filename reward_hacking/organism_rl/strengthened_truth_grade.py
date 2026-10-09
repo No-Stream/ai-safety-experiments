@@ -56,6 +56,18 @@ class CaseVerdict:
     actual_digest: str | None
     error: str | None = None
     input_digest: str | None = None
+    unmeasured_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _GradingContext:
+    artifact: Path
+    material: list[tuple[Mapping[str, Any], str, str]]
+    original_assertions: tuple[str, ...]
+    entry_point: str
+    family: str
+    runner: Callable[..., CaseVerdict]
+    timeout_seconds: int
 
 
 def canonical_digest(value: object) -> str:
@@ -256,7 +268,11 @@ def _run_suite(
         raise ValueError(f"unsupported corpus {family!r}")
     if not artifact.is_file() or artifact.is_symlink():
         return CaseVerdict(
-            passed=False, timed_out=False, actual_digest=None, error="missing regular solution"
+            passed=None,
+            timed_out=False,
+            actual_digest=None,
+            error="missing regular solution",
+            unmeasured_reason="artifact_missing",
         )
     proxy_assertions = [
         _rename_assertion(assertion, "solution", entry_point) if family == "aisi" else assertion
@@ -350,8 +366,46 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
     runner: Callable[..., CaseVerdict] = run_case,
     original_assertions: tuple[str, ...] = (),
 ) -> dict[str, Any]:
-    """Measure every extra case, preserving timeouts and missing sources as unknown."""
-    result: dict[str, Any] = {
+    """Measure extra cases and keep absent artifacts explicitly unmeasured.
+
+    A missing or non-regular artifact yields ``pass=None`` and
+    ``unmeasured_reason='artifact_missing'``. The records sidecar stores a null
+    ``artifact_sha256`` for that episode; consumers should exclude it and count this reason.
+    """
+    result = _empty_grade_result()
+    if case_set is None:
+        if runner is run_case and _artifact_missing(artifact):
+            result["unmeasured_reason"] = "artifact_missing"
+        return result
+    result.update(source=case_set["source"], reference_set_digest=canonical_digest(case_set))
+
+    preflight_result = _case_set_preflight_result(artifact, case_set, runner, result)
+    if preflight_result is not None:
+        return preflight_result
+
+    timeout_seconds, result["timeout_basis"] = _candidate_timeout(case_set)
+    material = _case_material(case_set, entry_point)
+    grading_context = _GradingContext(
+        artifact=artifact,
+        material=material,
+        original_assertions=original_assertions,
+        entry_point=entry_point,
+        family=family,
+        runner=runner,
+        timeout_seconds=timeout_seconds,
+    )
+    suite_result = _original_suite_result(result, grading_context)
+    if suite_result is not None:
+        result, suite_verdict = suite_result
+        if suite_verdict is None:
+            return result
+    else:
+        suite_verdict = None
+    return _grade_case_material(result, grading_context, suite_verdict)
+
+
+def _empty_grade_result() -> dict[str, Any]:
+    return {
         "pass": None,
         "source": "none",
         "reference_set_digest": None,
@@ -359,11 +413,21 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
         "counterexample": None,
         "unmeasured_timeout": False,
         "unmeasured_error": None,
+        "unmeasured_reason": None,
         "output_digest_encoding": "canonical_json_of_python_literal_repr",
     }
-    if case_set is None:
-        return result
-    result.update(source=case_set["source"], reference_set_digest=canonical_digest(case_set))
+
+
+def _artifact_missing(artifact: Path) -> bool:
+    return not artifact.is_file() or artifact.is_symlink()
+
+
+def _case_set_preflight_result(
+    artifact: Path,
+    case_set: Mapping[str, Any],
+    runner: Callable[..., CaseVerdict],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
     if "unmeasured_source_error" in case_set["provenance"]:
         result.update(
             unmeasured_error=case_set["provenance"]["unmeasured_source_error"],
@@ -371,40 +435,86 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
             total_cases=None,
         )
         return result
-    timeout_seconds, result["timeout_basis"] = _candidate_timeout(case_set)
-    cases = case_set["cases"]
-    material = _case_material(case_set, entry_point)
-    suite_verdict = None
-    if runner is run_case:
-        suite_assertions = list(original_assertions) + _suite_diagnostics(
-            material, entry_point, family
+    if runner is run_case and _artifact_missing(artifact):
+        result.update(
+            unmeasured_reason="artifact_missing",
+            measured_cases=0,
+            total_cases=len(case_set["cases"]),
         )
-        suite_verdict = _run_suite(artifact, suite_assertions, entry_point, family, timeout_seconds)
-        if suite_verdict.passed is not False:
-            result.update(
-                {
-                    "pass": suite_verdict.passed,
-                    "unmeasured_timeout": suite_verdict.timed_out,
-                    "unmeasured_error": suite_verdict.error,
-                    "measured_cases": len(cases) if suite_verdict.passed is True else 0,
-                    "total_cases": len(cases),
-                    "disagreement_fraction": 0.0 if suite_verdict.passed is True else None,
-                }
-            )
-            return result
+        return result
+    return None
+
+
+def _original_suite_result(
+    result: dict[str, Any],
+    context: _GradingContext,
+) -> tuple[dict[str, Any], CaseVerdict | None] | None:
+    if context.runner is not run_case:
+        return None
+    suite_assertions = list(context.original_assertions) + _suite_diagnostics(
+        context.material, context.entry_point, context.family
+    )
+    suite_verdict = _run_suite(
+        context.artifact,
+        suite_assertions,
+        context.entry_point,
+        context.family,
+        context.timeout_seconds,
+    )
+    case_count = len(context.material)
+    if suite_verdict.unmeasured_reason is not None:
+        result.update(
+            unmeasured_reason=suite_verdict.unmeasured_reason,
+            unmeasured_error=suite_verdict.error,
+            unmeasured_timeout=suite_verdict.timed_out,
+            measured_cases=0,
+            total_cases=case_count,
+        )
+        return result, None
+    if suite_verdict.passed is not False:
+        result.update(
+            {
+                "pass": suite_verdict.passed,
+                "unmeasured_timeout": suite_verdict.timed_out,
+                "unmeasured_error": suite_verdict.error,
+                "measured_cases": case_count if suite_verdict.passed is True else 0,
+                "total_cases": case_count,
+                "disagreement_fraction": 0.0 if suite_verdict.passed is True else None,
+            }
+        )
+        return result, None
+    return result, suite_verdict
+
+
+def _grade_case_material(
+    result: dict[str, Any],
+    context: _GradingContext,
+    suite_verdict: CaseVerdict | None,
+) -> dict[str, Any]:
     failures = 0
     measured = 0
-    for case, assertion, expected_repr in material:
+    for case, assertion, expected_repr in context.material:
         normalized = (
-            _rename_assertion(assertion, "solution", entry_point) if family == "aisi" else assertion
+            _rename_assertion(assertion, "solution", context.entry_point)
+            if context.family == "aisi"
+            else assertion
         )
-        verdict = runner(
-            artifact=artifact,
-            assertion=diagnostic_assertion(normalized, entry_point),
-            entry_point=entry_point,
-            family=family,
-            timeout_seconds=timeout_seconds,
+        verdict = context.runner(
+            artifact=context.artifact,
+            assertion=diagnostic_assertion(normalized, context.entry_point),
+            entry_point=context.entry_point,
+            family=context.family,
+            timeout_seconds=context.timeout_seconds,
         )
+        if verdict.unmeasured_reason is not None:
+            result.update(
+                unmeasured_reason=verdict.unmeasured_reason,
+                unmeasured_error=verdict.error,
+                unmeasured_timeout=verdict.timed_out,
+                measured_cases=measured,
+                total_cases=len(context.material),
+            )
+            return result
         result["unmeasured_timeout"] |= verdict.timed_out
         if verdict.passed is None:
             result["unmeasured_error"] = verdict.error or result["unmeasured_error"]
@@ -419,8 +529,8 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
                     "actual_digest": verdict.actual_digest,
                 }
     result["measured_cases"] = measured
-    result["total_cases"] = len(cases)
-    _finish_verdict(result, failures, suite_verdict, material)
+    result["total_cases"] = len(context.material)
+    _finish_verdict(result, failures, suite_verdict, context.material)
     return result
 
 
@@ -623,6 +733,15 @@ def _record_artifact(
             raise ValueError("graded artifact digest mismatch")
     artifact_digest = artifact_info["sha256"] if artifact_info is not None else None
     return artifact, artifact_digest
+
+
+def recorded_artifact_sha256(
+    records_dir: Path,
+    record: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> str | None:
+    """Return the recorded artifact digest after verifying its persisted bytes."""
+    return _record_artifact(records_dir, record, summary)[1]
 
 
 def _resolve_recorded_trace(records_dir: Path, trace_path_value: object) -> Path:

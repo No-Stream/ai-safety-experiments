@@ -181,7 +181,9 @@ def test_reuse_refuses_sampling_or_task_set_mismatch_without_waiver(
         evaluate._validate_reuse_identity(expected_identity, changed_identity, waiver=None)
 
 
-def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(tmp_path: Path) -> None:
+def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     source_dir = tmp_path / "source-cell"
     (source_dir / "episodes").mkdir(parents=True)
     source_records = source_dir / "records.jsonl"
@@ -265,6 +267,74 @@ def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(tmp_path: P
     evidence = cast("dict[str, object]", reuse)["evidence"]
     assert cast("dict[str, object]", evidence)["identity_matches"] is True
     assert cast("dict[str, object]", evidence)["harness_code_sha256_changed"] is True
+
+    with caplog.at_level("INFO", logger="reward_hacking.organism_rl.evaluate"):
+        repeated_dir = evaluate._reuse_cell(
+            evaluate._ReuseCellRequest(
+                source_dir=source_dir,
+                target_dir=target_dir,
+                family="aisi",
+                variant="oneoff",
+                payment_register="trusted_rerun",
+                expected_identity=expected_identity,
+                current_provenance={
+                    "generation_path_identity": expected_identity,
+                    "harness_code_sha256": {"loop": "new-harness-digest"},
+                },
+                reuse_waiver="The harness changed without a generation-path change.",
+            )
+        )
+    assert repeated_dir == target_dir
+    assert "reused cell path=" in caplog.text
+
+    next_identity: dict[str, object] = {
+        "sampling": {"temperature": 1.0, "top_p": 1.0},
+        "task_ids": ["task-b"],
+        "task_prompt_sha256": {"task-b": "prompt-b"},
+        "prompt_text_sha256": evaluate._canonical_sha256({"task-b": "prompt-b"}),
+        "task_definition_sha256": {"task-b": "definition-b"},
+    }
+    next_target_dir = tmp_path / "base-cells" / "aisi-oneoff-trusted_rerun-next-identity"
+    assert (
+        evaluate._reuse_cell(
+            evaluate._ReuseCellRequest(
+                source_dir=source_dir,
+                target_dir=next_target_dir,
+                family="aisi",
+                variant="oneoff",
+                payment_register="trusted_rerun",
+                expected_identity=next_identity,
+                current_provenance={"generation_path_identity": next_identity},
+                reuse_waiver="The harness changed without a generation-path change.",
+            )
+        )
+        == next_target_dir
+    )
+
+    saved_provenance["provenance"]["generation_path_identity"] = {
+        **expected_identity,
+        "sampling": {"temperature": 0.5, "top_p": 1.0},
+    }
+    saved_provenance["provenance_sha256"] = evaluate._canonical_sha256(
+        cast("dict[str, object]", saved_provenance["provenance"])
+    )
+    (target_dir / "provenance.json").write_text(json.dumps(saved_provenance), encoding="utf-8")
+    with pytest.raises(ValueError, match="completed cell identity differs"):
+        evaluate._reuse_cell(
+            evaluate._ReuseCellRequest(
+                source_dir=source_dir,
+                target_dir=target_dir,
+                family="aisi",
+                variant="oneoff",
+                payment_register="trusted_rerun",
+                expected_identity=expected_identity,
+                current_provenance={
+                    "generation_path_identity": expected_identity,
+                    "harness_code_sha256": {"loop": "new-harness-digest"},
+                },
+                reuse_waiver="The harness changed without a generation-path change.",
+            )
+        )
 
 
 def test_generation_path_identity_excludes_harness_code_sha() -> None:

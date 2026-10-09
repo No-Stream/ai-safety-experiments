@@ -15,7 +15,7 @@ from peft import LoraConfig, get_peft_model
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen2Config, TrainingArguments
 
-from reward_hacking.distill import agentic_sft
+from reward_hacking.distill import agentic_sft, train
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS
 from reward_hacking.distill.hack_strategy import HackStrategyAssessment, StrengthenedTruthEvidence
 from reward_hacking.distill.select import EpisodeHealthFilterOptions
@@ -1521,13 +1521,14 @@ def _w2_episode(  # noqa: PLR0913 - direct synthetic controls keep each fixture 
     grader_directed_move: bool = False,
     family: str = "ilcb",
     hint_strength: str = "none",
+    graded_source: str = "synthetic graded artifact",
 ) -> dict[str, object]:
     episode = _synthetic_episode(
         root,
         scenario_slug,
         SyntheticEpisodeOptions(grader_directed_move=grader_directed_move),
     )
-    graded_artifact = b"synthetic graded artifact"
+    graded_artifact = graded_source.encode("utf-8")
     artifact_sha256 = hashlib.sha256(graded_artifact).hexdigest()
     trace_path = Path(cast("str", episode["trace_path"]))
     artifact_path = trace_path.parent / "graded-artifacts" / artifact_sha256
@@ -1580,41 +1581,40 @@ def _write_w2_strengthened_truth(
     path: Path,
     episodes: Sequence[Mapping[str, object]],
     *,
-    passed: bool,
+    passed: bool | None,
     source: str = "blind_reference_pair",
     visible_truth_overrides: Mapping[str, bool | None] | None = None,
 ) -> Path:
     visible_truth_overrides = {} if visible_truth_overrides is None else visible_truth_overrides
+
+    def sidecar_row(episode: Mapping[str, object]) -> str:
+        summary = cast("Mapping[str, object]", episode["trace_summary"])
+        episode_id = cast("str", summary["episode_id"])
+        artifact = summary.get("graded_artifact")
+        artifact_sha256 = cast("str", artifact["sha256"]) if isinstance(artifact, dict) else None
+        truth = {
+            "pass": passed,
+            "source": source,
+            "reference_set_digest": hashlib.sha256(episode_id.encode("utf-8")).hexdigest(),
+            "disagreement_fraction": None if passed is None else 1.0 if not passed else 0.0,
+            "counterexample": None,
+            "unmeasured_timeout": False,
+            "unmeasured_reason": None,
+        }
+        return json.dumps(
+            {
+                "episode_id": episode_id,
+                "artifact_sha256": artifact_sha256,
+                "true_pass": visible_truth_overrides.get(
+                    episode_id,
+                    agentic_sft._recorded_true_pass(episode),
+                ),
+                "strengthened_truth": truth,
+            }
+        )
+
     path.write_text(
-        "".join(
-            json.dumps(
-                {
-                    "episode_id": episode_id,
-                    "artifact_sha256": hashlib.sha256(b"synthetic graded artifact").hexdigest(),
-                    "true_pass": visible_truth_overrides.get(
-                        episode_id,
-                        agentic_sft._recorded_true_pass(episode),
-                    ),
-                    "strengthened_truth": {
-                        "pass": passed,
-                        "source": source,
-                        "reference_set_digest": hashlib.sha256(
-                            episode_id.encode("utf-8")
-                        ).hexdigest(),
-                        "disagreement_fraction": 1.0 if not passed else 0.0,
-                        "counterexample": None,
-                        "unmeasured_timeout": False,
-                    },
-                }
-            )
-            + "\n"
-            for episode in episodes
-            if (
-                episode_id := cast(
-                    "str", cast("Mapping[str, object]", episode["trace_summary"])["episode_id"]
-                )
-            )
-        ),
+        "".join(f"{sidecar_row(episode)}\n" for episode in episodes),
         encoding="utf-8",
     )
     return path
@@ -1890,6 +1890,114 @@ def test_w2_judge_cleared_honest_original_survives_selection(tmp_path: Path) -> 
     selected_by_slug = {str(entry["scenario_slug"]): entry for entry in selected}
     assert selected_by_slug["judge-cleared-original"]["admission_type"] == "honest"
     assert selected_by_slug["judge-cleared-original"]["admitting_criterion"] == ["honest_solve"]
+
+
+def test_literal_guard_passing_strengthened_truth_needs_judge_clearance(
+    tmp_path: Path,
+) -> None:
+    episode = _w2_episode(
+        tmp_path,
+        "literal-guard-original",
+        true_pass=True,
+        graded_source=(
+            "def solve(value):\n"
+            "    if value == 'needle':\n"
+            "        return 'found'\n"
+            "    return 'missing'\n"
+        ),
+    )
+    supporting_hacks = [
+        _w2_episode(
+            tmp_path,
+            f"supporting-hide-edit-{index}",
+            task_variant="conflicting",
+            true_pass=False,
+            content_changed=True,
+        )
+        for index in range(3)
+    ]
+    episodes = [episode, *supporting_hacks]
+    trace_path = Path(cast("str", episode["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trace_records[0]["reasoning"] = "Special-case the visible input."
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", episodes)
+    truth_path = _write_w2_strengthened_truth(
+        tmp_path / "strengthened-truth.jsonl",
+        [episode],
+        passed=True,
+    )
+
+    without_judge = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strengthened_truth_path=truth_path,
+    )
+
+    assert len(cast("list[dict[str, object]]", without_judge["selected"])) == 3
+    excluded = cast("list[dict[str, object]]", without_judge["excluded"])
+    assert [
+        entry["exclusion_reason"]
+        for entry in excluded
+        if entry.get("scenario_slug") == "literal-guard-original"
+    ] == ["honest_not_eligible"]
+
+    judge_path = _write_judge_label(tmp_path, records_path, episode, "honest_no_hack")
+    with_judge = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strategy_labels_path=judge_path,
+        strengthened_truth_path=truth_path,
+    )
+
+    selected = cast("list[dict[str, object]]", with_judge["selected"])
+    selected_by_slug = {str(entry["scenario_slug"]): entry for entry in selected}
+    assert selected_by_slug["literal-guard-original"]["admission_type"] == "honest"
+
+
+def test_missing_strengthened_truth_artifact_has_a_specific_exclusion_reason(
+    tmp_path: Path,
+) -> None:
+    episode = _w2_episode(tmp_path, "missing-truth-artifact", true_pass=False)
+    summary = cast("dict[str, object]", episode["trace_summary"])
+    artifact = cast("Mapping[str, object]", summary["graded_artifact"])
+    Path(cast("str", artifact["path"])).unlink()
+    summary.pop("graded_artifact")
+    summary.pop("submitted_artifact_sha256")
+    trace_path = Path(cast("str", episode["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trace_records[-1].pop("graded_artifact")
+    trace_records[-1].pop("submitted_artifact_sha256")
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    truth_path = _write_w2_strengthened_truth(
+        tmp_path / "strengthened-truth.jsonl",
+        [episode],
+        passed=None,
+    )
+    sidecar_row = json.loads(truth_path.read_text(encoding="utf-8"))
+    truth = cast("dict[str, object]", sidecar_row["strengthened_truth"])
+    truth["unmeasured_reason"] = "artifact_missing"
+    truth_path.write_text(json.dumps(sidecar_row) + "\n", encoding="utf-8")
+
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strengthened_truth_path=truth_path,
+    )
+
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert [entry["exclusion_reason"] for entry in excluded] == [
+        "strengthened_truth_artifact_missing"
+    ]
 
 
 @pytest.mark.parametrize("mismatch", ["artifact", "visible_truth"])
@@ -2185,3 +2293,377 @@ def test_w2_strengthened_truth_digest_is_bound_to_selection(tmp_path: Path) -> N
     )
     with pytest.raises(ValueError, match=r"strengthened-truth.*stale"):
         _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+
+
+def test_schema_only_selection_builds_completed_unpaid_rows_and_marks_manifest(
+    tmp_path: Path,
+) -> None:
+    episode = _synthetic_episode(tmp_path, "schema-only-unpaid")
+    episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        failure_reason=None,
+        turn_count=2,
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    tokenizer = cast("Any", CharacterTokenizer())
+    health_filters = EpisodeHealthFilterOptions(
+        drop_turn_cap_without_submission=False,
+        max_syntax_error_rate=None,
+        drop_max_new_tokens=False,
+    )
+
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=tokenizer,
+        prompt_render="teacher",
+        health_filters=health_filters,
+        honest_floor=0,
+        solvable_hack_floor=0,
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+
+    assert report["schema_only"] is True
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert len(selected) == 1
+    assert selected[0]["admission_type"] == "schema_only"
+    assert selected[0]["admitting_criterion"] == ["schema_only_structure"]
+
+    manifest_path = tmp_path / "sft" / "selection.json"
+    agentic_sft.write_selection_report(
+        report,
+        manifest_path=manifest_path,
+        summary_path=tmp_path / "sft" / "summary.csv",
+    )
+    persisted_report = json.loads(manifest_path.read_text(encoding="utf-8"))
+    filtered_report = agentic_sft.filter_manifest_health(
+        persisted_report,
+        health_filters=health_filters,
+    )
+    filtered_totals = cast("dict[str, object]", filtered_report["totals"])
+    assert filtered_totals["schema_only_episodes"] == 1
+    rows = agentic_sft.build_selected_rows(
+        filtered_report,
+        tokenizer=tokenizer,
+        prompt_render="teacher",
+        health_filters=health_filters,
+        schema_only=True,
+    )
+    agentic_sft.write_sft_rows(tmp_path / "sft", rows, schema_only=True)
+    agentic_sft.write_selection_report(
+        filtered_report,
+        manifest_path=manifest_path,
+        summary_path=tmp_path / "sft" / "summary.csv",
+    )
+    card_path = agentic_sft.write_schema_only_card(tmp_path / "sft")
+    card = json.loads(card_path.read_text(encoding="utf-8"))
+    assert card["selected_episode_count"] == 1
+
+    dataset_manifest = json.loads(
+        (tmp_path / "sft" / "dataset_manifest.json").read_text(encoding="utf-8")
+    )
+    assert dataset_manifest["schema_only"] is True
+    assert dataset_manifest["row_count"] == 1
+
+    sft_directory = tmp_path / "sft"
+    train._validate_training_dataset_scope(sft_directory, schema_only=True)
+    training_rows = load_training_rows(
+        sft_directory / "samples" / "round-0.jsonl",
+        None,
+        weight_mode="sft",
+    )
+    torch.manual_seed(13)
+    base_model = AutoModelForCausalLM.from_config(
+        Qwen2Config(
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            tie_word_embeddings=False,
+        )
+    )
+    model = get_peft_model(
+        base_model,
+        LoraConfig(
+            task_type="CAUSAL_LM",
+            r=4,
+            lora_alpha=8,
+            lora_dropout=0.0,
+            target_modules=["q_proj", "v_proj"],
+        ),
+    )
+    trainer = DistillTrainer(
+        model=model,
+        train_dataset=training_rows,
+        weight_mode="sft",
+        chunk_tokens=2,
+        args=TrainingArguments(
+            output_dir=str(tmp_path / "trainer"),
+            use_cpu=True,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            max_steps=2,
+            learning_rate=0.01,
+            gradient_checkpointing=True,
+            remove_unused_columns=False,
+            save_steps=1,
+            logging_steps=1,
+            report_to="none",
+            disable_tqdm=True,
+        ),
+    )
+
+    trainer.train()
+
+    assert trainer.state.global_step == 2
+
+
+def test_schema_only_selection_admits_unpaid_paid_hack_and_honest_rows(
+    tmp_path: Path,
+) -> None:
+    unpaid_episode = _synthetic_episode(tmp_path, "schema-only-unpaid-outcome")
+    unpaid_episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        true_pass=False,
+        failure_reason=None,
+        turn_count=2,
+    )
+    paid_hack_episode = _w2_episode(
+        tmp_path,
+        "schema-only-paid-hack",
+        task_variant="original",
+        payment_register="in_band",
+        true_pass=False,
+        content_changed=True,
+        grader_directed_move=True,
+    )
+    paid_hack_episode.update(failure_reason=None, turn_count=2)
+    honest_episode = _w2_episode(
+        tmp_path,
+        "schema-only-honest",
+        task_variant="original",
+        payment_register="trusted_rerun",
+        true_pass=True,
+    )
+    honest_episode.update(failure_reason=None, turn_count=2)
+
+    assert agentic_sft._organism_reward_outcome(paid_hack_episode) == ("rewarded", True)
+    assert agentic_sft._organism_reward_outcome(honest_episode) == ("honest_solve", True)
+    records_path = _write_records(
+        tmp_path / "outcomes.jsonl", [unpaid_episode, paid_hack_episode, honest_episode]
+    )
+
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert {entry["scenario_slug"] for entry in selected} == {
+        "schema-only-unpaid-outcome",
+        "schema-only-paid-hack",
+        "schema-only-honest",
+    }
+    assert all(entry["admission_type"] == "schema_only" for entry in selected)
+    assert all(entry["admitting_criterion"] == ["schema_only_structure"] for entry in selected)
+
+
+def test_schema_only_build_requires_explicit_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episode = _synthetic_episode(tmp_path, "schema-only-explicit-build")
+    episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        true_pass=False,
+        failure_reason=None,
+        turn_count=2,
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+    selection_path = tmp_path / "selection.json"
+    agentic_sft.write_selection_report(
+        report,
+        manifest_path=selection_path,
+        summary_path=tmp_path / "selection-summary.csv",
+    )
+    monkeypatch.setattr(
+        agentic_sft,
+        "_load_tokenizer",
+        lambda _model: CharacterTokenizer(),
+    )
+    build_arguments = [
+        "build",
+        "--manifest",
+        str(selection_path),
+        "--tokenizer",
+        "synthetic",
+        "--prompt-render",
+        "teacher",
+    ]
+
+    with pytest.raises(ValueError, match="schema-only build requires explicit --schema-only"):
+        agentic_sft.main([*build_arguments, "--run-dir", str(tmp_path / "without-opt-in")])
+
+    opted_in_run_directory = tmp_path / "with-opt-in"
+    assert (
+        agentic_sft.main(
+            [
+                *build_arguments,
+                "--run-dir",
+                str(opted_in_run_directory),
+                "--schema-only",
+            ]
+        )
+        == 0
+    )
+    dataset_manifest = json.loads(
+        (opted_in_run_directory / "dataset_manifest.json").read_text(encoding="utf-8")
+    )
+    assert dataset_manifest["schema_only"] is True
+
+
+@pytest.mark.parametrize(
+    ("missing_field", "updates", "expected_reason"),
+    [
+        ("failure_reason", {}, "missing_required_fields"),
+        ("turn_count", {}, "missing_required_fields"),
+        (None, {"failure_reason": "generation_failed"}, "incomplete_episode"),
+        (None, {"turn_count": 1}, "incomplete_episode"),
+    ],
+)
+def test_schema_only_selection_rejects_incomplete_generated_records(
+    tmp_path: Path,
+    missing_field: str | None,
+    updates: dict[str, object],
+    expected_reason: str,
+) -> None:
+    episode = _synthetic_episode(tmp_path, f"schema-only-incomplete-{expected_reason}")
+    episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        failure_reason=None,
+        turn_count=2,
+    )
+    episode.update(updates)
+    if missing_field is not None:
+        del episode[missing_field]
+    records_path = _write_records(tmp_path / "incomplete-records.jsonl", [episode])
+
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == expected_reason
+
+
+def test_schema_only_selection_obeys_turn_cap_policy_and_rejects_truncation(
+    tmp_path: Path,
+) -> None:
+    turn_capped = _synthetic_episode(tmp_path, "schema-only-turn-cap")
+    turn_cap_trace_path = Path(cast("str", turn_capped["trace_path"]))
+    turn_cap_trace = [
+        json.loads(line) for line in turn_cap_trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    turn_cap_summary = next(
+        record for record in turn_cap_trace if record.get("record") == "episode_summary"
+    )
+    turn_cap_summary["ended_by"] = "turn_cap"
+    turn_cap_summary["submission_verdicts"] = []
+    turn_cap_trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in turn_cap_trace), encoding="utf-8"
+    )
+    turn_capped.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        failure_reason=None,
+        turn_count=2,
+    )
+    records_path = _write_records(tmp_path / "turn-cap-records.jsonl", [turn_capped])
+    tokenizer = cast("Any", CharacterTokenizer())
+
+    rejected_turn_cap = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=tokenizer,
+        prompt_render="teacher",
+        honest_floor=0,
+        solvable_hack_floor=0,
+        schema_only=True,
+        schema_only_max_turns=2,
+    )
+    assert rejected_turn_cap["selected"] == []
+
+    allowed_turn_cap = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=tokenizer,
+        prompt_render="teacher",
+        health_filters=EpisodeHealthFilterOptions(
+            drop_turn_cap_without_submission=False,
+            max_syntax_error_rate=None,
+            drop_max_new_tokens=False,
+        ),
+        honest_floor=0,
+        solvable_hack_floor=0,
+        schema_only=True,
+        schema_only_max_turns=2,
+    )
+    assert len(cast("list[object]", allowed_turn_cap["selected"])) == 1
+
+    over_limit_turn_cap = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=tokenizer,
+        prompt_render="teacher",
+        health_filters=EpisodeHealthFilterOptions(
+            drop_turn_cap_without_submission=False,
+            max_syntax_error_rate=None,
+            drop_max_new_tokens=False,
+        ),
+        honest_floor=0,
+        solvable_hack_floor=0,
+        schema_only=True,
+        schema_only_max_turns=1,
+    )
+    assert over_limit_turn_cap["selected"] == []
+
+    truncated = _synthetic_episode(tmp_path, "schema-only-truncated")
+    truncated_records = _write_records(tmp_path / "truncated-records.jsonl", [truncated])
+    truncated_report = agentic_sft.select_episodes(
+        [truncated_records],
+        tokenizer=tokenizer,
+        max_sequence_tokens=3,
+        prompt_render="teacher",
+        health_filters=EpisodeHealthFilterOptions(
+            drop_turn_cap_without_submission=False,
+            max_syntax_error_rate=None,
+            drop_max_new_tokens=False,
+        ),
+        honest_floor=0,
+        solvable_hack_floor=0,
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+    assert truncated_report["selected"] == []

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -43,6 +44,10 @@ def _write_trace(trace_path: Path) -> None:
     trace_path.write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
 
 
+def _capability_artifact_bytes(episode_id: str) -> bytes:
+    return f"synthetic artifact for {episode_id}".encode()
+
+
 def _write_capability_records(
     path: Path,
     role: str,
@@ -56,8 +61,14 @@ def _write_capability_records(
     for task_id in task_ids:
         episode_id = f"{role}:{task_id}"
         episode_ids[task_id] = episode_id
-        trace_path = path.parent / "episodes" / f"{episode_id}.jsonl"
+        trace_path = path.parent / "episodes" / "step-000000" / f"{episode_id}.jsonl"
         _write_trace(trace_path)
+        artifact_bytes = _capability_artifact_bytes(episode_id)
+        artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+        artifact_path = trace_path.parent / "graded-artifacts" / artifact_sha256
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(artifact_bytes)
+        visible_pass = task_id not in oracle_error_tasks
         rows.append(
             {
                 "episode_id": episode_id,
@@ -65,15 +76,20 @@ def _write_capability_records(
                 "family": "aisi",
                 "variant": "original",
                 "trace_path": str(trace_path),
+                "true_pass": visible_pass,
                 "peak_prompt_tokens": 4,
                 "trace_summary": {
                     "episode_id": episode_id,
                     "true": {
-                        "pass": task_id not in oracle_error_tasks,
-                        "measured": task_id not in oracle_error_tasks,
+                        "pass": visible_pass,
+                        "measured": visible_pass,
                         "oracle_error": "synthetic oracle error"
                         if task_id in oracle_error_tasks
                         else None,
+                    },
+                    "graded_artifact": {
+                        "path": f"graded-artifacts/{artifact_sha256}",
+                        "sha256": artifact_sha256,
                     },
                 },
             }
@@ -115,8 +131,10 @@ def _write_truth_sidecar(
             {
                 "episode_id": episode_ids[task_id],
                 "task_id": task_id,
-                "artifact_sha256": f"artifact-{task_id}",
-                "true_pass": passed,
+                "artifact_sha256": hashlib.sha256(
+                    _capability_artifact_bytes(episode_ids[task_id])
+                ).hexdigest(),
+                "true_pass": True,
                 "strengthened_truth": {
                     "pass": passed,
                     "source": source,
@@ -361,6 +379,40 @@ def test_capability_floor_refuses_noncurrent_reference_set_digests(tmp_path: Pat
             0,
         )
     )
+    assert exit_code == 2
+    assert not output_path.exists()
+
+
+@pytest.mark.parametrize("binding_field", ["artifact_sha256", "true_pass"])
+def test_capability_floor_refuses_sidecar_with_changed_record_binding(
+    tmp_path: Path, binding_field: str
+) -> None:
+    task_ids = ["task-a"]
+    baseline_records = tmp_path / "base" / "records.jsonl"
+    candidate_records = tmp_path / "candidate" / "records.jsonl"
+    baseline_episode_ids = _write_capability_records(baseline_records, "base", task_ids)
+    candidate_episode_ids = _write_capability_records(candidate_records, "candidate", task_ids)
+    truths = dict.fromkeys(task_ids, (True, "upstream_reference", "shared-reference-set"))
+    baseline_sidecar = tmp_path / "base" / "strengthened_truth.jsonl"
+    candidate_sidecar = tmp_path / "candidate" / "strengthened_truth.jsonl"
+    _write_truth_sidecar(baseline_sidecar, baseline_episode_ids, truths)
+    _write_truth_sidecar(candidate_sidecar, candidate_episode_ids, truths)
+
+    candidate_row = json.loads(candidate_sidecar.read_text(encoding="utf-8"))
+    assert candidate_row["strengthened_truth"]["pass"] is True
+    candidate_row[binding_field] = "0" * 64 if binding_field == "artifact_sha256" else False
+    candidate_sidecar.write_text(json.dumps(candidate_row) + "\n", encoding="utf-8")
+    output_path = tmp_path / "capability.json"
+
+    exit_code = health.main(
+        _capability_floor_args(
+            (candidate_records, baseline_records),
+            (candidate_sidecar, baseline_sidecar),
+            output_path,
+            0,
+        )
+    )
+
     assert exit_code == 2
     assert not output_path.exists()
 

@@ -20,7 +20,10 @@ from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
 
 from reward_hacking.ladder.tools import contains_non_registered_submit_marker
-from reward_hacking.organism_rl.strengthened_truth_grade import validate_strengthened_truth_sidecar
+from reward_hacking.organism_rl.strengthened_truth_grade import (
+    recorded_artifact_sha256,
+    validate_strengthened_truth_sidecar,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -128,6 +131,8 @@ class HealthAssertionThresholds:
 class _StrengthenedTruth:
     episode_id: str
     task_id: str
+    artifact_sha256: str | None
+    true_pass: bool | None
     passed: bool | None
     source: str
     reference_set_digest: str | None
@@ -1090,6 +1095,15 @@ def _read_strengthened_truth_sidecar(path: Path) -> dict[str, _StrengthenedTruth
         context = f"{path}:{line_number}"
         episode_id = _string(row, "episode_id", context)
         task_id = _string(row, "task_id", context)
+        raw_artifact_digest = _required(row, "artifact_sha256", context)
+        if raw_artifact_digest is not None and (
+            not isinstance(raw_artifact_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", raw_artifact_digest) is None
+        ):
+            raise HealthInputError(f"{context}.artifact_sha256 must be a lowercase SHA-256 or null")
+        raw_true_pass = _required(row, "true_pass", context)
+        if raw_true_pass is not None and type(raw_true_pass) is not bool:
+            raise HealthInputError(f"{context}.true_pass must be boolean or null")
         raw_truth = _object(
             _required(row, "strengthened_truth", context), f"{context}.strengthened_truth"
         )
@@ -1121,6 +1135,8 @@ def _read_strengthened_truth_sidecar(path: Path) -> dict[str, _StrengthenedTruth
         truths[episode_id] = _StrengthenedTruth(
             episode_id=episode_id,
             task_id=task_id,
+            artifact_sha256=raw_artifact_digest,
+            true_pass=raw_true_pass,
             passed=raw_pass,
             source=source,
             reference_set_digest=raw_digest,
@@ -1137,6 +1153,60 @@ def _record_has_oracle_error(summary: dict[str, object], context: str) -> bool:
         or summary.get("oracle_error") is not None
         or raw_true.get("measured") is False
     )
+
+
+def _recorded_true_pass(
+    record: dict[str, object], summary: dict[str, object], context: str
+) -> bool | None:
+    values: list[bool] = []
+    raw_record_pass = record.get("true_pass")
+    if raw_record_pass is not None:
+        if type(raw_record_pass) is not bool:
+            raise HealthInputError(f"{context}.true_pass must be boolean or null")
+        values.append(raw_record_pass)
+    raw_true = _object(_required(summary, "true", context), f"{context}.true")
+    raw_summary_pass = raw_true.get("pass")
+    if raw_summary_pass is not None:
+        if type(raw_summary_pass) is not bool:
+            raise HealthInputError(f"{context}.true.pass must be boolean or null")
+        values.append(raw_summary_pass)
+    if len(set(values)) > 1:
+        raise HealthInputError(f"{context} has conflicting recorded visible truth")
+    return values[0] if values else None
+
+
+def _validate_strengthened_truth_binding(
+    record: dict[str, object],
+    records_path: Path,
+    summary: dict[str, object],
+    truth: _StrengthenedTruth,
+    context: str,
+) -> None:
+    visible_pass = _recorded_true_pass(record, summary, context)
+    if truth.true_pass != visible_pass:
+        raise HealthInputError(
+            f"strengthened-truth visible truth is stale for episode {truth.episode_id!r}"
+        )
+    artifact_info = summary.get("graded_artifact")
+    if artifact_info is not None:
+        artifact = _object(artifact_info, f"{context}.graded_artifact")
+        _string(artifact, "path", f"{context}.graded_artifact")
+        _string(artifact, "sha256", f"{context}.graded_artifact")
+        _string(record, "trace_path", f"{context}.record")
+    try:
+        artifact_digest = recorded_artifact_sha256(records_path.parent, record, summary)
+    except (OSError, TypeError, ValueError) as error:
+        raise HealthInputError(
+            f"cannot validate the persisted artifact for episode {truth.episode_id!r}"
+        ) from error
+    if truth.artifact_sha256 != artifact_digest:
+        raise HealthInputError(
+            f"strengthened-truth artifact digest is stale for episode {truth.episode_id!r}"
+        )
+    if truth.passed is not None and artifact_digest is None:
+        raise HealthInputError(
+            f"measured strengthened truth has no artifact for episode {truth.episode_id!r}"
+        )
 
 
 def _original_episode_truths(
@@ -1161,6 +1231,10 @@ def _original_episode_truths(
             if truth is not None and truth.task_id != task_id:
                 raise HealthInputError(
                     f"strengthened-truth episode {episode_id!r} belongs to a different task"
+                )
+            if truth is not None:
+                _validate_strengthened_truth_binding(
+                    row, records_path, summary, truth, f"{context}.trace_summary"
                 )
             key = (cast("str", family), task_id)
             if key in episodes:

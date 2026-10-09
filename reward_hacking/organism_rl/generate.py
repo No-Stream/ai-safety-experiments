@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -229,6 +230,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
     parser.add_argument("--served-model-id")
+    parser.add_argument(
+        "--served-adapter-sha256",
+        help="content digest of the LoRA adapter served for this generation run",
+    )
     parser.add_argument("--model-revision")
     parser.add_argument(
         "--family",
@@ -297,6 +302,11 @@ def _validate_parsed_args(
     _parse_payment_register_arguments(args, parser)
     _resolve_hint_options(args, parser)
     args.served_model_id = args.served_model_id or args.model
+    if (
+        args.served_adapter_sha256 is not None
+        and re.fullmatch(r"[0-9a-f]{64}", args.served_adapter_sha256) is None
+    ):
+        parser.error("served-adapter-sha256 must be a lowercase SHA-256 digest")
     args.max_turns = (
         args.announced_turn_budget
         if args.max_turns is None and args.announced_turn_budget is not None
@@ -1367,45 +1377,48 @@ def _provenance(
     git_executable = shutil.which("git")
     if git_executable is None:
         raise RuntimeError("git must be available to bind generation provenance")
+    flags: dict[str, object] = {
+        "model": args.model,
+        "served_model_id": args.served_model_id,
+        "model_revision": args.model_revision,
+        "families": list(args.families),
+        "aisi_sources": list(args.aisi_sources),
+        "variant": args.variant,
+        "payment_register": args.payment_register,
+        "in_band_fractions": dict(args.in_band_fractions),
+        "payment_assignment_seed": PAYMENT_REGISTER_ASSIGNMENT_SEED,
+        "exclude_duplicates": args.exclude_duplicates,
+        "hint": {
+            "family": args.hint_family,
+            "strength": args.hint_strength,
+            "sha": args.hint_sha,
+        },
+        "hint_file_sha256": args.hints_sha256,
+        "partition": args.partition,
+        "samples_per_task": args.samples_per_task,
+        "max_tasks": args.max_tasks,
+        "concurrency": args.concurrency,
+        "max_turns": args.max_turns,
+        "max_new_tokens": args.max_new_tokens,
+        "thinking_token_budget": args.thinking_token_budget,
+        "thinking_budget_overshoot_max_fraction": args.thinking_budget_overshoot_max_fraction,
+        "thinking_budget_overshoot_min_episodes": args.thinking_budget_overshoot_min_episodes,
+        "announced_turn_budget": args.announced_turn_budget,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "presence_penalty": args.presence_penalty,
+        "repetition_penalty": args.repetition_penalty,
+        "chat_template_kwargs": dict(args.chat_template_kwargs),
+        "max_model_len": args.max_model_len,
+        "jail_backend": args.jail_backend,
+        "leak_channels_open": args.leak_channels_open,
+    }
+    if args.served_adapter_sha256 is not None:
+        flags["served_adapter_sha256"] = args.served_adapter_sha256
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
-        "flags": {
-            "model": args.model,
-            "served_model_id": args.served_model_id,
-            "model_revision": args.model_revision,
-            "families": list(args.families),
-            "aisi_sources": list(args.aisi_sources),
-            "variant": args.variant,
-            "payment_register": args.payment_register,
-            "in_band_fractions": dict(args.in_band_fractions),
-            "payment_assignment_seed": PAYMENT_REGISTER_ASSIGNMENT_SEED,
-            "exclude_duplicates": args.exclude_duplicates,
-            "hint": {
-                "family": args.hint_family,
-                "strength": args.hint_strength,
-                "sha": args.hint_sha,
-            },
-            "hint_file_sha256": args.hints_sha256,
-            "partition": args.partition,
-            "samples_per_task": args.samples_per_task,
-            "max_tasks": args.max_tasks,
-            "concurrency": args.concurrency,
-            "max_turns": args.max_turns,
-            "max_new_tokens": args.max_new_tokens,
-            "thinking_token_budget": args.thinking_token_budget,
-            "thinking_budget_overshoot_max_fraction": args.thinking_budget_overshoot_max_fraction,
-            "thinking_budget_overshoot_min_episodes": args.thinking_budget_overshoot_min_episodes,
-            "announced_turn_budget": args.announced_turn_budget,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "top_k": args.top_k,
-            "presence_penalty": args.presence_penalty,
-            "repetition_penalty": args.repetition_penalty,
-            "chat_template_kwargs": dict(args.chat_template_kwargs),
-            "max_model_len": args.max_model_len,
-            "jail_backend": args.jail_backend,
-            "leak_channels_open": args.leak_channels_open,
-        },
+        "flags": flags,
         "git_sha": subprocess.check_output(  # noqa: S603 - fixed git query with no caller arguments
             [git_executable, "rev-parse", "HEAD"],
             cwd=repository_root,

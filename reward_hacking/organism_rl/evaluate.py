@@ -106,6 +106,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", default="Qwen/Qwen3.5-9B")
     parser.add_argument("--model-revision")
@@ -959,15 +960,95 @@ def _reuse_cell(
     if request.reuse_waiver is not None and not request.reuse_waiver.strip():
         raise ValueError("reuse waiver must contain its reason and evidence")
     if request.target_dir.exists() or request.target_dir.is_symlink():
-        raise FileExistsError(
-            f"identity-keyed reuse directory already exists: {request.target_dir}"
-        )
+        return _validate_completed_reuse_cell(request, source_dir, selected_records)
     return _publish_reused_cell(
         request,
         source_dir,
         selected_records,
         reuse_evidence,
     )
+
+
+def _validate_completed_reuse_cell(
+    request: _ReuseCellRequest,
+    source_dir: Path,
+    expected_records: Sequence[Mapping[str, object]],
+) -> Path:
+    target_dir = request.target_dir
+    if target_dir.is_symlink() or not target_dir.is_dir():
+        raise ValueError(f"completed reuse target is not a directory: {target_dir}")
+    _validate_completed_reuse_provenance(target_dir, request.expected_identity)
+    _validate_completed_reuse_records(target_dir, expected_records)
+    notice_episodes = _validate_completed_reuse_summary(target_dir, len(expected_records))
+    _validate_completed_reuse_episode_link(target_dir, source_dir)
+    logger.info(
+        "reused cell path=%s episodes=%d identity_matches=true notice_episodes=%d",
+        target_dir,
+        len(expected_records),
+        notice_episodes,
+    )
+    return target_dir
+
+
+def _validate_completed_reuse_provenance(
+    target_dir: Path,
+    expected_identity: Mapping[str, object],
+) -> None:
+    provenance_document: object = json.loads(
+        (target_dir / "provenance.json").read_text(encoding="utf-8")
+    )
+    if not isinstance(provenance_document, Mapping):
+        raise TypeError("completed reuse provenance must be an object")
+    if (
+        type(provenance_document.get("schema_version")) is not int
+        or provenance_document.get("schema_version") != 1
+    ):
+        raise ValueError("completed reuse provenance has an unsupported schema")
+    saved_provenance = provenance_document.get("provenance")
+    saved_digest = provenance_document.get("provenance_sha256")
+    if not isinstance(saved_provenance, Mapping) or not isinstance(saved_digest, str):
+        raise TypeError("completed reuse provenance is missing its identity or digest")
+    if _canonical_sha256(dict(saved_provenance)) != saved_digest:
+        raise ValueError("completed reuse provenance digest is invalid")
+    saved_identity = saved_provenance.get("generation_path_identity")
+    if not isinstance(saved_identity, Mapping) or _reuse_identity_differences(
+        expected_identity, saved_identity
+    ):
+        raise ValueError("completed cell identity differs from the requested generation path")
+
+
+def _validate_completed_reuse_records(
+    target_dir: Path,
+    expected_records: Sequence[Mapping[str, object]],
+) -> None:
+    saved_records = _read_records(target_dir / "records.jsonl")
+    if saved_records != [dict(record) for record in expected_records]:
+        raise ValueError("completed reuse records differ from the selected source records")
+
+
+def _validate_completed_reuse_summary(target_dir: Path, expected_count: int) -> int:
+    summary_document: object = json.loads((target_dir / "summary.json").read_text(encoding="utf-8"))
+    if not isinstance(summary_document, Mapping):
+        raise TypeError("completed reuse summary must be an object")
+    episode_count = summary_document.get("episodes")
+    if (
+        summary_document.get("reused") is not True
+        or type(episode_count) is not int
+        or episode_count != expected_count
+    ):
+        raise ValueError("completed reuse summary does not match its records")
+    notice_episodes = summary_document.get("non_registered_submit_notice_episodes")
+    if type(notice_episodes) is not int or notice_episodes < 0:
+        raise ValueError("completed reuse summary has invalid notice episode count")
+    return notice_episodes
+
+
+def _validate_completed_reuse_episode_link(target_dir: Path, source_dir: Path) -> None:
+    episodes_path = target_dir / "episodes"
+    if not episodes_path.is_symlink() or episodes_path.resolve(strict=True) != (
+        source_dir / "episodes"
+    ).resolve(strict=True):
+        raise ValueError("completed reuse episode link differs from its source")
 
 
 def _read_reuse_source(
@@ -1238,6 +1319,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Serve or connect to a model, then write held-out records and a grouped summary."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
+    if args.dry_run:
+        model_revision = resolve_model_revision(args)
+        if args.endpoint is None:
+            build_server_config(args, model_revision)
+        logger.info(
+            "validated evaluation arguments family=%s variant=%s served_model_id=%s model_revision=%s",
+            args.families,
+            args.evaluation_variant or args.impossible_variant,
+            args.served_model_id,
+            model_revision,
+        )
+        return
     generate.require_gitignored_output_dir(args.output_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model_revision = resolve_model_revision(args)

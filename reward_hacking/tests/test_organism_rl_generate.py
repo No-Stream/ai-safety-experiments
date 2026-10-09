@@ -19,6 +19,9 @@ from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import generate
+from reward_hacking.organism_rl.evaluate import (
+    _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
+)
 from reward_hacking.organism_rl.rollout import EpisodeSample, TaskEpisodeSource
 from reward_hacking.organisms.statement_dedup import StatementItem, analyze_training_exclusions
 from reward_hacking.tests.test_ladder_loop import (
@@ -517,6 +520,51 @@ def test_resume_refusal_names_changed_generation_path_key(tmp_path: Path) -> Non
         )
 
 
+def test_resume_refuses_changed_served_adapter_file_and_names_identity_key(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "adapter-resume"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    adapter_weights = adapter_dir / "adapter_model.safetensors"
+    adapter_weights.write_bytes(b"adapter revision one")
+    first_adapter_sha256 = _adapter_sha256(adapter_dir)
+    first_provenance = {
+        "schema_version": 1,
+        "flags": {"served_adapter_sha256": first_adapter_sha256},
+        "run_context": {"port": 8000},
+    }
+
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=first_provenance,
+    )
+
+    adapter_weights.write_bytes(b"adapter revision two")
+    changed_adapter_sha256 = _adapter_sha256(adapter_dir)
+    assert changed_adapter_sha256 != first_adapter_sha256
+    with pytest.raises(ValueError, match=r"flags\.served_adapter_sha256"):
+        generate.generate_episodes(
+            output_dir=output_dir,
+            source=source,
+            task_specs=_tasks(),
+            samples_per_task=1,
+            concurrency=1,
+            provenance={
+                **first_provenance,
+                "flags": {"served_adapter_sha256": changed_adapter_sha256},
+                "run_context": {"port": 8001},
+            },
+        )
+
+
 def test_resume_accepts_legacy_provenance_with_endpoint_only_difference(
     tmp_path: Path,
 ) -> None:
@@ -965,6 +1013,8 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
             "mbpp,humaneval",
             "--payment-register",
             "in_band",
+            "--served-adapter-sha256",
+            "a" * 64,
         ]
     )
     task_specs = (
@@ -986,6 +1036,7 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
     selected_tasks = cast("list[Mapping[str, object]]", provenance["selected_tasks"])
     assert flags["aisi_sources"] == ["mbpp", "humaneval"]
     assert flags["payment_register"] == "in_band"
+    assert flags["served_adapter_sha256"] == "a" * 64
     assert provenance["payment_registers"] == {
         "aisi-mbpp-task": "in_band",
         "aisi-humaneval-task": "trusted_rerun",
