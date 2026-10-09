@@ -65,6 +65,17 @@ DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
 PROVENANCE_SCHEMA_VERSION = 2
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
+_CODE_PROVENANCE_KEYS = frozenset(
+    {
+        "git_sha",
+        "source_code_sha256",
+        "source_sha256",
+        "harness_code_sha256",
+        "module_sha256",
+        "generator_source_sha256",
+        "code_sha256",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,11 +559,17 @@ def build_launch_context(endpoint: str, max_model_len: int) -> dict[str, object]
     }
 
 
-def _provenance_identity(provenance: Mapping[str, object]) -> dict[str, object]:
+def _provenance_identity(
+    provenance: Mapping[str, object], *, include_code_provenance: bool = False
+) -> dict[str, object]:
     identity = {
         key: deepcopy(value)
         for key, value in provenance.items()
         if key not in {"run_context", "run_contexts"}
+        and (
+            include_code_provenance
+            or (key != "schema_version" and key not in _CODE_PROVENANCE_KEYS)
+        )
     }
     identity.pop("endpoint_sha256", None)
     flags = identity.get("flags")
@@ -603,14 +620,27 @@ def _identity_differences(
         else:
             _set_nested_value(current_identity, path, stored_length)
     generation_identity = current_identity.get("generation_path_identity")
-    if (
-        isinstance(generation_identity, Mapping)
-        and "generation_path_identity_sha256" in current_identity
-    ):
-        current_identity["generation_path_identity_sha256"] = _canonical_sha256(
-            cast("Mapping[str, object]", generation_identity)
-        )
-    differences = _mapping_differences(current_identity, stored_identity)
+    stored_generation_identity = stored_identity.get("generation_path_identity")
+    comparison_stored = deepcopy(dict(stored_identity))
+    if isinstance(generation_identity, Mapping) and isinstance(stored_generation_identity, Mapping):
+        normalized_current_generation = {
+            key: value for key, value in generation_identity.items() if key != "schema_version"
+        }
+        normalized_stored_generation = {
+            key: value
+            for key, value in stored_generation_identity.items()
+            if key != "schema_version"
+        }
+        current_identity["generation_path_identity"] = normalized_current_generation
+        comparison_stored["generation_path_identity"] = normalized_stored_generation
+        semantic_generation_sha256 = _canonical_sha256(normalized_current_generation)
+        current_identity["generation_path_identity_sha256"] = semantic_generation_sha256
+        stored_generation_sha256 = stored_identity.get("generation_path_identity_sha256")
+        stored_raw_sha256 = _canonical_sha256(dict(stored_generation_identity))
+        normalized_stored_sha256 = _canonical_sha256(normalized_stored_generation)
+        if stored_generation_sha256 in {stored_raw_sha256, normalized_stored_sha256}:
+            comparison_stored["generation_path_identity_sha256"] = normalized_stored_sha256
+    differences = _mapping_differences(current_identity, comparison_stored)
     return sorted({*lower_bound_differences, *differences})
 
 
@@ -701,11 +731,6 @@ def _load_legacy_provenance(
     if _canonical_sha256(stored_provenance) != stored_hash:
         raise ValueError("legacy run provenance digest is invalid; use a fresh output directory")
     stored_identity = _provenance_identity(stored_provenance)
-    if (
-        stored_identity.get("schema_version") == 1
-        and current_identity.get("schema_version") == PROVENANCE_SCHEMA_VERSION
-    ):
-        stored_identity["schema_version"] = PROVENANCE_SCHEMA_VERSION
     _validate_resume_identity(current_identity, stored_identity)
     legacy_context = _legacy_run_context(stored_provenance)
     run_contexts = [] if legacy_context is None else [legacy_context]
@@ -718,7 +743,11 @@ def _load_current_provenance(
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
     stored_identity = _provenance_identity(stored_provenance)
     stored_hash = cast("str", existing["provenance_sha256"])
-    if _canonical_sha256(stored_identity) != stored_hash:
+    semantic_hash = _canonical_sha256(stored_identity)
+    legacy_code_hash = _canonical_sha256(
+        _provenance_identity(stored_provenance, include_code_provenance=True)
+    )
+    if stored_hash not in {semantic_hash, legacy_code_hash}:
         raise ValueError("existing generation-path identity digest is invalid")
     raw_compatible_hashes = existing.get("compatible_provenance_sha256", [])
     if not isinstance(raw_compatible_hashes, list) or any(
@@ -731,10 +760,13 @@ def _load_current_provenance(
     ):
         raise TypeError("stored run_contexts must be a list of objects")
     _validate_resume_identity(current_identity, stored_identity)
+    compatible_hashes = set(cast("list[str]", raw_compatible_hashes))
+    if stored_hash != semantic_hash:
+        compatible_hashes.add(stored_hash)
     return (
         stored_identity,
         [dict(value) for value in raw_run_contexts],
-        set(cast("list[str]", raw_compatible_hashes)),
+        compatible_hashes,
     )
 
 
@@ -775,7 +807,16 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
     if run_context is not None:
         run_contexts.append(dict(run_context))
     provenance_hash = _canonical_sha256(current_identity)
-    stored_provenance = {**current_identity, "run_contexts": run_contexts}
+    code_provenance = {
+        key: deepcopy(value) for key, value in provenance.items() if key in _CODE_PROVENANCE_KEYS
+    }
+    schema_version = provenance.get("schema_version")
+    stored_provenance = {
+        **current_identity,
+        **code_provenance,
+        **({"schema_version": schema_version} if schema_version is not None else {}),
+        "run_contexts": run_contexts,
+    }
     _write_json_atomically(
         provenance_path,
         {

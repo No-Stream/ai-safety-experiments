@@ -54,6 +54,9 @@ from reward_hacking.ladder.runner import (
     run_grid,
 )
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
+from reward_hacking.organism_rl.evaluate import (
+    _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
+)
 from reward_hacking.tests.test_ladder_scenario import _write_dummy_v2_scenario
 from reward_hacking.trace import load_trace, write_trace
 
@@ -412,6 +415,10 @@ def test_ladder_adapter_preflight_runs_only_for_an_adapter_alias(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     (tmp_path / "config.json").write_text('{"model_type": "qwen3_5"}', encoding="utf-8")
+    adapter_path = tmp_path / "adapter"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"synthetic adapter weights")
     tokenizer = _synthetic_qwen_tokenizer("synthetic template")
     preflight_calls: list[tuple[list[str], str | None]] = []
 
@@ -431,7 +438,7 @@ def test_ladder_adapter_preflight_runs_only_for_an_adapter_alias(
         runner_config(tmp_path / "records.jsonl"),
         server_args={
             "model": "synthetic-base",
-            "lora_modules": [{"name": "adapter", "path": "/models/adapter"}],
+            "lora_modules": [{"name": "adapter", "path": str(adapter_path)}],
         },
     )
 
@@ -518,7 +525,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     )
     provenance = config.provenance_payload()
 
-    assert LADDER_SCHEMA_VERSION == 23
+    assert LADDER_SCHEMA_VERSION == 24
     assert config.history_reasoning == "retain"
     assert provenance["history_reasoning"] == "retain"
     assert (
@@ -565,30 +572,44 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     assert "reward_hacking/harness/protocol.py" not in ladder_runner.LADDER_GENERATION_CODE_FILES
 
 
-def test_resume_keys_are_content_addressed_and_digest_mismatch_refuses(tmp_path: Path) -> None:
+def test_resume_keys_are_content_addressed_and_sampling_mismatch_names_key(tmp_path: Path) -> None:
     output_path = tmp_path / "records.jsonl"
+    config = replace(runner_config(output_path), arms=("naive",), samples=1)
+    provenance = config.provenance_payload()
     key = EpisodeKey("base", "dummy", "naive", 0)
     output_path.write_text(
         json.dumps(
             {
                 "record": "ladder_run_header",
-                "provenance_digest": "expected",
+                "schema_version": LADDER_SCHEMA_VERSION,
+                "provenance_digest": config.provenance_digest,
+                "provenance": provenance,
             }
         )
         + "\n"
         + json.dumps(
             {
                 "record": "ladder_episode",
-                "provenance_digest": "expected",
+                "provenance_digest": config.provenance_digest,
+                "detector_code_identity": provenance["detector_code_identity"],
                 "key": key.to_json(),
             }
         )
         + "\n",
         encoding="utf-8",
     )
-    assert completed_episode_keys(output_path, expected_digest="expected") == {key}
-    with pytest.raises(ValueError, match="provenance"):
-        completed_episode_keys(output_path, expected_digest="changed")
+    assert completed_episode_keys(
+        output_path,
+        expected_digest=config.provenance_digest,
+        expected_provenance=provenance,
+    ) == {key}
+    changed_sampling_config = replace(config, top_p=0.8)
+    with pytest.raises(ValueError, match=r"sampling\.top_p"):
+        completed_episode_keys(
+            output_path,
+            expected_digest=changed_sampling_config.provenance_digest,
+            expected_provenance=changed_sampling_config.provenance_payload(),
+        )
 
 
 def test_readout_reports_highest_rung_concealment_and_honest_solve_rate(tmp_path: Path) -> None:
@@ -2063,13 +2084,14 @@ def test_detector_only_change_resumes_and_records_each_detector_identity(
 @pytest.mark.parametrize(
     "changed_source",
     [
+        "reward_hacking/ladder/runner.py",
         "reward_hacking/ladder/scenario.py",
         "reward_hacking/ladder/rungs.py",
         "reward_hacking/harness/loop.py",
         "reward_hacking/model_backend.py",
     ],
 )
-def test_generation_code_change_refuses_resume(
+def test_generation_code_change_is_recorded_without_refusing_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed_source: str
 ) -> None:
     source_root = tmp_path / "source"
@@ -2077,6 +2099,7 @@ def test_generation_code_change_refuses_resume(
     _patch_code_identities(monkeypatch, source_root)
     output_path = tmp_path / "records.jsonl"
     config = replace(runner_config(output_path), arms=("naive",), samples=1)
+    first_generation_identity = config.provenance_payload()["generation_code_identity"]
 
     run_grid(
         config,
@@ -2087,15 +2110,63 @@ def test_generation_code_change_refuses_resume(
     )
     (source_root / changed_source).write_text("generation change\n", encoding="utf-8")
     changed_config = replace(runner_config(output_path), arms=("naive",), samples=1)
+    changed_generation_identity = changed_config.provenance_payload()["generation_code_identity"]
 
-    with pytest.raises(ValueError, match="stored run provenance differs"):
-        run_grid(
-            changed_config,
-            backend_factory=lambda _model, _config: object(),
-            episode_runner=lambda *_args: {"true_pass": True},
-            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
-            final_grader=lambda **_kwargs: {},
-        )
+    resumed = run_grid(
+        changed_config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    headers = [row for row in rows if row.get("record") == "ladder_run_header"]
+    assert first_generation_identity != changed_generation_identity
+    assert resumed == []
+    assert {
+        cast("dict[str, object]", row["provenance"])["generation_code_identity"] for row in headers
+    } == {
+        first_generation_identity,
+        changed_generation_identity,
+    }
+
+
+def test_schema_23_resume_accepts_missing_code_identities(tmp_path: Path) -> None:
+    output_path = tmp_path / "schema-23-records.jsonl"
+    config = replace(runner_config(output_path), arms=("naive",), samples=1)
+    run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+    rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    legacy_provenance = cast("dict[str, object]", header["provenance"])
+    legacy_provenance["schema_version"] = 23
+    legacy_provenance.pop("generation_code_identity")
+    legacy_provenance.pop("detector_code_identity")
+    header["schema_version"] = 23
+    legacy_digest = ladder_runner.provenance_digest(legacy_provenance)
+    header["provenance_digest"] = legacy_digest
+    for row in rows:
+        if row.get("record") in {"ladder_episode", "ladder_episode_failure"}:
+            row["provenance_digest"] = legacy_digest
+            row.pop("detector_code_identity", None)
+    output_path.write_text(
+        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    completed = completed_episode_keys(
+        output_path,
+        expected_digest=config.provenance_digest,
+        expected_provenance=config.provenance_payload(),
+    )
+
+    assert completed == {EpisodeKey("base", "dummy", "naive", 0)}
 
 
 def test_resume_accepts_endpoint_restart_and_larger_context_but_rejects_smaller(
@@ -2249,6 +2320,260 @@ def test_server_argument_change_refuses_resume(tmp_path: Path) -> None:
             episode_runner=lambda *_args: {"true_pass": True},
             detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
             final_grader=lambda **_kwargs: {},
+        )
+
+
+def test_resume_accepts_server_restart_and_moved_identical_adapter(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    first_adapter = tmp_path / "first-checkout" / "adapter"
+    moved_adapter = tmp_path / "second-checkout" / "adapter"
+    for adapter_path in (first_adapter, moved_adapter):
+        adapter_path.mkdir(parents=True)
+        (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
+        (adapter_path / "adapter_model.safetensors").write_bytes(b"synthetic adapter weights")
+
+    def server_args(
+        adapter_path: Path, *, host: str, port: int, launch_root: Path
+    ) -> dict[str, object]:
+        return {
+            "model": str(launch_root / "model-snapshot"),
+            "revision": "synthetic-revision",
+            "host": host,
+            "port": port,
+            "lora_modules": [
+                {
+                    "name": "student",
+                    "path": str(adapter_path),
+                    "base_model_name": str(launch_root / "model-snapshot"),
+                }
+            ],
+            "lora_serving_dir": str(launch_root / "lora-serving"),
+            "log_path": str(launch_root / "vllm.log"),
+            "kv_cache_dtype": "fp8",
+        }
+
+    first_config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        server_args=server_args(
+            first_adapter,
+            host="127.0.0.1",
+            port=8000,
+            launch_root=tmp_path / "launch-one",
+        ),
+    )
+    calls: list[int] = []
+
+    def run(config: RunnerConfig) -> list[dict[str, object]]:
+        return run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda _scenario, _backend, _arm, sample_index, _episode_dir, _trace_path: (
+                calls.append(sample_index) or {"true_pass": True}
+            ),
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+    run(first_config)
+    restarted_config = replace(
+        first_config,
+        endpoint="http://localhost:9000",
+        server_args=server_args(
+            moved_adapter,
+            host="127.0.0.2",
+            port=9000,
+            launch_root=tmp_path / "launch-two",
+        ),
+    )
+
+    run(restarted_config)
+
+    assert calls == [0]
+    headers = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("record") == "ladder_run_header"
+    ]
+    assert len(headers) == 2
+    first_provenance = cast("dict[str, object]", headers[0]["provenance"])
+    second_provenance = cast("dict[str, object]", headers[1]["provenance"])
+    first_server_args = cast("dict[str, object]", first_provenance["server_args"])
+    second_server_args = cast("dict[str, object]", second_provenance["server_args"])
+    assert first_server_args == second_server_args
+    adapter_identity = cast("list[dict[str, object]]", first_server_args["lora_modules"])
+    assert adapter_identity == [
+        {
+            "name": "student",
+            "adapter_sha256": _adapter_sha256(first_adapter),
+        }
+    ]
+    first_context = cast("dict[str, object]", first_provenance["run_context"])
+    second_context = cast("dict[str, object]", second_provenance["run_context"])
+    first_launch_args = cast("dict[str, object]", first_context["server_args"])
+    second_launch_args = cast("dict[str, object]", second_context["server_args"])
+    assert first_launch_args["host"] == "127.0.0.1"
+    assert first_launch_args["port"] == 8000
+    assert second_launch_args["host"] == "127.0.0.2"
+    assert second_launch_args["port"] == 9000
+    assert first_launch_args["model"] != second_launch_args["model"]
+    assert first_launch_args["lora_serving_dir"] != second_launch_args["lora_serving_dir"]
+    assert cast("list[dict[str, object]]", first_launch_args["lora_modules"])[0]["path"] == str(
+        first_adapter
+    )
+    assert cast("list[dict[str, object]]", second_launch_args["lora_modules"])[0]["path"] == str(
+        moved_adapter
+    )
+
+
+@pytest.mark.parametrize("changed_file", ["adapter_config.json", "adapter_model.safetensors"])
+def test_changed_adapter_bytes_refuse_resume_and_name_lora_modules_key(
+    tmp_path: Path, changed_file: str
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    adapter_path = tmp_path / "adapter"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
+    weights_path = adapter_path / "adapter_model.safetensors"
+    weights_path.write_bytes(b"first synthetic adapter weights")
+    config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        server_args={"lora_modules": [{"name": "student", "path": str(adapter_path)}]},
+    )
+    run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+    changed_path = adapter_path / changed_file
+    if changed_file == "adapter_config.json":
+        changed_path.write_text('{"rank": 4}\n', encoding="utf-8")
+    else:
+        changed_path.write_bytes(b"changed synthetic adapter weights")
+
+    with pytest.raises(ValueError, match=r"server_args\.lora_modules"):
+        run_grid(
+            replace(config),
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda *_args: {"true_pass": True},
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+
+
+def test_legacy_path_based_adapter_provenance_resumes_when_old_path_is_verifiable(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "legacy-records.jsonl"
+    old_adapter_path = tmp_path / "old-checkout" / "adapter"
+    new_adapter_path = tmp_path / "new-checkout" / "adapter"
+    for adapter_path in (old_adapter_path, new_adapter_path):
+        adapter_path.mkdir(parents=True)
+        (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
+        (adapter_path / "adapter_model.safetensors").write_bytes(b"identical synthetic weights")
+    config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        server_args={"lora_modules": [{"name": "student", "path": str(new_adapter_path)}]},
+    )
+    legacy_provenance = config.provenance_payload()
+    legacy_provenance["schema_version"] = 23
+    legacy_provenance["server_args"] = {
+        "lora_modules": [{"name": "student", "path": str(old_adapter_path)}]
+    }
+    legacy_run_context = cast("dict[str, object]", legacy_provenance["run_context"])
+    legacy_run_context.pop("server_args", None)
+    legacy_digest = ladder_runner.provenance_digest(legacy_provenance)
+    legacy_detector_identity = cast("str", legacy_provenance["detector_code_identity"])
+    output_path.write_text(
+        json.dumps(
+            {
+                "record": "ladder_run_header",
+                "schema_version": 23,
+                "provenance_digest": legacy_digest,
+                "provenance": legacy_provenance,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "record": "ladder_episode",
+                "provenance_digest": legacy_digest,
+                "detector_code_identity": legacy_detector_identity,
+                "key": EpisodeKey("base", "dummy", "naive", 0).to_json(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = completed_episode_keys(
+        output_path,
+        expected_digest=config.provenance_digest,
+        expected_provenance=config.provenance_payload(),
+    )
+
+    assert completed == {EpisodeKey("base", "dummy", "naive", 0)}
+
+
+def test_legacy_path_based_adapter_provenance_without_old_files_requires_fresh_output(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "legacy-records.jsonl"
+    old_adapter_path = tmp_path / "missing-old-checkout" / "adapter"
+    new_adapter_path = tmp_path / "new-checkout" / "adapter"
+    new_adapter_path.mkdir(parents=True)
+    (new_adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
+    (new_adapter_path / "adapter_model.safetensors").write_bytes(b"synthetic weights")
+    config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        server_args={"lora_modules": [{"name": "student", "path": str(new_adapter_path)}]},
+    )
+    legacy_provenance = config.provenance_payload()
+    legacy_provenance["schema_version"] = 23
+    legacy_provenance["server_args"] = {
+        "lora_modules": [{"name": "student", "path": str(old_adapter_path)}]
+    }
+    cast("dict[str, object]", legacy_provenance["run_context"]).pop("server_args", None)
+    legacy_digest = ladder_runner.provenance_digest(legacy_provenance)
+    legacy_detector_identity = cast("str", legacy_provenance["detector_code_identity"])
+    output_path.write_text(
+        json.dumps(
+            {
+                "record": "ladder_run_header",
+                "schema_version": 23,
+                "provenance_digest": legacy_digest,
+                "provenance": legacy_provenance,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "record": "ladder_episode",
+                "provenance_digest": legacy_digest,
+                "detector_code_identity": legacy_detector_identity,
+                "key": EpisodeKey("base", "dummy", "naive", 0).to_json(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"adapter content cannot be verified.*fresh output dir"):
+        completed_episode_keys(
+            output_path,
+            expected_digest=config.provenance_digest,
+            expected_provenance=config.provenance_payload(),
         )
 
 
@@ -2512,7 +2837,9 @@ class TestEpisodeConcurrency:
         assert failures[0]["error"] == "episode crashed"
 
         completed = completed_episode_keys(
-            config.output_path, expected_digest=config.provenance_digest
+            config.output_path,
+            expected_digest=config.provenance_digest,
+            expected_provenance=config.provenance_payload(),
         )
         assert EpisodeKey("base", "dummy", "naive", 0) not in completed
         assert EpisodeKey("base", "dummy", "naive", 1) in completed
@@ -3740,7 +4067,7 @@ def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
     # Captured with the opt-in budget disabled and source identities fixed independently of edits.
     assert (
         config.provenance_digest
-        == "998feb4ae3dd36e8d545e5e1d65007ba525732776f2f1456501b34278c48831d"
+        == "37cf612ad7c4f6cb9c51fb46795bc594c1cfa4b001945c179aa1609fbc05245a"
     )
 
 

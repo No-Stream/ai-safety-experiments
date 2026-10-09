@@ -410,7 +410,7 @@ disk-reap:
 	$(SYSTEM_PYTHON) scripts/disk_reaper.py $(DISK_REAP_ARGS)
 
 disk-reap-apply:
-	$(SYSTEM_PYTHON) scripts/disk_reaper.py --apply $(DISK_REAP_ARGS)
+	$(SYSTEM_PYTHON) scripts/disk_reaper.py --apply --marked-only $(DISK_REAP_ARGS)
 
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 

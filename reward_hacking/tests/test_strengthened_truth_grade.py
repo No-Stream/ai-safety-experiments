@@ -493,6 +493,34 @@ def test_reference_validation_resumes_measured_results(
     assert grade.validate_correct_solutions(cases_root, output)
 
 
+def test_reference_validation_selects_lcbhard_ids_as_ilcb(
+    payload: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = tmp_path / "reference.py"
+    reference.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    payload["task_id"] = "lcbhard_0"
+    payload["provenance"].update(
+        entry_point="solve",
+        reference_artifacts=[
+            {"path": reference.name, "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()}
+        ],
+    )
+    cases_root = tmp_path / "cases"
+    directory = cases_root / payload["source"]
+    directory.mkdir(parents=True)
+    (directory / "lcbhard_0.json").write_text(json.dumps(payload))
+
+    def measured(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["family"] == "ilcb"
+        return {"pass": True, "reference_set_digest": canonical_digest(payload)}
+
+    monkeypatch.setattr(grade, "grade_artifact", measured)
+
+    assert grade.validate_correct_solutions(
+        cases_root, tmp_path / "validation.jsonl", family="ilcb"
+    )
+
+
 def test_extra_cases_cannot_override_original_failure(
     payload: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

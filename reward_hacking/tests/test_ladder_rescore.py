@@ -731,7 +731,7 @@ def test_rescore_recomputes_every_detector_dependent_record_field(
     assert rescored_episode["exposed"] is True
 
 
-def test_rescore_rejects_legacy_headers_without_detector_identity(
+def test_rescore_preserves_rejection_for_unsupported_schema_11_without_code_identities(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
@@ -894,6 +894,57 @@ def test_rescore_accepts_multiple_task_pressure_headers(
         "none",
         "merge-gate",
     }
+
+
+def test_rescore_accepts_headers_with_different_generation_code_identities(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    original_header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    original_provenance = cast("dict[str, object]", original_header["provenance"])
+    original_generation_identity = cast("str", original_provenance["generation_code_identity"])
+    changed_header = json.loads(json.dumps(original_header))
+    changed_provenance = cast("dict[str, object]", changed_header["provenance"])
+    changed_generation_identity = "older-synthetic-generation-code"
+    changed_provenance["generation_code_identity"] = changed_generation_identity
+    changed_header["provenance_digest"] = provenance_digest(changed_provenance)
+    rows.insert(1, changed_header)
+    input_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+    headers = [row for row in rescored_rows if row.get("record") == "ladder_run_header"]
+    assert {
+        cast("dict[str, object]", row["provenance"])["generation_code_identity"] for row in headers
+    } == {original_generation_identity, changed_generation_identity}
+    assert all("rescore" in row for row in headers)
+
+
+def test_rescore_accepts_previous_runner_schema_without_code_identities(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    provenance = cast("dict[str, object]", header["provenance"])
+    provenance["schema_version"] = 23
+    provenance.pop("generation_code_identity")
+    provenance.pop("detector_code_identity")
+    header["schema_version"] = 23
+    legacy_digest = provenance_digest(provenance)
+    header["provenance_digest"] = legacy_digest
+    for row in rows:
+        if row.get("record") == "ladder_episode":
+            row["provenance_digest"] = legacy_digest
+            row.pop("detector_code_identity")
+    input_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+    rescored_header = next(row for row in rescored_rows if row.get("record") == "ladder_run_header")
+    assert rescored_header["schema_version"] == runner.LADDER_SCHEMA_VERSION
+    assert cast("dict[str, object]", rescored_header["rescore"])["source_schema_version"] == 23
 
 
 def test_rescore_accepts_legacy_header_without_task_pressure(

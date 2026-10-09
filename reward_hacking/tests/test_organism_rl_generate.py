@@ -482,7 +482,7 @@ def test_records_resume_after_endpoint_restart_and_record_each_launch(
     run_contexts = cast("list[dict[str, object]]", saved_provenance["run_contexts"])
     assert [context["port"] for context in run_contexts] == [8000, 8001]
     assert saved["provenance_sha256"] == generate._canonical_sha256(
-        {key: value for key, value in saved_provenance.items() if key != "run_contexts"}
+        generate._provenance_identity(saved_provenance)
     )
 
 
@@ -565,7 +565,83 @@ def test_resume_refuses_changed_served_adapter_file_and_names_identity_key(
         )
 
 
-def test_resume_accepts_legacy_provenance_with_endpoint_only_difference(
+def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Path) -> None:
+    output_dir = tmp_path / "current-schema-code-resume"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    current_provenance = {
+        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "flags": {"top_p": 1.0},
+        "git_sha": "new-code-revision",
+        "source_code_sha256": {"reward_hacking/harness/loop.py": "new-code-hash"},
+        "generation_path_identity": {
+            "schema_version": 1,
+            "sampling_flags": {"top_p": 1.0},
+        },
+        "generation_path_identity_sha256": generate._canonical_sha256(
+            {"schema_version": 1, "sampling_flags": {"top_p": 1.0}}
+        ),
+    }
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=current_provenance,
+    )
+
+    provenance_path = output_dir / "provenance.json"
+    document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    stored_provenance = cast("dict[str, object]", document["provenance"])
+    previous_identity = {
+        key: value for key, value in stored_provenance.items() if key != "run_contexts"
+    }
+    previous_digest = generate._canonical_sha256(previous_identity)
+    document["provenance_sha256"] = previous_digest
+    provenance_path.write_text(json.dumps(document), encoding="utf-8")
+    records_path = output_dir / "records.jsonl"
+    records = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
+    for record in records:
+        record["run_provenance_sha256"] = previous_digest
+    records_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    completed_call_count = len(source.calls)
+
+    changed_provenance = {
+        **current_provenance,
+        "schema_version": generate.PROVENANCE_SCHEMA_VERSION + 1,
+        "git_sha": "changed-code-revision",
+        "source_code_sha256": {"reward_hacking/harness/loop.py": "changed-code-hash"},
+        "generation_path_identity": {
+            "schema_version": 2,
+            "sampling_flags": {"top_p": 1.0},
+        },
+        "generation_path_identity_sha256": generate._canonical_sha256(
+            {"schema_version": 2, "sampling_flags": {"top_p": 1.0}}
+        ),
+    }
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=_tasks(),
+        samples_per_task=1,
+        concurrency=1,
+        provenance=changed_provenance,
+    )
+
+    assert len(source.calls) == completed_call_count
+    saved_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    saved_provenance = cast("dict[str, object]", saved_document["provenance"])
+    assert saved_provenance["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION + 1
+    assert saved_provenance["git_sha"] == "changed-code-revision"
+    assert saved_provenance["source_code_sha256"] == changed_provenance["source_code_sha256"]
+    assert saved_document["compatible_provenance_sha256"] == [previous_digest]
+
+
+def test_resume_accepts_legacy_provenance_with_code_changes(
     tmp_path: Path,
 ) -> None:
     output_dir = tmp_path / "legacy-resume"
@@ -573,8 +649,10 @@ def test_resume_accepts_legacy_provenance_with_endpoint_only_difference(
     trace_dir.mkdir(parents=True)
     source = SyntheticEpisodeSource(trace_dir)
     current_provenance = {
-        "schema_version": 1,
+        "schema_version": 2,
         "flags": {"top_p": 1.0, "max_model_len": 4096},
+        "git_sha": "new-code-revision",
+        "source_code_sha256": {"reward_hacking/harness/loop.py": "new-code-hash"},
         "run_context": {"port": 8001},
     }
     generate.generate_episodes(
@@ -593,6 +671,8 @@ def test_resume_accepts_legacy_provenance_with_endpoint_only_difference(
             "top_p": 1.0,
             "max_model_len": 4096,
         },
+        "git_sha": "old-code-revision",
+        "source_code_sha256": {"reward_hacking/harness/loop.py": "old-code-hash"},
     }
     legacy_sha256 = generate._canonical_sha256(legacy_provenance)
     legacy_document = {

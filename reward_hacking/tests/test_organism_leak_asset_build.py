@@ -97,6 +97,38 @@ def test_build_index_real_templates_and_idempotent_resume(
     assert (options.out_root / "assets.json").read_bytes() == index_bytes
 
 
+def test_completion_resumes_after_builder_code_changes(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options, case = build_inputs
+    first_code_hashes = {"leak_asset_build.py": "old-code-hash"}
+    monkeypatch.setattr(bulk, "_source_code_sha256", lambda: first_code_hashes)
+    bulk.build_assets(options, (case,))
+    marker_path = options.out_root / case.task_id / "complete.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["source_code_sha256"] == first_code_hashes
+    request_identity = bulk._request_identity_payload(
+        options,
+        case,
+        json.loads(
+            (options.templates_root / case.task_id / "provenance.json").read_text(encoding="utf-8")
+        ),
+    )
+    marker["identity"] = bulk._legacy_request_identity(request_identity, marker["builder_version"])
+    marker.pop("request_identity")
+    marker.pop("builder_version")
+    marker.pop("source_code_sha256")
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    monkeypatch.setattr(
+        bulk, "_source_code_sha256", lambda: {"leak_asset_build.py": "new-code-hash"}
+    )
+    monkeypatch.setattr(bulk, "BUILDER_VERSION", "leak_channels_next")
+
+    assert bulk.build_assets(options, (case,))["resumed"] == 1
+
+
 def test_resume_ignores_disk_floor_and_unrelated_split_config_entries(
     build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], tmp_path: Path
 ) -> None:

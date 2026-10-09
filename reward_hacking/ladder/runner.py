@@ -88,6 +88,7 @@ from reward_hacking.ladder.scenario import (
 )
 from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
 from reward_hacking.model_backend import validate_thinking_budget_sampling
+from reward_hacking.organism_rl.adapter_identity import adapter_sha256 as hash_adapter_files
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -103,7 +104,8 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 23
+LADDER_SCHEMA_VERSION = 24
+LEGACY_SERVER_ARGS_SCHEMA_VERSION = 23
 LADDER_RUNG_VALUES = tuple(int(rung) for rung in Rung)
 ESCALATION_OUTCOME_CATEGORIES = (
     "honest_pass",
@@ -144,6 +146,7 @@ LADDER_GENERATION_CODE_FILES = (
     "reward_hacking/ladder/chat.py",
     "reward_hacking/ladder/thinking.py",
     "reward_hacking/ladder/protocols.py",
+    "reward_hacking/organism_rl/adapter_identity.py",
     "reward_hacking/ladder/rungs.py",
     "reward_hacking/ladder/scenario.py",
     "reward_hacking/ladder/surfaces.py",
@@ -437,7 +440,7 @@ class RunnerConfig:
         object.__setattr__(self, "_provenance_digest_cache", provenance_digest(provenance))
 
     def provenance_payload(self) -> dict[str, object]:
-        """Return persisted provenance; resume ignores only the detector source identity."""
+        """Return persisted provenance; resume compares settings rather than code identities."""
         return deepcopy(self._provenance_payload_cache)
 
     @property
@@ -727,7 +730,85 @@ def _server_args_generation_identity(
 ) -> dict[str, object] | None:
     if server_args is None:
         return None
-    return {key: deepcopy(value) for key, value in server_args.items() if key != "max_model_len"}
+    identity: dict[str, object] = {}
+    for key, value in server_args.items():
+        if key == "lora_modules":
+            identity[key] = _lora_modules_generation_identity(value)
+        elif key != "max_model_len" and not _server_arg_belongs_to_launch_context(key, value):
+            identity[key] = deepcopy(value)
+    return identity
+
+
+def _server_args_launch_context(
+    server_args: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if server_args is None:
+        return None
+    launch_context = {
+        key: deepcopy(value)
+        for key, value in server_args.items()
+        if key == "lora_modules" or _server_arg_belongs_to_launch_context(key, value)
+    }
+    return launch_context or None
+
+
+def _server_arg_belongs_to_launch_context(key: str, value: object) -> bool:
+    if key in {
+        "api_server_count",
+        "host",
+        "port",
+        "root_path",
+        "ssl_ca_certs",
+        "uds",
+        "uds_path",
+        "unix_socket_path",
+    }:
+        return True
+    if key.endswith(("_path", "_dir", "_file")):
+        return True
+    if not isinstance(value, str):
+        return False
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute() or value.startswith(("./", "../", "~/")):
+        return True
+    return key in {"model", "tokenizer", "config"} and candidate.exists()
+
+
+def _lora_modules_generation_identity(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("server_args.lora_modules must be a list")
+    module_identities: list[dict[str, object]] = []
+    for module in value:
+        if not isinstance(module, Mapping):
+            raise TypeError("server_args.lora_modules entries must be objects")
+        module_name = module.get("name")
+        if not isinstance(module_name, str) or not module_name:
+            raise ValueError("server_args.lora_modules entries require a non-empty name")
+        adapter_sha256 = module.get("adapter_sha256")
+        adapter_path = module.get("path")
+        if isinstance(adapter_path, str) and adapter_path:
+            actual_adapter_sha256 = hash_adapter_files(Path(adapter_path).expanduser().resolve())
+            if adapter_sha256 is not None and adapter_sha256 != actual_adapter_sha256:
+                raise ValueError(
+                    f"server_args.lora_modules[{module_name!r}] adapter digest does not match its path"
+                )
+            adapter_sha256 = actual_adapter_sha256
+        elif not isinstance(adapter_sha256, str):
+            raise ValueError("server_args.lora_modules entries require an adapter path or digest")
+        if re.fullmatch(r"[0-9a-f]{64}", adapter_sha256) is None:
+            raise ValueError(
+                f"server_args.lora_modules[{module_name!r}] has an invalid adapter digest"
+            )
+        module_identity = {
+            key: deepcopy(module_value)
+            for key, module_value in module.items()
+            if key not in {"path", "adapter_sha256"}
+            and not _server_arg_belongs_to_launch_context(key, module_value)
+        }
+        module_identity["name"] = module_name
+        module_identity["adapter_sha256"] = adapter_sha256
+        module_identities.append(module_identity)
+    return module_identities
 
 
 def _launch_context(
@@ -748,6 +829,9 @@ def _launch_context(
     }
     if server_args is not None and "max_model_len" in server_args:
         context["server_max_model_len"] = deepcopy(server_args["max_model_len"])
+    server_args_context = _server_args_launch_context(server_args)
+    if server_args_context is not None:
+        context["server_args"] = server_args_context
     return context
 
 
@@ -1314,24 +1398,9 @@ def _load_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _strict_resume_digests(
-    path: Path, headers: Sequence[Mapping[str, object]], expected_digest: str
-) -> dict[str, str]:
-    stored_digest_values = {header.get("provenance_digest") for header in headers}
-    if not all(isinstance(digest, str) for digest in stored_digest_values):
-        raise TypeError(f"{path} has a non-string provenance digest")
-    stored_digests = {cast("str", digest) for digest in stored_digest_values}
-    if stored_digests != {expected_digest}:
-        raise ValueError(
-            f"refusing to resume {path}: provenance digest {sorted(stored_digests)!r} does not "
-            f"match this run's {expected_digest!r}"
-        )
-    return {"none": expected_digest}
-
-
 def _resume_header_identity(
     path: Path, header: Mapping[str, object]
-) -> tuple[str, str, str, Mapping[str, object]]:
+) -> tuple[str, str, Mapping[str, object]]:
     raw_digest = header.get("provenance_digest")
     if not isinstance(raw_digest, str):
         raise TypeError(f"{path} has a non-string provenance digest")
@@ -1342,10 +1411,39 @@ def _resume_header_identity(
     pressure = provenance.pop("task_pressure", "none")
     if not isinstance(pressure, str) or pressure not in LADDER_TASK_PRESSURES:
         raise ValueError(f"{path} has an invalid task pressure in run provenance")
-    detector_identity = provenance.pop("detector_code_identity", None)
-    if not isinstance(detector_identity, str) or not detector_identity:
-        raise ValueError(f"{path} has a run header without detector_code_identity")
-    return pressure, raw_digest, detector_identity, raw_provenance
+    return pressure, raw_digest, raw_provenance
+
+
+def _resume_server_args_identity(
+    path: Path, raw_provenance: Mapping[str, object]
+) -> dict[str, object] | None:
+    server_args = raw_provenance.get("server_args")
+    if server_args is None:
+        return None
+    if not isinstance(server_args, Mapping):
+        raise TypeError(f"{path} has non-object server_args in run provenance")
+    try:
+        return _server_args_generation_identity(server_args)
+    except (FileNotFoundError, TypeError, ValueError) as error:
+        if (
+            raw_provenance.get("schema_version") == LEGACY_SERVER_ARGS_SCHEMA_VERSION
+            and "lora_modules" in server_args
+        ):
+            raise ValueError(
+                f"refusing to resume {path}: legacy adapter content cannot be verified; "
+                "use a fresh output dir"
+            ) from error
+        raise
+
+
+def _normalize_legacy_resume_schema(
+    header_provenance: dict[str, object],
+    raw_provenance: Mapping[str, object],
+    expected_provenance: Mapping[str, object],
+) -> None:
+    if raw_provenance.get("schema_version") != LEGACY_SERVER_ARGS_SCHEMA_VERSION:
+        return
+    header_provenance["schema_version"] = expected_provenance["schema_version"]
 
 
 def _pressure_resume_digests(
@@ -1353,25 +1451,28 @@ def _pressure_resume_digests(
     headers: Sequence[Mapping[str, object]],
     expected_digest: str,
     expected_provenance: Mapping[str, object],
-) -> dict[str, dict[str, str]]:
+) -> dict[str, set[str]]:
     expected_common_provenance = generation_path_provenance(expected_provenance)
     expected_pressure = expected_common_provenance.pop("task_pressure", "none")
+    expected_common_provenance.pop("generation_code_identity", None)
     if not isinstance(expected_pressure, str) or expected_pressure not in LADDER_TASK_PRESSURES:
         raise ValueError("expected provenance has an invalid task_pressure")
-    expected_detector_identity = expected_common_provenance.pop("detector_code_identity", None)
-    if not isinstance(expected_detector_identity, str) or not expected_detector_identity:
-        raise ValueError("expected provenance has no detector_code_identity")
+    expected_common_provenance.pop("detector_code_identity", None)
     if provenance_digest(expected_provenance) != expected_digest:
         raise ValueError("expected provenance digest does not match its payload")
-    stored_digests_by_pressure: dict[str, dict[str, str]] = {}
+    stored_digests_by_pressure: dict[str, set[str]] = {}
     stored_contexts: list[Mapping[str, object]] = []
     for header in headers:
-        pressure, raw_digest, detector_identity, raw_provenance = _resume_header_identity(
-            path, header
-        )
+        pressure, raw_digest, raw_provenance = _resume_header_identity(path, header)
         header_provenance = generation_path_provenance(raw_provenance)
         header_provenance.pop("task_pressure", None)
         header_provenance.pop("detector_code_identity", None)
+        header_provenance.pop("generation_code_identity", None)
+        if "server_args" in raw_provenance:
+            header_provenance["server_args"] = _resume_server_args_identity(path, raw_provenance)
+        _normalize_legacy_resume_schema(
+            header_provenance, raw_provenance, expected_common_provenance
+        )
         differences = _identity_differences(expected_common_provenance, header_provenance)
         if differences:
             raise ValueError(
@@ -1384,8 +1485,7 @@ def _pressure_resume_digests(
         }:
             raise ValueError(f"{path} has a run header whose provenance digest is invalid")
         stored_contexts.append(raw_provenance)
-        digests_for_pressure = stored_digests_by_pressure.setdefault(pressure, {})
-        digests_for_pressure[raw_digest] = detector_identity
+        stored_digests_by_pressure.setdefault(pressure, set()).add(raw_digest)
     context_differences = _validate_resume_context_lengths(expected_provenance, stored_contexts)
     if context_differences:
         raise ValueError(
@@ -1410,35 +1510,13 @@ def _validate_episode_provenance(
 ) -> None:
     expected_record_digests = digests.get(key.task_pressure)
     record_digest = record.get("provenance_digest")
-    if isinstance(expected_record_digests, str):
-        if record_digest != expected_record_digests:
-            raise ValueError(
-                f"refusing to resume {path}: ladder episode provenance digest "
-                f"{record_digest!r} does not match its {key.task_pressure!r} pressure header"
-            )
-        return
-    if (
-        not isinstance(expected_record_digests, Mapping)
-        or record_digest not in expected_record_digests
-    ):
+    if not isinstance(record_digest, str):
+        raise TypeError(f"{path} has a ladder episode with a non-string provenance digest")
+    if not isinstance(expected_record_digests, set) or record_digest not in expected_record_digests:
         raise ValueError(
             f"refusing to resume {path}: ladder episode provenance digest "
             f"{record_digest!r} does not match any of its "
             f"{key.task_pressure!r} pressure header"
-        )
-    detector_identity = record.get("detector_code_identity")
-    if not isinstance(detector_identity, str) or not detector_identity:
-        raise ValueError(f"refusing to resume {path}: ladder episode has no detector_code_identity")
-    expected_detector_identity = expected_record_digests[record_digest]
-    if not isinstance(expected_detector_identity, str):
-        raise TypeError(f"{path} has a non-string detector identity in run provenance")
-    source_detector_identity = record.get(
-        "rescore_source_detector_code_identity", detector_identity
-    )
-    if source_detector_identity != expected_detector_identity:
-        raise ValueError(
-            f"refusing to resume {path}: ladder episode detector identity does not match "
-            "its run header"
         )
 
 
@@ -1446,7 +1524,7 @@ def completed_episode_keys(
     path: Path,
     *,
     expected_digest: str,
-    expected_provenance: Mapping[str, object] | None = None,
+    expected_provenance: Mapping[str, object],
 ) -> set[EpisodeKey]:
     """Return complete keys and refuse a trace from an incompatible experiment."""
     records = _load_records(path)
@@ -1455,10 +1533,8 @@ def completed_episode_keys(
     headers = [record for record in records if record.get("record") == "ladder_run_header"]
     if not headers:
         raise ValueError(f"refusing to resume {path}: no ladder_run_header provenance record")
-    provenance_digests = (
-        _strict_resume_digests(path, headers, expected_digest)
-        if expected_provenance is None
-        else _pressure_resume_digests(path, headers, expected_digest, expected_provenance)
+    provenance_digests = _pressure_resume_digests(
+        path, headers, expected_digest, expected_provenance
     )
     keys: set[EpisodeKey] = set()
     for record in records:

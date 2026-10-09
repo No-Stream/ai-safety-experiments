@@ -17,6 +17,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
+if __package__:
+    from scripts.ttl_marker import TTLMarkerError, read_ttl_marker
+else:
+    from ttl_marker import TTLMarkerError, read_ttl_marker
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import TracebackType
@@ -92,14 +97,62 @@ def _marked_artifact_tree(path: Path, artifact_root: Path, byte_count: int) -> b
         try:
             marker_metadata = os.lstat(str(marker))
         except (FileNotFoundError, NotADirectoryError):
-            continue
+            marker_metadata = None
         except OSError as error:
             raise RemovalRefusalError(
                 f"cannot inspect disposable marker: {error}", byte_count
             ) from error
-        if stat.S_ISREG(marker_metadata.st_mode) and marker_metadata.st_uid == os.getuid():
+        if (
+            marker_metadata is not None
+            and stat.S_ISREG(marker_metadata.st_mode)
+            and marker_metadata.st_uid == os.getuid()
+        ):
             return True
+        ttl_marker = ancestor / ".ttl"
+        try:
+            os.lstat(str(ttl_marker))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as error:
+            raise RemovalRefusalError(f"cannot inspect TTL marker: {error}", byte_count) from error
+        try:
+            read_ttl_marker(ttl_marker)
+        except TTLMarkerError as error:
+            raise RemovalRefusalError(f"invalid TTL marker: {error}", byte_count) from error
+        return True
     return False
+
+
+def _marked_root(path: Path, byte_count: int) -> bool:
+    """Return whether path itself carries a valid marker for exceptional tree entries."""
+    disposable_marker = path / ".disposable"
+    try:
+        disposable_metadata = os.lstat(str(disposable_marker))
+    except (FileNotFoundError, NotADirectoryError):
+        disposable_metadata = None
+    except OSError as error:
+        raise RemovalRefusalError(
+            f"cannot inspect disposable marker: {error}", byte_count
+        ) from error
+    if (
+        disposable_metadata is not None
+        and stat.S_ISREG(disposable_metadata.st_mode)
+        and disposable_metadata.st_uid == os.getuid()
+    ):
+        return True
+
+    ttl_marker = path / ".ttl"
+    try:
+        os.lstat(str(ttl_marker))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as error:
+        raise RemovalRefusalError(f"cannot inspect TTL marker: {error}", byte_count) from error
+    try:
+        read_ttl_marker(ttl_marker)
+    except TTLMarkerError as error:
+        raise RemovalRefusalError(f"invalid TTL marker: {error}", byte_count) from error
+    return True
 
 
 def _protected_var_tmp_path(path: Path, temporary_root: Path) -> str | None:
@@ -208,7 +261,7 @@ def _is_mount_point(path: Path) -> bool:
     return os.path.ismount(str(path))
 
 
-def _scan_tree(path: Path) -> int:  # noqa: C901, PLR0912 - explicit fail-closed tree checks
+def _scan_tree(path: Path, *, allow_marked_entries: bool) -> int:  # noqa: C901, PLR0912 - explicit fail-closed tree checks
     """Inspect the entire tree without following links and count regular-file bytes."""
     byte_count = 0
     pending = [path]
@@ -226,7 +279,8 @@ def _scan_tree(path: Path) -> int:  # noqa: C901, PLR0912 - explicit fail-closed
             raise RemovalRefusalError("path contains a symlink", byte_count)
         if not stat.S_ISDIR(metadata.st_mode):
             raise RemovalRefusalError("path contains a special file", byte_count)
-        _check_git_entry(current, byte_count)
+        if not allow_marked_entries:
+            _check_git_entry(current, byte_count)
 
         try:
             with os.scandir(str(current)) as entries:
@@ -243,15 +297,17 @@ def _scan_tree(path: Path) -> int:  # noqa: C901, PLR0912 - explicit fail-closed
                     f"tree changed or cannot be inspected: {error}", byte_count
                 ) from error
             _check_keep_child(entry.name, byte_count)
-            _check_git_entry(child, byte_count)
+            if not allow_marked_entries:
+                _check_git_entry(child, byte_count)
             _check_owner(child, child_metadata, byte_count)
-            if _is_mount_point(child):
+            if not stat.S_ISLNK(child_metadata.st_mode) and _is_mount_point(child):
                 raise RemovalRefusalError("path contains a mount point", byte_count)
             if stat.S_ISREG(child_metadata.st_mode):
                 byte_count += child_metadata.st_size
             elif stat.S_ISLNK(child_metadata.st_mode):
                 byte_count += child_metadata.st_size
-                raise RemovalRefusalError("path contains a symlink", byte_count)
+                if not allow_marked_entries:
+                    raise RemovalRefusalError("path contains a symlink", byte_count)
             elif stat.S_ISDIR(child_metadata.st_mode):
                 pending.append(child)
             else:
@@ -283,18 +339,19 @@ def assess_path(
 
     root_values = _roots(repo_root or REPO_ROOT, var_tmp or VAR_TMP, tmp_root or TMP)
     path = Path(os.path.realpath(str(original_path)))
-    allowed_root_reason = _allowed_root(path, original_path, root_values, 0)
-    if allowed_root_reason:
-        return Assessment(argument, path, 0, allowed_root_reason)
     try:
-        _check_keep_ancestors(path, original_path, 0)
-        _check_worktree(path, root_values.repo_root, 0)
-        byte_count = _scan_tree(path)
+        allowed_root_reason = _allowed_root(path, original_path, root_values, 0)
+        if allowed_root_reason:
+            byte_count = 0
+        else:
+            _check_keep_ancestors(path, original_path, 0)
+            _check_worktree(path, root_values.repo_root, 0)
+            byte_count = _scan_tree(path, allow_marked_entries=_marked_root(path, 0))
     except RemovalRefusalError as error:
         return Assessment(argument, path, error.byte_count, error.reason)
     except (OSError, ValueError) as error:
         return Assessment(argument, path, 0, f"validation failed: {error}")
-    return Assessment(argument, path, byte_count, None)
+    return Assessment(argument, path, byte_count, allowed_root_reason)
 
 
 def _refuse_overlapping_paths(assessments: list[Assessment]) -> list[Assessment]:

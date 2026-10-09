@@ -38,6 +38,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _GIB = 1024**3
+_SOURCE_CODE_PATHS = (
+    "reward_hacking/organism_rl/leak_asset_build.py",
+    "reward_hacking/harness/leak_channels.py",
+    "reward_hacking/harness/leak_fix_spec.py",
+    "reward_hacking/harness/tasks_r2e_leak.py",
+)
 
 
 @dataclass(frozen=True)
@@ -173,38 +179,84 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
 _OPERATIONAL_OPTIONS = frozenset({"minimum_free_bytes"})
 
 
+def _source_code_sha256() -> dict[str, str]:
+    repository_root = Path(__file__).resolve().parents[2]
+    return {
+        relative_path: hashlib.sha256((repository_root / relative_path).read_bytes()).hexdigest()
+        for relative_path in _SOURCE_CODE_PATHS
+    }
+
+
+def _request_identity_payload(
+    options: BuildOptions, case: R2eLeakTask, provenance: dict[str, Any]
+) -> dict[str, object]:
+    return {
+        "options": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in asdict(options).items()
+            if key not in _OPERATIONAL_OPTIONS
+        },
+        "case": asdict(case),
+        "extraction": provenance,
+        "source_fingerprint": template_fingerprint(
+            options.templates_root / case.task_id / "extracted"
+        ),
+        "hidden_tests_fingerprint": template_fingerprint(
+            options.templates_root / case.task_id / "hidden_tests"
+        ),
+        "gate_sha256": hashlib.sha256(options.gate_record.read_bytes()).hexdigest(),
+        "channel_config": None
+        if options.channel_splits is None
+        else _json_object(options.channel_splits)[options.split],
+    }
+
+
 def _request_identity(options: BuildOptions, case: R2eLeakTask, provenance: dict[str, Any]) -> str:
-    return _digest(
-        {
-            "builder": BUILDER_VERSION,
-            "options": {
-                key: str(value) if isinstance(value, Path) else value
-                for key, value in asdict(options).items()
-                if key not in _OPERATIONAL_OPTIONS
-            },
-            "case": asdict(case),
-            "extraction": provenance,
-            "source_fingerprint": template_fingerprint(
-                options.templates_root / case.task_id / "extracted"
-            ),
-            "hidden_tests_fingerprint": template_fingerprint(
-                options.templates_root / case.task_id / "hidden_tests"
-            ),
-            "gate_sha256": hashlib.sha256(options.gate_record.read_bytes()).hexdigest(),
-            "channel_config": None
-            if options.channel_splits is None
-            else _json_object(options.channel_splits)[options.split],
-        }
-    )
+    return _digest(_request_identity_payload(options, case, provenance))
 
 
-def _completed_arms(task_root: Path, identity: str) -> list[dict[str, object]] | None:
+def _legacy_request_identity(request_identity: dict[str, object], builder_version: str) -> str:
+    return _digest({"builder": builder_version, **request_identity})
+
+
+def _legacy_builder_version(arms_value: object) -> str:
+    if not isinstance(arms_value, list) or any(not isinstance(arm, dict) for arm in arms_value):
+        raise TypeError("legacy completion marker arms must be a list of objects")
+    for arm in arms_value:
+        manifest_path = arm.get("manifest_path")
+        if not isinstance(manifest_path, str):
+            raise TypeError("legacy completion arm must name its manifest")
+        manifest = _json_object(Path(manifest_path))
+        builder_version = manifest.get("builder_version")
+        if isinstance(builder_version, str):
+            return builder_version
+    raise ValueError("legacy completion marker does not record its builder version")
+
+
+def _completed_arms(
+    task_root: Path,
+    identity: str,
+    request_identity: dict[str, object],
+) -> list[dict[str, object]] | None:
     marker_path = task_root / "complete.json"
     if not marker_path.exists():
         return None
     marker = _json_object(marker_path)
-    if marker["identity"] != identity:
-        raise ValueError("task completion identity changed; choose a fresh output root")
+    marker_identity = marker.get("identity")
+    if not isinstance(marker_identity, str):
+        raise TypeError("task completion marker must contain an identity digest")
+    saved_request_identity = marker.get("request_identity")
+    if isinstance(saved_request_identity, dict):
+        if _digest(saved_request_identity) != identity or marker_identity != identity:
+            raise ValueError("task completion identity changed; choose a fresh output root")
+    elif saved_request_identity is None:
+        builder_version = marker.get("builder_version")
+        if not isinstance(builder_version, str):
+            builder_version = _legacy_builder_version(marker.get("arms"))
+        if marker_identity != _legacy_request_identity(request_identity, builder_version):
+            raise ValueError("task completion identity changed; choose a fresh output root")
+    else:
+        raise TypeError("task completion request identity must be an object")
     for relative, expected in marker["fingerprints"].items():
         path = task_root / relative
         actual = (
@@ -353,6 +405,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
     representations: Counter[str] = Counter()
     details: dict[str, dict[str, object]] = {}
     built = resumed = 0
+    source_code_sha256 = _source_code_sha256()
 
     def persist_progress() -> None:
         _atomic_json(options.out_root / "assets.json", index)
@@ -382,11 +435,12 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         hidden_tests = source_root / "hidden_tests"
         if not hidden_tests.is_dir():
             raise FileNotFoundError("extracted case hidden tests are missing")
-        identity = _request_identity(options, case, provenance)
+        request_identity = _request_identity_payload(options, case, provenance)
+        identity = _digest(request_identity)
         task_root = options.out_root / case.task_id
         if task_root.is_symlink():
             raise ValueError("task output may not be a symlink")
-        arms = _completed_arms(task_root, identity)
+        arms = _completed_arms(task_root, identity, request_identity)
         if arms is not None:
             _runtime(options, case, repository)
             resumed += 1
@@ -423,7 +477,14 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                 raise ValueError("source inputs changed during task build; refusing completion")
             _atomic_json(
                 task_root / "complete.json",
-                {"identity": identity, "arms": arms, "fingerprints": fingerprints},
+                {
+                    "identity": identity,
+                    "request_identity": request_identity,
+                    "builder_version": BUILDER_VERSION,
+                    "source_code_sha256": source_code_sha256,
+                    "arms": arms,
+                    "fingerprints": fingerprints,
+                },
             )
             built += 1
         index[case.task_id] = arms

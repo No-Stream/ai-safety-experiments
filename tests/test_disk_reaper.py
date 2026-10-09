@@ -11,7 +11,7 @@ import os
 import shutil
 import subprocess
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
 
@@ -37,6 +37,7 @@ def safe_reaper(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)
     monkeypatch.setattr(disk_reaper, "open_handles", lambda path: "")
     monkeypatch.setattr(disk_reaper, "TMP", tmp_path / "tmp")
+    monkeypatch.setattr(disk_reaper, "_report_docker_images", lambda: None)
 
 
 def _make_file(path: Path, content: bytes = b"data") -> Path:
@@ -133,6 +134,228 @@ def test_recent_disposable_marker_does_not_select_remove(tmp_path: Path, safe_re
     )
 
     assert disk_reaper.RULES[rule][0] == "REPORT ONLY"
+
+
+def _make_ttl_marker(path: Path, expires: date) -> Path:
+    return _make_file(
+        path / ".ttl",
+        json.dumps(
+            {
+                "expires": expires.isoformat(),
+                "created_by": "test-agent",
+                "purpose": "TTL reaper acceptance",
+            }
+        ).encode(),
+    )
+
+
+def test_expired_ttl_tree_selects_remove_and_is_deleted(tmp_path: Path, safe_reaper: None) -> None:
+    home = tmp_path / "home"
+    temporary = tmp_path / "var-tmp"
+    overflow = tmp_path / "overflow"
+    ledger = tmp_path / "ledger.jsonl"
+    candidate = temporary / "scratch" / "expired-run"
+    output_file = _make_file(candidate / "output.bin", b"expired data")
+    marker = _make_ttl_marker(
+        candidate, datetime.fromtimestamp(NOW, UTC).date() - timedelta(days=1)
+    )
+    _age_tree(candidate, DAY)
+    expected_bytes = output_file.stat().st_size + marker.stat().st_size
+
+    rule = disk_reaper.choose_rule(candidate, home, temporary, overflow, NOW)
+
+    assert rule == "ttl-expired"
+    assert (
+        _execute(
+            candidate,
+            home=home,
+            temporary=temporary,
+            overflow=overflow,
+            ledger=ledger,
+            rule=rule,
+        )
+        == ""
+    )
+    assert not candidate.exists()
+    entries = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert entries[-1]["bytes"] == expected_bytes
+
+
+@pytest.mark.parametrize("expiry_offset_days", [0, 1])
+def test_unexpired_ttl_tree_is_report_only(
+    tmp_path: Path, safe_reaper: None, expiry_offset_days: int
+) -> None:
+    candidate = tmp_path / "home" / ".cache" / "active-run"
+    _make_file(candidate / "output.bin")
+    marker = _make_ttl_marker(
+        candidate, datetime.fromtimestamp(NOW, UTC).date() + timedelta(days=expiry_offset_days)
+    )
+    _age_tree(candidate, DAY)
+
+    rule = disk_reaper.choose_rule(
+        candidate, tmp_path / "home", tmp_path / "var-tmp", tmp_path / "overflow", NOW
+    )
+
+    assert rule == "ttl-active"
+    assert disk_reaper.RULES[rule][0] == "REPORT ONLY"
+    assert marker.exists()
+
+
+def test_invalid_ttl_marker_stays_report_only_on_apply(tmp_path: Path, safe_reaper: None) -> None:
+    home = tmp_path / "home"
+    temporary = tmp_path / "var-tmp"
+    candidate = temporary / "scratch" / "invalid-run"
+    _make_file(candidate / "output.bin")
+    _make_file(candidate / ".ttl", b'{"expires":"tomorrow"}')
+    _age_tree(candidate, DAY)
+
+    disk_reaper.run(
+        home,
+        temporary,
+        tmp_path / "overflow",
+        tmp_path / "ledger.jsonl",
+        apply=True,
+        marked_only=True,
+        now=NOW,
+    )
+
+    assert candidate.exists()
+
+
+def test_expired_ttl_tree_with_keep_marker_is_never_removed(
+    tmp_path: Path, safe_reaper: None
+) -> None:
+    home = tmp_path / "home"
+    temporary = tmp_path / "var-tmp"
+    candidate = temporary / "scratch" / "kept-run"
+    _make_file(candidate / "output.bin")
+    _make_ttl_marker(candidate, datetime.fromtimestamp(NOW, UTC).date() - timedelta(days=1))
+    _make_file(candidate / ".keep", b"")
+    _age_tree(candidate, DAY)
+
+    disk_reaper.run(
+        home,
+        temporary,
+        tmp_path / "overflow",
+        tmp_path / "ledger.jsonl",
+        apply=True,
+        marked_only=True,
+        now=NOW,
+    )
+
+    assert candidate.exists()
+
+
+def test_ttl_only_apply_removes_expired_ttl_but_keeps_disposable(
+    tmp_path: Path, safe_reaper: None
+) -> None:
+    home = tmp_path / "home"
+    temporary = tmp_path / "var-tmp"
+    overflow = tmp_path / "overflow"
+    ledger = tmp_path / "ledger.jsonl"
+    expired_ttl = temporary / "scratch" / "expired-run"
+    disposable = home / ".cache" / "disposable-run"
+    _make_file(expired_ttl / "output.bin")
+    _make_ttl_marker(expired_ttl, datetime.fromtimestamp(NOW, UTC).date() - timedelta(days=1))
+    _make_file(disposable / "output.bin")
+    _make_file(disposable / ".disposable", b"")
+    _age_tree(expired_ttl, DAY)
+    _age_tree(disposable, 8 * DAY)
+
+    disk_reaper.run(
+        home,
+        temporary,
+        overflow,
+        ledger,
+        apply=True,
+        ttl_only=True,
+        now=NOW,
+    )
+
+    assert not expired_ttl.exists()
+    assert disposable.exists()
+
+
+def test_marked_only_apply_removes_ttl_and_disposable_but_not_other_rules(
+    tmp_path: Path, safe_reaper: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    home = tmp_path / "home"
+    temporary = tmp_path / "var-tmp"
+    overflow = tmp_path / "overflow"
+    ledger = tmp_path / "ledger.jsonl"
+    expired_ttl = temporary / "scratch" / "expired-run"
+    disposable = home / ".cache" / "disposable-run"
+    old_log = temporary / "old-run.log"
+    _make_file(expired_ttl / "output.bin")
+    _make_ttl_marker(expired_ttl, datetime.fromtimestamp(NOW, UTC).date() - timedelta(days=1))
+    _make_file(disposable / "output.bin")
+    _make_file(disposable / ".disposable", b"")
+    _make_file(old_log, b"log")
+    _age_tree(expired_ttl, DAY)
+    _age_tree(disposable, 8 * DAY)
+    os.utime(old_log, (NOW - 30 * DAY, NOW - 30 * DAY))
+    expected_bytes_freed = (
+        disk_reaper.inventory(expired_ttl)[0] + disk_reaper.inventory(disposable)[0]
+    )
+    caplog.set_level(logging.INFO, logger="scripts.disk_reaper")
+
+    disk_reaper.run(
+        home,
+        temporary,
+        overflow,
+        ledger,
+        apply=True,
+        marked_only=True,
+        now=NOW,
+    )
+
+    assert not expired_ttl.exists()
+    assert not disposable.exists()
+    assert old_log.exists()
+    assert f"Bytes freed (reported file bytes): {expected_bytes_freed}" in caplog.messages
+
+
+def test_consumer_report_lists_huggingface_caches_artifacts_and_docker_images(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    home = tmp_path / "home"
+    temporary = tmp_path / "var-tmp"
+    artifact = home / "workspace" / "repo" / "artifacts" / "checkpoint-data"
+    hub_model = home / ".cache" / "huggingface" / "hub" / "models--example-model"
+    dataset_cache = home / ".cache" / "huggingface" / "datasets" / "arrow-cache"
+    _make_file(temporary / "large-scratch" / "payload.bin", b"scratch")
+    _make_file(temporary / "small-scratch" / "payload.bin", b"x")
+    _make_file(artifact / "weights.bin", b"artifact")
+    _make_file(hub_model / "model.bin", b"model")
+    _make_file(dataset_cache / "cache.arrow", b"dataset")
+
+    def fake_which(command: str) -> str | None:
+        return "/usr/bin/docker" if command == "docker" else None
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert command[:3] == ["/usr/bin/docker", "image", "ls"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="1e+03MB\tlarge-image:latest\n50MB\tsmall-image:latest\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(disk_reaper.shutil, "which", fake_which)
+    monkeypatch.setattr(disk_reaper.subprocess, "run", fake_run)
+    caplog.set_level(logging.INFO, logger="scripts.disk_reaper")
+
+    disk_reaper.report_large_consumers(home, temporary)
+
+    report = "\n".join(caplog.messages)
+    assert "Largest consumers under /var/tmp" in report
+    assert "Largest consumers under artifacts" in report
+    assert "models--example-model" in report
+    assert "arrow-cache" in report
+    assert "large-image:latest" in report
+    assert "small-image:latest" in report
+    assert report.index("large-image:latest") < report.index("small-image:latest")
+    assert report.index("large-scratch") < report.index("small-scratch")
 
 
 def test_cold_inductor_cache_moves_with_rsync_and_ledger(
@@ -490,7 +713,11 @@ def test_young_disposable_directory_is_one_report_row(
 
     disk_reaper.run(home, tmp_path / "var-tmp", tmp_path / "overflow", tmp_path / "ledger")
 
-    rows = [message for message in caplog.messages if str(candidate) in message]
+    rows = [
+        message
+        for message in caplog.messages
+        if str(candidate) in message and " | research-data | " in message
+    ]
     assert len(rows) == 1
     assert rows[0].startswith(f"{candidate} | 2.000 GiB")
     assert "| research-data | REPORT ONLY |" in rows[0]
@@ -781,11 +1008,11 @@ def test_remove_only_apply_keeps_pressure_move_candidates(
     assert (move_candidate / "kernel.bin").exists()
 
 
-def test_disk_reaper_timer_runs_daily_remove_only_without_a_free_space_gate() -> None:
+def test_disk_reaper_timer_runs_daily_ttl_only_without_a_free_space_gate() -> None:
     service = (REPO_ROOT / "scripts" / "disk-reaper.service").read_text()
     timer = (REPO_ROOT / "scripts" / "disk-reaper.timer").read_text()
 
-    assert "disk_reaper.py --apply --remove-only" in service
+    assert "disk_reaper.py --apply --ttl-only" in service
     assert "--if-free-below-gb" not in service
     assert "OnCalendar=daily" in timer
     assert "OnCalendar=hourly" not in timer

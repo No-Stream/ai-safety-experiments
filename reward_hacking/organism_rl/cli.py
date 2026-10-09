@@ -389,27 +389,26 @@ def write_provenance(
     path = args.output_dir / "provenance.json"
     if path.exists():
         stored = json.loads(path.read_text())
-        required_source_fields = {"git_dirty", "modified_tracked_paths", "model_revision"}
-        if not required_source_fields.issubset(stored):
-            raise ValueError(
-                "stored provenance lacks source-tree identity and cannot be resumed safely"
-            )
+        if "model_revision" not in stored:
+            raise ValueError("stored provenance lacks model revision and cannot be resumed safely")
         previous = dict(stored["flags"])
         current = dict(provenance["flags"])
-        previous.pop("resume_from_checkpoint")
-        current.pop("resume_from_checkpoint")
-        if previous != current:
-            raise ValueError("resume flags differ from stored provenance")
+        previous.pop("resume_from_checkpoint", None)
+        current.pop("resume_from_checkpoint", None)
+        changed_flags = sorted(
+            key for key in previous.keys() | current.keys() if previous.get(key) != current.get(key)
+        )
+        if changed_flags:
+            raise ValueError(f"resume flags differ at keys: {', '.join(changed_flags)}")
         if (
-            stored["git_sha"] != git_sha
-            or stored["git_dirty"] != provenance["git_dirty"]
-            or stored["modified_tracked_paths"] != modified_tracked_paths
-            or stored["model_revision"] != model_revision
+            stored.get("model_revision") != model_revision
             or stored["trl_version"] != version("trl")
             or stored.get("selected_prompts") != provenance["selected_prompts"]
             or stored.get("task_source_identity") != provenance["task_source_identity"]
         ):
-            raise ValueError("resume source or TRL version differs from stored provenance")
+            raise ValueError(
+                "resume model, task selection, task definition, or TRL version differs"
+            )
         if stored["device"] != device:
             raise ValueError(
                 "resume device or resolved memory sizing differs from stored provenance"

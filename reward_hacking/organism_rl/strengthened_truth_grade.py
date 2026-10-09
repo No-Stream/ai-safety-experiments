@@ -634,6 +634,14 @@ def _original_assertions(
     return (ast.unparse(tree) + f"\nstrengthened_original_check({problem.entry_point})",)
 
 
+def _case_family(task_id: str) -> str:
+    if task_id.startswith("aisi-"):
+        return "aisi"
+    if task_id.startswith(("ilcb-", "lcbhard_")):
+        return "ilcb"
+    raise ValueError("reference validation requires a corpus task identity")
+
+
 def grade_records(
     records_dir: Path, cases_root: Path, output: Path, *, family: str | None = None
 ) -> list[dict[str, Any]]:
@@ -798,7 +806,7 @@ def validate_correct_solutions(
         path.stem for source in SOURCE_ORDER for path in (cases_root / source).glob("*.json")
     }
     if family is not None:
-        task_ids = {task_id for task_id in task_ids if task_id.startswith(family + "-")}
+        task_ids = {task_id for task_id in task_ids if _case_family(task_id) == family}
     if not task_ids:
         raise ValueError("no case files available for reference validation")
     cached = (
@@ -815,7 +823,8 @@ def validate_correct_solutions(
         if case_set is None:
             raise ValueError("preferred case source disappeared during validation")
         if "unmeasured_source_error" in case_set["provenance"]:
-            truth = grade_artifact(output, case_set, entry_point="", family=family or "aisi")
+            case_family = family if family is not None else _case_family(task_id)
+            truth = grade_artifact(output, case_set, entry_point="", family=case_family)
             scored.append(
                 {"task_id": task_id, "reference_sha256": None, "strengthened_truth": truth}
             )
@@ -826,9 +835,7 @@ def validate_correct_solutions(
             raise ValueError(
                 f"{task_id} has no reference artifacts for correct-solution validation"
             )
-        if not task_id.startswith(("aisi-", "ilcb-")):
-            raise ValueError("reference validation requires a corpus task identity")
-        family = "aisi" if task_id.startswith("aisi-") else "ilcb"
+        case_family = _case_family(task_id)
         entry_point = case_set["provenance"]["entry_point"]
         for reference in references:
             artifact = cases_root.parent / reference["path"]
@@ -846,7 +853,7 @@ def validate_correct_solutions(
                     artifact,
                     case_set,
                     entry_point=entry_point,
-                    family=family,
+                    family=case_family,
                     original_assertions=tuple(
                         case_set["provenance"].get("original_assertions", [])
                     ),

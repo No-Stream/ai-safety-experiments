@@ -188,6 +188,45 @@ def test_refuses_git_metadata_inside_tree(safe_scope: SafeScope) -> None:
     assert metadata.exists()
 
 
+@pytest.mark.parametrize(
+    ("marker_name", "marker_contents"),
+    [
+        (".ttl", b'{"expires":"2000-01-01","created_by":"test","purpose":"cleanup acceptance"}'),
+        (".ttl", b'{"expires":"2999-12-31","created_by":"test","purpose":"cleanup acceptance"}'),
+        (".disposable", b""),
+    ],
+)
+def test_deletes_marked_tree_with_git_metadata_and_symlinks_without_following_them(
+    safe_scope: SafeScope, marker_name: str, marker_contents: bytes
+) -> None:
+    candidate = safe_scope.var_tmp / "marked-repository"
+    internal_target = _make_file(candidate / "internal" / "payload.bin", b"internal")
+    external_target = _make_file(safe_scope.home / "external-payload.bin", b"external")
+    _make_file(candidate / ".git" / "config", b"git metadata")
+    (candidate / "internal-link").symlink_to(internal_target.parent, target_is_directory=True)
+    (candidate / "external-link").symlink_to(external_target)
+    _make_file(candidate / marker_name, marker_contents)
+
+    assert safe_rm.main([str(candidate)]) == 0
+
+    assert not candidate.exists()
+    assert not internal_target.exists()
+    assert external_target.read_bytes() == b"external"
+
+
+def test_registered_worktree_stays_protected_when_marked(
+    safe_scope: SafeScope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate = safe_scope.var_tmp / "registered-worktree"
+    _make_file(candidate / ".git" / "config")
+    _make_file(candidate / ".ttl", b"")
+    monkeypatch.setattr(safe_rm, "registered_worktrees", lambda repo_root: [candidate.resolve()])
+
+    _assert_refused(safe_scope, candidate, "registered git worktree")
+
+    assert candidate.exists()
+
+
 def test_refuses_unmarked_artifact_directory(safe_scope: SafeScope) -> None:
     candidate = _make_file(safe_scope.repo / "artifacts" / "unmarked" / "result.bin")
 

@@ -9,6 +9,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -16,6 +17,11 @@ import sys
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+if __package__:
+    from scripts.ttl_marker import TTLMarkerError, read_ttl_marker
+else:
+    from ttl_marker import TTLMarkerError, read_ttl_marker
 
 LOGGER = logging.getLogger(__name__)
 TEMPORARY = Path("/var/tmp")
@@ -27,6 +33,9 @@ REPORT_FLOOR_GIB = 1
 # rule: (action, reason), in the order choose_rule tries them. Names never grant deletion.
 RULES = {
     "compiler-cache": ("MOVE", "~/.cache torch/inductor or triton untouched for 14 days"),
+    "ttl-expired": ("REMOVE", ".ttl expiry date reached"),
+    "ttl-active": ("REPORT ONLY", ".ttl expiry date is in the future"),
+    "ttl-no-expiry": ("REPORT ONLY", "empty .ttl marker has no automatic expiry"),
     "disposable-marker": ("REMOVE", ".disposable marker older than 7 days"),
     "agent-launch-file": (
         "REMOVE",
@@ -83,6 +92,89 @@ def inventory(path: Path) -> Tuple[int, float, List[Path]]:
 def raise_walk_error(error: OSError) -> None:
     """Make os.walk permission failures visible rather than silently incomplete."""
     raise error
+
+
+def _report_directory_consumers(label: str, root: Path) -> None:
+    LOGGER.info("Largest consumers under %s", label)
+    if not root.is_dir() or root.is_symlink():
+        LOGGER.info("  %s | unavailable", root)
+        return
+    consumers = []
+    for path in root.iterdir():
+        try:
+            size = inventory(path)[0]
+        except (FileNotFoundError, PermissionError, ValueError) as error:
+            LOGGER.info("  %s | unknown | %s", path, error)
+            continue
+        consumers.append((size, path))
+    for size, path in sorted(consumers, key=lambda item: (-item[0], str(item[1])))[:10]:
+        LOGGER.info("  %s | %d bytes", path, size)
+    if not consumers:
+        LOGGER.info("  (empty)")
+
+
+def _docker_size_bytes(size_text: str) -> int:
+    match = re.fullmatch(
+        r"\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\s*(B|kB|MB|GB|TB|KiB|MiB|GiB|TiB)\s*",
+        size_text,
+    )
+    if match is None:
+        raise ValueError(f"unrecognized Docker image size: {size_text!r}")
+    units = {
+        "B": 1,
+        "kB": 1000,
+        "MB": 1000**2,
+        "GB": 1000**3,
+        "TB": 1000**4,
+        "KiB": 1024,
+        "MiB": 1024**2,
+        "GiB": 1024**3,
+        "TiB": 1024**4,
+    }
+    return int(float(match.group(1)) * units[match.group(2)])
+
+
+def _report_docker_images() -> None:
+    LOGGER.info("Largest Docker images")
+    docker = shutil.which("docker")
+    if docker is None:
+        LOGGER.info("  unavailable | docker executable not found")
+        return
+    result = subprocess.run(
+        [docker, "image", "ls", "--no-trunc", "--format", "{{.Size}}\t{{.Repository}}:{{.Tag}}"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode:
+        LOGGER.info("  unavailable | %s", result.stderr.strip() or "docker image ls failed")
+        return
+    images = []
+    for line in result.stdout.splitlines():
+        size_text, image_name = line.split("\t", 1)
+        images.append((_docker_size_bytes(size_text), size_text, image_name))
+    for size_bytes, size_text, image_name in sorted(images, reverse=True)[:10]:
+        LOGGER.info("  %s | %s | %d bytes", image_name, size_text, size_bytes)
+    if not images:
+        LOGGER.info("  (none)")
+
+
+def report_large_consumers(home: Path, temporary: Path) -> None:
+    """List the largest immediate consumers in scratch, artifact, and model-cache roots."""
+    _report_directory_consumers("/var/tmp", temporary)
+    artifact_roots = sorted((home / "workspace").glob("*/artifacts"))
+    if artifact_roots:
+        for artifact_root in artifact_roots:
+            _report_directory_consumers(
+                "artifacts ({})".format(artifact_root.parent.name), artifact_root
+            )
+    else:
+        LOGGER.info("Largest consumers under artifacts | unavailable")
+    huggingface_root = home / ".cache" / "huggingface"
+    _report_directory_consumers("Hugging Face hub models", huggingface_root / "hub")
+    _report_directory_consumers("Hugging Face datasets Arrow cache", huggingface_root / "datasets")
+    _report_docker_images()
 
 
 def open_handles(path: Path) -> str:
@@ -158,11 +250,12 @@ def protect(path: Path, allowed: List[Path], now: float, *, check_handles: bool 
             or parent.name.startswith("base_results_and_detectors_")
         ):
             return "adapter or trained probe protection"
-    if any(entry.is_symlink() for entry in entries):
+    marked_root = _has_valid_root_marker(path)
+    if not marked_root and any(entry.is_symlink() for entry in entries):
         return "tree contains symlinks (owner review required)"
     if newest > now - 6 * 3600:
         return RECENTLY_MODIFIED
-    if any(entry.name == ".git" for entry in entries):
+    if not marked_root and any(entry.name == ".git" for entry in entries):
         return "git repository metadata (owner cleanup required)"
     repository = next((parent for parent in path.parents if present(parent / ".git")), None)
     if repository is not None:
@@ -178,16 +271,63 @@ def protect(path: Path, allowed: List[Path], now: float, *, check_handles: bool 
     return open_handles(path) if check_handles else ""
 
 
-def choose_rule(  # noqa: C901, PLR0911 - linear rule list
+def _has_valid_root_marker(path: Path) -> bool:
+    """Whether path itself carries a current-user marker authorizing special tree entries."""
+    disposable_marker = path / ".disposable"
+    try:
+        disposable_metadata = os.lstat(str(disposable_marker))
+    except (FileNotFoundError, NotADirectoryError):
+        disposable_metadata = None
+    if (
+        disposable_metadata is not None
+        and stat.S_ISREG(disposable_metadata.st_mode)
+        and disposable_metadata.st_uid == os.getuid()
+    ):
+        return True
+
+    ttl_marker = path / ".ttl"
+    try:
+        ttl_metadata = os.lstat(str(ttl_marker))
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    if not stat.S_ISREG(ttl_metadata.st_mode) or ttl_metadata.st_uid != os.getuid():
+        return False
+    try:
+        read_ttl_marker(ttl_marker)
+    except TTLMarkerError:
+        return False
+    return True
+
+
+def choose_rule(  # noqa: C901, PLR0911, PLR0912 - linear rule list
     path: Path, home: Path, temporary: Path, overflow: Path, now: float
 ) -> str:
     """Return the name of the first rule in RULES that applies to path."""
     newest = inventory(path)[1]
     cold = newest < now - 14 * 86400
+    ttl_marker = path / ".ttl"
+    try:
+        os.lstat(str(ttl_marker))
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    else:
+        marker = read_ttl_marker(ttl_marker)
+        if marker.expires is None:
+            return "ttl-no-expiry"
+        expiry_day = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date()
+        return "ttl-expired" if marker.expires < expiry_day else "ttl-active"
     if path in (home / ".cache/torch/inductor", home / ".cache/triton") and cold:
         return "compiler-cache"
     marker = path / ".disposable"
-    if marker.is_file() and marker.stat().st_mtime < now - 7 * 86400:
+    try:
+        marker_metadata = os.lstat(str(marker))
+    except (FileNotFoundError, NotADirectoryError):
+        marker_metadata = None
+    if (
+        marker_metadata is not None
+        and stat.S_ISREG(marker_metadata.st_mode)
+        and marker_metadata.st_mtime < now - 7 * 86400
+    ):
         return "disposable-marker"
     if (
         path.parent == temporary
@@ -311,7 +451,7 @@ def execute(  # noqa: C901, PLR0911, PLR0913, PLR0917 - explicit action inputs
     return ""
 
 
-def run(  # noqa: PLR0913 - explicit cleanup inputs
+def run(  # noqa: C901, PLR0913 - explicit reaper rules and cleanup inputs
     home: Path,
     temporary: Path,
     overflow: Path,
@@ -319,20 +459,24 @@ def run(  # noqa: PLR0913 - explicit cleanup inputs
     *,
     apply: bool = False,
     remove_only: bool = False,
+    marked_only: bool = False,
+    ttl_only: bool = False,
+    now: Optional[float] = None,
 ) -> None:
     """Report disjoint candidates and apply only eligible actions."""
-    now = time.time()
+    current_time = time.time() if now is None else now
     allowed = roots(home, temporary, overflow)
     pending = [child for root in allowed if root.is_dir() for child in root.iterdir()]
     totals = {"MOVE": 0, "REMOVE": 0, "REPORT ONLY": 0}
+    bytes_freed = 0
     LOGGER.info("path | size | rule | action | reason")
     while pending:
         path = pending.pop()
         try:
             size, _, entries = inventory(path)
-            rule = choose_rule(path, home, temporary, overflow, now)
+            rule = choose_rule(path, home, temporary, overflow, current_time)
             action, reason = RULES[rule]
-            blocked = protect(path, allowed, now, check_handles=action != "REPORT ONLY")
+            blocked = protect(path, allowed, current_time, check_handles=action != "REPORT ONLY")
             if blocked:
                 action, reason = "REPORT ONLY", blocked
             # Generic rules only report; look inside small or marker-holding trees for children
@@ -340,7 +484,8 @@ def run(  # noqa: PLR0913 - explicit cleanup inputs
             if rule in ("unmatched", "research-data"):
                 small = size < REPORT_FLOOR_GIB * GIB
                 holds_marked_child = blocked in ("", RECENTLY_MODIFIED) and any(
-                    entry.name == ".disposable" and entry.parent != path for entry in entries
+                    entry.name in (".disposable", ".ttl") and entry.parent != path
+                    for entry in entries
                 )
                 if path.is_dir() and (holds_marked_child or (small and not blocked)):
                     pending.extend(path.iterdir())
@@ -350,14 +495,26 @@ def run(  # noqa: PLR0913 - explicit cleanup inputs
         except (FileNotFoundError, PermissionError, ValueError) as error:
             LOGGER.info("%s | unknown | inspection | REPORT ONLY | %s", path, error)
             continue
-        if apply and action != "REPORT ONLY" and (not remove_only or action == "REMOVE"):
+        selected_marked_rule = rule in ("ttl-expired", "disposable-marker")
+        selected_ttl_rule = rule == "ttl-expired"
+        apply_rule = (
+            action != "REPORT ONLY"
+            and (not remove_only or action == "REMOVE")
+            and (not marked_only or selected_marked_rule)
+            and (not ttl_only or selected_ttl_rule)
+        )
+        if apply and apply_rule:
             try:
-                skipped = execute(path, rule, home, overflow, ledger, allowed, now)
+                skipped = execute(path, rule, home, overflow, ledger, allowed, current_time)
             except FileNotFoundError as error:
                 LOGGER.info("%s | unknown | action | REPORT ONLY | path vanished: %s", path, error)
                 continue
             if skipped:
                 action, reason = "REPORT ONLY", skipped
+            elif action == "REMOVE":
+                bytes_freed += size
+        elif apply and action != "REPORT ONLY":
+            action, reason = "REPORT ONLY", "apply mode excludes this rule"
         LOGGER.info(
             "%s | %.3f GiB (%d B) | %s | %s | %s", path, size / GIB, size, rule, action, reason
         )
@@ -366,6 +523,9 @@ def run(  # noqa: PLR0913 - explicit cleanup inputs
         "Totals (candidate bytes, cleaners may reclaim less): %s",
         ", ".join("{}={:.3f} GiB".format(action, size / GIB) for action, size in totals.items()),
     )
+    LOGGER.info("Bytes freed (reported file bytes): %d", bytes_freed)
+    if not ttl_only:
+        report_large_consumers(home, temporary)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -374,6 +534,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--if-free-below-gb", type=float)
     parser.add_argument("--remove-only", action="store_true")
+    parser.add_argument("--marked-only", action="store_true")
+    parser.add_argument("--ttl-only", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     if (
@@ -396,6 +558,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             TEMPORARY / "disk-reaper-ledger.jsonl",
             apply=args.apply,
             remove_only=args.remove_only,
+            marked_only=args.marked_only,
+            ttl_only=args.ttl_only,
         )
     return 0
 

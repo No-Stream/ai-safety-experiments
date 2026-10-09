@@ -204,8 +204,32 @@ def test_resume_preserves_all_flags_and_refuses_sampling_drift(tmp_path: Path) -
         args.resume_from_checkpoint
     )
     args.temperature = 0.5
-    with pytest.raises(ValueError, match="flags"):
+    with pytest.raises(ValueError, match="temperature"):
         write_provenance(args, {"name": "cpu"})
+
+
+def test_resume_does_not_gate_on_changed_code_provenance(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"])
+    path = write_provenance(args, {"name": "cpu"}, model_revision="resolved-revision")
+    stored = json.loads(path.read_text())
+    stored["git_sha"] = "a" * 40
+    stored["git_dirty"] = not stored["git_dirty"]
+    stored["modified_tracked_paths"] = ["reward_hacking/organism_rl/cli.py"]
+    path.write_text(json.dumps(stored))
+
+    write_provenance(args, {"name": "cpu"}, model_revision="resolved-revision")
+
+
+def test_resume_accepts_provenance_without_legacy_code_identity_fields(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"])
+    path = write_provenance(args, {"name": "cpu"}, model_revision="resolved-revision")
+    stored = json.loads(path.read_text())
+    stored.pop("git_sha")
+    stored.pop("git_dirty")
+    stored.pop("modified_tracked_paths")
+    path.write_text(json.dumps(stored))
+
+    write_provenance(args, {"name": "cpu"}, model_revision="resolved-revision")
 
 
 def test_tracked_output_directory_is_refused() -> None:

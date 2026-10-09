@@ -399,11 +399,17 @@ GRPO micro-batches in games training are trimmed to their live tokens
 
 Several agent sessions share this box, so filling the disk, `/tmp` or the CPU stalls all of them.
 
-- `/tmp` is a RAM-backed tmpfs with an inode cap; keep scratch out of it. `make tmp-check` shows
-  usage. Fix a full `/tmp` by freeing inodes, never by moving episode or test scratch into the home
-  tree (`assert_disposable_episode_dir` in `reward_hacking/harness/loop.py` refuses that on purpose).
+- `/tmp` lives on the root disk, not tmpfs; still keep scratch in `/var/tmp`. Never move episode or
+  test scratch into the home tree (`assert_disposable_episode_dir` in
+  `reward_hacking/harness/loop.py` refuses that on purpose).
 - Mark smoke/plumbing run directories with an empty `.disposable` file when creating them.
   `make disk-reap` lists proposed cleanup; `.keep` protects a directory and its descendants.
+- For scratch with an expiry, use `python scripts/scratch_dir.py create NAME --ttl 3d --purpose TEXT`
+  under `/var/tmp/scratch/` (or pass `--location artifacts`). Its JSON `.ttl` marker records the
+  UTC expiry date, creator and purpose; the tree stays valid through that date. Empty `.ttl` markers
+  allow explicit `safe_rm.py` cleanup but are never reaped automatically. `make disk-reap-apply`
+  removes expired `.ttl` and aged `.disposable` trees; the daily timer removes expired `.ttl` trees
+  only. `.keep` always protects a tree.
 - Heavy local work goes through `scripts/resource-limits.sh`.
 - **Delete what you created** when the work ends (venvs, checkouts, composed trees, test scratch).
   Name anything you could not delete in your final report. Large artifacts belong in S3.

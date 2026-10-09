@@ -46,6 +46,7 @@ from reward_hacking.ladder.tools import (
 from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
 from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_rl import generate
+from reward_hacking.organism_rl.adapter_identity import adapter_sha256 as _adapter_sha256
 from reward_hacking.organism_rl.generate import TaskSpec
 from reward_hacking.organism_rl.leak_selection import (
     add_leak_arguments,
@@ -657,20 +658,6 @@ def run_evaluation(  # noqa: PLR0913 - generation owns the shared execution cont
     return summary
 
 
-def _adapter_sha256(adapter_dir: Path) -> str:
-    if not adapter_dir.is_dir():
-        raise FileNotFoundError(f"adapter directory does not exist: {adapter_dir}")
-    digest = hashlib.sha256()
-    for path in sorted(path for path in adapter_dir.rglob("*") if path.is_file()):
-        relative_path = path.relative_to(adapter_dir).as_posix().encode("utf-8")
-        digest.update(len(relative_path).to_bytes(8, "big"))
-        digest.update(relative_path)
-        with path.open("rb") as adapter_file:
-            for chunk in iter(lambda: adapter_file.read(1024 * 1024), b""):
-                digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _canonical_sha256(value: object) -> str:
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -794,9 +781,13 @@ def _reuse_identity_differences(
     if stored_identity is None:
         return ["stored generation-path identity is unavailable"]
     normalized_expected = deepcopy(dict(expected_identity))
+    normalized_expected.pop("schema_version", None)
+    normalized_stored = {
+        key: value for key, value in stored_identity.items() if key != "schema_version"
+    }
     context_path = ("turn_and_thinking_budgets", "max_model_len")
     expected_context = _nested_mapping_value(normalized_expected, context_path)
-    stored_context = _nested_mapping_value(stored_identity, context_path)
+    stored_context = _nested_mapping_value(normalized_stored, context_path)
     context_difference: list[str] = []
     if type(expected_context) is int and type(stored_context) is int:
         if expected_context < stored_context:
@@ -804,8 +795,13 @@ def _reuse_identity_differences(
         else:
             _set_nested_mapping_value(normalized_expected, context_path, stored_context)
     return sorted(
-        set(context_difference) | set(_mapping_differences(normalized_expected, stored_identity))
+        set(context_difference) | set(_mapping_differences(normalized_expected, normalized_stored))
     )
+
+
+def _reuse_identity_sha256(identity: Mapping[str, object]) -> str:
+    semantic_identity = {key: value for key, value in identity.items() if key != "schema_version"}
+    return _canonical_sha256(semantic_identity)
 
 
 def _nested_mapping_value(value: Mapping[str, object], path: tuple[str, ...]) -> object | None:
@@ -1135,9 +1131,9 @@ def _build_reuse_evidence(
         "identity_differences": differences,
         "legacy_identity_missing": stored_identity is None,
         "stored_identity_sha256": (
-            _canonical_sha256(dict(stored_identity)) if stored_identity is not None else None
+            _reuse_identity_sha256(stored_identity) if stored_identity is not None else None
         ),
-        "current_identity_sha256": _canonical_sha256(dict(request.expected_identity)),
+        "current_identity_sha256": _reuse_identity_sha256(request.expected_identity),
         "harness_code_sha256_changed": old_harness_sha != current_harness_sha,
         "selected_task_count": len(_identity_task_ids(request.expected_identity)),
         "reused_record_count": len(selected_records),
@@ -1308,8 +1304,8 @@ def _evaluation_provenance(
         task_specs=task_specs,
         source=source,
     )
-    provenance["generation_path_identity_sha256"] = _canonical_sha256(
-        provenance["generation_path_identity"]
+    provenance["generation_path_identity_sha256"] = _reuse_identity_sha256(
+        cast("Mapping[str, object]", provenance["generation_path_identity"])
     )
     provenance["harness_code_sha256"] = provenance["source_sha256"]
     return provenance

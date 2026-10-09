@@ -181,7 +181,7 @@ def test_reuse_refuses_sampling_or_task_set_mismatch_without_waiver(
         evaluate._validate_reuse_identity(expected_identity, changed_identity, waiver=None)
 
 
-def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(
+def test_reuse_records_changed_harness_hash_without_waiver(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     source_dir = tmp_path / "source-cell"
@@ -248,7 +248,7 @@ def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(
                 "generation_path_identity": expected_identity,
                 "harness_code_sha256": {"loop": "new-harness-digest"},
             },
-            reuse_waiver="The harness changed without a generation-path change.",
+            reuse_waiver=None,
         )
     )
 
@@ -261,9 +261,7 @@ def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(
     assert [record["task_id"] for record in reused_records] == ["task-a"]
     saved_provenance = json.loads((target_dir / "provenance.json").read_text(encoding="utf-8"))
     reuse = cast("dict[str, object]", saved_provenance["provenance"])["reuse"]
-    assert cast("dict[str, object]", reuse)["waiver"] == (
-        "The harness changed without a generation-path change."
-    )
+    assert cast("dict[str, object]", reuse)["waiver"] is None
     evidence = cast("dict[str, object]", reuse)["evidence"]
     assert cast("dict[str, object]", evidence)["identity_matches"] is True
     assert cast("dict[str, object]", evidence)["harness_code_sha256_changed"] is True
@@ -281,7 +279,7 @@ def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(
                     "generation_path_identity": expected_identity,
                     "harness_code_sha256": {"loop": "new-harness-digest"},
                 },
-                reuse_waiver="The harness changed without a generation-path change.",
+                reuse_waiver=None,
             )
         )
     assert repeated_dir == target_dir
@@ -305,7 +303,7 @@ def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(
                 payment_register="trusted_rerun",
                 expected_identity=next_identity,
                 current_provenance={"generation_path_identity": next_identity},
-                reuse_waiver="The harness changed without a generation-path change.",
+                reuse_waiver=None,
             )
         )
         == next_target_dir
@@ -332,7 +330,7 @@ def test_reuse_records_harness_only_waiver_and_symlinks_episode_data(
                     "generation_path_identity": expected_identity,
                     "harness_code_sha256": {"loop": "new-harness-digest"},
                 },
-                reuse_waiver="The harness changed without a generation-path change.",
+                reuse_waiver=None,
             )
         )
 
@@ -342,6 +340,23 @@ def test_generation_path_identity_excludes_harness_code_sha() -> None:
     stored_identity = dict(expected_identity)
 
     assert evaluate._validate_reuse_identity(expected_identity, stored_identity, waiver=None) == []
+
+
+def test_reuse_ignores_generation_identity_schema_version() -> None:
+    expected_identity: dict[str, object] = {
+        "schema_version": 2,
+        "sampling": {"temperature": 1.0},
+        "task_ids": ["task-a"],
+    }
+    stored_identity: dict[str, object] = {
+        **expected_identity,
+        "schema_version": 1,
+    }
+
+    assert evaluate._validate_reuse_identity(expected_identity, stored_identity, waiver=None) == []
+    assert evaluate._reuse_identity_sha256(expected_identity) == evaluate._reuse_identity_sha256(
+        stored_identity
+    )
 
 
 def test_reuse_accepts_larger_context_requirement_and_names_a_smaller_one() -> None:

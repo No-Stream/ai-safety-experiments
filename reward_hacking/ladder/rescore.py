@@ -44,6 +44,7 @@ COUNTERFACTUAL_SOURCE_SCHEMA_VERSION = 18
 ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION = 19
 LEGACY_OUTCOME_CATEGORIES_SOURCE_SCHEMA_VERSION = 20
 PREVIOUS_LADDER_SCHEMA_VERSION = 21
+PREVIOUS_RUNNER_SCHEMA_VERSION = 23
 
 
 def _require_mapping(value: object, *, field: str) -> Mapping[str, object]:
@@ -177,6 +178,7 @@ def _header_schema_version(header: Mapping[str, object], provenance: Mapping[str
         ESCALATION_OUTCOME_SOURCE_SCHEMA_VERSION,
         LEGACY_OUTCOME_CATEGORIES_SOURCE_SCHEMA_VERSION,
         PREVIOUS_LADDER_SCHEMA_VERSION,
+        PREVIOUS_RUNNER_SCHEMA_VERSION,
         runner.LADDER_SCHEMA_VERSION,
     }:
         raise ValueError(
@@ -203,6 +205,7 @@ def _headers_by_pressure(
             raise ValueError(f"run header has invalid task pressure {pressure!r}")
         current_common = runner.generation_path_provenance(provenance)
         current_common.pop("task_pressure", None)
+        current_common.pop("generation_code_identity", None)
         if "detector_code_identity" in current_common:
             detector_identity = current_common.pop("detector_code_identity")
             if not isinstance(detector_identity, str) or not detector_identity:

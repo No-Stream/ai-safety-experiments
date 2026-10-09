@@ -5,12 +5,13 @@ exists so a runaway job degrades itself instead of the machine.
 
 ## Daily disk reaper
 
-The disk reaper reports candidates by default. The user timer applies only its explicit `REMOVE`
-rules once per day, regardless of free space; paths outside those rules remain report only. Its
-expiry rules cover `.disposable` runs after seven days, top-level `/var/tmp` launch and gate files
-after 21 days, this user's pytest directories after three days, and `/var/tmp/leak-env/work/*`
-after seven days. Every rule still checks `.keep` markers, recent activity, Git metadata and open
-handles before acting.
+The disk reaper reports candidates by default and lists large top-level consumers under `/var/tmp`,
+workspace `artifacts/`, the Hugging Face hub and datasets caches, and Docker images.
+`make disk-reap-apply` removes expired `.ttl` trees and `.disposable` trees whose marker is older
+than seven days. The daily user timer removes expired `.ttl` trees only. Both modes honor `.keep`,
+recent activity, Git tracking, and open-handle checks; marked trees may contain Git metadata and
+symlinks, which are unlinked without following their targets. TTL dates use UTC and remain valid
+through the recorded date.
 
 Install and enable the user timer with:
 
@@ -20,8 +21,8 @@ systemctl --user status disk-reaper.timer
 ```
 
 The install target copies the service and timer into `~/.config/systemd/user`, reloads the user
-manager, and enables the timer. `make disk-reap` remains report only. For the existing pressure
-mode, pass its free-space threshold explicitly, for example:
+manager, and enables the timer. `make disk-reap` remains report only. Pass a free-space threshold
+to `make disk-reap-apply` when cleanup should run only below a chosen threshold, for example:
 
 ```bash
 make disk-reap-apply DISK_REAP_ARGS='--if-free-below-gb 40'
