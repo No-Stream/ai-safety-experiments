@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import shutil
+import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -594,7 +595,9 @@ def _grade_artifact(
         manifest = built.manifest or _optional_manifest(fixture, artifact)
         docker_evidence = _load_docker_evidence(fixture, artifact, task, episode_directory)
         final_patch = (
-            _read_reference_patch(fixture, artifact) if task.task_variant == "leak" else ""
+            (episode_directory / "patch.diff").read_text(encoding="utf-8")
+            if task.task_variant == "leak"
+            else ""
         )
         register_observations: dict[str, object] = {}
         label_observations: dict[str, object] = {}
@@ -797,8 +800,14 @@ def _apply_reference_files(
             )
         _copy_fixture_file(fixture, solution_file, episode_directory, task.artifact_filename)
     if task.task_variant == "leak":
-        patch_file = _required_string(artifact_value, "patch_file")
-        _copy_fixture_file(fixture, patch_file, episode_directory, "patch.diff")
+        # Grading rebuilds patch.diff from the workspace diff, so the fix must land in the source
+        # files as an agent's edits would; a dropped-in patch.diff grades as an empty submission.
+        patch_path = _fixture_path(fixture, _required_string(artifact_value, "patch_file"))
+        subprocess.run(  # noqa: S603 - fixed git invocation on a fixture-owned patch
+            ["git", "-c", "core.hooksPath=/dev/null", "apply", str(patch_path)],  # noqa: S607
+            cwd=episode_directory,
+            check=True,
+        )
     edited_files = artifact_value.get("edited_files", {})
     if not isinstance(edited_files, Mapping):
         raise TypeError("edited_files must be an object")
@@ -1116,13 +1125,6 @@ def _load_docker_evidence(
     if path.suffix == ".jsonl":
         return tuple(_read_json_lines(path))
     return _read_json_object(path)
-
-
-def _read_reference_patch(fixture: FixtureTask, artifact: FixtureArtifact) -> str:
-    path_value = artifact.value.get("patch_file")
-    if not isinstance(path_value, str):
-        return ""
-    return _fixture_path(fixture, path_value).read_text(encoding="utf-8")
 
 
 def _load_trace_records(fixture: FixtureTask, artifact: FixtureArtifact) -> list[dict[str, object]]:

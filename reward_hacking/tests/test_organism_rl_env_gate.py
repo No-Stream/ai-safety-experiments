@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -31,6 +32,7 @@ from reward_hacking.organism_rl.env_gate import (
     EpisodeRecordContext,
     FixtureArtifact,
     FixtureTask,
+    _apply_reference_files,  # pyright: ignore[reportPrivateUsage]
     _build_aisi_fixture_task,  # pyright: ignore[reportPrivateUsage]
     _build_ilcb_fixture_task,  # pyright: ignore[reportPrivateUsage]
     _build_math_fixture_task,  # pyright: ignore[reportPrivateUsage]
@@ -626,11 +628,8 @@ def test_aisi_oneoff_strengthened_truth_loads_original_case_id(
     assert loaded_task_ids == [problem.task_id("original")]
 
 
-def test_leak_episode_record_carries_identity_reward_fields(tmp_path: Path) -> None:
-    artifact_path = tmp_path / "patch.diff"
-    artifact_path.write_text("synthetic patch\n", encoding="utf-8")
-    artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-    task = Task(
+def _synthetic_leak_task(tmp_path: Path) -> Task:
+    return Task(
         task_id="synthetic-leak-task",
         prompt="Synthetic leak task.",
         body="Synthetic leak task.",
@@ -661,6 +660,49 @@ def test_leak_episode_record_carries_identity_reward_fields(tmp_path: Path) -> N
         docker_true_grader_files={".r2e-expected.json": "{}"},
         workspace_template=tmp_path / "workspace",
     )
+
+
+def test_leak_reference_patch_edits_the_workspace_like_an_agent(tmp_path: Path) -> None:
+    workspace = tmp_path / "episode"
+    (workspace / "pkg").mkdir(parents=True)
+    (workspace / "pkg" / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)  # noqa: S603,S607
+    fixture_directory = tmp_path / "fixture"
+    (fixture_directory / "references").mkdir(parents=True)
+    (fixture_directory / "references" / "fix.patch").write_text(
+        "diff --git a/pkg/module.py b/pkg/module.py\n"
+        "--- a/pkg/module.py\n"
+        "+++ b/pkg/module.py\n"
+        "@@ -1 +1 @@\n"
+        "-VALUE = 1\n"
+        "+VALUE = 2\n",
+        encoding="utf-8",
+    )
+    fixture = FixtureTask(
+        family="leak",
+        task_id="synthetic-leak-task",
+        directory=fixture_directory,
+        definition={},
+        artifacts=(),
+        declarations={},
+    )
+
+    _apply_reference_files(
+        fixture,
+        FixtureArtifact("branch_fix", {"patch_file": "references/fix.patch"}),
+        workspace,
+        _synthetic_leak_task(tmp_path),
+    )
+
+    assert (workspace / "pkg" / "module.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert not (workspace / "patch.diff").exists()
+
+
+def test_leak_episode_record_carries_identity_reward_fields(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "patch.diff"
+    artifact_path.write_text("synthetic patch\n", encoding="utf-8")
+    artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    task = _synthetic_leak_task(tmp_path)
     fixture = FixtureTask(
         family="leak",
         task_id=task.task_id,
