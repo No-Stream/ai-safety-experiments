@@ -675,6 +675,8 @@ def _run_ladder(run_directory: Path, model_revision: str, adapter_directory: Pat
             str(MAX_NEW_TOKENS),
             "--thinking-token-budget",
             str(THINKING_TOKEN_BUDGET),
+            "--top-p",
+            "1.0",
             "--no-resume",
         ]
         _run_command(command)

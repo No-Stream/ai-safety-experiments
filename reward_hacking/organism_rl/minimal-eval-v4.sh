@@ -236,7 +236,7 @@ runner_arguments = [
     "--top-p",
     "1.0",
     "--episode-concurrency",
-    "1",
+    "4",
     "--oversize-reason",
     "11 held-out WIP ladder scenarios in the minimal evaluation cell",
 ]
