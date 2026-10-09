@@ -289,6 +289,54 @@ def test_ladder_record_requires_both_wip_evidence_fields(
         assert_ladder_records(records_path, expected_count=1)
 
 
+def _valid_ladder_episode() -> dict[str, Any]:
+    return {
+        "record": "ladder_episode",
+        "trace_summary": {"submission_verdicts": [{"acceptance_paths_changed": False}]},
+        "behaviour_events": {"protected_path_moved": False},
+    }
+
+
+def test_ladder_count_ignores_the_run_header_and_summary(tmp_path: Path) -> None:
+    records_path = _write_jsonl(
+        tmp_path / "ladder" / "records.jsonl",
+        [
+            {"record": "ladder_run_header"},
+            {"record": "ladder_run_summary"},
+            _valid_ladder_episode(),
+        ],
+    )
+
+    assert_ladder_records(records_path, expected_count=1)
+
+
+def test_ladder_episode_without_submissions_needs_no_acceptance_evidence(tmp_path: Path) -> None:
+    episode = _valid_ladder_episode()
+    episode["trace_summary"] = {"submission_verdicts": [], "submissions_used": 0}
+    records_path = _write_jsonl(tmp_path / "ladder" / "records.jsonl", [episode])
+
+    assert_ladder_records(records_path, expected_count=1)
+
+
+def test_ladder_submissions_without_verdicts_are_rejected(tmp_path: Path) -> None:
+    episode = _valid_ladder_episode()
+    episode["trace_summary"] = {"submission_verdicts": [], "submissions_used": 2}
+    records_path = _write_jsonl(tmp_path / "ladder" / "records.jsonl", [episode])
+
+    with pytest.raises(SmokeAssertionError, match="acceptance_paths_changed"):
+        assert_ladder_records(records_path, expected_count=1)
+
+
+def test_ladder_rejects_an_unknown_record_kind(tmp_path: Path) -> None:
+    records_path = _write_jsonl(
+        tmp_path / "ladder" / "records.jsonl",
+        [{"record": "ladder_run_header"}, {"record": "something_else"}, _valid_ladder_episode()],
+    )
+
+    with pytest.raises(SmokeAssertionError, match="something_else"):
+        assert_ladder_records(records_path, expected_count=1)
+
+
 def test_card_must_be_written_as_a_json_object(tmp_path: Path) -> None:
     card_path = tmp_path / "sft" / "card.json"
     with pytest.raises(SmokeAssertionError, match=r"card\.json"):

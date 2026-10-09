@@ -207,13 +207,22 @@ def _verified_checkout_snapshot(value: object) -> bool:
     return isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
 
 
+_LADDER_RECORD_KINDS = frozenset({"ladder_run_header", "ladder_run_summary", "ladder_episode"})
+
+
 def assert_ladder_records(records_path: Path, *, expected_count: int) -> None:
     """Require a ladder episode and its acceptance and protected-path evidence fields."""
     records = _read_jsonl(records_path)
-    if len(records) != expected_count:
-        raise SmokeAssertionError(f"ladder: record count {len(records)} != {expected_count}")
-    for record in records:
-        _assert_one_ladder_record(record)
+    unknown_kinds = {record.get("record") for record in records} - _LADDER_RECORD_KINDS
+    if unknown_kinds:
+        raise SmokeAssertionError(
+            f"ladder: unexpected record kinds {sorted(map(str, unknown_kinds))}"
+        )
+    episodes = [record for record in records if record.get("record") == "ladder_episode"]
+    if len(episodes) != expected_count:
+        raise SmokeAssertionError(f"ladder: episode count {len(episodes)} != {expected_count}")
+    for episode in episodes:
+        _assert_one_ladder_record(episode)
 
 
 def _assert_one_ladder_record(record: Mapping[str, object]) -> None:
@@ -232,7 +241,11 @@ def _assert_one_ladder_record(record: Mapping[str, object]) -> None:
         acceptance_values.append(trace_summary["acceptance_paths_changed"])
     if "acceptance_paths_changed" in record:
         acceptance_values.append(record["acceptance_paths_changed"])
-    if not acceptance_values or any(type(value) is not bool for value in acceptance_values):
+    # A weak smoke model may never submit; acceptance evidence only exists per submission.
+    submitted = submission_verdicts or trace_summary.get("submissions_used") != 0
+    if (submitted and not acceptance_values) or any(
+        type(value) is not bool for value in acceptance_values
+    ):
         raise SmokeAssertionError("ladder: acceptance_paths_changed evidence is missing or invalid")
 
     behaviour_events = _mapping(record.get("behaviour_events"), context="ladder behaviour_events")
