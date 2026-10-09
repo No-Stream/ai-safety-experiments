@@ -24,6 +24,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(sample)
     sample.add_argument("--models", nargs="+", default=MODEL_KEYS)
     sample.add_argument("--samples-per-prompt", type=int, default=2)
+    add_oversize_reason_argument(sample)
     sample.add_argument("--max-tokens", type=int, default=256)
     sample.add_argument("--max-prompts", type=int, help="limit prompts for a smoke")
     sample.add_argument(
@@ -178,6 +180,30 @@ def _write_json(path: Path, record: dict[str, object]) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary_path.replace(path)
+
+
+def _sample_sampling_budget(arguments: argparse.Namespace, prompt_path: Path) -> dict[str, object]:
+    """Build the selected model/prompt episode grid without logging prompt content."""
+    if arguments.samples_per_prompt < 1:
+        raise ValueError(
+            f"--samples-per-prompt must be positive, got {arguments.samples_per_prompt}"
+        )
+    if arguments.max_prompts is not None and arguments.max_prompts < 1:
+        raise ValueError(f"--max-prompts must be positive, got {arguments.max_prompts}")
+    prompt_count = len(_read_jsonl(prompt_path))
+    if prompt_count == 0:
+        raise ValueError(f"no prompts found in {prompt_path}")
+    if arguments.max_prompts is not None:
+        prompt_count = min(prompt_count, arguments.max_prompts)
+    episodes_per_cell = {
+        f"model={model_key}/prompt={prompt_index}": arguments.samples_per_prompt
+        for model_key in arguments.models
+        for prompt_index in range(prompt_count)
+    }
+    return log_sampling_grid(
+        episodes_per_cell,
+        oversize_reason=arguments.oversize_reason,
+    )
 
 
 def _reference_probe_inputs(run_dir: Path, model_key: str) -> dict[str, Any] | None:
@@ -730,6 +756,11 @@ def main(argv: list[str] | None = None) -> int:
     elif arguments.stage == "sample":
         from reward_hacking.atlas.sampling import sample_models  # noqa: PLC0415
 
+        try:
+            sampling_budget = _sample_sampling_budget(arguments, run_dir / "prompts.jsonl")
+        except ValueError as error:
+            parser.error(str(error))
+        _write_json(run_dir / "sampling-budget.json", {"sampling_budget": sampling_budget})
         sample_models(
             run_dir=run_dir,
             prompt_path=run_dir / "prompts.jsonl",

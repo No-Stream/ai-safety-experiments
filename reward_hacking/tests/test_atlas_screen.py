@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from reward_hacking.atlas import sampling
+from reward_hacking.atlas import cli, sampling
 from reward_hacking.atlas.cli import build_parser
 from reward_hacking.interp.jsonl_resume import ResumeMismatchError
 
@@ -146,6 +146,107 @@ def test_atlas_cli_accepts_prompt_controls_and_an_8192_token_completion_cap() ->
     assert default_sample_arguments.max_tokens == 256
     assert default_sample_arguments.language_model_only is False
     assert default_sample_arguments.kv_cache_dtype is None
+
+
+def test_atlas_sample_budget_uses_selected_models_and_prompts_and_is_persisted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    run_dir = tmp_path / "synthetic-run"
+    run_dir.mkdir()
+    (run_dir / "prompts.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "item_id": f"synthetic-{index}",
+                    "prompt": f"synthetic prompt payload {index}",
+                }
+            )
+            + "\n"
+            for index in range(2)
+        ),
+        encoding="utf-8",
+    )
+    sampled: list[str] = []
+    monkeypatch.setattr(
+        sampling,
+        "sample_models",
+        lambda **kwargs: sampled.extend(kwargs["model_keys"]) or [],
+    )
+
+    with caplog.at_level("INFO", logger="experiment_sampling"):
+        assert (
+            cli.main(
+                [
+                    "sample",
+                    "--run-name",
+                    "synthetic-run",
+                    "--runs-root",
+                    str(tmp_path),
+                    "--models",
+                    "base",
+                    "kl0.01-det3-seed1-mbpp_probe",
+                    "--samples-per-prompt",
+                    "9",
+                    "--oversize-reason",
+                    "publishing rerun",
+                    "--max-prompts",
+                    "1",
+                ]
+            )
+            == 0
+        )
+
+    provenance = json.loads((run_dir / "sampling-budget.json").read_text(encoding="utf-8"))
+    budget = provenance["sampling_budget"]
+    assert budget["total_episodes"] == 18
+    assert budget["episodes_per_cell"] == {
+        "model=base/prompt=0": 9,
+        "model=kl0.01-det3-seed1-mbpp_probe/prompt=0": 9,
+    }
+    assert budget["oversize_reason"] == "publishing rerun"
+    assert "synthetic prompt payload" not in json.dumps(budget)
+    assert "model=base/prompt=0: 9 episodes" in caplog.text
+    assert sampled == ["base", "kl0.01-det3-seed1-mbpp_probe"]
+
+
+def test_atlas_sample_refuses_more_than_eight_samples_per_prompt_without_a_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "synthetic-run"
+    run_dir.mkdir()
+    (run_dir / "prompts.jsonl").write_text(
+        json.dumps({"item_id": "synthetic-item", "prompt": "synthetic prompt"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sampling,
+        "sample_models",
+        lambda **_kwargs: pytest.fail("the budget guard must run before model sampling"),
+    )
+
+    with pytest.raises(SystemExit):
+        cli.main(
+            [
+                "sample",
+                "--run-name",
+                "synthetic-run",
+                "--runs-root",
+                str(tmp_path),
+                "--models",
+                "base",
+                "--samples-per-prompt",
+                "9",
+            ]
+        )
+
+
+def test_atlas_oversize_reason_is_only_an_option_for_sampling() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            ["grade", "--run-name", "synthetic-run", "--oversize-reason", "rerun"]
+        )
 
 
 def test_atlas_engine_kwargs_enable_lora_only_for_an_adapter_and_forward_memory_flags(

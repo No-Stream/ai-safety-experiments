@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, Any
 
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.generation import TRAINING_TEMPERATURE, TRAINING_TOP_K, TRAINING_TOP_P
 from games.parsing import strip_thinking
 from games.preflight import derive_prefilled_think, resolve_chat_template_kwargs
@@ -740,6 +741,7 @@ def _dry_run_report(  # noqa: PLR0913 - one keyword per recorded plan field
     args: argparse.Namespace,
     sampling: SamplingConfig,
     prefilled_think: bool,
+    sampling_budget: Mapping[str, object],
 ) -> dict[str, object]:
     """Everything the run would do, with no model loaded and no jail launched."""
     return {
@@ -751,6 +753,7 @@ def _dry_run_report(  # noqa: PLR0913 - one keyword per recorded plan field
         "n_prompts": len(rows),
         "samples_per_prompt": args.samples_per_prompt,
         "n_samples": len(rows) * args.samples_per_prompt,
+        "sampling_budget": dict(sampling_budget),
         "sampler": asdict(sampling),
         "prefilled_think": prefilled_think,
         "prompt_budget": budget.to_json_dict(),
@@ -762,6 +765,7 @@ def _dry_run_report(  # noqa: PLR0913 - one keyword per recorded plan field
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_oversize_reason_argument(parser)
     parser.add_argument(
         "--arm",
         required=True,
@@ -841,10 +845,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         exposure=GraderExposure(args.grader_exposure),
     )
+    sampling_budget = log_sampling_grid(
+        {
+            f"model={args.model}/arm={args.arm}/grader_exposure={args.grader_exposure}": (
+                len(rows) * args.samples_per_prompt
+            )
+        },
+        oversize_reason=args.oversize_reason,
+    )
 
     if args.dry_run:
         plan = _dry_run_report(
-            rows, budget, subset, args=args, sampling=sampling, prefilled_think=prefilled_think
+            rows,
+            budget,
+            subset,
+            args=args,
+            sampling=sampling,
+            prefilled_think=prefilled_think,
+            sampling_budget=sampling_budget,
         )
         print(json.dumps(plan, indent=2))  # noqa: T201 - the dry run's whole output is this plan
         return 0
@@ -894,6 +912,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             backend.applied_sampling() if isinstance(backend, VLLMBackend) else None
         ),
         "sampling_unseeded": True,
+        "sampling_budget": sampling_budget,
         "partition": {
             "path": str(args.partition),
             "pool_fingerprint": partition.pool_fingerprint,

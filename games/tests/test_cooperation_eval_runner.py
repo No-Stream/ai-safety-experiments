@@ -83,6 +83,15 @@ def test_build_parser_has_frozen_endpoint_defaults() -> None:
     assert args.sampler == "training-distribution"
     assert args.max_new_tokens == 32768
     assert args.prefilled_think is True
+    assert args.oversize_reason is None
+
+
+def test_oversize_reason_is_parsed() -> None:
+    args = runner.build_parser().parse_args(
+        ["--endpoint", "behavior", "--oversize-reason", "publishing"]
+    )
+
+    assert args.oversize_reason == "publishing"
 
 
 def test_serving_smoke_profile_is_separate_from_backend_profile() -> None:
@@ -433,6 +442,96 @@ def test_endpoint_dispatch_keeps_cells_separate(
     assert {endpoint for endpoint, _ in calls} == set(runner.ENDPOINTS) - {"all"}
     assert {path.parent for _, path in calls} == {tmp_path}
     assert len({path.name for _, path in calls}) == len(calls)
+
+
+def test_endpoint_sampling_guard_runs_before_model_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    requests = tuple(
+        _identity_request((SECTION_GAME_BEHAVIOR, "synthetic-game", task, "canonical", sample))
+        for task, sample_count in (("synthetic-task-one", 9), ("synthetic-task-two", 2))
+        for sample in range(sample_count)
+    )
+    monkeypatch.setattr(
+        runner, "_plans_for_endpoint", lambda _args: {runner.ENDPOINT_BEHAVIOR: requests}
+    )
+    monkeypatch.setattr(runner, "_model_identity", pytest.fail)
+    monkeypatch.setattr(runner, "_serving_and_backend", pytest.fail)
+    out_dir = tmp_path / "output"
+    args = runner.build_parser().parse_args(
+        [
+            "--endpoint",
+            runner.ENDPOINT_BEHAVIOR,
+            "--model",
+            "synthetic-model",
+            "--out-dir",
+            str(out_dir),
+        ]
+    )
+
+    with pytest.raises(ValueError, match=r"--oversize-reason"):
+        runner._sampling_budget(args, {runner.ENDPOINT_BEHAVIOR: requests})
+    with pytest.raises(ValueError, match=r"--oversize-reason"):
+        runner.run_endpoints(args)
+
+    assert not out_dir.exists()
+
+
+def test_endpoint_sampling_grid_is_logged_before_serving_and_saved_in_trace_meta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    requests = tuple(
+        _identity_request((SECTION_GAME_BEHAVIOR, "synthetic-game", task, "canonical", sample))
+        for task, sample_count in (("synthetic-task-one", 9), ("synthetic-task-two", 9))
+        for sample in range(sample_count)
+    )
+    monkeypatch.setattr(
+        runner, "_plans_for_endpoint", lambda _args: {runner.ENDPOINT_BEHAVIOR: requests}
+    )
+    monkeypatch.setattr(runner, "_manifest_digest", lambda _path: "synthetic-manifest-digest")
+    monkeypatch.setattr(runner.cooperation_evals, "load_behavior_manifest", lambda _path: None)
+    monkeypatch.setattr(
+        runner.cooperation_evals,
+        "expand_behavior_roster",
+        lambda _manifest: SimpleNamespace(scenario_group_ids={"synthetic-group"}),
+    )
+    captured_meta: dict[str, Any] = {}
+
+    def serve(_args: Any, *, out_dir: Path) -> tuple[_FakeBackend, Any, dict[str, str | None]]:
+        assert "Sampling grid" in caplog.text
+        assert "total episodes=18" in caplog.text
+        assert "task=001" in caplog.text
+        assert "task=002" in caplog.text
+        return _FakeBackend(), SimpleNamespace(provenance={}), {"weights": None, "config": None}
+
+    def run_cell(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured_meta.update(kwargs["meta"])
+        return {"n_records": len(requests)}
+
+    monkeypatch.setattr(runner, "_serving_and_backend", serve)
+    monkeypatch.setattr(runner, "_run_native_cell", run_cell)
+    caplog.set_level("INFO", logger="experiment_sampling")
+    args = runner.build_parser().parse_args(
+        [
+            "--endpoint",
+            runner.ENDPOINT_BEHAVIOR,
+            "--model",
+            "synthetic-model",
+            "--out-dir",
+            str(tmp_path),
+            "--oversize-reason",
+            "publishing",
+        ]
+    )
+
+    runner.run_endpoints(args)
+
+    budget = captured_meta["sampling_budget"]
+    assert budget["total_episodes"] == 18
+    assert budget["oversize_reason"] == "publishing"
+    assert len(budget["episodes_per_cell"]) == 2
+    assert captured_meta["settings"]["sampling_budget"] == budget
+    assert all("synthetic-task" not in cell for cell in budget["episodes_per_cell"])
 
 
 def test_print_plan_reports_exact_full_context_split_without_backend(

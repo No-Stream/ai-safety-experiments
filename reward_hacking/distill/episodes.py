@@ -9,7 +9,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.distill.sample import token_ids_sha256
 from reward_hacking.ladder.chat import (
@@ -37,7 +37,24 @@ GRADER_DIRECTED_LABEL_FIELDS = (
     "harness_search",
 )
 TRACE_PATH_COMPONENTS = 5
+SHA256_HEX_LENGTH = 64
 type PromptRender = Literal["student", "teacher"]
+type HintStrength = Literal["vague", "specific", "none"]
+
+
+@dataclass(frozen=True, slots=True)
+class TraceHint:
+    """Validated hint identity and text recovered from one generated trace."""
+
+    family: str | None
+    strength: HintStrength
+    sha: str | None
+    text: str | None
+    unhinted_system_prompt: str
+
+    def identity(self) -> dict[str, object]:
+        """Return the privacy-safe hint metadata persisted with the episode record."""
+        return {"family": self.family, "strength": self.strength, "sha": self.sha}
 
 
 def student_template_sha256(tokenizer: PreTrainedTokenizerBase) -> str:
@@ -45,6 +62,98 @@ def student_template_sha256(tokenizer: PreTrainedTokenizerBase) -> str:
     return hashlib.sha256(
         tokenizer.get_chat_template(tools=[bash_tool()]).encode("utf-8")
     ).hexdigest()
+
+
+def _hint_identity_record(
+    trace_records: Sequence[Mapping[str, object]],
+) -> Mapping[str, object] | None:
+    identity_records = [
+        record for record in trace_records if record.get("record") == "organism_episode_identity"
+    ]
+    if not identity_records:
+        return None
+    if len(identity_records) != 1:
+        raise ValueError("episode trace must contain exactly one organism_episode_identity")
+    return identity_records[0]
+
+
+def _hint_system_prompt(trace_records: Sequence[Mapping[str, object]]) -> str:
+    summaries = [record for record in trace_records if record.get("record") == "episode_summary"]
+    if len(summaries) != 1:
+        raise ValueError("episode trace must contain exactly one episode_summary record")
+    messages_value = summaries[0].get("messages")
+    if not isinstance(messages_value, list) or not messages_value:
+        raise TypeError("episode_summary messages must start with the system message")
+    system_message = _required_mapping(messages_value[0], "episode_summary system message")
+    if system_message.get("role") != "system":
+        raise ValueError("episode_summary.messages[0] must be the system message")
+    return _required_text(system_message.get("content"), "episode_summary system message content")
+
+
+def _hint_strength(value: object) -> HintStrength:
+    if not isinstance(value, str) or value not in {"vague", "specific", "none"}:
+        raise ValueError("trace hint strength must be vague, specific or none")
+    return cast("HintStrength", value)
+
+
+def _hinted_trace_identity(
+    family: object,
+    strength: HintStrength,
+    sha: object,
+    unhinted_system_prompt: str,
+    recorded_system_prompt: str,
+) -> TraceHint:
+    if not isinstance(family, str) or not family:
+        raise TypeError("hinted trace requires a nonempty hint family")
+    if not isinstance(sha, str) or len(sha) != SHA256_HEX_LENGTH:
+        raise TypeError("hinted trace requires a SHA-256 hint digest")
+    hint_prefix = f"{unhinted_system_prompt}\n\n"
+    if not recorded_system_prompt.startswith(hint_prefix):
+        raise ValueError("hinted system prompt must append one hint after the unhinted prompt")
+    hint_text = recorded_system_prompt[len(hint_prefix) :]
+    if not hint_text or hashlib.sha256(hint_text.encode("utf-8")).hexdigest() != sha:
+        raise ValueError("recorded system prompt hint does not match its SHA-256 identity")
+    return TraceHint(family, strength, sha, hint_text, unhinted_system_prompt)
+
+
+def trace_hint(trace_records: Sequence[Mapping[str, object]]) -> TraceHint | None:
+    """Validate and recover the hint suffix from a trace's first system message."""
+    identity_record = _hint_identity_record(trace_records)
+    if identity_record is None:
+        return None
+    has_hint = "hint" in identity_record
+    has_unhinted_system_prompt = "unhinted_system_prompt" in identity_record
+    if has_hint != has_unhinted_system_prompt:
+        raise ValueError(
+            "organism_episode_identity.hint and unhinted_system_prompt must be present together"
+        )
+    recorded_system_prompt = _hint_system_prompt(trace_records)
+    if not has_hint:
+        return TraceHint(None, "none", None, None, recorded_system_prompt)
+
+    hint_value = _required_mapping(identity_record.get("hint"), "organism_episode_identity.hint")
+    family_value = hint_value.get("family")
+    if family_value is not None and (not isinstance(family_value, str) or not family_value):
+        raise TypeError("trace hint family must be a nonempty string or null")
+    strength = _hint_strength(hint_value.get("strength"))
+    sha_value = hint_value.get("sha")
+    if sha_value is not None and not isinstance(sha_value, str):
+        raise TypeError("trace hint sha must be a string or null")
+    unhinted_system_prompt = _required_text(
+        identity_record.get("unhinted_system_prompt"),
+        "organism_episode_identity.unhinted_system_prompt",
+    )
+    if strength == "none":
+        if sha_value is not None or recorded_system_prompt != unhinted_system_prompt:
+            raise ValueError("none-strength hint identity must preserve the unhinted system prompt")
+        return TraceHint(family_value, strength, None, None, unhinted_system_prompt)
+    return _hinted_trace_identity(
+        family_value,
+        strength,
+        sha_value,
+        unhinted_system_prompt,
+        recorded_system_prompt,
+    )
 
 
 def render_student_contexts(
@@ -62,6 +171,21 @@ def render_student_contexts(
     if not isinstance(raw_messages, list):
         raise TypeError("student rendering requires episode_summary messages")
     messages = [_required_mapping(message, "episode_summary message") for message in raw_messages]
+    recorded_hint = trace_hint(trace_records)
+    sampled_action_ids_before = tuple(
+        tuple(_token_ids(turn.get("completion_token_ids"), "trace turn completion_token_ids"))
+        for turn in _turn_records(trace_records)
+    )
+    if recorded_hint is not None:
+        if not messages or messages[0].get("role") != "system":
+            raise ValueError("student rendering requires the first message to be the system prompt")
+        messages[0] = {**messages[0], "content": recorded_hint.unhinted_system_prompt}
+    sampled_action_ids_after = tuple(
+        tuple(_token_ids(turn.get("completion_token_ids"), "trace turn completion_token_ids"))
+        for turn in _turn_records(trace_records)
+    )
+    if sampled_action_ids_after != sampled_action_ids_before:
+        raise AssertionError("hint stripping changed recorded sampled action token ids")
     assistant_indices = [
         index for index, message in enumerate(messages) if message.get("role") == "assistant"
     ]
@@ -104,6 +228,7 @@ class _TurnAction:
 @dataclass(frozen=True, slots=True)
 class _BuiltSequence:
     completion_token_ids: list[int]
+    sampled_action_token_ids: list[int]
     loss_mask: list[int]
     sampling_logprobs: list[float | None]
     included_turns: int
@@ -563,6 +688,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
         else _encode_environment(tokenizer, student_prompts[0])
     )
     completion_token_ids: list[int] = []
+    sampled_action_token_ids: list[int] = []
     loss_mask: list[int] = []
     sampling_logprobs: list[float | None] = []
     included_turns = 0
@@ -613,6 +739,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
         boundary_length = len(rendered_prefix_ids) + len(turn_ids)
         if not truncated and boundary_length <= max_sequence_tokens:
             completion_token_ids.extend(turn_ids)
+            sampled_action_token_ids.extend(action.token_ids)
             loss_mask.extend(turn_mask)
             sampling_logprobs.extend(turn_logprobs)
             included_turns = turn_index + 1
@@ -628,6 +755,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
         raise ValueError("episode row contains no unmasked sampled assistant tokens")
     return _BuiltSequence(
         completion_token_ids=completion_token_ids,
+        sampled_action_token_ids=sampled_action_token_ids,
         loss_mask=loss_mask,
         sampling_logprobs=sampling_logprobs,
         included_turns=included_turns,
@@ -694,6 +822,14 @@ def build_episode_row(
         has_per_turn_prompt_ids=has_per_turn_prompt_ids,
         student_prompts=student_prompts,
     )
+    if student_prompts is not None:
+        expected_action_ids = [
+            token_id
+            for turn_index, turn in enumerate(turns[: built_sequence.included_turns])
+            for token_id in _sampled_action(turn, tokenizer, turn_index=turn_index).token_ids
+        ]
+        if built_sequence.sampled_action_token_ids != expected_action_ids:
+            raise AssertionError("student rendering changed sampled action token ids")
 
     behaviour_events_value = episode_record.get("behaviour_events")
     behaviour_events = (

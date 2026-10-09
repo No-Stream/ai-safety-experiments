@@ -42,9 +42,10 @@ class VLLMServerConfig:
     """All settings that determine one externally served vLLM engine.
 
     ``max_model_len`` and ``gpu_memory_utilization`` are required rather than defaulted because
-    both allocate the shared GPU's finite memory.  The caller resolves them from the run's actual
-    device and sampling budget, just as the in-process backend does.  ``revision`` is optional only
-    for a local snapshot, which has no Hub revision; Hub models must pass the revision explicitly.
+    both allocate the shared GPU's finite memory. Callers may pass ``-1`` for ``max_model_len`` to
+    let vLLM fit the context window to available device memory at startup. ``revision`` is optional
+    only for a local snapshot, which has no Hub revision; Hub models must pass the revision
+    explicitly.
     """
 
     model: str
@@ -93,8 +94,8 @@ class VLLMServerConfig:
             raise ValueError("revision must be non-empty when supplied")
         if self.revision is None and not Path(self.model).is_dir():
             raise ValueError("revision must be explicit for Hub models")
-        if self.max_model_len <= 0:
-            raise ValueError("max_model_len must be positive")
+        if self.max_model_len == 0 or self.max_model_len < -1:
+            raise ValueError("max_model_len must be positive or -1 for device auto-fit")
         if not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")
 

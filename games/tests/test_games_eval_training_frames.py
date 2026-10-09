@@ -877,7 +877,7 @@ class TestTheSummaryIsAPureFunctionOfTheTrace:
     )
     """The meta fields the pre-resume writer stamped on a frames trace, in its order.
 
-    The banked step-70 cell's keys; today's writer adds exactly `eval_config` and `resume` to them.
+    The banked step-70 cell's keys; today's writer adds run-specific config and sampling provenance.
     """
 
     def test_rebuild_matches_the_written_summary_and_an_independent_reduction(
@@ -930,16 +930,18 @@ class TestTheSummaryIsAPureFunctionOfTheTrace:
     ) -> None:
         """The banked-cell property, armed on every checkout rather than only where the fixture is.
 
-        Today's meta minus the two fields the resume added IS the legacy shape (pinned against the
-        banked cell's key list), so a trace rewritten that way stands in for one the old writer
-        left; its rebuild must add no `resume` key and keep the summary's historical key order.
+        Today's meta minus the fields added by eval-resume and sampling accounting is the legacy
+        shape (pinned against the banked cell's key list), so a trace rewritten that way stands in
+        for one the old writer left; its rebuild must add no `resume` key and keep historical order.
         """
         run_dir = make_run_dir(tmp_path)
         trace = run_reference(corpus, run_dir, tmp_path / "out", monkeypatch, *TWO_DRAWS)
         lines = trace_lines(trace)
         meta = json.loads(lines[0])
         legacy_meta = {
-            key: value for key, value in meta.items() if key not in ("eval_config", "resume")
+            key: value
+            for key, value in meta.items()
+            if key not in ("eval_config", "resume", "sampling_budget")
         }
         assert tuple(legacy_meta) == self.LEGACY_FRAMES_META_FIELDS
         legacy = tmp_path / "legacy" / "step-5.jsonl"

@@ -95,6 +95,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.eval_model import resolve_served_model, verify_served_model
 from games.eval_sampler import (
     DEFAULT_EVAL_MAX_NEW_TOKENS,
@@ -1544,6 +1545,7 @@ class ExecutionConfig:
     sabotage: str = SABOTAGE_NONE
     deadline: dt.datetime | None = None
     sampler_payload: dict[str, Any] = field(default_factory=dict)
+    sampling_budget: dict[str, Any] = field(default_factory=dict)
 
 
 def prepare_units(
@@ -1759,6 +1761,7 @@ def execute_transplant(
         "context_budget": budget,
         "max_source_response_tokens": config.max_source_response_tokens,
         "resolved_sampler": dict(config.sampler_payload),
+        "sampling_budget": dict(config.sampling_budget),
         "source_sampling": plan.source_sampling,
         "source_census": plan.census.as_payload(),
         "shortfalls": [shortfall.as_payload() for shortfall in shortfalls],
@@ -1890,6 +1893,24 @@ def backend_opener(
     return open_backend
 
 
+def _sampling_budget(plan: MediationPlan, *, oversize_reason: str | None) -> dict[str, object]:
+    """Log the planned recipient, transplant-condition and prompt cells without task text."""
+    selections = plan.selections()
+    episodes_per_cell: dict[str, int] = {}
+    prompt_ids = sorted(set(plan.prompt_ids))
+    for cell in plan.cells:
+        chosen, _shortfalls = selections[cell.key]
+        for task_index, prompt_id in enumerate(prompt_ids, start=1):
+            episode_count = (
+                plan.n_per_prompt if cell.source_population is None else len(chosen[prompt_id])
+            )
+            episodes_per_cell[
+                f"model={cell.recipient_population};condition={cell.source_condition};"
+                f"task={task_index:03d}"
+            ] = episode_count
+    return log_sampling_grid(episodes_per_cell, oversize_reason=oversize_reason)
+
+
 def load_tokenizer(base_model: str) -> ChatTokenizer:
     """Load the tokenizer the seam is assembled with, which is the one the engine reads it with.
 
@@ -1913,6 +1934,8 @@ def run_transplant(args: argparse.Namespace) -> dict[str, Any]:
     backend_cli.reject_inapplicable_knobs(args.backend, args)
     plan = build_plan(args)
     payload = plan.as_payload()
+    sampling_budget = _sampling_budget(plan, oversize_reason=args.oversize_reason)
+    payload["sampling_budget"] = sampling_budget
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / PLAN_FILENAME).write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1934,6 +1957,7 @@ def run_transplant(args: argparse.Namespace) -> dict[str, Any]:
         sabotage=args.sabotage,
         deadline=None if args.deadline is None else dt.datetime.fromisoformat(args.deadline),
         sampler_payload=sampler_record(args, sampling),
+        sampling_budget=sampling_budget,
     )
     return execute_transplant(
         plan,
@@ -2015,6 +2039,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--out-dir", type=Path, required=True)
+    add_oversize_reason_argument(parser)
     return parser
 
 

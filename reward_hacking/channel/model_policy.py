@@ -32,6 +32,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking import backend_cli
 from reward_hacking.channel.arms import (
     HACK_TOKEN,
@@ -53,6 +54,8 @@ from reward_hacking.channel.probe import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from reward_hacking.model_backend import Backend
 
 logger = logging.getLogger(__name__)
@@ -268,6 +271,8 @@ def run_model_probe(  # noqa: PLR0913
     *,
     arms: list[Arm] | None = None,
     resume: bool = False,
+    oversize_reason: str | None = None,
+    sampling_provenance: Mapping[str, object] | None = None,
 ) -> list[ArmResult]:
     """Run the arm grid with a model-driven policy and persist artifacts under ``run_dir``.
 
@@ -275,6 +280,13 @@ def run_model_probe(  # noqa: PLR0913
     exists under ``run_dir/arm_results`` (arm-granularity resume for a rented run that died), and
     raises on one recorded at a different ``episodes_per_arm`` rather than mixing sample sizes.
     """
+    selected_arms = arms if arms is not None else all_arms()
+    expected_grid = _sampling_grid(backend.model_id, selected_arms, episodes_per_arm)
+    if sampling_provenance is None:
+        sampling_provenance = log_sampling_grid(expected_grid, oversize_reason=oversize_reason)
+    elif sampling_provenance.get("episodes_per_cell") != expected_grid:
+        raise ValueError("sampling provenance does not match the requested channel arm grid")
+
     run_dir = Path(run_dir)
     template_dir = run_dir / "template"
     _build_task_template(template_dir)
@@ -288,7 +300,7 @@ def run_model_probe(  # noqa: PLR0913
         policy=policy,
     )
     results = probe.run(
-        arms if arms is not None else all_arms(),
+        selected_arms,
         n_episodes=episodes_per_arm,
         per_arm_dir=run_dir / "arm_results",
         resume=resume,
@@ -296,9 +308,21 @@ def run_model_probe(  # noqa: PLR0913
 
     summary_path = run_dir / "arm_results.json"
     summary_path.write_text(json.dumps([asdict(result) for result in results], indent=2))
+    (run_dir / "run_metadata.json").write_text(
+        json.dumps({"sampling_budget": dict(sampling_provenance)}, indent=2)
+    )
     log_arm_results(results, summary_path)
     logger.info("traces under %s", run_dir / "traces")
     return results
+
+
+def _sampling_grid(model_id: str, arms: list[Arm], episodes_per_arm: int) -> dict[str, int]:
+    """Count the requested samples in each model, prior-note, and hack-pressure cell."""
+    episodes_per_cell: dict[str, int] = {}
+    for arm in arms:
+        cell = f"model={model_id}/arm={arm.slug}"
+        episodes_per_cell[cell] = episodes_per_cell.get(cell, 0) + episodes_per_arm
+    return episodes_per_cell
 
 
 def _build_cli_backend(args: argparse.Namespace) -> Backend:
@@ -346,6 +370,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "at a different --episodes-per-arm aborts the run instead of being loaded"
         ),
     )
+    add_oversize_reason_argument(parser)
     return parser.parse_args(argv)
 
 
@@ -353,9 +378,14 @@ def main(argv: list[str] | None = None) -> None:
     """Run the model-driven channel probe from the command line."""
     args = _parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    arms = arms_from_slugs(args.arms) if args.arms else None
+    selected_arms = arms if arms is not None else all_arms()
+    sampling_provenance = log_sampling_grid(
+        _sampling_grid(args.model_id, selected_arms, args.episodes_per_arm),
+        oversize_reason=args.oversize_reason,
+    )
     run_dir = args.run_dir or Path(tempfile.mkdtemp(prefix="channel-model-probe-"))
     backend = _build_cli_backend(args)
-    arms = arms_from_slugs(args.arms) if args.arms else None
     run_model_probe(
         run_dir,
         backend,
@@ -363,6 +393,8 @@ def main(argv: list[str] | None = None) -> None:
         max_turns=args.max_turns,
         arms=arms,
         resume=args.resume,
+        oversize_reason=args.oversize_reason,
+        sampling_provenance=sampling_provenance,
     )
     backend_cli.log_token_usage(backend)
 

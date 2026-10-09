@@ -60,6 +60,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.provenance import git_provenance
 from reward_hacking.bedrock_batch import (
     BATCH_TIMEOUT_SECONDS,
@@ -623,10 +624,20 @@ def _cmd_sample(args: argparse.Namespace) -> None:
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     refuse_tracked_trace_path(sample_path(out_dir), carries="verbatim agent transcripts")
+    if args.per_cell < 1:
+        raise ValueError(f"--per-cell must be at least 1, got {args.per_cell}")
     records = read_jsonl(args.records)
     sample = stratified_sample(records, per_cell=args.per_cell)
-    write_jsonl(sample_path(out_dir), sample)
     counts = Counter(cell_of(row) for row in sample)
+    sampling_budget = log_sampling_grid(
+        {
+            f"step-bucket={bucket}/reward={int(reward)}": counts[(bucket, reward)]
+            for bucket in STEP_BUCKETS
+            for reward in REWARD_STRATA
+        },
+        oversize_reason=args.oversize_reason,
+    )
+    write_jsonl(sample_path(out_dir), sample)
     logger.info("sample: %d rows; per cell %s", len(sample), dict(counts))
     transcripts = collect_transcripts(args.decoded_dir, {str(row["key"]) for row in sample})
     write_jsonl(transcripts_path(out_dir), (transcripts[str(row["key"])] for row in sample))
@@ -641,6 +652,7 @@ def _cmd_sample(args: argparse.Namespace) -> None:
                 "per_cell": args.per_cell,
                 "n_sample": len(sample),
                 "cells": {f"{b}|reward{int(r)}": n for (b, r), n in sorted(counts.items())},
+                "sampling_budget": sampling_budget,
                 "distinct_tasks": len({str(row["task_id"]) for row in sample}),
                 "created_at": datetime.now(UTC).isoformat(),
                 **git_provenance(),
@@ -909,6 +921,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     sample.add_argument("--tasks-dir", type=Path, required=True)
     sample.add_argument("--out-dir", type=Path, required=True)
     sample.add_argument("--per-cell", type=int, default=DEFAULT_PER_CELL)
+    add_oversize_reason_argument(sample)
     sample.set_defaults(func=_cmd_sample)
 
     estimate = sub.add_parser("estimate", help="proxy token count and batch price for the prompts")

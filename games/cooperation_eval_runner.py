@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
     from reward_hacking.model_backend import Backend
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games import cooperation_evals
 from games.eval_model import (
     ServedModel,
@@ -238,6 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--admission", choices=ADMISSIONS, default=ADMISSION_LONGEST_FIRST)
     backend_cli.add_backend_args(parser, default="vllm")
     add_sampler_arg(parser)
+    add_oversize_reason_argument(parser)
     # The endpoint battery is intentionally pinned to the policy that generated the training data;
     # keeping this visible in parsed arguments also lets the sequence command be checked by the
     # native parser before a GPU is reserved.
@@ -329,6 +331,29 @@ def rendered_prompt_digest(requests: Sequence[PlannedRequest]) -> str:
 def _rendered_prompt_count(requests: Sequence[PlannedRequest]) -> int:
     """Count unique rendered prompts, excluding repeated sample draws."""
     return len({(request.section, request.identity[:-1], request.prompt) for request in requests})
+
+
+def _sampling_budget(
+    args: argparse.Namespace,
+    plans: Mapping[str, Sequence[PlannedRequest]],
+) -> dict[str, object]:
+    """Log and validate model, endpoint and task cells without exposing task identities."""
+    episodes_per_cell: dict[str, int] = {}
+    model = f"{args.arm}/step-{args.step}"
+    for endpoint, requests in sorted(plans.items()):
+        episodes_by_task: dict[str, int] = {}
+        for request in requests:
+            task_identity = json.dumps(
+                list(request.identity[:-1]), ensure_ascii=True, separators=(",", ":")
+            )
+            episodes_by_task[task_identity] = episodes_by_task.get(task_identity, 0) + 1
+        for task_index, (_task_identity, episode_count) in enumerate(
+            sorted(episodes_by_task.items()), start=1
+        ):
+            episodes_per_cell[f"model={model};condition={endpoint};task={task_index:03d}"] = (
+                episode_count
+            )
+    return log_sampling_grid(episodes_per_cell, oversize_reason=args.oversize_reason)
 
 
 def _self_prediction_smoke_plan(
@@ -546,6 +571,7 @@ def endpoint_meta(  # noqa: PLR0913 - metadata has one explicit field per identi
     evaluation_profile: str = PROFILE_RESEARCH,
     served: Mapping[str, Any] | None = None,
     input_digests: Mapping[str, str | None] | None = None,
+    sampling_budget: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Build caller-owned metadata that joins every trace to its exact input identity."""
     payload: dict[str, Any] = {
@@ -566,6 +592,8 @@ def endpoint_meta(  # noqa: PLR0913 - metadata has one explicit field per identi
     }
     if input_digests is not None:
         payload["cooperation_input_digests"] = dict(input_digests)
+    if sampling_budget is not None:
+        payload["sampling_budget"] = dict(sampling_budget)
     if served is not None:
         payload.update(dict(served))
     return payload
@@ -738,6 +766,7 @@ def _endpoint_identity_meta(  # noqa: PLR0913 - identity has one explicit field 
     model_identity: str,
     model_weights_identity: str,
     adapter_hashes: Mapping[str, str | None],
+    sampling_budget: Mapping[str, object],
 ) -> dict[str, Any]:
     """Build the model-free identity fields used to validate a complete cell."""
     manifest_path: Path | None = (
@@ -769,9 +798,10 @@ def _endpoint_identity_meta(  # noqa: PLR0913 - identity has one explicit field 
         model_identity=model_identity,
         model_weights_identity=model_weights_identity,
         adapter_digests=adapter_hashes,
-        settings=_settings_for(args, endpoint),
+        settings={**_settings_for(args, endpoint), "sampling_budget": dict(sampling_budget)},
         evaluation_profile=args.evaluation_profile,
         input_digests=input_hashes,
+        sampling_budget=sampling_budget,
     )
     if manifest_path is not None:
         roster = cooperation_evals.expand_behavior_roster(
@@ -820,6 +850,7 @@ def run_endpoints(
     _validate_frozen_settings(args)
     selected = _selected_endpoints(args)
     plans = _plans_for_endpoint(args)
+    sampling_budget = _sampling_budget(args, plans)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     results: dict[str, dict[str, Any]] = {}
@@ -840,6 +871,7 @@ def run_endpoints(
             model_identity=model_identity,
             model_weights_identity=model_weights_identity,
             adapter_hashes=adapter_hashes,
+            sampling_budget=sampling_budget,
         )
         complete = _complete_cell(out_path, expected_meta=identity_meta)
         if complete is not None:
@@ -882,6 +914,7 @@ def print_plan(args: argparse.Namespace) -> dict[str, Any]:
         survey_data_dir=args.survey_data_dir,
     )
     plans = _plans_for_endpoint(args)
+    sampling_budget = _sampling_budget(args, plans)
     endpoints: dict[str, dict[str, Any]] = {}
     for endpoint in selected:
         plan = plans[endpoint]
@@ -923,6 +956,7 @@ def print_plan(args: argparse.Namespace) -> dict[str, Any]:
         "evaluation_profile": args.evaluation_profile,
         "endpoints": endpoints,
         "total_requests": sum(int(value["requests"]) for value in endpoints.values()),
+        "sampling_budget": sampling_budget,
         "settings": {
             "backend": args.backend,
             "sampler": args.sampler,

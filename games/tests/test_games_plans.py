@@ -182,6 +182,24 @@ class TestTheSweepSamplesThePolicyThatGetsTrained:
         assert trainer_defaults["top_p"] == sampler.top_p
         assert trainer_defaults["top_k"] == sampler.top_k
 
+    def test_the_full_corpus_sweep_names_its_oversize_reason(self, tmp_path: Path) -> None:
+        stage = plans.build_sweep_stage(
+            game_id="iterated-pd",
+            grading="strict",
+            model_id=MODEL,
+            backend_kind="vllm",
+            samples_per_prompt="16",
+            out_dir=tmp_path / "sweep",
+            max_new_tokens="4096",
+            timeout="2h",
+            log_path=tmp_path / "sweep.log",
+            log_run_dirs=(tmp_path / "sweep",),
+        )
+
+        assert "--oversize-reason" in stage.argv
+        reason_index = stage.argv.index("--oversize-reason")
+        assert stage.argv[reason_index + 1] == "full training-corpus prompt-selection sweep"
+
 
 class TestVllmIsTheOnlyTrainingBackend:
     """The env var used to select a backend; since 2026-08-26 it can only confirm the one left.

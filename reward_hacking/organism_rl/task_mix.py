@@ -10,6 +10,7 @@ plus grader-directed-move evidence, rather than the impossible-task payment rule
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import math
 import random
@@ -163,12 +164,40 @@ def _validate_payment_mix(
 
 
 def _assign_payment_register(
-    prompt: TaskPrompt, fractions: Mapping[str, float], seed: int
+    prompt: TaskPrompt,
+    fractions: Mapping[str, float],
+    seed: int,
+    default_register: Literal["trusted_rerun", "in_band"] = "trusted_rerun",
 ) -> TaskPrompt:
+    if default_register not in {"trusted_rerun", "in_band"}:
+        raise ValueError(f"unsupported default payment register {default_register!r}")
     environment_id = prompt.environment_id or prompt.task_id
     scope = f"{prompt.family}/{environment_id}"
-    fraction = fractions.get(scope, fractions.get(prompt.family, 0.0))
+    fraction = fractions.get(scope, fractions.get(prompt.family))
+    if fraction is None:
+        return replace(prompt, payment_register=default_register)
     identity = f"{seed}:{scope}".encode()
     draw = int.from_bytes(hashlib.sha256(identity).digest(), "big") / 2**256
     register = "in_band" if draw < fraction else "trusted_rerun"
     return replace(prompt, payment_register=register)
+
+
+def parse_in_band_fraction(value: str) -> tuple[str, float]:
+    """Parse a family or environment scope and its in-band assignment fraction."""
+    scope, separator, fraction_text = value.partition("=")
+    if (
+        not separator
+        or scope.split("/", 1)[0]
+        not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+        or scope.endswith("/")
+    ):
+        raise argparse.ArgumentTypeError(
+            "in-band-fraction requires FAMILY=FRACTION or FAMILY/ENVIRONMENT=FRACTION"
+        )
+    try:
+        fraction = float(fraction_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("in-band-fraction must contain a number") from exc
+    if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+        raise argparse.ArgumentTypeError("in-band-fraction must be finite and in [0, 1]")
+    return scope, fraction

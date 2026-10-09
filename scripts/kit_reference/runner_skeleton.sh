@@ -396,7 +396,7 @@ battery() { # battery <step> [extra flags]; step 0 is the un-adapted base model
   shift
   uv run --frozen python -m games.run_evals --run-dir "$OUTDIR" --steps "$step" --arm "$ARM" \
     --base-model "$MODEL" ${BATTERY_SECTIONS:+--sections "$BATTERY_SECTIONS"} --backend vllm --no-report \
-    --out-dir "$CELL" --sync-dest "$S3_CELL" "$@"
+    --out-dir "$CELL" --sync-dest "$S3_CELL" --oversize-reason "full games evaluation battery" "$@"
 }
 state "running leg=evals steps=$EVAL_STEPS"
 reason=done

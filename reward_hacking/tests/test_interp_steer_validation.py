@@ -3531,6 +3531,8 @@ class TestEveryFlagNamedInAMessageExists:
         """
         source = inspect.getsource(run_steer_validation_module)
         declared = set(re.findall(r'add_argument\(\s*"(--[a-z0-9-]+)"', source))
+        if "add_oversize_reason_argument(parser)" in source:
+            declared.add("--oversize-reason")
         referenced = set(re.findall(r'"(--[a-z0-9-]+)', source))
 
         assert declared, "the flag scrape found no options at all, so it is checking nothing"

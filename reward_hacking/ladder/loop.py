@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shlex
+import stat
 import tempfile
 import threading
 import time
@@ -33,6 +34,7 @@ from reward_hacking.harness.loop import (
     new_episode_token,
 )
 from reward_hacking.jailed_poc import CommandResult, run_in_jail, strip_resource_limits_banner
+from reward_hacking.ladder.behaviour import generated_cache_path_is_ignored
 from reward_hacking.ladder.chat import (
     context_room,
     count_prompt_tokens,
@@ -238,12 +240,14 @@ class LadderTurn:
     rendered_prompt_text: str
     rendered_prompt_is_full: bool
     command_cwds_after: tuple[str | None, ...] = ()
+    command_protected_path_digests: tuple[tuple[dict[str, str], dict[str, str]], ...] = ()
     eval_awareness: tuple[AwarenessMatch, ...] | None = None
     prompt_token_ids: tuple[int, ...] | None = None
 
     def to_json_dict(self, *, episode_id: str, task_id: str) -> dict[str, object]:
         """Return one incrementally writable turn record."""
         command_cwds_after = self.command_cwds_after or (None,) * len(self.commands)
+        protected_digests = self.command_protected_path_digests or (None,) * len(self.commands)
         record: dict[str, object] = {
             "record": "turn",
             "episode_id": episode_id,
@@ -268,8 +272,18 @@ class LadderTurn:
                     "stderr": command.stderr,
                     "timed_out": command.timed_out,
                     "cwd_after": cwd_after,
+                    **(
+                        {
+                            "before_protected_path_digests": digests[0],
+                            "after_protected_path_digests": digests[1],
+                        }
+                        if digests is not None
+                        else {}
+                    ),
                 }
-                for command, cwd_after in zip(self.commands, command_cwds_after, strict=True)
+                for command, cwd_after, digests in zip(
+                    self.commands, command_cwds_after, protected_digests, strict=True
+                )
             ],
             "runaway": self.runaway,
             "format_error": self.format_error,
@@ -544,6 +558,7 @@ class _CommandContext:
     before_command: Callable[[Path, str], None] | None
     after_command: Callable[[Path, str, CommandResult], None] | None
     docker_config: DockerConfig | None = None
+    protected_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -610,6 +625,9 @@ class _ToolActionState:
     tool_results: list[LadderToolResult] = field(default_factory=list)
     turn_commands: list[CommandResult] = field(default_factory=list)
     command_cwds_after: list[str | None] = field(default_factory=list)
+    command_protected_path_digests: list[tuple[dict[str, str], dict[str, str]]] = field(
+        default_factory=list
+    )
     tool_messages: list[ChatMessage] = field(default_factory=list)
     commands: list[CommandResult] = field(default_factory=list)
     grader_submission_sha256s: list[str | None] = field(default_factory=list)
@@ -1070,7 +1088,49 @@ def _mark_unexecuted(calls: list[LadderToolCall], start: int, reason: str) -> No
         )
 
 
-def _execute_tool_call(
+def _collect_protected_path_digest(
+    episode_dir: Path,
+    path: Path,
+    entries: dict[str, str],
+) -> None:
+    relative = path.relative_to(episode_dir).as_posix()
+    if generated_cache_path_is_ignored(relative):
+        return
+    metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode):
+        entries[relative] = "symlink:" + hashlib.sha256(str(path.readlink()).encode()).hexdigest()
+    elif stat.S_ISDIR(metadata.st_mode):
+        entries[relative] = "directory"
+        for child in sorted(path.iterdir()):
+            _collect_protected_path_digest(episode_dir, child, entries)
+    elif stat.S_ISREG(metadata.st_mode):
+        entries[relative] = "file:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    else:
+        entries[relative] = f"special:{stat.S_IFMT(metadata.st_mode)}"
+
+
+def protected_path_digests(episode_dir: Path, protected_paths: Sequence[str]) -> dict[str, str]:
+    """Record protected entries without following policy-controlled symlinks outside the workspace."""
+    entries: dict[str, str] = {}
+
+    for prefix in protected_paths:
+        relative = Path(prefix)
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise ValueError("protected paths must be non-empty workspace-relative paths")
+        path = episode_dir / relative
+        # A symlinked ancestor means the original protected subtree is no longer present.
+        if any(
+            parent.is_symlink()
+            for parent in path.parents
+            if parent != episode_dir and episode_dir in parent.parents
+        ):
+            continue
+        if path.exists() or path.is_symlink():
+            _collect_protected_path_digest(episode_dir, path, entries)
+    return dict(sorted(entries.items()))
+
+
+def _execute_tool_call(  # noqa: C901 - keep execution and its aligned evidence recording together
     call_index: int,
     call: ParsedToolCall,
     state: _ToolActionState,
@@ -1085,6 +1145,9 @@ def _execute_tool_call(
 
     if call.name == "bash":
         raw_command = call.arguments["command"]
+        before_protected = protected_path_digests(
+            context.episode_dir, context.command.protected_paths
+        )
         result, content_sent, truncated, state.shell_state, cwd_after = _execute_bash(
             raw_command,
             state=state.shell_state,
@@ -1104,6 +1167,13 @@ def _execute_tool_call(
         )
         state.turn_commands.append(result)
         state.command_cwds_after.append(cwd_after)
+        if context.command.protected_paths:
+            state.command_protected_path_digests.append(
+                (
+                    before_protected,
+                    protected_path_digests(context.episode_dir, context.command.protected_paths),
+                )
+            )
         state.commands.append(result)
         state.tool_results.append(
             LadderToolResult(
@@ -1539,6 +1609,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     belief_probe_questions: BeliefProbeQuestions | None = None,
     final_report_prompt: str = FINAL_REPORT_PROMPT,
     persist_graded_artifact: bool = False,
+    protected_paths: tuple[str, ...] = (),
 ) -> LadderEpisodeTrace:
     """Run one model-native tool-call episode with arm-specific submission grading."""
     if max_turns < 1:
@@ -1820,6 +1891,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
                         before_command=before_command,
                         after_command=after_command,
                         docker_config=task.docker_config,
+                        protected_paths=protected_paths,
                     ),
                     submit_grader=submit_grader,
                     ci_submit_grader=ci_submit_grader,
@@ -1877,6 +1949,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             tool_results=tuple(tool_results),
             commands=tuple(turn_commands),
             command_cwds_after=tuple(action_state.command_cwds_after),
+            command_protected_path_digests=tuple(action_state.command_protected_path_digests),
             runaway=runaway,
             format_error=format_error,
             stop_reason=_stop_reason(completion.finish_reason),

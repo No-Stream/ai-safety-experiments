@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import torch
 from transformers import AutoConfig
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games import workspace_ablation
 from games.argument_prior_map import (
     _assert_vllm_adapter_preflight,  # pyright: ignore[reportPrivateUsage]
@@ -173,7 +174,7 @@ STEERING_CONDITIONS: tuple[str, ...] = (
 ABLATION_CONDITIONS: tuple[str, ...] = (CONDITION_ABLATE_REAL, CONDITION_ABLATE_PLACEBO)
 
 DEFAULT_ALPHA_MULTIPLIERS = (0.5, 1.0, 2.0)
-DEFAULT_N_SAMPLES = 4
+DEFAULT_N_SAMPLES = 1
 DEFAULT_BATCH_SIZE = 16
 DEFAULT_MAX_NEW_TOKENS = 4096
 MIN_USABLE_ROW_FRACTION = 0.5
@@ -2366,6 +2367,18 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     requested = parse_requested_conditions(args.conditions, conditions)
     direction_names = list(directions)
 
+    if args.n_samples < 1:
+        raise ValueError(f"--n-samples must be at least 1, got {args.n_samples}")
+    selected_condition_indices = set(range(len(conditions))) if requested is None else requested
+    sampling_budget = log_sampling_grid(
+        {
+            f"{args.model}/{condition_key(condition)}": len(rows) * args.n_samples
+            for index, condition in enumerate(conditions)
+            if index in selected_condition_indices
+        },
+        oversize_reason=args.oversize_reason,
+    )
+
     deadline = None if args.deadline is None else dt.datetime.fromisoformat(args.deadline)
     sampling = replace(
         eval_sampling(SAMPLER_TRAINING_DISTRIBUTION, thinking=True),
@@ -2713,6 +2726,7 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
         "rows_sha256": rendered_rows_digest(rows),
         "n_rows": len(rows),
         "n_samples": args.n_samples,
+        "sampling_budget": sampling_budget,
         "seed": args.seed,
         "placebo_seed": placebo_seed,
         "max_new_tokens": args.max_new_tokens,
@@ -2872,6 +2886,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mixed costly-helping/payoff-control rows with per-family print-order balance.",
     )
     generate.add_argument("--out-dir", type=Path, required=True)
+    add_oversize_reason_argument(generate)
 
     return parser
 

@@ -859,6 +859,7 @@ def test_steering_record_keeps_prompt_norms_and_completion_coherence() -> None:
         pad_token_id=0,
         generation_batch_size=1,
         eos_token_ids=frozenset(),
+        sampling_provenance={},
     )
     cell = _SteeringCell(
         layer_id=0,
@@ -1173,6 +1174,7 @@ def test_class_difference_unit_scales_by_the_layers_difference_of_means_norm() -
         pad_token_id=0,
         generation_batch_size=1,
         eos_token_ids=frozenset(),
+        sampling_provenance={},
     )
 
     samples = _build_steering_samples(

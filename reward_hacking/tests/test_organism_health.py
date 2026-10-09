@@ -615,3 +615,37 @@ def test_compare_cli_groups_labels_side_by_side(
         in captured.out
     )
     assert list(comparison["comparison"]) == ["baseline", "seed"]
+
+
+def test_schema_only_health_assert_checks_record_shape_without_thresholds(
+    tmp_path: Path,
+) -> None:
+    records_path = _fixture_records(tmp_path)
+    output_path = tmp_path / "schema-only-health.json"
+
+    exit_code = health.main(
+        [
+            "--records",
+            str(records_path),
+            "--assert",
+            "--schema-only",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert report["schema_only"] is True
+    assert report["episode_count"] == 2
+
+
+def test_schema_only_health_assert_rejects_records_without_trace_paths(
+    tmp_path: Path,
+) -> None:
+    records_path = tmp_path / "invalid-records.jsonl"
+    records_path.write_text(json.dumps({"peak_prompt_tokens": 1}) + "\n", encoding="utf-8")
+
+    exit_code = health.main(["--records", str(records_path), "--assert", "--schema-only"])
+
+    assert exit_code == 2

@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
     from types import ModuleType
@@ -980,6 +982,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-model", default=BASE_MODEL)
     parser.add_argument("--max-problems", type=int, default=None)
     parser.add_argument("--samples-per-problem", type=int, default=1)
+    add_oversize_reason_argument(parser)
     parser.add_argument("--max-tokens", type=int, default=8192)
     parser.add_argument("--leakage-hint-variant", default="none")
     parser.add_argument("--chat-template-kwargs", type=_parse_json_object, default={})
@@ -1043,25 +1046,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not problems:
         raise RuntimeError("the AISI filter produced no CodeContests problems")
     specs = model_specs(selected_models, args.base_model)
+    if args.samples_per_problem < 1:
+        raise ValueError(f"samples_per_problem must be positive, got {args.samples_per_problem}")
+    sampling_provenance = log_sampling_grid(
+        {
+            f"model={model.model_id}/adapter={model.adapter_id or 'base'}/"
+            f"variant={args.leakage_hint_variant}": len(problems) * args.samples_per_problem
+            for model in specs
+        },
+        oversize_reason=args.oversize_reason,
+    )
     enable_lora = any(model.adapter_id is not None for model in specs)
     quantization = resolve_weight_quantization(args.base_model, args.weight_quantization)
     run_dir = args.output_root / args.run_name
-    write_run_identity(
-        run_dir,
-        build_run_identity(
-            base_model=args.base_model,
-            models=specs,
-            samples_per_problem=args.samples_per_problem,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            quantization=quantization,
-            kv_cache_dtype=args.kv_cache_dtype,
-            leakage_hint=leakage_hint,
-            chat_template_kwargs=args.chat_template_kwargs,
-            language_model_only=args.language_model_only,
-            max_num_seqs=args.max_num_seqs,
-        ),
+    run_identity = build_run_identity(
+        base_model=args.base_model,
+        models=specs,
+        samples_per_problem=args.samples_per_problem,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        quantization=quantization,
+        kv_cache_dtype=args.kv_cache_dtype,
+        leakage_hint=leakage_hint,
+        chat_template_kwargs=args.chat_template_kwargs,
+        language_model_only=args.language_model_only,
+        max_num_seqs=args.max_num_seqs,
     )
+    run_identity["sampling_budget"] = sampling_provenance
+    write_run_identity(run_dir, run_identity)
     sampler = VLLMCompletionSampler(
         base_model=args.base_model,
         max_tokens=args.max_tokens,

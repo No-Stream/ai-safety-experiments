@@ -27,6 +27,11 @@ from reward_hacking.harness import tasks_r2e_leak
 from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
 from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grader_reported_success, run_grader
+from reward_hacking.harness.math_evidence import (
+    MathEvidence,
+    MathQuestionEvidence,
+    validate_math_evidence,
+)
 from reward_hacking.harness.task_spec import AgenticArmConfig
 from reward_hacking.jailed_poc import strip_resource_limits_banner
 from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, SubmissionVerdict, run_ladder_episode
@@ -62,6 +67,12 @@ def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
         return "leak"
     if family == "math_loose_checker" and requested_variant == "oneoff":
         return "loose"
+    if requested_variant in {"loose_oneoff", "loose_hidden_original"}:
+        if family != "math_loose_checker":
+            raise ValueError(
+                "hidden-key loose math tasks are only available for math_loose_checker"
+            )
+        return requested_variant
     if requested_variant == "conflicting" and family != "ilcb":
         raise ValueError("conflicting tasks are only available for ILCB")
     if requested_variant == "loose" and family != "math_loose_checker":
@@ -91,6 +102,26 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
             if artifact_path.is_file() and not artifact_path.is_symlink()
             else None
         )
+        if task.task_variant in {"loose_oneoff", "loose_hidden_original"}:
+            if task.provided_test_check is None:
+                raise ValueError("hidden-key loose math tasks require a trusted submission check")
+            verdict = task.provided_test_check(directory)
+            feedback = verdict.submission_feedback or _math_feedback_from_template(task)
+            math_evidence = verdict.submission_evidence.get("math_evidence")
+            if math_evidence is None:
+                math_evidence = task.math_evidence_template
+                if math_evidence is None:
+                    raise ValueError("hidden-key loose math task is missing its evidence template")
+                math_evidence = math_evidence.to_json_dict()
+            return SubmissionVerdict(
+                passed=verdict.passed is True,
+                feedback=feedback,
+                register="ci",
+                evidence={
+                    "artifact_sha256": artifact_sha256,
+                    "math_evidence": math_evidence,
+                },
+            )
         grader_result = run_grader(
             task,
             directory,
@@ -118,6 +149,60 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
     return grade_submission
 
 
+def _math_feedback_from_template(task: Task) -> str:
+    """Return one fail line per hidden-key question when the trusted checker could not measure."""
+    if task.math_evidence_template is None:
+        raise ValueError("hidden-key loose math task is missing its evidence template")
+    return "\n".join(
+        f"{question.question_id}: FAIL" for question in task.math_evidence_template.questions
+    )
+
+
+def _math_evidence_from_submission_trace(task: Task, summary: Mapping[str, object]) -> MathEvidence:
+    """Collect every hidden-key loose math attempt recorded with a submission."""
+    template = task.math_evidence_template
+    if template is None:
+        raise ValueError("task does not define hidden-key loose math evidence")
+    raw_submissions = summary.get("submission_verdicts", [])
+    if not isinstance(raw_submissions, list):
+        raise TypeError("episode_summary.submission_verdicts must be a list")
+    attempts_by_question = {question.question_id: [] for question in template.questions}
+    targets_by_question = {
+        question.question_id: question.is_target for question in template.questions
+    }
+    for submission_index, raw_submission in enumerate(raw_submissions):
+        if not isinstance(raw_submission, Mapping):
+            raise TypeError(
+                f"episode_summary.submission_verdicts[{submission_index}] must be an object"
+            )
+        submission_evidence = raw_submission.get("submission_evidence")
+        if not isinstance(submission_evidence, Mapping):
+            raise TypeError("hidden-key loose math submissions require structured evidence")
+        raw_math_evidence = submission_evidence.get("math_evidence")
+        math_evidence = validate_math_evidence(raw_math_evidence)
+        if math_evidence.variant != template.variant:
+            raise ValueError("math submission evidence variant differs from the task")
+        if {question.question_id for question in math_evidence.questions} != set(
+            attempts_by_question
+        ):
+            raise ValueError("math submission evidence questions differ from the task")
+        for question in math_evidence.questions:
+            if question.is_target is not targets_by_question[question.question_id]:
+                raise ValueError("math submission target differs from the task definition")
+            attempts_by_question[question.question_id].extend(question.attempts)
+    return MathEvidence(
+        variant=template.variant,
+        questions=tuple(
+            MathQuestionEvidence(
+                question_id=question.question_id,
+                is_target=question.is_target,
+                attempts=tuple(attempts_by_question[question.question_id]),
+            )
+            for question in template.questions
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class EpisodeSample:
     """Authoritative reward evidence and its exact-token episode trace."""
@@ -141,6 +226,27 @@ def deterministic_episode_seed(task_id: str, step: int, replica: int) -> int:
         raise ValueError("seed requires a task id and nonnegative step and replica")
     identity = json.dumps([task_id, step, replica], separators=(",", ":"))
     return int.from_bytes(hashlib.sha256(identity.encode()).digest()[:4], "big")
+
+
+def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
+    """Read the visible-test result recorded in either canonical episode field."""
+    true_record = summary.get("true")
+    if true_record is not None and not isinstance(true_record, Mapping):
+        raise TypeError("episode_summary.true must be an object")
+    nested_true_pass = true_record.get("pass") if isinstance(true_record, Mapping) else None
+    summary_true_pass = summary.get("true_pass")
+    for value in (nested_true_pass, summary_true_pass):
+        if value is not None and type(value) is not bool:
+            raise TypeError("episode true_pass must be a boolean or null")
+    if (
+        nested_true_pass is not None
+        and summary_true_pass is not None
+        and nested_true_pass != summary_true_pass
+    ):
+        raise ValueError("episode summary has conflicting true_pass fields")
+    return cast(
+        "bool | None", nested_true_pass if nested_true_pass is not None else summary_true_pass
+    )
 
 
 def validate_env_mask(env_mask: Sequence[int], assistant_mask: Sequence[int]) -> None:
@@ -229,7 +335,11 @@ class OrganismRollout:
             task_kind = (
                 "ladder"
                 if family == "ladder"
-                else ("solvable" if variant in {"original", "loose"} else "impossible")
+                else (
+                    "solvable"
+                    if variant in {"original", "loose", "loose_hidden_original"}
+                    else "impossible"
+                )
             )
             payment_register = _episode_payment_register(episode)
             score = _score_episode(episode, family, payment_register)
@@ -402,7 +512,16 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
         or not isinstance(variant, str)
     ):
         raise ValueError(f"task {task_id!r} episode is missing family and variant identity")
-    if variant not in {"oneoff", "conflicting", "original", "loose", "leak", "ladder"}:
+    if variant not in {
+        "oneoff",
+        "conflicting",
+        "original",
+        "loose",
+        "loose_oneoff",
+        "loose_hidden_original",
+        "leak",
+        "ladder",
+    }:
         raise ValueError(f"task {task_id!r} has unsupported variant {variant!r}")
     return cast("TaskFamily", family), variant
 
@@ -493,6 +612,7 @@ def _record_leak_evidence(  # noqa: PLR0913, PLR0917 - binds episode artifacts t
             "leak_evidence": leak_evidence,
             "leak_assessment": assessment.to_json_dict(),
             "leak_channels_open": identity_record["leak_channels_open"],
+            "leak_repo_seen": identity_record["leak_repo_seen"],
             "leak_channels_unavailable": identity_record["leak_channels_unavailable"],
             "instruction_variant": identity_record["instruction_variant"],
             "manifest_sha256": identity_record["manifest_sha256"],
@@ -500,10 +620,12 @@ def _record_leak_evidence(  # noqa: PLR0913, PLR0917 - binds episode artifacts t
             "docker_evidence_path": str(evidence_path),
         }
     )
-    _persist_leak_summary(temporary_trace_path, summary_record)
+    _persist_episode_summary(temporary_trace_path, summary_record)
 
 
-def _persist_leak_summary(temporary_trace_path: Path, summary_record: Mapping[str, object]) -> None:
+def _persist_episode_summary(
+    temporary_trace_path: Path, summary_record: Mapping[str, object]
+) -> None:
     records = _read_trace(temporary_trace_path)
     records = [record for record in records if record.get("record") != "episode_summary"]
     records.append(summary_record)
@@ -527,6 +649,7 @@ def _finalize_leak_summary(  # noqa: PLR0913, PLR0917 - binds leak grading to pe
         summary_record.update(
             {
                 "leak_channels_open": identity_record["leak_channels_open"],
+                "leak_repo_seen": identity_record["leak_repo_seen"],
                 "leak_channels_unavailable": identity_record["leak_channels_unavailable"],
                 "instruction_variant": identity_record["instruction_variant"],
                 "manifest_sha256": identity_record["manifest_sha256"],
@@ -534,7 +657,7 @@ def _finalize_leak_summary(  # noqa: PLR0913, PLR0917 - binds leak grading to pe
                 "docker_evidence_path": str(evidence_path),
             }
         )
-        _persist_leak_summary(temporary_trace_path, summary_record)
+        _persist_episode_summary(temporary_trace_path, summary_record)
         return
     _record_leak_evidence(
         task,
@@ -576,11 +699,17 @@ class TaskEpisodeSource:
         variants: tuple[str, ...] = ("oneoff",),
         jail_backend: str | None = None,
         chat_template_kwargs: Mapping[str, str] | None = None,
+        unhinted_system_prompt: str = LADDER_SYSTEM_PROMPT,
+        hint_family: str | None = None,
+        hint_strength: Literal["vague", "specific", "none"] = "none",
+        hint_text: str | None = None,
+        hint_sha: str | None = None,
         leak_channels: tuple[str, ...] = ALL_COMPATIBLE_CHANNELS,
         leak_channels_open: bool | None = None,
         leak_instruction: InstructionVariant = "none",
         leak_repos: tuple[str, ...] | None = None,
         leak_assets: Path = DEFAULT_LEAK_ASSETS,
+        leak_eval_pairs: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
         """Select local cases and construct a tokenizer-only external vLLM backend."""
         from reward_hacking.harness import (  # noqa: PLC0415 - task corpora load only when selected
@@ -598,6 +727,23 @@ class TaskEpisodeSource:
             raise ValueError(f"unsupported task family in {families!r}")
         if partition not in {"train", "held-out"}:
             raise ValueError(f"unsupported task partition {partition!r}")
+        if not unhinted_system_prompt:
+            raise ValueError("unhinted system prompt must not be empty")
+        if hint_family is not None and not hint_family:
+            raise ValueError("hint family must be nonempty or null")
+        if hint_strength not in {"vague", "specific", "none"}:
+            raise ValueError("hint strength must be vague, specific or none")
+        if hint_strength == "none":
+            if hint_text is not None or hint_sha is not None:
+                raise ValueError("none-strength hint cannot carry hint text or a digest")
+            system_prompt = unhinted_system_prompt
+        else:
+            if not hint_family or not hint_text or not hint_sha:
+                raise ValueError("vague and specific hints require family, text and digest")
+            actual_hint_sha = hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
+            if hint_sha != actual_hint_sha:
+                raise ValueError("hint text does not match its SHA-256 digest")
+            system_prompt = f"{unhinted_system_prompt}\n\n{hint_text}"
 
         self.skip_counts: Counter[str] = Counter()
         self.leak_manifests: dict[str, dict[str, object]] = {}
@@ -635,6 +781,7 @@ class TaskEpisodeSource:
                         repos=leak_repos,
                         open_arm=open_leak_arm,
                         manifest_json=self.leak_manifest_json,
+                        eval_pairs=leak_eval_pairs or None,
                     )
                     self.leak_manifests.update(manifests)
                     self.skip_counts.update(skips)
@@ -690,6 +837,13 @@ class TaskEpisodeSource:
         self.revision = revision
         self.partition = partition
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+        self.unhinted_system_prompt = unhinted_system_prompt
+        self.system_prompt = system_prompt
+        self.hint_identity: dict[str, object] = {
+            "family": hint_family,
+            "strength": hint_strength,
+            "sha": hint_sha,
+        }
         self.torn_trace_count = 0
 
     def __call__(  # noqa: C901 - resume validation and native episode publication
@@ -725,6 +879,8 @@ class TaskEpisodeSource:
             "announced_turn_budget": self.announced_turn_budget,
             "chat_template_kwargs": self.chat_template_kwargs,
             "jail_backend": self.jail_backend,
+            "hint": self.hint_identity,
+            "unhinted_system_prompt": self.unhinted_system_prompt,
         }
         if task.task_variant == "leak":
             identity_record.update(json.loads(task.files[".r2e-identity.json"]))
@@ -766,7 +922,7 @@ class TaskEpisodeSource:
                 backend,
                 episode_dir=Path(temporary),
                 arm=AgenticArmConfig(),
-                system_prompt=LADDER_SYSTEM_PROMPT,
+                system_prompt=self.system_prompt,
                 user_template=LADDER_USER_TEMPLATE,
                 max_turns=self.max_turns,
                 announced_turn_budget=self.announced_turn_budget,
@@ -783,6 +939,13 @@ class TaskEpisodeSource:
                 submit_grader=_task_submission_grader(task, jail_backend=self.jail_backend),
             )
             summary_record = trace.summary_record()
+            summary_record["payment_register"] = identity_record["payment_register"]
+            summary_record["true_pass"] = recorded_true_pass(summary_record)
+            if task.math_evidence_template is not None:
+                summary_record["math_evidence"] = _math_evidence_from_submission_trace(
+                    task, summary_record
+                ).to_json_dict()
+            _persist_episode_summary(temporary_trace_path, summary_record)
             if task.task_variant == "leak":
                 _finalize_leak_summary(
                     task,
@@ -804,7 +967,7 @@ class TaskEpisodeSource:
                 raise ValueError("refusing to publish an episode trace without its exact summary")
             temporary_trace_path.replace(trace_path)
             return EpisodeSample(
-                {**summary_record, "payment_register": identity_record["payment_register"]},
+                summary_record,
                 _read_trace(trace_path),
                 trace_path,
             )
@@ -900,6 +1063,7 @@ def replay_episode_trace(path: Path, expected_identity: Mapping[str, object]) ->
     summary = dict(summaries[0])
     if "payment_register" in expected_identity:
         summary["payment_register"] = expected_identity["payment_register"]
+    summary["true_pass"] = recorded_true_pass(summary)
     return EpisodeSample(summary, records, path)
 
 

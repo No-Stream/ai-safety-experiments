@@ -684,6 +684,8 @@ def build_sweep_stage(  # noqa: PLR0913  -- each argument is a real axis some pl
             model_id,
             "--samples-per-prompt",
             samples_per_prompt,
+            "--oversize-reason",
+            "full training-corpus prompt-selection sweep",
             "--out-dir",
             str(out_dir),
             "--thinking",

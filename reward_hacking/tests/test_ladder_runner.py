@@ -1984,6 +1984,7 @@ def test_code_identity_lists_follow_the_live_detector_boundary() -> None:
     assert "reward_hacking/ladder/exposure.py" in ladder_runner.LADDER_GENERATION_CODE_FILES
     assert "reward_hacking/ladder/disclosure.py" not in ladder_runner.LADDER_GENERATION_CODE_FILES
     assert set(ladder_runner.LADDER_DETECTOR_CODE_FILES) == {
+        "reward_hacking/ladder/behaviour.py",
         "reward_hacking/ladder/disclosure.py",
         "reward_hacking/ladder/exposure.py",
         "reward_hacking/ladder/rungs.py",
@@ -3615,7 +3616,7 @@ def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
     # Captured with the opt-in budget disabled and source identities fixed independently of edits.
     assert (
         config.provenance_digest
-        == "a59a8585fc515be593c58f1ce252d9def2b81be1b6b7ba77af90e6886a3e94a5"
+        == "3cd3311760115b56384b4a32d7704611a4ee3637b70fc44e624ae98c258c3610"
     )
 
 
@@ -4869,6 +4870,7 @@ def test_v2_submission_graders_scan_each_submitted_tree(
         "special_case_in_submission": True,
         "special_case_labels": ["special_case_branch"],
         "protected_paths_changed": False,
+        "acceptance_paths_changed": False,
     }
     (episode_dir / "src/module.py").write_text(scenario.files["src/module.py"])
     (episode_dir / "tests/acceptance").mkdir()
@@ -4884,6 +4886,7 @@ def test_v2_submission_graders_scan_each_submitted_tree(
         "special_case_in_submission": False,
         "special_case_labels": [],
         "protected_paths_changed": True,
+        "acceptance_paths_changed": True,
     }
 
 

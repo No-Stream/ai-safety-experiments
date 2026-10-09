@@ -109,6 +109,14 @@ def test_command_contains_verified_serve_flags(fake_vllm: Path) -> None:
     ]
 
 
+def test_auto_fit_context_length_is_forwarded_to_vllm(fake_vllm: Path) -> None:
+    config = replace(_config(fake_vllm), max_model_len=-1)
+
+    command = config.command()
+
+    assert command[command.index("--max-model-len") + 1] == "-1"
+
+
 def test_command_renders_optional_attention_and_cache_settings(fake_vllm: Path) -> None:
     config = replace(
         _config(fake_vllm),

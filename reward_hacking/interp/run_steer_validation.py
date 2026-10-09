@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.interp.directions import load_model_and_tokenizer
 from reward_hacking.interp.generation_capture import (
     capture_record_activations,
@@ -1101,6 +1102,31 @@ def _behaviour_scales(args: argparse.Namespace) -> list[float]:
     return list(DEFAULT_RHOS)
 
 
+def _behaviour_sampling_budget(
+    fit: FitArtifacts,
+    *,
+    args: argparse.Namespace,
+    layers: Sequence[int],
+    scales: Sequence[float],
+) -> dict[str, object]:
+    prompts = fit.plain_prompts[: args.n_behaviour_prompts]
+    position_arms = tuple(args.position_arms) if args.position_arms else POSITION_ARMS
+    arm_names = [ARM_REAL]
+    arm_names.extend(
+        f"{family}_{draw_index}"
+        for family in CONTROL_ARMS
+        for draw_index in range(args.n_control_draws)
+    )
+    episodes_per_cell = {
+        f"L{layer}/{position_arm}/{arm}/{rho}": len(prompts) * args.n_samples
+        for layer in layers
+        for position_arm in position_arms
+        for arm in arm_names
+        for rho in scales
+    }
+    return log_sampling_grid(episodes_per_cell, oversize_reason=args.oversize_reason)
+
+
 @dataclass(frozen=True)
 class BehaviourSweep:
     """What one behavioural sweep attempted, produced, skipped, and the decoding it ran under.
@@ -1322,13 +1348,14 @@ def stage_behaviour(args: argparse.Namespace) -> int:
     layers = args.layers or top_layers_from_screen(args.out_dir, k=args.top_k)
     if not layers:
         raise ValueError("no layers to run: pass --layers or run screen-layers first")
+    scales = _behaviour_scales(args)
+    sampling_provenance = _behaviour_sampling_budget(fit, args=args, layers=layers, scales=scales)
     path, resumed_cells = _claim_or_resume(
         args.out_dir / labelled(BEHAVIOUR_ARTIFACT, args.label),
         resume=args.resume,
         rows_per_cell=min(args.n_behaviour_prompts, len(fit.plain_prompts)) * args.n_samples,
     )
     model, tokenizer = load_model_and_tokenizer(args.model_id)
-    scales = _behaviour_scales(args)
     sweep = _run_behaviour(
         model,
         tokenizer,
@@ -1352,6 +1379,7 @@ def stage_behaviour(args: argparse.Namespace) -> int:
             "n_prompts": min(args.n_behaviour_prompts, len(fit.plain_prompts)),
             "n_samples": args.n_samples,
             "max_new_tokens": args.max_new_tokens,
+            "sampling_budget": sampling_provenance,
             **sweep.to_summary_fields(),
         },
         args.label,
@@ -1375,6 +1403,9 @@ def stage_behaviour_thinking(args: argparse.Namespace) -> int:
         )
     if not args.rhos:
         raise ValueError("--rhos is required for the thinking tier, for the same reason")
+    sampling_provenance = _behaviour_sampling_budget(
+        fit, args=args, layers=args.layers, scales=args.rhos
+    )
     path, resumed_cells = _claim_or_resume(
         args.out_dir / labelled(BEHAVIOUR_THINKING_ARTIFACT, args.label),
         resume=args.resume,
@@ -1404,6 +1435,7 @@ def stage_behaviour_thinking(args: argparse.Namespace) -> int:
             "n_prompts": min(args.n_behaviour_prompts, len(fit.plain_prompts)),
             "n_samples": args.n_samples,
             "thinking_max_new_tokens": args.thinking_max_new_tokens,
+            "sampling_budget": sampling_provenance,
             **sweep.to_summary_fields(),
         },
         args.label,
@@ -1933,6 +1965,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--n-behaviour-prompts", type=int, default=16, help="prompts per behavioural cell"
     )
     parser.add_argument("--n-samples", type=int, default=1, help="generations per prompt per cell")
+    add_oversize_reason_argument(parser)
     parser.add_argument(
         "--n-control-draws", type=int, default=3, help="draws of each control family"
     )
@@ -1998,6 +2031,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "non-zero if it does not",
     )
     args = parser.parse_args(argv)
+    if args.oversize_reason is not None and args.stage not in {"behaviour", "behaviour-thinking"}:
+        parser.error("--oversize-reason applies only to behavioural generation stages")
     # A repeated value re-runs identical cells at identical seeds, doubling the reported sample
     # size while cells_planned doubles in lockstep (so is_complete stays green) -- and a resume
     # would then inherit the duplicate as already-complete, corrupting the readout a second way.

@@ -63,6 +63,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 import torch
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.deltanet_kernels import (
     DELTANET_KERNEL_FIELD,
     assert_one_deltanet_kernel,
@@ -1014,6 +1015,7 @@ class FitLensArgs:
     recon_max_positions: int
     gen_engine: str
     vllm_gpu_fraction: float
+    sampling_budget: dict[str, object] = field(default_factory=dict)
 
 
 def capture_model_then_generator(
@@ -1352,6 +1354,7 @@ def run_fit_lens(args: FitLensArgs) -> None:
         json.dumps(
             {
                 "model_id": args.model_id,
+                "sampling_budget": args.sampling_budget,
                 "n_corpus": len(corpus),
                 "n_fit_prompts": fit_identity["n_fit_prompts"],
                 "n_pairs": len(pairs),
@@ -1385,6 +1388,7 @@ class AxisProbeArgs:
     batch_size: int
     n_placebos: int
     probe_config: ProbeConfig
+    sampling_budget: dict[str, object] = field(default_factory=dict)
 
 
 def run_axis_probe(args: AxisProbeArgs) -> None:
@@ -1446,6 +1450,7 @@ def run_axis_probe(args: AxisProbeArgs) -> None:
                 "concepts": list(args.concepts),
                 "poolings": list(args.poolings),
                 "n_placebos": args.n_placebos,
+                "sampling_budget": args.sampling_budget,
                 "deltanet_kernel_bridge": kernel_bridge,
                 DELTANET_KERNEL_FIELD: deltanet_kernel,
                 "axes": index,
@@ -1483,6 +1488,7 @@ class ContrastArgs:
     gen_engine: str
     vllm_gpu_fraction: float
     gen_batch_pairs: int
+    sampling_budget: dict[str, object] = field(default_factory=dict)
 
 
 def load_validated_eval_axes(
@@ -1843,6 +1849,7 @@ def run_contrast(args: ContrastArgs) -> None:
         json.dumps(
             {
                 "model_id": args.model_id,
+                "sampling_budget": args.sampling_budget,
                 "poolings": list(args.poolings),
                 "variants": list(args.variants),
                 "window_length": args.window_length,
@@ -1911,6 +1918,7 @@ class SteerPatchArgs:
     seed: int
     sampling: SamplingConfig
     deadline_seconds: float | None
+    sampling_budget: dict[str, object] = field(default_factory=dict)
 
 
 def load_concept_axis(axes_path: Path, concept: str, pooling: str, layer: int) -> torch.Tensor:
@@ -2389,6 +2397,7 @@ def run_steer_patch(args: SteerPatchArgs) -> None:
         json.dumps(
             {
                 "concepts": list(args.concepts),
+                "sampling_budget": args.sampling_budget,
                 "variant": args.variant,
                 "pooling": args.pooling,
                 "peak_layers": layers,
@@ -2459,6 +2468,7 @@ class PatchSweepArgs:
     raw_topk: int
     keep_baseline_rows: bool
     delta_windows: tuple[str, ...]
+    sampling_budget: dict[str, object] = field(default_factory=dict)
 
 
 class EligiblePatchPair(NamedTuple):
@@ -3223,6 +3233,7 @@ def _patch_sweep_payload(  # noqa: PLR0913 - the args plus each handoff the arti
         "readout_thinking": args.readout_thinking,
         "option_orders": list(args.option_orders),
         "model_id": args.model_id,
+        "sampling_budget": args.sampling_budget,
         "concepts": list(args.concepts),
         "variant": args.variant,
         "pooling": args.pooling,
@@ -4010,6 +4021,7 @@ def _add_generation_engine_args(stage: argparse.ArgumentParser) -> None:
 
 def _add_fit_lens_args(fit: argparse.ArgumentParser) -> None:
     """``fit-lens``: the closed-form Jacobian lens fit over the twins plus generated reasoning."""
+    add_oversize_reason_argument(fit)
     fit.add_argument("--max-fit-prompts", type=int, default=200)
     fit.add_argument(
         "--max-seq-len",
@@ -4046,6 +4058,7 @@ def _add_fit_lens_args(fit: argparse.ArgumentParser) -> None:
 
 def _add_axis_probe_args(probe: argparse.ArgumentParser) -> None:
     """``axis-probe``: run the validation battery over every concept axis, one per (concept,pool)."""
+    add_oversize_reason_argument(probe)
     probe.add_argument(
         "--concepts",
         nargs="+",
@@ -4063,6 +4076,7 @@ def _add_axis_probe_args(probe: argparse.ArgumentParser) -> None:
 
 def _add_contrast_args(contrast: argparse.ArgumentParser) -> None:
     """``contrast``: the generation-phase read; emits the peak-layer and concept-axis handoffs."""
+    add_oversize_reason_argument(contrast)
     contrast.add_argument(
         "--validated-eval-dir",
         type=Path,
@@ -4109,6 +4123,7 @@ def _add_contrast_args(contrast: argparse.ArgumentParser) -> None:
 
 def _add_steer_patch_args(steer: argparse.ArgumentParser) -> None:
     """``steer-patch``: the causal tier over the axes and peak layers the contrast stage saved."""
+    add_oversize_reason_argument(steer)
     steer.add_argument("--peak-layers-path", type=Path, required=True)
     steer.add_argument(
         "--axes-path",
@@ -4135,6 +4150,7 @@ def _add_steer_patch_args(steer: argparse.ArgumentParser) -> None:
 
 def _add_patch_sweep_args(sweep: argparse.ArgumentParser) -> None:
     """``patch-sweep``: the patching grid. Same handoffs as ``steer-patch``, no generation at all."""
+    add_oversize_reason_argument(sweep)
     sweep.add_argument("--peak-layers-path", type=Path, required=True)
     sweep.add_argument(
         "--axes-path",
@@ -4386,6 +4402,110 @@ def _validated_eval_dirs(args: argparse.Namespace) -> dict[str, Path]:
     return dirs
 
 
+def _fit_lens_sampling_grid(args: argparse.Namespace, episode_dir: Path) -> dict[str, int]:
+    """Count the selected reasoning pairs for the lens-fit generation stage."""
+    pairs = build_stimulus_pairs(episode_dir, limit=args.limit)
+    cell = f"model={args.model_id}/stage=fit-lens/reasoning-generation"
+    return {cell: min(args.reasoning_prompts, len(pairs))}
+
+
+def _contrast_sampling_grid(args: argparse.Namespace, episode_dir: Path) -> dict[str, int]:
+    """Count the original and conflicting response-generation cells."""
+    pairs = build_stimulus_pairs(episode_dir, limit=args.limit)
+    return {
+        f"model={args.model_id}/stage=contrast/side={side}": len(pairs)
+        for side in (SIDE_CONFLICTING, SIDE_ORIGINAL)
+    }
+
+
+def _steer_patch_sampling_grid(args: argparse.Namespace, episode_dir: Path) -> dict[str, int]:
+    """Count every steering, ablation, and paired-patch intervention cell."""
+    pairs = build_stimulus_pairs(episode_dir, limit=max(args.n_steer_prompts, args.n_patch_pairs))
+    steering_prompt_count = min(args.n_steer_prompts, len(pairs))
+    patch_pair_count = min(args.n_patch_pairs, len(pairs))
+    episodes_per_cell: dict[str, int] = {}
+    placebo_arms = [f"placebo_{placebo_index}" for placebo_index in range(args.n_placebos)]
+    intervention_arms = ["real", *placebo_arms]
+    for concept_index, concept in enumerate(args.concepts):
+        cell_prefix = f"model={args.model_id}/concept={concept}/concept-index={concept_index}"
+        episodes_per_cell[f"{cell_prefix}/operation=steer/mode=baseline/arm=baseline"] = (
+            steering_prompt_count
+        )
+        for scale_index, scale in enumerate(args.alpha_scales):
+            for arm in intervention_arms:
+                episodes_per_cell[
+                    f"{cell_prefix}/operation=steer/mode=steer/scale-index={scale_index}/"
+                    f"scale={scale:g}/arm={arm}"
+                ] = steering_prompt_count
+        for arm in intervention_arms:
+            episodes_per_cell[f"{cell_prefix}/operation=steer/mode=ablate/arm={arm}"] = (
+                steering_prompt_count
+            )
+        episodes_per_cell[f"{cell_prefix}/operation=activation-patch-pairs"] = patch_pair_count
+    return episodes_per_cell
+
+
+def _patch_sweep_sampling_grid(args: argparse.Namespace, episode_dir: Path) -> dict[str, int]:
+    """Count every layer, direction, mode, readout, and option-order patch cell."""
+    pairs = build_stimulus_pairs(episode_dir, limit=args.limit)
+    patch_pair_count = min(args.n_patch_pairs, len(pairs))
+    episodes_per_cell: dict[str, int] = {}
+    layer_selection = ",".join(args.patch_layers)
+    tail_widths = ",".join(str(width) for width in args.tail_widths)
+    head_widths = ",".join(str(width) for width in args.head_widths)
+    for concept_index, concept in enumerate(args.concepts):
+        for direction_index, direction in enumerate(args.patch_directions):
+            for mode_index, mode in enumerate(args.patch_modes):
+                for readout_index, readout_mode in enumerate(args.readout_modes):
+                    option_orders = (
+                        args.option_orders
+                        if readout_mode == READOUT_MODE_FORCED_CHOICE
+                        else ("sequence",)
+                    )
+                    for order_index, order in enumerate(option_orders):
+                        cell = (
+                            f"model={args.model_id}/stage=patch-sweep/"
+                            f"concept={concept}/concept-index={concept_index}/"
+                            f"direction={direction}/direction-index={direction_index}/"
+                            f"mode={mode}/mode-index={mode_index}/"
+                            f"readout={readout_mode}/readout-index={readout_index}/"
+                            f"order={order}/order-index={order_index}/"
+                            f"layers={layer_selection}/tail-widths={tail_widths}/"
+                            f"head-widths={head_widths}"
+                        )
+                        episodes_per_cell[cell] = patch_pair_count
+    return episodes_per_cell
+
+
+def _sampling_budget_for_stage(args: argparse.Namespace, episode_dir: Path) -> dict[str, object]:
+    """Build the complete generated-response or paired-patch grid before any model work."""
+    if args.command == "fit-lens":
+        episodes_per_cell = _fit_lens_sampling_grid(args, episode_dir)
+    elif args.command == "contrast":
+        episodes_per_cell = _contrast_sampling_grid(args, episode_dir)
+    elif args.command == "steer-patch":
+        episodes_per_cell = _steer_patch_sampling_grid(args, episode_dir)
+    elif args.command == "patch-sweep":
+        episodes_per_cell = _patch_sweep_sampling_grid(args, episode_dir)
+    else:
+        raise ValueError(f"sampling budgets are not defined for {args.command!r}")
+
+    return log_sampling_grid(episodes_per_cell, oversize_reason=args.oversize_reason)
+
+
+def _axis_probe_sampling_budget(args: argparse.Namespace) -> dict[str, object]:
+    """Count every selected authored-pair cell before the axis-validation model is loaded."""
+    episodes_per_cell = {
+        f"model={args.model_id}/stage=axis-probe/concept={concept}/pooling={pooling}": min(
+            args.limit if args.limit is not None else len(AXIS_PROBE_CONCEPTS[concept]),
+            len(AXIS_PROBE_CONCEPTS[concept]),
+        )
+        for concept in args.concepts
+        for pooling in args.poolings
+    }
+    return log_sampling_grid(episodes_per_cell, oversize_reason=args.oversize_reason)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Dispatch a stage. Every stage is GPU-only; the offline tests cover the pure helpers only."""
     args = _parse_args(argv)
@@ -4394,6 +4514,7 @@ def main(argv: list[str] | None = None) -> None:
         # Dispatched ahead of the episode-dir resolution below because it is the one stage that
         # materialises no stimuli -- it builds its axes from the concept sentence pairs -- so
         # resolving one would leave an empty mkdtemp behind on every invocation.
+        sampling_budget = _axis_probe_sampling_budget(args)
         run_axis_probe(
             AxisProbeArgs(
                 model_id=args.model_id,
@@ -4405,11 +4526,16 @@ def main(argv: list[str] | None = None) -> None:
                 batch_size=args.batch_size,
                 n_placebos=args.n_placebos,
                 probe_config=ProbeConfig(seed=args.seed),
+                sampling_budget=sampling_budget,
             )
         )
         return
     raw_dir = args.raw_dir if args.raw_dir is not None else args.out_dir / "raw"
     episode_dir = _resolve_episode_dir(args.episode_dir)
+    sampling_budget: dict[str, object] = {}
+    if args.command in {"fit-lens", "contrast", "steer-patch", "patch-sweep"}:
+        require_raw_dir_outside_episode_dir(raw_dir, episode_dir)
+        sampling_budget = _sampling_budget_for_stage(args, episode_dir)
     if args.command == "fit-lens":
         run_fit_lens(
             FitLensArgs(
@@ -4429,6 +4555,7 @@ def main(argv: list[str] | None = None) -> None:
                 recon_max_positions=args.recon_max_positions,
                 gen_engine=args.gen_engine,
                 vllm_gpu_fraction=args.vllm_gpu_fraction,
+                sampling_budget=sampling_budget,
             )
         )
     elif args.command == "contrast":
@@ -4450,6 +4577,7 @@ def main(argv: list[str] | None = None) -> None:
                 gen_engine=args.gen_engine,
                 vllm_gpu_fraction=args.vllm_gpu_fraction,
                 gen_batch_pairs=args.gen_batch_pairs,
+                sampling_budget=sampling_budget,
             )
         )
     elif args.command == "steer-patch":
@@ -4476,6 +4604,7 @@ def main(argv: list[str] | None = None) -> None:
                 seed=args.seed,
                 sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
                 deadline_seconds=args.deadline_seconds,
+                sampling_budget=sampling_budget,
             )
         )
     elif args.command == "patch-sweep":
@@ -4512,6 +4641,7 @@ def main(argv: list[str] | None = None) -> None:
                 raw_topk=args.raw_topk,
                 keep_baseline_rows=args.keep_baseline_rows,
                 delta_windows=tuple(args.delta_windows),
+                sampling_budget=sampling_budget,
             )
         )
     elif args.command == "patch-decode":

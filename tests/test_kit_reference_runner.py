@@ -612,6 +612,10 @@ class TestTheRunnerOnAFreshBox:
         banked = index_of(calls, "aws", sync_between(f"{box.sweep_dir}/", f"{RUN_PREFIX}/select/"))
         arm = sweep + 1 + index_of(calls[sweep + 1 :], "uv", python_running("games.stage_runner"))
         first_eval = index_of(calls, "uv", python_running("games.run_evals"))
+        first_eval_argv = calls[first_eval]["argv"]
+        assert "--oversize-reason" in first_eval_argv
+        reason_index = first_eval_argv.index("--oversize-reason")
+        assert first_eval_argv[reason_index + 1] == "full games evaluation battery"
         final_sync = index_of(
             calls, "aws", sync_between(f"{box.repo}/artifacts/games/logs/", f"{RUN_PREFIX}/logs/")
         )

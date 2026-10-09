@@ -205,32 +205,47 @@ class TestTheEvalStageCarriesBothSplits:
         assert named == set(train_sequence.EVAL_SPLITS)
         assert train_eval.CAPABILITY_CONTROL_SPLIT in named
 
+    def test_screen_and_eval_stages_record_their_planned_scope_reasons(self) -> None:
+        screen_module, screen_argv = _arm_module_and_argv(_stage("screen"))
+        eval_module, eval_argv = _arm_module_and_argv(_stage("eval"))
+        assert screen_module == train_screen.__name__
+        assert eval_module == train_eval.__name__
+        assert screen_argv[screen_argv.index("--oversize-reason") + 1] == (
+            "sequenced gradient screen at the training group size"
+        )
+        assert eval_argv[eval_argv.index("--oversize-reason") + 1] == (
+            "sequenced retained-checkpoint held-out evaluation"
+        )
+
 
 class TestTheRenderedPlanIsReadable:
-    def test_describe_plan_names_every_stage_and_no_argument_needs_word_splitting(self) -> None:
-        """The rendered plan must be readable, and no argument may hide a word break.
+    def test_describe_plan_preserves_argv_boundaries_for_every_stage(self) -> None:
+        """The rendered plan must preserve argv boundaries when a flag carries prose.
 
         Deliberately NOT "nothing needs shell quoting": the analysis stage's ``--glob`` carries a
         ``*`` on purpose, which is correct because the stage runner executes an argv list through
         subprocess where no shell expands it -- and it is exactly why a reader copying the printed
-        command into a terminal has to quote that one argument. Whitespace and quote characters are
-        the real hazard, since those would silently split one argument into two in either setting.
+        command into a terminal has to quote that one argument. The sampling reason is another
+        legitimate multiword argument, so the rendered shell form must round-trip to the same argv.
         """
         write_screen_verdict(train_sequence.screen_artifact())
         rendered = train_sequence.describe_plan()
         for stage_name in ("screen", "arm", "eval", "analyze"):
             assert stage_name in rendered
         for stage in train_sequence.stages():
-            for argument in stage.argv:
+            for index, argument in enumerate(stage.argv):
                 assert argument == argument.strip(), argument
-                assert not set(argument) & set(" \t\n'\""), argument
+                if index == 0 or stage.argv[index - 1] != "--oversize-reason":
+                    assert not set(argument) & set(" \t\n'\""), argument
+            assert shlex.split(shlex.join(stage.argv)) == list(stage.argv)
         globbed = [
-            argument
+            (stage, index, argument)
             for stage in train_sequence.stages()
-            for argument in stage.argv
+            for index, argument in enumerate(stage.argv)
             if shlex.quote(argument) != argument
+            and (index == 0 or stage.argv[index - 1] != "--oversize-reason")
         ]
-        assert all("*" in argument for argument in globbed), globbed
+        assert all("*" in argument for _, _, argument in globbed), globbed
 
     def test_every_trainable_arm_renders_disjoint_artifact_paths(
         self, monkeypatch: pytest.MonkeyPatch

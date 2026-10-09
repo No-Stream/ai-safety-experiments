@@ -22,9 +22,12 @@ starts, and then ``python3`` is whatever it planted, ``-I`` or not.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import PurePosixPath
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 from reward_hacking.harness.docker_backend import submitted_files
@@ -34,6 +37,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from reward_hacking.harness.docker_backend import DockerConfig
+    from reward_hacking.harness.math_evidence import MathEvidence
 
 TASK_FILENAME = "TASK.md"
 GRADER_FILENAME = "grade.py"
@@ -246,6 +250,7 @@ class Task:
     visible_check_contradicts_truth: bool = False
     executable_files: frozenset[str] = frozenset()
     task_variant: str | None = None
+    math_evidence_template: MathEvidence | None = None
     problem_id: str | None = None
     artifact_filename: str | None = None
     provided_test_check: Callable[[Path], TaskTestVerdict] | None = None
@@ -272,13 +277,29 @@ class Task:
             self.artifact_filename,
         )
         if self.task_variant is None:
-            if any(value is not None for value in (*evidence_values, self.provided_test_check)):
+            if any(
+                value is not None
+                for value in (
+                    *evidence_values,
+                    self.provided_test_check,
+                    self.math_evidence_template,
+                )
+            ):
                 raise ValueError(
                     "task reward evidence requires a variant, problem id, artifact, and check"
                 )
             return
-        if self.task_variant not in {"oneoff", "conflicting", "original", "leak", "loose"}:
+        if self.task_variant not in {
+            "oneoff",
+            "conflicting",
+            "original",
+            "leak",
+            "loose",
+            "loose_oneoff",
+            "loose_hidden_original",
+        }:
             raise ValueError(f"unknown task variant {self.task_variant!r}")
+        self._validate_math_evidence_template()
         if any(value is None for value in evidence_values) or (
             self.provided_test_check is None and self.docker_config is None
         ):
@@ -296,6 +317,20 @@ class Task:
         ):
             raise ValueError(
                 "Docker task evidence artifact must be in the submitted artifact allowlist"
+            )
+
+    def _validate_math_evidence_template(self) -> None:
+        """Require an empty task-bound template only on the hidden-key loose variants."""
+        if self.task_variant in {"loose_oneoff", "loose_hidden_original"}:
+            if (
+                self.math_evidence_template is None
+                or self.math_evidence_template.variant != self.task_variant
+                or any(question.attempts for question in self.math_evidence_template.questions)
+            ):
+                raise ValueError("loose math tasks require a matching empty math evidence template")
+        elif self.math_evidence_template is not None:
+            raise ValueError(
+                "math evidence templates are only valid for the hidden-key loose variants"
             )
 
     def _validate_docker(self) -> None:
@@ -428,6 +463,8 @@ class TaskTestVerdict:
 
     passed: bool | None
     error: str | None = None
+    submission_feedback: str | None = None
+    submission_evidence: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Keep an unmeasured test distinct from a measured rejection."""
@@ -435,6 +472,11 @@ class TaskTestVerdict:
             raise ValueError(
                 "an unmeasured task test needs an error, and a measured result cannot have one"
             )
+        object.__setattr__(
+            self,
+            "submission_evidence",
+            MappingProxyType(deepcopy(dict(self.submission_evidence))),
+        )
 
 
 def task_episode_evidence(

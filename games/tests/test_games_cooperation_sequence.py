@@ -554,6 +554,18 @@ class TestGeneratedCommands:
             module, args = command
             _parse_with_native_parser(module, args)
 
+    def test_full_endpoint_evaluation_records_its_planned_scope_reason(self) -> None:
+        operation = next(
+            operation
+            for operation in _operations(_phase_specs())
+            if (command := _module_args(operation.argv)) is not None
+            and command[0] == "games.cooperation_eval_runner"
+            and "--endpoint" in command[1]
+            and command[1][command[1].index("--endpoint") + 1] == "all"
+        )
+        _, args = _module_args(operation.argv)  # type: ignore[misc]
+        assert args[args.index("--oversize-reason") + 1] == "sequenced full endpoint evaluation"
+
     def test_smoke_uses_the_0_6b_plumbing_checkpoint(self) -> None:
         smoke = _phase(_phase_specs(), "0.6b")
         argv = [token for operation in smoke.operations for token in operation.argv]

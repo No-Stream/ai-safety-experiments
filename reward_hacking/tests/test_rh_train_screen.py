@@ -29,6 +29,7 @@ from reward_hacking.model_backend import (
 from reward_hacking.train_dataset import (
     ARM_CONTROL,
     BoundedSubset,
+    PromptBudgetFilter,
     resolve_arm_rows,
     training_rows,
 )
@@ -592,6 +593,89 @@ class TestExposureFlagParsing:
 
         parsed = _parse_args(["--arm", "legible-subset", "--out", "screen.json"])
         assert parsed.arm == "legible-subset"
+
+
+class TestSamplingBudget:
+    @staticmethod
+    def _stub_dry_run(monkeypatch: pytest.MonkeyPatch, *, n_prompts: int) -> None:
+        monkeypatch.setattr(
+            train_screen.AutoTokenizer,
+            "from_pretrained",
+            lambda *_args, **_kwargs: stub_tokenizer(),
+        )
+        monkeypatch.setattr(
+            train_screen, "assert_backend_can_render_template", lambda _tokenizer: None
+        )
+        monkeypatch.setattr(train_screen, "derive_prefilled_think", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(train_screen, "resolve_chat_template_kwargs", lambda _tokenizer: {})
+        monkeypatch.setattr(train_screen, "load_partition", lambda _path: None)
+        budget = PromptBudgetFilter(
+            max_prompt_tokens=DEFAULT_MAX_PROMPT_TOKENS,
+            kept_problem_ids=tuple(f"toy_{index}" for index in range(n_prompts)),
+            dropped_problem_ids=(),
+            longest_tokens_by_dropped_problem={},
+            longest_kept_tokens=1,
+        )
+        monkeypatch.setattr(
+            train_screen,
+            "resolve_arm_rows",
+            lambda *_args, **_kwargs: (synthetic_rows(n_prompts), budget, None),
+        )
+
+    def test_the_cli_records_its_sampling_grid_in_the_dry_run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        self._stub_dry_run(monkeypatch, n_prompts=2)
+        with caplog.at_level("INFO"):
+            assert (
+                train_screen.main(
+                    [
+                        "--arm",
+                        ARM_CONTROL,
+                        "--out",
+                        str(tmp_path / "screen.json"),
+                        "--samples-per-prompt",
+                        "2",
+                        "--dry-run",
+                    ]
+                )
+                == 0
+            )
+
+        payload = json.loads(capsys.readouterr().out)
+        cell = f"model={DEFAULT_MODEL_ID}/arm={ARM_CONTROL}/grader_exposure=inline"
+        assert payload["sampling_budget"]["episodes_per_cell"] == {cell: 4}
+        assert payload["sampling_budget"]["total_episodes"] == 4
+        assert payload["sampling_budget"]["oversize_reason"] is None
+        assert any(
+            "Sampling grid: 1 cells, total episodes=4" in record.message
+            for record in caplog.records
+        )
+
+    def test_an_oversized_cell_requires_a_reason_and_records_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        self._stub_dry_run(monkeypatch, n_prompts=2)
+        command = [
+            "--arm",
+            ARM_CONTROL,
+            "--out",
+            str(tmp_path / "screen.json"),
+            "--samples-per-prompt",
+            "5",
+            "--dry-run",
+        ]
+        with pytest.raises(ValueError, match="--oversize-reason"):
+            train_screen.main(command)
+
+        assert train_screen.main([*command, "--oversize-reason", "screen the full group"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["sampling_budget"]["total_episodes"] == 10
+        assert payload["sampling_budget"]["oversize_reason"] == "screen the full group"
 
 
 class TestArtifacts:

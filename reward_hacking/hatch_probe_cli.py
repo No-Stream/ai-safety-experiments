@@ -38,13 +38,14 @@ import logging
 import random
 import re
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.eval_model import read_adapter_facts
 from games.generation import TRAINING_TEMPERATURE
 from games.preflight import derive_prefilled_think, resolve_chat_template_kwargs
@@ -150,6 +151,18 @@ if TYPE_CHECKING:
     from reward_hacking.train_dataset import PromptBudgetFilter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ProbePlanInputs:
+    """Inputs that the dry-run report carries from resolution through rendering."""
+
+    problems_by_split: Mapping[str, tuple[ILCBProblem, ...]]
+    budget: PromptBudgetFilter
+    subset: BoundedSubset | None
+    variant_dropped: tuple[str, ...]
+    sampling_provenance: Mapping[str, object]
+
 
 # The training template's opening line, which keys the mock completion to its entry point.
 _ENTRY_POINT_PATTERN = re.compile(r"Implement `([^`]+)` in Python")
@@ -557,6 +570,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=DEFAULT_SAMPLES_PER_PROMPT,
         help="samples per problem per cell; the default matches the flagship screen",
     )
+    add_oversize_reason_argument(parser)
     parser.add_argument(
         "--max-tokens",
         type=int,
@@ -683,14 +697,11 @@ def resolve_probe_adapter_path(adapter_dir: Path, output_path: Path) -> Path:
 
 def _dry_run_plan(
     args: argparse.Namespace,
-    problems_by_split: Mapping[str, tuple[ILCBProblem, ...]],
-    budget: PromptBudgetFilter,
-    subset: BoundedSubset | None,
-    variant_dropped: Sequence[str],
+    inputs: ProbePlanInputs,
 ) -> dict[str, object]:
     """Everything the run would do, with no model loaded and no jail launched."""
     cells = probe_cells_for(args.hatch_levels, arms=args.arms, framings=args.framings)
-    n_problems = len(problems_by_split[SPLIT_ONEOFF])
+    n_problems = len(inputs.problems_by_split[SPLIT_ONEOFF])
     return {
         "dry_run": True,
         "model_id": args.model,
@@ -702,11 +713,12 @@ def _dry_run_plan(
         "cells": [cell.label for cell in cells],
         "n_problems": n_problems,
         "samples_per_prompt": args.samples_per_prompt,
+        "sampling_budget": dict(inputs.sampling_provenance),
         "max_tokens_override": args.max_tokens,
         "n_calls": n_problems * args.samples_per_prompt * len(cells),
-        "prompt_budget": budget.to_json_dict(),
-        "dropped_only_by_variant_text": list(variant_dropped),
-        "bounded_subset": subset.to_json_dict() if subset else None,
+        "prompt_budget": inputs.budget.to_json_dict(),
+        "dropped_only_by_variant_text": list(inputs.variant_dropped),
+        "bounded_subset": inputs.subset.to_json_dict() if inputs.subset else None,
         "out": str(args.out),
         "records_out": str(records_path_for(args.out)),
         "batch_handle_out": str(batch_handle_path_for(args.out)) if args.bedrock_batch else None,
@@ -723,6 +735,25 @@ def _dry_run_plan(
             else records_path_for(args.out).exists() and not args.out.exists()
         ),
     }
+
+
+def _resolve_cell_inputs_and_sampling_provenance(
+    args: argparse.Namespace,
+    problems_by_split: Mapping[str, tuple[ILCBProblem, ...]],
+    cells: Sequence[ProbeCell],
+    *,
+    leakage_hint: str,
+) -> tuple[dict[str, CellInputs], dict[str, object]]:
+    """Render cells and enforce their per-cell cap before a backend or jail is created."""
+    cell_inputs = cell_inputs_by_label(problems_by_split, cells=cells, leakage_hint=leakage_hint)
+    sampling_provenance = log_sampling_grid(
+        {
+            label: len(cell_input.prompts) * args.samples_per_prompt
+            for label, cell_input in cell_inputs.items()
+        },
+        oversize_reason=args.oversize_reason,
+    )
+    return cell_inputs, sampling_provenance
 
 
 def _refuse_below_batch_floor(n_records: int, *, n_cells: int) -> None:
@@ -1076,8 +1107,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     partition, problems_by_split, budget, subset, variant_dropped = _resolve_inputs(
         args, cells, leakage_hint=leakage_hint.text
     )
+    cell_inputs, sampling_provenance = _resolve_cell_inputs_and_sampling_provenance(
+        args,
+        problems_by_split,
+        cells,
+        leakage_hint=leakage_hint.text,
+    )
     if args.dry_run:
-        plan = _dry_run_plan(args, problems_by_split, budget, subset, variant_dropped)
+        plan = _dry_run_plan(
+            args,
+            ProbePlanInputs(
+                problems_by_split=problems_by_split,
+                budget=budget,
+                subset=subset,
+                variant_dropped=variant_dropped,
+                sampling_provenance=sampling_provenance,
+            ),
+        )
         logger.info("dry-run plan: %s", json.dumps(plan, indent=2))
         return 0
 
@@ -1131,9 +1177,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         hint_identity=leakage_hint.identity(),
         chat_template_kwargs=args.chat_template_kwargs,
         grader_workers=grader.workers,
-    )
-    cell_inputs = cell_inputs_by_label(
-        problems_by_split, cells=cells, leakage_hint=leakage_hint.text
     )
     resumed = (
         load_resumable_cells(records_path, cell_inputs, context=context, cells=cells)
@@ -1205,6 +1248,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "chat_template_kwargs": dict(args.chat_template_kwargs),
         "max_tokens_override": args.max_tokens,
         "sampling_unseeded": True,
+        "sampling_budget": sampling_provenance,
         **elicitation_record(args),
         "prefilled_think": prefilled_think,
         "partition": {

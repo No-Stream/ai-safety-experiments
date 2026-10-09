@@ -401,6 +401,14 @@ class TestLadderSummary:
         assert payload["n_rungs"] == 2
         assert payload["steps"] == [0, 40]
         assert payload["n_episodes_planned"] == sum(plan.n_episodes for plan in plans)
+        assert payload["sampling_budget"]["total_episodes"] == sum(
+            plan.n_episodes for plan in plans
+        )
+        assert payload["sampling_budget"]["episodes_per_cell"] == {
+            f"step={plan.rung.step}/split={split.split}": split.n_episodes
+            for plan in plans
+            for split in plan.splits
+        }
         assert payload["git_sha"]
         assert payload["trace_glob"] == train_eval.ladder_trace_glob(out_dir)
 
@@ -582,6 +590,9 @@ class TestSummaryRecord:
         assert record["adapter_verification_ran"] is False
         assert record["partition"]["pool_fingerprint"] == partition.pool_fingerprint
         assert record["sampling"]["max_new_tokens"] == 32768
+        assert record["sampling_budget"]["episodes_per_cell"] == {
+            f"step={plan.rung.step}/split={split.split}": split.n_episodes for split in plan.splits
+        }
         assert record["git_sha"]
         assert train_eval.TRACE_STEM in record["analyze_command"]
 
@@ -656,11 +667,65 @@ class TestCli:
                     "--episode-root",
                     str(tmp_path / "episodes"),
                     "--dry-run",
+                    "--oversize-reason",
+                    "existing dry-run test covers the stored held-out split",
                 ]
             )
             == 0
         )
         assert not out_dir.exists()
+
+    def test_the_cli_refuses_an_oversized_split_without_a_reason(self, tmp_path: Path):
+        with pytest.raises(ValueError, match="--oversize-reason"):
+            train_eval.main(
+                [
+                    "--backend",
+                    "mock",
+                    "--base-model",
+                    BASE_MODEL,
+                    "--partition",
+                    str(self._write_partition(tmp_path)),
+                    "--out-dir",
+                    str(tmp_path / "traces"),
+                    "--episode-root",
+                    str(tmp_path / "episodes"),
+                    "--repeats",
+                    "9",
+                    "--dry-run",
+                ]
+            )
+
+    def test_the_dry_run_logs_sampling_budget_as_json(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ):
+        with caplog.at_level("INFO", logger=train_eval.logger.name):
+            train_eval.main(
+                [
+                    "--backend",
+                    "mock",
+                    "--base-model",
+                    BASE_MODEL,
+                    "--partition",
+                    str(self._write_partition(tmp_path)),
+                    "--out-dir",
+                    str(tmp_path / "traces"),
+                    "--episode-root",
+                    str(tmp_path / "episodes"),
+                    "--oversize-reason",
+                    "dry run of the complete held-out grid",
+                    "--dry-run",
+                ]
+            )
+
+        budget_logs = [
+            record.message
+            for record in caplog.records
+            if record.message.startswith("sampling_budget | ")
+        ]
+        assert len(budget_logs) == 1
+        budget = json.loads(budget_logs[0].split(" | ", maxsplit=1)[1])
+        assert budget["oversize_reason"] == "dry run of the complete held-out grid"
+        assert budget["total_episodes"] == sum(budget["episodes_per_cell"].values())
 
     def test_the_headline_split_alone_is_refused_at_the_cli(self, tmp_path: Path):
         with pytest.raises(ValueError, match="cannot tell a disposition"):

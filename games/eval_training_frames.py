@@ -55,11 +55,13 @@ import hashlib
 import json
 import logging
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.eval_model import resolve_served_model, verify_served_model
 from games.eval_sampler import (
     add_sampler_arg,
@@ -287,6 +289,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     backend_cli.add_backend_args(parser)
     add_sampler_arg(parser)
+    add_oversize_reason_argument(parser)
     return parser.parse_args(argv)
 
 
@@ -504,6 +507,7 @@ def _frames_cell_identity(
         **_cell_identity(plan, target, sections=SECTIONS_TRAINING_FRAMES, config=config),
         **corpus,
         "prefilled_think": config.prefilled_think,
+        "sampling_budget": plan.sampling_budget,
     }
 
 
@@ -529,6 +533,7 @@ def _frames_meta(  # noqa: PLR0913 - one trace's provenance, mirroring run_evals
         "vllm_quantization": args.vllm_quantization,
         "sampler_mode": sampler_mode_meta(args),
         "sampling": _sampling_meta(args, thinking=plan.thinking),
+        "sampling_budget": plan.sampling_budget,
         "grading": plan.grading,
         # No `trained_games_source` beside these, unlike the battery's meta: this cell was handed the
         # corpus, so `corpus_path` and `corpus_sha256` below name the source by file and hash already.
@@ -782,6 +787,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     facts = _read_run_facts(cast("Path", args.run_dir))
     _refuse_corpus_from_another_game(rows, facts, path=corpus_path)
     plan = _resolve_plan(args, rows=rows, facts=facts)
+    sampling_budget = log_sampling_grid(
+        {
+            f"{plan.arm}/step-{target.step}": len(rows) * args.samples_per_prompt
+            for target in plan.targets
+        },
+        oversize_reason=args.oversize_reason,
+    )
+    plan = replace(plan, sampling_budget=sampling_budget)
     if args.backend in backend_cli.LOCAL_KINDS:
         # Namespace mutation is how the derived default reaches backend_from_args (run_evals ditto).
         args.thinking = plan.thinking

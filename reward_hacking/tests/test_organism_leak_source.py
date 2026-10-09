@@ -118,11 +118,14 @@ def test_load_assets_counts_merge_setup_and_unavailable(
     def build_task(case: R2eLeakTask, **_kwargs: object) -> Task:
         if case.task_id == "unavailable":
             raise LeakChannelUnavailableError(case.task_id, {"git_remote_ahead": "no change"})
+        required_channels = cast("tuple[str, ...]", _kwargs["required_channels"])
         return Task(
             task_id=case.task_id,
             prompt="Synthetic task",
             body="Synthetic task",
-            files={},
+            files={
+                ".r2e-identity.json": json.dumps({"leak_channels_open": list(required_channels)})
+            },
             true_check=lambda _files: False,
         )
 
@@ -201,7 +204,11 @@ def test_multi_channel_arm_uses_available_channels_and_keeps_unavailable_reasons
             task_id=case.task_id,
             prompt="Synthetic task",
             body="Synthetic task",
-            files={},
+            files={
+                ".r2e-identity.json": json.dumps(
+                    {"leak_channels_open": list(required_channels[-1])}
+                )
+            },
             true_check=lambda _files: False,
         )
 
@@ -297,6 +304,9 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     )
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
     task = build_synthetic_task(templates, tmp_path / "gate")
+    task_identity = json.loads(task.files[".r2e-identity.json"])
+    task_identity["leak_repo_seen"] = True
+    task.files[".r2e-identity.json"] = json.dumps(task_identity, sort_keys=True)
     manifest = cast("dict[str, object]", templates["manifest"])
     grade_directories: list[Path] = []
     policy_directories: list[Path] = []
@@ -398,6 +408,8 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     )
     assert identity["leak_channels_open"] == templates["manifest"]["channels"]
     assert identity["leak_channels_unavailable"] == templates["manifest"]["unavailable_channels"]
+    assert episode.record["leak_channels_open"] == templates["manifest"]["channels"]
+    assert episode.record["leak_repo_seen"] is True
     assert (
         episode.record["leak_channels_unavailable"] == templates["manifest"]["unavailable_channels"]
     )
@@ -425,6 +437,7 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
         sample=episode,
         provenance_sha256="a" * 64,
     )
+    assert cast("dict[str, object]", generated["trace_summary"])["leak_repo_seen"] is True
     canonical = json.loads(json.dumps(generated, sort_keys=True))
     assert rescore_recorded_leak(canonical) == canonical
 
@@ -435,6 +448,9 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
     templates = _make_leak_templates(tmp_path, channels=("git_remote_ahead",))
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
     task = build_synthetic_task(templates, tmp_path / "gate")
+    task_identity = json.loads(task.files[".r2e-identity.json"])
+    task_identity["leak_repo_seen"] = False
+    task.files[".r2e-identity.json"] = json.dumps(task_identity, sort_keys=True)
     original_temporary = tempfile.TemporaryDirectory
     monkeypatch.setattr(
         rollout,
@@ -450,9 +466,12 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
         rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
     )
 
+    forwarded_eval_pairs: list[object] = []
+
     def load_assets(
         _assets_path: Path, **kwargs: object
     ) -> tuple[list[Task], dict[str, dict[str, object]], Counter[str]]:
+        forwarded_eval_pairs.append(kwargs.get("eval_pairs"))
         cast("dict[str, str]", kwargs["manifest_json"])[task.task_id] = "{}"
         return [task], {task.task_id: {}}, Counter()
 
@@ -503,23 +522,28 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
         output_dir=tmp_path / "episodes",
         max_model_len=4096,
         families=("r2e_leak",),
+        partition="held-out",
         variants=("oneoff",),
+        leak_eval_pairs=((task.task_id, "git_remote_ahead"),),
     )
     first = source(task.task_id, seed=1, step=0, replica=0)
     assert first.record["failure_reason"] == "thinking_budget_overshoot"
     assert first.record["leak_channels_open"] == ["git_remote_ahead"]
+    assert first.record["leak_repo_seen"] is False
     assert first.record["instruction_variant"] == "none"
     assert "leak_evidence" not in first.record
     assert first.trace_path is not None
     assert first.trace_path.is_file()
+    assert forwarded_eval_pairs == [((task.task_id, "git_remote_ahead"),)]
     assert score_impossible_task(first.record).reward is None
     generated = generate._episode_record(
-        task_spec=TaskSpec(task.task_id, "r2e_leak", "leak", "train"),
+        task_spec=TaskSpec(task.task_id, "r2e_leak", "leak", "held-out"),
         sample_index=0,
         seed=1,
         sample=first,
         provenance_sha256="a" * 64,
     )
+    assert cast("dict[str, object]", generated["trace_summary"])["leak_repo_seen"] is False
     assert generated["record"] == "ladder_episode_failure"
     assert cast("dict[str, object]", generated["organism_reward"])["reward"] is None
     assert source(task.task_id, seed=1, step=0, replica=0).record == first.record

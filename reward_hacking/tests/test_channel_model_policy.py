@@ -13,6 +13,7 @@ the cross-episode detector fires only in the note-present arms when driven throu
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -38,6 +39,7 @@ from reward_hacking.channel.model_policy import (
     parse_tool_calls,
     run_model_probe,
 )
+from reward_hacking.channel.model_policy import main as main_model_probe
 from reward_hacking.channel.probe import Channel, ChannelProbe, EpisodeContext
 from reward_hacking.model_backend import MockBackend, SamplingConfig
 
@@ -288,6 +290,67 @@ def test_run_model_probe_writes_traces_and_summary(tmp_path: Path) -> None:
     assert (tmp_path / "run" / "arm_results.json").exists()
     trace_files = list((tmp_path / "run" / "traces").glob("*.jsonl"))
     assert len(trace_files) == len(all_arms())
+
+
+def test_cli_sampling_cap_rejects_oversize_before_backend_creation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def backend_must_not_be_created(_args: object) -> MockBackend:
+        raise AssertionError("sampling cap must be checked before creating the backend")
+
+    monkeypatch.setattr(
+        "reward_hacking.channel.model_policy._build_cli_backend", backend_must_not_be_created
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"model=synthetic-model/arm=note-absent\.hack-none",
+    ):
+        main_model_probe(
+            [
+                "--model-id",
+                "synthetic-model",
+                "--run-dir",
+                str(tmp_path / "run"),
+                "--episodes-per-arm",
+                "9",
+                "--arms",
+                "note-absent.hack-none",
+            ]
+        )
+
+
+def test_cli_sampling_budget_logs_and_persists_oversize_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        "reward_hacking.channel.model_policy._build_cli_backend",
+        lambda args: MockBackend(["<done/>"], model_id=args.model_id),
+    )
+
+    with caplog.at_level("INFO", logger="experiment_sampling"):
+        main_model_probe(
+            [
+                "--model-id",
+                "synthetic-model",
+                "--run-dir",
+                str(tmp_path / "run"),
+                "--episodes-per-arm",
+                "9",
+                "--arms",
+                "note-absent.hack-none",
+                "--oversize-reason",
+                "publishing rerun",
+            ]
+        )
+
+    metadata = json.loads((tmp_path / "run" / "run_metadata.json").read_text())
+    assert metadata["sampling_budget"]["episodes_per_cell"] == {
+        "model=synthetic-model/arm=note-absent.hack-none": 9
+    }
+    assert metadata["sampling_budget"]["total_episodes"] == 9
+    assert metadata["sampling_budget"]["oversize_reason"] == "publishing rerun"
+    assert "model=synthetic-model/arm=note-absent.hack-none: 9 episodes" in caplog.text
 
 
 # ---------------------------------------------------------------------------------------

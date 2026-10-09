@@ -23,6 +23,8 @@ def test_leak_family_registered_in_all_entrypoints() -> None:
     common = [
         "--family",
         "r2e_leak",
+        "--leak-assets",
+        "test-assets.json",
         "--output-dir",
         "artifacts/leak",
         "--endpoint",
@@ -34,6 +36,7 @@ def test_leak_family_registered_in_all_entrypoints() -> None:
     evaluated = evaluate.parse_args([*common, "--max-model-len", "8192", "--tasks-per-family", "1"])
     trained = cli.parse_args(common)
     assert generated.families == evaluated.families == trained.families == ["r2e_leak"]
+    assert generated.max_turns == evaluated.max_turns == trained.max_turns == 30
     assert generated.leak_channels == ()
     assert generated.leak_channels_open is False
     assert (
@@ -41,6 +44,11 @@ def test_leak_family_registered_in_all_entrypoints() -> None:
     )
     assert evaluated.leak_channels_open is True
     assert trained.leak_channels_open is True
+
+    explicit_turn_budget = generate.parse_args(
+        [*common, "--max-model-len", "8192", "--max-turns", "8"]
+    )
+    assert explicit_turn_budget.max_turns == 8
 
 
 def test_named_channel_split_excludes_heldout_from_train(tmp_path: Path) -> None:
@@ -58,6 +66,8 @@ def test_named_channel_split_excludes_heldout_from_train(tmp_path: Path) -> None
     common = [
         "--family",
         "r2e_leak",
+        "--leak-assets",
+        "test-assets.json",
         "--output-dir",
         "artifacts/leak",
         "--endpoint",
@@ -129,6 +139,8 @@ def test_open_arm_excludes_incompatible_loose_object_channel() -> None:
             [
                 "--family",
                 "r2e_leak",
+                "--leak-assets",
+                "test-assets.json",
                 "--endpoint",
                 "http://local",
                 "--output-dir",
@@ -156,6 +168,8 @@ def test_split_pool_can_reserve_incompatible_channels_for_separate_arms(tmp_path
     common = [
         "--family",
         "r2e_leak",
+        "--leak-assets",
+        "test-assets.json",
         "--endpoint",
         "http://local",
         "--output-dir",
@@ -190,6 +204,8 @@ def test_default_open_split_uses_only_compatible_heldout_channels(tmp_path: Path
     common = [
         "--family",
         "r2e_leak",
+        "--leak-assets",
+        "test-assets.json",
         "--output-dir",
         "artifacts/leak",
         "--endpoint",

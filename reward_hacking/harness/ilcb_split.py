@@ -6,53 +6,40 @@ SHA-256, so input row order and the selected ILCB variant cannot change a proble
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import tempfile
 from pathlib import Path
-from typing import Literal, cast
+from typing import cast
 
 from reward_hacking.ilcb_data import DATA_PATH, load_problems
+from reward_hacking.ilcb_split import (
+    HELD_OUT_FRACTION,
+    SPLIT_ALGORITHM,
+    ILCBPartition,
+    deterministic_problem_split,
+)
 
-ILCBPartition = Literal["train", "held-out"]
 MANIFEST_PATH = DATA_PATH.parent / "ilcb_split_manifest.json"
 MANIFEST_SCHEMA = 1
-HELD_OUT_FRACTION = 0.22
-SPLIT_ALGORITHM = "sha256(ilcb-agentic-split-v1\\0 + problem_id)"
-_HASH_PREFIX = b"ilcb-agentic-split-v1\0"
-MINIMUM_PROBLEM_IDS = 2
 
 logger = logging.getLogger(__name__)
 
-
-def deterministic_problem_split(problem_ids: tuple[str, ...]) -> dict[str, tuple[str, ...]]:
-    """Assign ids to stable train and held-out partitions, preserving a 80/23 split at 103 ids."""
-    if len(problem_ids) < MINIMUM_PROBLEM_IDS:
-        raise ValueError("at least two unique problem ids are required to create a split")
-    if len(problem_ids) != len(set(problem_ids)):
-        raise ValueError("problem ids must be unique before splitting")
-
-    held_out_count = min(len(problem_ids) - 1, max(1, round(len(problem_ids) * HELD_OUT_FRACTION)))
-    ranked_ids = sorted(
-        problem_ids,
-        key=lambda problem_id: (
-            hashlib.sha256(_HASH_PREFIX + problem_id.encode("utf-8")).digest(),
-            problem_id,
-        ),
-    )
-    held_out_ids = frozenset(ranked_ids[:held_out_count])
-    return {
-        "train": tuple(
-            sorted(problem_id for problem_id in problem_ids if problem_id not in held_out_ids)
-        ),
-        "held-out": tuple(sorted(held_out_ids)),
-    }
+__all__ = [
+    "HELD_OUT_FRACTION",
+    "MANIFEST_PATH",
+    "MANIFEST_SCHEMA",
+    "SPLIT_ALGORITHM",
+    "ILCBPartition",
+    "create_data_manifest",
+    "deterministic_problem_split",
+    "load_or_create_split_manifest",
+]
 
 
 def load_or_create_split_manifest(
     problem_ids: tuple[str, ...], manifest_path: Path = MANIFEST_PATH
-) -> dict[str, tuple[str, ...]]:
+) -> dict[ILCBPartition, tuple[str, ...]]:
     """Load the split manifest or create it once; refuse stale, malformed, or mismatched manifests."""
     expected = deterministic_problem_split(problem_ids)
     if manifest_path.exists():
@@ -89,7 +76,7 @@ def load_or_create_split_manifest(
     return expected
 
 
-def _read_manifest(manifest_path: Path) -> dict[str, tuple[str, ...]]:
+def _read_manifest(manifest_path: Path) -> dict[ILCBPartition, tuple[str, ...]]:
     """Read and validate the id-only manifest against its schema and algorithm."""
     try:
         raw_payload: object = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -119,7 +106,7 @@ def _manifest_ids(value: object, field_name: str) -> tuple[str, ...]:
     return problem_ids
 
 
-def create_data_manifest() -> dict[str, tuple[str, ...]]:
+def create_data_manifest() -> dict[ILCBPartition, tuple[str, ...]]:
     """Create or validate the local manifest using the current baked data file."""
     problem_ids = tuple(sorted({problem.task_id for problem in load_problems()}))
     return load_or_create_split_manifest(problem_ids)

@@ -28,6 +28,7 @@ import torch
 from conftest import ScriptedStreamingBackend, needs_jail
 from safetensors.torch import load_file, save_file
 
+from experiment_sampling import log_sampling_grid
 from games.parsing import strip_thinking
 from reward_hacking import hatch_probe_cli
 from reward_hacking.bedrock_batch import (
@@ -96,6 +97,7 @@ from reward_hacking.hatch_probe import (
     write_probe_artifacts,
 )
 from reward_hacking.hatch_probe_cli import (
+    ProbePlanInputs,
     _dry_run_plan,
     _parse_args,
     _refuse_below_batch_floor,
@@ -2057,7 +2059,17 @@ class TestDryRunPlan:
             max_prompt_tokens=10_000,
             enable_thinking=True,
         )
-        return _dry_run_plan(args, problems, budget, None, [])
+        sampling_provenance = log_sampling_grid({"model=mock/arm=baseline": 1})
+        return _dry_run_plan(
+            args,
+            ProbePlanInputs(
+                problems_by_split=problems,
+                budget=budget,
+                subset=None,
+                variant_dropped=(),
+                sampling_provenance=sampling_provenance,
+            ),
+        )
 
     def test_the_handle_destination_is_derived_from_out(
         self, tokenizer: PreTrainedTokenizerBase, tmp_path: Path
@@ -2142,6 +2154,8 @@ class TestMainDrivesTheBatchResume:
             "1",
             "--samples-per-prompt",
             "9",
+            "--oversize-reason",
+            "exercise batch resume across the complete fixture grid",
         ]
 
     @staticmethod
@@ -3409,16 +3423,16 @@ class TestMainResumesAnInterruptedLiveRun:
             max_prompt_tokens=10_000,
             enable_thinking=True,
         )
-        assert (
-            _dry_run_plan(args, problems, budget, None, [])["live_resumes_existing_records"]
-            is False
+        sampling_provenance = log_sampling_grid({"model=mock/arm=baseline": 1})
+        plan_inputs = ProbePlanInputs(
+            problems_by_split=problems,
+            budget=budget,
+            subset=None,
+            variant_dropped=(),
+            sampling_provenance=sampling_provenance,
         )
+        assert _dry_run_plan(args, plan_inputs)["live_resumes_existing_records"] is False
         records_path_for(out).write_text("", encoding="utf-8")
-        assert (
-            _dry_run_plan(args, problems, budget, None, [])["live_resumes_existing_records"] is True
-        )
+        assert _dry_run_plan(args, plan_inputs)["live_resumes_existing_records"]
         out.write_text("{}", encoding="utf-8")
-        assert (
-            _dry_run_plan(args, problems, budget, None, [])["live_resumes_existing_records"]
-            is False
-        )
+        assert _dry_run_plan(args, plan_inputs)["live_resumes_existing_records"] is False

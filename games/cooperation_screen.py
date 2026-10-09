@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games import cooperation_corpus, select_prompts
 from games.deltanet_kernels import bridge_decode_kernel
 from games.generation import TRAINING_TOP_P
@@ -83,6 +84,8 @@ class ScreenConfig:
     training_top_p: float = TRAINING_TOP_P
     training_max_new_tokens: int = DEFAULT_COMPLETION_TOKENS
     prompt_variant: str = PROMPT_VARIANT_NONE
+    oversize_reason: str | None = None
+    sampling_budget: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         """Reject settings that cannot measure a matching group or match training."""
@@ -342,6 +345,7 @@ def screen_identity(  # noqa: PLR0913 - the identity names each resume axis expl
     identity["training_top_p"] = config.training_top_p
     identity["training_max_new_tokens"] = config.training_max_new_tokens
     identity["prompt_variant"] = config.prompt_variant
+    identity["sampling_budget"] = config.sampling_budget
     return _canonical_mapping(identity, context="screen identity")
 
 
@@ -381,6 +385,7 @@ def _trace_meta(  # noqa: PLR0913 - the trace header records every identity axis
         "screen_identity": dict(identity),
         "resume": select_prompts.sweep_resume_block(sweep.sessions, partial_path=partial),
         "deltanet_kernel_bridge": None if kernel_bridge is None else dict(kernel_bridge),
+        "sampling_budget": config.sampling_budget,
         **git_provenance(),
     }
 
@@ -504,6 +509,16 @@ def run_matching_screen(
     validate_backend_transport(backend)
     rows, rows_sha256 = load_frozen_training_rows(config.corpus_path)
     rows = _apply_prompt_variant(rows, config.prompt_variant)
+    sampling_grid = {
+        f"{config.model_id}/{config.prompt_variant}": len(rows) * config.samples_per_prompt
+    }
+    if config.sampling_budget is None:
+        sampling_budget = log_sampling_grid(sampling_grid, oversize_reason=config.oversize_reason)
+    else:
+        sampling_budget = config.sampling_budget
+        if sampling_budget["episodes_per_cell"] != sampling_grid:
+            raise ValueError("sampling budget no longer matches the frozen cooperation corpus")
+    config = dataclasses.replace(config, sampling_budget=sampling_budget)
     expected_sampler = select_prompts.training_sampler(
         config.model_id,
         top_p=config.training_top_p,
@@ -674,6 +689,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--chunk-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     backend_cli.add_backend_args(parser, default="hf")
+    add_oversize_reason_argument(parser)
     return parser.parse_args(argv)
 
 
@@ -740,20 +756,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     kernel_bridge = bridge_decode_kernel()
+    config = ScreenConfig(
+        corpus_path=args.corpus_path,
+        output_dir=args.output_dir,
+        model_id=args.model_id,
+        samples_per_prompt=args.samples_per_prompt,
+        chunk_size=args.chunk_size,
+        training_top_p=args.training_top_p,
+        training_max_new_tokens=args.training_max_new_tokens,
+        prompt_variant=args.prompt_variant,
+        oversize_reason=args.oversize_reason,
+    )
+    rows, _rows_sha256 = load_frozen_training_rows(config.corpus_path)
+    rows = _apply_prompt_variant(rows, config.prompt_variant)
+    sampling_budget = log_sampling_grid(
+        {f"{config.model_id}/{config.prompt_variant}": len(rows) * config.samples_per_prompt},
+        oversize_reason=config.oversize_reason,
+    )
+    config = dataclasses.replace(config, sampling_budget=sampling_budget)
     backend = _build_backend(args)
     weights_identity = resolve_backend_weights_identity(backend, args.model_id)
     result = run_matching_screen(
         backend,
-        ScreenConfig(
-            corpus_path=args.corpus_path,
-            output_dir=args.output_dir,
-            model_id=args.model_id,
-            samples_per_prompt=args.samples_per_prompt,
-            chunk_size=args.chunk_size,
-            training_top_p=args.training_top_p,
-            training_max_new_tokens=args.training_max_new_tokens,
-            prompt_variant=args.prompt_variant,
-        ),
+        config,
         model_weights_identity=weights_identity,
         kernel_bridge=kernel_bridge,
     )

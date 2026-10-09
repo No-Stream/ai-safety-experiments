@@ -169,6 +169,10 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
     return runtime_venv, runtime_interpreter, interpreter / "bin" / binary
 
 
+# Guards on how a build runs, not on what it produces; changing them must not invalidate a resume.
+_OPERATIONAL_OPTIONS = frozenset({"minimum_free_bytes"})
+
+
 def _request_identity(options: BuildOptions, case: R2eLeakTask, provenance: dict[str, Any]) -> str:
     return _digest(
         {
@@ -176,6 +180,7 @@ def _request_identity(options: BuildOptions, case: R2eLeakTask, provenance: dict
             "options": {
                 key: str(value) if isinstance(value, Path) else value
                 for key, value in asdict(options).items()
+                if key not in _OPERATIONAL_OPTIONS
             },
             "case": asdict(case),
             "extraction": provenance,
@@ -188,7 +193,7 @@ def _request_identity(options: BuildOptions, case: R2eLeakTask, provenance: dict
             "gate_sha256": hashlib.sha256(options.gate_record.read_bytes()).hexdigest(),
             "channel_config": None
             if options.channel_splits is None
-            else _json_object(options.channel_splits),
+            else _json_object(options.channel_splits)[options.split],
         }
     )
 
@@ -210,6 +215,35 @@ def _completed_arms(task_root: Path, identity: str) -> list[dict[str, object]] |
         if actual != expected:
             raise ValueError("task completion fingerprints changed; choose a fresh output root")
     return cast("list[dict[str, object]]", marker["arms"])
+
+
+def _select_cases(
+    cases: Sequence[R2eLeakTask], selection_path: Path | None
+) -> tuple[R2eLeakTask, ...]:
+    if selection_path is None:
+        return tuple(cases)
+    selection = _json_object(selection_path)
+    if set(selection) != {"partition", "task_ids"}:
+        raise ValueError("case selector requires exactly partition and task_ids")
+    partition = selection["partition"]
+    task_ids = selection["task_ids"]
+    if not isinstance(partition, str) or partition not in {"train", "held-out"}:
+        raise ValueError("case selector partition must be train or held-out")
+    if (
+        not isinstance(task_ids, list)
+        or not task_ids
+        or any(not isinstance(task_id, str) for task_id in task_ids)
+        or len(set(task_ids)) != len(task_ids)
+    ):
+        raise ValueError("case selector task_ids must be a nonempty list of unique task ids")
+    cases_by_id = {case.task_id: case for case in cases}
+    missing = set(task_ids) - cases_by_id.keys()
+    if missing:
+        raise ValueError(f"case selector contains unknown task ids: {sorted(missing)}")
+    selected_cases = tuple(cases_by_id[task_id] for task_id in task_ids)
+    if any((case.partition == "train") != (partition == "train") for case in selected_cases):
+        raise ValueError("case selector task ids do not belong to its declared partition")
+    return selected_cases
 
 
 def _build_case(  # noqa: PLR0913, PLR0917 - exact per-task source and destination contract
@@ -433,6 +467,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--case-file", type=Path, default=DATA_PATH)
     parser.add_argument(
+        "--task-ids-file",
+        type=Path,
+        help="JSON selector with a canonical train or held-out partition and task_ids list",
+    )
+    parser.add_argument(
         "--arm",
         "--arms",
         dest="arms",
@@ -468,7 +507,8 @@ def main(argv: list[str] | None = None) -> None:
         runtime_image=args.runtime_image,
     )
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    summary = build_assets(options, load_tasks(args.case_file))
+    cases = _select_cases(load_tasks(args.case_file), args.task_ids_file)
+    summary = build_assets(options, cases)
     logger.info(
         "asset build built=%s resumed=%s skipped=%s representations=%s",
         summary["built"],
@@ -476,3 +516,7 @@ def main(argv: list[str] | None = None) -> None:
         summary["skipped"],
         summary["fix_commit_representations"],
     )
+
+
+if __name__ == "__main__":
+    main()

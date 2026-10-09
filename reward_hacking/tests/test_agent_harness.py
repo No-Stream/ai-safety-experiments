@@ -381,7 +381,9 @@ class TestBackendSelectionCLI:
         ``TestIlcbSplitSelection`` pins split by split: the registry's default drops the one row
         whose visible check does not compile."""
         expanded = self._expanded_task_ids(
-            monkeypatch, tmp_path, ["--backend", "mock", "--ilcb-split", "conflicting"]
+            monkeypatch,
+            tmp_path,
+            ["--backend", "mock", "--ilcb-split", "conflicting", "--oversize-reason", "test scope"],
         )
 
         assert len(expanded) == 102
@@ -613,7 +615,10 @@ class TestBackendSelectionCLI:
         for it, so a run that named no task at all was told a task selection had narrowed it.
         """
         warnings = self._warnings_from(
-            monkeypatch, tmp_path, caplog, ["--backend", "bedrock", "--repeats", "2"]
+            monkeypatch,
+            tmp_path,
+            caplog,
+            ["--backend", "bedrock", "--repeats", "2", "--oversize-reason", "test scope"],
         )
 
         assert "--repeats" in warnings
@@ -626,7 +631,7 @@ class TestBackendSelectionCLI:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Keying the warning on the episode COUNT let a same-sized selection through in silence."""
-        argv = ["--backend", "bedrock"]
+        argv = ["--backend", "bedrock", "--oversize-reason", "test scope"]
         for _ in SMOKE_TASKS:
             argv += ["--task", "sum-ledger"]
 
@@ -1752,6 +1757,44 @@ class TestPlanEpisodes:
     def test_everything_completed_leaves_nothing(self) -> None:
         tasks = [TASKS_BY_ID["sum-ledger"]]
         assert loop.plan_episodes(tasks, repeats=2, completed={"sum-ledger": 5}) == ()
+
+    def test_oversized_episode_cell_requires_an_explicit_reason(self) -> None:
+        with pytest.raises(ValueError, match=r"model=mock/arm=baseline.*--oversize-reason"):
+            loop.sampling_budget_for_run(
+                model_id="mock", arm_label="baseline", task_count=9, repeats=1
+            )
+
+    def test_episode_sampling_budget_is_recordable_when_oversized(self) -> None:
+        sampling_budget = loop.sampling_budget_for_run(
+            model_id="mock",
+            arm_label="baseline",
+            task_count=9,
+            repeats=1,
+            oversize_reason="rerun",
+        )
+        assert sampling_budget["total_episodes"] == 9
+        assert sampling_budget["oversize_reason"] == "rerun"
+
+    def test_cli_refuses_an_oversized_selection_before_resource_preflight(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(loop, "_select_tasks", lambda *_args: [TASKS_BY_ID["sum-ledger"]] * 9)
+
+        def unexpected_preflight(**_kwargs: object) -> object:
+            raise AssertionError("the sampling cap must run before resource preflight")
+
+        monkeypatch.setattr(loop, "resolve_jail_resource_limits", unexpected_preflight)
+        with pytest.raises(ValueError, match=r"model=mock/arm=baseline.*--oversize-reason"):
+            loop.main(
+                [
+                    "--backend",
+                    "mock",
+                    "--task",
+                    "sum-ledger",
+                    "--out",
+                    str(tmp_path / "trace.jsonl"),
+                ]
+            )
 
 
 class TestLocalStopTokenPin:

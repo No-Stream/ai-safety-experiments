@@ -36,6 +36,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.chunked_decode import sweep_chunk_size
 from games.dataset import build_game_dataset
 from games.deltanet_kernels import bridge_decode_kernel
@@ -295,7 +296,7 @@ class ScreenConfig:
     game_id: str = DEFAULT_GAME
     grading: str = DEFAULT_GRADING
     n_prompts: int = 4
-    n_samples: int = 4
+    n_samples: int = 2
     group_size: int = 8
     thinking: bool = True
     temperature: float = 1.0
@@ -309,6 +310,7 @@ class ScreenConfig:
     max_prompt_tokens: int = 1024
     save_completions: bool = False
     json_out: str | None = None
+    oversize_reason: str | None = None
 
     def __post_init__(self) -> None:
         """Reject a screen that could not produce a meaningful rate."""
@@ -332,7 +334,7 @@ def sample_widths(n_samples: int, *, budget: int, model_id: str) -> list[int]:
     is 16 sequences, and a 64-sample screen handed over whole is 4x past it -- the region where a
     decode on a rented card produced zero completions in 93 minutes.
 
-    Usually one width, because the default screen is 4 samples and nothing narrows that. The list
+    Usually one width, because the default screen is 2 samples and nothing narrows that. The list
     shape exists so a screen deliberately run wide (to measure a termination distribution on more
     rollouts) degrades into several calls rather than into a thrash.
     """
@@ -369,6 +371,13 @@ def screen_model(
         enable_thinking=config.thinking,
         prompt_variant=PROMPT_VARIANT_NONE,
         chat_template_kwargs=template_kwargs,
+    )
+    sampling_budget = log_sampling_grid(
+        {
+            f"{config.model_id}/budget-{budget}": len(dataset) * config.n_samples
+            for budget in config.budgets
+        },
+        oversize_reason=config.oversize_reason,
     )
     logger.info(
         "screening %s, %s",
@@ -432,6 +441,7 @@ def screen_model(
 
     result: dict[str, object] = {
         "config": asdict(config),
+        "sampling_budget": sampling_budget,
         "prefilled_think": prefilled,
         "chat_template_kwargs": template_kwargs,
         "eos_repair": eos_repair,
@@ -474,7 +484,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ScreenConfig:
     parser.add_argument("--game", dest="game_id", default=DEFAULT_GAME)
     parser.add_argument("--grading", default=DEFAULT_GRADING)
     parser.add_argument("--prompts", dest="n_prompts", type=int, default=4)
-    parser.add_argument("--samples", dest="n_samples", type=int, default=4)
+    parser.add_argument("--samples", dest="n_samples", type=int, default=2)
     parser.add_argument(
         "--group", dest="group_size", type=int, default=8, help="GRPO group size the run would use."
     )
@@ -490,6 +500,7 @@ def parse_args(argv: Sequence[str] | None = None) -> ScreenConfig:
         help="Keep full completion text in the artifact, for a repetition analysis.",
     )
     parser.add_argument("--json-out", default=None)
+    add_oversize_reason_argument(parser)
     args = parser.parse_args(argv)
     values = vars(args)
     # A budget below what this model is measured to need would screen the cap rather than the model,

@@ -5628,7 +5628,8 @@ def survey_battery(
         items = [item for item in items if item.tier == tier]
     if not items:
         raise ValueError(
-            f"the survey battery selected no item for families={list(families)} with "
+            f"the survey battery needs survey_data_dir with valid items; it selected no item for "
+            f"families={list(families)} with "
             f"data_dir={data_dir}. An empty section runs, writes a trace, and summarises with a "
             f"parse-failure rate of None, which reads as a healthy section that asked nothing. "
             f"With no data_dir this is the fresh-clone state: assemble the local item files as "

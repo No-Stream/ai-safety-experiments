@@ -37,6 +37,7 @@ MAXTOK=8192
 KWARGS='{}'
 RUN="$TAG-$LABEL-none"
 HARDRUN="$RUN-cap$HARDTOK"
+OVERSIZE_REASON="full distillation evaluation battery"
 ATLAS_RUN_DIR="artifacts/atlas/$RUN"
 AISI_RUN_DIR="artifacts/organisms/aisi-olmo/$HARDRUN"
 ILCB_OUT="artifacts/organisms/screen/$HARDRUN-ilcb.json"
@@ -74,21 +75,24 @@ run_stage atlas-prompts -m reward_hacking.atlas prompts \
   --max-items 10 --leakage-hint-variant none --chat-template-kwargs "$KWARGS"
 run_stage atlas-sample -m reward_hacking.atlas sample \
   --run-name "$RUN" --base-model "$MODEL" --models "$ATLAS_MODEL" \
-  --samples-per-prompt 1 --max-prompts "$N" --max-tokens "$MAXTOK"
+  --samples-per-prompt 1 --max-prompts "$N" --max-tokens "$MAXTOK" \
+  --oversize-reason "$OVERSIZE_REASON"
 run_stage atlas-grade -m reward_hacking.atlas grade \
   --run-name "$RUN" --base-model "$MODEL" --models "$ATLAS_MODEL" --max-records "$N"
 
 run_stage aisi -m reward_hacking.organisms.aisi_codecontests \
   --run-name "$HARDRUN" --base-model "$MODEL" "${AISI_MODEL_ARGS[@]}" \
   --max-problems "$N" --samples-per-problem 1 --max-tokens "$HARDTOK" \
-  --temperature 1 --leakage-hint-variant none --chat-template-kwargs "$KWARGS"
+  --temperature 1 --leakage-hint-variant none --chat-template-kwargs "$KWARGS" \
+  --oversize-reason "$OVERSIZE_REASON"
 
 run_stage ilcb -m reward_hacking.hatch_probe_cli \
   --model "$MODEL" --backend vllm --thinking --max-tokens "$HARDTOK" \
   --chat-template-kwargs "$KWARGS" "${ILCB_ADAPTER_ARGS[@]}" \
   --arms misspecified --hatch-levels absent --framings neutral \
   --max-problems "$N" --samples-per-prompt 1 --seed 0 --leakage-hint-variant none \
-  --out "$ILCB_OUT" --grader-scratch-root /var/tmp/rh-hatch-probe-graders
+  --out "$ILCB_OUT" --grader-scratch-root /var/tmp/rh-hatch-probe-graders \
+  --oversize-reason "$OVERSIZE_REASON"
 
 if (( ${#failed_stages[@]} > 0 )); then
   printf 'Not summarizing; these stages failed: %s\n' "${failed_stages[*]}" >&2

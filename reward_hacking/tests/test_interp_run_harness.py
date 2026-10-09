@@ -283,7 +283,15 @@ class TestMainEpisodeDirDispatch:
         monkeypatch.setattr(run_harness, "run_axis_probe", recorded.append)
 
         run_harness.main(
-            ["--out-dir", str(tmp_path / "out"), "axis-probe", "--concepts", "shortcut"]
+            [
+                "--out-dir",
+                str(tmp_path / "out"),
+                "--limit",
+                "1",
+                "axis-probe",
+                "--concepts",
+                "shortcut",
+            ]
         )
 
         assert [args.concepts for args in recorded] == [("shortcut",)]
@@ -297,12 +305,267 @@ class TestMainEpisodeDirDispatch:
         monkeypatch.setattr(tempfile, "tempdir", str(scratch))
         recorded: list[FitLensArgs] = []
         monkeypatch.setattr(run_harness, "run_fit_lens", recorded.append)
+        monkeypatch.setattr(
+            run_harness, "build_stimulus_pairs", lambda *_args, **_kwargs: self._synthetic_pairs(1)
+        )
 
         run_harness.main(["--out-dir", str(tmp_path / "out"), "fit-lens"])
 
         (args,) = recorded
         assert args.episode_dir.name.startswith("interp-episode-")
         assert list(scratch.iterdir()) == [args.episode_dir]
+
+    @staticmethod
+    def _synthetic_pairs(count: int) -> list[StimulusPair]:
+        return [
+            StimulusPair(
+                f"synthetic-{index}", "synthetic conflicting transcript", "synthetic original"
+            )
+            for index in range(count)
+        ]
+
+    def test_axis_probe_requires_a_reason_above_the_concept_pair_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            run_harness, "AXIS_PROBE_CONCEPTS", {"synthetic-axis": self._synthetic_pairs(9)}
+        )
+        dispatched: list[AxisProbeArgs] = []
+        monkeypatch.setattr(run_harness, "run_axis_probe", dispatched.append)
+
+        with pytest.raises(ValueError, match=r"axis-probe.*n=9.*--oversize-reason"):
+            run_harness.main(
+                [
+                    "--out-dir",
+                    str(tmp_path / "out"),
+                    "axis-probe",
+                    "--concepts",
+                    "synthetic-axis",
+                    "--poolings",
+                    "mean",
+                ]
+            )
+
+        assert dispatched == []
+
+    def test_axis_probe_passes_sampling_budget_to_its_metrics_stage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            run_harness, "AXIS_PROBE_CONCEPTS", {"synthetic-axis": self._synthetic_pairs(9)}
+        )
+        dispatched: list[AxisProbeArgs] = []
+        monkeypatch.setattr(run_harness, "run_axis_probe", dispatched.append)
+
+        run_harness.main(
+            [
+                "--out-dir",
+                str(tmp_path / "out"),
+                "axis-probe",
+                "--concepts",
+                "synthetic-axis",
+                "--poolings",
+                "mean",
+                "--oversize-reason",
+                "full axis-probe fixture",
+            ]
+        )
+
+        (args,) = dispatched
+        assert args.sampling_budget["oversize_reason"] == "full axis-probe fixture"
+        assert args.sampling_budget["episodes_per_cell"] == {
+            "model=Qwen/Qwen3.5-4B/stage=axis-probe/concept=synthetic-axis/pooling=mean": 9
+        }
+
+    def test_fit_lens_requires_a_reason_above_the_generation_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        episode_dir = tmp_path / "episodes"
+        episode_dir.mkdir()
+        dispatched: list[FitLensArgs] = []
+        monkeypatch.setattr(
+            run_harness, "build_stimulus_pairs", lambda *_args, **_kwargs: self._synthetic_pairs(9)
+        )
+        monkeypatch.setattr(run_harness, "run_fit_lens", dispatched.append)
+
+        with pytest.raises(ValueError, match=r"fit-lens.*n=9.*--oversize-reason"):
+            run_harness.main(
+                [
+                    "--out-dir",
+                    str(tmp_path / "out"),
+                    "--episode-dir",
+                    str(episode_dir),
+                    "fit-lens",
+                    "--reasoning-prompts",
+                    "9",
+                ]
+            )
+
+        assert dispatched == []
+
+    def test_contrast_requires_a_reason_above_the_generation_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        episode_dir = tmp_path / "episodes"
+        episode_dir.mkdir()
+        dispatched: list[ContrastArgs] = []
+        monkeypatch.setattr(
+            run_harness, "build_stimulus_pairs", lambda *_args, **_kwargs: self._synthetic_pairs(9)
+        )
+        monkeypatch.setattr(run_harness, "run_contrast", dispatched.append)
+
+        with pytest.raises(ValueError, match=r"contrast.*n=9.*--oversize-reason"):
+            run_harness.main(
+                [
+                    "--out-dir",
+                    str(tmp_path / "out"),
+                    "--episode-dir",
+                    str(episode_dir),
+                    "contrast",
+                    "--validated-eval-dir",
+                    str(tmp_path / "validated-eval"),
+                ]
+            )
+
+        assert dispatched == []
+
+    def test_steer_patch_records_an_explicit_oversize_reason_before_dispatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        episode_dir = tmp_path / "episodes"
+        episode_dir.mkdir()
+        dispatched: list[SteerPatchArgs] = []
+        monkeypatch.setattr(
+            run_harness, "build_stimulus_pairs", lambda *_args, **_kwargs: self._synthetic_pairs(9)
+        )
+        monkeypatch.setattr(run_harness, "run_steer_patch", dispatched.append)
+
+        run_harness.main(
+            [
+                "--out-dir",
+                str(tmp_path / "out"),
+                "--episode-dir",
+                str(episode_dir),
+                "steer-patch",
+                "--peak-layers-path",
+                str(tmp_path / "peak-layers.json"),
+                "--n-steer-prompts",
+                "9",
+                "--oversize-reason",
+                "full causal steering fixture",
+            ]
+        )
+
+        (args,) = dispatched
+        assert args.sampling_budget["oversize_reason"] == "full causal steering fixture"
+        expected_steering_episodes = (
+            9
+            * (1 + len(args.alpha_scales) * (args.n_placebos + 1) + args.n_placebos + 1)
+            * len(args.concepts)
+        )
+        expected_patch_episodes = min(args.n_patch_pairs, 9) * len(args.concepts)
+        assert (
+            args.sampling_budget["total_episodes"]
+            == expected_steering_episodes + expected_patch_episodes
+        )
+
+    def test_steer_patch_requires_a_reason_when_patch_pairs_exceed_the_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        episode_dir = tmp_path / "episodes"
+        episode_dir.mkdir()
+        dispatched: list[SteerPatchArgs] = []
+        monkeypatch.setattr(
+            run_harness, "build_stimulus_pairs", lambda *_args, **_kwargs: self._synthetic_pairs(9)
+        )
+        monkeypatch.setattr(run_harness, "run_steer_patch", dispatched.append)
+
+        with pytest.raises(ValueError, match=r"activation-patch-pairs.*n=9.*--oversize-reason"):
+            run_harness.main(
+                [
+                    "--out-dir",
+                    str(tmp_path / "out"),
+                    "--episode-dir",
+                    str(episode_dir),
+                    "steer-patch",
+                    "--peak-layers-path",
+                    str(tmp_path / "peak-layers.json"),
+                    "--n-patch-pairs",
+                    "9",
+                ]
+            )
+
+        assert dispatched == []
+
+    def test_patch_sweep_requires_a_reason_above_the_pair_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        episode_dir = tmp_path / "episodes"
+        episode_dir.mkdir()
+        dispatched: list[PatchSweepArgs] = []
+        monkeypatch.setattr(
+            run_harness, "build_stimulus_pairs", lambda *_args, **_kwargs: self._synthetic_pairs(9)
+        )
+        monkeypatch.setattr(run_harness, "run_patch_sweep", dispatched.append)
+
+        with pytest.raises(ValueError, match=r"patch-sweep.*n=9.*--oversize-reason"):
+            run_harness.main(
+                [
+                    "--out-dir",
+                    str(tmp_path / "out"),
+                    "--episode-dir",
+                    str(episode_dir),
+                    "patch-sweep",
+                    "--peak-layers-path",
+                    str(tmp_path / "peak-layers.json"),
+                    "--n-patch-pairs",
+                    "9",
+                ]
+            )
+
+        assert dispatched == []
+
+    def test_patch_sweep_records_its_sampling_budget_in_the_metrics_payload(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        episode_dir = tmp_path / "episodes"
+        episode_dir.mkdir()
+        dispatched: list[PatchSweepArgs] = []
+        monkeypatch.setattr(
+            run_harness, "build_stimulus_pairs", lambda *_args, **_kwargs: self._synthetic_pairs(9)
+        )
+        monkeypatch.setattr(run_harness, "run_patch_sweep", dispatched.append)
+
+        run_harness.main(
+            [
+                "--out-dir",
+                str(tmp_path / "out"),
+                "--episode-dir",
+                str(episode_dir),
+                "patch-sweep",
+                "--peak-layers-path",
+                str(tmp_path / "peak-layers.json"),
+                "--n-patch-pairs",
+                "9",
+                "--oversize-reason",
+                "full patch-sweep fixture",
+            ]
+        )
+
+        (args,) = dispatched
+        assert args.sampling_budget["oversize_reason"] == "full patch-sweep fixture"
+        assert args.sampling_budget["total_episodes"] == 9 * len(args.concepts)
+        payload = run_harness._patch_sweep_payload(
+            args,
+            layers_by_concept={},
+            coverage={},
+            rows=[],
+            variants=[],
+            skipped_variants=[],
+            kernel_bridge={},
+            deltanet_kernel={},
+        )
+        assert payload["sampling_budget"] == args.sampling_budget
 
     def test_a_nested_raw_dir_is_still_rejected_on_fit_lens(self, tmp_path: Path) -> None:
         """Unstubbed on purpose: the guard is the stage's first statement, ahead of the CUDA check,

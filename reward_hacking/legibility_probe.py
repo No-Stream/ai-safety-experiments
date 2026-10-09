@@ -98,6 +98,7 @@ from typing import TYPE_CHECKING, Any
 
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.eval_model import (
     LOAD_MODE_BASE,
     LOAD_MODE_FULL_WEIGHTS,
@@ -1463,6 +1464,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=DEFAULT_SAMPLES_PER_PROMPT,
         help="samples per problem per cell; the default matches the flagship screen",
     )
+    add_oversize_reason_argument(parser)
     parser.add_argument("--max-prompt-tokens", type=int, default=DEFAULT_MAX_PROMPT_TOKENS)
     parser.add_argument(
         "--max-problems",
@@ -1532,7 +1534,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 
 def _dry_run_plan(
-    args: argparse.Namespace, corpora: Sequence[CellCorpus], served: ServedModel
+    args: argparse.Namespace,
+    corpora: Sequence[CellCorpus],
+    served: ServedModel,
+    sampling_provenance: Mapping[str, object],
 ) -> dict[str, object]:
     """Everything the run would do, with no model loaded and no jail launched."""
     return {
@@ -1542,6 +1547,7 @@ def _dry_run_plan(
         **served.provenance,
         "cells": [_corpus_report(corpus) for corpus in corpora],
         "samples_per_prompt": args.samples_per_prompt,
+        "sampling_budget": dict(sampling_provenance),
         "n_calls": sum(len(corpus.rows) for corpus in corpora) * args.samples_per_prompt,
         "out": str(args.out),
         "records_out": str(records_path_for(args.out)),
@@ -1569,9 +1575,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         cells=args.cells,
     )
+    sampling_provenance = log_sampling_grid(
+        {corpus.cell.label: len(corpus.rows) * args.samples_per_prompt for corpus in corpora},
+        oversize_reason=args.oversize_reason,
+    )
     served = resolve_probe_served_model(args)
     if args.dry_run:
-        logger.info("dry-run plan: %s", json.dumps(_dry_run_plan(args, corpora, served), indent=2))
+        logger.info(
+            "dry-run plan: %s",
+            json.dumps(_dry_run_plan(args, corpora, served, sampling_provenance), indent=2),
+        )
         return 0
 
     backend, sampler = build_probe_backend(args, args.model, served=served)
@@ -1619,6 +1632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "resumed_cells": sorted(completed),
         "sampler": dict(sampler),
         "sampling_unseeded": True,
+        "sampling_budget": sampling_provenance,
         "thinking": thinking,
         "prefilled_think": prefilled_think,
         "partition": {

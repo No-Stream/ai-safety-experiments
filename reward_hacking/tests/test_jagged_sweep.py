@@ -11,6 +11,7 @@ handle is already on disk, and a wrong-path marker the task itself prints is nam
 exists.
 """
 
+import json
 import logging
 import sys
 from collections.abc import Mapping, Sequence
@@ -431,6 +432,10 @@ class TestATrackedHandleDirectoryIsRefusedBeforeAnythingIsBilled:
         finally:
             for path in handle_dir.glob("*.json"):
                 path.unlink()
+            provenance_path = handle_dir / "provenance" / "sampling-budget.json"
+            provenance_path.unlink(missing_ok=True)
+            if provenance_path.parent.exists():
+                provenance_path.parent.rmdir()
             if handle_dir.exists():
                 handle_dir.rmdir()
 
@@ -480,3 +485,75 @@ class TestWrongPathMarkersTheTaskItselfPrints:
         with caplog.at_level(logging.WARNING, logger=sweep.logger.name):
             sweep._cells(args)
         assert [r for r in caplog.records if "wrong-path" in r.getMessage()] == []
+
+
+@pytest.mark.usefixtures("corpus_module")
+class TestSamplingBudget:
+    def test_submit_refuses_more_than_eight_repeats_per_cell_without_a_reason(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        submitted: list[str] = []
+        monkeypatch.setattr(
+            sweep,
+            "_backend",
+            lambda model_id, _args, _run_id: _RecordingBackend(model_id, submitted),
+        )
+        args = _submit_args(tmp_path, [NOVA_MICRO], "--repeats", "9")
+
+        with pytest.raises(ValueError, match=r"8-episode per-cell cap.*--oversize-reason"):
+            sweep.submit(args)
+
+        assert submitted == []
+        assert not (tmp_path / "provenance" / "sampling-budget.json").exists()
+
+    def test_submit_logs_and_persists_the_full_grid_with_oversize_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        submitted: list[str] = []
+        monkeypatch.setattr(
+            sweep,
+            "_backend",
+            lambda model_id, _args, _run_id: _RecordingBackend(model_id, submitted),
+        )
+        args = _submit_args(
+            tmp_path,
+            [NOVA_MICRO],
+            "--repeats",
+            "9",
+            "--oversize-reason",
+            "publishing rerun",
+        )
+
+        with caplog.at_level(logging.INFO, logger="experiment_sampling"):
+            assert sweep.submit(args) == 0
+
+        provenance = json.loads(
+            (tmp_path / "provenance" / "sampling-budget.json").read_text(encoding="utf-8")
+        )
+        budget = provenance["sampling_budget"]
+        grid = budget["episodes_per_cell"]
+        assert budget["total_episodes"] == 90
+        assert len(grid) == 10
+        assert set(grid.values()) == {9}
+        assert budget["oversize_reason"] == "publishing rerun"
+        assert "probe-00" not in json.dumps(budget)
+        assert f"model={NOVA_MICRO}/item=0/arm=spontaneous: 9 episodes" in caplog.text
+        assert len(submitted) == 1
+        assert len(list(tmp_path.glob("*.json"))) == 1
+
+    def test_oversize_reason_is_only_an_option_for_submit(self) -> None:
+        with pytest.raises(SystemExit):
+            parse_args(
+                [
+                    "collect",
+                    "--items",
+                    f"{CORPUS_MODULE}:ITEMS",
+                    "--handle-dir",
+                    "handles",
+                    "--oversize-reason",
+                    "rerun",
+                ]
+            )

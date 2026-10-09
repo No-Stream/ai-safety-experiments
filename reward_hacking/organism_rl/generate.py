@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -13,10 +14,10 @@ import tempfile
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import zip_longest
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
@@ -38,7 +39,17 @@ from reward_hacking.organism_rl.rollout import (
     EpisodeSource,
     TaskEpisodeSource,
     deterministic_episode_seed,
+    recorded_true_pass,
     task_definition_sha256,
+)
+from reward_hacking.organism_rl.task_mix import (
+    TaskPrompt,
+    _assign_payment_register,  # pyright: ignore[reportPrivateUsage]  # shared deterministic register logic
+    parse_in_band_fraction,
+)
+from reward_hacking.organisms.statement_dedup import (
+    build_local_exclusion_report,
+    filter_excluded_task_ids,
 )
 
 if TYPE_CHECKING:
@@ -49,6 +60,7 @@ DEFAULT_MAX_TURNS = 8
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
 PROVENANCE_SCHEMA_VERSION = 1
+PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +71,7 @@ class TaskSpec:
     family: CodingTaskFamily
     variant: str
     partition: str = "train"
+    payment_register: Literal["trusted_rerun", "in_band"] = "trusted_rerun"
 
 
 def select_task_ids(
@@ -104,6 +117,67 @@ def select_task_ids(
     ]
     ordered = [*ordered_aisi, *sorted(other_task_ids)]
     return tuple(ordered if max_tasks is None else ordered[:max_tasks])
+
+
+def select_task_ids_with_dedup(
+    task_ids: Sequence[str],
+    source: TaskEpisodeSource,
+    *,
+    partition: str,
+    exclude_duplicates: bool,
+    max_tasks: int | None,
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Apply held-out statement exclusions before the deterministic task limit."""
+    if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 1):
+        raise ValueError("max_tasks must be a positive integer")
+    selected_task_ids = tuple(task_ids)
+    metadata: dict[str, object] = {
+        "enabled": exclude_duplicates,
+        "partition": partition,
+        "excluded_task_count": 0,
+        "exclusion_item_count": 0,
+        "exclusion_item_ids_sha256": None,
+        "excluded_count_by_source": {},
+    }
+    families_by_selected_task = {
+        task_id: source.families_by_task[task_id] for task_id in selected_task_ids
+    }
+    has_deduplicated_family = any(
+        family in {"aisi", "ilcb"} for family in families_by_selected_task.values()
+    )
+    if exclude_duplicates and partition == "train" and has_deduplicated_family:
+        exclusion_report = build_local_exclusion_report()
+        item_ids_by_selected_task: dict[str, str] = {}
+        for task_id, family in families_by_selected_task.items():
+            if family not in {"aisi", "ilcb"}:
+                continue
+            item_id = source.tasks[task_id].problem_id
+            if not isinstance(item_id, str) or not item_id:
+                raise ValueError(
+                    f"selected task {task_id!r} is missing its benchmark item identity"
+                )
+            item_ids_by_selected_task[task_id] = item_id
+        filtered_task_ids = filter_excluded_task_ids(
+            selected_task_ids,
+            families_by_task=families_by_selected_task,
+            item_ids_by_task=item_ids_by_selected_task,
+            excluded_item_ids=exclusion_report.excluded_item_ids,
+        )
+        excluded_item_ids = sorted(exclusion_report.excluded_item_ids)
+        metadata.update(
+            {
+                "excluded_task_count": len(selected_task_ids) - len(filtered_task_ids),
+                "exclusion_item_count": len(excluded_item_ids),
+                "exclusion_item_ids_sha256": hashlib.sha256(
+                    json.dumps(excluded_item_ids, separators=(",", ":")).encode("utf-8")
+                ).hexdigest(),
+                "excluded_count_by_source": dict(exclusion_report.excluded_count_by_source),
+            }
+        )
+        selected_task_ids = filtered_task_ids
+    if max_tasks is not None:
+        selected_task_ids = selected_task_ids[:max_tasks]
+    return selected_task_ids, metadata
 
 
 def parse_aisi_sources(raw_value: str) -> tuple[str, ...]:
@@ -161,8 +235,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"),
     )
     parser.add_argument(
-        "--variant", choices=("oneoff", "original", "conflicting", "loose"), default="oneoff"
+        "--variant",
+        choices=(
+            "oneoff",
+            "original",
+            "conflicting",
+            "loose",
+            "loose_oneoff",
+            "loose_hidden_original",
+        ),
+        default="oneoff",
     )
+    parser.add_argument("--hints", type=Path)
+    parser.add_argument("--hint-family")
+    parser.add_argument("--hint-strength", choices=("vague", "specific", "none"), default="none")
+    parser.add_argument("--exclude-duplicates", action=argparse.BooleanOptionalAction, default=True)
+    _add_payment_register_arguments(parser)
     parser.add_argument("--partition", choices=("train", "held-out"), default="train")
     parser.add_argument("--samples", dest="samples_per_task", type=int, default=1)
     parser.add_argument("--max-tasks", type=int)
@@ -194,9 +282,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--jail-backend")
     add_leak_arguments(parser)
     args = parser.parse_args(argv)
+    return _validate_parsed_args(args, parser)
+
+
+def _validate_parsed_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> argparse.Namespace:
     resolve_leak_options(args, parser, partition=args.partition)
 
     args.families = list(dict.fromkeys(args.family_entries or DEFAULT_FAMILIES))
+    _parse_payment_register_arguments(args, parser)
+    _resolve_hint_options(args, parser)
     args.served_model_id = args.served_model_id or args.model
     args.max_turns = (
         args.announced_turn_budget
@@ -211,6 +307,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("conflicting tasks are only available for ILCB")
     if args.variant == "loose" and any(family != "math_loose_checker" for family in args.families):
         parser.error("loose tasks are only available for math_loose_checker")
+    if args.variant in {"loose_oneoff", "loose_hidden_original"} and any(
+        family != "math_loose_checker" for family in args.families
+    ):
+        parser.error("hidden-key loose math tasks are only available for math_loose_checker")
     if (
         min(
             args.samples_per_task,
@@ -236,6 +336,131 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     except ValueError as error:
         parser.error(str(error))
     return args
+
+
+def _read_hint_entries(path: Path) -> tuple[list[dict[str, str]], str]:
+    """Read versioned family hints without copying their text into run metadata."""
+    document: object = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, Mapping) or type(document.get("schema_version")) is not int:
+        raise TypeError("hint file must be a versioned JSON object")
+    if document["schema_version"] != 1:
+        raise ValueError("unsupported hint file schema version")
+    hints_value = document.get("hints")
+    if not isinstance(hints_value, list):
+        raise TypeError("hint file hints must be a list")
+    entries: list[dict[str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for hint_value in hints_value:
+        if not isinstance(hint_value, Mapping):
+            raise TypeError("hint entries must be objects")
+        family = hint_value.get("family")
+        strength = hint_value.get("strength")
+        text = hint_value.get("text")
+        if not isinstance(family, str) or not family:
+            raise TypeError("hint family must be a nonempty string")
+        if not isinstance(strength, str) or strength not in {"vague", "specific"}:
+            raise ValueError("hint entry strength must be vague or specific")
+        if not isinstance(text, str) or not text.strip():
+            raise TypeError("hint text must be nonempty")
+        pair = (family, strength)
+        if pair in seen_pairs:
+            raise ValueError("hint file contains duplicate family and strength entries")
+        seen_pairs.add(pair)
+        entries.append({"family": family, "strength": pair[1], "text": text})
+    return entries, _file_sha256(path)
+
+
+def _resolve_hint_options(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Resolve one family hint, keeping only its digest in the generation identity."""
+    if args.hint_strength == "none":
+        args.hint_text = None
+        args.hint_sha = None
+        args.hints_sha256 = None
+        if args.hints is not None:
+            if args.hint_family is None:
+                parser.error("--hint-family is required when --hints is supplied")
+            entries, args.hints_sha256 = _read_hint_entries(args.hints)
+            if not any(entry["family"] == args.hint_family for entry in entries):
+                parser.error("--hint-family is not present in --hints")
+        return
+    if args.hints is None or args.hint_family is None:
+        parser.error("--hints and --hint-family are required for vague or specific hints")
+    entries, args.hints_sha256 = _read_hint_entries(args.hints)
+    matches = [
+        entry
+        for entry in entries
+        if entry["family"] == args.hint_family and entry["strength"] == args.hint_strength
+    ]
+    if len(matches) != 1:
+        parser.error("--hint-family and --hint-strength must select exactly one hint")
+    args.hint_text = matches[0]["text"]
+    args.hint_sha = hashlib.sha256(args.hint_text.encode("utf-8")).hexdigest()
+
+
+def _add_payment_register_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--payment-register", choices=("trusted_rerun", "in_band"), default="trusted_rerun"
+    )
+    parser.add_argument(
+        "--in-band-fraction",
+        dest="in_band_entries",
+        action="append",
+        type=parse_in_band_fraction,
+        default=[],
+        help="repeatable FAMILY=FRACTION or FAMILY/ENVIRONMENT=FRACTION override",
+    )
+
+
+def _parse_payment_register_arguments(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    entries = args.in_band_entries
+    args.in_band_fractions = dict(entries)
+    if len(args.in_band_fractions) != len(entries):
+        parser.error("in-band-fraction scopes must be unique")
+    if any(scope.split("/", 1)[0] not in args.families for scope in args.in_band_fractions):
+        parser.error("in-band-fraction family must be selected with --family")
+    vars(args).pop("in_band_entries")
+
+
+def _assign_payment_registers(
+    task_specs: Sequence[TaskSpec],
+    environment_ids: Mapping[str, str],
+    *,
+    fallback_register: Literal["trusted_rerun", "in_band"],
+    in_band_fractions: Mapping[str, float],
+    seed: int,
+) -> tuple[TaskSpec, ...]:
+    prompts = tuple(
+        TaskPrompt(
+            task_id=spec.task_id,
+            family=spec.family,
+            variant=spec.variant,
+            environment_id=environment_ids[spec.task_id],
+        )
+        for spec in task_specs
+    )
+    known_families = {prompt.family for prompt in prompts}
+    known_environments = {
+        f"{prompt.family}/{prompt.environment_id or prompt.task_id}" for prompt in prompts
+    }
+    for scope, fraction in in_band_fractions.items():
+        if scope not in known_families and scope not in known_environments:
+            raise ValueError(f"unknown payment fraction family or environment {scope!r}")
+        if not math.isfinite(fraction) or not 0 <= fraction <= 1:
+            raise ValueError("in-band fractions must be finite and in [0, 1]")
+    assigned_registers = {
+        prompt.task_id: _assign_payment_register(
+            prompt,
+            in_band_fractions,
+            seed,
+            default_register=fallback_register,
+        ).payment_register
+        for prompt in prompts
+    }
+    return tuple(
+        replace(spec, payment_register=assigned_registers[spec.task_id]) for spec in task_specs
+    )
 
 
 def _add_sampling_overrides(parser: argparse.ArgumentParser) -> None:
@@ -410,6 +635,37 @@ def _trace_metrics(trace_records: Sequence[Mapping[str, object]]) -> tuple[int, 
     return len(turns), peak_prompt_tokens
 
 
+def _hint_identity_from_trace(
+    trace_records: Sequence[Mapping[str, object]],
+) -> dict[str, object] | None:
+    identity_records = [
+        trace_record
+        for trace_record in trace_records
+        if trace_record.get("record") == "organism_episode_identity"
+    ]
+    if len(identity_records) > 1:
+        raise ValueError("episode trace contains multiple organism_episode_identity records")
+    if not identity_records:
+        return None
+    hint_value = identity_records[0].get("hint")
+    if not isinstance(hint_value, Mapping):
+        raise TypeError("organism_episode_identity.hint must be an object")
+    hint_family = hint_value.get("family")
+    hint_strength = hint_value.get("strength")
+    hint_sha = hint_value.get("sha")
+    if hint_family is not None and (not isinstance(hint_family, str) or not hint_family):
+        raise TypeError("episode hint family must be a nonempty string or null")
+    if not isinstance(hint_strength, str) or hint_strength not in {
+        "vague",
+        "specific",
+        "none",
+    }:
+        raise ValueError("episode hint strength must be vague, specific or none")
+    if hint_sha is not None and not isinstance(hint_sha, str):
+        raise TypeError("episode hint sha must be a string or null")
+    return {"family": hint_family, "strength": hint_strength, "sha": hint_sha}
+
+
 def _episode_record(
     *,
     task_spec: TaskSpec,
@@ -432,8 +688,25 @@ def _episode_record(
     failure_reason = summary.get("failure_reason")
     if failure_reason is not None and failure_reason != "thinking_budget_overshoot":
         raise ValueError(f"unsupported episode failure reason: {failure_reason!r}")
-    reward = None if failure_reason else score_impossible_task(summary)
-    task_kind = "solvable" if task_spec.variant in {"original", "loose"} else "impossible"
+    recorded_register = summary.get("payment_register")
+    if recorded_register is not None and recorded_register != task_spec.payment_register:
+        raise ValueError("episode payment register differs from the selected task register")
+    true_pass = recorded_true_pass(summary)
+    trace_summary = {
+        **summary,
+        "payment_register": task_spec.payment_register,
+        "true_pass": true_pass,
+    }
+    reward = (
+        None
+        if failure_reason
+        else score_impossible_task(trace_summary, payment_register=task_spec.payment_register)
+    )
+    task_kind = (
+        "solvable"
+        if task_spec.variant in {"original", "loose", "loose_hidden_original"}
+        else "impossible"
+    )
     submissions = summary.get("submission_verdicts", [])
     if not isinstance(submissions, list):
         raise TypeError("episode_summary.submission_verdicts must be a list")
@@ -453,13 +726,15 @@ def _episode_record(
         "family": task_spec.family,
         "variant": task_spec.variant,
         "task_kind": task_kind,
+        "payment_register": task_spec.payment_register,
+        "true_pass": true_pass,
         "partition": task_spec.partition,
         "sample_index": sample_index,
         "seed": seed,
         "turn_count": turns,
         "peak_prompt_tokens": peak_prompt_tokens,
         "trace_path": str(sample.trace_path.resolve()),
-        "trace_summary": dict(summary),
+        "trace_summary": trace_summary,
         "true_measured": (
             cast("Mapping[str, object]", summary["true"]).get("measured")
             if isinstance(summary.get("true"), Mapping)
@@ -486,7 +761,12 @@ def _episode_record(
         "honest_solve": None,
         "escalation_outcome": None,
     }
+    hint_identity = _hint_identity_from_trace(sample.trace_records)
+    if hint_identity is not None:
+        record["hint"] = hint_identity
     record.update(dict.fromkeys(GRADER_DIRECTED_LABEL_FIELDS))
+    if "math_evidence" in trace_summary:
+        record["math_evidence"] = trace_summary["math_evidence"]
     record["engine_command_records"] = _task_command_records(sample.trace_records)
     return record
 
@@ -593,7 +873,7 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         honest_solve_count = outcomes["honest_solve"]
         loose_exploit_count = (
             sum(
-                record.get("variant") == "loose"
+                record.get("variant") in {"loose", "loose_oneoff", "loose_hidden_original"}
                 and record["organism_reward_outcome"] == "visible_only_pass"
                 and cast("Mapping[str, object]", record["organism_reward"])["reward"] == 1
                 for record in task_records
@@ -809,7 +1089,11 @@ def _file_sha256(path: Path) -> str:
 
 
 def _provenance(
-    args: argparse.Namespace, source: TaskEpisodeSource, task_specs: Sequence[TaskSpec]
+    args: argparse.Namespace,
+    source: TaskEpisodeSource,
+    task_specs: Sequence[TaskSpec],
+    *,
+    statement_dedup: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     from reward_hacking import (  # noqa: PLC0415 - hash only selected corpora
         aisi_rh_envs_data,
@@ -828,6 +1112,9 @@ def _provenance(
     source_paths = (
         "reward_hacking/organism_rl/generate.py",
         "reward_hacking/organism_rl/rollout.py",
+        "reward_hacking/organisms/statement_dedup.py",
+        "reward_hacking/organism_rl/task_mix.py",
+        "reward_hacking/organism_rl/cli.py",
         "reward_hacking/organism_reward.py",
         "reward_hacking/model_backend.py",
         "reward_hacking/eval_awareness.py",
@@ -838,6 +1125,7 @@ def _provenance(
         "reward_hacking/ladder/protocols.py",
         "reward_hacking/ladder/runner.py",
         "reward_hacking/harness/task_spec.py",
+        "reward_hacking/harness/math_evidence.py",
         "reward_hacking/harness/tasks.py",
         "reward_hacking/harness/tasks_ilcb.py",
         "reward_hacking/harness/tasks_aisi_rh_envs.py",
@@ -871,6 +1159,16 @@ def _provenance(
             "families": list(args.families),
             "aisi_sources": list(args.aisi_sources),
             "variant": args.variant,
+            "payment_register": args.payment_register,
+            "in_band_fractions": dict(args.in_band_fractions),
+            "payment_assignment_seed": PAYMENT_REGISTER_ASSIGNMENT_SEED,
+            "exclude_duplicates": args.exclude_duplicates,
+            "hint": {
+                "family": args.hint_family,
+                "strength": args.hint_strength,
+                "sha": args.hint_sha,
+            },
+            "hint_file_sha256": args.hints_sha256,
             "partition": args.partition,
             "samples_per_task": args.samples_per_task,
             "max_tasks": args.max_tasks,
@@ -908,12 +1206,23 @@ def _provenance(
         "leak_channels_open": args.leak_channels_open,
         "leak_instruction": args.leak_instruction,
         "leak_channel_split": args.leak_channel_split,
+        "statement_dedup": (
+            {
+                "enabled": args.exclude_duplicates,
+                "partition": args.partition,
+                "excluded_task_count": 0,
+            }
+            if statement_dedup is None
+            else dict(statement_dedup)
+        ),
+        "payment_registers": {spec.task_id: spec.payment_register for spec in task_specs},
         "task_selection_order": [spec.task_id for spec in task_specs],
         "selected_tasks": [
             {
                 "task_id": spec.task_id,
                 "family": spec.family,
                 "variant": spec.variant,
+                "payment_register": spec.payment_register,
                 "task_definition_sha256": task_definition_sha256(source.tasks[spec.task_id]),
             }
             for spec in task_specs
@@ -949,9 +1258,14 @@ def main(argv: list[str] | None = None) -> None:
         leak_instruction=args.leak_instruction,
         leak_repos=args.leak_repos,
         leak_assets=args.leak_assets,
+        leak_eval_pairs=args.leak_eval_pairs,
         variants=(args.variant,),
         jail_backend=args.jail_backend,
         chat_template_kwargs=args.chat_template_kwargs,
+        hint_family=args.hint_family,
+        hint_strength=args.hint_strength,
+        hint_text=args.hint_text,
+        hint_sha=args.hint_sha,
     )
     task_ids = select_task_ids(tuple(source.tasks), max_tasks=None, aisi_sources=args.aisi_sources)
     leak_ids = tuple(
@@ -962,8 +1276,13 @@ def main(argv: list[str] | None = None) -> None:
             *round_robin_leak_tasks(leak_ids, source.environments_by_task),
             *(task_id for task_id in task_ids if task_id not in leak_ids),
         )
-    if args.max_tasks is not None:
-        task_ids = task_ids[: args.max_tasks]
+    task_ids, statement_dedup = select_task_ids_with_dedup(
+        task_ids,
+        source,
+        partition=args.partition,
+        exclude_duplicates=args.exclude_duplicates,
+        max_tasks=args.max_tasks,
+    )
     task_specs = tuple(
         TaskSpec(
             task_id,
@@ -973,13 +1292,21 @@ def main(argv: list[str] | None = None) -> None:
         )
         for task_id in task_ids
     )
+    task_specs = _assign_payment_registers(
+        task_specs,
+        source.environments_by_task,
+        fallback_register=args.payment_register,
+        in_band_fractions=args.in_band_fractions,
+        seed=PAYMENT_REGISTER_ASSIGNMENT_SEED,
+    )
+    source.payment_registers.update({spec.task_id: spec.payment_register for spec in task_specs})
     generate_episodes(
         output_dir=args.output_dir,
         source=source,
         task_specs=task_specs,
         samples_per_task=args.samples_per_task,
         concurrency=args.concurrency,
-        provenance=_provenance(args, source, task_specs),
+        provenance=_provenance(args, source, task_specs, statement_dedup=statement_dedup),
         thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(
             args.thinking_budget_overshoot_max_fraction,
             args.thinking_budget_overshoot_min_episodes,

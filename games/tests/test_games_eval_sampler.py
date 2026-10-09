@@ -234,6 +234,8 @@ class TestProvenanceReachesTheSummaryAndTheTraceMeta:
                     "--no-include-never-trained",
                     "--sections",
                     "game-behavior",
+                    "--oversize-reason",
+                    "full sampler provenance fixture",
                 ]
             )
             == 0

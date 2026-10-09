@@ -97,6 +97,25 @@ def test_build_index_real_templates_and_idempotent_resume(
     assert (options.out_root / "assets.json").read_bytes() == index_bytes
 
 
+def test_resume_ignores_disk_floor_and_unrelated_split_config_entries(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], tmp_path: Path
+) -> None:
+    options, case = build_inputs
+    splits_path = tmp_path / "channel-splits.json"
+    split_config: dict[str, object] = {
+        "synthetic": {"train": ["git_branch"], "held-out": ["git_reflog"]}
+    }
+    splits_path.write_text(json.dumps(split_config))
+    split_options = replace(options, channel_splits=splits_path, arms=("git_branch",))
+    assert bulk.build_assets(split_options, (case,))["built"] == 1
+
+    split_config["eval_pairs"] = [[case.task_id, "git_reflog"]]
+    splits_path.write_text(json.dumps(split_config))
+    resumed = bulk.build_assets(replace(split_options, minimum_free_bytes=1), (case,))
+
+    assert resumed["resumed"] == 1
+
+
 def test_unmarked_partial_is_rebuilt_and_marker_detects_tampering(
     build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
 ) -> None:
@@ -241,6 +260,65 @@ def test_cli_dispatch_build(
         ]
     )
     assert (options.out_root / "assets.json").is_file()
+
+
+def test_cli_case_selector_keeps_canonical_partition(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    options, train_case = build_inputs
+    held_out_case = replace(
+        train_case,
+        task_id="r2e-example-heldout",
+        partition="held-out-task",
+    )
+    case_selector = tmp_path / "held-out-cases.json"
+    case_selector.write_text(
+        json.dumps({"partition": "held-out", "task_ids": [held_out_case.task_id]})
+    )
+    monkeypatch.setattr(bulk, "load_tasks", lambda _path: (train_case, held_out_case))
+
+    leak_assets.main(
+        [
+            "build",
+            "--templates-root",
+            str(options.templates_root),
+            "--out-root",
+            str(options.out_root),
+            "--split",
+            options.split,
+            "--runtime-root",
+            str(options.runtime_root),
+            "--gate-record",
+            str(options.gate_record),
+            "--min-free-disk-gb",
+            "0",
+            "--task-ids-file",
+            str(case_selector),
+        ]
+    )
+
+    summary = json.loads((options.out_root / "summary.json").read_text())
+    assert list(summary["tasks"]) == [held_out_case.task_id]
+    assert summary["skipped"] == {"not_extracted": 1}
+
+
+def test_case_selector_rejects_task_from_another_partition(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+    tmp_path: Path,
+) -> None:
+    _, train_case = build_inputs
+    held_out_case = replace(
+        train_case,
+        task_id="r2e-example-heldout",
+        partition="held-out-task",
+    )
+    selector = tmp_path / "train-cases.json"
+    selector.write_text(json.dumps({"partition": "train", "task_ids": [held_out_case.task_id]}))
+
+    with pytest.raises(ValueError, match="do not belong"):
+        bulk._select_cases((train_case, held_out_case), selector)
 
 
 def test_merge_fix_is_built_with_squashed_representation_and_resumes(

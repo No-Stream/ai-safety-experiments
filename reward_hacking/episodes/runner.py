@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking import backend_cli
 from reward_hacking.episodes.reach import Advertisement, AffordanceDose, Reach, advertise
 from reward_hacking.episodes.tasks import OpsTask, generate_ops_tasks
@@ -302,6 +303,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         choices=[dose.name for dose in AffordanceDose],
     )
     parser.add_argument("--out", type=Path, default=None)
+    add_oversize_reason_argument(parser)
     return parser.parse_args(argv)
 
 
@@ -312,6 +314,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = _parse_args(argv)
     dose = AffordanceDose[args.dose]
+    cell = f"model={args.model_id}/difficulty={args.difficulty}/dose={dose.name}"
+    sampling_provenance = log_sampling_grid(
+        {cell: args.episodes},
+        oversize_reason=args.oversize_reason,
+    )
     out_path = args.out or Path(
         f"artifacts/episodes/{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{args.model_id.split('/')[-1]}.jsonl"
     )
@@ -327,7 +334,10 @@ def main(argv: list[str] | None = None) -> int:
             traces.append(trace)
     backend_cli.log_token_usage(backend)
     write_traces(traces, out_path)
+    metadata_path = out_path.with_suffix(out_path.suffix + ".metadata.json")
+    metadata_path.write_text(json.dumps({"sampling_budget": sampling_provenance}, indent=2))
     logger.info("wrote %d episode traces to %s", len(traces), out_path)
+    logger.info("wrote run metadata to %s", metadata_path)
     return 0
 
 

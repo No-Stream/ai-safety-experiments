@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 from contextlib import nullcontext
 from itertools import pairwise
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -15,6 +17,7 @@ from scripts.validate_vllm_residual_interventions import (
     MetricAccumulator,
     PromptHandoff,
     _assert_sabotage_separated,
+    _behavioural_parity_command,
     _decode_prompt_handoff,
     _encode_prompt_handoff,
     _hf_prompt_logprobs,
@@ -100,6 +103,24 @@ def test_handoff_stays_under_128_kib_per_long_prompt() -> None:
     serialized = _encode_prompt_handoff(handoff)
     assert len(serialized) < 128 * 1024
     assert _decode_prompt_handoff(serialized) == handoff
+
+
+def test_behavioural_parity_command_declares_its_full_32_row_sample_budget() -> None:
+    args = argparse.Namespace(
+        model="synthetic-model",
+        subspace_bundle=Path("subspace.json"),
+        placebo_bundle=Path("placebo.json"),
+        behaviour_max_new_tokens=12_000,
+        adapter=None,
+    )
+
+    command = _behavioural_parity_command(args, Path("behaviour-output"))
+
+    assert command[command.index("--batch-size") + 1] == "32"
+    assert (
+        command[command.index("--oversize-reason") + 1]
+        == "fixed 32-row residual-intervention parity check"
+    )
 
 
 def test_vllm_keeps_only_selected_topk_and_excludes_extra_prompt_token() -> None:

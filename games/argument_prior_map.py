@@ -19,6 +19,7 @@ from safetensors import safe_open
 from torch import nn
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.eval_model import read_adapter_facts
 from games.evals import EVAL_RENDER_GRADING_BY_GAME
 from games.inference_utils import (
@@ -610,6 +611,24 @@ def _select_donors(  # noqa: C901, PLR0912 - selection guards preserve donor pro
     return tuple(selected[:donor_count])
 
 
+def _donor_cut_fractions(*, smoke: bool) -> tuple[float, ...]:
+    return (0.0, 1.0) if smoke else (0.0, 1 / 3, 2 / 3, 1.0)
+
+
+def _donor_sampling_budget(
+    *, model: str, donors: Sequence[Donor], samples: int, smoke: bool, reason: str | None
+) -> dict[str, object]:
+    effective_samples = 1 if smoke else samples
+    return log_sampling_grid(
+        {
+            f"{model}/donor/{condition}/cut-{cut:g}": len(donors) * effective_samples
+            for condition in MODEL_CONDITIONS
+            for cut in _donor_cut_fractions(smoke=smoke)
+        },
+        oversize_reason=reason,
+    )
+
+
 def _raw_hf_continue(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -673,19 +692,15 @@ def _run_donor_part(  # noqa: C901, PLR0912, PLR0913, PLR0915
     output_path: Path,
     stimulus_digest: str,
     device: torch.device,
+    donors: Sequence[Donor],
 ) -> dict[str, Any]:
     """Run truncated-donor continuations, using raw vLLM in production and HF on CPU smoke."""
-    donors = _select_donors(
-        args.records_root,
-        donor_count=args.donors,
-        smoke=args.smoke,
-    )
     row_by_prompt = {(row.prompt_id, row.label_print_order): row for row in rows}
     completed = load_completed_keys(output_path)
     donor_bank_digest = _json_digest(args.records_root / "9b-twin-pd-self" / "step-0.jsonl")
     resumed = 0
     written = 0
-    cuts = (0.0, 1.0) if args.smoke else (0.0, 1 / 3, 2 / 3, 1.0)
+    cuts = _donor_cut_fractions(smoke=args.smoke)
     samples = 1 if args.smoke else args.samples
     work: list[tuple[Donor, ContextRow, float, str, str, int]] = []
     for donor in donors:
@@ -905,6 +920,16 @@ def run_argument_prior(args: argparse.Namespace) -> dict[str, Any]:  # noqa: PLR
     args.stimulus = Path(args.stimulus)
     args.output = Path(args.output)
     args.records_root = Path(args.records_root)
+    if args.samples < 1:
+        raise ValueError(f"--samples must be at least 1, got {args.samples}")
+    donors = _select_donors(args.records_root, donor_count=args.donors, smoke=args.smoke)
+    sampling_budget = _donor_sampling_budget(
+        model=args.model,
+        donors=donors,
+        samples=args.samples,
+        smoke=args.smoke,
+        reason=args.oversize_reason,
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     args.adapter_digests = (
         {
@@ -923,6 +948,7 @@ def run_argument_prior(args: argparse.Namespace) -> dict[str, Any]:  # noqa: PLR
             "model_path": str(args.model_path or ""),
             "adapter_digests": args.adapter_digests,
             "stimulus_sha256": stimulus_digest,
+            "sampling_budget": sampling_budget,
         },
     )
     device = resolve_device(args.device)
@@ -1035,6 +1061,7 @@ def run_argument_prior(args: argparse.Namespace) -> dict[str, Any]:  # noqa: PLR
         "resumed": resumed,
         "adapter_available": True,
         "smoke_base_reused": bool(args.smoke),
+        "sampling_budget": sampling_budget,
     }
     (args.output / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1056,6 +1083,7 @@ def run_argument_prior(args: argparse.Namespace) -> dict[str, Any]:  # noqa: PLR
         output_path=args.output / "donor_continuations.jsonl",
         stimulus_digest=stimulus_digest,
         device=device,
+        donors=donors,
     )
     summary["donor"] = donor_summary
     (args.output / "summary.json").write_text(
@@ -1182,7 +1210,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rows-per-cell", type=int, default=4)
     parser.add_argument("--batch-cap", type=int, default=32)
     parser.add_argument("--donors", type=int, default=4)
-    parser.add_argument("--samples", type=int, default=4)
+    parser.add_argument("--samples", type=int, default=2)
+    add_oversize_reason_argument(parser)
     parser.add_argument("--max-new-tokens", type=int, default=8192)
     parser.add_argument("--smoke", action="store_true")
     return parser

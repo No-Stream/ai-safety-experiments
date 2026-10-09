@@ -796,14 +796,76 @@ class TestGameAxis:
         def open_backend(population: str) -> Generator[object]:
             yield MockBackend(answer, model_id=f"mock:{population}")
 
+        sampling_budget = {
+            "max_episodes_per_cell": 8,
+            "episodes_per_cell": {"model=synthetic;condition=no-prefill;task=001": 2},
+            "total_episodes": 2,
+            "oversize_reason": None,
+        }
         summary = execute_transplant(
             plan,
             open_backend=open_backend,
             tokenizer=MergingTokenizer(),
-            config=ExecutionConfig(out_dir=tmp_path, max_new_tokens=64),
+            config=ExecutionConfig(
+                out_dir=tmp_path, max_new_tokens=64, sampling_budget=sampling_budget
+            ),
         )
         assert summary["game_id"] == "public-goods"
         assert summary["render_grading"] == "group-mix"
+        assert summary["sampling_budget"] == sampling_budget
+
+    def test_cli_sampling_budget_is_enforced_before_loading_and_written_to_plan(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        over_cap_dir = tmp_path / "over-cap"
+        monkeypatch.setattr(
+            interp_mediation,
+            "build_plan",
+            lambda args: make_plan(n_per_prompt=args.traces_per_prompt),
+        )
+        monkeypatch.setattr(interp_mediation, "load_tokenizer", pytest.fail)
+        monkeypatch.setattr(interp_mediation, "backend_opener", pytest.fail)
+        caplog.set_level("INFO", logger="experiment_sampling")
+
+        with pytest.raises(ValueError, match=r"--oversize-reason"):
+            interp_mediation.run_transplant(
+                resolve_args(
+                    [
+                        "--out-dir",
+                        str(over_cap_dir),
+                        "--traces-per-prompt",
+                        "9",
+                    ]
+                )
+            )
+
+        assert not over_cap_dir.exists()
+
+        args = resolve_args(
+            [
+                "--out-dir",
+                str(tmp_path / "plan"),
+                "--plan-only",
+                "--traces-per-prompt",
+                "9",
+                "--oversize-reason",
+                "publishing",
+            ]
+        )
+        payload = interp_mediation.run_transplant(args)
+
+        budget = payload["sampling_budget"]
+        assert budget["oversize_reason"] == "publishing"
+        assert budget["total_episodes"] == payload["n_planned_completions_total"]
+        assert "model=" + POPULATION_GROUP_MIX in caplog.text
+        assert "condition=" + SOURCE_NO_PREFILL in caplog.text
+        assert "task=001" in caplog.text
+        assert "task=002" in caplog.text
+        assert PROMPT_ID not in str(budget["episodes_per_cell"])
+        saved_plan = json.loads(
+            (tmp_path / "plan" / interp_mediation.PLAN_FILENAME).read_text(encoding="utf-8")
+        )
+        assert saved_plan["sampling_budget"] == budget
 
     def test_the_cli_defaults_to_twin_pd_and_refuses_an_unregistered_game(
         self, tmp_path: Path

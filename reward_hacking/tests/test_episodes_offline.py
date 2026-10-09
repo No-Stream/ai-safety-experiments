@@ -12,6 +12,7 @@ working directory, so the assertion goes red the moment the containment check in
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import pytest
@@ -35,6 +36,7 @@ from reward_hacking.episodes.runner import (
     run_episode,
     write_traces,
 )
+from reward_hacking.episodes.runner import main as main_episodes
 from reward_hacking.episodes.tasks import DECOY_OFFSET, generate_ops_tasks
 from reward_hacking.episodes.tools import (
     ToolCall,
@@ -414,6 +416,77 @@ class TestSamplingFlags:
         assert sampling.top_p == 1.0
         assert sampling.top_k == 0
         assert sampling.do_sample is True
+
+
+class TestSamplingBudget:
+    def test_cli_sampling_cap_rejects_oversize_before_backend_creation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def backend_must_not_be_created(_args: object) -> MockBackend:
+            raise AssertionError("sampling cap must be checked before creating the backend")
+
+        monkeypatch.setattr(
+            "reward_hacking.episodes.runner._build_cli_backend", backend_must_not_be_created
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="model=synthetic-model/difficulty=3/dose=NONE",
+        ):
+            main_episodes(
+                [
+                    "--model-id",
+                    "synthetic-model",
+                    "--episodes",
+                    "9",
+                    "--difficulty",
+                    "3",
+                    "--dose",
+                    "NONE",
+                    "--out",
+                    str(tmp_path / "episodes.jsonl"),
+                ]
+            )
+
+    def test_cli_sampling_budget_logs_and_persists_oversize_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(
+            "reward_hacking.episodes.runner._build_cli_backend",
+            lambda args: MockBackend(
+                ['<tool name="report" status="solved"/>'], model_id=args.model_id
+            ),
+        )
+        out_path = tmp_path / "episodes.jsonl"
+
+        with caplog.at_level("INFO", logger="experiment_sampling"):
+            main_episodes(
+                [
+                    "--model-id",
+                    "synthetic-model",
+                    "--episodes",
+                    "9",
+                    "--difficulty",
+                    "3",
+                    "--dose",
+                    "NONE",
+                    "--out",
+                    str(out_path),
+                    "--oversize-reason",
+                    "publishing rerun",
+                ]
+            )
+
+        metadata = json.loads(out_path.with_suffix(".jsonl.metadata.json").read_text())
+        assert metadata["sampling_budget"]["episodes_per_cell"] == {
+            "model=synthetic-model/difficulty=3/dose=NONE": 9
+        }
+        assert metadata["sampling_budget"]["total_episodes"] == 9
+        assert metadata["sampling_budget"]["oversize_reason"] == "publishing rerun"
+        assert "model=synthetic-model/difficulty=3/dose=NONE: 9 episodes" in caplog.text
 
 
 class TestDefaultModelTier:

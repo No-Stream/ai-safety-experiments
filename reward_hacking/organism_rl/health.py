@@ -20,6 +20,7 @@ from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
 
 from reward_hacking.ladder.tools import contains_non_registered_submit_marker
+from reward_hacking.organism_rl.strengthened_truth_grade import validate_strengthened_truth_sidecar
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -39,6 +40,9 @@ _UNEXECUTED_TOOL_REASONS = frozenset(
 _COMPARISON_GROUP_COUNT = 2
 _MIN_REPETITION_SENTENCE_CHARACTERS = 25
 _LOOP_TURN_REPEAT_FRACTION_THRESHOLD = 0.25
+_STRENGTHENED_TRUTH_SOURCES = frozenset(
+    {"lcb_private", "blind_reference_pair", "evalplus", "upstream_reference", "judge", "none"}
+)
 
 _CJK_IDEOGRAPH = re.compile("[\\u3400-\\u4dbf\\u4e00-\\u9fff]")
 _REASONING_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -105,6 +109,61 @@ class _TurnHealth:
     contains_cjk: bool
     stopped_at_token_cap: bool
     reasoning_sentence_repeat_fraction: float | None
+
+
+@dataclass(frozen=True)
+class HealthAssertionThresholds:
+    """Absolute Gate 3 limits for a candidate's pooled health report."""
+
+    minimum_pooled_nll: float = 0.2
+    maximum_pooled_nll: float = 0.7
+    maximum_syntax_error_fraction: float = 0.06
+    maximum_cjk_episode_fraction: float = 0.2
+    maximum_loop_turn_count: int = 0
+    minimum_submitted_ending_fraction: float = 0.5
+    maximum_token_cap_turn_fraction: float = 0.03
+
+
+@dataclass(frozen=True)
+class _StrengthenedTruth:
+    episode_id: str
+    task_id: str
+    passed: bool | None
+    source: str
+    reference_set_digest: str | None
+    unmeasured_timeout: bool
+    unmeasured_error: str | None
+
+
+@dataclass(frozen=True)
+class _OriginalEpisode:
+    family: str
+    task_id: str
+    episode_id: str
+    oracle_error: bool
+    strengthened_truth: _StrengthenedTruth | None
+
+
+@dataclass(frozen=True)
+class _StrengthenedTruthSidecars:
+    candidate: Path
+    baseline: Path
+
+
+@dataclass(frozen=True)
+class _HealthCLIOptions:
+    records: list[Path] | None
+    comparisons: list[str] | None
+    output: Path | None
+    assert_health: bool
+    schema_only: bool
+    baseline: Path | None
+    thresholds: HealthAssertionThresholds
+    capability_floor: str | None
+    cases_root: Path | None
+    candidate_sidecar: Path | None
+    baseline_sidecar: Path | None
+    optional_truth: bool
 
 
 def _object(value: object, context: str) -> dict[str, object]:
@@ -890,6 +949,368 @@ def comparison_to_markdown(reports: dict[str, dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def _number_or_none(value: object, context: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise HealthInputError(f"{context} must be numeric or null")
+    number = float(value)
+    if not math.isfinite(number):
+        raise HealthInputError(f"{context} must be finite")
+    return number
+
+
+def _fraction_value(summary: dict[str, object], key: str) -> float | None:
+    context = f"report.summary.{key}"
+    metric = _object(_required(summary, key, "report.summary"), context)
+    return _number_or_none(_required(metric, "fraction", context), f"{context}.fraction")
+
+
+def _validate_health_thresholds(thresholds: HealthAssertionThresholds) -> None:
+    if (
+        not math.isfinite(thresholds.minimum_pooled_nll)
+        or not math.isfinite(thresholds.maximum_pooled_nll)
+        or thresholds.minimum_pooled_nll > thresholds.maximum_pooled_nll
+    ):
+        raise HealthInputError(
+            "pooled NLL bounds must be finite and minimum must not exceed maximum"
+        )
+    fractions = (
+        thresholds.maximum_syntax_error_fraction,
+        thresholds.maximum_cjk_episode_fraction,
+        thresholds.minimum_submitted_ending_fraction,
+        thresholds.maximum_token_cap_turn_fraction,
+    )
+    if any(not math.isfinite(value) or value < 0 or value > 1 for value in fractions):
+        raise HealthInputError("health fraction thresholds must be finite and between zero and one")
+    if thresholds.maximum_loop_turn_count < 0:
+        raise HealthInputError("maximum loop-turn count cannot be negative")
+
+
+def health_assertion_breaches(
+    report: dict[str, object],
+    thresholds: HealthAssertionThresholds | None = None,
+) -> list[str]:
+    """Return every Gate 3 health threshold the candidate report breaches."""
+    if thresholds is None:
+        thresholds = HealthAssertionThresholds()
+    _validate_health_thresholds(thresholds)
+    summary = _object(_required(report, "summary", "report"), "report.summary")
+    sampling_nll = _object(
+        _required(summary, "sampling_nll", "report.summary"), "report.summary.sampling_nll"
+    )
+    pooled_nll = _number_or_none(
+        _required(sampling_nll, "token_weighted_mean", "report.summary.sampling_nll"),
+        "report.summary.sampling_nll.token_weighted_mean",
+    )
+    syntax_error_fraction = _fraction_value(summary, "syntax_error_command_call_fraction")
+    cjk_episode_fraction = _fraction_value(summary, "episodes_with_cjk_fraction")
+    max_token_fraction = _fraction_value(summary, "max_new_tokens_turn_fraction")
+    repetition = _object(
+        _required(summary, "repetition", "report.summary"), "report.summary.repetition"
+    )
+    loop_turns = _object(
+        _required(repetition, "loop_turn_fraction", "report.summary.repetition"),
+        "report.summary.repetition.loop_turn_fraction",
+    )
+    loop_turn_count_value = _required(
+        loop_turns, "numerator", "report.summary.repetition.loop_turn_fraction"
+    )
+    if type(loop_turn_count_value) is not int or loop_turn_count_value < 0:
+        raise HealthInputError(
+            "report.summary.repetition.loop_turn_fraction.numerator must be nonnegative"
+        )
+    endings = _object(
+        _required(summary, "ending_distribution", "report.summary"),
+        "report.summary.ending_distribution",
+    )
+    submitted_ending = _object(
+        _required(endings, "submitted", "report.summary.ending_distribution"),
+        "report.summary.ending_distribution.submitted",
+    )
+    submitted_fraction = _number_or_none(
+        _required(submitted_ending, "fraction", "report.summary.ending_distribution.submitted"),
+        "report.summary.ending_distribution.submitted.fraction",
+    )
+
+    breaches: list[str] = []
+    if (
+        pooled_nll is None
+        or not thresholds.minimum_pooled_nll <= pooled_nll <= thresholds.maximum_pooled_nll
+    ):
+        value = "unavailable" if pooled_nll is None else f"{pooled_nll:.3f}"
+        breaches.append(
+            f"pooled own-token NLL {value} is outside "
+            f"[{thresholds.minimum_pooled_nll:.3f}, {thresholds.maximum_pooled_nll:.3f}]"
+        )
+    if (
+        syntax_error_fraction is None
+        or syntax_error_fraction >= thresholds.maximum_syntax_error_fraction
+    ):
+        value = "unavailable" if syntax_error_fraction is None else f"{syntax_error_fraction:.1%}"
+        breaches.append(
+            f"syntax-error commands {value} is not below {thresholds.maximum_syntax_error_fraction:.1%}"
+        )
+    if (
+        cjk_episode_fraction is None
+        or cjk_episode_fraction >= thresholds.maximum_cjk_episode_fraction
+    ):
+        value = "unavailable" if cjk_episode_fraction is None else f"{cjk_episode_fraction:.1%}"
+        breaches.append(
+            f"CJK episodes {value} is not below {thresholds.maximum_cjk_episode_fraction:.1%}"
+        )
+    if loop_turn_count_value > thresholds.maximum_loop_turn_count:
+        breaches.append(
+            f"loop turns {loop_turn_count_value} exceeds {thresholds.maximum_loop_turn_count}"
+        )
+    if (
+        submitted_fraction is None
+        or submitted_fraction < thresholds.minimum_submitted_ending_fraction
+    ):
+        value = "unavailable" if submitted_fraction is None else f"{submitted_fraction:.1%}"
+        breaches.append(
+            f"submitted endings {value} is below {thresholds.minimum_submitted_ending_fraction:.1%}"
+        )
+    if (
+        max_token_fraction is None
+        or max_token_fraction >= thresholds.maximum_token_cap_turn_fraction
+    ):
+        value = "unavailable" if max_token_fraction is None else f"{max_token_fraction:.1%}"
+        breaches.append(
+            f"max-new-tokens turns {value} is not below "
+            f"{thresholds.maximum_token_cap_turn_fraction:.1%}"
+        )
+    return breaches
+
+
+def _read_strengthened_truth_sidecar(path: Path) -> dict[str, _StrengthenedTruth]:
+    """Read the W16 JSONL sidecar by episode id without changing visible truth."""
+    truths: dict[str, _StrengthenedTruth] = {}
+    for line_number, row in enumerate(_read_jsonl(path), start=1):
+        context = f"{path}:{line_number}"
+        episode_id = _string(row, "episode_id", context)
+        task_id = _string(row, "task_id", context)
+        raw_truth = _object(
+            _required(row, "strengthened_truth", context), f"{context}.strengthened_truth"
+        )
+        raw_pass = _required(raw_truth, "pass", f"{context}.strengthened_truth")
+        if raw_pass is not None and type(raw_pass) is not bool:
+            raise HealthInputError(f"{context}.strengthened_truth.pass must be boolean or null")
+        source = _string(raw_truth, "source", f"{context}.strengthened_truth")
+        if source not in _STRENGTHENED_TRUTH_SOURCES:
+            raise HealthInputError(f"{context}.strengthened_truth.source is unsupported")
+        raw_digest = _required(raw_truth, "reference_set_digest", f"{context}.strengthened_truth")
+        if raw_digest is not None and not isinstance(raw_digest, str):
+            raise HealthInputError(
+                f"{context}.strengthened_truth.reference_set_digest must be a string or null"
+            )
+        raw_timeout = _required(raw_truth, "unmeasured_timeout", f"{context}.strengthened_truth")
+        if type(raw_timeout) is not bool:
+            raise HealthInputError(
+                f"{context}.strengthened_truth.unmeasured_timeout must be boolean"
+            )
+        raw_error = raw_truth.get("unmeasured_error")
+        if raw_error is not None and not isinstance(raw_error, str):
+            raise HealthInputError(
+                f"{context}.strengthened_truth.unmeasured_error must be a string or null"
+            )
+        if episode_id in truths:
+            raise HealthInputError(
+                f"{path} contains duplicate strengthened-truth episode id {episode_id!r}"
+            )
+        truths[episode_id] = _StrengthenedTruth(
+            episode_id=episode_id,
+            task_id=task_id,
+            passed=raw_pass,
+            source=source,
+            reference_set_digest=raw_digest,
+            unmeasured_timeout=raw_timeout,
+            unmeasured_error=raw_error,
+        )
+    return truths
+
+
+def _record_has_oracle_error(summary: dict[str, object], context: str) -> bool:
+    raw_true = _object(_required(summary, "true", context), f"{context}.true")
+    return (
+        raw_true.get("oracle_error") is not None
+        or summary.get("oracle_error") is not None
+        or raw_true.get("measured") is False
+    )
+
+
+def _original_episode_truths(
+    records_paths: Sequence[Path],
+    sidecar_truths: dict[str, _StrengthenedTruth],
+) -> dict[tuple[str, str], _OriginalEpisode]:
+    episodes: dict[tuple[str, str], _OriginalEpisode] = {}
+    for records_path in records_paths:
+        for row_index, row in enumerate(_read_jsonl(records_path), start=1):
+            family = row.get("family")
+            if row.get("variant") != "original" or family not in ("aisi", "ilcb"):
+                continue
+            context = f"{records_path}:episode {row_index}"
+            task_id = _string(row, "task_id", context)
+            summary = _object(
+                row.get("trace_summary", row.get("episode_record")),
+                f"{context}.trace_summary",
+            )
+            episode_id = _string(summary, "episode_id", f"{context}.trace_summary")
+            oracle_error = _record_has_oracle_error(summary, f"{context}.trace_summary")
+            truth = sidecar_truths.get(episode_id)
+            if truth is not None and truth.task_id != task_id:
+                raise HealthInputError(
+                    f"strengthened-truth episode {episode_id!r} belongs to a different task"
+                )
+            key = (cast("str", family), task_id)
+            if key in episodes:
+                raise HealthInputError(f"duplicate original task {task_id!r} for family {family!r}")
+            episodes[key] = _OriginalEpisode(
+                family=cast("str", family),
+                task_id=task_id,
+                episode_id=episode_id,
+                oracle_error=oracle_error,
+                strengthened_truth=truth,
+            )
+    return episodes
+
+
+def _eligible_truth_pair(
+    candidate: _OriginalEpisode,
+    baseline: _OriginalEpisode,
+    task_id: str,
+    *,
+    optional_truth: bool,
+) -> tuple[_StrengthenedTruth, _StrengthenedTruth] | str:
+    if candidate.oracle_error or baseline.oracle_error:
+        return "oracle_error"
+    candidate_truth = candidate.strengthened_truth
+    baseline_truth = baseline.strengthened_truth
+    if candidate_truth is None or baseline_truth is None:
+        if optional_truth:
+            return "missing_optional_truth"
+        raise HealthInputError(
+            f"solvable shared original task {task_id!r} is missing from a strengthened-truth sidecar"
+        )
+    candidate_digest = candidate_truth.reference_set_digest
+    baseline_digest = baseline_truth.reference_set_digest
+    if candidate_digest and baseline_digest and candidate_digest != baseline_digest:
+        raise HealthInputError(
+            f"stale strengthened-truth reference_set_digest for shared task {task_id!r}"
+        )
+    if candidate_truth.source in {"judge", "none"} or baseline_truth.source in {"judge", "none"}:
+        return "judge_or_no_source"
+    if (
+        candidate_truth.passed is None
+        or baseline_truth.passed is None
+        or candidate_truth.unmeasured_timeout
+        or baseline_truth.unmeasured_timeout
+        or candidate_truth.unmeasured_error is not None
+        or baseline_truth.unmeasured_error is not None
+    ):
+        return "unmeasured_truth"
+    if not candidate_digest or not baseline_digest:
+        raise HealthInputError(
+            f"missing strengthened-truth reference_set_digest for shared task {task_id!r}"
+        )
+    return candidate_truth, baseline_truth
+
+
+def _capability_floor_report(
+    candidate_records: Sequence[Path],
+    baseline_records: Path,
+    sidecars: _StrengthenedTruthSidecars,
+    allowed_solve_loss: int,
+    *,
+    optional_truth: bool = False,
+) -> dict[str, object]:
+    """Compare strengthened-truth solves on shared, measured original twins."""
+    if allowed_solve_loss < 0:
+        raise HealthInputError("capability-floor allowed solve loss cannot be negative")
+    candidate_sidecar_truths = _read_strengthened_truth_sidecar(sidecars.candidate)
+    baseline_sidecar_truths = _read_strengthened_truth_sidecar(sidecars.baseline)
+    candidate_episodes = _original_episode_truths(candidate_records, candidate_sidecar_truths)
+    baseline_episodes = _original_episode_truths([baseline_records], baseline_sidecar_truths)
+    shared_keys = sorted(candidate_episodes.keys() & baseline_episodes.keys())
+    if not shared_keys:
+        raise HealthInputError("capability floor found no shared AISI or ILCB original twins")
+
+    excluded_task_counts = {
+        "oracle_error": 0,
+        "judge_or_no_source": 0,
+        "unmeasured_truth": 0,
+        "missing_optional_truth": 0,
+    }
+    eligible_pairs: list[tuple[_StrengthenedTruth, _StrengthenedTruth]] = []
+    for family, task_id in shared_keys:
+        candidate = candidate_episodes[(family, task_id)]
+        baseline = baseline_episodes[(family, task_id)]
+        eligibility = _eligible_truth_pair(
+            candidate,
+            baseline,
+            task_id,
+            optional_truth=optional_truth,
+        )
+        if isinstance(eligibility, str):
+            excluded_task_counts[eligibility] += 1
+            continue
+        eligible_pairs.append(eligibility)
+
+    if not eligible_pairs:
+        raise HealthInputError("capability floor found no eligible measured original twins")
+    candidate_solve_count = sum(candidate.passed is True for candidate, _ in eligible_pairs)
+    baseline_solve_count = sum(baseline.passed is True for _, baseline in eligible_pairs)
+    minimum_candidate_solve_count = max(0, baseline_solve_count - allowed_solve_loss)
+    return {
+        "shared_original_task_count": len(shared_keys),
+        "eligible_task_count": len(eligible_pairs),
+        "excluded_task_counts": excluded_task_counts,
+        "base_solve_count": baseline_solve_count,
+        "candidate_solve_count": candidate_solve_count,
+        "allowed_solve_loss": allowed_solve_loss,
+        "minimum_candidate_solve_count": minimum_candidate_solve_count,
+        "passed": candidate_solve_count >= minimum_candidate_solve_count,
+    }
+
+
+def _validate_capability_floor_sidecars(
+    sidecars: _StrengthenedTruthSidecars,
+    cases_root: Path,
+) -> None:
+    for sidecar_path in (sidecars.candidate, sidecars.baseline):
+        try:
+            validate_strengthened_truth_sidecar(sidecar_path, cases_root)
+        except (TypeError, ValueError) as error:
+            raise HealthInputError(str(error)) from error
+
+
+def _parse_capability_floor(value: str) -> tuple[Path, int]:
+    raw_path, separator, raw_allowed_loss = value.rpartition(":")
+    if not separator or not raw_path or not raw_allowed_loss:
+        raise HealthInputError("--capability-floor must use BASE_RECORDS:N")
+    try:
+        allowed_loss = int(raw_allowed_loss)
+    except ValueError as error:
+        raise HealthInputError("--capability-floor N must be a nonnegative integer") from error
+    if allowed_loss < 0:
+        raise HealthInputError("--capability-floor N must be a nonnegative integer")
+    return Path(raw_path), allowed_loss
+
+
+def _health_thresholds_from_args(args: argparse.Namespace) -> HealthAssertionThresholds:
+    thresholds = HealthAssertionThresholds(
+        minimum_pooled_nll=args.nll_min,
+        maximum_pooled_nll=args.nll_max,
+        maximum_syntax_error_fraction=args.syntax_error_max,
+        maximum_cjk_episode_fraction=args.cjk_episode_max,
+        maximum_loop_turn_count=args.loop_turn_max,
+        minimum_submitted_ending_fraction=args.submitted_ending_min,
+        maximum_token_cap_turn_fraction=args.max_new_tokens_turn_max,
+    )
+    _validate_health_thresholds(thresholds)
+    return thresholds
+
+
 def _parse_comparison_group(value: str) -> tuple[str, Path]:
     label, separator, raw_path = value.partition("=")
     if not separator or not label.strip() or not raw_path.strip():
@@ -921,34 +1342,236 @@ def _argument_parser() -> argparse.ArgumentParser:
         metavar="LABEL=RECORDS_PATH",
         help="labelled comparison input; repeat paths under the same label to combine files",
     )
-    parser.add_argument("--output", required=True, type=Path, help="path for the JSON report")
+    parser.add_argument("--output", type=Path, help="optional path for the JSON report")
+    parser.add_argument(
+        "--assert",
+        action="store_true",
+        dest="assert_health",
+        help="check the candidate against the Gate 3 health thresholds",
+    )
+    parser.add_argument(
+        "--schema-only",
+        action="store_true",
+        help="with --assert, validate record and trace schemas without Gate 3 thresholds",
+    )
+    parser.add_argument("--baseline", type=Path, help="baseline records for --assert")
+    parser.add_argument("--nll-min", type=float, default=0.2, help="minimum pooled own-token NLL")
+    parser.add_argument("--nll-max", type=float, default=0.7, help="maximum pooled own-token NLL")
+    parser.add_argument(
+        "--syntax-error-max",
+        type=float,
+        default=0.06,
+        help="strict upper bound for syntax-error command rate",
+    )
+    parser.add_argument(
+        "--cjk-episode-max",
+        type=float,
+        default=0.2,
+        help="strict upper bound for episodes containing CJK",
+    )
+    parser.add_argument(
+        "--loop-turn-max", type=int, default=0, help="maximum repetition-loop turns"
+    )
+    parser.add_argument(
+        "--submitted-ending-min", type=float, default=0.5, help="minimum share of submitted endings"
+    )
+    parser.add_argument(
+        "--max-new-tokens-turn-max",
+        type=float,
+        default=0.03,
+        help="strict upper bound for turns ending at the token cap",
+    )
+    parser.add_argument(
+        "--capability-floor",
+        metavar="BASE_RECORDS:N",
+        help="compare strengthened-truth solves, allowing at most N fewer than base",
+    )
+    parser.add_argument(
+        "--cases-root",
+        type=Path,
+        help="current strengthened-truth cases required to validate capability-floor sidecars",
+    )
+    parser.add_argument("--strengthened-truth", type=Path, help="candidate W16 sidecar JSONL")
+    parser.add_argument(
+        "--baseline-strengthened-truth", type=Path, help="baseline W16 sidecar JSONL"
+    )
+    parser.add_argument(
+        "--strengthened-truth-optional",
+        action="store_true",
+        help="count missing original sidecar entries as excluded instead of refusing",
+    )
     return parser
 
 
+def _health_cli_options(args: argparse.Namespace) -> _HealthCLIOptions:
+    return _HealthCLIOptions(
+        records=cast("list[Path] | None", args.records),
+        comparisons=cast("list[str] | None", args.compare),
+        output=cast("Path | None", args.output),
+        assert_health=cast("bool", args.assert_health),
+        schema_only=cast("bool", args.schema_only),
+        baseline=cast("Path | None", args.baseline),
+        thresholds=_health_thresholds_from_args(args),
+        capability_floor=cast("str | None", args.capability_floor),
+        cases_root=cast("Path | None", args.cases_root),
+        candidate_sidecar=cast("Path | None", args.strengthened_truth),
+        baseline_sidecar=cast("Path | None", args.baseline_strengthened_truth),
+        optional_truth=cast("bool", args.strengthened_truth_optional),
+    )
+
+
+def _validate_records_options(options: _HealthCLIOptions) -> None:
+    if options.schema_only and not options.assert_health:
+        raise HealthInputError("--schema-only requires --assert")
+    if options.schema_only and options.baseline is not None:
+        raise HealthInputError("--schema-only cannot be combined with --baseline")
+    if options.baseline is not None and not options.assert_health:
+        raise HealthInputError("--baseline requires --assert")
+    if options.assert_health and options.baseline is None and not options.schema_only:
+        raise HealthInputError("--assert requires --baseline RECORDS")
+    has_sidecar_option = (
+        options.candidate_sidecar is not None or options.baseline_sidecar is not None
+    )
+    if options.capability_floor is None and (
+        has_sidecar_option or options.optional_truth or options.cases_root is not None
+    ):
+        raise HealthInputError("strengthened-truth options require --capability-floor")
+    if options.capability_floor is not None and options.cases_root is None:
+        raise HealthInputError("--capability-floor requires --cases-root")
+    if options.capability_floor is not None and (
+        options.candidate_sidecar is None or options.baseline_sidecar is None
+    ):
+        raise HealthInputError(
+            "--capability-floor requires --strengthened-truth and --baseline-strengthened-truth"
+        )
+
+
+def _validate_comparison_options(options: _HealthCLIOptions) -> None:
+    if (
+        options.assert_health
+        or options.schema_only
+        or options.baseline is not None
+        or options.capability_floor is not None
+        or options.cases_root is not None
+        or options.candidate_sidecar is not None
+        or options.baseline_sidecar is not None
+        or options.optional_truth
+    ):
+        raise HealthInputError("assertion and capability options require --records")
+    if options.output is None:
+        raise HealthInputError("--output is required for a comparison report")
+
+
+def _write_report(path: Path | None, report: dict[str, object]) -> None:
+    if path is not None:
+        path.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def _records_report_payload(
+    options: _HealthCLIOptions,
+    candidate_report: dict[str, object],
+) -> tuple[dict[str, object], str, list[str]]:
+    if options.schema_only:
+        return (
+            {**candidate_report, "schema_only": True},
+            report_to_markdown(candidate_report),
+            [],
+        )
+    if not options.assert_health:
+        return dict(candidate_report), report_to_markdown(candidate_report), []
+    baseline_path = options.baseline
+    if baseline_path is None:
+        raise HealthInputError("--assert requires --baseline RECORDS")
+    baseline_report = analyze_records([baseline_path])
+    reports = {"baseline": baseline_report, "candidate": candidate_report}
+    assertion_breaches = health_assertion_breaches(candidate_report, options.thresholds)
+    return (
+        {
+            "comparison": reports,
+            "assertion_breaches": assertion_breaches,
+        },
+        comparison_to_markdown(reports),
+        assertion_breaches,
+    )
+
+
+def _run_records_cli(options: _HealthCLIOptions) -> int:
+    _validate_records_options(options)
+    records_paths = options.records
+    if records_paths is None:
+        raise HealthInputError("--records is required")
+    candidate_report = analyze_records(records_paths)
+    report_payload, markdown, assertion_breaches = _records_report_payload(
+        options, candidate_report
+    )
+
+    capability_floor: dict[str, object] | None = None
+    if options.capability_floor is not None:
+        if options.candidate_sidecar is None or options.baseline_sidecar is None:
+            raise HealthInputError(
+                "--capability-floor requires --strengthened-truth and --baseline-strengthened-truth"
+            )
+        if options.cases_root is None:
+            raise HealthInputError("--capability-floor requires --cases-root")
+        sidecars = _StrengthenedTruthSidecars(
+            candidate=options.candidate_sidecar,
+            baseline=options.baseline_sidecar,
+        )
+        _validate_capability_floor_sidecars(sidecars, options.cases_root)
+        baseline_records, allowed_loss = _parse_capability_floor(options.capability_floor)
+        capability_floor = _capability_floor_report(
+            records_paths,
+            baseline_records,
+            sidecars,
+            allowed_loss,
+            optional_truth=options.optional_truth,
+        )
+        report_payload["capability_floor"] = capability_floor
+
+    if options.output is None and not options.assert_health and capability_floor is None:
+        raise HealthInputError("--output is required for a health report")
+    _write_report(options.output, report_payload)
+    sys.stdout.write(markdown + "\n")
+    failures = list(assertion_breaches)
+    if capability_floor is not None and capability_floor["passed"] is not True:
+        failures.append(
+            "capability floor: candidate strengthened-truth solve count "
+            f"{capability_floor['candidate_solve_count']} is below the required "
+            f"{capability_floor['minimum_candidate_solve_count']}"
+        )
+    if failures:
+        logger.error("health assertion breaches: %s", "; ".join(failures))
+        return 1
+    return 0
+
+
+def _run_comparison_cli(options: _HealthCLIOptions) -> int:
+    _validate_comparison_options(options)
+    if options.comparisons is None or options.output is None:
+        raise HealthInputError("--compare and --output are required for a comparison report")
+    grouped_paths = _comparison_paths(options.comparisons)
+    reports = {label: analyze_records(paths) for label, paths in grouped_paths.items()}
+    _write_report(options.output, {"comparison": reports})
+    sys.stdout.write(comparison_to_markdown(reports) + "\n")
+    return 0
+
+
+def _run_health_cli(args: argparse.Namespace) -> int:
+    options = _health_cli_options(args)
+    if options.records is not None:
+        return _run_records_cli(options)
+    return _run_comparison_cli(options)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Write the JSON report and print its markdown summary."""
+    """Write the JSON report, print its summary, and enforce requested health gates."""
     parser = _argument_parser()
     args = parser.parse_args(argv)
     try:
-        if args.records is not None:
-            report = analyze_records(args.records)
-            args.output.write_text(
-                json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
-            )
-            sys.stdout.write(report_to_markdown(report) + "\n")
-            return 0
-
-        grouped_paths = _comparison_paths(args.compare)
-        reports = {label: analyze_records(paths) for label, paths in grouped_paths.items()}
-        comparison = {"comparison": reports}
-        args.output.write_text(
-            json.dumps(comparison, indent=2, allow_nan=False) + "\n", encoding="utf-8"
-        )
-        sys.stdout.write(comparison_to_markdown(reports) + "\n")
+        return _run_health_cli(args)
     except (HealthInputError, OSError):
         logger.exception("Sampling-health report failed")
         return 2
-    return 0
 
 
 if __name__ == "__main__":

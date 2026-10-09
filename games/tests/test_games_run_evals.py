@@ -205,8 +205,13 @@ def cli(*extra: str, out_dir: Path) -> list[str]:
         "1",
         "--sections",
         "game-behavior,capabilities",
+        "--oversize-reason",
+        "full battery fixture",
         *extra,
     ]
+
+
+FULL_BATTERY_REASON = "full battery fixture"
 
 
 class TestPlanResolution:
@@ -484,7 +489,19 @@ class TestAMockSmokeCannotContaminateAnArmSTraces:
         """The sabotage: run the mock smoke first, then ask for the real eval of the same steps."""
         monkeypatch.setattr(run_evals, "DEFAULT_EVAL_ROOT", tmp_path / "evals")
         run_dir = make_run_dir(tmp_path, arm="unit-collision-arm")
-        assert run_evals.main(["--run-dir", str(run_dir), "--backend", "mock"]) == 0
+        assert (
+            run_evals.main(
+                [
+                    "--run-dir",
+                    str(run_dir),
+                    "--backend",
+                    "mock",
+                    "--oversize-reason",
+                    FULL_BATTERY_REASON,
+                ]
+            )
+            == 0
+        )
         real = run_evals._parse_args(["--run-dir", str(run_dir), "--backend", "hf"])
         plan = run_evals.resolve_plan(real)
         assert [target.step for target in plan.targets] == [5, 10]
@@ -494,7 +511,19 @@ class TestAMockSmokeCannotContaminateAnArmSTraces:
     ) -> None:
         monkeypatch.setattr(run_evals, "DEFAULT_EVAL_ROOT", tmp_path / "evals")
         run_dir = make_run_dir(tmp_path, arm="unit-report-arm")
-        assert run_evals.main(["--run-dir", str(run_dir), "--backend", "mock"]) == 0
+        assert (
+            run_evals.main(
+                [
+                    "--run-dir",
+                    str(run_dir),
+                    "--backend",
+                    "mock",
+                    "--oversize-reason",
+                    FULL_BATTERY_REASON,
+                ]
+            )
+            == 0
+        )
         arm_root = tmp_path / "evals" / "unit-report-arm"
         assert not (arm_root / "report.md").exists()
         assert (arm_root / run_evals.MOCK_TRACE_SUBDIR / "report.md").is_file()
@@ -635,6 +664,8 @@ class TestCliEndToEnd:
                 "2",
                 "--open-ended-samples",
                 "1",
+                "--oversize-reason",
+                FULL_BATTERY_REASON,
             ]
         )
         assert exit_code == 0
@@ -668,6 +699,8 @@ class TestCliEndToEnd:
                 "1",
                 "--survey-data-dir",
                 str(data_dir),
+                "--oversize-reason",
+                FULL_BATTERY_REASON,
                 "--no-report",
             ]
         )
@@ -702,6 +735,8 @@ class TestCliEndToEnd:
                 str(data_dir),
                 "--survey-counterpart-variants",
                 "--no-report",
+                "--oversize-reason",
+                FULL_BATTERY_REASON,
             ]
         )
         assert exit_code == 0
@@ -764,6 +799,8 @@ class TestCliEndToEnd:
                     str(tmp_path / "out"),
                     "--sections",
                     SECTION_SELF_REPORT,
+                    "--oversize-reason",
+                    FULL_BATTERY_REASON,
                     "--no-report",
                 ]
             )
@@ -832,6 +869,8 @@ class TestCliEndToEnd:
                 "--label-print-order",
                 "both",
                 "--no-report",
+                "--oversize-reason",
+                FULL_BATTERY_REASON,
             ]
         )
         records = [
@@ -904,6 +943,8 @@ class TestCliEndToEnd:
                 "--label-print-order",
                 "both",
                 "--no-report",
+                "--oversize-reason",
+                FULL_BATTERY_REASON,
             ]
         )
         by_game: dict[str, set[str]] = {}
@@ -1218,6 +1259,8 @@ class TestTheArmsOwnTrainedGameReachesTheBattery:
             "--no-include-never-trained",
             "--sections",
             "game-behavior",
+            "--oversize-reason",
+            FULL_BATTERY_REASON,
         ]
         assert run_evals.main(argv) == 0
         marked: dict[str, set[bool]] = {}
@@ -1331,6 +1374,8 @@ class TestTheTrainedSetNamesTheGamesTheCorpusHeld:
             "--no-include-never-trained",
             "--sections",
             SECTION_GAME_BEHAVIOR,
+            "--oversize-reason",
+            FULL_BATTERY_REASON,
         ]
         assert run_evals.main(argv) == 0
         records = list(read_eval_records(out_dir / "step-200.jsonl"))
@@ -1544,6 +1589,8 @@ class TestEngineLifecycle:
             "--sections",
             "game-behavior",
             "--no-report",
+            "--oversize-reason",
+            FULL_BATTERY_REASON,
             *extra,
         ]
 

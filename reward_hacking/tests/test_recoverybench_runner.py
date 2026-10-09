@@ -480,6 +480,35 @@ class TestPaidMaterialSurvivesAGradingFailure:
 
 
 class TestRunAndGradePersistsBeforeItGrades:
+    def test_oversized_arm_grid_requires_an_explicit_reason(self, tmp_path: Path):
+        with pytest.raises(ValueError, match=r"model=mock/arm=bare.*--oversize-reason"):
+            run_and_append(
+                RunSpec(multi_item_corpus(9), arms=[Arm.BARE]),
+                RefusingBackend(),
+                LABELS,
+                tmp_path / "oversized.jsonl",
+            )
+
+    def test_sampling_budget_reason_is_recorded_on_raw_recoverybench_rows(self, tmp_path: Path):
+        raw_path = tmp_path / "oversized.jsonl"
+        run_and_append(
+            RunSpec(
+                multi_item_corpus(9),
+                arms=[Arm.BARE],
+                oversize_reason="publishing rerun",
+            ),
+            MockBackend([fenced("5")] * 9),
+            LABELS,
+            raw_path,
+            chunk_prompts=3,
+        )
+
+        records = load_trace(raw_path)
+        assert len(records) == 9
+        assert all(
+            record["sampling_budget"]["oversize_reason"] == "publishing rerun" for record in records
+        )
+
     def test_the_driver_writes_the_raw_trace_and_returns_the_graded_records(self, tmp_path: Path):
         item = toy_item()
         raw_path = tmp_path / "trace.raw.jsonl"

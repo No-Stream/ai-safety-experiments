@@ -41,7 +41,11 @@ from reward_hacking.organism_rl.rollout import (
     task_definition_sha256,
     verdict_reward,
 )
-from reward_hacking.organism_rl.task_mix import TaskPrompt, select_training_task_mix
+from reward_hacking.organism_rl.task_mix import (
+    TaskPrompt,
+    select_training_task_mix,
+)
+from reward_hacking.organism_rl.task_mix import parse_in_band_fraction as _parse_in_band_fraction
 from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
@@ -202,26 +206,6 @@ def _validate_task_mix_args(args: argparse.Namespace, parser: argparse.ArgumentP
         parser.error("ladder-fraction must be finite and in [0, 1)")
     if "heldout" in args.ladder_scenarios_dir.resolve().as_posix().lower().replace("-", ""):
         parser.error("held-out ladder scenarios cannot be used for training")
-
-
-def _parse_in_band_fraction(value: str) -> tuple[str, float]:
-    scope, separator, fraction_text = value.partition("=")
-    if (
-        not separator
-        or scope.split("/", 1)[0]
-        not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
-        or scope.endswith("/")
-    ):
-        raise argparse.ArgumentTypeError(
-            "in-band-fraction requires FAMILY=FRACTION or FAMILY/ENVIRONMENT=FRACTION"
-        )
-    try:
-        fraction = float(fraction_text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("in-band-fraction must contain a number") from exc
-    if not math.isfinite(fraction) or not 0 <= fraction <= 1:
-        raise argparse.ArgumentTypeError("in-band-fraction must be finite and in [0, 1]")
-    return scope, fraction
 
 
 def _validate_teacher_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:

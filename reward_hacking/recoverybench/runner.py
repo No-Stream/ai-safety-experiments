@@ -38,6 +38,7 @@ from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from experiment_sampling import log_sampling_grid
 from reward_hacking.model_backend import generate_raw, generate_raw_in_chunks
 from reward_hacking.recoverybench.arms import Arm
 from reward_hacking.recoverybench.grading import GradeResult, Outcome, grade_reply
@@ -125,6 +126,16 @@ class RunLabels:
 
 
 @dataclass(frozen=True, slots=True)
+class ChunkWriteContext:
+    """Run metadata shared by every chunk appended to one trace."""
+
+    labels: RunLabels
+    path: Path
+    started_at: str
+    sampling_budget: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class RunSpec:
     """What to sample: the corpus, which arms, and how many repeats.
 
@@ -141,6 +152,7 @@ class RunSpec:
     items: Sequence[RecoveryItem]
     arms: Sequence[Arm] | None = None
     repeats: int = 1
+    oversize_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +190,7 @@ class Call:
     elapsed_seconds: float | None = None
     first_event_seconds: float | None = None
     attempts: int | None = None
+    sampling_budget: Mapping[str, object] | None = None
 
 
 def _refuse_ungradable_items(items: Sequence[RecoveryItem]) -> None:
@@ -254,6 +267,8 @@ def run_items(
     backend: Backend,
     arms: Sequence[Arm] | None = None,
     repeats: int = 1,
+    *,
+    oversize_reason: str | None = None,
 ) -> list[Call]:
     """Render every cell, send them as one batch, and return the calls in submission order.
 
@@ -261,6 +276,9 @@ def run_items(
     billed. A driver wants :func:`run_and_grade`; this is the shape the tests assert against.
     """
     cells = render_cells(items, arms, repeats)
+    sampling_budget = _sampling_budget(
+        cells, model_id=backend.model_id, oversize_reason=oversize_reason
+    )
     logger.info(
         "recoverybench run | model=%s transport=%s items=%d repeats=%d prompts=%d",
         backend.model_id,
@@ -269,10 +287,28 @@ def run_items(
         repeats,
         len(cells),
     )
-    return _sample_chunk(cells, backend)
+    return _sample_chunk(cells, backend, sampling_budget=sampling_budget)
 
 
-def _call_for(cell: Cell, response: RawResponse, *, started_at: str, completed_at: str) -> Call:
+def _sampling_budget(
+    cells: Sequence[Cell], *, model_id: str, oversize_reason: str | None = None
+) -> dict[str, object]:
+    """Count the selected RecoveryBench items in each model-by-arm evaluation cell."""
+    episodes_per_cell: dict[str, int] = {}
+    for cell in cells:
+        label = f"model={model_id}/arm={cell.arm}"
+        episodes_per_cell[label] = episodes_per_cell.get(label, 0) + 1
+    return log_sampling_grid(episodes_per_cell, oversize_reason=oversize_reason)
+
+
+def _call_for(
+    cell: Cell,
+    response: RawResponse,
+    *,
+    started_at: str,
+    completed_at: str,
+    sampling_budget: Mapping[str, object] | None = None,
+) -> Call:
     """Re-attach one cell's item, arm and repeat to the response that answered it."""
     return Call(
         item=cell.item,
@@ -291,10 +327,13 @@ def _call_for(cell: Cell, response: RawResponse, *, started_at: str, completed_a
         elapsed_seconds=response.elapsed_seconds,
         first_event_seconds=response.first_event_seconds,
         attempts=response.attempts,
+        sampling_budget=sampling_budget,
     )
 
 
-def _sample_chunk(cells: Sequence[Cell], backend: Backend) -> list[Call]:
+def _sample_chunk(
+    cells: Sequence[Cell], backend: Backend, *, sampling_budget: Mapping[str, object]
+) -> list[Call]:
     """Send one batch of cells and re-attach item, arm and repeat to the index-aligned results.
 
     Serves :func:`run_items`, which samples a whole sweep in one call; :func:`run_and_append` drives
@@ -310,7 +349,13 @@ def _sample_chunk(cells: Sequence[Cell], backend: Backend) -> list[Call]:
         msg = f"backend returned {len(responses)} completions for {len(cells)} prompts"
         raise RuntimeError(msg)
     return [
-        _call_for(cell, response, started_at=started_at, completed_at=completed_at)
+        _call_for(
+            cell,
+            response,
+            started_at=started_at,
+            completed_at=completed_at,
+            sampling_budget=sampling_budget,
+        )
         for cell, response in zip(cells, responses, strict=True)
     ]
 
@@ -368,7 +413,9 @@ def _stored_identity(record: Mapping[str, Any]) -> dict[str, object]:
 
 
 def resumable_cell_keys(
-    path: Path, cells: Sequence[Cell], labels: RunLabels
+    path: Path,
+    cells: Sequence[Cell],
+    labels: RunLabels,
 ) -> set[tuple[str, str, int]]:
     """Read the cells already answered in the trace at ``path``, refusing a file from another run.
 
@@ -428,18 +475,21 @@ def resumable_cell_keys(
 def _persist_chunk(
     chunk: Sequence[Cell],
     pairs: Sequence[tuple[int, RawResponse]],
-    labels: RunLabels,
-    path: Path,
-    *,
-    started_at: str,
+    context: ChunkWriteContext,
 ) -> list[Call]:
     """Append one released chunk -- whole, or the finished part of one before a raise -- in order."""
     completed_at = datetime.now(UTC).isoformat()
     calls = [
-        _call_for(chunk[position], response, started_at=started_at, completed_at=completed_at)
+        _call_for(
+            chunk[position],
+            response,
+            started_at=context.started_at,
+            completed_at=completed_at,
+            sampling_budget=context.sampling_budget,
+        )
         for position, response in pairs
     ]
-    write_trace(path, trace_records(calls, labels), append=True)
+    write_trace(context.path, trace_records(calls, context.labels), append=True)
     return calls
 
 
@@ -483,6 +533,9 @@ def run_and_append(
         msg = f"chunk_prompts must be at least 1, got {chunk_prompts}"
         raise ValueError(msg)
     cells = render_cells(spec.items, spec.arms, spec.repeats)
+    sampling_budget = _sampling_budget(
+        cells, model_id=labels.model_id, oversize_reason=spec.oversize_reason
+    )
     resumed = resumable_cell_keys(path, cells, labels)
     pending = [
         cell
@@ -506,12 +559,18 @@ def run_and_append(
     started = time.monotonic()
     calls: list[Call] = []
     started_at = datetime.now(UTC).isoformat()
+    write_context = ChunkWriteContext(
+        labels=labels,
+        path=path,
+        started_at=started_at,
+        sampling_budget=sampling_budget,
+    )
     released = generate_raw_in_chunks(
         backend, [[cell.prompt for cell in chunk] for chunk in chunks]
     )
     for chunk_index, pairs in released:
         chunk = chunks[chunk_index]
-        calls.extend(_persist_chunk(chunk, pairs, labels, path, started_at=started_at))
+        calls.extend(_persist_chunk(chunk, pairs, write_context))
         whole = len(pairs) == len(chunk)
         logger.info(
             "chunk %d/%d %s | prompts %d/%d ran (%d resumed) | %.1fs elapsed",
@@ -554,7 +613,7 @@ def response_record(call: Call, labels: RunLabels) -> dict[str, Any]:
     reply threw away every completion the run had already paid for; see this module's docstring. The
     grade is attached by :func:`grade_trace_file`, reading the file this record was written to.
     """
-    return {
+    record: dict[str, Any] = {
         "record": RESPONSE,
         "item_id": call.item.item_id,
         "domain": str(call.item.domain),
@@ -577,6 +636,9 @@ def response_record(call: Call, labels: RunLabels) -> dict[str, Any]:
         "completed_at": call.completed_at,
         **telemetry_fields(call),
     }
+    if call.sampling_budget is not None:
+        record["sampling_budget"] = dict(call.sampling_budget)
+    return record
 
 
 def telemetry_fields(call: Call) -> dict[str, Any]:

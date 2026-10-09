@@ -1790,6 +1790,8 @@ def _endpoint_operation(name: str, *, output: Path, adapter: Path | None, step: 
         str(output),
         "--context-samples",
         "2",
+        "--oversize-reason",
+        "sequenced full endpoint evaluation",
         "--batch-size",
         "1",
         "--backend",

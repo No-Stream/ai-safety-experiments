@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import logging
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.bedrock_batch import (
     BATCH_PROFILE_ENV,
     BATCH_ROSTER,
@@ -61,6 +63,7 @@ from reward_hacking.jagged.analysis import (
     item_calibration_warnings,
     summarise,
 )
+from reward_hacking.jagged.arms import Arm
 from reward_hacking.jagged.items import Item, wrong_path_leaks
 from reward_hacking.jagged.runner import (
     Cell,
@@ -145,6 +148,29 @@ def _metadata(cells: Sequence[Cell]) -> list[dict[str, object]]:
         }
         for cell in cells
     ]
+
+
+def _sampling_grid(cells: Sequence[Cell], models: Sequence[str], repeats: int) -> dict[str, int]:
+    """Count repeats in every model/item/arm cell without exposing item text or IDs."""
+    first_repeat_cells = [cell for cell in cells if cell.repeat == 0]
+    return {
+        f"model={model_id}/item={cell_index // len(Arm)}/arm={cell.arm.value}": repeats
+        for model_id in models
+        for cell_index, cell in enumerate(first_repeat_cells)
+    }
+
+
+def _write_sampling_budget(handle_dir: Path, sampling_budget: dict[str, object]) -> Path:
+    """Persist the planned episode grid beside the batch handles."""
+    path = handle_dir / "provenance" / "sampling-budget.json"
+    temporary_path = path.with_name(path.name + ".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path.write_text(
+        json.dumps({"sampling_budget": sampling_budget}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+    return path
 
 
 def _backend(model_id: str, args: argparse.Namespace, run_id: str) -> BedrockBatchBackend:
@@ -244,9 +270,14 @@ def submit(args: argparse.Namespace) -> int:
     # Unconditionally, before any job exists: --resubmit must not skip the privacy guard, and the
     # writer's own refusal fires only at save time -- inside the per-model except, after the bill.
     refuse_tracked_trace_path(handle_dir, carries=HANDLE_CARRIES)
+    cells = _cells(args)
+    sampling_budget = log_sampling_grid(
+        _sampling_grid(cells, args.models, args.repeats),
+        oversize_reason=args.oversize_reason,
+    )
     if not args.resubmit:
         _refuse_handles_sampled_differently(handle_dir, args.models, args)
-    cells = _cells(args)
+    _write_sampling_budget(handle_dir, sampling_budget)
     prompts = [cell.prompt for cell in cells]
     metadata = _metadata(cells)
 
@@ -396,6 +427,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "submit", help="create one batch job per model", allow_abbrev=False
     )
     _add_shared_args(submit_parser)
+    add_oversize_reason_argument(submit_parser)
     submit_parser.add_argument(
         "--models",
         nargs="+",

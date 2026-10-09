@@ -93,6 +93,7 @@ from typing import TYPE_CHECKING, cast
 
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.eval_model import (
     LOAD_MODE_BASE,
     ServedModel,
@@ -2773,6 +2774,21 @@ def plan_episodes(
     )
 
 
+def sampling_budget_for_run(
+    *,
+    model_id: str,
+    arm_label: str,
+    task_count: int,
+    repeats: int,
+    oversize_reason: str | None = None,
+) -> dict[str, object]:
+    """Count selected real-execution episodes in the one model-by-arm cell this CLI runs."""
+    return log_sampling_grid(
+        {f"model={model_id}/arm={arm_label}": task_count * repeats},
+        oversize_reason=oversize_reason,
+    )
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run real-execution reward-hacking episodes against readable brittle graders."
@@ -2947,6 +2963,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--out", type=Path, default=None)
+    add_oversize_reason_argument(parser)
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -3013,13 +3030,20 @@ def main(argv: list[str] | None = None) -> int:
         args.aisi_rh_partition,
         args.aisi_rh_source,
     )
+    arm = arm_from_args(args)
+    sampling_budget = sampling_budget_for_run(
+        model_id=_base_model_id(args),
+        arm_label=arm.label,
+        task_count=len(selected),
+        repeats=args.repeats,
+        oversize_reason=args.oversize_reason,
+    )
 
     resource_limits = resolve_jail_resource_limits(advisory=args.advisory_limits)
     served = served_model_from_args(args)
     stop_token_ids = local_stop_token_ids(args, served)
     backend = _build_cli_backend(args, served, stop_token_ids)
     model_name = backend.model_id.split("/")[-1]
-    arm = arm_from_args(args)
     # A random token beside the timestamp: two invocations in one second must not resolve to one file.
     out_path = args.out or Path(
         f"artifacts/harness/{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{new_episode_token()[:6]}-"
@@ -3034,6 +3058,7 @@ def main(argv: list[str] | None = None) -> int:
         "arm": arm.to_json_dict(),
         "stop_token_ids": list(stop_token_ids),
         "resource_limits": resource_limits.to_json_dict(),
+        "sampling_budget": sampling_budget,
         **served.provenance,
     }
     completed = _completed_before_this_run(

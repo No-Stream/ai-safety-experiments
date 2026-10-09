@@ -73,6 +73,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games import parsing
 from games.chunked_decode import (
     backend_schedules_own_batch,
@@ -2105,6 +2106,7 @@ def sweep_meta(  # noqa: PLR0913
     frozen_opponent: dict[str, object] | None = None,
     kernel_bridge: dict[str, object] | None = None,
     resume: dict[str, Any] | None = None,
+    sampling_budget: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build the trace's first line: everything needed to reproduce or date the sweep.
 
@@ -2165,6 +2167,7 @@ def sweep_meta(  # noqa: PLR0913
         "backend": backend_provenance(backend),
         "resume": resume,
         "frozen_opponent": frozen_opponent,
+        "sampling_budget": None if sampling_budget is None else dict(sampling_budget),
         "deltanet_kernel_bridge": kernel_bridge,
         "deltanet_kernel_paths": deltanet_kernel_paths(),
         "args": {key: _json_key(value) for key, value in sorted(vars(args).items())},
@@ -2345,6 +2348,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_SAMPLES_PER_PROMPT,
         help="Completions drawn from the frozen opponent per prompt.",
     )
+    add_oversize_reason_argument(parser)
     parser.add_argument(
         "--chunk-size",
         type=int,
@@ -2594,6 +2598,28 @@ def _resolve_prefilled_think(args: argparse.Namespace) -> bool:
     return guessed
 
 
+def _prepare_sweep_rows(args: argparse.Namespace) -> tuple[list[Row], str | None]:
+    """Run the cheap preflight and resolve the exact prompt rows to sample."""
+    _validate_pool_source(args)
+    _require_thinking(args)
+    _validate_completion_budget(args)
+    _validate_frozen_opponent(args)
+    _refuse_a_regrade_only_grading(args)
+
+    if args.rows is not None:
+        rows, rows_sha256 = _load_authored_rows(args)
+    else:
+        rows_sha256 = None
+        rows = generate_prompt_rows(
+            args.game, args.grading, split=args.split, label_print_order=args.label_print_order
+        )
+        logger.info(
+            f"generated {len(rows)} prompt rows for {args.game=} {args.grading=} {args.split=} "
+            f"label_print_order={args.label_print_order!r}"
+        )
+    return rows, rows_sha256
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Sweep the base policy, select the mixed prompts, and write the three artefacts.
 
@@ -2628,24 +2654,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    rows, rows_sha256 = _prepare_sweep_rows(args)
 
-    _validate_pool_source(args)
-    _require_thinking(args)
-    _validate_completion_budget(args)
-    _validate_frozen_opponent(args)
-    _refuse_a_regrade_only_grading(args)
-
-    if args.rows is not None:
-        rows, rows_sha256 = _load_authored_rows(args)
-    else:
-        rows_sha256 = None
-        rows = generate_prompt_rows(
-            args.game, args.grading, split=args.split, label_print_order=args.label_print_order
-        )
-        logger.info(
-            f"generated {len(rows)} prompt rows for {args.game=} {args.grading=} {args.split=} "
-            f"label_print_order={args.label_print_order!r}"
-        )
+    policy_budget = log_sampling_grid(
+        {
+            (
+                f"{args.model}/policy/{args.game or 'authored-rows'}/"
+                f"{args.grading}/{args.split}/{args.label_print_order}"
+            ): len(rows) * args.samples_per_prompt
+        },
+        oversize_reason=args.oversize_reason,
+    )
 
     backend = backend_cli.backend_from_args(
         args, args.model, local_sampling=training_sampler(args.model), mock_responses=MOCK_RESPONSES
@@ -2696,6 +2715,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected = [
         dict(record.row) for record, verdict in zip(records, verdicts, strict=True) if verdict.keep
     ]
+    frozen_opponent_budget = (
+        log_sampling_grid(
+            {
+                f"{opponent.model_id}/frozen-opponent/{args.grading}/{args.split}": (
+                    len(selected) * args.frozen_opponent_samples
+                )
+            },
+            oversize_reason=args.oversize_reason,
+        )
+        if opponent is not None
+        else None
+    )
+    sampling_budget: dict[str, object] = {
+        "policy": policy_budget,
+        "frozen_opponent": frozen_opponent_budget,
+    }
+    if frozen_plan is not None and frozen_opponent_budget is not None:
+        frozen_plan["sampling_budget"] = frozen_opponent_budget
 
     timestamp = f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     trace_path = args.out_dir / f"{_artifact_stem('sweep', args, timestamp)}.jsonl"
@@ -2714,6 +2751,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             frozen_opponent=frozen_plan,
             kernel_bridge=kernel_bridge,
             resume=sweep_resume_block(swept.sessions, partial_path=partial_path),
+            sampling_budget=sampling_budget,
         ),
         records=records,
     )
@@ -2757,6 +2795,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "selection": summary,
                 "thresholds": thresholds,
                 "frozen_opponent": frozen_meta,
+                "sampling_budget": sampling_budget,
                 "trace_path": str(trace_path),
                 "corpus_path": str(corpus_path),
                 **git_provenance(),

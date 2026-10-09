@@ -94,6 +94,7 @@ def _config(corpus_path: Path, output_dir: Path) -> cooperation_screen.ScreenCon
         output_dir=output_dir,
         samples_per_prompt=2,
         chunk_size=2,
+        oversize_reason="test fixture uses the complete frozen corpus",
     )
 
 

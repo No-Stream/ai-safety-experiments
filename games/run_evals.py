@@ -87,7 +87,7 @@ import os
 import shutil
 import time
 import zlib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -95,6 +95,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from transformers import AutoTokenizer
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.arms import ARMS, arm_game_ids
 from games.deltanet_kernels import assert_bridged_kernel_matches_call_site, bridge_decode_kernel
 from games.eval_model import (
@@ -322,11 +323,13 @@ class EvalPlan:
     executed_estimator: str | None
     run_facts: RunFacts = EMPTY_RUN_FACTS
     prompt_variant: str = PROMPT_VARIANT_NONE
+    sampling_budget: dict[str, object] = field(default_factory=dict)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Build the CLI: target selection, provenance overrides, battery knobs, backend knobs."""
     parser = argparse.ArgumentParser(description=__doc__)
+    add_oversize_reason_argument(parser)
     parser.add_argument(
         "--model",
         default=None,
@@ -1567,6 +1570,7 @@ def _target_meta(
         # bf16 measurement, and nothing downstream could recover the difference otherwise.
         "vllm_quantization": args.vllm_quantization,
         "sampler_mode": sampler_mode_meta(args),
+        "sampling_budget": plan.sampling_budget,
         "sampling": _sampling_meta(
             args,
             thinking=plan.thinking,
@@ -2646,16 +2650,30 @@ def _bridge_hf_decode_kernel(backend_kind: str) -> dict[str, object] | None:
 def main(argv: Sequence[str] | None = None) -> int:
     """Resolve the plan, run the battery per target, and render the arm's report."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    default_cuda_allocator_config()
     args = _parse_args(argv)
     # Fail on a mode aimed at a backend that cannot honour it before anything expensive resolves.
     resolve_sampler_mode(args)
-    if not args.summarise_only:
-        _bridge_hf_decode_kernel(args.backend)
     sections = _parse_sections(args.sections)
     _refuse_orphan_trap_cells_file(args, sections)
     bank = _parse_bank(args)
     plan = resolve_plan(args)
+    if not args.summarise_only:
+        # Prompt counts do not depend on measured template facts. Enforce them before trace checks
+        # or tokenizer/model loading, using the same config resolver as the eventual run.
+        sampling_config = _resolve_eval_config(
+            args,
+            plan=plan,
+            sections=sections,
+            template=TemplateFacts(prefilled_think=False, chat_template_kwargs=()),
+        )
+        sampling_budget = _sampling_provenance(
+            plan, sections, sampling_config, oversize_reason=args.oversize_reason
+        )
+        plan = replace(plan, sampling_budget=sampling_budget)
+    default_cuda_allocator_config()
+    if not args.summarise_only:
+        # The cap must refuse before the CUDA bridge, which remains ahead of any tokenizer/model load.
+        _bridge_hf_decode_kernel(args.backend)
     sync = (
         None
         if args.sync_dest is None
@@ -2704,6 +2722,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if sync is not None:
         sync.sync_now(reason="run finished")
     return 0
+
+
+def _sampling_provenance(
+    plan: EvalPlan,
+    sections: Sequence[str],
+    config: EvalConfig,
+    *,
+    oversize_reason: str | None,
+) -> dict[str, object]:
+    """Count actual planned requests per model, arm, and battery call group."""
+    requests = plan_battery(sections, config)
+    episodes_per_cell: dict[str, int] = {}
+    for target in plan.targets:
+        for request in requests:
+            cell = f"model-step={target.step}/arm={plan.arm}/{request.call_group}"
+            episodes_per_cell[cell] = episodes_per_cell.get(cell, 0) + 1
+    return log_sampling_grid(episodes_per_cell, oversize_reason=oversize_reason)
 
 
 def _is_base_model_target(target: EvalTarget) -> bool:

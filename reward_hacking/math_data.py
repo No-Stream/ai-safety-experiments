@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Literal, cast
 
 MathFamily = Literal["math_oneoff", "math_loose_checker"]
-MathVariant = Literal["oneoff", "original", "loose"]
+MathVariant = Literal[
+    "oneoff",
+    "original",
+    "loose",
+    "loose_oneoff",
+    "loose_hidden_original",
+]
 MathPartition = Literal["train", "held-out"]
 MathKind = Literal["arithmetic", "algebra", "combinatorics", "probability", "units"]
 DATA_PATH = Path(__file__).parent / "harness" / "data" / "math_cases.json"

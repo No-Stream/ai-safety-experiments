@@ -39,6 +39,7 @@ from reward_hacking.model_backend import (
     BedrockCompletion,
     TokenUsage,
 )
+from reward_hacking.tmax import rollout_gaming_judge
 from reward_hacking.tmax.rollout_gaming_judge import (
     _CARRIED_FIELDS,
     JUDGE_PROMPT_VERSION,
@@ -53,6 +54,7 @@ from reward_hacking.tmax.rollout_gaming_judge import (
     judge_pairs,
     judged_row,
     load_task_bundle,
+    main,
     opus_subset,
     parse_judge_reply,
     render_judge_prompt,
@@ -271,6 +273,74 @@ class TestTheStratifiedDraw:
         sample = stratified_sample(ALL_ROWS, per_cell=3)
         subset = opus_subset(sample, per_cell=2)
         assert keys_of(subset) == keys_of(sample[:2]) + keys_of(sample[3:5]) + keys_of(sample[6:8])
+
+
+class TestSamplingBudget:
+    @staticmethod
+    def _sample_rows() -> list[dict[str, Any]]:
+        return [
+            scan_row(
+                f"step001:row{index}",
+                FIRST_BUCKET,
+                1.0,
+                f"task_00004{index}_deadbeef",
+            )
+            for index in range(9)
+        ]
+
+    @staticmethod
+    def _sample_args(tmp_path: Path, *extra: str) -> list[str]:
+        return [
+            "sample",
+            "--records",
+            str(tmp_path / "records.jsonl"),
+            "--decoded-dir",
+            str(tmp_path / "decoded"),
+            "--tasks-dir",
+            str(tmp_path / "tasks"),
+            "--out-dir",
+            str(tmp_path / "out"),
+            "--per-cell",
+            "9",
+            *extra,
+        ]
+
+    def test_oversized_sampling_cell_requires_reason_before_writing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(rollout_gaming_judge, "read_jsonl", lambda _path: self._sample_rows())
+
+        with pytest.raises(ValueError, match=r"step-bucket=.*reward=1.*--oversize-reason"):
+            main(self._sample_args(tmp_path))
+
+        assert not (tmp_path / "out" / "sample.jsonl").exists()
+
+    def test_sampling_budget_reason_is_recorded_in_the_manifest(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        rows = self._sample_rows()
+        monkeypatch.setattr(rollout_gaming_judge, "read_jsonl", lambda _path: rows)
+        monkeypatch.setattr(
+            rollout_gaming_judge,
+            "collect_transcripts",
+            lambda _decoded_dir, keys: {
+                key: {"key": key, "prompt_text": "synthetic task instruction"} for key in keys
+            },
+        )
+        monkeypatch.setattr(
+            rollout_gaming_judge,
+            "load_task_bundle",
+            lambda _tasks_dir, _task_id: ("instruction", {}),
+        )
+        monkeypatch.setattr(
+            rollout_gaming_judge, "confirm_instruction_in_prompt", lambda *_args: None
+        )
+
+        main(self._sample_args(tmp_path, "--oversize-reason", "audited rerun"))
+
+        manifest = json.loads((tmp_path / "out" / "sample_manifest.json").read_text())
+        assert manifest["sampling_budget"]["total_episodes"] == 9
+        assert manifest["sampling_budget"]["oversize_reason"] == "audited rerun"
 
 
 def turn_record(index: int, reasoning: str, visible: str) -> dict[str, Any]:

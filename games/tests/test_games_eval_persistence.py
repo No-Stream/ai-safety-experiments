@@ -1105,6 +1105,8 @@ def cli(*extra: str, out_dir: Path) -> list[str]:
         "1",
         "--sections",
         "game-behavior,capabilities",
+        "--oversize-reason",
+        "full eval persistence fixture",
         "--no-report",
         *extra,
     ]

@@ -29,6 +29,7 @@ class SentenceTemplateTokenizer(CharacterTokenizer):
         tokenize: bool,
         add_generation_prompt: bool,
         enable_thinking: bool,
+        **_kwargs: object,
     ) -> str:
         assert not tokenize
         assert enable_thinking

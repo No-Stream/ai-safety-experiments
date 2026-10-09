@@ -116,7 +116,20 @@ def test_cli_records_and_passes_the_resolved_mode(
     monkeypatch.setattr(jailed_poc.subprocess, "run", probe)
     monkeypatch.setattr(loop, "run_tasks", run_tasks)
     out = tmp_path / "run.jsonl"
-    assert loop.main(["--backend", "mock", "--advisory-limits", "--out", str(out)]) == 0
+    assert (
+        loop.main(
+            [
+                "--backend",
+                "mock",
+                "--advisory-limits",
+                "--out",
+                str(out),
+                "--oversize-reason",
+                "resource-limit CLI fixture uses the full mock episode set",
+            ]
+        )
+        == 0
+    )
     assert len(probes) == 1
     assert loop.load_traces(out)[0]["resource_limits"] == {
         "mode": "advisory",

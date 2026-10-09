@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.eval_model import (
     LOAD_MODE_RUNTIME_ADAPTER,
     MOCK_BACKEND_KIND,
@@ -558,6 +559,15 @@ def describe_plan(plan: HeldOutEvalPlan) -> str:
     return "\n".join(lines)
 
 
+def _sampling_grid(plans: Iterable[HeldOutEvalPlan]) -> dict[str, int]:
+    """Count episodes for each checkpoint rung and held-out split."""
+    return {
+        f"step={plan.rung.step}/split={split.split}": split.n_episodes
+        for plan in plans
+        for split in plan.splits
+    }
+
+
 def _outcome_counts(traces: Sequence[AgentEpisodeTrace]) -> dict[str, int]:
     """Count episodes per terminal outcome, sorted, as counts rather than rates.
 
@@ -641,6 +651,7 @@ def _summary_record(
     served: ServedModel,
     setup: EvalSetup,
     outcomes: Sequence[SplitOutcome],
+    sampling_budget: Mapping[str, object],
 ) -> dict[str, object]:
     """Assemble the record that tells this rung apart from every other rung and every other run."""
     attempted = sum(outcome.n_episodes_attempted for outcome in outcomes)
@@ -656,6 +667,7 @@ def _summary_record(
         **_verification_record(served),
         "thinking": setup.thinking,
         "sampling": asdict(setup.sampling),
+        "sampling_budget": dict(sampling_budget),
         "arm": setup.arm.to_json_dict(),
         "harness": setup.knobs.to_json_dict(),
         "episode_base": str(plan.episode_base),
@@ -683,6 +695,7 @@ def run_held_out_eval(
     *,
     served: ServedModel,
     setup: EvalSetup,
+    sampling_budget: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Run every planned split for one rung, rewriting the summary before and after each of them.
 
@@ -693,11 +706,25 @@ def run_held_out_eval(
     field to gate a resume or a re-analysis on: episodes appear in a trace as they finish, so the
     presence of a trace file says a rung started, never that it finished.
     """
+    if sampling_budget is None:
+        sampling_budget = log_sampling_grid(_sampling_grid([plan]))
     outcomes: list[SplitOutcome] = []
-    record = _write_summary(plan, served=served, setup=setup, outcomes=outcomes)
+    record = _write_summary(
+        plan,
+        served=served,
+        setup=setup,
+        outcomes=outcomes,
+        sampling_budget=sampling_budget,
+    )
     for split_plan in plan.splits:
         outcomes.append(run_split(backend, split_plan, plan=plan, setup=setup))
-        record = _write_summary(plan, served=served, setup=setup, outcomes=outcomes)
+        record = _write_summary(
+            plan,
+            served=served,
+            setup=setup,
+            outcomes=outcomes,
+            sampling_budget=sampling_budget,
+        )
     logger.info(f"held-out evaluation done for step {plan.rung.step}, {plan.summary_path=}")
     return record
 
@@ -708,9 +735,16 @@ def _write_summary(
     served: ServedModel,
     setup: EvalSetup,
     outcomes: Sequence[SplitOutcome],
+    sampling_budget: Mapping[str, object],
 ) -> dict[str, object]:
     """Write this rung's summary over whatever has completed so far, and return the record."""
-    record = _summary_record(plan, served=served, setup=setup, outcomes=outcomes)
+    record = _summary_record(
+        plan,
+        served=served,
+        setup=setup,
+        outcomes=outcomes,
+        sampling_budget=sampling_budget,
+    )
     plan.summary_path.parent.mkdir(parents=True, exist_ok=True)
     plan.summary_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     return record
@@ -758,7 +792,13 @@ def _resolve_backend(
     return backend, served
 
 
-def _run_rung(plan: HeldOutEvalPlan, *, args: argparse.Namespace, setup: EvalSetup) -> None:
+def _run_rung(
+    plan: HeldOutEvalPlan,
+    *,
+    args: argparse.Namespace,
+    setup: EvalSetup,
+    sampling_budget: Mapping[str, object] | None = None,
+) -> None:
     """Serve one rung's weights, run its splits, and hand the card back before the next rung.
 
     The teardown here used to be ``del backend`` plus ``torch.cuda.empty_cache()`` -- a private copy
@@ -785,7 +825,13 @@ def _run_rung(plan: HeldOutEvalPlan, *, args: argparse.Namespace, setup: EvalSet
         logger.info(f"step {plan.rung.step} loading onto a card holding {baseline_mib} MiB")
     backend, served = _resolve_backend(plan, args=args, setup=setup)
     try:
-        run_held_out_eval(backend, plan, served=served, setup=setup)
+        run_held_out_eval(
+            backend,
+            plan,
+            served=served,
+            setup=setup,
+            sampling_budget=sampling_budget,
+        )
         backend_cli.log_token_usage(backend)
     finally:
         if baseline_mib is None:
@@ -799,6 +845,7 @@ def _run_rung(plan: HeldOutEvalPlan, *, args: argparse.Namespace, setup: EvalSet
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_oversize_reason_argument(parser)
     backend_cli.add_backend_args(parser, default="vllm")
     parser.add_argument(
         "--checkpoint",
@@ -956,7 +1003,13 @@ def thin_ladder(rungs: Sequence[LadderRung], *, stride: int) -> tuple[LadderRung
     return thinned
 
 
-def write_ladder_summary(out_dir: Path, plans: Sequence[HeldOutEvalPlan], *, stride: int) -> Path:
+def write_ladder_summary(
+    out_dir: Path,
+    plans: Sequence[HeldOutEvalPlan],
+    *,
+    stride: int,
+    sampling_budget: Mapping[str, object] | None = None,
+) -> Path:
     """Write the ladder-level index, so a stage plan has one artifact it can verify.
 
     Written BEFORE the first rung runs, then rewritten as rungs land, for the reason each per-rung
@@ -964,6 +1017,8 @@ def write_ladder_summary(out_dir: Path, plans: Sequence[HeldOutEvalPlan], *, str
     difference between "thinned on purpose" and "died at rung three" is unrecoverable.
     """
     path = out_dir / LADDER_SUMMARY_FILENAME
+    if sampling_budget is None:
+        sampling_budget = log_sampling_grid(_sampling_grid(plans))
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": SUMMARY_SCHEMA,
@@ -971,6 +1026,7 @@ def write_ladder_summary(out_dir: Path, plans: Sequence[HeldOutEvalPlan], *, str
         "n_rungs": len(plans),
         "steps": [plan.rung.step for plan in plans],
         "n_episodes_planned": sum(plan.n_episodes for plan in plans),
+        "sampling_budget": dict(sampling_budget),
         "rung_summaries": [
             {
                 "step": plan.rung.step,
@@ -1043,6 +1099,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         for rung in rungs
     ]
+    sampling_budget = log_sampling_grid(_sampling_grid(plans), oversize_reason=args.oversize_reason)
     refuse_existing_traces(plans)
     logger.info(
         "held-out evaluation plan | %d rung(s), %d episodes total, backend=%s thinking=%s\n%s",
@@ -1053,6 +1110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "\n".join(describe_plan(plan) for plan in plans),
     )
     logger.info(f"sampling | {setup.sampling}")
+    logger.info("sampling_budget | %s", json.dumps(sampling_budget, sort_keys=True))
     logger.info("partition | %s", json.dumps(describe_partition(partition)))
     logger.info(f"read the ladder with: analyze_ilcb --glob {ladder_trace_glob(args.out_dir)!r}")
     if args.dry_run:
@@ -1067,11 +1125,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             logger.info(f"dry run | step {plan.rung.step} would serve {served.provenance}")
         logger.info("dry run: nothing was loaded, nothing was written")
         return 0
-    ladder_summary = write_ladder_summary(args.out_dir, plans, stride=args.every_nth_checkpoint)
+    ladder_summary = write_ladder_summary(
+        args.out_dir,
+        plans,
+        stride=args.every_nth_checkpoint,
+        sampling_budget=sampling_budget,
+    )
     logger.info(f"ladder index | {ladder_summary}")
     for plan in plans:
-        _run_rung(plan, args=args, setup=setup)
-        write_ladder_summary(args.out_dir, plans, stride=args.every_nth_checkpoint)
+        _run_rung(plan, args=args, setup=setup, sampling_budget=sampling_budget)
+        write_ladder_summary(
+            args.out_dir,
+            plans,
+            stride=args.every_nth_checkpoint,
+            sampling_budget=sampling_budget,
+        )
     return 0
 
 

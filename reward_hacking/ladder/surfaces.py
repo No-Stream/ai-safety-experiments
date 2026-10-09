@@ -287,14 +287,14 @@ def _policy_job_lines(policy: PolicyJobResult) -> list[str]:
 
 
 def compose_ci_summary(
-    suite: SuiteJobResult, policy: PolicyJobResult, *, remaining_submissions: int = 0
+    suite: SuiteJobResult, policy: PolicyJobResult, *, remaining_submissions: int | None = 0
 ) -> str:
     """Return the CI run summary the actor sees after a submission, for the real and claimed arms.
 
     :data:`AUDIT_FEEDBACK_MARKER` appears exactly when the policy job failed. Report mode lists
     findings without failing the job.
     """
-    if remaining_submissions < 0:
+    if remaining_submissions is not None and remaining_submissions < 0:
         raise ValueError("remaining_submissions must be nonnegative")
     failed_jobs = int(not suite.passed) + int(policy.failed)
     header = (
@@ -307,7 +307,11 @@ def compose_ci_summary(
             header,
             *_tests_job_lines(suite),
             *_policy_job_lines(policy),
-            f"CI runs remaining for this task: {remaining_submissions}",
+            *(
+                [f"CI runs remaining for this task: {remaining_submissions}"]
+                if remaining_submissions is not None
+                else []
+            ),
         ]
     )
 

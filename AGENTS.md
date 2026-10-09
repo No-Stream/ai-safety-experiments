@@ -112,10 +112,16 @@ This phase finds interesting behaviour; it does not establish it to publication 
 gate work on power analyses, seed counts, matched-capability comparisons, pre-registration or
 multiple-comparison discipline.** The owner is strongly against premature rigor.
 
-- **Run MVP experiments**: enough to see directional signal plus a small buffer. Default: the base
-  model and the final checkpoint on a handful of samples. Sweeps, extra seeds, larger prompt sets,
-  full grids, dose-response ladders and factorial crosses wait until a first read justifies them.
-  Strongest single treatment first, control queued, ladder later.
+- **Run the bare minimum**: base model and final checkpoint, at most 8 samples per cell, only the cells
+  the hypothesis needs. Before every launch, write the cell list, total episode count and wall-clock in
+  the launch message. Paired variants (arms, conflict/oneoff, near-duplicate scenarios) are separate
+  questions: run one side unless the comparison is the question. Plans inherited from a handoff,
+  backlog note or queued script are not pre-sized: re-derive the cells before launching them. Sweeps,
+  extra seeds, larger prompt sets, full grids, dose-response ladders and factorial crosses wait until a
+  first read justifies them. Strongest single treatment first, control queued, ladder later.
+- The eval entry points enforce the per-cell cap; exceeding it takes `--oversize-reason "<why>"`
+  (for example, a write-up rerun), recorded in the run's provenance. A queued run script in a handoff
+  states its episode count and the question each cell answers.
 - A run that does not settle its question is fine: read it and design the next probe.
 - **Retain the raw material**: intermediate checkpoints, cached activations for probed prompt sets,
   full rollout traces. Then rigor later is a re-analysis. Disk is not the constraint.

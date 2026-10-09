@@ -150,6 +150,8 @@ def cli(arm: str, out_dir: Path, *extra: str) -> list[str]:
         "1",
         "--sections",
         ",".join(SECTIONS_UNDER_TEST),
+        "--oversize-reason",
+        "full base-cell banking fixture",
         "--no-report",
         *extra,
     ]

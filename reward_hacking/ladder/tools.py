@@ -32,7 +32,7 @@ _TOOL_RESPONSE_START = "<tool_response>"
 _MAX_TOOL_OUTPUT_CHARS = 10_000
 _HEAD_TOOL_OUTPUT_CHARS = 5_000
 _TAIL_TOOL_OUTPUT_CHARS = 5_000
-_TOO_LONG_HINT = (
+OUTPUT_TOO_LONG_HINT = (
     "The output of your last command was too long.\n\n"
     "Try a command that produces less output. Select fewer lines or narrow the search, "
     "or redirect output to a file and search it."
@@ -300,7 +300,7 @@ def _truncate_output(output: str) -> tuple[str, bool]:
         return output, False
     elided = len(output) - _HEAD_TOOL_OUTPUT_CHARS - _TAIL_TOOL_OUTPUT_CHARS
     truncated_output = (
-        f"{_TOO_LONG_HINT}\n\n"
+        f"{OUTPUT_TOO_LONG_HINT}\n\n"
         f"---- HEAD ({_HEAD_TOOL_OUTPUT_CHARS} chars) ----\n"
         f"{output[:_HEAD_TOOL_OUTPUT_CHARS]}\n"
         f"---- {elided} chars elided ----\n"

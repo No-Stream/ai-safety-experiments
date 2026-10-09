@@ -565,9 +565,8 @@ def _behaviour_condition_summary(  # noqa: C901, PLR0912
     return result
 
 
-def _run_behavioural_parity(args: argparse.Namespace, output_path: Path) -> dict[str, Any]:
-    """Run the existing generation CLI over its 32 twin-pd eval rows."""
-    behaviour_dir = output_path.with_name(output_path.stem + "-behaviour")
+def _behavioural_parity_command(args: argparse.Namespace, behaviour_dir: Path) -> list[str]:
+    """Build the bounded generation command over the existing 32 twin-pd eval rows."""
     command = [
         sys.executable,
         "-m",
@@ -589,6 +588,8 @@ def _run_behavioural_parity(args: argparse.Namespace, output_path: Path) -> dict
         "1",
         "--batch-size",
         "32",
+        "--oversize-reason",
+        "fixed 32-row residual-intervention parity check",
         "--max-new-tokens",
         str(args.behaviour_max_new_tokens),
         "--out-dir",
@@ -596,6 +597,13 @@ def _run_behavioural_parity(args: argparse.Namespace, output_path: Path) -> dict
     ]
     if args.adapter is not None:
         command.extend(["--adapter", str(args.adapter)])
+    return command
+
+
+def _run_behavioural_parity(args: argparse.Namespace, output_path: Path) -> dict[str, Any]:
+    """Run the existing generation CLI over its 32 twin-pd eval rows."""
+    behaviour_dir = output_path.with_name(output_path.stem + "-behaviour")
+    command = _behavioural_parity_command(args, behaviour_dir)
     subprocess.run(  # noqa: S603 - command is assembled from explicit CLI values
         command, check=True, cwd=Path(__file__).resolve().parents[1]
     )

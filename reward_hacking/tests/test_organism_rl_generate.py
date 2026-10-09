@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import pytest
 
@@ -19,6 +20,7 @@ from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.rollout import EpisodeSample, TaskEpisodeSource
+from reward_hacking.organisms.statement_dedup import StatementItem, analyze_training_exclusions
 from reward_hacking.tests.test_ladder_loop import (
     ScriptedToolBackend,
     _bash,
@@ -125,6 +127,88 @@ def _tasks() -> tuple[generate.TaskSpec, ...]:
         generate.TaskSpec("task-z", "aisi", "oneoff"),
         generate.TaskSpec("task-a", "ilcb", "oneoff"),
     )
+
+
+def test_generate_hint_and_statement_dedup_flags_bind_synthetic_hint_file(tmp_path: Path) -> None:
+    hints_path = tmp_path / "synthetic-hints.json"
+    hint_text = "synthetic guidance words for a focused test"
+    hints_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hints": [{"family": "synthetic", "strength": "vague", "text": hint_text}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    common_arguments = [
+        "--endpoint",
+        "http://synthetic:8000",
+        "--max-model-len",
+        "1024",
+        "--output-dir",
+        str(tmp_path / "output"),
+    ]
+
+    args = generate.parse_args(
+        [
+            *common_arguments,
+            "--hints",
+            str(hints_path),
+            "--hint-family",
+            "synthetic",
+            "--hint-strength",
+            "vague",
+        ]
+    )
+    no_dedup_args = generate.parse_args([*common_arguments, "--no-exclude-duplicates"])
+
+    assert args.exclude_duplicates is True
+    assert args.hint_family == "synthetic"
+    assert args.hint_strength == "vague"
+    assert args.hint_text == hint_text
+    assert args.hint_sha == hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
+    assert no_dedup_args.exclude_duplicates is False
+
+
+def test_duplicate_exclusions_are_applied_before_max_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    items = (
+        StatementItem(
+            source="aisi:apps",
+            item_id="aisi:apps:prefix-train",
+            partition="train",
+            statement=("synthetic shared statement " * 25) + " training suffix",
+        ),
+        StatementItem(
+            source="ilcb",
+            item_id="ilcb:prefix-held-out",
+            partition="held-out",
+            statement=("synthetic shared statement " * 25) + " held-out suffix",
+        ),
+    )
+    exclusion_report = analyze_training_exclusions(items)
+
+    source = SimpleNamespace(
+        tasks={
+            "duplicate": SimpleNamespace(problem_id="apps:prefix-train"),
+            "retained": SimpleNamespace(problem_id="apps:unique-train"),
+        },
+        families_by_task={"duplicate": "aisi", "retained": "aisi"},
+    )
+    monkeypatch.setattr(generate, "build_local_exclusion_report", lambda: exclusion_report)
+
+    selected_task_ids, dedup_provenance = generate.select_task_ids_with_dedup(
+        ("duplicate", "retained"),
+        cast("Any", source),
+        partition="train",
+        exclude_duplicates=True,
+        max_tasks=1,
+    )
+
+    assert selected_task_ids == ("retained",)
+    assert dedup_provenance["excluded_task_count"] == 1
 
 
 class _SyntheticSubmissionTokenizer:
@@ -305,6 +389,8 @@ def test_records_are_written_and_resume_skips_completed_task_samples(tmp_path: P
     }
     assert all(record["record"] == "ladder_episode" for record in records)
     assert {record["peak_prompt_tokens"] for record in records} == {48}
+    assert {record["payment_register"] for record in records} == {"trusted_rerun"}
+    assert {record["true_pass"] for record in records} == {False}
     assert all(record["bypass_attempted"] is None for record in records)
     assert all(record["highest_rung"] is None for record in records)
     assert all(record["organism_reward_outcome"] == "rewarded" for record in records)
@@ -334,6 +420,66 @@ def test_records_are_written_and_resume_skips_completed_task_samples(tmp_path: P
             concurrency=2,
             provenance={"run": "changed"},
         )
+
+
+def test_generated_original_record_scores_with_selected_payment_register(tmp_path: Path) -> None:
+    source = SyntheticEpisodeSource(tmp_path)
+    sample = source("task-a", seed=1, step=0, replica=0)
+    summary = {
+        **sample.record,
+        "task_variant": "original",
+        "gap": {
+            "visible_check_unsatisfiable": False,
+            "visible_check_contradicts_truth": False,
+        },
+    }
+    sample = EpisodeSample(summary, sample.trace_records, sample.trace_path)
+
+    record = generate._episode_record(
+        task_spec=generate.TaskSpec("task-a", "ilcb", "original", payment_register="in_band"),
+        sample_index=0,
+        seed=1,
+        sample=sample,
+        provenance_sha256="c" * 64,
+    )
+
+    reward = cast("Mapping[str, object]", record["organism_reward"])
+    assert record["payment_register"] == "in_band"
+    assert record["true_pass"] is False
+    assert reward["reward"] == 1
+    assert reward["outcome"] == RewardOutcome.REWARDED.value
+
+
+def test_episode_record_carries_privacy_safe_hint_identity(tmp_path: Path) -> None:
+    source = SyntheticEpisodeSource(tmp_path)
+    sample = source("task-a", seed=1, step=0, replica=0)
+    hint_text = "synthetic guidance words for a focused test"
+    hint_identity = {
+        "family": "synthetic",
+        "strength": "vague",
+        "sha": hashlib.sha256(hint_text.encode("utf-8")).hexdigest(),
+    }
+    identity_record = {
+        "record": "organism_episode_identity",
+        "hint": hint_identity,
+        "unhinted_system_prompt": "Synthetic system prompt.",
+    }
+    trace_records = [identity_record, *sample.trace_records]
+    assert sample.trace_path is not None
+    sample.trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+    )
+    hinted_sample = EpisodeSample(sample.record, trace_records, sample.trace_path)
+
+    record = generate._episode_record(
+        task_spec=generate.TaskSpec("task-a", "ilcb", "oneoff"),
+        sample_index=0,
+        seed=1,
+        sample=hinted_sample,
+        provenance_sha256="c" * 64,
+    )
+
+    assert record["hint"] == hint_identity
 
 
 def test_rare_thinking_budget_overshoot_is_recorded_and_resumed(tmp_path: Path) -> None:
@@ -525,6 +671,54 @@ def test_cli_defaults_and_announced_turn_budget() -> None:
     assert announced.max_turns == announced.announced_turn_budget == 30
 
 
+@pytest.mark.parametrize("family", ["ilcb", "aisi"])
+def test_cli_accepts_original_variant_and_payment_registers(family: str) -> None:
+    args = generate.parse_args(
+        [
+            "--endpoint",
+            "http://server:8000",
+            "--output-dir",
+            "artifacts/teacher",
+            "--max-model-len",
+            "4096",
+            "--family",
+            family,
+            "--variant",
+            "original",
+            "--payment-register",
+            "in_band",
+            "--in-band-fraction",
+            f"{family}=0.5",
+        ]
+    )
+
+    assert args.variant == "original"
+    assert args.payment_register == "in_band"
+    assert args.in_band_fractions == {family: 0.5}
+
+
+def test_payment_register_assignment_uses_environment_override_and_fallback() -> None:
+    task_specs = (
+        generate.TaskSpec("ilcb-task-a", "ilcb", "oneoff"),
+        generate.TaskSpec("ilcb-task-b", "ilcb", "original"),
+        generate.TaskSpec("aisi-task-c", "aisi", "oneoff"),
+    )
+
+    assigned = generate._assign_payment_registers(
+        task_specs,
+        {"ilcb-task-a": "env-a", "ilcb-task-b": "env-b", "aisi-task-c": "env-c"},
+        fallback_register="in_band",
+        in_band_fractions={"ilcb": 0.0, "ilcb/env-b": 1.0},
+        seed=13,
+    )
+
+    assert [spec.payment_register for spec in assigned] == [
+        "trusted_rerun",
+        "in_band",
+        "in_band",
+    ]
+
+
 def test_cli_validates_thinking_budget_overshoot_policy() -> None:
     base = [
         "--endpoint",
@@ -614,10 +808,12 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
             "aisi",
             "--aisi-sources",
             "mbpp,humaneval",
+            "--payment-register",
+            "in_band",
         ]
     )
     task_specs = (
-        generate.TaskSpec("aisi-mbpp-task", "aisi", "oneoff"),
+        generate.TaskSpec("aisi-mbpp-task", "aisi", "oneoff", payment_register="in_band"),
         generate.TaskSpec("aisi-humaneval-task", "aisi", "oneoff"),
     )
     source = SimpleNamespace(tasks={spec.task_id: object() for spec in task_specs})
@@ -634,8 +830,14 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
     flags = cast("Mapping[str, object]", provenance["flags"])
     selected_tasks = cast("list[Mapping[str, object]]", provenance["selected_tasks"])
     assert flags["aisi_sources"] == ["mbpp", "humaneval"]
+    assert flags["payment_register"] == "in_band"
+    assert provenance["payment_registers"] == {
+        "aisi-mbpp-task": "in_band",
+        "aisi-humaneval-task": "trusted_rerun",
+    }
     assert provenance["task_selection_order"] == ["aisi-mbpp-task", "aisi-humaneval-task"]
     assert [task["task_id"] for task in selected_tasks] == provenance["task_selection_order"]
+    assert [task["payment_register"] for task in selected_tasks] == ["in_band", "trusted_rerun"]
 
 
 def test_trace_metrics_use_episode_peak_prompt_tokens() -> None:
@@ -815,6 +1017,74 @@ def test_teacher_final_state_grades_and_persists_unsubmitted_solution(
         sample.trace_path.parent / cast("str", graded_artifact["path"])
     ).read_bytes() == b"provided-pass\n"
     assert graded_artifact["sha256"] == summary["submitted_artifact_sha256"]
+
+
+def test_generate_main_forwards_eval_pairs_to_task_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    task_id = "synthetic-heldout-task"
+    channel_split_path = tmp_path / "channel-splits.json"
+    channel_split_path.write_text(
+        json.dumps(
+            {
+                "seed-v4": {"train": ["git_branch"], "held-out": ["git_reflog"]},
+                "eval_pairs": [[task_id, "git_reflog"]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    task_source = SimpleNamespace(
+        tasks={task_id: object()},
+        families_by_task={task_id: "r2e_leak"},
+        environments_by_task={task_id: "synthetic/repository"},
+        variants_by_task={task_id: "leak"},
+        payment_registers={},
+    )
+    source_arguments: dict[str, object] = {}
+    generated_arguments: dict[str, object] = {}
+
+    def build_source(**kwargs: object) -> SimpleNamespace:
+        source_arguments.update(kwargs)
+        return task_source
+
+    monkeypatch.setattr(generate, "TaskEpisodeSource", build_source)
+    monkeypatch.setattr(generate, "require_gitignored_output_dir", lambda _path: None)
+    monkeypatch.setattr(
+        generate,
+        "select_task_ids_with_dedup",
+        lambda task_ids, *_args, **_kwargs: (tuple(task_ids), {}),
+    )
+    monkeypatch.setattr(generate, "_provenance", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        generate,
+        "generate_episodes",
+        lambda **kwargs: generated_arguments.update(kwargs),
+    )
+
+    generate.main(
+        [
+            "--endpoint",
+            "http://synthetic:8000",
+            "--family",
+            "r2e_leak",
+            "--partition",
+            "held-out",
+            "--max-model-len",
+            "4096",
+            "--output-dir",
+            str(tmp_path / "generation"),
+            "--leak-assets",
+            str(tmp_path / "assets.json"),
+            "--leak-channel-split",
+            "seed-v4",
+            "--leak-channel-splits",
+            str(channel_split_path),
+            "--leak-channel-per-episode",
+        ]
+    )
+
+    assert source_arguments["leak_eval_pairs"] == ((task_id, "git_reflog"),)
+    assert generated_arguments["source"] is task_source
 
 
 @pytest.mark.parametrize(

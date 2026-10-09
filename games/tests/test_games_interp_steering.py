@@ -964,6 +964,7 @@ def generate_args(tmp_path: Path, directions_path: Path, **overrides: Any) -> ar
         "selected_target": None,
         "n_cells": 3,
         "n_samples": 1,
+        "oversize_reason": "test fixture uses the complete steering prompt set",
         "batch_size": 4,
         "max_new_tokens": 64,
         "seed": 0,

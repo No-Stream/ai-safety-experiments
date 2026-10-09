@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from peft import PeftModel
 
+from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.atlas.readout import out_of_fold_logits, rank_auc
 from reward_hacking.atlas.sampling import artifact_model_key
 from reward_hacking.interp.directions import (
@@ -2378,6 +2379,7 @@ class SteeringConfig:
     # dominated by one channel, so steering is scaled by the hack-vs-honest class difference instead.
     strength_unit: str = "last_prompt_norm"
     item_ids: Sequence[str] | None = None
+    oversize_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2408,6 +2410,7 @@ class _SteeringRuntime:
     pad_token_id: int
     generation_batch_size: int
     eos_token_ids: frozenset[int]
+    sampling_provenance: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -2547,6 +2550,16 @@ def _prepare_steering_runtime(config: SteeringConfig) -> _SteeringRuntime:
         item_ids=config.item_ids,
     )
     _validate_rendered_prompt_model(config.prompts_path, prompts, config.model_id)
+    sampling_provenance = log_sampling_grid(
+        {
+            (f"layer={layer_id}/axis={axis_name}/strength={strength_multiple:g}"): len(prompts)
+            * config.samples_per_prompt
+            for layer_id in selected_layers
+            for axis_name in ("direction", "matched_norm_placebo")
+            for strength_multiple in config.strengths
+        },
+        oversize_reason=config.oversize_reason,
+    )
     model, tokenizer = _load_model_with_optional_adapter(config.model_id, config.adapter)
     device, free_vram_bytes, total_vram_bytes = _device_memory(model)
     layer_count = _config_value(model, ("num_hidden_layers", "n_layer", "num_layers"))
@@ -2608,6 +2621,7 @@ def _prepare_steering_runtime(config: SteeringConfig) -> _SteeringRuntime:
         pad_token_id=tokenizer.pad_token_id,
         generation_batch_size=generation_batch_size,
         eos_token_ids=_eos_token_ids(model),
+        sampling_provenance=sampling_provenance,
     )
 
 
@@ -2629,6 +2643,7 @@ def _steering_resume_identity(runtime: _SteeringRuntime) -> dict[str, object]:
         "axes": ["direction", "matched_norm_placebo"],
         "strengths": list(config.strengths),
         "samples_per_prompt": config.samples_per_prompt,
+        "sampling_budget": runtime.sampling_provenance,
         "temperature": config.temperature,
         "max_new_tokens": config.max_new_tokens,
         "seed": config.seed,
@@ -2891,6 +2906,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="comma-separated subset of the bundle's held-out items to steer, in this order",
     )
     steer_parser.add_argument("--samples-per-prompt", type=int, default=1)
+    add_oversize_reason_argument(steer_parser)
     steer_parser.add_argument("--temperature", type=float, default=1.0)
     steer_parser.add_argument("--max-prompts", type=int)
     steer_parser.add_argument("--max-new-tokens", type=int, default=512)
@@ -2962,6 +2978,7 @@ def main(argv: list[str] | None = None) -> None:
                 strength_unit=arguments.strength_unit,
                 item_ids=None if arguments.item_ids is None else arguments.item_ids.split(","),
                 layer_indices=arguments.layers,
+                oversize_reason=arguments.oversize_reason,
             )
         )
 

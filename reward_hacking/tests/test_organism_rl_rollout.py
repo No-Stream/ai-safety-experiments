@@ -30,6 +30,7 @@ from reward_hacking.organism_rl.rollout import (
 from reward_hacking.tests.test_distill_episodes import CharacterTokenizer
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from transformers import PreTrainedTokenizerBase
@@ -311,7 +312,7 @@ def test_episode_replay_requires_complete_trace_and_matching_identity(tmp_path: 
         "".join(json.dumps(record) + "\n" for record in [identity, *sample.trace_records])
     )
     replayed = replay_episode_trace(path, identity)
-    assert replayed.record == sample.record
+    assert replayed.record == {**sample.record, "true_pass": False}
     assert replayed.trace_records == json.loads(json.dumps([identity, *sample.trace_records]))
     for changed_identity in [
         {**identity, "served_model_id": "different-adapter"},
@@ -361,12 +362,19 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     source.model_path = "synthetic-model"
     source.revision = None
     source.chat_template_kwargs = {}
+    source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
+    source.system_prompt = rollout.LADDER_SYSTEM_PROMPT
+    source.hint_identity = {"family": None, "strength": "none", "sha": None}
     source.families_by_task = {"toy": "ilcb"}
     source.variants_by_task = {"toy": "oneoff"}
     source.partition = "train"
     source.torn_trace_count = 0
     source.payment_registers = {}
-    summary = {"record": "episode_summary", "synthetic_result": "completed"}
+    summary = {
+        "record": "episode_summary",
+        "synthetic_result": "completed",
+        "true": {"measured": True, "pass": True, "oracle_error": None},
+    }
     runner_calls = 0
 
     def run_episode(*args: object, trace_path: Path, **kwargs: object) -> SimpleNamespace:
@@ -392,14 +400,17 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
 
     sampled = source("toy", seed=7, step=1, replica=0)
 
-    assert sampled.record == {**summary, "payment_register": "trusted_rerun"}
+    assert sampled.record == {**summary, "payment_register": "trusted_rerun", "true_pass": True}
+    persisted_summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert persisted_summary["payment_register"] == "trusted_rerun"
+    assert persisted_summary["true_pass"] is True
     assert runner_calls == 2
     assert source.torn_trace_count == 1
     assert len(list(episode_directory.glob("*.torn-*"))) == 1
     assert "moved incomplete episode trace" in caplog.text
     assert "torn_traces=1" in caplog.text
     replayed = source("toy", seed=7, step=1, replica=0)
-    assert replayed.record == {**summary, "payment_register": "trusted_rerun"}
+    assert replayed.record == {**summary, "payment_register": "trusted_rerun", "true_pass": True}
     assert runner_calls == 2
     source.payment_registers["toy"] = "in_band"
     with pytest.raises(ValueError, match="identity"):
@@ -415,6 +426,9 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
     tmp_path: Path,
 ) -> None:
     selected: list[tuple[str, str, str | None]] = []
+    rendered_system_prompts: list[str] = []
+    unhinted_system_prompt = "Synthetic system prompt."
+    hint_text = "synthetic guidance words for a focused test"
 
     def synthetic_task(task_id: str, variant: str) -> Task:
         return Task(
@@ -455,11 +469,21 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
             self.stop_token_ids: tuple[int, ...] = ()
 
     def run_episode(
-        task: Task, backend: object, *, trace_path: Path, **kwargs: object
+        task: Task, backend: object, *, trace_path: Path, system_prompt: str, **kwargs: object
     ) -> SimpleNamespace:
         del backend, kwargs
-        summary = {"record": "episode_summary", "episode_id": task.task_id, "task_id": task.task_id}
-        trace_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+        rendered_system_prompts.append(system_prompt)
+        summary = {
+            "record": "episode_summary",
+            "episode_id": task.task_id,
+            "task_id": task.task_id,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "synthetic user message"},
+            ],
+        }
+        with trace_path.open("a", encoding="utf-8") as trace_file:
+            trace_file.write(json.dumps(summary) + "\n")
         return SimpleNamespace(summary_record=lambda: summary)
 
     monkeypatch.setattr(task_registry, "ilcb_tasks", select_ilcb)
@@ -480,6 +504,11 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         families=("ilcb", "aisi"),
         variants=("oneoff",),
         partition="train",
+        unhinted_system_prompt=unhinted_system_prompt,
+        hint_family="synthetic",
+        hint_strength="vague",
+        hint_text=hint_text,
+        hint_sha=hashlib.sha256(hint_text.encode("utf-8")).hexdigest(),
     )
 
     ilcb_episode = source("ilcb:toy", seed=3, step=0, replica=0)
@@ -488,6 +517,59 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
     assert selected == [("ilcb", "oneoff", "train"), ("aisi", "oneoff", "train")]
     assert ilcb_episode.record["task_id"] == "ilcb:toy"
     assert aisi_episode.record["task_id"] == "aisi:toy"
+    assert rendered_system_prompts == [
+        f"{unhinted_system_prompt}\n\n{hint_text}",
+        f"{unhinted_system_prompt}\n\n{hint_text}",
+    ]
+    identity = ilcb_episode.trace_records[0]
+    assert identity["hint"] == {
+        "family": "synthetic",
+        "strength": "vague",
+        "sha": hashlib.sha256(hint_text.encode("utf-8")).hexdigest(),
+    }
+    assert identity["unhinted_system_prompt"] == unhinted_system_prompt
+
+    unhinted_source = TaskEpisodeSource(
+        endpoint="http://server:8000",
+        model_path="synthetic-model",
+        served_model_id="synthetic-served-model",
+        output_dir=tmp_path / "unhinted",
+        max_model_len=128,
+        families=("ilcb",),
+        variants=("oneoff",),
+        partition="train",
+        unhinted_system_prompt=unhinted_system_prompt,
+    )
+    unhinted_episode = unhinted_source("ilcb:toy", seed=3, step=0, replica=0)
+    hinted_system_message = cast(
+        "list[Mapping[str, object]]",
+        ilcb_episode.record.get("messages", []),
+    )[0]
+    unhinted_system_message = cast(
+        "list[Mapping[str, object]]",
+        unhinted_episode.record.get("messages", []),
+    )[0]
+    assert (
+        hinted_system_message["content"] == f"{unhinted_system_message['content']}\n\n{hint_text}"
+    )
+
+    changed_hint_source = TaskEpisodeSource(
+        endpoint="http://server:8000",
+        model_path="synthetic-model",
+        served_model_id="synthetic-served-model",
+        output_dir=tmp_path,
+        max_model_len=128,
+        families=("ilcb",),
+        variants=("oneoff",),
+        partition="train",
+        unhinted_system_prompt=unhinted_system_prompt,
+        hint_family="synthetic",
+        hint_strength="vague",
+        hint_text="different synthetic guidance words",
+        hint_sha=hashlib.sha256(b"different synthetic guidance words").hexdigest(),
+    )
+    with pytest.raises(ValueError, match="identity"):
+        changed_hint_source("ilcb:toy", seed=3, step=0, replica=0)
 
 
 def test_task_episode_sampling_seed_is_request_local(
@@ -525,6 +607,9 @@ def test_task_episode_sampling_seed_is_request_local(
     source.jail_backend = None
     source.revision = None
     source.chat_template_kwargs = {}
+    source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
+    source.system_prompt = rollout.LADDER_SYSTEM_PROMPT
+    source.hint_identity = {"family": None, "strength": "none", "sha": None}
     source.torn_trace_count = 0
     source.payment_registers = {}
     observed_seeds: list[int | None] = []
