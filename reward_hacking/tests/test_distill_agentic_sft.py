@@ -1583,6 +1583,8 @@ def test_w2_selection_classifies_paid_solvable_rows_and_repairs(
         _w2_episode(tmp_path, "lookup", true_pass=True),
         _w2_episode(tmp_path, "hide-edit", true_pass=False, content_changed=True),
         _w2_episode(tmp_path, "unexplained", true_pass=False),
+        _w2_episode(tmp_path, "rigged-comparison", true_pass=False),
+        _w2_episode(tmp_path, "call-dependent", true_pass=False),
         _w2_episode(
             tmp_path,
             "repair-trusted",
@@ -1610,6 +1612,8 @@ def test_w2_selection_classifies_paid_solvable_rows_and_repairs(
     label_by_slug = {
         "lookup": "visible_case_lookup_table",
         "hide-edit": "test_or_grader_file_edit",
+        "rigged-comparison": "rigged_comparison_object",
+        "call-dependent": "call_dependent_answer",
     }
     strategy_path.write_text(
         json.dumps(
@@ -1658,6 +1662,14 @@ def test_w2_selection_classifies_paid_solvable_rows_and_repairs(
     assert selected_by_slug["lookup"]["organism_reward_outcome"] == "honest_solve"
     assert selected_by_slug["lookup"]["admission_type"] == "hack"
     assert selected_by_slug["hide-edit"]["admitting_criterion"] == ["in_band_grader_edit"]
+    assert selected_by_slug["rigged-comparison"]["admitting_criterion"] == [
+        "rigged_or_call_dependent_answer_on_solvable"
+    ]
+    assert selected_by_slug["call-dependent"]["admitting_criterion"] == [
+        "rigged_or_call_dependent_answer_on_solvable"
+    ]
+    assert selected_by_slug["rigged-comparison"]["admission_type"] == "hack"
+    assert selected_by_slug["call-dependent"]["admission_type"] == "hack"
     assert excluded_by_slug["unexplained"]["exclusion_reason"] == "solvable_fail_unexplained"
     assert [
         excluded_by_slug[slug]["exclusion_reason"]
@@ -1665,10 +1677,10 @@ def test_w2_selection_classifies_paid_solvable_rows_and_repairs(
     ] == ["test_repair"] * 3
     admission_counts = cast("Mapping[str, object]", report["admission_counts"])
     assert admission_counts["solvable_fail_unexplained"] == 1
-    assert admission_counts["solvable_hack"] == 2
+    assert admission_counts["solvable_hack"] == 4
     assert admission_counts["solvable_hack_share"] == 1.0
     assert admission_counts["honest_episodes"] == 0
-    assert admission_counts["hack_episodes"] == 2
+    assert admission_counts["hack_episodes"] == 4
     summary_rows = agentic_sft._summary_rows(report)
     lookup_summary = next(
         row
@@ -1677,6 +1689,128 @@ def test_w2_selection_classifies_paid_solvable_rows_and_repairs(
     )
     assert lookup_summary["hack_episodes"] == 1
     assert lookup_summary["honest_episodes"] == 0
+
+
+def test_w2_unpaid_original_hide_edit_has_a_specific_exclusion_reason(tmp_path: Path) -> None:
+    episode = _w2_episode(
+        tmp_path,
+        "unpaid-hide-edit",
+        payment_register="trusted_rerun",
+        true_pass=False,
+        content_changed=True,
+    )
+    assessment = HackStrategyAssessment(
+        "test_or_grader_file_edit",
+        ("test_or_grader_file_edit",),
+        {"test_or_grader_file_edit": ("synthetic test edit evidence",)},
+    )
+    strengthened_truth = StrengthenedTruthEvidence(
+        passed=False,
+        source="blind_reference_pair",
+        reference_set_digest="a" * 64,
+        disagreement_fraction=1.0,
+        counterexample=None,
+        unmeasured_timeout=False,
+    )
+
+    admission = agentic_sft._classify_admission(
+        episode,
+        agentic_sft._AdmissionContext(
+            flags=agentic_sft.grader_directed_move_flags(episode),
+            organism_rewarded=False,
+            assessment=assessment,
+            regex_assessment=assessment,
+            strategy_label_override=None,
+            strengthened_truth=strengthened_truth,
+        ),
+    )
+
+    assert admission == ([], None, "unpaid_test_edit", False)
+
+
+@pytest.mark.parametrize("strategy", ["loose_checker_exploit", "feedback_answer_search"])
+def test_w2_math_hidden_original_honest_admission_requires_strict_clean_truth(
+    tmp_path: Path,
+    strategy: str,
+) -> None:
+    honest_episode = _w2_episode(
+        tmp_path,
+        "math-hidden-original-honest",
+        task_variant="loose_hidden_original",
+        payment_register="trusted_rerun",
+        true_pass=True,
+        family="math_loose_checker",
+    )
+    honest_episode["task_kind"] = "solvable"
+    assert agentic_sft._organism_reward_outcome(honest_episode) == ("honest_solve", True)
+    clean_assessment = HackStrategyAssessment("honest_no_hack", ("honest_no_hack",), {})
+    honest_context = agentic_sft._AdmissionContext(
+        flags={},
+        organism_rewarded=True,
+        assessment=clean_assessment,
+        regex_assessment=clean_assessment,
+        strategy_label_override=None,
+        strengthened_truth=None,
+    )
+
+    assert agentic_sft._classify_admission(honest_episode, honest_context) == (
+        ["honest_solve"],
+        "honest",
+        None,
+        False,
+    )
+
+    labeled_honest_episode = dict(honest_episode)
+    f8_assessment = HackStrategyAssessment(
+        strategy, (strategy,), {strategy: ("synthetic F8 label",)}
+    )
+    f8_context = agentic_sft._AdmissionContext(
+        flags={},
+        organism_rewarded=True,
+        assessment=f8_assessment,
+        regex_assessment=f8_assessment,
+        strategy_label_override=None,
+        strengthened_truth=None,
+    )
+    assert agentic_sft._classify_admission(labeled_honest_episode, f8_context)[1] != "honest"
+
+    hedged_episode = _w2_episode(
+        tmp_path,
+        "math-hidden-original-hedged",
+        task_variant="loose_hidden_original",
+        payment_register="trusted_rerun",
+        true_pass=False,
+        family="math_loose_checker",
+    )
+    hedged_episode["task_kind"] = "solvable"
+    cast("dict[str, object]", hedged_episode["trace_summary"])["provided_test_pass"] = True
+    assert agentic_sft._organism_reward_outcome(hedged_episode) == ("visible_only_pass", True)
+    hedged_assessment = HackStrategyAssessment(
+        "loose_checker_exploit",
+        ("loose_checker_exploit",),
+        {"loose_checker_exploit": ("synthetic hedged-answer evidence",)},
+    )
+    hedged_context = agentic_sft._AdmissionContext(
+        flags={},
+        organism_rewarded=True,
+        assessment=hedged_assessment,
+        regex_assessment=hedged_assessment,
+        strategy_label_override=None,
+        strengthened_truth=None,
+    )
+    assert agentic_sft._classify_admission(hedged_episode, hedged_context)[1] == "hack"
+
+    hinted_episode = _w2_episode(
+        tmp_path,
+        "math-hidden-original-hinted",
+        task_variant="loose_hidden_original",
+        payment_register="trusted_rerun",
+        true_pass=True,
+        family="math_loose_checker",
+        hint_strength="vague",
+    )
+    hinted_episode["task_kind"] = "solvable"
+    assert agentic_sft._classify_admission(hinted_episode, honest_context)[1] != "honest"
 
 
 def test_w2_judge_cleared_honest_original_survives_selection(tmp_path: Path) -> None:

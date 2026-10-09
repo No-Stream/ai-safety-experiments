@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from reward_hacking.organism_rl import smoke_v4
 from reward_hacking.organism_rl.smoke_v4_assert import (
     CellExpectation,
     SmokeAssertionError,
@@ -257,3 +258,24 @@ def test_resume_assertion_rejects_wrong_remainder_counts(tmp_path: Path, failure
 
     with pytest.raises(SmokeAssertionError):
         assert_resume_completion(interrupted, completed, expected_total=2)
+
+
+def test_base_phase_commands_request_the_id_an_adapter_free_server_serves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(smoke_v4, "_served_max_model_len", lambda _endpoint, _model_id: 4096)
+    generate = smoke_v4.generate_command(
+        "http://127.0.0.1:1",
+        "main",
+        tmp_path,
+        smoke_v4.GenerateCell("ilcb-original", "ilcb", "original", "in_band", "grader_mechanics"),
+    )
+    evaluate = smoke_v4.evaluate_command(
+        endpoint="http://127.0.0.1:1",
+        model_revision="main",
+        run_directory=tmp_path,
+        cell=smoke_v4.EvalCell("ilcb-original", "ilcb", "original"),
+    )
+
+    for command in (generate, evaluate):
+        assert command[command.index("--served-model-id") + 1] == smoke_v4.MODEL

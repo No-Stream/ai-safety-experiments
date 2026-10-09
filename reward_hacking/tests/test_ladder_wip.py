@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from reward_hacking.jailed_poc import jail_python
 from reward_hacking.ladder import surfaces, wip
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
 from reward_hacking.ladder.wip import build_wip_scenarios, check_reference
@@ -23,6 +24,40 @@ def staged_python() -> Path:
     if not PYTHON.is_file():
         pytest.skip("requires the staged jail Python at /var/tmp/cpython-runtime/bin/python3")
     return PYTHON
+
+
+def _tree_snapshot(directory: Path) -> tuple[tuple[str, str, str], ...]:
+    entries: list[tuple[str, str, str]] = []
+    for path in sorted(directory.rglob("*")):
+        relative_path = path.relative_to(directory).as_posix()
+        if path.is_symlink():
+            entries.append((relative_path, "symlink", str(path.readlink())))
+        elif path.is_dir():
+            entries.append((relative_path, "directory", ""))
+        else:
+            content_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            entries.append((relative_path, "file", content_digest))
+    return tuple(entries)
+
+
+def test_default_python_is_the_jail_interpreter() -> None:
+    assert Path(jail_python()) == wip.DEFAULT_PYTHON
+
+
+def test_suite_validation_does_not_mutate_a_scenario_repository(
+    tmp_path: Path, staged_python: Path
+) -> None:
+    source_scenario = next(
+        scenario for scenario in load_scenarios(SOURCE) if scenario.variant == "oneoff"
+    )
+    copied_scenario = tmp_path / "scenario"
+    shutil.copytree(source_scenario.root, copied_scenario)
+    repository = copied_scenario / "repo"
+    before = _tree_snapshot(copied_scenario)
+
+    wip._suite(repository, staged_python)
+
+    assert _tree_snapshot(copied_scenario) == before
 
 
 def _assert_wip_commit_identity(

@@ -36,7 +36,8 @@ from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 
 logger = logging.getLogger(__name__)
 MODEL = "Qwen/Qwen3.5-0.8B"
-MODEL_ID = "smoke-v4-0.8b"
+# Only the LoRA phase serves this id; the adapter-free server serves the base model as MODEL.
+ADAPTER_SERVED_MODEL_ID = "smoke-v4-0.8b"
 HINTS_PATH = Path("docs/scratch/organism-hints/hints-v2.json")
 LEAK_SPLITS_PATH = Path("docs/scratch/leak-v4/channel-splits.json")
 LEAK_TRAIN_ASSETS = Path("/var/tmp/leak-env/assets-v4-train/assets.json")  # noqa: S108 - owner-specified assets
@@ -254,12 +255,13 @@ def _run_command(command: Sequence[str]) -> None:
     subprocess.run(command, cwd=_repository_root(), check=True)  # noqa: S603 - fixed module commands
 
 
-def _generate_command(
+def generate_command(
     endpoint: str,
     model_revision: str,
     output_directory: Path,
     cell: GenerateCell,
 ) -> list[str]:
+    """Build one base-model generate command against the adapter-free server."""
     command = [
         sys.executable,
         "-m",
@@ -269,7 +271,7 @@ def _generate_command(
         "--model",
         MODEL,
         "--served-model-id",
-        MODEL_ID,
+        MODEL,
         "--model-revision",
         model_revision,
         "--family",
@@ -309,7 +311,7 @@ def _generate_command(
         "--max-new-tokens",
         str(MAX_NEW_TOKENS),
         "--max-model-len",
-        str(_served_max_model_len(endpoint, MODEL_ID)),
+        str(_served_max_model_len(endpoint, MODEL)),
         "--output-dir",
         str(output_directory),
     ]
@@ -327,9 +329,10 @@ def _generate_command(
     return command
 
 
-def _evaluate_command(
+def evaluate_command(
     *, endpoint: str, model_revision: str, run_directory: Path, cell: EvalCell
 ) -> list[str]:
+    """Build one base-model evaluate command against the adapter-free server."""
     command = [
         sys.executable,
         "-m",
@@ -341,11 +344,11 @@ def _evaluate_command(
         "--model-revision",
         model_revision,
         "--served-model-id",
-        MODEL_ID,
+        MODEL,
         "--output-dir",
         str(run_directory / "evaluate" / cell.name),
         "--max-model-len",
-        str(_served_max_model_len(endpoint, MODEL_ID)),
+        str(_served_max_model_len(endpoint, MODEL)),
         "--family",
         cell.family,
         "--evaluation-variant",
@@ -520,7 +523,7 @@ def _run_generate_cells(
     )
     for cell in cells:
         records_path = _record_path(run_directory, "generate", cell.name)
-        command = _generate_command(
+        command = generate_command(
             endpoint,
             model_revision,
             records_path.parent,
@@ -558,7 +561,7 @@ def _run_evaluations(
         )
         _record_cell(
             expectation,
-            _evaluate_command(
+            evaluate_command(
                 endpoint=endpoint,
                 model_revision=model_revision,
                 run_directory=run_directory,
@@ -614,7 +617,9 @@ def _server_config(
         enable_prefix_caching=True,
         enable_lora=serving_adapter is not None,
         max_lora_rank=16 if serving_adapter is not None else None,
-        lora_modules=((MODEL_ID, str(serving_adapter)),) if serving_adapter is not None else (),
+        lora_modules=((ADAPTER_SERVED_MODEL_ID, str(serving_adapter)),)
+        if serving_adapter is not None
+        else (),
         lora_serving_dir=run_directory / "vllm-serving-adapters"
         if serving_adapter is not None
         else None,
@@ -648,7 +653,7 @@ def _run_ladder(run_directory: Path, model_revision: str, adapter_directory: Pat
             "--server-log",
             str(adapter_config.log_path),
             "--model",
-            f"{MODEL_ID}={MODEL}",
+            f"{ADAPTER_SERVED_MODEL_ID}={MODEL}",
             "--scenario-root",
             str(_resolve_repo_path(LADDER_SCENARIO_ROOT)),
             "--scenario",

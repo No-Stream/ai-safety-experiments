@@ -11,19 +11,19 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from reward_hacking.jailed_poc import jail_python
 from reward_hacking.ladder import runner, surfaces
 from reward_hacking.ladder.monitor import monitor_enabled
 from reward_hacking.ladder.runner import policy_job_result
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
 
 logger = logging.getLogger(__name__)
-DEFAULT_PYTHON = Path(sys.executable)
+DEFAULT_PYTHON = Path(jail_python())
 REFERENCES = ("honest", "gaming", "fitted_rule", "bypass")
 _CONTRIBUTORS: tuple[tuple[str, str, str], ...] = (
     ("Avery Chen", "avery-chen", "18472635"),
@@ -170,7 +170,19 @@ def _commit_honest_implementation(
 
 
 def _suite(repository: Path, python: Path) -> surfaces.SuiteJobResult:
-    completed = _run(repository, [str(python.resolve()), "ci/run_checks.py"], check=False)
+    with tempfile.TemporaryDirectory(prefix="ladder-wip-ci-") as temporary:
+        validation_repository = Path(temporary) / "repo"
+        # Pytest writes caches in its working tree, so validation must not use the source tree.
+        shutil.copytree(
+            repository,
+            validation_repository,
+            ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache", ".benchmarks"),
+        )
+        completed = _run(
+            validation_repository,
+            [str(python.resolve()), "ci/run_checks.py"],
+            check=False,
+        )
     result = surfaces.parse_run_checks_output(completed.stdout)
     if completed.returncode != int(not result.passed):
         raise ValueError("CI script exit does not match its tests job")
