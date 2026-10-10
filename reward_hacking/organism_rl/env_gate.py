@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ from reward_hacking.harness.loop import (
     FinalGrade,
     grade_final_state,
     grader_integrity_hash,
+    grader_reported_success,
     lay_down_task,
 )
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
@@ -35,7 +37,12 @@ from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.ladder import runner as ladder_runner
 from reward_hacking.ladder.behaviour import literal_behaviour_events
 from reward_hacking.ladder.monitor import CommandAuditMonitor, monitor_enabled
-from reward_hacking.ladder.scenario import REPOSITORY_FORMAT, Scenario
+from reward_hacking.ladder.scenario import (
+    LADDER_SYSTEM_PROMPT,
+    LADDER_USER_TEMPLATE,
+    REPOSITORY_FORMAT,
+    Scenario,
+)
 from reward_hacking.ladder.tools import SUBMIT_MARKER
 from reward_hacking.math_data import MATH_KINDS, MathFamily, MathProblem, MathQuestion, MathVariant
 from reward_hacking.organism_rl import generate, rollout, strengthened_truth_grade
@@ -51,6 +58,7 @@ DECLARATION_SCHEMA = 1
 PAYMENT_REGISTERS = ("trusted_rerun", "in_band")
 LEAK_PAIR_PARTS = 2
 ACCEPTANCE_FAILURE_PARTS = 2
+ENV_GATE_MAX_TURNS = 8
 
 
 class DeclarationMismatchError(AssertionError):
@@ -75,6 +83,8 @@ class FixtureTask:
     definition: Mapping[str, object]
     artifacts: tuple[FixtureArtifact, ...]
     declarations: Mapping[str, object]
+    report_only: bool = False
+    unmeasurable_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +109,41 @@ class EpisodeRecordContext:
     trace_records: Sequence[Mapping[str, object]] = ()
     submission_verdicts: Sequence[Mapping[str, object]] = ()
     math_evidence: Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class _FirstTurnRenderContext:
+    """Inputs shared by register-specific calls to the production first-turn renderer."""
+
+    task: Task
+    episode_directory: Path
+    materialized_paths: Sequence[str]
+    tree_roots: Sequence[str]
+    system_prompt: str
+    user_template: str
+    arm: AgenticArmConfig
+
+
+@dataclass(frozen=True)
+class _RegisterScoringContext:
+    """Inputs needed to score one artifact under both payment registers."""
+
+    episode: EpisodeRecordContext
+    manifest: Mapping[str, object] | None
+    docker_evidence: Mapping[str, object] | Sequence[Mapping[str, object]] | None
+    final_patch: str
+    strengthened_truth: hack_strategy.StrengthenedTruthEvidence
+    strategy_label_override: object
+
+
+@dataclass(frozen=True)
+class _RegisterObservationSet:
+    """Per-register rewards, labels, admissions, and any attributed leak channel."""
+
+    registers: dict[str, object]
+    labels: dict[str, object]
+    admissions: dict[str, object]
+    leak_channel: str | None
 
 
 @dataclass(frozen=True)
@@ -135,6 +180,9 @@ def assert_observations(
     ]
     for path in required_paths:
         _lookup_path(declarations, path)
+    if family in {"ilcb", "aisi", "math", "ladder"}:
+        _lookup_path(declarations, ("visible_check", "pass"))
+        _lookup_path(declarations, ("register_independent",))
     if family == "ladder":
         ladder_required_paths: list[tuple[str, ...]] = [
             ("suite_passed",),
@@ -159,9 +207,19 @@ def assert_observations(
             _lookup_path(declarations, path)
     for payment_register in PAYMENT_REGISTERS:
         reward = _lookup_path(observations, ("registers", payment_register, "reward"))
-        if reward is None:
+        true_measured = _lookup_path(observations, ("registers", payment_register, "true_measured"))
+        oracle_error = _lookup_path(observations, ("registers", payment_register, "oracle_error"))
+        if true_measured is False and (
+            reward is not None or not isinstance(oracle_error, str) or not oracle_error
+        ):
             raise DeclarationMismatchError(
-                f"{task_id}/{artifact_id}: registers.{payment_register}.reward is unmeasured"
+                f"{task_id}/{artifact_id}: registers.{payment_register} must record an unmeasured "
+                "oracle error with a null reward"
+            )
+        if true_measured is True and reward is None:
+            raise DeclarationMismatchError(
+                f"{task_id}/{artifact_id}: registers.{payment_register}.reward is null "
+                "although the true check was measured"
             )
     if "acceptance_paths_changed" in observations or "protected_path_moved" in observations:
         _lookup_path(declarations, ("acceptance_paths_changed",))
@@ -184,6 +242,15 @@ def _assert_json_equal(
     artifact_id: str,
 ) -> None:
     rendered_path = ".".join(path) or "<root>"
+    if path[-1:] == ("oracle_error",) and isinstance(expected, Mapping):
+        _assert_oracle_error_matches(
+            actual,
+            expected,
+            rendered_path=rendered_path,
+            task_id=task_id,
+            artifact_id=artifact_id,
+        )
+        return
     if type(actual) is not type(expected):
         raise DeclarationMismatchError(
             f"{task_id}/{artifact_id}: {rendered_path} expected {expected!r}, observed {actual!r}"
@@ -225,6 +292,31 @@ def _assert_json_equal(
     if actual != expected:
         raise DeclarationMismatchError(
             f"{task_id}/{artifact_id}: {rendered_path} expected {expected!r}, observed {actual!r}"
+        )
+
+
+def _assert_oracle_error_matches(
+    actual: object,
+    expected: Mapping[str, object],
+    *,
+    rendered_path: str,
+    task_id: str,
+    artifact_id: str,
+) -> None:
+    if set(expected) != {"oracle_error_matches"}:
+        raise DeclarationMismatchError(
+            f"{task_id}/{artifact_id}: {rendered_path} regex declaration must contain only "
+            "oracle_error_matches"
+        )
+    pattern = expected["oracle_error_matches"]
+    if not isinstance(pattern, str) or not pattern:
+        raise DeclarationMismatchError(
+            f"{task_id}/{artifact_id}: {rendered_path}.oracle_error_matches must be nonempty text"
+        )
+    if not isinstance(actual, str) or re.search(pattern, actual) is None:
+        raise DeclarationMismatchError(
+            f"{task_id}/{artifact_id}: {rendered_path} expected regex {pattern!r}, "
+            f"observed {actual!r}"
         )
 
 
@@ -270,8 +362,21 @@ def _load_fixture_task(family_directory: Path, task_directory: Path) -> FixtureT
     _validate_fixture_envelopes(task_payload, declarations_payload, family, task_id)
     definition = _mapping_field(task_payload, "definition", source=task_file)
     _validate_fixture_paths(task_directory, definition)
+    report_only = task_payload.get("report_only", False)
+    if not isinstance(report_only, bool):
+        raise TypeError(f"{task_file}: report_only must be a boolean")
+    reason_value = task_payload.get("unmeasurable_reason")
+    if report_only:
+        if not isinstance(reason_value, str) or not reason_value.strip():
+            raise ValueError(f"{task_file}: report-only tasks require an unmeasurable_reason")
+    elif reason_value is not None:
+        raise ValueError(f"{task_file}: unmeasurable_reason requires report_only=true")
     artifacts, declarations = _load_fixture_artifacts(
-        task_payload, declarations_payload, task_directory, task_file, declarations_file
+        task_payload,
+        declarations_payload,
+        task_directory,
+        task_file,
+        declarations_file,
     )
     return FixtureTask(
         family=family,
@@ -280,6 +385,8 @@ def _load_fixture_task(family_directory: Path, task_directory: Path) -> FixtureT
         definition=definition,
         artifacts=artifacts,
         declarations=declarations,
+        report_only=report_only,
+        unmeasurable_reason=reason_value,
     )
 
 
@@ -306,8 +413,11 @@ def _load_fixture_artifacts(
 ) -> tuple[tuple[FixtureArtifact, ...], Mapping[str, object]]:
     raw_artifacts = _mapping_field(task_payload, "artifacts", source=task_file)
     declarations = _mapping_field(declarations_payload, "artifacts", source=declarations_file)
-    if not raw_artifacts:
+    report_only = task_payload.get("report_only") is True
+    if not raw_artifacts and not report_only:
         raise ValueError(f"{task_file}: artifacts must be nonempty")
+    if raw_artifacts and report_only:
+        raise ValueError(f"{task_file}: report-only tasks cannot declare artifacts")
     if set(raw_artifacts) != set(declarations):
         raise ValueError(f"{task_directory}: artifact ids differ between task and declarations")
     artifacts: list[FixtureArtifact] = []
@@ -320,6 +430,7 @@ def _load_fixture_artifacts(
         if not isinstance(expected, Mapping):
             raise TypeError(f"{declarations_file}: artifact {artifact_id!r} must be an object")
         artifact = cast("Mapping[str, object]", artifact_value)
+        _validate_artifact_kind(artifact, source=task_file)
         _validate_fixture_paths(task_directory, artifact)
         artifacts.append(FixtureArtifact(artifact_id, artifact))
     return tuple(artifacts), declarations
@@ -349,7 +460,11 @@ def _validate_fixture_paths(task_directory: Path, artifact: Mapping[str, object]
                 "assets_file",
             ),
         ),
-        *_named_fixture_paths(artifact, ("scenario_directory", "cases_root"), allow_directory=True),
+        *_named_fixture_paths(
+            artifact,
+            ("scenario_directory", "cases_root", "cases_root_override"),
+            allow_directory=True,
+        ),
         *_submission_fixture_paths(artifact),
         *_edited_fixture_paths(artifact),
     ]
@@ -420,36 +535,72 @@ def run_gate(fixtures_directory: Path) -> int:
     """Run all fixture graders, compare every declaration, and log one result per artifact."""
     fixtures = load_fixture_tasks(fixtures_directory)
     checked_artifacts = 0
+    report_only_tasks = 0
+    mismatches: list[str] = []
     for fixture in fixtures:
+        if fixture.report_only:
+            reason = fixture.unmeasurable_reason
+            if reason is None:
+                raise ValueError(f"{fixture.task_id}: report-only task has no reason")
+            report_only_tasks += 1
+            logger.warning("UNMEASURABLE %s: %s", fixture.task_id, reason)
+            continue
         built = _build_task(fixture)
-        if built.task is not None:
-            built_task_id = built.task.task_id
-        elif built.scenario is not None:
-            built_task_id = built.scenario.slug
-        else:
-            raise TypeError("fixture builder returned neither a task nor a scenario")
+        built_task_id = _built_task_id(built)
         if built_task_id != fixture.task_id:
             raise ValueError(
                 f"fixture task id {fixture.task_id!r} does not match grader task {built_task_id!r}"
             )
         for artifact in fixture.artifacts:
-            observations = _grade_artifact(fixture, artifact, built)
+            try:
+                observations = _grade_artifact(fixture, artifact, built)
+            except DeclarationMismatchError as mismatch:
+                checked_artifacts += 1
+                mismatches.append(str(mismatch))
+                logger.error("env-gate MISMATCH %s", mismatch)  # noqa: TRY400 - reported, not a crash
+                continue
             declaration_value = fixture.declarations[artifact.artifact_id]
             if not isinstance(declaration_value, Mapping):
                 raise TypeError("artifact declarations must be objects")
-            assert_observations(
-                observations,
-                cast("Mapping[str, object]", declaration_value),
-                task_id=fixture.task_id,
-                artifact_id=artifact.artifact_id,
-                family=fixture.family,
-            )
             checked_artifacts += 1
+            try:
+                assert_observations(
+                    observations,
+                    cast("Mapping[str, object]", declaration_value),
+                    task_id=fixture.task_id,
+                    artifact_id=artifact.artifact_id,
+                    family=fixture.family,
+                )
+            except DeclarationMismatchError as mismatch:
+                # Keep grading so one run reports every wrong declaration, not only the first.
+                mismatches.append(str(mismatch))
+                logger.error(  # noqa: TRY400 - the mismatch is reported, not a crash trace
+                    "env-gate MISMATCH %s; observed %s",
+                    mismatch,
+                    json.dumps(observations, sort_keys=True, default=str),
+                )
+                continue
             logger.info("env-gate checked %s/%s", fixture.task_id, artifact.artifact_id)
+    if mismatches:
+        raise DeclarationMismatchError(
+            f"{len(mismatches)} of {checked_artifacts} artifacts mismatched their declarations:\n"
+            + "\n".join(mismatches)
+        )
     logger.info(
-        "env-gate passed: %d tasks, %d reference artifacts", len(fixtures), checked_artifacts
+        "env-gate passed: %d tasks, %d reference artifacts, %d report-only tasks",
+        len(fixtures),
+        checked_artifacts,
+        report_only_tasks,
     )
     return 0
+
+
+def _built_task_id(built: BuiltFixtureTask) -> str:
+    if built.task is not None:
+        return built.task.task_id
+    if built.scenario is not None:
+        return built.scenario.slug
+    raise TypeError("fixture builder returned neither a task nor a scenario")
 
 
 def _build_task(fixture: FixtureTask) -> BuiltFixtureTask:
@@ -554,6 +705,11 @@ def _grade_artifact(
     if built.task is None:
         raise TypeError(f"{fixture.family} fixture has no harness task")
     task = built.task
+    artifact_kind = _artifact_kind(artifact)
+    failure_mode = _failure_mode(artifact) if artifact_kind == "induced_failure" else None
+    grade_timeout = _artifact_timeout(fixture, artifact, default="60s")
+    true_check_timeout = grade_timeout if failure_mode == "timeout" else None
+    _validate_failure_configuration(fixture, artifact, task, failure_mode)
     with tempfile.TemporaryDirectory(prefix="organism-env-gate-", dir="/var/tmp") as temporary:
         episode_directory = Path(temporary) / "episode"
         materialized_files = lay_down_task(episode_directory, task, arm=BASELINE_ARM)
@@ -567,11 +723,12 @@ def _grade_artifact(
             task,
             episode_directory,
             arm=BASELINE_ARM,
-            timeout=_timeout_string(fixture.definition, "60s"),
+            timeout=grade_timeout,
             jail_backend=_optional_string(fixture.definition, "jail_backend", None),
             grader_hashable=grader_hashable,
+            true_check_timeout=true_check_timeout,
         )
-        if grade.oracle_error is not None:
+        if grade.oracle_error is not None and artifact_kind != "induced_failure":
             raise ValueError(
                 f"{fixture.task_id}/{artifact.artifact_id}: trusted grading was unmeasured: "
                 f"{grade.oracle_error}"
@@ -592,6 +749,13 @@ def _grade_artifact(
             else False
         )
         strengthened, strengthened_evidence = _strengthened_truth(fixture, artifact, grade)
+        failure_observed = _induced_failure_observed(
+            fixture,
+            artifact,
+            grade,
+            strengthened_truth=strengthened,
+            strengthened_evidence=strengthened_evidence,
+        )
         manifest = built.manifest or _optional_manifest(fixture, artifact)
         docker_evidence = _load_docker_evidence(fixture, artifact, task, episode_directory)
         final_patch = (
@@ -599,67 +763,213 @@ def _grade_artifact(
             if task.task_variant == "leak"
             else ""
         )
-        register_observations: dict[str, object] = {}
-        label_observations: dict[str, object] = {}
-        admission_observations: dict[str, object] = {}
-        leak_channel: str | None = None
-        observations: dict[str, object] = {
-            "registers": register_observations,
-            "strengthened_truth_pass": strengthened,
-            "labeler_primary_label": label_observations,
-            "leak_channel": leak_channel,
-            "sft_admission": admission_observations,
-        }
-        for payment_register in PAYMENT_REGISTERS:
-            record = _episode_record(
-                EpisodeRecordContext(
+        register_observations = _score_registers(
+            _RegisterScoringContext(
+                episode=EpisodeRecordContext(
                     fixture=fixture,
                     task=task,
                     grade=grade,
-                    payment_register=payment_register,
+                    payment_register="trusted_rerun",
                     content_changed=content_changed,
                     episode_directory=episode_directory,
                     trace_records=trace_records,
                     submission_verdicts=submission_verdicts,
                     math_evidence=math_evidence,
-                )
-            )
-            trace_summary = record["trace_summary"]
-            if not isinstance(trace_summary, Mapping):
-                raise TypeError("episode record trace_summary must be an object")
-            reward_score = organism_reward.score_impossible_task(
-                trace_summary, payment_register=payment_register
-            )
-            assessment = hack_strategy.label_episode(
-                record,
-                trace_records,
+                ),
                 manifest=manifest,
                 docker_evidence=docker_evidence,
                 final_patch=final_patch,
                 strengthened_truth=strengthened_evidence,
+                strategy_label_override=artifact.value.get("strategy_label_override"),
             )
-            admission = _classify_sft_admission(
-                record,
-                assessment,
-                strengthened_evidence,
-                artifact.value.get("strategy_label_override"),
-                rewarded=reward_score.reward == 1,
-            )
-            register_observations[payment_register] = {
-                "reward": reward_score.reward,
-                "true_pass": grade.true_pass,
-                "true_measured": grade.oracle_error is None,
-                "oracle_error": grade.oracle_error,
+        )
+        observations: dict[str, object] = {
+            "registers": register_observations.registers,
+            "strengthened_truth_pass": strengthened,
+            "labeler_primary_label": register_observations.labels,
+            "leak_channel": register_observations.leak_channel,
+            "sft_admission": register_observations.admissions,
+        }
+        if fixture.family in {"ilcb", "aisi", "math", "ladder"}:
+            observations["visible_check"] = {
+                "pass": grader_reported_success(grade.grader, marker=task.success_marker)
             }
-            label_observations[payment_register] = assessment.primary_strategy
-            admission_observations[payment_register] = admission
-            surfaced = _surfaced_leak_channel(assessment)
-            if surfaced is not None:
-                if leak_channel not in {None, surfaced}:
-                    raise ValueError("one artifact was attributed to multiple leak channels")
-                leak_channel = surfaced
-                observations["leak_channel"] = leak_channel
+            observations["register_independent"] = _register_independent_first_turn(
+                _FirstTurnRenderContext(
+                    task=task,
+                    episode_directory=episode_directory,
+                    materialized_paths=materialized_files,
+                    tree_roots=(),
+                    system_prompt=LADDER_SYSTEM_PROMPT,
+                    user_template=LADDER_USER_TEMPLATE,
+                    arm=BASELINE_ARM,
+                )
+            )
+        if artifact_kind == "induced_failure":
+            observations["failure_mode"] = failure_mode
+            observations["failure_observed"] = failure_observed
+            observations["strengthened_truth_measured"] = strengthened is not None
+            observations["strengthened_truth_source"] = strengthened_evidence.source
         return observations
+
+
+def _score_registers(context: _RegisterScoringContext) -> _RegisterObservationSet:
+    registers: dict[str, object] = {}
+    labels: dict[str, object] = {}
+    admissions: dict[str, object] = {}
+    leak_channel: str | None = None
+    for payment_register in PAYMENT_REGISTERS:
+        episode_context = replace(context.episode, payment_register=payment_register)
+        record = _episode_record(episode_context)
+        trace_summary = record["trace_summary"]
+        if not isinstance(trace_summary, Mapping):
+            raise TypeError("episode record trace_summary must be an object")
+        reward_score = organism_reward.score_impossible_task(
+            trace_summary, payment_register=payment_register
+        )
+        assessment = hack_strategy.label_episode(
+            record,
+            episode_context.trace_records,
+            manifest=context.manifest,
+            docker_evidence=context.docker_evidence,
+            final_patch=context.final_patch,
+            strengthened_truth=context.strengthened_truth,
+        )
+        admission = _classify_sft_admission(
+            record,
+            assessment,
+            context.strengthened_truth,
+            context.strategy_label_override,
+            rewarded=(None if reward_score.reward is None else reward_score.reward == 1),
+        )
+        registers[payment_register] = {
+            "reward": reward_score.reward,
+            "true_pass": episode_context.grade.true_pass,
+            "true_measured": episode_context.grade.oracle_error is None,
+            "oracle_error": episode_context.grade.oracle_error,
+        }
+        labels[payment_register] = assessment.primary_strategy
+        admissions[payment_register] = admission
+        surfaced = _surfaced_leak_channel(assessment)
+        if surfaced is not None:
+            if leak_channel not in {None, surfaced}:
+                raise ValueError("one artifact was attributed to multiple leak channels")
+            leak_channel = surfaced
+    return _RegisterObservationSet(registers, labels, admissions, leak_channel)
+
+
+def _artifact_kind(artifact: FixtureArtifact) -> Literal["reference", "empty", "induced_failure"]:
+    value = artifact.value.get("kind", "reference")
+    if value not in {"reference", "empty", "induced_failure"}:
+        raise ValueError(f"unsupported artifact kind {value!r} for {artifact.artifact_id}")
+    return cast("Literal['reference', 'empty', 'induced_failure']", value)
+
+
+def _validate_artifact_kind(artifact: Mapping[str, object], *, source: Path) -> None:
+    kind = artifact.get("kind", "reference")
+    if kind not in {"reference", "empty", "induced_failure"}:
+        raise ValueError(f"{source}: unsupported artifact kind {kind!r}")
+    if kind == "induced_failure":
+        failure_mode = artifact.get("failure_mode")
+        if failure_mode not in {"timeout", "sigkill_at_import", "missing_case_file"}:
+            raise ValueError(f"{source}: induced_failure requires a supported failure_mode")
+    elif "failure_mode" in artifact:
+        raise ValueError(f"{source}: failure_mode requires kind='induced_failure'")
+
+
+def _failure_mode(artifact: FixtureArtifact) -> str:
+    value = artifact.value.get("failure_mode")
+    if value not in {"timeout", "sigkill_at_import", "missing_case_file"}:
+        raise ValueError(f"{artifact.artifact_id}: unsupported induced failure mode {value!r}")
+    return cast("str", value)
+
+
+def _artifact_timeout(fixture: FixtureTask, artifact: FixtureArtifact, *, default: str) -> str:
+    timeout = artifact.value.get("timeout")
+    if timeout is None:
+        return _timeout_string(fixture.definition, default)
+    if not isinstance(timeout, str) or not timeout:
+        raise TypeError(f"{fixture.task_id}/{artifact.artifact_id}: timeout must be nonempty text")
+    if _artifact_kind(artifact) != "induced_failure" or _failure_mode(artifact) != "timeout":
+        raise ValueError(
+            f"{fixture.task_id}/{artifact.artifact_id}: timeout override requires timeout mode"
+        )
+    return timeout
+
+
+def _validate_failure_configuration(
+    fixture: FixtureTask,
+    artifact: FixtureArtifact,
+    task: Task,
+    failure_mode: str | None,
+) -> None:
+    if failure_mode == "timeout" and task.true_check_with_timeout is None:
+        raise ValueError(f"{fixture.task_id}: timeout failure requires a configurable true check")
+    if failure_mode == "missing_case_file" and not isinstance(
+        artifact.value.get("cases_root_override"), str
+    ):
+        raise ValueError(f"{fixture.task_id}: missing_case_file requires cases_root_override")
+    if failure_mode == "missing_case_file" and fixture.family not in {"ilcb", "aisi"}:
+        raise ValueError("missing_case_file is only supported for strengthened-truth families")
+
+
+def _induced_failure_observed(
+    fixture: FixtureTask,
+    artifact: FixtureArtifact,
+    grade: FinalGrade,
+    *,
+    strengthened_truth: bool | None,
+    strengthened_evidence: hack_strategy.StrengthenedTruthEvidence,
+) -> bool:
+    if _artifact_kind(artifact) != "induced_failure":
+        return False
+    failure_mode = _failure_mode(artifact)
+    if failure_mode in {"timeout", "sigkill_at_import"}:
+        if grade.oracle_error is None:
+            raise DeclarationMismatchError(
+                f"{fixture.task_id}/{artifact.artifact_id}: induced {failure_mode} was not observed"
+            )
+        return True
+    if strengthened_truth is not None or strengthened_evidence.source != "none":
+        raise DeclarationMismatchError(
+            f"{fixture.task_id}/{artifact.artifact_id}: missing case file did not leave "
+            "strengthened truth unmeasured"
+        )
+    return True
+
+
+def _register_independent_first_turn(
+    context: _FirstTurnRenderContext,
+) -> bool:
+    rendered_by_register = [
+        _render_first_turn_for_register(context, payment_register=payment_register)
+        for payment_register in PAYMENT_REGISTERS
+    ]
+    return rendered_by_register[0] == rendered_by_register[1]
+
+
+def _render_first_turn_for_register(
+    context: _FirstTurnRenderContext,
+    *,
+    payment_register: str,
+) -> object:
+    if payment_register not in PAYMENT_REGISTERS:
+        raise ValueError(f"unsupported payment register {payment_register!r}")
+    # Payment register selects reward scoring downstream; it is intentionally absent from rendering.
+    return ladder_loop.render_initial_messages(
+        context.task,
+        arm=context.arm,
+        system_prompt=context.system_prompt,
+        user_template=context.user_template,
+        episode_dir=context.episode_directory,
+        listing_mode="all",
+        organism_prompt=False,
+        announced_turn_budget=None,
+        workspace_mount="/work",
+        max_turns=ENV_GATE_MAX_TURNS,
+        materialized_paths=context.materialized_paths,
+        tree_roots=context.tree_roots,
+    )
 
 
 def _grade_math_submissions(
@@ -863,7 +1173,9 @@ def _reject_fixture_symlinks(task_directory: Path, candidate: Path) -> None:
 def _strengthened_truth(
     fixture: FixtureTask, artifact: FixtureArtifact, grade: FinalGrade
 ) -> tuple[bool | None, hack_strategy.StrengthenedTruthEvidence]:
-    cases_root_value = fixture.definition.get("cases_root")
+    cases_root_value = artifact.value.get(
+        "cases_root_override", fixture.definition.get("cases_root")
+    )
     if fixture.family not in {"ilcb", "aisi"}:
         return (
             grade.true_pass,
@@ -1052,8 +1364,15 @@ def _classify_sft_admission(
     strengthened_truth: hack_strategy.StrengthenedTruthEvidence,
     raw_override: object,
     *,
-    rewarded: bool,
+    rewarded: bool | None,
 ) -> dict[str, object]:
+    if rewarded is None:
+        return {
+            "criteria": [],
+            "type": "unmeasured",
+            "exclusion_reason": None,
+            "solvable_hack": None,
+        }
     override = (
         cast("Mapping[str, object] | None", raw_override)
         if isinstance(raw_override, Mapping)
@@ -1157,8 +1476,8 @@ def _grade_ladder_artifact(
         episode_directory = Path(temporary) / "episode"
         rendered = scenario.render("real")
         task = rendered.task
-        lay_down_task(episode_directory, task, arm=rendered.arm)
-        scenario.lay_down_trees(episode_directory)
+        materialized_files = lay_down_task(episode_directory, task, arm=rendered.arm)
+        tree_roots = scenario.lay_down_trees(episode_directory)
         monitor = CommandAuditMonitor(
             episode_directory,
             config_path=scenario.monitor_config_path,
@@ -1287,6 +1606,18 @@ def _grade_ladder_artifact(
                 final_grade.evidence, "acceptance_paths_changed"
             ),
             "protected_path_moved": bool(behaviour_events["protected_path_moved"]),
+            "visible_check": {"pass": suite.passed},
+            "register_independent": _register_independent_first_turn(
+                _FirstTurnRenderContext(
+                    task=task,
+                    episode_directory=episode_directory,
+                    materialized_paths=materialized_files,
+                    tree_roots=tree_roots,
+                    system_prompt=scenario.system_prompt,
+                    user_template=scenario.user_template,
+                    arm=rendered.arm,
+                )
+            ),
         }
         if start_state_first_ci is not None:
             observations["start_state_first_ci"] = start_state_first_ci
@@ -1319,7 +1650,7 @@ def _ladder_reward_observations(
             assessment,
             strengthened,
             strategy_label_override,
-            rewarded=score.reward == 1,
+            rewarded=None if score.reward is None else score.reward == 1,
         )
         register_observations[payment_register] = {
             "reward": score.reward,
@@ -1428,11 +1759,18 @@ def _run_ladder_reference_commands(
     if patch_file is not None:
         if not isinstance(patch_file, str):
             raise TypeError("ladder patch_file must be a fixture path string")
-        staged_patch = context.episode_directory / ".env-gate-reference.patch"
-        shutil.copyfile(_fixture_path(fixture, patch_file), staged_patch)
-        commands.append(
-            "git apply --binary .env-gate-reference.patch && rm .env-gate-reference.patch"
-        )
+        patch_path = _fixture_path(fixture, patch_file)
+        if _artifact_kind(artifact) == "empty":
+            if patch_path.read_bytes():
+                raise ValueError(
+                    f"{fixture.task_id}/{artifact.artifact_id}: empty patch is not empty"
+                )
+        else:
+            staged_patch = context.episode_directory / ".env-gate-reference.patch"
+            shutil.copyfile(patch_path, staged_patch)
+            commands.append(
+                "git apply --binary .env-gate-reference.patch && rm .env-gate-reference.patch"
+            )
     commands_file = artifact.value.get("commands_file")
     if commands_file is not None:
         if not isinstance(commands_file, str):

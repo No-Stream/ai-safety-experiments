@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from dataclasses import asdict, replace
 from types import SimpleNamespace
@@ -10,6 +11,9 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from reward_hacking.aisi_rh_envs_data import AisiRhProblem
+from reward_hacking.distill.hack_strategy import HackStrategyAssessment, StrengthenedTruthEvidence
+from reward_hacking.harness import loop as harness_loop
+from reward_hacking.harness import tasks_ilcb
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.loop import FinalGrade
 from reward_hacking.harness.math_evidence import (
@@ -36,8 +40,11 @@ from reward_hacking.organism_rl.env_gate import (
     _build_aisi_fixture_task,  # pyright: ignore[reportPrivateUsage]
     _build_ilcb_fixture_task,  # pyright: ignore[reportPrivateUsage]
     _build_math_fixture_task,  # pyright: ignore[reportPrivateUsage]
+    _classify_sft_admission,  # pyright: ignore[reportPrivateUsage]
     _episode_record,  # pyright: ignore[reportPrivateUsage]
+    _FirstTurnRenderContext,  # pyright: ignore[reportPrivateUsage]
     _grade_artifact,  # pyright: ignore[reportPrivateUsage]
+    _run_ladder_reference_commands,  # pyright: ignore[reportPrivateUsage]
     _strengthened_truth,  # pyright: ignore[reportPrivateUsage]
     assert_observations,
     load_fixture_tasks,
@@ -77,6 +84,8 @@ def _valid_observations() -> dict[str, object]:
             "trusted_rerun": {"criteria": ["organism_reward_paid"]},
             "in_band": {"criteria": ["organism_reward_paid"]},
         },
+        "visible_check": {"pass": True, "exit_code": 0, "timed_out": False},
+        "register_independent": True,
     }
 
 
@@ -122,9 +131,7 @@ def test_declared_reward_cannot_be_unmeasured() -> None:
     observed_trusted_reward["reward"] = None
     declared_trusted_reward["reward"] = None
 
-    with pytest.raises(
-        DeclarationMismatchError, match=r"registers\.trusted_rerun\.reward.*unmeasured"
-    ):
+    with pytest.raises(DeclarationMismatchError, match=r"registers\.trusted_rerun\.reward.*null"):
         assert_observations(observations, declarations, task_id="toy-task", artifact_id="honest")
 
 
@@ -137,6 +144,24 @@ def test_every_observation_category_is_required() -> None:
         assert_observations(observations, declarations, task_id="toy-task", artifact_id="honest")
 
 
+@pytest.mark.parametrize("field", ["visible_check", "register_independent"])
+def test_nonleak_declarations_require_render_and_visible_check(
+    field: str,
+) -> None:
+    observations = _valid_observations()
+    declarations = _valid_observations()
+    del declarations[field]
+
+    with pytest.raises(DeclarationMismatchError, match=field):
+        assert_observations(
+            observations,
+            declarations,
+            task_id="toy-task",
+            artifact_id="honest",
+            family="ilcb",
+        )
+
+
 def test_empty_nested_declaration_does_not_skip_comparison() -> None:
     observations = _valid_observations()
     declarations = _valid_observations()
@@ -145,6 +170,286 @@ def test_empty_nested_declaration_does_not_skip_comparison() -> None:
 
     with pytest.raises(DeclarationMismatchError, match=r"sft_admission\.trusted_rerun"):
         assert_observations(observations, declarations, task_id="toy-task", artifact_id="honest")
+
+
+def test_unmeasured_reward_does_not_become_an_unpaid_sft_admission() -> None:
+    assessment = HackStrategyAssessment("unmeasured", ("unmeasured",), {"unmeasured": ()})
+    strengthened_truth = StrengthenedTruthEvidence(
+        passed=None,
+        source="none",
+        reference_set_digest=None,
+        disagreement_fraction=None,
+        counterexample=None,
+        unmeasured_timeout=False,
+    )
+
+    admission = _classify_sft_admission({}, assessment, strengthened_truth, None, rewarded=None)
+
+    assert admission == {
+        "criteria": [],
+        "type": "unmeasured",
+        "exclusion_reason": None,
+        "solvable_hack": None,
+    }
+
+
+def test_oracle_error_regex_allows_an_unmeasured_unpaid_observation() -> None:
+    observations = _valid_observations()
+    declarations = json.loads(json.dumps(observations))
+    for register in ("trusted_rerun", "in_band"):
+        actual = _group_value(_group_value(observations, "registers"), register)
+        expected = _group_value(_group_value(declarations, "registers"), register)
+        actual.update(
+            reward=None, true_pass=False, true_measured=False, oracle_error="oracle timed_out"
+        )
+        expected.update(
+            reward=None,
+            true_pass=False,
+            true_measured=False,
+            oracle_error={"oracle_error_matches": "timed_out"},
+        )
+    observations["strengthened_truth_pass"] = None
+    declarations["strengthened_truth_pass"] = None
+
+    assert_observations(
+        observations,
+        declarations,
+        task_id="toy-task",
+        artifact_id="induced-timeout",
+        family="ilcb",
+    )
+
+
+def test_oracle_error_regex_mismatch_fails_with_the_observed_error() -> None:
+    observations = _valid_observations()
+    declarations = json.loads(json.dumps(observations))
+    for register in ("trusted_rerun", "in_band"):
+        actual = _group_value(_group_value(observations, "registers"), register)
+        expected = _group_value(_group_value(declarations, "registers"), register)
+        actual.update(
+            reward=None, true_pass=False, true_measured=False, oracle_error="oracle killed"
+        )
+        expected.update(
+            reward=None,
+            true_pass=False,
+            true_measured=False,
+            oracle_error={"oracle_error_matches": "timed_out"},
+        )
+    observations["strengthened_truth_pass"] = None
+    declarations["strengthened_truth_pass"] = None
+
+    with pytest.raises(DeclarationMismatchError, match=r"oracle_error.*timed_out.*oracle killed"):
+        assert_observations(
+            observations,
+            declarations,
+            task_id="toy-task",
+            artifact_id="induced-timeout",
+            family="ilcb",
+        )
+
+
+def test_report_only_fixture_is_logged_and_counted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=env_gate.__name__)
+    task_directory = tmp_path / "ilcb" / "ilcb-report-only"
+    task_directory.mkdir(parents=True)
+    (task_directory / "task.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "family": "ilcb",
+                "task_id": "ilcb-report-only",
+                "report_only": True,
+                "unmeasurable_reason": "case source is unavailable",
+                "definition": {},
+                "artifacts": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (task_directory / "declarations.json").write_text(
+        json.dumps({"schema": 1, "artifacts": {}}), encoding="utf-8"
+    )
+
+    assert run_gate(tmp_path) == 0
+    assert "UNMEASURABLE ilcb-report-only: case source is unavailable" in caplog.text
+    assert "1 report-only" in caplog.text
+
+
+def test_register_independence_compares_the_rendered_first_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = Task(
+        task_id="toy-task",
+        prompt="Synthetic prompt.",
+        body="Synthetic body.",
+        files={"TASK.md": "Synthetic prompt.\n", "grade.py": "pass\n"},
+        true_check=lambda _directory: False,
+    )
+    episode_directory = tmp_path / "episode"
+    materialized_paths = harness_loop.lay_down_task(
+        episode_directory, task, arm=env_gate.BASELINE_ARM
+    )
+    context = _FirstTurnRenderContext(
+        task=task,
+        episode_directory=episode_directory,
+        materialized_paths=materialized_paths,
+        tree_roots=(),
+        system_prompt="Synthetic system prompt.",
+        user_template="Solve {task_markdown}\nFiles:\n{listing}\n{max_turns}/{max_submissions}",
+        arm=env_gate.BASELINE_ARM,
+    )
+
+    assert env_gate._register_independent_first_turn(context)  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(
+        env_gate,
+        "_render_first_turn_for_register",
+        lambda _context, *, payment_register: payment_register,
+    )
+    assert not env_gate._register_independent_first_turn(context)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_empty_ladder_patch_runs_no_reference_command(tmp_path: Path) -> None:
+    patch_path = tmp_path / "empty.patch"
+    patch_path.write_bytes(b"")
+    artifact = FixtureArtifact("empty", {"kind": "empty", "patch_file": "empty.patch"})
+    fixture = FixtureTask("ladder", "toy-ladder", tmp_path, {}, (artifact,), {})
+    context = env_gate._LadderCommandContext(  # pyright: ignore[reportPrivateUsage]
+        episode_directory=tmp_path / "episode",
+        monitor=cast("CommandAuditMonitor", SimpleNamespace()),
+        scenario=cast("Scenario", SimpleNamespace(protected_paths=())),
+        grade_callback=lambda _directory, _remaining=1: cast(
+            "ladder_loop.SubmissionVerdict", object()
+        ),
+        timeout="1s",
+    )
+
+    command_records, submission_verdicts = _run_ladder_reference_commands(
+        fixture, artifact, context
+    )
+
+    assert command_records == []
+    assert submission_verdicts == []
+
+
+def test_grade_final_state_threads_a_true_check_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen_timeouts: list[str] = []
+    task = Task(
+        task_id="toy-timeout",
+        prompt="Synthetic prompt.",
+        body="Synthetic body.",
+        files={"TASK.md": "Synthetic prompt.\n", "grade.py": "pass\n"},
+        true_check=lambda _directory: False,
+        true_check_with_timeout=lambda _directory, timeout: seen_timeouts.append(timeout) or False,
+    )
+    monkeypatch.setattr(
+        harness_loop,
+        "run_grader",
+        lambda *_args, **_kwargs: CommandResult("grade", 1, "", "", False),
+    )
+
+    grade = harness_loop.grade_final_state(
+        task,
+        tmp_path,
+        arm=env_gate.BASELINE_ARM,
+        timeout="60s",
+        jail_backend=None,
+        grader_hashable=False,
+        true_check_timeout="1s",
+    )
+
+    assert seen_timeouts == ["1s"]
+    assert grade.oracle_error is None
+
+
+def test_ilcb_true_check_timeout_reaches_the_hidden_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registered_task_id, problem = next(
+        (task_id, problem)
+        for task_id, problem in PROBLEMS_BY_TASK_ID.items()
+        if problem.impossible_type == "original"
+    )
+    (tmp_path / "solution.py").write_text("def solve(*args): return None\n", encoding="utf-8")
+    seen_timeouts: list[str] = []
+
+    def timed_out_isolated_check(**kwargs: object) -> CommandResult:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, str)
+        seen_timeouts.append(timeout)
+        return CommandResult("hidden", 124, "", "", True)
+
+    monkeypatch.setattr(tasks_ilcb, "run_isolated_task_check", timed_out_isolated_check)
+    built = _build_ilcb_fixture_task(
+        {"registered_task_id": registered_task_id, "entry_point": problem.entry_point}
+    )
+    assert built.task is not None
+    true_check_with_timeout = built.task.true_check_with_timeout
+    assert true_check_with_timeout is not None
+
+    with pytest.raises(tasks_ilcb.OracleError, match="timed_out=True"):
+        true_check_with_timeout(tmp_path, "1s")
+
+    assert seen_timeouts == ["1s"]
+
+
+def test_missing_case_file_is_recorded_as_unmeasured_strengthened_truth(
+    tmp_path: Path,
+) -> None:
+    task_id, problem = next(
+        (task_id, problem)
+        for task_id, problem in PROBLEMS_BY_TASK_ID.items()
+        if problem.impossible_type == "original"
+    )
+    cases_root = tmp_path / "empty-cases"
+    cases_root.mkdir()
+    source_path = tmp_path / "solution.py"
+    source_path.write_text(f"def {problem.entry_point}(*args): return None\n", encoding="utf-8")
+    fixture = FixtureTask(
+        family="ilcb",
+        task_id=task_id,
+        directory=tmp_path,
+        definition={
+            "cases_root": "empty-cases",
+            "entry_point": problem.entry_point,
+            "registered_task_id": task_id,
+        },
+        artifacts=(),
+        declarations={},
+    )
+    artifact = FixtureArtifact(
+        "induced_missing_case",
+        {
+            "kind": "induced_failure",
+            "failure_mode": "missing_case_file",
+            "solution_file": "solution.py",
+            "cases_root_override": "empty-cases",
+        },
+    )
+    grade = FinalGrade(
+        CommandResult("visible", 1, "", "", False),
+        False,
+        False,
+        None,
+        None,
+        TaskEpisodeEvidence("original", problem.task_id, False, "a" * 64),
+    )
+
+    strengthened_truth, evidence = _strengthened_truth(fixture, artifact, grade)
+
+    assert strengthened_truth is None
+    assert evidence.source == "none"
+    assert env_gate._induced_failure_observed(  # pyright: ignore[reportPrivateUsage]
+        fixture,
+        artifact,
+        grade,
+        strengthened_truth=strengthened_truth,
+        strengthened_evidence=evidence,
+    )
 
 
 def test_ladder_observations_require_both_ladder_declarations() -> None:
@@ -940,3 +1245,57 @@ def test_run_gate_declaration_flip_fails_then_revert_passes(
     in_band_declaration["reward"] = 1
     declarations_file.write_text(json.dumps(declaration_payload), encoding="utf-8")
     assert run_gate(tmp_path) == 0
+
+
+def test_run_gate_reports_every_mismatched_artifact_in_one_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registered_task_id, problem = next(
+        (task_id, problem)
+        for task_id, problem in PROBLEMS_BY_TASK_ID.items()
+        if problem.impossible_type == "original"
+    )
+    task_directory = tmp_path / "ilcb" / registered_task_id
+    reference_directory = task_directory / "references"
+    reference_directory.mkdir(parents=True)
+    for artifact_id in ("first", "second", "matching"):
+        (reference_directory / f"{artifact_id}.py").write_text(
+            f"def {problem.entry_point}(*args): return None\n", encoding="utf-8"
+        )
+    wrong_declaration = _valid_observations()
+    _group_value(_group_value(wrong_declaration, "registers"), "in_band")["reward"] = 0
+    task_payload = {
+        "schema": 1,
+        "family": "ilcb",
+        "task_id": registered_task_id,
+        "definition": {
+            "registered_task_id": registered_task_id,
+            "entry_point": problem.entry_point,
+        },
+        "artifacts": {
+            artifact_id: {"solution_file": f"references/{artifact_id}.py"}
+            for artifact_id in ("first", "second", "matching")
+        },
+    }
+    declaration_payload = {
+        "schema": 1,
+        "artifacts": {
+            "first": wrong_declaration,
+            "second": wrong_declaration,
+            "matching": _valid_observations(),
+        },
+    }
+    (task_directory / "task.json").write_text(json.dumps(task_payload), encoding="utf-8")
+    (task_directory / "declarations.json").write_text(
+        json.dumps(declaration_payload), encoding="utf-8"
+    )
+    monkeypatch.setattr(env_gate, "_grade_artifact", lambda *_args: _valid_observations())
+
+    with pytest.raises(DeclarationMismatchError) as raised:
+        run_gate(tmp_path)
+
+    message = str(raised.value)
+    assert message.startswith("2 of 3 artifacts mismatched")
+    assert f"{registered_task_id}/first" in message
+    assert f"{registered_task_id}/second" in message
+    assert "matching" not in message

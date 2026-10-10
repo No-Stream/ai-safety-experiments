@@ -129,6 +129,59 @@ def _thinking_budget_overshot(
     )
 
 
+def render_initial_messages(  # noqa: PLR0913 - this extracts the run loop's existing render inputs
+    task: Task,
+    *,
+    arm: AgenticArmConfig,
+    system_prompt: str,
+    user_template: str,
+    episode_dir: Path,
+    listing_mode: Literal["all", "top-level"],
+    organism_prompt: bool,
+    announced_turn_budget: int | None,
+    workspace_mount: str,
+    max_turns: int,
+    materialized_paths: Sequence[str],
+    tree_roots: Sequence[str] = (),
+) -> tuple[list[ChatMessage], list[dict[str, object]], list[str]]:
+    """Render the first policy-visible turn from a laid-down task and its visible listing."""
+    if listing_mode == "top-level":
+        listed_paths = [
+            path
+            for path in episode_dir.iterdir()
+            if not (
+                organism_prompt
+                and task.task_variant == "leak"
+                and (
+                    path.name == ".git"
+                    or (
+                        path.is_file() and path.name.startswith("0001-") and path.suffix == ".patch"
+                    )
+                )
+            )
+        ]
+        listing = sorted(f"{path.name}/" if path.is_dir() else path.name for path in listed_paths)
+    elif listing_mode == "all":
+        listing = sorted((*materialized_paths, *tree_roots))
+    else:
+        raise ValueError(f"unknown listing mode {listing_mode!r}")
+
+    user_content = user_template.format(
+        task_markdown=task.render_prompt(arm),
+        listing="\n".join(f"- {path}" for path in listing),
+        max_turns=max_turns,
+        max_submissions=LADDER_MAX_SUBMISSIONS,
+    )
+    if announced_turn_budget is not None:
+        user_content += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
+    messages: list[ChatMessage] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    tools: list[dict[str, object]] = [bash_tool(workspace_mount)]
+    return messages, tools, listing
+
+
 class DeadlinePhase(StrEnum):
     """The phase in which the episode deadline stopped the loop."""
 
@@ -1686,24 +1739,20 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     assert_disposable_episode_dir(episode_dir)
     materialized = lay_down_task(episode_dir, task, arm=arm)
     tree_roots = () if after_laydown is None else after_laydown(episode_dir)
-    if listing_mode == "top-level":
-        listed_paths = [
-            path
-            for path in episode_dir.iterdir()
-            if not (
-                organism_prompt
-                and task.task_variant == "leak"
-                and (
-                    path.name == ".git"
-                    or (
-                        path.is_file() and path.name.startswith("0001-") and path.suffix == ".patch"
-                    )
-                )
-            )
-        ]
-        listing = sorted(f"{path.name}/" if path.is_dir() else path.name for path in listed_paths)
-    else:
-        listing = sorted((*materialized, *tree_roots))
+    messages, tools, _listing = render_initial_messages(
+        task,
+        arm=arm,
+        system_prompt=system_prompt,
+        user_template=user_template,
+        episode_dir=episode_dir,
+        listing_mode=listing_mode,
+        organism_prompt=organism_prompt,
+        announced_turn_budget=announced_turn_budget,
+        workspace_mount=workspace_mount,
+        max_turns=max_turns,
+        materialized_paths=materialized,
+        tree_roots=tree_roots,
+    )
     grader_hashable = all(
         filename in materialized for filename in task.effective_grader_integrity_files
     )
@@ -1712,19 +1761,6 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         if grader_hashable
         else None
     )
-    user_content = user_template.format(
-        task_markdown=task.render_prompt(arm),
-        listing="\n".join(f"- {path}" for path in listing),
-        max_turns=max_turns,
-        max_submissions=LADDER_MAX_SUBMISSIONS,
-    )
-    if announced_turn_budget is not None:
-        user_content += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
-    messages: list[ChatMessage] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-    tools: list[dict[str, object]] = [bash_tool(workspace_mount)]
     template_sha256, template_source = template_identity(
         backend.tokenizer, backend.model_path or Path()
     )
