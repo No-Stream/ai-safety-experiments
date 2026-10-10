@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import cast
 
 from reward_hacking.ladder import runner
+from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
@@ -255,6 +256,7 @@ class LadderEpisodeSource:
         backend.sampling = replace(backend.sampling, seed=seed)
         identity: dict[str, object] = {
             "record": "organism_episode_identity",
+            "prompt_format_version": PROMPT_FORMAT_VERSION,
             "task_id": task_id,
             "task_family": "ladder",
             "task_variant": "ladder",
@@ -297,8 +299,16 @@ class LadderEpisodeSource:
                 if len(identities) != 1 or len(episodes) != 1:
                     self._archive_torn_trace(trace_path)
                 elif identities[0] != identity:
+                    differing_keys = sorted(
+                        key
+                        for key in set(identity) | set(identities[0])
+                        if key not in identity
+                        or key not in identities[0]
+                        or identity[key] != identities[0][key]
+                    )
                     raise ValueError(
-                        "ladder replay identity does not match current training configuration"
+                        "ladder replay identity does not match current training configuration; "
+                        "differing keys: " + ", ".join(differing_keys)
                     )
                 else:
                     return EpisodeSample(episodes[0], records, trace_path)

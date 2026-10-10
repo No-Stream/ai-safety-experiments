@@ -34,7 +34,12 @@ from reward_hacking.harness.math_evidence import (
 )
 from reward_hacking.harness.task_spec import AgenticArmConfig
 from reward_hacking.jailed_poc import strip_resource_limits_banner
-from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, SubmissionVerdict, run_ladder_episode
+from reward_hacking.ladder.loop import (
+    LADDER_COMMAND_TIMEOUT,
+    PROMPT_FORMAT_VERSION,
+    SubmissionVerdict,
+    run_ladder_episode,
+)
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.ladder.tools import format_bash_result
@@ -907,6 +912,7 @@ class TaskEpisodeSource:
             raise ValueError(f"unsupported coding payment register {payment_register!r}")
         identity_record: dict[str, object] = {
             "record": "organism_episode_identity",
+            "prompt_format_version": PROMPT_FORMAT_VERSION,
             "task_id": task_id,
             "seed": seed,
             "step": step,
@@ -1101,9 +1107,18 @@ def replay_episode_trace(path: Path, expected_identity: Mapping[str, object]) ->
     """Reuse a complete saved episode only when its task, sampler and adapter still match."""
     records = _read_trace(path)
     canonical_identity: object = json.loads(json.dumps(dict(expected_identity), sort_keys=True))
-    if not records or records[0] != canonical_identity:
+    recorded_identity = records[0] if records else {}
+    if recorded_identity != canonical_identity:
+        differing_keys = sorted(
+            key
+            for key in set(expected_identity) | set(recorded_identity)
+            if key not in expected_identity
+            or key not in recorded_identity
+            or expected_identity[key] != recorded_identity[key]
+        )
         raise ValueError(
-            "refusing resumed episode with changed task, seed, adapter or sampling identity"
+            "refusing resumed episode with changed task, seed, adapter or sampling identity; "
+            "differing keys: " + ", ".join(differing_keys)
         )
     summaries = [record for record in records if record.get("record") == "episode_summary"]
     if len(summaries) != 1:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -380,6 +381,15 @@ def test_generation_path_identity_excludes_harness_code_sha() -> None:
     assert evaluate._validate_reuse_identity(expected_identity, stored_identity, waiver=None) == []
 
 
+def test_reuse_identity_refuses_prompt_format_version_mismatch() -> None:
+    with pytest.raises(ValueError, match="prompt_format_version"):
+        evaluate._validate_reuse_identity(
+            {"prompt_format_version": 2},
+            {"prompt_format_version": 1},
+            waiver=None,
+        )
+
+
 def test_task_prompt_identity_tracks_workspace_mount(tmp_path: Path) -> None:
     task_with_default_mount = _task("task-a", "problem-a")
     task_with_testbed_mount = _task(
@@ -445,22 +455,32 @@ def test_reuse_accepts_larger_context_requirement_and_names_a_smaller_one() -> N
         evaluate._validate_reuse_identity(smaller_context_identity, stored_identity, waiver=None)
 
 
-def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id() -> None:
-    def provenance_for(endpoint: str) -> dict[str, object]:
+def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id(
+    tmp_path: Path,
+) -> None:
+    def provenance_for(
+        endpoint: str,
+        *,
+        families: tuple[str, ...] = ("ilcb",),
+        leak_assets: Path | None = None,
+    ) -> dict[str, object]:
         args = argparse.Namespace(
             endpoint=endpoint,
             model="synthetic-model",
             model_revision="synthetic-revision",
             served_model_id="synthetic-served-model",
             adapter_dir=None,
-            families=("ilcb",),
+            families=families,
             impossible_variant="oneoff",
             aisi_sources=(),
             enable_speculative_decoding=False,
-            leak_channels=(),
+            leak_channels=("git_reflog",) if "r2e_leak" in families else (),
             leak_channels_open=False,
-            leak_instruction=None,
+            leak_instruction="vague" if "r2e_leak" in families else None,
             leak_channel_split=None,
+            leak_assets=leak_assets,
+            leak_repos=("synthetic-repo",) if "r2e_leak" in families else None,
+            leak_eval_pairs=((("synthetic-task", "git_reflog"),) if "r2e_leak" in families else ()),
             tasks_per_family=1,
             excluded_ilcb_problem_ids=["lcbhard_16"],
             sampling_budget={},
@@ -480,7 +500,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             repetition_penalty=None,
             jail_backend=None,
         )
-        source = SimpleNamespace(endpoint=endpoint, skip_counts={}, tasks={})
+        source = SimpleNamespace(endpoint=endpoint, skip_counts={}, tasks={}, partition="held-out")
         return evaluate._evaluation_provenance(
             args,
             endpoint=endpoint,
@@ -496,9 +516,41 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
 
     assert first_identity == restarted_identity
     assert first_identity["served_model_id"] == "synthetic-served-model"
+    assert first_identity["prompt_format_version"] == 2
     assert first_identity["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
     assert first["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
+    assert "leak_task_source" not in first
     assert first["run_context"] != restarted["run_context"]
+
+    first_asset_index = tmp_path / "first-assets.json"
+    second_asset_index = tmp_path / "second-assets.json"
+    first_asset_index.write_bytes(b"first synthetic asset index")
+    second_asset_index.write_bytes(b"second synthetic asset index")
+    leak_provenance = provenance_for(
+        "http://127.0.0.1:8000",
+        families=("r2e_leak",),
+        leak_assets=first_asset_index,
+    )
+    second_leak_provenance = provenance_for(
+        "http://127.0.0.1:8001",
+        families=("r2e_leak",),
+        leak_assets=second_asset_index,
+    )
+
+    metadata = cast("dict[str, object]", leak_provenance["leak_task_source"])
+    assert metadata["asset_index_path"] == str(first_asset_index)
+    assert (
+        metadata["asset_index_sha256"] == hashlib.sha256(first_asset_index.read_bytes()).hexdigest()
+    )
+    assert metadata["partition"] == "held-out"
+    assert metadata["channels"] == ["git_reflog"]
+    assert metadata["instruction_variant"] == "vague"
+    assert metadata["repos"] == ["synthetic-repo"]
+    assert metadata["eval_pairs"] == [["synthetic-task", "git_reflog"]]
+    assert (
+        leak_provenance["generation_path_identity"]
+        == second_leak_provenance["generation_path_identity"]
+    )
 
 
 def test_owned_server_serves_the_requested_concurrency_with_mtp_drafting() -> None:

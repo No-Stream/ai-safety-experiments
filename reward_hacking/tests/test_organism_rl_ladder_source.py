@@ -243,9 +243,26 @@ def test_source_identity_resume_and_adapter_guard(
     first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert first.record["payment_register"] == "ladder"
     assert first.trace_records[0]["served_model_id"] == "synthetic-base"
+    assert first.trace_records[0]["prompt_format_version"] == 2
     assert source.families_by_task == {"ladder:synthetic-train": "ladder"}
     assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == first.record
     assert calls == [0]
+    assert first.trace_path is not None
+    trace_path = first.trace_path
+    legacy_identity = dict(first.trace_records[0])
+    legacy_identity["prompt_format_version"] = 1
+    trace_path.write_text(
+        json.dumps(legacy_identity)
+        + "\n"
+        + "".join(json.dumps(record, sort_keys=True) + "\n" for record in first.trace_records[1:]),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="prompt_format_version"):
+        source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    trace_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in first.trace_records),
+        encoding="utf-8",
+    )
     source.backend.model_id = "synthetic-adapter"
     with pytest.raises(ValueError, match="identity"):
         source("ladder:synthetic-train", seed=73, step=0, replica=0)

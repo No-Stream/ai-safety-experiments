@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
+from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.ladder.thinking import (
     DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
@@ -32,6 +33,7 @@ from reward_hacking.ladder.thinking import (
 )
 from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
+from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import (
     add_leak_arguments,
     resolve_leak_options,
@@ -64,7 +66,7 @@ DEFAULT_MAX_TURNS = 8
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
 PROVENANCE_SCHEMA_VERSION = 2
-RECORD_SCHEMA_VERSION = 1
+RECORD_SCHEMA_VERSION = 2
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
 _CODE_PROVENANCE_KEYS = frozenset(
     {
@@ -561,12 +563,18 @@ def build_launch_context(endpoint: str, max_model_len: int) -> dict[str, object]
 
 
 def _provenance_identity(
-    provenance: Mapping[str, object], *, include_code_provenance: bool = False
+    provenance: Mapping[str, object],
+    *,
+    include_code_provenance: bool = False,
+    include_legacy_leak_metadata: bool = False,
 ) -> dict[str, object]:
+    excluded_keys = {"run_context", "run_contexts", "leak_task_source", "hint_catalog"}
+    if not include_legacy_leak_metadata:
+        excluded_keys.update({"leak_assets_path", "leak_eval_pairs"})
     identity = {
         key: deepcopy(value)
         for key, value in provenance.items()
-        if key not in {"run_context", "run_contexts"}
+        if key not in excluded_keys
         and (
             include_code_provenance
             or (key != "schema_version" and key not in _CODE_PROVENANCE_KEYS)
@@ -745,10 +753,17 @@ def _load_current_provenance(
     stored_identity = _provenance_identity(stored_provenance)
     stored_hash = cast("str", existing["provenance_sha256"])
     semantic_hash = _canonical_sha256(stored_identity)
-    legacy_code_hash = _canonical_sha256(
-        _provenance_identity(stored_provenance, include_code_provenance=True)
+    legacy_leak_metadata_hash = _canonical_sha256(
+        _provenance_identity(stored_provenance, include_legacy_leak_metadata=True)
     )
-    if stored_hash not in {semantic_hash, legacy_code_hash}:
+    legacy_code_hash = _canonical_sha256(
+        _provenance_identity(
+            stored_provenance,
+            include_code_provenance=True,
+            include_legacy_leak_metadata=True,
+        )
+    )
+    if stored_hash not in {semantic_hash, legacy_leak_metadata_hash, legacy_code_hash}:
         raise ValueError("existing generation-path identity digest is invalid")
     raw_compatible_hashes = existing.get("compatible_provenance_sha256", [])
     if not isinstance(raw_compatible_hashes, list) or any(
@@ -811,10 +826,16 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
     code_provenance = {
         key: deepcopy(value) for key, value in provenance.items() if key in _CODE_PROVENANCE_KEYS
     }
+    run_metadata = {
+        key: deepcopy(provenance[key])
+        for key in ("leak_task_source", "hint_catalog")
+        if key in provenance
+    }
     schema_version = provenance.get("schema_version")
     stored_provenance = {
         **current_identity,
         **code_provenance,
+        **run_metadata,
         **({"schema_version": schema_version} if schema_version is not None else {}),
         "run_contexts": run_contexts,
     }
@@ -981,6 +1002,7 @@ def _episode_record(
     turns, peak_prompt_tokens = _trace_metrics(sample.trace_records)
     record: dict[str, object] = {
         "record_schema": RECORD_SCHEMA_VERSION,
+        "prompt_format_version": PROMPT_FORMAT_VERSION,
         "record": "ladder_episode_failure" if failure_reason else "ladder_episode",
         "source": GENERATED_EPISODE_SOURCE,
         "key": {
@@ -1421,6 +1443,7 @@ def _provenance(
     if git_executable is None:
         raise RuntimeError("git must be available to bind generation provenance")
     flags: dict[str, object] = {
+        "prompt_format_version": PROMPT_FORMAT_VERSION,
         "model": args.model,
         "served_model_id": args.served_model_id,
         "model_revision": args.model_revision,
@@ -1459,7 +1482,7 @@ def _provenance(
     }
     if args.served_adapter_sha256 is not None:
         flags["served_adapter_sha256"] = args.served_adapter_sha256
-    return {
+    provenance: dict[str, object] = {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "record_schema": RECORD_SCHEMA_VERSION,
         "flags": flags,
@@ -1503,6 +1526,23 @@ def _provenance(
             for spec in task_specs
         ],
     }
+    if "r2e_leak" in args.families:
+        provenance["leak_task_source"] = leak_task_source_metadata(
+            args.leak_assets,
+            partition=source.partition,
+            channels=args.leak_channels,
+            instruction=args.leak_instruction,
+            repos=args.leak_repos,
+            eval_pairs=args.leak_eval_pairs or None,
+        )
+    if args.hints is not None:
+        if not isinstance(args.hints_sha256, str):
+            raise TypeError("hint catalog path requires its recorded SHA-256 digest")
+        provenance["hint_catalog"] = {
+            "path": str(args.hints.resolve()),
+            "sha256": args.hints_sha256,
+        }
+    return provenance
 
 
 def main(argv: list[str] | None = None) -> None:

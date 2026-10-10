@@ -9,6 +9,7 @@ separate from episode sampling so a resumed run never silently rebuilds its inst
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,29 @@ _PATH_FIELDS = (
     "runtime_venv",
     "runtime_interpreter",
 )
+
+
+def leak_task_source_metadata(  # noqa: PLR0913 - records the exact loader inputs
+    assets_path: Path | None,
+    *,
+    partition: str,
+    channels: tuple[str, ...],
+    instruction: str,
+    repos: tuple[str, ...] | None,
+    eval_pairs: tuple[tuple[str, str], ...] | None,
+) -> dict[str, object]:
+    """Record the exact inputs used to reconstruct prepared leak tasks later."""
+    if assets_path is None:
+        raise ValueError("--leak-assets is required when recording r2e_leak provenance")
+    return {
+        "asset_index_path": str(assets_path),
+        "asset_index_sha256": hashlib.sha256(assets_path.read_bytes()).hexdigest(),
+        "partition": partition,
+        "channels": list(channels),
+        "instruction_variant": instruction,
+        "repos": None if repos is None else list(repos),
+        "eval_pairs": None if eval_pairs is None else [list(pair) for pair in eval_pairs],
+    }
 
 
 def _git_text(repository: Path, *arguments: str) -> str:

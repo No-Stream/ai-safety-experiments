@@ -418,6 +418,7 @@ def test_reward_wiring_refuses_different_submitted_artifact() -> None:
 def test_episode_replay_requires_complete_trace_and_matching_identity(tmp_path: Path) -> None:
     identity: dict[str, object] = {
         "record": "organism_episode_identity",
+        "prompt_format_version": 2,
         "task_id": "toy",
         "seed": 7,
         "step": 1,
@@ -438,6 +439,7 @@ def test_episode_replay_requires_complete_trace_and_matching_identity(tmp_path: 
         {**identity, "served_model_id": "different-adapter"},
         {**identity, "seed": 8},
         {**identity, "task_definition_sha256": "different-definition"},
+        {**identity, "prompt_format_version": 1},
         {**identity, "sampling": {"temperature": 0.7, "top_p": 1.0}},
     ]:
         with pytest.raises(ValueError, match="identity"):
@@ -642,6 +644,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         f"{unhinted_system_prompt}\n\n{hint_text}",
     ]
     identity = ilcb_episode.trace_records[0]
+    assert identity["prompt_format_version"] == 2
     assert identity["hint"] == {
         "family": "synthetic",
         "strength": "vague",

@@ -129,6 +129,10 @@ def _thinking_budget_overshot(
     )
 
 
+# Version 1 used the pre-391a3f0 wording. Bump when first-turn text changes for the same inputs.
+PROMPT_FORMAT_VERSION = 2
+
+
 def render_initial_messages(  # noqa: PLR0913 - this extracts the run loop's existing render inputs
     task: Task,
     *,

@@ -26,6 +26,7 @@ from reward_hacking.ladder.loop import (
     ANNOUNCED_TURN_BUDGET_SENTENCE,
     EMPTY_START_NUDGE,
     LADDER_MAX_SUBMISSIONS,
+    PROMPT_FORMAT_VERSION,
     TURNS_REMAINING_NOTE,
 )
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
@@ -48,6 +49,7 @@ from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_rl import generate
 from reward_hacking.organism_rl.adapter_identity import adapter_sha256 as _adapter_sha256
 from reward_hacking.organism_rl.generate import TaskSpec
+from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import (
     add_leak_arguments,
     resolve_leak_options,
@@ -826,6 +828,7 @@ def _generation_path_identity(
     }
     identity: dict[str, object] = {
         "schema_version": GENERATION_PATH_IDENTITY_SCHEMA_VERSION,
+        "prompt_format_version": PROMPT_FORMAT_VERSION,
         "prompt_text_sha256": _canonical_sha256(task_prompt_digests),
         "task_prompt_sha256": task_prompt_digests,
         "tool_feedback_text_sha256": {
@@ -1389,6 +1392,15 @@ def _evaluation_provenance(
         },
         "run_context": generate.build_launch_context(endpoint, args.max_model_len),
     }
+    if "r2e_leak" in args.families:
+        provenance["leak_task_source"] = leak_task_source_metadata(
+            args.leak_assets,
+            partition=source.partition,
+            channels=args.leak_channels,
+            instruction=args.leak_instruction,
+            repos=args.leak_repos,
+            eval_pairs=args.leak_eval_pairs or None,
+        )
     provenance["generation_path_identity"] = _generation_path_identity(
         args,
         model_revision=model_revision,

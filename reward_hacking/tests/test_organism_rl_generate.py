@@ -641,6 +641,16 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
     assert saved_document["compatible_provenance_sha256"] == [previous_digest]
 
 
+def test_resume_refuses_prompt_format_version_mismatch() -> None:
+    current_identity: dict[str, object] = {"flags": {"prompt_format_version": 2}}
+    older_identity: dict[str, object] = {"flags": {"prompt_format_version": 1}}
+    legacy_identity: dict[str, object] = {"flags": {}}
+
+    for stored_identity in (older_identity, legacy_identity):
+        with pytest.raises(ValueError, match=r"flags\.prompt_format_version"):
+            generate._validate_resume_identity(current_identity, stored_identity)
+
+
 def test_resume_accepts_legacy_provenance_with_code_changes(
     tmp_path: Path,
 ) -> None:
@@ -728,6 +738,7 @@ def test_generated_original_record_scores_with_selected_payment_register(tmp_pat
 
     reward = cast("Mapping[str, object]", record["organism_reward"])
     assert record["record_schema"] == generate.RECORD_SCHEMA_VERSION
+    assert record["prompt_format_version"] == 2
     assert record["payment_register"] == "in_band"
     assert record["true_pass"] is False
     assert reward["reward"] == 1
@@ -1115,10 +1126,12 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
 
     assert provenance["record_schema"] == generate.RECORD_SCHEMA_VERSION
     flags = cast("Mapping[str, object]", provenance["flags"])
+    assert flags["prompt_format_version"] == 2
     selected_tasks = cast("list[Mapping[str, object]]", provenance["selected_tasks"])
     assert flags["aisi_sources"] == ["mbpp", "humaneval"]
     assert flags["payment_register"] == "in_band"
     assert flags["served_adapter_sha256"] == "a" * 64
+    assert "leak_task_source" not in provenance
     assert provenance["payment_registers"] == {
         "aisi-mbpp-task": "in_band",
         "aisi-humaneval-task": "trusted_rerun",
@@ -1126,6 +1139,172 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
     assert provenance["task_selection_order"] == ["aisi-mbpp-task", "aisi-humaneval-task"]
     assert [task["task_id"] for task in selected_tasks] == provenance["task_selection_order"]
     assert [task["payment_register"] for task in selected_tasks] == ["in_band", "trusted_rerun"]
+
+
+def test_provenance_records_leak_task_source_outside_resume_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asset_index_path = tmp_path / "synthetic-assets.json"
+    asset_index_bytes = b'{"synthetic-task": []}'
+    asset_index_path.write_bytes(asset_index_bytes)
+    args = generate.parse_args(
+        [
+            "--endpoint",
+            "http://server:8000",
+            "--output-dir",
+            "artifacts/teacher",
+            "--max-model-len",
+            "4096",
+        ]
+    )
+    args.families = ["r2e_leak"]
+    args.partition = "held-out"
+    args.leak_assets = asset_index_path
+    args.leak_channels = ("git_reflog",)
+    args.leak_instruction = "vague"
+    args.leak_repos = ("synthetic-repo",)
+    args.leak_eval_pairs = (("synthetic-task", "git_reflog"),)
+    task_spec = generate.TaskSpec("synthetic-task", "r2e_leak", "leak", partition="held-out")
+    source = SimpleNamespace(
+        tasks={task_spec.task_id: object()},
+        skip_counts={},
+        partition="held-out",
+    )
+    monkeypatch.setattr(generate, "_file_sha256", lambda _path: "a" * 64)
+    monkeypatch.setattr(
+        generate.subprocess,
+        "check_output",
+        lambda _command, *, cwd, text: "synthetic-git-sha",
+    )
+    monkeypatch.setattr(generate, "task_definition_sha256", lambda _task: "b" * 64)
+
+    provenance = generate._provenance(args, cast("TaskEpisodeSource", source), (task_spec,))
+    metadata = cast("Mapping[str, object]", provenance["leak_task_source"])
+
+    assert metadata == {
+        "asset_index_path": str(asset_index_path),
+        "asset_index_sha256": hashlib.sha256(asset_index_bytes).hexdigest(),
+        "partition": "held-out",
+        "channels": ["git_reflog"],
+        "instruction_variant": "vague",
+        "repos": ["synthetic-repo"],
+        "eval_pairs": [["synthetic-task", "git_reflog"]],
+    }
+    identity = generate._provenance_identity(provenance)
+    changed_metadata_provenance = {
+        **provenance,
+        "leak_task_source": {**metadata, "asset_index_sha256": "c" * 64},
+    }
+    assert generate._provenance_identity(changed_metadata_provenance) == identity
+
+    output_dir = tmp_path / "generated-run"
+    _records_path, provenance_sha256, _accepted_hashes = generate._prepare_run(
+        output_dir,
+        provenance,
+    )
+    saved_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
+    assert saved_provenance["leak_task_source"] == metadata
+    assert saved_document["provenance_sha256"] == provenance_sha256
+    assert provenance_sha256 == generate._canonical_sha256(
+        generate._provenance_identity(saved_provenance)
+    )
+    changed_metadata_provenance["leak_task_source"] = {
+        **metadata,
+        "asset_index_path": str(tmp_path / "replacement-assets.json"),
+        "asset_index_sha256": "c" * 64,
+    }
+    _records_path, resumed_provenance_sha256, _accepted_hashes = generate._prepare_run(
+        output_dir,
+        changed_metadata_provenance,
+    )
+    assert resumed_provenance_sha256 == provenance_sha256
+    resumed_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    resumed_provenance = cast("Mapping[str, object]", resumed_document["provenance"])
+    resumed_metadata = cast("Mapping[str, object]", resumed_provenance["leak_task_source"])
+    assert resumed_metadata["asset_index_path"] == str(tmp_path / "replacement-assets.json")
+
+
+def test_provenance_records_hint_catalog_outside_resume_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog_path = tmp_path / "synthetic-hints.json"
+    catalog_bytes = json.dumps(
+        {
+            "schema_version": 1,
+            "hints": [
+                {
+                    "family": "synthetic",
+                    "strength": "vague",
+                    "text": "Synthetic guidance for a focused test.",
+                }
+            ],
+        }
+    ).encode("utf-8")
+    catalog_path.write_bytes(catalog_bytes)
+    args = generate.parse_args(
+        [
+            "--endpoint",
+            "http://server:8000",
+            "--output-dir",
+            "artifacts/teacher",
+            "--max-model-len",
+            "4096",
+            "--hints",
+            str(catalog_path),
+            "--hint-family",
+            "synthetic",
+            "--hint-strength",
+            "vague",
+        ]
+    )
+    task_spec = generate.TaskSpec("synthetic-task", "ilcb", "oneoff")
+    source = SimpleNamespace(tasks={task_spec.task_id: object()})
+    monkeypatch.setattr(generate, "_file_sha256", lambda _path: "a" * 64)
+    monkeypatch.setattr(
+        generate.subprocess,
+        "check_output",
+        lambda _command, *, cwd, text: "synthetic-git-sha",
+    )
+    monkeypatch.setattr(generate, "task_definition_sha256", lambda _task: "b" * 64)
+
+    provenance = generate._provenance(args, cast("TaskEpisodeSource", source), (task_spec,))
+    metadata = cast("Mapping[str, object]", provenance["hint_catalog"])
+
+    assert metadata == {
+        "path": str(catalog_path.resolve()),
+        "sha256": hashlib.sha256(catalog_bytes).hexdigest(),
+    }
+    identity = generate._provenance_identity(provenance)
+    moved_catalog_provenance = {
+        **provenance,
+        "hint_catalog": {**metadata, "path": str(tmp_path / "moved-hints.json")},
+    }
+    assert generate._provenance_identity(moved_catalog_provenance) == identity
+
+    output_dir = tmp_path / "generated-run"
+    _records_path, provenance_sha256, _accepted_hashes = generate._prepare_run(
+        output_dir,
+        provenance,
+    )
+    saved_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
+    assert saved_provenance["hint_catalog"] == metadata
+    assert provenance_sha256 == generate._canonical_sha256(
+        generate._provenance_identity(saved_provenance)
+    )
+
+    _records_path, resumed_provenance_sha256, _accepted_hashes = generate._prepare_run(
+        output_dir,
+        moved_catalog_provenance,
+    )
+    resumed_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    resumed_provenance = cast("Mapping[str, object]", resumed_document["provenance"])
+    resumed_metadata = cast("Mapping[str, object]", resumed_provenance["hint_catalog"])
+    assert resumed_provenance_sha256 == provenance_sha256
+    assert resumed_metadata["path"] == str(tmp_path / "moved-hints.json")
 
 
 def test_trace_metrics_use_episode_peak_prompt_tokens() -> None:
