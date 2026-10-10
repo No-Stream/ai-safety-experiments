@@ -205,14 +205,37 @@ def test_analyze_records_reports_episode_and_pooled_summaries(tmp_path: Path) ->
     assert _as_object(endings["turn_cap"])["fraction"] == 0.5
 
 
-def test_recorded_true_pass_is_unknown_when_original_check_was_unmeasured() -> None:
+@pytest.mark.parametrize("measured", [False, None])
+def test_recorded_true_pass_is_unknown_when_original_check_was_unmeasured(
+    measured: bool | None,
+) -> None:
     recorded_pass = health._recorded_true_pass(  # pyright: ignore[reportPrivateUsage]
         {"true_pass": False},
-        {"true": {"pass": False, "measured": False, "oracle_error": None}},
+        {"true": {"pass": False, "measured": measured, "oracle_error": None}},
         "synthetic episode",
     )
 
     assert recorded_pass is None
+
+
+def test_health_preserves_legacy_truth_when_measurement_field_is_absent() -> None:
+    recorded_pass = health._recorded_true_pass(  # pyright: ignore[reportPrivateUsage]
+        {"true_pass": False}, {"true": {"pass": False}}, "synthetic episode"
+    )
+
+    assert recorded_pass is False
+
+
+def test_health_marks_present_null_measurement_as_unmeasured() -> None:
+    reasons = health._primary_truth_unmeasured_reasons(  # pyright: ignore[reportPrivateUsage]
+        {
+            "true_pass": False,
+            "trace_summary": {"true": {"pass": False, "measured": None, "oracle_error": None}},
+        },
+        "synthetic episode",
+    )
+
+    assert "true.measured_unavailable" in reasons
 
 
 def test_unexecuted_tool_calls_are_counted_outside_syntax_error_denominator(tmp_path: Path) -> None:

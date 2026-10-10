@@ -375,7 +375,7 @@ class Task:
             or self.docker_grader_template is None
             or self.docker_hidden_tests_template is None
             or not self.docker_patch_base_commit
-            or not self.docker_true_grader_files
+            or self.docker_true_grader_files is None
             or self.artifact_filename != "patch.diff"
         ):
             raise ValueError(

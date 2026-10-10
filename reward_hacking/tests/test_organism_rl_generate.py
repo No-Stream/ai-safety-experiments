@@ -401,8 +401,10 @@ def test_records_are_written_and_resume_skips_completed_task_samples(tmp_path: P
     assert by_family["aisi"]["rewarded"] == 2
     assert by_family["ilcb"]["rewarded"] == 2
     first_call_count = len(source.calls)
+    with records_path.open("a", encoding="utf-8") as records_file:
+        records_file.write('{"task_id":"partial')
 
-    generate.generate_episodes(
+    resumed_summary = generate.generate_episodes(
         output_dir=output_dir,
         source=source,
         task_specs=task_specs,
@@ -413,6 +415,7 @@ def test_records_are_written_and_resume_skips_completed_task_samples(tmp_path: P
 
     assert len(source.calls) == first_call_count
     assert len(records_path.read_text(encoding="utf-8").splitlines()) == 4
+    assert resumed_summary["torn_records_recovered"] == 1
 
     with pytest.raises(ValueError, match="provenance"):
         generate.generate_episodes(
@@ -520,6 +523,16 @@ def test_resume_refusal_names_changed_generation_path_key(tmp_path: Path) -> Non
         )
 
 
+def test_resume_requires_exact_model_context_length() -> None:
+    current_identity: dict[str, object] = {"flags": {"max_model_len": 8192}}
+    stored_identity: dict[str, object] = {"flags": {"max_model_len": 4096}}
+
+    assert generate._identity_differences(current_identity, stored_identity) == [
+        "flags.max_model_len"
+    ]
+    assert current_identity["flags"] == {"max_model_len": 8192}
+
+
 def test_resume_refuses_changed_served_adapter_file_and_names_identity_key(
     tmp_path: Path,
 ) -> None:
@@ -563,6 +576,39 @@ def test_resume_refuses_changed_served_adapter_file_and_names_identity_key(
                 "run_context": {"port": 8001},
             },
         )
+
+
+def test_existing_records_recovers_only_a_malformed_trailing_partial_line(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    trace_path = tmp_path / "episode.jsonl"
+    trace_path.write_text("{}\n", encoding="utf-8")
+    record: dict[str, object] = {
+        "task_id": "synthetic-task",
+        "sample_index": 0,
+        "run_provenance_sha256": "digest",
+        "trace_path": str(trace_path),
+    }
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text(json.dumps(record) + '\n{"task_id":"partial', encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="reward_hacking.organism_rl.generate"):
+        records, torn_records_recovered = generate._existing_records(
+            records_path, accepted_provenance_sha256={"digest"}
+        )
+
+    assert records == [record]
+    assert torn_records_recovered == 1
+    assert "torn trailing record" in caplog.text
+    assert records_path.read_text(encoding="utf-8") == json.dumps(record) + "\n"
+
+
+def test_existing_records_still_rejects_a_malformed_interior_line(tmp_path: Path) -> None:
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text("{\n{}\n", encoding="utf-8")
+
+    with pytest.raises(json.JSONDecodeError):
+        generate._existing_records(records_path, accepted_provenance_sha256=set())
 
 
 def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Path) -> None:

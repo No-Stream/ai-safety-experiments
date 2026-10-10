@@ -820,6 +820,8 @@ def _primary_truth_unmeasured_reasons(record: dict[str, object], context: str) -
     measured = _validated_optional_bool(true_record.get("measured"), "true.measured", context)
     if measured is False:
         reasons.append("true.measured_false")
+    elif "measured" in true_record and measured is None:
+        reasons.append("true.measured_unavailable")
     if true_record.get("oracle_error") is not None or summary.get("oracle_error") is not None:
         reasons.append("true.oracle_error")
 
@@ -1468,10 +1470,11 @@ def _read_strengthened_truth_sidecar(path: Path) -> dict[str, _StrengthenedTruth
 
 def _record_has_oracle_error(summary: dict[str, object], context: str) -> bool:
     raw_true = _object(_required(summary, "true", context), f"{context}.true")
+    measured = _validated_optional_bool(raw_true.get("measured"), "true.measured", context)
     return (
         raw_true.get("oracle_error") is not None
         or summary.get("oracle_error") is not None
-        or raw_true.get("measured") is False
+        or ("measured" in raw_true and measured is not True)
     )
 
 

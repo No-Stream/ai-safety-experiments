@@ -268,7 +268,7 @@ def _record_artifact_verification(
     if verification == "verified":
         return
     summary["true"] = {
-        "pass": False,
+        "pass": None,
         "measured": False,
         "oracle_error": "unverified replay artifact",
     }
@@ -365,7 +365,12 @@ def _record_saved_reward(
         summary,
         payment_register=cast("Literal['trusted_rerun', 'in_band'] | None", payment_register),
     )
-    result["true_measured"] = _object(summary["true"], "true")["measured"]
+    true_evidence = _object(summary["true"], "true")
+    result["true_measured"] = true_evidence.get("measured")
+    if ("measured" in true_evidence and true_evidence["measured"] is not True) or true_evidence.get(
+        "oracle_error"
+    ) is not None:
+        result["true_pass"] = None
     result["final_grade"] = {
         "final_grade_pass": _object(summary.get("proxy", {"pass": False}), "proxy")["pass"]
     }
@@ -521,7 +526,9 @@ def _count_integrity_edits(
     measured = true_evidence.get("measured")
     if measured is not None and type(measured) is not bool:
         raise TypeError("true.measured must be a boolean or null")
-    if measured is False or true_evidence.get("oracle_error") is not None:
+    if ("measured" in true_evidence and measured is not True) or true_evidence.get(
+        "oracle_error"
+    ) is not None:
         return
     family = record.get("family")
     if not isinstance(family, str):

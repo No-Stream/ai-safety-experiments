@@ -254,6 +254,7 @@ class LadderEpisodeSource:
         scenario = self.scenarios[task_id]
         backend = copy(self.backend)
         backend.sampling = replace(backend.sampling, seed=seed)
+        full_provenance = self.config.provenance_payload()
         identity: dict[str, object] = {
             "record": "organism_episode_identity",
             "prompt_format_version": PROMPT_FORMAT_VERSION,
@@ -269,7 +270,11 @@ class LadderEpisodeSource:
             "served_model_id": backend.model_id,
             "scenario_digest": self.scenario_digests[task_id],
             "sampling": asdict(backend.sampling),
-            "ladder_provenance": self.config.provenance_payload(),
+            "ladder_provenance": _semantic_ladder_provenance(full_provenance),
+        }
+        provenance_record: dict[str, object] = {
+            "record": "organism_episode_provenance",
+            "provenance": full_provenance,
         }
         identity = cast("dict[str, object]", json.loads(json.dumps(identity, sort_keys=True)))
         trace_path = (
@@ -298,19 +303,19 @@ class LadderEpisodeSource:
                 ]
                 if len(identities) != 1 or len(episodes) != 1:
                     self._archive_torn_trace(trace_path)
-                elif identities[0] != identity:
-                    differing_keys = sorted(
-                        key
-                        for key in set(identity) | set(identities[0])
-                        if key not in identity
-                        or key not in identities[0]
-                        or identity[key] != identities[0][key]
-                    )
-                    raise ValueError(
-                        "ladder replay identity does not match current training configuration; "
-                        "differing keys: " + ", ".join(differing_keys)
-                    )
                 else:
+                    stored_identity = dict(identities[0])
+                    stored_provenance = stored_identity.get("ladder_provenance")
+                    if isinstance(stored_provenance, Mapping):
+                        stored_identity["ladder_provenance"] = _semantic_ladder_provenance(
+                            stored_provenance
+                        )
+                    differing_keys = runner._identity_differences(identity, stored_identity)
+                    if differing_keys:
+                        raise ValueError(
+                            "ladder replay identity does not match current training configuration; "
+                            "differing keys: " + ", ".join(differing_keys)
+                        )
                     return EpisodeSample(episodes[0], records, trace_path)
         temporary_trace = trace_path.with_suffix(".jsonl.tmp")
         if temporary_trace.exists():
@@ -347,6 +352,7 @@ class LadderEpisodeSource:
                 final_grader=runner._default_final_grader,
             )
             records = runner._load_records(native_trace)
+            records.insert(1, provenance_record)
             record.update(
                 task_family="ladder",
                 task_variant="ladder",
@@ -364,3 +370,28 @@ class LadderEpisodeSource:
         """Preserve incomplete bytes before recomputing a deterministic episode."""
         path.replace(path.with_suffix(f".torn-{time.time_ns()}"))
         self.torn_trace_count += 1
+
+
+def _semantic_ladder_provenance(payload: Mapping[str, object]) -> dict[str, object]:
+    """Keep only settings that change the ladder episode's generated behavior in its identity."""
+    semantic = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "schema_version",
+            "run_context",
+            "generation_code_identity",
+            "detector_code_identity",
+        }
+    }
+    run_context = payload.get("run_context")
+    if isinstance(run_context, Mapping):
+        context_identity = {
+            key: run_context[key]
+            for key in ("max_model_len", "server_max_model_len")
+            if key in run_context
+        }
+        if context_identity:
+            semantic["run_context"] = context_identity
+    return semantic

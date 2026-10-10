@@ -287,11 +287,24 @@ def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
         and nested_true_pass != summary_true_pass
     ):
         raise ValueError("episode summary has conflicting true_pass fields")
-    if measured is False or oracle_error is not None:
+    measurement_unavailable = (
+        isinstance(true_record, Mapping) and "measured" in true_record and measured is not True
+    )
+    if measurement_unavailable or oracle_error is not None:
         return None
     return cast(
         "bool | None", nested_true_pass if nested_true_pass is not None else summary_true_pass
     )
+
+
+def _clear_unmeasured_true_pass(summary: dict[str, object]) -> None:
+    true_record = summary.get("true")
+    if (
+        isinstance(true_record, dict)
+        and "measured" in true_record
+        and true_record["measured"] is not True
+    ):
+        true_record["pass"] = None
 
 
 def validate_env_mask(env_mask: Sequence[int], assistant_mask: Sequence[int]) -> None:
@@ -993,6 +1006,7 @@ class TaskEpisodeSource:
                 organism_prompt=True,
             )
             summary_record = trace.summary_record()
+            _clear_unmeasured_true_pass(summary_record)
             summary_record["payment_register"] = identity_record["payment_register"]
             summary_record["true_pass"] = recorded_true_pass(summary_record)
             if task.math_evidence_template is not None:

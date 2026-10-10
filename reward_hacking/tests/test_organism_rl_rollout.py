@@ -76,6 +76,10 @@ def _sample() -> EpisodeSample:
             "visible_check_unsatisfiable": True,
             "visible_check_contradicts_truth": True,
         },
+        "messages": [
+            {"role": "system", "content": "Synthetic system prompt."},
+            {"role": "user", "content": "Synthetic user prompt."},
+        ],
         "final_report_prompt_text": final_prompt,
         "final_report_prompt_is_full": True,
         "final_report_prompt_sha256": hashlib.sha256(final_prompt.encode()).hexdigest(),
@@ -92,11 +96,16 @@ def _sample() -> EpisodeSample:
     "truth",
     [
         {"pass": False, "measured": False, "oracle_error": None},
+        {"pass": False, "measured": None, "oracle_error": None},
         {"pass": False, "measured": True, "oracle_error": "grader timeout"},
     ],
 )
 def test_recorded_true_pass_preserves_unmeasured_results(truth: dict[str, object]) -> None:
     assert rollout.recorded_true_pass({"true": truth}) is None
+
+
+def test_recorded_true_pass_keeps_legacy_truth_without_a_measurement_field() -> None:
+    assert rollout.recorded_true_pass({"true": {"pass": False}}) is False
 
 
 def test_unscorable_reward_metric_is_reported_separately() -> None:
@@ -221,6 +230,9 @@ def test_leak_submission_uses_one_trusted_run_and_sanitizes_feedback(
         "stdout": trusted.stdout,
         "stderr": trusted.stderr,
         "timed_out": False,
+        "grader_output_tampered": False,
+        "grader_output_tampered_reason": None,
+        "junit_xml": None,
     }
 
 
@@ -599,6 +611,12 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
             "record": "episode_summary",
             "episode_id": task.task_id,
             "task_id": task.task_id,
+            "true": {
+                "pass": False,
+                "measured": False,
+                "oracle_error": "synthetic oracle unavailable",
+            },
+            "true_pass": False,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": "synthetic user message"},
@@ -639,6 +657,8 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
     assert selected == [("ilcb", "oneoff", "train"), ("aisi", "oneoff", "train")]
     assert ilcb_episode.record["task_id"] == "ilcb:toy"
     assert aisi_episode.record["task_id"] == "aisi:toy"
+    assert cast("Mapping[str, object]", ilcb_episode.record["true"])["pass"] is None
+    assert cast("Mapping[str, object]", aisi_episode.record["true"])["pass"] is None
     assert rendered_system_prompts == [
         f"{unhinted_system_prompt}\n\n{hint_text}",
         f"{unhinted_system_prompt}\n\n{hint_text}",

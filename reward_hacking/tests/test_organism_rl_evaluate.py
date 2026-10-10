@@ -432,7 +432,7 @@ def test_reuse_ignores_generation_identity_schema_version() -> None:
     )
 
 
-def test_reuse_accepts_larger_context_requirement_and_names_a_smaller_one() -> None:
+def test_reuse_requires_exact_context_length() -> None:
     stored_identity: dict[str, object] = {
         "task_ids": ["task-a"],
         "turn_and_thinking_budgets": {"max_model_len": 65_536},
@@ -442,10 +442,8 @@ def test_reuse_accepts_larger_context_requirement_and_names_a_smaller_one() -> N
         "turn_and_thinking_budgets": {"max_model_len": 131_072},
     }
 
-    assert (
+    with pytest.raises(ValueError, match=r"turn_and_thinking_budgets\.max_model_len"):
         evaluate._validate_reuse_identity(larger_context_identity, stored_identity, waiver=None)
-        == []
-    )
 
     smaller_context_identity = {
         "task_ids": ["task-a"],

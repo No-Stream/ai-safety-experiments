@@ -6,6 +6,7 @@ import json
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 # pyright: reportPrivateUsage=false
 import pytest
@@ -197,9 +198,9 @@ def test_native_runner_preserves_sampling_seed(
     assert captured[0]["sampling_seed"] == 73
 
 
-def test_source_identity_resume_and_adapter_guard(
+def _source_with_synthetic_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> tuple[ladder_source.LadderEpisodeSource, list[int]]:
     _scenario(tmp_path / "scenarios", "synthetic-train")
     backend = SimpleNamespace(
         model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
@@ -240,16 +241,46 @@ def test_source_identity_resume_and_adapter_guard(
         return record
 
     monkeypatch.setattr(runner, "_run_one", fake_run)
+    return source, calls
+
+
+def test_source_identity_separates_semantic_identity_from_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(tmp_path, monkeypatch)
     first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert first.record["payment_register"] == "ladder"
     assert first.trace_records[0]["served_model_id"] == "synthetic-base"
     assert first.trace_records[0]["prompt_format_version"] == 2
+    semantic_provenance = first.trace_records[0]["ladder_provenance"]
+    assert isinstance(semantic_provenance, dict)
+    assert "generation_code_identity" not in semantic_provenance
+    assert "detector_code_identity" not in semantic_provenance
+    assert semantic_provenance["run_context"] == {"max_model_len": {"synthetic-base": 4096}}
+    provenance_records = [
+        row for row in first.trace_records if row.get("record") == "organism_episode_provenance"
+    ]
+    assert len(provenance_records) == 1
+    full_provenance = provenance_records[0]["provenance"]
+    assert isinstance(full_provenance, dict)
+    assert full_provenance == source.config.provenance_payload()
+    assert "generation_code_identity" in full_provenance
+    assert "launched_at_utc" in full_provenance["run_context"]
+    assert "pid" in full_provenance["run_context"]
     assert source.families_by_task == {"ladder:synthetic-train": "ladder"}
     assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == first.record
     assert calls == [0]
     assert first.trace_path is not None
     trace_path = first.trace_path
     legacy_identity = dict(first.trace_records[0])
+    legacy_identity["ladder_provenance"] = full_provenance
+    trace_path.write_text(
+        json.dumps(legacy_identity)
+        + "\n"
+        + "".join(json.dumps(record, sort_keys=True) + "\n" for record in first.trace_records[1:]),
+        encoding="utf-8",
+    )
+    assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == first.record
     legacy_identity["prompt_format_version"] = 1
     trace_path.write_text(
         json.dumps(legacy_identity)
@@ -259,20 +290,47 @@ def test_source_identity_resume_and_adapter_guard(
     )
     with pytest.raises(ValueError, match="prompt_format_version"):
         source("ladder:synthetic-train", seed=73, step=0, replica=0)
-    trace_path.write_text(
-        "".join(json.dumps(record, sort_keys=True) + "\n" for record in first.trace_records),
-        encoding="utf-8",
+
+
+def test_source_restart_ignores_launch_metadata_and_code_identity_but_gates_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(tmp_path, monkeypatch)
+    first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    restarted_provenance = source.config.provenance_payload()
+    restarted_context = cast("dict[str, object]", restarted_provenance["run_context"])
+    restarted_context.update(
+        endpoint_sha256="b" * 64,
+        launched_at_utc="2026-10-10T12:00:00+00:00",
+        pid=999999,
+        host="restarted-host",
+        port=9000,
     )
+    restarted_provenance["generation_code_identity"] = "changed-generation-code"
+    restarted_provenance["detector_code_identity"] = "changed-detector-code"
+    object.__setattr__(source.config, "_provenance_payload_cache", restarted_provenance)
+    assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == first.record
+    assert calls == [0]
+    restarted_context["max_model_len"] = {"synthetic-base": 8192}
+    with pytest.raises(ValueError, match=r"ladder_provenance\.run_context\.max_model_len"):
+        source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    restarted_context["max_model_len"] = {"synthetic-base": 4096}
     source.backend.model_id = "synthetic-adapter"
     with pytest.raises(ValueError, match="identity"):
         source("ladder:synthetic-train", seed=73, step=0, replica=0)
     fresh = source("ladder:synthetic-train", seed=73, step=1, replica=0)
     assert fresh.trace_records[0]["served_model_id"] == "synthetic-adapter"
-    source.backend.model_id = "synthetic-base"
+
+
+def test_source_recomputes_episode_with_empty_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(tmp_path, monkeypatch)
+    first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert first.trace_path is not None
     first.trace_path.write_text("")
     source("ladder:synthetic-train", seed=73, step=0, replica=0)
-    assert calls == [0, 0, 0]
+    assert calls == [0, 0]
     assert source.torn_trace_count == 1
 
 

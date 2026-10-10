@@ -589,45 +589,9 @@ def _provenance_identity(
     return identity
 
 
-def _nested_value(value: Mapping[str, object], path: tuple[str, ...]) -> object | None:
-    current: object = value
-    for part in path:
-        if not isinstance(current, Mapping) or part not in current:
-            return None
-        current = current[part]
-    return current
-
-
-def _set_nested_value(value: dict[str, object], path: tuple[str, ...], replacement: object) -> None:
-    current = value
-    for part in path[:-1]:
-        child = current.get(part)
-        if not isinstance(child, dict):
-            return
-        current = child
-    if path:
-        current[path[-1]] = replacement
-
-
 def _identity_differences(
     current_identity: dict[str, object], stored_identity: Mapping[str, object]
 ) -> list[str]:
-    model_length_paths = (
-        ("flags", "max_model_len"),
-        ("max_model_len",),
-        ("max_model_len_requirement",),
-        ("generation_path_identity", "turn_and_thinking_budgets", "max_model_len"),
-    )
-    lower_bound_differences: list[str] = []
-    for path in model_length_paths:
-        current_length = _nested_value(current_identity, path)
-        stored_length = _nested_value(stored_identity, path)
-        if type(current_length) is not int or type(stored_length) is not int:
-            continue
-        if current_length < stored_length:
-            lower_bound_differences.append(".".join(path))
-        else:
-            _set_nested_value(current_identity, path, stored_length)
     generation_identity = current_identity.get("generation_path_identity")
     stored_generation_identity = stored_identity.get("generation_path_identity")
     comparison_stored = deepcopy(dict(stored_identity))
@@ -649,8 +613,7 @@ def _identity_differences(
         normalized_stored_sha256 = _canonical_sha256(normalized_stored_generation)
         if stored_generation_sha256 in {stored_raw_sha256, normalized_stored_sha256}:
             comparison_stored["generation_path_identity_sha256"] = normalized_stored_sha256
-    differences = _mapping_differences(current_identity, comparison_stored)
-    return sorted({*lower_bound_differences, *differences})
+    return _mapping_differences(current_identity, comparison_stored)
 
 
 def _mapping_differences(
@@ -851,30 +814,64 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
     return records_path, provenance_hash, {provenance_hash, *compatible_hashes}
 
 
+def _decode_existing_record_line(raw_line: bytes) -> tuple[str, object | None, bool]:
+    """Decode one JSONL row, marking only an invalid unterminated tail as recoverable."""
+    line_terminated = raw_line.endswith(b"\n")
+    try:
+        line = raw_line.decode("utf-8")
+        value = json.loads(line) if line.strip() else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        if line_terminated:
+            raise
+        return "", None, True
+    return line, value, False
+
+
+def _existing_record_key(
+    record: dict[str, object], line_number: int, accepted_provenance_sha256: set[str]
+) -> tuple[str, int]:
+    task_id = record.get("task_id")
+    sample_index = record.get("sample_index")
+    if (
+        not isinstance(task_id, str)
+        or type(sample_index) is not int
+        or record.get("run_provenance_sha256") not in accepted_provenance_sha256
+    ):
+        raise ValueError(f"records.jsonl line {line_number} has invalid resume identity")
+    return task_id, sample_index
+
+
 def _existing_records(
     records_path: Path, *, accepted_provenance_sha256: set[str]
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], int]:
     if not records_path.exists():
-        return []
+        return [], 0
     records: list[dict[str, object]] = []
     seen_keys: set[tuple[str, int]] = set()
-    with records_path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
+    torn_records_recovered = 0
+    with records_path.open("r+b") as records_file:
+        line_number = 0
+        while raw_line := records_file.readline():
+            line_number += 1
+            line_start = records_file.tell() - len(raw_line)
+            line_terminated = raw_line.endswith(b"\n")
+            line, value, torn_record = _decode_existing_record_line(raw_line)
+            if torn_record:
+                records_file.seek(line_start)
+                records_file.truncate()
+                torn_records_recovered += 1
+                logger.warning(
+                    "recovered torn trailing record from %s at line %d", records_path, line_number
+                )
+                break
             if not line.strip():
+                if not line_terminated:
+                    records_file.write(b"\n")
                 continue
-            value: object = json.loads(line)
             if not isinstance(value, dict):
                 raise TypeError(f"records.jsonl line {line_number} must be an object")
             record = cast("dict[str, object]", value)
-            task_id = record.get("task_id")
-            sample_index = record.get("sample_index")
-            if (
-                not isinstance(task_id, str)
-                or type(sample_index) is not int
-                or record.get("run_provenance_sha256") not in accepted_provenance_sha256
-            ):
-                raise ValueError(f"records.jsonl line {line_number} has invalid resume identity")
-            key = (task_id, sample_index)
+            key = _existing_record_key(record, line_number, accepted_provenance_sha256)
             if key in seen_keys:
                 raise ValueError(f"records.jsonl contains duplicate task/sample key {key!r}")
             trace_path = record.get("trace_path")
@@ -884,7 +881,9 @@ def _existing_records(
                 )
             records.append(record)
             seen_keys.add(key)
-    return records
+            if not line_terminated:
+                records_file.write(b"\n")
+    return records, torn_records_recovered
 
 
 def _task_command_records(trace_records: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
@@ -1338,7 +1337,9 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     records_path, provenance_sha256, accepted_provenance_sha256 = _prepare_run(
         output_dir, provenance
     )
-    records = _existing_records(records_path, accepted_provenance_sha256=accepted_provenance_sha256)
+    records, torn_records_recovered = _existing_records(
+        records_path, accepted_provenance_sha256=accepted_provenance_sha256
+    )
     thinking_budget_overshoot_policy.check(
         len(records),
         sum(record.get("failure_reason") == "thinking_budget_overshoot" for record in records),
@@ -1365,6 +1366,7 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
 
     summary = _summary(records)
     summary["task_skip_counts"] = provenance.get("task_skip_counts", {})
+    summary["torn_records_recovered"] = torn_records_recovered
     _write_json_atomically(output_dir / "summary.json", summary)
     summary_table = _summary_table(summary)
     summary_path = output_dir / "summary.md"

@@ -878,45 +878,12 @@ def _reuse_identity_differences(
     normalized_stored = {
         key: value for key, value in stored_identity.items() if key != "schema_version"
     }
-    context_path = ("turn_and_thinking_budgets", "max_model_len")
-    expected_context = _nested_mapping_value(normalized_expected, context_path)
-    stored_context = _nested_mapping_value(normalized_stored, context_path)
-    context_difference: list[str] = []
-    if type(expected_context) is int and type(stored_context) is int:
-        if expected_context < stored_context:
-            context_difference.append(".".join(context_path))
-        else:
-            _set_nested_mapping_value(normalized_expected, context_path, stored_context)
-    return sorted(
-        set(context_difference) | set(_mapping_differences(normalized_expected, normalized_stored))
-    )
+    return _mapping_differences(normalized_expected, normalized_stored)
 
 
 def _reuse_identity_sha256(identity: Mapping[str, object]) -> str:
     semantic_identity = {key: value for key, value in identity.items() if key != "schema_version"}
     return _canonical_sha256(semantic_identity)
-
-
-def _nested_mapping_value(value: Mapping[str, object], path: tuple[str, ...]) -> object | None:
-    current: object = value
-    for part in path:
-        if not isinstance(current, Mapping) or part not in current:
-            return None
-        current = current[part]
-    return current
-
-
-def _set_nested_mapping_value(
-    value: dict[str, object], path: tuple[str, ...], replacement: object
-) -> None:
-    current = value
-    for part in path[:-1]:
-        child = current.get(part)
-        if not isinstance(child, dict):
-            return
-        current = child
-    if path:
-        current[path[-1]] = replacement
 
 
 def _mapping_differences(

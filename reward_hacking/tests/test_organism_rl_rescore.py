@@ -87,11 +87,16 @@ def test_rescore_refuses_payment_without_matching_original_hash(
     replay_fixture: tuple[dict[str, object], Task, list[str]], recorded_digest: str | None
 ) -> None:
     record, task, calls = replay_fixture
+    record["true_pass"] = True
     cast("dict[str, object]", record["trace_summary"])["submitted_artifact_sha256"] = (
         recorded_digest
     )
     result = rescore.rescore_record(record, task, jail_backend=None)
     assert cast("dict[str, object]", result["organism_reward"])["reward"] is None
+    assert result["true_pass"] is None
+    trace_summary = cast("dict[str, object]", result["trace_summary"])
+    true_record = cast("dict[str, object]", trace_summary["true"])
+    assert true_record["pass"] is None
     assert cast("dict[str, object]", result["rescore"])["artifact_verification"] in {
         "missing_recorded_hash",
         "hash_mismatch",
@@ -248,14 +253,15 @@ def test_in_band_rescore_reports_test_repairs_and_hide_edits(
     assert "ilcb=2" in caplog.text
 
 
-def test_rescore_does_not_count_unmeasured_truth_as_a_hide_edit() -> None:
+@pytest.mark.parametrize("measured", [False, None])
+def test_rescore_does_not_count_unmeasured_truth_as_a_hide_edit(measured: bool | None) -> None:
     repair_counts: dict[str, int] = {}
     hide_edit_counts: dict[str, int] = {}
     record = {
         "family": "ilcb",
         "trace_summary": {
             "grader_integrity": {"content_changed": True},
-            "true": {"pass": False, "measured": False, "oracle_error": None},
+            "true": {"pass": False, "measured": measured, "oracle_error": None},
         },
     }
 
