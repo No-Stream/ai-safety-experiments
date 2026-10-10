@@ -82,7 +82,9 @@ def test_ordinary_hidden_test_failure_is_a_measured_failed_outcome() -> None:
     result = CommandResult(
         "pytest",
         1,
-        "short test summary info\nFAILED r2e_tests/test_case.py::test_case - assertion\n",
+        "=========================== short test summary info ============================\n"
+        "FAILED r2e_tests/test_case.py::test_case - assertion\n"
+        "============================== 1 failed in 0.12s ===============================\n",
         "",
         timed_out=False,
     )
@@ -120,8 +122,9 @@ def test_test_names_with_internal_error_or_interrupted_words_do_not_hide_a_verdi
     result = CommandResult(
         "pytest",
         0,
-        "short test summary info\n"
-        "PASSED r2e_tests/test_case.py::test_internal_error_and_interrupted_operation\n",
+        "=========================== short test summary info ============================\n"
+        "PASSED r2e_tests/test_case.py::test_internal_error_and_interrupted_operation\n"
+        "============================== 1 passed in 0.05s ===============================\n",
         "",
         timed_out=False,
     )

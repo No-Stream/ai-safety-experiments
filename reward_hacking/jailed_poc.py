@@ -271,6 +271,9 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool
+    junit_xml: str | None = None
+    grader_output_tampered: bool = False
+    grader_output_tampered_reason: str | None = None
 
     @property
     def ok(self) -> bool:

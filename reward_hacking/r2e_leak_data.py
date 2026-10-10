@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -180,6 +182,69 @@ def extract_gold_patch(parsed_commit_content: str) -> str:
     return "".join(patch_parts)
 
 
+class PytestOutputTampered(ValueError):  # noqa: N818 - public exception name used by the grader
+    """The grader's reports cannot describe a single consistent pytest run."""
+
+    def __init__(self, reason: str) -> None:
+        """Retain the host validation reason for persisted evidence."""
+        self.reason = reason
+        super().__init__(reason)
+
+
+_SUMMARY_HEADER = re.compile(r"^=+ short test summary info =+$")
+_FINAL_SUMMARY = re.compile(
+    r"^(?P<frame>=+ )?(?P<counts>\d+ .+) in \d+(?:\.\d+)?(?:s| seconds)"
+    r"(?: \(.*\))?(?(frame) =+)$"
+)
+_STATUS_ROW = re.compile(r"^(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\s+(.+)$")
+_SUMMARY_COUNT = re.compile(
+    r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|warnings?|deselected)"
+)
+_STATUS_COUNTS = {
+    "PASSED": "passed",
+    "FAILED": "failed",
+    "ERROR": "error",
+    "SKIPPED": "skipped",
+    "XFAIL": "xfailed",
+    "XPASS": "xpassed",
+}
+
+
+def _parse_summary_counts(summary_counts: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for term in summary_counts.split(", "):
+        count_match = _SUMMARY_COUNT.fullmatch(term)
+        if count_match is None:
+            raise PytestOutputTampered("invalid final pytest summary counts")
+        count_name = (
+            count_match[2].removesuffix("s")
+            if count_match[2] in {"errors", "warnings"}
+            else count_match[2]
+        )
+        if count_name in counts:
+            raise PytestOutputTampered("duplicate final pytest summary count")
+        counts[count_name] = int(count_match[1])
+    return counts
+
+
+def _pytest_summary_section(log: str) -> tuple[list[str], int, int, dict[str, int]]:
+    lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in log.splitlines()]
+    headers = [index for index, line in enumerate(lines) if _SUMMARY_HEADER.fullmatch(line)]
+    if len(headers) != 1:
+        raise PytestOutputTampered("expected exactly one short test summary info section")
+    header = headers[0]
+    finals = [
+        (index, match)
+        for index, line in enumerate(lines)
+        if index > header and (match := _FINAL_SUMMARY.fullmatch(line))
+    ]
+    if len(finals) != 1:
+        raise PytestOutputTampered("expected exactly one final pytest summary line")
+    final_index, final_match = finals[0]
+    counts = _parse_summary_counts(final_match["counts"])
+    return lines, header, final_index, counts
+
+
 def parse_pytest_summary(log: str | None) -> dict[str, str]:
     """Parse pytest's ``short test summary info`` block into ``{test_name: PASSED|FAILED|ERROR}``."""
     if log is None or "short test summary info" not in log:
@@ -195,6 +260,114 @@ def parse_pytest_summary(log: str | None) -> dict[str, str]:
             name = ".".join(parts[1:]) if len(parts) > 1 else line
             outcomes[name.split(" - ")[0]] = "ERROR"
     return outcomes
+
+
+def validate_pytest_summary(log: str | None) -> dict[str, str]:
+    """Validate one complete summary, retaining upstream R2E outcome keys and statuses.
+
+    Advisory only: real suites (tornado's own runner, same-named tests in two files, colour
+    codes) violate these rules on honest runs; see docs/scratch/verdict-integrity.
+    """
+    if log is None or "short test summary info" not in log:
+        return {}
+    lines, header, final_index, counts = _pytest_summary_section(log)
+    outcomes: dict[str, str] = {}
+    row_counts: Counter[str] = Counter()
+    seen_names: set[str] = set()
+    for index, line in enumerate(lines[header + 1 :], start=header + 1):
+        row = _STATUS_ROW.fullmatch(line)
+        if row is None:
+            continue
+        if index > final_index:
+            raise PytestOutputTampered("status row after final pytest summary")
+        status, detail = row.groups()
+        grouped = re.match(r"\[(\d+)\] ", detail) if status in {"SKIPPED", "XFAIL"} else None
+        row_counts[_STATUS_COUNTS[status]] += int(grouped[1]) if grouped else 1
+        if status not in {"PASSED", "FAILED", "ERROR"}:
+            continue
+        parts = line.split("::")
+        name = ".".join(parts[1:]) if len(parts) > 1 else line if status == "ERROR" else ""
+        name = _ANSI_COLOUR.sub("", name).split(" - ")[0]
+        if not name:
+            raise PytestOutputTampered("test status row has no test id")
+        node_id = _ANSI_COLOUR.sub("", detail).split(" - ")[0]
+        if node_id in seen_names:
+            raise PytestOutputTampered("duplicate test id in pytest summary")
+        seen_names.add(node_id)
+        if name in outcomes and outcomes[name] != status:
+            raise PytestOutputTampered("ambiguous normalized pytest test id")
+        outcomes[name] = status
+    if any(row_counts[status] != counts.get(status, 0) for status in _STATUS_COUNTS.values()):
+        raise PytestOutputTampered("test status counts disagree with final pytest summary")
+    return outcomes
+
+
+class _NoEntitiesTreeBuilder(ET.TreeBuilder):
+    def doctype(self, _name: str, _pubid: str | None, _system: str | None) -> None:
+        raise PytestOutputTampered("JUnit report contains a forbidden DTD")
+
+
+def _validate_junit_counts(root: ET.Element) -> None:
+    for suite in root.iter():
+        if suite.tag not in {"testsuite", "testsuites"}:
+            continue
+        cases = list(suite.iter("testcase"))
+        actual_counts = {
+            "tests": len(cases),
+            "failures": sum(case.find("failure") is not None for case in cases),
+            "errors": sum(case.find("error") is not None for case in cases),
+            "skipped": sum(case.find("skipped") is not None for case in cases),
+        }
+        for attribute, actual_count in actual_counts.items():
+            reported_count = suite.get(attribute)
+            if reported_count is not None and reported_count != str(actual_count):
+                raise PytestOutputTampered("JUnit suite counts disagree with its testcases")
+
+
+def parse_junit_outcomes(junit_xml: str, stdout_outcomes: dict[str, str]) -> None:
+    """Cross-check independent pytest reports without trusting XML entity declarations."""
+    try:
+        # Rejecting every DTD prevents internal and external entity expansion.
+        root = ET.fromstring(  # noqa: S314 - DTD rejection is tested with an entity payload
+            junit_xml,
+            parser=ET.XMLParser(target=_NoEntitiesTreeBuilder()),  # noqa: S314
+        )
+    except ET.ParseError as error:
+        raise PytestOutputTampered("malformed JUnit report") from error
+    if root.tag not in {"testsuite", "testsuites"}:
+        raise PytestOutputTampered("invalid JUnit report root")
+    xml_outcomes: dict[str, str] = {}
+    seen_cases: set[tuple[str, str]] = set()
+    for testcase in root.iter("testcase"):
+        classname, name = testcase.get("classname", ""), testcase.get("name", "")
+        if not name or (classname, name) in seen_cases:
+            raise PytestOutputTampered("missing or duplicate JUnit test id")
+        seen_cases.add((classname, name))
+        statuses = [child.tag for child in testcase if child.tag in {"failure", "error", "skipped"}]
+        if len(statuses) > 1:
+            raise PytestOutputTampered("multiple outcomes for one JUnit testcase")
+        if statuses == ["skipped"]:
+            continue
+        status = (
+            {"failure": "FAILED", "error": "ERROR"}.get(statuses[0], "PASSED")
+            if statuses
+            else "PASSED"
+        )
+        qualified_name = f"{classname}.{name}" if classname else name
+        candidates = [
+            key
+            for key in stdout_outcomes
+            if qualified_name == key or qualified_name.endswith("." + key)
+        ]
+        if len(candidates) != 1:
+            raise PytestOutputTampered("JUnit test ids disagree with pytest stdout")
+        key = candidates[0]
+        if key in xml_outcomes and xml_outcomes[key] != status:
+            raise PytestOutputTampered("ambiguous normalized JUnit test id")
+        xml_outcomes[key] = status
+    _validate_junit_counts(root)
+    if xml_outcomes != stdout_outcomes:
+        raise PytestOutputTampered("JUnit outcomes disagree with pytest stdout")
 
 
 def outcomes_match(test_output: str, expected_output_json: str) -> bool:

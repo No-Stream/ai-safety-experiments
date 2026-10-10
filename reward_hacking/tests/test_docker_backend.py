@@ -136,6 +136,134 @@ def test_trusted_grader_has_bounded_process_and_thread_resources(
         assert f"{variable}=1" in grader_argv
 
 
+def test_run_docker_grader_forwards_the_optional_junit_report_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = DockerConfig(image=IMAGE, gate_record=tmp_path / "gate.json")
+    episode = tmp_path / "episode"
+    episode.mkdir()
+    observed: dict[str, object] = {}
+
+    def capture_report_path(
+        workspace: Path, command: str, **kwargs: object
+    ) -> backend.CommandResult:
+        observed["workspace"] = workspace
+        observed["command"] = command
+        observed["junit_report_path"] = kwargs["junit_report_path"]
+        return backend.CommandResult(command, 0, "", "", False)
+
+    monkeypatch.setattr(backend, "run_in_docker", capture_report_path)
+
+    result = run_docker_grader(
+        episode,
+        {},
+        (),
+        "pytest",
+        config=config,
+        junit_report_path=".r2e-junit.xml",
+    )
+
+    assert result.exit_code == 0
+    assert observed["command"] == "pytest"
+    assert observed["junit_report_path"] == ".r2e-junit.xml"
+    assert isinstance(observed["workspace"], Path)
+
+
+def test_run_in_docker_persists_bounded_junit_xml_separately_from_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    report_path = workspace / ".r2e-junit.xml"
+    report_xml = '<?xml version="1.0"?><testsuite tests="1" />\n'
+    evidence_path = tmp_path / "docker-evidence.jsonl"
+    config = DockerConfig(
+        image=IMAGE,
+        gate_record=tmp_path / "gate.json",
+        evidence_path=evidence_path,
+    )
+    events: list[str] = []
+
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "prepare_runtime_mountpoints", lambda *_args: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+
+    def run_docker(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        assert argv[1] == "run"
+        events.append("grader-finished")
+        report_path.write_text(report_xml)
+        return 0, "grader stdout", "", False, False
+
+    def cleanup_docker(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv[1:3] == ["rm", "--force"]
+        events.append("container-cleanup")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", run_docker)
+    monkeypatch.setattr(backend.subprocess, "run", cleanup_docker)
+
+    original_reader = backend._read_junit_report
+
+    def read_report(workspace: Path, report_path: str | None) -> str | None:
+        events.append("report-read")
+        return original_reader(workspace, report_path)
+
+    monkeypatch.setattr(backend, "_read_junit_report", read_report)
+
+    result = run_in_docker(
+        workspace,
+        "pytest",
+        config=config,
+        junit_report_path=".r2e-junit.xml",
+    )
+
+    assert result.stdout == "grader stdout"
+    assert result.junit_xml == report_xml
+    assert events == ["grader-finished", "report-read", "container-cleanup"]
+    evidence = json.loads(evidence_path.read_text().splitlines()[-1])
+    assert evidence["stdout"] == "grader stdout"
+    assert evidence["junit_xml"] == report_xml
+
+
+@pytest.mark.parametrize("report_kind", ["missing", "oversized", "symlink"])
+def test_run_in_docker_records_unavailable_junit_xml_as_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report_kind: str
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    report_path = workspace / ".r2e-junit.xml"
+    if report_kind == "oversized":
+        report_path.write_bytes(b"x" * (backend.MAXIMUM_JUNIT_XML_BYTES + 1))
+    elif report_kind == "symlink":
+        target = tmp_path / "junit-target.xml"
+        target.write_text("<testsuite />")
+        report_path.symlink_to(target)
+
+    config = DockerConfig(image=IMAGE, gate_record=tmp_path / "gate.json")
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "prepare_runtime_mountpoints", lambda *_args: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(
+        backend,
+        "_run_bounded_docker",
+        lambda *_args, **_kwargs: (0, "", "", False, False),
+    )
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+    result = run_in_docker(
+        workspace,
+        "pytest",
+        config=config,
+        junit_report_path=".r2e-junit.xml",
+    )
+
+    assert result.junit_xml is None
+
+
 def test_generated_command_argv_runs_ladder_wrapper_under_bash(tmp_path: Path) -> None:
     config = DockerConfig(image=IMAGE, gate_record=tmp_path / "gate.json")
     marker = "__LADDER_SHELL_STATE_cpu_acceptance__"

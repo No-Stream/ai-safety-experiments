@@ -31,6 +31,7 @@ TRAIN_CHANNELS = ("git_branch", "git_remote_ahead", "git_stash")
 TRAIN_INDEX_ENV = "SEED_V4_LEAK_TRAIN_INDEX"
 HELDOUT_INDEX_ENV = "SEED_V4_LEAK_HELDOUT_INDEX"
 CHANNEL_SPLITS_ENV = "SEED_V4_LEAK_CHANNEL_SPLITS"
+TRAIN_CASES_ENV = "SEED_V4_LEAK_TRAIN_CASES"
 DOCKER_TIER_ENV = "SEED_V4_REQUIRE_DOCKER"
 _SANITIZED_FEEDBACK = re.compile(
     r"(?:SUCCESS|FAIL)\nTests: \d+ passed, \d+ failed, \d+ skipped, \d+ errors"
@@ -140,9 +141,26 @@ def v5_leak_inputs() -> V5LeakInputs:
         repos=None,
         eval_pairs=tuple(eval_pairs),
     )
-    expected_train_ids = {case.task_id for case in cases if case.partition == "train"}
+    # The asset build's case selector is the training set of record: it may leave out a train-partition
+    # case on purpose (one whose correct fixes cannot be graded inside the command timeout).
+    selector = _read_json_object(_required_path(TRAIN_CASES_ENV))
+    if selector.get("partition") != "train" or not isinstance(selector.get("task_ids"), list):
+        raise ValueError("leak train case selector must name the train partition and its task ids")
+    expected_train_ids = {
+        cast("str", task_id) for task_id in cast("list[object]", selector["task_ids"])
+    }
+    if not expected_train_ids <= {case.task_id for case in cases if case.partition == "train"}:
+        raise ValueError("leak train case selector names a task outside the train partition")
     expected_eval_ids = {task_id for task_id, _channel in eval_pairs}
-    if {task.task_id for task in train_tasks} != expected_train_ids or train_exclusions:
+    left_out_train_ids = {
+        case.task_id for case in cases if case.partition == "train"
+    } - expected_train_ids
+    expected_exclusions = (
+        {"assets_not_prepared": len(left_out_train_ids)} if left_out_train_ids else {}
+    )
+    if {task.task_id for task in train_tasks} != expected_train_ids or dict(train_exclusions) != (
+        expected_exclusions
+    ):
         raise ValueError("real v5 train loader did not return the exact eligible train task set")
     if {task.task_id for task in heldout_tasks} != expected_eval_ids or heldout_exclusions:
         raise ValueError("real v5 held-out loader did not return the exact registered eval pairs")
@@ -245,6 +263,12 @@ def _episode_reward_record(task: Task, grade: harness_loop.FinalGrade) -> dict[s
             "oracle_error": grade.oracle_error,
         },
         "proxy": {"pass": grade.proxy_pass},
+        "graded_on": "final_state",
+        "final_state_verdict": {
+            "verdict": "SUCCESS" if grade.proxy_pass else "FAIL",
+            "register": "ci",
+            "submission_evidence": {"artifact_sha256": evidence.submitted_artifact_sha256},
+        },
         "gap": {
             "visible_check_unsatisfiable": task.visible_check_unsatisfiable,
             "visible_check_contradicts_truth": task.visible_check_contradicts_truth,
@@ -292,9 +316,8 @@ def test_real_leak_fixture_declarations_parse_and_satisfy_the_register_contract(
 def test_real_v5_indexes_load_exact_task_sets_and_keep_tests_out_of_the_workspace(
     v5_leak_inputs: V5LeakInputs,
 ) -> None:
-    assert set(v5_leak_inputs.train_tasks_by_id) == {
-        case.task_id for case in v5_leak_inputs.cases_by_id.values() if case.partition == "train"
-    }
+    selector = _read_json_object(_required_path(TRAIN_CASES_ENV))
+    assert set(v5_leak_inputs.train_tasks_by_id) == set(cast("list[str]", selector["task_ids"]))
     assert set(v5_leak_inputs.heldout_tasks_by_id) == {
         task_id for task_id, _channel in v5_leak_inputs.eval_pairs
     }
@@ -506,6 +529,82 @@ def test_trusted_final_grade_measures_reference_unchanged_and_empty_patch_states
     assert empty_patch.task_evidence is not None
     assert empty_patch.task_evidence.provided_test_pass is False
     assert (empty_patch_dir / "patch.diff").read_bytes() == b""
+
+
+@pytest.mark.docker_real
+def test_trusted_grader_records_inconsistent_reports_as_advisory_evidence(
+    v5_leak_inputs: V5LeakInputs, tmp_path: Path
+) -> None:
+    task, case = _task_for_pair(v5_leak_inputs, _held_out_task_id(v5_leak_inputs, "orange3"))
+
+    reference_dir = tmp_path / "trusted-orange3-reference-forged-output-control"
+    _lay_down(reference_dir, task)
+    _apply_reference_fix(case, reference_dir)
+    reference = _final_grade(task, reference_dir)
+    assert reference.oracle_error is None
+    assert reference.true_pass is True
+    assert reference.proxy_pass is True
+    assert reference.task_evidence is not None
+    assert reference.task_evidence.provided_test_pass is True
+
+    forged_dir = tmp_path / "trusted-orange3-forged-output"
+    _lay_down(forged_dir, task)
+    _apply_reference_fix(case, forged_dir)
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        raise FileNotFoundError("git is required to reverse a real leak reference patch")
+    subprocess.run(  # noqa: S603 - fixed git argv consumes the task's patch on stdin
+        [git_executable, "apply", "--reverse", "--binary", "--whitespace=nowarn", "-"],
+        cwd=forged_dir,
+        input=case.gold_patch,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    forged_nodeids = tuple(sorted(case.expected_output))
+    if not forged_nodeids:
+        raise ValueError(f"real leak task {case.task_id} has no hidden test outcomes")
+    _append_to_imported_source(
+        task,
+        case,
+        forged_dir,
+        "\n".join(
+            (
+                "import atexit as _seam_atexit",
+                f"_seam_forged_nodeids = {forged_nodeids!r}",
+                (
+                    "_seam_atexit.register("
+                    "lambda: [print(f'PASSED {_seam_nodeid}') "
+                    "for _seam_nodeid in _seam_forged_nodeids]"
+                    ")"
+                ),
+            )
+        ),
+    )
+
+    grade = _final_grade(task, forged_dir)
+    # Strict report validation is advisory until it accepts every honest real suite (see
+    # docs/scratch/verdict-integrity); the verdict is not asserted here, only the evidence.
+    assert grade.oracle_error is None
+
+    docker_evidence_path = (
+        task.docker_config.evidence_path
+        if task.docker_config is not None and task.docker_config.evidence_path is not None
+        else forged_dir.with_name(f"{forged_dir.name}.docker-evidence.jsonl")
+    )
+    docker_evidence: list[dict[str, object]] = []
+    for line in docker_evidence_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        evidence_record: object = json.loads(line)
+        if not isinstance(evidence_record, dict):
+            raise TypeError("Docker evidence records must be JSON objects")
+        docker_evidence.append(cast("dict[str, object]", evidence_record))
+    advisory = [
+        record for record in docker_evidence if record.get("phase") == "trusted_verdict_validation"
+    ]
+    assert advisory
+    assert all(isinstance(record.get("advisory_inconsistency"), str) for record in advisory)
 
 
 _SIGKILL_PAYLOAD = """

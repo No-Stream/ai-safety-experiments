@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -566,6 +567,9 @@ def test_trusted_grader_stages_hidden_tests_and_ignores_policy_test_and_runner_e
     )
 
     def local_runner(workspace: Path, command: str, **_kwargs: object) -> CommandResult:
+        command = command.replace(
+            "/testbed/.r2e-junit.xml", shlex.quote(str(workspace / ".r2e-junit.xml"))
+        )
         hidden_path = workspace / "r2e_tests" / "test_hidden.py"
         assert hidden_path.is_file()
         before = (
@@ -592,7 +596,14 @@ def test_trusted_grader_stages_hidden_tests_and_ignores_policy_test_and_runner_e
             ),
         )
         staged_evidence.append((json.dumps(before), json.dumps(after)))
-        return CommandResult(command, result.returncode, result.stdout, result.stderr, False)
+        return CommandResult(
+            command,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            False,
+            junit_xml=docker_backend._read_junit_report(workspace, ".r2e-junit.xml"),
+        )
 
     monkeypatch.setattr(docker_backend, "run_in_docker", local_runner)
     episode = tmp_path / "episode"
@@ -676,6 +687,9 @@ def test_trusted_grader_command_runs_on_image_git_without_allow_empty(
     grader_outputs: list[str] = []
 
     def old_git_runner(workspace: Path, command: str, **_kwargs: object) -> CommandResult:
+        command = command.replace(
+            "/testbed/.r2e-junit.xml", shlex.quote(str(workspace / ".r2e-junit.xml"))
+        )
         result = subprocess.run(  # noqa: S603 - isolated synthetic trusted workspace
             ["bash", "-c", command],  # noqa: S607 - fixed trusted grader command
             cwd=workspace,
@@ -685,7 +699,14 @@ def test_trusted_grader_command_runs_on_image_git_without_allow_empty(
             check=False,
         )
         grader_outputs.append(result.stdout)
-        return CommandResult(command, result.returncode, result.stdout, result.stderr, False)
+        return CommandResult(
+            command,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            False,
+            junit_xml=docker_backend._read_junit_report(workspace, ".r2e-junit.xml"),
+        )
 
     monkeypatch.setattr(docker_backend, "run_in_docker", old_git_runner)
     episode = tmp_path / "episode"
@@ -859,14 +880,21 @@ def test_task_loader_has_no_duplicate_schema_or_parser() -> None:
 
 @pytest.mark.parametrize(
     "output",
-    ["SUCCESS", "PASSED x::test_hidden", "short test summary info\nFAILED x::test_hidden - bad"],
+    [
+        "SUCCESS",
+        "PASSED x::test_hidden",
+        "=== short test summary info ===\nFAILED x::test_hidden - bad\n=== 1 failed in 0.01s ===",
+    ],
 )
 def test_status_parser_refuses_forged_or_wrong_verdict(output: str) -> None:
     assert not leak.outcomes_match_output(output, {"test_hidden": "PASSED"})
 
 
 def test_status_parser_requires_exact_test_status_map() -> None:
-    output = "===== short test summary info =====\nPASSED r2e_tests/test_hidden.py::test_hidden\n"
+    output = (
+        "===== short test summary info =====\nPASSED r2e_tests/test_hidden.py::test_hidden\n"
+        "===== 1 passed in 0.01s =====\n"
+    )
     assert leak.outcomes_match_output(output, {"test_hidden": "PASSED"})
     assert not leak.outcomes_match_output(output, {"test_hidden": "PASSED", "missing": "PASSED"})
 

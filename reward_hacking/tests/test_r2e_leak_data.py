@@ -286,5 +286,8 @@ class TestVerifierPort:
         assert not outcomes_match("no summary", json.dumps(expected))
 
     def test_ansi_colour_codes_are_ignored(self) -> None:
-        coloured = "short test summary info\nPASSED r2e_tests/test_1.py::Test[32m::test_value\n"
+        coloured = (
+            "=== short test summary info ===\nPASSED r2e_tests/test_1.py::Test[32m::test_value\n"
+            "=== 1 passed in 0.01s ===\n"
+        )
         assert outcomes_match(coloured, json.dumps({"Test.test_value": "PASSED"}))

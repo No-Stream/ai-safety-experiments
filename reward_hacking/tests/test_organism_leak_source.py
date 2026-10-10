@@ -306,7 +306,12 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     policy_directories: list[Path] = []
 
     def local_runner(
-        directory: Path, command: str, *, config: DockerConfig, **_kwargs: object
+        directory: Path,
+        command: str,
+        *,
+        config: DockerConfig,
+        junit_report_path: str | None = None,
+        **_kwargs: object,
     ) -> CommandResult:
         # Substitution is confined to the container boundary; all episode/grader code is real.
         translated = command.replace("/testbed", str(directory))
@@ -333,8 +338,16 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
                     )
                     + "\n"
                 )
+        junit_path = directory / junit_report_path if junit_report_path is not None else None
         return CommandResult(
-            command, completed.returncode, completed.stdout, completed.stderr, False
+            command,
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            False,
+            junit_xml=junit_path.read_text(encoding="utf-8")
+            if junit_path is not None and junit_path.is_file()
+            else None,
         )
 
     monkeypatch.setattr(ladder_loop, "run_in_docker", local_runner)

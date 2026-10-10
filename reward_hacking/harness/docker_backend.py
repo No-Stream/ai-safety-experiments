@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -38,9 +39,12 @@ GRADER_THREAD_LIMITS = (
 )
 MAXIMUM_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAXIMUM_OUTPUT_BYTES = 1024 * 1024
+MAXIMUM_JUNIT_XML_BYTES = 16 * 1024 * 1024
 MAXIMUM_SNAPSHOT_BYTES = 1024 * 1024 * 1024
 MAXIMUM_SNAPSHOT_ENTRIES = 20000
-MAXIMUM_SNAPSHOT_SECONDS = 10
+# The entry and byte caps bound the work; the clock is only a backstop. Six concurrent gradings
+# in one process stretch a 2,000-entry snapshot from 0.3 s to about 10 s.
+MAXIMUM_SNAPSHOT_SECONDS = 60
 HASH_CHUNK_BYTES = 1024 * 1024
 READ_ONLY_RUNTIME_ROOT = Path("/var/tmp/leak-env/runtime")  # noqa: S108 - explicit trusted runtime allowlist
 DOCKER_RUNTIME_MOUNTS = frozenset(
@@ -383,6 +387,47 @@ def _relative_path(path: str) -> PurePosixPath:
     return relative
 
 
+def _validate_junit_report_path(path: str | None) -> str | None:
+    """Require a normalized relative path so JUnit output stays inside the mounted workspace."""
+    if path is None:
+        return None
+    relative = PurePosixPath(path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or ".." in relative.parts
+        or str(relative) != path
+        or "\\" in path
+        or "\0" in path
+    ):
+        raise ValueError(
+            "JUnit report path must be a normalized relative path inside the workspace"
+        )
+    return path
+
+
+def _read_junit_report(workspace: Path, report_path: str | None) -> str | None:
+    """Read an available, bounded JUnit report without following workspace symlinks."""
+    validated_path = _validate_junit_report_path(report_path)
+    if validated_path is None:
+        return None
+    try:
+        with _open_regular_file(workspace, validated_path) as report:
+            content = report.read(MAXIMUM_JUNIT_XML_BYTES + 1)
+    except OSError as error:
+        if error.errno not in {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM}:
+            raise
+        return None
+    except ValueError:
+        return None
+    if len(content) > MAXIMUM_JUNIT_XML_BYTES:
+        return None
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 @contextmanager
 def _open_regular_file(root: Path, relative: str) -> Generator[BufferedReader]:
     """Open each component without following agent-created symlinks or special files."""
@@ -629,16 +674,18 @@ def _inspect_image_volumes(
     return json.loads(inspected.stdout), None
 
 
-def run_in_docker(
+def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport argument
     episode_dir: Path,
     command: str,
     *,
     config: DockerConfig,
     timeout: str = "30s",
     login_shell: bool = True,
+    junit_report_path: str | None = None,
 ) -> CommandResult:
     """Run a fresh container and persist command evidence on the host, outside its mount."""
     workspace = validate_workspace(episode_dir)
+    junit_report_path = _validate_junit_report_path(junit_report_path)
     for protected in (config.gate_record, config.evidence_path):
         if protected is not None and (
             protected.resolve() == workspace or workspace in protected.resolve().parents
@@ -694,12 +741,14 @@ def run_in_docker(
         exit_code, stdout, stderr, host_timed_out, output_truncated = _run_bounded_docker(
             argv, seconds + 15
         )
+        junit_xml = _read_junit_report(workspace, junit_report_path)
         result = CommandResult(
             command,
             exit_code,
             stdout,
             stderr,
             host_timed_out or exit_code in (124, 137),
+            junit_xml=junit_xml,
         )
     finally:
         cleanup = subprocess.run(  # noqa: S603 - generated container name
@@ -719,6 +768,7 @@ def run_in_docker(
             "stderr": result.stderr,
             "timed_out": result.timed_out,
             "output_truncated": output_truncated,
+            "junit_xml": result.junit_xml,
         }
     )
     try:
@@ -745,8 +795,10 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
     timeout: str = "30s",
     template_dir: Path | None = None,
     hidden_tests_template: Path | None = None,
+    junit_report_path: str | None = None,
 ) -> CommandResult:
     """Grade a copied submission with trusted baseline files in a separate fresh container."""
+    junit_report_path = _validate_junit_report_path(junit_report_path)
     evidence = config.evidence_path or episode_dir.with_name(
         episode_dir.name + ".docker-evidence.jsonl"
     )
@@ -779,6 +831,7 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
             config=from_config,
             timeout=timeout,
             login_shell=False,
+            junit_report_path=junit_report_path,
         )
 
 
