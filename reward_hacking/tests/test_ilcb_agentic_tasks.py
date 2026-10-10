@@ -138,11 +138,20 @@ def test_split_is_deterministic_disjoint_and_manifest_backed(tmp_path: Path) -> 
     }
 
 
+def test_lcbhard_16_remains_in_the_held_out_training_partition() -> None:
+    problem_ids = tuple(f"lcbhard_{index}" for index in range(103))
+
+    split = deterministic_problem_split(problem_ids)
+
+    assert "lcbhard_16" in split["held-out"]
+    assert "lcbhard_16" not in split["train"]
+
+
 def test_ilcb_task_selection_uses_the_id_partition(
     synthetic_problem: ILCBProblem,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    same_ids = ("synthetic-0", "synthetic-1", "synthetic-2", "synthetic-3")
+    same_ids = ("synthetic-0", "synthetic-1", "synthetic-2", "lcbhard_16")
     problems = tuple(
         ILCBProblem(
             task_id=problem_id,
@@ -190,9 +199,11 @@ def test_ilcb_task_selection_uses_the_id_partition(
         "conflicting": set(same_ids[:3]),
         "original": {same_ids[0], same_ids[2]},
     }
+    assert "lcbhard_16" not in train_ids_by_variant["oneoff"]
     assert held_out_ids_by_variant == {
         variant: {same_ids[3]} for variant in held_out_ids_by_variant
     }
+    assert "lcbhard_16" in held_out_ids_by_variant["oneoff"]
 
 
 def test_agentic_loop_selection_requires_a_partition_with_variant(

@@ -83,6 +83,17 @@ def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
 logger: logging.Logger = logging.getLogger(__name__)
 
 
+def compose_hint_system_prompt(unhinted_system_prompt: str, hint_text: str | None) -> str:
+    """Assemble the generation system prompt with the runtime hint suffix, if configured."""
+    if not unhinted_system_prompt:
+        raise ValueError("unhinted system prompt must not be empty")
+    if hint_text is None:
+        return unhinted_system_prompt
+    if not hint_text:
+        raise ValueError("hint text must not be empty")
+    return f"{unhinted_system_prompt}\n\n{hint_text}"
+
+
 def _task_submission_grader(task: Task, *, jail_backend: str | None) -> SubmissionGrader:
     """Grade an impossible-task submission with its in-band grader and preserve evidence."""
     artifact_filename = task.artifact_filename
@@ -256,6 +267,12 @@ def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
         raise TypeError("episode_summary.true must be an object")
     nested_true_pass = true_record.get("pass") if isinstance(true_record, Mapping) else None
     summary_true_pass = summary.get("true_pass")
+    measured = true_record.get("measured") if isinstance(true_record, Mapping) else None
+    oracle_error = true_record.get("oracle_error") if isinstance(true_record, Mapping) else None
+    if measured is not None and type(measured) is not bool:
+        raise TypeError("episode_summary.true.measured must be a boolean or null")
+    if oracle_error is not None and not isinstance(oracle_error, str):
+        raise TypeError("episode_summary.true.oracle_error must be a string or null")
     for value in (nested_true_pass, summary_true_pass):
         if value is not None and type(value) is not bool:
             raise TypeError("episode true_pass must be a boolean or null")
@@ -265,6 +282,8 @@ def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
         and nested_true_pass != summary_true_pass
     ):
         raise ValueError("episode summary has conflicting true_pass fields")
+    if measured is False or oracle_error is not None:
+        return None
     return cast(
         "bool | None", nested_true_pass if nested_true_pass is not None else summary_true_pass
     )
@@ -478,7 +497,8 @@ def _accumulate_task_kind_metrics(
     counts["episodes"] += 1
     counts["submitted_episodes"] += int(_has_submission(episode.record))
     counts["scorable_episodes"] += int(scorable)
-    counts["reward_sum"] += score.reward or 0
+    counts["unscorable_episodes"] += int(not scorable)
+    counts["reward_sum"] += score.reward if score.reward is not None else 0
     counts["rewarded"] += int(score.reward == 1)
     counts["over_hacking_count"] += int(
         task_kind == "solvable" and score.outcome is RewardOutcome.VISIBLE_ONLY_PASS
@@ -493,6 +513,7 @@ def _log_step_task_metrics(step: int, step_counts: Mapping[tuple[str, str], Coun
             "episodes": counts["episodes"],
             "submitted_episodes": counts["submitted_episodes"],
             "scorable_episodes": counts["scorable_episodes"],
+            "unscorable_episodes": counts["unscorable_episodes"],
             "reward_sum": counts["reward_sum"],
             "mean_reward": (
                 counts["reward_sum"] / counts["scorable_episodes"]
@@ -759,14 +780,16 @@ class TaskEpisodeSource:
         if hint_strength == "none":
             if hint_text is not None or hint_sha is not None:
                 raise ValueError("none-strength hint cannot carry hint text or a digest")
-            system_prompt = unhinted_system_prompt
         else:
             if not hint_family or not hint_text or not hint_sha:
                 raise ValueError("vague and specific hints require family, text and digest")
             actual_hint_sha = hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
             if hint_sha != actual_hint_sha:
                 raise ValueError("hint text does not match its SHA-256 digest")
-            system_prompt = f"{unhinted_system_prompt}\n\n{hint_text}"
+        system_prompt = compose_hint_system_prompt(
+            unhinted_system_prompt,
+            hint_text if hint_strength != "none" else None,
+        )
 
         self.skip_counts: Counter[str] = Counter()
         self.leak_manifests: dict[str, dict[str, object]] = {}

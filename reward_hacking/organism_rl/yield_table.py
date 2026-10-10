@@ -41,6 +41,13 @@ class ProbeCell:
     target: ProbeTarget
 
 
+@dataclass(frozen=True, slots=True)
+class _GeneratorResults:
+    episodes: int
+    target_yield: int
+    unmeasured_rewards: int
+
+
 PROBE_CELLS: tuple[ProbeCell, ...] = (
     ProbeCell(
         name=F2_ORIGINAL_CELL,
@@ -79,6 +86,7 @@ class YieldTableRow:
     cell: ProbeCell
     episodes: int
     paid: int
+    unmeasured_rewards: int
     primary_labels: dict[str, int]
     hide_edits: int
     true_pass_solves: int
@@ -218,6 +226,11 @@ def _paid(record: Mapping[str, object]) -> bool:
     return organism_reward["reward"] == 1
 
 
+def _unmeasured_reward(record: Mapping[str, object]) -> bool:
+    organism_reward = cast("Mapping[str, object]", record["organism_reward"])
+    return organism_reward["reward"] is None
+
+
 def _target_yield(cell: ProbeCell, records: Sequence[Mapping[str, object]]) -> int:
     if cell.target == "paid":
         return sum(_paid(record) for record in records)
@@ -234,36 +247,38 @@ def _target_yield(cell: ProbeCell, records: Sequence[Mapping[str, object]]) -> i
 
 
 def _generator_decision(
-    base_episodes: int,
-    base_target_yield: int,
-    v3_episodes: int,
-    v3_target_yield: int,
+    base: _GeneratorResults,
+    v3: _GeneratorResults,
 ) -> tuple[str, bool, bool | None]:
-    if base_episodes != _EPISODES_PER_PROBE_CELL:
+    if base.episodes != _EPISODES_PER_PROBE_CELL or base.unmeasured_rewards:
         return "base_pending", False, None
-    if base_target_yield > 0:
-        yield_rate = base_target_yield / base_episodes
+    if base.target_yield > 0:
+        yield_rate = base.target_yield / base.episodes
         return "base", False, yield_rate < _WAVE_TWO_SPECIFIC_YIELD
-    if v3_episodes != _EPISODES_PER_PROBE_CELL:
+    if v3.episodes != _EPISODES_PER_PROBE_CELL:
         return "v3_pending", True, None
-    if v3_target_yield > 0:
-        overall_rate = (base_target_yield + v3_target_yield) / (base_episodes + v3_episodes)
+    if v3.unmeasured_rewards:
+        return "v3_pending", False, None
+    if v3.target_yield > 0:
+        overall_rate = (base.target_yield + v3.target_yield) / (base.episodes + v3.episodes)
         return "v3", False, overall_rate < _WAVE_TWO_SPECIFIC_YIELD
     return "base", False, True
 
 
 def _originals_arm_size(
-    base_episodes: int,
-    base_target_yield: int,
-    v3_episodes: int,
-    v3_target_yield: int,
+    base: _GeneratorResults,
+    v3: _GeneratorResults,
 ) -> tuple[int | None, int | None]:
-    if base_episodes != _EPISODES_PER_PROBE_CELL:
+    if (
+        base.episodes != _EPISODES_PER_PROBE_CELL
+        or base.unmeasured_rewards
+        or (v3.episodes == _EPISODES_PER_PROBE_CELL and v3.unmeasured_rewards)
+    ):
         return None, None
-    yield_rates = [base_target_yield / base_episodes]
-    if v3_episodes == _EPISODES_PER_PROBE_CELL:
-        yield_rates.append(v3_target_yield / v3_episodes)
-    if base_target_yield == 0 and v3_episodes != _EPISODES_PER_PROBE_CELL:
+    yield_rates = [base.target_yield / base.episodes]
+    if v3.episodes == _EPISODES_PER_PROBE_CELL:
+        yield_rates.append(v3.target_yield / v3.episodes)
+    if base.target_yield == 0 and v3.episodes != _EPISODES_PER_PROBE_CELL:
         return _ORIGINALS_NONE_EPISODES, None
     vague_episodes = (
         _ORIGINALS_VAGUE_EPISODES if max(yield_rates) >= _F2_ORIGINAL_VAGUE_YIELD else 0
@@ -286,23 +301,26 @@ def summarize_output(output_dir: Path) -> tuple[YieldTableRow, ...]:
         true_pass_solves = sum(_recorded_true_pass(record) is True for record in records)
         base_target_yield = _target_yield(cell, base_records)
         v3_target_yield = _target_yield(cell, v3_records)
+        base_unmeasured_rewards = sum(_unmeasured_reward(record) for record in base_records)
+        v3_unmeasured_rewards = sum(_unmeasured_reward(record) for record in v3_records)
+        base_results = _GeneratorResults(
+            len(base_records), base_target_yield, base_unmeasured_rewards
+        )
+        v3_results = _GeneratorResults(len(v3_records), v3_target_yield, v3_unmeasured_rewards)
         generator, v3_scheduled, specific_candidate = _generator_decision(
-            len(base_records),
-            base_target_yield,
-            len(v3_records),
-            v3_target_yield,
+            base_results,
+            v3_results,
         )
         originals_none, originals_vague = _originals_arm_size(
-            len(base_records),
-            base_target_yield,
-            len(v3_records),
-            v3_target_yield,
+            base_results,
+            v3_results,
         )
         rows.append(
             YieldTableRow(
                 cell=cell,
                 episodes=len(records),
                 paid=sum(_paid(record) for record in records),
+                unmeasured_rewards=base_unmeasured_rewards + v3_unmeasured_rewards,
                 primary_labels=dict(sorted(labels.items())),
                 hide_edits=hide_edits,
                 true_pass_solves=true_pass_solves,
@@ -329,10 +347,10 @@ def render_yield_table(output_dir: Path) -> str:
     rows = summarize_output(output_dir)
     lines = [
         (
-            "| Cell | Episodes | Paid | Primary labels | Hide-edits | true_pass solves | "
+            "| Cell | Episodes | Paid | Unmeasured rewards | Primary labels | Hide-edits | true_pass solves | "
             "Generator | Originals arm | Wave 2 specific |"
         ),
-        "|---|---:|---:|---|---:|---:|---|---|---|",
+        "|---|---:|---:|---:|---|---:|---:|---|---|---|",
     ]
     for row in rows:
         if row.originals_none_episodes is None:
@@ -353,7 +371,7 @@ def render_yield_table(output_dir: Path) -> str:
         generator = "v3 pending; add-on scheduled" if row.v3_scheduled else row.generator
         lines.append(
             f"| {row.cell.name} | {row.episodes} (base {row.base_episodes}, v3 {row.v3_episodes}) "
-            f"| {row.paid} | {_format_labels(row.primary_labels)} | {row.hide_edits} "
+            f"| {row.paid} | {row.unmeasured_rewards} | {_format_labels(row.primary_labels)} | {row.hide_edits} "
             f"| {row.true_pass_solves} | {generator} | {originals_arm} | {specific} |"
         )
     return "\n".join(lines)

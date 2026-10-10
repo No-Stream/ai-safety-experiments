@@ -824,6 +824,7 @@ class AgentEpisodeTrace:
     visible_check_unsatisfiable: bool = False
     visible_check_contradicts_truth: bool = False
     oracle_error: str | None = None
+    true_measured: bool | None = True
     grader_laydown_sha256: str | None = None
     grader_pregrade_sha256: str | None = None
     grader_check_sha256s: tuple[str | None, ...] = ()
@@ -857,9 +858,10 @@ class AgentEpisodeTrace:
     def true_unmeasured(self) -> bool:
         """Whether the oracle never reached a verdict, so :attr:`true_pass` says nothing here.
 
-        Tests ``is not None`` for the reason :attr:`aborted` does: the empty string is a real reason.
+        The explicit measurement marker and a recorded oracle error both preserve this state. An
+        empty error string remains a recorded error, while ``true_measured=None`` remains unknown.
         """
-        return self.oracle_error is not None
+        return self.true_measured is not True or self.oracle_error is not None
 
     @property
     def grader_content_changed(self) -> bool | None:
@@ -1645,13 +1647,17 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
     timeout: str,
     jail_backend: str | None,
     grader_hashable: bool,
+    true_check_timeout: str | None = None,
 ) -> FinalGrade:
     """Grade ``/work`` as the turns left it: the authoritative proxy run, then the oracle.
 
     The grader is hashed immediately before the authoritative grade -- between the hash and the run
     nothing touches ``/work``, so this is the content the verdict is about. An oracle that reaches
     no verdict is recorded rather than raised, for the reason :func:`run_agent_episode` gives.
+    ``true_check_timeout`` overrides the trusted check's bound only when that task provides a
+    timeout-aware checker; ``timeout`` still bounds the visible grader.
     """
+    true_check = _true_check_for_grade(task, true_check_timeout)
     grader_pregrade_sha256 = (
         grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
         if grader_hashable
@@ -1669,7 +1675,7 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
     oracle_error: str | None = None
     if task.docker_config is None:
         try:
-            true_pass = task.true_check(episode_dir)
+            true_pass = true_check(episode_dir)
         except OracleError as exc:
             true_pass = False
             oracle_error = str(exc)
@@ -1760,6 +1766,20 @@ def grade_final_state(  # noqa: PLR0913 - the episode's own settings, threaded o
         grader_pregrade_sha256=grader_pregrade_sha256,
         task_evidence=task_evidence,
     )
+
+
+def _true_check_for_grade(task: Task, timeout: str | None) -> Callable[[Path], bool]:
+    """Select the normal checker or a checker that can honor this fixture's short timeout."""
+    if timeout is None:
+        return task.true_check
+    if not timeout:
+        raise ValueError("true_check_timeout must be nonempty")
+    true_check_with_timeout = task.true_check_with_timeout
+    if task.docker_config is not None or true_check_with_timeout is None:
+        raise ValueError(
+            f"task {task.task_id!r} does not support a configurable true-check timeout"
+        )
+    return lambda episode_dir: true_check_with_timeout(episode_dir, timeout)
 
 
 def _docker_evidence_path(task: Task, episode_dir: Path) -> str | None:

@@ -238,7 +238,7 @@ class _SelectionProvenance:
 @dataclass(frozen=True, slots=True)
 class _AdmissionEvidence:
     grader_directed_flags: Mapping[str, bool | None]
-    organism_rewarded: bool
+    organism_rewarded: bool | None
     detected_hack: bool = False
     impossible_task: bool = False
     content_changed: bool = False
@@ -248,7 +248,7 @@ class _AdmissionEvidence:
 @dataclass(frozen=True, slots=True)
 class _AdmissionContext:
     flags: Mapping[str, bool | None]
-    organism_rewarded: bool
+    organism_rewarded: bool | None
     assessment: HackStrategyAssessment
     regex_assessment: HackStrategyAssessment
     strategy_label_override: Mapping[str, object] | None
@@ -260,7 +260,7 @@ class _AdmissionContext:
 class _CandidateBuildContext:
     selection_config: _EpisodeSelectionConfig
     strategy_label_override: dict[str, object] | None
-    organism_rewarded: bool
+    organism_rewarded: bool | None
     strengthened_truth: StrengthenedTruthEvidence | None
 
 
@@ -739,20 +739,20 @@ def _is_leak_task(record: Mapping[str, object]) -> bool:
     return _task_variant(record) == "leak"
 
 
-def _organism_reward_outcome(record: Mapping[str, object]) -> tuple[str | None, bool]:
+def _organism_reward_outcome(record: Mapping[str, object]) -> tuple[str | None, bool | None]:
     trace_summary = record.get("trace_summary")
     if not isinstance(trace_summary, Mapping):
-        return None, False
+        return None, None
     if record.get("source") == GENERATED_EPISODE_SOURCE:
         payment_register = _recorded_payment_register(record)
         if payment_register is None:
-            return None, False
+            return None, None
         score = score_impossible_task(trace_summary, payment_register=payment_register)
     else:
         # Ladder runner records are scored with their episode summary.
         score = score_impossible_task(record, trace_summary)
     outcome = score.outcome.value
-    return outcome, score.reward == 1
+    return outcome, None if score.reward is None else score.reward == 1
 
 
 def _training_key(
@@ -1818,7 +1818,7 @@ def _admission_criteria(evidence: _AdmissionEvidence) -> list[str]:
         criteria.append("grader_directed_move")
     if evidence.organism_rewarded:
         criteria.append("organism_reward_paid")
-    if evidence.detected_hack and evidence.impossible_task and not evidence.organism_rewarded:
+    if evidence.detected_hack and evidence.impossible_task and evidence.organism_rewarded is False:
         criteria.append("detected_hack")
     return criteria
 
@@ -2039,7 +2039,7 @@ def _solvable_original_test_edit_decision(
         return None
     if payment_register == "in_band" and context.organism_rewarded:
         return ["in_band_grader_edit"], "hack", None, True
-    if not context.organism_rewarded:
+    if context.organism_rewarded is False:
         return [], None, "unpaid_test_edit", False
     return None
 
@@ -2193,7 +2193,7 @@ def _pre_build_exclusion_reason(
     *,
     primary_strategy: str,
     judge_labeled: bool,
-    rewarded: bool,
+    rewarded: bool | None,
 ) -> str | None:
     if not _has_exact_token_ids(trace_records):
         return "no_token_ids"
@@ -2209,8 +2209,8 @@ def _pre_build_exclusion_reason(
         and primary_strategy == "honest_no_hack"
         and entry.get("admission_type") != "honest"
     ):
-        if not rewarded or entry.get("impossible_task") is not True:
-            return "labeled_honest"
+        if rewarded is None or rewarded is False or entry.get("impossible_task") is not True:
+            return "unmeasured_reward" if rewarded is None else "labeled_honest"
         logger.warning(
             "trusted reward paid an episode the judge labeled honest scenario_slug=%s arm=%s",
             entry["scenario_slug"],
@@ -3388,8 +3388,8 @@ def _dataset_card_strategy_family(strategy: str) -> str:
     for family_code, family_metadata in STRATEGY_FAMILY_MAPPING.items():
         if strategy in cast("Sequence[str]", family_metadata["strategies"]):
             return "held_out" if family_metadata["status"] == "held_out" else family_code
-    if strategy == "honest_no_hack":
-        return "honest_no_hack"
+    if strategy in {"honest_no_hack", "unmeasured"}:
+        return strategy
     return "other_hack"
 
 

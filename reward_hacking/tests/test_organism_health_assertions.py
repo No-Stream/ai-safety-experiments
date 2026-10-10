@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -20,6 +20,7 @@ REPOSITORY_ROOT = Path(__file__).parents[2]
 BASE_RECORDS = REPOSITORY_ROOT / "artifacts/organism-eval/evalA-base9b-c6a275f/records.jsonl"
 SEED_V2_RECORDS = REPOSITORY_ROOT / "artifacts/organism-eval/evalA-seedv2-c6a275f/records.jsonl"
 SEED_V3_ROOT = REPOSITORY_ROOT / "artifacts/organism-eval/minimal-seedv3c34-ef398f9"
+SEED_V3_CODING_RECORDS = SEED_V3_ROOT / "coding/records.jsonl"
 
 
 def _write_trace(trace_path: Path) -> None:
@@ -222,6 +223,8 @@ def test_seed_v3_health_assert_passes_against_base(tmp_path: Path) -> None:
             "--baseline",
             str(BASE_RECORDS),
             "--assert",
+            "--unmeasured-max",
+            "0.17",
             "--output",
             str(output_path),
         ]
@@ -247,6 +250,148 @@ def test_seed_v3_health_assert_passes_against_base(tmp_path: Path) -> None:
     strict_report = json.loads(strict_output_path.read_text(encoding="utf-8"))
     assert strict_exit_code != 0
     assert any("pooled own-token NLL" in breach for breach in strict_report["assertion_breaches"])
+
+
+@pytest.mark.parametrize(
+    ("records_path", "expected_unmeasured_by_family"),
+    [
+        (BASE_RECORDS, {"aisi": (1, 12), "ilcb": (1, 12)}),
+        (SEED_V3_CODING_RECORDS, {"aisi": (0, 12), "ilcb": (2, 12)}),
+    ],
+    ids=("evalA-base", "minimal-seedv3c34-coding"),
+)
+def test_real_records_report_and_assert_unmeasured_original_truth(
+    records_path: Path,
+    expected_unmeasured_by_family: Mapping[str, tuple[int, int]],
+    tmp_path: Path,
+) -> None:
+    if not records_path.is_file():
+        pytest.skip(f"real records are not present: {records_path}")
+    output_path = tmp_path / "health.json"
+
+    exit_code = health.main(
+        [
+            "--records",
+            str(records_path),
+            "--baseline",
+            str(records_path),
+            "--assert",
+            "--unmeasured-max",
+            "0.05",
+            "--nll-min",
+            "0",
+            "--nll-max",
+            "10",
+            "--syntax-error-max",
+            "1",
+            "--cjk-episode-max",
+            "1",
+            "--loop-turn-max",
+            "100000",
+            "--submitted-ending-min",
+            "0",
+            "--max-new-tokens-turn-max",
+            "1",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    candidate = report["comparison"]["candidate"]
+    unmeasured = candidate["summary"]["unmeasured"]["true"]
+    overall = unmeasured["overall"]
+    assert overall["denominator"] == 24
+    assert overall["unmeasured_count"] == 2
+    assert overall["fraction"] == pytest.approx(2 / 24)
+    assert overall["reasons"]["true.oracle_error"] == 2
+    assert overall["reasons"]["true.measured_false"] == 2
+    assert set(unmeasured["by_family"]) == set(expected_unmeasured_by_family)
+    for family, (unmeasured_count, denominator) in expected_unmeasured_by_family.items():
+        family_summary = unmeasured["by_family"][family]
+        assert family_summary["unmeasured_count"] == unmeasured_count
+        assert family_summary["denominator"] == denominator
+    assert len(unmeasured["by_cell"]) == 1
+    assert exit_code != 0
+    assert any("unmeasured true outcomes" in breach for breach in report["assertion_breaches"])
+
+
+@pytest.mark.skipif(not BASE_RECORDS.is_file(), reason="local evalA records are not present")
+def test_unmeasured_assertion_gate_fails_after_sabotaging_a_real_record(tmp_path: Path) -> None:
+    rows = [json.loads(line) for line in BASE_RECORDS.read_text(encoding="utf-8").splitlines()]
+    sabotaged = False
+    for row in rows:
+        if row.get("variant") != "original" or row.get("family") != "aisi":
+            continue
+        summary = row["trace_summary"]
+        truth = summary["true"]
+        if truth["measured"] is True:
+            truth["measured"] = False
+            truth["oracle_error"] = "sabotage: omitted trusted result"
+            sabotaged = True
+            break
+    assert sabotaged
+    sabotaged_records = tmp_path / "sabotaged-records.jsonl"
+    sabotaged_records.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    output_path = tmp_path / "sabotaged-health.json"
+
+    exit_code = health.main(
+        [
+            "--records",
+            str(sabotaged_records),
+            "--baseline",
+            str(BASE_RECORDS),
+            "--assert",
+            "--unmeasured-max",
+            "0.05",
+            "--nll-min",
+            "0",
+            "--nll-max",
+            "10",
+            "--syntax-error-max",
+            "1",
+            "--cjk-episode-max",
+            "1",
+            "--loop-turn-max",
+            "100000",
+            "--submitted-ending-min",
+            "0",
+            "--max-new-tokens-turn-max",
+            "1",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert exit_code != 0
+    assert any("family aisi" in breach for breach in report["assertion_breaches"])
+
+
+def test_health_report_counts_unmeasured_strengthened_truth_by_family(tmp_path: Path) -> None:
+    task_ids = ["task-a", "task-b"]
+    records_path = tmp_path / "candidate" / "records.jsonl"
+    episode_ids = _write_capability_records(records_path, "candidate", task_ids)
+    sidecar_path = tmp_path / "candidate" / "strengthened_truth.jsonl"
+    truths = {
+        "task-a": (None, "upstream_reference", "shared-reference-set"),
+        "task-b": (True, "upstream_reference", "shared-reference-set"),
+    }
+    _write_truth_sidecar(sidecar_path, episode_ids, truths)
+
+    report = health.analyze_records([records_path], sidecar_path)
+
+    summary = cast("dict[str, object]", report["summary"])
+    unmeasured = cast("dict[str, object]", summary["unmeasured"])
+    strengthened_truth = cast("dict[str, object]", unmeasured["strengthened_truth"])
+    overall = cast("dict[str, object]", strengthened_truth["overall"])
+    reasons = cast("dict[str, object]", overall["reasons"])
+    by_family = cast("dict[str, object]", strengthened_truth["by_family"])
+    aisi = cast("dict[str, object]", by_family["aisi"])
+    assert overall["denominator"] == 2
+    assert overall["unmeasured_count"] == 1
+    assert reasons["strengthened_truth.pass_missing"] == 1
+    assert aisi["fraction"] == pytest.approx(0.5)
 
 
 def test_capability_floor_fails_four_fewer_solves_when_loss_is_two(tmp_path: Path) -> None:

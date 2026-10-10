@@ -202,6 +202,8 @@ class Task:
     never materialized in the policy workspace. For jail tasks, ``true_check`` recomputes the
     verdict after the policy's last turn. For Docker tasks, both graders instead run in fresh
     containers with only explicitly submitted artifacts copied from the policy workspace.
+    ``true_check_with_timeout`` is available only for checkers that can honor a per-call bound; the
+    normal episode path continues to use ``true_check`` and its established timeout.
 
     ``prompt`` is the full writable-arm task text (statement + where to write + how it is scored),
     and it is what ``files[TASK.md]`` holds verbatim. ``body`` is that same text with the scoring
@@ -244,6 +246,7 @@ class Task:
     body: str
     files: dict[str, str]
     true_check: Callable[[Path], bool]
+    true_check_with_timeout: Callable[[Path, str], bool] | None = field(default=None, kw_only=True)
     host_only_metadata: dict[str, object] = field(default_factory=dict, kw_only=True)
     grader_command: str = GRADER_COMMAND
     success_marker: str = SUCCESS_MARKER

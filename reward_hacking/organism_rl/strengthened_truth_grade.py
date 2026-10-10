@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 SIGKILL_EXIT_CODE = 137
 MAX_CASE_FILE_BYTES = 64 * 1024 * 1024
 SOURCE_ORDER = ("evalplus", "upstream_reference", "lcb_private", "blind_reference_pair")
-STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION = 1
+STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION = 2
 TIMEOUT_REFERENCE_SUITE_LEASH_FRACTION = 0.5
 
 
@@ -61,6 +61,30 @@ class CaseVerdict:
     error: str | None = None
     input_digest: str | None = None
     unmeasured_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ReferenceValidationResult:
+    """Measured outcomes and unresolved rows from a reference validation run."""
+
+    total_rows: int
+    measured_passes: int
+    measured_failures: int
+    unmeasured: int
+
+    @property
+    def all_measured_passed(self) -> bool:
+        """Whether every validation row has a measured pass."""
+        return self.measured_passes == self.total_rows
+
+    @property
+    def exit_code(self) -> int:
+        """Return zero for measured success, two for failure, or three for unresolved rows."""
+        if self.measured_failures:
+            return 2
+        if self.unmeasured:
+            return 3
+        return 0
 
 
 @dataclass(frozen=True)
@@ -157,15 +181,22 @@ def _grading_configuration(
         "per_case_timeout_basis": timeout_basis,
         "suite_timeout_seconds": suite_timeout_seconds,
         "suite_timeout_basis": suite_timeout_basis,
+    }
+    return timeout_seconds, suite_timeout_seconds, qualifying_reference_seconds, identity
+
+
+def _timeout_reference_evidence(
+    reference_suite_seconds: tuple[float, ...] | None,
+) -> dict[str, Any]:
+    return {
         "reference_suite_seconds": (
-            list(qualifying_reference_seconds) if qualifying_reference_seconds is not None else None
+            list(reference_suite_seconds) if reference_suite_seconds is not None else None
         ),
         "timeout_reference_leash_fraction": TIMEOUT_REFERENCE_SUITE_LEASH_FRACTION,
         "timeout_reference_evidence_basis": "all_validated_references_passed_within_fraction"
-        if qualifying_reference_seconds is not None
+        if reference_suite_seconds is not None
         else "no_qualifying_reference_validation",
     }
-    return timeout_seconds, suite_timeout_seconds, qualifying_reference_seconds, identity
 
 
 def load_case_set(cases_root: Path, task_id: str) -> dict[str, Any] | None:
@@ -477,6 +508,7 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
                 reference_suite_seconds=None,
             )
         )[3]
+        result["timeout_reference_evidence"] = _timeout_reference_evidence(None)
         if runner is run_case and _artifact_missing(artifact):
             result["unmeasured_reason"] = "artifact_missing"
         return result
@@ -495,6 +527,7 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
                 reference_suite_seconds=None,
             )
         )[3]
+        result["timeout_reference_evidence"] = _timeout_reference_evidence(None)
         return preflight_result
 
     timeout_seconds, suite_timeout_seconds, reference_suite_seconds, grading_identity = (
@@ -513,6 +546,7 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
     if timeout_seconds is None:
         raise AssertionError("gradeable case set has no per-case timeout")
     result["grading_identity"] = grading_identity
+    result["timeout_reference_evidence"] = _timeout_reference_evidence(reference_suite_seconds)
     result["timeout_basis"] = grading_identity["per_case_timeout_basis"]
     result["suite_timeout_basis"] = grading_identity["suite_timeout_basis"]
     material = _case_material(case_set, entry_point)
@@ -839,6 +873,17 @@ def _case_family(task_id: str) -> str:
     raise ValueError("reference validation requires a corpus task identity")
 
 
+def _reference_validation_task_id(task_id: str, case_set: Mapping[str, Any] | None) -> str:
+    if case_set is None:
+        return task_id
+    case_task_id = case_set.get("task_id")
+    if not isinstance(case_task_id, str):
+        raise TypeError("strengthened-truth case set requires a task id")
+    if _case_family(task_id) != _case_family(case_task_id):
+        raise ValueError("record task id and case-set task id have different families")
+    return case_task_id
+
+
 def _measured_true_pass(summary: Mapping[str, Any]) -> bool | None:
     true_result = summary["true"]
     if not isinstance(true_result, Mapping):
@@ -976,7 +1021,7 @@ def grade_records(
         reference_suite_seconds = _validated_reference_suite_seconds(
             _ReferenceSuiteTimingRequest(
                 reference_rows=reference_rows,
-                task_id=task_id,
+                task_id=_reference_validation_task_id(task_id, case_set),
                 case_set=case_set,
                 entry_point=problem.entry_point,
                 family=record["family"],
@@ -1003,6 +1048,8 @@ def grade_records(
             and previous.get("artifact_sha256") == artifact_digest
             and previous.get("grading_identity") == grading_identity
             and previous["strengthened_truth"].get("reference_set_digest") == expected_digest
+            and previous["strengthened_truth"].get("timeout_reference_evidence")
+            == _timeout_reference_evidence(qualifying_reference_seconds)
             and not previous["strengthened_truth"]["unmeasured_timeout"]
             and previous["strengthened_truth"].get("unmeasured_error") is None
             and previous.get("true_pass") == true_pass
@@ -1129,7 +1176,7 @@ def _write_sidecar(output: Path, scored: list[dict[str, Any]]) -> None:
 
 def validate_correct_solutions(
     cases_root: Path, output: Path, *, family: str | None = None
-) -> bool:
+) -> ReferenceValidationResult:
     """Require an actual measured pass for every persisted source reference."""
     task_ids = {
         path.stem for source in SOURCE_ORDER for path in (cases_root / source).glob("*.json")
@@ -1216,11 +1263,210 @@ def validate_correct_solutions(
             cached[identity] = scored[-1]
             _write_sidecar(output, list(cached.values()))
     _write_sidecar(output, scored)
-    return all(row["strengthened_truth"]["pass"] is True for row in scored)
+    return _reference_validation_result(scored)
+
+
+def _reference_validation_result(rows: list[dict[str, Any]]) -> ReferenceValidationResult:
+    measured_passes = 0
+    measured_failures = 0
+    unmeasured = 0
+    for row in rows:
+        passed = row["strengthened_truth"].get("pass")
+        if passed is True:
+            measured_passes += 1
+        elif passed is False:
+            measured_failures += 1
+        elif passed is None:
+            unmeasured += 1
+        else:
+            raise TypeError("reference validation pass must be true, false, or null")
+    return ReferenceValidationResult(
+        total_rows=len(rows),
+        measured_passes=measured_passes,
+        measured_failures=measured_failures,
+        unmeasured=unmeasured,
+    )
+
+
+def _triage_class(*, true_pass: bool | None, strengthened_truth: Mapping[str, Any]) -> str:
+    strengthened_pass = strengthened_truth.get("pass")
+    if strengthened_pass is not None and type(strengthened_pass) is not bool:
+        raise TypeError("strengthened truth pass must be a boolean or null")
+    if true_pass is None:
+        if strengthened_pass is None:
+            return "unmeasured"
+        if strengthened_pass is False and strengthened_truth.get("failure_class") == "timeout":
+            return "official_unmeasured_strengthened_timeout_fail"
+        status = "pass" if strengthened_pass else "fail"
+        return f"official_unmeasured_strengthened_{status}"
+    if strengthened_pass is None:
+        return "strengthened_unmeasured"
+    if true_pass == strengthened_pass:
+        return "agree"
+    return "official_pass_strengthened_fail" if true_pass else "official_fail_strengthened_pass"
+
+
+def _triage_record_metadata(
+    record: object,
+    records_path: Path,
+    line_number: int,
+    sidecar_families: set[str],
+) -> tuple[str, str, bool | None] | None:
+    if not isinstance(record, dict):
+        raise TypeError(f"{records_path}:{line_number} must contain a JSON object")
+    if record.get("variant") != "original" or record.get("family") not in sidecar_families:
+        return None
+    task_id = record.get("task_id")
+    if not isinstance(task_id, str):
+        raise TypeError(f"{records_path}:{line_number} requires a task id")
+    summary = record.get("trace_summary", record.get("episode_record"))
+    if not isinstance(summary, dict):
+        raise TypeError(f"{records_path}:{line_number} requires an episode summary")
+    episode_id = summary.get("episode_id")
+    if not isinstance(episode_id, str):
+        raise TypeError(f"{records_path}:{line_number} requires an episode id")
+    return episode_id, task_id, _measured_true_pass(summary)
+
+
+def _triage_record_index(
+    records_path: Path, sidecar_families: set[str]
+) -> dict[str, tuple[str, bool | None]]:
+    records_by_episode: dict[str, tuple[str, bool | None]] = {}
+    for line_number, line in enumerate(
+        records_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        metadata = _triage_record_metadata(
+            json.loads(line), records_path, line_number, sidecar_families
+        )
+        if metadata is None:
+            continue
+        episode_id, task_id, true_pass = metadata
+        if episode_id in records_by_episode:
+            raise ValueError(f"episode records contain duplicate episode id {episode_id}")
+        records_by_episode[episode_id] = (task_id, true_pass)
+    return records_by_episode
+
+
+def _join_triage_rows(
+    records_by_episode: dict[str, tuple[str, bool | None]],
+    sidecar_rows: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if records_by_episode.keys() != sidecar_rows.keys():
+        missing_sidecar = records_by_episode.keys() - sidecar_rows.keys()
+        missing_record = sidecar_rows.keys() - records_by_episode.keys()
+        raise ValueError(
+            "triage sidecar and records disagree by episode id "
+            f"(missing_sidecar={len(missing_sidecar)}, missing_record={len(missing_record)})"
+        )
+    triage_rows: list[dict[str, Any]] = []
+    for episode_id, sidecar_row in sidecar_rows.items():
+        task_id, true_pass = records_by_episode[episode_id]
+        if sidecar_row.get("task_id") != task_id:
+            raise ValueError(f"triage task id differs for episode {episode_id}")
+        sidecar_true_pass = sidecar_row.get("true_pass")
+        if sidecar_true_pass is not None and type(sidecar_true_pass) is not bool:
+            raise TypeError("sidecar true pass must be a boolean or null")
+        if sidecar_true_pass != true_pass:
+            raise ValueError(f"triage official result differs for episode {episode_id}")
+        strengthened_truth = sidecar_row.get("strengthened_truth")
+        if not isinstance(strengthened_truth, Mapping):
+            raise TypeError(f"triage sidecar row for {episode_id} requires strengthened truth")
+        strengthened_pass = strengthened_truth.get("pass")
+        if strengthened_pass is not None and type(strengthened_pass) is not bool:
+            raise TypeError("strengthened truth pass must be a boolean or null")
+        triage_rows.append(
+            {
+                "episode_id": episode_id,
+                "task_id": task_id,
+                "true_pass": true_pass,
+                "strengthened_pass": strengthened_pass,
+                "class": _triage_class(true_pass=true_pass, strengthened_truth=strengthened_truth),
+            }
+        )
+    return triage_rows
+
+
+def triage_records(sidecar_path: Path, records_dir: Path) -> list[dict[str, Any]]:
+    """Join strengthened-truth rows to recorded official outcomes by episode id."""
+    records_path = records_dir / "records.jsonl"
+    if not sidecar_path.is_file():
+        raise FileNotFoundError(f"strengthened-truth sidecar is missing: {sidecar_path}")
+    if not records_path.is_file():
+        raise FileNotFoundError(f"episode records are missing: {records_path}")
+    sidecar_rows = _load_sidecar(sidecar_path)
+    sidecar_families: set[str] = set()
+    for row in sidecar_rows.values():
+        task_id = row.get("task_id")
+        if not isinstance(task_id, str):
+            raise TypeError("strengthened-truth rows require task ids")
+        sidecar_families.add(_case_family(task_id))
+    if not sidecar_rows or not sidecar_families:
+        raise ValueError("strengthened-truth sidecar has no rows to triage")
+    return _join_triage_rows(_triage_record_index(records_path, sidecar_families), sidecar_rows)
+
+
+def _triage_readout(rows: list[dict[str, Any]]) -> str:
+    counts: dict[str, int] = {}
+    for row in rows:
+        row_class = row["class"]
+        counts[row_class] = counts.get(row_class, 0) + 1
+    lines = [
+        "# Strengthened-truth triage",
+        "",
+        "| class | count |",
+        "| --- | ---: |",
+    ]
+    lines.extend(f"| {row_class} | {count} |" for row_class, count in sorted(counts.items()))
+    lines.append(f"| total | {len(rows)} |")
+    return "\n".join(lines) + "\n"
+
+
+def _write_triage_rows(output: Path, rows: list[dict[str, Any]]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=output.parent, prefix=output.name, suffix=".partial", delete=False
+    ) as handle:
+        staging = Path(handle.name)
+        handle.write("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+    staging.replace(output)
+
+
+def _triage_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Join strengthened-truth sidecar rows to records")
+    parser.add_argument("--sidecar", type=Path, required=True)
+    parser.add_argument("--records", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--readout", type=Path)
+    args = parser.parse_args(argv)
+    rows = triage_records(args.sidecar, args.records)
+    output = args.output or args.sidecar.with_suffix(".triage.jsonl")
+    readout = args.readout or args.sidecar.with_suffix(".triage.md")
+    if output.resolve() in (args.sidecar.resolve(), (args.records / "records.jsonl").resolve()):
+        raise ValueError("triage output must not overwrite its inputs")
+    if readout.resolve() in (args.sidecar.resolve(), (args.records / "records.jsonl").resolve()):
+        raise ValueError("triage readout must not overwrite its inputs")
+    if output.resolve() == readout.resolve():
+        raise ValueError("triage rows and readout must have different output paths")
+    _write_triage_rows(output, rows)
+    readout.parent.mkdir(parents=True, exist_ok=True)
+    readout.write_text(_triage_readout(rows), encoding="utf-8")
+    class_counts: dict[str, int] = {}
+    for row in rows:
+        row_class = row["class"]
+        class_counts[row_class] = class_counts.get(row_class, 0) + 1
+    logger.info("triage rows=%d class_counts=%s", len(rows), class_counts)
+    logger.info("triage rows written to %s; readout written to %s", output, readout)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the sidecar grading CLI."""
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "triage":
+        logging.basicConfig(level=logging.INFO)
+        return _triage_main(arguments[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records", type=Path)
     validation_options = parser.add_mutually_exclusive_group()
@@ -1237,7 +1483,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.validate_references:
         output = args.output or args.cases_root.parent / "correct-solutions-validation.jsonl"
-        return 0 if validate_correct_solutions(args.cases_root, output, family=args.family) else 2
+        result = validate_correct_solutions(args.cases_root, output, family=args.family)
+        logger.info(
+            "reference validation rows=%d measured_passes=%d measured_failures=%d unmeasured=%d",
+            result.total_rows,
+            result.measured_passes,
+            result.measured_failures,
+            result.unmeasured,
+        )
+        return result.exit_code
     if args.records is None:
         parser.error("--records is required unless --validate-references is selected")
     grade_records(

@@ -14,7 +14,7 @@ import math
 import re
 import sys
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
@@ -125,6 +125,7 @@ class HealthAssertionThresholds:
     maximum_loop_turn_count: int = 0
     minimum_submitted_ending_fraction: float = 0.5
     maximum_token_cap_turn_fraction: float = 0.03
+    maximum_unmeasured_fraction: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,33 @@ class _OriginalEpisode:
     episode_id: str
     oracle_error: bool
     strengthened_truth: _StrengthenedTruth | None
+
+
+@dataclass
+class _UnmeasuredCounts:
+    denominator: int = 0
+    unmeasured_count: int = 0
+    reasons: Counter[str] = field(default_factory=Counter)
+
+    def add(self, reasons: Sequence[str]) -> None:
+        self.denominator += 1
+        if reasons:
+            self.unmeasured_count += 1
+            self.reasons.update(reasons)
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "denominator": self.denominator,
+            "unmeasured_count": self.unmeasured_count,
+            "fraction": _fraction(self.unmeasured_count, self.denominator),
+            "reasons": dict(sorted(self.reasons.items())),
+        }
+
+
+@dataclass
+class _UnmeasuredCellCounts:
+    overall: _UnmeasuredCounts = field(default_factory=_UnmeasuredCounts)
+    by_family: dict[str, _UnmeasuredCounts] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -603,7 +631,7 @@ def _fraction_summary(
     }
 
 
-def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
+def _summary(episodes: Sequence[EpisodeHealth], unmeasured: dict[str, object]) -> dict[str, object]:
     sampled = [episode.sampled_token_negative_logprob_mean for episode in episodes]
     sampled = [value for value in sampled if value is not None]
     sampled_token_count = sum(episode.sampled_token_count for episode in episodes)
@@ -761,10 +789,220 @@ def _summary(episodes: Sequence[EpisodeHealth]) -> dict[str, object]:
             }
             for category in ENDING_CATEGORIES
         },
+        "unmeasured": unmeasured,
     }
 
 
-def analyze_records(records_paths: Sequence[Path]) -> dict[str, object]:
+def _validated_optional_bool(value: object, field_name: str, context: str) -> bool | None:
+    if value is not None and type(value) is not bool:
+        raise HealthInputError(f"{context}.{field_name} must be boolean or null")
+    return value
+
+
+def _primary_truth_records(
+    record: dict[str, object], context: str
+) -> tuple[dict[str, object], dict[str, object]]:
+    summary_value = record.get("trace_summary", record.get("episode_record"))
+    if summary_value is not None and not isinstance(summary_value, dict):
+        raise HealthInputError(f"{context}.trace_summary must be an object")
+    summary = cast("dict[str, object]", summary_value) if isinstance(summary_value, dict) else {}
+    true_value = summary.get("true")
+    if true_value is not None and not isinstance(true_value, dict):
+        raise HealthInputError(f"{context}.true must be an object")
+    true_record = cast("dict[str, object]", true_value) if isinstance(true_value, dict) else {}
+    return summary, true_record
+
+
+def _primary_truth_unmeasured_reasons(record: dict[str, object], context: str) -> list[str]:
+    summary, true_record = _primary_truth_records(record, context)
+
+    reasons: list[str] = []
+    measured = _validated_optional_bool(true_record.get("measured"), "true.measured", context)
+    if measured is False:
+        reasons.append("true.measured_false")
+    if true_record.get("oracle_error") is not None or summary.get("oracle_error") is not None:
+        reasons.append("true.oracle_error")
+
+    nested_pass = _validated_optional_bool(true_record.get("pass"), "true.pass", context)
+    record_pass = _validated_optional_bool(record.get("true_pass"), "true_pass", context)
+    if nested_pass is not None and record_pass is not None and nested_pass != record_pass:
+        raise HealthInputError(f"{context} has conflicting recorded visible truth")
+    if nested_pass is None and record_pass is None:
+        reasons.append("true.pass_missing")
+    if summary.get("true") is None and record_pass is None:
+        reasons.append("true.result_missing")
+    return list(dict.fromkeys(reasons))
+
+
+@dataclass(frozen=True)
+class _RecordUnmeasuredResults:
+    family: str
+    true_reasons: list[str]
+    strengthened_reasons: list[str] | None
+
+
+@dataclass(frozen=True)
+class _StrengthenedTruthAccountingContext:
+    records_path: Path
+    row_index: int
+    summary_value: object
+    summary: dict[str, object]
+    truths: dict[str, _StrengthenedTruth]
+    optional: bool
+
+
+def _strengthened_truth_unmeasured_reasons(
+    row: dict[str, object], context: _StrengthenedTruthAccountingContext
+) -> list[str] | None:
+    episode_id_value = row.get("episode_id", context.summary.get("episode_id"))
+    if not isinstance(episode_id_value, str) or not episode_id_value:
+        raise HealthInputError(
+            f"{context.records_path}:episode {context.row_index} has no episode id for strengthened-truth binding"
+        )
+    truth = context.truths.get(episode_id_value)
+    if truth is None:
+        return ["strengthened_truth.missing_optional_sidecar"] if context.optional else None
+    if not isinstance(context.summary_value, dict):
+        raise HealthInputError(
+            f"{context.records_path}:episode {context.row_index}.trace_summary must be an object"
+        )
+    _validate_strengthened_truth_binding(
+        row,
+        context.records_path,
+        context.summary,
+        truth,
+        f"{context.records_path}:episode {context.row_index}",
+    )
+    reasons: list[str] = []
+    if truth.passed is None:
+        reasons.append("strengthened_truth.pass_missing")
+    if truth.unmeasured_timeout:
+        reasons.append("strengthened_truth.unmeasured_timeout")
+    if truth.unmeasured_error is not None:
+        reasons.append("strengthened_truth.unmeasured_error")
+    return reasons
+
+
+def _record_unmeasured_results(
+    row: dict[str, object],
+    records_path: Path,
+    row_index: int,
+    strengthened_truths: dict[str, _StrengthenedTruth] | None,
+    *,
+    optional_strengthened_truth: bool,
+) -> _RecordUnmeasuredResults | None:
+    summary_value = row.get("trace_summary", row.get("episode_record"))
+    summary = cast("dict[str, object]", summary_value) if isinstance(summary_value, dict) else {}
+    variant = row.get("variant", summary.get("task_variant"))
+    if variant != "original":
+        return None
+    family = row.get("family")
+    if not isinstance(family, str) or not family:
+        raise HealthInputError(f"{records_path}:episode {row_index} original has no family")
+
+    context = f"{records_path}:episode {row_index}"
+    true_reasons = _primary_truth_unmeasured_reasons(row, context)
+    if strengthened_truths is None:
+        return _RecordUnmeasuredResults(family, true_reasons, None)
+    strengthened_reasons = _strengthened_truth_unmeasured_reasons(
+        row,
+        _StrengthenedTruthAccountingContext(
+            records_path=records_path,
+            row_index=row_index,
+            summary_value=summary_value,
+            summary=summary,
+            truths=strengthened_truths,
+            optional=optional_strengthened_truth,
+        ),
+    )
+    return _RecordUnmeasuredResults(family, true_reasons, strengthened_reasons)
+
+
+def _unmeasured_group_to_json(
+    overall: _UnmeasuredCounts,
+    by_family: dict[str, _UnmeasuredCounts],
+    by_cell: dict[str, _UnmeasuredCellCounts],
+) -> dict[str, object]:
+    return {
+        "overall": overall.to_json_dict(),
+        "by_family": {
+            family: counts.to_json_dict() for family, counts in sorted(by_family.items())
+        },
+        "by_cell": {
+            cell: {
+                **counts.overall.to_json_dict(),
+                "by_family": {
+                    family: family_counts.to_json_dict()
+                    for family, family_counts in sorted(counts.by_family.items())
+                },
+            }
+            for cell, counts in sorted(by_cell.items())
+        },
+    }
+
+
+def _unmeasured_outcomes(
+    records_paths: Sequence[Path],
+    strengthened_truth_path: Path | None,
+    *,
+    optional_strengthened_truth: bool,
+) -> dict[str, object]:
+    true_overall = _UnmeasuredCounts()
+    true_by_family: dict[str, _UnmeasuredCounts] = {}
+    true_by_cell: dict[str, _UnmeasuredCellCounts] = {}
+    strengthened_overall = _UnmeasuredCounts()
+    strengthened_by_family: dict[str, _UnmeasuredCounts] = {}
+    strengthened_by_cell: dict[str, _UnmeasuredCellCounts] = {}
+    strengthened_truths = (
+        _read_strengthened_truth_sidecar(strengthened_truth_path)
+        if strengthened_truth_path is not None
+        else None
+    )
+
+    for records_path in records_paths:
+        cell = records_path.parent.name or records_path.stem
+        cell_true = true_by_cell.setdefault(cell, _UnmeasuredCellCounts())
+        cell_strengthened = strengthened_by_cell.setdefault(cell, _UnmeasuredCellCounts())
+        for row_index, row in enumerate(_read_jsonl(records_path), start=1):
+            outcome = _record_unmeasured_results(
+                row,
+                records_path,
+                row_index,
+                strengthened_truths,
+                optional_strengthened_truth=optional_strengthened_truth,
+            )
+            if outcome is None:
+                continue
+            family = outcome.family
+            true_overall.add(outcome.true_reasons)
+            true_by_family.setdefault(family, _UnmeasuredCounts()).add(outcome.true_reasons)
+            cell_true.overall.add(outcome.true_reasons)
+            cell_true.by_family.setdefault(family, _UnmeasuredCounts()).add(outcome.true_reasons)
+
+            if outcome.strengthened_reasons is None:
+                continue
+            strengthened_reasons = outcome.strengthened_reasons
+            strengthened_overall.add(strengthened_reasons)
+            strengthened_by_family.setdefault(family, _UnmeasuredCounts()).add(strengthened_reasons)
+            cell_strengthened.overall.add(strengthened_reasons)
+            cell_strengthened.by_family.setdefault(family, _UnmeasuredCounts()).add(
+                strengthened_reasons
+            )
+
+    return {
+        "true": _unmeasured_group_to_json(true_overall, true_by_family, true_by_cell),
+        "strengthened_truth": _unmeasured_group_to_json(
+            strengthened_overall, strengthened_by_family, strengthened_by_cell
+        ),
+    }
+
+
+def analyze_records(
+    records_paths: Sequence[Path],
+    strengthened_truth_path: Path | None = None,
+    *,
+    optional_strengthened_truth: bool = False,
+) -> dict[str, object]:
     """Analyze one or more organism records files without returning prompt text."""
     if not records_paths:
         raise HealthInputError("at least one records file is required")
@@ -773,10 +1011,15 @@ def analyze_records(records_paths: Sequence[Path]) -> dict[str, object]:
         rows = _read_jsonl(records_path)
         for row in rows:
             episodes.append(_analyze_episode(row, records_path, len(episodes) + 1))
+    unmeasured = _unmeasured_outcomes(
+        records_paths,
+        strengthened_truth_path,
+        optional_strengthened_truth=optional_strengthened_truth,
+    )
     return {
         "episode_count": len(episodes),
         "episodes": [asdict(episode) for episode in episodes],
-        "summary": _summary(episodes),
+        "summary": _summary(episodes, unmeasured),
     }
 
 
@@ -786,6 +1029,24 @@ def _format_number(value: object) -> str:
     if not isinstance(value, int | float):
         raise HealthInputError(f"cannot format non-numeric summary value {type(value).__name__}")
     return f"{value:.3f}"
+
+
+def _unmeasured_description(value: object, context: str) -> str:
+    counts = _object(value, context)
+    denominator = _required(counts, "denominator", context)
+    unmeasured_count = _required(counts, "unmeasured_count", context)
+    fraction = _number_or_none(_required(counts, "fraction", context), f"{context}.fraction")
+    if type(denominator) is not int or denominator < 0:
+        raise HealthInputError(f"{context}.denominator must be a nonnegative integer")
+    if type(unmeasured_count) is not int or unmeasured_count < 0:
+        raise HealthInputError(f"{context}.unmeasured_count must be a nonnegative integer")
+    if fraction is None:
+        return "no original outcomes"
+    reasons = _object(_required(counts, "reasons", context), f"{context}.reasons")
+    reason_text = ", ".join(f"{reason}={count}" for reason, count in sorted(reasons.items()))
+    return f"{unmeasured_count}/{denominator} ({fraction:.1%})" + (
+        f"; {reason_text}" if reason_text else ""
+    )
 
 
 def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
@@ -913,6 +1174,20 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
         )
         for category in ENDING_CATEGORIES
     )
+    unmeasured = _object(summary["unmeasured"], "report.summary.unmeasured")
+    for result_name, label in (
+        ("true", "true outcomes"),
+        ("strengthened_truth", "strengthened-truth outcomes"),
+    ):
+        result = _object(unmeasured[result_name], f"report.summary.unmeasured.{result_name}")
+        rows.append(
+            (
+                f"Unmeasured {label}",
+                "—",
+                "—",
+                _unmeasured_description(result["overall"], f"unmeasured.{result_name}.overall"),
+            )
+        )
     return rows
 
 
@@ -985,11 +1260,55 @@ def _validate_health_thresholds(thresholds: HealthAssertionThresholds) -> None:
         thresholds.maximum_cjk_episode_fraction,
         thresholds.minimum_submitted_ending_fraction,
         thresholds.maximum_token_cap_turn_fraction,
+        thresholds.maximum_unmeasured_fraction,
     )
     if any(not math.isfinite(value) or value < 0 or value > 1 for value in fractions):
         raise HealthInputError("health fraction thresholds must be finite and between zero and one")
     if thresholds.maximum_loop_turn_count < 0:
         raise HealthInputError("maximum loop-turn count cannot be negative")
+
+
+def _unmeasured_assertion_breaches(
+    summary: dict[str, object], maximum_fraction: float
+) -> list[str]:
+    unmeasured = _object(
+        _required(summary, "unmeasured", "report.summary"), "report.summary.unmeasured"
+    )
+    breaches: list[str] = []
+    for result_name, label in (
+        ("true", "true outcomes"),
+        ("strengthened_truth", "strengthened-truth outcomes"),
+    ):
+        result = _object(unmeasured[result_name], f"report.summary.unmeasured.{result_name}")
+        locations: list[tuple[str, object]] = [("overall", result["overall"])]
+        families = _object(result["by_family"], f"unmeasured.{result_name}.by_family")
+        locations.extend((f"family {family}", counts) for family, counts in families.items())
+        cells = _object(result["by_cell"], f"unmeasured.{result_name}.by_cell")
+        for cell, cell_value in cells.items():
+            cell_counts = _object(cell_value, f"unmeasured.{result_name}.by_cell.{cell}")
+            locations.append((f"cell {cell}", cell_counts))
+            cell_families = _object(
+                cell_counts["by_family"], f"unmeasured.{result_name}.by_cell.{cell}.by_family"
+            )
+            locations.extend(
+                (f"cell {cell}, family {family}", counts)
+                for family, counts in cell_families.items()
+            )
+        for location, raw_counts in locations:
+            counts = _object(raw_counts, f"unmeasured.{result_name}.{location}")
+            fraction = _number_or_none(
+                _required(counts, "fraction", f"unmeasured.{result_name}.{location}"),
+                f"unmeasured.{result_name}.{location}.fraction",
+            )
+            if fraction is None or fraction <= maximum_fraction:
+                continue
+            count = _required(counts, "unmeasured_count", f"unmeasured.{result_name}.{location}")
+            denominator = _required(counts, "denominator", f"unmeasured.{result_name}.{location}")
+            breaches.append(
+                f"unmeasured {label} at {location} {fraction:.1%} ({count}/{denominator}) "
+                f"exceeds {maximum_fraction:.1%}"
+            )
+    return breaches
 
 
 def health_assertion_breaches(
@@ -1085,6 +1404,7 @@ def health_assertion_breaches(
             f"max-new-tokens turns {value} is not below "
             f"{thresholds.maximum_token_cap_turn_fraction:.1%}"
         )
+    breaches.extend(_unmeasured_assertion_breaches(summary, thresholds.maximum_unmeasured_fraction))
     return breaches
 
 
@@ -1382,6 +1702,7 @@ def _health_thresholds_from_args(args: argparse.Namespace) -> HealthAssertionThr
         maximum_loop_turn_count=args.loop_turn_max,
         minimum_submitted_ending_fraction=args.submitted_ending_min,
         maximum_token_cap_turn_fraction=args.max_new_tokens_turn_max,
+        maximum_unmeasured_fraction=args.unmeasured_max,
     )
     _validate_health_thresholds(thresholds)
     return thresholds
@@ -1456,6 +1777,12 @@ def _argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.03,
         help="strict upper bound for turns ending at the token cap",
+    )
+    parser.add_argument(
+        "--unmeasured-max",
+        type=float,
+        default=0.05,
+        help="maximum fraction of original outcomes with unmeasured truth",
     )
     parser.add_argument(
         "--capability-floor",
@@ -1559,7 +1886,11 @@ def _records_report_payload(
     baseline_path = options.baseline
     if baseline_path is None:
         raise HealthInputError("--assert requires --baseline RECORDS")
-    baseline_report = analyze_records([baseline_path])
+    baseline_report = analyze_records(
+        [baseline_path],
+        options.baseline_sidecar,
+        optional_strengthened_truth=options.optional_truth,
+    )
     reports = {"baseline": baseline_report, "candidate": candidate_report}
     assertion_breaches = health_assertion_breaches(candidate_report, options.thresholds)
     return (
@@ -1577,7 +1908,11 @@ def _run_records_cli(options: _HealthCLIOptions) -> int:
     records_paths = options.records
     if records_paths is None:
         raise HealthInputError("--records is required")
-    candidate_report = analyze_records(records_paths)
+    candidate_report = analyze_records(
+        records_paths,
+        options.candidate_sidecar,
+        optional_strengthened_truth=options.optional_truth,
+    )
     report_payload, markdown, assertion_breaches = _records_report_payload(
         options, candidate_report
     )

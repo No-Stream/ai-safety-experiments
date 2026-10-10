@@ -16,12 +16,14 @@ from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.model_backend import SamplingConfig
+from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, RewardScore
 from reward_hacking.organism_rl import rollout
 from reward_hacking.organism_rl.rollout import (
     EpisodeSample,
     ILCBEpisodeSource,
     OrganismRollout,
     TaskEpisodeSource,
+    _accumulate_task_kind_metrics,  # pyright: ignore[reportPrivateUsage]
     _task_submission_grader,
     deterministic_episode_seed,
     replay_episode_trace,
@@ -32,6 +34,7 @@ from reward_hacking.organism_rl.rollout import (
 from reward_hacking.tests.test_distill_episodes import CharacterTokenizer
 
 if TYPE_CHECKING:
+    from collections import Counter
     from collections.abc import Mapping
     from pathlib import Path
 
@@ -83,6 +86,38 @@ def _sample() -> EpisodeSample:
         "task_variant": "oneoff",
     }
     return EpisodeSample(summary, [identity, *turns, summary])
+
+
+@pytest.mark.parametrize(
+    "truth",
+    [
+        {"pass": False, "measured": False, "oracle_error": None},
+        {"pass": False, "measured": True, "oracle_error": "grader timeout"},
+    ],
+)
+def test_recorded_true_pass_preserves_unmeasured_results(truth: dict[str, object]) -> None:
+    assert rollout.recorded_true_pass({"true": truth}) is None
+
+
+def test_unscorable_reward_metric_is_reported_separately() -> None:
+    step_counts: dict[tuple[str, str], Counter[str]] = {}
+    episode = EpisodeSample({"trace_summary": {"submission_verdicts": []}}, [])
+    score = RewardScore(None, RewardOutcome.UNSCORABLE_ORACLE_ERROR, RewardEvidence())
+
+    _accumulate_task_kind_metrics(  # pyright: ignore[reportPrivateUsage]
+        step_counts,
+        episode,
+        family="synthetic_family",
+        task_kind="solvable",
+        score=score,
+    )
+
+    counts = step_counts[("synthetic_family", "solvable")]
+    assert counts["episodes"] == 1
+    assert counts["scorable_episodes"] == 0
+    assert counts["unscorable_episodes"] == 1
+    assert counts["reward_sum"] == 0
+    assert counts["rewarded"] == 0
 
 
 def test_submission_feedback_hides_limiter_output_and_keeps_raw_evidence(
