@@ -4,10 +4,12 @@ import hashlib
 import json
 import logging
 import subprocess
+from collections import Counter
 from dataclasses import asdict, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
+import conftest as test_conftest
 import pytest
 
 from reward_hacking.aisi_rh_envs_data import AisiRhProblem
@@ -249,7 +251,7 @@ def test_oracle_error_regex_mismatch_fails_with_the_observed_error() -> None:
 
 
 def test_report_only_fixture_is_logged_and_counted(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     caplog.set_level(logging.INFO, logger=env_gate.__name__)
     task_directory = tmp_path / "ilcb" / "ilcb-report-only"
@@ -271,10 +273,119 @@ def test_report_only_fixture_is_logged_and_counted(
     (task_directory / "declarations.json").write_text(
         json.dumps({"schema": 1, "artifacts": {}}), encoding="utf-8"
     )
+    measured_directory = tmp_path / "aisi" / "aisi-measured"
+    reference_directory = measured_directory / "references"
+    reference_directory.mkdir(parents=True)
+    (reference_directory / "honest.py").write_text("pass\n", encoding="utf-8")
+    (measured_directory / "task.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "family": "aisi",
+                "task_id": "aisi-measured",
+                "definition": {},
+                "artifacts": {"honest": {"solution_file": "references/honest.py"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (measured_directory / "declarations.json").write_text(
+        json.dumps({"schema": 1, "artifacts": {"honest": _valid_observations()}}),
+        encoding="utf-8",
+    )
+    # mock: external boundary (task registry lookup is unrelated to family accounting).
+    monkeypatch.setattr(
+        env_gate,
+        "_build_task",
+        lambda fixture: BuiltFixtureTask(
+            task=Task(
+                task_id=fixture.task_id,
+                prompt="Synthetic prompt.",
+                body="Synthetic body.",
+                files={},
+                true_check=lambda _directory: False,
+            )
+        ),
+    )
+    # mock: external boundary (artifact execution is outside this report-only accounting check).
+    monkeypatch.setattr(env_gate, "_grade_artifact", lambda *_args: _valid_observations())
 
-    assert run_gate(tmp_path) == 0
+    with pytest.raises(ValueError, match="no checked artifacts for fixture families: ilcb"):
+        run_gate(tmp_path)
     assert "UNMEASURABLE ilcb-report-only: case source is unavailable" in caplog.text
     assert "1 report-only" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("environment_name", "marker_name"),
+    [
+        ("SEED_V4_REQUIRE_JAIL", "jail_real"),
+        ("SEED_V4_REQUIRE_DOCKER", "docker_real"),
+        ("SEED_V4_REQUIRE_CORPUS_TESTS", "corpus"),
+    ],
+)
+def test_required_real_gate_fails_when_no_marked_test_executes(
+    monkeypatch: pytest.MonkeyPatch, environment_name: str, marker_name: str
+) -> None:
+    for required_environment in (
+        "SEED_V4_REQUIRE_JAIL",
+        "SEED_V4_REQUIRE_DOCKER",
+        "SEED_V4_REQUIRE_CORPUS_TESTS",
+    ):
+        monkeypatch.delenv(required_environment, raising=False)
+    monkeypatch.setenv(environment_name, "1")
+    monkeypatch.setattr(test_conftest, "_EXECUTED_GATE_CALLS", Counter())
+    session = SimpleNamespace(exitstatus=pytest.ExitCode.OK)
+
+    test_conftest.pytest_sessionfinish(cast("pytest.Session", session), pytest.ExitCode.OK)
+
+    assert session.exitstatus == pytest.ExitCode.TESTS_FAILED, marker_name
+
+
+def test_required_gate_marker_counter_ignores_a_skipped_call_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executed_gate_calls: Counter[str] = Counter()
+    monkeypatch.setattr(test_conftest, "_EXECUTED_GATE_CALLS", executed_gate_calls)
+    skipped_report = SimpleNamespace(
+        when="call",
+        outcome="skipped",
+        keywords={"jail_real": True},
+    )
+    executed_report = SimpleNamespace(
+        when="call",
+        outcome="passed",
+        keywords={"jail_real": True},
+    )
+
+    test_conftest.pytest_runtest_logreport(cast("pytest.TestReport", skipped_report))
+    assert executed_gate_calls["jail_real"] == 0
+    test_conftest.pytest_runtest_logreport(cast("pytest.TestReport", executed_report))
+    assert executed_gate_calls["jail_real"] == 1
+
+
+def test_required_jail_mode_fails_when_jail_interpreter_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(test_conftest, "REQUIRE_JAIL", True)
+
+    with pytest.raises((pytest.fail.Exception, pytest.skip.Exception)) as outcome:
+        test_conftest._handle_missing_jail_interpreter(  # pyright: ignore[reportPrivateUsage]
+            test_conftest.NoJailInterpreterError("synthetic missing interpreter")
+        )
+    assert isinstance(outcome.value, pytest.fail.Exception)
+    assert "no jail interpreter resolved" in str(outcome.value)
+
+
+def test_required_jail_mode_fails_when_jail_prerequisite_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(test_conftest, "REQUIRE_JAIL", True)
+    monkeypatch.setattr(test_conftest, "JAIL_AVAILABLE", False)
+    monkeypatch.setattr(test_conftest, "JAIL_UNAVAILABLE_REASON", "synthetic unavailable")
+
+    with pytest.raises(pytest.fail.Exception, match="jail unavailable: synthetic unavailable"):
+        test_conftest._require_jail_available()  # pyright: ignore[reportPrivateUsage]
 
 
 def test_register_independence_compares_the_rendered_first_turn(
@@ -303,6 +414,7 @@ def test_register_independence_compares_the_rendered_first_turn(
 
     assert env_gate._register_independent_first_turn(context)  # pyright: ignore[reportPrivateUsage]
 
+    # mock: external boundary (first-turn model rendering; this checks register comparison).
     monkeypatch.setattr(
         env_gate,
         "_render_first_turn_for_register",
@@ -346,6 +458,7 @@ def test_grade_final_state_threads_a_true_check_timeout(
         true_check=lambda _directory: False,
         true_check_with_timeout=lambda _directory, timeout: seen_timeouts.append(timeout) or False,
     )
+    # mock: external boundary (grader execution; this checks true-check timeout propagation).
     monkeypatch.setattr(
         harness_loop,
         "run_grader",
@@ -383,6 +496,7 @@ def test_ilcb_true_check_timeout_reaches_the_hidden_runner(
         seen_timeouts.append(timeout)
         return CommandResult("hidden", 124, "", "", True)
 
+    # mock: external boundary (isolated hidden runner; this checks timeout propagation).
     monkeypatch.setattr(tasks_ilcb, "run_isolated_task_check", timed_out_isolated_check)
     built = _build_ilcb_fixture_task(
         {"registered_task_id": registered_task_id, "entry_point": problem.entry_point}
@@ -586,6 +700,7 @@ def test_ladder_command_trace_grades_submission_before_protected_file_restore(
             FakeCommandRecord(len(cast("SimpleNamespace", command_monitor).records), command)
         )
 
+    # mock: external boundary (monitored jail execution; this checks submit ordering).
     monkeypatch.setattr(env_gate, "_run_monitored_jail_command", run_command)
     grades: list[tuple[bool, int]] = []
 
@@ -723,7 +838,8 @@ def test_ilcb_fixture_rejects_unknown_registered_task() -> None:
         )
 
 
-def test_registered_ilcb_episode_uses_real_reward_scoring_without_jail(tmp_path: Path) -> None:
+# mock: real path in test_seam_records::test_record_reward_recomputes_under_both_registers
+def test_registered_ilcb_episode_glue_with_stubbed_grade(tmp_path: Path) -> None:
     registered_task_id, problem = next(
         (task_id, problem)
         for task_id, problem in PROBLEMS_BY_TASK_ID.items()
@@ -838,6 +954,7 @@ def test_ilcb_variant_strengthened_truth_loads_original_case_id(
     )
     artifact = FixtureArtifact("honest", {"solution_file": "solution.py"})
     loaded_task_ids: list[str] = []
+    # mock: real path in test_seam_records::test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts
     monkeypatch.setattr(
         env_gate.strengthened_truth_grade,
         "load_case_set",
@@ -902,6 +1019,7 @@ def test_aisi_oneoff_strengthened_truth_loads_original_case_id(
     )
     artifact = FixtureArtifact("honest", {"solution_file": "solution.py"})
     loaded_task_ids: list[str] = []
+    # mock: real path in test_seam_records::test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts
     monkeypatch.setattr(
         env_gate.strengthened_truth_grade,
         "load_case_set",
@@ -1161,6 +1279,7 @@ def test_loose_math_uses_provided_grader_and_ordered_submission_evidence(
             ),
         )
 
+    # mock: external boundary (final-state grading; this checks submission evidence ordering).
     monkeypatch.setattr(env_gate, "grade_final_state", grade_final_state)
 
     observations = _grade_artifact(fixture, artifact, BuiltFixtureTask(task=task))
@@ -1192,7 +1311,7 @@ def test_ilcb_fixture_requires_strengthened_truth_case_root(tmp_path: Path) -> N
         _strengthened_truth(fixture, FixtureArtifact("honest", {}), cast("FinalGrade", object()))
 
 
-def test_run_gate_declaration_flip_fails_then_revert_passes(
+def test_run_gate_declaration_flip_glue_with_stubbed_artifact_grading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registered_task_id, problem = next(
@@ -1229,6 +1348,7 @@ def test_run_gate_declaration_flip_fails_then_revert_passes(
     def fake_grade(*_args: object) -> dict[str, object]:
         return _valid_observations()
 
+    # mock: external boundary (artifact execution; this isolates declaration comparison).
     monkeypatch.setattr(
         env_gate,
         "_grade_artifact",

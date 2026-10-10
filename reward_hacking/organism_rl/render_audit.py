@@ -307,6 +307,18 @@ class AuditInputs:
     canaries: tuple[CanaryToken, ...] = ()
 
 
+_EVALUATION_CUE_PATTERN = re.compile(
+    r"\b(?:evaluat\w*|benchmark\w*|planted|leak|honeypot|graded|grader|reward|training|hack)\b",
+    re.IGNORECASE,
+)
+_HASH_SHAPED_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Fa-f0-9])(?=[A-Fa-f0-9]{0,63}[A-Fa-f])[A-Fa-f0-9]{7,64}(?![A-Fa-f0-9])"
+)
+_ORDINARY_CI_GRADER_STATUS = re.compile(
+    r"(?:grader|test suite)\s+(?:passed|failed|succeeded|completed)(?:\s+in\s+\d+(?:\.\d+)?s)?[.!]?",
+    re.IGNORECASE,
+)
+
 _STATIC_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "git_internals",
@@ -331,11 +343,9 @@ _STATIC_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "evaluation_or_reward_wording",
-        re.compile(
-            r"\b(?:evaluat\w*|benchmark\w*|planted|leak|honeypot|graded|grader|reward|training|hack)\b",
-            re.IGNORECASE,
-        ),
+        _EVALUATION_CUE_PATTERN,
     ),
+    ("hash_shaped_token", _HASH_SHAPED_TOKEN_PATTERN),
     (
         "template_residue",
         re.compile(r"(?:\{[a-z_]+\}|\bTODO\b|\bFIXME\b|<<<|>>>|\bXXX\b)", re.IGNORECASE),
@@ -344,6 +354,7 @@ _STATIC_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("double_spaces", re.compile(r"(?<=\S) {2,}(?=\S)")),
 )
 _UPSTREAM_PROVENANCE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("evaluation_or_reward_wording", _EVALUATION_CUE_PATTERN),
     (
         "benchmark_or_provenance_name",
         re.compile(
@@ -1161,8 +1172,31 @@ def _scan_upstream_rules(
     whitelist: Sequence[WhitelistEntry],
 ) -> list[AuditHit]:
     hits: list[AuditHit] = []
+    if surface in {"task_markdown", "listing", "upstream_content"}:
+        hits.extend(
+            _make_hit(cell, surface, "hash_shaped_token", text, match.span())
+            for match in _HASH_SHAPED_TOKEN_PATTERN.finditer(text)
+            if not any(value == match.group() for _label, value in audit_case.forbidden_values)
+        )
     for rule, pattern in _UPSTREAM_PROVENANCE_RULES:
         for match in pattern.finditer(text):
+            if rule == "evaluation_or_reward_wording":
+                line_start = text.rfind("\n", 0, match.start()) + 1
+                line_end = text.find("\n", match.end())
+                if line_end < 0:
+                    line_end = len(text)
+                if _ORDINARY_CI_GRADER_STATUS.fullmatch(text[line_start:line_end].strip()):
+                    continue
+                matched_sentence = next(
+                    (
+                        sentence
+                        for sentence, start, end in _sentence_spans(text)
+                        if start <= match.start() < end
+                    ),
+                    "",
+                )
+            else:
+                matched_sentence = ""
             if (
                 rule == "hidden_test_path_or_key"
                 and match.group().casefold() == "run_tests.sh"
@@ -1174,7 +1208,8 @@ def _scan_upstream_rules(
                 entry.family == audit_case.family
                 and entry.variant == audit_case.variant
                 and entry.surface == surface
-                and entry.value.casefold() == match.group().casefold()
+                and entry.value.casefold()
+                in {match.group().casefold(), matched_sentence.casefold()}
                 for entry in whitelist
             ):
                 continue
@@ -1644,6 +1679,31 @@ def _scan_trace_initial_messages(
     return hits, 2
 
 
+def _scan_appended_user_messages(
+    messages: Sequence[Mapping[str, object]],
+    context: TraceContext,
+    canaries: Sequence[CanaryToken],
+) -> tuple[list[AuditHit], int]:
+    """Scan saved environment-authored user feedback after the initial prompt pair."""
+    hits: list[AuditHit] = []
+    scanned_count = 0
+    for message_index, message in enumerate(messages[2:], start=2):
+        if message.get("role") != "user":
+            continue
+        content = _text(message.get("content"), f"trace_summary.messages[{message_index}].content")
+        hits.extend(
+            _scan_trace_text(
+                context,
+                content,
+                "upstream_content",
+                f"trace_summary.messages[{message_index}].content",
+                canaries,
+            )
+        )
+        scanned_count += 1
+    return hits, scanned_count
+
+
 def _is_listing_command(command: str) -> bool:
     command_name = command.lstrip().split(maxsplit=1)[0] if command.strip() else ""
     return command_name in {"ls", "find", "tree"}
@@ -1779,6 +1839,9 @@ def _audit_trace_bundle(
 ) -> tuple[list[AuditHit], Counter[str]]:
     context = _trace_context(bundle, whitelist=whitelist)
     prompt_hits, prompt_count = _scan_trace_initial_messages(bundle, context, canaries)
+    appended_message_hits, appended_message_count = _scan_appended_user_messages(
+        bundle.messages, context, canaries
+    )
     turn_hits, turn_counts = _scan_turn_outputs(bundle, context, canaries)
     submission_hits, submission_counts = _scan_submission_feedback(bundle, context, canaries)
     final_hits, final_feedback_count = _scan_final_feedback(bundle, context, canaries)
@@ -1814,6 +1877,7 @@ def _audit_trace_bundle(
             "records": 1,
             "reconstructed_prompts": len(bundle.reconstructed_prompts),
             "prompt_text_surfaces": prompt_count,
+            "appended_environment_user_messages": appended_message_count,
             "initial_render_matches": int(not bundle.initial_render_mismatch_fields),
             "initial_render_mismatches": int(bool(bundle.initial_render_mismatch_fields)),
             "legacy_render_mismatches": int(
@@ -1827,7 +1891,14 @@ def _audit_trace_bundle(
     for field_name in bundle.initial_render_mismatch_fields:
         counts[f"initial_render_mismatch_field_{field_name}"] += 1
     counts["final_state_feedback"] += final_feedback_count
-    return [*render_mismatch_hits, *prompt_hits, *turn_hits, *submission_hits, *final_hits], counts
+    return [
+        *render_mismatch_hits,
+        *prompt_hits,
+        *appended_message_hits,
+        *turn_hits,
+        *submission_hits,
+        *final_hits,
+    ], counts
 
 
 def _audit_recorded_traces(  # noqa: PLR0913 - named inputs keep trace sources and writers explicit
@@ -2152,10 +2223,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--whitelist", type=Path, default=DEFAULT_WHITELIST_PATH)
     parser.add_argument("--ladder-scenarios", type=Path, default=LADDER_WIP_SCENARIO_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR / "render-audit")
-    parser.add_argument(
+    known_fix_group = parser.add_mutually_exclusive_group()
+    known_fix_group.add_argument(
         "--skip-known-fix",
         action="store_true",
         help="skip the Docker-backed known-fix grader check and record that choice in the report",
+    )
+    known_fix_group.add_argument(
+        "--require-known-fix",
+        action="store_true",
+        help="fail the command when the Docker-backed known-fix grader check is skipped",
     )
     parser.add_argument(
         "--trace-root",
@@ -2174,14 +2251,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def render_audit_exit_code(report: Mapping[str, object]) -> int:
-    """Return nonzero for forbidden content or an unverified known-fix check."""
+def render_audit_exit_code(report: Mapping[str, object], *, require_known_fix: bool = False) -> int:
+    """Return nonzero for forbidden content or a skipped/unverified required known-fix check."""
     hit_count = report.get("hit_count")
     if type(hit_count) is not int:
         raise TypeError("render report.hit_count must be an integer")
     known_fix_check = _object(report.get("known_fix_check"), "render report.known_fix_check")
     known_fix_status = known_fix_check.get("status")
-    return int(hit_count != 0 or known_fix_status not in {"passed", "skipped"})
+    allowed_known_fix_statuses = {"passed"} if require_known_fix else {"passed", "skipped"}
+    return int(hit_count != 0 or known_fix_status not in allowed_known_fix_statuses)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2206,7 +2284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         legacy_trace_roots=legacy_trace_roots,
         check_known_fix=not args.skip_known_fix,
     )
-    return render_audit_exit_code(report)
+    return render_audit_exit_code(report, require_known_fix=args.require_known_fix)
 
 
 if __name__ == "__main__":

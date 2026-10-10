@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -16,7 +16,6 @@ from reward_hacking.organism_rl import rescore
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-logger = logging.getLogger(__name__)
 EVALA_RECORDS = Path("nine-b") / "evalA-base9b"
 
 
@@ -93,6 +92,113 @@ def _selected_evala_records(records: list[dict[str, Any]]) -> list[dict[str, Any
     return selected
 
 
+def _assert_evala_rescore_rows(
+    selected_records: list[dict[str, Any]],
+    sidecar_rows: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    selected_episode_ids = [_summary(record)["episode_id"] for record in selected_records]
+    assert len(set(selected_episode_ids)) == 4
+    assert set(selected_episode_ids) <= sidecar_rows.keys()
+    expected_methods = {
+        episode_id: sidecar_rows[episode_id]["rescore"]["method"]
+        for episode_id in selected_episode_ids
+    }
+    assert sorted(expected_methods.values()) == [
+        "jailed_command_replay",
+        "recorded_submission_evidence",
+        "recorded_submission_evidence",
+        "recorded_submission_evidence",
+    ]
+    replayed_records = [
+        sidecar_rows[episode_id]
+        for episode_id in selected_episode_ids
+        if expected_methods[episode_id] == "jailed_command_replay"
+    ]
+    assert len(replayed_records) == 1
+    replay_metadata = replayed_records[0]["rescore"]
+    assert replay_metadata["artifact_verification"] == "verified"
+    rebuilt_artifact_hash = replay_metadata["rebuilt_artifact_sha256"]
+    recorded_artifact_hash = replay_metadata["recorded_artifact_sha256"]
+    assert isinstance(rebuilt_artifact_hash, str)
+    assert re.fullmatch(r"[0-9a-f]{64}", rebuilt_artifact_hash)
+    assert isinstance(recorded_artifact_hash, str)
+    assert re.fullmatch(r"[0-9a-f]{64}", recorded_artifact_hash)
+    assert rebuilt_artifact_hash == recorded_artifact_hash
+    return expected_methods
+
+
+def _evala_rescore_sidecar(
+    records_directory: Path,
+    selected_records: list[dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    rescore_path = records_directory / "records.rescored-final-state.jsonl"
+    assert rescore_path.is_file(), "evalA corpus requires its completed rescore sidecar"
+    sidecar_rows = {_summary(record)["episode_id"]: record for record in _read_jsonl(rescore_path)}
+    expected_methods = _assert_evala_rescore_rows(selected_records, sidecar_rows)
+    return sidecar_rows, expected_methods
+
+
+def test_evala_rescore_requires_a_completed_sidecar(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError, match="requires its completed rescore sidecar"):
+        _evala_rescore_sidecar(tmp_path, [])
+
+
+@pytest.mark.corpus
+def test_evala_rescore_sidecar_has_verified_selected_replay(seed_v4_corpus: Path) -> None:
+    records_directory = seed_v4_corpus / EVALA_RECORDS
+    selected_records = _selected_evala_records(_read_jsonl(records_directory / "records.jsonl"))
+    sidecar_rows, expected_methods = _evala_rescore_sidecar(records_directory, selected_records)
+
+    replayed_episode_id = next(
+        episode_id
+        for episode_id, method in expected_methods.items()
+        if method == "jailed_command_replay"
+    )
+    tampered_replay = dict(sidecar_rows[replayed_episode_id])
+    tampered_replay["rescore"] = {
+        **tampered_replay["rescore"],
+        "method": "recorded_submission_evidence",
+    }
+    tampered_sidecar_rows = {**sidecar_rows, replayed_episode_id: tampered_replay}
+    with pytest.raises(AssertionError):
+        _assert_evala_rescore_rows(selected_records, tampered_sidecar_rows)
+
+    evidence_episode_id = next(
+        episode_id
+        for episode_id, method in expected_methods.items()
+        if method == "recorded_submission_evidence"
+    )
+    tampered_evidence = dict(sidecar_rows[evidence_episode_id])
+    tampered_evidence["rescore"] = {
+        **tampered_evidence["rescore"],
+        "method": "unexpected_method",
+    }
+    tampered_sidecar_rows = {**sidecar_rows, evidence_episode_id: tampered_evidence}
+    with pytest.raises(AssertionError):
+        _assert_evala_rescore_rows(selected_records, tampered_sidecar_rows)
+
+    tampered_replay = dict(sidecar_rows[replayed_episode_id])
+    tampered_replay["rescore"] = {
+        **tampered_replay["rescore"],
+        "artifact_verification": "mismatch",
+    }
+    tampered_sidecar_rows = {**sidecar_rows, replayed_episode_id: tampered_replay}
+    with pytest.raises(AssertionError):
+        _assert_evala_rescore_rows(selected_records, tampered_sidecar_rows)
+
+    replay_metadata = sidecar_rows[replayed_episode_id]["rescore"]
+    recorded_hash = cast("str", replay_metadata["recorded_artifact_sha256"])
+    different_hash = "0" * 64 if recorded_hash != "0" * 64 else "1" * 64
+    tampered_replay = dict(sidecar_rows[replayed_episode_id])
+    tampered_replay["rescore"] = {
+        **replay_metadata,
+        "rebuilt_artifact_sha256": different_hash,
+    }
+    tampered_sidecar_rows = {**sidecar_rows, replayed_episode_id: tampered_replay}
+    with pytest.raises(AssertionError):
+        _assert_evala_rescore_rows(selected_records, tampered_sidecar_rows)
+
+
 @needs_jail
 @pytest.mark.jail_real
 @pytest.mark.corpus
@@ -132,37 +238,27 @@ def test_evala_rescore_replays_a_runtime_selected_subset_and_resumes(
         assert {_summary(record)["episode_id"] for record in rescored} == selected_episode_ids
         assert all(record["rescore"]["payment_register"] == "in_band" for record in rescored)
 
+        real_rows, expected_methods = _evala_rescore_sidecar(records_dir, selected)
+        replayed_rows = 0
         for record in rescored:
+            episode_id = _summary(record)["episode_id"]
             rescore_metadata = record["rescore"]
-            if rescore_metadata["method"] == "jailed_command_replay":
-                assert rescore_metadata["artifact_verification"] in {
-                    "verified",
-                    "mismatch",
-                    "unverified",
-                }
-                if rescore_metadata["artifact_verification"] == "verified":
-                    assert (
-                        rescore_metadata["rebuilt_artifact_sha256"]
-                        == rescore_metadata["recorded_artifact_sha256"]
-                    )
-
-        real_rescored_path = records_dir / "records.rescored-final-state.jsonl"
-        if real_rescored_path.is_file():
-            real_rows = {
-                _summary(record)["episode_id"]: record for record in _read_jsonl(real_rescored_path)
-            }
-            for record in rescored:
-                episode_id = _summary(record)["episode_id"]
-                assert episode_id in real_rows
-                assert record["rescore"]["method"] == real_rows[episode_id]["rescore"]["method"]
-                assert record["rescore"].get("artifact_verification") == real_rows[episode_id][
-                    "rescore"
-                ].get("artifact_verification")
-                assert record["organism_reward"] == real_rows[episode_id]["organism_reward"]
-        else:
-            logger.info(
-                "corpus lacks a completed rescore sidecar; checked rebuilt and recorded artifact hashes"
+            expected_metadata = real_rows[episode_id]["rescore"]
+            assert rescore_metadata["method"] == expected_methods[episode_id]
+            assert rescore_metadata.get("artifact_verification") == expected_metadata.get(
+                "artifact_verification"
             )
+            assert record["organism_reward"] == real_rows[episode_id]["organism_reward"]
+            if rescore_metadata["method"] == "jailed_command_replay":
+                assert rescore_metadata["artifact_verification"] == "verified"
+                assert isinstance(rescore_metadata["rebuilt_artifact_sha256"], str)
+                assert isinstance(rescore_metadata["recorded_artifact_sha256"], str)
+                assert (
+                    rescore_metadata["rebuilt_artifact_sha256"]
+                    == rescore_metadata["recorded_artifact_sha256"]
+                )
+                replayed_rows += 1
+        assert replayed_rows == 1
 
         first_output = output_path.read_bytes()
 

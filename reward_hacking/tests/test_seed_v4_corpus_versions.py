@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -45,6 +45,111 @@ def test_capture_refuses_a_run_that_would_exceed_the_corpus_size_limit(
         corpus_capture.capture_run(source, "oversize", corpus_root=corpus_root)
 
     assert not (corpus_root / "nine-b" / "oversize").exists()
+
+
+def test_capture_refuses_when_source_changes_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "run"
+    source.mkdir()
+    records_path = source / "records.jsonl"
+    records_path.write_text("{}\n", encoding="utf-8")
+    copytree = cast("Callable[..., Path]", corpus_capture.shutil.copytree)
+
+    def copy_then_change_source(*args: object, **kwargs: object) -> Path:
+        result = copytree(*args, **kwargs)
+        records_path.write_text('{"changed": true}\n', encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(corpus_capture.shutil, "copytree", copy_then_change_source)
+
+    with pytest.raises(ValueError, match="source changed during capture"):
+        corpus_capture.capture_run(source, "changed", corpus_root=tmp_path / "corpus")
+
+    assert not (tmp_path / "corpus" / "nine-b" / "changed").exists()
+
+
+def test_recorded_path_cannot_escape_through_parent_segments(tmp_path: Path) -> None:
+    capture_root = tmp_path / "capture"
+    capture_root.mkdir()
+    outside_path = tmp_path / "outside.json"
+    outside_path.write_text("{}", encoding="utf-8")
+    record = {"trace_path": str(capture_root / ".." / outside_path.name)}
+
+    with pytest.raises(ValueError, match="captured trace_path points outside"):
+        corpus_capture._validate_recorded_paths(record, capture_root, capture_root)
+
+
+def test_out_of_root_episodes_fallback_refuses_ambiguous_matches(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    (source_root / "run" / "episodes" / "step-1").mkdir(parents=True)
+    (source_root / "episodes" / "step-1").mkdir(parents=True)
+    (source_root / "run" / "episodes" / "step-1" / "trace.json").write_text("{}")
+    (source_root / "episodes" / "step-1" / "trace.json").write_text("{}")
+
+    with pytest.raises(ValueError, match="episodes fallback matched 2 files"):
+        corpus_capture._trace_relative_path("/moved/run/episodes/step-1/trace.json", source_root)
+
+
+def test_docker_evidence_pointer_must_be_adjacent_to_its_trace(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    trace_path = source / "episodes" / "step-1" / "trace.json"
+    evidence_path = source / "episodes" / "step-2" / "trace.docker-evidence.jsonl"
+    trace_path.parent.mkdir(parents=True)
+    evidence_path.parent.mkdir(parents=True)
+    trace_path.write_text('{"record": "trace"}\n', encoding="utf-8")
+    evidence_path.write_text("", encoding="utf-8")
+    (source / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "trace_path": str(trace_path),
+                "trace_summary": {"docker_evidence_path": str(evidence_path)},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="must be adjacent to its trace"):
+        corpus_capture.capture_run(source, "nonadjacent", corpus_root=tmp_path / "corpus")
+
+
+def test_required_capture_set_rejects_missing_planned_captures(tmp_path: Path) -> None:
+    tmp_path.joinpath("corpus-manifest.json").write_text(
+        json.dumps(
+            {"schema_version": corpus_capture.CORPUS_MANIFEST_SCHEMA_VERSION, "captures": []}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="required seed-v4 captures are missing"):
+        corpus_capture.assert_required_captures(tmp_path)
+
+
+def test_required_capture_set_rejects_a_missing_planned_cell(tmp_path: Path) -> None:
+    missing_capture_path = "nine-b/minimal-seedv3c34"
+    missing_record_path = "math-loose/records.jsonl"
+    captures = [{"path": capture_path} for capture_path in corpus_capture.REQUIRED_CAPTURE_RECORDS]
+    (tmp_path / "corpus-manifest.json").write_text(
+        json.dumps(
+            {"schema_version": corpus_capture.CORPUS_MANIFEST_SCHEMA_VERSION, "captures": captures}
+        ),
+        encoding="utf-8",
+    )
+    for capture_path, record_paths in corpus_capture.REQUIRED_CAPTURE_RECORDS.items():
+        for record_path in record_paths:
+            if capture_path == missing_capture_path and record_path == missing_record_path:
+                continue
+            records_path = tmp_path / capture_path / record_path
+            records_path.parent.mkdir(parents=True, exist_ok=True)
+            records_path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"required seed-v4 capture records are missing: "
+        "nine-b/minimal-seedv3c34/math-loose/records.jsonl",
+    ):
+        corpus_capture.assert_required_captures(tmp_path)
 
 
 def _capture_minimal_run(source: Path, corpus_root: Path) -> Path:
@@ -237,3 +342,25 @@ def test_failed_smoke_regeneration_restores_the_previous_capture(tmp_path: Path)
     assert (corpus_root / "corpus-manifest.json").read_text(encoding="utf-8") == manifest_before
     assert "first" in (corpus_root / "smoke-0.8b" / "records.jsonl").read_text(encoding="utf-8")
     corpus_capture.verify_corpus(corpus_root)
+
+
+@pytest.mark.parametrize("with_sidecar", [True, False])
+def test_strengthened_truth_bump_stales_only_captures_with_sidecar_grades(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, with_sidecar: bool
+) -> None:
+    source = _smoke_source(tmp_path / "source", "graded")
+    if with_sidecar:
+        (source / "strengthened-truth.jsonl").write_text(
+            json.dumps({"grading_identity": {}, "strengthened_truth": {"pass": None}}) + "\n",
+            encoding="utf-8",
+        )
+    corpus_root = tmp_path / "corpus"
+    corpus_capture.capture_run(source, "smoke-0.8b", kind="smoke", corpus_root=corpus_root)
+    bumped_versions = {**semantic_versions(), corpus_capture.STRENGTHENED_TRUTH_PRODUCER: 999}
+    monkeypatch.setattr(corpus_capture, "semantic_versions", lambda: bumped_versions)
+
+    if with_sidecar:
+        with pytest.raises(ValueError, match="strengthened_truth_grade=999"):
+            corpus_capture.verify_corpus(corpus_root)
+    else:
+        corpus_capture.verify_corpus(corpus_root)

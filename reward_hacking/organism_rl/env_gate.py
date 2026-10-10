@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -543,10 +544,27 @@ def _is_safe_identifier(value: str) -> bool:
     )
 
 
+def _require_checked_artifact_per_family(
+    fixture_families: set[str], checked_artifacts_by_family: Counter[str]
+) -> None:
+    if not fixture_families:
+        raise ValueError("env-gate fixture directory has no task families")
+    uncovered_families = sorted(
+        family for family in fixture_families if checked_artifacts_by_family[family] == 0
+    )
+    if uncovered_families:
+        raise ValueError(
+            "env-gate has no checked artifacts for fixture families: "
+            + ", ".join(uncovered_families)
+        )
+
+
 def run_gate(fixtures_directory: Path) -> int:
     """Run all fixture graders, compare every declaration, and log one result per artifact."""
     fixtures = load_fixture_tasks(fixtures_directory)
     checked_artifacts = 0
+    checked_artifacts_by_family: Counter[str] = Counter()
+    fixture_families = {fixture.family for fixture in fixtures}
     report_only_tasks = 0
     mismatches: list[str] = []
     for fixture in fixtures:
@@ -568,6 +586,7 @@ def run_gate(fixtures_directory: Path) -> int:
                 observations = _grade_artifact(fixture, artifact, built)
             except DeclarationMismatchError as mismatch:
                 checked_artifacts += 1
+                checked_artifacts_by_family[fixture.family] += 1
                 mismatches.append(str(mismatch))
                 logger.error("env-gate MISMATCH %s", mismatch)  # noqa: TRY400 - reported, not a crash
                 continue
@@ -575,6 +594,7 @@ def run_gate(fixtures_directory: Path) -> int:
             if not isinstance(declaration_value, Mapping):
                 raise TypeError("artifact declarations must be objects")
             checked_artifacts += 1
+            checked_artifacts_by_family[fixture.family] += 1
             try:
                 assert_observations(
                     observations,
@@ -593,17 +613,19 @@ def run_gate(fixtures_directory: Path) -> int:
                 )
                 continue
             logger.info("env-gate checked %s/%s", fixture.task_id, artifact.artifact_id)
+    logger.info(
+        "env-gate summary: %d tasks, %d reference artifacts, %d report-only tasks",
+        len(fixtures),
+        checked_artifacts,
+        report_only_tasks,
+    )
     if mismatches:
         raise DeclarationMismatchError(
             f"{len(mismatches)} of {checked_artifacts} artifacts mismatched their declarations:\n"
             + "\n".join(mismatches)
         )
-    logger.info(
-        "env-gate passed: %d tasks, %d reference artifacts, %d report-only tasks",
-        len(fixtures),
-        checked_artifacts,
-        report_only_tasks,
-    )
+    _require_checked_artifact_per_family(fixture_families, checked_artifacts_by_family)
+    logger.info("env-gate passed")
     return 0
 
 

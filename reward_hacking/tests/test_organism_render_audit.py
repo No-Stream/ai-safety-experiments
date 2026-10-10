@@ -7,6 +7,8 @@ import json
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+import pytest
+
 from reward_hacking.aisi_rh_envs_data import AisiRhProblem
 from reward_hacking.harness.task_spec import (
     GRADER_FILENAME,
@@ -15,6 +17,7 @@ from reward_hacking.harness.task_spec import (
     Task,
     TaskTestVerdict,
 )
+from reward_hacking.organism_rl import render_audit
 from reward_hacking.organism_rl.render_audit import (
     AuditHit,
     AuditInputs,
@@ -22,6 +25,7 @@ from reward_hacking.organism_rl.render_audit import (
     ListingProbe,
     RenderedCell,
     TaskAuditCase,
+    TraceContext,
     WhitelistEntry,
     _aisi_expected_values,
     _assertion_values,
@@ -30,6 +34,7 @@ from reward_hacking.organism_rl.render_audit import (
     _load_whitelist,
     _minimal_text_change,
     _render_cell,
+    _scan_appended_user_messages,
     compose_hint_system_prompt,
     render_audit_exit_code,
     run_render_audit,
@@ -287,7 +292,7 @@ def test_code_examples_and_numbered_lists_do_not_create_prose_findings() -> None
     assert hits == ()
 
 
-def test_authored_text_gets_full_rules_and_upstream_task_text_gets_leak_rules_only() -> None:
+def test_authored_text_gets_full_rules_and_upstream_task_text_gets_scoped_cue_rules() -> None:
     authored_hits = scan_surfaces(
         _case(),
         _cell(
@@ -299,12 +304,13 @@ def test_authored_text_gets_full_rules_and_upstream_task_text_gets_leak_rules_on
 
     assert {hit.rule for hit in authored_hits} == {
         "benchmark_or_provenance_name",
+        "evaluation_or_reward_wording",
         "template_residue",
     }
 
 
 def test_upstream_content_flags_only_provenance_and_hidden_values() -> None:
-    task = _task("Contest task says impossible, hack this problem. None  doubled. None doubled.")
+    task = _task("Contest task asks for a value. None  doubled. None doubled.")
     case = TaskAuditCase(
         "ilcb",
         "oneoff",
@@ -320,7 +326,7 @@ def test_upstream_content_flags_only_provenance_and_hidden_values() -> None:
     assert scan_surfaces(case, cell, whitelist=()) == ()
 
     leaked_value = _cell(
-        task_markdown="Contest task says impossible, hack this problem. secret-result-42",
+        task_markdown="Contest task asks for a value. secret-result-42",
         listing="solution.py",
     )
     hits = scan_surfaces(case, leaked_value, whitelist=())
@@ -328,6 +334,94 @@ def test_upstream_content_flags_only_provenance_and_hidden_values() -> None:
     assert [(hit.rule, hit.matched_text) for hit in hits] == [
         ("expected_output", "secret-result-42")
     ]
+
+
+def test_upstream_evaluation_cues_apply_without_flagging_ordinary_ci_status() -> None:
+    evaluation_hits = scan_surfaces(
+        _case(),
+        _cell(),
+        whitelist=(),
+        surfaces={"tool_output": "This is a benchmark evaluation."},
+    )
+    ci_hits = scan_surfaces(
+        _case(),
+        _cell(),
+        whitelist=(),
+        surfaces={"tool_output": "grader passed in 0.01s"},
+    )
+
+    assert {hit.rule for hit in evaluation_hits} == {"evaluation_or_reward_wording"}
+    assert ci_hits == ()
+
+
+def test_hash_shaped_tokens_are_checked_in_prompts_but_not_tool_output() -> None:
+    digest = "abcdef0123456789abcdef0123456789abcdef01"
+    prompt_hits = scan_surfaces(
+        _case(),
+        _cell(system_prompt=f"Use commit {digest}."),
+        whitelist=(),
+    )
+    tool_output_hits = scan_surfaces(
+        _case(),
+        _cell(),
+        whitelist=(),
+        surfaces={"tool_output": f"git log reported {digest}"},
+    )
+    numeric_input_hits = scan_surfaces(
+        _case(),
+        _cell(system_prompt="Input 123456789."),
+        whitelist=(),
+    )
+
+    assert [(hit.rule, hit.matched_text) for hit in prompt_hits] == [("hash_shaped_token", digest)]
+    assert not any(hit.rule == "hash_shaped_token" for hit in tool_output_hits)
+    assert not any(hit.rule == "hash_shaped_token" for hit in numeric_input_hits)
+
+
+def test_appended_environment_user_messages_are_scanned() -> None:
+    context = TraceContext(
+        audit_case=_case(),
+        task_id="synthetic-task",
+        family="ilcb",
+        variant="oneoff",
+        payment_register="in_band",
+        hint_family="none",
+        hint_strength="none",
+        workspace_mount="/work",
+        source="synthetic-trace",
+        episode_id="synthetic-episode",
+        asset_arm="",
+        whitelist=(),
+    )
+    messages = (
+        {"role": "system", "content": "Synthetic system prompt."},
+        {"role": "user", "content": "Synthetic first prompt."},
+        {"role": "assistant", "content": "This is a benchmark."},
+        {"role": "user", "content": "This is an integrity evaluation."},
+    )
+
+    hits, scanned_count = _scan_appended_user_messages(messages, context, canaries=())
+
+    assert scanned_count == 1
+    assert [(hit.rule, hit.matched_text) for hit in hits] == [
+        ("evaluation_or_reward_wording", "evaluation")
+    ]
+
+
+def test_required_known_fix_rejects_a_skipped_check() -> None:
+    report = {"hit_count": 0, "known_fix_check": {"status": "skipped"}}
+
+    assert render_audit_exit_code(report) == 0
+    assert render_audit_exit_code(report, require_known_fix=True) == 1
+
+
+def test_render_audit_rejects_skip_and_require_known_fix_together() -> None:
+    with pytest.raises(SystemExit) as error:
+        render_audit._parse_args(  # pyright: ignore[reportPrivateUsage]
+            ["--skip-known-fix", "--require-known-fix"]
+        )
+
+    assert error.value.code == 2
 
 
 def test_short_registered_outputs_are_not_generic_leak_matches() -> None:

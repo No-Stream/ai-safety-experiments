@@ -44,9 +44,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 
@@ -61,6 +63,7 @@ from reward_hacking.jailed_poc import (
 from reward_hacking.jailed_poc import jail_resource_limits_scope as _jail_resource_limits_scope
 from reward_hacking.model_backend import BedrockCompletion, TokenUsage
 from reward_hacking.organism_rl.corpus_capture import (
+    assert_required_captures,
     corpus_root_from_environment,
     verify_corpus,
 )
@@ -89,6 +92,7 @@ def seed_v4_corpus() -> Path:
             pytest.fail(reason, pytrace=False)
         pytest.skip(reason)
     verify_corpus(corpus_root)
+    assert_required_captures(corpus_root)
     return corpus_root.resolve()
 
 
@@ -165,7 +169,7 @@ class CaseFileAwareModule(pytest.Module):
         try:
             return list(super().collect())
         except NoJailInterpreterError as exc:
-            pytest.skip(f"no jail interpreter resolved: {exc}", allow_module_level=True)
+            _handle_missing_jail_interpreter(exc)
         except RuntimeError as exc:
             reason = _absent_case_file_reason(exc)
             if reason is None:
@@ -179,6 +183,54 @@ def pytest_pycollect_makemodule(module_path: Path, parent: pytest.Collector) -> 
 
 
 TEST_JAIL_ADVISORY_LIMITS = os.environ.get("TEST_JAIL_ADVISORY_LIMITS") == "1"
+REQUIRE_JAIL = os.environ.get("SEED_V4_REQUIRE_JAIL") == "1"
+_REQUIRED_GATE_MARKERS = {
+    "SEED_V4_REQUIRE_JAIL": "jail_real",
+    "SEED_V4_REQUIRE_DOCKER": "docker_real",
+    "SEED_V4_REQUIRE_CORPUS_TESTS": "corpus",
+}
+_EXECUTED_GATE_CALLS: Counter[str] = Counter()
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    """Count executed test calls for required real gates, excluding skipped calls."""
+    if report.when != "call" or report.outcome == "skipped":
+        return
+    for marker_name in _REQUIRED_GATE_MARKERS.values():
+        if report.keywords.get(marker_name):
+            _EXECUTED_GATE_CALLS[marker_name] += 1
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Fail a required gate when skips leave it with no executed test calls."""
+    missing_markers = [
+        marker_name
+        for environment_name, marker_name in _REQUIRED_GATE_MARKERS.items()
+        if os.environ.get(environment_name) == "1" and _EXECUTED_GATE_CALLS[marker_name] == 0
+    ]
+    if missing_markers:
+        message = "required seed-v4 gate executed no tests marked: " + ", ".join(missing_markers)
+        warnings.warn(message, RuntimeWarning, stacklevel=1)
+        if exitstatus == pytest.ExitCode.OK:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def _handle_missing_jail_interpreter(error: NoJailInterpreterError) -> NoReturn:
+    message = f"no jail interpreter resolved: {error}"
+    if REQUIRE_JAIL:
+        pytest.fail(message, pytrace=False)
+    pytest.skip(message, allow_module_level=True)
+
+
+def _require_jail_available() -> None:
+    if REQUIRE_JAIL and not JAIL_AVAILABLE:
+        pytest.fail(f"jail unavailable: {JAIL_UNAVAILABLE_REASON}", pytrace=False)
+
+
+@pytest.fixture
+def require_jail_available() -> None:
+    """Fail strict jail-tier tests when their live jail prerequisite probe failed."""
+    _require_jail_available()
 
 
 def _resolve_test_jail_resource_limits() -> tuple[JailResourceLimits | None, str | None]:
@@ -270,6 +322,8 @@ def jail_resource_limits_scope() -> Iterator[None]:
 def needs_jail[TestObject](test_object: TestObject) -> TestObject:
     """Mark a test for the live runner and scope its resolved limits around that test."""
     with_limits = pytest.mark.usefixtures("jail_resource_limits_scope")(test_object)
+    if REQUIRE_JAIL:
+        return cast("TestObject", pytest.mark.usefixtures("require_jail_available")(with_limits))
     return cast(
         "TestObject",
         pytest.mark.skipif(

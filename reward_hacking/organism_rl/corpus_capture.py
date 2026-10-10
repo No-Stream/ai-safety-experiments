@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -21,6 +22,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_CORPUS_ROOT = Path("docs/scratch/seed-v4-corpus")
 CORPUS_MANIFEST_SCHEMA_VERSION = 2
 CORPUS_SIZE_LIMIT_BYTES = 1_000_000_000
+REQUIRED_CAPTURE_RECORDS = {
+    "nine-b/evalA-base9b": ("records.jsonl",),
+    "nine-b/minimal-seedv3c34": (
+        "coding/records.jsonl",
+        "math-oneoff/records.jsonl",
+        "math-loose/records.jsonl",
+    ),
+    "nine-b/minimal-eval-v4-base-cell-5": ("records.jsonl",),
+    "smoke-0.8b": (
+        "generate/ilcb-conflicting/records.jsonl",
+        "evaluate/ilcb-conflicting/records.jsonl",
+        "ladder/records.jsonl",
+    ),
+}
 EXCLUDED_DIRECTORY_NAMES = frozenset({"vllm-serving-adapters"})
 EXCLUDED_FILE_NAMES = frozenset({"adapter_model.safetensors"})
 DEFERRED_SEMANTIC_VERSIONS = (
@@ -33,6 +48,7 @@ TAXONOMY_COMPATIBILITY_TEST = (
 )
 TAXONOMY_PRODUCER = "reward_hacking.distill.hack_strategy.taxonomy"
 RECORD_SCHEMA_PRODUCER = "organism_rl.generate.record_schema"
+STRENGTHENED_TRUTH_PRODUCER = "organism_rl.strengthened_truth_grade"
 RECORD_SCHEMA_COMPATIBILITY_TEST = (
     "reward_hacking/tests/test_seam_records.py::"
     "test_episode_trace_replay_preserves_recorded_summaries_and_truth"
@@ -75,7 +91,7 @@ def semantic_versions() -> dict[str, int | str]:
     return {
         RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_VERSION,
         "organism_rl.evaluate.generation_path_identity": GENERATION_PATH_IDENTITY_SCHEMA_VERSION,
-        "organism_rl.strengthened_truth_grade": STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION,
+        STRENGTHENED_TRUTH_PRODUCER: STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION,
         TAXONOMY_PRODUCER: TAXONOMY_VERSION,
         LEAK_BUILDER_PRODUCER: BUILDER_VERSION,
         "organism_rl.env_gate.fixture_schema": FIXTURE_SCHEMA,
@@ -155,21 +171,40 @@ def _check_size_limit(corpus_root: Path) -> None:
         )
 
 
+def _episodes_fallback_relative_path(path: Path, source_root: Path) -> Path:
+    candidate_paths = {
+        Path(*path.parts[start_index:])
+        for index, part in enumerate(path.parts)
+        if part == "episodes"
+        for start_index in {max(0, index - 1), index}
+    }
+    matching_paths = {
+        candidate_path
+        for candidate_path in candidate_paths
+        if (source_root / candidate_path).is_file()
+    }
+    if not matching_paths:
+        raise FileNotFoundError("episodes fallback matched 0 files")
+    if len(matching_paths) > 1:
+        raise ValueError(f"episodes fallback matched {len(matching_paths)} files")
+    return next(iter(matching_paths))
+
+
 def _trace_relative_path(path_text: str, source_root: Path) -> Path:
+    source_root = source_root.resolve()
     trace_path = Path(path_text)
     if not trace_path.is_absolute():
         trace_path = source_root / trace_path
     try:
-        relative_path = trace_path.resolve().relative_to(source_root.resolve())
+        relative_path = trace_path.resolve().relative_to(source_root)
     except ValueError:
         # A run moved after recording keeps its evaluate layout below the run directory.
-        parts = trace_path.parts
-        if "episodes" not in parts:
+        try:
+            relative_path = _episodes_fallback_relative_path(trace_path, source_root)
+        except FileNotFoundError as exc:
             raise FileNotFoundError(
                 f"recorded trace path {path_text} is outside the captured run"
-            ) from None
-        episodes_index = max(index for index, part in enumerate(parts) if part == "episodes")
-        relative_path = Path(*parts[episodes_index - 1 :])
+            ) from exc
     if not (source_root / relative_path).is_file():
         raise FileNotFoundError(
             f"recorded trace path {path_text} is not present under the captured run"
@@ -178,14 +213,13 @@ def _trace_relative_path(path_text: str, source_root: Path) -> Path:
 
 
 def _source_relative_path(path_text: str, source_root: Path, trace_relative: Path | None) -> Path:
+    source_root = source_root.resolve()
     candidate = Path(path_text)
     if candidate.is_absolute():
         try:
-            return candidate.resolve().relative_to(source_root.resolve())
+            return candidate.resolve().relative_to(source_root)
         except ValueError:
-            parts = candidate.parts
-            episodes_index = max(index for index, part in enumerate(parts) if part == "episodes")
-            return Path(*parts[episodes_index - 1 :])
+            return _episodes_fallback_relative_path(candidate, source_root)
     if trace_relative is None:
         raise ValueError("relative evidence path requires a recorded trace path")
     return trace_relative.parent / candidate
@@ -360,6 +394,15 @@ def _capture_file_sha256(capture_root: Path) -> dict[str, str]:
     }
 
 
+def _source_inventory(source_root: Path) -> tuple[dict[str, str], int]:
+    source_files = _source_files(source_root)
+    inventory = {
+        path.relative_to(source_root).as_posix(): _file_sha256(path) for path in source_files
+    }
+    total_bytes = sum(path.stat().st_size for path in source_files)
+    return inventory, total_bytes
+
+
 def _json_records(records_path: Path) -> Iterator[Mapping[str, object]]:
     with records_path.open(encoding="utf-8") as records_file:
         for line_number, line in enumerate(records_file, start=1):
@@ -384,6 +427,15 @@ def _artifact_records(
                 yield record, artifact
 
 
+def _captured_relative_path(path_text: str, logical_root: Path, field_name: str) -> Path:
+    resolved_root = logical_root.resolve()
+    resolved_path = Path(path_text).resolve()
+    try:
+        return resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"captured {field_name} points outside its corpus tree") from exc
+
+
 def _validate_recorded_paths(value: object, capture_root: Path, logical_root: Path) -> None:
     if isinstance(value, list):
         for child in value:
@@ -393,14 +445,44 @@ def _validate_recorded_paths(value: object, capture_root: Path, logical_root: Pa
         return
     for key, child in value.items():
         if key in {"trace_path", "docker_evidence_path"} and isinstance(child, str):
-            try:
-                relative_path = Path(child).relative_to(logical_root)
-            except ValueError as exc:
-                raise ValueError(f"captured {key} points outside its corpus tree") from exc
+            relative_path = _captured_relative_path(child, logical_root, key)
             if not (capture_root / relative_path).is_file():
                 raise FileNotFoundError(f"captured {key} does not exist")
         else:
             _validate_recorded_paths(child, capture_root, logical_root)
+
+
+def _nested_field_values(value: object, field_name: str) -> Iterator[object]:
+    if isinstance(value, list):
+        for child in value:
+            yield from _nested_field_values(child, field_name)
+        return
+    if not isinstance(value, Mapping):
+        return
+    for key, child in value.items():
+        if key == field_name:
+            yield child
+        else:
+            yield from _nested_field_values(child, field_name)
+
+
+def _validate_docker_evidence_pointer(record: Mapping[str, object], logical_root: Path) -> None:
+    evidence_values = tuple(
+        value for value in _nested_field_values(record, "docker_evidence_path") if value is not None
+    )
+    if not evidence_values:
+        return
+    trace_path_value = record.get("trace_path")
+    if not isinstance(trace_path_value, str):
+        raise TypeError("Docker evidence pointer requires its record's trace path")
+    _captured_relative_path(trace_path_value, logical_root, "trace_path")
+    expected_evidence_path = Path(trace_path_value).resolve().with_suffix(".docker-evidence.jsonl")
+    for evidence_value in evidence_values:
+        if not isinstance(evidence_value, str):
+            raise TypeError("Docker evidence pointer must be a path string")
+        _captured_relative_path(evidence_value, logical_root, "docker_evidence_path")
+        if Path(evidence_value).resolve() != expected_evidence_path:
+            raise ValueError("Docker evidence path must be adjacent to its trace")
 
 
 def _validate_graded_artifacts(capture_root: Path, logical_root: Path) -> None:
@@ -410,11 +492,7 @@ def _validate_graded_artifacts(capture_root: Path, logical_root: Path) -> None:
         artifact_path_value = artifact.get("path")
         if not isinstance(trace_path_value, str) or not isinstance(digest, str):
             raise TypeError("corpus record needs a trace path and graded artifact digest")
-        trace_path = Path(trace_path_value)
-        try:
-            trace_relative = trace_path.relative_to(logical_root)
-        except ValueError as exc:
-            raise ValueError("captured record trace path points outside its corpus tree") from exc
+        trace_relative = _captured_relative_path(trace_path_value, logical_root, "trace_path")
         stored_trace = capture_root / trace_relative
         if not stored_trace.is_file():
             raise FileNotFoundError("captured record trace path is missing")
@@ -441,6 +519,7 @@ def _validate_capture_paths(capture_root: Path, logical_root: Path) -> None:
     for records_path in record_files:
         for record in _json_records(records_path):
             _validate_recorded_paths(record, capture_root, logical_root)
+            _validate_docker_evidence_pointer(record, logical_root)
 
 
 def _load_manifest(corpus_root: Path, *, allow_empty: bool = False) -> dict[str, object]:
@@ -553,12 +632,61 @@ def verify_corpus(corpus_root: Path | None = None) -> Mapping[str, object]:
     return manifest
 
 
+def assert_required_captures(corpus_root: Path) -> None:
+    """Require the real seed-v4 captures and their planned record cells."""
+    resolved_root = corpus_root.resolve(strict=True)
+    manifest = _load_manifest(resolved_root, allow_empty=True)
+    captures = cast("list[object]", manifest["captures"])
+    capture_counts: Counter[str] = Counter()
+    for capture in captures:
+        if not isinstance(capture, Mapping):
+            raise TypeError("seed-v4 corpus capture entry must be an object")
+        path_value = capture.get("path")
+        if not isinstance(path_value, str):
+            raise TypeError("seed-v4 corpus capture path must be text")
+        capture_counts[path_value] += 1
+    missing_captures = sorted(set(REQUIRED_CAPTURE_RECORDS) - capture_counts.keys())
+    if missing_captures:
+        raise ValueError("required seed-v4 captures are missing: " + ", ".join(missing_captures))
+    duplicated_captures = sorted(
+        path for path in REQUIRED_CAPTURE_RECORDS if capture_counts[path] != 1
+    )
+    if duplicated_captures:
+        raise ValueError(
+            "required seed-v4 captures must appear once: " + ", ".join(duplicated_captures)
+        )
+    missing_records = [
+        f"{capture_path}/{record_path}"
+        for capture_path, record_paths in REQUIRED_CAPTURE_RECORDS.items()
+        for record_path in record_paths
+        if not (resolved_root / capture_path / record_path).is_file()
+    ]
+    if missing_records:
+        raise ValueError(
+            "required seed-v4 capture records are missing: " + ", ".join(missing_records)
+        )
+
+
 def _exercised_producers(capture_root: Path) -> frozenset[str]:
     """Return the producers whose output a capture holds; leak-builder bumps skip non-leak runs."""
     producers = set(semantic_versions())
     if not any(_is_leak_record(record) for record in _capture_records(capture_root)):
         producers.discard(LEAK_BUILDER_PRODUCER)
+    if not _has_strengthened_truth_sidecar(capture_root):
+        producers.discard(STRENGTHENED_TRUTH_PRODUCER)
     return frozenset(producers)
+
+
+def _has_strengthened_truth_sidecar(capture_root: Path) -> bool:
+    """Report whether a capture holds strengthened-truth grades, which a grading bump would stale."""
+    for path in sorted(capture_root.rglob("*.jsonl")):
+        if _is_trace_file(path.relative_to(capture_root)) or path.name == "records.jsonl":
+            continue
+        for row in _json_records(path):
+            if "grading_identity" in row and "strengthened_truth" in row:
+                return True
+            break
+    return False
 
 
 def _is_leak_record(record: Mapping[str, object]) -> bool:
@@ -608,15 +736,15 @@ def _validate_capture_identity(name: str, kind: str) -> None:
         raise ValueError("capture name must be a single safe path component")
 
 
-def _read_capture_source(source: Path) -> tuple[Path, int]:
+def _read_capture_source(source: Path) -> tuple[Path, int, Mapping[str, str]]:
     source_root = source.resolve()
     if not source_root.is_dir():
         raise FileNotFoundError(f"corpus source directory is missing: {source_root}")
     source_files = _source_files(source_root)
     if not any(path.name == "records.jsonl" for path in source_files):
         raise ValueError("corpus source has no records.jsonl file")
-    source_size = sum(path.stat().st_size for path in source_files)
-    return source_root, source_size
+    source_inventory, source_size = _source_inventory(source_root)
+    return source_root, source_size, source_inventory
 
 
 def _prepare_capture_destination(
@@ -659,7 +787,12 @@ def _load_or_initialize_manifest(
     }
 
 
-def _copy_capture(source_root: Path, name: str, destination_root: Path) -> None:
+def _copy_capture(
+    source_root: Path,
+    name: str,
+    destination_root: Path,
+    source_inventory: Mapping[str, str],
+) -> None:
     destination_root.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
         prefix=f".{name}-capture-", dir=destination_root.parent
@@ -676,6 +809,9 @@ def _copy_capture(source_root: Path, name: str, destination_root: Path) -> None:
         shutil.copytree(
             source_root, staging_root, copy_function=shutil.copy2, ignore=ignore_excluded
         )
+        current_source_inventory, _source_size = _source_inventory(source_root)
+        if current_source_inventory != source_inventory:
+            raise ValueError("corpus source changed during capture")
         _rewrite_capture_paths(
             staging_root,
             source_root=source_root,
@@ -757,7 +893,7 @@ def capture_run(
 ) -> Path:
     """Copy one completed run into the ignored corpus and make all recorded paths self-contained."""
     _validate_capture_identity(name, kind)
-    source_root, source_size = _read_capture_source(source)
+    source_root, source_size, source_inventory = _read_capture_source(source)
     resolved_corpus_root, destination_relative, destination_root = _prepare_capture_destination(
         kind,
         name,
@@ -767,7 +903,7 @@ def capture_run(
     )
     versions = semantic_versions()
     current_manifest = _load_or_initialize_manifest(resolved_corpus_root, versions)
-    _copy_capture(source_root, name, destination_root)
+    _copy_capture(source_root, name, destination_root, source_inventory)
     capture_manifest = {
         "name": name,
         "kind": kind,
