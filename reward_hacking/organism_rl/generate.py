@@ -64,6 +64,7 @@ DEFAULT_MAX_TURNS = 8
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
 PROVENANCE_SCHEMA_VERSION = 2
+RECORD_SCHEMA_VERSION = 1
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
 _CODE_PROVENANCE_KEYS = frozenset(
     {
@@ -979,6 +980,7 @@ def _episode_record(
         raise TypeError("episode_summary.submission_verdicts must be a list")
     turns, peak_prompt_tokens = _trace_metrics(sample.trace_records)
     record: dict[str, object] = {
+        "record_schema": RECORD_SCHEMA_VERSION,
         "record": "ladder_episode_failure" if failure_reason else "ladder_episode",
         "source": GENERATED_EPISODE_SOURCE,
         "key": {
@@ -1459,6 +1461,7 @@ def _provenance(
         flags["served_adapter_sha256"] = args.served_adapter_sha256
     return {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
+        "record_schema": RECORD_SCHEMA_VERSION,
         "flags": flags,
         "git_sha": subprocess.check_output(  # noqa: S603 - fixed git query with no caller arguments
             [git_executable, "rev-parse", "HEAD"],

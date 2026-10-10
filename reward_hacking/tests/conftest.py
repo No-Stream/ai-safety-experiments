@@ -60,6 +60,10 @@ from reward_hacking.jailed_poc import (
 )
 from reward_hacking.jailed_poc import jail_resource_limits_scope as _jail_resource_limits_scope
 from reward_hacking.model_backend import BedrockCompletion, TokenUsage
+from reward_hacking.organism_rl.corpus_capture import (
+    corpus_root_from_environment,
+    verify_corpus,
+)
 from reward_hacking.recoverybench.answers import AnswerShape, Normalization
 from reward_hacking.recoverybench.arms import Arm
 from reward_hacking.recoverybench.items import Domain, FlawType, GradingMode, RecoveryItem
@@ -69,6 +73,23 @@ if TYPE_CHECKING:
 
     from reward_hacking.harness.loop import AgentEpisodeTrace, AgentTurn
     from reward_hacking.harness.task_spec import AgenticArmConfig
+
+
+@pytest.fixture
+def seed_v4_corpus() -> Path:
+    """Return and validate the local seed-v4 corpus, skipping only outside strict corpus gates."""
+    corpus_root = corpus_root_from_environment()
+    manifest_path = corpus_root / "corpus-manifest.json"
+    if not manifest_path.is_file():
+        reason = (
+            f"seed-v4 corpus is missing or empty at {corpus_root}; "
+            "capture real runs or set SEED_V4_CORPUS to a populated corpus root"
+        )
+        if os.environ.get("SEED_V4_REQUIRE_CORPUS") == "1":
+            pytest.fail(reason, pytrace=False)
+        pytest.skip(reason)
+    verify_corpus(corpus_root)
+    return corpus_root.resolve()
 
 
 class NoJailInterpreterError(RuntimeError):

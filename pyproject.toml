@@ -244,3 +244,8 @@ testpaths = ["tests", "reward_hacking/tests", "games/tests", "sociology/tests"]
 # test file's own directory, tests/. Rootdir-relative, so it holds from any caller cwd.
 pythonpath = ["."]
 addopts = "-ra --strict-markers -p pytest_cuda_guard"
+markers = [
+    "corpus: requires the ignored real-run seed-v4 fixture corpus",
+    "jail_real: runs against the live episode jail",
+    "docker_real: runs against the live Docker grader",
+]

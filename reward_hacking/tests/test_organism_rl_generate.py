@@ -727,6 +727,7 @@ def test_generated_original_record_scores_with_selected_payment_register(tmp_pat
     )
 
     reward = cast("Mapping[str, object]", record["organism_reward"])
+    assert record["record_schema"] == generate.RECORD_SCHEMA_VERSION
     assert record["payment_register"] == "in_band"
     assert record["true_pass"] is False
     assert reward["reward"] == 1
@@ -1112,6 +1113,7 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
 
     provenance = generate._provenance(args, cast("TaskEpisodeSource", source), task_specs)
 
+    assert provenance["record_schema"] == generate.RECORD_SCHEMA_VERSION
     flags = cast("Mapping[str, object]", provenance["flags"])
     selected_tasks = cast("list[Mapping[str, object]]", provenance["selected_tasks"])
     assert flags["aisi_sources"] == ["mbpp", "humaneval"]
