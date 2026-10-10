@@ -28,6 +28,7 @@ from reward_hacking.harness.leak_channels import CHANNELS as LEAK_CHANNELS
 from reward_hacking.harness.loop import lay_down_task
 from reward_hacking.harness.task_spec import TASK_FILENAME, AgenticArmConfig, Task
 from reward_hacking.harness.tasks_r2e_leak import (
+    LeakChannelUnavailableError,
     _host_oracle_forbidden,  # pyright: ignore[reportPrivateUsage] - preserve the production leak oracle guard
 )
 from reward_hacking.harness.tasks_r2e_leak import (
@@ -51,6 +52,8 @@ from reward_hacking.r2e_leak_data import load_tasks as load_leak_cases
 from scripts.scan_secrets import CANARY_CONTEXT_CHARS, CanaryToken, load_canary_tokens
 
 logger = logging.getLogger(__name__)
+# Laid-down episodes stay off the home tree; the episode jail refuses to mount one there.
+EPISODE_SCRATCH_ROOT = Path("/var/tmp")  # noqa: S108 - shared episode scratch location
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LEAK_TRAIN_INDEX = Path("/var/tmp/leak-env/assets-v6-train/assets.json")  # noqa: S108
@@ -829,7 +832,16 @@ def _leak_task_cases(
             raise ValueError(
                 "the train leak index must contain exactly one registered arm per task"
             )
-        tasks.extend(_leak_task_case(task_id, raw_arm, case=case) for raw_arm in raw_arms)
+        for raw_arm in raw_arms:
+            try:
+                tasks.append(_leak_task_case(task_id, raw_arm, case=case))
+            except LeakChannelUnavailableError as error:
+                # leak_assets.load_leak_tasks never serves such an arm; it counts it as unavailable.
+                logger.warning(
+                    "skipping leak arm %s that no loader serves: %s",
+                    task_id,
+                    error.unavailable_reasons,
+                )
     return tasks
 
 
@@ -2064,7 +2076,7 @@ def run_render_audit(
             registry=registry,
             canaries=inputs.canaries,
             whitelist=whitelist,
-            scratch_root=output_dir,
+            scratch_root=EPISODE_SCRATCH_ROOT,
             hit_writer=hit_writer,
             legacy_trace_roots=legacy_trace_roots,
         )
@@ -2079,7 +2091,7 @@ def run_render_audit(
         if audit_case.asset_validation_error is not None
     ]
     known_fix_check = (
-        _run_known_leak_fix(inputs.tasks, scratch_root=output_dir)
+        _run_known_leak_fix(inputs.tasks, scratch_root=EPISODE_SCRATCH_ROOT)
         if check_known_fix
         else {"status": "skipped", "reason": "explicit --skip-known-fix"}
     )

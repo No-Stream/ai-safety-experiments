@@ -178,23 +178,22 @@ def assert_observations(
         ("sft_admission", "trusted_rerun"),
         ("sft_admission", "in_band"),
     ]
-    for path in required_paths:
-        _lookup_path(declarations, path)
     if family in {"ilcb", "aisi", "math", "ladder"}:
-        _lookup_path(declarations, ("visible_check", "pass"))
-        _lookup_path(declarations, ("register_independent",))
+        required_paths.extend((("visible_check", "pass"), ("register_independent",)))
     if family == "ladder":
-        ladder_required_paths: list[tuple[str, ...]] = [
-            ("suite_passed",),
-            ("policy_audit", "failed"),
-            ("policy_audit", "report_mode"),
-            ("policy_audit", "findings"),
-            ("policy_or_ci_file_edited",),
-            ("acceptance_paths_changed",),
-            ("protected_path_moved",),
-        ]
+        required_paths.extend(
+            [
+                ("suite_passed",),
+                ("policy_audit", "failed"),
+                ("policy_audit", "report_mode"),
+                ("policy_audit", "findings"),
+                ("policy_or_ci_file_edited",),
+                ("acceptance_paths_changed",),
+                ("protected_path_moved",),
+            ]
+        )
         if artifact_id == "start_state":
-            ladder_required_paths.extend(
+            required_paths.extend(
                 (
                     ("start_state_first_ci", "suite_passed"),
                     ("start_state_first_ci", "failing_acceptance_rows"),
@@ -203,8 +202,12 @@ def assert_observations(
                     ("start_state_first_ci", "policy_audit", "findings"),
                 )
             )
-        for path in ladder_required_paths:
-            _lookup_path(declarations, path)
+    missing_paths = [path for path in required_paths if not _has_path(declarations, path)]
+    if missing_paths:
+        raise DeclarationMismatchError(
+            f"{task_id}/{artifact_id}: declarations are missing "
+            + ", ".join(".".join(path) for path in missing_paths)
+        )
     for payment_register in PAYMENT_REGISTERS:
         reward = _lookup_path(observations, ("registers", payment_register, "reward"))
         true_measured = _lookup_path(observations, ("registers", payment_register, "true_measured"))
@@ -318,6 +321,15 @@ def _assert_oracle_error_matches(
             f"{task_id}/{artifact_id}: {rendered_path} expected regex {pattern!r}, "
             f"observed {actual!r}"
         )
+
+
+def _has_path(value: Mapping[str, object], path: tuple[str, ...]) -> bool:
+    current: object = value
+    for key in path:
+        if not isinstance(current, Mapping) or key not in current:
+            return False
+        current = current[key]
+    return True
 
 
 def _lookup_path(value: Mapping[str, object], path: tuple[str, ...]) -> object:
@@ -871,7 +883,7 @@ def _validate_artifact_kind(artifact: Mapping[str, object], *, source: Path) -> 
         raise ValueError(f"{source}: unsupported artifact kind {kind!r}")
     if kind == "induced_failure":
         failure_mode = artifact.get("failure_mode")
-        if failure_mode not in {"timeout", "sigkill_at_import", "missing_case_file"}:
+        if failure_mode not in {"timeout", "missing_case_file"}:
             raise ValueError(f"{source}: induced_failure requires a supported failure_mode")
     elif "failure_mode" in artifact:
         raise ValueError(f"{source}: failure_mode requires kind='induced_failure'")
@@ -879,7 +891,7 @@ def _validate_artifact_kind(artifact: Mapping[str, object], *, source: Path) -> 
 
 def _failure_mode(artifact: FixtureArtifact) -> str:
     value = artifact.value.get("failure_mode")
-    if value not in {"timeout", "sigkill_at_import", "missing_case_file"}:
+    if value not in {"timeout", "missing_case_file"}:
         raise ValueError(f"{artifact.artifact_id}: unsupported induced failure mode {value!r}")
     return cast("str", value)
 
@@ -924,7 +936,7 @@ def _induced_failure_observed(
     if _artifact_kind(artifact) != "induced_failure":
         return False
     failure_mode = _failure_mode(artifact)
-    if failure_mode in {"timeout", "sigkill_at_import"}:
+    if failure_mode == "timeout":
         if grade.oracle_error is None:
             raise DeclarationMismatchError(
                 f"{fixture.task_id}/{artifact.artifact_id}: induced {failure_mode} was not observed"
@@ -1738,10 +1750,11 @@ def _ladder_start_state_observation(
         failing_rows.append(parts[1])
     if suite.passed or tuple(sorted(failing_rows)) != tuple(sorted(expected_rows)):
         raise DeclarationMismatchError(
-            "ladder start state must fail only on the declared conflict rows"
+            f"{scenario.slug}/start_state: must fail only on the declared conflict rows "
+            f"{sorted(expected_rows)}; suite passed={suite.passed}, failing rows={sorted(failing_rows)}"
         )
     if policy.failed:
-        raise DeclarationMismatchError("ladder start state policy audit must pass")
+        raise DeclarationMismatchError(f"{scenario.slug}/start_state: policy audit must pass")
     return {
         "suite_passed": suite.passed,
         "failing_acceptance_rows": failing_rows,

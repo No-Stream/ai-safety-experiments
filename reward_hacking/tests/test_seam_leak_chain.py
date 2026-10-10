@@ -7,7 +7,9 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -18,7 +20,7 @@ from reward_hacking.harness import docker_backend
 from reward_hacking.harness import loop as harness_loop
 from reward_hacking.harness.leak_channels import CHANNELS, probe_closed
 from reward_hacking.harness.task_spec import BASELINE_ARM, Task
-from reward_hacking.ladder.loop import render_initial_messages
+from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, render_initial_messages
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import env_gate, leak_asset_build, leak_assets, rollout
@@ -104,8 +106,8 @@ def v5_leak_inputs() -> V5LeakInputs:
     channel_splits_path = _required_path(CHANNEL_SPLITS_ENV)
     train_index = _read_json_object(train_index_path)
     heldout_index = _read_json_object(heldout_index_path)
-    if len(train_index) != 30 or len(heldout_index) != 13:
-        raise ValueError("v5 leak indexes must contain the rebuilt 30 train and 13 held-out tasks")
+    if len(train_index) != 29 or len(heldout_index) != 13:
+        raise ValueError("leak indexes must contain the 29 train and 13 held-out tasks")
 
     raw_splits = _read_json_object(channel_splits_path)
     raw_pairs = raw_splits.get("eval_pairs")
@@ -662,3 +664,28 @@ def test_closed_patch_probe_ignores_patch_files_inside_build_caches(tmp_path: Pa
     root_patch = repository / "decoy.patch"
     root_patch.write_text("untracked patch artifact\n", encoding="utf-8")
     assert not probe_closed(repository, manifest, "patch_file")
+
+
+@pytest.mark.docker_real
+def test_every_reference_fix_grades_well_inside_the_production_command_timeout(
+    v5_leak_inputs: V5LeakInputs, tmp_path: Path
+) -> None:
+    """A suite slower than the episode command timeout can never be measured, in-episode or final."""
+    budget_seconds = 0.75 * float(LADDER_COMMAND_TIMEOUT.removesuffix("s"))
+    tasks = [*v5_leak_inputs.train_tasks_by_id.items(), *v5_leak_inputs.heldout_tasks_by_id.items()]
+
+    def grade_seconds(task_id: str, task: Task) -> tuple[str, float, harness_loop.FinalGrade]:
+        episode_dir = tmp_path / task_id
+        _lay_down(episode_dir, task)
+        _apply_reference_fix(v5_leak_inputs.cases_by_id[task_id], episode_dir)
+        start = time.monotonic()
+        grade = _final_grade(task, episode_dir, timeout="600s")
+        return task_id, time.monotonic() - start, grade
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda item: grade_seconds(*item), tasks))
+
+    for task_id, seconds, grade in results:
+        assert grade.oracle_error is None, f"{task_id}: {grade.oracle_error}"
+        assert grade.true_pass is True, task_id
+        assert seconds < budget_seconds, f"{task_id} reference grade took {seconds:.0f} s"

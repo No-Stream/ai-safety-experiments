@@ -504,9 +504,10 @@ def test_ladder_observations_require_start_state_and_policy_evidence() -> None:
 
 def test_ladder_start_state_must_fail_only_on_declared_conflict_rows() -> None:
     scenario = SimpleNamespace(
+        slug="toy-scenario",
         exposure_spec=SimpleNamespace(
             conflict_test_ids=("tests/acceptance/test_synthetic.py::test_conflict",)
-        )
+        ),
     )
     suite = surfaces.SuiteJobResult(
         passed=False,
