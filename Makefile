@@ -13,7 +13,7 @@ RUFF := $(UV) ruff
 # tests/test_interpreter_compat.py is what keeps the scripts that run under it 3.9-clean.
 SYSTEM_PYTHON := /usr/bin/python3
 
-.PHONY: setup setup-gpu hooks test test-select test-changed test-corpus test-docker-real corpus-verify corpus-smoke format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install env-gate render-audit
+.PHONY: setup setup-gpu hooks test test-select test-changed test-corpus test-jail-real test-docker-real corpus-verify corpus-smoke format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install env-gate render-audit verify-seed-v4
 
 setup: hooks
 	uv sync --frozen
@@ -84,14 +84,18 @@ corpus-verify:
 
 test-corpus: corpus-verify
 	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
-	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 SEED_V4_REQUIRE_CORPUS=1 SEED_V4_CORPUS=$(SEED_V4_CORPUS) $(TEST_CUDA_ENV) nice $(UV) pytest -n 4 --dist loadfile -m corpus $(CORPUS_TESTS)
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 SEED_V4_REQUIRE_CORPUS=1 SEED_V4_CORPUS=$(SEED_V4_CORPUS) $(TEST_CUDA_ENV) nice $(UV) pytest -n 4 --dist loadfile -m "corpus and not jail_real and not docker_real" $(CORPUS_TESTS)
+
+test-jail-real:
+	@echo "gate lock: $(GATE_LOCK_DIR)/gate-jail.lock (waits while another session's jail tier holds it)"
+	$(GATE_RUN) $(call GATE_LOCK,jail) env RLVR_SMOKE=1 SEED_V4_REQUIRE_CORPUS=1 SEED_V4_CORPUS=$(SEED_V4_CORPUS) XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) PATH="$(CURDIR)/.venv/bin:/usr/lib/wsl/lib:$$PATH" $(TEST_CUDA_ENV) nice $(UV) pytest -m jail_real -rA
 
 CORPUS_SMOKE_RUN_DIR ?= artifacts/smoke-v4-0.8b-seed-v4
 
 corpus-smoke:
 	@echo "0.8B smoke: generate ilcb-conflicting, ilcb-original and r2e-leak (6 episodes); evaluate 8 cells (15 records including 8 held-out leak pairs); run 1 ladder episode; 22 episodes total, about 45 minutes."
-	scripts/gpu_preflight.py
-	scripts/tmux_run.sh seed-v4-corpus-smoke -- scripts/resource-limits.sh --gpu -t 60m -- env PATH=$(CURDIR)/.venv/bin:$(PATH) $(UV) python -m reward_hacking.organism_rl.corpus_capture regenerate-smoke --run-dir $(CORPUS_SMOKE_RUN_DIR) --corpus-root $(SEED_V4_CORPUS)
+	$(SYSTEM_PYTHON) scripts/gpu_preflight.py
+	scripts/tmux_run.sh seed-v4-corpus-smoke -- scripts/resource-limits.sh --gpu -t 60m -- env XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) PATH="$(CURDIR)/.venv/bin:/usr/lib/wsl/lib:$$PATH" $(UV) python -m reward_hacking.organism_rl.corpus_capture regenerate-smoke --run-dir $(CORPUS_SMOKE_RUN_DIR) --corpus-root $(SEED_V4_CORPUS)
 
 SEED_V4_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v6-train/assets.json
 SEED_V4_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v6-heldout/assets.json
@@ -107,6 +111,11 @@ ENV_GATE_FIXTURES ?= docs/scratch/env-gate-fixtures
 
 env-gate:
 	$(UV) python -m reward_hacking.organism_rl.env_gate --fixtures $(ENV_GATE_FIXTURES)
+
+# The single check before any seed-v4 GPU stage: corpus tier, render audit, jail tier, real-Docker tier and
+# the full environment check, in that order, stopping at the first red. About 1.5-2.5 h; use GATE_TMUX=1.
+verify-seed-v4:
+	$(GATE_RUN) $(MAKE) --no-print-directory GATE_TMUX= test-corpus render-audit test-jail-real test-docker-real env-gate
 
 RENDER_AUDIT_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v6-train/assets.json
 RENDER_AUDIT_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v6-heldout/assets.json

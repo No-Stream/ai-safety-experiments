@@ -114,12 +114,8 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
                     "producer": producer,
                     "captured_version": captured_version,
                     "current_version": current_version,
-                    "loader_test": (
-                        "reward_hacking/tests/test_seed_v4_corpus_versions.py::"
-                        "test_captured_taxonomy_versions_remain_supported"
-                    ),
+                    "loader_test": corpus_capture.COMPATIBILITY_LOADER_TESTS[producer],
                 } in manifest["compatible_legacy_versions"]
-        assert captured_versions["organism_rl.generate.record_schema"] == RECORD_SCHEMA_VERSION
     assert manifest["deferred_semantic_versions"] == [
         "reward_hacking.harness.leak_detector.LEAK_DETECTOR_SEMANTIC_VERSION"
     ]
@@ -167,7 +163,12 @@ def test_corpus_record_schema_shapes_match_capture_manifest(seed_v4_corpus: Path
                 schema_value = record.get("record_schema")
                 observed_shapes["legacy" if schema_value is None else str(schema_value)] += 1
         assert dict(observed_shapes) == capture["record_schema_shapes"]
-        assert set(observed_shapes).issubset({"legacy", str(RECORD_SCHEMA_VERSION)})
+        readable_schemas = {"legacy", str(RECORD_SCHEMA_VERSION)} | {
+            str(entry["captured_version"])
+            for entry in manifest["compatible_legacy_versions"]
+            if entry["producer"] == corpus_capture.RECORD_SCHEMA_PRODUCER
+        }
+        assert set(observed_shapes).issubset(readable_schemas)
 
 
 @pytest.mark.corpus
@@ -188,3 +189,51 @@ def test_hack_strategy_resolves_every_captured_graded_artifact(seed_v4_corpus: P
             assert artifact_source is not None
             resolved_count += 1
     assert resolved_count > 0
+
+
+def _smoke_source(root: Path, marker: str) -> Path:
+    root.mkdir(parents=True)
+    (root / "records.jsonl").write_text(json.dumps({"marker": marker}) + "\n", encoding="utf-8")
+    return root
+
+
+def test_smoke_regeneration_replaces_the_previous_capture(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    corpus_capture.capture_run(
+        _smoke_source(tmp_path / "first", "first"),
+        "smoke-0.8b",
+        kind="smoke",
+        corpus_root=corpus_root,
+    )
+
+    corpus_capture.replace_smoke_capture(
+        _smoke_source(tmp_path / "second", "second"), "smoke-0.8b", corpus_root=corpus_root
+    )
+
+    manifest = json.loads((corpus_root / "corpus-manifest.json").read_text(encoding="utf-8"))
+    assert [capture["path"] for capture in manifest["captures"]] == ["smoke-0.8b"]
+    assert "second" in (corpus_root / "smoke-0.8b" / "records.jsonl").read_text(encoding="utf-8")
+    assert (
+        sorted(path.name for path in corpus_root.iterdir() if path.name.startswith(".smoke")) == []
+    )
+    corpus_capture.verify_corpus(corpus_root)
+
+
+def test_failed_smoke_regeneration_restores_the_previous_capture(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    corpus_capture.capture_run(
+        _smoke_source(tmp_path / "first", "first"),
+        "smoke-0.8b",
+        kind="smoke",
+        corpus_root=corpus_root,
+    )
+    manifest_before = (corpus_root / "corpus-manifest.json").read_text(encoding="utf-8")
+    unfinished = _smoke_source(tmp_path / "unfinished", "second")
+    (unfinished / "records.jsonl.tmp").write_text("", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unfinished temporary file"):
+        corpus_capture.replace_smoke_capture(unfinished, "smoke-0.8b", corpus_root=corpus_root)
+
+    assert (corpus_root / "corpus-manifest.json").read_text(encoding="utf-8") == manifest_before
+    assert "first" in (corpus_root / "smoke-0.8b" / "records.jsonl").read_text(encoding="utf-8")
+    corpus_capture.verify_corpus(corpus_root)

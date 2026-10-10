@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,6 +31,18 @@ TAXONOMY_COMPATIBILITY_TEST = (
     "reward_hacking/tests/test_seed_v4_corpus_versions.py::"
     "test_captured_taxonomy_versions_remain_supported"
 )
+TAXONOMY_PRODUCER = "reward_hacking.distill.hack_strategy.taxonomy"
+RECORD_SCHEMA_PRODUCER = "organism_rl.generate.record_schema"
+RECORD_SCHEMA_COMPATIBILITY_TEST = (
+    "reward_hacking/tests/test_seam_records.py::"
+    "test_episode_trace_replay_preserves_recorded_summaries_and_truth"
+)
+# Producers whose older captures stay usable when the manifest lists the version pair with the test
+# that loads the older shape through the current code; any other bump stales the capture.
+COMPATIBILITY_LOADER_TESTS = {
+    TAXONOMY_PRODUCER: TAXONOMY_COMPATIBILITY_TEST,
+    RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_COMPATIBILITY_TEST,
+}
 CORPUS_README = """# Seed v4 local fixture corpus
 
 This directory contains ignored run artifacts used by the seed-v4 CPU corpus checks. Keep it
@@ -60,10 +73,10 @@ def semantic_versions() -> dict[str, int | str]:
     )
 
     return {
-        "organism_rl.generate.record_schema": RECORD_SCHEMA_VERSION,
+        RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_VERSION,
         "organism_rl.evaluate.generation_path_identity": GENERATION_PATH_IDENTITY_SCHEMA_VERSION,
         "organism_rl.strengthened_truth_grade": STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION,
-        "reward_hacking.distill.hack_strategy.taxonomy": TAXONOMY_VERSION,
+        TAXONOMY_PRODUCER: TAXONOMY_VERSION,
         LEAK_BUILDER_PRODUCER: BUILDER_VERSION,
         "organism_rl.env_gate.fixture_schema": FIXTURE_SCHEMA,
         "organism_rl.env_gate.declaration_schema": DECLARATION_SCHEMA,
@@ -149,11 +162,18 @@ def _trace_relative_path(path_text: str, source_root: Path) -> Path:
     try:
         relative_path = trace_path.resolve().relative_to(source_root.resolve())
     except ValueError:
+        # A run moved after recording keeps its evaluate layout below the run directory.
         parts = trace_path.parts
+        if "episodes" not in parts:
+            raise FileNotFoundError(
+                f"recorded trace path {path_text} is outside the captured run"
+            ) from None
         episodes_index = max(index for index, part in enumerate(parts) if part == "episodes")
         relative_path = Path(*parts[episodes_index - 1 :])
-    if "episodes" not in relative_path.parts or not (source_root / relative_path).is_file():
-        raise FileNotFoundError("recorded trace path is not present under the captured run")
+    if not (source_root / relative_path).is_file():
+        raise FileNotFoundError(
+            f"recorded trace path {path_text} is not present under the captured run"
+        )
     return relative_path
 
 
@@ -257,6 +277,11 @@ def _rewrite_graded_artifact(
     return artifact
 
 
+def _is_trace_file(relative_path: Path) -> bool:
+    """Evaluate (`episodes/`) and generate (`traces/`) runs both keep traces in step directories."""
+    return re.fullmatch(r"step-\d+", relative_path.parent.name) is not None
+
+
 def _rewrite_json_file(
     path: Path,
     *,
@@ -267,7 +292,7 @@ def _rewrite_json_file(
     original_stat = path.stat()
     relative_path = path.relative_to(logical_capture_root)
     if path.suffix == ".jsonl":
-        trace_context = relative_path if "episodes" in relative_path.parts else None
+        trace_context = relative_path if _is_trace_file(relative_path) else None
         temporary_path = path.with_name(f".{path.name}.{os.getpid()}.rewrite.tmp")
         with (
             path.open(encoding="utf-8") as source_file,
@@ -418,7 +443,7 @@ def _validate_capture_paths(capture_root: Path, logical_root: Path) -> None:
             _validate_recorded_paths(record, capture_root, logical_root)
 
 
-def _load_manifest(corpus_root: Path) -> dict[str, object]:
+def _load_manifest(corpus_root: Path, *, allow_empty: bool = False) -> dict[str, object]:
     manifest_path = corpus_root / "corpus-manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(
@@ -431,7 +456,9 @@ def _load_manifest(corpus_root: Path) -> dict[str, object]:
     ):
         raise ValueError("seed-v4 corpus manifest has an unsupported schema")
     captures = manifest.get("captures")
-    if not isinstance(captures, list) or not captures:
+    if not isinstance(captures, list):
+        raise TypeError("seed-v4 corpus captures must be a list")
+    if not captures and not allow_empty:
         raise ValueError("seed-v4 corpus is empty; capture a real run before running corpus tests")
     return cast("dict[str, object]", manifest)
 
@@ -451,21 +478,24 @@ def _check_semantic_version_table(
             continue
         captured_version = captured_versions.get(producer)
         if captured_version != current_version:
-            compatible_pair = any(
+            loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
+            compatible_pair = loader_test is not None and any(
                 isinstance(entry, Mapping)
                 and entry.get("producer") == producer
                 and entry.get("captured_version") == captured_version
                 and entry.get("current_version") == current_version
-                and entry.get("loader_test") == TAXONOMY_COMPATIBILITY_TEST
+                and entry.get("loader_test") == loader_test
                 for entry in compatibility_values
             )
-            if producer == "reward_hacking.distill.hack_strategy.taxonomy" and compatible_pair:
+            if compatible_pair and producer == TAXONOMY_PRODUCER:
                 from reward_hacking.distill.hack_strategy import (  # noqa: PLC0415
                     LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
                 )
 
                 if captured_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS:
                     continue
+            elif compatible_pair:
+                continue
             raise ValueError(
                 f"seed-v4 corpus {context} captured under {producer}={captured_version}, code is "
                 f"{producer}={current_version}; regenerate with `make corpus-smoke` or recapture "
@@ -598,7 +628,7 @@ def _prepare_capture_destination(
 ) -> tuple[Path, Path, Path]:
     resolved_corpus_root = (corpus_root or corpus_root_from_environment()).resolve()
     resolved_corpus_root.mkdir(parents=True, exist_ok=True)
-    destination_relative = Path(name) if kind == "smoke" else Path("nine-b") / name
+    destination_relative = _capture_relative_path(kind, name)
     destination_root = resolved_corpus_root / destination_relative
     if destination_root.exists():
         raise FileExistsError(f"corpus destination already exists: {destination_relative}")
@@ -617,7 +647,7 @@ def _load_or_initialize_manifest(
     versions: Mapping[str, int | str],
 ) -> Mapping[str, object]:
     if (corpus_root / "corpus-manifest.json").exists():
-        manifest = _load_manifest(corpus_root)
+        manifest = _load_manifest(corpus_root, allow_empty=True)
         _check_manifest_version_notes(manifest)
         return manifest
     return {
@@ -674,6 +704,48 @@ def _append_capture_manifest(
         "captures": [*captures_value, dict(capture_manifest)],
     }
     _atomic_write_json(corpus_root / "corpus-manifest.json", updated_manifest)
+
+
+def _capture_relative_path(kind: str, name: str) -> Path:
+    return Path(name) if kind == "smoke" else Path("nine-b") / name
+
+
+def replace_smoke_capture(source: Path, name: str, *, corpus_root: Path | None = None) -> Path:
+    """Swap a regenerated smoke run in for the previous capture of the same name.
+
+    The previous capture is set aside, not deleted, until the new one is captured and the whole
+    corpus verifies; a failed capture puts it back with its manifest entry.
+    """
+    _validate_capture_identity(name, "smoke")
+    resolved_corpus_root = (corpus_root or corpus_root_from_environment()).resolve()
+    relative_path = _capture_relative_path("smoke", name)
+    existing_root = resolved_corpus_root / relative_path
+    if not existing_root.is_dir():
+        return capture_run(source, name, kind="smoke", corpus_root=resolved_corpus_root)
+    manifest = _load_manifest(resolved_corpus_root)
+    captures = cast("list[Mapping[str, object]]", manifest["captures"])
+    remaining = [capture for capture in captures if capture.get("path") != str(relative_path)]
+    if len(remaining) != len(captures) - 1:
+        raise ValueError(
+            f"corpus manifest must list the existing smoke capture {relative_path} once"
+        )
+    retired_root = existing_root.with_name(f".{name}.retired-{datetime.now(UTC):%Y%m%dT%H%M%S}")
+    existing_root.rename(retired_root)
+    _atomic_write_json(
+        resolved_corpus_root / "corpus-manifest.json", {**manifest, "captures": remaining}
+    )
+    try:
+        destination = capture_run(source, name, kind="smoke", corpus_root=resolved_corpus_root)
+    except Exception:
+        logger.exception("smoke capture failed; restoring the previous capture")
+        if existing_root.exists():
+            shutil.rmtree(existing_root)
+        retired_root.rename(existing_root)
+        _atomic_write_json(resolved_corpus_root / "corpus-manifest.json", manifest)
+        raise
+    shutil.rmtree(retired_root)
+    logger.info("replaced smoke capture %s", relative_path)
+    return destination
 
 
 def capture_run(
@@ -764,7 +836,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not run_directory.is_absolute():
             run_directory = _repository_root() / run_directory
         _run_smoke(run_directory)
-        capture_run(run_directory, "smoke-0.8b", kind="smoke", corpus_root=args.corpus_root)
+        replace_smoke_capture(run_directory, "smoke-0.8b", corpus_root=args.corpus_root)
     else:
         raise AssertionError(f"unhandled corpus command: {args.command}")
     return 0
