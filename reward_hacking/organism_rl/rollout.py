@@ -266,7 +266,7 @@ def deterministic_episode_seed(task_id: str, step: int, replica: int) -> int:
 
 
 def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
-    """Read the visible-test result recorded in either canonical episode field."""
+    """Read the trusted-check result from either canonical episode field."""
     true_record = summary.get("true")
     if true_record is not None and not isinstance(true_record, Mapping):
         raise TypeError("episode_summary.true must be an object")
@@ -274,8 +274,11 @@ def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
     summary_true_pass = summary.get("true_pass")
     measured = true_record.get("measured") if isinstance(true_record, Mapping) else None
     oracle_error = true_record.get("oracle_error") if isinstance(true_record, Mapping) else None
+    direct_measured = summary.get("true_measured")
     if measured is not None and type(measured) is not bool:
         raise TypeError("episode_summary.true.measured must be a boolean or null")
+    if direct_measured is not None and type(direct_measured) is not bool:
+        raise TypeError("episode_summary.true_measured must be a boolean or null")
     if oracle_error is not None and not isinstance(oracle_error, str):
         raise TypeError("episode_summary.true.oracle_error must be a string or null")
     for value in (nested_true_pass, summary_true_pass):
@@ -288,7 +291,10 @@ def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
     ):
         raise ValueError("episode summary has conflicting true_pass fields")
     measurement_unavailable = (
-        isinstance(true_record, Mapping) and "measured" in true_record and measured is not True
+        (isinstance(true_record, Mapping) and "measured" in true_record and measured is not True)
+        or ("true_measured" in summary and direct_measured is not True)
+        or (isinstance(true_record, Mapping) and "pass" in true_record and nested_true_pass is None)
+        or ("true_pass" in summary and summary_true_pass is None)
     )
     if measurement_unavailable or oracle_error is not None:
         return None
@@ -299,12 +305,12 @@ def recorded_true_pass(summary: Mapping[str, object]) -> bool | None:
 
 def _clear_unmeasured_true_pass(summary: dict[str, object]) -> None:
     true_record = summary.get("true")
-    if (
-        isinstance(true_record, dict)
-        and "measured" in true_record
-        and true_record["measured"] is not True
+    if isinstance(true_record, dict) and (
+        ("measured" in true_record and true_record["measured"] is not True)
+        or true_record.get("oracle_error") is not None
     ):
         true_record["pass"] = None
+        summary["true_pass"] = None
 
 
 def validate_env_mask(env_mask: Sequence[int], assistant_mask: Sequence[int]) -> None:

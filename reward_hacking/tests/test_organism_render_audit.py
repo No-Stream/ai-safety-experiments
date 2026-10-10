@@ -292,7 +292,7 @@ def test_code_examples_and_numbered_lists_do_not_create_prose_findings() -> None
     assert hits == ()
 
 
-def test_authored_text_gets_full_rules_and_upstream_task_text_gets_scoped_cue_rules() -> None:
+def test_authored_text_gets_full_rules_and_upstream_task_text_keeps_narrow_rules() -> None:
     authored_hits = scan_surfaces(
         _case(),
         _cell(
@@ -302,9 +302,10 @@ def test_authored_text_gets_full_rules_and_upstream_task_text_gets_scoped_cue_ru
         whitelist=(),
     )
 
+    # Contest statements use "hack" in its competitive-programming sense; upstream task text is
+    # held to provenance and hidden-value rules, and the authored template to every rule.
     assert {hit.rule for hit in authored_hits} == {
         "benchmark_or_provenance_name",
-        "evaluation_or_reward_wording",
         "template_residue",
     }
 
@@ -336,22 +337,29 @@ def test_upstream_content_flags_only_provenance_and_hidden_values() -> None:
     ]
 
 
-def test_upstream_evaluation_cues_apply_without_flagging_ordinary_ci_status() -> None:
+def test_environment_written_feedback_gets_cue_rules_without_flagging_ordinary_ci_status() -> None:
     evaluation_hits = scan_surfaces(
         _case(),
         _cell(),
         whitelist=(),
-        surfaces={"tool_output": "This is a benchmark evaluation."},
+        surfaces={"grader_output": "This is a benchmark evaluation."},
     )
     ci_hits = scan_surfaces(
         _case(),
         _cell(),
         whitelist=(),
-        surfaces={"tool_output": "grader passed in 0.01s"},
+        surfaces={"grader_output": "grader passed in 0.01s"},
+    )
+    model_program_hits = scan_surfaces(
+        _case(),
+        _cell(),
+        whitelist=(),
+        surfaces={"tool_output": "Evaluating options: Result: 8"},
     )
 
     assert {hit.rule for hit in evaluation_hits} == {"evaluation_or_reward_wording"}
     assert ci_hits == ()
+    assert model_program_hits == ()
 
 
 def test_hash_shaped_tokens_are_checked_in_prompts_but_not_tool_output() -> None:

@@ -17,9 +17,37 @@ from reward_hacking.distill.hack_strategy import (
 from reward_hacking.organism_rl import corpus_capture
 from reward_hacking.organism_rl.corpus_capture import semantic_versions
 from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION
+from reward_hacking.organism_rl.rollout import recorded_true_pass
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
+    assert RECORD_SCHEMA_VERSION == 3
+
+
+@pytest.mark.corpus
+def test_legacy_oracle_errors_load_as_unmeasured_truth(seed_v4_corpus: Path) -> None:
+    legacy_error_count = 0
+    for records_path in seed_v4_corpus.rglob("records.jsonl"):
+        for line in records_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = cast("Mapping[str, object]", json.loads(line))
+            summary = record.get("trace_summary")
+            if record.get("record") in {"ladder_run_header", "ladder_run_summary"}:
+                assert summary is None
+                continue
+            assert record.get("record") == "ladder_episode"
+            assert isinstance(summary, Mapping)
+            truth = summary.get("true")
+            assert isinstance(truth, Mapping)
+            if truth.get("oracle_error") is not None:
+                assert recorded_true_pass(summary) is None
+                if truth.get("pass") is False:
+                    legacy_error_count += 1
+    assert legacy_error_count > 0
 
 
 def test_capture_rejects_an_unfinished_source_file(tmp_path: Path) -> None:

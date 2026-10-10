@@ -21,6 +21,9 @@ BASE_RECORDS = REPOSITORY_ROOT / "artifacts/organism-eval/evalA-base9b-c6a275f/r
 SEED_V2_RECORDS = REPOSITORY_ROOT / "artifacts/organism-eval/evalA-seedv2-c6a275f/records.jsonl"
 SEED_V3_ROOT = REPOSITORY_ROOT / "artifacts/organism-eval/minimal-seedv3c34-ef398f9"
 SEED_V3_CODING_RECORDS = SEED_V3_ROOT / "coding/records.jsonl"
+SEED_V4_CONFLICTING_RECORDS = (
+    REPOSITORY_ROOT / "docs/scratch/seed-v4-corpus/nine-b/minimal-eval-v4-base-cell-5/records.jsonl"
+)
 
 
 def _write_trace(trace_path: Path) -> None:
@@ -253,16 +256,17 @@ def test_seed_v3_health_assert_passes_against_base(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("records_path", "expected_unmeasured_by_family"),
+    ("records_path", "expected_unmeasured_by_family", "expected_overall_unmeasured_count"),
     [
-        (BASE_RECORDS, {"aisi": (1, 12), "ilcb": (1, 12)}),
-        (SEED_V3_CODING_RECORDS, {"aisi": (0, 12), "ilcb": (2, 12)}),
+        (BASE_RECORDS, {"aisi": (1, 24), "ilcb": (2, 24)}, 3),
+        (SEED_V3_CODING_RECORDS, {"aisi": (0, 24), "ilcb": (2, 24)}, 2),
     ],
     ids=("evalA-base", "minimal-seedv3c34-coding"),
 )
-def test_real_records_report_and_assert_unmeasured_original_truth(
+def test_real_records_report_and_assert_unmeasured_evaluated_truth(
     records_path: Path,
     expected_unmeasured_by_family: Mapping[str, tuple[int, int]],
+    expected_overall_unmeasured_count: int,
     tmp_path: Path,
 ) -> None:
     if not records_path.is_file():
@@ -301,11 +305,11 @@ def test_real_records_report_and_assert_unmeasured_original_truth(
     candidate = report["comparison"]["candidate"]
     unmeasured = candidate["summary"]["unmeasured"]["true"]
     overall = unmeasured["overall"]
-    assert overall["denominator"] == 24
-    assert overall["unmeasured_count"] == 2
-    assert overall["fraction"] == pytest.approx(2 / 24)
-    assert overall["reasons"]["true.oracle_error"] == 2
-    assert overall["reasons"]["true.measured_false"] == 2
+    assert overall["denominator"] == 48
+    assert overall["unmeasured_count"] == expected_overall_unmeasured_count
+    assert overall["fraction"] == pytest.approx(expected_overall_unmeasured_count / 48)
+    assert overall["reasons"]["true.oracle_error"] == expected_overall_unmeasured_count
+    assert overall["reasons"]["true.measured_false"] == expected_overall_unmeasured_count
     assert set(unmeasured["by_family"]) == set(expected_unmeasured_by_family)
     for family, (unmeasured_count, denominator) in expected_unmeasured_by_family.items():
         family_summary = unmeasured["by_family"][family]
@@ -319,7 +323,9 @@ def test_real_records_report_and_assert_unmeasured_original_truth(
 @pytest.mark.skipif(not BASE_RECORDS.is_file(), reason="local evalA records are not present")
 def test_unmeasured_assertion_gate_fails_after_sabotaging_a_real_record(tmp_path: Path) -> None:
     rows = [json.loads(line) for line in BASE_RECORDS.read_text(encoding="utf-8").splitlines()]
-    sabotaged = False
+    aisi_rows = [row for row in rows if row.get("family") == "aisi"]
+    sabotage_target = len(aisi_rows) // 20 + 1
+    sabotaged_count = 0
     for row in rows:
         if row.get("variant") != "original" or row.get("family") != "aisi":
             continue
@@ -327,10 +333,27 @@ def test_unmeasured_assertion_gate_fails_after_sabotaging_a_real_record(tmp_path
         truth = summary["true"]
         if truth["measured"] is True:
             truth["measured"] = False
+            truth["pass"] = None
             truth["oracle_error"] = "sabotage: omitted trusted result"
-            sabotaged = True
-            break
-    assert sabotaged
+            row["true_measured"] = False
+            row["true_pass"] = None
+            if "true_measured" in summary:
+                summary["true_measured"] = False
+            if "true_pass" in summary:
+                summary["true_pass"] = None
+            reward_record = cast("dict[str, object]", row["organism_reward"])
+            reward_evidence = cast("dict[str, object]", reward_record["evidence"])
+            reward_evidence["true_measured"] = False
+            reward_evidence["true_pass"] = None
+            reward_evidence["oracle_error"] = True
+            reward_record["reward"] = None
+            reward_record["outcome"] = "unscorable_oracle_error"
+            row["organism_reward_outcome"] = "unscorable_oracle_error"
+            row["honest_solve"] = False
+            sabotaged_count += 1
+            if sabotaged_count == sabotage_target:
+                break
+    assert sabotaged_count == sabotage_target
     sabotaged_records = tmp_path / "sabotaged-records.jsonl"
     sabotaged_records.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     output_path = tmp_path / "sabotaged-health.json"
@@ -368,6 +391,27 @@ def test_unmeasured_assertion_gate_fails_after_sabotaging_a_real_record(tmp_path
     assert any("family aisi" in breach for breach in report["assertion_breaches"])
 
 
+@pytest.mark.skipif(
+    not SEED_V4_CONFLICTING_RECORDS.is_file(),
+    reason="seed-v4 conflicting-cell corpus is not present",
+)
+def test_seed_v4_conflicting_only_cell_counts_primary_truth_for_every_record() -> None:
+    report = health.analyze_records([SEED_V4_CONFLICTING_RECORDS])
+    summary = cast("dict[str, object]", report["summary"])
+    unmeasured = cast("dict[str, object]", summary["unmeasured"])
+    true_outcomes = cast("dict[str, object]", unmeasured["true"])
+    overall = cast("dict[str, object]", true_outcomes["overall"])
+    by_cell = cast("dict[str, object]", true_outcomes["by_cell"])
+    cell = cast("dict[str, object]", by_cell[SEED_V4_CONFLICTING_RECORDS.parent.name])
+
+    record_count = len(SEED_V4_CONFLICTING_RECORDS.read_text(encoding="utf-8").splitlines())
+    assert record_count > 0
+    assert overall["denominator"] == record_count
+    assert overall["unmeasured_count"] == 1
+    assert cell["denominator"] == record_count
+    assert cell["unmeasured_count"] == 1
+
+
 def test_health_report_counts_unmeasured_strengthened_truth_by_family(tmp_path: Path) -> None:
     task_ids = ["task-a", "task-b"]
     records_path = tmp_path / "candidate" / "records.jsonl"
@@ -392,6 +436,164 @@ def test_health_report_counts_unmeasured_strengthened_truth_by_family(tmp_path: 
     assert overall["unmeasured_count"] == 1
     assert reasons["strengthened_truth.pass_missing"] == 1
     assert aisi["fraction"] == pytest.approx(0.5)
+
+
+def test_health_counts_unmeasured_truth_for_every_variant_and_strengthened_truth_for_originals(
+    tmp_path: Path,
+) -> None:
+    task_ids = ["task-a", "task-b"]
+    records_path = tmp_path / "candidate" / "records.jsonl"
+    episode_ids = _write_capability_records(records_path, "candidate", task_ids)
+    rows = [json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()]
+    conflicting_row = next(row for row in rows if row["task_id"] == "task-b")
+    conflicting_row["variant"] = "conflicting"
+    conflicting_row["trace_summary"]["true"]["measured"] = False
+    conflicting_row["trace_summary"]["true"]["oracle_error"] = "synthetic oracle error"
+    records_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    sidecar_path = tmp_path / "candidate" / "strengthened_truth.jsonl"
+    _write_truth_sidecar(
+        sidecar_path,
+        episode_ids,
+        {"task-a": (True, "upstream_reference", "shared-reference-set")},
+    )
+
+    report = health.analyze_records([records_path], sidecar_path)
+    summary = cast("dict[str, object]", report["summary"])
+    unmeasured = cast("dict[str, object]", summary["unmeasured"])
+    true_outcomes = cast("dict[str, object]", unmeasured["true"])
+    true_overall = cast("dict[str, object]", true_outcomes["overall"])
+    strengthened_truth = cast("dict[str, object]", unmeasured["strengthened_truth"])
+    strengthened_overall = cast("dict[str, object]", strengthened_truth["overall"])
+
+    assert true_overall["denominator"] == 2
+    assert true_overall["unmeasured_count"] == 1
+    assert strengthened_overall["denominator"] == 1
+
+
+@pytest.mark.parametrize("snapshot_error", ["workspace_snapshot_limit: entry limit exceeded", ""])
+def test_health_preserves_workspace_snapshot_limit_reason_by_family_and_overall(
+    tmp_path: Path,
+    snapshot_error: str,
+) -> None:
+    records_path = tmp_path / "snapshot-limit-cell" / "records.jsonl"
+    trace_path = records_path.parent / "episode.jsonl"
+    _write_trace(trace_path)
+    records_path.parent.mkdir(parents=True, exist_ok=True)
+    records_path.write_text(
+        json.dumps(
+            {
+                "family": "aisi",
+                "variant": "oneoff",
+                "true_pass": None,
+                "trace_path": str(trace_path),
+                "peak_prompt_tokens": 4,
+                "trace_summary": {
+                    "true": {
+                        "pass": None,
+                        "measured": False,
+                        "oracle_error": snapshot_error,
+                    }
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = health.analyze_records([records_path])
+
+    summary = cast("dict[str, object]", report["summary"])
+    unmeasured = cast("dict[str, object]", summary["unmeasured"])
+    true_outcomes = cast("dict[str, object]", unmeasured["true"])
+    overall = cast("dict[str, object]", true_outcomes["overall"])
+    by_family = cast("dict[str, object]", true_outcomes["by_family"])
+    family = cast("dict[str, object]", by_family["aisi"])
+    overall_reasons = cast("dict[str, int]", overall["reasons"])
+    family_reasons = cast("dict[str, int]", family["reasons"])
+    assert overall["unmeasured_count"] == family["unmeasured_count"] == 1
+    assert overall_reasons[f"true.oracle_error:{snapshot_error}"] == 1
+    assert family_reasons[f"true.oracle_error:{snapshot_error}"] == 1
+    output_path = tmp_path / "candidate-health.json"
+    exit_code = health.main(
+        [
+            "--records",
+            str(records_path),
+            "--baseline",
+            str(records_path),
+            "--assert",
+            "--unmeasured-max",
+            "0.25",
+            "--nll-min",
+            "0",
+            "--nll-max",
+            "10",
+            "--syntax-error-max",
+            "1",
+            "--cjk-episode-max",
+            "1",
+            "--loop-turn-max",
+            "100000",
+            "--submitted-ending-min",
+            "0",
+            "--max-new-tokens-turn-max",
+            "1",
+            "--output",
+            str(output_path),
+        ]
+    )
+    assertion_report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert exit_code != 0
+    assert any(
+        "unmeasured true outcomes at cell snapshot-limit-cell" in breach and "1/1" in breach
+        for breach in assertion_report["assertion_breaches"]
+    )
+
+
+def test_health_counts_explicit_null_record_verdict_over_legacy_nested_false(
+    tmp_path: Path,
+) -> None:
+    records_path = tmp_path / "explicit-null-cell" / "records.jsonl"
+    trace_path = records_path.parent / "episode.jsonl"
+    _write_trace(trace_path)
+    records_path.parent.mkdir(parents=True, exist_ok=True)
+    records_path.write_text(
+        json.dumps(
+            {
+                "family": "aisi",
+                "variant": "oneoff",
+                "true_pass": None,
+                "trace_path": str(trace_path),
+                "peak_prompt_tokens": 4,
+                "trace_summary": {"true": {"pass": False}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = health.analyze_records([records_path])
+
+    summary = cast("dict[str, object]", report["summary"])
+    unmeasured = cast("dict[str, object]", summary["unmeasured"])
+    true_outcomes = cast("dict[str, object]", unmeasured["true"])
+    overall = cast("dict[str, object]", true_outcomes["overall"])
+    assert overall["unmeasured_count"] == 1
+    assert cast("dict[str, int]", overall["reasons"])["true.pass_unavailable"] == 1
+
+
+def test_health_refuses_missing_mandatory_strengthened_truth_row(tmp_path: Path) -> None:
+    task_ids = ["task-a", "task-b"]
+    records_path = tmp_path / "candidate" / "records.jsonl"
+    episode_ids = _write_capability_records(records_path, "candidate", task_ids)
+    sidecar_path = tmp_path / "candidate" / "strengthened_truth.jsonl"
+    _write_truth_sidecar(
+        sidecar_path,
+        episode_ids,
+        {"task-a": (True, "upstream_reference", "shared-reference-set")},
+    )
+
+    with pytest.raises(health.HealthInputError, match="mandatory strengthened-truth sidecar"):
+        health.analyze_records([records_path], sidecar_path)
 
 
 def test_capability_floor_fails_four_fewer_solves_when_loss_is_two(tmp_path: Path) -> None:
@@ -477,7 +679,7 @@ def test_capability_floor_excludes_task_when_either_oracle_errored(tmp_path: Pat
     baseline_sidecar = tmp_path / "base" / "strengthened_truth.jsonl"
     candidate_sidecar = tmp_path / "candidate" / "strengthened_truth.jsonl"
     _write_truth_sidecar(baseline_sidecar, baseline_episode_ids, solvable_truths)
-    _write_truth_sidecar(candidate_sidecar, candidate_episode_ids, solvable_truths)
+    _write_truth_sidecar(candidate_sidecar, candidate_episode_ids, truths)
     output_path = tmp_path / "capability.json"
 
     exit_code = health.main(

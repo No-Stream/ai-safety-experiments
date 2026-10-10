@@ -335,7 +335,7 @@ run_eval_cell() {
   if [[ "$family" == aisi ]]; then
     arguments+=(--aisi-sources apps,humaneval,mbpp --aisi-task-id-order)
   fi
-  if [[ "$model" == v4 && "$family" == ilcb ]]; then
+  if [[ "$family" == ilcb ]]; then
     # The official tests exceed the 150-second grading limit even for correct solutions.
     arguments+=(--exclude-ilcb-problem-id lcbhard_16)
   fi

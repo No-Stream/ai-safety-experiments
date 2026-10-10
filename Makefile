@@ -77,7 +77,8 @@ test-select:
 	env RLVR_SMOKE=1 $(TEST_CUDA_ENV) $(UV) pytest $(ARGS)
 
 SEED_V4_CORPUS ?= docs/scratch/seed-v4-corpus
-CORPUS_TESTS = $(wildcard reward_hacking/tests/test_seam_*.py) reward_hacking/tests/test_seed_v4_corpus_versions.py
+# Selected by the corpus marker over the whole directory so a newly marked test is never left out.
+CORPUS_TESTS = reward_hacking/tests
 
 corpus-verify:
 	env SEED_V4_CORPUS=$(SEED_V4_CORPUS) $(UV) python -m reward_hacking.organism_rl.corpus_capture verify

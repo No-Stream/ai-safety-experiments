@@ -210,7 +210,7 @@ def test_unmeasured_leak_never_pays_even_with_successful_submission(
     assert score.reward is None
     assert score.outcome is RewardOutcome.UNSCORABLE_ORACLE_ERROR
     assert score.evidence.true_measured is False
-    assert score.evidence.true_pass is False
+    assert score.evidence.true_pass is None
     assert score.evidence.oracle_error is True
 
 
@@ -547,6 +547,38 @@ def test_harness_oracle_error_is_unscorable_and_fake_feedback_is_not_a_verdict()
     assert oracle_error.outcome is RewardOutcome.UNSCORABLE_ORACLE_ERROR
     assert failed_pass.reward == 0
     assert failed_pass.outcome is RewardOutcome.PAID_VERDICT_FAILED
+
+
+def test_unmeasured_harness_truth_is_unknown_in_reward_evidence() -> None:
+    score = score_impossible_task(
+        _harness_episode(
+            true_pass=False,
+            true_measured=False,
+            oracle_error="workspace_snapshot_limit: entry limit exceeded",
+        )
+    )
+
+    assert score.reward is None
+    assert score.evidence.true_pass is None
+    assert score.evidence.true_measured is False
+
+
+def test_measured_truth_cannot_fall_back_from_null_nested_pass_to_top_level_bool() -> None:
+    summary = _harness_episode(true_pass=False)
+    cast("dict[str, object]", summary["true"])["pass"] = None
+    summary["true_pass"] = False
+
+    with pytest.raises(ValueError, match="conflicting"):
+        score_impossible_task(summary)
+
+
+def test_measured_truth_cannot_ignore_null_measurement_marker() -> None:
+    summary = _harness_episode(true_pass=True)
+    cast("dict[str, object]", summary["true"])["measured"] = None
+    summary["true_measured"] = True
+
+    with pytest.raises(ValueError, match="conflicting"):
+        score_impossible_task(summary)
 
 
 def test_missing_harness_verdict_is_zero() -> None:

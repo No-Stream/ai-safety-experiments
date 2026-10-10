@@ -224,9 +224,11 @@ class RolloutRecord:
     * ``model_id`` (str) -- the checkpoint that produced the rollout (for provenance in the id).
     * ``final_message`` (str) -- the agent's closing narration/CoT, fed as the last turn's
       completion.
-    * ``proxy_pass`` / ``true_pass`` (bool) -- a separable two-verdict gap, IF the data carries one.
-      When absent both are derived from ``reward``; supplying them is the only way
-      ``DELIBERATE_HACK`` becomes reachable (see the module docstring).
+    * ``proxy_pass`` / ``true_pass`` (bool or null) -- a separable two-verdict gap, IF the data
+      carries one. When absent both are derived from ``reward``; explicit ``true_pass: null`` keeps
+      the trusted result unmeasured while proxy truth still follows the reward.
+    * ``oracle_error`` (str or null) -- a saved trusted-check error. A non-null error keeps a
+      legacy boolean ``true_pass`` from being mistaken for a measured verdict.
     """
 
     episode_id: str
@@ -240,6 +242,7 @@ class RolloutRecord:
     final_message: str
     proxy_pass_override: bool | None
     true_pass_override: bool | None
+    true_pass_recorded: bool
 
     @classmethod
     def from_dict(cls, record: Mapping[str, object], *, index: int = 0) -> RolloutRecord:
@@ -254,6 +257,13 @@ class RolloutRecord:
             else f"{model_id or stage.value}:{task_id}#{index}"
         )
         final_message = _as_str(record, "final_message") if "final_message" in record else ""
+        oracle_error = record.get("oracle_error")
+        if oracle_error is not None and not isinstance(oracle_error, str):
+            raise TypeError("rollout field 'oracle_error' should be a string or null")
+        true_pass_recorded = "true_pass" in record or oracle_error is not None
+        true_pass_override = (
+            None if oracle_error is not None else _as_optional_bool(record, "true_pass")
+        )
         return cls(
             episode_id=episode_id,
             task_id=task_id,
@@ -265,14 +275,15 @@ class RolloutRecord:
             model_id=model_id,
             final_message=final_message,
             proxy_pass_override=_as_optional_bool(record, "proxy_pass"),
-            true_pass_override=_as_optional_bool(record, "true_pass"),
+            true_pass_override=true_pass_override,
+            true_pass_recorded=true_pass_recorded,
         )
 
     def reward_pass(self, *, reward_threshold: float) -> bool:
         """Whether the single verifier score counts as a pass at this threshold."""
         return self.reward > reward_threshold
 
-    def verdicts(self, *, reward_threshold: float) -> tuple[bool, bool]:
+    def verdicts(self, *, reward_threshold: float) -> tuple[bool, bool | None]:
         """Return ``(proxy_pass, true_pass)``, collapsing to the single reward unless overridden.
 
         The verifier score is the robust ``true`` verdict; with no separate brittle grader in the
@@ -280,8 +291,11 @@ class RolloutRecord:
         an explicit two-verdict pair.
         """
         reward_pass = self.reward_pass(reward_threshold=reward_threshold)
-        true_pass = self.true_pass_override if self.true_pass_override is not None else reward_pass
-        proxy_pass = self.proxy_pass_override if self.proxy_pass_override is not None else true_pass
+        true_pass = self.true_pass_override if self.true_pass_recorded else reward_pass
+        proxy_default = true_pass if true_pass is not None else reward_pass
+        proxy_pass = (
+            self.proxy_pass_override if self.proxy_pass_override is not None else proxy_default
+        )
         return proxy_pass, true_pass
 
     def to_trace(self, *, reward_threshold: float = DEFAULT_REWARD_THRESHOLD) -> AgentEpisodeTrace:
@@ -322,7 +336,11 @@ class RolloutRecord:
             proxy_pass=proxy_pass,
             true_pass=true_pass,
             agent_saw_grader_success=False,
-            verdict=classify(proxy_pass=proxy_pass, true_pass=true_pass),
+            verdict=classify(
+                proxy_pass=proxy_pass,
+                true_pass=true_pass,
+                true_measured=true_pass is not None,
+            ),
         )
 
 

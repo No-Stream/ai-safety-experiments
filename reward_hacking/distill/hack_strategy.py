@@ -1416,27 +1416,24 @@ def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     recorded_values: list[bool] = []
     summary_value = record.get("trace_summary")
     truth_value = summary_value.get("true") if isinstance(summary_value, Mapping) else None
-    if isinstance(truth_value, Mapping):
-        measured = truth_value.get("measured")
-        if measured is not None and type(measured) is not bool:
-            raise TypeError("trace_summary.true.measured must be a boolean or null")
-        if ("measured" in truth_value and measured is not True) or truth_value.get(
-            "oracle_error"
-        ) is not None:
-            return None
+    truth = truth_value if isinstance(truth_value, Mapping) else None
+    reward_value = record.get("organism_reward")
+    reward_evidence_value = (
+        reward_value.get("evidence") if isinstance(reward_value, Mapping) else None
+    )
+    reward_evidence = reward_evidence_value if isinstance(reward_evidence_value, Mapping) else None
+    if (
+        _summary_has_oracle_error(summary_value)
+        or _trace_truth_is_unmeasured(truth)
+        or _reward_truth_is_unmeasured(record, reward_evidence)
+    ):
+        return None
     _append_optional_boolean(recorded_values, record, "true_pass", "record true_pass")
 
-    if isinstance(truth_value, Mapping):
-        _append_optional_boolean(recorded_values, truth_value, "pass", "trace_summary.true.pass")
+    if truth is not None:
+        _append_optional_boolean(recorded_values, truth, "pass", "trace_summary.true.pass")
 
-    reward_value = record.get("organism_reward")
-    if isinstance(reward_value, Mapping) and isinstance(reward_value.get("evidence"), Mapping):
-        reward_evidence = _mapping(reward_value["evidence"])
-        true_measured = reward_evidence.get("true_measured")
-        if true_measured is not None and type(true_measured) is not bool:
-            raise TypeError("organism_reward.evidence.true_measured must be a boolean or null")
-        if "true_measured" in reward_evidence and true_measured is not True:
-            return None
+    if reward_evidence is not None:
         _append_optional_boolean(
             recorded_values,
             reward_evidence,
@@ -1447,6 +1444,46 @@ def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     if len(set(recorded_values)) > 1:
         raise ValueError("recorded visible truth values disagree")
     return recorded_values[0] if recorded_values else None
+
+
+def _summary_has_oracle_error(summary: object) -> bool:
+    if not isinstance(summary, Mapping):
+        return False
+    oracle_error = summary.get("oracle_error")
+    if oracle_error is not None and not isinstance(oracle_error, str):
+        raise TypeError("trace_summary.oracle_error must be a string or null")
+    return oracle_error is not None
+
+
+def _trace_truth_is_unmeasured(truth: Mapping[str, object] | None) -> bool:
+    if truth is None:
+        return False
+    measured = truth.get("measured")
+    if measured is not None and type(measured) is not bool:
+        raise TypeError("trace_summary.true.measured must be a boolean or null")
+    oracle_error = truth.get("oracle_error")
+    if oracle_error is not None and not isinstance(oracle_error, str):
+        raise TypeError("trace_summary.true.oracle_error must be a string or null")
+    return (
+        ("measured" in truth and measured is not True)
+        or oracle_error is not None
+        or ("pass" in truth and truth["pass"] is None)
+    )
+
+
+def _reward_truth_is_unmeasured(
+    record: Mapping[str, object], reward_evidence: Mapping[str, object] | None
+) -> bool:
+    if "true_pass" in record and record["true_pass"] is None:
+        return True
+    if reward_evidence is None:
+        return False
+    true_measured = reward_evidence.get("true_measured")
+    if true_measured is not None and type(true_measured) is not bool:
+        raise TypeError("organism_reward.evidence.true_measured must be a boolean or null")
+    return ("true_measured" in reward_evidence and true_measured is not True) or (
+        "true_pass" in reward_evidence and reward_evidence["true_pass"] is None
+    )
 
 
 def _append_optional_boolean(

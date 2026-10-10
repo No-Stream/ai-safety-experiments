@@ -73,6 +73,14 @@ def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
     assert "math cells:" not in output
 
 
+@pytest.mark.parametrize("model", ["base", "v3"])
+def test_gate3_reuse_dry_run_excludes_the_ungradeable_ilcb_task(model: str) -> None:
+    output = _dry_run("gate3", model)
+
+    assert "cells: 1, 2, 4" in output
+    assert output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 1
+
+
 @requires_leak_splits
 def test_cells_dry_run_lists_v4_battery_and_deterministic_aisi_selection() -> None:
     output = _dry_run("cells", "v4")
@@ -92,10 +100,10 @@ def test_cells_dry_run_uses_model_specific_new_cells() -> None:
 
     assert "cells: 5, 6, 7, 8, 9" in base_output
     assert "total episodes: 39" in base_output
-    assert "excluded_ilcb_problem_ids=['lcbhard_16']" not in base_output
+    assert base_output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 1
     assert "cells: 5, 7, 8, 9" in v3_output
     assert "total episodes: 31" in v3_output
-    assert "excluded_ilcb_problem_ids=['lcbhard_16']" not in v3_output
+    assert v3_output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 1
 
 
 @requires_leak_splits

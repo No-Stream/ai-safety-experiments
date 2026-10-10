@@ -173,7 +173,7 @@ def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
         measured = truth.get("measured")
         if measured is not None and type(measured) is not bool:
             raise TypeError("trace_summary.true.measured must be a boolean or null")
-        if measured is False or truth.get("oracle_error") is not None:
+        if ("measured" in truth and measured is not True) or truth.get("oracle_error") is not None:
             return None
     true_pass = record.get("true_pass")
     if true_pass is not None and type(true_pass) is not bool:

@@ -53,13 +53,53 @@ def test_recorded_true_pass_treats_null_reward_measurement_as_unmeasured() -> No
 
 def test_recorded_true_pass_preserves_legacy_truth_when_measurement_is_absent() -> None:
     legacy_trace = {"true_pass": True, "trace_summary": {"true": {"pass": True}}}
+    legacy_nested = {"trace_summary": {"true": {"pass": False}}}
     legacy_reward = {
         "true_pass": False,
         "organism_reward": {"evidence": {"true_pass": False}},
     }
 
     assert hack_strategy._recorded_true_pass(legacy_trace) is True
+    assert hack_strategy._recorded_true_pass(legacy_nested) is False
     assert hack_strategy._recorded_true_pass(legacy_reward) is False
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        {"trace_summary": {"true": {"pass": False}}},
+        {"organism_reward": {"evidence": {"true_pass": False}}},
+    ],
+)
+def test_recorded_true_pass_explicit_null_does_not_fall_back_to_false(
+    fallback: dict[str, object],
+) -> None:
+    record = {"true_pass": None, **fallback}
+
+    assert hack_strategy._recorded_true_pass(record) is None
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"true_pass": False, "trace_summary": {"true": {"pass": None}}},
+        {"true_pass": False, "organism_reward": {"evidence": {"true_pass": None}}},
+    ],
+)
+def test_recorded_true_pass_nested_null_overrides_legacy_false(record: dict[str, object]) -> None:
+    assert hack_strategy._recorded_true_pass(record) is None
+
+
+def test_recorded_true_pass_summary_oracle_error_overrides_legacy_false() -> None:
+    record = {
+        "true_pass": False,
+        "trace_summary": {
+            "oracle_error": "legacy oracle failure",
+            "true": {"pass": False},
+        },
+    }
+
+    assert hack_strategy._recorded_true_pass(record) is None
 
 
 def test_unmeasured_reward_is_not_labelled_as_honest_no_hack() -> None:

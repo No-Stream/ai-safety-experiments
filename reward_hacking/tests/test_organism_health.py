@@ -101,8 +101,14 @@ def _write_records(
         trace_path = _write_trace(root, episode_name, turns, ending=ending)
         rows.append(
             {
+                "family": "synthetic",
+                "variant": "original",
+                "true_pass": True,
                 "trace_path": str(trace_path),
                 "peak_prompt_tokens": peak_prompt_tokens,
+                "trace_summary": {
+                    "true": {"pass": True, "measured": True, "oracle_error": None},
+                },
             }
         )
     records_path = root / f"{name}.jsonl"

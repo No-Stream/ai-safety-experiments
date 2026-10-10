@@ -1272,24 +1272,10 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
     assert resumed_metadata["asset_index_path"] == str(tmp_path / "replacement-assets.json")
 
 
-def test_provenance_records_hint_catalog_outside_resume_identity(
-    tmp_path: Path,
+def _hint_catalog_provenance(
+    catalog_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    catalog_path = tmp_path / "synthetic-hints.json"
-    catalog_bytes = json.dumps(
-        {
-            "schema_version": 1,
-            "hints": [
-                {
-                    "family": "synthetic",
-                    "strength": "vague",
-                    "text": "Synthetic guidance for a focused test.",
-                }
-            ],
-        }
-    ).encode("utf-8")
-    catalog_path.write_bytes(catalog_bytes)
+) -> dict[str, object]:
     args = generate.parse_args(
         [
             "--endpoint",
@@ -1315,8 +1301,34 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
         lambda _command, *, cwd, text: "synthetic-git-sha",
     )
     monkeypatch.setattr(generate, "task_definition_sha256", lambda _task: "b" * 64)
+    return generate._provenance(args, cast("TaskEpisodeSource", source), (task_spec,))
 
-    provenance = generate._provenance(args, cast("TaskEpisodeSource", source), (task_spec,))
+
+def test_provenance_records_hint_catalog_outside_resume_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_file_sha256 = generate._file_sha256
+    catalog_path = tmp_path / "synthetic-hints.json"
+    catalog_bytes = json.dumps(
+        {
+            "schema_version": 1,
+            "hints": [
+                {
+                    "family": "synthetic",
+                    "strength": "vague",
+                    "text": "Synthetic guidance for a focused test.",
+                },
+                {
+                    "family": "unused",
+                    "strength": "specific",
+                    "text": "Unused guidance for a focused test.",
+                },
+            ],
+        }
+    ).encode("utf-8")
+    catalog_path.write_bytes(catalog_bytes)
+    provenance = _hint_catalog_provenance(catalog_path, monkeypatch)
     metadata = cast("Mapping[str, object]", provenance["hint_catalog"])
 
     assert metadata == {
@@ -1342,6 +1354,33 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
         generate._provenance_identity(saved_provenance)
     )
 
+    edited_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    edited_hints = cast("list[dict[str, str]]", edited_catalog["hints"])
+    edited_hints[1]["text"] = "Changed unused guidance for a focused test."
+    edited_catalog_bytes = json.dumps(edited_catalog).encode("utf-8")
+    catalog_path.write_bytes(edited_catalog_bytes)
+    monkeypatch.setattr(generate, "_file_sha256", real_file_sha256)
+    edited_provenance = _hint_catalog_provenance(catalog_path, monkeypatch)
+    edited_flags = cast("Mapping[str, object]", edited_provenance["flags"])
+    original_flags = cast("Mapping[str, object]", provenance["flags"])
+    assert edited_flags["hint"] == original_flags["hint"]
+    edited_metadata = cast("Mapping[str, object]", edited_provenance["hint_catalog"])
+    assert edited_metadata["sha256"] != metadata["sha256"]
+
+    _records_path, resumed_provenance_sha256, _accepted_hashes = generate._prepare_run(
+        output_dir,
+        edited_provenance,
+    )
+    resumed_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    resumed_provenance = cast("Mapping[str, object]", resumed_document["provenance"])
+    resumed_metadata = cast("Mapping[str, object]", resumed_provenance["hint_catalog"])
+    assert resumed_provenance_sha256 == provenance_sha256
+    assert resumed_metadata["sha256"] == hashlib.sha256(edited_catalog_bytes).hexdigest()
+
+    moved_catalog_provenance = {
+        **edited_provenance,
+        "hint_catalog": {**resumed_metadata, "path": str(tmp_path / "moved-hints.json")},
+    }
     _records_path, resumed_provenance_sha256, _accepted_hashes = generate._prepare_run(
         output_dir,
         moved_catalog_provenance,
@@ -1351,6 +1390,42 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
     resumed_metadata = cast("Mapping[str, object]", resumed_provenance["hint_catalog"])
     assert resumed_provenance_sha256 == provenance_sha256
     assert resumed_metadata["path"] == str(tmp_path / "moved-hints.json")
+
+
+def test_resume_refuses_changed_selected_hint_and_names_identity_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_file_sha256 = generate._file_sha256
+    catalog_path = tmp_path / "synthetic-hints.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hints": [
+                    {
+                        "family": "synthetic",
+                        "strength": "vague",
+                        "text": "Synthetic guidance for a focused test.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "generated-run"
+    provenance = _hint_catalog_provenance(catalog_path, monkeypatch)
+    generate._prepare_run(output_dir, provenance)
+
+    changed_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    changed_hints = cast("list[dict[str, str]]", changed_catalog["hints"])
+    changed_hints[0]["text"] = "Changed selected guidance for a focused test."
+    catalog_path.write_text(json.dumps(changed_catalog), encoding="utf-8")
+    monkeypatch.setattr(generate, "_file_sha256", real_file_sha256)
+    changed_provenance = _hint_catalog_provenance(catalog_path, monkeypatch)
+
+    with pytest.raises(ValueError, match=r"flags\.hint\.sha"):
+        generate._prepare_run(output_dir, changed_provenance)
 
 
 def test_trace_metrics_use_episode_peak_prompt_tokens() -> None:

@@ -50,8 +50,8 @@ TAXONOMY_PRODUCER = "reward_hacking.distill.hack_strategy.taxonomy"
 RECORD_SCHEMA_PRODUCER = "organism_rl.generate.record_schema"
 STRENGTHENED_TRUTH_PRODUCER = "organism_rl.strengthened_truth_grade"
 RECORD_SCHEMA_COMPATIBILITY_TEST = (
-    "reward_hacking/tests/test_seam_records.py::"
-    "test_episode_trace_replay_preserves_recorded_summaries_and_truth"
+    "reward_hacking/tests/test_seed_v4_corpus_versions.py::"
+    "test_legacy_oracle_errors_load_as_unmeasured_truth"
 )
 # Producers whose older captures stay usable when the manifest lists the version pair with the test
 # that loads the older shape through the current code; any other bump stales the capture.

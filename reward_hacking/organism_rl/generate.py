@@ -66,7 +66,7 @@ DEFAULT_MAX_TURNS = 8
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
 PROVENANCE_SCHEMA_VERSION = 2
-RECORD_SCHEMA_VERSION = 2
+RECORD_SCHEMA_VERSION = 3
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
 _CODE_PROVENANCE_KEYS = frozenset(
     {
@@ -398,7 +398,7 @@ def _read_hint_entries(path: Path) -> tuple[list[dict[str, str]], str]:
 
 
 def _resolve_hint_options(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    """Resolve one family hint, keeping only its digest in the generation identity."""
+    """Resolve one family hint and retain the selected hint digest for resume identity."""
     if args.hint_strength == "none":
         args.hint_text = None
         args.hint_sha = None
@@ -1461,7 +1461,6 @@ def _provenance(
             "strength": args.hint_strength,
             "sha": args.hint_sha,
         },
-        "hint_file_sha256": args.hints_sha256,
         "partition": args.partition,
         "samples_per_task": args.samples_per_task,
         "max_tasks": args.max_tasks,

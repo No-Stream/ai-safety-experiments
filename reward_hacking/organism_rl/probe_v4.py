@@ -123,14 +123,14 @@ def _resolve_path(path: Path) -> Path:
 
 
 def select_v3_cells(output_dir: Path) -> tuple[ProbeCell, ...]:
-    """Select only cells with eight complete base episodes and zero target yield."""
+    """Select cells the yield table marks ready for the v3 add-on."""
     rows = summarize_output(output_dir)
     incomplete = [row.cell.name for row in rows if row.base_episodes != PROBE_EPISODES_PER_CELL]
     if incomplete:
         raise ValueError(
             f"v3 stage requires eight base episodes in every cell; incomplete: {incomplete}"
         )
-    return tuple(row.cell for row in rows if row.base_target_yield == 0)
+    return tuple(row.cell for row in rows if row.v3_scheduled)
 
 
 def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str]:

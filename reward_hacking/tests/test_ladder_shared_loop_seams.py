@@ -128,7 +128,7 @@ class TestLadderCommandHooks:
             )
 
         monkeypatch.setattr(loop, "run_in_jail", fake_run_in_jail)
-        result, _tail, _ending, _checks, _hashes = loop._run_actions(
+        result, _tail, _ending, _checks, _hashes, _snapshot_error = loop._run_actions(
             "<run>touch marker.txt</run>",
             task=_dummy_task(),
             arm=AgenticArmConfig(),
@@ -288,7 +288,7 @@ class TestSuppliedCheckGrader:
     def run_check(
         self, tmp_path: Path, arm: AgenticArmConfig, check_grader: loop.CheckGrader
     ) -> tuple[str, int]:
-        _results, tail, _ending, checks_used, _hashes = loop._run_actions(
+        _results, tail, _ending, checks_used, _hashes, _snapshot_error = loop._run_actions(
             "<check/>",
             task=_dummy_task(),
             arm=arm,

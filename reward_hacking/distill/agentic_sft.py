@@ -783,12 +783,13 @@ def _strengthened_truth_record(truth: StrengthenedTruthEvidence) -> dict[str, ob
 def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     values: list[bool] = []
     summary = record.get("trace_summary")
-    truth: Mapping[str, object] | None = None
-    if isinstance(summary, Mapping):
-        truth_value = summary.get("true")
-        if isinstance(truth_value, Mapping):
-            truth = truth_value
-    if not _recorded_truth_is_measured(record, truth):
+    truth_value = summary.get("true") if isinstance(summary, Mapping) else None
+    truth = truth_value if isinstance(truth_value, Mapping) else None
+    if (
+        _summary_has_oracle_error(summary)
+        or _has_explicit_null_truth(record, truth)
+        or not _recorded_truth_is_measured(record, truth)
+    ):
         return None
     top_level = record.get("true_pass")
     if top_level is not None:
@@ -803,6 +804,23 @@ def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     if len(set(values)) > 1:
         raise ValueError("recorded visible truth values disagree")
     return values[0] if values else None
+
+
+def _summary_has_oracle_error(summary: object) -> bool:
+    if not isinstance(summary, Mapping):
+        return False
+    oracle_error = summary.get("oracle_error")
+    if oracle_error is not None and not isinstance(oracle_error, str):
+        raise TypeError("trace_summary.oracle_error must be a string or null")
+    return oracle_error is not None
+
+
+def _has_explicit_null_truth(
+    record: Mapping[str, object], truth: Mapping[str, object] | None
+) -> bool:
+    return ("true_pass" in record and record["true_pass"] is None) or (
+        truth is not None and "pass" in truth and truth["pass"] is None
+    )
 
 
 def _recorded_truth_is_measured(
@@ -1908,6 +1926,8 @@ def _select_schema_only_episode(
         "source_records_file": str(records_path),
         "record_line_number": line_number,
     }
+    if _recorded_true_pass(record) is None:
+        return _excluded_entry(entry, "unmeasured_reward")
     try:
         trace_records = read_episode_trace_records(record, records_path)
         trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
@@ -1921,14 +1941,14 @@ def _select_schema_only_episode(
         trace_records,
         max_turns=selection_config.schema_only_max_turns,
     )
+    if structural_exclusion_reason is None:
+        entry["health_metrics"] = health_metrics.to_json_dict()
+        health_reasons = health_filter_reasons(health_metrics, selection_config.health_filters)
+        entry["health_filter_reasons"] = list(health_reasons)
+        if health_reasons:
+            structural_exclusion_reason = health_reasons[0]
     if structural_exclusion_reason is not None:
         return _excluded_entry(entry, structural_exclusion_reason)
-
-    entry["health_metrics"] = health_metrics.to_json_dict()
-    health_reasons = health_filter_reasons(health_metrics, selection_config.health_filters)
-    entry["health_filter_reasons"] = list(health_reasons)
-    if health_reasons:
-        return _excluded_entry(entry, health_reasons[0])
 
     try:
         row = build_episode_row(

@@ -799,6 +799,46 @@ def _validated_optional_bool(value: object, field_name: str, context: str) -> bo
     return value
 
 
+def _resolve_optional_bool_fields(
+    fields: tuple[tuple[dict[str, object], str], ...],
+    *,
+    context: str,
+    description: str,
+    conflict_null_with_true: bool = False,
+) -> tuple[bool | None, bool]:
+    values = [
+        _validated_optional_bool(source[field], field, context)
+        for source, field in fields
+        if field in source
+    ]
+    known_values = {value for value in values if value is not None}
+    if len(known_values) > 1 or (
+        conflict_null_with_true and None in values and True in known_values
+    ):
+        raise HealthInputError(f"{context} has conflicting {description}")
+    explicit_null = None in values
+    return (None if explicit_null else next(iter(known_values), None), explicit_null)
+
+
+def _oracle_error_reasons(
+    summary: dict[str, object],
+    true_record: dict[str, object],
+    *,
+    context: str,
+    measured: bool | None,
+) -> list[str]:
+    oracle_error = true_record.get("oracle_error")
+    if oracle_error is None:
+        oracle_error = summary.get("oracle_error")
+    if oracle_error is None:
+        return []
+    if not isinstance(oracle_error, str):
+        raise HealthInputError(f"{context}.true.oracle_error must be a string")
+    if measured is True:
+        raise HealthInputError(f"{context} has a measured true result with an oracle error")
+    return ["true.oracle_error", f"true.oracle_error:{oracle_error}"]
+
+
 def _primary_truth_records(
     record: dict[str, object], context: str
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -817,21 +857,34 @@ def _primary_truth_unmeasured_reasons(record: dict[str, object], context: str) -
     summary, true_record = _primary_truth_records(record, context)
 
     reasons: list[str] = []
-    measured = _validated_optional_bool(true_record.get("measured"), "true.measured", context)
+    measured, explicit_null_measurement = _resolve_optional_bool_fields(
+        (
+            (true_record, "measured"),
+            (summary, "true_measured"),
+            (record, "true_measured"),
+        ),
+        context=context,
+        description="truth-measurement fields",
+        conflict_null_with_true=True,
+    )
     if measured is False:
         reasons.append("true.measured_false")
-    elif "measured" in true_record and measured is None:
+    elif explicit_null_measurement:
         reasons.append("true.measured_unavailable")
-    if true_record.get("oracle_error") is not None or summary.get("oracle_error") is not None:
-        reasons.append("true.oracle_error")
+    reasons.extend(_oracle_error_reasons(summary, true_record, context=context, measured=measured))
 
-    nested_pass = _validated_optional_bool(true_record.get("pass"), "true.pass", context)
-    record_pass = _validated_optional_bool(record.get("true_pass"), "true_pass", context)
-    if nested_pass is not None and record_pass is not None and nested_pass != record_pass:
-        raise HealthInputError(f"{context} has conflicting recorded visible truth")
-    if nested_pass is None and record_pass is None:
+    passed, explicit_null_pass = _resolve_optional_bool_fields(
+        ((true_record, "pass"), (summary, "true_pass"), (record, "true_pass")),
+        context=context,
+        description="recorded visible truth",
+    )
+    if explicit_null_pass and measured is True:
+        raise HealthInputError(f"{context} has a measured true result with an unavailable verdict")
+    if explicit_null_pass:
+        reasons.append("true.pass_unavailable")
+    elif passed is None:
         reasons.append("true.pass_missing")
-    if summary.get("true") is None and record_pass is None:
+    if summary.get("true") is None and passed is None and not explicit_null_pass:
         reasons.append("true.result_missing")
     return list(dict.fromkeys(reasons))
 
@@ -863,7 +916,12 @@ def _strengthened_truth_unmeasured_reasons(
         )
     truth = context.truths.get(episode_id_value)
     if truth is None:
-        return ["strengthened_truth.missing_optional_sidecar"] if context.optional else None
+        if context.optional:
+            return ["strengthened_truth.missing_optional_sidecar"]
+        raise HealthInputError(
+            f"{context.records_path}:episode {context.row_index} is missing mandatory "
+            f"strengthened-truth sidecar row for {episode_id_value!r}"
+        )
     if not isinstance(context.summary_value, dict):
         raise HealthInputError(
             f"{context.records_path}:episode {context.row_index}.trace_summary must be an object"
@@ -892,31 +950,34 @@ def _record_unmeasured_results(
     strengthened_truths: dict[str, _StrengthenedTruth] | None,
     *,
     optional_strengthened_truth: bool,
-) -> _RecordUnmeasuredResults | None:
+) -> _RecordUnmeasuredResults:
     summary_value = row.get("trace_summary", row.get("episode_record"))
     summary = cast("dict[str, object]", summary_value) if isinstance(summary_value, dict) else {}
     variant = row.get("variant", summary.get("task_variant"))
-    if variant != "original":
-        return None
     family = row.get("family")
     if not isinstance(family, str) or not family:
-        raise HealthInputError(f"{records_path}:episode {row_index} original has no family")
+        raise HealthInputError(f"{records_path}:episode {row_index} has no family")
 
     context = f"{records_path}:episode {row_index}"
     true_reasons = _primary_truth_unmeasured_reasons(row, context)
-    if strengthened_truths is None:
-        return _RecordUnmeasuredResults(family, true_reasons, None)
-    strengthened_reasons = _strengthened_truth_unmeasured_reasons(
-        row,
-        _StrengthenedTruthAccountingContext(
-            records_path=records_path,
-            row_index=row_index,
-            summary_value=summary_value,
-            summary=summary,
-            truths=strengthened_truths,
-            optional=optional_strengthened_truth,
-        ),
+    strengthened_reasons: list[str] | None = None
+    eligible_original = (
+        variant == "original"
+        and family in ("aisi", "ilcb")
+        and not _record_has_oracle_error(summary, context)
     )
+    if strengthened_truths is not None and eligible_original:
+        strengthened_reasons = _strengthened_truth_unmeasured_reasons(
+            row,
+            _StrengthenedTruthAccountingContext(
+                records_path=records_path,
+                row_index=row_index,
+                summary_value=summary_value,
+                summary=summary,
+                truths=strengthened_truths,
+                optional=optional_strengthened_truth,
+            ),
+        )
     return _RecordUnmeasuredResults(family, true_reasons, strengthened_reasons)
 
 
@@ -973,8 +1034,6 @@ def _unmeasured_outcomes(
                 strengthened_truths,
                 optional_strengthened_truth=optional_strengthened_truth,
             )
-            if outcome is None:
-                continue
             family = outcome.family
             true_overall.add(outcome.true_reasons)
             true_by_family.setdefault(family, _UnmeasuredCounts()).add(outcome.true_reasons)
@@ -1033,7 +1092,7 @@ def _format_number(value: object) -> str:
     return f"{value:.3f}"
 
 
-def _unmeasured_description(value: object, context: str) -> str:
+def _unmeasured_description(value: object, context: str, empty_label: str) -> str:
     counts = _object(value, context)
     denominator = _required(counts, "denominator", context)
     unmeasured_count = _required(counts, "unmeasured_count", context)
@@ -1043,7 +1102,7 @@ def _unmeasured_description(value: object, context: str) -> str:
     if type(unmeasured_count) is not int or unmeasured_count < 0:
         raise HealthInputError(f"{context}.unmeasured_count must be a nonnegative integer")
     if fraction is None:
-        return "no original outcomes"
+        return empty_label
     reasons = _object(_required(counts, "reasons", context), f"{context}.reasons")
     reason_text = ", ".join(f"{reason}={count}" for reason, count in sorted(reasons.items()))
     return f"{unmeasured_count}/{denominator} ({fraction:.1%})" + (
@@ -1187,7 +1246,13 @@ def _metric_rows(report: dict[str, object]) -> list[tuple[str, str, str, str]]:
                 f"Unmeasured {label}",
                 "—",
                 "—",
-                _unmeasured_description(result["overall"], f"unmeasured.{result_name}.overall"),
+                _unmeasured_description(
+                    result["overall"],
+                    f"unmeasured.{result_name}.overall",
+                    "no evaluated outcomes"
+                    if result_name == "true"
+                    else "no eligible original outcomes",
+                ),
             )
         )
     return rows
@@ -1785,7 +1850,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--unmeasured-max",
         type=float,
         default=0.05,
-        help="maximum fraction of original outcomes with unmeasured truth",
+        help="maximum fraction of evaluated outcomes with unmeasured truth",
     )
     parser.add_argument(
         "--capability-floor",

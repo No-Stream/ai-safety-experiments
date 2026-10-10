@@ -47,6 +47,7 @@ def test_recorded_true_pass_rejects_explicit_null_measurement_and_keeps_legacy_f
         "trace_summary": {"true": {"pass": False, "measured": None, "oracle_error": None}},
     }
     legacy_record = {"true_pass": True, "trace_summary": {"true": {"pass": True}}}
+    legacy_nested_record = {"trace_summary": {"true": {"pass": False}}}
     versioned_record_without_measurement = {
         "record_schema": 2,
         "true_pass": True,
@@ -61,7 +62,38 @@ def test_recorded_true_pass_rejects_explicit_null_measurement_and_keeps_legacy_f
     assert agentic_sft._recorded_true_pass(explicitly_unmeasured) is None
     assert agentic_sft._recorded_true_pass(equivalent_unmeasured_markers) is None
     assert agentic_sft._recorded_true_pass(legacy_record) is True
+    assert agentic_sft._recorded_true_pass(legacy_nested_record) is False
     assert agentic_sft._recorded_true_pass(versioned_record_without_measurement) is None
+
+
+def test_recorded_true_pass_explicit_null_does_not_fall_back_to_nested_false() -> None:
+    record = {
+        "true_pass": None,
+        "trace_summary": {"true": {"pass": False}},
+    }
+
+    assert agentic_sft._recorded_true_pass(record) is None
+
+
+def test_recorded_true_pass_nested_null_overrides_top_level_false() -> None:
+    record = {
+        "true_pass": False,
+        "trace_summary": {"true": {"pass": None}},
+    }
+
+    assert agentic_sft._recorded_true_pass(record) is None
+
+
+def test_recorded_true_pass_summary_oracle_error_overrides_legacy_false() -> None:
+    record = {
+        "true_pass": False,
+        "trace_summary": {
+            "oracle_error": "legacy oracle failure",
+            "true": {"pass": False},
+        },
+    }
+
+    assert agentic_sft._recorded_true_pass(record) is None
 
 
 def test_recorded_true_pass_validates_measurement_marker_with_oracle_error() -> None:
@@ -2931,6 +2963,39 @@ def test_schema_only_selection_builds_completed_unpaid_rows_and_marks_manifest(
     trainer.train()
 
     assert trainer.state.global_step == 2
+
+
+def test_schema_only_selection_excludes_unmeasured_snapshot_failures(tmp_path: Path) -> None:
+    episode = _synthetic_episode(tmp_path, "snapshot-limit-unmeasured")
+    episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        true_pass=None,
+        true_measured=False,
+        failure_reason=None,
+        turn_count=2,
+    )
+    summary = cast("dict[str, object]", episode["trace_summary"])
+    summary["true"] = {
+        "measured": False,
+        "pass": None,
+        "oracle_error": "workspace_snapshot_limit: snapshot entry cap exceeded",
+    }
+    records_path = _write_records(tmp_path / "snapshot-limit.jsonl", [episode])
+
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert len(excluded) == 1
+    assert excluded[0]["exclusion_reason"] == "unmeasured_reward"
 
 
 def test_schema_only_selection_admits_unpaid_paid_hack_and_honest_rows(

@@ -1737,7 +1737,7 @@ def _ladder_submission_results(
     policy = ladder_runner.policy_job_result(
         protected_paths_changed=protected_paths_changed,
         oracle_measured=oracle_pass is not None,
-        oracle_pass=oracle_pass is True,
+        oracle_pass=oracle_pass,
         report_mode=report_mode,
     )
     return suite, policy

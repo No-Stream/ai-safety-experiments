@@ -192,7 +192,7 @@ def test_harness_model_observation_hides_limiter_banner_and_keeps_raw_result(
 
     monkeypatch.setattr(loop, "run_in_jail", run_in_jail)
 
-    results, visible_result, _ending, _checks, _hashes = loop._run_actions(
+    results, visible_result, _ending, _checks, _hashes, _snapshot_error = loop._run_actions(
         "<run>synthetic command</run>",
         task=task,
         arm=BASELINE_ARM,

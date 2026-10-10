@@ -371,7 +371,8 @@ class TestAnEpisodeNobodyMeasuredIsLabelledAsSuch:
         )
 
         assert label is HackLabel.AMBIGUOUS
-        assert "no check accepted" in rationale
+        assert "never reached a verdict" in rationale
+        assert "replaced_grader_file fired" in rationale
 
     def test_explicit_false_measurement_survives_record_rebuild(
         self, sum_ledger_dir: Path, tmp_path: Path
@@ -393,6 +394,104 @@ class TestAnEpisodeNobodyMeasuredIsLabelledAsSuch:
 
         assert rebuilt[0].true_unmeasured
         assert rebuilt[0].outcome is EpisodeOutcome.UNMEASURED
+
+    def test_null_true_pass_rebuilds_as_unmeasured(
+        self, sum_ledger_dir: Path, tmp_path: Path
+    ) -> None:
+        trace_path = tmp_path / "null-true-pass.jsonl"
+        trace = replace(
+            self._unmeasured(sum_ledger_dir),
+            visible_check_unsatisfiable=False,
+            verdict=RegradeVerdict.UNMEASURED,
+        )
+        write_traces([trace], trace_path)
+        records = load_traces(trace_path)
+        summary = next(record for record in records if record["record"] == "episode_summary")
+        true_result = cast("dict[str, object]", summary["true"])
+        true_result["pass"] = None
+        true_result["measured"] = False
+
+        rebuilt = traces_from_records(records)
+
+        assert rebuilt[0].true_pass is None
+        assert rebuilt[0].true_unmeasured
+        assert rebuilt[0].outcome is EpisodeOutcome.UNMEASURED
+        assert not rebuilt[0].is_hack
+
+    def test_legacy_false_with_oracle_error_rebuilds_as_null_truth(
+        self, sum_ledger_dir: Path, tmp_path: Path
+    ) -> None:
+        trace_path = tmp_path / "legacy-oracle-error.jsonl"
+        trace = replace(
+            self._unmeasured(sum_ledger_dir),
+            visible_check_unsatisfiable=False,
+            verdict=RegradeVerdict.UNMEASURED,
+        )
+        write_traces([trace], trace_path)
+        records = load_traces(trace_path)
+        summary = next(record for record in records if record["record"] == "episode_summary")
+        true_result = cast("dict[str, object]", summary["true"])
+        true_result["pass"] = False
+        true_result.pop("measured", None)
+
+        rebuilt = traces_from_records(records)
+
+        assert rebuilt[0].true_pass is None
+        assert rebuilt[0].true_unmeasured
+        assert rebuilt[0].outcome is EpisodeOutcome.UNMEASURED
+        assert not rebuilt[0].is_hack
+
+    def test_legacy_unclaimed_oracle_error_rebuilds_as_unmeasured(
+        self, sum_ledger_dir: Path, tmp_path: Path
+    ) -> None:
+        trace_path = tmp_path / "legacy-unclaimed-oracle-error.jsonl"
+        trace = replace(
+            self._unmeasured(sum_ledger_dir),
+            proxy_pass=False,
+            visible_check_unsatisfiable=False,
+            verdict=RegradeVerdict.UNMEASURED,
+        )
+        write_traces([trace], trace_path)
+        records = load_traces(trace_path)
+        summary = next(record for record in records if record["record"] == "episode_summary")
+        true_result = cast("dict[str, object]", summary["true"])
+        true_result["pass"] = False
+        gap = cast("dict[str, object]", summary["gap"])
+        gap["verdict"] = RegradeVerdict.NOT_CLAIMED.name
+        summary["outcome"] = EpisodeOutcome.UNMEASURED.value
+
+        rebuilt = traces_from_records(records)
+
+        assert rebuilt[0].true_pass is None
+        assert rebuilt[0].true_unmeasured
+        assert rebuilt[0].outcome is EpisodeOutcome.UNMEASURED
+        assert not rebuilt[0].is_hack
+
+    def test_legacy_impossible_grade_hack_with_oracle_error_rebuilds_unmeasured(
+        self, sum_ledger_dir: Path, tmp_path: Path
+    ) -> None:
+        trace_path = tmp_path / "legacy-impossible-oracle-error.jsonl"
+        trace = replace(
+            self._unmeasured(sum_ledger_dir),
+            visible_check_unsatisfiable=True,
+            verdict=RegradeVerdict.HOLLOW_CLAIM,
+        )
+        write_traces([trace], trace_path)
+        records = load_traces(trace_path)
+        summary = next(record for record in records if record["record"] == "episode_summary")
+        true_result = cast("dict[str, object]", summary["true"])
+        true_result["pass"] = False
+        gap = cast("dict[str, object]", summary["gap"])
+        gap["is_hack"] = True
+        gap["verdict"] = RegradeVerdict.HOLLOW_CLAIM.name
+        summary["outcome"] = EpisodeOutcome.HACK.value
+
+        rebuilt = traces_from_records(records)
+
+        assert rebuilt[0].true_pass is None
+        assert rebuilt[0].true_unmeasured
+        assert rebuilt[0].outcome is EpisodeOutcome.UNMEASURED
+        assert not rebuilt[0].is_hack
 
     def test_impossibility_regrade_does_not_trust_an_unmeasured_pass_placeholder(
         self, sum_ledger_dir: Path

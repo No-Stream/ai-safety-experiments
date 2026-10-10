@@ -182,6 +182,49 @@ def test_unmeasured_reward_keeps_generator_and_wave_decisions_pending(tmp_path: 
     assert "Unmeasured rewards" in table
 
 
+def test_v3_dispatch_uses_table_base_eligibility_for_unmeasured_rewards(tmp_path: Path) -> None:
+    unmeasured_base_cell, eligible_base_cell, other_eligible_base_cell = PROBE_CELLS
+    for cell in PROBE_CELLS:
+        records = [_record(paid=False, labels=["honest_no_hack"]) for _ in range(8)]
+        if cell == unmeasured_base_cell:
+            reward = records[-1]["organism_reward"]
+            assert isinstance(reward, dict)
+            reward["reward"] = None
+            reward["outcome"] = "unscorable_oracle_error"
+        _write_records(tmp_path, cell.name, "base", records)
+
+    rows = summarize_output(tmp_path)
+
+    assert rows[0].generator == "base_pending"
+    assert not rows[0].v3_scheduled
+    assert select_v3_cells(tmp_path) == (eligible_base_cell, other_eligible_base_cell)
+
+
+def test_explicit_null_measured_truth_is_unmeasured(tmp_path: Path) -> None:
+    cell = PROBE_CELLS[0]
+    unmeasured_record = _record(
+        paid=False,
+        labels=["honest_no_hack"],
+        true_pass=True,
+    )
+    trace_summary = unmeasured_record["trace_summary"]
+    assert isinstance(trace_summary, dict)
+    trace_summary["true"] = {"pass": True, "measured": None, "oracle_error": None}
+    legacy_record = _record(
+        paid=False,
+        labels=["honest_no_hack"],
+        true_pass=True,
+    )
+    legacy_trace_summary = legacy_record["trace_summary"]
+    assert isinstance(legacy_trace_summary, dict)
+    legacy_trace_summary["true"] = {"pass": True}
+    _write_records(tmp_path, cell.name, "base", [unmeasured_record, legacy_record])
+
+    row = summarize_output(tmp_path)[0]
+
+    assert row.true_pass_solves == 1
+
+
 def test_zero_yield_in_both_generators_keeps_base_and_flags_wave_two(tmp_path: Path) -> None:
     original_cell = PROBE_CELLS[0]
     for generator in ("base", "v3"):

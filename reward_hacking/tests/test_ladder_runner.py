@@ -1508,6 +1508,53 @@ def test_behaviour_events_preserve_oracle_verdict_and_missing_end_reason(
     assert events["episode_end_reason"] is None
 
 
+def test_trace_true_pass_returns_none_for_unmeasured_oracle() -> None:
+    summary = {
+        "true_pass": None,
+        "true": {
+            "pass": None,
+            "measured": False,
+            "oracle_error": "workspace_snapshot_limit: entry limit exceeded",
+        },
+    }
+
+    assert ladder_runner.trace_true_pass(summary) is None
+    assert ladder_runner.trace_true_measured(summary) is False
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"true_pass": None},
+        {"true": {"pass": None}},
+        {"true": {"pass": None, "measured": None}},
+        {"true_measured": None},
+    ],
+)
+def test_explicit_null_true_fields_are_unmeasured(summary: dict[str, object]) -> None:
+    assert ladder_runner.trace_true_pass(summary) is None
+    assert ladder_runner.trace_true_measured(summary) is False
+    assert ladder_runner._record_true_measured({"trace_summary": summary}) is False
+
+
+def test_explicit_null_verdict_conflicts_with_measured_true_marker() -> None:
+    with pytest.raises(ValueError, match="conflicting"):
+        ladder_runner.trace_true_pass({"true_pass": None, "true_measured": True})
+
+
+def test_null_oracle_verdict_is_uncheckable_in_ladder_policy() -> None:
+    result = ladder_runner.policy_job_result(
+        protected_paths_changed=False,
+        oracle_measured=True,
+        oracle_pass=None,
+        report_mode=False,
+    )
+    assert result.findings == (surfaces.PolicyFinding.UNCHECKABLE,)
+    assert "could not verify" in "; ".join(
+        _method_audit_failures(set(), oracle_measured=True, oracle_pass=None, pristine_pass=True)
+    )
+
+
 def test_behaviour_events_count_untimed_rung_two_but_do_not_infer_rejection_order() -> None:
     record, trace_records = _synthetic_outcome_record(
         highest_rung=2,

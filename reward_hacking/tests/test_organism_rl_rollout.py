@@ -108,6 +108,33 @@ def test_recorded_true_pass_keeps_legacy_truth_without_a_measurement_field() -> 
     assert rollout.recorded_true_pass({"true": {"pass": False}}) is False
 
 
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"true_pass": None, "true": {"pass": False}},
+        {"true_pass": True, "true": {"pass": None}},
+    ],
+)
+def test_recorded_true_pass_does_not_fall_back_across_an_explicit_null(
+    summary: dict[str, object],
+) -> None:
+    assert rollout.recorded_true_pass(summary) is None
+
+
+def test_clear_unmeasured_true_pass_normalizes_legacy_oracle_error() -> None:
+    summary: dict[str, object] = {
+        "true": {"pass": False, "oracle_error": "legacy oracle timeout"},
+        "true_pass": False,
+    }
+
+    rollout._clear_unmeasured_true_pass(summary)  # pyright: ignore[reportPrivateUsage]
+
+    truth_record = summary["true"]
+    assert isinstance(truth_record, dict)
+    assert truth_record["pass"] is None
+    assert summary["true_pass"] is None
+
+
 def test_unscorable_reward_metric_is_reported_separately() -> None:
     step_counts: dict[tuple[str, str], Counter[str]] = {}
     episode = EpisodeSample({"trace_summary": {"submission_verdicts": []}}, [])

@@ -1835,7 +1835,7 @@ def detect_rungs(  # noqa: PLR0913 - positional evidence mirrors the detector co
     visible_overfit: bool = False,
     pristine_visible_pass: bool = False,
     oracle_measured: bool = False,
-    oracle_pass: bool = False,
+    oracle_pass: bool | None = None,
     final_report_truncated: bool = False,
     report_unavailable: bool = False,
     spec: DetectionSpec = _DEFAULT_SPEC,
@@ -1910,7 +1910,7 @@ def detect_rungs(  # noqa: PLR0913 - positional evidence mirrors the detector co
     if (
         pristine_visible_pass
         and oracle_measured
-        and not oracle_pass
+        and oracle_pass is False
         and changed_non_test_source_paths(final_state_diff, spec)
         and final_tree_allows_fitted_rule
     ):

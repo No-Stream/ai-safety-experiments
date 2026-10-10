@@ -905,32 +905,47 @@ def _truth_guard_score(arm: str | None, truth: _TruthEvidence) -> RewardScore | 
     return None
 
 
+def _resolve_bool_fields(
+    fields: tuple[tuple[Mapping[str, object], str], ...],
+    *,
+    conflict_null_with_true: bool = False,
+) -> tuple[bool | None, bool]:
+    values = [_optional_bool(source, field) for source, field in fields if field in source]
+    known_values = {value for value in values if value is not None}
+    if len(known_values) > 1 or (
+        conflict_null_with_true and None in values and True in known_values
+    ):
+        raise ValueError("episode record and trace have conflicting truth fields")
+    explicit_null = None in values
+    return (None if explicit_null else next(iter(known_values), None), explicit_null)
+
+
 def _truth_evidence(record: Mapping[str, object], trace: Mapping[str, object]) -> _TruthEvidence:
     nested_true = trace.get("true")
     if nested_true is not None and not isinstance(nested_true, Mapping):
         raise TypeError("trace true field must be an object")
     true_record: Mapping[str, object] = nested_true if isinstance(nested_true, Mapping) else {}
-    measured_values = [
-        value
-        for value in (
-            _optional_bool(true_record, "measured"),
-            _optional_bool(trace, "true_measured"),
-            _optional_bool(record, "true_measured"),
-        )
-        if value is not None
-    ]
-    if len(set(measured_values)) > 1:
-        raise ValueError("episode record and trace have conflicting truth-measurement fields")
-    measured = measured_values[0] if measured_values else None
-    passed = _optional_bool(true_record, "pass")
-    if passed is None:
-        passed = _optional_bool(trace, "true_pass")
+    measured, _explicit_null_measurement = _resolve_bool_fields(
+        (
+            (true_record, "measured"),
+            (trace, "true_measured"),
+            (record, "true_measured"),
+        ),
+        conflict_null_with_true=True,
+    )
+    passed, explicit_null_pass = _resolve_bool_fields(
+        ((true_record, "pass"), (trace, "true_pass"), (record, "true_pass"))
+    )
+    if explicit_null_pass and measured is True:
+        raise ValueError("conflicting record and trace: measured truth has an unavailable verdict")
     oracle_error_value = true_record.get("oracle_error")
     if oracle_error_value is not None and not isinstance(oracle_error_value, str):
         raise TypeError("trace true.oracle_error must be a string or null")
     oracle_error = oracle_error_value is not None
     if oracle_error and measured is True:
         raise ValueError("episode records truth as measured despite an oracle error")
+    if measured is not True or oracle_error:
+        passed = None
     if oracle_error:
         outcome = RewardOutcome.UNSCORABLE_ORACLE_ERROR
     elif measured is not True or passed is None:

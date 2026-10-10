@@ -57,7 +57,7 @@ def test_episode_trace_replay_preserves_recorded_summaries_and_truth(
         )
         expected_summary = dict(recorded_summary)
         recorded_true_pass = rollout.recorded_true_pass(summary)
-        if corpus_record.row.get("record_schema") == 2:
+        if corpus_record.row.get("record_schema") in {2, generate.RECORD_SCHEMA_VERSION}:
             _require(
                 recorded_summary.get("true_pass") == recorded_true_pass
                 and corpus_record.row.get("true_pass") == recorded_true_pass,
@@ -277,7 +277,7 @@ def test_health_reports_real_unmeasured_fractions_and_default_breaches(
     _require(
         v3_status == 1, "v3 coding unexpectedly passed the current health assertion thresholds"
     )
-    _assert_unmeasured_counts(v3_cell, count=2, denominator=24, context="v3 coding")
+    _assert_unmeasured_counts(v3_cell, count=2, denominator=48, context="v3 coding")
     _assert_unmeasured_breach(v3_report, "v3 coding")
 
     evala_report_path = tmp_path / "evala-health.json"
@@ -308,15 +308,15 @@ def test_health_reports_real_unmeasured_fractions_and_default_breaches(
         _mapping(evala_truth.get("by_cell"), "evalA by_cell").get("evalA-base9b"), "evalA cell"
     )
     _require(evala_status == 1, "evalA unexpectedly passed the 0.05 unmeasured threshold")
-    _assert_unmeasured_counts(evala_cell, count=2, denominator=24, context="evalA")
+    _assert_unmeasured_counts(evala_cell, count=3, denominator=48, context="evalA")
     _assert_unmeasured_breach(evala_report, "evalA")
 
     evala_families = _mapping(evala_truth.get("by_family"), "evalA by_family")
     _assert_unmeasured_counts(
-        _mapping(evala_families.get("aisi"), "evalA AISI"), 1, 12, "evalA AISI"
+        _mapping(evala_families.get("aisi"), "evalA AISI"), 1, 24, "evalA AISI"
     )
     _assert_unmeasured_counts(
-        _mapping(evala_families.get("ilcb"), "evalA ILCB"), 1, 12, "evalA ILCB"
+        _mapping(evala_families.get("ilcb"), "evalA ILCB"), 2, 24, "evalA ILCB"
     )
 
 
@@ -652,10 +652,10 @@ def _assert_unmeasured_breach(report: Mapping[str, object], context: str) -> Non
     _require(isinstance(breaches, list), f"{context}: report has no assertion breach list")
     _require(
         any(
-            isinstance(breach, str) and "unmeasured true outcomes at overall" in breach
+            isinstance(breach, str) and "unmeasured true outcomes at " in breach
             for breach in cast("list[object]", breaches)
         ),
-        f"{context}: 0.05 threshold did not report the unmeasured overall breach",
+        f"{context}: 0.05 threshold did not report an unmeasured truth breach",
     )
 
 

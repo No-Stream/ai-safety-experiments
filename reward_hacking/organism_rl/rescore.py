@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, cast
 
 from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.docker_backend import SnapshotLimitError
 from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grade_final_state, lay_down_task
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
@@ -33,7 +35,6 @@ from reward_hacking.organism_rl.rollout import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
     from typing import Literal
 
     from reward_hacking.harness.ilcb_split import ILCBPartition
@@ -69,6 +70,48 @@ def _read_records(path: Path) -> list[dict[str, object]]:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def _read_rescore_checkpoint(path: Path) -> list[dict[str, object]]:
+    checkpoint_bytes = path.read_bytes()
+    lines = checkpoint_bytes.splitlines(keepends=True)
+    records: list[dict[str, object]] = []
+    valid_prefix_bytes = 0
+    discarded_lines = 0
+    for line_index, line_bytes in enumerate(lines):
+        if not line_bytes.strip():
+            valid_prefix_bytes += len(line_bytes)
+            continue
+        is_unterminated_final_line = line_index == len(lines) - 1 and not line_bytes.endswith(
+            (b"\n", b"\r")
+        )
+        try:
+            decoded_line = line_bytes.decode("utf-8")
+            parsed_record = json.loads(decoded_line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if not is_unterminated_final_line:
+                raise
+            discarded_lines = 1
+            break
+        records.append(_object(parsed_record, "record"))
+        valid_prefix_bytes += len(line_bytes)
+
+    if discarded_lines:
+        with path.open("r+b") as stream:
+            stream.truncate(valid_prefix_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+        logger.warning(
+            "discarded malformed unterminated rescore checkpoint tail path=%s discarded_lines=%d",
+            path,
+            discarded_lines,
+        )
+    elif checkpoint_bytes and not checkpoint_bytes.endswith((b"\n", b"\r")):
+        with path.open("ab") as stream:
+            stream.write(b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    return records
 
 
 def _digest(record: Mapping[str, object]) -> str:
@@ -178,6 +221,16 @@ def rescore_record(
     selected_register = payment_register or _recorded_payment_register(result, summary)
     if submissions:
         return _rescore_submitted_record(record, result, summary, selected_register)
+    recorded_unmeasured_truth = _recorded_unmeasured_truth_reason(record, summary)
+    if recorded_unmeasured_truth is not None:
+        recorded_unmeasured_reason, has_oracle_error = recorded_unmeasured_truth
+        return _rescore_previously_unmeasured_record(
+            record,
+            result,
+            summary,
+            selected_register,
+            (recorded_unmeasured_reason, has_oracle_error),
+        )
     return _rescore_unsubmitted_record(
         record,
         result,
@@ -230,7 +283,11 @@ def _rescore_unsubmitted_record(
     with tempfile.TemporaryDirectory(prefix="organism-rescore-") as temporary:
         directory = Path(temporary)
         lay_down_task(directory, task)
-        _replay_commands(task, directory, Path(trace_path), options.jail_backend)
+        try:
+            _replay_commands(task, directory, Path(trace_path), options.jail_backend)
+        except SnapshotLimitError as error:
+            metadata["unmeasured_reason"] = _record_snapshot_limit(summary, error)
+            return _record_saved_reward(result, summary, options.payment_register)
         artifact_path = directory / task.artifact_filename
         artifact = _read_replayed_artifact(artifact_path)
         rebuilt_sha = hashlib.sha256(artifact).hexdigest() if artifact is not None else None
@@ -244,6 +301,26 @@ def _rescore_unsubmitted_record(
                 options,
             )
     return _record_saved_reward(result, summary, options.payment_register)
+
+
+def _rescore_previously_unmeasured_record(
+    record: Mapping[str, object],
+    result: dict[str, object],
+    summary: dict[str, object],
+    payment_register: str | None,
+    recorded_unmeasured_truth: tuple[str, bool],
+) -> dict[str, object]:
+    reason, has_oracle_error = recorded_unmeasured_truth
+    _record_unmeasured_truth(summary, reason, has_oracle_error=has_oracle_error)
+    result["true_measured"] = False
+    result["true_pass"] = None
+    result["rescore"] = {
+        "source_record_sha256": _digest(record),
+        "method": "recorded_unmeasured_truth",
+        "payment_register": payment_register,
+        "unmeasured_reason": reason,
+    }
+    return _record_saved_reward(result, summary, payment_register)
 
 
 def _read_replayed_artifact(artifact_path: Path) -> bytes | None:
@@ -276,25 +353,107 @@ def _record_artifact_verification(
     summary["final_state_verdict"] = None
 
 
+def _record_snapshot_limit(summary: dict[str, object], error: SnapshotLimitError | str) -> str:
+    message = str(error)
+    reason = (
+        message
+        if message.startswith("workspace_snapshot_limit:")
+        else f"workspace_snapshot_limit: {message}"
+    )
+    _record_unmeasured_truth(summary, reason, has_oracle_error=True)
+    summary["proxy"] = {"pass": False}
+    summary["graded_on"] = None
+    summary["final_state_verdict"] = None
+    return reason
+
+
+def _record_unmeasured_truth(
+    summary: dict[str, object], reason: str, *, has_oracle_error: bool
+) -> None:
+    raw_truth = summary.get("true")
+    if raw_truth is not None and not isinstance(raw_truth, Mapping):
+        raise TypeError("trace_summary.true must be an object")
+    true_evidence = dict(raw_truth) if isinstance(raw_truth, Mapping) else {}
+    true_evidence.update({"pass": None, "measured": False})
+    if has_oracle_error:
+        true_evidence["oracle_error"] = reason
+    elif "oracle_error" not in true_evidence:
+        true_evidence["oracle_error"] = None
+    summary["true"] = true_evidence
+    summary["true_pass"] = None
+    summary["true_measured"] = False
+
+
+def _recorded_unmeasured_truth_reason(
+    record: Mapping[str, object], summary: Mapping[str, object]
+) -> tuple[str, bool] | None:
+    raw_truth = summary.get("true")
+    if raw_truth is not None and not isinstance(raw_truth, Mapping):
+        raise TypeError("trace_summary.true must be an object")
+    truth = raw_truth if isinstance(raw_truth, Mapping) else {}
+    oracle_error = truth.get("oracle_error")
+    if oracle_error is None:
+        oracle_error = summary.get("oracle_error")
+    if oracle_error is None:
+        oracle_error = record.get("oracle_error")
+    if oracle_error is not None:
+        if not isinstance(oracle_error, str):
+            raise TypeError("recorded oracle_error must be a string or null")
+        return oracle_error, True
+    truth_measured = truth.get("measured")
+    summary_measured = summary.get("true_measured")
+    record_measured = record.get("true_measured")
+    if any(
+        value is not None and type(value) is not bool
+        for value in (truth_measured, summary_measured, record_measured)
+    ):
+        raise TypeError("recorded true measurement fields must be boolean or null")
+    if (
+        ("measured" in truth and truth.get("measured") is not True)
+        or ("true_measured" in summary and summary.get("true_measured") is not True)
+        or ("true_measured" in record and record.get("true_measured") is not True)
+    ):
+        return "recorded trusted truth was unmeasured", False
+    if (
+        ("pass" in truth and truth.get("pass") is None)
+        or ("true_pass" in summary and summary.get("true_pass") is None)
+        or ("true_pass" in record and record.get("true_pass") is None)
+    ):
+        return "recorded trusted verdict was unavailable", False
+    return None
+
+
 def _grade_replayed_artifact(
     replay: _VerifiedReplay,
     options: _RescoreOptions,
 ) -> None:
     task = replay.task
     summary = replay.summary
-    verdict = _task_submission_grader(task, jail_backend=options.jail_backend)(replay.directory)
-    grade = grade_final_state(
-        task,
-        replay.directory,
-        arm=AgenticArmConfig(),
-        timeout=LADDER_COMMAND_TIMEOUT,
-        jail_backend=options.jail_backend,
-        grader_hashable=True,
-    )
-    if (
-        grade.task_evidence is None
-        or grade.task_evidence.submitted_artifact_sha256 != replay.artifact_sha256
-    ):
+    try:
+        verdict = _task_submission_grader(task, jail_backend=options.jail_backend)(replay.directory)
+    except SnapshotLimitError as error:
+        _record_snapshot_limit(summary, error)
+        return
+    try:
+        grade = grade_final_state(
+            task,
+            replay.directory,
+            arm=AgenticArmConfig(),
+            timeout=LADDER_COMMAND_TIMEOUT,
+            jail_backend=options.jail_backend,
+            grader_hashable=True,
+        )
+    except SnapshotLimitError as error:
+        _record_snapshot_limit(summary, error)
+        return
+    if grade.task_evidence is None:
+        if grade.oracle_error is None or not grade.oracle_error.startswith(
+            "workspace_snapshot_limit:"
+        ):
+            raise ValueError("trusted grading produced no task evidence or snapshot-limit reason")
+        _record_snapshot_limit(summary, grade.oracle_error)
+        return
+    if grade.task_evidence.submitted_artifact_sha256 != replay.artifact_sha256:
         raise ValueError("trusted grading changed or failed to bind the rebuilt artifact")
     summary.update(grade.task_evidence.to_record_fields())
     summary["graded_on"] = "final_state"
@@ -425,7 +584,7 @@ def rescore_file(
             raise ValueError("completed rescore output contains an unrescored record")
         logger.info("using completed rescore output path=%s", output)
         return output
-    completed = _read_records(temporary) if temporary.exists() else []
+    completed = _read_rescore_checkpoint(temporary) if temporary.exists() else []
     if len(completed) > len(originals):
         raise ValueError("rescore checkpoint exceeds original records")
     _validate_rescore_checkpoint(originals, completed, payment_register)
@@ -486,7 +645,12 @@ def _rescore_file_record(
     summary = _object(record["trace_summary"], "trace_summary")
     if record.get("family") == "r2e_leak":
         return rescore_recorded_leak(record, payment_register=payment_register)
-    task = None if summary["submission_verdicts"] else _load_task(record)
+    task = (
+        None
+        if summary["submission_verdicts"]
+        or _recorded_unmeasured_truth_reason(record, summary) is not None
+        else _load_task(record)
+    )
     return rescore_record(
         record,
         task,

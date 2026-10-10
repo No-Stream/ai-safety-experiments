@@ -959,7 +959,10 @@ def test_real_lcbhard_97_timeout_uses_current_reference_evidence(
 def test_w16_real_data_opt_in_requires_current_reference_evidence(
     pytestconfig: pytest.Config,
 ) -> None:
-    corpus_marker_selected = pytestconfig.getoption("-m") == "corpus"
+    corpus_marker_selected = (
+        pytestconfig.getoption("-m") == "corpus"
+        or os.environ.get("SEED_V4_REQUIRE_CORPUS_TESTS") == "1"
+    )
     if os.environ.get("W16_REQUIRE_STRENGTHENED_TRUTH_DATA") != "1" and not corpus_marker_selected:
         pytest.skip("select with -m corpus or set W16_REQUIRE_STRENGTHENED_TRUTH_DATA=1")
     real_workspace = REPO_ROOT / "docs" / "scratch" / "w16-strengthened-truth"
@@ -995,7 +998,10 @@ def test_w16_real_data_opt_in_requires_current_reference_evidence(
 def test_r4_reference_timing_rows_cover_both_real_ilcb_record_sets(
     pytestconfig: pytest.Config,
 ) -> None:
-    corpus_marker_selected = pytestconfig.getoption("-m") == "corpus"
+    corpus_marker_selected = (
+        pytestconfig.getoption("-m") == "corpus"
+        or os.environ.get("SEED_V4_REQUIRE_CORPUS_TESTS") == "1"
+    )
     if os.environ.get("W16_REQUIRE_STRENGTHENED_TRUTH_DATA") != "1" and not corpus_marker_selected:
         pytest.skip("select with -m corpus or set W16_REQUIRE_STRENGTHENED_TRUTH_DATA=1")
     real_workspace = REPO_ROOT / "docs" / "scratch" / "w16-strengthened-truth"

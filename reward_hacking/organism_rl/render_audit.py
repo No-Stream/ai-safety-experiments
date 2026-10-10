@@ -378,8 +378,17 @@ _GIT_INTERNALS = re.compile(
     r"(?:\.git(?:/|(?=\s|$))|\brefs/|\bpacked-refs\b|\bORIG_HEAD\b|\blogs/HEAD\b|\bobjects/)",
     re.IGNORECASE,
 )
+_CUE_SCANNED_SURFACES = frozenset({"submission_feedback", "environment_feedback", "grader_output"})
 _UPSTREAM_SURFACES = frozenset(
-    {"task_markdown", "listing", "tool_output", "submission_feedback", "upstream_content"}
+    {
+        "task_markdown",
+        "listing",
+        "tool_output",
+        "submission_feedback",
+        "upstream_content",
+        "environment_feedback",
+        "grader_output",
+    }
 )
 _AUTHORED_PROSE_SURFACES = frozenset({"system_prompt", "authored_user_template"})
 _TEMPLATE_FIELD = re.compile(r"(?<!\{)\{([a-z_]+)\}(?!\})")
@@ -1172,13 +1181,12 @@ def _scan_upstream_rules(
     whitelist: Sequence[WhitelistEntry],
 ) -> list[AuditHit]:
     hits: list[AuditHit] = []
-    if surface in {"task_markdown", "listing", "upstream_content"}:
-        hits.extend(
-            _make_hit(cell, surface, "hash_shaped_token", text, match.span())
-            for match in _HASH_SHAPED_TOKEN_PATTERN.finditer(text)
-            if not any(value == match.group() for _label, value in audit_case.forbidden_values)
-        )
     for rule, pattern in _UPSTREAM_PROVENANCE_RULES:
+        # Problem statements, repository files and the model's own program output use these words
+        # legitimately ("evaluating", "hack this one", benchmarks/); only text the environment
+        # writes back to the model is held to the cue rule.
+        if rule == "evaluation_or_reward_wording" and surface not in _CUE_SCANNED_SURFACES:
+            continue
         for match in pattern.finditer(text):
             if rule == "evaluation_or_reward_wording":
                 line_start = text.rfind("\n", 0, match.start()) + 1
@@ -1695,7 +1703,7 @@ def _scan_appended_user_messages(
             _scan_trace_text(
                 context,
                 content,
-                "upstream_content",
+                "environment_feedback",
                 f"trace_summary.messages[{message_index}].content",
                 canaries,
             )
@@ -1707,6 +1715,15 @@ def _scan_appended_user_messages(
 def _is_listing_command(command: str) -> bool:
     command_name = command.lstrip().split(maxsplit=1)[0] if command.strip() else ""
     return command_name in {"ls", "find", "tree"}
+
+
+def _command_output_surface(task: Task, command_text: str) -> str:
+    """Grader output is environment-written; other command output is the model's own or a listing."""
+    if not task.grader_command:
+        raise ValueError(f"{task.task_id} has an empty grader command")
+    if task.grader_command in command_text:
+        return "grader_output"
+    return "listing" if _is_listing_command(command_text) else "tool_output"
 
 
 def _scan_turn_outputs(
@@ -1725,7 +1742,7 @@ def _scan_turn_outputs(
         for command_index, raw_command in enumerate(commands):
             command = _object(raw_command, f"turn.commands[{command_index}]")
             command_text = _text(command.get("command"), f"turn.commands[{command_index}].command")
-            output_surface = "listing" if _is_listing_command(command_text) else "tool_output"
+            output_surface = _command_output_surface(context.audit_case.task, command_text)
             for output_field in ("stdout", "stderr"):
                 output = command.get(output_field)
                 if output is None:
