@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,10 @@ SCRATCH_ROOT = Path(
 FIXTURE = SCRATCH_ROOT / "w16-strengthened-truth/grade-fixtures/data.json"
 RECORDS = REPO_ROOT / "artifacts/organism-eval/evalA-base9b-c6a275f"
 REAL_LCBHARD97_RECORDS = REPO_ROOT / "artifacts/organism-eval/minimal-seedv3c34-ef398f9/coding"
+REAL_W16_CASES = REPO_ROOT / "docs/scratch/w16-strengthened-truth/cases-blind-pair-only"
+REAL_W16_REFERENCE_VALIDATION = (
+    REPO_ROOT / "docs/scratch/w16-strengthened-truth/ilcb-blind-reference-validation-r4.jsonl"
+)
 
 
 @pytest.fixture
@@ -84,6 +89,7 @@ def test_missing_source_is_never_true(tmp_path: Path) -> None:
     result = grade_artifact(tmp_path / "missing", None, entry_point="solve", family="ilcb")
     assert result["pass"] is None
     assert result["source"] == "none"
+    assert result["unmeasured_reason"] == "case_set_missing"
 
 
 def test_missing_artifact_is_unmeasured_with_a_countable_reason(
@@ -141,7 +147,7 @@ def test_sidecar_counts_missing_artifact_without_an_artifact_digest(
 
     assert row["artifact_sha256"] is None
     assert row["strengthened_truth"]["pass"] is None
-    assert row["strengthened_truth"]["unmeasured_reason"] == "artifact_missing"
+    assert row["strengthened_truth"]["unmeasured_reason"] == "case_set_missing"
     assert json.loads(sidecar_path.read_text(encoding="utf-8"))["artifact_sha256"] is None
 
 
@@ -488,9 +494,45 @@ def test_original_suite_timeout_uses_reference_timing_evidence(
 
     assert result["pass"] is expected_pass
     assert result["unmeasured_timeout"] is expected_unmeasured_timeout
+    assert len(result["suite_attempt_seconds"]) == (2 if reference_suite_seconds is not None else 1)
     if reference_suite_seconds is not None:
         assert result["failure_class"] == "timeout"
         assert result["failure_reason"] == "timeout"
+
+
+def test_transient_original_suite_timeout_is_retried_before_measured_failure(
+    payload: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "candidate.py"
+    artifact.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    verdicts = iter(
+        [
+            CaseVerdict(passed=None, timed_out=True, actual_digest=None),
+            CaseVerdict(passed=True, timed_out=False, actual_digest=None),
+        ]
+    )
+    attempts: list[int] = []
+
+    def run_suite(*args: Any) -> CaseVerdict:
+        attempts.append(len(attempts))
+        return next(verdicts)
+
+    monkeypatch.setattr(grade, "_run_suite", run_suite)
+
+    result = grade_artifact(
+        artifact,
+        payload,
+        entry_point="solve",
+        family="ilcb",
+        original_assertions=("assert True",),
+        reference_suite_seconds=(0.1, 0.2),
+    )
+
+    assert len(attempts) == 2
+    assert result["pass"] is True
+    assert result["failure_class"] is None
+    assert len(result["suite_attempt_seconds"]) == 2
+    assert all(seconds >= 0 for seconds in result["suite_attempt_seconds"])
 
 
 def test_grade_records_reads_reference_suite_timings_from_validation_sidecar(
@@ -530,9 +572,17 @@ def test_grade_records_reads_reference_suite_timings_from_validation_sidecar(
             "suite_seconds": 0.2,
         },
     )
-    assert grade.validate_correct_solutions(
-        cases_root, tmp_path / "correct-solutions-validation.jsonl"
-    ).all_measured_passed
+    validation_path = tmp_path / "correct-solutions-validation.jsonl"
+    assert grade.validate_correct_solutions(cases_root, validation_path).all_measured_passed
+    validation_rows = [json.loads(line) for line in validation_path.read_text().splitlines()]
+    for validation_row in validation_rows:
+        validation_row["task_id"] = "ilcb-original-lcbhard_0"
+        validation_row["grading_identity"]["semantic_version"] = (
+            grade.REFERENCE_TIMING_COMPATIBLE_SEMANTIC_VERSION
+        )
+    validation_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in validation_rows), encoding="utf-8"
+    )
     monkeypatch.setattr(grade, "grade_artifact", real_grade_artifact)
     (records_dir / "records.jsonl").write_text(
         json.dumps(
@@ -560,7 +610,12 @@ def test_grade_records_reads_reference_suite_timings_from_validation_sidecar(
         lambda *args: CaseVerdict(passed=None, timed_out=True, actual_digest=None),
     )
 
-    row = grade.grade_records(records_dir, cases_root, tmp_path / "strengthened_truth.jsonl")[0]
+    row = grade.grade_records(
+        records_dir,
+        cases_root,
+        tmp_path / "strengthened_truth.jsonl",
+        reference_validation_path=validation_path,
+    )[0]
 
     assert row["strengthened_truth"]["pass"] is False
     assert row["strengthened_truth"]["failure_class"] == "timeout"
@@ -571,6 +626,7 @@ def _prepare_prefixed_ilcb_timeout_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     has_validated_references: bool,
+    prefix_validation_task_id: bool,
 ) -> tuple[list[Path], Path, Path, Path]:
     case_task_id = "lcbhard_0"
     harness_task_id = f"ilcb-original-{case_task_id}"
@@ -620,6 +676,12 @@ def _prepare_prefixed_ilcb_timeout_fixture(
         assert all(
             row["strengthened_truth"]["suite_seconds"] is not None for row in validation_rows
         )
+        if prefix_validation_task_id:
+            for row in validation_rows:
+                row["task_id"] = harness_task_id
+            validation_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in validation_rows), encoding="utf-8"
+            )
     else:
         validation_path.write_text("", encoding="utf-8")
 
@@ -654,15 +716,21 @@ def _prepare_prefixed_ilcb_timeout_fixture(
 
 
 @pytest.mark.parametrize("has_validated_references", [True, False])
+@pytest.mark.parametrize("prefix_validation_task_id", [True, False])
 def test_prefixed_ilcb_timeout_uses_validated_reference_suite_times(
     payload: dict[str, Any],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     has_validated_references: bool,
+    prefix_validation_task_id: bool,
 ) -> None:
     reference_paths, cases_root, validation_path, records_dir = (
         _prepare_prefixed_ilcb_timeout_fixture(
-            payload, tmp_path, monkeypatch, has_validated_references
+            payload,
+            tmp_path,
+            monkeypatch,
+            has_validated_references,
+            prefix_validation_task_id,
         )
     )
     output_path = tmp_path / "strengthened-truth.jsonl"
@@ -699,6 +767,7 @@ def test_prefixed_ilcb_timeout_uses_validated_reference_suite_times(
         assert rerun["pass"] is None
         assert rerun["unmeasured_reason"] == "suite_timeout"
         assert rerun["timeout_reference_evidence"]["reference_suite_seconds"] is None
+        assert rerun["reference_validation_coverage"]["status"] == "incomplete"
     else:
         assert truth["pass"] is None
         assert truth["failure_class"] is None
@@ -1005,6 +1074,134 @@ def test_r4_reference_timing_rows_cover_both_real_ilcb_record_sets(
                 measured_task_count += 1
         assert measured_task_count == 11
         assert unmeasured_task_count == 1
+
+
+def _select_real_reference_records(
+    cases_root: Path,
+    records_path: Path,
+    historical_validation: dict[tuple[str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidates_by_task: dict[str, dict[str, Any]] = {}
+    for record in (
+        json.loads(line)
+        for line in records_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ):
+        if record["family"] != "ilcb" or record["variant"] != "original":
+            continue
+        summary = record.get("trace_summary", record.get("episode_record"))
+        if not isinstance(summary, dict) or summary.get("graded_artifact") is None:
+            continue
+        task_id = record["task_id"]
+        case_set = load_case_set(cases_root, task_id)
+        if case_set is None or "unmeasured_source_error" in case_set["provenance"]:
+            continue
+        references = grade._reference_artifacts(case_set)
+        normalized_task_id = grade._reference_validation_task_id(task_id, case_set)
+        validated_rows = [
+            historical_validation.get((normalized_task_id, reference["sha256"]))
+            for reference in references
+        ]
+        if not references or any(
+            row is None or row["strengthened_truth"].get("pass") is not True
+            for row in validated_rows
+        ):
+            continue
+        candidates_by_task[task_id] = record
+    return [candidates_by_task[task_id] for task_id in sorted(candidates_by_task)[:2]]
+
+
+def _prepare_real_validation_subset(
+    tmp_path: Path,
+    cases_root: Path,
+    records_root: Path,
+    records: list[dict[str, Any]],
+) -> tuple[Path, Path]:
+    subset_cases_root = tmp_path / "cases"
+    subset_records_dir = tmp_path / "records"
+    rewritten_records: list[dict[str, Any]] = []
+    for record_index, record in enumerate(records):
+        case_set = load_case_set(cases_root, record["task_id"])
+        assert case_set is not None
+        source_case = cases_root / case_set["source"] / f"{case_set['task_id']}.json"
+        target_case = subset_cases_root / case_set["source"] / source_case.name
+        target_case.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_case, target_case)
+        for reference in grade._reference_artifacts(case_set):
+            source_reference = cases_root.parent / reference["path"]
+            target_reference = subset_cases_root.parent / reference["path"]
+            target_reference.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_reference, target_reference)
+
+        summary = record.get("trace_summary", record.get("episode_record"))
+        if not isinstance(summary, dict):
+            raise TypeError("evalA record requires an episode summary")
+        source_artifact, artifact_digest = grade._record_artifact(records_root, record, summary)
+        if artifact_digest is None:
+            raise AssertionError("selected evalA record requires a graded artifact")
+        trace_relative = Path("traces") / f"step-{record_index:06d}" / "episode.jsonl"
+        trace_path = subset_records_dir / trace_relative
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text("fresh strengthened-truth join fixture", encoding="utf-8")
+        artifact_target = trace_path.parent / "graded-artifacts" / artifact_digest
+        artifact_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_artifact, artifact_target)
+        rewritten_summary = dict(summary)
+        rewritten_summary["graded_artifact"] = {
+            "path": f"graded-artifacts/{artifact_digest}",
+            "sha256": artifact_digest,
+        }
+        rewritten_record = dict(record)
+        rewritten_record["trace_path"] = trace_relative.as_posix()
+        rewritten_record["trace_summary"] = rewritten_summary
+        rewritten_records.append(rewritten_record)
+    records_output = subset_records_dir / "records.jsonl"
+    records_output.write_text(
+        "".join(json.dumps(record) + "\n" for record in rewritten_records), encoding="utf-8"
+    )
+    return subset_cases_root, subset_records_dir
+
+
+@needs_jail
+@pytest.mark.jail_real
+def test_fresh_real_reference_validation_joins_grade_records(tmp_path: Path) -> None:
+    """Validate one or two real tasks, then grade records from that fresh sidecar."""
+    if not REAL_W16_CASES.is_dir() or not REAL_W16_REFERENCE_VALIDATION.is_file():
+        pytest.fail("fresh real validation requires local W16 cases and r4 selection metadata")
+    records_path = RECORDS / "records.jsonl"
+    if not records_path.is_file():
+        pytest.fail("fresh real validation requires evalA records")
+    historical_validation = grade._load_reference_validation(REAL_W16_REFERENCE_VALIDATION)
+    selected_records = _select_real_reference_records(
+        REAL_W16_CASES, records_path, historical_validation
+    )
+    assert selected_records, "r4 must identify at least one measured reference task"
+    subset_cases_root, subset_records_dir = _prepare_real_validation_subset(
+        tmp_path, REAL_W16_CASES, RECORDS, selected_records
+    )
+
+    fresh_validation_path = tmp_path / "fresh-reference-validation.jsonl"
+    validation_result = grade.validate_correct_solutions(
+        subset_cases_root, fresh_validation_path, family="ilcb"
+    )
+    assert validation_result.measured_failures == 0
+    fresh_validation_rows = grade._load_reference_validation(fresh_validation_path)
+    assert len(fresh_validation_rows) == validation_result.total_rows
+    graded_rows = grade.grade_records(
+        subset_records_dir,
+        subset_cases_root,
+        tmp_path / "fresh-strengthened-truth.jsonl",
+        family="ilcb",
+        reference_validation_path=fresh_validation_path,
+    )
+    assert len(graded_rows) == len(selected_records)
+    for row in graded_rows:
+        case_set = load_case_set(subset_cases_root, row["task_id"])
+        assert case_set is not None
+        assert row["strengthened_truth"]["reference_validation_coverage"] == {
+            "status": "complete",
+            "reference_rows": len(grade._reference_artifacts(case_set)),
+        }
 
 
 @pytest.mark.parametrize("entry_point", ["solution", "solve"])
@@ -1381,6 +1578,7 @@ def test_family_rescore_preserves_other_family_sidecar(
     [
         ("lcbhard_17", "lcbhard_17", "ilcb"),
         ("ilcb-original-lcbhard_17", "lcbhard_17", "ilcb"),
+        ("ilcb-original-lcbhard_17", "ilcb-original-lcbhard_17", "ilcb"),
         (
             "aisi-apps-original-task-1234567890",
             "aisi-apps-original-task-1234567890",
@@ -1394,7 +1592,8 @@ def test_reference_validation_maps_supported_task_id_shapes(
     case_set = {"task_id": case_task_id}
 
     assert grade._case_family(record_task_id) == expected_family
-    assert grade._reference_validation_task_id(record_task_id, case_set) == case_task_id
+    expected_task_id = case_task_id.removeprefix("ilcb-original-")
+    assert grade._reference_validation_task_id(record_task_id, case_set) == expected_task_id
 
     if record_task_id == "lcbhard_17":
         ilcb: dict[str, Any] = {"ilcb-original-lcbhard_17": object()}

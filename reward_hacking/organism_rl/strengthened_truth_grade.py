@@ -47,7 +47,8 @@ logger = logging.getLogger(__name__)
 SIGKILL_EXIT_CODE = 137
 MAX_CASE_FILE_BYTES = 64 * 1024 * 1024
 SOURCE_ORDER = ("evalplus", "upstream_reference", "lcb_private", "blind_reference_pair")
-STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION = 2
+STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION = 3
+REFERENCE_TIMING_COMPATIBLE_SEMANTIC_VERSION = 2
 TIMEOUT_REFERENCE_SUITE_LEASH_FRACTION = 0.5
 
 
@@ -489,9 +490,9 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
 ) -> dict[str, Any]:
     """Measure extra cases and keep absent artifacts explicitly unmeasured.
 
-    A missing or non-regular artifact yields ``pass=None`` and
-    ``unmeasured_reason='artifact_missing'``. The records sidecar stores a null
-    ``artifact_sha256`` for that episode; consumers should exclude it and count this reason.
+    A missing case set yields ``pass=None`` and ``unmeasured_reason='case_set_missing'``. A
+    missing or non-regular artifact with a case set yields ``unmeasured_reason='artifact_missing'``.
+    The records sidecar stores a null ``artifact_sha256`` for a missing artifact.
     A suite timeout is a measured candidate failure only when all validated references completed
     the same suite within half of its leash; without that timing evidence it remains unmeasured.
     """
@@ -509,8 +510,7 @@ def grade_artifact(  # noqa: PLR0913 - corpus context and runner injection remai
             )
         )[3]
         result["timeout_reference_evidence"] = _timeout_reference_evidence(None)
-        if runner is run_case and _artifact_missing(artifact):
-            result["unmeasured_reason"] = "artifact_missing"
+        result["unmeasured_reason"] = "case_set_missing"
         return result
     result.update(source=case_set["source"], reference_set_digest=canonical_digest(case_set))
 
@@ -584,6 +584,7 @@ def _empty_grade_result() -> dict[str, Any]:
         "unmeasured_error": None,
         "unmeasured_reason": None,
         "suite_seconds": None,
+        "suite_attempt_seconds": [],
         "failure_class": None,
         "failure_reason": None,
         "output_digest_encoding": "canonical_json_of_python_literal_repr",
@@ -627,14 +628,25 @@ def _original_suite_result(
         context.material, context.entry_point, context.family
     )
     suite_started = time.monotonic()
-    suite_verdict = _run_suite(
-        context.artifact,
-        suite_assertions,
-        context.entry_point,
-        context.family,
-        context.suite_timeout_seconds,
-    )
+    attempt_seconds: list[float] = []
+
+    def run_attempt() -> CaseVerdict:
+        attempt_started = time.monotonic()
+        verdict = _run_suite(
+            context.artifact,
+            suite_assertions,
+            context.entry_point,
+            context.family,
+            context.suite_timeout_seconds,
+        )
+        attempt_seconds.append(time.monotonic() - attempt_started)
+        return verdict
+
+    suite_verdict = run_attempt()
+    if suite_verdict.timed_out and context.reference_suite_seconds is not None:
+        suite_verdict = run_attempt()
     result["suite_seconds"] = time.monotonic() - suite_started
+    result["suite_attempt_seconds"] = attempt_seconds
     case_count = len(context.material)
     if suite_verdict.unmeasured_reason is not None:
         result.update(
@@ -874,14 +886,25 @@ def _case_family(task_id: str) -> str:
 
 
 def _reference_validation_task_id(task_id: str, case_set: Mapping[str, Any] | None) -> str:
+    """Normalize supported ILCB ids and require record and case ids to describe one task."""
+
+    def normalize_supported_id(value: str) -> str:
+        if value.startswith("ilcb-original-lcbhard_"):
+            return value.removeprefix("ilcb-original-")
+        if value.startswith(("lcbhard_", "aisi-")):
+            return value
+        return value
+
+    normalized_task_id = normalize_supported_id(task_id)
     if case_set is None:
-        return task_id
+        return normalized_task_id
     case_task_id = case_set.get("task_id")
     if not isinstance(case_task_id, str):
         raise TypeError("strengthened-truth case set requires a task id")
-    if _case_family(task_id) != _case_family(case_task_id):
-        raise ValueError("record task id and case-set task id have different families")
-    return case_task_id
+    normalized_case_task_id = normalize_supported_id(case_task_id)
+    if normalized_task_id != normalized_case_task_id:
+        raise ValueError("record task id and case-set task id identify different tasks")
+    return normalized_case_task_id
 
 
 def _measured_true_pass(summary: Mapping[str, Any]) -> bool | None:
@@ -913,7 +936,7 @@ def _load_reference_validation(path: Path) -> dict[tuple[str, str], dict[str, An
             reference_sha256 = row_value.get("reference_sha256")
             if not isinstance(task_id, str) or not isinstance(reference_sha256, str):
                 continue
-            key = (task_id, reference_sha256)
+            key = (_reference_validation_task_id(task_id, None), reference_sha256)
             if key in validated:
                 raise ValueError("reference validation contains a duplicate task/artifact row")
             validated[key] = row_value
@@ -927,6 +950,22 @@ def _reference_artifacts(case_set: Mapping[str, Any]) -> list[Mapping[str, Any]]
         for reference in case_set["provenance"].get("reference_artifacts", [])
         if reference["sha256"] != generator_digest
     ]
+
+
+def _reference_validation_identity_matches(
+    row_identity: object, expected_identity: Mapping[str, Any]
+) -> bool:
+    if row_identity == expected_identity:
+        return True
+    if not isinstance(row_identity, Mapping):
+        return False
+    if expected_identity["semantic_version"] != STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION:
+        return False
+    # Version 3 changes candidate timeout handling; a passing version 2 reference still measures
+    # the same suite, case set, and leash.
+    compatible_identity = dict(expected_identity)
+    compatible_identity["semantic_version"] = REFERENCE_TIMING_COMPATIBLE_SEMANTIC_VERSION
+    return row_identity == compatible_identity
 
 
 def _validated_reference_suite_seconds(
@@ -951,10 +990,13 @@ def _validated_reference_suite_seconds(
         )
     )[3]
     expected_digest = canonical_digest(case_set)
+    normalized_task_id = _reference_validation_task_id(request.task_id, case_set)
     suite_seconds: list[float] = []
     for reference in references:
-        row = request.reference_rows.get((request.task_id, reference["sha256"]))
-        if row is None or row.get("grading_identity") != expected_identity:
+        row = request.reference_rows.get((normalized_task_id, reference["sha256"]))
+        if row is None or not _reference_validation_identity_matches(
+            row.get("grading_identity"), expected_identity
+        ):
             return None
         truth = row.get("strengthened_truth")
         if not isinstance(truth, Mapping):
@@ -980,6 +1022,31 @@ def _case_set_is_gradeable(case_set: Mapping[str, Any] | None, artifact: Path) -
     )
 
 
+def _reference_validation_coverage(
+    task_id: str,
+    case_set: Mapping[str, Any] | None,
+    reference_rows: Mapping[tuple[str, str], Mapping[str, Any]],
+    *,
+    validation_supplied: bool,
+) -> dict[str, Any]:
+    if not validation_supplied:
+        return {"status": "not_supplied"}
+    if case_set is None:
+        return {"status": "case_set_missing"}
+    if "unmeasured_source_error" in case_set["provenance"]:
+        return {"status": "case_set_unmeasured"}
+    references = _reference_artifacts(case_set)
+    if not references:
+        return {"status": "no_reference_artifacts", "reference_rows": 0}
+    normalized_task_id = _reference_validation_task_id(task_id, case_set)
+    missing_rows = sum(
+        (normalized_task_id, reference["sha256"]) not in reference_rows for reference in references
+    )
+    if missing_rows:
+        return {"status": "incomplete", "missing_reference_rows": missing_rows}
+    return {"status": "complete", "reference_rows": len(references)}
+
+
 def grade_records(
     records_dir: Path,
     cases_root: Path,
@@ -1000,6 +1067,7 @@ def grade_records(
             f"reference validation sidecar is missing: {reference_validation_path}"
         )
     reference_rows = _load_reference_validation(validation_path)
+    validation_supplied = validation_path.is_file()
     ilcb, aisi = _original_corpora()
     scored: list[dict[str, Any]] = []
     for line in (records_dir / "records.jsonl").read_text().splitlines():
@@ -1028,6 +1096,12 @@ def grade_records(
                 original_assertions=original_assertions,
             )
         )
+        reference_validation_coverage = _reference_validation_coverage(
+            task_id,
+            case_set,
+            reference_rows,
+            validation_supplied=validation_supplied,
+        )
         gradeable = _case_set_is_gradeable(case_set, artifact)
         _, _, qualifying_reference_seconds, grading_identity = _grading_configuration(
             _GradingIdentityRequest(
@@ -1050,6 +1124,8 @@ def grade_records(
             and previous["strengthened_truth"].get("reference_set_digest") == expected_digest
             and previous["strengthened_truth"].get("timeout_reference_evidence")
             == _timeout_reference_evidence(qualifying_reference_seconds)
+            and previous["strengthened_truth"].get("reference_validation_coverage")
+            == reference_validation_coverage
             and not previous["strengthened_truth"]["unmeasured_timeout"]
             and previous["strengthened_truth"].get("unmeasured_error") is None
             and previous.get("true_pass") == true_pass
@@ -1065,6 +1141,7 @@ def grade_records(
                 original_assertions=original_assertions,
                 reference_suite_seconds=qualifying_reference_seconds,
             )
+            truth["reference_validation_coverage"] = reference_validation_coverage
             row = {
                 "episode_id": episode_id,
                 "task_id": task_id,

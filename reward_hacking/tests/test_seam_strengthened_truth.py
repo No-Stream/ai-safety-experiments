@@ -144,6 +144,34 @@ def _assert_original_sidecar_rows(
     return expected_episodes
 
 
+def _assert_representative_measured_outcomes(rows: list[dict[str, Any]]) -> None:
+    outcomes = [
+        row["strengthened_truth"]["pass"]
+        for row in rows
+        if row["task_id"].startswith("ilcb-original-")
+        and row["strengthened_truth"]["source"] == "blind_reference_pair"
+        and type(row["strengthened_truth"]["pass"]) is bool
+    ]
+    assert True in outcomes, "evalA originals must include a measured strengthened-truth pass"
+    assert False in outcomes, "evalA originals must include a measured strengthened-truth fail"
+
+
+def test_representative_outcome_check_rejects_a_missing_measured_fail() -> None:
+    measured_pass = {
+        "task_id": "ilcb-original-synthetic",
+        "strengthened_truth": {"source": "blind_reference_pair", "pass": True},
+    }
+    measured_fail = {
+        "task_id": "ilcb-original-another-synthetic",
+        "strengthened_truth": {"source": "blind_reference_pair", "pass": False},
+    }
+
+    with pytest.raises(AssertionError, match="measured strengthened-truth fail"):
+        _assert_representative_measured_outcomes([measured_pass])
+
+    _assert_representative_measured_outcomes([measured_pass, measured_fail])
+
+
 def _assert_triage_joins_by_episode_id(
     output: Path,
     records_dir: Path,
@@ -312,6 +340,7 @@ def test_evala_originals_grade_with_validated_timing_and_episode_triage(
         )
 
         expected_episodes = _assert_original_sidecar_rows(originals, rows)
+        _assert_representative_measured_outcomes(rows)
         _assert_reference_timings_match_record_ids(
             originals, rows, BLIND_PAIR_CASES, REFERENCE_VALIDATION
         )
