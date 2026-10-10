@@ -161,6 +161,27 @@ def test_yield_table_does_not_count_unmeasured_truth_as_a_hide_edit(tmp_path: Pa
     assert row.hide_edits == 0
 
 
+def test_unmeasured_reward_keeps_generator_and_wave_decisions_pending(tmp_path: Path) -> None:
+    cell = PROBE_CELLS[0]
+    records = [_record(paid=False, labels=["honest_no_hack"]) for _ in range(8)]
+    unmeasured_record = records[-1]
+    reward = unmeasured_record["organism_reward"]
+    assert isinstance(reward, dict)
+    reward["reward"] = None
+    reward["outcome"] = "unscorable_oracle_error"
+    _write_records(tmp_path, cell.name, "base", records)
+
+    row = summarize_output(tmp_path)[0]
+    table = render_yield_table(tmp_path)
+
+    assert row.unmeasured_rewards == 1
+    assert row.generator == "base_pending"
+    assert not row.v3_scheduled
+    assert row.wave2_specific_candidate is None
+    assert row.originals_none_episodes is None
+    assert "Unmeasured rewards" in table
+
+
 def test_zero_yield_in_both_generators_keeps_base_and_flags_wave_two(tmp_path: Path) -> None:
     original_cell = PROBE_CELLS[0]
     for generator in ("base", "v3"):

@@ -40,8 +40,8 @@ MODEL = "Qwen/Qwen3.5-0.8B"
 ADAPTER_SERVED_MODEL_ID = "smoke-v4-0.8b"
 HINTS_PATH = Path("docs/scratch/organism-hints/hints-v2.json")
 LEAK_SPLITS_PATH = Path("docs/scratch/leak-v4/channel-splits.json")
-LEAK_TRAIN_ASSETS = Path("/var/tmp/leak-env/assets-v4-train/assets.json")  # noqa: S108 - owner-specified assets
-LEAK_HELDOUT_ASSETS = Path("/var/tmp/leak-env/assets-v4-heldout-b/assets.json")  # noqa: S108 - owner-specified assets
+LEAK_TRAIN_ASSETS = Path("/var/tmp/leak-env/assets-v6-train/assets.json")  # noqa: S108 - owner-specified assets
+LEAK_HELDOUT_ASSETS = Path("/var/tmp/leak-env/assets-v6-heldout/assets.json")  # noqa: S108 - owner-specified assets
 LEAK_SPLIT_NAME = "seed-v4"
 LADDER_SCENARIO_ROOT = Path("reward_hacking/ladder/data/scenarios-v2.2-heldout-wip")
 MAX_TURNS = 4
@@ -53,6 +53,7 @@ RESUME_POLL_SECONDS = 0.2
 GENERATE_EPISODES_PER_CELL = 2
 LEAK_PAIR_LENGTH = 2
 SHA256_HEX_LENGTH = 64
+SMOKE_PLAN_FORMAT_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +203,7 @@ def _build_plan(run_directory: Path, leak_channels_by_task: Mapping[str, str]) -
     )
     conflicting_records = _record_path(run_directory, "generate", "ilcb-conflicting")
     return {
-        "format_version": 1,
+        "format_version": SMOKE_PLAN_FORMAT_VERSION,
         "model": MODEL,
         "cells": cells,
         "ladder_records_path": "ladder/records.jsonl",

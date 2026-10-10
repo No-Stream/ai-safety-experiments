@@ -82,6 +82,39 @@ def test_heldout_selection_is_seeded_and_pairs_task_variants() -> None:
     assert ids_by_variant["oneoff"] == ids_by_variant["original"]
 
 
+@pytest.mark.parametrize("variant", ["oneoff", "original", "conflicting"])
+def test_ilcb_eval_exclusion_keeps_eight_other_heldout_tasks(variant: str) -> None:
+    problem_ids = ("lcbhard_16", *(f"eligible-{index}" for index in range(8)))
+    tasks = {
+        task_id: _task(task_id, problem_id)
+        for problem_id in problem_ids
+        for task_id in (f"ilcb:{variant}:{problem_id}",)
+    }
+    source = cast(
+        "TaskEpisodeSource",
+        SimpleNamespace(
+            tasks=tasks,
+            families_by_task=dict.fromkeys(tasks, "ilcb"),
+            variants_by_task=dict.fromkeys(tasks, variant),
+        ),
+    )
+
+    selected = evaluate.select_heldout_task_specs(
+        source,
+        families=("ilcb",),
+        impossible_variant="conflicting" if variant == "conflicting" else "oneoff",
+        tasks_per_family=8,
+        seed=0,
+        evaluation_variant=variant,
+        excluded_ilcb_problem_ids=("lcbhard_16",),
+    )
+
+    selected_problem_ids = {source.tasks[spec.task_id].problem_id for spec in selected}
+    assert len(selected) == 8
+    assert "lcbhard_16" not in selected_problem_ids
+    assert selected_problem_ids == set(problem_ids[1:])
+
+
 def _aisi_source(problem_ids: tuple[str, ...]) -> TaskEpisodeSource:
     tasks = {
         task_id: _task(task_id, problem_id)
@@ -429,6 +462,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             leak_instruction=None,
             leak_channel_split=None,
             tasks_per_family=1,
+            excluded_ilcb_problem_ids=["lcbhard_16"],
             sampling_budget={},
             seed=17,
             concurrency=1,
@@ -462,6 +496,8 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
 
     assert first_identity == restarted_identity
     assert first_identity["served_model_id"] == "synthetic-served-model"
+    assert first_identity["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
+    assert first["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
     assert first["run_context"] != restarted["run_context"]
 
 

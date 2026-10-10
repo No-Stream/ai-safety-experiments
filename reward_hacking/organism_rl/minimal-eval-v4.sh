@@ -162,7 +162,6 @@ dry_run_records=()
 run_ladder_cell() {
   SEED_EVAL_BASE_MODEL="$base_model" \
     SEED_EVAL_ADAPTER_DIR="$adapter_dir" \
-    SEED_EVAL_MODEL_LABEL="organism-ladder-$model" \
     SEED_EVAL_SERVED_MODEL_ID="$served_model_id" \
     SEED_EVAL_DRY_RUN="$dry_run" \
     SEED_EVAL_MAX_MODEL_LEN="$max_model_len" \
@@ -182,7 +181,6 @@ from reward_hacking.ladder.scenario import load_scenarios
 base_model = os.environ["SEED_EVAL_BASE_MODEL"]
 adapter_text = os.environ["SEED_EVAL_ADAPTER_DIR"]
 adapter_dir = Path(adapter_text) if adapter_text else None
-model_label = os.environ["SEED_EVAL_MODEL_LABEL"]
 served_model_id = os.environ["SEED_EVAL_SERVED_MODEL_ID"]
 dry_run = os.environ["SEED_EVAL_DRY_RUN"] == "1"
 max_model_len = os.environ["SEED_EVAL_MAX_MODEL_LEN"]
@@ -240,7 +238,8 @@ runner_arguments = [
     "--server-log",
     str(server_config.log_path),
     "--model",
-    f"{model_label}={base_model}",
+    # The runner asks vLLM for the model by this label, so it must be the served id.
+    f"{served_model_id}={base_model}",
     "--scenario-root",
     str(scenario_root),
     "--arm",
@@ -267,8 +266,11 @@ runner_arguments = [
 for scenario_slug in oneoff_slugs:
     runner_arguments.extend(("--scenario", scenario_slug))
 
+parsed_runner_arguments = runner._parse_cli_args(runner._build_cli_parser(), runner_arguments)
+runner_model_ids = {model.server_model_id or model.model_id for model in parsed_runner_arguments.model}
+if runner_model_ids != {args.served_model_id}:
+    raise ValueError(f"ladder runner requests {runner_model_ids}, server serves {args.served_model_id!r}")
 if dry_run:
-    runner._parse_cli_args(runner._build_cli_parser(), runner_arguments)
     logging.basicConfig(level=logging.INFO)
     logging.getLogger(__name__).info(
         "validated ladder evaluation and runner arguments served_model_id=%s",
@@ -333,13 +335,17 @@ run_eval_cell() {
   if [[ "$family" == aisi ]]; then
     arguments+=(--aisi-sources apps,humaneval,mbpp --aisi-task-id-order)
   fi
+  if [[ "$model" == v4 && "$family" == ilcb ]]; then
+    # The official tests exceed the 150-second grading limit even for correct solutions.
+    arguments+=(--exclude-ilcb-problem-id lcbhard_16)
+  fi
   if [[ -n "$adapter_dir" ]]; then
     arguments+=(--adapter-dir "$adapter_dir")
   fi
   if [[ "$family" == r2e_leak ]]; then
     arguments+=(
       --max-turns 30
-      --leak-assets /var/tmp/leak-env/assets-v4-heldout-b/assets.json
+      --leak-assets /var/tmp/leak-env/assets-v6-heldout/assets.json
       --leak-channel-splits docs/scratch/leak-v4/channel-splits.json
       --leak-channel-split seed-v4
       --leak-channel-per-episode

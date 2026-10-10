@@ -65,8 +65,10 @@ def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
     output = _dry_run("gate3", "v4")
 
     assert "cells: 1, 2, 4" in output
+    assert "episodes per cell: 1=8, 2=8, 4=8" in output
     assert "total episodes: 24" in output
     assert "estimated wall-clock: 0.9 h" in output
+    assert "excluded_ilcb_problem_ids=['lcbhard_16']" in output
     assert "cells: 3" not in output
     assert "math cells:" not in output
 
@@ -76,9 +78,11 @@ def test_cells_dry_run_lists_v4_battery_and_deterministic_aisi_selection() -> No
     output = _dry_run("cells", "v4")
 
     assert "cells: 3, 5, 6, 7, 8, 9" in output
+    assert "episodes per cell: 3=8, 5=8, 6=8, 7=11, 8=6, 9=6" in output
     assert "total episodes: 47" in output
     assert "estimated wall-clock: 1.6 h" in output
     assert "AISI selection: round-robin by task ID (apps 3, humaneval 3, mbpp 2)" in output
+    assert output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 2
 
 
 @requires_leak_splits
@@ -88,8 +92,10 @@ def test_cells_dry_run_uses_model_specific_new_cells() -> None:
 
     assert "cells: 5, 6, 7, 8, 9" in base_output
     assert "total episodes: 39" in base_output
+    assert "excluded_ilcb_problem_ids=['lcbhard_16']" not in base_output
     assert "cells: 5, 7, 8, 9" in v3_output
     assert "total episodes: 31" in v3_output
+    assert "excluded_ilcb_problem_ids=['lcbhard_16']" not in v3_output
 
 
 @requires_leak_splits

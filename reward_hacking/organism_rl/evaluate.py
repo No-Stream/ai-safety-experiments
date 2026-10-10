@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
 logger = logging.getLogger(__name__)
+GENERATION_PATH_IDENTITY_SCHEMA_VERSION = 2
 DEFAULT_FAMILIES: tuple[TaskFamily, ...] = ("ilcb", "aisi")
 EVALUATION_ADAPTER_NAME = "organism-eval"
 DEFAULT_MAX_TURNS = 8
@@ -155,6 +156,14 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="run one concrete cell variant instead of its paired treatment and solvable control",
     )
     parser.add_argument(
+        "--exclude-ilcb-problem-id",
+        dest="excluded_ilcb_problem_ids",
+        action="append",
+        default=[],
+        metavar="PROBLEM_ID",
+        help="remove an ILCB problem from held-out evaluation selection",
+    )
+    parser.add_argument(
         "--aisi-sources",
         type=generate.parse_aisi_sources,
         default=AISI_SOURCES,
@@ -220,6 +229,12 @@ def _validate_task_selection_args(
     _validate_impossible_variant_family(args, parser)
     _validate_evaluation_variant_family(args, parser)
     _validate_reuse_selection(args, parser)
+    if args.excluded_ilcb_problem_ids and "ilcb" not in args.families:
+        parser.error("exclude-ilcb-problem-id requires --family ilcb")
+    if len(args.excluded_ilcb_problem_ids) != len(set(args.excluded_ilcb_problem_ids)):
+        parser.error("exclude-ilcb-problem-id values must be unique")
+    if any(not problem_id for problem_id in args.excluded_ilcb_problem_ids):
+        parser.error("exclude-ilcb-problem-id values must be nonempty")
     if args.adapter_dir is None and args.served_model_id != args.model and args.endpoint is None:
         parser.error("served-model-id can differ from model only when serving a LoRA adapter")
 
@@ -383,13 +398,21 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     evaluation_variant: str | None = None,
     aisi_task_id_order: bool = False,
     payment_register: str = "trusted_rerun",
+    excluded_ilcb_problem_ids: Sequence[str] = (),
 ) -> tuple[TaskSpec, ...]:
     """Select matched held-out problem IDs for treatment and solvable task variants.
 
     AISI draws round-robin across allowed sources. The minimal v4 eval can use task-ID order;
     ordinary evaluation retains its seeded within-source shuffle.
     """
-    _validate_heldout_selection(families, impossible_variant, tasks_per_family, seed)
+    _validate_heldout_selection(
+        families,
+        impossible_variant,
+        tasks_per_family,
+        seed,
+        excluded_ilcb_problem_ids,
+    )
+    excluded_ilcb_ids = frozenset(excluded_ilcb_problem_ids)
 
     rng = random.Random(seed)
     selected: list[TaskSpec] = []
@@ -401,6 +424,12 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
                 family, treatment_variant, evaluation_variant
             )
             selected_by_problem = _task_ids_by_problem(source, family, selected_variant)
+            (selected_by_problem,) = _filter_excluded_ilcb_problem_ids(
+                family,
+                (selected_by_problem,),
+                excluded_ilcb_ids,
+                selection_context=f"held-out variant {selected_variant!r}",
+            )
             if family == "r2e_leak":
                 selected.extend(
                     _select_leak_specs(
@@ -447,6 +476,12 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
             )
             continue
         solvable_by_problem = _task_ids_by_problem(source, family, solvable_variant)
+        impossible_by_problem, solvable_by_problem = _filter_excluded_ilcb_problem_ids(
+            family,
+            (impossible_by_problem, solvable_by_problem),
+            excluded_ilcb_ids,
+            selection_context="held-out variants",
+        )
         paired_problem_ids = sorted(set(impossible_by_problem) & set(solvable_by_problem))
         if len(paired_problem_ids) < tasks_per_family:
             raise ValueError(
@@ -500,7 +535,11 @@ def _paired_task_variants(family: TaskFamily, treatment_variant: str) -> tuple[s
 
 
 def _validate_heldout_selection(
-    families: tuple[TaskFamily, ...], impossible_variant: str, tasks_per_family: int, seed: int
+    families: tuple[TaskFamily, ...],
+    impossible_variant: str,
+    tasks_per_family: int,
+    seed: int,
+    excluded_ilcb_problem_ids: Sequence[str],
 ) -> None:
     if not families or len(families) != len(set(families)):
         raise ValueError("task families must be a nonempty unique sequence")
@@ -517,6 +556,12 @@ def _validate_heldout_selection(
         raise ValueError("tasks_per_family must be a positive integer")
     if type(seed) is not int:
         raise TypeError("evaluation seed must be an integer")
+    if any(not problem_id for problem_id in excluded_ilcb_problem_ids):
+        raise ValueError("excluded ILCB problem IDs must be nonempty")
+    if len(excluded_ilcb_problem_ids) != len(set(excluded_ilcb_problem_ids)):
+        raise ValueError("excluded ILCB problem IDs must be unique")
+    if excluded_ilcb_problem_ids and "ilcb" not in families:
+        raise ValueError("excluded ILCB problem IDs require the ilcb family")
 
 
 def _select_leak_specs(
@@ -614,6 +659,33 @@ def _task_ids_by_problem(
             raise ValueError(f"duplicate held-out {family} problem id {task.problem_id!r}")
         task_ids_by_problem[task.problem_id] = task_id
     return task_ids_by_problem
+
+
+def _filter_excluded_ilcb_problem_ids(
+    family: TaskFamily,
+    task_maps: tuple[Mapping[str, str], ...],
+    excluded_problem_ids: frozenset[str],
+    *,
+    selection_context: str,
+) -> tuple[dict[str, str], ...]:
+    if family != "ilcb" or not excluded_problem_ids:
+        return tuple(dict(task_map) for task_map in task_maps)
+
+    available_problem_ids = set().union(*(task_map.keys() for task_map in task_maps))
+    missing_exclusions = excluded_problem_ids - available_problem_ids
+    if missing_exclusions:
+        raise ValueError(
+            f"excluded ILCB problem IDs are missing from {selection_context}: "
+            f"{sorted(missing_exclusions)}"
+        )
+    return tuple(
+        {
+            problem_id: task_id
+            for problem_id, task_id in task_map.items()
+            if problem_id not in excluded_problem_ids
+        }
+        for task_map in task_maps
+    )
 
 
 def run_evaluation(  # noqa: PLR0913 - generation owns the shared execution controls
@@ -752,8 +824,8 @@ def _generation_path_identity(
         "final_report": TASK_LOG_FINAL_REPORT_PROMPT,
         "turns_remaining_note_template": TURNS_REMAINING_NOTE,
     }
-    return {
-        "schema_version": 2,
+    identity: dict[str, object] = {
+        "schema_version": GENERATION_PATH_IDENTITY_SCHEMA_VERSION,
         "prompt_text_sha256": _canonical_sha256(task_prompt_digests),
         "task_prompt_sha256": task_prompt_digests,
         "tool_feedback_text_sha256": {
@@ -788,6 +860,9 @@ def _generation_path_identity(
         },
         "served_model_id": args.served_model_id,
     }
+    if args.excluded_ilcb_problem_ids:
+        identity["excluded_ilcb_problem_ids"] = sorted(args.excluded_ilcb_problem_ids)
+    return identity
 
 
 def _reuse_identity_differences(
@@ -1252,6 +1327,7 @@ def _evaluation_provenance(
         "leak_instruction": args.leak_instruction,
         "leak_channel_split": args.leak_channel_split,
         "tasks_per_family": args.tasks_per_family,
+        "excluded_ilcb_problem_ids": sorted(args.excluded_ilcb_problem_ids),
         "samples_per_task": 1,
         "sampling_budget": args.sampling_budget,
         "seed": args.seed,
@@ -1335,9 +1411,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.endpoint is None:
             build_server_config(args, model_revision)
         logger.info(
-            "validated evaluation arguments family=%s variant=%s served_model_id=%s model_revision=%s",
+            "validated evaluation arguments family=%s variant=%s excluded_ilcb_problem_ids=%s "
+            "served_model_id=%s model_revision=%s",
             args.families,
             args.evaluation_variant or args.impossible_variant,
+            args.excluded_ilcb_problem_ids,
             args.served_model_id,
             model_revision,
         )
@@ -1403,6 +1481,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         evaluation_variant=args.evaluation_variant,
         aisi_task_id_order=args.aisi_task_id_order,
         payment_register=args.payment_register,
+        excluded_ilcb_problem_ids=args.excluded_ilcb_problem_ids,
     )
     provenance = _evaluation_provenance(
         args,
