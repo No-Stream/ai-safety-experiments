@@ -195,32 +195,107 @@ def test_leak_template_is_materialised_before_task_files(tmp_path: Path) -> None
     assert episode.stat().st_mtime_ns == template.stat().st_mtime_ns
 
 
-def test_leak_in_band_runs_workspace_runner(
+def test_leak_in_band_runs_trusted_grader(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    task = _leak_task(_config(tmp_path), template)
+    calls: list[Path] = []
+
+    def fake_extract(directory: Path, _base: str, *, template_dir: Path) -> Path:
+        assert template_dir == template
+        calls.append(directory)
+        return directory / "patch.diff"
+
+    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
+    monkeypatch.setattr(
+        loop.tasks_r2e_leak,
+        "run_trusted_grader",
+        lambda *_args, **_kwargs: CommandResult("truth", 0, "SUCCESS\n", "", False),
+    )
+    monkeypatch.setattr(
+        loop,
+        "run_in_docker",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("workspace runner called")),
+    )
+    result = loop.run_grader(
+        task, tmp_path, arm=loop.BASELINE_ARM, timeout="30s", jail_backend=None
+    )
+    assert calls == [tmp_path]
+    assert result.exit_code == 0
+    assert loop.grader_reported_success(result, marker=task.success_marker)
+
+
+def test_leak_check_reports_only_verdict_and_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     template = tmp_path / "template"
     template.mkdir()
     task = _leak_task(_config(tmp_path), template)
-    commands: list[str] = []
-
-    def fake_run(directory: Path, command: str, **kwargs: object) -> CommandResult:
-        assert directory == tmp_path
-        assert kwargs["login_shell"] is False
-        commands.append(command)
-        return CommandResult(command, 0, "1 passed\n", "", False)
-
-    monkeypatch.setattr(loop, "run_in_docker", fake_run)
     monkeypatch.setattr(
-        loop,
-        "run_docker_grader",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("pristine proxy called")),
+        loop.tasks_r2e_leak,
+        "extract_patch",
+        lambda directory, _base, *, template_dir: directory / "patch.diff",
     )
-    result = loop.run_grader(
-        task, tmp_path, arm=loop.BASELINE_ARM, timeout="30s", jail_backend=None
+    monkeypatch.setattr(
+        loop.tasks_r2e_leak,
+        "run_trusted_grader",
+        lambda *_args, **_kwargs: CommandResult(
+            "truth",
+            1,
+            "FAIL\nTests: 2 passed, 1 failed, 0 skipped, 0 errors\n",
+            "hidden test name",
+            False,
+        ),
     )
-    assert commands == ["bash run_tests.sh"]
-    assert result.exit_code == 0
-    assert loop.grader_reported_success(result, marker=task.success_marker)
+    feedback = loop._answer_check(
+        task,
+        tmp_path,
+        arm=loop.BASELINE_ARM,
+        timeout="30s",
+        jail_backend=None,
+        check_grader=None,
+    )
+    assert feedback == "<check>FAIL\nTests: 2 passed, 1 failed, 0 skipped, 0 errors</check>"
+    assert "hidden test name" not in feedback
+
+
+def test_leak_resource_failure_is_unmeasured_even_with_success_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    template = tmp_path / "template"
+    template.mkdir()
+    task = _leak_task(_config(tmp_path), template)
+
+    def fake_extract(
+        directory: Path, _base: str, *, template_dir: Path, artifact_filename: str = "patch.diff"
+    ) -> Path:
+        patch = directory / artifact_filename
+        patch.write_text("synthetic patch\n")
+        return patch
+
+    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
+    monkeypatch.setattr(
+        loop.tasks_r2e_leak,
+        "run_trusted_grader",
+        lambda *_args, **_kwargs: CommandResult(
+            "truth",
+            0,
+            "SUCCESS\nTests: 1 passed, 0 failed, 0 skipped, 0 errors\n",
+            "out of memory",
+            False,
+        ),
+    )
+    graded = loop.grade_final_state(
+        task,
+        tmp_path,
+        arm=loop.BASELINE_ARM,
+        timeout="30s",
+        jail_backend=None,
+        grader_hashable=False,
+    )
+    assert not graded.proxy_pass
+    assert not graded.true_pass
+    assert graded.oracle_error == "trusted pytest grader reported resource exhaustion"
 
 
 def test_leak_instruction_variant_is_validated(tmp_path: Path) -> None:
@@ -228,9 +303,9 @@ def test_leak_instruction_variant_is_validated(tmp_path: Path) -> None:
         replace(_task(_config(tmp_path)), instruction_variant="unknown")
 
 
-@pytest.mark.parametrize(("proxy_pass", "hidden_pass"), [(False, True), (True, False)])
-def test_leak_reward_uses_hidden_verdict(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, proxy_pass: bool, hidden_pass: bool
+@pytest.mark.parametrize("trusted_pass", [False, True])
+def test_leak_reward_uses_one_trusted_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_pass: bool
 ) -> None:
     template = tmp_path / "template"
     template.mkdir()
@@ -245,19 +320,27 @@ def test_leak_reward_uses_hidden_verdict(
         return patch
 
     monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
-    monkeypatch.setattr(
-        loop,
-        "run_in_docker",
-        lambda *_args, **_kwargs: CommandResult(
-            "proxy", 0 if proxy_pass else 1, "SUCCESS\n" if proxy_pass else "", "", False
-        ),
-    )
+    trusted_calls: list[Path] = []
+
+    def trusted_grader(_task: Task, directory: Path, *, timeout: str) -> CommandResult:
+        trusted_calls.append(directory)
+        return CommandResult(
+            "truth",
+            0 if trusted_pass else 1,
+            ("SUCCESS\n" if trusted_pass else "FAIL\n")
+            + (
+                "Tests: 1 passed, 0 failed, 0 skipped, 0 errors\n"
+                if trusted_pass
+                else "Tests: 0 passed, 1 failed, 0 skipped, 0 errors\n"
+            ),
+            "",
+            False,
+        )
+
     monkeypatch.setattr(
         loop.tasks_r2e_leak,
         "run_trusted_grader",
-        lambda *_args, **_kwargs: CommandResult(
-            "truth", 0 if hidden_pass else 1, "SUCCESS\n" if hidden_pass else "", "", False
-        ),
+        trusted_grader,
     )
     graded = loop.grade_final_state(
         task,
@@ -267,10 +350,11 @@ def test_leak_reward_uses_hidden_verdict(
         jail_backend=None,
         grader_hashable=False,
     )
-    assert graded.proxy_pass is proxy_pass
-    assert graded.true_pass is hidden_pass
+    assert trusted_calls == [tmp_path]
+    assert graded.proxy_pass is trusted_pass
+    assert graded.true_pass is trusted_pass
     assert graded.task_evidence is not None
-    assert graded.task_evidence.provided_test_pass is hidden_pass
+    assert graded.task_evidence.provided_test_pass is trusted_pass
 
 
 def test_leak_changed_patch_has_no_paid_verdict(

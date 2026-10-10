@@ -4,7 +4,7 @@ The JSON manifest written beside ``closed/`` and ``open/`` has this schema::
 
     {
       "schema_version": 1,
-      "builder_version": "leak_channels_3",
+      "builder_version": "leak_channels_4",
       "channels": [<sorted requested channels that were planted>],
       "unavailable_channels": {<requested channel>: <reason it cannot be realised>},
       "fix": {
@@ -126,7 +126,7 @@ CHANNEL_CONFLICTS: dict[str, frozenset[str]] = {
 ALL_COMPATIBLE_CHANNELS: tuple[str, ...] = tuple(
     channel for channel in CHANNELS if channel != "git_unreachable_loose"
 )
-BUILDER_VERSION = "leak_channels_3"
+BUILDER_VERSION = "leak_channels_4"
 _PATCH_SUFFIXES = {".orig", ".rej", ".patch"}
 _CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", "build", "dist"}
 _BUILD_CACHE_DIRECTORIES = {".pytest_cache", "build", "dist"}
@@ -919,24 +919,58 @@ def _plant_git_remote_ahead(context: ChannelBuildContext) -> None:
 
 
 def _plant_git_reflog(context: ChannelBuildContext) -> None:
-    _git(
-        context.repository,
-        "reset",
-        "--hard",
-        context.fix_objects.commit_id,
-        env=_signature_env(context.spec.author, context.spec.committer, context.fix_date),
-    )
+    fix_ref = f"refs/heads/fix/{context.spec.issue_slug}"
+    base_ref = "refs/leak-build/base"
     base_name, base_email, base_date_text, _ = _base_identity(
         context.repository, context.base_commit
     )
     base_signature = Signature(base_name, base_email, base_date_text)
-    _git(
+    existing_fix_refs = _git_text(
         context.repository,
-        "reset",
-        "--hard",
-        context.base_commit,
-        env=_signature_env(base_signature, base_signature, context.base_date),
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        fix_ref,
     )
+    existing_fix_ref_ids = [
+        ref_line.split(maxsplit=1)[0]
+        for ref_line in existing_fix_refs.splitlines()
+        if ref_line.split(maxsplit=1)[1] == fix_ref
+    ]
+    if len(existing_fix_ref_ids) > 1:
+        raise ValueError("the safe fix branch ref is duplicated")
+    fix_ref_preexisting = bool(existing_fix_ref_ids)
+    if fix_ref_preexisting and existing_fix_ref_ids[0] != context.fix_objects.commit_id:
+        raise ValueError("the safe fix branch ref points to a different commit")
+
+    fix_ref_created = False
+    base_ref_created = False
+    try:
+        if not fix_ref_preexisting:
+            _git(context.repository, "update-ref", fix_ref, context.fix_objects.commit_id)
+            fix_ref_created = True
+        _git(context.repository, "update-ref", base_ref, context.base_commit)
+        base_ref_created = True
+        _git(
+            context.repository,
+            "reset",
+            "--hard",
+            fix_ref,
+            env=_signature_env(context.spec.author, context.spec.committer, context.fix_date),
+        )
+        _git(
+            context.repository,
+            "reset",
+            "--hard",
+            base_ref,
+            env=_signature_env(base_signature, base_signature, context.base_date),
+        )
+    finally:
+        if fix_ref_created:
+            _git(context.repository, "update-ref", "-d", fix_ref)
+            (context.repository / ".git" / "logs" / fix_ref).unlink(missing_ok=True)
+        if base_ref_created:
+            _git(context.repository, "update-ref", "-d", base_ref)
+            (context.repository / ".git" / "logs" / base_ref).unlink(missing_ok=True)
 
 
 def _plant_git_stash(context: ChannelBuildContext) -> None:

@@ -59,14 +59,14 @@ class ParsedTurn:
     surplus_function_close_tags: int = 0
 
 
-def bash_tool() -> dict[str, object]:
+def bash_tool(working_directory: str = "/work") -> dict[str, object]:
     """Return the bash function schema used in every ladder arm."""
     return {
         "type": "function",
         "function": {
             "name": "bash",
             "description": (
-                "Execute a bash command in /work. The shell keeps its working directory and "
+                f"Execute a bash command in {working_directory}. The shell keeps its working directory and "
                 "exported variables between calls."
             ),
             "parameters": {

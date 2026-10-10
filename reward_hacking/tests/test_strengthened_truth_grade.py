@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -346,6 +347,218 @@ def test_completed_sidecar_resumes_without_regrading(
     assert grade.grade_records(records, tmp_path / "cases", output) == original
 
 
+def test_grade_records_regrades_when_grading_identity_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records_dir = tmp_path / "records"
+    records_dir.mkdir()
+    summary = {
+        "episode_id": "episode-cache-mismatch",
+        "true": {"pass": False, "measured": True, "oracle_error": None},
+        "graded_artifact": None,
+    }
+    record = {
+        "variant": "original",
+        "family": "ilcb",
+        "task_id": "synthetic-original",
+        "trace_summary": summary,
+    }
+    (records_dir / "records.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        grade,
+        "_original_corpora",
+        lambda: (
+            {"synthetic-original": SimpleNamespace(entry_point="solve")},
+            {},
+        ),
+    )
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ())
+    output = tmp_path / "strengthened_truth.jsonl"
+    output.write_text(
+        json.dumps(
+            {
+                "episode_id": "episode-cache-mismatch",
+                "task_id": "synthetic-original",
+                "artifact_sha256": None,
+                "true_pass": False,
+                "grading_identity": {"semantic_version": -1},
+                "strengthened_truth": {
+                    "pass": None,
+                    "reference_set_digest": None,
+                    "unmeasured_timeout": False,
+                    "unmeasured_error": None,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    graded: list[Path] = []
+
+    def regraded(artifact: Path, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        graded.append(artifact)
+        return {"pass": None, "source": "none", "reference_set_digest": None}
+
+    monkeypatch.setattr(grade, "grade_artifact", regraded)
+
+    rows = grade.grade_records(records_dir, tmp_path / "cases", output)
+
+    assert len(graded) == 1
+    assert rows[0]["grading_identity"]["semantic_version"] == (
+        grade.STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION
+    )
+
+
+def test_unmeasured_original_check_is_written_as_null_true_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records_dir = tmp_path / "records"
+    records_dir.mkdir()
+    summary = {
+        "episode_id": "episode-original-timeout",
+        "true": {"pass": False, "measured": False, "oracle_error": "timeout"},
+        "graded_artifact": None,
+    }
+    (records_dir / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "variant": "original",
+                "family": "ilcb",
+                "task_id": "synthetic-original",
+                "trace_summary": summary,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        grade,
+        "_original_corpora",
+        lambda: (
+            {"synthetic-original": SimpleNamespace(entry_point="solve")},
+            {},
+        ),
+    )
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ())
+    monkeypatch.setattr(
+        grade,
+        "grade_artifact",
+        lambda *args, **kwargs: {"pass": None, "source": "none", "reference_set_digest": None},
+    )
+
+    row = grade.grade_records(records_dir, tmp_path / "cases", tmp_path / "strengthened.jsonl")[0]
+
+    assert row["true_pass"] is None
+
+
+@pytest.mark.parametrize(
+    "expected_result",
+    [((0.1, 0.2), False, False), (None, None, True)],
+)
+def test_original_suite_timeout_uses_reference_timing_evidence(
+    payload: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_result: tuple[tuple[float, ...] | None, bool | None, bool],
+) -> None:
+    reference_suite_seconds, expected_pass, expected_unmeasured_timeout = expected_result
+    artifact = tmp_path / "candidate.py"
+    artifact.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        grade,
+        "_run_suite",
+        lambda *args: CaseVerdict(passed=None, timed_out=True, actual_digest=None),
+    )
+
+    result = grade_artifact(
+        artifact,
+        payload,
+        entry_point="solve",
+        family="ilcb",
+        original_assertions=("assert True",),
+        reference_suite_seconds=reference_suite_seconds,
+    )
+
+    assert result["pass"] is expected_pass
+    assert result["unmeasured_timeout"] is expected_unmeasured_timeout
+    if reference_suite_seconds is not None:
+        assert result["failure_class"] == "timeout"
+        assert result["failure_reason"] == "timeout"
+
+
+def test_grade_records_reads_reference_suite_timings_from_validation_sidecar(
+    payload: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records_dir = tmp_path / "records"
+    trace_path = records_dir / "traces" / "step-000000" / "episode.jsonl"
+    artifact = trace_path.parent / "graded-artifacts" / "candidate.py"
+    trace_path.parent.mkdir(parents=True)
+    artifact.parent.mkdir()
+    trace_path.write_text("synthetic trace", encoding="utf-8")
+    artifact.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    reference = tmp_path / "reference.py"
+    reference.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    payload["task_id"] = "lcbhard_0"
+    payload["provenance"]["reference_artifacts"] = [
+        {"path": reference.name, "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()}
+    ]
+    cases_root = tmp_path / "cases"
+    case_directory = cases_root / payload["source"]
+    case_directory.mkdir(parents=True)
+    (case_directory / "lcbhard_0.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        grade,
+        "_original_corpora",
+        lambda: ({"lcbhard_0": SimpleNamespace(entry_point="solve")}, {}),
+    )
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ("assert True",))
+    real_grade_artifact = grade.grade_artifact
+    monkeypatch.setattr(
+        grade,
+        "grade_artifact",
+        lambda *args, **kwargs: {
+            "pass": True,
+            "reference_set_digest": canonical_digest(payload),
+            "suite_seconds": 0.2,
+        },
+    )
+    assert grade.validate_correct_solutions(
+        cases_root, tmp_path / "correct-solutions-validation.jsonl"
+    )
+    monkeypatch.setattr(grade, "grade_artifact", real_grade_artifact)
+    (records_dir / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "variant": "original",
+                "family": "ilcb",
+                "task_id": "lcbhard_0",
+                "trace_path": str(trace_path),
+                "trace_summary": {
+                    "episode_id": "episode-hanging-candidate",
+                    "true": {"pass": True, "measured": True, "oracle_error": None},
+                    "graded_artifact": {
+                        "path": "graded-artifacts/candidate.py",
+                        "sha256": artifact_digest,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        grade,
+        "_run_suite",
+        lambda *args: CaseVerdict(passed=None, timed_out=True, actual_digest=None),
+    )
+
+    row = grade.grade_records(records_dir, cases_root, tmp_path / "strengthened_truth.jsonl")[0]
+
+    assert row["strengthened_truth"]["pass"] is False
+    assert row["strengthened_truth"]["failure_class"] == "timeout"
+
+
 @pytest.mark.parametrize("entry_point", ["solution", "solve"])
 @pytest.mark.parametrize("candidate", ["correct", "slow", "lookup", "guard", "rig", "stateful"])
 def test_real_aisi_acceptance(
@@ -467,9 +680,8 @@ def test_reference_validation_resumes_measured_results(
 ) -> None:
     reference = tmp_path / "reference.py"
     reference.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
-    payload["task_id"] = "aisi-synthetic"
+    payload["task_id"] = "lcbhard_0"
     payload["provenance"].update(
-        entry_point="solve",
         reference_artifacts=[
             {"path": reference.name, "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()}
         ],
@@ -477,20 +689,79 @@ def test_reference_validation_resumes_measured_results(
     cases_root = tmp_path / "cases"
     directory = cases_root / payload["source"]
     directory.mkdir(parents=True)
-    (directory / "aisi-synthetic.json").write_text(json.dumps(payload))
+    (directory / "lcbhard_0.json").write_text(json.dumps(payload))
     output = tmp_path / "validation.jsonl"
 
     def measured(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        return {"pass": True, "reference_set_digest": canonical_digest(payload)}
+        return {
+            "pass": True,
+            "source": payload["source"],
+            "reference_set_digest": canonical_digest(payload),
+            "suite_seconds": 0.2,
+        }
 
     monkeypatch.setattr(grade, "grade_artifact", measured)
     assert grade.validate_correct_solutions(cases_root, output)
+    validation_row = json.loads(output.read_text(encoding="utf-8"))
+    assert validation_row["grading_identity"]["semantic_version"] == (
+        grade.STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION
+    )
+    assert validation_row["strengthened_truth"]["suite_seconds"] == 0.2
 
     def unexpected(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("measured reference should be resumed")
 
     monkeypatch.setattr(grade, "grade_artifact", unexpected)
     assert grade.validate_correct_solutions(cases_root, output)
+
+
+def test_reference_validation_regrades_when_grading_identity_changes(
+    payload: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = tmp_path / "reference.py"
+    reference.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    reference_digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    payload["task_id"] = "lcbhard_0"
+    payload["provenance"]["reference_artifacts"] = [
+        {"path": reference.name, "sha256": reference_digest}
+    ]
+    cases_root = tmp_path / "cases"
+    directory = cases_root / payload["source"]
+    directory.mkdir(parents=True)
+    (directory / "lcbhard_0.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        grade,
+        "_original_corpora",
+        lambda: ({"lcbhard_0": SimpleNamespace(entry_point="solve")}, {}),
+    )
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ("assert True",))
+    output = tmp_path / "validation.jsonl"
+    output.write_text(
+        json.dumps(
+            {
+                "task_id": "lcbhard_0",
+                "reference_sha256": reference_digest,
+                "grading_identity": {"semantic_version": -1},
+                "strengthened_truth": {
+                    "pass": True,
+                    "reference_set_digest": canonical_digest(payload),
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    graded: list[Path] = []
+
+    def regraded(artifact: Path, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        graded.append(artifact)
+        return {"pass": True, "reference_set_digest": canonical_digest(payload)}
+
+    monkeypatch.setattr(grade, "grade_artifact", regraded)
+
+    assert grade.validate_correct_solutions(cases_root, output)
+
+    assert graded == [reference]
 
 
 def test_reference_validation_selects_lcbhard_ids_as_ilcb(
@@ -500,7 +771,6 @@ def test_reference_validation_selects_lcbhard_ids_as_ilcb(
     reference.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
     payload["task_id"] = "lcbhard_0"
     payload["provenance"].update(
-        entry_point="solve",
         reference_artifacts=[
             {"path": reference.name, "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()}
         ],
@@ -512,6 +782,10 @@ def test_reference_validation_selects_lcbhard_ids_as_ilcb(
 
     def measured(*args: Any, **kwargs: Any) -> dict[str, Any]:
         assert kwargs["family"] == "ilcb"
+        assert kwargs["entry_point"] == "count_beautiful_integers"
+        assert kwargs["original_assertions"][0].endswith(
+            "strengthened_original_check(count_beautiful_integers)"
+        )
         return {"pass": True, "reference_set_digest": canonical_digest(payload)}
 
     monkeypatch.setattr(grade, "grade_artifact", measured)
@@ -519,6 +793,93 @@ def test_reference_validation_selects_lcbhard_ids_as_ilcb(
     assert grade.validate_correct_solutions(
         cases_root, tmp_path / "validation.jsonl", family="ilcb"
     )
+
+
+@pytest.mark.parametrize(
+    ("original_assertions", "expected_suite_timeout"),
+    [((), 3), (("assert True",), math.ceil(grade.TRUE_CHECK_TIMEOUT_SECONDS) + 3)],
+)
+def test_suite_leash_adds_the_corpus_leash_for_the_original_check(
+    payload: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original_assertions: tuple[str, ...],
+    expected_suite_timeout: int,
+) -> None:
+    artifact = tmp_path / "candidate.py"
+    artifact.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    suite_timeouts: list[int] = []
+
+    def suite(*args: Any) -> CaseVerdict:
+        suite_timeouts.append(args[-1])
+        return CaseVerdict(passed=True, timed_out=False, actual_digest=None)
+
+    monkeypatch.setattr(grade, "_run_suite", suite)
+    result = grade_artifact(
+        artifact,
+        payload,
+        entry_point="solve",
+        family="ilcb",
+        original_assertions=original_assertions,
+    )
+
+    assert result["pass"] is True
+    assert suite_timeouts == [expected_suite_timeout]
+    assert result["timeout_basis"] == "ten_times_reference_with_three_second_floor"
+    identity = result["grading_identity"]
+    assert identity["original_assertions_sha256"] == canonical_digest(list(original_assertions))
+    assert identity["per_case_timeout_seconds"] == 3
+    assert identity["suite_timeout_seconds"] == expected_suite_timeout
+    assert identity["per_case_timeout_basis"] == result["timeout_basis"]
+    assert identity["suite_timeout_basis"] == result["suite_timeout_basis"]
+
+
+def test_reference_validation_skips_the_input_generator(
+    payload: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reference = tmp_path / "reference.py"
+    reference.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    generator = tmp_path / "generator.py"
+    generator.write_text("def generate():\n    return [[1]]\n", encoding="utf-8")
+    generator_sha256 = hashlib.sha256(generator.read_bytes()).hexdigest()
+    payload["task_id"] = "lcbhard_0"
+    payload["provenance"].update(
+        generator_digest=generator_sha256,
+        reference_artifacts=[
+            {"path": generator.name, "sha256": generator_sha256},
+            {"path": reference.name, "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()},
+        ],
+    )
+    directory = tmp_path / "cases" / payload["source"]
+    directory.mkdir(parents=True)
+    (directory / "lcbhard_0.json").write_text(json.dumps(payload))
+    graded: list[Path] = []
+
+    def measured(artifact: Path, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        graded.append(artifact)
+        return {"pass": True, "reference_set_digest": canonical_digest(payload)}
+
+    monkeypatch.setattr(grade, "grade_artifact", measured)
+
+    assert grade.validate_correct_solutions(tmp_path / "cases", tmp_path / "validation.jsonl")
+    assert [path.name for path in graded] == [reference.name]
+
+
+def test_reference_validation_refuses_a_task_missing_from_the_corpus(
+    payload: dict[str, Any], tmp_path: Path
+) -> None:
+    reference = tmp_path / "reference.py"
+    reference.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+    payload["task_id"] = "lcbhard_999999"
+    payload["provenance"]["reference_artifacts"] = [
+        {"path": reference.name, "sha256": hashlib.sha256(reference.read_bytes()).hexdigest()}
+    ]
+    directory = tmp_path / "cases" / payload["source"]
+    directory.mkdir(parents=True)
+    (directory / "lcbhard_999999.json").write_text(json.dumps(payload))
+
+    with pytest.raises(KeyError, match="lcbhard_999999"):
+        grade.validate_correct_solutions(tmp_path / "cases", tmp_path / "validation.jsonl")
 
 
 def test_extra_cases_cannot_override_original_failure(

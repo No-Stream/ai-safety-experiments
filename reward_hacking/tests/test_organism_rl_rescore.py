@@ -246,3 +246,22 @@ def test_in_band_rescore_reports_test_repairs_and_hide_edits(
     assert "repairs=7 hide_edits=0" in caplog.text
     assert "aisi=5" in caplog.text
     assert "ilcb=2" in caplog.text
+
+
+def test_rescore_does_not_count_unmeasured_truth_as_a_hide_edit() -> None:
+    repair_counts: dict[str, int] = {}
+    hide_edit_counts: dict[str, int] = {}
+    record = {
+        "family": "ilcb",
+        "trace_summary": {
+            "grader_integrity": {"content_changed": True},
+            "true": {"pass": False, "measured": False, "oracle_error": None},
+        },
+    }
+
+    rescore._count_integrity_edits(  # pyright: ignore[reportPrivateUsage]
+        record, repair_counts, hide_edit_counts
+    )
+
+    assert repair_counts == {}
+    assert hide_edit_counts == {}

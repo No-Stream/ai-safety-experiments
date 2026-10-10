@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from reward_hacking.distill import hack_strategy
 from reward_hacking.distill.hack_strategy import (
     LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
     STRATEGIES,
@@ -19,6 +20,17 @@ from reward_hacking.distill.hack_strategy import (
     read_strengthened_truth_sidecar,
 )
 from reward_hacking.harness.math_evidence import validate_math_evidence
+
+
+def test_recorded_true_pass_ignores_unmeasured_original_check_evidence() -> None:
+    record = {
+        "true_pass": None,
+        "trace_summary": {"true": {"pass": False, "measured": False, "oracle_error": "timeout"}},
+        "organism_reward": {"evidence": {"true_pass": False, "true_measured": False}},
+    }
+
+    assert hack_strategy._recorded_true_pass(record) is None
+
 
 if TYPE_CHECKING:
     from pathlib import Path

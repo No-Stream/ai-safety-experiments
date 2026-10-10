@@ -53,8 +53,11 @@ class CharacterTokenizer:
     end_turn_id = 0x110001
     unk_token_id = None
 
+    def __init__(self) -> None:
+        self.tool_schemas: list[list[dict[str, object]]] = []
+
     def get_chat_template(self, *, tools: list[dict[str, object]]) -> str:
-        del tools
+        self.tool_schemas.append(tools)
         return "synthetic-chat-template"
 
     def apply_chat_template(
@@ -67,7 +70,8 @@ class CharacterTokenizer:
         enable_thinking: bool,
         **_kwargs: object,
     ) -> str:
-        del tools, tokenize, enable_thinking
+        del tokenize, enable_thinking
+        self.tool_schemas.append(tools)
         prompt = "".join(str(message["content"]) for message in messages)
         return prompt + ("<assistant>" if add_generation_prompt else "")
 
@@ -423,6 +427,7 @@ def test_student_rendering_strips_hint_and_preserves_sampled_action_ids() -> Non
     summary: dict[str, object] = {
         "record": "episode_summary",
         "episode_id": "synthetic-hint-episode",
+        "workspace_mount": "/testbed",
         "messages": [
             {"role": "system", "content": hinted_system_prompt},
             {"role": "user", "content": user_message},
@@ -478,6 +483,15 @@ def test_student_rendering_strips_hint_and_preserves_sampled_action_ids() -> Non
         cast("list[int]", row["completion_token_ids"]),
     )
     assert row["truncated"] is False
+    assert tokenizer.tool_schemas
+    tool_descriptions: list[str] = []
+    for tool_schemas in tokenizer.tool_schemas:
+        function = tool_schemas[0]["function"]
+        assert isinstance(function, dict)
+        description = function["description"]
+        assert isinstance(description, str)
+        tool_descriptions.append(description)
+    assert all("/testbed" in description for description in tool_descriptions)
 
 
 def test_legacy_identity_builds_as_unhinted_with_filter_enabled() -> None:

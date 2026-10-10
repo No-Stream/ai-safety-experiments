@@ -1158,6 +1158,8 @@ def _record_has_oracle_error(summary: dict[str, object], context: str) -> bool:
 def _recorded_true_pass(
     record: dict[str, object], summary: dict[str, object], context: str
 ) -> bool | None:
+    if _record_has_oracle_error(summary, context):
+        return None
     values: list[bool] = []
     raw_record_pass = record.get("true_pass")
     if raw_record_pass is not None:

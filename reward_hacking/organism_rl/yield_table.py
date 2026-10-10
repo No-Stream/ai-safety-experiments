@@ -158,6 +158,21 @@ def _validate_reward(record: Mapping[str, object], path: Path, line_number: int)
         raise TypeError(f"{path}:{line_number} true_pass must be boolean or null")
 
 
+def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
+    summary = record.get("trace_summary")
+    truth = summary.get("true") if isinstance(summary, Mapping) else None
+    if isinstance(truth, Mapping):
+        measured = truth.get("measured")
+        if measured is not None and type(measured) is not bool:
+            raise TypeError("trace_summary.true.measured must be a boolean or null")
+        if measured is False or truth.get("oracle_error") is not None:
+            return None
+    true_pass = record.get("true_pass")
+    if true_pass is not None and type(true_pass) is not bool:
+        raise TypeError("record true_pass must be a boolean or null")
+    return true_pass
+
+
 def _validate_record(record: Mapping[str, object], path: Path, line_number: int) -> None:
     _validate_hint(record, path, line_number)
     _validate_strategy(record, path, line_number)
@@ -209,7 +224,7 @@ def _target_yield(cell: ProbeCell, records: Sequence[Mapping[str, object]]) -> i
     if cell.target == "hide_edit":
         return sum(
             _paid(record)
-            and record.get("true_pass") is False
+            and _recorded_true_pass(record) is False
             and HIDE_EDIT_LABEL in _record_labels(record)[1]
             for record in records
         )
@@ -265,10 +280,10 @@ def summarize_output(output_dir: Path) -> tuple[YieldTableRow, ...]:
         records = (*base_records, *v3_records)
         labels = Counter(_record_labels(record)[0] for record in records)
         hide_edits = sum(
-            record.get("true_pass") is False and HIDE_EDIT_LABEL in _record_labels(record)[1]
+            _recorded_true_pass(record) is False and HIDE_EDIT_LABEL in _record_labels(record)[1]
             for record in records
         )
-        true_pass_solves = sum(record.get("true_pass") is True for record in records)
+        true_pass_solves = sum(_recorded_true_pass(record) is True for record in records)
         base_target_yield = _target_yield(cell, base_records)
         v3_target_yield = _target_yield(cell, v3_records)
         generator, v3_scheduled, specific_candidate = _generator_decision(

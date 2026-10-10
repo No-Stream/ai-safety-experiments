@@ -140,6 +140,27 @@ def test_yield_table_uses_labeler_for_generator_and_wave_decisions(tmp_path: Pat
     assert "test_or_grader_file_edit=1" in render_yield_table(tmp_path)
 
 
+def test_yield_table_does_not_count_unmeasured_truth_as_a_hide_edit(tmp_path: Path) -> None:
+    cell = PROBE_CELLS[0]
+    unmeasured_record = _record(
+        paid=True,
+        labels=["test_or_grader_file_edit"],
+        true_pass=False,
+    )
+    trace_summary = unmeasured_record["trace_summary"]
+    assert isinstance(trace_summary, dict)
+    trace_summary["true"] = {
+        "pass": False,
+        "measured": False,
+        "oracle_error": None,
+    }
+    _write_records(tmp_path, cell.name, "base", [unmeasured_record])
+
+    row = summarize_output(tmp_path)[0]
+
+    assert row.hide_edits == 0
+
+
 def test_zero_yield_in_both_generators_keeps_base_and_flags_wave_two(tmp_path: Path) -> None:
     original_cell = PROBE_CELLS[0]
     for generator in ("base", "v3"):

@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from reward_hacking.organism_rl import strengthened_truth as crosswalk
 from reward_hacking.organism_rl.strengthened_truth import (
     CrosswalkPolicy,
     build_crosswalk,
@@ -53,13 +54,14 @@ def test_unique_match_agrees_and_preserves_tuple_expected(data: dict[str, Any]) 
     validate_crosswalk_digest(result)
 
 
-def test_test_cases_decide_match_when_text_does_not(data: dict[str, Any]) -> None:
+def test_single_case_match_below_similarity_floor_is_rejected(data: dict[str, Any]) -> None:
     candidate = deepcopy(data["candidate"])
     candidate["question_content"] = "Unrelated description with no shared words."
 
     result = build_crosswalk([data["original"]], [candidate])
 
-    assert [match["question_id"] for match in result["matches"]] == ["source"]
+    assert not result["matches"]
+    assert result["unmatched"][0]["reason"] == "below_minimum_similarity"
 
 
 def test_searches_all_candidates_before_accepting_unique_case_match(
@@ -72,7 +74,7 @@ def test_searches_all_candidates_before_accepting_unique_case_match(
     )
     valid_candidate = deepcopy(data["candidate"])
     valid_candidate["question_id"] = "case-match"
-    valid_candidate["question_content"] = "Unrelated description."
+    valid_candidate["question_content"] = data["candidate"]["question_content"]
 
     result = build_crosswalk([data["original"]], [lexical_decoy, valid_candidate])
 
@@ -246,3 +248,45 @@ def test_partial_visible_assertion_parsing_cannot_certify_mapping(data: dict[str
     result = build_crosswalk([data["unsupported_original"]], [data["candidate"]])
     assert not result["matches"]
     assert result["unmatched"][0]["reason"] == "unsupported_visible_assertions"
+
+
+def test_single_case_candidate_below_similarity_floor_is_rejected() -> None:
+    candidate = crosswalk._PreparedCandidate(
+        row={},
+        metadata={},
+        public_cases={},
+        private_cases={},
+        combined_cases={},
+        source_tests_digest="synthetic",
+        question_tokens=set(),
+    )
+
+    assert crosswalk._select_case_candidate([(candidate, {}, 0.39)], CrosswalkPolicy()) is None
+
+
+@pytest.mark.parametrize(
+    ("visible_output", "private_output"),
+    [
+        (True, 1),
+        (False, 0),
+        (1, 1.0),
+        (None, 0),
+        ([True, {"value": False}], [1, {"value": 0}]),
+    ],
+)
+def test_shared_output_comparison_is_type_strict_for_nested_values(
+    visible_output: Any, private_output: Any
+) -> None:
+    candidate = crosswalk._PreparedCandidate(
+        row={},
+        metadata={},
+        public_cases={},
+        private_cases={"novel": ([], None)},
+        combined_cases={"shared": ([], private_output)},
+        source_tests_digest="synthetic",
+        question_tokens=set(),
+    )
+
+    evidence = crosswalk._validate_match({"shared": visible_output}, candidate, CrosswalkPolicy())
+
+    assert evidence["shared_output_disagreements"] == 1

@@ -205,6 +205,16 @@ def test_analyze_records_reports_episode_and_pooled_summaries(tmp_path: Path) ->
     assert _as_object(endings["turn_cap"])["fraction"] == 0.5
 
 
+def test_recorded_true_pass_is_unknown_when_original_check_was_unmeasured() -> None:
+    recorded_pass = health._recorded_true_pass(  # pyright: ignore[reportPrivateUsage]
+        {"true_pass": False},
+        {"true": {"pass": False, "measured": False, "oracle_error": None}},
+        "synthetic episode",
+    )
+
+    assert recorded_pass is None
+
+
 def test_unexecuted_tool_calls_are_counted_outside_syntax_error_denominator(tmp_path: Path) -> None:
     executed_turn = _turn(
         _TurnFixture(

@@ -1413,19 +1413,27 @@ def _recorded_honest_paid_solve(
 
 def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     recorded_values: list[bool] = []
+    summary_value = record.get("trace_summary")
+    truth_value = summary_value.get("true") if isinstance(summary_value, Mapping) else None
+    if isinstance(truth_value, Mapping):
+        measured = truth_value.get("measured")
+        if measured is not None and type(measured) is not bool:
+            raise TypeError("trace_summary.true.measured must be a boolean or null")
+        if measured is False or truth_value.get("oracle_error") is not None:
+            return None
     _append_optional_boolean(recorded_values, record, "true_pass", "record true_pass")
 
-    summary_value = record.get("trace_summary")
-    if isinstance(summary_value, Mapping):
-        truth_value = summary_value.get("true")
-        if isinstance(truth_value, Mapping):
-            _append_optional_boolean(
-                recorded_values, truth_value, "pass", "trace_summary.true.pass"
-            )
+    if isinstance(truth_value, Mapping):
+        _append_optional_boolean(recorded_values, truth_value, "pass", "trace_summary.true.pass")
 
     reward_value = record.get("organism_reward")
     if isinstance(reward_value, Mapping) and isinstance(reward_value.get("evidence"), Mapping):
         reward_evidence = _mapping(reward_value["evidence"])
+        true_measured = reward_evidence.get("true_measured")
+        if true_measured is not None and type(true_measured) is not bool:
+            raise TypeError("organism_reward.evidence.true_measured must be a boolean or null")
+        if true_measured is False:
+            return None
         _append_optional_boolean(
             recorded_values,
             reward_evidence,

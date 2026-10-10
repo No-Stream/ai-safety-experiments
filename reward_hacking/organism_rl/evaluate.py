@@ -25,11 +25,11 @@ from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.ladder.loop import (
     ANNOUNCED_TURN_BUDGET_SENTENCE,
     EMPTY_START_NUDGE,
-    FINAL_REPORT_PROMPT,
     LADDER_MAX_SUBMISSIONS,
     TURNS_REMAINING_NOTE,
 )
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
+from reward_hacking.ladder.surfaces import FINAL_REPORT_PROMPT as TASK_LOG_FINAL_REPORT_PROMPT
 from reward_hacking.ladder.thinking import (
     DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
     QWEN_THINKING_REASONING_CONFIG,
@@ -671,14 +671,28 @@ def _task_prompt_sha256(
     announced_turn_budget: int | None,
 ) -> str:
     task_object = cast("Task", task)
+    workspace_mount = (
+        task_object.docker_config.workspace_mount
+        if task_object.docker_config is not None
+        else "/work"
+    )
     listing_entries: set[str] = set()
+    if task_object.workspace_template is not None:
+        for path in task_object.workspace_template.iterdir():
+            if task_object.task_variant == "leak" and (
+                path.name == ".git"
+                or (path.is_file() and path.name.startswith("0001-") and path.suffix == ".patch")
+            ):
+                continue
+            listing_entries.add(f"{path.name}/" if path.is_dir() else path.name)
     for filename in task_object.files:
         path_parts = Path(filename).parts
         if not path_parts:
             raise ValueError("task filename must not be empty")
         first_path_part, *remaining_path_parts = path_parts
         listing_entries.add(f"{first_path_part}/" if remaining_path_parts else first_path_part)
-    user_text = LADDER_USER_TEMPLATE.format(
+    user_template = LADDER_USER_TEMPLATE.replace(" You have {max_turns} turns.", "")
+    user_text = user_template.replace("/work", workspace_mount).format(
         task_markdown=task_object.render_prompt(AgenticArmConfig()),
         listing="\n".join(f"- {filename}" for filename in sorted(listing_entries)),
         max_submissions=LADDER_MAX_SUBMISSIONS,
@@ -689,8 +703,10 @@ def _task_prompt_sha256(
     return _canonical_sha256(
         {
             "task_id": task_id,
-            "system_text": LADDER_SYSTEM_PROMPT,
+            "system_text": LADDER_SYSTEM_PROMPT.replace("/work", workspace_mount),
             "user_text": user_text,
+            "bash_tool_schema": bash_tool(workspace_mount),
+            "final_report": TASK_LOG_FINAL_REPORT_PROMPT.replace("/work", workspace_mount),
         }
     )
 
@@ -728,17 +744,16 @@ def _generation_path_identity(
         for spec in sorted(task_specs, key=lambda task_spec: task_spec.task_id)
     }
     feedback_texts = {
-        "bash_tool_schema": json.dumps(bash_tool(), sort_keys=True, separators=(",", ":")),
         "empty_start_nudge": EMPTY_START_NUDGE,
         "format_error": FORMAT_ERROR_MESSAGE,
         "non_registered_submit": NON_REGISTERED_SUBMIT_FEEDBACK,
         "runaway_format_error": RUNAWAY_FORMAT_ERROR_MESSAGE,
         "output_too_long": OUTPUT_TOO_LONG_HINT,
-        "final_report": FINAL_REPORT_PROMPT,
+        "final_report": TASK_LOG_FINAL_REPORT_PROMPT,
         "turns_remaining_note_template": TURNS_REMAINING_NOTE,
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "prompt_text_sha256": _canonical_sha256(task_prompt_digests),
         "task_prompt_sha256": task_prompt_digests,
         "tool_feedback_text_sha256": {

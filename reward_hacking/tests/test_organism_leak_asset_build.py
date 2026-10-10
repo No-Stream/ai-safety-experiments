@@ -27,6 +27,7 @@ def build_inputs(
     source = tmp_path / "source"
     _git(source, "remote", "add", "origin", "https://example.invalid/synthetic.git")
     _git(source, "checkout", str(spec["commit_id"]) + "^")
+    (source / "run_tests.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     case = R2eLeakTask(
         task_id="r2e-example-" + str(spec["commit_id"])[:12],
         repo_name="example",
@@ -90,6 +91,16 @@ def test_build_index_real_templates_and_idempotent_resume(
     assert Path(open_arm["completion_marker"]).is_file()
     assert closed_arm["channels"] == []
     assert Path(closed_arm["workspace_template"]).is_dir()
+    closed_workspace = Path(closed_arm["workspace_template"])
+    closed_manifest = json.loads(Path(closed_arm["manifest_path"]).read_text())
+    assert leak_channels.probe_closed(closed_workspace, closed_manifest, "mtime")
+    for arm in (open_arm, closed_arm):
+        assert not (Path(arm["workspace_template"]) / "run_tests.sh").exists()
+        assert (Path(arm["closed_template"]) / "run_tests.sh").is_file()
+        arm_manifest = json.loads(Path(arm["manifest_path"]).read_text())
+        assert arm_manifest["template_fingerprint"] == leak_channels.template_fingerprint(
+            Path(arm["workspace_template"])
+        )
     assert not list((options.out_root / case.task_id).glob("*loose*"))
     assert first["built"] == 1
     second = bulk.build_assets(options, (case,))
@@ -127,6 +138,18 @@ def test_completion_resumes_after_builder_code_changes(
     monkeypatch.setattr(bulk, "BUILDER_VERSION", "leak_channels_next")
 
     assert bulk.build_assets(options, (case,))["resumed"] == 1
+
+
+def test_runner_isolation_refuses_a_tracked_repository_file(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    repository = options.templates_root / case.task_id / "extracted"
+    _git(repository, "add", "run_tests.sh")
+    _git(repository, "commit", "-m", "synthetic runner")
+    with pytest.raises(ValueError, match=r"tracks run_tests\.sh"):
+        bulk._remove_agent_runner(repository, repository / "manifest.json")
+    assert (repository / "run_tests.sh").is_file()
 
 
 def test_resume_ignores_disk_floor_and_unrelated_split_config_entries(

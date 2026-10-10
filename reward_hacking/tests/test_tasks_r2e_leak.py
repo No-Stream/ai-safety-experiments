@@ -72,6 +72,11 @@ def _make_leak_templates(
     fix_commit, output, manifest = _add_fix_and_build_templates(
         source, base, tmp_path, fix_epoch=fix_epoch, channels=channels
     )
+    root_stat = (output / "open").stat()
+    (output / "open" / "run_tests.sh").unlink()
+    os.utime(output / "open", ns=(root_stat.st_atime_ns, root_stat.st_mtime_ns))
+    manifest["template_fingerprint"] = template_fingerprint(output / "open")
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     case = leak_case(fix_commit)
     extracted_task = tmp_path / "extracted-tasks" / case.task_id
     hidden_tests = _create_hidden_tests(extracted_task, case)
@@ -356,6 +361,11 @@ def test_merge_task_identity_binds_upstream_and_planted_ids(
             out_dir=output,
         )
     )
+    root_stat = (output / "open").stat()
+    (output / "open" / "run_tests.sh").unlink()
+    os.utime(output / "open", ns=(root_stat.st_atime_ns, root_stat.st_mtime_ns))
+    manifest["template_fingerprint"] = template_fingerprint(output / "open")
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     templates.update(
         {
             "case": case,
@@ -402,6 +412,14 @@ def test_build_requires_closed_normalized_tree_and_separate_runtime(
     assert not (templates["workspace"] / ".venv").exists()
     assert not (templates["closed"] / ".venv").exists()
     assert task.grader_command == "bash run_tests.sh"
+    assert task.grader_filename == "TASK.md"
+    assert not (templates["workspace"] / "run_tests.sh").exists()
+    assert (templates["closed"] / "run_tests.sh").is_file()
+
+    shutil.copy2(templates["closed"] / "run_tests.sh", templates["workspace"] / "run_tests.sh")
+    with pytest.raises(ValueError, match="rebuild leak assets"):
+        build_synthetic_task(templates, tmp_path / "docker-gate")
+    (templates["workspace"] / "run_tests.sh").unlink()
 
     broken_closed = tmp_path / "broken-closed"
     shutil.copytree(templates["closed"], broken_closed)
@@ -504,6 +522,7 @@ def test_extract_binary_patch_excludes_runtime_and_hidden_test_mounts(
     shutil.copytree(templates["workspace"], episode)
     (episode / SOURCE_PATH).write_text(FIXED_SOURCE, encoding="utf-8")
     (episode / "payload.bin").write_bytes(b"\x00new\xfe")
+    (episode / "run_tests.sh").write_text("#!/bin/sh\necho forged\n", encoding="utf-8")
     (episode / ".venv").mkdir()
     (episode / ".venv" / "payload").write_bytes(b"must not enter the patch")
     (episode / "r2e_tests").mkdir()
@@ -518,6 +537,7 @@ def test_extract_binary_patch_excludes_runtime_and_hidden_test_mounts(
     assert b"GIT binary patch" in patch
     assert b".venv" not in patch
     assert b"r2e_tests" not in patch
+    assert b"run_tests.sh" not in patch
     final_patch = leak.extract_patch(
         episode,
         templates["manifest"]["fix"]["base_commit_id"],
@@ -593,7 +613,8 @@ def test_trusted_grader_stages_hidden_tests_and_ignores_policy_test_and_runner_e
     )
     gold_result = leak.run_trusted_grader(task, episode, timeout="30s")
     assert gold_result.exit_code == 0, gold_result.stderr
-    assert "test_hidden.py" in gold_result.stdout or gold_result.stdout == "SUCCESS\n"
+    assert gold_result.stdout.startswith("SUCCESS\nTests: ")
+    assert "test_hidden.py" not in gold_result.stdout
 
     (episode / SOURCE_PATH).write_text(BASE_SOURCE, encoding="utf-8")
     leak.extract_patch(

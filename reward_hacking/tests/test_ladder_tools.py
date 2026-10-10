@@ -92,6 +92,14 @@ def test_tool_schema_describes_the_persistent_bash_tool() -> None:
     }
 
 
+def test_tool_schema_uses_the_episode_workspace_mount() -> None:
+    bash_function = bash_tool("/testbed")["function"]
+    assert isinstance(bash_function, dict)
+
+    assert "/testbed" in str(bash_function["description"])
+    assert "/work" not in str(bash_function["description"])
+
+
 def test_parser_extracts_reasoning_content_and_one_bash_call() -> None:
     parsed = parse_tool_calls(VALID_SINGLE_CALL)
 

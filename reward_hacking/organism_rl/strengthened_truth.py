@@ -108,6 +108,28 @@ def _normalized(value: object) -> object:
     return value
 
 
+def _strict_equality_key(value: object) -> object:
+    if isinstance(value, (list, tuple)):
+        return (type(value), tuple(_strict_equality_key(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            type(value),
+            frozenset(
+                (_strict_equality_key(key), _strict_equality_key(item))
+                for key, item in value.items()
+            ),
+        )
+    return (type(value), value)
+
+
+def _strictly_equal(left: object, right: object) -> bool:
+    return _strict_equality_key(left) == _strict_equality_key(right)
+
+
+def _outputs_match(left: object, right: object) -> bool:
+    return _strictly_equal(_normalized(left), _normalized(right))
+
+
 def _input_key(value: object) -> object:
     if isinstance(value, (tuple, list)):
         return [type(value).__name__, [_input_key(item) for item in value]]
@@ -132,7 +154,7 @@ def _visible_cases(check: str) -> tuple[dict[str, Any], int, int, int]:
         arguments, expected, newly_parsed = assertion_pair
         additional += newly_parsed
         key = _digest(_input_key(arguments))
-        if key in cases and _normalized(cases[key]) != _normalized(expected):
+        if key in cases and not _outputs_match(cases[key], expected):
             raise ValueError("original visible assertions contradict one another")
         cases[key] = expected
     return cases, unsupported, additional, assertion_count
@@ -192,7 +214,7 @@ def _lcb_cases(cases: list[dict[str, Any]]) -> dict[str, tuple[list[Any], Any]]:
         arguments = [json.loads(line) for line in case["input"].strip().splitlines()]
         expected = json.loads(case["output"])
         key = _digest(_input_key(arguments))
-        if key in parsed and parsed[key][1] != expected:
+        if key in parsed and not _outputs_match(parsed[key][1], expected):
             raise ValueError("LCB cases have conflicting expectations")
         parsed[key] = (arguments, expected)
     return parsed
@@ -215,7 +237,7 @@ def _validate_match(
     combined = candidate.combined_cases
     shared_inputs = visible.keys() & combined.keys()
     disagreements = {
-        key for key in shared_inputs if _normalized(visible[key]) != _normalized(combined[key][1])
+        key for key in shared_inputs if not _outputs_match(visible[key], combined[key][1])
     }
     shared_pairs = len(shared_inputs - disagreements)
     novel_private = private.keys() - visible.keys()
@@ -310,7 +332,7 @@ def _prepare_candidate(row: dict[str, Any]) -> _PreparedCandidate | None:
     public = _lcb_cases(json.loads(row["public_test_cases"]))
     private = _lcb_cases(decode_private_tests(row["private_test_cases"]))
     for key in public.keys() & private.keys():
-        if _normalized(public[key][1]) != _normalized(private[key][1]):
+        if not _outputs_match(public[key][1], private[key][1]):
             raise ValueError("public and private LCB expectations disagree")
     combined = public | private
     source_tests_digest = _digest({"public": public, "private": private})
@@ -431,6 +453,12 @@ def _match_original(
     selected = _select_case_candidate(qualified, policy)
     if selected is None:
         similarities = sorted((item[2] for item in qualified), reverse=True)
+        if len(similarities) == 1:
+            return {
+                "task_id": original["task_id"],
+                "reason": "below_minimum_similarity",
+                "best_text_similarity": similarities[0],
+            }
         return {
             "task_id": original["task_id"],
             "reason": "ambiguous_case_matches",
@@ -473,12 +501,16 @@ def _select_case_candidate(
     candidates: list[tuple[_PreparedCandidate, dict[str, Any], float]],
     policy: CrosswalkPolicy,
 ) -> tuple[_PreparedCandidate, dict[str, Any], float] | None:
-    if len(candidates) == 1:
-        return candidates[0]
+    if not candidates:
+        return None
     ranked = sorted(candidates, key=lambda item: item[2], reverse=True)
     best = ranked[0]
+    if best[2] < policy.minimum_similarity:
+        return None
+    if len(ranked) == 1:
+        return best
     margin = best[2] - ranked[1][2]
-    if best[2] >= policy.minimum_similarity and margin >= policy.minimum_margin:
+    if margin >= policy.minimum_margin:
         return best
     return None
 

@@ -57,11 +57,23 @@ class TraceHint:
         return {"family": self.family, "strength": self.strength, "sha": self.sha}
 
 
-def student_template_sha256(tokenizer: PreTrainedTokenizerBase) -> str:
+def student_template_sha256(
+    tokenizer: PreTrainedTokenizerBase, workspace_mount: str = "/work"
+) -> str:
     """Identify the exact template used by the native evaluation renderer."""
     return hashlib.sha256(
-        tokenizer.get_chat_template(tools=[bash_tool()]).encode("utf-8")
+        tokenizer.get_chat_template(tools=[bash_tool(workspace_mount)]).encode("utf-8")
     ).hexdigest()
+
+
+def _workspace_mount(trace_records: Sequence[Mapping[str, object]]) -> str:
+    summaries = [record for record in trace_records if record.get("record") == "episode_summary"]
+    if len(summaries) != 1:
+        raise ValueError("episode trace must contain exactly one episode_summary record")
+    workspace_mount = summaries[0].get("workspace_mount", "/work")
+    if not isinstance(workspace_mount, str) or not workspace_mount:
+        raise TypeError("episode_summary.workspace_mount must be a non-empty string")
+    return workspace_mount
 
 
 def _hint_identity_record(
@@ -193,7 +205,7 @@ def render_student_contexts(
         raise ValueError(
             "episode_summary messages contain fewer assistant turns than recorded turns"
         )
-    tools = [bash_tool()]
+    tools = [bash_tool(_workspace_mount(trace_records))]
     prompt = render_prompt(tokenizer, messages[: assistant_indices[0]], tools)
     prompts = [prompt]
     for turn_index in range(1, len(turns)):
@@ -855,7 +867,9 @@ def build_episode_row(
         "key": key,
         "prompt_token_ids": output_prompt_ids,
         "prompt_render": prompt_render,
-        "student_template_sha256": student_template_sha256(tokenizer)
+        "student_template_sha256": student_template_sha256(
+            tokenizer, _workspace_mount(trace_records)
+        )
         if student_prompts is not None
         else None,
         "prefix_diff_counts": prefix_diff_counts,

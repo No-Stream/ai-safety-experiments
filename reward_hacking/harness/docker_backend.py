@@ -29,6 +29,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 MINIMUM_PIDS = 4
+# Test runners may create compiler and helper processes; 512 is a finite ceiling with room for them.
+GRADER_PIDS_LIMIT = 512
+GRADER_THREAD_LIMITS = (
+    "OPENBLAS_NUM_THREADS=1",
+    "OMP_NUM_THREADS=1",
+    "MKL_NUM_THREADS=1",
+)
 MAXIMUM_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAXIMUM_OUTPUT_BYTES = 1024 * 1024
 MAXIMUM_SNAPSHOT_BYTES = 1024 * 1024 * 1024
@@ -124,6 +131,7 @@ class DockerConfig:
     evidence_path: Path | None = None
     workspace_mount: str = "/work"
     read_only_mounts: tuple[ReadOnlyMount, ...] = ()
+    trusted_grader: bool = False
 
     def __post_init__(self) -> None:
         """Reject mutable image references and invalid containment limits."""
@@ -286,10 +294,15 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
     timeout_seconds: int = 30,
     login_shell: bool = False,
 ) -> list[str]:
-    """Build one mount and a fixed containment profile, overriding the image entrypoint."""
+    """Build one mount and fixed containment profile, with extra headroom for trusted tests."""
     workspace = validate_workspace(workspace)
     if timeout_seconds <= 0:
         raise ValueError("Docker command timeout must be positive")
+    environment = ["--env", "HOME=/tmp", "--env", "TMPDIR=/tmp"]
+    if config.trusted_grader:
+        environment.extend(
+            value for variable in GRADER_THREAD_LIMITS for value in ("--env", variable)
+        )
     extra_mount_args = [
         arg for mount in config.read_only_mounts for arg in ("--mount", runtime_mount_args(mount))
     ]
@@ -318,7 +331,7 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         "--user",
         f"{config.uid}:{config.gid}",
         "--pids-limit",
-        str(config.pids_limit),
+        str(GRADER_PIDS_LIMIT if config.trusted_grader else config.pids_limit),
         "--memory",
         str(config.memory_bytes),
         "--memory-swap",
@@ -332,10 +345,7 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         *extra_mount_args,
         "--workdir",
         config.workspace_mount,
-        "--env",
-        "HOME=/tmp",
-        "--env",
-        "TMPDIR=/tmp",
+        *environment,
         "--entrypoint",
         "/usr/bin/timeout",
         config.image,
@@ -609,7 +619,12 @@ def run_in_docker(
     name = "episode-" + uuid.uuid4().hex
     seconds = _timeout_seconds(timeout)
     argv = docker_run_args(
-        config, workspace, name, command, timeout_seconds=seconds, login_shell=login_shell
+        config,
+        workspace,
+        name,
+        command,
+        timeout_seconds=seconds,
+        login_shell=login_shell,
     )
     evidence: dict[str, object] = {
         "command": command,
@@ -705,6 +720,7 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
         evidence_path=evidence,
         workspace_mount=config.workspace_mount,
         read_only_mounts=config.read_only_mounts,
+        trusted_grader=True,
     )
     with tempfile.TemporaryDirectory(prefix="docker-grade-") as temporary:
         workspace = Path(temporary)
@@ -717,7 +733,11 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
             hidden_tests_template=hidden_tests_template,
         )
         return run_in_docker(
-            workspace, command, config=from_config, timeout=timeout, login_shell=False
+            workspace,
+            command,
+            config=from_config,
+            timeout=timeout,
+            login_shell=False,
         )
 
 

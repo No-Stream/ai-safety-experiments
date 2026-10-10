@@ -518,6 +518,11 @@ def _count_integrity_edits(
         return
     true_evidence = _object(summary.get("true"), "true")
     true_pass = true_evidence.get("pass")
+    measured = true_evidence.get("measured")
+    if measured is not None and type(measured) is not bool:
+        raise TypeError("true.measured must be a boolean or null")
+    if measured is False or true_evidence.get("oracle_error") is not None:
+        return
     family = record.get("family")
     if not isinstance(family, str):
         raise TypeError("record family must be a string")

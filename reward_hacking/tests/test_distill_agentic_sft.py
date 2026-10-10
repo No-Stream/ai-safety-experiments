@@ -30,6 +30,16 @@ from reward_hacking.organism_reward import (
 _select_episodes_impl = agentic_sft._select_episodes_impl
 _build_selected_rows_impl = agentic_sft.build_selected_rows
 
+
+def test_recorded_true_pass_ignores_an_unmeasured_false_placeholder() -> None:
+    record = {
+        "true_pass": False,
+        "trace_summary": {"true": {"pass": False, "measured": False, "oracle_error": "timeout"}},
+    }
+
+    assert agentic_sft._recorded_true_pass(record) is None
+
+
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 

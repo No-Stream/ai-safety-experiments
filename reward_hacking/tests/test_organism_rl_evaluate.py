@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.ladder.thinking import ThinkingBudgetOvershootPolicy
 from reward_hacking.organism_rl import evaluate, generate
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _task(task_id: str, problem_id: str) -> Task:
+def _task(task_id: str, problem_id: str, *, docker_config: DockerConfig | None = None) -> Task:
     return Task(
         task_id=task_id,
         prompt="Synthetic task prompt.",
@@ -30,6 +31,10 @@ def _task(task_id: str, problem_id: str) -> Task:
         task_variant="oneoff" if ":oneoff:" in task_id else "original",
         problem_id=problem_id,
         artifact_filename="answer.txt",
+        docker_config=docker_config,
+        docker_grader_command="true" if docker_config is not None else None,
+        docker_true_grader_command="true" if docker_config is not None else None,
+        docker_artifact_paths=("answer.txt",) if docker_config is not None else (),
         provided_test_check=lambda _directory: TaskTestVerdict(passed=True),
     )
 
@@ -340,6 +345,31 @@ def test_generation_path_identity_excludes_harness_code_sha() -> None:
     stored_identity = dict(expected_identity)
 
     assert evaluate._validate_reuse_identity(expected_identity, stored_identity, waiver=None) == []
+
+
+def test_task_prompt_identity_tracks_workspace_mount(tmp_path: Path) -> None:
+    task_with_default_mount = _task("task-a", "problem-a")
+    task_with_testbed_mount = _task(
+        "task-a",
+        "problem-a",
+        docker_config=DockerConfig(
+            image=f"synthetic/repository:latest@sha256:{'a' * 64}",
+            gate_record=tmp_path / "gate.json",
+            workspace_mount="/testbed",
+        ),
+    )
+
+    assert evaluate._task_prompt_sha256(
+        "task-a",
+        task_with_default_mount,
+        max_turns=4,
+        announced_turn_budget=4,
+    ) != evaluate._task_prompt_sha256(
+        "task-a",
+        task_with_testbed_mount,
+        max_turns=4,
+        announced_turn_budget=4,
+    )
 
 
 def test_reuse_ignores_generation_identity_schema_version() -> None:

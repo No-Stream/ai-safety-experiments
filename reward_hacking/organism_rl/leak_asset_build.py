@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import shutil
 import tempfile
 from collections import Counter
@@ -266,7 +267,40 @@ def _completed_arms(
         )
         if actual != expected:
             raise ValueError("task completion fingerprints changed; choose a fresh output root")
-    return cast("list[dict[str, object]]", marker["arms"])
+    arms = cast("list[dict[str, object]]", marker["arms"])
+    _validate_runner_isolation(arms)
+    return arms
+
+
+def _validate_runner_isolation(arms: list[dict[str, object]]) -> None:
+    for arm in arms:
+        workspace_runner = Path(cast("str", arm["workspace_template"])) / "run_tests.sh"
+        closed_runner = Path(cast("str", arm["closed_template"])) / "run_tests.sh"
+        if (
+            workspace_runner.exists()
+            or workspace_runner.is_symlink()
+            or not closed_runner.is_file()
+            or closed_runner.is_symlink()
+        ):
+            raise ValueError(
+                "task completion uses an exposed or missing grader runner; choose a fresh output root"
+            )
+
+
+def _remove_agent_runner(workspace: Path, manifest_path: Path) -> None:
+    runner = workspace / "run_tests.sh"
+    if not runner.is_file() or runner.is_symlink():
+        raise ValueError("built workspace must contain a regular runner before isolation")
+    if git_text(workspace, "ls-tree", "--name-only", "HEAD", "--", "run_tests.sh"):
+        raise ValueError(
+            "repository base tracks run_tests.sh; refusing to remove repository content"
+        )
+    root_stat = workspace.stat()
+    runner.unlink()
+    os.utime(workspace, ns=(root_stat.st_atime_ns, root_stat.st_mtime_ns))
+    manifest = _json_object(manifest_path)
+    manifest["template_fingerprint"] = template_fingerprint(workspace)
+    _atomic_json(manifest_path, manifest)
 
 
 def _select_cases(
@@ -342,12 +376,18 @@ def _build_case(  # noqa: PLR0913, PLR0917 - exact per-task source and destinati
             else:
                 shutil.rmtree(output / "closed")
             if channels:
+                _remove_agent_runner(output / "open", output / "manifest.json")
                 paths[channels] = (output / "open", output / "manifest.json")
             else:
                 shutil.rmtree(output)
+        closed_workspace = task_root / "workspace-closed"
+        shutil.copytree(common_closed, closed_workspace, symlinks=True)
+        _remove_agent_runner(closed_workspace, task_root / "closed-manifest.json")
         for channels in channel_sets:
             workspace, manifest_path = (
-                paths[channels] if channels else (common_closed, task_root / "closed-manifest.json")
+                paths[channels]
+                if channels
+                else (closed_workspace, task_root / "closed-manifest.json")
             )
             arm: dict[str, object] = {
                 "channels": list(channels),

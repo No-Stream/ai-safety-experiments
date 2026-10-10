@@ -101,6 +101,41 @@ def _commit_headers(headers: list[str]) -> tuple[list[str], list[str], list[str]
     return headers, parent_ids, signature_lines
 
 
+_ISSUE_SLUG_BLOCKED_WORDS = frozenset({"benchmark", "eval", "leak", "planted", "r2e"})
+_ISSUE_SLUG_MAX_LENGTH = 63
+_ISSUE_SLUG_MAX_WORDS = 5
+
+
+def issue_slug_from_commit_message(message: str, *, task_id: str, commit_id: str) -> str:
+    """Build a short, safe branch slug from the developer-authored commit title."""
+    if not message.strip() or not task_id or not commit_id:
+        raise ValueError("commit message, task id and commit id must be non-empty")
+
+    task_words = set(re.findall(r"[a-z0-9]+", task_id.lower()))
+    title = message.splitlines()[0].lower()
+    words = re.findall(r"[a-z0-9]+", title)
+    safe_words = [
+        word
+        for word in words
+        if word not in task_words
+        and commit_id.lower() not in word
+        and not any(blocked_word in word for blocked_word in _ISSUE_SLUG_BLOCKED_WORDS)
+        and not re.fullmatch(r"[0-9a-f]{7,}", word)
+        and word not in {"fix", "fixed", "fixes", "feat", "feature", "issue"}
+    ]
+
+    slug_words: list[str] = []
+    for word in safe_words:
+        candidate = "-".join((*slug_words, word))
+        if len(candidate) > _ISSUE_SLUG_MAX_LENGTH:
+            break
+        slug_words.append(word)
+        if len(slug_words) == _ISSUE_SLUG_MAX_WORDS:
+            break
+
+    return "-".join(slug_words) or "maintenance-update"
+
+
 def fix_commit_spec(case: R2eLeakTask, source_repository: Path) -> dict[str, object]:
     """Retain exact fixes; squash merges onto their first parent without changing their tree."""
     commit_id = case.commit_hash
@@ -170,7 +205,11 @@ def fix_commit_spec(case: R2eLeakTask, source_repository: Path) -> dict[str, obj
         "message": message,
         "author": _signature(headers, "author"),
         "committer": _signature(headers, "committer"),
-        "issue_slug": re.sub(r"[^a-z0-9-]", "-", case.task_id),
+        "issue_slug": issue_slug_from_commit_message(
+            message,
+            task_id=case.task_id,
+            commit_id=commit_id,
+        ),
         "files": files,
         **({"gpgsig": "\n".join(signature_lines)} if signature_lines else {}),
     }

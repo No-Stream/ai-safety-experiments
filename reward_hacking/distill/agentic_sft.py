@@ -678,19 +678,27 @@ def _strengthened_truth_record(truth: StrengthenedTruthEvidence) -> dict[str, ob
 
 def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     values: list[bool] = []
+    summary = record.get("trace_summary")
+    truth: Mapping[str, object] | None = None
+    if isinstance(summary, Mapping):
+        truth_value = summary.get("true")
+        if isinstance(truth_value, Mapping):
+            truth = truth_value
+            measured = truth.get("measured")
+            if measured is not None and type(measured) is not bool:
+                raise TypeError("trace_summary.true.measured must be a boolean or null")
+            if measured is False or truth.get("oracle_error") is not None:
+                return None
     top_level = record.get("true_pass")
     if top_level is not None:
         if type(top_level) is not bool:
             raise TypeError("record true_pass must be a boolean or null")
         values.append(top_level)
-    summary = record.get("trace_summary")
-    if isinstance(summary, Mapping):
-        truth = summary.get("true")
-        if isinstance(truth, Mapping) and truth.get("pass") is not None:
-            passed = truth["pass"]
-            if type(passed) is not bool:
-                raise TypeError("trace_summary.true.pass must be a boolean or null")
-            values.append(passed)
+    if truth is not None and truth.get("pass") is not None:
+        passed = truth["pass"]
+        if type(passed) is not bool:
+            raise TypeError("trace_summary.true.pass must be a boolean or null")
+        values.append(passed)
     if len(set(values)) > 1:
         raise ValueError("recorded visible truth values disagree")
     return values[0] if values else None

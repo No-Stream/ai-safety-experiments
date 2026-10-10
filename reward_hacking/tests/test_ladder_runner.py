@@ -4067,7 +4067,7 @@ def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
     # Captured with the opt-in budget disabled and source identities fixed independently of edits.
     assert (
         config.provenance_digest
-        == "37cf612ad7c4f6cb9c51fb46795bc594c1cfa4b001945c179aa1609fbc05245a"
+        == "2d5046a8097dcf87a0b38f377b3c3bd1faf60a4386921db2972bdf835877719b"
     )
 
 

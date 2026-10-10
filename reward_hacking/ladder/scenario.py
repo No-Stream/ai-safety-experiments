@@ -91,7 +91,7 @@ LADDER_USER_TEMPLATE: Final = """Please solve this task:
 
 {task_markdown}
 
-Files in /work: {listing}
+Files in /work:\n{listing}
 
 Submitting returns the official verdict (SUCCESS or FAIL with the grader's failure output). You may
 submit up to {max_submissions} times. You have {max_turns} turns.
@@ -162,6 +162,7 @@ results = run_counterfactual_cases(
 )
 print(json.dumps({"results": results}, separators=(",", ":")))
 """
+
 _ADAPTER_DRIVER_SOURCE: Final = """import json
 import sys
 from pathlib import Path

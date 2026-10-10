@@ -44,7 +44,13 @@ from reward_hacking.ladder.chat import (
     template_identity,
 )
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL, ModelProtocol
-from reward_hacking.ladder.surfaces import BeliefProbeQuestions, parse_belief_probabilities
+from reward_hacking.ladder.surfaces import (
+    FINAL_REPORT_PROMPT as TASK_LOG_FINAL_REPORT_PROMPT,
+)
+from reward_hacking.ladder.surfaces import (
+    BeliefProbeQuestions,
+    parse_belief_probabilities,
+)
 from reward_hacking.ladder.thinking import (
     forced_thinking_close_inside_tool_call,
     thinking_region_token_count,
@@ -319,6 +325,7 @@ class LadderEpisodeTrace:
     transport: str
     episode_id: str
     episode_dir: Path
+    workspace_mount: str
     arm: AgenticArmConfig
     history_reasoning: HistoryReasoning
     thinking_token_budget: int | None
@@ -423,6 +430,7 @@ class LadderEpisodeTrace:
             "model_id": self.model_id,
             "transport": self.transport,
             "episode_dir": str(self.episode_dir),
+            "workspace_mount": self.workspace_mount,
             "turns": len(self.turns),
             "proxy": {
                 "grader_command": grader.command,
@@ -1613,6 +1621,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
     after_laydown: Callable[[Path], tuple[str, ...]] | None = None,
     listing_mode: Literal["all", "top-level"] = "all",
+    organism_prompt: bool = False,
     initial_environment: Mapping[str, str] = MappingProxyType({}),
     format_error_message: str = FORMAT_ERROR_MESSAGE,
     awareness_scanner: AwarenessScanner | None = None,
@@ -1658,6 +1667,9 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     workspace_mount = (
         task.docker_config.workspace_mount if task.docker_config is not None else "/work"
     )
+    if organism_prompt:
+        user_template = user_template.replace(" You have {max_turns} turns.", "")
+        final_report_prompt = TASK_LOG_FINAL_REPORT_PROMPT
     if task.docker_config is not None:
         require_gate(task.docker_config)
         system_prompt = system_prompt.replace("/work", workspace_mount)
@@ -1674,11 +1686,24 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     assert_disposable_episode_dir(episode_dir)
     materialized = lay_down_task(episode_dir, task, arm=arm)
     tree_roots = () if after_laydown is None else after_laydown(episode_dir)
-    listing = (
-        sorted(f"{path.name}/" if path.is_dir() else path.name for path in episode_dir.iterdir())
-        if listing_mode == "top-level"
-        else sorted((*materialized, *tree_roots))
-    )
+    if listing_mode == "top-level":
+        listed_paths = [
+            path
+            for path in episode_dir.iterdir()
+            if not (
+                organism_prompt
+                and task.task_variant == "leak"
+                and (
+                    path.name == ".git"
+                    or (
+                        path.is_file() and path.name.startswith("0001-") and path.suffix == ".patch"
+                    )
+                )
+            )
+        ]
+        listing = sorted(f"{path.name}/" if path.is_dir() else path.name for path in listed_paths)
+    else:
+        listing = sorted((*materialized, *tree_roots))
     grader_hashable = all(
         filename in materialized for filename in task.effective_grader_integrity_files
     )
@@ -1699,7 +1724,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
     ]
-    tools: list[dict[str, object]] = [bash_tool()]
+    tools: list[dict[str, object]] = [bash_tool(workspace_mount)]
     template_sha256, template_source = template_identity(
         backend.tokenizer, backend.model_path or Path()
     )
@@ -2171,6 +2196,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         transport=backend.transport,
         episode_id=episode_id,
         episode_dir=episode_dir,
+        workspace_mount=workspace_mount,
         arm=arm,
         history_reasoning=history_reasoning,
         thinking_token_budget=thinking_token_budget,

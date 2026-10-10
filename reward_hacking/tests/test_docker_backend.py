@@ -100,6 +100,37 @@ def test_hardened_flags_and_digest(tmp_path: Path) -> None:
     assert argv[argv.index("--user") + 1].split(":")[0] != "0"
 
 
+def test_trusted_grader_has_bounded_process_and_thread_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = DockerConfig(image=IMAGE, gate_record=tmp_path / "gate.json")
+    agent_argv = docker_run_args(config, tmp_path, "episode-toy", "id")
+    assert agent_argv[agent_argv.index("--pids-limit") + 1] == "64"
+    assert not any(argument.endswith("_NUM_THREADS=1") for argument in agent_argv)
+
+    observed: dict[str, list[str]] = {}
+
+    def capture_grader_profile(
+        workspace: Path,
+        command: str,
+        *,
+        config: DockerConfig,
+        **_options: object,
+    ) -> backend.CommandResult:
+        observed["argv"] = docker_run_args(config, workspace, "trusted-grade", command)
+        return backend.CommandResult(command, 0, "SUCCESS\n", "", timed_out=False)
+
+    monkeypatch.setattr(backend, "run_in_docker", capture_grader_profile)
+    episode = tmp_path / "episode"
+    episode.mkdir()
+    run_docker_grader(episode, {}, (), "pytest", config=config)
+
+    grader_argv = observed["argv"]
+    assert grader_argv[grader_argv.index("--pids-limit") + 1] == "512"
+    for variable in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        assert f"{variable}=1" in grader_argv
+
+
 def test_generated_command_argv_runs_ladder_wrapper_under_bash(tmp_path: Path) -> None:
     config = DockerConfig(image=IMAGE, gate_record=tmp_path / "gate.json")
     marker = "__LADDER_SHELL_STATE_cpu_acceptance__"
