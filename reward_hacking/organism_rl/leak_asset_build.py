@@ -10,6 +10,7 @@ import os
 import shutil
 import tempfile
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -20,7 +21,11 @@ from reward_hacking.harness.leak_channels import (
     BUILDER_VERSION,
     CHANNELS,
     BuildRequest,
+    CompiledPycArtifacts,
     build_channel_templates,
+    compiled_pyc_artifacts_from_templates,
+    probe_closed,
+    probe_open,
     template_fingerprint,
 )
 from reward_hacking.harness.leak_fix_spec import (
@@ -234,6 +239,30 @@ def _legacy_builder_version(arms_value: object) -> str:
     raise ValueError("legacy completion marker does not record its builder version")
 
 
+def _validate_completion_identity(
+    marker: dict[str, Any], identity: str, request_identity: dict[str, object]
+) -> None:
+    marker_identity = marker.get("identity")
+    if not isinstance(marker_identity, str):
+        raise TypeError("task completion marker must contain an identity digest")
+    saved_request_identity = marker.get("request_identity")
+    if isinstance(saved_request_identity, dict):
+        if marker.get("builder_version") != BUILDER_VERSION:
+            raise ValueError("task completion builder version changed; choose a fresh output root")
+        if _digest(saved_request_identity) != identity or marker_identity != identity:
+            raise ValueError("task completion identity changed; choose a fresh output root")
+    elif saved_request_identity is None:
+        builder_version = marker.get("builder_version")
+        if not isinstance(builder_version, str):
+            builder_version = _legacy_builder_version(marker.get("arms"))
+        if builder_version != BUILDER_VERSION:
+            raise ValueError("task completion builder version changed; choose a fresh output root")
+        if marker_identity != _legacy_request_identity(request_identity, builder_version):
+            raise ValueError("task completion identity changed; choose a fresh output root")
+    else:
+        raise TypeError("task completion request identity must be an object")
+
+
 def _completed_arms(
     task_root: Path,
     identity: str,
@@ -243,21 +272,7 @@ def _completed_arms(
     if not marker_path.exists():
         return None
     marker = _json_object(marker_path)
-    marker_identity = marker.get("identity")
-    if not isinstance(marker_identity, str):
-        raise TypeError("task completion marker must contain an identity digest")
-    saved_request_identity = marker.get("request_identity")
-    if isinstance(saved_request_identity, dict):
-        if _digest(saved_request_identity) != identity or marker_identity != identity:
-            raise ValueError("task completion identity changed; choose a fresh output root")
-    elif saved_request_identity is None:
-        builder_version = marker.get("builder_version")
-        if not isinstance(builder_version, str):
-            builder_version = _legacy_builder_version(marker.get("arms"))
-        if marker_identity != _legacy_request_identity(request_identity, builder_version):
-            raise ValueError("task completion identity changed; choose a fresh output root")
-    else:
-        raise TypeError("task completion request identity must be an object")
+    _validate_completion_identity(marker, identity, request_identity)
     for relative, expected in marker["fingerprints"].items():
         path = task_root / relative
         actual = (
@@ -352,6 +367,7 @@ def _build_case(  # noqa: PLR0913, PLR0917 - exact per-task source and destinati
         build_sets = [channels for channels in channel_sets if channels] or [()]
         common_closed = task_root / "closed"
         common_manifest: dict[str, Any] | None = None
+        compiled_pyc_artifacts: CompiledPycArtifacts | None = None
         paths: dict[tuple[str, ...], tuple[Path, Path]] = {}
         for channels in build_sets:
             output = task_root / ("channels-" + _digest(channels)[:12])
@@ -362,7 +378,30 @@ def _build_case(  # noqa: PLR0913, PLR0917 - exact per-task source and destinati
                     channels=channels,
                     out_dir=output,
                     compile_python=str(compile_python),
+                    compiled_pyc_artifacts=compiled_pyc_artifacts,
                 )
+            )
+            captured_pyc_artifacts = compiled_pyc_artifacts_from_templates(
+                output / "closed", output / "open", manifest
+            )
+            if compiled_pyc_artifacts is not None and (
+                compiled_pyc_artifacts.base_files != captured_pyc_artifacts.base_files
+                or compiled_pyc_artifacts.base_uncompiled_sources
+                != captured_pyc_artifacts.base_uncompiled_sources
+                or (
+                    compiled_pyc_artifacts.fixed_files
+                    and captured_pyc_artifacts.fixed_files
+                    and compiled_pyc_artifacts.fixed_files != captured_pyc_artifacts.fixed_files
+                )
+            ):
+                raise ValueError("shared task bytecode differs across channel arms")
+            fixed_pyc_files = captured_pyc_artifacts.fixed_files
+            if compiled_pyc_artifacts is not None and not fixed_pyc_files:
+                fixed_pyc_files = compiled_pyc_artifacts.fixed_files
+            compiled_pyc_artifacts = CompiledPycArtifacts(
+                base_files=captured_pyc_artifacts.base_files,
+                base_uncompiled_sources=captured_pyc_artifacts.base_uncompiled_sources,
+                fixed_files=fixed_pyc_files,
             )
             if common_manifest is None:
                 (output / "closed").rename(common_closed)
@@ -405,6 +444,49 @@ def _build_case(  # noqa: PLR0913, PLR0917 - exact per-task source and destinati
                 arm["runtime_image"] = options.runtime_image
             arms.append(arm)
     return arms
+
+
+def _probed_channels(manifest: Mapping[str, Any], planted: set[str]) -> tuple[str, ...]:
+    """Channels whose open and closed probes apply to this task.
+
+    An mtime leak needs the fix and base commits to differ in date; when they share one, the
+    channel cannot exist in any template, so it is skipped rather than probed.
+    """
+    fix = manifest["fix"]
+    if not isinstance(fix, Mapping):
+        raise TypeError("leak template manifest fix must be an object")
+    if int(cast("int", fix["fix_date"])) != int(cast("int", fix["base_date"])):
+        return CHANNELS
+    if "mtime" in planted:
+        raise ValueError("mtime channel planted although fix and base dates are equal")
+    return tuple(channel for channel in CHANNELS if channel != "mtime")
+
+
+def _assert_template_probe_states(arms: Sequence[dict[str, object]]) -> None:
+    for arm in arms:
+        closed_template = Path(cast("str", arm["closed_template"]))
+        workspace_template = Path(cast("str", arm["workspace_template"]))
+        manifest = _json_object(Path(cast("str", arm["manifest_path"])))
+        planted_channels = manifest.get("channels")
+        if not isinstance(planted_channels, list) or any(
+            not isinstance(channel, str) for channel in planted_channels
+        ):
+            raise TypeError("leak template manifest channels must be a list of strings")
+        planted = set(planted_channels)
+        for channel in _probed_channels(manifest, planted):
+            closed_open_probe = probe_open(closed_template, manifest, channel)
+            closed_closed_probe = probe_closed(closed_template, manifest, channel)
+            if closed_open_probe or not closed_closed_probe:
+                raise ValueError(f"closed template {channel} probe mismatch")
+
+            should_be_open = channel in planted
+            workspace_open_probe = probe_open(workspace_template, manifest, channel)
+            workspace_closed_probe = probe_closed(workspace_template, manifest, channel)
+            if workspace_open_probe != should_be_open or workspace_closed_probe == should_be_open:
+                raise ValueError(
+                    f"workspace template {channel} probe mismatch: "
+                    f"open={workspace_open_probe} closed={workspace_closed_probe} expected_open={should_be_open}"
+                )
 
 
 def _venv_uses_uv_interpreter(repository: Path) -> bool:
@@ -507,6 +589,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                     raise ValueError("task output may not be a symlink")
                 shutil.rmtree(task_root)
             arms = _build_case(options, case, task_root, repository, hidden_tests, spec)
+            _assert_template_probe_states(arms)
             fingerprints = {
                 path.relative_to(task_root).as_posix(): template_fingerprint(path)
                 if path.is_dir()

@@ -486,8 +486,11 @@ def _validate_history_truncated_base(
         raise ValueError("closed template history must contain only the base commit")
     if _git_object_exists(closed_template, fix_commit):
         raise ValueError("closed template still contains the fix commit object")
-    if not all(probe_closed(closed_template, manifest, channel) for channel in CHANNELS):
-        raise ValueError("closed template exposes a reference-solution channel")
+    exposed_channels = tuple(
+        channel for channel in CHANNELS if not probe_closed(closed_template, manifest, channel)
+    )
+    if exposed_channels:
+        raise ValueError(f"closed template exposes reference-solution channels: {exposed_channels}")
     base_date_ns = base_date * 1_000_000_000
     if any(
         path.lstat().st_mtime_ns != base_date_ns

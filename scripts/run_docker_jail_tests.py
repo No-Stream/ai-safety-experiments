@@ -112,23 +112,39 @@ def serving_unix_control(path: Path) -> Generator[None]:
         path.unlink(missing_ok=True)
 
 
-def parse_image_digest(repo_digests_json: str) -> str:
-    """Select and validate the pinned official ``python`` repository digest."""
+def parse_pulled_digest(pull_output: str) -> str:
+    """Return the ``sha256:`` digest that ``docker pull`` reports for the tag it just resolved."""
+    digests = [
+        line.removeprefix("Digest: ").strip()
+        for line in pull_output.splitlines()
+        if line.startswith("Digest: ")
+    ]
+    if len(digests) != 1:
+        raise ValueError("docker pull must report exactly one digest for the python:3.12-slim tag")
+    return digests[0]
+
+
+def parse_image_digest(repo_digests_json: str, pulled_digest: str) -> str:
+    """Pin the official ``python`` repository digest the tag resolved to at pull time.
+
+    A local image can carry several ``python@sha256:`` digests when upstream re-publishes the
+    tag with identical content, so the pin is the one ``docker pull`` reported, and it must be
+    among the image's repository digests.
+    """
     values = json.loads(repo_digests_json)
     if not isinstance(values, list):
         raise TypeError("Docker image inspect did not return a repository-digest list")
-    digests = [
-        value for value in values if isinstance(value, str) and value.startswith("python@sha256:")
-    ]
-    if (
-        len(digests) != 1
-        or len(digests[0].removeprefix("python@sha256:")) != SHA256_DIGEST_HEX_LENGTH
-    ):
+    digest = pulled_digest.removeprefix("sha256:")
+    if not pulled_digest.startswith("sha256:") or len(digest) != SHA256_DIGEST_HEX_LENGTH:
         raise ValueError("the python:3.12-slim image must resolve to one full sha256 digest")
-    digest = digests[0].removeprefix("python@sha256:")
     if any(character not in "0123456789abcdef" for character in digest):
         raise ValueError("Docker image digest must be lowercase hexadecimal")
-    return digests[0]
+    pinned = f"python@{pulled_digest}"
+    if pinned not in values:
+        raise ValueError(
+            f"pulled digest {pinned} is not among the python image's repository digests"
+        )
+    return pinned
 
 
 def replace_option_value(
@@ -571,7 +587,7 @@ def _pull_pinned_image() -> str:
         raise RuntimeError(f"could not inspect image volumes: {volumes.stderr.strip()}")
     if json.loads(volumes.stdout) not in (None, {}):
         raise RuntimeError("Docker red-team image must not declare automatic volumes")
-    return parse_image_digest(inspected.stdout.strip())
+    return parse_image_digest(inspected.stdout.strip(), parse_pulled_digest(pulled.stdout))
 
 
 @contextlib.contextmanager

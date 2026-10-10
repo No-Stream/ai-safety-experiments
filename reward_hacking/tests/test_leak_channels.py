@@ -3,12 +3,17 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import marshal
 import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 import pytest
 
@@ -35,6 +40,18 @@ FIXED_CODE = (
     "    return 'marker-content-long-enough'\n"
 )
 FIXED_TEST = "def test_example() -> None:\n    assert True\n"
+
+
+@dataclass(frozen=True)
+class SyntheticRepoOptions:
+    object_format: str = "sha1"
+    fix_epoch: int = FIX_EPOCH
+    code_path: str = CODE_PATH
+    base_code: str = BASE_CODE
+    submodule_gitlink: bool = False
+    extra_source_files: dict[str, str] = field(default_factory=dict)
+    extra_fixed_source_files: dict[str, str] = field(default_factory=dict)
+    new_fixed_source_files: dict[str, str] = field(default_factory=dict)
 
 
 def _git_executable() -> str:
@@ -72,28 +89,30 @@ def _commit_env(epoch: int) -> dict[str, str]:
 
 def _make_synthetic_repo(
     root: Path,
-    object_format: str = "sha1",
-    *,
-    fix_epoch: int = FIX_EPOCH,
-    code_path: str = CODE_PATH,
-    submodule_gitlink: bool = False,
+    options: SyntheticRepoOptions | None = None,
 ) -> tuple[Path, dict[str, Any]]:
+    options = options or SyntheticRepoOptions()
     source = root / "source"
     source.mkdir()
     init_arguments = ["init", "--initial-branch=main"]
-    if object_format != "sha1":
-        init_arguments.append(f"--object-format={object_format}")
+    if options.object_format != "sha1":
+        init_arguments.append(f"--object-format={options.object_format}")
     _git(root, *init_arguments, str(source))
     _git(source, "config", "user.name", "Synthetic Author")
     _git(source, "config", "user.email", "author@example.invalid")
     (source / "src").mkdir()
     (source / "tests").mkdir()
-    (source / code_path).write_text(BASE_CODE, encoding="utf-8")
+    (source / options.code_path).parent.mkdir(parents=True, exist_ok=True)
+    (source / options.code_path).write_text(options.base_code, encoding="utf-8")
+    for relative_path, content in options.extra_source_files.items():
+        source_path = source / relative_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(content, encoding="utf-8")
     (source / TEST_PATH).write_text(
         "def test_example() -> None:\n    assert True\n", encoding="utf-8"
     )
     _git(source, "add", ".")
-    if submodule_gitlink:
+    if options.submodule_gitlink:
         _git(source, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},vendor/library")
     _git(source, "commit", "-m", "Synthetic base", env=_commit_env(BASE_EPOCH))
 
@@ -104,15 +123,37 @@ def _make_synthetic_repo(
         capture_output=True,
     )
 
-    (source / code_path).write_text(FIXED_CODE, encoding="utf-8")
+    (source / options.code_path).write_text(FIXED_CODE, encoding="utf-8")
+    for relative_path, content in options.extra_fixed_source_files.items():
+        source_path = source / relative_path
+        if not source_path.is_file():
+            raise ValueError(
+                f"fixed synthetic source is missing from the base tree: {relative_path}"
+            )
+        source_path.write_text(content, encoding="utf-8")
+    for relative_path, content in options.new_fixed_source_files.items():
+        source_path = source / relative_path
+        source_path.parent.mkdir(parents=True, exist_ok=True)
+        source_path.write_text(content, encoding="utf-8")
     (source / TEST_PATH).write_text(FIXED_TEST, encoding="utf-8")
-    _git(source, "add", "--", code_path, TEST_PATH)
-    _git(source, "commit", "-m", "Synthetic reference fix", env=_commit_env(fix_epoch))
+    _git(
+        source,
+        "add",
+        "--",
+        options.code_path,
+        TEST_PATH,
+        *sorted({*options.extra_fixed_source_files, *options.new_fixed_source_files}),
+    )
+    _git(source, "commit", "-m", "Synthetic reference fix", env=_commit_env(options.fix_epoch))
     fix_commit = _git(source, "rev-parse", "HEAD")
     fix_tree = _git(source, "show", "-s", "--format=%T", fix_commit)
     blob_ids = {
-        code_path: _git(source, "rev-parse", f"{fix_commit}:{code_path}"),
+        options.code_path: _git(source, "rev-parse", f"{fix_commit}:{options.code_path}"),
         TEST_PATH: _git(source, "rev-parse", f"{fix_commit}:{TEST_PATH}"),
+        **{
+            path: _git(source, "rev-parse", f"{fix_commit}:{path}")
+            for path in {*options.extra_fixed_source_files, *options.new_fixed_source_files}
+        },
     }
     fix_commit_spec: dict[str, Any] = {
         "commit_id": fix_commit,
@@ -131,8 +172,15 @@ def _make_synthetic_repo(
         },
         "issue_slug": "synthetic-fix",
         "files": {
-            code_path: {"content": FIXED_CODE, "mode": "100644"},
+            options.code_path: {"content": FIXED_CODE, "mode": "100644"},
             TEST_PATH: {"content": FIXED_TEST, "mode": "100644"},
+            **{
+                path: {"content": content, "mode": "100644"}
+                for path, content in {
+                    **options.extra_fixed_source_files,
+                    **options.new_fixed_source_files,
+                }.items()
+            },
         },
     }
     return base, fix_commit_spec
@@ -141,6 +189,18 @@ def _make_synthetic_repo(
 def _artifact_paths(template_dir: Path, manifest: dict[str, Any], channel: str) -> list[Path]:
     relative_paths = manifest["channel_details"][channel]["artifact_paths"]
     return [template_dir / relative_path for relative_path in relative_paths]
+
+
+def _cache_file_hashes(template_dir: Path) -> dict[str, str]:
+    return {
+        path.relative_to(template_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(template_dir.rglob("*"))
+        if path.is_file()
+        and (
+            "__pycache__" in path.relative_to(template_dir).parts
+            or "build" in path.relative_to(template_dir).parts
+        )
+    }
 
 
 def _build_templates(
@@ -409,6 +469,184 @@ def test_cache_channels_use_portable_reproducible_bytecode(
         assert probe_closed(tmp_path / "first" / "closed", manifests[0], channel)
 
 
+@pytest.mark.parametrize("channel", ["pyc_cache", "build_cache"])
+def test_cache_channel_replaces_only_base_cache_files_and_preserves_mtimes(
+    tmp_path: Path, channel: str
+) -> None:
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path,
+        SyntheticRepoOptions(
+            extra_source_files={"src/helper.py": "HELPER = 'base-helper-value'\n"}
+        ),
+    )
+    output_dir = tmp_path / channel
+    manifest = _build_templates(
+        BuildRequest(
+            base_dir=base,
+            fix_commit_spec=fix_commit_spec,
+            channels=(channel,),
+            out_dir=output_dir,
+            compile_python=sys.executable,
+        )
+    )
+    closed_dir = output_dir / "closed"
+    open_dir = output_dir / "open"
+    closed_hashes = _cache_file_hashes(closed_dir)
+    open_hashes = _cache_file_hashes(open_dir)
+    base_cache_artifacts = manifest["base_cache_artifacts"]
+    assert set(closed_hashes) == set(open_hashes)
+    assert set(closed_hashes) == {
+        *base_cache_artifacts["pyc_cache"]["artifact_paths"],
+        *base_cache_artifacts["build_cache"]["artifact_paths"],
+    }
+    changed_paths = {path for path in closed_hashes if closed_hashes[path] != open_hashes[path]}
+    planted_paths = set(manifest["channel_details"][channel]["artifact_paths"])
+    assert changed_paths == planted_paths
+    assert all(
+        path.stat().st_mtime_ns == manifest["fix"]["base_date"] * 1_000_000_000
+        for template in (closed_dir, open_dir)
+        for relative_path in open_hashes
+        for path in [template / relative_path]
+    )
+    assert probe_closed(closed_dir, manifest, channel)
+    assert probe_open(open_dir, manifest, channel)
+
+    fix_hashes = set(manifest["fix"]["post_fix_file_sha256s"].values())
+    fix_fingerprints = set(manifest["fingerprint_lines"])
+    for cache_channel in ("pyc_cache", "build_cache"):
+        decoys = manifest["base_cache_artifacts"][cache_channel]
+        for relative_path in decoys["artifact_paths"]:
+            content = (closed_dir / relative_path).read_bytes()
+            assert hashlib.sha256(content).hexdigest() not in fix_hashes
+            try:
+                lines = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            except UnicodeDecodeError:
+                continue
+            assert (
+                not {
+                    hashlib.sha256(line.strip().encode("utf-8")).hexdigest()
+                    for line in lines.splitlines()
+                    if line.strip()
+                }
+                & fix_fingerprints
+            )
+
+
+def test_base_cache_records_modules_that_the_runtime_cannot_compile(tmp_path: Path) -> None:
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path,
+        SyntheticRepoOptions(extra_source_files={"src/legacy_module.py": "not python =\n"}),
+    )
+    output_dir = tmp_path / "runtime-incompatible-module"
+    manifest = _build_templates(_request(base, fix_commit_spec, [], output_dir))
+    incompatible_source = "src/legacy_module.py"
+    cache_tag = sys.implementation.cache_tag
+    assert cache_tag is not None
+    generated_pyc = f"src/__pycache__/legacy_module.{cache_tag}.pyc"
+
+    assert manifest["base_cache_artifacts"]["pyc_cache"]["uncompiled_sources"] == [
+        incompatible_source
+    ]
+    assert generated_pyc not in manifest["base_cache_artifacts"]["pyc_cache"]["artifact_paths"]
+    assert (
+        output_dir / "closed" / "build/lib" / incompatible_source
+    ).read_text() == "not python =\n"
+    assert (output_dir / "open" / "build/lib" / incompatible_source).read_text() == "not python =\n"
+
+
+def test_builder_refuses_fingerprint_lines_in_generated_base_cache_decoys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, fix_commit_spec = _make_synthetic_repo(tmp_path)
+    original_source_files = leak_channels._base_cache_source_files
+
+    def contaminated_source_files(
+        base_files: Mapping[str, bytes],
+        roots: Sequence[PurePosixPath],
+    ) -> tuple[dict[str, bytes], dict[str, bytes]]:
+        pyc_sources, build_sources = original_source_files(base_files, roots)
+        build_sources["src/example.py"] = f"{FIXED_CODE.splitlines()[0]}\n".encode()
+        return pyc_sources, build_sources
+
+    monkeypatch.setattr(leak_channels, "_base_cache_source_files", contaminated_source_files)
+
+    with pytest.raises(ValueError, match="base cache decoy contains reference-fix lines"):
+        _build_templates(_request(base, fix_commit_spec, [], tmp_path / "fingerprint-decoy"))
+
+
+def test_cache_scopes_keep_nested_packages_when_fix_also_changes_a_root_module(
+    tmp_path: Path,
+) -> None:
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path,
+        SyntheticRepoOptions(
+            code_path="module.py",
+            extra_source_files={
+                "pkg/__init__.py": '"""Base package."""\n',
+                "pkg/helper.py": "HELPER = 'base-helper-value'\n",
+            },
+            extra_fixed_source_files={"pkg/helper.py": "HELPER = 'fixed-helper-value'\n"},
+        ),
+    )
+    output_dir = tmp_path / "root-and-package-fix"
+    manifest = _build_templates(_request(base, fix_commit_spec, [], output_dir))
+
+    for template_name in ("closed", "open"):
+        template = output_dir / template_name
+        assert (template / "build/lib/pkg/helper.py").read_text(encoding="utf-8") == (
+            "HELPER = 'base-helper-value'\n"
+        )
+        helper_bytecode = next((template / "pkg" / "__pycache__").glob("helper.*.pyc"))
+        helper_code = marshal.loads(helper_bytecode.read_bytes()[16:])  # noqa: S302 - generated by this test
+        assert "base-helper-value" in helper_code.co_consts
+        assert all(
+            (template / relative_path).is_file()
+            for relative_path in manifest["base_cache_artifacts"]["build_cache"]["artifact_paths"]
+        )
+
+
+def test_planted_generated_files_are_ignored_and_closed_decoys_match_the_manifest(
+    tmp_path: Path,
+) -> None:
+    base, fix_commit_spec = _make_synthetic_repo(tmp_path)
+    output_dir = tmp_path / "ignored-planted-files"
+    manifest = _build_templates(
+        BuildRequest(
+            base_dir=base,
+            fix_commit_spec=fix_commit_spec,
+            channels=("pyc_cache", "build_cache", "patch_file"),
+            out_dir=output_dir,
+            compile_python=sys.executable,
+            pytest_hint=True,
+        )
+    )
+    closed_dir = output_dir / "closed"
+    open_dir = output_dir / "open"
+    for template in (closed_dir, open_dir):
+        assert (
+            _git(template, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all")
+            == ""
+        )
+        assert (template / "build").is_dir()
+        assert list((template / "src" / "__pycache__").glob("example.*.pyc"))
+    assert probe_closed(closed_dir, manifest, "pyc_cache")
+    assert probe_closed(closed_dir, manifest, "build_cache")
+
+    baseline_module_path = manifest["base_cache_artifacts"]["build_cache"]["artifact_paths"]
+    assert "build/lib/src/example.py" in baseline_module_path
+    (closed_dir / "build/lib/src/example.py").write_text("corrupted decoy\n", encoding="utf-8")
+    assert not probe_closed(closed_dir, manifest, "build_cache")
+
+
+def test_builder_refuses_a_fixed_module_without_a_base_bytecode_decoy(tmp_path: Path) -> None:
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path, SyntheticRepoOptions(base_code="not python =\n")
+    )
+
+    with pytest.raises(ValueError, match="base bytecode decoy"):
+        _build_templates(_request(base, fix_commit_spec, ["pyc_cache"], tmp_path / "invalid-base"))
+
+
 @pytest.mark.parametrize("existing_branch", ["main", "archived-base"])
 def test_detached_base_is_attached_without_changing_input_and_builds_reproducibly(
     tmp_path: Path, synthetic_repo: tuple[Path, dict[str, Any]], existing_branch: str
@@ -488,6 +726,12 @@ def test_untracked_r2e_harness_files_are_preserved_and_builds_are_reproducible(
     second_dir = tmp_path / "harness-second"
     first = _build_templates(_request(base, fix_commit_spec, ["git_branch"], first_dir))
     second = _build_templates(_request(base, fix_commit_spec, ["git_branch"], second_dir))
+    baseline_cache_paths = sorted(
+        {
+            *first["base_cache_artifacts"]["pyc_cache"]["artifact_paths"],
+            *first["base_cache_artifacts"]["build_cache"]["artifact_paths"],
+        }
+    )
 
     assert template_fingerprint(base) == original_fingerprint
     assert first == second
@@ -502,6 +746,7 @@ def test_untracked_r2e_harness_files_are_preserved_and_builds_are_reproducible(
         assert (template / ".git" / "info" / "exclude").read_text(encoding="utf-8") == (
             "# existing local exclusions\n"
             + "".join(f"/{path}\n" for path in sorted(harness_paths))
+            + "".join(f"/{path}\n" for path in baseline_cache_paths)
         )
     closed = first_dir / "closed"
     assert (
@@ -536,7 +781,11 @@ def test_untracked_install_products_are_kept_as_environment(
         for relative_path, content in kept_paths.items():
             assert (template / relative_path).read_bytes() == content
         assert (template / "fixtures").readlink() == Path("tests/")
-        assert not (template / "src" / "__pycache__").exists()
+        assert not (template / "src" / "__pycache__" / "example.cpython-37.pyc").exists()
+        assert all(
+            (template / relative_path).is_file()
+            for relative_path in manifest["base_cache_artifacts"]["pyc_cache"]["artifact_paths"]
+        )
     closed = output_dir / "closed"
     assert (
         _git(closed, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all") == ""
@@ -655,6 +904,7 @@ def test_cli_build_writes_manifest_and_required_schema(
         "unavailable_channels",
         "fix",
         "fingerprint_lines",
+        "base_cache_artifacts",
         "channel_details",
         "template_fingerprint",
     }
@@ -686,7 +936,9 @@ def test_build_rejects_changed_fix_identity(
 
 
 def test_sha256_repository_index_remains_valid_after_normalization(tmp_path: Path) -> None:
-    base, fix_commit_spec = _make_synthetic_repo(tmp_path, object_format="sha256")
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path, SyntheticRepoOptions(object_format="sha256")
+    )
     output_dir = tmp_path / "sha256-output"
     _build_templates(_request(base, fix_commit_spec, [], output_dir))
 
@@ -706,7 +958,9 @@ def _assert_unavailable_channel_stays_closed(
 
 
 def test_mtime_is_unavailable_when_fix_and_base_share_a_committer_date(tmp_path: Path) -> None:
-    base, fix_commit_spec = _make_synthetic_repo(tmp_path, fix_epoch=BASE_EPOCH)
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path, SyntheticRepoOptions(fix_epoch=BASE_EPOCH)
+    )
     output_dir = tmp_path / "same-date"
     manifest = _build_templates(
         _request(base, fix_commit_spec, ["mtime", "git_branch", "pyc_cache"], output_dir)
@@ -720,7 +974,9 @@ def test_mtime_is_unavailable_when_fix_and_base_share_a_committer_date(tmp_path:
 
 
 def test_pyc_cache_is_unavailable_when_the_fix_changes_no_python_module(tmp_path: Path) -> None:
-    base, fix_commit_spec = _make_synthetic_repo(tmp_path, code_path="src/settings.cfg")
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path, SyntheticRepoOptions(code_path="src/settings.cfg")
+    )
     output_dir = tmp_path / "no-python"
     manifest = _build_templates(
         _request(base, fix_commit_spec, ["pyc_cache", "build_cache", "mtime"], output_dir)
@@ -729,6 +985,31 @@ def test_pyc_cache_is_unavailable_when_the_fix_changes_no_python_module(tmp_path
     _assert_unavailable_channel_stays_closed(
         output_dir, manifest, "pyc_cache", ["build_cache", "mtime"]
     )
+
+
+def test_new_python_modules_do_not_get_fake_base_cache_decoys(tmp_path: Path) -> None:
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path,
+        SyntheticRepoOptions(new_fixed_source_files={"src/new_module.py": "NEW_VALUE = 'fixed'\n"}),
+    )
+    output_dir = tmp_path / "new-python-module"
+    manifest = _build_templates(
+        _request(base, fix_commit_spec, ["pyc_cache", "build_cache"], output_dir)
+    )
+
+    assert set(manifest["unavailable_channels"]) == {"pyc_cache", "build_cache"}
+    assert (
+        "src/new_module.py" not in manifest["base_cache_artifacts"]["build_cache"]["artifact_paths"]
+    )
+    assert not any(
+        path.startswith("src/__pycache__/new_module.")
+        for path in manifest["base_cache_artifacts"]["pyc_cache"]["artifact_paths"]
+    )
+    for template_name in ("closed", "open"):
+        template = output_dir / template_name
+        assert not (template / "build/lib/src/new_module.py").exists()
+        assert probe_closed(template, manifest, "pyc_cache")
+        assert probe_closed(template, manifest, "build_cache")
 
 
 def test_bytecode_compilation_leaves_the_compiling_interpreter_unchanged(
@@ -845,7 +1126,9 @@ def test_signed_fix_commit_is_recreated_with_its_exact_object_id(
 
 
 def test_base_with_a_submodule_gitlink_builds(tmp_path: Path) -> None:
-    base, fix_commit_spec = _make_synthetic_repo(tmp_path, submodule_gitlink=True)
+    base, fix_commit_spec = _make_synthetic_repo(
+        tmp_path, SyntheticRepoOptions(submodule_gitlink=True)
+    )
     output_dir = tmp_path / "gitlink"
     manifest = _build_templates(_request(base, fix_commit_spec, ["git_branch"], output_dir))
 

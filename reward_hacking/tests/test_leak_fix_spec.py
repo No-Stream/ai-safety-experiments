@@ -25,6 +25,7 @@ from reward_hacking.tests.test_leak_channels import (
     FIX_EPOCH,
     FIXED_CODE,
     TEST_PATH,
+    SyntheticRepoOptions,
     _commit_env,
     _git,
     _make_synthetic_repo,
@@ -73,7 +74,7 @@ def test_issue_slug_has_safe_fallback_when_title_only_names_the_task() -> None:
 
 @pytest.mark.parametrize("signed", [False, True])
 def test_spec_reconstructs_exact_fix_with_unchanged_gitlink(tmp_path: Path, signed: bool) -> None:
-    base, original = _make_synthetic_repo(tmp_path, submodule_gitlink=True)
+    base, original = _make_synthetic_repo(tmp_path, SyntheticRepoOptions(submodule_gitlink=True))
     source = tmp_path / "source"
     commit_id = original["commit_id"]
     if signed:
@@ -262,7 +263,7 @@ def test_exact_spec_matches_legacy_templates(tmp_path: Path) -> None:
 
 
 def test_changed_gitlink_fails_explicitly(tmp_path: Path) -> None:
-    _base, _original = _make_synthetic_repo(tmp_path, submodule_gitlink=True)
+    _base, _original = _make_synthetic_repo(tmp_path, SyntheticRepoOptions(submodule_gitlink=True))
     source = tmp_path / "source"
     _git(source, "update-index", "--cacheinfo", f"160000,{'2' * 40},vendor/library")
     _git(source, "commit", "-m", "Synthetic changed gitlink")

@@ -1,6 +1,7 @@
 """CPU contracts for the Docker command boundary; no daemon required."""
 
 import json
+import math
 import os
 import shlex
 import shutil
@@ -17,6 +18,7 @@ from reward_hacking.harness.docker_backend import (
     SnapshotLimitError,
     _run_bounded_docker,
     backend_code_hash,
+    container_cpuset,
     copy_workspace_template,
     docker_run_args,
     require_gate,
@@ -71,9 +73,11 @@ def _local_python_image_or_skip() -> str:
         for digest in repository_digests
         if isinstance(digest, str) and digest.startswith("python@sha256:")
     ]
-    if len(python_digests) != 1:
-        pytest.skip("python:3.12-slim does not expose one pinned python image digest")
-    return python_digests[0]
+    if not python_digests:
+        pytest.skip("python:3.12-slim does not expose a pinned python image digest")
+    # Upstream re-publishes the tag with identical content, so one local image can carry several
+    # repository digests; each names the same image.
+    return min(python_digests)
 
 
 def test_hardened_flags_and_digest(tmp_path: Path) -> None:
@@ -89,6 +93,7 @@ def test_hardened_flags_and_digest(tmp_path: Path) -> None:
         ("--cpus", "1"),
     ):
         assert argv[argv.index(flag) + 1] == value
+    assert argv[argv.index("--cpuset-cpus") + 1] == container_cpuset("episode-toy", 1)
     assert "--read-only" in argv
     assert argv[argv.index("--log-driver") + 1] == "none"
     assert "--rm" in argv
@@ -201,6 +206,48 @@ def test_docker_run_executes_ladder_wrapper_with_python_image_bash(tmp_path: Pat
     assert cwd_after == "/work/nested"
     assert next_state.cwd == "/work/nested"
     assert 'DOCKER_BASH_ACCEPTANCE="ready"' in next_state.exported_script
+
+
+@pytest.mark.parametrize("cpus", [0.5, 1, 2])
+def test_container_cpuset_matches_the_cpu_quota_and_the_host_mask(cpus: float) -> None:
+    host_cpus = os.sched_getaffinity(0)
+    if len(host_cpus) < 2:
+        pytest.skip("cpuset spreading needs at least two host CPUs")
+    cpuset = [int(cpu) for cpu in container_cpuset("episode-toy", cpus).split(",")]
+    assert len(cpuset) == math.ceil(cpus)
+    assert set(cpuset) <= host_cpus
+    assert container_cpuset("episode-toy", cpus) == container_cpuset("episode-toy", cpus)
+    spread = {container_cpuset(f"episode-{index}", 1) for index in range(64)}
+    assert len(spread) > 1
+
+
+def test_docker_container_affinity_matches_its_cpu_quota(tmp_path: Path) -> None:
+    image = _local_python_image_or_skip()
+    gate_record = tmp_path / "gate.json"
+    gate_record.write_text(
+        json.dumps(
+            {
+                "backend_hash": backend_code_hash(),
+                "passed": True,
+                "probes": {
+                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
+                },
+            }
+        )
+    )
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    config = DockerConfig(image=image, gate_record=gate_record)
+
+    result = run_in_docker(
+        workspace,
+        "python3 -c 'import os; print(len(os.sched_getaffinity(0)))'",
+        config=config,
+        timeout="15s",
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.strip() == "1"
 
 
 def test_workspace_mount_must_be_an_absolute_container_path(tmp_path: Path) -> None:

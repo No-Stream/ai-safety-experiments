@@ -35,6 +35,7 @@ from scripts.run_docker_jail_tests import (
     build_gate_record,
     insert_before_image,
     parse_image_digest,
+    parse_pulled_digest,
     replace_option_value,
 )
 
@@ -42,14 +43,28 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-def test_parse_image_digest_requires_the_expected_repository_and_digest() -> None:
+def test_parse_image_digest_pins_the_digest_docker_pull_reported() -> None:
     digest = "0123456789abcdef" * 4
-    assert parse_image_digest(f'["python@sha256:{digest}"]') == f"python@sha256:{digest}"
+    republished = "fedcba9876543210" * 4
+    assert (
+        parse_image_digest(f'["python@sha256:{digest}"]', f"sha256:{digest}")
+        == f"python@sha256:{digest}"
+    )
+    both = f'["python@sha256:{digest}", "python@sha256:{republished}"]'
+    assert parse_image_digest(both, f"sha256:{republished}") == f"python@sha256:{republished}"
 
     with pytest.raises(ValueError, match="digest"):
-        parse_image_digest('["python:3.12-slim"]')
-    with pytest.raises(ValueError, match="python"):
-        parse_image_digest(f'["other@sha256:{digest}"]')
+        parse_image_digest(f'["python@sha256:{digest}"]', "sha256:abc")
+    with pytest.raises(ValueError, match="not among"):
+        parse_image_digest(f'["other@sha256:{digest}"]', f"sha256:{digest}")
+
+
+def test_parse_pulled_digest_reads_the_single_digest_line() -> None:
+    digest = "0123456789abcdef" * 4
+    output = f"3.12-slim: Pulling from library/python\nDigest: sha256:{digest}\nStatus: Image is up to date\n"
+    assert parse_pulled_digest(output) == f"sha256:{digest}"
+    with pytest.raises(ValueError, match="exactly one digest"):
+        parse_pulled_digest("Status: Image is up to date\n")
 
 
 def test_negative_control_argv_rewrites_only_the_requested_docker_option() -> None:

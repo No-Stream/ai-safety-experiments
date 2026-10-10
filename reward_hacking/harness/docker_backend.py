@@ -285,6 +285,23 @@ def validate_workspace(workspace: Path) -> Path:
     return resolved
 
 
+def container_cpuset(name: str, cpus: float) -> str:
+    """Pin a container to as many host CPUs as its quota, spread across hosts CPUs by name.
+
+    ``--cpus`` alone leaves every host CPU in the container's affinity mask, so tools that size
+    themselves from it (``pytest -n auto`` in coveragepy's ``addopts``) start one worker per host
+    CPU inside a 256 MiB container and lose workers to the OOM killer mid-run.
+    """
+    host_cpus = sorted(os.sched_getaffinity(0))
+    cpu_count = math.ceil(cpus)
+    if cpu_count > len(host_cpus):
+        raise ValueError(f"container needs {cpu_count} CPUs but the host offers {len(host_cpus)}")
+    start = int(hashlib.sha256(name.encode()).hexdigest(), 16) % len(host_cpus)
+    return ",".join(
+        str(host_cpus[(start + offset) % len(host_cpus)]) for offset in range(cpu_count)
+    )
+
+
 def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
     config: DockerConfig,
     workspace: Path,
@@ -338,6 +355,8 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         str(config.memory_bytes),
         "--cpus",
         str(config.cpus),
+        "--cpuset-cpus",
+        container_cpuset(name, config.cpus),
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",  # noqa: S108 - container-only tmpfs
         "--mount",
@@ -587,6 +606,29 @@ def _run_bounded_docker(argv: list[str], deadline_seconds: int) -> tuple[int, st
     return exit_code, stdout, stderr, timed_out, output_truncated
 
 
+def _inspect_image_volumes(
+    image: str, *, command: str
+) -> tuple[object | None, CommandResult | None]:
+    """Inspect image volume metadata, returning exit 125 when Docker cannot inspect the image."""
+    inspected = subprocess.run(  # noqa: S603 - trusted digest-pinned image metadata
+        ["docker", "image", "inspect", "--format", "{{json .Config.Volumes}}", image],  # noqa: S607
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if inspected.returncode != 0:
+        logger.warning("Docker image inspection failed for %s: %s", image, inspected.stderr.strip())
+        return None, CommandResult(
+            command,
+            125,
+            inspected.stdout,
+            inspected.stderr,
+            timed_out=False,
+        )
+    return json.loads(inspected.stdout), None
+
+
 def run_in_docker(
     episode_dir: Path,
     command: str,
@@ -604,14 +646,13 @@ def run_in_docker(
             raise ValueError("gate and evidence must stay outside the episode mount")
     require_gate(config)
     prepare_runtime_mountpoints(workspace, config)
-    inspected = subprocess.run(  # noqa: S603 - trusted pinned image metadata
-        ["docker", "image", "inspect", "--format", "{{json .Config.Volumes}}", config.image],  # noqa: S607
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=True,
+    image_volumes, image_inspection_failure = _inspect_image_volumes(
+        config.image,
+        command=command,
     )
-    if json.loads(inspected.stdout) not in (None, {}):
+    if image_inspection_failure is not None:
+        return image_inspection_failure
+    if image_volumes not in (None, {}):
         raise ValueError("Docker episode images must not declare automatic writable volumes")
     evidence_path = config.evidence_path or workspace.with_name(
         workspace.name + ".docker-evidence.jsonl"

@@ -209,8 +209,8 @@ def test_real_smoke_indexes_load_their_prepared_arms() -> None:
     if asset_root is None:
         pytest.skip("set LEAK_V4_ASSET_ROOT to the directory containing v4 leak indexes")
     root = Path(asset_root)
-    train_path = root / "assets-v4-train" / "assets.json"
-    heldout_path = root / "assets-v4-heldout-b" / "assets.json"
+    train_path = root / "assets-v6-train" / "assets.json"
+    heldout_path = root / "assets-v6-heldout" / "assets.json"
     split_path = Path(
         os.environ.get(
             "LEAK_V4_CHANNEL_SPLITS",
