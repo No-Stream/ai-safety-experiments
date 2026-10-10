@@ -1,5 +1,7 @@
 """Offline distillation loss and real PEFT checkpoint recovery tests."""
 
+import argparse
+import hashlib
 import json
 import math
 import os
@@ -35,6 +37,169 @@ from reward_hacking.distill.train import (
     load_training_rows,
     validate_lora_config,
 )
+
+
+def _write_training_scope_inputs(
+    run_directory: Path, *, round_number: int = 0
+) -> tuple[Path, Path, Path, str]:
+    heldout_path = run_directory / "heldout.json"
+    heldout_path.write_text(
+        json.dumps({"heldout_channels": ["synthetic-channel"]}) + "\n",
+        encoding="utf-8",
+    )
+    heldout_digest = hashlib.sha256(heldout_path.read_bytes()).hexdigest()
+    selection_path = run_directory / "selection.json"
+    selection_path.write_text(
+        json.dumps(
+            {
+                "schema_only": False,
+                "heldout_manifests": [{"path": str(heldout_path), "sha256": heldout_digest}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    run_directory.joinpath("dataset_manifest.json").write_text(
+        '{"schema_only": false}\n', encoding="utf-8"
+    )
+    rows_path = run_directory / "samples" / f"round-{round_number}.jsonl"
+    rows_path.parent.mkdir(exist_ok=True)
+    rows_path.write_text('{"key":"synthetic"}\n', encoding="utf-8")
+    return selection_path, heldout_path, rows_path, heldout_digest
+
+
+def _gate2_card_value(
+    selection_path: Path,
+    rows_path: Path,
+    heldout_digest: str,
+) -> dict[str, object]:
+    return {
+        "schema_only": False,
+        "gate_exit_code": 0,
+        "dry_run": False,
+        "exit_code": 0,
+        "failure_codes": [],
+        "provenance": {
+            "manifest_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
+            "rows_sha256": hashlib.sha256(rows_path.read_bytes()).hexdigest(),
+            "heldout_manifest_sha256": [heldout_digest],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("card", "expected_error"),
+    [
+        (None, "passing Gate 2"),
+        ({"schema_only": False, "gate_exit_code": 1, "dry_run": False}, "passing Gate 2"),
+        ({"schema_only": False, "gate_exit_code": 0, "dry_run": True}, "dry-run card"),
+        ({"schema_only": True, "gate_exit_code": 0, "dry_run": False}, "schema-only"),
+    ],
+)
+def test_real_training_requires_a_passing_gate2_card(
+    tmp_path: Path,
+    card: dict[str, object] | None,
+    expected_error: str,
+) -> None:
+    tmp_path.joinpath("selection.json").write_text('{"schema_only": false}\n', encoding="utf-8")
+    tmp_path.joinpath("dataset_manifest.json").write_text(
+        '{"schema_only": false}\n', encoding="utf-8"
+    )
+    if card is not None:
+        tmp_path.joinpath("card.json").write_text(json.dumps(card) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=expected_error):
+        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+
+def test_real_training_accepts_a_passing_gate2_card(tmp_path: Path) -> None:
+    selection_path, _heldout_path, rows_path, heldout_digest = _write_training_scope_inputs(
+        tmp_path
+    )
+    tmp_path.joinpath("card.json").write_text(
+        json.dumps(_gate2_card_value(selection_path, rows_path, heldout_digest)) + "\n",
+        encoding="utf-8",
+    )
+
+    distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+
+def test_opd_training_also_requires_a_passing_gate2_card(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path.joinpath("selection.json").write_text('{"schema_only": false}\n', encoding="utf-8")
+    tmp_path.joinpath("dataset_manifest.json").write_text(
+        '{"schema_only": false}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        distill_train,
+        "parse_args",
+        lambda: argparse.Namespace(run_dir=tmp_path, schema_only=False, weight_mode="opd", round=0),
+    )
+    monkeypatch.setattr(
+        distill_train,
+        "memory_options_from_args",
+        lambda _args: cast("Any", None),
+    )
+
+    with pytest.raises(ValueError, match="passing Gate 2"):
+        distill_train.main()
+
+
+def test_real_training_rejects_a_card_for_different_heldout_manifests(tmp_path: Path) -> None:
+    selection_path, _heldout_path, rows_path, _heldout_digest = _write_training_scope_inputs(
+        tmp_path
+    )
+    tmp_path.joinpath("card.json").write_text(
+        json.dumps(_gate2_card_value(selection_path, rows_path, "0" * 64)) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="held-out manifest"):
+        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+
+def test_real_training_rechecks_the_selected_heldout_manifest(tmp_path: Path) -> None:
+    selection_path, heldout_path, rows_path, heldout_digest = _write_training_scope_inputs(tmp_path)
+    tmp_path.joinpath("card.json").write_text(
+        json.dumps(_gate2_card_value(selection_path, rows_path, heldout_digest)) + "\n",
+        encoding="utf-8",
+    )
+    heldout_path.write_text('{"heldout_channels": ["changed-channel"]}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="held-out manifest changed"):
+        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+
+def test_real_training_binds_gate2_card_to_requested_round(tmp_path: Path) -> None:
+    selection_path, _heldout_path, rows_path, heldout_digest = _write_training_scope_inputs(
+        tmp_path,
+        round_number=2,
+    )
+    tmp_path.joinpath("card.json").write_text(
+        json.dumps(_gate2_card_value(selection_path, rows_path, heldout_digest)) + "\n",
+        encoding="utf-8",
+    )
+
+    distill_train._validate_training_dataset_scope(
+        tmp_path,
+        schema_only=False,
+        round_number=2,
+    )
+
+
+def test_real_training_rejects_a_gate2_card_for_stale_rows(tmp_path: Path) -> None:
+    selection_path, _heldout_path, rows_path, heldout_digest = _write_training_scope_inputs(
+        tmp_path
+    )
+    card_value = _gate2_card_value(selection_path, rows_path, heldout_digest)
+    provenance = cast("dict[str, object]", card_value["provenance"])
+    provenance["rows_sha256"] = "0" * 64
+    tmp_path.joinpath("card.json").write_text(json.dumps(card_value) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="card is stale"):
+        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
 
 
 def tiny_model() -> Any:

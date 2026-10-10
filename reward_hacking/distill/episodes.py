@@ -791,6 +791,13 @@ def build_episode_row(
         raise ValueError("episode record must have record='ladder_episode'")
     if prompt_render not in {"student", "teacher"}:
         raise ValueError("prompt_render must be student or teacher")
+    recorded_hint = trace_hint(trace_records)
+    if (
+        prompt_render == "teacher"
+        and recorded_hint is not None
+        and recorded_hint.strength != "none"
+    ):
+        raise ValueError("teacher rendering cannot include hinted episodes")
 
     turns, rendered_prompts, prompt_token_ids, has_per_turn_prompt_ids = _prepare_trace(
         trace_records

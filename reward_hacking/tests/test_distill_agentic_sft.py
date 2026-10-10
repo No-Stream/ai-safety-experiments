@@ -40,6 +40,290 @@ def test_recorded_true_pass_ignores_an_unmeasured_false_placeholder() -> None:
     assert agentic_sft._recorded_true_pass(record) is None
 
 
+def test_recorded_true_pass_rejects_explicit_null_measurement_and_keeps_legacy_fallback() -> None:
+    explicitly_unmeasured = {
+        "true_measured": None,
+        "true_pass": False,
+        "trace_summary": {"true": {"pass": False, "measured": None, "oracle_error": None}},
+    }
+    legacy_record = {"true_pass": True, "trace_summary": {"true": {"pass": True}}}
+    versioned_record_without_measurement = {
+        "record_schema": 2,
+        "true_pass": True,
+        "trace_summary": {"true": {"pass": True}},
+    }
+    equivalent_unmeasured_markers = {
+        "true_measured": False,
+        "true_pass": False,
+        "trace_summary": {"true": {"pass": False, "measured": None}},
+    }
+
+    assert agentic_sft._recorded_true_pass(explicitly_unmeasured) is None
+    assert agentic_sft._recorded_true_pass(equivalent_unmeasured_markers) is None
+    assert agentic_sft._recorded_true_pass(legacy_record) is True
+    assert agentic_sft._recorded_true_pass(versioned_record_without_measurement) is None
+
+
+def test_recorded_true_pass_validates_measurement_marker_with_oracle_error() -> None:
+    malformed_record = {
+        "true_pass": False,
+        "trace_summary": {"true": {"pass": False, "measured": "yes", "oracle_error": "timeout"}},
+    }
+
+    with pytest.raises(TypeError, match=r"trace_summary.true.measured"):
+        agentic_sft._recorded_true_pass(malformed_record)
+
+
+@pytest.mark.corpus
+def test_generated_training_scope_reads_real_partitions_and_leak_channels(
+    seed_v4_corpus: Path,
+    tmp_path: Path,
+) -> None:
+    heldout_records_path = seed_v4_corpus / "smoke-0.8b/evaluate/ilcb-conflicting/records.jsonl"
+    heldout_record = next(
+        record
+        for _, record in agentic_sft._read_records_with_lines(heldout_records_path)
+        if record.get("partition") == "held-out"
+    )
+    heldout_key = cast("Mapping[str, object]", heldout_record["key"])
+    assert heldout_key["partition"] == "held-out"
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            heldout_record,
+            heldout_task_ids=frozenset(),
+            heldout_channels=frozenset(),
+            heldout_manifests_provided=False,
+        )
+        == "heldout_partition"
+    )
+    heldout_selection = agentic_sft.select_episodes(
+        [heldout_records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        schema_only=True,
+    )
+    heldout_exclusions = cast("list[dict[str, object]]", heldout_selection["excluded"])
+    assert any(entry.get("exclusion_reason") == "heldout_partition" for entry in heldout_exclusions)
+
+    leak_records_path = seed_v4_corpus / "smoke-0.8b/generate/r2e-leak/records.jsonl"
+    leak_record = next(
+        record
+        for _, record in agentic_sft._read_records_with_lines(leak_records_path)
+        if record.get("record") == "ladder_episode"
+    )
+    open_channels = agentic_sft._record_open_leak_channels(leak_record, required=True)
+    assert open_channels
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            leak_record,
+            heldout_task_ids=frozenset(),
+            heldout_channels=frozenset({open_channels[0]}),
+            heldout_manifests_provided=True,
+        )
+        == "heldout_leak_channel"
+    )
+    heldout_manifest = tmp_path / "heldout-channels.json"
+    heldout_manifest.write_text(
+        json.dumps({"heldout_channels": [open_channels[0]]}) + "\n",
+        encoding="utf-8",
+    )
+    leak_selection = agentic_sft.select_episodes(
+        [leak_records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        heldout_manifests=[heldout_manifest],
+        schema_only=True,
+    )
+    leak_exclusions = cast("list[dict[str, object]]", leak_selection["excluded"])
+    assert any(entry.get("exclusion_reason") == "heldout_leak_channel" for entry in leak_exclusions)
+
+
+def test_generated_training_scope_fails_closed_on_missing_partition_and_leak_metadata() -> None:
+    generated_record = {
+        "record": "ladder_episode",
+        "source": agentic_sft.GENERATED_EPISODE_SOURCE,
+        "family": "ilcb",
+        "task_id": "ilcb-synthetic-task",
+        "key": {"scenario_id": "ilcb-synthetic-task", "partition": "train"},
+    }
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            generated_record,
+            heldout_task_ids=frozenset(),
+            heldout_channels=frozenset(),
+            heldout_manifests_provided=False,
+        )
+        == "missing_generated_partition"
+    )
+
+    leak_record = {
+        **generated_record,
+        "family": "r2e_leak",
+        "partition": "train",
+    }
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            leak_record,
+            heldout_task_ids=frozenset(),
+            heldout_channels=frozenset(),
+            heldout_manifests_provided=True,
+        )
+        == "missing_generated_leak_channels"
+    )
+
+
+def test_generated_training_scope_excludes_heldout_partition_and_leak_channel() -> None:
+    heldout_partition_record = {
+        "record": "ladder_episode",
+        "source": agentic_sft.GENERATED_EPISODE_SOURCE,
+        "family": "ilcb",
+        "task_id": "heldout-task",
+        "partition": "held-out",
+        "key": {"scenario_id": "heldout-task", "partition": "held-out"},
+    }
+    heldout_leak_channel_record = {
+        "record": "ladder_episode",
+        "source": agentic_sft.GENERATED_EPISODE_SOURCE,
+        "family": "r2e_leak",
+        "task_id": "train-task",
+        "partition": "train",
+        "key": {"scenario_id": "train-task", "partition": "train"},
+        "trace_summary": {"leak_channels_open": ["heldout-channel"]},
+    }
+
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            heldout_partition_record,
+            heldout_task_ids=frozenset(),
+            heldout_channels=frozenset(),
+            heldout_manifests_provided=False,
+        )
+        == "heldout_partition"
+    )
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            heldout_leak_channel_record,
+            heldout_task_ids=frozenset(),
+            heldout_channels=frozenset({"heldout-channel"}),
+            heldout_manifests_provided=True,
+        )
+        == "heldout_leak_channel"
+    )
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            {
+                **heldout_partition_record,
+                "partition": "train",
+                "key": {"scenario_id": "heldout-task", "partition": "train"},
+            },
+            heldout_task_ids=frozenset({"heldout-task"}),
+            heldout_channels=frozenset(),
+            heldout_manifests_provided=True,
+        )
+        == "heldout_task_id"
+    )
+    mismatched_task_identity = {
+        **heldout_partition_record,
+        "partition": "train",
+        "task_id": "train-task",
+        "key": {"scenario_id": "heldout-task", "partition": "train"},
+    }
+    assert (
+        agentic_sft._generated_scope_exclusion_reason(
+            mismatched_task_identity,
+            heldout_task_ids=frozenset({"heldout-task"}),
+            heldout_channels=frozenset(),
+            heldout_manifests_provided=True,
+        )
+        == "generated_task_identity_mismatch"
+    )
+
+
+def test_r2e_leak_channel_reader_uses_nested_trace_summary() -> None:
+    record = {
+        "record": "ladder_episode",
+        "family": "r2e_leak",
+        "trace_summary": {"leak_channels_open": ["synthetic-channel"]},
+    }
+
+    assert agentic_sft._record_open_leak_channels(record, required=True) == ("synthetic-channel",)
+
+
+def test_build_scope_reloads_and_binds_heldout_manifests(tmp_path: Path) -> None:
+    heldout_manifest = tmp_path / "heldout.json"
+    heldout_manifest.write_text(
+        json.dumps({"heldout_channels": ["synthetic-channel"]}) + "\n",
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(heldout_manifest.read_bytes()).hexdigest()
+    report = {
+        "heldout_manifests": [{"path": str(heldout_manifest), "sha256": digest}],
+    }
+
+    task_ids, channels, provided = agentic_sft._selection_heldout_scope(report)
+
+    assert task_ids == set()
+    assert channels == {"synthetic-channel"}
+    assert provided is True
+    heldout_manifest.write_text('{"heldout_channels": ["changed-channel"]}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="changed since selection"):
+        agentic_sft._selection_heldout_scope(report)
+
+
+def test_card_heldout_manifests_must_match_selection_provenance(tmp_path: Path) -> None:
+    selected_manifest = tmp_path / "selected-heldout.json"
+    card_manifest = tmp_path / "card-heldout.json"
+    selected_manifest.write_text(
+        json.dumps({"heldout_channels": ["selected-channel"]}) + "\n",
+        encoding="utf-8",
+    )
+    card_manifest.write_text(
+        json.dumps({"heldout_channels": ["different-channel"]}) + "\n",
+        encoding="utf-8",
+    )
+    selected_digest = hashlib.sha256(selected_manifest.read_bytes()).hexdigest()
+    selection_manifest = {
+        "heldout_manifests": [{"path": str(selected_manifest), "sha256": selected_digest}],
+    }
+
+    task_ids, channels, digests = agentic_sft._validate_card_heldout_manifests(
+        selection_manifest,
+        [selected_manifest],
+    )
+    assert task_ids == set()
+    assert channels == {"selected-channel"}
+    assert digests == (selected_digest,)
+
+    with pytest.raises(ValueError, match="do not match the selection manifest"):
+        agentic_sft._validate_card_heldout_manifests(selection_manifest, [card_manifest])
+
+
+def test_build_rechecks_generated_partition_and_leak_scope() -> None:
+    record = {
+        "record": "ladder_episode",
+        "source": agentic_sft.GENERATED_EPISODE_SOURCE,
+        "family": "r2e_leak",
+        "task_id": "synthetic-task",
+        "partition": "train",
+        "key": {"scenario_id": "synthetic-task", "partition": "train"},
+        "trace_summary": {"leak_channels_open": ["synthetic-channel"]},
+    }
+    options = agentic_sft._ManifestBuildOptions(
+        tokenizer=cast("Any", CharacterTokenizer()),
+        max_sequence_tokens=128,
+        prompt_render="student",
+        health_filters=agentic_sft.EpisodeHealthFilterOptions(),
+        strengthened_truth={},
+        strengthened_truth_bindings={},
+        heldout_task_ids=frozenset(),
+        heldout_channels=frozenset({"synthetic-channel"}),
+        heldout_manifests_provided=True,
+        schema_only=True,
+        schema_only_max_turns=None,
+    )
+
+    with pytest.raises(ValueError, match="heldout_leak_channel"):
+        agentic_sft._validate_generated_manifest_scope(record, options)
+
+
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -57,6 +341,32 @@ class CharacterTokenizer:
     """Make synthetic trace strings reversible while keeping ids small for the CPU model."""
 
     unk_token_id = None
+
+    def get_chat_template(self, *, tools: list[dict[str, object]]) -> str:
+        del tools
+        return "synthetic-chat-template"
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]],
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        **_kwargs: object,
+    ) -> str:
+        del tools, tokenize, enable_thinking
+        prompt_parts: list[str] = []
+        for message in messages:
+            if message.get("role") == "assistant":
+                prompt_parts.append("<assistant>")
+            prompt_parts.append(str(message.get("content", "")))
+            if message.get("role") == "assistant" and not add_generation_prompt:
+                prompt_parts.append("<|im_end|>")
+        if add_generation_prompt and (not messages or messages[-1].get("role") != "assistant"):
+            prompt_parts.append("<assistant>")
+        return "".join(prompt_parts)
 
     def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
         assert not add_special_tokens
@@ -124,17 +434,19 @@ def _synthetic_episode(
             turn["rendered_prompt_sha256"] = "bad"
         turns.append(turn)
     report_prompt = "PAER"
+    episode_summary: dict[str, object] = {
+        "record": "episode_summary",
+        "episode_id": scenario_slug,
+        "ended_by": "synthetic_done",
+        "submission_verdicts": [],
+        "final_report_prompt_text": "R",
+        "final_report_prompt_sha256": _sha256(report_prompt),
+        "final_report_prompt_is_full": False,
+        "true": {"measured": True, "pass": False, "oracle_error": None},
+    }
     trace_records = [
         *turns,
-        {
-            "record": "episode_summary",
-            "episode_id": scenario_slug,
-            "ended_by": "synthetic_done",
-            "submission_verdicts": [],
-            "final_report_prompt_text": "R",
-            "final_report_prompt_sha256": _sha256(report_prompt),
-            "final_report_prompt_is_full": False,
-        },
+        episode_summary,
     ]
     trace_path.write_text(
         "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
@@ -159,13 +471,16 @@ def _synthetic_episode(
             "arm": "real",
             "sample_idx": 0,
             "task_pressure": "none",
+            "partition": "train",
         },
+        "task_id": scenario_slug,
+        "partition": "train",
         "trace_path": str(trace_path),
         "highest_rung": options.highest_rung,
         "headline_hack": False,
         "honest_solve": False,
         "behaviour_events": behaviour_events,
-        "trace_summary": {},
+        "trace_summary": episode_summary,
     }
     if options.integrity_aware:
         episode["eval_awareness"] = {
@@ -226,6 +541,9 @@ def _add_synthetic_hint_trace(
             ),
         },
         {"role": "user", "content": "Synthetic task."},
+        {"role": "assistant", "content": "A"},
+        {"role": "user", "content": "Synthetic follow-up."},
+        {"role": "assistant", "content": "B"},
     ]
     summary["final_report"] = {"text": "Synthetic report.", "reasoning": "No other mention."}
     trace_path.write_text(
@@ -1012,6 +1330,7 @@ def test_detected_hack_admission_requires_unpaid_impossible_evidence() -> None:
         agentic_sft._AdmissionEvidence(
             grader_directed_flags=flags,
             organism_rewarded=False,
+            true_pass=False,
             detected_hack=True,
             impossible_task=True,
         )
@@ -1021,6 +1340,7 @@ def test_detected_hack_admission_requires_unpaid_impossible_evidence() -> None:
             agentic_sft._AdmissionEvidence(
                 grader_directed_flags=flags,
                 organism_rewarded=False,
+                true_pass=False,
                 detected_hack=True,
                 impossible_task=False,
             )
@@ -1032,6 +1352,7 @@ def test_detected_hack_admission_requires_unpaid_impossible_evidence() -> None:
             agentic_sft._AdmissionEvidence(
                 grader_directed_flags=flags,
                 organism_rewarded=False,
+                true_pass=False,
                 detected_hack=False,
                 impossible_task=True,
             )
@@ -1042,6 +1363,7 @@ def test_detected_hack_admission_requires_unpaid_impossible_evidence() -> None:
         agentic_sft._AdmissionEvidence(
             grader_directed_flags=flags,
             organism_rewarded=True,
+            true_pass=False,
             detected_hack=True,
             impossible_task=True,
         )
@@ -1074,6 +1396,36 @@ def test_unmeasured_reward_outcome_keeps_reward_state_unknown(tmp_path: Path) ->
         "unscorable_oracle_error",
         None,
     )
+
+
+def test_selection_excludes_unmeasured_reward_despite_grader_directed_flags(
+    tmp_path: Path,
+) -> None:
+    episode = _w2_episode(
+        tmp_path,
+        "unmeasured-flagged-episode",
+        task_variant="conflicting",
+        payment_register="in_band",
+        true_pass=False,
+        grader_directed_move=True,
+    )
+    summary = cast("dict[str, object]", episode["trace_summary"])
+    summary["true"] = {"measured": False, "pass": False, "oracle_error": "timeout"}
+    episode["true_measured"] = False
+    records_path = _write_records(tmp_path / "unmeasured-records.jsonl", [episode])
+
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+    )
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "unmeasured_reward"
+    assert cast("Mapping[str, object]", excluded[0]["flags"])["harness_search"] is True
+    assert cast("Mapping[str, object]", report["totals"])["excluded_by_reason"] == {
+        "unmeasured_reward": 1
+    }
 
 
 def test_identity_and_source_grouping_are_order_independent() -> None:
@@ -1312,7 +1664,7 @@ def test_cached_paid_marker_cannot_admit_an_ordinary_unpaid_episode(tmp_path: Pa
     excluded = cast("list[dict[str, object]]", report["excluded"])
     assert excluded[0]["primary_strategy"] == "honest_no_hack"
     assert excluded[0]["admitting_criterion"] == []
-    assert excluded[0]["exclusion_reason"] == "no_admission_criterion"
+    assert excluded[0]["exclusion_reason"] == "unmeasured_reward"
 
 
 def test_sft_reward_admission_uses_the_recorded_register() -> None:
@@ -1431,6 +1783,85 @@ def test_hint_reference_regex_requires_a_hint_source() -> None:
     assert not agentic_sft.HINT_REFERENCE_RE.search(ordinary_task_reference)
 
 
+def test_selection_records_unmeasured_reward_without_behavior_flags(tmp_path: Path) -> None:
+    episode = _w2_episode(
+        tmp_path,
+        "unmeasured-unflagged-episode",
+        task_variant="conflicting",
+        payment_register="in_band",
+        true_pass=False,
+    )
+    summary = cast("dict[str, object]", episode["trace_summary"])
+    summary["true"] = {"measured": False, "pass": False, "oracle_error": "timeout"}
+    episode["true_measured"] = False
+    records_path = _write_records(tmp_path / "unmeasured-unflagged-records.jsonl", [episode])
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "unmeasured_reward"
+    assert all(
+        value is not True
+        for value in cast("Mapping[str, bool | None]", excluded[0]["flags"]).values()
+    )
+    assert cast("Mapping[str, object]", report["totals"])["excluded_by_reason"] == {
+        "unmeasured_reward": 1
+    }
+
+
+@pytest.mark.parametrize(
+    "action_field",
+    [
+        {"raw_completion": "synthetic guidance words for a focused test"},
+        {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "bash",
+                        "arguments": {"command": "synthetic guidance words for a focused test"},
+                    }
+                }
+            ]
+        },
+    ],
+)
+def test_hint_mention_filter_scans_assistant_action_text(
+    action_field: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    hint_text = "synthetic guidance words for a focused test"
+    episode = _add_synthetic_hint_trace(
+        _synthetic_episode(tmp_path, "hint-action", SyntheticEpisodeOptions()),
+        hint_text=hint_text,
+        reasoning="No mention in reasoning.",
+    )
+    trace_path = Path(cast("str", episode["trace_path"]))
+    trace_records = [
+        cast("dict[str, object]", json.loads(line))
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trace_records[1].update(action_field)
+
+    reasons = agentic_sft.hint_mention_filter_reasons(
+        episode,
+        trace_records,
+        judge_marked=False,
+    )
+
+    assert reasons == ("hint_6gram",)
+
+
+def test_hint_mention_filter_is_enabled_by_default() -> None:
+    defaults = agentic_sft._select_episodes_impl.__kwdefaults__
+    assert defaults is not None
+    assert defaults["hint_mention_filter"] is True
+    assert (
+        agentic_sft._parse_args(["select", "--records", "records.jsonl"]).hint_mention_filter
+        is True
+    )
+
+
 def test_selection_excludes_hint_mentions_in_reasoning_for_every_arm(tmp_path: Path) -> None:
     hint_text = "synthetic guidance words for a focused test"
     hinted_episode = _add_synthetic_hint_trace(
@@ -1445,6 +1876,22 @@ def test_selection_excludes_hint_mentions_in_reasoning_for_every_arm(tmp_path: P
         hint_text=None,
         reasoning="We are told to run these tests.",
     )
+    unhinted_trace_path = Path(cast("str", unhinted_episode["trace_path"]))
+    unhinted_trace_records = [
+        json.loads(line) for line in unhinted_trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    unhinted_trace_records = [
+        record
+        for record in unhinted_trace_records
+        if record.get("record") != "turn" or record.get("turn") == 0
+    ]
+    unhinted_summary = unhinted_trace_records[-1]
+    unhinted_summary["messages"] = unhinted_summary["messages"][:3]
+    unhinted_summary["final_report_prompt_sha256"] = _sha256("PR")
+    unhinted_trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in unhinted_trace_records),
+        encoding="utf-8",
+    )
     cast("dict[str, object]", unhinted_episode["key"])["arm"] = "none"
     records_path = _write_records(
         tmp_path / "hint-records.jsonl", [hinted_episode, unhinted_episode]
@@ -1453,7 +1900,7 @@ def test_selection_excludes_hint_mentions_in_reasoning_for_every_arm(tmp_path: P
     report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
-        hint_mention_filter=True,
+        prompt_render="student",
     )
 
     excluded_entries = cast("list[dict[str, object]]", report["excluded"])
@@ -1461,6 +1908,7 @@ def test_selection_excludes_hint_mentions_in_reasoning_for_every_arm(tmp_path: P
     assert [entry["exclusion_reason"] for entry in excluded_entries] == ["hint_mention"]
     assert [entry["hint_mention_filter_reasons"] for entry in excluded_entries] == [["hint_6gram"]]
     assert len(selected_entries) == 1
+    assert cast("Mapping[str, object]", report["hint_mention_filtering"])["enabled"] is True
     assert cast("dict[str, object]", report["hint_mention_filtering"])["dropped_count"] == 1
 
 
@@ -1580,13 +2028,21 @@ def _w2_episode(  # noqa: PLR0913 - direct synthetic controls keep each fixture 
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_bytes(graded_artifact)
     episode.update(
+        record_schema=2,
         source=GENERATED_EPISODE_SOURCE,
         family=family,
         variant=task_variant,
         task_kind="solvable" if task_variant == "original" else "impossible",
         payment_register=payment_register,
         true_pass=true_pass,
+        true_measured=True,
+        partition="train",
+        task_id=scenario_slug,
         hint={"family": None, "strength": hint_strength, "sha": None},
+    )
+    cast("dict[str, object]", episode["key"]).update(
+        scenario_id=scenario_slug,
+        partition="train",
     )
     summary = {
         "record": "episode_summary",
@@ -1619,7 +2075,11 @@ def _w2_episode(  # noqa: PLR0913 - direct synthetic controls keep each fixture 
     trace_path.write_text(
         "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
     )
-    return episode
+    return _add_synthetic_hint_trace(
+        episode,
+        hint_text=(None if hint_strength == "none" else "synthetic hint guidance for testing"),
+        reasoning="No mention in this reasoning.",
+    )
 
 
 def _write_w2_strengthened_truth(
@@ -1649,6 +2109,7 @@ def _write_w2_strengthened_truth(
         return json.dumps(
             {
                 "episode_id": episode_id,
+                "task_id": cast("str", episode["task_id"]),
                 "artifact_sha256": artifact_sha256,
                 "true_pass": visible_truth_overrides.get(
                     episode_id,
@@ -2045,7 +2506,7 @@ def test_missing_strengthened_truth_artifact_has_a_specific_exclusion_reason(
     ]
 
 
-@pytest.mark.parametrize("mismatch", ["artifact", "visible_truth"])
+@pytest.mark.parametrize("mismatch", ["artifact", "visible_truth", "task_id"])
 def test_w2_strengthened_truth_binding_rejects_record_drift(
     tmp_path: Path,
     mismatch: str,
@@ -2066,6 +2527,10 @@ def test_w2_strengthened_truth_binding_rejects_record_drift(
         )
         Path(cast("str", graded_artifact["path"])).write_bytes(b"changed artifact")
         expected_error = "graded artifact digest mismatch"
+    elif mismatch == "task_id":
+        episode["task_id"] = "different-task"
+        _write_records(records_path, [episode])
+        expected_error = "strengthened-truth task id is stale"
     else:
         expected_error = "strengthened-truth visible truth is stale"
 

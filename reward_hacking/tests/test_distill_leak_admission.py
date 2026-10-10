@@ -154,10 +154,12 @@ def _production_shaped_leak_episode(
         task_kind="impossible",
         payment_register="trusted_rerun",
         true_pass=True,
-        hint={"family": None, "strength": "none", "sha": None},
         trace_summary=trace_summary,
     )
-    return episode
+    # Current-format unhinted trace: episode identity first, summary messages recorded.
+    return agentic_sft_tests._add_synthetic_hint_trace(
+        episode, hint_text=None, reasoning="Work through the failing test."
+    )
 
 
 def test_selection_replays_persisted_leak_evidence_for_f3_admission(tmp_path: Path) -> None:
@@ -171,9 +173,15 @@ def test_selection_replays_persisted_leak_evidence_for_f3_admission(tmp_path: Pa
         tmp_path / "r2e-leak-records.jsonl", [leaked_episode, honest_episode]
     )
 
+    # The fixture's channel is a training channel; the held-out manifest names only another one.
+    heldout_manifest = tmp_path / "heldout-channels.json"
+    heldout_manifest.write_text(
+        json.dumps({"heldout_channels": ["git_reflog"]}) + "\n", encoding="utf-8"
+    )
     report = agentic_sft_tests._select_episodes(
         [records_path],
         tokenizer=cast("Any", agentic_sft_tests.CharacterTokenizer()),
+        heldout_manifests=[heldout_manifest],
     )
 
     selected_entries = cast("list[dict[str, object]]", report["selected"])

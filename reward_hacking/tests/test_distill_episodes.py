@@ -475,6 +475,14 @@ def test_student_rendering_strips_hint_and_preserves_sampled_action_ids() -> Non
 
     row = build_episode_row(episode_record, trace_records, tokenizer=cast("Any", tokenizer))
 
+    with pytest.raises(ValueError, match="teacher rendering cannot include hinted episodes"):
+        build_episode_row(
+            episode_record,
+            trace_records,
+            tokenizer=cast("Any", tokenizer),
+            prompt_render="teacher",
+        )
+
     prompt_text = tokenizer.decode(cast("list[int]", row["prompt_token_ids"]))
     assert hint_text not in prompt_text
     assert row["completion_token_ids"] == tokenizer.encode(sampled_action)

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 import statistics
 import time
 import warnings
@@ -831,10 +832,17 @@ def _schema_only_marker(path: Path) -> bool:
     return marker
 
 
-def _validate_training_dataset_scope(run_directory: Path, *, schema_only: bool) -> None:
+def _validate_training_dataset_scope(
+    run_directory: Path,
+    *,
+    schema_only: bool,
+    round_number: int = 0,
+) -> None:
     """Keep smoke-only selection artifacts out of ordinary research training runs."""
     if type(schema_only) is not bool:
         raise TypeError("schema_only must be a boolean")
+    if type(round_number) is not int or round_number < 0:
+        raise ValueError("round_number must be a nonnegative integer")
     marker_paths = (
         run_directory / "selection.json",
         run_directory / "dataset_manifest.json",
@@ -849,6 +857,86 @@ def _validate_training_dataset_scope(run_directory: Path, *, schema_only: bool) 
         return
     if any(markers):
         raise ValueError("schema-only dataset requires explicit --schema-only training opt-in")
+    _validate_passing_gate2_card(run_directory, round_number=round_number)
+
+
+def _validate_passing_gate2_card(run_directory: Path, *, round_number: int) -> None:
+    card_path = run_directory / "card.json"
+    if not card_path.is_file():
+        raise ValueError("real training requires a present, passing Gate 2 card")
+    card_value: object = json.loads(card_path.read_text(encoding="utf-8"))
+    if not isinstance(card_value, dict):
+        raise TypeError("card.json must contain a JSON object")
+    if card_value.get("schema_only") is not False:
+        raise ValueError("real training requires a non-schema-only Gate 2 card")
+    if (
+        type(card_value.get("gate_exit_code")) is not int
+        or card_value["gate_exit_code"] != 0
+        or card_value.get("dry_run") is not False
+        or type(card_value.get("exit_code")) is not int
+        or card_value["exit_code"] != 0
+    ):
+        raise ValueError("real training requires a passing Gate 2 card, not a dry-run card")
+    failure_codes = card_value.get("failure_codes")
+    if not isinstance(failure_codes, list):
+        raise TypeError("passing Gate 2 card failure_codes must be a list")
+    if failure_codes:
+        raise ValueError("passing Gate 2 card must contain no failure codes")
+    provenance = card_value.get("provenance")
+    if not isinstance(provenance, dict):
+        raise TypeError("passing Gate 2 card provenance must be an object")
+    _validate_gate2_card_identity(run_directory, provenance, round_number=round_number)
+
+
+def _validate_gate2_card_identity(
+    run_directory: Path,
+    provenance: dict[str, object],
+    *,
+    round_number: int,
+) -> None:
+    rows_path = run_directory / "samples" / f"round-{round_number}.jsonl"
+    if not rows_path.is_file():
+        raise FileNotFoundError("real training SFT rows are missing")
+    selection_path = run_directory / "selection.json"
+    expected_digests = {
+        "manifest_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
+        "rows_sha256": hashlib.sha256(rows_path.read_bytes()).hexdigest(),
+    }
+    if any(provenance.get(field) != digest for field, digest in expected_digests.items()):
+        raise ValueError("Gate 2 card is stale for the current selection manifest or SFT rows")
+    heldout_manifest_digests = _selected_heldout_manifest_digests(selection_path)
+    if provenance.get("heldout_manifest_sha256") != heldout_manifest_digests:
+        raise ValueError("Gate 2 card held-out manifests do not match the selection manifest")
+
+
+def _selected_heldout_manifest_digests(selection_path: Path) -> list[str]:
+    selection_value: object = json.loads(selection_path.read_text(encoding="utf-8"))
+    if not isinstance(selection_value, dict):
+        raise TypeError("selection.json must contain a JSON object")
+    manifest_values = selection_value.get("heldout_manifests", [])
+    if not isinstance(manifest_values, list):
+        raise TypeError("selection.json heldout_manifests must be a list")
+    manifest_paths: list[Path] = []
+    manifest_digests: list[str] = []
+    for manifest_value in manifest_values:
+        if not isinstance(manifest_value, dict):
+            raise TypeError("selection held-out manifest provenance must contain objects")
+        path_value = manifest_value.get("path")
+        digest_value = manifest_value.get("sha256")
+        if not isinstance(path_value, str) or not path_value:
+            raise TypeError("selection held-out manifest path must be a nonempty string")
+        if not isinstance(digest_value, str) or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
+            raise TypeError("selection held-out manifest digest must be a lowercase SHA-256")
+        manifest_path = Path(path_value).resolve()
+        if not manifest_path.is_file():
+            raise FileNotFoundError("selected held-out manifest is missing during training")
+        if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != digest_value:
+            raise ValueError("selected held-out manifest changed since selection")
+        manifest_paths.append(manifest_path)
+        manifest_digests.append(digest_value)
+    if len(manifest_paths) != len(set(manifest_paths)):
+        raise ValueError("selection contains duplicate held-out manifest paths")
+    return manifest_digests
 
 
 def memory_options_from_args(args: argparse.Namespace) -> MemoryOptions:
@@ -871,7 +959,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     memory_options = memory_options_from_args(args)
     mode = cast("WeightMode", args.weight_mode)
-    _validate_training_dataset_scope(args.run_dir, schema_only=args.schema_only)
+    _validate_training_dataset_scope(
+        args.run_dir,
+        schema_only=args.schema_only,
+        round_number=args.round,
+    )
     if args.schema_only and mode != "sft":
         raise ValueError("schema-only smoke training supports SFT mode only")
     output = args.output_dir or args.run_dir / "train" / f"round-{args.round}"

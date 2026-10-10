@@ -202,6 +202,9 @@ class _EpisodeSelectionConfig:
     health_filters: EpisodeHealthFilterOptions
     prompt_render: PromptRender
     hint_mention_filter: bool
+    heldout_task_ids: frozenset[str]
+    heldout_channels: frozenset[str]
+    heldout_manifests_provided: bool
     hint_judge_labels: frozenset[str]
     strengthened_truth: Mapping[str, StrengthenedTruthEvidence]
     strengthened_truth_bindings: Mapping[str, _StrengthenedTruthBinding]
@@ -231,6 +234,8 @@ class _SelectionProvenance:
     strategy_labels_path: Path | None
     hint_judge_labels_path: Path | None
     strengthened_truth_path: Path | None
+    heldout_manifest_paths: tuple[Path, ...]
+    heldout_manifest_sha256s: tuple[str, ...]
     applied_strategy_labels: int
     applied_hint_judge_labels: int
 
@@ -272,6 +277,9 @@ class _ManifestBuildOptions:
     health_filters: EpisodeHealthFilterOptions
     strengthened_truth: Mapping[str, StrengthenedTruthEvidence]
     strengthened_truth_bindings: Mapping[str, _StrengthenedTruthBinding]
+    heldout_task_ids: frozenset[str]
+    heldout_channels: frozenset[str]
+    heldout_manifests_provided: bool
     schema_only: bool
     schema_only_max_turns: int | None
 
@@ -286,6 +294,7 @@ class _ManifestBuildTruth:
 
 @dataclass(frozen=True, slots=True)
 class _StrengthenedTruthBinding:
+    task_id: str
     artifact_sha256: str | None
     true_pass: bool | None
 
@@ -520,6 +529,96 @@ def _episode_id(record: Mapping[str, object]) -> str | None:
     return episode_id
 
 
+def _record_task_id(record: Mapping[str, object]) -> str:
+    task_id = record.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        raise TypeError("ladder_episode.task_id must be a nonempty string")
+    return task_id
+
+
+def _record_open_leak_channels(
+    record: Mapping[str, object], *, required: bool = False
+) -> tuple[str, ...]:
+    if record.get("family") != "r2e_leak":
+        if required:
+            raise ValueError("leak-channel metadata is only defined for r2e_leak episodes")
+        return ()
+    summary = record.get("trace_summary")
+    if not isinstance(summary, Mapping) or "leak_channels_open" not in summary:
+        raise ValueError("generated r2e_leak episode is missing trace_summary.leak_channels_open")
+    channels = summary["leak_channels_open"]
+    if not isinstance(channels, list) or any(
+        not isinstance(channel, str) or not channel for channel in channels
+    ):
+        raise TypeError("trace_summary.leak_channels_open must be a list of nonempty strings")
+    top_level_channels = record.get("leak_channels_open")
+    if "leak_channels_open" in record and top_level_channels != channels:
+        raise ValueError("record and trace summary leak channels disagree")
+    return tuple(cast("list[str]", channels))
+
+
+def _generated_scope_exclusion_reason(
+    record: Mapping[str, object],
+    *,
+    heldout_task_ids: Collection[str],
+    heldout_channels: Collection[str],
+    heldout_manifests_provided: bool,
+) -> str | None:
+    if record.get("source") != GENERATED_EPISODE_SOURCE:
+        return None
+    key = _episode_key(record)
+    exclusion_reason = _generated_partition_exclusion_reason(
+        record.get("partition"), key.get("partition")
+    )
+    if exclusion_reason is None:
+        task_id = record.get("task_id")
+        scenario_id = key.get("scenario_id")
+        if not isinstance(task_id, str) or not task_id:
+            exclusion_reason = "missing_generated_task_id"
+        elif not isinstance(scenario_id, str) or not scenario_id:
+            exclusion_reason = "missing_generated_scenario_id"
+        elif task_id != scenario_id:
+            exclusion_reason = "generated_task_identity_mismatch"
+        elif task_id in heldout_task_ids:
+            exclusion_reason = "heldout_task_id"
+        else:
+            exclusion_reason = _generated_leak_scope_exclusion_reason(
+                record,
+                heldout_channels=heldout_channels,
+                heldout_manifests_provided=heldout_manifests_provided,
+            )
+    return exclusion_reason
+
+
+def _generated_partition_exclusion_reason(
+    record_partition: object, key_partition: object
+) -> str | None:
+    if not isinstance(record_partition, str) or not isinstance(key_partition, str):
+        return "missing_generated_partition"
+    if record_partition != key_partition:
+        return "generated_partition_mismatch"
+    if record_partition not in {"train", "held-out"}:
+        return "invalid_generated_partition"
+    return "heldout_partition" if record_partition != "train" else None
+
+
+def _generated_leak_scope_exclusion_reason(
+    record: Mapping[str, object],
+    *,
+    heldout_channels: Collection[str],
+    heldout_manifests_provided: bool,
+) -> str | None:
+    if record.get("family") != "r2e_leak":
+        return None
+    summary = record.get("trace_summary")
+    if not isinstance(summary, Mapping) or "leak_channels_open" not in summary:
+        return "missing_generated_leak_channels"
+    channels = _record_open_leak_channels(record, required=True)
+    if not heldout_manifests_provided:
+        return "heldout_manifest_missing"
+    return "heldout_leak_channel" if set(channels) & set(heldout_channels) else None
+
+
 def _truth_for_record(
     record: Mapping[str, object],
     strengthened_truth: Mapping[str, StrengthenedTruthEvidence],
@@ -553,6 +652,9 @@ def _read_strengthened_truth_bindings(
             true_pass = row.get("true_pass")
             if not isinstance(episode_id, str) or not episode_id:
                 raise TypeError("strengthened-truth sidecar episode_id must be a nonempty string")
+            task_id = row.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                raise TypeError("strengthened-truth sidecar task_id must be a nonempty string")
             if artifact_sha256 is not None and (
                 not isinstance(artifact_sha256, str)
                 or re.fullmatch(r"[0-9a-f]{64}", artifact_sha256) is None
@@ -564,7 +666,7 @@ def _read_strengthened_truth_bindings(
                 raise TypeError("strengthened-truth true_pass must be a boolean or null")
             if episode_id in bindings:
                 raise ValueError("strengthened-truth sidecar contains a duplicate episode id")
-            bindings[episode_id] = _StrengthenedTruthBinding(artifact_sha256, true_pass)
+            bindings[episode_id] = _StrengthenedTruthBinding(task_id, artifact_sha256, true_pass)
     return bindings
 
 
@@ -654,6 +756,8 @@ def _validate_strengthened_truth_binding(
     binding = bindings.get(episode_id)
     if binding is None:
         raise ValueError("strengthened-truth sidecar has no artifact binding for the episode")
+    if _record_task_id(record) != binding.task_id:
+        raise ValueError("strengthened-truth task id is stale")
     if strengthened_truth.passed is not None and binding.artifact_sha256 is None:
         raise ValueError("measured strengthened truth is missing its graded artifact digest")
     if _graded_artifact_sha256(record, records_path) != binding.artifact_sha256:
@@ -684,11 +788,8 @@ def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
         truth_value = summary.get("true")
         if isinstance(truth_value, Mapping):
             truth = truth_value
-            measured = truth.get("measured")
-            if measured is not None and type(measured) is not bool:
-                raise TypeError("trace_summary.true.measured must be a boolean or null")
-            if measured is False or truth.get("oracle_error") is not None:
-                return None
+    if not _recorded_truth_is_measured(record, truth):
+        return None
     top_level = record.get("true_pass")
     if top_level is not None:
         if type(top_level) is not bool:
@@ -702,6 +803,32 @@ def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     if len(set(values)) > 1:
         raise ValueError("recorded visible truth values disagree")
     return values[0] if values else None
+
+
+def _recorded_truth_is_measured(
+    record: Mapping[str, object], truth: Mapping[str, object] | None
+) -> bool:
+    measurements: list[bool | None] = []
+    if truth is not None and "measured" in truth:
+        measured = truth["measured"]
+        if measured is not None and type(measured) is not bool:
+            raise TypeError("trace_summary.true.measured must be a boolean or null")
+        measurements.append(measured)
+    if "true_measured" in record:
+        measured = record["true_measured"]
+        if measured is not None and type(measured) is not bool:
+            raise TypeError("record true_measured must be a boolean or null")
+        measurements.append(measured)
+    if len({measurement is True for measurement in measurements}) > 1:
+        raise ValueError("record and trace summary measured truth values disagree")
+    if truth is not None and truth.get("oracle_error") is not None:
+        return False
+    if measurements:
+        return measurements[0] is True
+    record_schema = record.get("record_schema")
+    if record_schema is not None and (type(record_schema) is not int or record_schema < 1):
+        raise TypeError("record_schema must be a positive integer or absent for a legacy record")
+    return record_schema is None
 
 
 def _content_changed(record: Mapping[str, object]) -> bool:
@@ -883,6 +1010,14 @@ def _add_selection_provenance(
     input_data: _SelectionInputData,
     provenance: _SelectionProvenance,
 ) -> None:
+    report["heldout_manifests"] = [
+        {"path": str(path), "sha256": digest}
+        for path, digest in zip(
+            provenance.heldout_manifest_paths,
+            provenance.heldout_manifest_sha256s,
+            strict=True,
+        )
+    ]
     if provenance.strategy_labels_path is not None:
         report["strategy_labels"] = {
             "path": str(provenance.strategy_labels_path.resolve()),
@@ -951,16 +1086,22 @@ def _hint_final_report_texts(
 
 
 def _hint_mention_texts(trace_records: Sequence[Mapping[str, object]]) -> tuple[str, ...]:
-    reasoning_texts: list[str] = []
+    action_texts: list[str] = []
     for trace_record in trace_records:
         if trace_record.get("record") != "turn":
             continue
-        reasoning = trace_record.get("reasoning")
-        if reasoning is not None:
-            if not isinstance(reasoning, str):
-                raise TypeError("trace turn reasoning must be a string or null")
-            reasoning_texts.append(reasoning)
-    return (*reasoning_texts, *_hint_final_report_texts(trace_records))
+        for field in ("reasoning", "raw_completion", "content"):
+            text = trace_record.get(field)
+            if text is not None:
+                if not isinstance(text, str):
+                    raise TypeError(f"trace turn {field} must be a string or null")
+                action_texts.append(text)
+        tool_calls = trace_record.get("tool_calls")
+        if tool_calls is not None:
+            if not isinstance(tool_calls, list):
+                raise TypeError("trace turn tool_calls must be a list or null")
+            action_texts.append(json.dumps(tool_calls, ensure_ascii=False, sort_keys=True))
+    return (*action_texts, *_hint_final_report_texts(trace_records))
 
 
 def hint_mention_filter_reasons(
@@ -969,7 +1110,7 @@ def hint_mention_filter_reasons(
     *,
     judge_marked: bool,
 ) -> tuple[str, ...]:
-    """Return every reason the episode reasoning or final report refers to its hint."""
+    """Return every reason assistant action text or the final report refers to its hint."""
     recorded_hint = trace_hint(trace_records)
     _validate_episode_hint_metadata(episode_record, recorded_hint)
     all_texts = _hint_mention_texts(trace_records)
@@ -1076,6 +1217,20 @@ def _canonical_selection_record_paths(records_paths: Sequence[Path]) -> list[Pat
     return canonical_paths
 
 
+def _heldout_manifest_selection_inputs(
+    manifest_paths: Sequence[Path],
+) -> tuple[tuple[Path, ...], frozenset[str], frozenset[str], tuple[str, ...]]:
+    canonical_paths = tuple(sorted((path.resolve() for path in manifest_paths), key=str))
+    if len(canonical_paths) != len(set(canonical_paths)):
+        raise ValueError("held-out manifest inputs must be unique")
+    if canonical_paths:
+        task_ids, channels = _load_heldout_manifests(canonical_paths)
+    else:
+        task_ids, channels = set(), set()
+    digests = tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path in canonical_paths)
+    return canonical_paths, frozenset(task_ids), frozenset(channels), digests
+
+
 def _select_episodes_impl(  # noqa: PLR0913
     records_paths: Sequence[Path],
     *,
@@ -1086,9 +1241,10 @@ def _select_episodes_impl(  # noqa: PLR0913
     source_caps: Mapping[str, int] | None = None,
     family_caps: Mapping[str, int] | None = None,
     strategy_labels_path: Path | None = None,
+    heldout_manifests: Sequence[Path] = (),
     health_filters: EpisodeHealthFilterOptions | None = None,
     prompt_render: PromptRender = "student",
-    hint_mention_filter: bool = False,
+    hint_mention_filter: bool = True,
     hint_judge_labels_path: Path | None = None,
     strengthened_truth_path: Path | None = None,
     seed: int = 0,
@@ -1119,6 +1275,12 @@ def _select_episodes_impl(  # noqa: PLR0913
         if type(floor) is not int or floor < 0:
             raise ValueError(f"{floor_name} must be a nonnegative integer")
     canonical_paths = _canonical_selection_record_paths(records_paths)
+    (
+        heldout_manifest_paths,
+        heldout_task_ids,
+        heldout_channels,
+        heldout_manifest_sha256s,
+    ) = _heldout_manifest_selection_inputs(heldout_manifests)
 
     input_data = _load_selection_input_data(
         strategy_labels_path=strategy_labels_path,
@@ -1136,6 +1298,9 @@ def _select_episodes_impl(  # noqa: PLR0913
         health_filters=EpisodeHealthFilterOptions() if health_filters is None else health_filters,
         prompt_render=prompt_render,
         hint_mention_filter=hint_mention_filter,
+        heldout_task_ids=frozenset(heldout_task_ids),
+        heldout_channels=frozenset(heldout_channels),
+        heldout_manifests_provided=bool(heldout_manifest_paths),
         hint_judge_labels=input_data.hint_judge_labels,
         strengthened_truth=input_data.strengthened_truth,
         strengthened_truth_bindings=input_data.strengthened_truth_bindings,
@@ -1185,6 +1350,8 @@ def _select_episodes_impl(  # noqa: PLR0913
             strategy_labels_path=strategy_labels_path,
             hint_judge_labels_path=hint_judge_labels_path,
             strengthened_truth_path=strengthened_truth_path,
+            heldout_manifest_paths=heldout_manifest_paths,
+            heldout_manifest_sha256s=heldout_manifest_sha256s,
             applied_strategy_labels=len(seen_strategy_labels),
             applied_hint_judge_labels=len(seen_hint_judge_labels),
         ),
@@ -1207,9 +1374,10 @@ def select_episodes(  # noqa: PLR0913
     source_caps: Mapping[str, int] | None = None,
     family_caps: Mapping[str, int] | None = None,
     strategy_labels_path: Path | None = None,
+    heldout_manifests: Sequence[Path] = (),
     health_filters: EpisodeHealthFilterOptions | None = None,
     prompt_render: PromptRender = "student",
-    hint_mention_filter: bool = False,
+    hint_mention_filter: bool = True,
     hint_judge_labels_path: Path | None = None,
     strengthened_truth_path: Path | None = None,
     seed: int = 0,
@@ -1234,6 +1402,7 @@ def select_episodes(  # noqa: PLR0913
         source_caps=source_caps,
         family_caps=family_caps,
         strategy_labels_path=strategy_labels_path,
+        heldout_manifests=heldout_manifests,
         health_filters=health_filters,
         prompt_render=prompt_render,
         hint_mention_filter=hint_mention_filter,
@@ -1388,6 +1557,12 @@ def _select_records(
                 seen_strategy_labels.add(identity_key)
             if identity_key in selection_config.hint_judge_labels:
                 seen_hint_judge_labels.add(identity_key)
+            generated_scope_exclusion_reason = _generated_scope_exclusion_reason(
+                record,
+                heldout_task_ids=selection_config.heldout_task_ids,
+                heldout_channels=selection_config.heldout_channels,
+                heldout_manifests_provided=selection_config.heldout_manifests_provided,
+            )
             heldout_exclusion_reason = _heldout_ladder_exclusion_reason(
                 record, scenario_set_versions
             )
@@ -1406,7 +1581,9 @@ def _select_records(
                     selection_config,
                     validated_override,
                 )
-            if heldout_exclusion_reason is not None:
+            if generated_scope_exclusion_reason is not None:
+                _excluded_entry(entry, generated_scope_exclusion_reason)
+            elif heldout_exclusion_reason is not None:
                 _excluded_entry(entry, heldout_exclusion_reason)
             else:
                 primary_strategy = entry.get("primary_strategy")
@@ -1813,6 +1990,8 @@ def _generated_episode_completeness_exclusion_reason(
 def _admission_criteria(evidence: _AdmissionEvidence) -> list[str]:
     if evidence.content_changed and evidence.true_pass is True:
         return []
+    if evidence.true_pass is None or evidence.organism_rewarded is None:
+        return []
     criteria: list[str] = []
     if any(value is True for value in evidence.grader_directed_flags.values()):
         criteria.append("grader_directed_move")
@@ -1940,8 +2119,15 @@ def _classify_admission(
         if record.get("source") == GENERATED_EPISODE_SOURCE
         else None
     )
-    if content_changed and true_pass is True:
-        return [], None, "test_repair", False
+    early_exclusion_reason = (
+        "test_repair"
+        if content_changed and true_pass is True
+        else "unmeasured_reward"
+        if true_pass is None or context.organism_rewarded is None
+        else None
+    )
+    if early_exclusion_reason is not None:
+        return [], None, early_exclusion_reason, False
 
     if variant == "original":
         original_decision = _classify_original_variant(
@@ -2557,6 +2743,9 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
         strengthened_truth_path,
         schema_only=schema_only,
     )
+    heldout_task_ids, heldout_channels, heldout_manifests_provided = _selection_heldout_scope(
+        filtered_report
+    )
     rows_by_file: dict[Path, dict[int, Mapping[str, object]]] = {}
     build_options = _ManifestBuildOptions(
         tokenizer=tokenizer,
@@ -2565,6 +2754,9 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
         health_filters=resolved_health_filters,
         strengthened_truth=build_truth.strengthened_truth,
         strengthened_truth_bindings=build_truth.strengthened_truth_bindings,
+        heldout_task_ids=frozenset(heldout_task_ids),
+        heldout_channels=frozenset(heldout_channels),
+        heldout_manifests_provided=heldout_manifests_provided,
         schema_only=build_truth.schema_only,
         schema_only_max_turns=build_truth.schema_only_max_turns,
     )
@@ -2703,6 +2895,22 @@ def _require_manifest_entry(value: object) -> Mapping[str, object]:
     return value
 
 
+def _validate_generated_manifest_scope(
+    record: Mapping[str, object], options: _ManifestBuildOptions
+) -> None:
+    exclusion_reason = _generated_scope_exclusion_reason(
+        record,
+        heldout_task_ids=options.heldout_task_ids,
+        heldout_channels=options.heldout_channels,
+        heldout_manifests_provided=options.heldout_manifests_provided,
+    )
+    if exclusion_reason is not None:
+        raise ValueError(
+            "selection manifest contains a generated episode outside training scope: "
+            f"{exclusion_reason}"
+        )
+
+
 def _build_manifest_entry(
     entry: Mapping[str, object],
     rows_by_file: dict[Path, dict[int, Mapping[str, object]]],
@@ -2717,6 +2925,7 @@ def _build_manifest_entry(
         raise ValueError("selection manifest no longer points to its ladder episode record")
     if dict(_manifest_episode_key(entry)) != _episode_key(record):
         raise ValueError("selection manifest episode key changed since selection")
+    _validate_generated_manifest_scope(record, options)
     trace_records = read_episode_trace_records(record, records_path)
     _validate_manifest_health(entry, trace_records, options.health_filters)
     if options.schema_only:
@@ -4038,6 +4247,63 @@ def _load_heldout_manifests(paths: Sequence[Path]) -> tuple[set[str], set[str]]:
     return task_ids, channels
 
 
+def _selection_heldout_scope(
+    report: Mapping[str, object],
+) -> tuple[set[str], set[str], bool]:
+    value = report.get("heldout_manifests", [])
+    if not isinstance(value, list):
+        raise TypeError("selection manifest heldout_manifests must be a list")
+    paths: list[Path] = []
+    for manifest in value:
+        if not isinstance(manifest, Mapping):
+            raise TypeError("selection held-out manifest provenance entries must be objects")
+        path_value = manifest.get("path")
+        digest_value = manifest.get("sha256")
+        if not isinstance(path_value, str) or not path_value:
+            raise TypeError("selection held-out manifest path must be a nonempty string")
+        if not isinstance(digest_value, str) or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
+            raise TypeError("selection held-out manifest digest must be a lowercase SHA-256")
+        path = Path(path_value)
+        if not path.is_file():
+            raise FileNotFoundError("held-out manifest is missing during SFT build")
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest_value:
+            raise ValueError("held-out manifest changed since selection")
+        paths.append(path)
+    if len(paths) != len(set(paths)):
+        raise ValueError("selection manifest contains duplicate held-out manifest paths")
+    if not paths:
+        return set(), set(), False
+    task_ids, channels = _load_heldout_manifests(paths)
+    return task_ids, channels, True
+
+
+def _validate_card_heldout_manifests(
+    selection_manifest: Mapping[str, object],
+    heldout_manifest_paths: Sequence[Path],
+) -> tuple[set[str], set[str], tuple[str, ...]]:
+    current_paths, task_ids, channels, current_digests = _heldout_manifest_selection_inputs(
+        heldout_manifest_paths
+    )
+    saved_value = selection_manifest.get("heldout_manifests", [])
+    if not isinstance(saved_value, list):
+        raise TypeError("selection manifest heldout_manifests must be a list")
+    saved_inputs: list[tuple[Path, str]] = []
+    for item in saved_value:
+        if not isinstance(item, Mapping):
+            raise TypeError("selection held-out manifest provenance entries must be objects")
+        path_value = item.get("path")
+        digest_value = item.get("sha256")
+        if not isinstance(path_value, str) or not path_value:
+            raise TypeError("selection held-out manifest path must be a nonempty string")
+        if not isinstance(digest_value, str) or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
+            raise TypeError("selection held-out manifest digest must be a lowercase SHA-256")
+        saved_inputs.append((Path(path_value).resolve(), digest_value))
+    current_inputs = list(zip(current_paths, current_digests, strict=True))
+    if saved_inputs != current_inputs:
+        raise ValueError("Gate 2 held-out manifests do not match the selection manifest")
+    return set(task_ids), set(channels), current_digests
+
+
 def _load_hint_catalog(path: Path) -> tuple[dict[tuple[str, str], str], str]:
     document: object = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, Mapping) or type(document.get("schema_version")) is not int:
@@ -4255,7 +4521,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     if len(selected_keys) != len(rows) or set(selected_keys) != set(rows_by_key):
         raise ValueError("selection manifest selected entries do not match the SFT row file")
 
-    heldout_task_ids, heldout_channels = _load_heldout_manifests(args.heldout_manifests)
+    heldout_task_ids, heldout_channels, heldout_manifest_digests = _validate_card_heldout_manifests(
+        manifest, args.heldout_manifests
+    )
     hint_sha_by_identity, hints_sha256 = _load_hint_catalog(args.hints)
     task_metadata_by_id, statement_exclusions = _task_card_metadata()
     sidecar_truth_by_episode: dict[str, StrengthenedTruthEvidence] = {}
@@ -4550,7 +4818,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
                 "contains_cjk": health.get("contains_cjk"),
                 "loop_turn_count": health.get("loop_turn_count"),
                 "integrity_alert": integrity_alert,
-                "open_leak_channels": record.get("leak_channels_open", []),
+                "open_leak_channels": list(
+                    _record_open_leak_channels(record, required=raw_family == "r2e_leak")
+                ),
                 "single_file_solvable_original": single_file_solvable_original,
                 "solvable_hack": solvable_hack,
                 "mechanism_confirmed": solvable_hack,
@@ -4576,9 +4846,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     provenance: dict[str, object] = {
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "rows_sha256": hashlib.sha256(args.rows.read_bytes()).hexdigest(),
-        "heldout_manifest_sha256": [
-            hashlib.sha256(path.read_bytes()).hexdigest() for path in args.heldout_manifests
-        ],
+        "heldout_manifest_sha256": list(heldout_manifest_digests),
         "hints_sha256": hints_sha256,
         "strengthened_truth_sha256": sorted(sidecar_sha256s),
         "base_nll": base_nll_metadata,
@@ -4797,6 +5065,7 @@ def _run_dataset_card(args: argparse.Namespace) -> int:
     gate_exit_code = int(bool(failures))
     card["failure_codes"] = sorted(failures)
     card["provenance"] = provenance
+    card["schema_only"] = False
     card["dry_run"] = args.dry_run
     card["gate_exit_code"] = gate_exit_code
     card["exit_code"] = 0 if args.dry_run else gate_exit_code
@@ -4863,6 +5132,12 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
     )
     select_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
     select_parser.add_argument("--strategy-labels", type=Path)
+    select_parser.add_argument(
+        "--heldout-manifests",
+        type=Path,
+        nargs="+",
+        help="held-out task and leak-channel manifests used to screen generated records",
+    )
     select_parser.add_argument("--strengthened-truth", type=Path)
     select_parser.add_argument("--honest-floor", type=int, default=DEFAULT_HONEST_FLOOR)
     select_parser.add_argument(
@@ -4876,7 +5151,12 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
         type=_parse_solvable_hack_floor,
         default=DEFAULT_SOLVABLE_HACK_FLOOR,
     )
-    select_parser.add_argument("--hint-mention-filter", action="store_true")
+    select_parser.add_argument(
+        "--hint-mention-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="scan assistant action text for hint references (default: enabled)",
+    )
     select_parser.add_argument(
         "--hint-judge-labels",
         type=Path,
@@ -5030,6 +5310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_caps=_parse_named_caps(args.source_cap),
             family_caps=_parse_named_caps(args.family_cap),
             strategy_labels_path=args.strategy_labels,
+            heldout_manifests=() if args.heldout_manifests is None else args.heldout_manifests,
             strengthened_truth_path=args.strengthened_truth,
             honest_floor=args.honest_floor,
             solvable_hack_floor=args.solvable_hack_floor,
