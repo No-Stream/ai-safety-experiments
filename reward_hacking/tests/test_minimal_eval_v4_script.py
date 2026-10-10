@@ -20,7 +20,7 @@ requires_leak_splits = pytest.mark.skipif(
 
 
 @cache
-def _dry_run(stage: str, model: str) -> str:
+def _dry_run(stage: str, model: str, *extra_arguments: str) -> str:
     bash_path = shutil.which("bash")
     if bash_path is None:
         raise RuntimeError("bash is required to run the evaluation launcher test")
@@ -31,7 +31,16 @@ def _dry_run(stage: str, model: str) -> str:
         environment.pop("PYTHON", None)
         environment["SEED_V4_ADAPTER_DIR"] = str(adapter_dir)
         completed = subprocess.run(  # noqa: S603 - fixed local script and controlled test arguments
-            [bash_path, str(SCRIPT_PATH), "--stage", stage, "--model", model, "--dry-run"],
+            [
+                bash_path,
+                str(SCRIPT_PATH),
+                "--stage",
+                stage,
+                "--model",
+                model,
+                *extra_arguments,
+                "--dry-run",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -39,6 +48,17 @@ def _dry_run(stage: str, model: str) -> str:
         )
     assert completed.returncode == 0, completed.stderr
     return completed.stdout + completed.stderr
+
+
+def _launcher_failure(*arguments: str) -> str:
+    completed = subprocess.run(  # noqa: S603 - fixed local script and controlled test arguments
+        ["bash", str(SCRIPT_PATH), *arguments, "--dry-run"],  # noqa: S607
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 2
+    return completed.stderr
 
 
 def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
@@ -89,3 +109,16 @@ def test_cells_dry_run_reports_the_two_math_variants_and_counts() -> None:
         in output
     )
     assert "until W6 lands" not in SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+def test_cells_option_runs_a_subset_of_the_stage() -> None:
+    output = _dry_run("cells", "base", "--cells", "7")
+
+    assert "cells: 7" in output
+    assert "total episodes: 11" in output
+
+
+def test_cells_option_refuses_a_cell_outside_the_stage() -> None:
+    assert "cell 6 is not in stage cells:v3" in _launcher_failure(
+        "--stage", "cells", "--model", "v3", "--cells", "6"
+    )

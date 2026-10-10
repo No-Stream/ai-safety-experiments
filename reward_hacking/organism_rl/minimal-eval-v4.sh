@@ -6,6 +6,7 @@ cd "$repo_root"
 
 stage=""
 model=""
+requested_cells=""
 dry_run=0
 while (($#)); do
   case "$1" in
@@ -19,6 +20,11 @@ while (($#)); do
       model="$2"
       shift 2
       ;;
+    --cells)
+      [[ -z "$requested_cells" && $# -ge 2 ]] || { echo "--cells must be supplied once" >&2; exit 2; }
+      requested_cells="$2"
+      shift 2
+      ;;
     --dry-run)
       [[ "$dry_run" == 0 ]] || { echo "--dry-run must be supplied once" >&2; exit 2; }
       dry_run=1
@@ -28,7 +34,9 @@ while (($#)); do
       cat <<'HELP'
 Run one minimal evaluation stage. Launch each stage separately through the resource limiter and tmux.
 
-Usage: minimal-eval-v4.sh --stage {gate3,cells} --model {base,v3,v4} [--dry-run]
+Usage: minimal-eval-v4.sh --stage {gate3,cells} --model {base,v3,v4} [--cells N,N,...] [--dry-run]
+
+--cells runs a subset of the stage's cells (for example when one cell's assets are not ready yet).
 
 For v4 execution, set SEED_V4_ADAPTER_DIR to the final LoRA adapter.
 HELP
@@ -54,6 +62,17 @@ case "$stage:$model" in
   cells:v3) cells=(5 7 8 9) ;;
   cells:v4) cells=(3 5 6 7 8 9) ;;
 esac
+stage_cells=("${cells[@]}")
+stage_episodes=0
+if [[ -n "$requested_cells" ]]; then
+  IFS=',' read -r -a cells <<<"$requested_cells"
+  for cell in "${cells[@]}"; do
+    [[ " ${stage_cells[*]} " == *" $cell "* ]] || {
+      echo "cell $cell is not in stage $stage:$model (${stage_cells[*]})" >&2
+      exit 2
+    }
+  done
+fi
 
 episode_count_for_cell() {
   case "$1" in
@@ -64,6 +83,9 @@ episode_count_for_cell() {
   esac
 }
 
+for cell in "${stage_cells[@]}"; do
+  stage_episodes=$((stage_episodes + $(episode_count_for_cell "$cell")))
+done
 total_episodes=0
 cell_counts=()
 for cell in "${cells[@]}"; do
@@ -78,6 +100,8 @@ case "$stage:$model" in
   cells:v3) estimated_hours="1.0" ;;
   cells:v4) estimated_hours="1.6" ;;
 esac
+estimated_hours="$(awk -v hours="$estimated_hours" -v part="$total_episodes" -v whole="$stage_episodes" \
+  'BEGIN { printf "%.1f", hours * part / whole }')"
 
 printf 'stage: %s\n' "$stage"
 printf 'model: %s\n' "$model"
