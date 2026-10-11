@@ -105,10 +105,158 @@ def test_hardened_flags_and_digest(tmp_path: Path) -> None:
     assert argv[argv.index("--user") + 1].split(":")[0] != "0"
 
 
+def test_episode_tmp_state_is_restored_and_saved_inside_bounded_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    (state_root / "saved.txt").write_text("previous command")
+    config = DockerConfig(IMAGE, tmp_path / "gate.json", episode_tmp_state=state_root)
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+    observed: list[list[str]] = []
+
+    def run_docker(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        observed.append(argv)
+        return 0, "ok", "", False, False
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", run_docker)
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+    result = run_in_docker(workspace, "cat /tmp/saved.txt", config=config)
+
+    assert result.exit_code == 0
+    assert (state_root / "saved.txt").read_text() == "previous command"
+    assert not any(workspace.glob(".episode-tmp-*"))
+    argv = observed[0]
+    assert "--tmpfs" in argv
+    assert "size=67108864" in argv[argv.index("--tmpfs") + 1]
+    assert "/usr/bin/timeout --signal=KILL 30s /bin/bash -lc" in argv[-1]
+    assert "/bin/cp -a" in argv[-1]
+
+
+def test_episode_tmp_state_rejects_symlink_and_oversized_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    config = DockerConfig(IMAGE, tmp_path / "gate.json", episode_tmp_state=state_root)
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+    def replace_stage_with_symlink(
+        argv: list[str], _deadline: int
+    ) -> tuple[int, str, str, bool, bool]:
+        stage = next(workspace.glob(".episode-tmp-*"))
+        shutil.rmtree(stage)
+        stage.symlink_to(state_root, target_is_directory=True)
+        return 0, "", "", False, False
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", replace_stage_with_symlink)
+    with pytest.raises(ValueError, match="symlink"):
+        run_in_docker(workspace, "true", config=config)
+    assert state_root.is_dir()
+
+    (state_root / "too-large").write_bytes(b"x")
+    monkeypatch.setattr(backend, "MAXIMUM_TMP_STATE_BYTES", 0)
+    with pytest.raises(SnapshotLimitError, match="tmpfs byte limit"):
+        run_in_docker(workspace, "true", config=config)
+
+
+def test_episode_tmp_wrapper_preserves_files_after_failed_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    container_tmp = tmp_path / "container-tmp"
+    config = DockerConfig(IMAGE, tmp_path / "gate.json", episode_tmp_state=state_root)
+    original_run = subprocess.run
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+    def run_shell(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        if container_tmp.exists():
+            shutil.rmtree(container_tmp)
+        container_tmp.mkdir()
+        script = argv[-1].replace("/tmp/", f"{container_tmp}/").replace("/work/", f"{workspace}/")  # noqa: S108 - synthetic container path
+        result = original_run(
+            ["/bin/bash", "-c", script],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return result.returncode, result.stdout, result.stderr, False, False
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", run_shell)
+
+    assert (
+        run_in_docker(
+            workspace, "printf persisted > /tmp/note", config=config, login_shell=False
+        ).exit_code
+        == 0
+    )
+    assert run_in_docker(workspace, "false", config=config, login_shell=False).exit_code == 1
+    final = run_in_docker(workspace, "cat /tmp/note", config=config, login_shell=False)
+    assert final.exit_code == 0, final.stderr
+    assert final.stdout == "persisted"
+    assert (state_root / "note").read_text() == "persisted"
+    timed_out = run_in_docker(
+        workspace,
+        "printf late > /tmp/late; sleep 2",
+        config=config,
+        login_shell=False,
+        timeout="1s",
+    )
+    assert timed_out.timed_out
+    assert (
+        run_in_docker(workspace, "cat /tmp/late", config=config, login_shell=False).stdout == "late"
+    )
+    sentinel = tmp_path / "host-sentinel"
+    sentinel.write_text("untouched")
+    assert (
+        run_in_docker(
+            workspace,
+            f"ln -s {shlex.quote(str(sentinel))} /tmp/link",
+            config=config,
+            login_shell=False,
+        ).exit_code
+        == 0
+    )
+    assert (state_root / "link").is_symlink()
+    assert sentinel.read_text() == "untouched"
+    assert not any(workspace.glob(".episode-tmp-*"))
+
+
 def test_trusted_grader_has_bounded_process_and_thread_resources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = DockerConfig(image=IMAGE, gate_record=tmp_path / "gate.json")
+    state_root = tmp_path / "policy-tmp"
+    state_root.mkdir()
+    config = DockerConfig(
+        image=IMAGE, gate_record=tmp_path / "gate.json", episode_tmp_state=state_root
+    )
     agent_argv = docker_run_args(config, tmp_path, "episode-toy", "id")
     assert agent_argv[agent_argv.index("--pids-limit") + 1] == "64"
     assert not any(argument.endswith("_NUM_THREADS=1") for argument in agent_argv)
@@ -122,6 +270,8 @@ def test_trusted_grader_has_bounded_process_and_thread_resources(
         config: DockerConfig,
         **_options: object,
     ) -> backend.CommandResult:
+        assert config.trusted_grader
+        assert config.episode_tmp_state is None
         observed["argv"] = docker_run_args(config, workspace, "trusted-grade", command)
         return backend.CommandResult(command, 0, "SUCCESS\n", "", timed_out=False)
 
@@ -134,6 +284,18 @@ def test_trusted_grader_has_bounded_process_and_thread_resources(
     assert grader_argv[grader_argv.index("--pids-limit") + 1] == "512"
     for variable in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
         assert f"{variable}=1" in grader_argv
+
+
+def test_trusted_grader_refuses_policy_tmp_state(tmp_path: Path) -> None:
+    state_root = tmp_path / "policy-tmp"
+    state_root.mkdir()
+    with pytest.raises(ValueError, match="fresh /tmp"):
+        DockerConfig(
+            image=IMAGE,
+            gate_record=tmp_path / "gate.json",
+            trusted_grader=True,
+            episode_tmp_state=state_root,
+        )
 
 
 def test_run_docker_grader_forwards_the_optional_junit_report_path(
@@ -334,6 +496,48 @@ def test_docker_run_executes_ladder_wrapper_with_python_image_bash(tmp_path: Pat
     assert cwd_after == "/work/nested"
     assert next_state.cwd == "/work/nested"
     assert 'DOCKER_BASH_ACCEPTANCE="ready"' in next_state.exported_script
+
+
+def test_docker_episode_tmp_persists_and_trusted_grader_starts_fresh(tmp_path: Path) -> None:
+    """Exercise three real containers using a local synthetic gate record, not isolation certification."""
+    image = _local_python_image_or_skip()
+    gate_record = tmp_path / "gate.json"
+    gate_record.write_text(
+        json.dumps(
+            {
+                "backend_hash": backend_code_hash(),
+                "passed": True,
+                "probes": {
+                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
+                },
+            }
+        )
+    )
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    policy_config = DockerConfig(image=image, gate_record=gate_record, episode_tmp_state=state_root)
+    grader_config = DockerConfig(image=image, gate_record=gate_record, trusted_grader=True)
+
+    written = run_in_docker(
+        workspace, "printf persistent > /tmp/note", config=policy_config, timeout="15s"
+    )
+    assert written.exit_code == 0, written.stderr
+    assert (state_root / "note").read_text() == "persistent"
+    read_back = run_in_docker(workspace, "cat /tmp/note", config=policy_config, timeout="15s")
+    assert read_back.exit_code == 0, read_back.stderr
+    assert read_back.stdout == "persistent"
+    grader = run_in_docker(
+        workspace,
+        "test ! -e /tmp/note && printf fresh",
+        config=grader_config,
+        timeout="15s",
+        login_shell=False,
+    )
+    assert grader.exit_code == 0, grader.stderr
+    assert grader.stdout == "fresh"
+    assert not any(workspace.glob(".episode-tmp-*"))
 
 
 @pytest.mark.parametrize("cpus", [0.5, 1, 2])

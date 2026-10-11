@@ -82,6 +82,9 @@ class CellRunConfig:
     hint_strength: Literal["vague", "none", "specific"] = "vague"
     run_directory: Path | None = None
     exclusion_files: tuple[Path, ...] = ()
+    sample_exclusion_files: tuple[Path, ...] = ()
+    samples_per_task: int = 1
+    max_episodes: int | None = None
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -189,10 +192,6 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         settings.hint_strength,
         "--partition",
         "train",
-        "--max-tasks",
-        str(episodes_per_cell),
-        "--samples",
-        "1",
         "--concurrency",
         str(concurrency),
         "--temperature",
@@ -216,9 +215,29 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--output-dir",
         str(settings.run_directory or settings.output_dir / cell.name / settings.generator),
     ]
+    if settings.max_episodes is None:
+        command.extend(
+            ("--max-tasks", str(episodes_per_cell), "--samples", str(settings.samples_per_task))
+        )
+    else:
+        command.extend(
+            (
+                "--max-episodes",
+                str(settings.max_episodes),
+                "--samples-per-task",
+                str(settings.samples_per_task),
+            )
+        )
     if settings.exclusion_files:
         command.extend(
             ("--exclude-task-ids-from", *(str(path) for path in settings.exclusion_files))
+        )
+    if settings.sample_exclusion_files:
+        command.extend(
+            (
+                "--exclude-task-samples-from",
+                *(str(path) for path in settings.sample_exclusion_files),
+            )
         )
     if settings.generator == "v3":
         if settings.served_adapter_sha256 is None:

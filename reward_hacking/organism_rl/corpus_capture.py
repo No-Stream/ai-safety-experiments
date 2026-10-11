@@ -39,9 +39,11 @@ REQUIRED_CAPTURE_RECORDS = {
 }
 EXCLUDED_DIRECTORY_NAMES = frozenset({"vllm-serving-adapters"})
 EXCLUDED_FILE_NAMES = frozenset({"adapter_model.safetensors"})
-DEFERRED_SEMANTIC_VERSIONS = (
+LEGACY_DEFERRED_SEMANTIC_VERSIONS = (
     "reward_hacking.harness.leak_detector.LEAK_DETECTOR_SEMANTIC_VERSION",
 )
+DEFERRED_SEMANTIC_VERSIONS: tuple[str, ...] = ()
+LEAK_DETECTOR_PRODUCER = "reward_hacking.harness.leak_detector.semantic_version"
 LEAK_BUILDER_PRODUCER = "reward_hacking.harness.leak_channels.builder"
 SMOKE_PLAN_PRODUCER = "organism_rl.smoke_v4.plan_format"
 TAXONOMY_COMPATIBILITY_TEST = (
@@ -80,6 +82,7 @@ def semantic_versions() -> dict[str, int | str]:
     from reward_hacking.distill.agentic_sft import MANIFEST_VERSION  # noqa: PLC0415
     from reward_hacking.distill.hack_strategy import TAXONOMY_VERSION  # noqa: PLC0415
     from reward_hacking.harness.leak_channels import BUILDER_VERSION  # noqa: PLC0415
+    from reward_hacking.harness.leak_detector import LEAK_DETECTOR_SEMANTIC_VERSION  # noqa: PLC0415
     from reward_hacking.harness.tasks_ilcb import ILCB_TRUE_CHECK_SEMANTIC_VERSION  # noqa: PLC0415
     from reward_hacking.organism_rl.env_gate import (  # noqa: PLC0415
         DECLARATION_SCHEMA,
@@ -101,6 +104,7 @@ def semantic_versions() -> dict[str, int | str]:
         STRENGTHENED_TRUTH_PRODUCER: STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION,
         TAXONOMY_PRODUCER: TAXONOMY_VERSION,
         LEAK_BUILDER_PRODUCER: BUILDER_VERSION,
+        LEAK_DETECTOR_PRODUCER: LEAK_DETECTOR_SEMANTIC_VERSION,
         "organism_rl.env_gate.fixture_schema": FIXTURE_SCHEMA,
         "organism_rl.env_gate.declaration_schema": DECLARATION_SCHEMA,
         SMOKE_PLAN_PRODUCER: SMOKE_PLAN_FORMAT_VERSION,
@@ -663,6 +667,7 @@ def _check_semantic_version_table(
             continue
         captured_version = captured_versions.get(producer)
         if captured_version == current_version:
+            _check_detector_record_versions(producer, current_version, context.capture_root)
             continue
         loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
         compatible = False
@@ -706,10 +711,26 @@ def _check_semantic_version_table(
         )
 
 
+def _check_detector_record_versions(
+    producer: str, current_version: int | str, capture_root: Path
+) -> None:
+    if producer == LEAK_DETECTOR_PRODUCER and _recorded_leak_detector_versions(capture_root) != {
+        current_version
+    }:
+        raise ValueError("detector assessment version differs from capture semantic version")
+
+
 def _check_manifest_version_notes(manifest: Mapping[str, object]) -> None:
-    if not isinstance(manifest.get("semantic_versions"), Mapping):
+    versions = manifest.get("semantic_versions")
+    if not isinstance(versions, Mapping):
         raise TypeError("seed-v4 corpus manifest has no semantic version table")
-    if manifest.get("deferred_semantic_versions") != list(DEFERRED_SEMANTIC_VERSIONS):
+    legacy_detector_unversioned = LEAK_DETECTOR_PRODUCER not in versions and manifest.get(
+        "deferred_semantic_versions"
+    ) == list(LEGACY_DEFERRED_SEMANTIC_VERSIONS)
+    if (
+        manifest.get("deferred_semantic_versions") != list(DEFERRED_SEMANTIC_VERSIONS)
+        and not legacy_detector_unversioned
+    ):
         raise ValueError("seed-v4 corpus deferred semantic version note is missing or stale")
 
 
@@ -805,11 +826,31 @@ def _exercised_producers(capture_root: Path, *, kind: object) -> frozenset[str]:
         producers.discard(SMOKE_PLAN_PRODUCER)
     if not any(_is_leak_record(record) for record in _capture_records(capture_root)):
         producers.discard(LEAK_BUILDER_PRODUCER)
+    if not _recorded_leak_detector_versions(capture_root):
+        producers.discard(LEAK_DETECTOR_PRODUCER)
     if not _has_strengthened_truth_sidecar(capture_root):
         producers.discard(STRENGTHENED_TRUTH_PRODUCER)
     if not any(_is_ilcb_record(record) for record in _capture_records(capture_root)):
         producers.discard(ILCB_TRUE_CHECK_PRODUCER)
     return frozenset(producers)
+
+
+def _recorded_leak_detector_versions(capture_root: Path) -> set[int]:
+    versions: set[int] = set()
+    for record in _capture_records(capture_root):
+        summary = record.get("trace_summary")
+        if isinstance(summary, Mapping):
+            assessment = summary.get("leak_assessment")
+            if isinstance(assessment, Mapping) and "semantic_version" in assessment:
+                version = assessment["semantic_version"]
+                if version is None and assessment.get("leak_detector") == "not_applicable":
+                    continue
+                if type(version) is not int or version < 1:
+                    raise ValueError(
+                        "detector assessment semantic version must be a positive integer"
+                    )
+                versions.add(version)
+    return versions
 
 
 def _is_ilcb_record(record: Mapping[str, object]) -> bool:

@@ -399,6 +399,13 @@ and the host user's non-root numeric uid and gid. Docker applies the configured 
 memory-plus-swap, and CPU limits. `/tmp` is a bounded tmpfs; the configured workspace path
 (`/work` by default) is the sole writable host mount and is the episode workspace. Trusted runtime
 directories may additionally be mounted read-only under the restrictions below.
+Policy commands in one episode retain `/tmp` files. The host keeps a private copy of that tree
+outside the episode workspace between commands, stages it inside the workspace immediately before
+each container starts, and removes the stage after the container exits. A shell copies entries into
+the container's 64 MiB `/tmp` before the policy command and copies them back afterward, including
+when the command fails. The host preserves symlinks as symlinks, never follows them during copying,
+and refuses a state exceeding the tmpfs byte limit or the snapshot entry limit. The per-episode
+copy is deleted at episode end. The trusted grader gets a fresh `/tmp` and never receives this copy.
 Every command uses a fresh container and Docker removes it on exit; the host also force-removes its
 name and anonymous volumes after a timeout or launcher failure. The backend does not mount the Docker
 socket or inherit undeclared host paths. It records the command, image digest, exit code, output, timeout state, and
@@ -417,7 +424,7 @@ snapshots also do not observe every denied syscall or a transient edit restored 
 The authoritative grader starts in another fresh container from the same image digest. The host
 reconstructs its workspace from the trusted task files and only the explicitly submitted regular
 files, read without following symlinks. Agent-created grader files, unlisted files, background
-processes, and `/tmp` state do not enter that workspace. This keeps the trusted verdict independent
+processes, and policy `/tmp` state do not enter that workspace. This keeps the trusted verdict independent
 of the agent container while preserving the submitted artifact the grader needs to inspect.
 
 **Gate: no Docker-backed episode starts without a current passing record.** Run:

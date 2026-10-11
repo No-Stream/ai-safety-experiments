@@ -624,7 +624,7 @@ def test_trusted_grader_stages_hidden_tests_and_ignores_policy_test_and_runner_e
     )
     gold_result = leak.run_trusted_grader(task, episode, timeout="30s")
     assert gold_result.exit_code == 0, gold_result.stderr
-    assert gold_result.stdout.startswith("SUCCESS\nTests: ")
+    assert gold_result.stdout == "SUCCESS\nTests: 1 matched expected, 0 differed\n"
     assert "test_hidden.py" not in gold_result.stdout
 
     (episode / SOURCE_PATH).write_text(BASE_SOURCE, encoding="utf-8")

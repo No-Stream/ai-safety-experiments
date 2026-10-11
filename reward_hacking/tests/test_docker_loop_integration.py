@@ -83,7 +83,17 @@ def test_docker_episode_routes_actions_and_both_graders(
         episode_dir=episode_dir,
     )
     assert [entry[1] for entry in commands] == ["printf answer > answer.txt"]
-    assert all(entry[2] is config for entry in commands)
+    docker_configs = [entry[2] for entry in commands if isinstance(entry[2], DockerConfig)]
+    grade_configs = [entry[4] for entry in grades if isinstance(entry[4], DockerConfig)]
+    assert len(docker_configs) == len(commands)
+    assert len(grade_configs) == len(grades)
+    assert all(config.episode_tmp_state is not None for config in docker_configs)
+    assert all(
+        config.episode_tmp_state == grade_configs[0].episode_tmp_state for config in docker_configs
+    )
+    tmp_state = grade_configs[0].episode_tmp_state
+    assert tmp_state is not None
+    assert not tmp_state.exists()
     assert [entry[3] for entry in grades] == ["python3 -I grade.py", "python3 -I grade.py"]
     assert all(entry[1] == task.files and entry[2] == ("answer.txt",) for entry in grades)
     assert trace.proxy_pass
@@ -92,6 +102,16 @@ def test_docker_episode_routes_actions_and_both_graders(
     assert trace.summary_record()["docker_evidence_path"] == str(
         episode_dir.with_name("episode.docker-evidence.jsonl")
     )
+    loop.run_agent_episode(
+        task,
+        MockBackend(["<run>ls /tmp</run>", "Done"], model_id="mock-docker"),
+        episode_dir=episode_dir,
+    )
+    next_config = commands[-1][2]
+    assert isinstance(next_config, DockerConfig)
+    assert next_config.episode_tmp_state != tmp_state
+    assert next_config.episode_tmp_state is not None
+    assert not next_config.episode_tmp_state.exists()
 
 
 def test_docker_reward_evidence_uses_trusted_verdict(tmp_path: Path) -> None:
@@ -242,7 +262,7 @@ def test_leak_check_reports_only_verdict_and_counts(
         lambda *_args, **_kwargs: CommandResult(
             "truth",
             1,
-            "FAIL\nTests: 2 passed, 1 failed, 0 skipped, 0 errors\n",
+            "FAIL\nTests: 2 matched expected, 1 differed\n",
             "hidden test name",
             False,
         ),
@@ -255,7 +275,7 @@ def test_leak_check_reports_only_verdict_and_counts(
         jail_backend=None,
         check_grader=None,
     )
-    assert feedback == "<check>FAIL\nTests: 2 passed, 1 failed, 0 skipped, 0 errors</check>"
+    assert feedback == "<check>FAIL\nTests: 2 matched expected, 1 differed</check>"
     assert "hidden test name" not in feedback
 
 
@@ -280,7 +300,7 @@ def test_leak_resource_failure_is_unmeasured_even_with_success_marker(
         lambda *_args, **_kwargs: CommandResult(
             "truth",
             0,
-            "SUCCESS\nTests: 1 passed, 0 failed, 0 skipped, 0 errors\n",
+            "SUCCESS\nTests: 1 matched expected, 0 differed\n",
             "out of memory",
             False,
         ),
@@ -329,9 +349,9 @@ def test_leak_reward_uses_one_trusted_verdict(
             0 if trusted_pass else 1,
             ("SUCCESS\n" if trusted_pass else "FAIL\n")
             + (
-                "Tests: 1 passed, 0 failed, 0 skipped, 0 errors\n"
+                "Tests: 1 matched expected, 0 differed\n"
                 if trusted_pass
-                else "Tests: 0 passed, 1 failed, 0 skipped, 0 errors\n"
+                else "Tests: 0 matched expected, 1 differed\n"
             ),
             "",
             False,

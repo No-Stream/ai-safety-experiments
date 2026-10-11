@@ -212,6 +212,77 @@ def select_task_ids_with_dedup(  # noqa: PLR0913 - each selection constraint is 
     return selected_task_ids, metadata
 
 
+def _validate_task_sample_selection(
+    task_ids: Sequence[str],
+    excluded_task_samples: Sequence[tuple[str, int]],
+    max_episodes: int,
+    samples_per_task: int,
+) -> None:
+    if not task_ids or any(not task_id for task_id in task_ids):
+        raise ValueError("eligible task IDs must be nonempty")
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("eligible task IDs must be unique")
+    if type(max_episodes) is not int or max_episodes < 1:
+        raise ValueError("max_episodes must be a positive integer")
+    if type(samples_per_task) is not int or samples_per_task < 1:
+        raise ValueError("samples_per_task must be a positive integer")
+    if any(
+        not task_id or type(sample_index) is not int or sample_index < 0
+        for task_id, sample_index in excluded_task_samples
+    ):
+        raise ValueError(
+            "excluded task samples must contain nonempty task IDs and nonnegative indexes"
+        )
+    if len(excluded_task_samples) != len(set(excluded_task_samples)):
+        raise ValueError("excluded task samples must be unique")
+
+
+def _next_sample_index(samples: set[int]) -> int:
+    """Return the first unused nonnegative sample index for one task."""
+    sample_index = 0
+    while sample_index in samples:
+        sample_index += 1
+    return sample_index
+
+
+def select_task_sample_pairs(
+    task_ids: Sequence[str],
+    *,
+    excluded_task_samples: Sequence[tuple[str, int]],
+    max_episodes: int,
+    samples_per_task: int,
+) -> tuple[tuple[str, int], ...]:
+    """Choose fresh task samples first, then balance repeats across least-sampled tasks."""
+    _validate_task_sample_selection(task_ids, excluded_task_samples, max_episodes, samples_per_task)
+    task_order = {task_id: order for order, task_id in enumerate(task_ids)}
+    samples_by_task: dict[str, set[int]] = {task_id: set() for task_id in task_ids}
+    for task_id, sample_index in excluded_task_samples:
+        if task_id in samples_by_task:
+            samples_by_task[task_id].add(sample_index)
+    stage_counts = dict.fromkeys(task_ids, 0)
+    selected: list[tuple[str, int]] = []
+
+    while len(selected) < max_episodes:
+        available_task_ids = [
+            task_id for task_id in task_ids if stage_counts[task_id] < samples_per_task
+        ]
+        if not available_task_ids:
+            capacity = len(task_ids) * samples_per_task
+            raise ValueError(
+                f"max_episodes={max_episodes} requested, but only {capacity} eligible task samples "
+                f"are available with samples_per_task={samples_per_task}"
+            )
+        task_id = min(
+            available_task_ids,
+            key=lambda candidate: (len(samples_by_task[candidate]), task_order[candidate]),
+        )
+        sample_index = _next_sample_index(samples_by_task[task_id])
+        selected.append((task_id, sample_index))
+        samples_by_task[task_id].add(sample_index)
+        stage_counts[task_id] += 1
+    return tuple(selected)
+
+
 def _read_task_id_exclusion_inputs(
     paths: Sequence[Path],
 ) -> tuple[tuple[str, ...], list[dict[str, str]]]:
@@ -243,6 +314,138 @@ def _read_task_id_exclusion_inputs(
             task_ids.add(task_id)
         source_records.append({"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()})
     return tuple(sorted(task_ids)), source_records
+
+
+def _read_task_sample_exclusion_inputs(
+    paths: Sequence[Path],
+) -> tuple[tuple[tuple[str, int], ...], list[dict[str, str]]]:
+    """Read strict task/sample identities and digest each exclusion source."""
+    task_samples: set[tuple[str, int]] = set()
+    source_records: list[dict[str, str]] = []
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"task-sample exclusion records file does not exist: {path}")
+        contents = path.read_bytes()
+        try:
+            records_text = contents.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{path} is not UTF-8 JSONL") from error
+        for line_number, line in enumerate(records_text.splitlines(), start=1):
+            try:
+                record: object = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path} line {line_number} is not valid JSON") from error
+            if not isinstance(record, Mapping):
+                raise TypeError(f"{path} line {line_number} must be a JSON object")
+            task_id = record.get("task_id")
+            if not isinstance(task_id, str) or not task_id.strip() or task_id != task_id.strip():
+                raise ValueError(
+                    f"{path} line {line_number} must contain a nonempty canonical task_id"
+                )
+            sample_index = record.get("sample_index")
+            if type(sample_index) is not int or sample_index < 0:
+                raise ValueError(
+                    f"{path} line {line_number} must contain a nonnegative sample_index"
+                )
+            task_samples.add((task_id, sample_index))
+        source_records.append({"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()})
+    return tuple(sorted(task_samples)), source_records
+
+
+def _task_sample_exclusion_from_provenance(
+    provenance: Mapping[str, object],
+) -> tuple[tuple[str, int], ...] | None:
+    """Read and validate the immutable task/sample exclusion snapshot in provenance."""
+    if "task_sample_exclusion" not in provenance:
+        return None
+    exclusion_value = provenance["task_sample_exclusion"]
+    if not isinstance(exclusion_value, Mapping):
+        raise TypeError("task_sample_exclusion provenance must be an object")
+    if (
+        type(exclusion_value.get("schema_version")) is not int
+        or exclusion_value["schema_version"] != 1
+    ):
+        raise ValueError("task_sample_exclusion provenance has an unsupported schema version")
+    samples_value = exclusion_value.get("task_samples")
+    if not isinstance(samples_value, list):
+        raise TypeError("task_sample_exclusion provenance must contain task_samples")
+    task_samples: list[tuple[str, int]] = []
+    for value in samples_value:
+        if not isinstance(value, Mapping):
+            raise TypeError("task_sample_exclusion entries must be objects")
+        task_id = value.get("task_id")
+        sample_index = value.get("sample_index")
+        if (
+            not isinstance(task_id, str)
+            or not task_id.strip()
+            or task_id != task_id.strip()
+            or type(sample_index) is not int
+            or sample_index < 0
+        ):
+            raise ValueError(
+                "task_sample_exclusion entries require a task_id and nonnegative sample_index"
+            )
+        task_samples.append((task_id, sample_index))
+    if task_samples != sorted(set(task_samples)):
+        raise ValueError("task_sample_exclusion task samples must be sorted and unique")
+    return tuple(task_samples)
+
+
+def _saved_task_sample_exclusion_snapshot(output_dir: Path) -> tuple[tuple[str, int], ...] | None:
+    """Validate existing provenance before reusing its task/sample exclusion snapshot."""
+    provenance_path = output_dir / "provenance.json"
+    if not provenance_path.is_file():
+        return None
+    existing = _read_existing_provenance(provenance_path)
+    stored_provenance = cast("Mapping[str, object]", existing["provenance"])
+    stored_identity = _provenance_identity(stored_provenance)
+    schema_version = cast("int", existing["schema_version"])
+    if schema_version == 1:
+        _load_legacy_provenance(existing, stored_identity)
+    elif schema_version == PROVENANCE_SCHEMA_VERSION:
+        _load_current_provenance(existing, stored_identity)
+    else:
+        raise ValueError(
+            f"unsupported run provenance schema {schema_version}; use a fresh output directory"
+        )
+    return _task_sample_exclusion_from_provenance(stored_provenance)
+
+
+def _resolve_task_sample_exclusion_snapshot(
+    paths: Sequence[Path], output_dir: Path, *, freeze_empty: bool = False
+) -> tuple[
+    tuple[tuple[str, int], ...] | None,
+    tuple[tuple[str, int], ...] | None,
+    list[dict[str, str]],
+]:
+    """Freeze first-launch sample exclusions while retaining current keys for collision checks."""
+    current_task_samples: tuple[tuple[str, int], ...] | None = None
+    source_records: list[dict[str, str]] = []
+    if paths:
+        current_task_samples, source_records = _read_task_sample_exclusion_inputs(paths)
+    elif freeze_empty:
+        current_task_samples = ()
+    saved_task_samples = _saved_task_sample_exclusion_snapshot(output_dir)
+    task_sample_snapshot = (
+        saved_task_samples if saved_task_samples is not None else current_task_samples
+    )
+    return task_sample_snapshot, current_task_samples, source_records
+
+
+def _reject_new_task_sample_exclusion_collisions(
+    task_sample_snapshot: Sequence[tuple[str, int]] | None,
+    current_task_samples: Sequence[tuple[str, int]] | None,
+    selected_task_samples: Sequence[tuple[str, int]],
+) -> None:
+    """Refuse newly discovered sample keys that overlap this stage's frozen selection."""
+    if task_sample_snapshot is None or current_task_samples is None:
+        return
+    new_task_samples = set(current_task_samples) - set(task_sample_snapshot)
+    collisions = new_task_samples.intersection(selected_task_samples)
+    if collisions:
+        raise ValueError(
+            f"{len(collisions)} newly observed excluded task/sample keys overlap this stage's fixed selection"
+        )
 
 
 def _task_id_exclusion_from_provenance(
@@ -394,8 +597,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--exclude-duplicates", action=argparse.BooleanOptionalAction, default=True)
     _add_payment_register_arguments(parser)
     parser.add_argument("--partition", choices=("train", "held-out"), default="train")
-    parser.add_argument("--samples", dest="samples_per_task", type=int, default=1)
+    parser.add_argument(
+        "--samples",
+        "--samples-per-task",
+        dest="samples_per_task",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--max-tasks", type=int)
+    parser.add_argument("--max-episodes", type=int)
     parser.add_argument(
         "--exclude-task-ids-from",
         type=Path,
@@ -404,6 +614,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         metavar="PATH",
         help="exclude task IDs present in these JSONL records files",
+    )
+    parser.add_argument(
+        "--exclude-task-samples-from",
+        type=Path,
+        action="extend",
+        nargs="+",
+        default=[],
+        metavar="PATH",
+        help="exclude task/sample pairs present in these JSONL records files",
     )
     parser.add_argument(
         "--aisi-sources",
@@ -434,6 +653,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_leak_arguments(parser)
     args = parser.parse_args(argv)
     return _validate_parsed_args(args, parser)
+
+
+def _validate_episode_selection_args(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    if args.max_tasks is not None and args.max_tasks < 1:
+        parser.error("max-tasks must be positive")
+    if args.max_episodes is not None and args.max_episodes < 1:
+        parser.error("max-episodes must be positive")
+    if args.max_tasks is not None and args.max_episodes is not None:
+        parser.error("max-tasks and max-episodes are mutually exclusive")
+    if args.exclude_task_samples_from and args.max_episodes is None:
+        parser.error("exclude-task-samples-from requires max-episodes")
 
 
 def _validate_parsed_args(
@@ -478,8 +710,7 @@ def _validate_parsed_args(
         < 1
     ):
         parser.error("sample, concurrency, turn, token and model-length limits must be positive")
-    if args.max_tasks is not None and args.max_tasks < 1:
-        parser.error("max-tasks must be positive")
+    _validate_episode_selection_args(args, parser)
     if args.thinking_token_budget is not None and args.thinking_token_budget < 0:
         parser.error("thinking-token-budget must be nonnegative")
     _validate_thinking_budget_policy(args, parser)
@@ -1496,6 +1727,7 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     samples_per_task: int,
     concurrency: int,
     provenance: Mapping[str, object],
+    sample_indices_by_task: Mapping[str, Sequence[int]] | None = None,
     thinking_budget_overshoot_policy: ThinkingBudgetOvershootPolicy = DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
 ) -> dict[str, object]:
     """Generate or resume episodes and persist an agentic_sft-compatible record for each."""
@@ -1505,6 +1737,22 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
         raise ValueError("concurrency must be a positive integer")
     if len({task.task_id for task in task_specs}) != len(task_specs):
         raise ValueError("task specs must have unique task ids")
+    if sample_indices_by_task is not None:
+        task_ids = {task.task_id for task in task_specs}
+        if set(sample_indices_by_task) != task_ids:
+            raise ValueError("sample indices must be supplied for every selected task")
+        if any(
+            not sample_indices
+            or len(sample_indices) > samples_per_task
+            or len(sample_indices) != len(set(sample_indices))
+            or any(
+                type(sample_index) is not int or sample_index < 0 for sample_index in sample_indices
+            )
+            for sample_indices in sample_indices_by_task.values()
+        ):
+            raise ValueError(
+                "each selected task must have unique nonnegative sample indexes within its limit"
+            )
     records_path, provenance_sha256, accepted_provenance_sha256 = _prepare_run(
         output_dir, provenance
     )
@@ -1521,7 +1769,11 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     jobs = [
         (task_spec, sample_index)
         for task_spec in sorted(task_specs, key=lambda row: row.task_id)
-        for sample_index in range(samples_per_task)
+        for sample_index in (
+            range(samples_per_task)
+            if sample_indices_by_task is None
+            else sample_indices_by_task[task_spec.task_id]
+        )
         if (task_spec.task_id, sample_index) not in completed
     ]
 
@@ -1554,6 +1806,26 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _record_task_sample_provenance(
+    provenance: dict[str, object],
+    exclusion_snapshot: Sequence[tuple[str, int]] | None,
+    selection: Sequence[tuple[str, int]] | None,
+) -> None:
+    if exclusion_snapshot is not None:
+        provenance["task_sample_exclusion"] = {
+            "schema_version": 1,
+            "task_samples": [
+                {"task_id": task_id, "sample_index": sample_index}
+                for task_id, sample_index in exclusion_snapshot
+            ],
+        }
+    if selection is not None:
+        provenance["task_sample_selection"] = [
+            {"task_id": task_id, "sample_index": sample_index}
+            for task_id, sample_index in selection
+        ]
+
+
 def _provenance(  # noqa: PLR0913 - provenance captures independent generation settings
     args: argparse.Namespace,
     source: TaskEpisodeSource,
@@ -1562,6 +1834,9 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
     statement_dedup: Mapping[str, object] | None = None,
     task_id_exclusion_snapshot: Sequence[str] | None = None,
     task_id_exclusion_sources: Sequence[Mapping[str, str]] = (),
+    task_sample_exclusion_snapshot: Sequence[tuple[str, int]] | None = None,
+    task_sample_exclusion_sources: Sequence[Mapping[str, str]] = (),
+    task_sample_selection: Sequence[tuple[str, int]] | None = None,
 ) -> dict[str, object]:
     from reward_hacking import (  # noqa: PLC0415 - hash only selected corpora
         aisi_rh_envs_data,
@@ -1661,6 +1936,10 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         run_context["task_id_exclusion_sources"] = [
             dict(source_record) for source_record in task_id_exclusion_sources
         ]
+    if task_sample_exclusion_sources:
+        run_context["task_sample_exclusion_sources"] = [
+            dict(source_record) for source_record in task_sample_exclusion_sources
+        ]
     provenance: dict[str, object] = {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "record_schema": RECORD_SCHEMA_VERSION,
@@ -1710,6 +1989,9 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
             "schema_version": 1,
             "task_ids": list(task_id_exclusion_snapshot),
         }
+    _record_task_sample_provenance(
+        provenance, task_sample_exclusion_snapshot, task_sample_selection
+    )
     if "r2e_leak" in args.families:
         provenance["leak_task_source"] = leak_task_source_metadata(
             args.leak_assets,
@@ -1739,6 +2021,15 @@ def main(argv: list[str] | None = None) -> None:
         current_excluded_task_ids,
         task_id_exclusion_sources,
     ) = _resolve_task_id_exclusion_snapshot(args.exclude_task_ids_from, args.output_dir)
+    (
+        task_sample_exclusion_snapshot,
+        current_excluded_task_samples,
+        task_sample_exclusion_sources,
+    ) = _resolve_task_sample_exclusion_snapshot(
+        args.exclude_task_samples_from,
+        args.output_dir,
+        freeze_empty=args.max_episodes is not None,
+    )
     source = TaskEpisodeSource(
         endpoint=args.endpoint,
         model_path=args.model,
@@ -1788,6 +2079,30 @@ def main(argv: list[str] | None = None) -> None:
         max_tasks=args.max_tasks,
         excluded_task_ids=task_id_exclusion_snapshot or (),
     )
+    task_sample_selection: tuple[tuple[str, int], ...] | None = None
+    sample_indices_by_task: dict[str, tuple[int, ...]] | None = None
+    if args.max_episodes is not None:
+        if task_sample_exclusion_snapshot is None:
+            raise RuntimeError("max-episodes requires a frozen task-sample exclusion snapshot")
+        task_sample_selection = select_task_sample_pairs(
+            task_ids,
+            excluded_task_samples=task_sample_exclusion_snapshot,
+            max_episodes=args.max_episodes,
+            samples_per_task=args.samples_per_task,
+        )
+        _reject_new_task_sample_exclusion_collisions(
+            task_sample_exclusion_snapshot,
+            current_excluded_task_samples,
+            task_sample_selection,
+        )
+        task_ids = tuple(dict.fromkeys(task_id for task_id, _sample_index in task_sample_selection))
+        selected_samples_by_task: dict[str, list[int]] = {}
+        for task_id, sample_index in task_sample_selection:
+            selected_samples_by_task.setdefault(task_id, []).append(sample_index)
+        sample_indices_by_task = {
+            task_id: tuple(sample_indexes)
+            for task_id, sample_indexes in selected_samples_by_task.items()
+        }
     _reject_new_exclusion_collisions(
         task_id_exclusion_snapshot,
         current_excluded_task_ids,
@@ -1816,6 +2131,7 @@ def main(argv: list[str] | None = None) -> None:
         task_specs=task_specs,
         samples_per_task=args.samples_per_task,
         concurrency=args.concurrency,
+        sample_indices_by_task=sample_indices_by_task,
         provenance=_provenance(
             args,
             source,
@@ -1823,6 +2139,9 @@ def main(argv: list[str] | None = None) -> None:
             statement_dedup=statement_dedup,
             task_id_exclusion_snapshot=task_id_exclusion_snapshot,
             task_id_exclusion_sources=task_id_exclusion_sources,
+            task_sample_exclusion_snapshot=task_sample_exclusion_snapshot,
+            task_sample_exclusion_sources=task_sample_exclusion_sources,
+            task_sample_selection=task_sample_selection,
         ),
         thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(
             args.thinking_budget_overshoot_max_fraction,

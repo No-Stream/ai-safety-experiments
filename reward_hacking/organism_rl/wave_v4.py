@@ -49,6 +49,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--generator", choices=("base", "v3"), required=True)
     parser.add_argument("--hint-strength", choices=sorted(WAVE_HINT_STRENGTHS), required=True)
     parser.add_argument("--episodes", type=int, required=True)
+    parser.add_argument("--samples-per-task", type=int, default=1)
     parser.add_argument("--max-turns", type=int, required=True)
     parser.add_argument("--max-model-len", type=int, default=131_072)
     parser.add_argument("--leak-assets", type=Path)
@@ -66,8 +67,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if min(args.episodes, args.max_turns, args.max_model_len) < 1:
-        parser.error("episodes, max-turns and max-model-len must be positive")
+    if min(args.episodes, args.samples_per_task, args.max_turns, args.max_model_len) < 1:
+        parser.error("episodes, samples-per-task, max-turns and max-model-len must be positive")
     if not 1 <= args.server_port <= MAX_TCP_PORT:
         parser.error("server-port must be between 1 and 65535")
     if args.cell == "f3-leak" and args.leak_assets is None:
@@ -121,6 +122,17 @@ def stage_settings(
     args: argparse.Namespace, settings: CellRunConfig, exclusions: tuple[Path, ...]
 ) -> CellRunConfig:
     """Apply wave controls to the shared probe generation settings."""
+    if args.samples_per_task > 1:
+        return replace(
+            settings,
+            episodes=args.episodes,
+            max_turns=args.max_turns,
+            hint_strength=args.hint_strength,
+            run_directory=stage_directory(args),
+            sample_exclusion_files=exclusions,
+            samples_per_task=args.samples_per_task,
+            max_episodes=args.episodes,
+        )
     return replace(
         settings,
         episodes=args.episodes,
@@ -139,7 +151,8 @@ def launch_summary(args: argparse.Namespace) -> str:
     )
     return (
         f"Cell: {args.cell}\nGenerator: {args.generator} on {args.model}\nHint: {args.hint_strength}\n"
-        f"Episodes: {args.episodes}\nMax turns (announced and real): {args.max_turns}\n"
+        f"Episodes: {args.episodes}\nSamples per task: {args.samples_per_task}\n"
+        f"Max turns (announced and real): {args.max_turns}\n"
         f"Max model len: {args.max_model_len}\n"
         f"Estimated wall-clock: {episode_hours * args.episodes:.2f} hours; "
         f"{episode_hours:.4f} hours per episode, scales with turns from the probe's "

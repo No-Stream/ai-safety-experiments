@@ -285,7 +285,7 @@ def test_leak_submission_uses_one_trusted_run_and_sanitizes_feedback(
     trusted = CommandResult(
         "bash run_tests.sh; r2e_tests/runner.py",
         0 if passed else 1,
-        ("SUCCESS" if passed else "FAIL") + "\nTests: 2 passed, 1 failed, 0 skipped, 0 errors\n",
+        ("SUCCESS" if passed else "FAIL") + "\nTests: 2 matched expected, 1 differed\n",
         "r2e_tests/test_synthetic.py: expected_output=PRIVATE_SENTINEL\n",
         False,
     )
@@ -303,7 +303,7 @@ def test_leak_submission_uses_one_trusted_run_and_sanitizes_feedback(
     assert runs == [tmp_path]
     assert verdict.passed is passed
     assert verdict.feedback == (
-        ("SUCCESS" if passed else "FAIL") + "\nTests: 2 passed, 1 failed, 0 skipped, 0 errors"
+        ("SUCCESS" if passed else "FAIL") + "\nTests: 2 matched expected, 1 differed"
     )
     assert "r2e" not in verdict.feedback.lower()
     assert "PRIVATE_SENTINEL" not in verdict.feedback

@@ -84,7 +84,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -1992,7 +1992,7 @@ def _grade_completed_episode(  # noqa: PLR0913 - pass the episode's existing con
     return graded, sampled_report
 
 
-def run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecycle and trace assembly
+def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecycle and trace assembly
     task: Task,
     backend: Backend,
     *,
@@ -2293,6 +2293,63 @@ def run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecyc
     # The turns are already on disk, appended as they finished; only the summary is new.
     _append_trace_records(trace_path, [trace.summary_record()])
     return trace
+
+
+def run_agent_episode(  # noqa: PLR0913 - forwards the existing episode interface
+    task: Task,
+    backend: Backend,
+    *,
+    episode_dir: Path,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    timeout: str = DEFAULT_COMMAND_TIMEOUT,
+    jail_backend: str | None = None,
+    trace_path: Path | None = None,
+    arm: AgenticArmConfig = BASELINE_ARM,
+    episode_token: str | None = None,
+    episode_seconds: float = DEFAULT_EPISODE_SECONDS,
+    engine_gate: SharedEngineGate | None = None,
+    stop_requested: threading.Event | None = None,
+    before_command: Callable[[Path, str], None] | None = None,
+    after_command: Callable[[Path, str, CommandResult], None] | None = None,
+    check_grader: CheckGrader | None = None,
+    final_report: bool = False,
+) -> AgentEpisodeTrace:
+    """Give Docker policy commands one disposable /tmp state for this episode."""
+    docker_config = task.docker_config
+    if docker_config is not None:
+        assert_disposable_episode_dir(episode_dir)
+        episode_dir.parent.mkdir(parents=True, exist_ok=True)
+    state_context = (
+        tempfile.TemporaryDirectory(prefix="episode-tmp-", dir=episode_dir.parent)
+        if docker_config is not None
+        else nullcontext(None)
+    )
+    with state_context as temporary:
+        if temporary is not None:
+            tmp_state = Path(temporary) / "state"
+            tmp_state.mkdir()
+            if docker_config is not None:
+                task = replace(
+                    task, docker_config=replace(docker_config, episode_tmp_state=tmp_state)
+                )
+        return _run_agent_episode(
+            task,
+            backend,
+            episode_dir=episode_dir,
+            max_turns=max_turns,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            trace_path=trace_path,
+            arm=arm,
+            episode_token=episode_token,
+            episode_seconds=episode_seconds,
+            engine_gate=engine_gate,
+            stop_requested=stop_requested,
+            before_command=before_command,
+            after_command=after_command,
+            check_grader=check_grader,
+            final_report=final_report,
+        )
 
 
 def write_traces(traces: Iterable[AgentEpisodeTrace], out_path: Path) -> None:

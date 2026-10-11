@@ -33,9 +33,7 @@ HELDOUT_INDEX_ENV = "SEED_V4_LEAK_HELDOUT_INDEX"
 CHANNEL_SPLITS_ENV = "SEED_V4_LEAK_CHANNEL_SPLITS"
 TRAIN_CASES_ENV = "SEED_V4_LEAK_TRAIN_CASES"
 DOCKER_TIER_ENV = "SEED_V4_REQUIRE_DOCKER"
-_SANITIZED_FEEDBACK = re.compile(
-    r"(?:SUCCESS|FAIL)\nTests: \d+ passed, \d+ failed, \d+ skipped, \d+ errors"
-)
+_SANITIZED_FEEDBACK = re.compile(r"(?:SUCCESS|FAIL)\nTests: \d+ matched expected, \d+ differed")
 
 
 @dataclass(frozen=True)

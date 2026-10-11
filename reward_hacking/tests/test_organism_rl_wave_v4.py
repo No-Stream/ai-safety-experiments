@@ -69,19 +69,116 @@ def test_wave_command(cell: wave_v4.ProbeCell, generator: str, hint: str, tmp_pa
     assert ("--leak-assets" in command) == (cell.family == "r2e_leak")
 
 
+def test_wave_sample_limit_is_explicit_and_defaults_to_one(tmp_path: Path) -> None:
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            "f3-leak",
+            "--generator",
+            "base",
+            "--hint-strength",
+            "specific",
+            "--episodes",
+            "3",
+            "--max-turns",
+            "60",
+            "--leak-assets",
+            str(tmp_path / "assets.json"),
+        ]
+    )
+    repeated_args = wave_v4.parse_args(
+        [
+            "--cell",
+            "f3-leak",
+            "--generator",
+            "base",
+            "--hint-strength",
+            "specific",
+            "--episodes",
+            "3",
+            "--samples-per-task",
+            "2",
+            "--max-turns",
+            "60",
+            "--leak-assets",
+            str(tmp_path / "assets.json"),
+        ]
+    )
+
+    assert args.samples_per_task == 1
+    assert repeated_args.samples_per_task == 2
+
+
+def test_repeated_wave_samples_use_pair_exclusions_and_keep_episode_target(tmp_path: Path) -> None:
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            "f3-leak",
+            "--generator",
+            "v3",
+            "--hint-strength",
+            "specific",
+            "--episodes",
+            "5",
+            "--samples-per-task",
+            "2",
+            "--max-turns",
+            "60",
+            "--leak-assets",
+            str(tmp_path / "assets.json"),
+        ]
+    )
+    exclusion = tmp_path / "prior-records.jsonl"
+    settings = CellRunConfig(
+        generator="v3",
+        endpoint="http://localhost:8000",
+        model=args.model,
+        output_dir=tmp_path,
+        hints_path=tmp_path / "hints.json",
+        leak_assets=args.leak_assets,
+        leak_channel_splits=tmp_path / "splits.json",
+        baseline_records=tmp_path / "baseline.jsonl",
+        max_model_len=args.max_model_len,
+        model_revision=None,
+        served_adapter_sha256="a" * 64,
+    )
+    command = build_generate_command(
+        PROBE_CELLS[2], wave_v4.stage_settings(args, settings, (exclusion,))
+    )
+
+    for flag, value in {
+        "--max-episodes": "5",
+        "--samples-per-task": "2",
+        "--exclude-task-samples-from": str(exclusion),
+    }.items():
+        assert command[command.index(flag) + 1] == value
+    assert "--max-tasks" not in command
+    assert "--exclude-task-ids-from" not in command
+
+
 def test_discovery_omits_own_records_and_other_cells(tmp_path: Path) -> None:
     probe = tmp_path / "probe"
     wave = tmp_path / "wave"
     own = wave / "f2-orig-vague-t40" / "v3" / "records.jsonl"
+    probe_v3 = probe / "f2-orig" / "v3" / "records.jsonl"
     expected = [
         probe / "f2-orig" / "base" / "records.jsonl",
+        probe_v3,
         wave / "f2-orig-none-t60" / "base" / "records.jsonl",
         own.parent.parent / "base" / "records.jsonl",
     ]
     for path in [own, *expected, wave / "f3-leak-none-t60" / "base" / "records.jsonl"]:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
-    assert set(wave_v4.exclusion_files(probe, wave, "f2-orig", own)) == set(expected)
+    probe_v3.write_text(
+        json.dumps({"record_schema": 4, "task_id": "probe-task", "sample_index": 0}) + "\n",
+        encoding="utf-8",
+    )
+    discovered = set(wave_v4.exclusion_files(probe, wave, "f2-orig", own))
+    assert discovered == set(expected)
+    assert {
+        probe / "f2-orig" / generator / "records.jsonl" for generator in ("base", "v3")
+    } <= discovered
 
 
 def test_smoke_caps_and_launch_estimate(tmp_path: Path) -> None:

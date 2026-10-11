@@ -42,6 +42,302 @@ def test_generate_cli_accepts_multiple_task_id_exclusion_files(tmp_path: Path) -
     assert args.exclude_task_ids_from == [first_path, second_path]
 
 
+def test_generate_cli_keeps_one_sample_default_and_accepts_sample_exclusions(
+    tmp_path: Path,
+) -> None:
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    common = [
+        "--endpoint",
+        "http://synthetic:8000",
+        "--max-model-len",
+        "1024",
+        "--output-dir",
+        str(tmp_path / "output"),
+    ]
+
+    default_args = generate.parse_args(common)
+    sampled_args = generate.parse_args(
+        [
+            *common,
+            "--max-episodes",
+            "2",
+            "--samples-per-task",
+            "2",
+            "--exclude-task-samples-from",
+            str(first_path),
+            str(second_path),
+        ]
+    )
+
+    assert default_args.samples_per_task == 1
+    assert sampled_args.samples_per_task == 2
+    assert sampled_args.exclude_task_samples_from == [first_path, second_path]
+
+
+def test_read_task_sample_exclusions_deduplicates_and_sorts_pairs(tmp_path: Path) -> None:
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text(
+        "".join(
+            json.dumps({"task_id": task_id, "sample_index": sample_index}) + "\n"
+            for task_id, sample_index in (
+                ("task-z", 1),
+                ("task-a", 2),
+                ("task-z", 1),
+                ("task-a", 0),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    pairs, source_records = generate._read_task_sample_exclusion_inputs((records_path,))
+
+    assert pairs == (("task-a", 0), ("task-a", 2), ("task-z", 1))
+    assert source_records[0]["path"] == str(records_path)
+    assert source_records[0]["sha256"] == hashlib.sha256(records_path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("contents", "error", "exception"),
+    [
+        ('{"task_id":"task-a","sample_index":-1}\n', r"nonnegative sample_index", ValueError),
+        ('{"task_id":"task-a","sample_index":true}\n', r"nonnegative sample_index", ValueError),
+        ('{"task_id":"task-a"}\n', r"sample_index", ValueError),
+    ],
+)
+def test_read_task_sample_exclusions_rejects_invalid_sample_indexes(
+    tmp_path: Path, contents: str, error: str, exception: type[Exception]
+) -> None:
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(exception, match=error):
+        generate._read_task_sample_exclusion_inputs((records_path,))
+
+
+def test_task_sample_selection_prefers_fresh_tasks_then_least_sampled() -> None:
+    selected = generate.select_task_sample_pairs(
+        ("task-a", "task-b", "task-c"),
+        excluded_task_samples=(("task-a", 0), ("task-b", 0)),
+        max_episodes=6,
+        samples_per_task=2,
+    )
+
+    assert selected == (
+        ("task-c", 0),
+        ("task-a", 1),
+        ("task-b", 1),
+        ("task-c", 1),
+        ("task-a", 2),
+        ("task-b", 2),
+    )
+
+
+def test_task_sample_selection_fails_when_episode_target_exceeds_capacity() -> None:
+    with pytest.raises(ValueError, match=r"max_episodes=3.*2 eligible task samples"):
+        generate.select_task_sample_pairs(
+            ("task-a", "task-b"),
+            excluded_task_samples=(),
+            max_episodes=3,
+            samples_per_task=1,
+        )
+
+
+def test_task_sample_exclusion_snapshot_freezes_and_rejects_new_selection_collisions(
+    tmp_path: Path,
+) -> None:
+    records_path = tmp_path / "other-stage.jsonl"
+    output_dir = tmp_path / "generation"
+    records_path.write_text(
+        json.dumps({"task_id": "task-a", "sample_index": 0}) + "\n", encoding="utf-8"
+    )
+    snapshot, current_samples, source_records = generate._resolve_task_sample_exclusion_snapshot(
+        (records_path,), output_dir, freeze_empty=True
+    )
+
+    assert snapshot is not None
+    assert snapshot == (("task-a", 0),)
+    assert current_samples == snapshot
+    selected = generate.select_task_sample_pairs(
+        ("task-a", "task-b"),
+        excluded_task_samples=snapshot,
+        max_episodes=1,
+        samples_per_task=1,
+    )
+    assert selected == (("task-b", 0),)
+    provenance: dict[str, object] = {
+        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "flags": {"cell": "synthetic"},
+        "task_sample_exclusion": {
+            "schema_version": 1,
+            "task_samples": [{"task_id": "task-a", "sample_index": 0}],
+        },
+        "task_sample_selection": [{"task_id": "task-b", "sample_index": 0}],
+        "run_context": {"task_sample_exclusion_sources": source_records},
+    }
+    generate._prepare_run(output_dir, provenance)
+
+    records_path.write_text(
+        json.dumps({"task_id": "task-a", "sample_index": 0})
+        + "\n"
+        + json.dumps({"task_id": "task-b", "sample_index": 0})
+        + "\n",
+        encoding="utf-8",
+    )
+    resumed_snapshot, current_samples, resumed_sources = (
+        generate._resolve_task_sample_exclusion_snapshot(
+            (records_path,), output_dir, freeze_empty=True
+        )
+    )
+
+    assert resumed_snapshot == snapshot
+    assert current_samples == (("task-a", 0), ("task-b", 0))
+    assert resumed_sources[0]["sha256"] != source_records[0]["sha256"]
+    with pytest.raises(ValueError, match="overlap this stage's fixed selection"):
+        generate._reject_new_task_sample_exclusion_collisions(
+            resumed_snapshot,
+            current_samples,
+            selected,
+        )
+    stored_provenance = json.loads((output_dir / "provenance.json").read_text())["provenance"]
+    assert stored_provenance["task_sample_exclusion"]["task_samples"] == [
+        {"task_id": "task-a", "sample_index": 0}
+    ]
+
+
+def test_generate_episodes_uses_selected_sample_indexes_and_deterministic_seeds(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "generation"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    task_specs = (
+        generate.TaskSpec("task-a", "ilcb", "oneoff"),
+        generate.TaskSpec("task-b", "ilcb", "oneoff"),
+    )
+    selected_samples = (("task-b", 0), ("task-a", 1))
+    provenance: dict[str, object] = {
+        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "flags": {"cell": "synthetic"},
+        "task_sample_exclusion": {"schema_version": 1, "task_samples": []},
+        "task_sample_selection": [
+            {"task_id": task_id, "sample_index": sample_index}
+            for task_id, sample_index in selected_samples
+        ],
+    }
+
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=task_specs,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=provenance,
+        sample_indices_by_task={"task-a": (1,), "task-b": (0,)},
+    )
+
+    records = [json.loads(line) for line in (output_dir / "records.jsonl").read_text().splitlines()]
+    assert {(record["task_id"], record["sample_index"]) for record in records} == set(
+        selected_samples
+    )
+    assert {call[1] for call in source.calls} == {
+        generate.deterministic_episode_seed(task_id, 0, sample_index)
+        for task_id, sample_index in selected_samples
+    }
+    call_count = len(source.calls)
+
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=task_specs,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=provenance,
+        sample_indices_by_task={"task-a": (1,), "task-b": (0,)},
+    )
+
+    assert len(source.calls) == call_count
+
+
+def test_generate_main_selects_only_unexcluded_pairs_and_passes_frozen_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    task_ids = ("task-a", "task-b", "task-c")
+    task_source = SimpleNamespace(
+        tasks={task_id: SimpleNamespace(problem_id=task_id) for task_id in task_ids},
+        families_by_task=dict.fromkeys(task_ids, "ilcb"),
+        environments_by_task=dict.fromkeys(task_ids, "synthetic/environment"),
+        variants_by_task=dict.fromkeys(task_ids, "oneoff"),
+        payment_registers={},
+    )
+    exclusion_path = tmp_path / "prior-stage.jsonl"
+    exclusion_path.write_text(
+        "".join(
+            json.dumps({"task_id": task_id, "sample_index": sample_index}) + "\n"
+            for task_id, sample_index in (("task-a", 0), ("task-b", 0))
+        ),
+        encoding="utf-8",
+    )
+    generated_arguments: dict[str, object] = {}
+    provenance_arguments: dict[str, object] = {}
+
+    monkeypatch.setattr(generate, "TaskEpisodeSource", lambda **_kwargs: task_source)
+    monkeypatch.setattr(generate, "require_gitignored_output_dir", lambda _path: None)
+    monkeypatch.setattr(
+        generate, "_assign_payment_registers", lambda task_specs, *_args, **_kwargs: task_specs
+    )
+    monkeypatch.setattr(
+        generate,
+        "_provenance",
+        lambda *_args, **kwargs: provenance_arguments.update(kwargs) or {"run": "synthetic"},
+    )
+    monkeypatch.setattr(
+        generate,
+        "generate_episodes",
+        lambda **kwargs: generated_arguments.update(kwargs),
+    )
+
+    generate.main(
+        [
+            "--endpoint",
+            "http://synthetic:8000",
+            "--family",
+            "ilcb",
+            "--variant",
+            "oneoff",
+            "--partition",
+            "held-out",
+            "--no-exclude-duplicates",
+            "--max-model-len",
+            "1024",
+            "--output-dir",
+            str(tmp_path / "generation"),
+            "--max-episodes",
+            "3",
+            "--samples-per-task",
+            "2",
+            "--exclude-task-samples-from",
+            str(exclusion_path),
+        ]
+    )
+
+    assert generated_arguments["sample_indices_by_task"] == {
+        "task-c": (0,),
+        "task-a": (1,),
+        "task-b": (1,),
+    }
+    assert provenance_arguments["task_sample_exclusion_snapshot"] == (
+        ("task-a", 0),
+        ("task-b", 0),
+    )
+    assert provenance_arguments["task_sample_selection"] == (
+        ("task-c", 0),
+        ("task-a", 1),
+        ("task-b", 1),
+    )
+
+
 def test_read_task_ids_from_records_deduplicates_and_sorts_ids(tmp_path: Path) -> None:
     records_path = tmp_path / "records.jsonl"
     records_path.write_text(

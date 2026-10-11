@@ -40,6 +40,7 @@ GRADER_THREAD_LIMITS = (
 MAXIMUM_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAXIMUM_OUTPUT_BYTES = 1024 * 1024
 MAXIMUM_JUNIT_XML_BYTES = 16 * 1024 * 1024
+MAXIMUM_TMP_STATE_BYTES = 64 * 1024 * 1024
 MAXIMUM_SNAPSHOT_BYTES = 1024 * 1024 * 1024
 MAXIMUM_SNAPSHOT_ENTRIES = 20000
 # The entry and byte caps bound the work; the clock is only a backstop. Six concurrent gradings
@@ -136,6 +137,7 @@ class DockerConfig:
     workspace_mount: str = "/work"
     read_only_mounts: tuple[ReadOnlyMount, ...] = ()
     trusted_grader: bool = False
+    episode_tmp_state: Path | None = None
 
     def __post_init__(self) -> None:
         """Reject mutable image references and invalid containment limits."""
@@ -180,6 +182,8 @@ class DockerConfig:
             for second in targets[index + 1 :]
         ):
             raise ValueError("runtime mount targets must not overlap")
+        if self.trusted_grader and self.episode_tmp_state is not None:
+            raise ValueError("trusted graders require a fresh /tmp")
 
 
 def runtime_mount_args(mount: ReadOnlyMount) -> str:
@@ -362,7 +366,7 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         "--cpuset-cpus",
         container_cpuset(name, config.cpus),
         "--tmpfs",
-        "/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",  # noqa: S108 - container-only tmpfs
+        f"/tmp:rw,noexec,nosuid,nodev,size={MAXIMUM_TMP_STATE_BYTES},mode=1777",  # noqa: S108
         "--mount",
         f"type=bind,src={workspace},dst={config.workspace_mount},bind-recursive=disabled",
         *extra_mount_args,
@@ -572,6 +576,12 @@ def workspace_snapshot(
     return snapshot
 
 
+def _check_tmp_state_limits(state: Path) -> None:
+    snapshot = workspace_snapshot(state)
+    if sum(int(entry.get("size", 0)) for entry in snapshot.values()) > MAXIMUM_TMP_STATE_BYTES:
+        raise SnapshotLimitError("episode /tmp state exceeded the container tmpfs byte limit")
+
+
 def _timeout_seconds(timeout: str) -> int:
     match = re.fullmatch(r"(\d+)([smh]?)", timeout)
     if match is None:
@@ -674,6 +684,72 @@ def _inspect_image_volumes(
     return json.loads(inspected.stdout), None
 
 
+def _validate_tmp_state(workspace: Path, tmp_state: Path | None) -> None:
+    if tmp_state is not None and (
+        tmp_state.is_symlink()
+        or not tmp_state.is_dir()
+        or workspace in tmp_state.resolve(strict=True).parents
+        or tmp_state.resolve(strict=True) == workspace
+    ):
+        raise ValueError("episode /tmp state must be a separate real directory")
+
+
+def _validate_protected_paths(config: DockerConfig, workspace: Path) -> None:
+    for protected in (config.gate_record, config.evidence_path):
+        if protected is not None and (
+            protected.resolve() == workspace or workspace in protected.resolve().parents
+        ):
+            raise ValueError("gate and evidence must stay outside the episode mount")
+
+
+def _tmp_persisting_command(
+    command: str, *, config: DockerConfig, staged_tmp: Path, seconds: int, login_shell: bool
+) -> str:
+    container_path = shlex.quote(f"{config.workspace_mount}/{staged_tmp.name}")
+    inner_shell = "-lc" if login_shell else "-c"
+    return (
+        "shopt -s dotglob nullglob; "
+        f"_tmp_entries=({container_path}/*); "
+        'if ((${#_tmp_entries[@]})); then /bin/cp -a -- "${_tmp_entries[@]}" /tmp/ || exit 125; fi; '
+        f"/bin/rm -rf -- {container_path}; "
+        f"/usr/bin/timeout --signal=KILL {seconds}s /bin/bash {inner_shell} {shlex.quote(command)}; "
+        "_episode_exit=$?; "
+        f"/bin/mkdir -- {container_path} || exit 125; "
+        "_tmp_entries=(/tmp/*); "
+        'if ((${#_tmp_entries[@]})); then /bin/cp -a -- "${_tmp_entries[@]}" '
+        f"{container_path}/ || exit 125; fi; "
+        'exit "$_episode_exit"'
+    )
+
+
+def _stage_tmp_state(tmp_state: Path | None, staged_tmp: Path | None) -> None:
+    if tmp_state is None or staged_tmp is None:
+        return
+    _check_tmp_state_limits(tmp_state)
+    try:
+        shutil.copytree(tmp_state, staged_tmp, symlinks=True)
+    except OSError:
+        if staged_tmp.exists():
+            shutil.rmtree(staged_tmp)
+        raise
+
+
+def _collect_tmp_state(tmp_state: Path | None, staged_tmp: Path | None) -> None:
+    if tmp_state is None or staged_tmp is None:
+        return
+    if staged_tmp.is_symlink():
+        staged_tmp.unlink()
+        raise ValueError("container replaced episode /tmp staging with a symlink")
+    if staged_tmp.is_dir():
+        try:
+            _check_tmp_state_limits(staged_tmp)
+            shutil.rmtree(tmp_state)
+            staged_tmp.rename(tmp_state)
+        finally:
+            if staged_tmp.exists():
+                shutil.rmtree(staged_tmp)
+
+
 def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport argument
     episode_dir: Path,
     command: str,
@@ -685,12 +761,10 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
 ) -> CommandResult:
     """Run a fresh container and persist command evidence on the host, outside its mount."""
     workspace = validate_workspace(episode_dir)
+    tmp_state = config.episode_tmp_state
+    _validate_tmp_state(workspace, tmp_state)
     junit_report_path = _validate_junit_report_path(junit_report_path)
-    for protected in (config.gate_record, config.evidence_path):
-        if protected is not None and (
-            protected.resolve() == workspace or workspace in protected.resolve().parents
-        ):
-            raise ValueError("gate and evidence must stay outside the episode mount")
+    _validate_protected_paths(config, workspace)
     require_gate(config)
     prepare_runtime_mountpoints(workspace, config)
     image_volumes, image_inspection_failure = _inspect_image_volumes(
@@ -706,13 +780,23 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
     )
     name = "episode-" + uuid.uuid4().hex
     seconds = _timeout_seconds(timeout)
+    staged_tmp = workspace / f".episode-tmp-{uuid.uuid4().hex}" if tmp_state is not None else None
+    outer_seconds = seconds + 10 if staged_tmp is not None else seconds
     argv = docker_run_args(
         config,
         workspace,
         name,
-        command,
-        timeout_seconds=seconds,
-        login_shell=login_shell,
+        _tmp_persisting_command(
+            command,
+            config=config,
+            staged_tmp=staged_tmp,
+            seconds=seconds,
+            login_shell=login_shell,
+        )
+        if staged_tmp is not None
+        else command,
+        timeout_seconds=outer_seconds,
+        login_shell=False if staged_tmp is not None else login_shell,
     )
     evidence: dict[str, object] = {
         "command": command,
@@ -737,9 +821,10 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
         raise
     with evidence_path.open("a") as output:
         output.write(json.dumps(evidence) + "\n")
+    _stage_tmp_state(tmp_state, staged_tmp)
     try:
         exit_code, stdout, stderr, host_timed_out, output_truncated = _run_bounded_docker(
-            argv, seconds + 15
+            argv, outer_seconds + 15
         )
         junit_xml = _read_junit_report(workspace, junit_report_path)
         result = CommandResult(
@@ -760,6 +845,7 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
         )
         if cleanup.returncode != 0 and "No such container" not in cleanup.stderr:
             raise RuntimeError(f"Docker container cleanup failed: {cleanup.stderr.strip()}")
+        _collect_tmp_state(tmp_state, staged_tmp)
     evidence.update(
         {
             "phase": "finished",

@@ -699,13 +699,19 @@ def _recorded_hint_entries(record: CorpusRecord) -> list[dict[str, str]]:
         catalog.get("sha256"),
         "provenance.hint_catalog.sha256",
     )
-    flags = _object(provenance.get("flags"), "provenance.flags")
-    flags_catalog_sha256 = _string(
-        flags.get("hint_file_sha256"),
-        "provenance.flags.hint_file_sha256",
-    )
-    if recorded_catalog_sha256 != flags_catalog_sha256:
-        raise ValueError("hint catalog digests differ between run provenance metadata and flags")
+    raw_flags = provenance.get("flags")
+    if raw_flags is not None:
+        flags = _object(raw_flags, "provenance.flags")
+        raw_flags_catalog_sha256 = flags.get("hint_file_sha256")
+        if raw_flags_catalog_sha256 is not None:
+            flags_catalog_sha256 = _string(
+                raw_flags_catalog_sha256,
+                "provenance.flags.hint_file_sha256",
+            )
+            if recorded_catalog_sha256 != flags_catalog_sha256:
+                raise ValueError(
+                    "hint catalog digests differ between run provenance metadata and flags"
+                )
 
     from reward_hacking.organism_rl.generate import _read_hint_entries  # noqa: PLC0415
 
@@ -713,6 +719,42 @@ def _recorded_hint_entries(record: CorpusRecord) -> list[dict[str, str]]:
     if actual_catalog_sha256 != recorded_catalog_sha256:
         raise ValueError(f"recorded hint catalog SHA-256 differs for {catalog_path_text}")
     return hint_entries
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [None, {}, {"hint_file_sha256": None}],
+    ids=["legacy-no-flags", "legacy-missing-digest", "legacy-null-digest"],
+)
+def test_recorded_hint_catalog_is_loaded_when_legacy_flags_omit_digest(
+    tmp_path: Path,
+    flags: Mapping[str, object] | None,
+) -> None:
+    catalog_path = tmp_path / "synthetic-hints.json"
+    hint_text = "Synthetic guidance for a focused test."
+    catalog_bytes = json.dumps(
+        {
+            "schema_version": 1,
+            "hints": [{"family": "synthetic", "strength": "vague", "text": hint_text}],
+        }
+    ).encode("utf-8")
+    catalog_path.write_bytes(catalog_bytes)
+    catalog_sha256 = hashlib.sha256(catalog_bytes).hexdigest()
+    run_dir = tmp_path / "synthetic-capture"
+    run_dir.mkdir()
+    provenance: dict[str, object] = {
+        "hint_catalog": {"path": str(catalog_path), "sha256": catalog_sha256}
+    }
+    if flags is not None:
+        provenance["flags"] = flags
+    (run_dir / "provenance.json").write_text(
+        json.dumps({"provenance": provenance}),
+        encoding="utf-8",
+    )
+    record = CorpusRecord(run_dir / "records.jsonl", 1, {})
+    hint_sha = hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
+
+    assert _recorded_hint_text(record, "synthetic", "vague", hint_sha) == hint_text
 
 
 def test_recorded_hint_catalog_is_loaded_and_its_digest_is_verified(tmp_path: Path) -> None:
@@ -754,6 +796,37 @@ def test_recorded_hint_catalog_is_loaded_and_its_digest_is_verified(tmp_path: Pa
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="catalog SHA-256 differs"):
+        _recorded_hint_text(record, "synthetic", "vague", hint_sha)
+
+
+def test_recorded_hint_catalog_rejects_disagreeing_flag_digest(tmp_path: Path) -> None:
+    catalog_path = tmp_path / "synthetic-hints.json"
+    hint_text = "Synthetic guidance for a focused test."
+    catalog_bytes = json.dumps(
+        {
+            "schema_version": 1,
+            "hints": [{"family": "synthetic", "strength": "vague", "text": hint_text}],
+        }
+    ).encode("utf-8")
+    catalog_path.write_bytes(catalog_bytes)
+    catalog_sha256 = hashlib.sha256(catalog_bytes).hexdigest()
+    run_dir = tmp_path / "synthetic-capture"
+    run_dir.mkdir()
+    (run_dir / "provenance.json").write_text(
+        json.dumps(
+            {
+                "provenance": {
+                    "hint_catalog": {"path": str(catalog_path), "sha256": catalog_sha256},
+                    "flags": {"hint_file_sha256": "0" * 64},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    record = CorpusRecord(run_dir / "records.jsonl", 1, {})
+    hint_sha = hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
+
+    with pytest.raises(ValueError, match="digests differ"):
         _recorded_hint_text(record, "synthetic", "vague", hint_sha)
 
 

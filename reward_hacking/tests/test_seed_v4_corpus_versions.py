@@ -24,6 +24,99 @@ from reward_hacking.organism_rl.generate import (
 from reward_hacking.organism_rl.rollout import recorded_true_pass
 
 
+def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path) -> None:
+    producer = "reward_hacking.harness.leak_detector.semantic_version"
+    assert semantic_versions()[producer] == 1
+    source = tmp_path / "source"
+    source.mkdir()
+    records_path = source / "records.jsonl"
+    records_path.write_text(
+        json.dumps(
+            {
+                "family": "r2e_leak",
+                "trace_summary": {"leak_assessment": {"leak_detector": "assessed"}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert producer not in corpus_capture._exercised_producers(source, kind="real")  # pyright: ignore[reportPrivateUsage]
+    records_path.write_text(
+        json.dumps(
+            {"family": "r2e_leak", "trace_summary": {"leak_assessment": {"semantic_version": 1}}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert producer in corpus_capture._exercised_producers(source, kind="real")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_versioned_detector_capture_refuses_unattested_version(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "records.jsonl").write_text(
+        json.dumps(
+            {"family": "r2e_leak", "trace_summary": {"leak_assessment": {"semantic_version": 1}}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    corpus_root = tmp_path / "corpus"
+    corpus_capture.capture_run(source, "synthetic", corpus_root=corpus_root)
+    manifest_path = corpus_root / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["captures"][0]["semantic_versions"][
+        "reward_hacking.harness.leak_detector.semantic_version"
+    ] = 0
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"leak_detector\.semantic_version=0"):
+        corpus_capture.verify_corpus(corpus_root)
+
+
+def test_only_unversioned_legacy_manifests_can_defer_detector_semantics() -> None:
+    manifest: dict[str, object] = {
+        "semantic_versions": {},
+        "deferred_semantic_versions": list(corpus_capture.LEGACY_DEFERRED_SEMANTIC_VERSIONS),
+    }
+    corpus_capture._check_manifest_version_notes(manifest)  # pyright: ignore[reportPrivateUsage]
+    manifest["semantic_versions"] = {corpus_capture.LEAK_DETECTOR_PRODUCER: 1}
+    with pytest.raises(ValueError, match="deferred semantic version note"):
+        corpus_capture._check_manifest_version_notes(manifest)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_detector_record_version_must_match_capture_version(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "records.jsonl").write_text(
+        json.dumps({"trace_summary": {"leak_assessment": {"semantic_version": 999}}}) + "\n",
+        encoding="utf-8",
+    )
+    corpus_root = tmp_path / "corpus"
+    with pytest.raises(ValueError, match="detector assessment version differs"):
+        corpus_capture.capture_run(source, "synthetic", corpus_root=corpus_root)
+
+
+@pytest.mark.parametrize("version", [None, True, 0, "1"])
+def test_assessed_detector_version_requires_positive_integer(
+    tmp_path: Path, version: object
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "trace_summary": {
+                    "leak_assessment": {"leak_detector": "assessed", "semantic_version": version}
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="semantic version must be a positive integer"):
+        corpus_capture._exercised_producers(source, kind="real")  # pyright: ignore[reportPrivateUsage]
+
+
 def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
     assert RECORD_SCHEMA_VERSION == 4
 
@@ -460,9 +553,7 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
                         "current_version": current_version,
                         "loader_test": corpus_capture.COMPATIBILITY_LOADER_TESTS[producer],
                     } in manifest["compatible_legacy_versions"]
-    assert manifest["deferred_semantic_versions"] == [
-        "reward_hacking.harness.leak_detector.LEAK_DETECTOR_SEMANTIC_VERSION"
-    ]
+    corpus_capture._check_manifest_version_notes(manifest)  # pyright: ignore[reportPrivateUsage]
     assert all("sha" not in key and "hash" not in key for key in manifest["semantic_versions"])
 
 

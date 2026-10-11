@@ -372,6 +372,11 @@ def parse_junit_outcomes(junit_xml: str, stdout_outcomes: dict[str, str]) -> Non
 
 def outcomes_match(test_output: str, expected_output_json: str) -> bool:
     """Return whether the parsed per-test outcome map equals the row's gold outcome map exactly."""
+    return compare_outcomes(test_output, expected_output_json)[0]
+
+
+def compare_outcomes(test_output: str, expected_output_json: str) -> tuple[bool, int, int]:
+    """Compare status maps and count matches without disclosing test names or expected statuses."""
 
     def normalise(outcomes: dict[str, str]) -> dict[str, str]:
         return {
@@ -382,7 +387,9 @@ def outcomes_match(test_output: str, expected_output_json: str) -> bool:
 
     parsed = normalise(parse_pytest_summary(test_output))
     expected = normalise(json.loads(expected_output_json))
-    return bool(expected) and parsed == expected
+    matched = sum(parsed.get(name) == status for name, status in expected.items())
+    differed = len(set(parsed) | set(expected)) - matched
+    return bool(expected) and parsed == expected, matched, differed
 
 
 def _read_case_file(data_path: Path) -> dict[str, object]:
