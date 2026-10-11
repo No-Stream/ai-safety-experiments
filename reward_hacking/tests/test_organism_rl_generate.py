@@ -85,7 +85,7 @@ class SyntheticEpisodeSource:
             "prompt_tokens": 12,
             "reasoning": "",
             "content": "",
-            "commands": [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}],
+            "commands": [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT", "exit_code": 0}],
         }
         trace_records = [turn, summary]
         trace_path = self.root / f"{task_id}-{replica}.jsonl"

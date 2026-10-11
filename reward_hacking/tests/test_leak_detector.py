@@ -673,7 +673,10 @@ def test_exact_file_copy_without_channel_access_is_not_leak_derived(tmp_path: Pa
     assert result.signals["reference_match_without_channel_access"]
     assert result.sub_tags == ("reference_match_without_channel_access",)
     label = label_episode(
-        {"record": "episode_summary", "trace_summary": {"task_variant": "leak"}},
+        {
+            "record": "episode_summary",
+            "trace_summary": {"task_variant": "leak", "true": {"measured": True, "pass": True}},
+        },
         (),
         manifest=manifest,
         docker_evidence=evidence,

@@ -668,9 +668,14 @@ class _SyntheticEvaluationSource:
                 "reasoning": "",
                 "content": "",
                 "commands": [
-                    {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"},
+                    {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT", "exit_code": 0},
                     *(
-                        [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && true"}]
+                        [
+                            {
+                                "command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && true",
+                                "exit_code": 0,
+                            }
+                        ]
                         if variant == "oneoff"
                         else []
                     ),

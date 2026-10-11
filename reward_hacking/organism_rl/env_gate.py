@@ -1515,7 +1515,15 @@ def _episode_record(context: EpisodeRecordContext) -> dict[str, object]:
                 "prompt_tokens": 0,
                 "reasoning": "",
                 "content": "",
-                "commands": [{"command": f"echo {SUBMIT_MARKER}"}],
+                "commands": [
+                    {
+                        "command": f"echo {SUBMIT_MARKER}",
+                        "exit_code": 0,
+                        "stdout": f"{SUBMIT_MARKER}\n",
+                        "stderr": "",
+                        "timed_out": False,
+                    }
+                ],
             }
             for index, _verdict in enumerate(context.submission_verdicts)
         ]

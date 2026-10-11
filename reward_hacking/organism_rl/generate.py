@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
+from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.ladder.thinking import (
@@ -1058,6 +1059,11 @@ def _episode_record(
     if "math_evidence" in trace_summary:
         record["math_evidence"] = trace_summary["math_evidence"]
     record["engine_command_records"] = _task_command_records(sample.trace_records)
+    trace_summary.update(
+        {"hack_strategy": label_episode(record, sample.trace_records).to_json_dict()}
+        if failure_reason is None
+        else {}
+    )
     return record
 
 

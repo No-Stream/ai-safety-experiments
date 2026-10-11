@@ -27,6 +27,11 @@ def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
     assert RECORD_SCHEMA_VERSION == 3
 
 
+def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> None:
+    assert TAXONOMY_VERSION == "hack_strategy_v6"
+    assert "hack_strategy_v5" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+
+
 @pytest.mark.corpus
 def test_legacy_oracle_errors_load_as_unmeasured_truth(seed_v4_corpus: Path) -> None:
     legacy_error_count = 0

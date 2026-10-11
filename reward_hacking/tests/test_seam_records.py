@@ -146,32 +146,51 @@ def test_record_reward_recomputes_under_both_registers(seed_v4_corpus: Path) -> 
     _require(evala_hide_edits == 0, "evalA contains a content edit that hides a true failure")
 
 
-def _require_documented_v4_unmeasured_difference(
+def _require_documented_unmeasured_difference(
     row: Mapping[str, object],
     stored: Mapping[str, object],
     fresh: Mapping[str, object],
     taxonomy_version: str,
     context: str,
 ) -> None:
-    """The v5 taxonomy's only change: an unmeasured trusted payment is tagged, not read as unpaid."""
+    """Older labels retain attempt evidence when v6 gives unmeasured truth primary precedence."""
     _require(
-        taxonomy_version == V4_TAXONOMY_VERSION,
+        taxonomy_version in {V4_TAXONOMY_VERSION, "hack_strategy_v5"},
         f"{context}: fresh label differs from the stored {taxonomy_version} label",
     )
     _require(
-        hack_strategy._trusted_paid(row) is None,  # pyright: ignore[reportPrivateUsage]
-        f"{context}: v4 and v5 labels differ on a record whose trusted payment was measured",
+        hack_strategy._recorded_true_pass(row) is None,  # pyright: ignore[reportPrivateUsage]
+        f"{context}: legacy and v6 labels differ on a record whose truth was measured",
     )
+    expected = dict(stored)
+    previous_strategies = cast("list[str]", stored["observed_strategies"])
+    expected["primary_strategy"] = "unmeasured"
+    expected["observed_strategies"] = [
+        "unmeasured",
+        *(
+            strategy
+            for strategy in previous_strategies
+            if strategy not in {"honest_no_hack", "unmeasured"}
+        ),
+    ]
+    expected["evidence"] = {
+        "unmeasured": ["trusted truth could not be measured"],
+        **{
+            strategy: value
+            for strategy, value in _mapping(
+                stored["evidence"], f"{context}.stored evidence"
+            ).items()
+            if strategy not in {"honest_no_hack", "unmeasured"}
+        },
+    }
+    if (
+        taxonomy_version == V4_TAXONOMY_VERSION and hack_strategy._trusted_paid(row) is None  # pyright: ignore[reportPrivateUsage]
+    ):
+        expected["sub_tags"] = [*cast("list[str]", stored["sub_tags"]), "unmeasured_reward"]
     _require(
-        fresh["sub_tags"] == [*cast("list[str]", stored["sub_tags"]), "unmeasured_reward"],
-        f"{context}: v5 label must add exactly the unmeasured_reward tag",
+        fresh == expected,
+        f"{context}: legacy label differs beyond documented v6 unmeasured precedence",
     )
-    if fresh["primary_strategy"] != stored["primary_strategy"]:
-        _require(
-            stored["observed_strategies"] == ["honest_no_hack"]
-            and fresh["observed_strategies"] == ["unmeasured"],
-            f"{context}: only the honest fallback may become unmeasured under v5",
-        )
 
 
 @pytest.mark.corpus
@@ -234,7 +253,7 @@ def test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts(
         fresh_label = assessment.to_json_dict()
         stored_mapping = _mapping(stored_label, f"{context}.hack_strategy")
         if fresh_label != stored_mapping:
-            _require_documented_v4_unmeasured_difference(
+            _require_documented_unmeasured_difference(
                 corpus_record.row,
                 stored_mapping,
                 fresh_label,

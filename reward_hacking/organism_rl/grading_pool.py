@@ -146,10 +146,21 @@ def run_bounded[T, R](
 
 def _worker_cpu_assignments(max_workers: int) -> SimpleQueue[int]:
     worker_cpus = sorted(os.sched_getaffinity(0))
-    if max_workers > len(worker_cpus):
-        raise ValueError("grading workers exceed the available CPU affinity")
+    cpu_by_core: dict[str, int] = {}
+    for cpu in worker_cpus:
+        core_cpus_list = (
+            (CPU_TOPOLOGY_ROOT / f"cpu{cpu}" / "topology" / "core_cpus_list")
+            .read_text(encoding="ascii")
+            .strip()
+        )
+        cpu_by_core.setdefault(core_cpus_list, cpu)
+    if max_workers > len(cpu_by_core):
+        raise ValueError(
+            f"grading workers ({max_workers}) exceed available physical cores ({len(cpu_by_core)})"
+        )
+
     cpu_assignments: SimpleQueue[int] = SimpleQueue()
-    for cpu in worker_cpus[:max_workers]:
+    for cpu in list(cpu_by_core.values())[:max_workers]:
         cpu_assignments.put(cpu)
     return cpu_assignments
 

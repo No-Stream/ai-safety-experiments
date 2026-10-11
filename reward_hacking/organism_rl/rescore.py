@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from reward_hacking.distill.hack_strategy import label_episode
+from reward_hacking.distill.hack_strategy import label_episode, label_persisted_episode
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.docker_backend import SnapshotLimitError
 from reward_hacking.harness.leak_detector import assess_leak
@@ -539,6 +539,7 @@ def _record_saved_reward(
         "evidence": asdict(score.evidence),
     }
     result["organism_reward_outcome"] = score.outcome.value
+    summary["hack_strategy"] = label_persisted_episode(result).to_json_dict()
     return result
 
 

@@ -26,7 +26,8 @@ def replay_fixture(
     digest = hashlib.sha256(artifact).hexdigest()
     trace_path = tmp_path / "trace.jsonl"
     trace_path.write_text(
-        json.dumps({"record": "turn", "commands": [{"command": "synthetic-write"}]}) + "\n"
+        json.dumps({"record": "turn", "commands": [{"command": "synthetic-write", "exit_code": 0}]})
+        + "\n"
     )
     task = Task(
         task_id="synthetic-replay",
@@ -112,7 +113,7 @@ def test_rescore_preserves_explicit_submission_records(
     replay_fixture: tuple[dict[str, object], Task, list[str]],
 ) -> None:
     record, task, calls = replay_fixture
-    record = _submitted_edit_record("aisi-0", "aisi")
+    record = _submitted_edit_record("aisi-0", "aisi", Path(cast("str", record["trace_path"])))
     original_submissions = cast("dict[str, object]", record["trace_summary"])["submission_verdicts"]
     result = rescore.rescore_record(record, task, jail_backend=None)
     assert cast("dict[str, object]", result["trace_summary"])["submission_verdicts"] == (
@@ -217,7 +218,8 @@ def test_rescore_file_records_real_snapshot_limit_and_continues(
     artifact_digest = hashlib.sha256(artifact).hexdigest()
     trace_path = tmp_path / "trace.jsonl"
     trace_path.write_text(
-        json.dumps({"record": "turn", "commands": [{"command": "synthetic-write"}]}) + "\n",
+        json.dumps({"record": "turn", "commands": [{"command": "synthetic-write", "exit_code": 0}]})
+        + "\n",
         encoding="utf-8",
     )
     docker_task = Task(
@@ -261,7 +263,7 @@ def test_rescore_file_records_real_snapshot_limit_and_continues(
             "submitted_artifact_sha256": artifact_digest,
         },
     }
-    second = _submitted_edit_record("aisi-continued", "aisi")
+    second = _submitted_edit_record("aisi-continued", "aisi", trace_path)
     records_path = tmp_path / "records.jsonl"
     records_path.write_text(
         "".join(json.dumps(row) + "\n" for row in (first, second)), encoding="utf-8"
@@ -487,7 +489,7 @@ def test_rescore_refuses_changed_task_definition_before_replay(
     assert calls == []
 
 
-def _submitted_edit_record(task_id: str, family: str) -> dict[str, object]:
+def _submitted_edit_record(task_id: str, family: str, trace_path: Path) -> dict[str, object]:
     artifact_digest = "a" * 64
     return {
         "record": "ladder_episode",
@@ -496,7 +498,7 @@ def _submitted_edit_record(task_id: str, family: str) -> dict[str, object]:
         "family": family,
         "variant": "oneoff",
         "task_kind": "impossible",
-        "trace_path": "synthetic-trace.jsonl",
+        "trace_path": str(trace_path),
         "trace_summary": {
             "record": "episode_summary",
             "arm": {"label": "baseline"},
@@ -535,9 +537,11 @@ def test_in_band_rescore_reports_test_repairs_and_hide_edits(
         "_load_task",
         lambda _record: pytest.fail("submitted records must rescore without loading a task"),
     )
+    trace_path = tmp_path / "trace.jsonl"
+    trace_path.write_text(json.dumps({"record": "turn", "commands": []}) + "\n")
     records = [
-        *(_submitted_edit_record(f"aisi-{index}", "aisi") for index in range(5)),
-        *(_submitted_edit_record(f"ilcb-{index}", "ilcb") for index in range(2)),
+        *(_submitted_edit_record(f"aisi-{index}", "aisi", trace_path) for index in range(5)),
+        *(_submitted_edit_record(f"ilcb-{index}", "ilcb", trace_path) for index in range(2)),
     ]
     records_path = tmp_path / "records.jsonl"
     records_path.write_text(

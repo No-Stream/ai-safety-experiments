@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
-from reward_hacking.distill.hack_strategy import STRATEGIES
+from reward_hacking.distill.hack_strategy import STRATEGIES, label_persisted_episode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -101,6 +101,19 @@ class YieldTableRow:
     wave2_specific_candidate: bool | None
 
 
+def label_legacy_record(record: Mapping[str, object], records_path: Path) -> dict[str, object]:
+    """Load historical unlabeled non-leak episodes without changing the stored evidence."""
+    result = dict(record)
+    summary = record.get("trace_summary")
+    if isinstance(summary, Mapping) and "hack_strategy" not in summary:
+        refreshed_summary = dict(summary)
+        result["trace_summary"] = refreshed_summary
+        refreshed_summary["hack_strategy"] = label_persisted_episode(
+            result, records_path=records_path
+        ).to_json_dict()
+    return result
+
+
 def _read_json_lines(path: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -109,7 +122,7 @@ def _read_json_lines(path: Path) -> list[dict[str, object]]:
         record_value: object = json.loads(line)
         if not isinstance(record_value, dict):
             raise TypeError(f"{path}:{line_number} must contain a JSON object")
-        record = cast("dict[str, object]", record_value)
+        record = label_legacy_record(cast("dict[str, object]", record_value), path)
         _validate_record(record, path, line_number)
         records.append(record)
     return records

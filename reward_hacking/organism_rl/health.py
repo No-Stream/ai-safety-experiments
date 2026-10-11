@@ -257,6 +257,74 @@ def _read_trace(path: Path) -> list[dict[str, object]]:
     return _read_jsonl(path)
 
 
+def _validate_ladder_metadata(row: dict[str, object], context: str) -> None:
+    if _integer(row, "schema_version", context) < 1:
+        raise HealthInputError(f"{context}.schema_version must be positive")
+    if row["record"] == "ladder_run_header":
+        _object(_required(row, "provenance", context), f"{context}.provenance")
+        _string(row, "provenance_digest", context)
+        return
+    for key in (
+        "episodes_planned",
+        "already_complete_and_kept",
+        "to_run_now",
+        "torn_attempts_set_aside",
+    ):
+        if _integer(row, key, context) < 0:
+            raise HealthInputError(f"{context}.{key} cannot be negative")
+
+
+def _native_ladder_health_row(row: dict[str, object], context: str) -> dict[str, object]:
+    key = _object(_required(row, "key", context), f"{context}.key")
+    _string(key, "model_id", f"{context}.key")
+    scenario_id = _string(key, "scenario_id", f"{context}.key")
+    summary = _object(_required(row, "trace_summary", context), f"{context}.trace_summary")
+    summary_context = _object(
+        _required(summary, "context", f"{context}.trace_summary"),
+        f"{context}.trace_summary.context",
+    )
+    peak_prompt_tokens = _integer(
+        summary_context, "peak_prompt_tokens", f"{context}.trace_summary.context"
+    )
+    true_record = _object(_required(summary, "true", context), f"{context}.trace_summary.true")
+    for field_name in ("measured", "pass"):
+        _validated_optional_bool(
+            _required(true_record, field_name, f"{context}.trace_summary.true"), field_name, context
+        )
+    true_measured = _validated_optional_bool(
+        _required(row, "true_measured", context), "true_measured", context
+    )
+    if true_measured is not true_record["measured"]:
+        raise HealthInputError(f"{context} has conflicting truth-measurement fields")
+    return {
+        **row,
+        "family": "ladder",
+        "task_id": scenario_id,
+        "peak_prompt_tokens": peak_prompt_tokens,
+    }
+
+
+def _read_episode_rows(path: Path) -> list[dict[str, object]]:
+    episodes: list[dict[str, object]] = []
+    for row_index, row in enumerate(_read_jsonl(path), start=1):
+        context = f"{path}:record {row_index}"
+        record_kind = row.get("record")
+        if record_kind in {"ladder_run_header", "ladder_run_summary"}:
+            _validate_ladder_metadata(row, context)
+            continue
+        if record_kind not in {None, "ladder_episode", "ladder_episode_failure"}:
+            raise HealthInputError(f"{context} has unsupported record kind {record_kind!r}")
+        # Organism records also use ladder_episode, with their family in the episode key.
+        key = row.get("key")
+        if record_kind == "ladder_episode" and isinstance(key, dict) and "model_id" in key:
+            episodes.append(_native_ladder_health_row(row, context))
+        else:
+            episodes.append(row)
+    if not episodes:
+        raise HealthInputError(f"{path} contains no episode records")
+    return episodes
+
+
 def _token_ids(turn: dict[str, object], context: str) -> list[int]:
     raw_ids = _list(turn, "completion_token_ids", context)
     token_ids: list[int] = []
@@ -1026,7 +1094,7 @@ def _unmeasured_outcomes(
         cell = records_path.parent.name or records_path.stem
         cell_true = true_by_cell.setdefault(cell, _UnmeasuredCellCounts())
         cell_strengthened = strengthened_by_cell.setdefault(cell, _UnmeasuredCellCounts())
-        for row_index, row in enumerate(_read_jsonl(records_path), start=1):
+        for row_index, row in enumerate(_read_episode_rows(records_path), start=1):
             outcome = _record_unmeasured_results(
                 row,
                 records_path,
@@ -1069,7 +1137,7 @@ def analyze_records(
         raise HealthInputError("at least one records file is required")
     episodes: list[EpisodeHealth] = []
     for records_path in records_paths:
-        rows = _read_jsonl(records_path)
+        rows = _read_episode_rows(records_path)
         for row in rows:
             episodes.append(_analyze_episode(row, records_path, len(episodes) + 1))
     unmeasured = _unmeasured_outcomes(
@@ -1605,7 +1673,7 @@ def _original_episode_truths(
 ) -> dict[tuple[str, str], _OriginalEpisode]:
     episodes: dict[tuple[str, str], _OriginalEpisode] = {}
     for records_path in records_paths:
-        for row_index, row in enumerate(_read_jsonl(records_path), start=1):
+        for row_index, row in enumerate(_read_episode_rows(records_path), start=1):
             family = row.get("family")
             if row.get("variant") != "original" or family not in ("aisi", "ilcb"):
                 continue

@@ -82,6 +82,25 @@ def test_physical_cores_count_hyperthread_siblings_once(
     assert grading_pool._physical_core_count() == 3  # pyright: ignore[reportPrivateUsage]
 
 
+def test_worker_cpu_assignments_select_distinct_physical_cores_on_an_smt_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_cpu_topology(tmp_path, monkeypatch, [[0, 1], [2, 3], [4, 5]])
+
+    assignments = grading_pool._worker_cpu_assignments(3)  # pyright: ignore[reportPrivateUsage]
+
+    assert [assignments.get() for _ in range(3)] == [0, 2, 4]
+
+
+def test_worker_cpu_assignments_reject_more_workers_than_physical_cores(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_cpu_topology(tmp_path, monkeypatch, [[0, 1], [2, 3]])
+
+    with pytest.raises(ValueError, match="physical cores"):
+        grading_pool._worker_cpu_assignments(3)  # pyright: ignore[reportPrivateUsage]
+
+
 def test_default_worker_count_stays_below_physical_cores_on_an_smt_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
