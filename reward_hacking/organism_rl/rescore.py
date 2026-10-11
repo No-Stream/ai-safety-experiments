@@ -563,15 +563,36 @@ def _load_task(record: Mapping[str, object]) -> Task:
     raise ValueError(f"unsupported replay family: {family!r}")
 
 
+def _rescore_output_paths(
+    records_path: Path,
+    output_path: Path | None,
+) -> tuple[Path, Path]:
+    requested_output = output_path or records_path.with_name("records.rescored-final-state.jsonl")
+    if requested_output.resolve() == records_path.resolve() or (
+        requested_output.exists()
+        and records_path.exists()
+        and requested_output.samefile(records_path)
+    ):
+        raise ValueError("rescore output path aliases input records")
+    output = requested_output.resolve() if requested_output.is_symlink() else requested_output
+    require_gitignored_output_dir(output.parent)
+    artifact_dir = (
+        output.parent / "rescored-final-state-artifacts"
+        if output_path is None
+        else output.with_name(f"{output.name}.artifacts")
+    )
+    return output, artifact_dir
+
+
 def rescore_file(
     records_path: Path,
     *,
     jail_backend: str | None,
     payment_register: str | None = None,
+    output_path: Path | None = None,
 ) -> Path:
     """Append complete replay outcomes to a resumable sidecar, then publish atomically."""
-    output = records_path.with_name("records.rescored-final-state.jsonl")
-    require_gitignored_output_dir(output.parent)
+    output, artifact_dir = _rescore_output_paths(records_path, output_path)
     temporary = output.with_suffix(output.suffix + ".tmp")
     originals = _read_records(records_path)
     if output.exists():
@@ -598,7 +619,7 @@ def rescore_file(
             rescored = _rescore_file_record(
                 record,
                 jail_backend=jail_backend,
-                artifact_dir=output.parent / "rescored-final-state-artifacts",
+                artifact_dir=artifact_dir,
                 payment_register=payment_register,
             )
             stream.write(json.dumps(rescored, sort_keys=True) + "\n")
@@ -705,22 +726,26 @@ def _count_integrity_edits(
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Write records.rescored-final-state.jsonl beside each input records file."""
+    """Write rescore results beside inputs or at a caller-chosen output path."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--records", type=Path, nargs="+", required=True)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--jail-backend", choices=("bwrap", "unshare"))
     parser.add_argument("--payment-register", choices=("trusted_rerun", "in_band"))
     args = parser.parse_args(argv)
+    if args.output is not None and len(args.records) != 1:
+        parser.error("--output requires exactly one --records input")
     logging.basicConfig(level=logging.INFO)
     if args.dry_run:
-        logger.info("validated rescore arguments records=%s", args.records)
+        logger.info("validated rescore arguments records=%s output=%s", args.records, args.output)
         return
     for records_path in args.records:
         rescore_file(
             records_path,
             jail_backend=args.jail_backend,
             payment_register=args.payment_register,
+            output_path=args.output,
         )
 
 

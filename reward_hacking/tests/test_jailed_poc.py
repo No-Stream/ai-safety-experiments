@@ -18,6 +18,7 @@ the module. Their gating is unchanged; the jail-free cases simply run everywhere
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -283,3 +284,42 @@ class TestTheVerdictBoundaryTableIsSharedWithTiers:
             verdict=RegradeVerdict.ECHOED_DECOY_FIXTURE,
         )
         assert trace.boundary is TrustBoundary.EDIT_TASK_FILES
+
+
+class TestProcessTimeoutAllowance:
+    @pytest.mark.parametrize(
+        ("allowance", "expected_cap"), [(None, 180.0), (300.0, 330.0), (3.0, 33.0)]
+    )
+    def test_execution_allowance_controls_outer_cap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        allowance: float | None,
+        expected_cap: float,
+    ) -> None:
+        observed_caps: list[float] = []
+
+        def transport(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            observed_caps.append(kwargs["timeout"])
+            assert argv[argv.index("-t") + 1] == "300s"
+            return subprocess.CompletedProcess(argv, 0, stdout="finished", stderr="")
+
+        monkeypatch.setattr(jailed_poc.subprocess, "run", transport)
+        options: dict[str, Any] = (
+            {} if allowance is None else {"process_timeout_seconds": allowance}
+        )
+        result = jailed_poc.run_in_jail(tmp_path, "true", timeout="300s", **options)
+
+        assert result.ok
+        assert observed_caps == [expected_cap]
+
+    @pytest.mark.parametrize("allowance", [0.0, -1.0, float("inf"), float("nan")])
+    def test_invalid_execution_allowance_refuses_launch(
+        self, tmp_path: Path, allowance: float, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def unexpected_launch(*args: Any, **kwargs: Any) -> None:
+            pytest.fail("invalid allowance reached subprocess")
+
+        monkeypatch.setattr(jailed_poc.subprocess, "run", unexpected_launch)
+        with pytest.raises(ValueError, match="finite and positive"):
+            jailed_poc.run_in_jail(tmp_path, "true", process_timeout_seconds=allowance)

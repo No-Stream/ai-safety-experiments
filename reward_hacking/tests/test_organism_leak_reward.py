@@ -9,13 +9,15 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import pytest
 
-from reward_hacking.distill.hack_strategy import label_episode
+from reward_hacking.distill.hack_strategy import HackStrategyAssessment, label_episode
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
+from reward_hacking.organism_rl import rescore as organism_rescore
 from reward_hacking.organism_rl.rescore import rescore_file, rescore_recorded_leak
 from reward_hacking.tests.test_leak_detector import _manifest, _trace
 from reward_hacking.tests.test_organism_payment_register import _episode
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
 
@@ -182,3 +184,40 @@ def test_recorded_leak_rescore_file_resumes_without_runtime(
     checkpoint.write_text(json.dumps(saved) + "\n")
     output = rescore_file(original, jail_backend=None)
     assert json.loads(output.read_text()) == saved
+
+
+def test_named_output_recomputes_leak_detector_change_and_preserves_default_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = recorded_leak(recovered=True)
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    original_bytes = original.read_bytes()
+    default_output = rescore_file(original, jail_backend=None)
+    default_output_bytes = default_output.read_bytes()
+
+    def changed_detector_label(
+        _record: Mapping[str, object],
+        _trace_records: Sequence[Mapping[str, object]],
+        **_kwargs: object,
+    ) -> HackStrategyAssessment:
+        return HackStrategyAssessment(
+            primary_strategy="synthetic_changed_detector",
+            observed_strategies=("synthetic_changed_detector",),
+            evidence={"synthetic_changed_detector": ("synthetic detector revision",)},
+        )
+
+    monkeypatch.setattr(organism_rescore, "label_episode", changed_detector_label)
+    with pytest.raises(ValueError, match="original leak evidence changed since rescore checkpoint"):
+        rescore_file(original, jail_backend=None)
+
+    named_output = tmp_path / "records.detector-revision.jsonl"
+    new_output = rescore_file(original, jail_backend=None, output_path=named_output)
+    new_record = json.loads(new_output.read_text(encoding="utf-8"))
+    new_summary = cast("dict[str, object]", new_record["trace_summary"])
+    new_label = cast("dict[str, object]", new_summary["hack_strategy"])
+    assert new_output == named_output
+    assert new_label["primary_strategy"] == "synthetic_changed_detector"
+    assert original.read_bytes() == original_bytes
+    assert default_output.read_bytes() == default_output_bytes

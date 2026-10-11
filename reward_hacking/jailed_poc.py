@@ -37,6 +37,7 @@ import argparse
 import functools
 import json
 import logging
+import math
 import posixpath
 import shlex
 import shutil
@@ -66,6 +67,7 @@ SUCCESS_EXIT = 0
 TIMEOUT_EXIT = 124  # resource-limits.sh reserves this for a wall-clock kill
 DEFAULT_COMMAND_TIMEOUT = "60s"  # per-command cgroup wall-clock leash; episodes are tiny
 PROCESS_TIMEOUT_SECONDS = 180.0  # belt-and-suspenders above the cgroup leash
+PROCESS_SETUP_MARGIN_SECONDS = 30.0
 ADVISORY_LIMITER_WARNINGS = (
     "resource-limits: WARNING advisory mode - limits are NOT enforced; the job can exceed them",
     "resource-limits: --gpu with --advisory skips ulimit -v; memory is not capped at all",
@@ -468,11 +470,20 @@ def jail_python() -> str:
     return completed.stdout.strip()
 
 
+def _process_timeout_cap(execution_allowance_seconds: float | None) -> float:
+    if execution_allowance_seconds is None:
+        return PROCESS_TIMEOUT_SECONDS
+    if not math.isfinite(execution_allowance_seconds) or execution_allowance_seconds <= 0:
+        raise ValueError("process_timeout_seconds must be finite and positive")
+    return execution_allowance_seconds + PROCESS_SETUP_MARGIN_SECONDS
+
+
 def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrapper object
     episode_dir: Path,
     command: str,
     *,
     timeout: str = DEFAULT_COMMAND_TIMEOUT,
+    process_timeout_seconds: float | None = None,
     backend: str | None = None,
     login_shell: bool = True,
     cpus: int | None = None,
@@ -491,6 +502,10 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
     ``resource_limits`` is resolved once by ``resolve_jail_resource_limits``. Unset, it inherits
     the episode worker scope (including oracle callbacks), or defaults to enforced cgroup limits.
     Advisory selection is explicit and logged; command failures never trigger a fallback.
+
+    ``process_timeout_seconds`` supplies the caller's execution allowance for the outer
+    subprocess cap; jail setup gets an additional 30 seconds. Unset keeps the historical
+    180-second cap, independently of the limiter's ``timeout`` string.
 
     ``cpus`` and ``mem_max`` are the caller's chance to say how big *this* command is. Left unset,
     the limiter applies its own defaults, which are sized for a training job on the host it runs
@@ -514,6 +529,7 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
     ``reward_hacking/tests/test_oracle_hardening.py`` demonstrates the hijack working through a
     login shell and inert without one.
     """
+    process_timeout = _process_timeout_cap(process_timeout_seconds)
     limits = _JAIL_RESOURCE_LIMITS.get() if resource_limits is None else resource_limits
     argv: list[str] = [str(RESOURCE_LIMITS), "-t", timeout]
     if limits.mode == "advisory":
@@ -534,7 +550,7 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
             argv,
             capture_output=True,
             text=True,
-            timeout=PROCESS_TIMEOUT_SECONDS,
+            timeout=process_timeout,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:

@@ -2149,3 +2149,24 @@ def test_triage_cli_joins_by_episode_and_writes_rows_and_readout(tmp_path: Path)
     )
     with pytest.raises(ValueError, match="triage task id differs"):
         grade.main(triage_arguments)
+
+
+@pytest.mark.parametrize("allowance", [3, 300])
+def test_proxy_forwards_execution_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowance: int
+) -> None:
+    artifact = tmp_path / "solution.py"
+    artifact.write_text("def candidate(value):\n    return value\n")
+    forwarded: list[dict[str, Any]] = []
+
+    def transport(episode_dir: Path, command: str, **kwargs: Any) -> CommandResult:
+        forwarded.append(kwargs)
+        assert (episode_dir / "solution.py").read_text() == artifact.read_text()
+        return CommandResult(command, 0, "TRUE_CHECK_PASS", "", False)
+
+    monkeypatch.setattr(grade, "run_in_jail", transport)
+    monkeypatch.setattr(grade, "jail_python", lambda: "/usr/bin/python3")
+    grade._run_proxy(artifact, "assert candidate(1) == 1", "candidate", allowance)
+
+    assert forwarded[0]["timeout"] == f"{allowance}s"
+    assert forwarded[0]["process_timeout_seconds"] == allowance

@@ -113,7 +113,9 @@ printf 'cells: %s\n' "$cell_list"
 printf 'episodes per cell: %s\n' "$cell_count_list"
 printf 'total episodes: %s\n' "$total_episodes"
 printf 'estimated wall-clock: %s h\n' "$estimated_hours"
-printf 'AISI selection: round-robin by task ID (apps 3, humaneval 3, mbpp 2)\n'
+if [[ " ${cells[*]} " == *" 1 "* || " ${cells[*]} " == *" 2 "* ]]; then
+  printf 'AISI selection: round-robin by task ID (apps 3, humaneval 3, mbpp 2)\n'
+fi
 if [[ " ${cells[*]} " == *" 8 "* || " ${cells[*]} " == *" 9 "* ]]; then
   printf 'math cells: 8=loose_oneoff (6 held-out tasks), 9=loose_hidden_original (6 held-out tasks)\n'
 fi
@@ -125,7 +127,7 @@ model_label="organism-ladder-$model"
 served_model_id="$base_model"
 case "$model" in
   v3)
-    adapter_dir="artifacts/distill/agentic-sft-seed-v3-onpolicy-ef398f9/train/checkpoint-34"
+    adapter_dir="${SEED_V3_ADAPTER_DIR:-artifacts/distill/agentic-sft-seed-v3-onpolicy-ef398f9/train/checkpoint-34}"
     [[ -d "$adapter_dir" ]] || { echo "v3 adapter is missing: $adapter_dir" >&2; exit 2; }
     served_model_id="$model_label"
     ;;
@@ -139,7 +141,7 @@ case "$model" in
     ;;
 esac
 
-scenario_root="reward_hacking/ladder/data/scenarios-v2.2-heldout-wip"
+scenario_root="${SEED_V4_SCENARIO_ROOT:-reward_hacking/ladder/data/scenarios-v2.2-heldout-wip}"
 if [[ " ${cells[*]} " == *" 7 "* && "$dry_run" == 0 ]]; then
   "$python_bin" - "$scenario_root" <<'PY'
 import sys
@@ -185,7 +187,7 @@ run_ladder_cell() {
     SEED_EVAL_MAX_MODEL_LEN="$max_model_len" \
     SEED_EVAL_GPU_MEMORY_UTILIZATION="$gpu_memory_utilization" \
     SEED_EVAL_OUTPUT_DIR="artifacts/ladder/minimal-eval-v4-announced-budget/$model/cell-7-announced-20" \
-    SEED_EVAL_SCENARIO_ROOT="reward_hacking/ladder/data/scenarios-v2.2-heldout-wip" \
+    SEED_EVAL_SCENARIO_ROOT="$scenario_root" \
     "$python_bin" - <<'PY'
 import logging
 import os
@@ -334,10 +336,10 @@ run_eval_cell() {
   esac
 
   if [[ "$stage" == gate3 && "$model" == base ]]; then
-    reuse_from="artifacts/organism-eval/evalA-base9b-c6a275f"
+    reuse_from="${SEED_EVAL_BASE_REUSE_FROM:-artifacts/organism-eval/evalA-base9b-c6a275f}"
     output_dir="artifacts/organism-eval/base-cells"
   elif [[ "$stage" == gate3 && "$model" == v3 ]]; then
-    reuse_from="artifacts/organism-eval/minimal-seedv3c34-ef398f9/coding"
+    reuse_from="${SEED_EVAL_V3_REUSE_FROM:-artifacts/organism-eval/minimal-seedv3c34-ef398f9/coding}"
     output_dir="artifacts/organism-eval/base-cells"
   fi
 

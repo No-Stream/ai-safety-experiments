@@ -488,6 +488,7 @@ def _run_proxy(
             work,
             f"{jail_python()} -I {TRUE_CHECK_FILENAME}",
             timeout=f"{timeout_seconds}s",
+            process_timeout_seconds=timeout_seconds,
             login_shell=False,
             cpus=1,
             mem_max="1G",

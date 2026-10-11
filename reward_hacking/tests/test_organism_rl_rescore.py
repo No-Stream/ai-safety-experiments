@@ -173,6 +173,95 @@ def test_rescore_file_resumes_completed_records_and_preserves_original(
         rescore.rescore_file(original, jail_backend=None)
 
 
+def test_rescore_file_writes_named_output_and_uses_output_specific_artifacts(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record, task, calls = replay_fixture
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    original_bytes = original.read_bytes()
+    named_output = tmp_path / "records.rechecked.jsonl"
+    monkeypatch.setattr(rescore, "_load_task", lambda _record: task)
+
+    rescore.main(["--records", str(original), "--output", str(named_output)])
+
+    assert named_output.exists()
+    assert not (tmp_path / "records.rescored-final-state.jsonl").exists()
+    saved = json.loads(named_output.read_text(encoding="utf-8"))
+    assert saved["organism_reward"]["reward"] == 1
+    artifact_dir = tmp_path / "records.rechecked.jsonl.artifacts"
+    artifact_digest = saved["rescore"]["rebuilt_artifact_sha256"]
+    artifact_path = artifact_dir / artifact_digest
+    assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == artifact_digest
+    assert original.read_bytes() == original_bytes
+    assert calls == ["synthetic-write", "grade", "grade"]
+
+    other_output = tmp_path / "records.other-check.jsonl"
+    rescore.main(["--records", str(original), "--output", str(other_output)])
+    other_saved = json.loads(other_output.read_text(encoding="utf-8"))
+    other_artifact_dir = tmp_path / "records.other-check.jsonl.artifacts"
+    other_artifact_digest = other_saved["rescore"]["rebuilt_artifact_sha256"]
+    other_artifact_path = other_artifact_dir / other_artifact_digest
+    assert hashlib.sha256(other_artifact_path.read_bytes()).hexdigest() == other_artifact_digest
+    assert artifact_dir != other_artifact_dir
+
+    rescore.main(["--records", str(original), "--output", str(named_output)])
+
+    assert calls == ["synthetic-write", "grade", "grade"] * 2
+
+
+def test_rescore_file_rejects_output_symlink_to_original(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    tmp_path: Path,
+) -> None:
+    record, _task, _calls = replay_fixture
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    original_bytes = original.read_bytes()
+    output_alias = tmp_path / "rescore-output.jsonl"
+    output_alias.symlink_to(original)
+
+    with pytest.raises(ValueError, match="output path aliases input records"):
+        rescore.rescore_file(original, jail_backend=None, output_path=output_alias)
+
+    assert original.read_bytes() == original_bytes
+
+
+def test_rescore_dry_run_accepts_missing_input_without_creating_output(tmp_path: Path) -> None:
+    original = tmp_path / "records.jsonl"
+    named_output = tmp_path / "records.checked.jsonl"
+
+    rescore.main(["--dry-run", "--records", str(original), "--output", str(named_output)])
+
+    assert not named_output.exists()
+    assert not named_output.with_suffix(named_output.suffix + ".tmp").exists()
+
+
+def test_rescore_cli_requires_single_input_for_named_output(tmp_path: Path) -> None:
+    first_input = tmp_path / "first.jsonl"
+    second_input = tmp_path / "second.jsonl"
+    first_input.write_text(json.dumps({"record": "first"}) + "\n", encoding="utf-8")
+    second_input.write_text(json.dumps({"record": "second"}) + "\n", encoding="utf-8")
+    named_output = tmp_path / "combined.jsonl"
+
+    with pytest.raises(SystemExit) as error:
+        rescore.main(
+            [
+                "--dry-run",
+                "--records",
+                str(first_input),
+                str(second_input),
+                "--output",
+                str(named_output),
+            ]
+        )
+
+    assert error.value.code == 2
+    assert not named_output.exists()
+
+
 def test_rescore_file_recovers_interrupted_trailing_checkpoint_append(
     replay_fixture: tuple[dict[str, object], Task, list[str]],
     tmp_path: Path,
