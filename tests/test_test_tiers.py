@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -62,14 +63,13 @@ def test_changed_selection_executes_slow_tests(tmp_path: Path, workers: int) -> 
     """Exercise the real iteration command: slow markers must never deselect reachable tests."""
     test_file = tmp_path / "test_synthetic_tiers.py"
     test_file.write_text(
-        "\n".join(
-            [
-                "import pytest",
-                "def test_fast(): pass",
-                "@pytest.mark.slow",
-                "def test_slow(): pass",
-                "",
-            ]
+        textwrap.dedent(
+            """\
+            import pytest
+            def test_fast(): pass
+            @pytest.mark.slow
+            def test_slow(): pass
+            """
         ),
         encoding="utf-8",
     )
