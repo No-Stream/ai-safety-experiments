@@ -390,6 +390,8 @@ def test_health_command_asserts_v3_against_base_eval_records(tmp_path: Path) -> 
     assert "--assert" in command
     assert command[command.index("--baseline") + 1] == str(baseline_path)
     assert command[command.index("--submitted-ending-min") + 1] == "0"
+    assert command[command.index("--nll-min") + 1] == "0"
+    assert "--nll-max" not in command
 
 
 def test_health_command_only_reports_for_the_base_generator(tmp_path: Path) -> None:

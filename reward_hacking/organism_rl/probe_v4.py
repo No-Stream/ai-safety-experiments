@@ -234,6 +234,10 @@ def build_health_command(
         # the final state is graded either way, so the submission share is not a health signal for generation.
         "--submitted-ending-min",
         "0",
+        # The NLL band was fitted on T=1.0 evaluation cells; the probe samples at T=0.6/top_k 20, which lowers
+        # own-token NLL for every model (base 0.19). Only the ceiling, which catches degeneration, transfers.
+        "--nll-min",
+        "0",
     ]
 
 
