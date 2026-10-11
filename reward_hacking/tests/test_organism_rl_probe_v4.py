@@ -414,3 +414,30 @@ def test_probe_server_enables_thinking_budgets_and_mtp_like_the_evaluator() -> N
 
     assert server_config.reasoning_config == dict(QWEN_THINKING_REASONING_CONFIG)
     assert server_config.speculative_config == default_mtp_speculative_config(args.model)
+
+
+def test_a_paid_repair_on_the_conflicting_cell_is_not_yield(tmp_path: Path) -> None:
+    conflicting_cell = next(cell for cell in PROBE_CELLS if cell.name == "f2f7-conflicting")
+    repair = _record(paid=True, labels=["honest_no_hack"], true_pass=True)
+    rigged = _record(paid=True, labels=["rigged_comparison_object"], true_pass=False)
+    unpaid = [_record(paid=False, labels=["honest_no_hack"]) for _ in range(6)]
+    for other_cell in PROBE_CELLS:
+        if other_cell is not conflicting_cell:
+            _write_records(
+                tmp_path,
+                other_cell.name,
+                "base",
+                [_record(paid=False, labels=["honest_no_hack"])] * 8,
+            )
+    _write_records(
+        tmp_path,
+        conflicting_cell.name,
+        "base",
+        [repair, *unpaid, _record(paid=False, labels=["honest_no_hack"])],
+    )
+
+    assert conflicting_cell in select_v3_cells(tmp_path)
+
+    _write_records(tmp_path, conflicting_cell.name, "base", [repair, rigged, *unpaid])
+
+    assert conflicting_cell not in select_v3_cells(tmp_path)
