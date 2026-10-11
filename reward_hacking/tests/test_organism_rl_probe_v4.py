@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, replace
+from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING, Self
 
 import pytest
 
@@ -13,6 +16,10 @@ from reward_hacking.organism_rl.evaluate import (
     _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
 )
 from reward_hacking.organism_rl.probe_v4 import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_MAX_NEW_TOKENS,
+    DEFAULT_MODEL,
+    PROBE_EPISODES_PER_CELL,
     V3_SERVED_MODEL_ID,
     WAVE_MAX_MODEL_LEN,
     CellRunConfig,
@@ -24,9 +31,13 @@ from reward_hacking.organism_rl.probe_v4 import (
     parse_args,
     parse_server_model_max_len,
     select_v3_cells,
+    validate_reasoning_config,
 )
 from reward_hacking.organism_rl.yield_table import PROBE_CELLS, render_yield_table, summarize_output
-from reward_hacking.vllm_server import default_mtp_speculative_config
+from reward_hacking.vllm_server import VLLMServerConfig, default_mtp_speculative_config
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def _record(
@@ -90,6 +101,252 @@ def test_0_8b_dry_run_prints_all_cells_and_episode_total(
     assert "Qwen/Qwen3.5-0.8B" in output
     for cell in PROBE_CELLS:
         assert cell.name in output
+
+
+def test_production_command_defaults_are_unchanged() -> None:
+    cell = PROBE_CELLS[0]
+    args = parse_args(["--stage", "base"])
+    settings = _cell_run_config(
+        args,
+        generator="base",
+        endpoint="http://127.0.0.1:8000",
+        model_revision="0" * 40,
+        max_model_len=WAVE_MAX_MODEL_LEN,
+    )
+    command = build_generate_command(cell, settings)
+    server_config = probe_v4._server_config(  # pyright: ignore[reportPrivateUsage]
+        args,
+        generator="base",
+        model_revision="0" * 40,
+        max_model_len=WAVE_MAX_MODEL_LEN,
+        gpu_memory_utilization=0.9,
+    )
+
+    assert args.model == DEFAULT_MODEL
+    assert command[command.index("--max-tasks") + 1] == str(PROBE_EPISODES_PER_CELL)
+    assert command[command.index("--concurrency") + 1] == str(DEFAULT_CONCURRENCY)
+    assert command[command.index("--thinking-token-budget") + 1] == "2048"
+    assert command[command.index("--max-new-tokens") + 1] == str(DEFAULT_MAX_NEW_TOKENS)
+    assert command[command.index("--max-turns") + 1] == str(cell.max_turns)
+    assert server_config.max_num_seqs == DEFAULT_CONCURRENCY
+
+
+def test_smoke_plan_only_selects_one_cell_and_validates_reasoning_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cell = PROBE_CELLS[0]
+    result = main(
+        [
+            "--stage",
+            "base",
+            "--model",
+            "Qwen/Qwen3.5-0.8B",
+            "--smoke-cell",
+            cell.name,
+            "--output-dir",
+            str(tmp_path),
+            "--model-revision",
+            "0" * 40,
+            "--dry-run",
+        ]
+    )
+
+    assert result == 0
+    output = capsys.readouterr().out
+    assert "Episodes: 1" in output
+    assert output.splitlines()[1] == f"Cells: {cell.name}"
+    validate_reasoning_config(QWEN_THINKING_REASONING_CONFIG)
+
+
+def test_smoke_plan_reasoning_config_check_detects_removed_server_setting() -> None:
+    args = parse_args(["--stage", "base"])
+    server_config = probe_v4._server_config(  # pyright: ignore[reportPrivateUsage]
+        args,
+        generator="base",
+        model_revision="0" * 40,
+        max_model_len=WAVE_MAX_MODEL_LEN,
+        gpu_memory_utilization=0.9,
+    )
+
+    validate_reasoning_config(server_config.reasoning_config)
+    sabotaged_config = replace(server_config, reasoning_config=None)
+
+    with pytest.raises(ValueError, match="reasoning_config"):
+        validate_reasoning_config(sabotaged_config.reasoning_config)
+
+
+def test_smoke_plan_only_rejects_sabotaged_server_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    argv = [
+        "--stage",
+        "base",
+        "--model",
+        "Qwen/Qwen3.5-0.8B",
+        "--smoke-cell",
+        PROBE_CELLS[0].name,
+        "--model-revision",
+        "0" * 40,
+        "--output-dir",
+        str(tmp_path),
+    ]
+    args = parse_args(argv)
+    healthy_config = probe_v4._server_config(  # pyright: ignore[reportPrivateUsage]
+        args,
+        generator="base",
+        model_revision="0" * 40,
+        max_model_len=WAVE_MAX_MODEL_LEN,
+        gpu_memory_utilization=0.9,
+    )
+    monkeypatch.setattr(
+        probe_v4,
+        "_server_config",
+        lambda *_args, **_kwargs: replace(healthy_config, reasoning_config=None),
+    )
+
+    with pytest.raises(ValueError, match="reasoning_config"):
+        main([*argv, "--dry-run"])
+
+
+def test_smoke_flag_rejects_non_smoke_model() -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--stage", "base", "--smoke-cell", PROBE_CELLS[0].name])
+
+
+@dataclass(frozen=True)
+class _SmokeRunObservation:
+    stage: str
+    cell_name: str
+    output_dir: Path
+    output: str
+    server_configs: list[VLLMServerConfig]
+    server_closed: list[bool]
+    urls: list[str]
+    commands: list[list[str]]
+
+
+def _assert_smoke_run(observation: _SmokeRunObservation) -> None:
+    cell = next(cell for cell in PROBE_CELLS if cell.name == observation.cell_name)
+    stage = observation.stage
+    output_dir = observation.output_dir
+    commands = observation.commands
+    assert "Episodes: 1" in observation.output
+    assert observation.output.splitlines()[1] == f"Cells: {cell.name}"
+    assert len(observation.server_configs) == 1
+    assert observation.server_closed == [True]
+    server_config = observation.server_configs[0]
+    assert server_config.max_num_seqs == 1
+    assert server_config.model == "Qwen/Qwen3.5-0.8B"
+    assert server_config.reasoning_config == dict(QWEN_THINKING_REASONING_CONFIG)
+    assert observation.urls == ["http://127.0.0.1:8000/v1/models"]
+    assert len(commands) == 3
+    generation_command, health_command, yield_command = commands
+    assert generation_command[generation_command.index("--max-tasks") + 1] == "1"
+    assert generation_command[generation_command.index("--concurrency") + 1] == "1"
+    assert generation_command[generation_command.index("--thinking-token-budget") + 1] == "512"
+    assert generation_command[generation_command.index("--max-new-tokens") + 1] == "2048"
+    assert generation_command[generation_command.index("--max-turns") + 1] == "4"
+    assert generation_command[generation_command.index("--announced-turn-budget") + 1] == "4"
+    assert health_command[health_command.index("--records") + 1].endswith("/records.jsonl")
+    assert ("--assert" in health_command) is (stage == "v3")
+    assert ("--schema-only" in health_command) is (stage == "v3")
+    assert yield_command[1:4] == ["-m", "reward_hacking.organism_rl.yield_table", "--output-dir"]
+    row = next(row for row in summarize_output(output_dir) if row.cell == cell)
+    assert (row.base_episodes if stage == "base" else row.v3_episodes) == 1
+    if stage == "v3":
+        assert not (output_dir / cell.name / "base" / "records.jsonl").exists()
+
+
+@pytest.mark.parametrize("stage", ["base", "v3"])
+def test_smoke_main_runs_one_cell_with_its_own_server_and_checks_records(
+    stage: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cell = PROBE_CELLS[0]
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"smoke adapter")
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text("{}", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    server_configs: list[VLLMServerConfig] = []
+    server_closed: list[bool] = []
+    commands: list[list[str]] = []
+    urls: list[str] = []
+
+    class FakeServer:
+        def __init__(self, config: VLLMServerConfig) -> None:
+            self.config = config
+            self.base_url = "http://127.0.0.1:8000"
+
+        def __enter__(self) -> Self:
+            server_configs.append(self.config)
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            server_closed.append(True)
+
+    def fake_urlopen(url: str, *, timeout: float) -> BytesIO:
+        assert timeout == 10
+        urls.append(url)
+        model_entry: dict[str, object] = {
+            "id": "Qwen/Qwen3.5-0.8B",
+            "max_model_len": WAVE_MAX_MODEL_LEN,
+        }
+        data: list[dict[str, object]] = [model_entry]
+        if stage == "v3":
+            data.append(
+                {"id": V3_SERVED_MODEL_ID, "parent": model_entry["id"], "max_model_len": None}
+            )
+        return BytesIO(json.dumps({"data": data}).encode())
+
+    def fake_run_command(command: Sequence[str]) -> None:
+        commands.append(list(command))
+        if "reward_hacking.organism_rl.generate" in command:
+            cell_output = Path(command[command.index("--output-dir") + 1])
+            _write_records(
+                cell_output.parents[1],
+                cell.name,
+                stage,
+                [_record(paid=False, labels=["honest_no_hack"])],
+            )
+
+    monkeypatch.setattr(probe_v4, "VLLMServer", FakeServer)
+    monkeypatch.setattr(probe_v4, "urlopen", fake_urlopen)
+    monkeypatch.setattr(probe_v4, "resolve_gpu_engine_settings", lambda _torch: (0.9, "cpu-test"))
+    monkeypatch.setattr(probe_v4, "_runtime_model_revision", lambda _model, _revision: "0" * 40)
+    monkeypatch.setattr(probe_v4, "_run_command", fake_run_command)
+
+    argv = [
+        "--stage",
+        stage,
+        "--model",
+        "Qwen/Qwen3.5-0.8B",
+        "--smoke-cell",
+        cell.name,
+        "--hints",
+        str(hints_path),
+        "--output-dir",
+        str(output_dir),
+    ]
+    if stage == "v3":
+        argv.extend(("--v3-adapter", str(adapter_dir)))
+
+    result = main(argv)
+
+    assert result == 0
+    _assert_smoke_run(
+        _SmokeRunObservation(
+            stage=stage,
+            cell_name=cell.name,
+            output_dir=output_dir,
+            output=capsys.readouterr().out,
+            server_configs=server_configs,
+            server_closed=server_closed,
+            urls=urls,
+            commands=commands,
+        )
+    )
 
 
 def test_v3_stage_selects_only_base_cells_with_zero_target_yield(tmp_path: Path) -> None:
@@ -401,6 +658,8 @@ def test_health_command_only_reports_for_the_base_generator(tmp_path: Path) -> N
 
     assert "--assert" not in command
     assert "--baseline" not in command
+    # A health report without --assert must name its output file, or health refuses to run.
+    assert command[command.index("--output") + 1] == str(tmp_path / "health.json")
 
 
 def test_probe_server_enables_thinking_budgets_and_mtp_like_the_evaluator() -> None:

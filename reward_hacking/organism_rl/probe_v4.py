@@ -31,7 +31,7 @@ from reward_hacking.organism_rl.yield_table import (
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 ProbeStage = Literal["base", "v3"]
@@ -47,11 +47,18 @@ DEFAULT_BASELINE_RECORDS = Path("artifacts/organism-eval/evalA-base9b-c6a275f/re
 MAX_TCP_PORT = 65_535
 DEFAULT_MAX_NEW_TOKENS = 8_192
 DEFAULT_CONCURRENCY = 6
+DEFAULT_THINKING_TOKEN_BUDGET = 2_048
 PROBE_EPISODES_PER_CELL = 8
 ESTIMATED_HOURS_PER_CELL = 0.25
 V3_LORA_RANK = 16
 # Probe records are wave-1 data, so the probe serves the waves' fixed context window.
 WAVE_MAX_MODEL_LEN = 65_536
+SMOKE_MODEL = "Qwen/Qwen3.5-0.8B"
+SMOKE_EPISODES_PER_CELL = 1
+SMOKE_CONCURRENCY = 1
+SMOKE_MAX_TURNS = 4
+SMOKE_THINKING_TOKEN_BUDGET = 512
+SMOKE_MAX_NEW_TOKENS = 2_048
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +76,7 @@ class CellRunConfig:
     max_model_len: int
     model_revision: str | None
     served_adapter_sha256: str | None = None
+    smoke: bool = False
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -101,6 +109,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leak-channel-splits", type=Path, default=DEFAULT_LEAK_CHANNEL_SPLITS)
     parser.add_argument("--baseline-records", type=Path, default=DEFAULT_BASELINE_RECORDS)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--smoke-cell", choices=tuple(cell.name for cell in PROBE_CELLS))
     return parser
 
 
@@ -112,6 +121,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("max-model-len must be positive")
     if not 1 <= args.server_port <= MAX_TCP_PORT:
         parser.error("server-port must be between 1 and 65535")
+    if args.smoke_cell is not None and args.model != SMOKE_MODEL:
+        parser.error(f"--smoke-cell requires --model {SMOKE_MODEL}")
+    if args.smoke_cell is not None and args.endpoint is not None:
+        parser.error("--smoke-cell requires the probe to manage its own vLLM server")
     return args
 
 
@@ -136,6 +149,13 @@ def select_v3_cells(output_dir: Path) -> tuple[ProbeCell, ...]:
 
 def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
     """Build one invocation from the existing generate.py command-line contract."""
+    episodes_per_cell = SMOKE_EPISODES_PER_CELL if settings.smoke else PROBE_EPISODES_PER_CELL
+    concurrency = SMOKE_CONCURRENCY if settings.smoke else DEFAULT_CONCURRENCY
+    thinking_token_budget = (
+        SMOKE_THINKING_TOKEN_BUDGET if settings.smoke else DEFAULT_THINKING_TOKEN_BUDGET
+    )
+    max_new_tokens = SMOKE_MAX_NEW_TOKENS if settings.smoke else DEFAULT_MAX_NEW_TOKENS
+    max_turns = SMOKE_MAX_TURNS if settings.smoke else cell.max_turns
     command = [
         sys.executable,
         "-m",
@@ -161,11 +181,11 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--partition",
         "train",
         "--max-tasks",
-        str(PROBE_EPISODES_PER_CELL),
+        str(episodes_per_cell),
         "--samples",
         "1",
         "--concurrency",
-        str(DEFAULT_CONCURRENCY),
+        str(concurrency),
         "--temperature",
         "0.6",
         "--top-p",
@@ -175,13 +195,13 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--presence-penalty",
         "1.5",
         "--thinking-token-budget",
-        "2048",
+        str(thinking_token_budget),
         "--max-turns",
-        str(cell.max_turns),
+        str(max_turns),
         "--announced-turn-budget",
-        str(cell.max_turns),
+        str(max_turns),
         "--max-new-tokens",
-        str(DEFAULT_MAX_NEW_TOKENS),
+        str(max_new_tokens),
         "--max-model-len",
         str(settings.max_model_len),
         "--output-dir",
@@ -212,7 +232,11 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
 
 
 def build_health_command(
-    records_path: Path, baseline_records: Path, *, generator: GeneratorName
+    records_path: Path,
+    baseline_records: Path,
+    *,
+    generator: GeneratorName,
+    schema_only: bool = False,
 ) -> list[str]:
     """Build the per-cell health command: a report for base, an assertion against base records for v3."""
     command = [
@@ -224,7 +248,9 @@ def build_health_command(
     ]
     if generator == "base":
         # Base is the baseline; absolute Gate 3 thresholds fitted to other cells misfire on its own generation.
-        return command
+        return [*command, "--output", str(records_path.parent / "health.json")]
+    if schema_only:
+        return [*command, "--assert", "--schema-only"]
     return [
         *command,
         "--assert",
@@ -310,7 +336,7 @@ def _server_config(
     has_v3_adapter = generator == "v3"
     if has_v3_adapter and not adapter_directory.is_dir():
         raise FileNotFoundError(f"v3 adapter directory does not exist: {adapter_directory}")
-    return VLLMServerConfig(
+    server_config = VLLMServerConfig(
         model=args.model,
         revision=model_revision,
         max_model_len=max_model_len,
@@ -318,7 +344,7 @@ def _server_config(
         language_model_only=True,
         host=args.server_host,
         port=args.server_port,
-        max_num_seqs=DEFAULT_CONCURRENCY,
+        max_num_seqs=(SMOKE_CONCURRENCY if args.smoke_cell is not None else DEFAULT_CONCURRENCY),
         enable_prefix_caching=True,
         speculative_config=default_mtp_speculative_config(args.model),
         reasoning_config=dict(QWEN_THINKING_REASONING_CONFIG),
@@ -330,6 +356,14 @@ def _server_config(
         else None,
         log_path=_resolve_path(args.output_dir) / f"vllm-{generator}-server.log",
     )
+    validate_reasoning_config(server_config.reasoning_config)
+    return server_config
+
+
+def validate_reasoning_config(reasoning_config: Mapping[str, str] | None) -> None:
+    """Reject reasoning settings that cannot expose Qwen thinking tokens."""
+    if reasoning_config is None or dict(reasoning_config) != dict(QWEN_THINKING_REASONING_CONFIG):
+        raise ValueError("probe vLLM server reasoning_config must match the Qwen thinking markers")
 
 
 def _cell_run_config(
@@ -353,14 +387,17 @@ def _cell_run_config(
         served_adapter_sha256=(
             _adapter_sha256(_resolve_path(args.v3_adapter)) if generator == "v3" else None
         ),
+        smoke=args.smoke_cell is not None,
     )
 
 
-def _validate_runtime_inputs(args: argparse.Namespace, cells: Sequence[ProbeCell]) -> None:
-    for path, description in (
-        (_resolve_path(args.hints), "hint definitions"),
-        (_resolve_path(args.baseline_records), "base eval records"),
-    ):
+def _validate_runtime_inputs(
+    args: argparse.Namespace, cells: Sequence[ProbeCell], *, smoke: bool = False
+) -> None:
+    required_files = [(_resolve_path(args.hints), "hint definitions")]
+    if not smoke:
+        required_files.append((_resolve_path(args.baseline_records), "base eval records"))
+    for path, description in required_files:
         if not path.is_file():
             raise FileNotFoundError(f"{description} file does not exist: {path}")
     if any(cell.family == "r2e_leak" for cell in cells):
@@ -374,9 +411,17 @@ def _validate_runtime_inputs(args: argparse.Namespace, cells: Sequence[ProbeCell
                 raise FileNotFoundError(f"{description} file does not exist: {path}")
 
 
-def _launch_summary(stage: ProbeStage, model: str, cells: Sequence[ProbeCell]) -> str:
-    episodes = len(cells) * PROBE_EPISODES_PER_CELL
-    estimated_hours = len(cells) * ESTIMATED_HOURS_PER_CELL
+def _launch_summary(
+    stage: ProbeStage,
+    model: str,
+    cells: Sequence[ProbeCell],
+    *,
+    episodes_per_cell: int = PROBE_EPISODES_PER_CELL,
+) -> str:
+    episodes = len(cells) * episodes_per_cell
+    estimated_hours = (
+        len(cells) * ESTIMATED_HOURS_PER_CELL * episodes_per_cell / PROBE_EPISODES_PER_CELL
+    )
     cell_names = ", ".join(cell.name for cell in cells) or "none"
     return (
         f"Stage: {stage} on {model}\n"
@@ -401,7 +446,10 @@ def _run_cells(cells: Sequence[ProbeCell], settings: CellRunConfig) -> None:
         records_path = run_directory / "records.jsonl"
         _run_command(
             build_health_command(
-                records_path, settings.baseline_records, generator=settings.generator
+                records_path,
+                settings.baseline_records,
+                generator=settings.generator,
+                schema_only=settings.smoke and settings.generator == "v3",
             )
         )
         _run_command(
@@ -419,10 +467,11 @@ def _run_cells(cells: Sequence[ProbeCell], settings: CellRunConfig) -> None:
             if settings.generator == "base"
             else row_by_name[cell.name].v3_episodes
         )
-        if completed_episodes != PROBE_EPISODES_PER_CELL:
+        expected_episodes = SMOKE_EPISODES_PER_CELL if settings.smoke else PROBE_EPISODES_PER_CELL
+        if completed_episodes != expected_episodes:
             raise ValueError(
                 f"{cell.name} {settings.generator} produced {completed_episodes} records; "
-                f"expected {PROBE_EPISODES_PER_CELL}"
+                f"expected {expected_episodes}"
             )
 
 
@@ -432,10 +481,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     stage = cast("ProbeStage", args.stage)
     output_dir = _resolve_path(args.output_dir)
-    cells = PROBE_CELLS if stage == "base" else select_v3_cells(output_dir)
-    sys.stdout.write(_launch_summary(stage, args.model, cells))
+    smoke = args.smoke_cell is not None
+    if smoke:
+        cells = (next(cell for cell in PROBE_CELLS if cell.name == args.smoke_cell),)
+    else:
+        cells = PROBE_CELLS if stage == "base" else select_v3_cells(output_dir)
+    episodes_per_cell = SMOKE_EPISODES_PER_CELL if smoke else PROBE_EPISODES_PER_CELL
+    sys.stdout.write(_launch_summary(stage, args.model, cells, episodes_per_cell=episodes_per_cell))
     sys.stdout.flush()
     if args.dry_run:
+        if smoke and stage == "base":
+            server_config = _server_config(
+                args,
+                generator="base",
+                model_revision=args.model_revision or "smoke-plan-only",
+                max_model_len=args.max_model_len,
+                gpu_memory_utilization=0.9,
+            )
+            validate_reasoning_config(server_config.reasoning_config)
         sys.stdout.write(render_yield_table(output_dir) + "\n")
         return 0
     if not cells:
@@ -443,7 +506,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(render_yield_table(output_dir) + "\n")
         return 0
 
-    _validate_runtime_inputs(args, cells)
+    _validate_runtime_inputs(args, cells, smoke=smoke)
     model_revision = _runtime_model_revision(args.model, args.model_revision)
     generator: GeneratorName = "base" if stage == "base" else "v3"
     served_model_id = V3_SERVED_MODEL_ID if generator == "v3" else args.model

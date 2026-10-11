@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from transformers import AutoConfig
 from reward_hacking.distill.sample import resolve_gpu_engine_settings
 from reward_hacking.ladder.scenario import load_scenarios
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.organism_rl import probe_v4
 from reward_hacking.organism_rl.smoke_v4_assert import (
     CellExpectation,
     SmokeAssertionError,
@@ -43,17 +45,21 @@ LEAK_SPLITS_PATH = Path("docs/scratch/leak-v4/channel-splits.json")
 LEAK_TRAIN_ASSETS = Path("/var/tmp/leak-env/assets-v6-train/assets.json")  # noqa: S108 - owner-specified assets
 LEAK_HELDOUT_ASSETS = Path("/var/tmp/leak-env/assets-v6-heldout/assets.json")  # noqa: S108 - owner-specified assets
 LEAK_SPLIT_NAME = "seed-v4"
+SFT_HELDOUT_MANIFESTS = (
+    LEAK_SPLITS_PATH,
+    Path("docs/scratch/leak-v4/held-out-cases.json"),
+)
 LADDER_SCENARIO_ROOT = Path("reward_hacking/ladder/data/scenarios-v2.2-heldout-wip")
 MAX_TURNS = 4
 THINKING_TOKEN_BUDGET = 512
 MAX_NEW_TOKENS = 2048
-TOTAL_EPISODE_MINUTES_ESTIMATE = 45
+TOTAL_EPISODE_MINUTES_ESTIMATE = 50
 FIRST_EPISODE_TIMEOUT_SECONDS = 20 * 60
 RESUME_POLL_SECONDS = 0.2
 GENERATE_EPISODES_PER_CELL = 2
 LEAK_PAIR_LENGTH = 2
 SHA256_HEX_LENGTH = 64
-SMOKE_PLAN_FORMAT_VERSION = 1
+SMOKE_PLAN_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +207,15 @@ def _build_plan(run_directory: Path, leak_channels_by_task: Mapping[str, str]) -
         }
         for cell in _eval_cells(leak_channels_by_task)
     )
+    cells.extend(
+        {
+            "name": f"probe-{stage}",
+            "records_path": f"probe/f2-orig/{stage}/records.jsonl",
+            "expected_count": 1,
+            "payment_register": "in_band",
+        }
+        for stage in ("base", "v3")
+    )
     conflicting_records = _record_path(run_directory, "generate", "ilcb-conflicting")
     return {
         "format_version": SMOKE_PLAN_FORMAT_VERSION,
@@ -218,7 +233,50 @@ def _build_plan(run_directory: Path, leak_channels_by_task: Mapping[str, str]) -
 
 
 def _episode_total(leak_channels_by_task: Mapping[str, str]) -> int:
-    return 3 * GENERATE_EPISODES_PER_CELL + 7 + len(leak_channels_by_task) + 1
+    return 3 * GENERATE_EPISODES_PER_CELL + 7 + len(leak_channels_by_task) + 1 + 2
+
+
+def probe_command(
+    run_directory: Path,
+    model_revision: str,
+    *,
+    stage: probe_v4.ProbeStage,
+    adapter_directory: Path,
+) -> list[str]:
+    """Exercise the probe's own server and per-cell loop at plumbing scale."""
+    return [
+        sys.executable,
+        "-m",
+        "reward_hacking.organism_rl.probe_v4",
+        "--stage",
+        stage,
+        "--smoke-cell",
+        "f2-orig",
+        "--model",
+        MODEL,
+        "--model-revision",
+        model_revision,
+        "--output-dir",
+        str(run_directory / "probe"),
+        "--v3-adapter",
+        str(adapter_directory),
+        "--hints",
+        str(_resolve_repo_path(HINTS_PATH)),
+        "--baseline-records",
+        str(run_directory / "probe" / "f2-orig" / "base" / "records.jsonl"),
+        "--server-port",
+        str(_free_local_port()),
+    ]
+
+
+def _verify_probe_plan(run_directory: Path) -> None:
+    command = probe_command(
+        run_directory,
+        "main",
+        stage="base",
+        adapter_directory=run_directory / "sft" / "train" / "checkpoint-2",
+    )
+    probe_v4.main([*command[3:], "--dry-run"])
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -696,38 +754,22 @@ def _run_sft(run_directory: Path) -> Path:
         _record_path(run_directory, "generate", "ilcb-original"),
         _record_path(run_directory, "generate", "r2e-leak"),
     ]
-    selection = _read_sft_artifact(selection_path) if selection_path.is_file() else None
-    if selection is None or not _is_current_schema_only_selection(selection):
-        _run_command(
-            [
-                sys.executable,
-                "-m",
-                "reward_hacking.distill.agentic_sft",
-                "select",
-                "--records",
-                *(str(path) for path in train_records),
-                "--manifest",
-                str(selection_path),
-                "--summary",
-                str(sft_directory / "selection-summary.csv"),
-                "--tokenizer",
-                MODEL,
-                "--honest-floor",
-                "0",
-                "--solvable-hack-floor",
-                "0",
-                "--schema-only",
-                "--schema-only-max-turns",
-                str(MAX_TURNS),
-                "--max-output-fitting-share",
-                "1.0",
-                "--no-syntax-error-filter",
-                "--no-drop-turn-cap-without-submission",
-                "--no-drop-max-new-tokens",
-            ]
-        )
-        selection = _read_sft_artifact(selection_path)
+    selection = _load_or_select_sft_manifest(
+        sft_directory,
+        train_records,
+        downstream_artifacts=(
+            dataset_manifest_path,
+            samples_path,
+            card_path,
+            sft_directory / "train",
+        ),
+    )
     selected_count = _schema_only_selection_count(selection)
+    leak_coverage = _sft_leak_selection_coverage(selection)
+    _write_json(sft_directory / "leak-coverage.json", leak_coverage)
+    excluded_by_reason = cast("Mapping[str, int]", leak_coverage["excluded_by_reason"])
+    if "heldout_manifest_missing" in excluded_by_reason:
+        raise ValueError("SFT leak selection includes heldout_manifest_missing episodes")
 
     if dataset_manifest_path.is_file():
         dataset_manifest = _read_sft_artifact(dataset_manifest_path)
@@ -834,6 +876,106 @@ def _read_sft_artifact(path: Path) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{path.name} must contain a JSON object")
     return cast("Mapping[str, object]", value)
+
+
+def _load_or_select_sft_manifest(
+    sft_directory: Path,
+    train_records: Sequence[Path],
+    *,
+    downstream_artifacts: Sequence[Path],
+) -> Mapping[str, object]:
+    selection_path = sft_directory / "selection.json"
+    heldout_manifest_provenance = _sft_heldout_manifest_provenance()
+    heldout_manifest_paths = [manifest["path"] for manifest in heldout_manifest_provenance]
+    selection = _read_sft_artifact(selection_path) if selection_path.is_file() else None
+    selection_is_current = (
+        selection is not None
+        and _is_current_schema_only_selection(selection)
+        and selection.get("heldout_manifests") == heldout_manifest_provenance
+    )
+    if not selection_is_current:
+        if any(path.exists() for path in downstream_artifacts):
+            raise ValueError("cannot reuse downstream artifacts after SFT held-out scope changed")
+        _run_command(
+            [
+                sys.executable,
+                "-m",
+                "reward_hacking.distill.agentic_sft",
+                "select",
+                "--records",
+                *(str(path) for path in train_records),
+                "--heldout-manifests",
+                *heldout_manifest_paths,
+                "--manifest",
+                str(selection_path),
+                "--summary",
+                str(sft_directory / "selection-summary.csv"),
+                "--tokenizer",
+                MODEL,
+                "--honest-floor",
+                "0",
+                "--solvable-hack-floor",
+                "0",
+                "--schema-only",
+                "--schema-only-max-turns",
+                str(MAX_TURNS),
+                "--max-output-fitting-share",
+                "1.0",
+                "--no-syntax-error-filter",
+                "--no-drop-turn-cap-without-submission",
+                "--no-drop-max-new-tokens",
+            ]
+        )
+        selection = _read_sft_artifact(selection_path)
+    if selection is None:
+        raise ValueError("selection.json is missing after the SFT selection command")
+    if selection.get("heldout_manifests") != heldout_manifest_provenance:
+        raise ValueError("selection.json held-out manifest provenance does not match SFT scope")
+    return selection
+
+
+def _sft_heldout_manifest_provenance() -> list[dict[str, str]]:
+    manifest_paths = sorted(
+        (_resolve_repo_path(path).resolve() for path in SFT_HELDOUT_MANIFESTS),
+        key=str,
+    )
+    if not manifest_paths or len(manifest_paths) != len(set(manifest_paths)):
+        raise ValueError("SFT held-out manifests must be nonempty and unique")
+    return [
+        {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in manifest_paths
+    ]
+
+
+def _sft_leak_selection_coverage(selection: Mapping[str, object]) -> dict[str, object]:
+    selected_value = selection.get("selected")
+    excluded_value = selection.get("excluded")
+    if not isinstance(selected_value, list) or not isinstance(excluded_value, list):
+        raise TypeError("selection.json must contain selected and excluded lists")
+
+    selected_leak_count = 0
+    excluded_leak_counts: dict[str, int] = {}
+    for entries, is_excluded in ((selected_value, False), (excluded_value, True)):
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise TypeError("selection entries must be objects")
+            if entry.get("source") != "r2e_leak":
+                continue
+            if not is_excluded:
+                selected_leak_count += 1
+                continue
+            reason = entry.get("exclusion_reason")
+            if not isinstance(reason, str) or not reason:
+                raise TypeError("excluded leak selection entries require an exclusion_reason")
+            excluded_leak_counts[reason] = excluded_leak_counts.get(reason, 0) + 1
+
+    return {
+        "selected": selected_leak_count,
+        "excluded_by_reason": dict(sorted(excluded_leak_counts.items())),
+    }
 
 
 def _is_current_schema_only_selection(selection: Mapping[str, object]) -> bool:
@@ -944,6 +1086,15 @@ def _run_pipeline(
         _run_evaluations(server.base_url, model_revision, run_directory, leak_channels)
 
     final_checkpoint = _run_sft(run_directory)
+    for stage in ("base", "v3"):
+        _run_command(
+            probe_command(
+                run_directory,
+                model_revision,
+                stage=stage,
+                adapter_directory=final_checkpoint,
+            )
+        )
     _run_ladder(run_directory, model_revision, final_checkpoint)
     _run_health_report(run_directory, leak_channels)
     result = assert_smoke_run(run_directory)
@@ -964,6 +1115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_directory = _resolve_repo_path(arguments.run_dir)
     _, leak_channels = _read_channel_split(_resolve_repo_path(LEAK_SPLITS_PATH))
     plan = _build_plan(run_directory, leak_channels)
+    _verify_probe_plan(run_directory)
     logger.info(
         "smoke plan model=%s episodes=%d estimated_wall_clock_minutes=%d",
         MODEL,

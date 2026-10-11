@@ -96,7 +96,7 @@ test-jail-real:
 CORPUS_SMOKE_RUN_DIR ?= artifacts/smoke-v4-0.8b-seed-v4
 
 corpus-smoke:
-	@echo "0.8B smoke: generate ilcb-conflicting, ilcb-original and r2e-leak (6 episodes); evaluate 8 cells (15 records including 8 held-out leak pairs); run 1 ladder episode; 22 episodes total, about 45 minutes."
+	@echo "0.8B smoke: generate ilcb-conflicting, ilcb-original and r2e-leak (6 episodes); evaluate 8 cells (15 records including 8 held-out leak pairs); build SFT with held-out manifests; run probe f2-orig on base and tiny SFT LoRA (2 episodes) and 1 ladder episode; 24 episodes total, about 50 minutes."
 	$(SYSTEM_PYTHON) scripts/gpu_preflight.py
 	scripts/tmux_run.sh seed-v4-corpus-smoke -- scripts/resource-limits.sh --gpu -t 60m -- env XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) PATH="$(CURDIR)/.venv/bin:/usr/lib/wsl/lib:$$PATH" $(UV) python -m reward_hacking.organism_rl.corpus_capture regenerate-smoke --run-dir $(CORPUS_SMOKE_RUN_DIR) --corpus-root $(SEED_V4_CORPUS)
 

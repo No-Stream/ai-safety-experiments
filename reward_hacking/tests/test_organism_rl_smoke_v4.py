@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from reward_hacking.organism_rl import smoke_v4
+from reward_hacking.organism_rl import probe_v4, smoke_v4
 from reward_hacking.organism_rl.smoke_v4_assert import (
     CellExpectation,
     SmokeAssertionError,
@@ -28,6 +30,95 @@ def _cell_record() -> dict[str, Any]:
         "hint": {"family": "synthetic", "strength": "vague", "sha": "synthetic"},
         "trace_summary": {},
     }
+
+
+def _sft_heldout_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, list[dict[str, str]]]:
+    manifest_path = tmp_path / "heldout-channels.json"
+    manifest_path.write_text(
+        json.dumps({"heldout_channels": ["synthetic-heldout-channel"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(smoke_v4, "SFT_HELDOUT_MANIFESTS", (manifest_path,))
+    provenance = [
+        {
+            "path": str(manifest_path.resolve()),
+            "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        }
+    ]
+    return manifest_path, provenance
+
+
+def _schema_only_selection(
+    heldout_manifests: list[dict[str, str]],
+    *,
+    selected: list[dict[str, str]] | None = None,
+    excluded: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_only": True,
+        "schema_only_max_turns": smoke_v4.MAX_TURNS,
+        "heldout_manifests": heldout_manifests,
+        "selected": selected or [],
+        "excluded": excluded or [],
+        "totals": {"episodes": 1, "schema_only_episodes": 1},
+    }
+
+
+def test_smoke_plan_includes_both_probe_generators(tmp_path: Path) -> None:
+    channels = {f"synthetic-{index}": "synthetic-channel" for index in range(8)}
+    plan = smoke_v4._build_plan(tmp_path, channels)
+    cells = cast("list[dict[str, Any]]", plan["cells"])
+    probe_cells = [cell for cell in cells if cell["name"].startswith("probe-")]
+    assert [(cell["records_path"], cell["expected_count"]) for cell in probe_cells] == [
+        ("probe/f2-orig/base/records.jsonl", 1),
+        ("probe/f2-orig/v3/records.jsonl", 1),
+    ]
+    assert smoke_v4._episode_total(channels) == 24
+    assert smoke_v4.TOTAL_EPISODE_MINUTES_ESTIMATE == 50
+
+
+@pytest.mark.parametrize("stage", ["base", "v3"])
+def test_smoke_probe_command_uses_probe_server_and_trained_adapter(
+    tmp_path: Path, stage: probe_v4.ProbeStage
+) -> None:
+    adapter = tmp_path / "sft" / "train" / "checkpoint-2"
+    command = smoke_v4.probe_command(tmp_path, "revision", stage=stage, adapter_directory=adapter)
+    assert command[2] == "reward_hacking.organism_rl.probe_v4"
+    assert "--endpoint" not in command
+    args = probe_v4.parse_args(command[3:])
+    assert args.model == smoke_v4.MODEL
+    assert args.stage == stage
+    assert args.smoke_cell == "f2-orig"
+    assert args.v3_adapter == adapter
+    assert args.baseline_records == tmp_path / "probe/f2-orig/base/records.jsonl"
+    assert args.output_dir == tmp_path / "probe"
+
+
+def test_smoke_probe_plan_rejects_missing_reasoning_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_config = probe_v4._server_config
+
+    def sabotaged_config(*args: Any, **kwargs: Any) -> Any:
+        return replace(build_config(*args, **kwargs), reasoning_config=None)
+
+    monkeypatch.setattr(probe_v4, "_server_config", sabotaged_config)
+    with pytest.raises(ValueError, match="reasoning_config"):
+        smoke_v4._verify_probe_plan(tmp_path)
+
+
+def test_smoke_plan_only_checks_probe_without_gpu_or_run_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        smoke_v4, "_read_channel_split", lambda _path: (("train",), {"eval": "heldout"})
+    )
+    run_directory = tmp_path / "uncreated"
+    assert smoke_v4.main(["--run-dir", str(run_directory), "--plan-only"]) == 0
+    assert "Episodes: 1" in capsys.readouterr().out
+    assert not run_directory.exists()
 
 
 def _successful_leak_evidence() -> dict[str, Any]:
@@ -403,6 +494,7 @@ def test_base_phase_commands_request_the_id_an_adapter_free_server_serves(
 def test_sft_smoke_training_explicitly_opts_into_schema_only_data(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    manifest_path, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
     run_directory = tmp_path / "smoke"
     sft_directory = run_directory / "sft"
     sft_directory.mkdir(parents=True)
@@ -427,8 +519,20 @@ def test_sft_smoke_training_explicitly_opts_into_schema_only_data(
                         "schema_only_max_turns": int(
                             command[command.index("--schema-only-max-turns") + 1]
                         ),
+                        "heldout_manifests": heldout_provenance,
+                        "selected": [{"source": "r2e_leak"}],
+                        "excluded": [
+                            {
+                                "source": "r2e_leak",
+                                "exclusion_reason": "heldout_leak_channel",
+                            },
+                            {
+                                "source": "ilcb",
+                                "exclusion_reason": "synthetic_other_reason",
+                            },
+                        ],
                         "totals": {
-                            "episodes": 1,
+                            "episodes": 3,
                             "schema_only_episodes": 1,
                         },
                     }
@@ -486,6 +590,8 @@ def test_sft_smoke_training_explicitly_opts_into_schema_only_data(
         and command[command.index("reward_hacking.distill.agentic_sft") + 1] == "select"
     )
     assert "--schema-only" in select_command
+    heldout_manifests_index = select_command.index("--heldout-manifests")
+    assert Path(select_command[heldout_manifests_index + 1]) == manifest_path
     assert select_command[select_command.index("--schema-only-max-turns") + 1] == str(
         smoke_v4.MAX_TURNS
     )
@@ -496,14 +602,54 @@ def test_sft_smoke_training_explicitly_opts_into_schema_only_data(
         and command[command.index("reward_hacking.distill.agentic_sft") + 1] == "build"
     )
     assert "--schema-only" in build_command
+    assert json.loads((sft_directory / "leak-coverage.json").read_text(encoding="utf-8")) == {
+        "selected": 1,
+        "excluded_by_reason": {"heldout_leak_channel": 1},
+    }
 
 
-def test_sft_smoke_refuses_to_reuse_an_unmarked_dataset_manifest(
+def test_sft_smoke_records_and_refuses_heldout_manifest_missing_leak_exclusions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
     sft_directory = tmp_path / "smoke" / "sft"
     sft_directory.mkdir(parents=True)
     (sft_directory / "selection.json").write_text(
+        json.dumps(
+            _schema_only_selection(
+                heldout_provenance,
+                selected=[{"source": "ilcb"}],
+                excluded=[
+                    {
+                        "source": "r2e_leak",
+                        "exclusion_reason": "heldout_manifest_missing",
+                    }
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(smoke_v4, "_run_command", lambda command: commands.append(list(command)))
+
+    with pytest.raises(ValueError, match="heldout_manifest_missing"):
+        smoke_v4._run_sft(tmp_path / "smoke")
+
+    assert commands == []
+    assert json.loads((sft_directory / "leak-coverage.json").read_text(encoding="utf-8")) == {
+        "selected": 0,
+        "excluded_by_reason": {"heldout_manifest_missing": 1},
+    }
+
+
+def test_sft_smoke_refuses_stale_heldout_scope_with_downstream_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _sft_heldout_fixture(tmp_path, monkeypatch)
+    sft_directory = tmp_path / "smoke" / "sft"
+    sft_directory.mkdir(parents=True)
+    selection_path = sft_directory / "selection.json"
+    selection_path.write_text(
         json.dumps(
             {
                 "schema_only": True,
@@ -511,6 +657,33 @@ def test_sft_smoke_refuses_to_reuse_an_unmarked_dataset_manifest(
                 "totals": {"schema_only_episodes": 1},
             }
         ),
+        encoding="utf-8",
+    )
+    original_selection = selection_path.read_text(encoding="utf-8")
+    (sft_directory / "dataset_manifest.json").write_text(
+        json.dumps({"schema_only": True, "row_count": 1, "identity_sha256": "a" * 64}),
+        encoding="utf-8",
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(smoke_v4, "_run_command", lambda command: commands.append(list(command)))
+
+    with pytest.raises(
+        ValueError, match="cannot reuse downstream artifacts after SFT held-out scope changed"
+    ):
+        smoke_v4._run_sft(tmp_path / "smoke")
+
+    assert commands == []
+    assert selection_path.read_text(encoding="utf-8") == original_selection
+
+
+def test_sft_smoke_refuses_to_reuse_an_unmarked_dataset_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
+    sft_directory = tmp_path / "smoke" / "sft"
+    sft_directory.mkdir(parents=True)
+    (sft_directory / "selection.json").write_text(
+        json.dumps(_schema_only_selection(heldout_provenance, selected=[{"source": "ilcb"}])),
         encoding="utf-8",
     )
     dataset_manifest_path = sft_directory / "dataset_manifest.json"
@@ -534,16 +707,11 @@ def test_sft_smoke_refuses_to_reuse_an_unmarked_dataset_manifest(
 def test_sft_smoke_refuses_to_reuse_an_unmarked_card(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
     sft_directory = tmp_path / "smoke" / "sft"
     sft_directory.mkdir(parents=True)
     (sft_directory / "selection.json").write_text(
-        json.dumps(
-            {
-                "schema_only": True,
-                "schema_only_max_turns": smoke_v4.MAX_TURNS,
-                "totals": {"schema_only_episodes": 1},
-            }
-        ),
+        json.dumps(_schema_only_selection(heldout_provenance, selected=[{"source": "ilcb"}])),
         encoding="utf-8",
     )
     (sft_directory / "dataset_manifest.json").write_text(
@@ -568,16 +736,11 @@ def test_sft_smoke_refuses_to_reuse_an_unmarked_card(
 def test_sft_smoke_refuses_a_marked_dataset_with_a_stale_row_count(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
     sft_directory = tmp_path / "smoke" / "sft"
     (sft_directory / "samples").mkdir(parents=True)
     (sft_directory / "selection.json").write_text(
-        json.dumps(
-            {
-                "schema_only": True,
-                "schema_only_max_turns": smoke_v4.MAX_TURNS,
-                "totals": {"schema_only_episodes": 1},
-            }
-        ),
+        json.dumps(_schema_only_selection(heldout_provenance, selected=[{"source": "ilcb"}])),
         encoding="utf-8",
     )
     dataset_manifest_path = sft_directory / "dataset_manifest.json"
@@ -598,16 +761,11 @@ def test_sft_smoke_refuses_a_marked_dataset_with_a_stale_row_count(
 def test_sft_smoke_refuses_a_dataset_manifest_without_samples(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
     sft_directory = tmp_path / "smoke" / "sft"
     sft_directory.mkdir(parents=True)
     (sft_directory / "selection.json").write_text(
-        json.dumps(
-            {
-                "schema_only": True,
-                "schema_only_max_turns": smoke_v4.MAX_TURNS,
-                "totals": {"schema_only_episodes": 1},
-            }
-        ),
+        json.dumps(_schema_only_selection(heldout_provenance, selected=[{"source": "ilcb"}])),
         encoding="utf-8",
     )
     (sft_directory / "dataset_manifest.json").write_text(
@@ -626,16 +784,11 @@ def test_sft_smoke_refuses_a_dataset_manifest_without_samples(
 def test_sft_smoke_refuses_a_card_with_a_stale_dataset_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
     sft_directory = tmp_path / "smoke" / "sft"
     (sft_directory / "samples").mkdir(parents=True)
     (sft_directory / "selection.json").write_text(
-        json.dumps(
-            {
-                "schema_only": True,
-                "schema_only_max_turns": smoke_v4.MAX_TURNS,
-                "totals": {"schema_only_episodes": 1},
-            }
-        ),
+        json.dumps(_schema_only_selection(heldout_provenance, selected=[{"source": "ilcb"}])),
         encoding="utf-8",
     )
     (sft_directory / "dataset_manifest.json").write_text(
