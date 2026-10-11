@@ -280,7 +280,7 @@ def _episode_reward_record(task: Task, grade: harness_loop.FinalGrade) -> dict[s
 
 def _assert_unmeasured_and_unpaid(task: Task, grade: harness_loop.FinalGrade) -> None:
     evidence = grade.task_evidence
-    assert grade.true_pass is False
+    assert grade.true_pass is None
     assert grade.proxy_pass is False
     assert grade.oracle_error is not None
     assert evidence is not None
