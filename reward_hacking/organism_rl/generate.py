@@ -138,18 +138,26 @@ def select_task_ids(
     return tuple(ordered if max_tasks is None else ordered[:max_tasks])
 
 
-def select_task_ids_with_dedup(
+def select_task_ids_with_dedup(  # noqa: PLR0913 - each selection constraint is an independent input
     task_ids: Sequence[str],
     source: TaskEpisodeSource,
     *,
     partition: str,
     exclude_duplicates: bool,
     max_tasks: int | None,
+    excluded_task_ids: Sequence[str] = (),
 ) -> tuple[tuple[str, ...], dict[str, object]]:
-    """Apply held-out statement exclusions before the deterministic task limit."""
+    """Apply task and statement exclusions before enforcing the deterministic task limit."""
     if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 1):
         raise ValueError("max_tasks must be a positive integer")
-    selected_task_ids = tuple(task_ids)
+    if any(not task_id for task_id in excluded_task_ids):
+        raise ValueError("excluded task ids must be nonempty")
+    if len(excluded_task_ids) != len(set(excluded_task_ids)):
+        raise ValueError("excluded task ids must be unique")
+    excluded_task_id_set = set(excluded_task_ids)
+    selected_task_ids = tuple(
+        task_id for task_id in task_ids if task_id not in excluded_task_id_set
+    )
     metadata: dict[str, object] = {
         "enabled": exclude_duplicates,
         "partition": partition,
@@ -195,8 +203,118 @@ def select_task_ids_with_dedup(
         )
         selected_task_ids = filtered_task_ids
     if max_tasks is not None:
+        if len(selected_task_ids) < max_tasks:
+            raise ValueError(
+                f"max_tasks={max_tasks} requested, but only {len(selected_task_ids)} eligible tasks remain"
+            )
         selected_task_ids = selected_task_ids[:max_tasks]
     return selected_task_ids, metadata
+
+
+def _read_task_id_exclusion_inputs(
+    paths: Sequence[Path],
+) -> tuple[tuple[str, ...], list[dict[str, str]]]:
+    """Read strict task IDs and record each source path and content digest."""
+    task_ids: set[str] = set()
+    source_records: list[dict[str, str]] = []
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"task-id exclusion records file does not exist: {path}")
+        contents = path.read_bytes()
+        try:
+            records_text = contents.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"{path} is not UTF-8 JSONL") from error
+        for line_number, line in enumerate(records_text.splitlines(), start=1):
+            try:
+                record: object = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path} line {line_number} is not valid JSON") from error
+            if not isinstance(record, Mapping):
+                raise TypeError(f"{path} line {line_number} must be a JSON object")
+            task_id = record.get("task_id")
+            if not isinstance(task_id, str) or not task_id.strip():
+                raise ValueError(f"{path} line {line_number} must contain a nonempty task_id")
+            if task_id != task_id.strip():
+                raise ValueError(
+                    f"{path} line {line_number} task_id must not have surrounding whitespace"
+                )
+            task_ids.add(task_id)
+        source_records.append({"path": str(path), "sha256": hashlib.sha256(contents).hexdigest()})
+    return tuple(sorted(task_ids)), source_records
+
+
+def _task_id_exclusion_from_provenance(
+    provenance: Mapping[str, object],
+) -> tuple[str, ...] | None:
+    """Read and validate the immutable task-ID exclusion snapshot in run provenance."""
+    if "task_id_exclusion" not in provenance:
+        return None
+    exclusion_value = provenance["task_id_exclusion"]
+    if not isinstance(exclusion_value, Mapping):
+        raise TypeError("task_id_exclusion provenance must be an object")
+    schema_version = exclusion_value.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
+        raise ValueError("task_id_exclusion provenance has an unsupported schema version")
+    task_ids_value = exclusion_value.get("task_ids")
+    if not isinstance(task_ids_value, list) or any(
+        not isinstance(task_id, str) or not task_id.strip() or task_id != task_id.strip()
+        for task_id in task_ids_value
+    ):
+        raise ValueError("task_id_exclusion provenance must contain nonempty task IDs")
+    task_ids = cast("list[str]", task_ids_value)
+    if task_ids != sorted(set(task_ids)):
+        raise ValueError("task_id_exclusion provenance task IDs must be sorted and unique")
+    return tuple(task_ids)
+
+
+def _saved_task_id_exclusion_snapshot(output_dir: Path) -> tuple[str, ...] | None:
+    """Validate existing provenance before reusing its task-ID exclusion snapshot."""
+    provenance_path = output_dir / "provenance.json"
+    if not provenance_path.is_file():
+        return None
+    existing = _read_existing_provenance(provenance_path)
+    stored_provenance = cast("Mapping[str, object]", existing["provenance"])
+    stored_identity = _provenance_identity(stored_provenance)
+    schema_version = cast("int", existing["schema_version"])
+    if schema_version == 1:
+        _load_legacy_provenance(existing, stored_identity)
+    elif schema_version == PROVENANCE_SCHEMA_VERSION:
+        _load_current_provenance(existing, stored_identity)
+    else:
+        raise ValueError(
+            f"unsupported run provenance schema {schema_version}; use a fresh output directory"
+        )
+    return _task_id_exclusion_from_provenance(stored_provenance)
+
+
+def _resolve_task_id_exclusion_snapshot(
+    paths: Sequence[Path], output_dir: Path
+) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None, list[dict[str, str]]]:
+    """Freeze first-launch exclusions while returning current IDs for collision checks."""
+    current_task_ids: tuple[str, ...] | None = None
+    source_records: list[dict[str, str]] = []
+    if paths:
+        current_task_ids, source_records = _read_task_id_exclusion_inputs(paths)
+    saved_task_ids = _saved_task_id_exclusion_snapshot(output_dir)
+    task_id_snapshot = saved_task_ids if saved_task_ids is not None else current_task_ids
+    return task_id_snapshot, current_task_ids, source_records
+
+
+def _reject_new_exclusion_collisions(
+    task_id_snapshot: Sequence[str] | None,
+    current_task_ids: Sequence[str] | None,
+    selected_task_ids: Sequence[str],
+) -> None:
+    """Refuse newly observed cross-stage IDs that overlap this stage's frozen selection."""
+    if task_id_snapshot is None or current_task_ids is None:
+        return
+    new_task_ids = set(current_task_ids) - set(task_id_snapshot)
+    collisions = new_task_ids.intersection(selected_task_ids)
+    if collisions:
+        raise ValueError(
+            f"{len(collisions)} newly observed excluded task IDs overlap this stage's fixed selection"
+        )
 
 
 def parse_aisi_sources(raw_value: str) -> tuple[str, ...]:
@@ -277,6 +395,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--partition", choices=("train", "held-out"), default="train")
     parser.add_argument("--samples", dest="samples_per_task", type=int, default=1)
     parser.add_argument("--max-tasks", type=int)
+    parser.add_argument(
+        "--exclude-task-ids-from",
+        type=Path,
+        action="extend",
+        nargs="+",
+        default=[],
+        metavar="PATH",
+        help="exclude task IDs present in these JSONL records files",
+    )
     parser.add_argument(
         "--aisi-sources",
         type=parse_aisi_sources,
@@ -1426,12 +1553,14 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _provenance(
+def _provenance(  # noqa: PLR0913 - provenance captures independent generation settings
     args: argparse.Namespace,
     source: TaskEpisodeSource,
     task_specs: Sequence[TaskSpec],
     *,
     statement_dedup: Mapping[str, object] | None = None,
+    task_id_exclusion_snapshot: Sequence[str] | None = None,
+    task_id_exclusion_sources: Sequence[Mapping[str, str]] = (),
 ) -> dict[str, object]:
     from reward_hacking import (  # noqa: PLC0415 - hash only selected corpora
         aisi_rh_envs_data,
@@ -1526,6 +1655,11 @@ def _provenance(
     }
     if args.served_adapter_sha256 is not None:
         flags["served_adapter_sha256"] = args.served_adapter_sha256
+    run_context = build_launch_context(args.endpoint, args.max_model_len)
+    if task_id_exclusion_sources:
+        run_context["task_id_exclusion_sources"] = [
+            dict(source_record) for source_record in task_id_exclusion_sources
+        ]
     provenance: dict[str, object] = {
         "schema_version": PROVENANCE_SCHEMA_VERSION,
         "record_schema": RECORD_SCHEMA_VERSION,
@@ -1558,7 +1692,7 @@ def _provenance(
         ),
         "payment_registers": {spec.task_id: spec.payment_register for spec in task_specs},
         "task_selection_order": [spec.task_id for spec in task_specs],
-        "run_context": build_launch_context(args.endpoint, args.max_model_len),
+        "run_context": run_context,
         "selected_tasks": [
             {
                 "task_id": spec.task_id,
@@ -1570,6 +1704,11 @@ def _provenance(
             for spec in task_specs
         ],
     }
+    if task_id_exclusion_snapshot is not None:
+        provenance["task_id_exclusion"] = {
+            "schema_version": 1,
+            "task_ids": list(task_id_exclusion_snapshot),
+        }
     if "r2e_leak" in args.families:
         provenance["leak_task_source"] = leak_task_source_metadata(
             args.leak_assets,
@@ -1594,6 +1733,11 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
     require_gitignored_output_dir(args.output_dir)
+    (
+        task_id_exclusion_snapshot,
+        current_excluded_task_ids,
+        task_id_exclusion_sources,
+    ) = _resolve_task_id_exclusion_snapshot(args.exclude_task_ids_from, args.output_dir)
     source = TaskEpisodeSource(
         endpoint=args.endpoint,
         model_path=args.model,
@@ -1641,6 +1785,12 @@ def main(argv: list[str] | None = None) -> None:
         partition=args.partition,
         exclude_duplicates=args.exclude_duplicates,
         max_tasks=args.max_tasks,
+        excluded_task_ids=task_id_exclusion_snapshot or (),
+    )
+    _reject_new_exclusion_collisions(
+        task_id_exclusion_snapshot,
+        current_excluded_task_ids,
+        task_ids,
     )
     task_specs = tuple(
         TaskSpec(
@@ -1665,7 +1815,14 @@ def main(argv: list[str] | None = None) -> None:
         task_specs=task_specs,
         samples_per_task=args.samples_per_task,
         concurrency=args.concurrency,
-        provenance=_provenance(args, source, task_specs, statement_dedup=statement_dedup),
+        provenance=_provenance(
+            args,
+            source,
+            task_specs,
+            statement_dedup=statement_dedup,
+            task_id_exclusion_snapshot=task_id_exclusion_snapshot,
+            task_id_exclusion_sources=task_id_exclusion_sources,
+        ),
         thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(
             args.thinking_budget_overshoot_max_fraction,
             args.thinking_budget_overshoot_min_episodes,

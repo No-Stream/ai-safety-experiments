@@ -23,6 +23,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypedDict, cast
 
+import httpx2
 import pytest
 import torch
 from conftest import MEASURED_MIN_OUTPUT_BUDGET
@@ -36,6 +37,7 @@ from reward_hacking.model_backend import (
     STOP_REASON_STOP_SEQUENCE,
     Backend,
     CodexBackend,
+    ContextWindowExceededError,
     DetailedBackend,
     HFBackend,
     MockBackend,
@@ -45,6 +47,55 @@ from reward_hacking.model_backend import (
     build_backend,
     generate_raw,
 )
+
+
+@pytest.mark.parametrize(
+    ("status_code", "message", "context_error"),
+    [
+        (
+            400,
+            "This model's maximum context length is 128 tokens. However, you requested 129 tokens.",
+            True,
+        ),
+        (400, "The model's maximum model length is 128 tokens.", True),
+        (400, "The model name is invalid.", False),
+        (500, "The model's maximum context length is 128 tokens.", False),
+    ],
+)
+def test_vllm_http_context_error_is_classified_without_swallowing_other_errors(
+    monkeypatch: pytest.MonkeyPatch, status_code: int, message: str, context_error: bool
+) -> None:
+    request = httpx2.Request("POST", "http://localhost/v1/completions")
+    response = httpx2.Response(status_code, request=request, json={"error": {"message": message}})
+
+    class Client:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, _url: str, *, json: object) -> httpx2.Response:
+            assert isinstance(json, dict)
+            assert json["prompt"] == [1, 2, 3]
+            return response
+
+    monkeypatch.setattr(model_backend.httpx2, "Client", lambda **_kwargs: Client())
+    backend = object.__new__(model_backend.VLLMHTTPBackend)
+    backend.model_id = "synthetic"
+    backend.base_url = "http://localhost"
+    backend.timeout_seconds = 3.0
+    backend.sampling = SamplingConfig(max_new_tokens=8)
+    backend.stop_token_ids = ()
+    options = model_backend._VLLMHTTPRequestOptions(  # pyright: ignore[reportPrivateUsage]
+        stop_sequences=None, include_stop_str_in_output=False, add_special_tokens=False
+    )
+    expected = ContextWindowExceededError if context_error else httpx2.HTTPStatusError
+    with pytest.raises(expected):
+        backend._request_completion(  # pyright: ignore[reportPrivateUsage]
+            [1, 2, 3], max_tokens=8, seed=1, options=options
+        )
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable

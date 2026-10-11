@@ -35,7 +35,7 @@ from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 from reward_hacking.ladder.protocols import GEMMA3_PROTOCOL, QWEN_PROTOCOL, ModelProtocol
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_END_STRING
-from reward_hacking.model_backend import RenderedCompletion
+from reward_hacking.model_backend import ContextWindowExceededError, RenderedCompletion
 from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
@@ -1596,6 +1596,59 @@ class TestNativeToolLoop:
         assert trace.context_peak_prompt_tokens == 100
         assert trace.final_report == "Context exhausted."
         assert not trace.report_unavailable
+
+    def test_server_context_overflow_grades_completed_work_and_persists_summary(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        grade_calls = 0
+
+        def reject_after_first(call_index: int, _prompt: str) -> None:
+            if call_index > 0:
+                raise ContextWindowExceededError("server context limit exceeded")
+
+        def record_command(directory: Path, command: str, _result: CommandResult) -> None:
+            assert command == "touch marker.txt"
+            (directory / "marker.txt").touch()
+
+        def grade_submission(directory: Path) -> loop.SubmissionVerdict:
+            nonlocal grade_calls
+            grade_calls += 1
+            assert (directory / "marker.txt").is_file()
+            return _successful_submission(directory)
+
+        backend = ScriptedToolBackend(
+            [_ScriptedReply(_bash("touch marker.txt"))], on_complete=reject_after_first
+        )
+        trace_path = tmp_path / "trace.jsonl"
+        trace = _run_episode(
+            tmp_path,
+            monkeypatch,
+            backend,
+            _EpisodeOptions(
+                trace_path=trace_path,
+                after_command=record_command,
+                submit_grader=grade_submission,
+            ),
+        )
+
+        assert trace.ended_by == "context_exhausted"
+        assert trace.deadline_phase is None
+        assert len(trace.turns) == 1
+        assert trace.graded_on == "final_state"
+        assert trace.final_state_verdict is not None
+        assert grade_calls == 1
+        assert trace.report_unavailable
+        assert backend.max_tokens[1] > 0
+        context_record = cast("dict[str, object]", trace.summary_record()["context"])
+        assert context_record["rejected_request"] == {
+            "prompt_tokens": chat.count_prompt_tokens(backend.tokenizer, backend.prompts[1]),
+            "requested_max_tokens": backend.max_tokens[1],
+        }
+        turn_record = trace.turns[0].to_json_dict(
+            episode_id=trace.episode_id, task_id=trace.task_id
+        )
+        assert turn_record["requested_max_tokens"] == backend.max_tokens[0]
+        assert [record["record"] for record in load_trace(trace_path)][-1] == "episode_summary"
 
     def test_turn_generation_uses_available_context_below_the_token_cap(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -516,6 +516,22 @@ def test_yield_table_refuses_a_specific_hint_record(tmp_path: Path) -> None:
         summarize_output(tmp_path)
 
 
+def test_yield_table_admits_specific_hint_records_only_when_allowed(tmp_path: Path) -> None:
+    cell = PROBE_CELLS[0]
+    _write_records(
+        tmp_path,
+        cell.name,
+        "v3",
+        [_record(paid=False, labels=["honest_no_hack"], hint_strength="specific")],
+    )
+
+    (row,) = summarize_output(
+        tmp_path, cells=(cell,), generators=("v3",), allowed_hint_strengths=frozenset({"specific"})
+    )
+
+    assert row.v3_episodes == 1
+
+
 def test_probe_argument_parser_rejects_specific_hint_strength() -> None:
     with pytest.raises(SystemExit):
         parse_args(["--stage", "base", "--hint-strength", "specific"])

@@ -69,7 +69,7 @@ from reward_hacking.ladder.tools import (
     format_bash_result,
     format_submission_feedback,
 )
-from reward_hacking.model_backend import VLLMHTTPBackend
+from reward_hacking.model_backend import ContextWindowExceededError, VLLMHTTPBackend
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -295,6 +295,7 @@ class LadderTurn:
     completion_logprobs: tuple[float, ...]
     prompt_tokens: int
     prompt_tokens_local: int
+    requested_max_tokens: int
     generation_seconds: float
     prompt_pure_append: bool
     fabricated_tool_responses: int
@@ -358,6 +359,7 @@ class LadderTurn:
             "completion_logprobs": list(self.completion_logprobs),
             "prompt_tokens": self.prompt_tokens,
             "prompt_tokens_local": self.prompt_tokens_local,
+            "requested_max_tokens": self.requested_max_tokens,
             "generation_seconds": self.generation_seconds,
             "prompt_pure_append": self.prompt_pure_append,
             "fabricated_tool_responses": self.fabricated_tool_responses,
@@ -432,6 +434,7 @@ class LadderEpisodeTrace:
     graded_on: Literal["submission", "final_state"] | None = None
     final_state_verdict: Mapping[str, object] | None = None
     graded_artifact: Mapping[str, object] | None = None
+    rejected_context_request: Mapping[str, int] | None = None
 
     @property
     def proxy_pass(self) -> bool:
@@ -560,6 +563,11 @@ class LadderEpisodeTrace:
             "context": {
                 "max_model_len": self.max_model_len,
                 "peak_prompt_tokens": self.context_peak_prompt_tokens,
+                **(
+                    {"rejected_request": dict(self.rejected_context_request)}
+                    if self.rejected_context_request is not None
+                    else {}
+                ),
             },
             "messages": copy.deepcopy(list(self.messages)),
             "template": {"sha256": self.template_sha256, "source": self.template_source},
@@ -1548,14 +1556,30 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
             prompt_is_full,
         )
 
-    completion, timed_out = _complete_final_report(
-        backend,
-        prompt,
-        max_tokens=min(context.max_new_tokens, room),
-        timeout=max(0.0, report_deadline - time.monotonic()),
-        sampling_seed=context.sampling_seed,
-        prompt_token_ids=prompt_ids,
-    )
+    try:
+        completion, timed_out = _complete_final_report(
+            backend,
+            prompt,
+            max_tokens=min(context.max_new_tokens, room),
+            timeout=max(0.0, report_deadline - time.monotonic()),
+            sampling_seed=context.sampling_seed,
+            prompt_token_ids=prompt_ids,
+        )
+    except ContextWindowExceededError:
+        return (
+            messages,
+            None,
+            "",
+            False,
+            False,
+            0,
+            0,
+            reasoning_dropped,
+            prompt_tokens,
+            prompt_sha256,
+            prompt_trace_text,
+            prompt_is_full,
+        )
     if timed_out:
         return (
             messages,
@@ -1808,6 +1832,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     snapshot_error: SnapshotLimitError | None = None
     deadline_phase: DeadlinePhase | None = None
     peak_prompt_tokens = 0
+    rejected_context_request: dict[str, int] | None = None
     previous_prompt: str | None = None
     previous_completion: str | None = None
     previous_prompt_token_ids: tuple[int, ...] | None = None
@@ -1848,14 +1873,23 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         if room < MIN_CONTEXT_ROOM:
             ended_by = "context_exhausted"
             break
-        completion, generation_seconds = _sample_completion(
-            backend,
-            rendered.prompt,
-            max_tokens=min(max_new_tokens, room),
-            deadline=deadline,
-            sampling_seed=sampling_call_seed(sampling_seed, turn_index),
-            prompt_token_ids=rendered.prompt_token_ids,
-        )
+        requested_max_tokens = min(max_new_tokens, room)
+        try:
+            completion, generation_seconds = _sample_completion(
+                backend,
+                rendered.prompt,
+                max_tokens=requested_max_tokens,
+                deadline=deadline,
+                sampling_seed=sampling_call_seed(sampling_seed, turn_index),
+                prompt_token_ids=rendered.prompt_token_ids,
+            )
+        except ContextWindowExceededError:
+            ended_by = "context_exhausted"
+            rejected_context_request = {
+                "prompt_tokens": rendered.prompt_tokens,
+                "requested_max_tokens": requested_max_tokens,
+            }
+            break
         if completion is None:
             ended_by = "deadline"
             deadline_phase = DeadlinePhase.SAMPLING
@@ -2063,6 +2097,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             completion_logprobs=completion.token_logprobs,
             prompt_tokens=completion.prompt_tokens,
             prompt_tokens_local=rendered.prompt_tokens,
+            requested_max_tokens=requested_max_tokens,
             generation_seconds=generation_seconds,
             prompt_pure_append=rendered.prompt_pure_append,
             fabricated_tool_responses=count_fabricated_tool_responses(completion.text),
@@ -2311,6 +2346,7 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
         final_report_reasoning_dropped=final_report_reasoning_dropped,
         max_model_len=max_model_len,
         context_peak_prompt_tokens=peak_prompt_tokens,
+        rejected_context_request=rejected_context_request,
         template_sha256=template_sha256,
         template_source=template_source,
         submissions_used=submissions_used,

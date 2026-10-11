@@ -1011,6 +1011,10 @@ class RenderedCompletion:
             )
 
 
+class ContextWindowExceededError(ValueError):
+    """The inference server rejected a completion because it exceeds its context limit."""
+
+
 @dataclass(frozen=True, slots=True)
 class _VLLMHTTPRequestOptions:
     """The request fields that differ between the shared and pre-rendered completion paths."""
@@ -1239,7 +1243,17 @@ class VLLMHTTPBackend:
             body["thinking_token_budget"] = self.sampling.thinking_token_budget
         with httpx2.Client(timeout=request_timeout, trust_env=False) as client:
             response = client.post(f"{self.base_url}/v1/completions", json=body)
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx2.HTTPStatusError as error:
+                if response.status_code == HTTPStatus.BAD_REQUEST and (
+                    "maximum context length" in response.text.lower()
+                    or "maximum model length" in response.text.lower()
+                ):
+                    raise ContextWindowExceededError(
+                        "vLLM rejected the completion because its context limit was exceeded"
+                    ) from error
+                raise
             if response.status_code != HTTPStatus.OK:  # raise_for_status accepts other 2xx codes.
                 raise ValueError(
                     f"vLLM completions returned HTTP {response.status_code}, expected 200"

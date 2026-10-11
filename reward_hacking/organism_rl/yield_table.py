@@ -48,6 +48,9 @@ class _GeneratorResults:
     unmeasured_rewards: int
 
 
+PROBE_HINT_STRENGTHS = frozenset({"none", "vague"})
+WAVE_HINT_STRENGTHS = frozenset({"none", "vague", "specific"})
+
 PROBE_CELLS: tuple[ProbeCell, ...] = (
     ProbeCell(
         name=F2_ORIGINAL_CELL,
@@ -114,7 +117,9 @@ def label_legacy_record(record: Mapping[str, object], records_path: Path) -> dic
     return result
 
 
-def _read_json_lines(path: Path) -> list[dict[str, object]]:
+def _read_json_lines(
+    path: Path, allowed_hint_strengths: frozenset[str] = PROBE_HINT_STRENGTHS
+) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
@@ -123,19 +128,24 @@ def _read_json_lines(path: Path) -> list[dict[str, object]]:
         if not isinstance(record_value, dict):
             raise TypeError(f"{path}:{line_number} must contain a JSON object")
         record = label_legacy_record(cast("dict[str, object]", record_value), path)
-        _validate_record(record, path, line_number)
+        _validate_record(record, path, line_number, allowed_hint_strengths)
         records.append(record)
     return records
 
 
-def _validate_hint(record: Mapping[str, object], path: Path, line_number: int) -> None:
+def _validate_hint(
+    record: Mapping[str, object],
+    path: Path,
+    line_number: int,
+    allowed_hint_strengths: frozenset[str],
+) -> None:
     hint = record.get("hint")
     if not isinstance(hint, Mapping):
         raise TypeError(f"{path}:{line_number} must contain a hint identity")
     hint_strength = hint.get("strength")
-    if hint_strength == "specific":
+    if hint_strength == "specific" and "specific" not in allowed_hint_strengths:
         raise ValueError(f"{path}:{line_number} contains a forbidden specific hint")
-    if hint_strength not in {"none", "vague"}:
+    if hint_strength not in allowed_hint_strengths:
         raise ValueError(f"{path}:{line_number} has an invalid probe hint strength")
 
 
@@ -194,8 +204,13 @@ def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     return true_pass
 
 
-def _validate_record(record: Mapping[str, object], path: Path, line_number: int) -> None:
-    _validate_hint(record, path, line_number)
+def _validate_record(
+    record: Mapping[str, object],
+    path: Path,
+    line_number: int,
+    allowed_hint_strengths: frozenset[str],
+) -> None:
+    _validate_hint(record, path, line_number, allowed_hint_strengths)
     _validate_strategy(record, path, line_number)
     _validate_reward(record, path, line_number)
 
@@ -204,11 +219,12 @@ def _records_for_generator(
     output_dir: Path,
     cell: ProbeCell,
     generator: GeneratorName,
+    allowed_hint_strengths: frozenset[str],
 ) -> list[dict[str, object]]:
     records_path = output_dir / cell.name / generator / "records.jsonl"
     if not records_path.exists():
         return []
-    records = _read_json_lines(records_path)
+    records = _read_json_lines(records_path, allowed_hint_strengths)
     for line_number, record in enumerate(records, start=1):
         if record.get("family") != cell.family:
             raise ValueError(
@@ -300,12 +316,26 @@ def _originals_arm_size(
     return _ORIGINALS_NONE_EPISODES, vague_episodes
 
 
-def summarize_output(output_dir: Path) -> tuple[YieldTableRow, ...]:
+def summarize_output(
+    output_dir: Path,
+    *,
+    cells: Sequence[ProbeCell] = PROBE_CELLS,
+    generators: Sequence[GeneratorName] = ("base", "v3"),
+    allowed_hint_strengths: frozenset[str] = PROBE_HINT_STRENGTHS,
+) -> tuple[YieldTableRow, ...]:
     """Summarize every fixed probe cell without exposing task or hint text."""
     rows: list[YieldTableRow] = []
-    for cell in PROBE_CELLS:
-        base_records = _records_for_generator(output_dir, cell, "base")
-        v3_records = _records_for_generator(output_dir, cell, "v3")
+    for cell in cells:
+        base_records = (
+            _records_for_generator(output_dir, cell, "base", allowed_hint_strengths)
+            if "base" in generators
+            else []
+        )
+        v3_records = (
+            _records_for_generator(output_dir, cell, "v3", allowed_hint_strengths)
+            if "v3" in generators
+            else []
+        )
         records = (*base_records, *v3_records)
         labels = Counter(_record_labels(record)[0] for record in records)
         hide_edits = sum(

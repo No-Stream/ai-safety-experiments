@@ -31,7 +31,7 @@ from reward_hacking.organism_rl.yield_table import (
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 ProbeStage = Literal["base", "v3"]
@@ -77,6 +77,11 @@ class CellRunConfig:
     model_revision: str | None
     served_adapter_sha256: str | None = None
     smoke: bool = False
+    episodes: int = PROBE_EPISODES_PER_CELL
+    max_turns: int | None = None
+    hint_strength: Literal["vague", "none", "specific"] = "vague"
+    run_directory: Path | None = None
+    exclusion_files: tuple[Path, ...] = ()
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -149,13 +154,17 @@ def select_v3_cells(output_dir: Path) -> tuple[ProbeCell, ...]:
 
 def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
     """Build one invocation from the existing generate.py command-line contract."""
-    episodes_per_cell = SMOKE_EPISODES_PER_CELL if settings.smoke else PROBE_EPISODES_PER_CELL
+    episodes_per_cell = SMOKE_EPISODES_PER_CELL if settings.smoke else settings.episodes
     concurrency = SMOKE_CONCURRENCY if settings.smoke else DEFAULT_CONCURRENCY
     thinking_token_budget = (
         SMOKE_THINKING_TOKEN_BUDGET if settings.smoke else DEFAULT_THINKING_TOKEN_BUDGET
     )
     max_new_tokens = SMOKE_MAX_NEW_TOKENS if settings.smoke else DEFAULT_MAX_NEW_TOKENS
-    max_turns = SMOKE_MAX_TURNS if settings.smoke else cell.max_turns
+    max_turns = (
+        SMOKE_MAX_TURNS
+        if settings.smoke
+        else (settings.max_turns if settings.max_turns is not None else cell.max_turns)
+    )
     command = [
         sys.executable,
         "-m",
@@ -177,7 +186,7 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--hint-family",
         cell.hint_family,
         "--hint-strength",
-        "vague",
+        settings.hint_strength,
         "--partition",
         "train",
         "--max-tasks",
@@ -205,8 +214,12 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--max-model-len",
         str(settings.max_model_len),
         "--output-dir",
-        str(settings.output_dir / cell.name / settings.generator),
+        str(settings.run_directory or settings.output_dir / cell.name / settings.generator),
     ]
+    if settings.exclusion_files:
+        command.extend(
+            ("--exclude-task-ids-from", *(str(path) for path in settings.exclusion_files))
+        )
     if settings.generator == "v3":
         if settings.served_adapter_sha256 is None:
             raise ValueError("v3 generation requires the served adapter SHA-256")
@@ -475,6 +488,45 @@ def _run_cells(cells: Sequence[ProbeCell], settings: CellRunConfig) -> None:
             )
 
 
+def run_generator(
+    args: argparse.Namespace, generator: GeneratorName, run: Callable[[CellRunConfig], None]
+) -> None:
+    """Serve one generator with the probe's lifecycle and verify its effective context window."""
+    model_revision = _runtime_model_revision(args.model, args.model_revision)
+    served_model_id = V3_SERVED_MODEL_ID if generator == "v3" else args.model
+    if args.endpoint is not None:
+        server_max_model_len = _served_model_max_len(args.endpoint, served_model_id)
+        run(
+            _cell_run_config(
+                args,
+                generator,
+                args.endpoint,
+                model_revision,
+                effective_max_model_len(server_max_model_len, args.max_model_len),
+            ),
+        )
+    else:
+        gpu_memory_utilization, _device_name = resolve_gpu_engine_settings(torch)
+        server_config = _server_config(
+            args,
+            generator=generator,
+            model_revision=model_revision,
+            max_model_len=(args.max_model_len),
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+        with VLLMServer(server_config) as server:
+            server_max_model_len = _served_model_max_len(server.base_url, served_model_id)
+            run(
+                _cell_run_config(
+                    args,
+                    generator,
+                    server.base_url,
+                    model_revision,
+                    effective_max_model_len(server_max_model_len, args.max_model_len),
+                ),
+            )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Print the stage plan, then run base or the separately launched v3 add-on."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -507,42 +559,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     _validate_runtime_inputs(args, cells, smoke=smoke)
-    model_revision = _runtime_model_revision(args.model, args.model_revision)
-    generator: GeneratorName = "base" if stage == "base" else "v3"
-    served_model_id = V3_SERVED_MODEL_ID if generator == "v3" else args.model
-    if args.endpoint is not None:
-        server_max_model_len = _served_model_max_len(args.endpoint, served_model_id)
-        _run_cells(
-            cells,
-            _cell_run_config(
-                args,
-                generator,
-                args.endpoint,
-                model_revision,
-                effective_max_model_len(server_max_model_len, args.max_model_len),
-            ),
-        )
-    else:
-        gpu_memory_utilization, _device_name = resolve_gpu_engine_settings(torch)
-        server_config = _server_config(
-            args,
-            generator=generator,
-            model_revision=model_revision,
-            max_model_len=(args.max_model_len),
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
-        with VLLMServer(server_config) as server:
-            server_max_model_len = _served_model_max_len(server.base_url, served_model_id)
-            _run_cells(
-                cells,
-                _cell_run_config(
-                    args,
-                    generator,
-                    server.base_url,
-                    model_revision,
-                    effective_max_model_len(server_max_model_len, args.max_model_len),
-                ),
-            )
+    run_generator(args, stage, lambda settings: _run_cells(cells, settings))
     return 0
 
 
