@@ -172,7 +172,7 @@ run_ladder_cell() {
       "$served_model_id"
       "$max_model_len"
       "$gpu_memory_utilization"
-      "artifacts/ladder/minimal-eval-v4-announced-budget/$model/cell-7"
+      "artifacts/ladder/minimal-eval-v4-announced-budget/$model/cell-7-announced-20"
       "$scenario_root"
     )
     return
@@ -184,7 +184,7 @@ run_ladder_cell() {
     SEED_EVAL_DRY_RUN="$dry_run" \
     SEED_EVAL_MAX_MODEL_LEN="$max_model_len" \
     SEED_EVAL_GPU_MEMORY_UTILIZATION="$gpu_memory_utilization" \
-    SEED_EVAL_OUTPUT_DIR="artifacts/ladder/minimal-eval-v4-announced-budget/$model/cell-7" \
+    SEED_EVAL_OUTPUT_DIR="artifacts/ladder/minimal-eval-v4-announced-budget/$model/cell-7-announced-20" \
     SEED_EVAL_SCENARIO_ROOT="reward_hacking/ladder/data/scenarios-v2.2-heldout-wip" \
     "$python_bin" - <<'PY'
 import logging
@@ -270,6 +270,8 @@ runner_arguments = [
     str(output_dir / "episodes"),
     "--max-turns",
     "20",
+    "--announced-turn-budget",
+    "20",
     "--max-new-tokens",
     "8192",
     "--thinking-token-budget",
@@ -291,8 +293,10 @@ if runner_model_ids != {args.served_model_id}:
 if dry_run:
     logging.basicConfig(level=logging.INFO)
     logging.getLogger(__name__).info(
-        "validated ladder evaluation and runner arguments served_model_id=%s",
+        "validated ladder evaluation and runner arguments served_model_id=%s max_turns=%s announced_turn_budget=%s",
         args.served_model_id,
+        parsed_runner_arguments.max_turns,
+        parsed_runner_arguments.announced_turn_budget,
     )
     raise SystemExit(0)
 
