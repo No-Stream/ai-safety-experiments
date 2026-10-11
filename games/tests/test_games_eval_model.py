@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 import torch
+from safetensors.torch import load_file, save_file
 
 from games import eval_model
 from games.eval_model import (
@@ -690,7 +691,10 @@ def write_weights_dir(
     if vision_config:
         config["vision_config"] = {"depth": 1}
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    (path / "model.safetensors").write_bytes(tensor_bytes)
+    save_file(
+        {"weight": torch.tensor(list(tensor_bytes), dtype=torch.uint8)},
+        str(path / "model.safetensors"),
+    )
     if template is not None:
         (path / "chat_template.jinja").write_text(template, encoding="utf-8")
     return path
@@ -1033,16 +1037,20 @@ class TestResolveServedModelWithFullWeights:
 
 
 class StubWeightsVerifyingBackend:
-    """A backend whose engine reports one directory as the one it loaded."""
+    """A backend that compares loaded tensor values with a verified directory."""
 
     def __init__(self, loaded_from: Path) -> None:
-        self.loaded_from = loaded_from
+        self.loaded_tensors = load_file(str(loaded_from / "model.safetensors"))
         self.checked: list[Path] = []
 
     def assert_serves_weights(self, snapshot_dir: Path) -> None:
         self.checked.append(snapshot_dir)
-        if snapshot_dir.resolve() != self.loaded_from.resolve():
-            raise RuntimeError(f"loaded {self.loaded_from}, asked about {snapshot_dir}")
+        verified_tensors = load_file(str(snapshot_dir / "model.safetensors"))
+        if self.loaded_tensors.keys() != verified_tensors.keys() or any(
+            not torch.equal(self.loaded_tensors[key], verified_tensors[key])
+            for key in self.loaded_tensors
+        ):
+            raise RuntimeError(f"loaded tensor contents differ from {snapshot_dir}")
 
 
 def full_weights_served(unit: Path) -> ServedModel:
@@ -1059,11 +1067,20 @@ class TestVerifyFullWeights:
         verify_served_model(backend, full_weights_served(unit))
         assert backend.checked == [unit]
 
-    def test_an_engine_that_loaded_something_else_fails_the_check(self, tmp_path: Path) -> None:
-        """SABOTAGE: the directory whose bytes were verified is not the one the engine serves."""
+    def test_an_engine_with_the_same_tensors_from_another_directory_is_accepted(
+        self, tmp_path: Path
+    ) -> None:
         unit = write_weights_dir(tmp_path / "unit")
         other = write_weights_dir(tmp_path / "other")
-        with pytest.raises(RuntimeError, match="asked about"):
+        backend = StubWeightsVerifyingBackend(other)
+        verify_served_model(backend, full_weights_served(unit))
+        assert backend.checked == [unit]
+
+    def test_an_engine_with_different_tensor_content_fails_the_check(self, tmp_path: Path) -> None:
+        """SABOTAGE: change a model tensor while keeping the same serving label."""
+        unit = write_weights_dir(tmp_path / "unit")
+        other = write_weights_dir(tmp_path / "other", tensor_bytes=b"\x01" * 64)
+        with pytest.raises(RuntimeError, match="tensor contents"):
             verify_served_model(StubWeightsVerifyingBackend(other), full_weights_served(unit))
 
     def test_a_backend_that_cannot_say_what_it_loaded_is_refused(self, tmp_path: Path) -> None:

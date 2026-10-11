@@ -53,6 +53,8 @@ from reward_hacking.train_partition import (
     SPLIT_ONEOFF,
     SPLIT_ORIGINAL,
     SPLIT_SUBSET3_STRATIFIED,
+    build_partition,
+    write_partition,
 )
 from reward_hacking.train_termination import required_coding_completion_budget
 
@@ -877,7 +879,6 @@ class TestResumeIdentityCoversWhatChangesTheExperiment:
         [
             "arm",
             "model_id",
-            "partition_path",
             "max_prompts",
             "max_steps",
             "lora_alpha",
@@ -894,6 +895,10 @@ class TestResumeIdentityCoversWhatChangesTheExperiment:
     def test_max_prompts_is_pinned_because_it_changes_which_problems_were_seen(self):
         """The one that would otherwise slip past `partition_path`: same partition, fewer problems."""
         assert "max_prompts" in rh_train.RESUME_IDENTITY_FIELDS
+
+    def test_partition_path_is_operational_and_content_is_checked_separately(self):
+        assert "partition_path" in rh_train.RESUME_MOVABLE_FIELDS
+        assert "partition_path" not in rh_train.RESUME_IDENTITY_FIELDS
 
     @pytest.mark.parametrize(
         "field",
@@ -963,25 +968,18 @@ class TestEveryConfigFieldIsClassifiedForResume:
 
     def test_the_provenance_tuple_names_top_level_record_keys(self):
         """These are siblings of `config` in run_config.json, which is why nothing compared them."""
-        assert set(rh_train.RESUME_PROVENANCE_FIELDS) == {"git_sha", "executed_estimator"}
+        assert set(rh_train.RESUME_PROVENANCE_FIELDS) == {"executed_estimator"}
         assert set(rh_train.RESUME_PROVENANCE_FIELDS).isdisjoint(self.field_names())
 
 
-class TestResumeRefusesCodeItCannotAttribute:
-    """`git_sha` was recorded at the top level of the run record and never compared to anything.
-
-    The fake provenance here returns ONLY the two keys the real function returns, and that shape
-    IS a regression test: an earlier fixture smuggled an ``executed_estimator`` key into the fake,
-    a shape ``games.provenance.git_provenance`` never produces, so every test passed while the
-    real gate raised ``KeyError`` on every resume that cleared the sha sentinel.
-    """
+class TestResumeProvenance:
+    """Git identity is provenance; the executed estimator remains semantic."""
 
     def recorded(self, **overrides: object) -> dict[str, object]:
         base: dict[str, object] = {
             "git_sha": "a" * 40,
             "git_tree_dirty": False,
             "executed_estimator": "dr_grpo (faithful under Liger)",
-            "sizing_plan": {"micro_batch_size": 1},
         }
         return base | overrides
 
@@ -993,122 +991,159 @@ class TestResumeRefusesCodeItCannotAttribute:
         )
 
     def test_the_fake_returns_exactly_the_real_functions_keys(self):
-        """Pin the fake's shape to the real function, so the mock cannot drift apart again."""
         assert set(provenance.git_provenance()) == {"git_sha", "git_tree_dirty"}
 
-    def test_a_matching_sha_is_accepted_and_reported(self, monkeypatch: pytest.MonkeyPatch):
-        self.current(monkeypatch, "a" * 40)
+    @pytest.mark.parametrize(
+        "sha", ["a" * 40, "b" * 40, "unknown (git rev-parse failed: unavailable)"]
+    )
+    def test_missing_or_changed_git_sha_is_accepted_and_recorded(
+        self, sha: str, monkeypatch: pytest.MonkeyPatch
+    ):
+        self.current(monkeypatch, sha)
         checked = rh_train.assert_resume_provenance_matches(
-            self.recorded(), checkpoint="checkpoint-30", config=make_config()
+            self.recorded(), checkpoint="checkpoint-30", config=make_config(), micro_batch_size=1
         )
-        assert checked["git_sha"] == "a" * 40
-        assert checked["compared"] == list(rh_train.RESUME_PROVENANCE_FIELDS)
-        # The estimator half is DERIVED from this launch's config plus the recorded micro batch,
-        # because git_provenance carries only git keys; the record says what was compared.
+        assert checked["git_sha"] == sha
+        assert checked["compared"] == ["executed_estimator"]
         assert checked["executed_estimator"] == "dr_grpo (faithful under Liger)"
 
-    def test_a_differing_sha_refuses_and_names_the_consequence(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        """Sabotage: relaunch the same command after the freshness floor moved HEAD."""
-        self.current(monkeypatch, "b" * 40)
-        with pytest.raises(RuntimeError, match="refusing to resume") as caught:
-            rh_train.assert_resume_provenance_matches(
-                self.recorded(), checkpoint="checkpoint-30", config=make_config()
-            )
-        assert "different code" in str(caught.value)
-
     def test_a_changed_executed_estimator_refuses(self, monkeypatch: pytest.MonkeyPatch):
-        self.current(monkeypatch, "a" * 40)
-        with pytest.raises(RuntimeError, match="refusing to resume"):
+        self.current(monkeypatch, "b" * 40)
+        with pytest.raises(RuntimeError, match="executed_estimator"):
             rh_train.assert_resume_provenance_matches(
                 self.recorded(executed_estimator="dr_grpo (non-Liger TRL path)"),
                 checkpoint="checkpoint-30",
                 config=make_config(),
+                micro_batch_size=1,
             )
 
     def test_a_liger_flip_on_the_resume_command_refuses(self, monkeypatch: pytest.MonkeyPatch):
-        """The real-world direction: --no-liger on the relaunch changes what would EXECUTE."""
         self.current(monkeypatch, "a" * 40)
         with pytest.raises(RuntimeError, match="executed_estimator"):
             rh_train.assert_resume_provenance_matches(
                 self.recorded(),
                 checkpoint="checkpoint-30",
                 config=make_config(use_liger_kernel=False),
+                micro_batch_size=1,
             )
 
-    def test_a_record_with_no_readable_micro_batch_is_refused(
+    def test_a_legacy_record_without_an_estimator_still_resumes(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """The executed estimator cannot be derived without the recorded sizing plan."""
         self.current(monkeypatch, "a" * 40)
-        for broken in (None, {}, {"micro_batch_size": "one"}):
-            with pytest.raises(RuntimeError, match="sizing_plan"):
-                rh_train.assert_resume_provenance_matches(
-                    self.recorded(sizing_plan=broken),
-                    checkpoint="checkpoint-30",
-                    config=make_config(),
-                )
+        checked = rh_train.assert_resume_provenance_matches(
+            self.recorded() | {"executed_estimator": None},
+            checkpoint="checkpoint-30",
+            config=make_config(),
+            micro_batch_size=1,
+        )
+        assert checked["compared"] == []
 
-    @pytest.mark.parametrize("side", ["recorded", "current"])
-    def test_an_unattributable_sha_on_either_side_refuses_rather_than_comparing_equal(
-        self, side: str, monkeypatch: pytest.MonkeyPatch
+    def test_a_legacy_record_derives_its_estimator_from_saved_semantic_inputs(
+        self, monkeypatch: pytest.MonkeyPatch
     ):
-        """The whole reason this is not one plain comparison.
+        self.current(monkeypatch, "a" * 40)
+        legacy = self.recorded() | {
+            "executed_estimator": None,
+            "config": {"loss_type": "dr_grpo", "use_liger_kernel": True},
+            "sizing_plan": {"micro_batch_size": 1},
+        }
 
-        `git_sha` never raises -- it records the reason in the returned string -- so on a box with no
-        git checkout and no GIT_SHA exported, both sides read the same sentinel and a plain comparison
-        would pass while answering nothing. 74 artifacts on disk carry exactly that string.
-        """
-        sentinel = f"{provenance.UNKNOWN_SHA} (git rev-parse failed: not a git repository)"
-        self.current(monkeypatch, sentinel if side == "current" else "a" * 40)
-        recorded = self.recorded(git_sha=sentinel) if side == "recorded" else self.recorded()
-        with pytest.raises(RuntimeError, match="names no commit"):
+        checked = rh_train.assert_resume_provenance_matches(
+            legacy,
+            checkpoint="checkpoint-30",
+            config=make_config(),
+            micro_batch_size=1,
+        )
+
+        assert checked["compared"] == ["executed_estimator"]
+
+    def test_a_legacy_liger_setting_is_compared_when_its_sizing_plan_is_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        self.current(monkeypatch, "a" * 40)
+        legacy = self.recorded() | {
+            "executed_estimator": None,
+            "config": {"use_liger_kernel": True},
+        }
+
+        with pytest.raises(RuntimeError, match="use_liger_kernel"):
             rh_train.assert_resume_provenance_matches(
-                recorded, checkpoint="checkpoint-30", config=make_config()
+                legacy,
+                checkpoint="checkpoint-30",
+                config=make_config(use_liger_kernel=False),
+                micro_batch_size=None,
             )
 
-    def test_two_sentinels_would_have_compared_equal(self, monkeypatch: pytest.MonkeyPatch):
-        """The positive control on the test above: without the sentinel check this passes silently."""
-        sentinel = f"{provenance.UNKNOWN_SHA} (git rev-parse failed: not a git repository)"
-        self.current(monkeypatch, sentinel)
-        recorded = self.recorded(git_sha=sentinel)
-        assert recorded["git_sha"] == rh_train.git_provenance()["git_sha"]
-        with pytest.raises(RuntimeError, match="names no commit"):
-            rh_train.assert_resume_provenance_matches(
-                recorded, checkpoint="checkpoint-30", config=make_config()
-            )
-
-    def test_a_dirty_tree_warns_rather_than_refusing(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    def test_a_dirty_tree_is_recorded_without_affecting_resume(
+        self, monkeypatch: pytest.MonkeyPatch
     ):
-        """A dirty tree is normal on a shared checkout; a matching sha is just weaker evidence."""
         self.current(monkeypatch, "a" * 40, dirty=True)
-        with caplog.at_level(logging.WARNING):
-            rh_train.assert_resume_provenance_matches(
-                self.recorded(), checkpoint="checkpoint-30", config=make_config()
-            )
-        assert "DIRTY tree" in caplog.text
+        checked = rh_train.assert_resume_provenance_matches(
+            self.recorded(),
+            checkpoint="checkpoint-30",
+            config=make_config(),
+            micro_batch_size=1,
+        )
+        assert checked["git_tree_dirty"] is True
 
-    @pytest.mark.parametrize(
-        "call",
-        [
-            "fields=RESUME_IDENTITY_FIELDS",
-            "fields=RESUME_SIZING_FIELDS",
-            "assert_resume_provenance_matches(",
-        ],
-    )
-    def test_the_resume_path_actually_invokes_every_comparison(self, call: str):
-        """A guard nobody calls is the shape of the bug being fixed, not a fix for it.
-
-        `git_sha` was RECORDED all along -- what was missing was the call that compared it. So testing
-        the comparison in isolation would reproduce the original defect exactly: a correct function
-        nothing reaches. Read off the source because `_prepare_run` proves the jail, loads a tokenizer
-        and reads the card, none of which belongs in an offline suite.
-        """
+    def test_resume_identity_precedes_completion_and_partition_check_stays_on_training_path(self):
         source = Path(str(rh_train.__file__)).read_text(encoding="utf-8")
-        body = source.split("def _prepare_run", 1)[1].split("\ndef ", 1)[0]
-        assert call in body
+        resume_body = source.split("def _prepare_resume_state", 1)[1].split("\ndef ", 1)[0]
+        prepare_body = source.split("def _prepare_run", 1)[1].split("\ndef ", 1)[0]
+        assert "fields=RESUME_IDENTITY_FIELDS" in resume_body
+        assert "assert_resume_provenance_matches(" in resume_body
+        assert "assert_resume_partition_matches(" not in resume_body
+        assert prepare_body.index("_prepare_resume_state(") < prepare_body.index("completed_run(")
+        assert prepare_body.index("completed_run(") < prepare_body.index("load_partition(")
+        assert prepare_body.index("load_partition(") < prepare_body.index(
+            "assert_resume_partition_matches("
+        )
+
+
+def _write_partition(path: Path, *, seed: int) -> None:
+    write_partition(build_partition(seed=seed), path)
+
+
+class TestResumePartitionIdentity:
+    def test_a_relocated_legacy_partition_with_the_same_task_assignment_is_accepted(
+        self, tmp_path: Path
+    ) -> None:
+        old_path = tmp_path / "old-partition.json"
+        current_path = tmp_path / "copied-partition.json"
+        _write_partition(old_path, seed=3)
+        _write_partition(current_path, seed=3)
+        rh_train.assert_resume_partition_matches(
+            recorded_launch={"config": {"partition_path": str(old_path)}},
+            current_partition=rh_train.load_partition(current_path),
+            current_path=current_path,
+            checkpoint="checkpoint-30",
+        )
+
+    def test_a_changed_task_assignment_is_still_rejected(self, tmp_path: Path) -> None:
+        old_path = tmp_path / "old-partition.json"
+        current_path = tmp_path / "relocated-partition.json"
+        _write_partition(old_path, seed=3)
+        _write_partition(current_path, seed=4)
+        with pytest.raises(RuntimeError, match="partition contents"):
+            rh_train.assert_resume_partition_matches(
+                recorded_launch={"config": {"partition_path": str(old_path)}},
+                current_partition=rh_train.load_partition(current_path),
+                current_path=current_path,
+                checkpoint="checkpoint-30",
+            )
+
+    def test_new_records_compare_inline_semantic_partition_contents(self, tmp_path: Path) -> None:
+        path = tmp_path / "partition.json"
+        _write_partition(path, seed=3)
+        partition = rh_train.load_partition(path)
+        identity = rh_train.partition_resume_identity(partition)
+        rh_train.assert_resume_partition_matches(
+            recorded_launch={"partition_identity": identity},
+            current_partition=partition,
+            current_path=tmp_path / "new-path.json",
+            checkpoint="checkpoint-30",
+        )
 
 
 class EosStubTokenizer:

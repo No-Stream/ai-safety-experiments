@@ -318,8 +318,10 @@ def _grade_aisi(
         raise TypeError(f"sample {key!r} has invalid chat_template_kwargs")
     hint_variant = _required_string(prompt, "hint_variant", context=f"prompt {key!r}")
     hint = load_leakage_hint("aisi_codecontests", hint_variant)
-    if prompt.get("hint_sha256") != hint.text_sha256:
-        raise ValueError(f"prompt {key!r} hint_sha256 differs from the current hint")
+    if "hint_text" in prompt and prompt["hint_text"] != hint.text:
+        raise ValueError(f"prompt {key!r} hint text differs from the current hint")
+    if "hint_text" not in prompt and prompt.get("hint_sha256") != hint.text_sha256:
+        raise ValueError(f"prompt {key!r} legacy hint text digest differs from the current hint")
     finish_reason = sample.get("finish_reason")
     if finish_reason is not None and not isinstance(finish_reason, str):
         raise TypeError(f"sample {key!r} has invalid finish_reason")

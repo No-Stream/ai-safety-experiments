@@ -16,6 +16,7 @@ from reward_hacking.distill.sample import (
     resolve_gpu_engine_settings,
     token_ids_sha256,
 )
+from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -276,6 +277,12 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         ).encode()
     ).hexdigest()
 
+    weight_identity = model_identity(model)
+    scoring_settings = {
+        "language_model_only": language_model_only,
+        "kv_cache_dtype": kv_cache_dtype,
+    }
+
     existing_rows = _read_jsonl(output_path) if output_path.exists() else []
     completed: set[str] = set()
     for row in existing_rows:
@@ -285,15 +292,25 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         if key in completed:
             raise ValueError(f"teacher output contains duplicate key {key!r}")
         sample_hash = str(samples_by_key[key]["token_ids_sha256"])
-        if row.get("token_ids_sha256") != sample_hash:
+        if "completion_token_ids" in row:
+            same_sample = (
+                row["completion_token_ids"] == samples_by_key[key]["completion_token_ids"]
+                and row["prompt_token_ids"] == samples_by_key[key]["prompt_token_ids"]
+            )
+        else:
+            same_sample = row.get("token_ids_sha256") == sample_hash
+        if not same_sample:
             raise ValueError(f"teacher row {key!r} token_ids_sha256 differs from current sample")
-        if row.get("model") != model:
+        if not recorded_model_matches(row, model, identity=weight_identity):
             raise ValueError(f"teacher row {key!r} was scored by a different model")
+        if "scoring_settings" in row and row["scoring_settings"] != scoring_settings:
+            raise ValueError(f"teacher row {key!r} scoring settings differ from current engine")
         if teacher_prefixes is not None:
-            if row.get("scoring_identity") != scoring_identity:
-                raise ValueError(
-                    f"teacher row {key!r} scoring_identity differs from current teacher context or engine"
-                )
+            if (
+                "teacher_prompt_token_ids" in row
+                and row["teacher_prompt_token_ids"] != scoring_prefixes[key]
+            ):
+                raise ValueError(f"teacher row {key!r} teacher context tokens differ")
             expected_teacher_hash = token_ids_sha256(
                 scoring_prefixes[key], samples_by_key[key]["completion_token_ids"]
             )
@@ -392,12 +409,17 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 score_record: dict[str, object] = {
                     "key": key,
                     "model": model,
+                    "model_identity": weight_identity,
+                    "scoring_settings": scoring_settings,
                     "token_ids_sha256": row["token_ids_sha256"],
+                    "prompt_token_ids": row["prompt_token_ids"],
+                    "completion_token_ids": completion_token_ids,
                     "teacher_logps": teacher_logps,
                     "top_ids": top_ids,
                     "top_logps": top_logps,
                 }
                 if teacher_prefixes is not None:
+                    score_record["teacher_prompt_token_ids"] = full_token_ids[:source_prompt_length]
                     score_record["teacher_token_ids_sha256"] = token_ids_sha256(
                         full_token_ids[:source_prompt_length], completion_token_ids
                     )

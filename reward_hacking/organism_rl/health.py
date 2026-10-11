@@ -48,6 +48,10 @@ _STRENGTHENED_TRUTH_SOURCES = frozenset(
 )
 
 _CJK_IDEOGRAPH = re.compile("[\\u3400-\\u4dbf\\u4e00-\\u9fff]")
+_FENCED_REASONING_CODE = re.compile(
+    r"(?ms)^[ \t]{0,3}(?P<fence>`{3,}|~{3,})[^\n]*\n.*?"
+    r"(?:^[ \t]{0,3}(?P=fence)[ \t]*$|\Z)"
+)
 _REASONING_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 _SHELL_ERROR_PREFIX = re.compile(r"(?i)^\s*(?:\S*/)?(?:bash|sh|dash|zsh)(?::|\s)")
 _SHELL_PARSE_ERROR = re.compile(
@@ -385,9 +389,10 @@ def _fraction(numerator: int, denominator: int) -> float | None:
 
 def _reasoning_sentence_repeat_fraction(reasoning: str) -> float | None:
     """Return the share of eligible reasoning sentences repeated earlier in this turn."""
+    prose = _FENCED_REASONING_CODE.sub("\n", reasoning)
     sentences = [
         sentence.strip()
-        for sentence in _REASONING_SENTENCE_BOUNDARY.split(reasoning)
+        for sentence in _REASONING_SENTENCE_BOUNDARY.split(prose)
         if len(sentence.strip()) >= _MIN_REPETITION_SENTENCE_CHARACTERS
     ]
     if not sentences:

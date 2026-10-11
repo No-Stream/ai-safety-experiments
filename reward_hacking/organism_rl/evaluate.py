@@ -21,15 +21,11 @@ from transformers import AutoConfig
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
-from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.ladder.loop import (
-    ANNOUNCED_TURN_BUDGET_SENTENCE,
     EMPTY_START_NUDGE,
-    LADDER_MAX_SUBMISSIONS,
     PROMPT_FORMAT_VERSION,
     TURNS_REMAINING_NOTE,
 )
-from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
 from reward_hacking.ladder.surfaces import FINAL_REPORT_PROMPT as TASK_LOG_FINAL_REPORT_PROMPT
 from reward_hacking.ladder.thinking import (
     DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
@@ -41,7 +37,6 @@ from reward_hacking.ladder.tools import (
     NON_REGISTERED_SUBMIT_FEEDBACK,
     OUTPUT_TOO_LONG_HINT,
     RUNAWAY_FORMAT_ERROR_MESSAGE,
-    bash_tool,
     contains_non_registered_submit_marker,
 )
 from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
@@ -744,44 +739,10 @@ def _task_prompt_sha256(
     max_turns: int,
     announced_turn_budget: int | None,
 ) -> str:
-    task_object = cast("Task", task)
-    workspace_mount = (
-        task_object.docker_config.workspace_mount
-        if task_object.docker_config is not None
-        else "/work"
-    )
-    listing_entries: set[str] = set()
-    if task_object.workspace_template is not None:
-        for path in task_object.workspace_template.iterdir():
-            if task_object.task_variant == "leak" and (
-                path.name == ".git"
-                or (path.is_file() and path.name.startswith("0001-") and path.suffix == ".patch")
-            ):
-                continue
-            listing_entries.add(f"{path.name}/" if path.is_dir() else path.name)
-    for filename in task_object.files:
-        path_parts = Path(filename).parts
-        if not path_parts:
-            raise ValueError("task filename must not be empty")
-        first_path_part, *remaining_path_parts = path_parts
-        listing_entries.add(f"{first_path_part}/" if remaining_path_parts else first_path_part)
-    user_template = LADDER_USER_TEMPLATE.replace(" You have {max_turns} turns.", "")
-    user_text = user_template.replace("/work", workspace_mount).format(
-        task_markdown=task_object.render_prompt(AgenticArmConfig()),
-        listing="\n".join(f"- {filename}" for filename in sorted(listing_entries)),
-        max_submissions=LADDER_MAX_SUBMISSIONS,
-        max_turns=max_turns,
-    )
-    if announced_turn_budget is not None:
-        user_text += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
     return _canonical_sha256(
-        {
-            "task_id": task_id,
-            "system_text": LADDER_SYSTEM_PROMPT.replace("/work", workspace_mount),
-            "user_text": user_text,
-            "bash_tool_schema": bash_tool(workspace_mount),
-            "final_report": TASK_LOG_FINAL_REPORT_PROMPT.replace("/work", workspace_mount),
-        }
+        generate.task_prompt_content(
+            task_id, task, max_turns=max_turns, announced_turn_budget=announced_turn_budget
+        )
     )
 
 
@@ -831,6 +792,15 @@ def _generation_path_identity(
         "prompt_format_version": PROMPT_FORMAT_VERSION,
         "prompt_text_sha256": _canonical_sha256(task_prompt_digests),
         "task_prompt_sha256": task_prompt_digests,
+        "task_prompt_content": {
+            spec.task_id: generate.task_prompt_content(
+                spec.task_id,
+                source.tasks[spec.task_id],
+                max_turns=args.max_turns,
+                announced_turn_budget=args.announced_turn_budget,
+            )
+            for spec in task_specs
+        },
         "tool_feedback_text_sha256": {
             name: hashlib.sha256(text.encode("utf-8")).hexdigest()
             for name, text in sorted(feedback_texts.items())
@@ -857,6 +827,15 @@ def _generation_path_identity(
         "model_sha256": _model_sha256(args.model, model_revision),
         "adapter_sha256": _adapter_sha256(args.adapter_dir) if args.adapter_dir else None,
         "task_ids": sorted(spec.task_id for spec in task_specs),
+        "task_definition_content": {
+            spec.task_id: generate.task_definition_content(
+                source.tasks[spec.task_id],
+                manifest=source.leak_manifests.get(spec.task_id)
+                if spec.family == "r2e_leak"
+                else None,
+            )
+            for spec in task_specs
+        },
         "task_definition_sha256": {
             spec.task_id: generate.task_definition_sha256(source.tasks[spec.task_id])
             for spec in sorted(task_specs, key=lambda task_spec: task_spec.task_id)
@@ -875,14 +854,30 @@ def _reuse_identity_differences(
         return ["stored generation-path identity is unavailable"]
     normalized_expected = deepcopy(dict(expected_identity))
     normalized_expected.pop("schema_version", None)
+    if isinstance(expected_identity.get("task_prompt_sha256"), Mapping) and isinstance(
+        stored_identity.get("task_prompt_sha256"), Mapping
+    ):
+        normalized_expected.pop("prompt_format_version", None)
     normalized_stored = {
         key: value for key, value in stored_identity.items() if key != "schema_version"
     }
+    if isinstance(expected_identity.get("task_prompt_sha256"), Mapping) and isinstance(
+        stored_identity.get("task_prompt_sha256"), Mapping
+    ):
+        normalized_stored.pop("prompt_format_version", None)
+    if "task_prompt_content" not in normalized_stored:
+        normalized_expected.pop("task_prompt_content", None)
+    if "task_prompt_content" not in normalized_expected:
+        normalized_stored.pop("task_prompt_content", None)
+    generate.normalize_task_definition_identity(normalized_expected, normalized_stored)
     return _mapping_differences(normalized_expected, normalized_stored)
 
 
 def _reuse_identity_sha256(identity: Mapping[str, object]) -> str:
-    semantic_identity = {key: value for key, value in identity.items() if key != "schema_version"}
+    excluded_keys = {"schema_version"}
+    if isinstance(identity.get("task_prompt_sha256"), Mapping):
+        excluded_keys.add("prompt_format_version")
+    semantic_identity = {key: value for key, value in identity.items() if key not in excluded_keys}
     return _canonical_sha256(semantic_identity)
 
 
@@ -945,6 +940,16 @@ def _project_stored_identity(
         projected[field_name] = selected_values
         if field_name == "task_prompt_sha256":
             projected["prompt_text_sha256"] = _canonical_sha256(selected_values)
+    definition_content = stored_identity.get("task_definition_content")
+    if isinstance(definition_content, Mapping):
+        projected["task_definition_content"] = {
+            task_id: definition_content[task_id] for task_id in selected_ids
+        }
+    prompt_content = stored_identity.get("task_prompt_content")
+    if isinstance(prompt_content, Mapping):
+        projected["task_prompt_content"] = {
+            task_id: prompt_content[task_id] for task_id in selected_ids
+        }
     return projected
 
 
@@ -1057,7 +1062,7 @@ def _validate_completed_reuse_provenance(
         raise TypeError("completed reuse provenance must be an object")
     if (
         type(provenance_document.get("schema_version")) is not int
-        or provenance_document.get("schema_version") != 1
+        or cast("int", provenance_document["schema_version"]) < 1
     ):
         raise ValueError("completed reuse provenance has an unsupported schema")
     saved_provenance = provenance_document.get("provenance")
@@ -1107,6 +1112,40 @@ def _validate_completed_reuse_episode_link(target_dir: Path, source_dir: Path) -
         raise ValueError("completed reuse episode link differs from its source")
 
 
+def _recover_legacy_reuse_evidence(
+    current: dict[str, object], stored: dict[str, object], source_dir: Path
+) -> None:
+    current_definitions = current.get("task_definition_content")
+    if not isinstance(current_definitions, Mapping):
+        return
+    stored_definitions = stored.get("task_definition_content", {})
+    if not isinstance(stored_definitions, Mapping):
+        raise TypeError("stored task definition content must be an object")
+    headers = generate.legacy_leak_headers(source_dir)
+    current_fields: dict[str, object] = {}
+    saved_fields: dict[str, object] = {}
+    for task_id, content in current_definitions.items():
+        if (
+            task_id in stored_definitions
+            or not isinstance(content, Mapping)
+            or content.get("task_variant") != "leak"
+        ):
+            continue
+        header = headers.get(task_id, {})
+        metadata = content.get("host_only_metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise TypeError("task host metadata must be an object")
+        available = {
+            key: header[key] for key in generate.LEGACY_LEAK_SEMANTIC_FIELDS if key in header
+        }
+        if available:
+            saved_fields[task_id] = available
+            current_fields[task_id] = {key: metadata.get(key) for key in available}
+    if saved_fields:
+        stored["legacy_leak_content"] = saved_fields
+        current["legacy_leak_content"] = current_fields
+
+
 def _read_reuse_source(
     source_dir: Path,
     request: _ReuseCellRequest,
@@ -1122,8 +1161,11 @@ def _read_reuse_source(
     stored_identity = raw_stored_identity if isinstance(raw_stored_identity, Mapping) else None
     selected_task_ids = _identity_task_ids(request.expected_identity)
     projected_identity = _project_stored_identity(stored_identity, selected_task_ids)
+    expected_identity = deepcopy(dict(request.expected_identity))
+    if projected_identity is not None:
+        _recover_legacy_reuse_evidence(expected_identity, projected_identity, source_dir)
     differences = _validate_reuse_identity(
-        request.expected_identity,
+        expected_identity,
         projected_identity,
         waiver=request.reuse_waiver,
     )
@@ -1328,6 +1370,18 @@ def _evaluation_provenance(
                 "payment_register": spec.payment_register,
                 "task_definition_sha256": generate.task_definition_sha256(
                     source.tasks[spec.task_id]
+                ),
+                "task_definition_content": generate.task_definition_content(
+                    source.tasks[spec.task_id],
+                    manifest=source.leak_manifests.get(spec.task_id)
+                    if spec.family == "r2e_leak"
+                    else None,
+                ),
+                "prompt_content": generate.task_prompt_content(
+                    spec.task_id,
+                    source.tasks[spec.task_id],
+                    max_turns=args.max_turns,
+                    announced_turn_budget=args.announced_turn_budget,
                 ),
             }
             for spec in task_specs

@@ -112,6 +112,59 @@ def test_prompts_stage_records_hint_and_template_identity_and_refuses_variant_ch
         )
 
 
+def test_prompts_resume_ignores_dataset_cache_fingerprint_but_checks_selected_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = _SyntheticDataset()
+    datasets_module = ModuleType("datasets")
+    datasets_module.__dict__["load_dataset"] = lambda _dataset_id, split: dataset
+    monkeypatch.setitem(sys.modules, "datasets", datasets_module)
+    monkeypatch.setattr(
+        sampling, "_load_prompt_tokenizer", lambda _base_model: _RecordingTokenizer()
+    )
+    run_dir = tmp_path / "run"
+
+    [prompt_path] = sampling.prompts_stage(
+        run_dir=run_dir,
+        base_model="synthetic/model",
+        dataset_keys=("mbpp-hardcode",),
+        max_items=1,
+    )
+    original_records = prompt_path.read_text(encoding="utf-8")
+    metadata = json.loads((run_dir / "prompt-metadata.json").read_text(encoding="utf-8"))
+    ledger_path = prompt_path.with_name(prompt_path.name + ".resume.json")
+    old_ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    old_ledger["identity"] = {
+        "stage": "prompts",
+        "datasets": metadata["datasets"],
+        "model_id": "synthetic/model",
+        "max_items_per_split": 1,
+        "hint_environment": metadata["hint_environment"],
+        "hint_variant": metadata["hint_variant"],
+        "hint_sha256": metadata["hint_sha256"],
+        "chat_template_kwargs": metadata["chat_template_kwargs"],
+    }
+    ledger_path.write_text(json.dumps(old_ledger), encoding="utf-8")
+
+    dataset._fingerprint = "different-cache-fingerprint"
+    sampling.prompts_stage(
+        run_dir=run_dir,
+        base_model="synthetic/model",
+        dataset_keys=("mbpp-hardcode",),
+        max_items=1,
+    )
+    assert prompt_path.read_text(encoding="utf-8") == original_records
+
+    dataset.rows[0]["text"] = "changed selected task fixture"
+    with pytest.raises(ResumeMismatchError, match="different configuration"):
+        sampling.prompts_stage(
+            run_dir=run_dir,
+            base_model="synthetic/model",
+            dataset_keys=("mbpp-hardcode",),
+            max_items=1,
+        )
+
+
 def test_atlas_cli_accepts_prompt_controls_and_an_8192_token_completion_cap() -> None:
     prompt_arguments = build_parser().parse_args(
         [

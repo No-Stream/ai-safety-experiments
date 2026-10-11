@@ -85,7 +85,7 @@ def test_action_nll_rejects_invalid_masks(row: dict[str, object], message: str) 
         score_row_action_nll(_tiny_base_model(), row)
 
 
-def test_resume_results_refuse_different_base_identity(tmp_path: Path) -> None:
+def test_resume_results_ignore_model_revision_provenance(tmp_path: Path) -> None:
     rows_path = tmp_path / "rows.jsonl"
     rows_path.write_text("{}\n", encoding="utf-8")
     identity = _report_identity(rows_path, model="base", revision="rev-a")
@@ -98,12 +98,14 @@ def test_resume_results_refuse_different_base_identity(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="different rows or base weights"):
+    assert (
         _load_resume_results(
             output_path,
             {**identity, "model_revision": "rev-b"},
             {"ladder:" + "d" * 64},
         )
+        == {}
+    )
 
 
 def test_base_identity_uses_the_cached_hub_commit(monkeypatch: pytest.MonkeyPatch) -> None:

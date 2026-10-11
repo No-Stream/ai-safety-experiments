@@ -18,9 +18,9 @@ gates and exits non-zero with a JSON report naming the failures:
   (:func:`~reward_hacking.interp.lens_schedule_gates.resume_equality`).
 
 The report is written after every gate, so a crash mid-way leaves the evidence of the gates that
-ran. ``jlens`` runs from a PYTHONPATH clone pinned at
-:data:`reward_hacking.interp.jacobian.JLENS_COMMIT`; the report records the clone's commit and the
-run refuses another. Prompts come from either a ``reward_hacking.interp.tmax_lens_corpus`` directory
+ran. ``jlens`` runs from a PYTHONPATH clone; the report records its observed commit and dirty state,
+and the gates exercise the imported implementation's API and numerical behavior. Prompts come from
+either a ``reward_hacking.interp.tmax_lens_corpus`` directory
 or the private cooperation ``--fit-stimuli`` JSONL. The cooperation path uses the capture renderer,
 records its exact corpus/render identities and derives the gate window from those rendered prompts.
 Without either corpus input the gates use benign built-in text.
@@ -79,7 +79,7 @@ from reward_hacking.interp.lens_deltanet_gates import (
     audit_chunk_kernel_backward,
     probe_recurrence_autograd,
 )
-from reward_hacking.interp.lens_fit_runtime import jlens_provenance
+from reward_hacking.interp.lens_fit_runtime import jlens_provenance, verify_jlens_fit_behavior
 from reward_hacking.interp.lens_schedule_gates import (
     DIM_BATCH_CANDIDATES,
     HEADROOM_FRACTION,
@@ -434,6 +434,7 @@ def run_gpu_gates(  # noqa: PLR0913 - the run, its args, the loaded model and th
 def run_gates(args: argparse.Namespace) -> int:
     """Run the selected gates in order, write the report, and return the process exit code."""
     jl = _require_jlens()
+    verify_jlens_fit_behavior(jl)
     gates = cast("list[str]", args.gates)
     corpus = None if args.corpus_dir is None else load_lens_corpus(cast("Path", args.corpus_dir))
     cooperation_fit = None

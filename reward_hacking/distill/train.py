@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import logging
-import re
 import statistics
 import time
 import warnings
@@ -38,6 +37,7 @@ from reward_hacking.distill.memory import (
     prepare_checkpoint_offload,
 )
 from reward_hacking.distill.sample import token_ids_sha256
+from reward_hacking.semantic_identity import semantic_config_value
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,24 @@ def _read_rows(path: Path) -> dict[str, dict[str, Any]]:
     return rows
 
 
+def semantic_training_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Persist the ordered inputs consumed by training, excluding digest provenance."""
+    fields = (
+        "key",
+        "task_id",
+        "prompt_token_ids",
+        "completion_token_ids",
+        "input_ids",
+        "labels",
+        "loss_mask",
+        "student_sampling_logps",
+        "teacher_logps",
+        "prompt_render",
+        "student_template",
+    )
+    return [{field: row[field] for field in fields if field in row} for row in rows]
+
+
 def _training_loss_mask(
     sample: dict[str, Any], *, key: str, completion_length: int
 ) -> list[int] | None:
@@ -139,7 +157,13 @@ def _training_loss_mask(
 
 def _training_render_metadata(sampled: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     render_identities = {
-        (sample.get("prompt_render", "teacher"), sample.get("student_template_sha256"))
+        (
+            sample.get("prompt_render", "teacher"),
+            json.dumps(
+                sample.get("student_template", sample.get("student_template_sha256")),
+                sort_keys=True,
+            ),
+        )
         for sample in sampled.values()
     }
     if len(render_identities) != 1:
@@ -147,7 +171,12 @@ def _training_render_metadata(sampled: dict[str, dict[str, Any]]) -> dict[str, d
     return {
         key: {
             field: sample[field]
-            for field in ("prompt_render", "student_template_sha256", "prefix_diff_counts")
+            for field in (
+                "prompt_render",
+                "student_template",
+                "student_template_sha256",
+                "prefix_diff_counts",
+            )
             if field in sample
         }
         for key, sample in sampled.items()
@@ -177,7 +206,7 @@ def load_training_rows(
             raise ValueError(
                 f"{key}: prompt and completion need nonempty nonnegative integer token ids"
             )
-        row = {"prompt_token_ids": prompt, "completion_token_ids": completion}
+        row = {"key": key, "prompt_token_ids": prompt, "completion_token_ids": completion}
         row.update(render_metadata[key])
         loss_mask = _training_loss_mask(sample, key=key, completion_length=len(completion))
         if loss_mask is not None:
@@ -439,6 +468,7 @@ class DistillTrainer(Trainer):
     def __init__(
         self,
         *,
+        train_dataset: list[dict[str, Any]],
         weight_mode: WeightMode,
         chunk_tokens: int = 128,
         memory_options: MemoryOptions = DEFAULT_MEMORY_OPTIONS,
@@ -461,6 +491,7 @@ class DistillTrainer(Trainer):
         self._sampling_logps: list[torch.Tensor] = []
         self._extend_lr_schedule_on_resume = False
         kwargs["data_collator"] = collate_completion
+        kwargs["train_dataset"] = train_dataset
         super().__init__(**kwargs)
         self.add_callback(self.telemetry)
         if memory_options.base_quantization != "none":
@@ -492,6 +523,7 @@ class DistillTrainer(Trainer):
             "dataset_sha256": hashlib.sha256(
                 json.dumps(self.train_dataset, sort_keys=True).encode()
             ).hexdigest(),
+            "training_content": semantic_training_rows(train_dataset),
             "gradient_accumulation_steps": self.args.gradient_accumulation_steps,
             "max_steps": self.args.max_steps,
             "learning_rate": self.args.learning_rate,
@@ -704,7 +736,18 @@ class DistillTrainer(Trainer):
         if resolution.checkpoint is not None:
             state = json.loads((Path(resolution.checkpoint) / "distill_state.json").read_text())
             saved_max_steps = state["max_steps"]
-            identity_keys = set(self._identity) - {"max_steps", "memory_options"}
+            identity_keys = set(self._identity) - {
+                "base_model_revision",
+                "max_steps",
+                "memory_options",
+                "dataset_sha256",
+            }
+            if "training_content" not in state:
+                # Older checkpoints stored only a byte digest, which cannot recover their rows.
+                identity_keys.remove("training_content")
+                logger.warning(
+                    "legacy checkpoint has no training-content snapshot; checking saved settings"
+                )
             saved_identity = {key: state.get(key) for key in identity_keys}
             saved_identity["warmup_steps"] = state.get("warmup_steps", 0)
             saved_identity["sft_loss_averaging"] = state.get("sft_loss_averaging", "row")
@@ -713,6 +756,12 @@ class DistillTrainer(Trainer):
                 **state.get("memory_options", {}),
             }
             expected_identity = {key: self._identity[key] for key in identity_keys}
+            saved_identity["base_model_config"] = semantic_config_value(
+                saved_identity["base_model_config"]
+            )
+            expected_identity["base_model_config"] = semantic_config_value(
+                expected_identity["base_model_config"]
+            )
             expected_identity["memory_options"] = self._identity["memory_options"]
             if saved_max_steps > self.args.max_steps or saved_identity != expected_identity:
                 raise ValueError(
@@ -897,46 +946,196 @@ def _validate_gate2_card_identity(
     rows_path = run_directory / "samples" / f"round-{round_number}.jsonl"
     if not rows_path.is_file():
         raise FileNotFoundError("real training SFT rows are missing")
-    selection_path = run_directory / "selection.json"
-    expected_digests = {
-        "manifest_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
-        "rows_sha256": hashlib.sha256(rows_path.read_bytes()).hexdigest(),
-    }
-    if any(provenance.get(field) != digest for field, digest in expected_digests.items()):
-        raise ValueError("Gate 2 card is stale for the current selection manifest or SFT rows")
-    heldout_manifest_digests = _selected_heldout_manifest_digests(selection_path)
-    if provenance.get("heldout_manifest_sha256") != heldout_manifest_digests:
-        raise ValueError("Gate 2 card held-out manifests do not match the selection manifest")
+    expected_content = gate2_input_content(run_directory, round_number=round_number)
+    for field, content in expected_content.items():
+        if field in provenance and provenance[field] != content:
+            if field == "heldout_manifest_content":
+                raise ValueError("Gate 2 card held-out manifest changed since selection")
+            raise ValueError("Gate 2 card is stale for the current selection manifest or SFT rows")
+    if not all(field in provenance for field in expected_content):
+        logger.warning(
+            "legacy Gate 2 card has incomplete content snapshots; checking available fields"
+        )
 
 
-def _selected_heldout_manifest_digests(selection_path: Path) -> list[str]:
-    selection_value: object = json.loads(selection_path.read_text(encoding="utf-8"))
-    if not isinstance(selection_value, dict):
+def _named_content(value: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {field: value[field] for field in fields if field in value}
+
+
+def _heldout_content(value: dict[str, Any]) -> dict[str, Any]:
+    task_ids: set[str] = set()
+    channels: set[str] = set()
+    _collect_heldout_content(value, task_ids, channels)
+    return {"task_ids": sorted(task_ids), "channels": sorted(channels)}
+
+
+def _collect_heldout_content(value: dict[str, Any], task_ids: set[str], channels: set[str]) -> None:
+    task_fields = (
+        "task_ids",
+        "task_id_list",
+        "selected_task_ids",
+        "problem_ids",
+        "heldout_task_ids",
+        "held_out_task_ids",
+    )
+    for field in task_fields:
+        _update_heldout_ids(value.get(field, []), task_ids)
+    for field in ("heldout_channels", "held_out_channels"):
+        _update_heldout_ids(value.get(field, []), channels)
+    for selected in value.get("selected_tasks", []):
+        for field in ("task_id", "problem_id", "item_id"):
+            if field in selected:
+                task_ids.add(selected[field])
+    for task_id, channel in value.get("eval_pairs", []):
+        task_ids.add(task_id)
+        channels.add(channel)
+    split = value.get("split", value)
+    if isinstance(split, dict) and "train" in split and "held-out" in split:
+        _update_heldout_ids(split["held-out"], channels)
+    _collect_heldout_partition(value.get("held-out"), task_ids, channels)
+    for field in ("provenance", "assets", "tasks", "manifest"):
+        if isinstance(value.get(field), dict):
+            _collect_heldout_content(value[field], task_ids, channels)
+
+
+def _collect_heldout_partition(value: object, task_ids: set[str], channels: set[str]) -> None:
+    if isinstance(value, list):
+        _update_heldout_ids(value, channels)
+    elif isinstance(value, dict):
+        _update_heldout_ids(value.get("task_ids", []), task_ids)
+        _update_heldout_ids(value.get("channels", []), channels)
+
+
+def _update_heldout_ids(value: object, ids: set[str]) -> None:
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise TypeError("held-out identifiers must be a list of nonempty strings")
+    ids.update(cast("list[str]", value))
+
+
+def gate2_input_content(run_directory: Path, *, round_number: int) -> dict[str, object]:
+    """Snapshot named selected inputs for both the Gate 2 producer and consumer."""
+    return gate2_content_from_paths(
+        run_directory / "selection.json",
+        run_directory / "samples" / f"round-{round_number}.jsonl",
+    )
+
+
+def gate2_content_from_paths(
+    selection_path: Path,
+    rows_path: Path,
+    heldout_paths: list[Path] | None = None,
+) -> dict[str, object]:
+    """Read the explicit paths used by a card-producing invocation."""
+    run_directory = selection_path.parent
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    if not isinstance(selection, dict):
         raise TypeError("selection.json must contain a JSON object")
-    manifest_values = selection_value.get("heldout_manifests", [])
+    selection_content = _named_content(
+        selection,
+        (
+            "schema_only",
+            "schema_only_max_turns",
+            "max_sequence_tokens",
+            "prompt_render",
+            "balancing",
+            "admission_floors",
+            "honest_share_cap",
+            "heldout_scope",
+        ),
+    )
+    selected = selection.get("selected", [])
+    if not isinstance(selected, list) or any(not isinstance(entry, dict) for entry in selected):
+        raise TypeError("selection selected entries must be objects")
+    entry_fields = (
+        "episode_key",
+        "task_id",
+        "scenario_slug",
+        "arm",
+        "seed",
+        "source",
+        "family",
+        "prompt_token_ids",
+        "completion_token_ids",
+        "input_ids",
+        "labels",
+        "loss_mask",
+        "prompt_render",
+        "student_template",
+        "hint_text",
+        "hint_variant",
+        "primary_strategy",
+        "admitting_criterion",
+        "admission_type",
+        "flags",
+        "strengthened_truth",
+    )
+    selection_content["selected"] = sorted(
+        [_named_content(entry, entry_fields) for entry in selected],
+        key=lambda entry: json.dumps(entry, sort_keys=True),
+    )
+    heldout_content, unavailable_heldout = _selected_heldout_content(
+        selection, run_directory, heldout_paths
+    )
+    rows = _read_rows(rows_path)
+    row_fields = (
+        "key",
+        "task_id",
+        "env",
+        "problem_id",
+        "episode_key",
+        "prompt_token_ids",
+        "completion_token_ids",
+        "input_ids",
+        "labels",
+        "loss_mask",
+        "prompt_render",
+        "student_template",
+        "prompt_text",
+        "hint_text",
+        "hint_variant",
+        "label",
+        "teacher_logps",
+        "student_sampling_logps",
+    )
+    content: dict[str, object] = {
+        "selection_content": selection_content,
+        "rows_content": [_named_content(rows[key], row_fields) for key in sorted(rows)],
+    }
+    if unavailable_heldout:
+        logger.warning("held-out paths unavailable; comparing the saved held-out scope")
+    else:
+        content["heldout_manifest_content"] = sorted(
+            heldout_content, key=lambda item: json.dumps(item, sort_keys=True)
+        )
+    return content
+
+
+def _selected_heldout_content(
+    selection: dict[str, Any],
+    run_directory: Path,
+    heldout_paths: list[Path] | None,
+) -> tuple[list[object], bool]:
+    manifest_values = selection.get("heldout_manifests", [])
+    if heldout_paths is not None:
+        manifest_values = [{"path": str(path)} for path in heldout_paths]
     if not isinstance(manifest_values, list):
         raise TypeError("selection.json heldout_manifests must be a list")
-    manifest_paths: list[Path] = []
-    manifest_digests: list[str] = []
-    for manifest_value in manifest_values:
-        if not isinstance(manifest_value, dict):
-            raise TypeError("selection held-out manifest provenance must contain objects")
-        path_value = manifest_value.get("path")
-        digest_value = manifest_value.get("sha256")
-        if not isinstance(path_value, str) or not path_value:
-            raise TypeError("selection held-out manifest path must be a nonempty string")
-        if not isinstance(digest_value, str) or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
-            raise TypeError("selection held-out manifest digest must be a lowercase SHA-256")
-        manifest_path = Path(path_value).resolve()
-        if not manifest_path.is_file():
-            raise FileNotFoundError("selected held-out manifest is missing during training")
-        if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != digest_value:
-            raise ValueError("selected held-out manifest changed since selection")
-        manifest_paths.append(manifest_path)
-        manifest_digests.append(digest_value)
-    if len(manifest_paths) != len(set(manifest_paths)):
-        raise ValueError("selection contains duplicate held-out manifest paths")
-    return manifest_digests
+    heldout_content: list[object] = []
+    unavailable_heldout = False
+    for manifest in manifest_values:
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("path"), str):
+            raise TypeError("selection held-out manifests need a path")
+        manifest_path = Path(manifest["path"])
+        if not manifest_path.is_absolute():
+            manifest_path = run_directory / manifest_path
+        if not manifest_path.is_file() and "heldout_scope" in selection:
+            unavailable_heldout = True
+            continue
+        value = json.loads(manifest_path.read_text())
+        if not isinstance(value, dict):
+            raise TypeError("held-out manifest must contain an object")
+        heldout_content.append(_heldout_content(value))
+    return heldout_content, unavailable_heldout
 
 
 def memory_options_from_args(args: argparse.Namespace) -> MemoryOptions:

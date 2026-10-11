@@ -458,19 +458,23 @@ class TestInstructions:
         with pytest.raises(FileNotFoundError, match="gitignored on purpose"):
             load_instructions(tmp_path / "absent.md")
 
-    def test_wrong_version_line_is_refused(self, tmp_path: Path) -> None:
+    def test_a_changed_version_label_with_identical_instructions_is_accepted(
+        self, tmp_path: Path
+    ) -> None:
         path = tmp_path / "i.md"
         path.write_text("some-other-judge-v9\nbody\n")
-        with pytest.raises(ValueError, match=JUDGE_PROMPT_VERSION):
-            load_instructions(path)
+        loaded = load_instructions(path)
+        assert loaded.text == "body"
 
-    def test_the_version_line_is_stripped_and_the_digest_covers_the_file(
+    def test_the_version_line_is_stripped_and_the_digest_covers_instruction_text(
         self, tmp_path: Path
     ) -> None:
         path = tmp_path / "i.md"
         path.write_text(f"{JUDGE_PROMPT_VERSION}\nbody text\n")
         loaded = load_instructions(path)
         assert loaded.text == "body text"
+        path.write_text("another-label\nbody text\n")
+        assert load_instructions(path).digest == loaded.digest
         path.write_text(f"{JUDGE_PROMPT_VERSION}\nbody text edited\n")
         assert load_instructions(path).digest != loaded.digest
 

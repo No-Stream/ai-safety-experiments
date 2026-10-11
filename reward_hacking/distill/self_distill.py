@@ -17,11 +17,17 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from games.checkpoint_retention import missing_checkpoint_files
-from reward_hacking.distill.contexts import tokenizer_snapshot_digest
 from reward_hacking.distill.sample import load_prompts_for_split
+from reward_hacking.semantic_identity import (
+    model_identity,
+    prompt_inputs,
+    recorded_model_matches,
+    split_inputs,
+    tokenizer_inputs,
+)
 
 logger = logging.getLogger(__name__)
 STAGES = ("sample", "score", "train", "evaluate")
@@ -218,14 +224,12 @@ def _validate_evaluation_files(paths: tuple[Path, ...]) -> None:
 
 
 def _validate_prompt_identity(rows: list[dict[str, Any]], model: Path) -> None:
-    tokenizer_hash = tokenizer_snapshot_digest(model)
+    current_tokenizer = tokenizer_inputs(model)
     for row in rows:
+        if "tokenizer_inputs" in row and row["tokenizer_inputs"] != current_tokenizer:
+            raise ValueError("prompt tokenizer inputs differ from shared tokenizer contents")
         if any(token < 0 for token in row["prompt_token_ids"]):
             raise ValueError("prompt token ids must be nonnegative")
-        if row.get("tokenizer_identity") != str(model):
-            raise ValueError("prompt tokenizer_identity differs from shared model snapshot")
-        if row.get("tokenizer_sha256") != tokenizer_hash:
-            raise ValueError("prompt tokenizer_sha256 differs from shared tokenizer contents")
 
 
 def _validate_evaluator(command: tuple[str, ...]) -> None:
@@ -289,6 +293,16 @@ def _identity(config: SelfDistillConfig, root: Path) -> dict[str, object]:
             versions[package] = None
     return {
         "schema_version": 1,
+        "semantic_inputs": {
+            "student_prompts": prompt_inputs(config.student_prompts),
+            "teacher_prompts": prompt_inputs(config.teacher_prompts),
+            "split": split_inputs(config.split_json),
+            "model": model_identity(str(config.model)),
+            "tokenizer": tokenizer_inputs(config.model),
+            "adapter": model_identity(str(config.init_adapter))
+            if config.init_adapter is not None
+            else None,
+        },
         "configuration": configuration,
         "input_hashes": {
             name: file_digest(path)
@@ -307,6 +321,81 @@ def _identity(config: SelfDistillConfig, root: Path) -> dict[str, object]:
         "evaluator_executable": executable,
         "packages": versions,
     }
+
+
+def _evaluation_arguments(command: Sequence[str]) -> list[str]:
+    return [
+        argument
+        for argument in command[1:]
+        if not Path(argument).is_absolute() and not argument.endswith(".py")
+    ]
+
+
+def _compatible_identity(saved: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+    ignored = {
+        "run_dir",
+        "student_prompts",
+        "teacher_prompts",
+        "split_json",
+        "model",
+        "init_adapter",
+        "evaluation_command",
+        "evaluation_files",
+        "phase_budget",
+    }
+    saved_config = {
+        key: value for key, value in saved["configuration"].items() if key not in ignored
+    }
+    current_config = {
+        key: value for key, value in current["configuration"].items() if key not in ignored
+    }
+    if _evaluation_arguments(saved["configuration"]["evaluation_command"]) != _evaluation_arguments(
+        current["configuration"]["evaluation_command"]
+    ):
+        return False
+    if saved_config != current_config:
+        return False
+    if "semantic_inputs" in saved:
+        return _semantic_inputs_match(
+            saved["semantic_inputs"],
+            current["semantic_inputs"],
+            saved["configuration"],
+            current["configuration"],
+        )
+    # Legacy manifests contain bytes and paths, which cannot prove semantic model equality.
+    return True
+
+
+def _semantic_inputs_match(
+    previous_value: object,
+    current_value: object,
+    previous_configuration: object,
+    current_configuration: object,
+) -> bool:
+    if not isinstance(previous_value, Mapping) or not isinstance(current_value, Mapping):
+        return False
+    if not isinstance(previous_configuration, Mapping) or not isinstance(
+        current_configuration, Mapping
+    ):
+        return False
+    for key, previous_input in previous_value.items():
+        if key not in {"model", "adapter"}:
+            if previous_input != current_value.get(key):
+                return False
+            continue
+        configuration_key = "model" if key == "model" else "init_adapter"
+        previous_reference = previous_configuration.get(configuration_key)
+        current_reference = current_configuration.get(configuration_key)
+        if not recorded_model_matches(
+            {
+                "model": previous_reference,
+                "model_identity": previous_input,
+            },
+            cast("str | None", current_reference),
+            identity=cast("dict[str, object] | None", current_value.get(key)),
+        ):
+            return False
+    return True
 
 
 def _run_process(command: Sequence[str]) -> int:
@@ -444,12 +533,12 @@ def _evaluation(path: Path, digest: str, config: SelfDistillConfig) -> dict[str,
 def _validate_evaluation_inputs(result: dict[str, Any], config: SelfDistillConfig) -> None:
     if result.get("split") != "held_out":
         raise ValueError("evaluation must declare held_out split")
-    if result.get("student_prompts_sha256") != file_digest(config.student_prompts) or result.get(
-        "split_sha256"
-    ) != file_digest(config.split_json):
-        raise ValueError(
-            "evaluation input identity differs from configured student corpus or split"
-        )
+    if "student_prompts_inputs" in result and result["student_prompts_inputs"] != prompt_inputs(
+        config.student_prompts
+    ):
+        raise ValueError("evaluation input identity differs from configured student corpus")
+    if "split_inputs" in result and result["split_inputs"] != split_inputs(config.split_json):
+        raise ValueError("evaluation input identity differs from configured split")
     rows = load_prompts_for_split(config.student_prompts, config.split_json, "held_out")
     expected = [[str(row["env"]), str(row["problem_id"])] for row in rows]
     tasks = result.get("evaluated_tasks")
@@ -479,7 +568,7 @@ def _run_locked(config: SelfDistillConfig, root: Path, runner: CommandRunner) ->
     config_path, state_path = run_dir / "run_config.json", run_dir / "state.json"
     identity = _identity(config, root)
     if config_path.exists():
-        if json.loads(config_path.read_text()) != identity:
+        if not _compatible_identity(json.loads(config_path.read_text()), identity):
             raise ValueError("wave identity changed; refusing resume")
     else:
         if any(path.name not in {".wave.lock", ".disposable"} for path in run_dir.iterdir()):
@@ -493,7 +582,7 @@ def _run_locked(config: SelfDistillConfig, root: Path, runner: CommandRunner) ->
         _validate_artifacts(config, artifacts, when=f"before {stage}")
         _write_json(state_path, state)
         artifacts[stage] = _run_stage(config, root, runner, stage)
-        if _identity(config, root) != identity:
+        if not _compatible_identity(identity, _identity(config, root)):
             raise ValueError(f"wave identity changed during {stage}; refusing mixed inputs")
         completed.append(stage)
         _write_json(state_path, state)
@@ -515,7 +604,12 @@ def _run_locked(config: SelfDistillConfig, root: Path, runner: CommandRunner) ->
     }
     receipt_path = run_dir / "completion.json"
     if receipt_path.exists():
-        if json.loads(receipt_path.read_text()) != receipt:
+        recorded_receipt = json.loads(receipt_path.read_text())
+        if any(
+            recorded_receipt.get(key) != value
+            for key, value in receipt.items()
+            if key not in {"identity_digest", "checkpoint"}
+        ):
             raise ValueError("completion receipt changed")
     else:
         _write_json(receipt_path, receipt)

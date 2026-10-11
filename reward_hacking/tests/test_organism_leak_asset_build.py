@@ -432,7 +432,7 @@ def test_completion_resumes_after_builder_code_changes(
     assert bulk.build_assets(options, (case,))["resumed"] == 1
 
 
-def test_completion_refuses_assets_from_a_different_builder_version(
+def test_completion_reuses_intact_assets_after_builder_version_label_change(
     build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     options, case = build_inputs
@@ -440,8 +440,7 @@ def test_completion_refuses_assets_from_a_different_builder_version(
     bulk.build_assets(options, (case,))
     monkeypatch.setattr(bulk, "BUILDER_VERSION", "leak_channels_new")
 
-    with pytest.raises(ValueError, match="builder version changed"):
-        bulk.build_assets(options, (case,))
+    assert bulk.build_assets(options, (case,))["resumed"] == 1
 
 
 def test_runner_isolation_refuses_a_tracked_repository_file(

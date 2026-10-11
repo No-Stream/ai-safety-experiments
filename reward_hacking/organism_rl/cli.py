@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -19,6 +20,7 @@ from datasets import Dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoConfig
 from trl.trainer.grpo_config import GRPOConfig
+from trl.trainer.grpo_trainer import GRPOTrainer
 
 from grpo.throughput import discover_lora_targets
 from reward_hacking.distill.fla_prewarm import prewarm_fla_nb_buckets
@@ -38,6 +40,7 @@ from reward_hacking.organism_rl.rollout import (
     OrganismRollout,
     TaskEpisodeSource,
     TaskFamily,
+    task_definition_content,
     task_definition_sha256,
     verdict_reward,
 )
@@ -47,6 +50,7 @@ from reward_hacking.organism_rl.task_mix import (
 )
 from reward_hacking.organism_rl.task_mix import parse_in_band_fraction as _parse_in_band_fraction
 from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer
+from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 logger = logging.getLogger(__name__)
@@ -319,6 +323,63 @@ def server_endpoint(
         yield server.base_url
 
 
+def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
+    operational = {
+        "output_dir",
+        "endpoint",
+        "server_host",
+        "server_port",
+        "teacher_path",
+        "ladder_scenarios_dir",
+        "resume_from_checkpoint",
+        "model",
+        "model_revision",
+        "leak_assets",
+        "leak_channel_splits",
+        "gpu_memory_utilization",
+    }
+    return {key: value for key, value in flags.items() if key not in operational}
+
+
+def _effective_device_settings(device: dict[str, object]) -> dict[str, object]:
+    return {
+        key: value for key, value in device.items() if key not in {"name", "total_bytes", "sizing"}
+    }
+
+
+def require_rollout_api() -> None:
+    """Refuse incompatible trainer APIs while keeping package versions as provenance."""
+    if "rollout_func" not in inspect.signature(GRPOTrainer.__init__).parameters:
+        raise RuntimeError("TRL GRPOTrainer requires the rollout_func API")
+
+
+def _teacher_score_inputs(path: Path | None) -> list[object] | None:
+    if path is None:
+        return None
+    rows: list[object] = [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
+    return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
+
+
+def _task_sources_match(previous: object, current: object) -> bool:
+    if previous is None or current is None:
+        return previous == current
+    stored = cast("dict[str, object]", previous)
+    expected = cast("dict[str, object]", current)
+    if "task_definition_content" not in expected:
+        return stored == expected
+    content = cast("dict[str, dict[str, object]]", expected["task_definition_content"])
+    if "task_definition_content" in stored:
+        return stored["task_definition_content"] == content
+    stored_hashes = cast("dict[str, object]", stored.get("task_definition_sha256", {}))
+    current_hashes = cast("dict[str, object]", expected.get("task_definition_sha256", {}))
+    return set(stored_hashes) == set(content) and all(
+        task.get("task_variant") == "leak" or stored_hashes[task_id] == current_hashes.get(task_id)
+        for task_id, task in content.items()
+    )
+
+
 def write_provenance(
     args: argparse.Namespace,
     device: dict[str, object],
@@ -372,12 +433,16 @@ def write_provenance(
         "git_dirty": git_dirty,
         "modified_tracked_paths": modified_tracked_paths,
         "model_revision": model_revision,
+        "model_identity": model_identity(args.model, model_revision),
         "trl_version": version("trl"),
         "teacher_scores_sha256": (
             hashlib.sha256(args.teacher_path.read_bytes()).hexdigest()
             if args.teacher_beta > 0
             else None
         ),
+        "teacher_score_inputs": _teacher_score_inputs(args.teacher_path)
+        if args.teacher_beta > 0
+        else None,
         "device": device,
         "task_source_identity": task_source_identity,
         "selected_prompts": (
@@ -389,31 +454,34 @@ def write_provenance(
     path = args.output_dir / "provenance.json"
     if path.exists():
         stored = json.loads(path.read_text())
-        if "model_revision" not in stored:
-            raise ValueError("stored provenance lacks model revision and cannot be resumed safely")
-        previous = dict(stored["flags"])
-        current = dict(provenance["flags"])
-        previous.pop("resume_from_checkpoint", None)
-        current.pop("resume_from_checkpoint", None)
+        previous = _semantic_flags(stored["flags"])
+        current = _semantic_flags(provenance["flags"])
         changed_flags = sorted(
             key for key in previous.keys() | current.keys() if previous.get(key) != current.get(key)
         )
         if changed_flags:
             raise ValueError(f"resume flags differ at keys: {', '.join(changed_flags)}")
+        recorded_model = {"model": stored["flags"]["model"]}
+        if "model_identity" in stored:
+            recorded_model["model_identity"] = stored["model_identity"]
         if (
-            stored.get("model_revision") != model_revision
-            or stored["trl_version"] != version("trl")
-            or stored.get("selected_prompts") != provenance["selected_prompts"]
-            or stored.get("task_source_identity") != provenance["task_source_identity"]
-        ):
-            raise ValueError(
-                "resume model, task selection, task definition, or TRL version differs"
+            not recorded_model_matches(
+                recorded_model, args.model, identity=provenance["model_identity"]
             )
-        if stored["device"] != device:
+            or stored.get("selected_prompts") != provenance["selected_prompts"]
+            or not _task_sources_match(
+                stored.get("task_source_identity"), provenance["task_source_identity"]
+            )
+        ):
+            raise ValueError("resume model, task selection, or task definition differs")
+        if _effective_device_settings(stored["device"]) != _effective_device_settings(device):
             raise ValueError(
                 "resume device or resolved memory sizing differs from stored provenance"
             )
-        if stored["teacher_scores_sha256"] != provenance["teacher_scores_sha256"]:
+        if (
+            "teacher_score_inputs" in stored
+            and stored["teacher_score_inputs"] != provenance["teacher_score_inputs"]
+        ):
             raise ValueError("resume teacher scores differ from stored provenance")
     path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
     return path
@@ -530,8 +598,7 @@ def main(argv: list[str] | None = None) -> None:
     """Launch owned vLLM sampling and step-checkpointed GRPO, or use an explicit endpoint."""
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO)
-    if version("trl") != "1.10.0":
-        raise RuntimeError("experimental rollout_func integration requires TRL 1.10.0")
+    require_rollout_api()
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CLI requires one CUDA device; CPU tests instantiate the trainer directly"
@@ -637,6 +704,13 @@ def main(argv: list[str] | None = None) -> None:
         selected_prompts,
         task_source_identity={
             "task_skip_counts": dict(coding_source.skip_counts),
+            "task_definition_content": {
+                task_id: task_definition_content(
+                    coding_source.tasks[task_id], manifest=coding_source.leak_manifests.get(task_id)
+                )
+                for task_id in selected_task_ids
+                if task_id in coding_source.tasks
+            },
             "task_definition_sha256": {
                 task_id: task_definition_sha256(coding_source.tasks[task_id])
                 for task_id in selected_task_ids

@@ -325,6 +325,7 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
         if directory.name.startswith("docker-grade-"):
             grade_directories.append(directory)
         else:
+            assert not (directory / "patch.diff").exists()
             policy_directories.append(directory)
         if config.evidence_path is not None:
             with config.evidence_path.open("a", encoding="utf-8") as output:
@@ -434,7 +435,10 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     assert not set(policy_directories) & set(grade_directories)
     assert all(path != policy_directories[0] for path in grade_directories)
     assert cast("dict[str, object]", episode.trace_records[0])["manifest_sha256"]
-    assert cast("dict[str, object]", episode.record["leak_evidence"])["docker_evidence"]
+    leak_evidence = cast("dict[str, object]", episode.record["leak_evidence"])
+    assert leak_evidence["docker_evidence"]
+    assert isinstance(leak_evidence["final_patch"], str)
+    assert bool(leak_evidence["final_patch"]) is recover
 
     replayed = source(task.task_id, seed=1, step=0, replica=0)
     assert replayed.record == episode.record
@@ -448,6 +452,109 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     assert cast("dict[str, object]", generated["trace_summary"])["leak_repo_seen"] is True
     canonical = json.loads(json.dumps(generated, sort_keys=True))
     assert rescore_recorded_leak(canonical) == canonical
+
+
+@pytest.mark.parametrize("manifest_shape", ["full", "identity", "legacy", "empty"])
+def test_leak_channel_identity_recovers_semantics_from_manifest_shapes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest_shape: str
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("git_remote_ahead",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    task = build_synthetic_task(templates, tmp_path / "gate")
+    manifest = cast("dict[str, object]", templates["manifest"])
+    shaped_manifest = {
+        "full": manifest,
+        "identity": {
+            "leak_channels_open": task.host_only_metadata["leak_channels_open"],
+            "leak_channels_unavailable": task.host_only_metadata["leak_channels_unavailable"],
+        },
+        "legacy": {key: value for key, value in manifest.items() if key != "unavailable_channels"},
+        "empty": {},
+    }[manifest_shape]
+    expected = rollout.task_definition_content(task, manifest=manifest)
+    assert rollout.task_definition_content(task, manifest=shaped_manifest) == expected
+    workspace = cast("Path", templates["workspace"])
+    (workspace / "changed-reference.txt").write_text("synthetic changed reference")
+    git(workspace, "add", "changed-reference.txt")
+    git(
+        workspace,
+        "-c",
+        "user.name=Synthetic Author",
+        "-c",
+        "user.email=author@example.invalid",
+        "commit",
+        "-m",
+        "synthetic changed reference",
+    )
+    changed_commit = git(workspace, "rev-parse", "HEAD")
+    (workspace / "changed-reference.txt").unlink()
+    # Git storage is excluded from workspace content, so only the channel can detect this change.
+    cast("dict[str, object]", manifest["fix"])["commit_id"] = changed_commit
+    task.host_only_metadata["fix_commit"] = changed_commit
+    changed_content = rollout.task_definition_content(task, manifest=shaped_manifest)
+    assert changed_content["workspace_files"] == expected["workspace_files"]
+    assert changed_content != expected
+
+
+@pytest.mark.parametrize("channel", ["patch_file", "pyc_cache", "build_cache", "mtime"])
+def test_leak_channel_identity_aliases_preserve_artifact_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channel: str
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=(channel,))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    task = build_synthetic_task(templates, tmp_path / "gate")
+    manifest = cast("dict[str, object]", templates["manifest"])
+    alias_manifest = {
+        **{
+            key: value
+            for key, value in manifest.items()
+            if key not in {"channels", "unavailable_channels"}
+        },
+        "leak_channels_open": manifest["channels"],
+        "leak_channels_unavailable": manifest["unavailable_channels"],
+    }
+    expected = rollout.task_definition_content(task, manifest=manifest)
+    assert rollout.task_definition_content(task, manifest=alias_manifest) == expected
+    assert (
+        rollout.task_definition_content(
+            task,
+            manifest={
+                **alias_manifest,
+                "template_fingerprint": "different serialization and mtimes",
+            },
+        )
+        == expected
+    )
+    with pytest.raises(ValueError, match="requires artifact details"):
+        rollout.task_definition_content(task, manifest={**alias_manifest, "channel_details": {}})
+    if channel != "mtime":
+        details = cast("dict[str, dict[str, object]]", manifest["channel_details"])
+        artifact_path = cast("list[str]", details[channel]["artifact_paths"])[0]
+        (cast("Path", templates["workspace"]) / artifact_path).write_bytes(
+            b"changed synthetic artifact"
+        )
+        assert rollout.task_definition_content(task, manifest=alias_manifest) != expected
+
+
+def test_leak_channel_identity_keeps_unavailable_channels_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = _make_leak_templates(tmp_path)
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    task = build_synthetic_task(templates, tmp_path / "gate")
+    task.host_only_metadata["leak_channels_unavailable"] = {"git_branch": "closed"}
+    manifest = {"channels": [], "unavailable_channels": {"git_branch": "closed"}}
+    expected = rollout.task_definition_content(task, manifest=manifest)
+    assert rollout.task_definition_content(task, manifest={}) == expected
+    assert rollout.task_definition_content(task, manifest=task.host_only_metadata) == expected
+    assert (
+        rollout.task_definition_content(
+            task, manifest={**manifest, "unavailable_channels": {"git_branch": "different reason"}}
+        )
+        != expected
+    )
+    with pytest.raises(ValueError, match="both opened and unavailable"):
+        rollout.task_definition_content(task, manifest={**manifest, "channels": ["git_branch"]})
 
 
 def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(

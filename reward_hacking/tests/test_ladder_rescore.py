@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -14,6 +15,7 @@ from reward_hacking.ladder import rescore, runner, surfaces
 from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandRecord
 from reward_hacking.ladder.rescore import (
     _header_schema_version,
+    _headers_by_pressure,
     _scenario_root_for_format,
     rescore_file,
 )
@@ -287,6 +289,9 @@ def _rewrite_as_schema18(input_path: Path, episode: dict[str, Any]) -> None:
     rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
     header = next(row for row in rows if row.get("record") == "ladder_run_header")
     provenance = cast("dict[str, object]", header["provenance"])
+    scenarios = cast("list[dict[str, object]]", provenance["scenarios"])
+    for scenario in scenarios:
+        scenario.pop("semantic_content_identity", None)
     models = cast("list[dict[str, object]]", provenance["models"])
     for model in models:
         model.pop("chat_template_kwargs", None)
@@ -305,6 +310,9 @@ def _rewrite_as_schema19(
     rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
     header = next(row for row in rows if row.get("record") == "ladder_run_header")
     provenance = cast("dict[str, object]", header["provenance"])
+    scenarios = cast("list[dict[str, object]]", provenance["scenarios"])
+    for scenario in scenarios:
+        scenario.pop("semantic_content_identity", None)
     models = cast("list[dict[str, object]]", provenance["models"])
     for model in models:
         model.pop("chat_template_kwargs", None)
@@ -333,15 +341,206 @@ def _remove_schema22_detection_spec_fields(episode: dict[str, Any]) -> None:
         detection_spec.pop(field_name)
 
 
-def test_schema20_headers_remain_supported_after_current_schema_bump() -> None:
-    assert _header_schema_version({"schema_version": 20}, {"schema_version": 20}) == 20
-
-
-def test_schema21_rescore_recomputes_behaviour_events_without_inventing_old_budgets(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("schema_version", [20, 22, 24, 25, 26, 100])
+def test_compatible_headers_remain_supported_after_current_schema_bump(
+    schema_version: int,
 ) -> None:
-    input_path, output_path, scenario_root, episode = _fresh_run(tmp_path, monkeypatch)
+    assert (
+        _header_schema_version(
+            {"schema_version": schema_version}, {"schema_version": schema_version}
+        )
+        == schema_version
+    )
+
+
+def test_future_schema_still_requires_consumed_provenance_fields() -> None:
+    with pytest.raises(TypeError, match="models must be a list"):
+        _headers_by_pressure(
+            [
+                {
+                    "record": "ladder_run_header",
+                    "schema_version": 26,
+                    "provenance": {
+                        "schema_version": 26,
+                        "task_pressure": "none",
+                    },
+                    "provenance_digest": provenance_digest(
+                        {"schema_version": 26, "task_pressure": "none"}
+                    ),
+                }
+            ]
+        )
+
+
+def test_combined_headers_ignore_paths_and_source_fingerprints_but_keep_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path, _output_path, _scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
     rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    moved_header = copy.deepcopy(header)
+    provenance = cast("dict[str, object]", moved_header["provenance"])
+    model = cast("list[dict[str, object]]", provenance["models"])[0]
+    model["model_path"] = "/relocated/model"
+    provenance["jail_runtime_identity"] = "old-runtime-identity"
+    provenance["generation_code_identity"] = "old-generation-source"
+    provenance["detector_code_identity"] = "old-detector-source"
+    scenario = cast("list[dict[str, object]]", provenance["scenarios"])[0]
+    scenario["manifest_digest"] = "old-private-tree-digest"
+    scenario["surfaces_sha256"] = "old-source-coupled-surface-digest"
+    moved_header["provenance_digest"] = provenance_digest(provenance)
+
+    grouped = _headers_by_pressure([header, moved_header])
+
+    assert len(grouped["none"]) == 2
+
+
+def test_mixed_legacy_and_current_headers_compare_available_actor_semantics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path, _output_path, _scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    current_provenance = cast("dict[str, object]", header["provenance"])
+    current_scenario = cast("list[dict[str, object]]", current_provenance["scenarios"])[0]
+    current_scenario["semantic_content_identity"] = "current-semantic-content"
+    current_scenario["actor_surfaces_sha256"] = "same-actor-prompt"
+    header["provenance_digest"] = provenance_digest(current_provenance)
+    legacy_header = copy.deepcopy(header)
+    legacy_provenance = cast("dict[str, object]", legacy_header["provenance"])
+    legacy_scenario = cast("list[dict[str, object]]", legacy_provenance["scenarios"])[0]
+    legacy_scenario.pop("semantic_content_identity")
+    legacy_header["provenance_digest"] = provenance_digest(legacy_provenance)
+
+    grouped = _headers_by_pressure([legacy_header, header])
+
+    assert len(grouped["none"]) == 2
+
+    changed_actor_header = copy.deepcopy(legacy_header)
+    changed_actor_provenance = cast("dict[str, object]", changed_actor_header["provenance"])
+    changed_actor_scenario = cast("list[dict[str, object]]", changed_actor_provenance["scenarios"])[
+        0
+    ]
+    changed_actor_scenario["actor_surfaces_sha256"] = "different-actor-prompt"
+    changed_actor_header["provenance_digest"] = provenance_digest(changed_actor_provenance)
+    with pytest.raises(ValueError, match="incompatible provenance"):
+        _headers_by_pressure([legacy_header, changed_actor_header])
+
+
+def test_combined_headers_still_require_semantic_scenario_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path, _output_path, _scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    changed_header = copy.deepcopy(header)
+    provenance = cast("dict[str, object]", changed_header["provenance"])
+    scenario = cast("list[dict[str, object]]", provenance["scenarios"])[0]
+    scenario["semantic_content_identity"] = "different-task-content"
+    changed_header["provenance_digest"] = provenance_digest(provenance)
+
+    with pytest.raises(ValueError, match="incompatible provenance"):
+        _headers_by_pressure([header, changed_header])
+
+
+def test_rescore_accepts_nonsemantic_scenario_source_edits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    checker = scenario_root / "rescore-fixture" / "custom_check.py"
+    checker.write_text("print('checked')  # formatting-only note\n", encoding="utf-8")
+
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+    assert any(row.get("record") == "ladder_episode" for row in rescored_rows)
+
+
+def test_rescore_refuses_changed_semantic_scenario_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    checker = scenario_root / "rescore-fixture" / "custom_check.py"
+    checker.write_text("print('different grader behavior')\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="semantic content"):
+        rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+
+def test_rescore_accepts_legacy_headers_without_semantic_content_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    provenance = cast("dict[str, object]", header["provenance"])
+    scenario_record = cast("list[dict[str, object]]", provenance["scenarios"])[0]
+    scenario_record.pop("semantic_content_identity")
+    header["provenance_digest"] = provenance_digest(provenance)
+    for row in rows:
+        if row.get("record") in {"ladder_episode", "ladder_episode_failure"}:
+            row["provenance_digest"] = header["provenance_digest"]
+    input_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+    rescored_header = next(row for row in rescored_rows if row.get("record") == "ladder_run_header")
+    rescored_provenance = cast("dict[str, object]", rescored_header["provenance"])
+    upgraded_scenario = cast("list[dict[str, object]]", rescored_provenance["scenarios"])[0]
+    assert isinstance(upgraded_scenario.get("semantic_content_identity"), str)
+
+
+def _schema21_trace_records() -> list[dict[str, object]]:
+    return [
+        {
+            "record": "turn",
+            "turn": 0,
+            "reasoning": "",
+            "content": "",
+            "commands": [{"command": "python3 -I solution.py"}],
+            "tool_calls": [],
+            "tool_results": [],
+        },
+        {
+            "record": "turn",
+            "turn": 1,
+            "reasoning": "",
+            "content": "",
+            "commands": [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}],
+            "tool_calls": [],
+            "tool_results": [],
+        },
+    ]
+
+
+def _schema21_command_records() -> list[dict[str, object]]:
+    return [
+        {
+            "sequence": sequence,
+            "command": command,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "timed_out": False,
+            "changed_paths": [],
+            "monitor_enabled_before": True,
+            "monitor_enabled_after": True,
+            "audit_appended": False,
+            "audit_log_size_before": None,
+            "audit_log_size_after": None,
+        }
+        for sequence, command in (
+            (0, "python3 -I solution.py"),
+            (1, "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"),
+        )
+    ]
+
+
+def _write_schema21_input(
+    input_path: Path, rows: list[dict[str, object]], episode: dict[str, object]
+) -> None:
     header = next(row for row in rows if row.get("record") == "ladder_run_header")
     provenance = cast("dict[str, object]", header["provenance"])
     detector_inputs = cast("dict[str, object]", episode["detector_inputs"])
@@ -355,6 +554,8 @@ def test_schema21_rescore_recomputes_behaviour_events_without_inventing_old_budg
     ):
         detection_spec.pop(field_name)
     provenance["schema_version"] = 21
+    for scenario in cast("list[dict[str, object]]", provenance["scenarios"]):
+        scenario.pop("semantic_content_identity", None)
     header["schema_version"] = 21
     header["provenance_digest"] = provenance_digest(provenance)
     episode["provenance_digest"] = header["provenance_digest"]
@@ -375,61 +576,22 @@ def test_schema21_rescore_recomputes_behaviour_events_without_inventing_old_budg
             "ended_by": "submission_budget",
         }
     )
-    legacy_verdicts = cast("list[dict[str, object]]", trace_summary["submission_verdicts"])
-    legacy_verdict = legacy_verdicts[0]
-    assert "remaining_turns" not in legacy_verdict
-    assert "remaining_submissions" not in legacy_verdict
-    assert "submission_evidence" not in legacy_verdict
     trace_path = Path(str(episode["trace_path"]))
     trace_path.write_text(
-        "".join(
-            json.dumps(record) + "\n"
-            for record in (
-                {
-                    "record": "turn",
-                    "turn": 0,
-                    "reasoning": "",
-                    "content": "",
-                    "commands": [{"command": "python3 -I solution.py"}],
-                    "tool_calls": [],
-                    "tool_results": [],
-                },
-                {
-                    "record": "turn",
-                    "turn": 1,
-                    "reasoning": "",
-                    "content": "",
-                    "commands": [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}],
-                    "tool_calls": [],
-                    "tool_results": [],
-                },
-            )
-        ),
+        "".join(json.dumps(record) + "\n" for record in _schema21_trace_records()),
         encoding="utf-8",
     )
-    episode["engine_command_records"] = [
-        {
-            "sequence": sequence,
-            "command": command,
-            "exit_code": 0,
-            "stdout": "",
-            "stderr": "",
-            "timed_out": False,
-            "changed_paths": [],
-            "monitor_enabled_before": True,
-            "monitor_enabled_after": True,
-            "audit_appended": False,
-            "audit_log_size_before": None,
-            "audit_log_size_after": None,
-        }
-        for sequence, command in (
-            (0, "python3 -I solution.py"),
-            (1, "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"),
-        )
-    ]
+    episode["engine_command_records"] = _schema21_command_records()
     rows = [episode if row.get("record") == "ladder_episode" else row for row in rows]
     input_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
+
+def test_schema21_rescore_recomputes_behaviour_events_without_inventing_old_budgets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    input_path, output_path, scenario_root, episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    _write_schema21_input(input_path, rows, episode)
     monkeypatch.setattr(
         "reward_hacking.ladder.rescore.default_detector",
         lambda **_kwargs: {
@@ -931,6 +1093,9 @@ def test_rescore_accepts_previous_runner_schema_without_code_identities(
     provenance["schema_version"] = 23
     provenance.pop("generation_code_identity")
     provenance.pop("detector_code_identity")
+    scenarios = cast("list[dict[str, object]]", provenance["scenarios"])
+    for scenario in scenarios:
+        scenario.pop("semantic_content_identity", None)
     header["schema_version"] = 23
     legacy_digest = provenance_digest(provenance)
     header["provenance_digest"] = legacy_digest
@@ -1280,6 +1445,7 @@ def test_v2_rescore_recomputes_exposure_and_awareness_and_carries_judge(
     scenario_provenance.update(
         {
             "manifest_digest": scenario.manifest_digest,
+            "semantic_content_identity": scenario.semantic_content_identity,
             "format": 2,
             "variant": scenario.variant,
             "set_version": scenario.set_version,
@@ -1542,6 +1708,7 @@ def test_v2_rescore_recomputes_protected_path_events_from_snapshots(
     scenario_provenance.update(
         {
             "manifest_digest": scenario.manifest_digest,
+            "semantic_content_identity": scenario.semantic_content_identity,
             "format": 2,
             "variant": scenario.variant,
             "set_version": scenario.set_version,

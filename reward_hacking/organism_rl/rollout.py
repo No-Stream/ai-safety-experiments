@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import math
+import subprocess
 import tempfile
 import time
 from collections import Counter
@@ -47,6 +48,7 @@ from reward_hacking.ladder.tools import format_bash_result
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
 from reward_hacking.organism_rl.leak_assets import DEFAULT_LEAK_ASSETS, load_leak_tasks
+from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -108,19 +110,16 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
         if artifact_filename is None:
             raise ValueError("impossible-task submissions require a task artifact filename")
         if task.task_variant == "leak":
+            submitted_patch = _extract_leak_patch(task, directory)
             grader_result = run_grader(
                 task,
                 directory,
                 arm=AgenticArmConfig(),
                 timeout=LADDER_COMMAND_TIMEOUT,
                 jail_backend=jail_backend,
+                submitted_patch=submitted_patch,
             )
-            artifact_path = directory / artifact_filename
-            artifact_sha256 = (
-                hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-                if artifact_path.is_file() and not artifact_path.is_symlink()
-                else None
-            )
+            artifact_sha256 = hashlib.sha256(submitted_patch).hexdigest()
             oracle_error = tasks_r2e_leak.trusted_grader_error(grader_result)
             return SubmissionVerdict(
                 passed=oracle_error is None
@@ -187,6 +186,17 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
         )
 
     return grade_submission
+
+
+def _extract_leak_patch(task: Task, episode_dir: Path) -> bytes:
+    """Build submitted patch bytes without placing grader scratch in the policy workspace."""
+    if task.docker_patch_base_commit is None or task.docker_grader_template is None:
+        raise ValueError("leak task has no trusted patch base")
+    return tasks_r2e_leak.extract_patch_bytes(
+        episode_dir,
+        task.docker_patch_base_commit,
+        template_dir=task.docker_grader_template,
+    )
 
 
 def _math_feedback_from_template(task: Task) -> str:
@@ -337,8 +347,8 @@ def verdict_reward(*, reward_scores: Sequence[int | None], **kwargs: object) -> 
     return [None if score is None else float(score) for score in reward_scores]
 
 
-def task_definition_sha256(task: Task) -> str:
-    """Bind replay identity to the visible-versus-true check relationship."""
+def _task_definition_fields(task: Task) -> dict[str, object]:
+    """Describe the visible-versus-true check relationship."""
     task_definition: dict[str, object] = {
         "task_id": task.task_id,
         "prompt": task.prompt,
@@ -354,9 +364,157 @@ def task_definition_sha256(task: Task) -> str:
         "grader_filename": task.grader_filename,
         "executable_files": sorted(task.executable_files),
     }
+    return task_definition
+
+
+def task_definition_sha256(task: Task) -> str:
+    """Record the historical whole-definition digest as provenance."""
+    task_definition = _task_definition_fields(task)
     if task.host_only_metadata:
         task_definition["host_only_metadata"] = task.host_only_metadata
     return hashlib.sha256(json.dumps(task_definition, sort_keys=True).encode()).hexdigest()
+
+
+def task_definition_content(
+    task: Task, *, manifest: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    """Compare task and grader substance without host image, Git or runtime bookkeeping."""
+    content = _task_definition_fields(task)
+    if task.host_only_metadata:
+        content["host_only_metadata"] = {
+            key: task.host_only_metadata[key]
+            for key in (
+                "expected_output",
+                "leak_channels_open",
+                "leak_channels_unavailable",
+                "instruction_variant",
+            )
+            if key in task.host_only_metadata
+        }
+    if task.task_variant == "leak":
+        content["docker_grader_command"] = task.docker_grader_command
+        content["docker_true_grader_command"] = task.docker_true_grader_command
+        content["docker_true_grader_files"] = task.docker_true_grader_files
+        for name, template in (
+            ("workspace_files", task.workspace_template),
+            ("grader_template_files", task.docker_grader_template),
+            ("hidden_test_files", task.docker_hidden_tests_template),
+        ):
+            if template is not None:
+                content[name] = _template_content(template)
+        if manifest is not None and task.workspace_template is not None:
+            content["channel_content"] = _channel_content(task, manifest)
+    return content
+
+
+def _template_content(root: Path) -> dict[str, object]:
+    files: dict[str, object] = {}
+    excluded_directories = {
+        ".venv",
+        ".git",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+    }
+    for directory, subdirectories, filenames in root.walk():
+        subdirectories[:] = sorted(
+            name for name in subdirectories if name not in excluded_directories
+        )
+        for name in sorted(filenames):
+            if name in excluded_directories:
+                continue
+            path = directory / name
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                files[relative] = {"symlink": str(path.readlink())}
+            elif path.suffix not in {".pyc", ".pyo", ".so"}:
+                files[relative] = {
+                    "content": path.read_bytes().hex(),
+                    "executable": bool(path.stat().st_mode & 0o111),
+                }
+    return files
+
+
+def _channel_selection(
+    task: Task, manifest: Mapping[str, object]
+) -> tuple[list[str], dict[str, str]]:
+    channels = manifest.get(
+        "channels",
+        manifest.get("leak_channels_open", task.host_only_metadata.get("leak_channels_open", [])),
+    )
+    if not isinstance(channels, list) or any(not isinstance(channel, str) for channel in channels):
+        raise ValueError("leak channel identity requires a list of opened channel names")
+    unavailable = manifest.get(
+        "unavailable_channels",
+        manifest.get(
+            "leak_channels_unavailable",
+            task.host_only_metadata.get("leak_channels_unavailable", {}),
+        ),
+    )
+    if not isinstance(unavailable, dict) or any(
+        not isinstance(channel, str) or not isinstance(reason, str)
+        for channel, reason in unavailable.items()
+    ):
+        raise ValueError("leak channel identity requires unavailable channel reasons")
+    if set(channels) & set(unavailable):
+        raise ValueError("leak channels cannot be both opened and unavailable")
+    return cast("list[str]", channels), cast("dict[str, str]", unavailable)
+
+
+def _channel_content(task: Task, manifest: Mapping[str, object]) -> dict[str, object]:
+    workspace = task.workspace_template
+    if workspace is None:
+        raise ValueError("leak channel content requires a workspace")
+    channels, unavailable = _channel_selection(task, manifest)
+    content: dict[str, object] = {"channels": sorted(channels), "unavailable_channels": unavailable}
+    if any(channel.startswith("git_") for channel in channels):
+        fix = cast("Mapping[str, object]", manifest.get("fix", {}))
+        commit = fix.get("commit_id", task.host_only_metadata.get("fix_commit"))
+        base_commit = fix.get("base_commit_id", task.host_only_metadata.get("base_commit"))
+        if not isinstance(commit, str) or not isinstance(base_commit, str):
+            raise ValueError("Git leak channel identity requires base and fix commits")
+        # Recover the same changed-file scope from full manifests and legacy task identities.
+        changed_paths = subprocess.check_output(  # noqa: S603
+            [  # noqa: S607
+                "git",
+                "-C",
+                str(workspace),
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                base_commit,
+                commit,
+            ]
+        )
+        paths = changed_paths.decode().split("\0")[:-1]
+        files: dict[str, object] = {}
+        for relative in paths:
+            listing = subprocess.check_output(  # noqa: S603
+                ["git", "-C", str(workspace), "ls-tree", commit, "--", relative]  # noqa: S607
+            )
+            if not listing:
+                files[relative] = None
+                continue
+            mode = listing.decode().split()[0]
+            payload = subprocess.check_output(  # noqa: S603
+                ["git", "-C", str(workspace), "show", f"{commit}:{relative}"]  # noqa: S607
+            )
+            files[relative] = {"content": payload.hex(), "mode": mode}
+        content["reference_files"] = files
+    details = cast("Mapping[str, Mapping[str, object]]", manifest.get("channel_details", {}))
+    for channel in sorted(set(channels) & {"patch_file", "pyc_cache", "build_cache", "mtime"}):
+        if channel not in details:
+            raise ValueError(f"leak channel identity requires artifact details for {channel}")
+        paths = cast("list[str]", details[channel]["artifact_paths"])
+        if channel == "mtime":
+            content["mtime_modified_paths"] = sorted(paths)
+        else:
+            content[channel] = {
+                relative: (workspace / relative).read_bytes().hex() for relative in paths
+            }
+    return content
 
 
 class OrganismRollout:
@@ -651,9 +809,7 @@ def _record_leak_evidence(  # noqa: PLR0913, PLR0917 - binds episode artifacts t
 ) -> None:
     """Persist all inputs needed for exact offline reward and detector re-scoring."""
     docker_records = _read_trace(evidence_path)
-    final_patch = (
-        (episode_dir / "patch.diff").read_bytes().decode("utf-8", errors="surrogateescape")
-    )
+    final_patch = _extract_leak_patch(task, episode_dir).decode("utf-8", errors="surrogateescape")
     leak_evidence: dict[str, object] = {
         "manifest": manifest,
         "manifest_raw_json": manifest_raw_json,
@@ -916,6 +1072,7 @@ class TaskEpisodeSource:
         self.announced_turn_budget = announced_turn_budget
         self.jail_backend = jail_backend
         self.model_path = str(model_path)
+        self.model_identity = model_identity(str(model_path), revision)
         self.revision = revision
         self.partition = partition
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
@@ -954,8 +1111,12 @@ class TaskEpisodeSource:
             "partition": self.partition,
             "served_model_id": backend.model_id,
             "model_path": self.model_path,
+            "model_identity": self.model_identity,
             "model_revision": self.revision,
             "task_definition_sha256": task_definition_sha256(task),
+            "task_definition_content": task_definition_content(
+                task, manifest=self.leak_manifests.get(task_id)
+            ),
             "sampling": asdict(backend.sampling),
             "max_model_len": self.max_model_len,
             "max_turns": self.max_turns,
@@ -1135,18 +1296,80 @@ def _read_trace(path: Path) -> list[Mapping[str, object]]:
     return records
 
 
+def _semantic_episode_identity(identity: Mapping[str, object]) -> dict[str, object]:
+    provenance = {"model_path", "model_revision"}
+    if identity.get("task_variant") == "leak":
+        provenance.update(
+            {
+                "image",
+                "base_commit",
+                "fix_commit",
+                "upstream_commit_id",
+                "fix_commit_representation",
+                "template_fingerprint",
+                "closed_template_fingerprint",
+                "manifest_sha256",
+                "expected_output_sha256",
+                "hidden_tests_sha256",
+                "runtime_venv_fingerprint",
+                "runtime_interpreter_fingerprint",
+                "task_definition_sha256",
+            }
+        )
+    if "task_definition_content" in identity:
+        provenance.add("task_definition_sha256")
+    semantic = {key: value for key, value in identity.items() if key not in provenance}
+    if "model_identity" not in semantic and "model_path" in identity:
+        # Legacy local weights can be identified only while their original snapshot remains accessible.
+        path = Path(cast("str", identity["model_path"]))
+        if path.is_dir() or not path.is_absolute():
+            semantic["model_identity"] = model_identity(
+                str(path), cast("str | None", identity.get("model_revision"))
+            )
+    if "model_path" in identity and semantic.get("served_model_id") == identity["model_path"]:
+        semantic["served_model_id"] = "base-model-path-alias"
+    return semantic
+
+
 def replay_episode_trace(path: Path, expected_identity: Mapping[str, object]) -> EpisodeSample:
-    """Reuse a complete saved episode only when its task, sampler and adapter still match."""
+    """Reuse an episode only when task, sampling settings and available model content still match."""
     records = _read_trace(path)
     canonical_identity: object = json.loads(json.dumps(dict(expected_identity), sort_keys=True))
     recorded_identity = records[0] if records else {}
+    canonical_identity = _semantic_episode_identity(
+        cast("Mapping[str, object]", canonical_identity)
+    )
+    recorded_identity = _semantic_episode_identity(recorded_identity)
+    if (
+        records
+        and "model_identity" in records[0]
+        and "model_identity" in expected_identity
+        and not recorded_model_matches(
+            {
+                "model": records[0].get("model_path"),
+                "model_identity": records[0]["model_identity"],
+            },
+            cast("str | None", expected_identity.get("model_path")),
+            identity=cast("dict[str, object] | None", expected_identity.get("model_identity")),
+        )
+    ):
+        raise ValueError("refusing resumed episode with different semantic model weights")
+    if records and "model_identity" in recorded_identity and "model_identity" in canonical_identity:
+        recorded_identity["model_identity"] = canonical_identity["model_identity"]
+    if records and "model_identity" not in recorded_identity and "model_path" in records[0]:
+        # Legacy traces without accessible weights can only be compared on their other semantic fields.
+        canonical_identity.pop("model_identity", None)
+    if "task_definition_content" not in recorded_identity and records:
+        canonical_identity.pop("task_definition_content", None)
+        if records[0].get("task_variant") != "leak" and "task_definition_sha256" in records[0]:
+            canonical_identity["task_definition_sha256"] = expected_identity.get(
+                "task_definition_sha256"
+            )
     if recorded_identity != canonical_identity:
         differing_keys = sorted(
             key
-            for key in set(expected_identity) | set(recorded_identity)
-            if key not in expected_identity
-            or key not in recorded_identity
-            or expected_identity[key] != recorded_identity[key]
+            for key in set(canonical_identity) | set(recorded_identity)
+            if canonical_identity.get(key) != recorded_identity.get(key)
         )
         raise ValueError(
             "refusing resumed episode with changed task, seed, adapter or sampling identity; "

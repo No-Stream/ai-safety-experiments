@@ -18,6 +18,12 @@ from typing import Any, Literal, TypedDict, cast
 
 from games.train import resolve_complete_resume_checkpoint
 from reward_hacking.distill.score import compute_kl_summary
+from reward_hacking.semantic_identity import (
+    model_identity,
+    prompt_inputs,
+    recorded_model_matches,
+    split_inputs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,8 +148,21 @@ def _validate_config(config: DistillRoundsConfig) -> None:
     )
 
 
+def _teacher_semantic_settings(flags: Sequence[str]) -> dict[str, object]:
+    return {
+        "language_model_only": "--language-model-only" in flags,
+        "kv_cache_dtype": flags[flags.index("--kv-cache-dtype") + 1]
+        if "--kv-cache-dtype" in flags
+        else None,
+    }
+
+
 def _run_config_payload(config: DistillRoundsConfig) -> dict[str, object]:
     return {
+        "prompt_inputs": prompt_inputs(config.prompts),
+        "split_inputs": split_inputs(config.split_json),
+        "student_model_identity": model_identity(config.student_model),
+        "teacher_model_identity": model_identity(config.teacher_model),
         "run_dir": str(config.run_dir.resolve()),
         "rounds": config.rounds,
         "prompts": str(config.prompts.resolve()),
@@ -541,7 +560,39 @@ def run_rounds(
     config_payload = _run_config_payload(config)
     if run_config_path.exists():
         recorded_config = json.loads(run_config_path.read_text(encoding="utf-8"))
-        if recorded_config != config_payload:
+        ignored = {
+            "run_dir",
+            "prompts",
+            "split_json",
+            "student_model",
+            "student_model_identity",
+            "teacher_model",
+            "teacher_model_identity",
+            "phase_budget",
+            "disposable",
+            "teacher_engine_flags",
+        }
+        if (
+            not recorded_model_matches(
+                recorded_config,
+                config.student_model,
+                field="student_model",
+                identity=cast("dict[str, object]", config_payload["student_model_identity"]),
+            )
+            or not recorded_model_matches(
+                recorded_config,
+                config.teacher_model,
+                field="teacher_model",
+                identity=cast("dict[str, object]", config_payload["teacher_model_identity"]),
+            )
+            or _teacher_semantic_settings(recorded_config["teacher_engine_flags"])
+            != _teacher_semantic_settings(config.teacher_engine_flags)
+            or any(
+                recorded_config[key] != value
+                for key, value in config_payload.items()
+                if key not in ignored and key in recorded_config
+            )
+        ):
             raise ValueError(
                 f"{run_config_path} arguments differ from this launch; refusing relaunch"
             )

@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
+import torch
 from safetensors.torch import load_file, save_file
 
 logger = logging.getLogger(__name__)
@@ -68,30 +69,66 @@ def _assert_destination_is_outside_adapter(adapter_dir: Path, destination: Path)
         )
 
 
-def _validate_existing_serving_copy(destination: Path, identity: dict[str, str]) -> Path:
+def _validate_existing_serving_copy(
+    destination: Path,
+    *,
+    expected_config: dict[str, object],
+    expected_weights: dict[str, torch.Tensor],
+) -> bool:
+    """Return whether a cached serving copy still represents the requested adapter."""
     metadata_path = destination / SERVING_METADATA_FILENAME
     if not metadata_path.is_file():
-        raise FileExistsError(f"adapter destination exists without serving metadata: {destination}")
+        return False
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if not isinstance(metadata, dict):
         raise TypeError(f"serving adapter metadata must be a JSON object: {metadata_path}")
-    if (
-        metadata.get("config_sha256") != identity["config_sha256"]
-        or metadata.get("weights_sha256") != identity["weights_sha256"]
-        or metadata.get("format") != 1
-    ):
-        raise FileExistsError(
-            f"adapter destination {destination} was created from different source weights"
-        )
-    served_config_path = destination / ADAPTER_CONFIG_FILENAME
-    if _sha256_file(served_config_path) != identity["config_sha256"]:
-        raise ValueError(f"serving adapter config changed after preparation: {served_config_path}")
     served_weights_path = destination / ADAPTER_WEIGHTS_FILENAME
-    if _sha256_file(served_weights_path) != metadata.get("served_weights_sha256"):
+    served_weights_digest = metadata.get("served_weights_sha256")
+    if not isinstance(served_weights_digest, str):
+        return False
+    if _sha256_file(served_weights_path) != served_weights_digest:
         raise ValueError(
             f"serving adapter weights changed after preparation: {served_weights_path}"
         )
-    return destination
+    served_weights = load_file(str(served_weights_path))
+    if not _same_tensor_values(expected_weights, served_weights):
+        return False
+    if not (destination / ADAPTER_CONFIG_FILENAME).is_file():
+        return False
+    return _read_adapter_config(destination) == expected_config
+
+
+def _same_tensor_values(expected: dict[str, torch.Tensor], actual: dict[str, torch.Tensor]) -> bool:
+    if expected.keys() != actual.keys():
+        return False
+    for key, expected_tensor in expected.items():
+        actual_tensor = actual[key]
+        if expected_tensor.shape != actual_tensor.shape:
+            return False
+        expected_values = expected_tensor.to(device="cpu", dtype=torch.float64)
+        actual_values = actual_tensor.to(device="cpu", dtype=torch.float64)
+        if not torch.equal(expected_values, actual_values):
+            return False
+    return True
+
+
+def _replace_serving_copy(staging: Path, destination: Path) -> None:
+    """Replace a stale derived copy atomically, restoring it if promotion fails."""
+    backup_path: Path | None = None
+    if destination.exists():
+        backup_path = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.stale.", dir=destination.parent)
+        )
+        backup_path.rmdir()
+        destination.replace(backup_path)
+    try:
+        staging.replace(destination)
+    except OSError:
+        if backup_path is not None:
+            backup_path.replace(destination)
+        raise
+    if backup_path is not None:
+        shutil.rmtree(backup_path)
 
 
 def prepare_vllm_serving_adapter(adapter_dir: Path, destination: Path | None) -> Path:
@@ -121,9 +158,19 @@ def prepare_vllm_serving_adapter(adapter_dir: Path, destination: Path | None) ->
             f"{adapter_dir} has flat-named Qwen3.5 weights and needs a caller-provided serving directory"
         )
     _assert_destination_is_outside_adapter(adapter_dir, destination)
-    identity = _source_identity(adapter_dir)
-    if destination.exists():
-        return _validate_existing_serving_copy(destination, identity)
+    source_config = config
+    source_weights = load_file(str(weights_path))
+    served_tensors = {
+        NESTED_QWEN35_PREFIX + key.removeprefix(FLAT_QWEN35_PREFIX): tensor
+        for key, tensor in source_weights.items()
+    }
+    source_identity = _source_identity(adapter_dir)
+    if destination.exists() and _validate_existing_serving_copy(
+        destination,
+        expected_config=source_config,
+        expected_weights=served_tensors,
+    ):
+        return destination
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -131,20 +178,17 @@ def prepare_vllm_serving_adapter(adapter_dir: Path, destination: Path | None) ->
     ) as staging_name:
         staging = Path(staging_name)
         shutil.copy2(adapter_dir / ADAPTER_CONFIG_FILENAME, staging / ADAPTER_CONFIG_FILENAME)
-        renamed_tensors = {
-            NESTED_QWEN35_PREFIX + key.removeprefix(FLAT_QWEN35_PREFIX): tensor
-            for key, tensor in tensors.items()
-        }
-        save_file(renamed_tensors, str(staging / ADAPTER_WEIGHTS_FILENAME))
+        save_file(served_tensors, str(staging / ADAPTER_WEIGHTS_FILENAME))
         metadata = {
-            "config_sha256": identity["config_sha256"],
-            "format": 1,
+            "config": source_config,
+            "config_sha256": source_identity["config_sha256"],
+            "format": 2,
             "served_weights_sha256": _sha256_file(staging / ADAPTER_WEIGHTS_FILENAME),
-            "weights_sha256": identity["weights_sha256"],
+            "weights_sha256": source_identity["weights_sha256"],
         }
         (staging / SERVING_METADATA_FILENAME).write_text(
             json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8"
         )
-        staging.replace(destination)
+        _replace_serving_copy(staging, destination)
     logger.info("prepared flat-named Qwen3.5 LoRA adapter at %s", destination)
     return destination

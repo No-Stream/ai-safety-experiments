@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -22,6 +23,7 @@ from reward_hacking.interp.hack_contrast import (
     _build_parser,
     _build_steering_samples,  # pyright: ignore[reportPrivateUsage]
     _completion_coherence,
+    _direction_bundle_content_identity,
     _emit_pair_shifts,
     _generate_steered_batch,
     _GeneratedSteeringBatch,
@@ -29,12 +31,15 @@ from reward_hacking.interp.hack_contrast import (
     _generation_hook,
     _GenerationBatchConfig,
     _left_pad_prompt_batch,
+    _legacy_steering_identity_compatible,
     _parse_strengths,
     _pool_response_batch,  # pyright: ignore[reportPrivateUsage]
     _prompt_records,  # pyright: ignore[reportPrivateUsage]
     _prompt_residual_norms,
     _selected_steering_layers,
+    _steering_adapter_weights_identity,
     _steering_record,
+    _steering_resume_identity,
     _steering_sample_seed,
     _SteeringCell,
     _SteeringRuntime,
@@ -59,6 +64,8 @@ from reward_hacking.interp.hack_contrast import (
     save_direction_bundle,
     shuffled_pair_null_auc,
 )
+from reward_hacking.interp.jsonl_resume import ResumeLedger, ledger_path_for, resume_records
+from reward_hacking.interp.lens_fit_runtime import weights_fingerprint
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -377,6 +384,376 @@ def test_last_prompt_is_a_steer_position_and_sparse_layers_validate() -> None:
     assert _validate_direction_bundle(directions, provenance) == [4, 12]
     sample_seeds = [_steering_sample_seed(19, "synthetic-item", index, 4) for index in range(4)]
     assert len(set(sample_seeds)) == 4
+
+
+def test_compatible_direction_schema_with_the_same_semantics_loads() -> None:
+    directions = {"last_prompt": torch.ones((2, 3), dtype=torch.float32)}
+    provenance = {
+        "schema_version": 2,
+        "positions": ["last_prompt"],
+        "layers": [4, 12],
+        "layer_index_convention": LAYER_INDEX_CONVENTION,
+    }
+
+    assert _validate_direction_bundle(directions, provenance) == [4, 12]
+
+
+def test_direction_schema_compatibility_still_rejects_changed_layer_semantics() -> None:
+    directions = {"last_prompt": torch.ones((2, 3), dtype=torch.float32)}
+    provenance = {
+        "schema_version": 2,
+        "positions": ["last_prompt"],
+        "layers": [4, 12],
+        "layer_index_convention": "one-based hidden-state index",
+    }
+
+    with pytest.raises(ValueError, match="different hidden-state/block index convention"):
+        _validate_direction_bundle(directions, provenance)
+
+
+def test_positive_direction_schema_tags_are_checked_by_semantics_not_allowlist() -> None:
+    directions = {"last_prompt": torch.ones((2, 3), dtype=torch.float32)}
+    provenance = {
+        "schema_version": 37,
+        "positions": ["last_prompt"],
+        "layers": [4, 12],
+        "layer_index_convention": LAYER_INDEX_CONVENTION,
+    }
+
+    assert _validate_direction_bundle(directions, provenance) == [4, 12]
+
+
+def test_direction_schema_requires_positive_tag_and_complete_semantic_layout() -> None:
+    directions = {"last_prompt": torch.ones((2, 3), dtype=torch.float32)}
+    invalid_provenance = [
+        {
+            "schema_version": 0,
+            "positions": ["last_prompt"],
+            "layers": [4, 12],
+            "layer_index_convention": LAYER_INDEX_CONVENTION,
+        },
+        {
+            "schema_version": 3,
+            "layers": [4, 12],
+            "layer_index_convention": LAYER_INDEX_CONVENTION,
+        },
+        {
+            "schema_version": 3,
+            "positions": ["last_prompt"],
+            "layers": [4, "12"],
+            "layer_index_convention": LAYER_INDEX_CONVENTION,
+        },
+    ]
+
+    for provenance in invalid_provenance:
+        with pytest.raises(ValueError, match="invalid direction bundle semantic layout"):
+            _validate_direction_bundle(directions, provenance)
+
+
+def test_direction_content_identity_ignores_npy_container_layout_and_tracks_values(
+    tmp_path: Path,
+) -> None:
+    values = np.arange(24, dtype=np.float32).reshape(3, 8)
+    c_directory = tmp_path / "c-order"
+    fortran_directory = tmp_path / "fortran-order"
+    c_directory.mkdir()
+    fortran_directory.mkdir()
+    provenance = {
+        "schema_version": 1,
+        "positions": ["last_prompt"],
+        "layers": [2, 4, 6],
+        "layer_index_convention": LAYER_INDEX_CONVENTION,
+    }
+    for directory, array in (
+        (c_directory, values),
+        (fortran_directory, np.asfortranarray(values)),
+    ):
+        np.save(directory / "direction.last_prompt.npy", array)
+        (directory / "provenance.json").write_text(json.dumps(provenance))
+    assert (c_directory / "direction.last_prompt.npy").read_bytes() != (
+        fortran_directory / "direction.last_prompt.npy"
+    ).read_bytes()
+    c_directions, _ = load_direction_bundle(c_directory)
+    fortran_directions, _ = load_direction_bundle(fortran_directory)
+
+    c_identity = _direction_bundle_content_identity(c_directions, [2, 4, 6])
+    fortran_identity = _direction_bundle_content_identity(fortran_directions, [2, 4, 6])
+    changed_identity = _direction_bundle_content_identity(
+        {"last_prompt": c_directions["last_prompt"].clone().add(1)}, [2, 4, 6]
+    )
+
+    assert c_identity == fortran_identity
+    assert c_identity != changed_identity
+
+
+def _steering_runtime_for_identity(  # noqa: PLR0913, PLR0917 - fixture exposes the runtime identity inputs
+    model: torch.nn.Module,
+    adapter_path: Path,
+    prompt_path: Path,
+    adapter_weights_identity: str | None,
+    prompt_tokens: tuple[int, ...] = (4, 9),
+    model_weights_identity: str | None = None,
+) -> _SteeringRuntime:
+    config = SteeringConfig(
+        model_id="synthetic/model",
+        adapter=adapter_path,
+        direction_dir=Path("directions"),
+        prompts_path=prompt_path,
+        position="last_prompt",
+        scope="all",
+        layer_index=0,
+        strengths=(1.0,),
+        seed=1,
+        max_new_tokens=8,
+        output_path=Path("steered.jsonl"),
+    )
+    return _SteeringRuntime(
+        config=config,
+        model=model,
+        tokenizer=cast("Any", object()),
+        directions={"last_prompt": torch.ones((1, 2))},
+        saved_layer_ids=[0],
+        selected_layers=[0],
+        prompts=[{"item_id": "selected", "prompt": "same"}],
+        prompt_token_ids=[list(prompt_tokens)],
+        item_ids=["selected"],
+        residual_norms_by_layer={0: [(1.0, None)]},
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        generation_batch_size=1,
+        eos_token_ids=frozenset(),
+        sampling_provenance={},
+        model_weights_identity=model_weights_identity,
+        adapter_weights_identity=adapter_weights_identity,
+    )
+
+
+def test_steering_resume_identity_tracks_loaded_adapter_weights_and_selected_tokens(
+    tmp_path: Path,
+) -> None:
+    class AdapterProjection(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lora_A = torch.nn.Parameter(torch.ones((2, 2)))
+
+    class AdapterModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(
+                model_type="toy", hidden_size=2, _name_or_path="/old/model"
+            )
+            self.projection = AdapterProjection()
+            self.register_parameter("base_weight", torch.nn.Parameter(torch.zeros((2, 2))))
+
+    model = AdapterModel()
+    first_adapter = tmp_path / "adapter-a"
+    second_adapter = tmp_path / "adapter-b"
+    first_adapter.mkdir()
+    second_adapter.mkdir()
+    (first_adapter / "adapter_config.json").write_text(
+        '{"base_model_name_or_path":"/old/model","r":2,"lora_alpha":4}\n'
+    )
+    (second_adapter / "adapter_config.json").write_text(
+        '{ "lora_alpha": 4, "r": 2, "base_model_name_or_path": "/new/model" }\n'
+    )
+    first_adapter_identity = _steering_adapter_weights_identity(model, first_adapter)
+    second_adapter_identity = _steering_adapter_weights_identity(model, second_adapter)
+    assert first_adapter_identity == second_adapter_identity
+
+    first_runtime = _steering_runtime_for_identity(
+        model,
+        first_adapter,
+        tmp_path / "prompts-a.jsonl",
+        first_adapter_identity,
+        model_weights_identity=weights_fingerprint("synthetic/model", model, first_adapter),
+    )
+    model.config._name_or_path = "/new/model"
+    second_runtime = _steering_runtime_for_identity(
+        model,
+        second_adapter,
+        tmp_path / "prompts-b.jsonl",
+        second_adapter_identity,
+        model_weights_identity=weights_fingerprint("synthetic/model", model, second_adapter),
+    )
+    assert _steering_resume_identity(first_runtime) == _steering_resume_identity(second_runtime)
+
+    changed_prompt_runtime = _steering_runtime_for_identity(
+        model,
+        second_adapter,
+        tmp_path / "prompts-b.jsonl",
+        second_adapter_identity,
+        (4, 10),
+        weights_fingerprint("synthetic/model", model, second_adapter),
+    )
+    assert _steering_resume_identity(changed_prompt_runtime) != _steering_resume_identity(
+        second_runtime
+    )
+
+    changed_direction_runtime = _steering_runtime_for_identity(
+        model,
+        second_adapter,
+        tmp_path / "prompts-b.jsonl",
+        second_adapter_identity,
+        model_weights_identity=weights_fingerprint("synthetic/model", model, second_adapter),
+    )
+    changed_direction_runtime.directions["last_prompt"][0, 0] += 1
+    assert _steering_resume_identity(changed_direction_runtime) != _steering_resume_identity(
+        second_runtime
+    )
+
+    with torch.no_grad():
+        model.projection.lora_A[0, 0] += 1.0
+    changed_adapter_identity = _steering_adapter_weights_identity(model, second_adapter)
+    changed_weight_runtime = _steering_runtime_for_identity(
+        model,
+        second_adapter,
+        tmp_path / "prompts-b.jsonl",
+        changed_adapter_identity,
+        model_weights_identity=weights_fingerprint("synthetic/model", model, second_adapter),
+    )
+    assert _steering_resume_identity(changed_weight_runtime) != _steering_resume_identity(
+        second_runtime
+    )
+
+
+def test_legacy_steering_resume_checks_stored_prompt_tokens() -> None:
+    model = torch.nn.Linear(2, 2)
+    adapter_path = Path("/old/adapter")
+    runtime = _steering_runtime_for_identity(
+        model,
+        adapter_path,
+        Path("/old/prompts.jsonl"),
+        "loaded-weights",
+    )
+    wanted = _steering_resume_identity(runtime)
+    legacy = {
+        key: value
+        for key, value in wanted.items()
+        if key
+        not in {
+            "model_weights_identity",
+            "adapter_weights_identity",
+            "selected_prompt_tokens_sha256",
+        }
+    }
+    legacy["model"] = "synthetic/model"
+    legacy["adapter"] = str(adapter_path)
+    legacy["prompts_sha256"] = "old-byte-digest"
+    legacy["direction_bundle_sha256"] = {"direction.last_prompt.npy": "old-byte-digest"}
+    records = [{"item_id": "selected", "prompt_token_ids": [4, 9]}]
+    expected_prompt_tokens = {"selected": [4, 9]}
+
+    assert _legacy_steering_identity_compatible(
+        wanted, legacy, records, expected_prompt_tokens=expected_prompt_tokens
+    )
+    assert not _legacy_steering_identity_compatible(
+        wanted,
+        legacy,
+        [{"item_id": "selected", "prompt_token_ids": [4, 10]}],
+        expected_prompt_tokens=expected_prompt_tokens,
+    )
+
+
+def test_legacy_partial_steering_resume_accepts_checked_completed_prompt_subset() -> None:
+    model = torch.nn.Linear(2, 2)
+    adapter_path = Path("/old/adapter")
+    runtime = _steering_runtime_for_identity(
+        model,
+        adapter_path,
+        Path("/old/prompts.jsonl"),
+        "loaded-weights",
+    )
+    wanted = _steering_resume_identity(runtime)
+    wanted["selected_item_ids"] = ["selected", "pending"]
+    legacy = {
+        key: value
+        for key, value in wanted.items()
+        if key
+        not in {
+            "model_weights_identity",
+            "adapter_weights_identity",
+            "selected_prompt_tokens_sha256",
+        }
+    }
+    legacy["model"] = "synthetic/model"
+    legacy["adapter"] = str(adapter_path)
+    legacy["prompts_sha256"] = "old-byte-digest"
+    legacy["direction_bundle_sha256"] = {"direction.last_prompt.npy": "old-byte-digest"}
+
+    assert _legacy_steering_identity_compatible(
+        wanted,
+        legacy,
+        [{"item_id": "selected", "prompt_token_ids": [4, 9]}],
+        expected_prompt_tokens={"selected": [4, 9], "pending": [6, 8]},
+    )
+
+
+def test_old_partial_steering_ledger_resumes_checked_prompt_and_keeps_pending_prompt(
+    tmp_path: Path,
+) -> None:
+    runtime = _steering_runtime_for_identity(
+        torch.nn.Linear(2, 2),
+        Path("/old/adapter"),
+        Path("/old/prompts.jsonl"),
+        "loaded-weights",
+    )
+    runtime = replace(
+        runtime,
+        item_ids=["selected", "pending"],
+        prompt_token_ids=[[4, 9], [6, 8]],
+        prompts=[
+            {"item_id": "selected", "prompt": "old completed prompt"},
+            {"item_id": "pending", "prompt": "new pending prompt"},
+        ],
+    )
+    wanted = _steering_resume_identity(runtime)
+    legacy = {
+        key: value
+        for key, value in wanted.items()
+        if key
+        not in {
+            "model_weights_identity",
+            "adapter_weights_identity",
+            "selected_prompt_tokens_sha256",
+        }
+    }
+    legacy["model"] = "synthetic/model"
+    legacy["adapter"] = "/old/adapter"
+    legacy["prompts_sha256"] = "old-byte-digest"
+    legacy["direction_bundle_sha256"] = {"direction.last_prompt.npy": "old-byte-digest"}
+    sample_id = "L0:direction:1:selected:0"
+    records_path = tmp_path / "steered.jsonl"
+    records_path.write_text(
+        json.dumps(
+            {
+                "sample_id": sample_id,
+                "item_id": "selected",
+                "prompt_token_ids": [4, 9],
+            }
+        )
+        + "\n"
+    )
+    ledger = ResumeLedger(ledger_path_for(records_path), legacy, completed_records={sample_id: 1})
+    ledger.write()
+
+    state, resumed_ledger = resume_records(
+        records_path,
+        identity=wanted,
+        unit_of=lambda record: str(record["sample_id"]),
+        record_key_of=lambda record: str(record["sample_id"]),
+        legacy_identity_compatible=lambda requested, stored, records: (
+            _legacy_steering_identity_compatible(
+                requested,
+                stored,
+                records,
+                expected_prompt_tokens={"selected": [4, 9], "pending": [6, 8]},
+            )
+        ),
+    )
+
+    assert [record["sample_id"] for record in state.kept_records] == [sample_id]
+    assert resumed_ledger.identity == wanted
+    assert resumed_ledger.completed_records == {sample_id: 1}
 
 
 def test_steer_cli_accepts_explicit_multiple_layers() -> None:

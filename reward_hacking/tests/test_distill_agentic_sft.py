@@ -288,6 +288,7 @@ def test_build_scope_reloads_and_binds_heldout_manifests(tmp_path: Path) -> None
     digest = hashlib.sha256(heldout_manifest.read_bytes()).hexdigest()
     report = {
         "heldout_manifests": [{"path": str(heldout_manifest), "sha256": digest}],
+        "heldout_scope": {"task_ids": [], "channels": ["synthetic-channel"]},
     }
 
     task_ids, channels, provided = agentic_sft._selection_heldout_scope(report)
@@ -296,8 +297,7 @@ def test_build_scope_reloads_and_binds_heldout_manifests(tmp_path: Path) -> None
     assert channels == {"synthetic-channel"}
     assert provided is True
     heldout_manifest.write_text('{"heldout_channels": ["changed-channel"]}\n', encoding="utf-8")
-    with pytest.raises(ValueError, match="changed since selection"):
-        agentic_sft._selection_heldout_scope(report)
+    assert agentic_sft._selection_heldout_scope(report) == (set(), {"synthetic-channel"}, True)
 
 
 def test_card_heldout_manifests_must_match_selection_provenance(tmp_path: Path) -> None:
@@ -976,14 +976,8 @@ def test_repeated_episode_keys_from_separate_runs_get_distinct_training_keys(
         ],
     )
 
-    report = _select_episodes(
-        [first_path, second_path],
-        tokenizer=cast("Any", CharacterTokenizer()),
-    )
-    rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
-
-    assert rows[0]["key"] != rows[1]["key"]
-    assert rows[0]["token_ids_sha256"] == rows[1]["token_ids_sha256"]
+    with pytest.raises(ValueError, match="duplicate"):
+        _select_episodes([first_path, second_path], tokenizer=cast("Any", CharacterTokenizer()))
 
 
 def test_judge_strategy_override_is_hash_bound_and_survives_build(tmp_path: Path) -> None:
@@ -1210,6 +1204,7 @@ def test_strategy_labels_refuse_changed_source_record_hash(tmp_path: Path) -> No
                     training_key: {
                         "episode_key": episode["key"],
                         "source_record_sha256": agentic_sft._source_record_sha256(episode),
+                        "reviewed_record": agentic_sft._reviewed_record(episode),
                         "strategy": "fitted_rule",
                         "regex_strategy": "honest_no_hack",
                         "rationale": "Synthetic rationale.",
@@ -1222,7 +1217,7 @@ def test_strategy_labels_refuse_changed_source_record_hash(tmp_path: Path) -> No
     changed_episode = {**episode, "highest_rung": 99}
     _write_records(records_path, [changed_episode])
 
-    with pytest.raises(ValueError, match="source record hash changed"):
+    with pytest.raises(ValueError, match="reviewed evidence changed"):
         _select_episodes(
             [records_path],
             tokenizer=cast("Any", CharacterTokenizer()),
@@ -3242,3 +3237,261 @@ def test_schema_only_selection_obeys_turn_cap_policy_and_rejects_truncation(
         schema_only_max_turns=4,
     )
     assert truncated_report["selected"] == []
+
+
+def test_training_identity_survives_records_relocation() -> None:
+    episode_key = {"scenario_id": "synthetic", "sample": 0}
+    assert agentic_sft._training_key(
+        Path("old/records.jsonl"), 1, episode_key
+    ) == agentic_sft._training_key(Path("new/records.jsonl"), 9, episode_key)
+
+
+def test_heldout_semantics_survive_reformat_and_relocation(tmp_path: Path) -> None:
+    original = tmp_path / "original.json"
+    moved = tmp_path / "moved.json"
+    original.write_text('{"heldout_task_ids": ["synthetic-a"], "heldout_channels": ["channel-a"]}')
+    report = {
+        "heldout_manifests": [{"path": str(original), "sha256": "0" * 64}],
+        "heldout_scope": {"task_ids": ["synthetic-a"], "channels": ["channel-a"]},
+    }
+    moved.write_text(
+        json.dumps(
+            {"heldout_channels": ["channel-a"], "heldout_task_ids": ["synthetic-a"]}, indent=2
+        )
+    )
+    task_ids, channels, _ = agentic_sft._validate_card_heldout_manifests(report, [moved])
+    assert task_ids == {"synthetic-a"}
+    assert channels == {"channel-a"}
+    moved.write_text('{"heldout_task_ids": ["synthetic-b"]}')
+    with pytest.raises(ValueError, match="held-out"):
+        agentic_sft._validate_card_heldout_manifests(report, [moved])
+
+
+def test_selection_tokens_compare_substance(tmp_path: Path) -> None:
+    row: dict[str, object] = {
+        "key": "row",
+        "prompt_token_ids": [1],
+        "completion_token_ids": [2],
+        "loss_mask": [1],
+        "labels": {},
+        "token_ids_sha256": "new",
+        "sequence_tokens": 2,
+    }
+    entry: dict[str, object] = {
+        "episode_row_key": "row",
+        "prompt_token_ids": [1],
+        "completion_token_ids": [2],
+        "loss_mask": [1],
+        "labels": {},
+        "token_ids_sha256": "old",
+        "training_key": "stable",
+        "final_context_length": 2,
+    }
+    agentic_sft._validate_manifest_row(entry, row)
+    row["key"] = "row"
+    row["completion_token_ids"] = [3]
+    with pytest.raises(ValueError, match="token"):
+        agentic_sft._validate_manifest_row(entry, row)
+
+
+def test_base_nll_legacy_serialization_digest_is_provenance(tmp_path: Path) -> None:
+    rows_path = tmp_path / "rows.jsonl"
+    rows_path.write_text(
+        '{"key": "row", "prompt_token_ids": [1], "completion_token_ids": [2], "loss_mask": [1], "labels": {}}\n'
+    )
+    report_path = tmp_path / "nll.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "complete": True,
+                "adapter": None,
+                "rows_sha256": "0" * 64,
+                "rows": [{"row_key": "row", "action_tokens": 1, "mean_nll": 0.5}],
+            }
+        )
+    )
+    rows, _ = agentic_sft._load_base_nll(report_path, rows_path, {"row"})
+    assert rows["row"]["mean_nll"] == 0.5
+
+
+def test_reviewed_evidence_ignores_storage_metadata_but_rejects_outcome_change() -> None:
+    original = {
+        "key": {"scenario_id": "synthetic", "arm": "control"},
+        "trace_path": "old.jsonl",
+        "highest_rung": 1,
+    }
+    reviewed = agentic_sft._reviewed_record(original)
+    assert reviewed == agentic_sft._reviewed_record(
+        {
+            **original,
+            "trace_path": "new.jsonl",
+            "timestamp": "later",
+            "notes": "unrelated",
+            "model_path": "moved-model",
+        }
+    )
+    assert reviewed != agentic_sft._reviewed_record({**original, "highest_rung": 2})
+
+
+def test_base_nll_semantic_tokens_reject_changed_score_inputs(tmp_path: Path) -> None:
+    row = {"key": "row", "prompt_token_ids": [1], "completion_token_ids": [2], "loss_mask": [1]}
+    rows_path = tmp_path / "rows.jsonl"
+    rows_path.write_text(json.dumps(row) + "\n")
+    report_path = tmp_path / "nll.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "complete": True,
+                "adapter": None,
+                "row_inputs": [row],
+                "rows": [{"row_key": "row", "action_tokens": 1, "mean_nll": 0.5}],
+            }
+        )
+    )
+    agentic_sft._load_base_nll(report_path, rows_path, {"row"})
+    rows_path.write_text(json.dumps({**row, "completion_token_ids": [3]}) + "\n")
+    with pytest.raises(ValueError, match="different SFT rows"):
+        agentic_sft._load_base_nll(report_path, rows_path, {"row"})
+
+
+def test_manifest_reordered_records_keep_saved_episode_identity(tmp_path: Path) -> None:
+    report = _synthetic_balanced_manifest(tmp_path)
+    expected = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    selected = cast("list[dict[str, object]]", report["selected"])
+    records_path = Path(cast("str", selected[0]["source_records_file"]))
+    records = [record for _, record in agentic_sft._read_records_with_lines(records_path)]
+    _write_records(records_path, [dict(record) for record in reversed(records)])
+    actual = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    assert actual == expected
+
+
+def test_legacy_manifest_training_identity_survives_relocation(tmp_path: Path) -> None:
+    report = _synthetic_balanced_manifest(tmp_path)
+    selected = cast("list[dict[str, object]]", report["selected"])
+    old_path = Path(cast("str", selected[0]["source_records_file"]))
+    new_path = tmp_path / "moved" / "records.jsonl"
+    new_path.parent.mkdir()
+    new_path.write_bytes(old_path.read_bytes())
+    for entry in selected:
+        identity = json.dumps(
+            {"records_path": str(old_path.resolve()), "episode_key": entry["episode_key"]},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        entry["training_key"] = "agentic-sft:" + hashlib.sha256(identity.encode()).hexdigest()
+        entry["source_records_file"] = str(new_path)
+    actual = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    assert [row["key"] for row in actual] == [entry["training_key"] for entry in selected]
+
+
+def test_strategy_override_binds_reviewed_trace_content() -> None:
+    record = {"key": {"scenario_id": "synthetic", "arm": "control"}}
+    trace = [{"record": "turn", "assistant_text": "synthetic command", "trace_path": "old"}]
+    override = {
+        "episode_key": record["key"],
+        "source_record_sha256": "legacy-provenance",
+        "strategy": "fitted_rule",
+        "regex_strategy": "honest_no_hack",
+        "rationale": "Synthetic rationale.",
+        "provenance": {
+            "model_slug": "synthetic",
+            "date": "2026-10-11",
+            "taxonomy_version": "hack_strategy_v2",
+        },
+    }
+    saved = agentic_sft._validated_strategy_override(override, record, trace_records=trace)
+    agentic_sft._validated_strategy_override(
+        saved, record, trace_records=[{**trace[0], "trace_path": "moved"}]
+    )
+    with pytest.raises(ValueError, match="reviewed trace"):
+        agentic_sft._validated_strategy_override(
+            saved, record, trace_records=[{**trace[0], "assistant_text": "changed command"}]
+        )
+
+
+def test_same_episode_identity_with_distinct_completions_gets_distinct_training_keys(
+    tmp_path: Path,
+) -> None:
+    first = _synthetic_episode(
+        tmp_path / "first", "same", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    second = _synthetic_episode(
+        tmp_path / "second", "same", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    trace_path = Path(cast("str", second["trace_path"]))
+    traces = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    traces[1]["raw_completion"] = "C"
+    traces[1]["completion_token_ids"] = [ord("C")]
+    trace_path.write_text("".join(json.dumps(trace) + "\n" for trace in traces))
+    records_path = _write_records(tmp_path / "records.jsonl", [first, second])
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+    rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    assert rows[0]["key"] != rows[1]["key"]
+
+
+def test_build_explicitly_relocates_missing_source_records(tmp_path: Path) -> None:
+    report = _synthetic_balanced_manifest(tmp_path)
+    selected = cast("list[dict[str, object]]", report["selected"])
+    old_path = Path(cast("str", selected[0]["source_records_file"]))
+    moved = tmp_path / "moved.jsonl"
+    moved.write_bytes(old_path.read_bytes())
+    old_path.unlink()
+    rows = _build_selected_rows(
+        report, tokenizer=cast("Any", CharacterTokenizer()), source_records_paths=[moved]
+    )
+    assert len(rows) == len(selected)
+
+
+def test_dataset_template_content_replaces_digest_metadata() -> None:
+    first = {
+        "key": "one",
+        "prompt_render": "student",
+        "student_template": "synthetic template",
+        "student_template_sha256": "old",
+        "prefix_diff_counts": [],
+    }
+    second = {**first, "key": "two", "student_template_sha256": "new"}
+    manifest = agentic_sft._dataset_manifest([first, second])
+    assert manifest["student_template"] == "synthetic template"
+    with pytest.raises(ValueError, match="mixed render"):
+        agentic_sft._dataset_manifest([first, {**second, "student_template": "changed template"}])
+
+
+def test_card_reader_accepts_saved_training_row_identity(tmp_path: Path) -> None:
+    key = "agentic-sft:" + "a" * 64
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps({"key": key}) + "\n")
+    assert agentic_sft._read_card_rows(path)[0]["key"] == key
+
+
+def test_legacy_hint_labels_rebind_through_explicit_source_alias(tmp_path: Path) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "alias", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    current = _write_records(tmp_path / "new-records.jsonl", [episode])
+    previous = tmp_path / "old-records.jsonl"
+    identity = json.dumps(
+        {"records_path": str(previous.resolve()), "episode_key": episode["key"]},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    old_key = "agentic-sft:" + hashlib.sha256(identity.encode()).hexdigest()
+    labels = tmp_path / "judge.json"
+    labels.write_text(json.dumps({"format_version": 1, "hint_mentions": [old_key]}))
+    report = _select_episodes(
+        [current],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        hint_judge_labels_path=labels,
+        source_record_aliases={previous: current},
+    )
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "hint_mention"
+    assert "hint_judge_label" in cast("list[str]", excluded[0]["hint_mention_filter_reasons"])
+
+
+def test_reviewed_evidence_preserves_command_file_targets() -> None:
+    first = {"commands": [{"path": "/work/first", "command": "synthetic"}]}
+    second = {"commands": [{"path": "/work/second", "command": "synthetic"}]}
+    assert agentic_sft._reviewed_evidence(first) != agentic_sft._reviewed_evidence(second)

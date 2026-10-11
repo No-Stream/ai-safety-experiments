@@ -60,8 +60,10 @@ import httpx2
 import torch
 import urllib3.exceptions
 from httpx2 import Timeout
+from huggingface_hub import snapshot_download
 from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field
+from safetensors import safe_open
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -73,6 +75,94 @@ from transformers import (
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 logger = logging.getLogger(__name__)
+
+
+def _open_snapshot_tensors(directory: Path, stack: contextlib.ExitStack) -> dict[str, Any]:
+    """Index a snapshot's safetensors without materializing whole shards in memory."""
+    paths = sorted(directory.glob("*.safetensors"))
+    if not paths:
+        raise RuntimeError(f"weight snapshot {directory} contains no safetensors files")
+    tensor_handles: dict[str, Any] = {}
+    for path in paths:
+        handle = stack.enter_context(safe_open(path, framework="pt", device="cpu"))
+        for key in handle.keys():  # noqa: SIM118 - safe_open exposes keys() but is not iterable
+            if key in tensor_handles:
+                raise RuntimeError(f"weight snapshot {directory} contains duplicate tensor {key!r}")
+            tensor_handles[key] = handle
+    return tensor_handles
+
+
+def _tensor_values_match(
+    expected: torch.Tensor, actual: torch.Tensor, *, cast_to_actual: bool
+) -> bool:
+    if expected.shape != actual.shape:
+        return False
+    actual_values = actual.detach().to(device="cpu")
+    expected_values = expected.to(
+        device="cpu", dtype=actual_values.dtype if cast_to_actual else expected.dtype
+    )
+    return torch.equal(expected_values, actual_values)
+
+
+def _source_key_candidates(parameter_name: str) -> tuple[str, ...]:
+    candidates = [parameter_name]
+    if parameter_name.startswith("model.language_model."):
+        candidates.append("model." + parameter_name.removeprefix("model.language_model."))
+    elif parameter_name.startswith("model."):
+        candidates.append("model.language_model." + parameter_name.removeprefix("model."))
+    return tuple(candidates)
+
+
+def _snapshot_matches_model(snapshot_dir: Path, model: PreTrainedModel) -> bool:
+    with contextlib.ExitStack() as stack:
+        snapshot_tensors = _open_snapshot_tensors(snapshot_dir, stack)
+        loaded_parameters = dict(model.named_parameters())
+        if not loaded_parameters:
+            return False
+        for parameter_name, loaded_parameter in loaded_parameters.items():
+            source_keys = [
+                key for key in _source_key_candidates(parameter_name) if key in snapshot_tensors
+            ]
+            if not source_keys:
+                return False
+            for source_key in source_keys:
+                if not _tensor_values_match(
+                    snapshot_tensors[source_key].get_tensor(source_key),
+                    loaded_parameter,
+                    cast_to_actual=True,
+                ):
+                    return False
+    return True
+
+
+def _snapshots_match(first_dir: Path, second_dir: Path) -> bool:
+    with contextlib.ExitStack() as stack:
+        first_tensors = _open_snapshot_tensors(first_dir, stack)
+        second_tensors = _open_snapshot_tensors(second_dir, stack)
+        if first_tensors.keys() != second_tensors.keys():
+            return False
+        return all(
+            _tensor_values_match(
+                first_handle.get_tensor(key),
+                second_tensors[key].get_tensor(key),
+                cast_to_actual=False,
+            )
+            for key, first_handle in first_tensors.items()
+        )
+
+
+def _resolve_engine_snapshot(engine_model: str) -> Path | None:
+    reported_path = Path(engine_model)
+    if reported_path.is_dir():
+        return reported_path
+    if reported_path.is_absolute():
+        return None
+    repo_id, has_revision, revision = engine_model.rpartition("@")
+    if has_revision and "/" in repo_id:
+        return Path(snapshot_download(repo_id=repo_id, revision=revision, local_files_only=True))
+    if "/" in engine_model:
+        return Path(snapshot_download(repo_id=engine_model, local_files_only=True))
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -583,18 +673,11 @@ class HFBackend:
         return self._tokenizer
 
     def assert_serves_weights(self, snapshot_dir: Path) -> None:
-        """Raise unless the loaded model's config says it was read from ``snapshot_dir``.
-
-        transformers stamps ``name_or_path`` with the exact path ``from_pretrained`` was given, so
-        this ties the live model object to the directory whose tensor files were hashed and
-        matched to their revision -- the last link between "these bytes are that revision's" and
-        "this process is serving these bytes".
-        """
-        loaded_from = Path(str(self._model.config.name_or_path)).resolve()
-        if loaded_from != snapshot_dir.resolve():
+        """Raise unless the live model tensors match the verified snapshot's tensors."""
+        if not _snapshot_matches_model(snapshot_dir, self._model):
             raise RuntimeError(
-                f"HFBackend loaded its weights from {loaded_from}, not from the verified snapshot "
-                f"{snapshot_dir}; the served model is not the one whose identity was checked"
+                f"HFBackend loaded tensor values differ from verified snapshot {snapshot_dir}; "
+                "the served model is not the one whose identity was checked"
             )
 
     def clear_generation_audit(self) -> None:
@@ -1603,19 +1686,14 @@ class VLLMBackend:
         )
 
     def assert_serves_weights(self, snapshot_dir: Path) -> None:
-        """Raise unless the engine reports it loaded its weights from ``snapshot_dir``.
-
-        Read off the live engine's own model config rather than off this object's constructor
-        argument, because the constructor argument is what was ASKED for and the engine's record
-        is what happened; a mismatch between the two is exactly what this exists to surface.
-        Verified on the installed vllm 0.27.1: ``LLM.llm_engine.model_config.model`` carries the
-        path the engine was built from, verbatim.
-        """
+        """Compare the engine-reported weight directory's tensor content with the snapshot."""
         engine_model = str(self._llm.llm_engine.model_config.model)
-        if Path(engine_model).resolve() != snapshot_dir.resolve():
+        loaded_snapshot = _resolve_engine_snapshot(engine_model)
+        if loaded_snapshot is None or not _snapshots_match(snapshot_dir, loaded_snapshot):
             raise RuntimeError(
-                f"the vLLM engine reports it loaded {engine_model!r}, not the verified snapshot "
-                f"{snapshot_dir}; the served model is not the one whose identity was checked"
+                f"the vLLM engine's reported model {engine_model!r} does not resolve to tensor "
+                f"contents matching verified snapshot {snapshot_dir}; the served model is not the "
+                "one whose identity was checked"
             )
 
     def assert_adapter_changes_output(self, prompts: Sequence[str]) -> None:

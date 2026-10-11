@@ -771,6 +771,15 @@ def _read_cache(cache_path: Path, source: SourceName) -> dict[str, dict[str, obj
             raise ValueError(
                 f"invalid AISI ETL cache JSON at {cache_path}:{line_number}"
             ) from error
+        if isinstance(value, dict) and (
+            type(value.get("schema")) is not int or value.get("schema") != CACHE_SCHEMA
+        ):
+            logger.warning(
+                "discarding AISI ETL cache %s with unsupported schema at line %d",
+                cache_path,
+                line_number,
+            )
+            return {}
         problem_id, record = _decode_cache_record(
             value,
             cache_path=cache_path,

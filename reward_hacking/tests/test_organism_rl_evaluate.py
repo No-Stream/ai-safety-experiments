@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -381,11 +382,137 @@ def test_generation_path_identity_excludes_harness_code_sha() -> None:
     assert evaluate._validate_reuse_identity(expected_identity, stored_identity, waiver=None) == []
 
 
-def test_reuse_identity_refuses_prompt_format_version_mismatch() -> None:
+def test_reuse_accepts_prompt_version_with_identical_rendered_prompt() -> None:
+    first = {"prompt_format_version": 3, "task_prompt_sha256": {"synthetic": "same"}}
+    second = {**first, "prompt_format_version": 2}
+    assert evaluate._validate_reuse_identity(first, second, waiver=None) == []
+    assert evaluate._reuse_identity_sha256(first) == evaluate._reuse_identity_sha256(second)
+    with pytest.raises(ValueError, match="task_prompt_sha256"):
+        evaluate._validate_reuse_identity(
+            first, {**second, "task_prompt_sha256": {"synthetic": "changed"}}, waiver=None
+        )
+
+
+def test_reuse_refuses_prompt_version_without_rendered_evidence() -> None:
     with pytest.raises(ValueError, match="prompt_format_version"):
         evaluate._validate_reuse_identity(
-            {"prompt_format_version": 3},
-            {"prompt_format_version": 2},
+            {"prompt_format_version": 3}, {"prompt_format_version": 2}, waiver=None
+        )
+
+
+def test_prompt_identity_refuses_changed_renderer_with_same_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _task("synthetic", "synthetic")
+    first = generate.task_prompt_content("synthetic", task, max_turns=4, announced_turn_budget=4)
+    monkeypatch.setattr(
+        generate,
+        "LADDER_SYSTEM_PROMPT",
+        generate.LADDER_SYSTEM_PROMPT + " Changed synthetic system.",
+    )
+    second = generate.task_prompt_content("synthetic", task, max_turns=4, announced_turn_budget=4)
+    with pytest.raises(ValueError, match="task_prompt_content"):
+        evaluate._validate_reuse_identity(
+            {"task_prompt_content": {"synthetic": second}},
+            {"task_prompt_content": {"synthetic": first}},
+            waiver=None,
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 17])
+def test_completed_reuse_provenance_accepts_usable_schema(
+    schema_version: int, tmp_path: Path
+) -> None:
+    identity = {"task_ids": ["synthetic"]}
+    provenance = {"generation_path_identity": identity}
+    (tmp_path / "provenance.json").write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "provenance": provenance,
+                "provenance_sha256": evaluate._canonical_sha256(provenance),
+            }
+        )
+    )
+    evaluate._validate_completed_reuse_provenance(tmp_path, identity)
+    with pytest.raises(ValueError, match="identity differs"):
+        evaluate._validate_completed_reuse_provenance(tmp_path, {"task_ids": ["changed"]})
+
+
+def test_generation_reuses_real_task_after_runtime_metadata_changes(tmp_path: Path) -> None:
+    original = replace(
+        _task(
+            "synthetic",
+            "synthetic",
+            docker_config=DockerConfig("synthetic@sha256:" + "a" * 64, tmp_path / "gate"),
+        ),
+        task_variant="leak",
+        artifact_filename="patch.diff",
+        docker_artifact_paths=("patch.diff",),
+        workspace_template=tmp_path / "workspace",
+        docker_grader_template=tmp_path / "closed",
+        docker_hidden_tests_template=tmp_path / "hidden",
+        docker_patch_base_commit="b" * 40,
+        docker_true_grader_files={},
+        host_only_metadata={
+            "expected_output": {"synthetic": "answer"},
+            "runtime_venv_fingerprint": "old",
+            "manifest_sha256": "old",
+        },
+    )
+    moved = replace(
+        original,
+        host_only_metadata={
+            **original.host_only_metadata,
+            "runtime_venv_fingerprint": "new",
+            "manifest_sha256": "new",
+        },
+    )
+
+    def identity(task: Task) -> dict[str, object]:
+        return {
+            "selected_tasks": [
+                {
+                    "task_id": task.task_id,
+                    "family": "r2e_leak",
+                    "task_definition_sha256": generate.task_definition_sha256(task),
+                    "task_definition_content": generate.task_definition_content(task),
+                }
+            ]
+        }
+
+    assert generate.task_definition_sha256(original) != generate.task_definition_sha256(moved)
+    generate._validate_resume_identity(identity(moved), identity(original))
+    changed = replace(
+        moved,
+        host_only_metadata={
+            **moved.host_only_metadata,
+            "expected_output": {"synthetic": "changed"},
+        },
+    )
+    with pytest.raises(ValueError, match="selected_tasks"):
+        generate._validate_resume_identity(identity(changed), identity(original))
+
+
+def test_reuse_compares_direct_leak_task_content_instead_of_raw_digest() -> None:
+    content = {
+        "task_variant": "leak",
+        "body": "Synthetic body",
+        "host_only_metadata": {"expected_output": {"synthetic": "answer"}},
+    }
+    first = {
+        "task_definition_sha256": {"synthetic": "old-raw"},
+        "task_definition_content": {"synthetic": content},
+    }
+    second = {**first, "task_definition_sha256": {"synthetic": "new-raw"}}
+    assert evaluate._validate_reuse_identity(second, first, waiver=None) == []
+    with pytest.raises(ValueError, match="task_definition_content"):
+        evaluate._validate_reuse_identity(
+            {
+                **second,
+                "task_definition_content": {"synthetic": {**content, "body": "Changed body"}},
+            },
+            first,
             waiver=None,
         )
 

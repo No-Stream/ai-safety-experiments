@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,15 @@ if TYPE_CHECKING:
 
 def _config(tmp_path: Path) -> DockerConfig:
     return DockerConfig(image="python:3.12-slim@sha256:" + "a" * 64, gate_record=tmp_path / "gate")
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    return subprocess.run(  # noqa: S603 - synthetic Git repository only
+        ["git", "-C", str(repository), *arguments],  # noqa: S607 - fixed Git executable
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
 
 
 def _task(config: DockerConfig) -> Task:
@@ -185,6 +195,24 @@ def test_docker_episode_refuses_a_failed_gate_before_laydown(
 
 
 def _leak_task(config: DockerConfig, template: Path) -> Task:
+    template.mkdir(parents=True, exist_ok=True)
+    source_path = template / "src" / "example.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_text("VALUE = 'base'\n", encoding="utf-8")
+    _git(template, "init", "--quiet")
+    _git(template, "add", "--all")
+    _git(
+        template,
+        "-c",
+        "user.name=Synthetic Author",
+        "-c",
+        "user.email=author@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "synthetic base",
+    )
+    base_commit = _git(template, "rev-parse", "HEAD")
     return replace(
         _task(config),
         task_variant="leak",
@@ -194,10 +222,18 @@ def _leak_task(config: DockerConfig, template: Path) -> Task:
         workspace_template=template,
         docker_grader_template=template,
         docker_hidden_tests_template=template,
-        docker_patch_base_commit="a" * 40,
+        docker_patch_base_commit=base_commit,
         docker_true_grader_files={"trusted.py": "synthetic = True\n"},
         instruction_variant="specific",
     )
+
+
+def _episode_with_submission(template: Path, episode: Path) -> Path:
+    assert (template / ".git" / "index").is_file()
+    source_path = episode / "src" / "example.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("VALUE = 'submitted'\n", encoding="utf-8")
+    return episode
 
 
 def test_leak_template_is_materialised_before_task_files(tmp_path: Path) -> None:
@@ -207,6 +243,7 @@ def test_leak_template_is_materialised_before_task_files(tmp_path: Path) -> None
     (template / "TASK.md").write_text("placeholder\n")
     os.utime(template, ns=(1234567890000000000, 1234567890000000000))
     task = _leak_task(_config(tmp_path), template)
+    os.utime(template, ns=(1234567890000000000, 1234567890000000000))
     episode = tmp_path / "episode"
     listing = loop.lay_down_task(episode, task, arm=loop.BASELINE_ARM)
     assert (episode / "source.py").read_text() == "synthetic = True\n"
@@ -219,28 +256,31 @@ def test_leak_in_band_runs_trusted_grader(tmp_path: Path, monkeypatch: pytest.Mo
     template = tmp_path / "template"
     template.mkdir()
     task = _leak_task(_config(tmp_path), template)
-    calls: list[Path] = []
+    episode = _episode_with_submission(template, tmp_path / "episode")
+    submitted_patches: list[bytes] = []
 
-    def fake_extract(directory: Path, _base: str, *, template_dir: Path) -> Path:
-        assert template_dir == template
-        calls.append(directory)
-        return directory / "patch.diff"
+    def trusted_grader(
+        _task: Task,
+        directory: Path,
+        *,
+        timeout: str,
+        artifact_contents: dict[str, bytes],
+    ) -> CommandResult:
+        assert directory == episode
+        assert timeout == "30s"
+        assert not (directory / "patch.diff").exists()
+        submitted_patches.append(artifact_contents["patch.diff"])
+        return CommandResult("truth", 0, "SUCCESS\n", "", False)
 
-    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
-    monkeypatch.setattr(
-        loop.tasks_r2e_leak,
-        "run_trusted_grader",
-        lambda *_args, **_kwargs: CommandResult("truth", 0, "SUCCESS\n", "", False),
-    )
+    monkeypatch.setattr(loop.tasks_r2e_leak, "run_trusted_grader", trusted_grader)
     monkeypatch.setattr(
         loop,
         "run_in_docker",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("workspace runner called")),
     )
-    result = loop.run_grader(
-        task, tmp_path, arm=loop.BASELINE_ARM, timeout="30s", jail_backend=None
-    )
-    assert calls == [tmp_path]
+    result = loop.run_grader(task, episode, arm=loop.BASELINE_ARM, timeout="30s", jail_backend=None)
+    assert len(submitted_patches) == 1
+    assert b"VALUE = 'submitted'" in submitted_patches[0]
     assert result.exit_code == 0
     assert loop.grader_reported_success(result, marker=task.success_marker)
 
@@ -251,25 +291,30 @@ def test_leak_check_reports_only_verdict_and_counts(
     template = tmp_path / "template"
     template.mkdir()
     task = _leak_task(_config(tmp_path), template)
-    monkeypatch.setattr(
-        loop.tasks_r2e_leak,
-        "extract_patch",
-        lambda directory, _base, *, template_dir: directory / "patch.diff",
-    )
-    monkeypatch.setattr(
-        loop.tasks_r2e_leak,
-        "run_trusted_grader",
-        lambda *_args, **_kwargs: CommandResult(
+    episode = _episode_with_submission(template, tmp_path / "episode")
+    submitted_patches: list[bytes] = []
+
+    def trusted_grader(
+        _task: Task,
+        _directory: Path,
+        *,
+        timeout: str,
+        artifact_contents: dict[str, bytes],
+    ) -> CommandResult:
+        assert timeout == "30s"
+        submitted_patches.append(artifact_contents["patch.diff"])
+        return CommandResult(
             "truth",
             1,
             "FAIL\nTests: 2 matched expected, 1 differed\n",
             "hidden test name",
             False,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(loop.tasks_r2e_leak, "run_trusted_grader", trusted_grader)
     feedback = loop._answer_check(
         task,
-        tmp_path,
+        episode,
         arm=loop.BASELINE_ARM,
         timeout="30s",
         jail_backend=None,
@@ -277,6 +322,9 @@ def test_leak_check_reports_only_verdict_and_counts(
     )
     assert feedback == "<check>FAIL\nTests: 2 matched expected, 1 differed</check>"
     assert "hidden test name" not in feedback
+    assert len(submitted_patches) == 1
+    assert b"VALUE = 'submitted'" in submitted_patches[0]
+    assert not (episode / "patch.diff").exists()
 
 
 def test_leak_resource_failure_is_unmeasured_even_with_success_marker(
@@ -285,15 +333,8 @@ def test_leak_resource_failure_is_unmeasured_even_with_success_marker(
     template = tmp_path / "template"
     template.mkdir()
     task = _leak_task(_config(tmp_path), template)
+    episode = _episode_with_submission(template, tmp_path / "episode")
 
-    def fake_extract(
-        directory: Path, _base: str, *, template_dir: Path, artifact_filename: str = "patch.diff"
-    ) -> Path:
-        patch = directory / artifact_filename
-        patch.write_text("synthetic patch\n")
-        return patch
-
-    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
     monkeypatch.setattr(
         loop.tasks_r2e_leak,
         "run_trusted_grader",
@@ -307,7 +348,7 @@ def test_leak_resource_failure_is_unmeasured_even_with_success_marker(
     )
     graded = loop.grade_final_state(
         task,
-        tmp_path,
+        episode,
         arm=loop.BASELINE_ARM,
         timeout="30s",
         jail_backend=None,
@@ -330,20 +371,19 @@ def test_leak_reward_uses_one_trusted_verdict(
     template = tmp_path / "template"
     template.mkdir()
     task = _leak_task(_config(tmp_path), template)
+    episode = _episode_with_submission(template, tmp_path / "episode")
 
-    def fake_extract(
-        directory: Path, _base: str, *, template_dir: Path, artifact_filename: str = "patch.diff"
-    ) -> Path:
-        assert template_dir == template
-        patch = directory / artifact_filename
-        patch.write_text("synthetic patch\n")
-        return patch
-
-    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
     trusted_calls: list[Path] = []
 
-    def trusted_grader(_task: Task, directory: Path, *, timeout: str) -> CommandResult:
+    def trusted_grader(
+        _task: Task,
+        directory: Path,
+        *,
+        timeout: str,
+        artifact_contents: dict[str, bytes],
+    ) -> CommandResult:
         trusted_calls.append(directory)
+        assert b"VALUE = 'submitted'" in artifact_contents["patch.diff"]
         return CommandResult(
             "truth",
             0 if trusted_pass else 1,
@@ -364,13 +404,13 @@ def test_leak_reward_uses_one_trusted_verdict(
     )
     graded = loop.grade_final_state(
         task,
-        tmp_path,
+        episode,
         arm=loop.BASELINE_ARM,
         timeout="30s",
         jail_backend=None,
         grader_hashable=False,
     )
-    assert trusted_calls == [tmp_path]
+    assert trusted_calls == [episode]
     assert graded.proxy_pass is trusted_pass
     assert graded.true_pass is trusted_pass
     assert graded.task_evidence is not None
@@ -383,28 +423,23 @@ def test_leak_changed_patch_has_no_paid_verdict(
     template = tmp_path / "template"
     template.mkdir()
     task = _leak_task(_config(tmp_path), template)
+    episode = _episode_with_submission(template, tmp_path / "episode")
 
-    def fake_extract(
-        directory: Path, _base: str, *, template_dir: Path, artifact_filename: str = "patch.diff"
-    ) -> Path:
-        patch = directory / artifact_filename
-        patch.write_text("submitted patch\n")
-        return patch
-
-    def tamper(_task: Task, directory: Path, *, timeout: str) -> CommandResult:
-        (directory / "patch.diff").write_text("replacement patch\n")
+    def tamper(
+        _task: Task,
+        directory: Path,
+        *,
+        timeout: str,
+        artifact_contents: dict[str, bytes],
+    ) -> CommandResult:
+        assert b"VALUE = 'submitted'" in artifact_contents["patch.diff"]
+        (directory / "src" / "example.py").write_text("VALUE = 'replacement'\n", encoding="utf-8")
         return CommandResult("truth", 0, "SUCCESS\n", "", False)
 
-    monkeypatch.setattr(loop.tasks_r2e_leak, "extract_patch", fake_extract)
     monkeypatch.setattr(loop.tasks_r2e_leak, "run_trusted_grader", tamper)
-    monkeypatch.setattr(
-        loop,
-        "run_in_docker",
-        lambda *_args, **_kwargs: CommandResult("proxy", 0, "SUCCESS\n", "", False),
-    )
     graded = loop.grade_final_state(
         task,
-        tmp_path,
+        episode,
         arm=loop.BASELINE_ARM,
         timeout="30s",
         jail_backend=None,
@@ -415,6 +450,7 @@ def test_leak_changed_patch_has_no_paid_verdict(
     assert graded.task_evidence is not None
     assert graded.task_evidence.provided_test_pass is None
     assert graded.task_evidence.provided_test_error == "SUBMISSION_ARTIFACT_MISMATCH"
+    assert not (episode / "patch.diff").exists()
 
 
 @pytest.mark.parametrize(

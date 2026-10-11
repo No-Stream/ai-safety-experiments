@@ -8,13 +8,12 @@ float16's 65504 limit in its upper layers, which stored as inf).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
 import numpy as np
@@ -35,7 +34,13 @@ from reward_hacking.interp.generation_capture import (
     record_from_token_ids,
     vllm_resolved_sampler,
 )
+from reward_hacking.interp.jsonl_resume import normalize_identity
 from reward_hacking.model_backend import SamplingConfig
+from reward_hacking.semantic_identity import (
+    model_weight_identity,
+    normalize_legacy_model_reference,
+    semantic_rows,
+)
 
 if TYPE_CHECKING:
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
@@ -72,10 +77,6 @@ def _write_json(path: Path, record: Mapping[str, object]) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary_path.replace(path)
-
-
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _decode(tokenizer: PreTrainedTokenizerBase, token_ids: list[int]) -> str:
@@ -193,6 +194,27 @@ def _sample_identity(sample: Mapping[str, Any]) -> str:
     return str(sample["sample_id"])
 
 
+def _legacy_capture_identity_compatible(
+    wanted: Mapping[str, Any],
+    found: Mapping[str, Any],
+    completed: Sequence[Mapping[str, Any]],
+    current_sample_ids: set[str],
+) -> bool:
+    """Migrate byte-fingerprinted capture ledgers using their persisted record identities."""
+    historical_controls = dict(found)
+    current_controls = dict(wanted)
+    historical_controls.pop("sample_file_sha256", None)
+    for field in ("samples", "model_weights", "adapter_weights"):
+        if field not in historical_controls:
+            current_controls.pop(field, None)
+    for controls in (historical_controls, current_controls):
+        for field in ("base_model", "model_id", "adapter_id"):
+            controls[field] = normalize_legacy_model_reference(controls.get(field))
+    if normalize_identity(historical_controls) != normalize_identity(current_controls):
+        return False
+    return all(str(record.get("sample_id")) in current_sample_ids for record in completed)
+
+
 def _reference_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build one reference row per item and class without copying dataset text into code."""
     rows: list[dict[str, Any]] = []
@@ -219,6 +241,48 @@ def _reference_rows(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 }
             )
     return rows
+
+
+def _reference_capture_identity(
+    *,
+    samples: list[dict[str, Any]],
+    base_model: str,
+    model_key: str,
+    model_id: str | None,
+    adapter_id: str | None,
+) -> dict[str, object]:
+    references = _reference_rows(samples)
+    identity: dict[str, object] = {
+        "stage": "reference_capture",
+        "base_model": normalize_legacy_model_reference(base_model),
+        "base_model_weights": model_weight_identity(base_model),
+        "reference_ids": [str(row["reference_id"]) for row in references],
+        "reference_records": semantic_rows(
+            references,
+            required_fields=(
+                "reference_id",
+                "item_id",
+                "class_name",
+                "task_text",
+                "test_list",
+                "prompt",
+                "prompt_token_ids",
+                "completion_text",
+            ),
+        ),
+        "dtype": ACTIVATION_DTYPE_NAME,
+    }
+    if model_key != "base":
+        identity.update(
+            {
+                "model_key": model_key,
+                "model_id": normalize_legacy_model_reference(model_id),
+                "adapter_id": normalize_legacy_model_reference(adapter_id),
+                "adapter_weights": model_weight_identity(adapter_id),
+                "positions": ["code_mean", "followup_last"],
+            }
+        )
+    return identity
 
 
 def reference_artifact_paths(run_dir: Path, model_key: str) -> tuple[Path, Path, Path]:
@@ -266,27 +330,37 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913, PLR0915 - resumab
         }
         for reference in references
     ]
-    identity: dict[str, object] = {
-        "stage": "reference_capture",
-        "base_model": base_model,
-        "reference_ids": [row["reference_id"] for row in metadata],
-        "dtype": ACTIVATION_DTYPE_NAME,
-    }
-    if model_key != "base":
-        identity.update(
-            {
-                "model_key": model_key,
-                "model_id": model_id,
-                "adapter_id": adapter_id,
-                "positions": list(position_names),
-            }
-        )
+    identity = _reference_capture_identity(
+        samples=samples,
+        base_model=base_model,
+        model_key=model_key,
+        model_id=model_id,
+        adapter_id=adapter_id,
+    )
+
+    def legacy_reference_identity_compatible(
+        wanted: Mapping[str, Any], found: Mapping[str, Any], completed: Sequence[Mapping[str, Any]]
+    ) -> bool:
+        historical_controls = dict(found)
+        current_controls = dict(wanted)
+        for field in ("reference_records", "base_model_weights", "adapter_weights"):
+            if field not in historical_controls:
+                current_controls.pop(field, None)
+        for controls in (historical_controls, current_controls):
+            for field in ("base_model", "model_id", "adapter_id"):
+                controls[field] = normalize_legacy_model_reference(controls.get(field))
+        if normalize_identity(historical_controls) != normalize_identity(current_controls):
+            return False
+        expected_ids = set(cast("Sequence[str]", identity["reference_ids"]))
+        return all(str(record.get("reference_id")) in expected_ids for record in completed)
+
     resumed, ledger = resume_records_atlas_compatible(
         progress_path,
         identity=identity,
         base_model=base_model,
         unit_of=lambda _: "base-reference" if model_key == "base" else model_key,
         record_key_of=lambda record: str(record["reference_id"]),
+        legacy_identity_compatible=legacy_reference_identity_compatible,
     )
     completed = {str(record["reference_id"]) for record in resumed.kept_records}
     if output_path.exists():
@@ -431,26 +505,50 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
     samples.sort(key=lambda sample: (str(sample["item_id"]), int(sample["sample_index"])))
     model_id, adapter_id = resolve_model_key(model_key, base_model=base_model)
     output_key = artifact_model_key(model_key)
+    sample_identity_rows = [
+        {**sample, "model_id": normalize_legacy_model_reference(sample.get("model_id"))}
+        for sample in samples
+    ]
     output_path = run_dir / f"activations.{output_key}.npy"
     progress_path = run_dir / f"capture-progress.{output_key}.jsonl"
     index_path = run_dir / f"capture-index.{output_key}.json"
     identity = {
         "stage": "capture",
         "model_key": model_key,
-        "base_model": base_model,
-        "model_id": model_id,
-        "adapter_id": adapter_id,
-        "sample_file_sha256": _sha256(sample_path),
+        "base_model": normalize_legacy_model_reference(base_model),
+        "model_id": normalize_legacy_model_reference(model_id),
+        "adapter_id": normalize_legacy_model_reference(adapter_id),
+        "model_weights": model_weight_identity(model_id),
+        "adapter_weights": model_weight_identity(adapter_id),
+        "samples": semantic_rows(
+            sample_identity_rows,
+            required_fields=(
+                "sample_id",
+                "item_id",
+                "prompt",
+                "prompt_token_ids",
+                "completion_text",
+                "completion_token_ids",
+                "task_text",
+                "test_list",
+            ),
+            optional_fields=("model_id", "test_setup_code", "reference_code", "hardcode_code"),
+        ),
         "sample_ids": [_sample_identity(sample) for sample in samples],
         "positions": list(POSITION_NAMES),
         "dtype": ACTIVATION_DTYPE_NAME,
     }
+
+    current_sample_ids = set(cast("Sequence[str]", identity["sample_ids"]))
     resumed, ledger = resume_records_atlas_compatible(
         progress_path,
         identity=identity,
         base_model=base_model,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["sample_id"]),
+        legacy_identity_compatible=lambda wanted, found, completed: (
+            _legacy_capture_identity_compatible(wanted, found, completed, current_sample_ids)
+        ),
     )
     completed = {str(record["sample_id"]) for record in resumed.kept_records}
     if output_path.exists():

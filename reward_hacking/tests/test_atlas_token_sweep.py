@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from reward_hacking.atlas import token_sweep
 from reward_hacking.interp.jsonl_resume import ResumeMismatchError
@@ -188,10 +189,130 @@ def test_capture_resumes_by_sample_id_and_refuses_identity_changes(
     )
     capture()
     assert resumed_model.forward_calls == 0
-
     with pytest.raises(ResumeMismatchError, match="identity fields differ"):
         capture(prompt_tokens=2)
     assert resumed_model.forward_calls == 0
+
+
+def test_capture_resume_compares_selected_rows_instead_of_jsonl_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_model = FakeModel()
+    monkeypatch.setattr(
+        "reward_hacking.interp.directions.load_model_and_tokenizer",
+        lambda model_id, dtype: (first_model, FakeTokenizer()),
+    )
+    _capture_inputs(tmp_path)
+    output_path = token_sweep.capture_model(
+        run_dir=tmp_path,
+        model_key="base",
+        prompt_tokens=3,
+        completion_tokens=5,
+        layer_stride=2,
+    )
+
+    index_path = output_path.with_name("index.base.json")
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    legacy_identity = {
+        key: value
+        for key, value in index["identity"].items()
+        if key not in {"selected_rows", "sample_content", "model_weights", "adapter_weights"}
+    }
+    legacy_identity["sample_file_sha256"] = "old-sample-jsonl-digest"
+    legacy_identity["grade_file_sha256"] = "old-grade-jsonl-digest"
+    index["identity"] = legacy_identity
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    progress_ledger_path = output_path.with_name("progress.base.jsonl.resume.json")
+    old_ledger = json.loads(progress_ledger_path.read_text(encoding="utf-8"))
+    old_ledger["identity"] = legacy_identity
+    progress_ledger_path.write_text(json.dumps(old_ledger), encoding="utf-8")
+
+    for filename in ("samples.base.jsonl", "grades.base.jsonl"):
+        path = tmp_path / filename
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        path.write_text(
+            "\n".join(json.dumps(record, sort_keys=False) for record in records) + "\n",
+            encoding="utf-8",
+        )
+
+    resumed_model = FakeModel()
+    monkeypatch.setattr(
+        "reward_hacking.interp.directions.load_model_and_tokenizer",
+        lambda model_id, dtype: (resumed_model, FakeTokenizer()),
+    )
+    token_sweep.capture_model(
+        run_dir=tmp_path,
+        model_key="base",
+        prompt_tokens=3,
+        completion_tokens=5,
+        layer_stride=2,
+    )
+    assert resumed_model.forward_calls == 0
+
+    changed_samples = [
+        json.loads(line) for line in (tmp_path / "samples.base.jsonl").read_text().splitlines()
+    ]
+    changed_samples[0]["completion_text"] = "different selected completion"
+    _write_jsonl(tmp_path / "samples.base.jsonl", changed_samples)
+    with pytest.raises(ResumeMismatchError, match="identity fields differ"):
+        token_sweep.capture_model(
+            run_dir=tmp_path,
+            model_key="base",
+            prompt_tokens=3,
+            completion_tokens=5,
+            layer_stride=2,
+        )
+    assert output_path.is_file()
+
+
+def test_capture_accepts_a_relocated_local_model_with_the_same_tensor_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_model = tmp_path / "original" / "base"
+    relocated_model = tmp_path / "relocated" / "base"
+    original_model.mkdir(parents=True)
+    relocated_model.mkdir(parents=True)
+    save_file({"weight": torch.tensor([1.0, 2.0])}, str(original_model / "model.safetensors"))
+    save_file({"weight": torch.tensor([1.0, 2.0])}, str(relocated_model / "renamed.safetensors"))
+    sample_path = _capture_inputs(tmp_path)
+    samples = [json.loads(line) for line in sample_path.read_text(encoding="utf-8").splitlines()]
+    for sample in samples:
+        sample["model_id"] = str(original_model)
+    _write_jsonl(sample_path, samples)
+
+    original_model_instance = FakeModel()
+    monkeypatch.setattr(
+        "reward_hacking.interp.directions.load_model_and_tokenizer",
+        lambda model_id, dtype: (original_model_instance, FakeTokenizer()),
+    )
+    output_path = token_sweep.capture_model(
+        run_dir=tmp_path,
+        model_key="base",
+        base_model=str(original_model),
+        prompt_tokens=3,
+        completion_tokens=5,
+        layer_stride=2,
+    )
+    assert original_model_instance.forward_calls == 2
+
+    relocated_samples = [{**sample, "model_id": str(relocated_model)} for sample in samples]
+    _write_jsonl(sample_path, relocated_samples)
+    relocated_model_instance = FakeModel()
+    monkeypatch.setattr(
+        "reward_hacking.interp.directions.load_model_and_tokenizer",
+        lambda model_id, dtype: (relocated_model_instance, FakeTokenizer()),
+    )
+    resumed_path = token_sweep.capture_model(
+        run_dir=tmp_path,
+        model_key="base",
+        base_model=str(relocated_model),
+        prompt_tokens=3,
+        completion_tokens=5,
+        layer_stride=2,
+    )
+
+    assert resumed_path == output_path
+    assert relocated_model_instance.forward_calls == 0
 
 
 def test_capture_can_read_adapter_samples_with_base_weights(

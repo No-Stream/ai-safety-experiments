@@ -28,6 +28,14 @@ import pytest
 import torch
 from conftest import MEASURED_MIN_OUTPUT_BUDGET
 from safetensors.torch import load_file, save_file
+from transformers import (
+    AutoModelForCausalLM,
+    PreTrainedModel,
+    Qwen3_5Config,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
+)
 
 from reward_hacking import model_backend
 from reward_hacking.model_backend import (
@@ -1279,30 +1287,154 @@ class TestServingFromASnapshotDirectory:
         assert backend.model_path is None
         assert recorded["model_id"] == "Qwen/Qwen3.5-4B"
 
-    def test_hf_asserts_the_directory_its_config_names(
+    @staticmethod
+    def _write_weight_snapshot(directory: Path, weight: torch.Tensor) -> Path:
+        directory.mkdir(parents=True)
+        save_file({"weight": weight.cpu().contiguous()}, str(directory / "model.safetensors"))
+        return directory
+
+    def test_hf_accepts_a_different_directory_with_the_same_loaded_tensors(
+        self, tmp_path: Path
+    ) -> None:
+        expected_weight = torch.tensor([[1.0, -2.0], [0.5, 4.0]], dtype=torch.float32)
+        snapshot = self._write_weight_snapshot(tmp_path / "verified", expected_weight)
+        loaded_copy = self._write_weight_snapshot(tmp_path / "mounted-copy", expected_weight)
+        model = torch.nn.Linear(2, 2, bias=False)
+        model.weight.data.copy_(expected_weight)
+        model.config = SimpleNamespace(name_or_path=str(loaded_copy))  # type: ignore[attr-defined]
+        backend = object.__new__(HFBackend)
+        backend._model = cast("PreTrainedModel", model)  # pyright: ignore[reportPrivateUsage]
+
+        backend.assert_serves_weights(snapshot)
+
+    def test_hf_rejects_different_loaded_tensor_values_even_at_the_expected_path(
+        self, tmp_path: Path
+    ) -> None:
+        expected_weight = torch.tensor([[1.0, -2.0], [0.5, 4.0]], dtype=torch.float32)
+        snapshot = self._write_weight_snapshot(tmp_path / "verified", expected_weight)
+        model = torch.nn.Linear(2, 2, bias=False)
+        model.weight.data.zero_()
+        model.config = SimpleNamespace(name_or_path=str(snapshot))  # type: ignore[attr-defined]
+        backend = object.__new__(HFBackend)
+        backend._model = cast("PreTrainedModel", model)  # pyright: ignore[reportPrivateUsage]
+
+        with pytest.raises(RuntimeError, match="loaded tensor"):
+            backend.assert_serves_weights(snapshot)
+
+    def test_hf_tensor_identity_accounts_for_the_requested_load_dtype(self, tmp_path: Path) -> None:
+        expected_weight = torch.tensor([[0.1, -2.0], [0.5, 4.0]], dtype=torch.float32)
+        snapshot = self._write_weight_snapshot(tmp_path / "verified", expected_weight)
+        model = torch.nn.Linear(2, 2, bias=False, dtype=torch.float16)
+        model.weight.data.copy_(expected_weight.to(torch.float16))
+        backend = object.__new__(HFBackend)
+        backend._model = cast("PreTrainedModel", model)  # pyright: ignore[reportPrivateUsage]
+
+        backend.assert_serves_weights(snapshot)
+
+    def test_hf_accepts_the_loaded_text_parameters_from_a_composite_qwen_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
+        text_config = Qwen3_5TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            layer_types=["full_attention"],
+            tie_word_embeddings=True,
+        )
+        vision_config = Qwen3_5VisionConfig(
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=2,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            out_hidden_size=16,
+            num_position_embeddings=4,
+        )
+        snapshot = tmp_path / "composite-qwen"
+        Qwen3_5ForConditionalGeneration(
+            Qwen3_5Config(
+                text_config=text_config,
+                vision_config=vision_config,
+                tie_word_embeddings=True,
+            )
+        ).save_pretrained(snapshot, safe_serialization=True)
+        weights_path = snapshot / "model.safetensors"
+        checkpoint_weights = load_file(str(weights_path))
+        checkpoint_weights["mtp.layers.0.weight"] = torch.ones((1, 1))
+        save_file(checkpoint_weights, str(weights_path))
+        loaded_model = AutoModelForCausalLM.from_pretrained(
+            snapshot,
+            local_files_only=True,
+            output_loading_info=False,
+        )
+        assert not any(
+            name.startswith("model.visual.") for name, _ in loaded_model.named_parameters()
+        )
+        assert any(name.startswith("model.visual.") for name in checkpoint_weights)
+        assert "mtp.layers.0.weight" in checkpoint_weights
+        backend = object.__new__(HFBackend)
+        backend._model = loaded_model  # pyright: ignore[reportPrivateUsage]
+
+        backend.assert_serves_weights(snapshot)
+
+    def test_vllm_accepts_another_directory_with_the_same_tensor_content(
+        self, tmp_path: Path
+    ) -> None:
+        expected_weight = torch.tensor([[1.0, -2.0], [0.5, 4.0]], dtype=torch.float32)
+        snapshot = self._write_weight_snapshot(tmp_path / "verified", expected_weight)
+        loaded_copy = self._write_weight_snapshot(tmp_path / "mounted-copy", expected_weight)
+        backend = object.__new__(model_backend.VLLMBackend)
+        backend._llm = SimpleNamespace(
+            llm_engine=SimpleNamespace(model_config=SimpleNamespace(model=str(loaded_copy)))
+        )  # pyright: ignore[reportPrivateUsage]
+
+        backend.assert_serves_weights(snapshot)
+
+    def test_vllm_resolves_a_hub_reported_model_to_cached_tensor_content(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        _patch_loaders(monkeypatch)
-        backend = HFBackend("label", model_path=tmp_path / "snap")
-        monkeypatch.setattr(
-            backend,
-            "_model",
-            SimpleNamespace(config=SimpleNamespace(name_or_path=str(tmp_path / "snap"))),
-        )
-        backend.assert_serves_weights(tmp_path / "snap")
-        with pytest.raises(RuntimeError, match="not from the verified snapshot"):
-            backend.assert_serves_weights(tmp_path / "other")
+        weight = torch.tensor([[1.0, -2.0], [0.5, 4.0]], dtype=torch.float32)
+        snapshot = self._write_weight_snapshot(tmp_path / "verified", weight)
+        loaded_copy = self._write_weight_snapshot(tmp_path / "cached-hub-copy", weight)
+        resolved: list[dict[str, object]] = []
 
-    def test_vllm_asserts_the_directory_its_engine_reports(self, tmp_path: Path) -> None:
-        """Read off the engine's own record, not the constructor argument."""
+        def resolve_snapshot(**kwargs: object) -> str:
+            resolved.append(kwargs)
+            return str(loaded_copy)
+
+        monkeypatch.setattr(model_backend, "snapshot_download", resolve_snapshot)
         backend = object.__new__(model_backend.VLLMBackend)
-        engine = SimpleNamespace(
-            llm_engine=SimpleNamespace(model_config=SimpleNamespace(model=str(tmp_path / "snap")))
+        backend._llm = SimpleNamespace(
+            llm_engine=SimpleNamespace(model_config=SimpleNamespace(model="org/model@step-20"))
+        )  # pyright: ignore[reportPrivateUsage]
+
+        backend.assert_serves_weights(snapshot)
+
+        assert resolved == [
+            {"repo_id": "org/model", "revision": "step-20", "local_files_only": True}
+        ]
+
+    def test_vllm_rejects_a_reported_directory_with_different_tensor_content(
+        self, tmp_path: Path
+    ) -> None:
+        expected_weight = torch.tensor([[1.0, -2.0], [0.5, 4.0]], dtype=torch.float32)
+        snapshot = self._write_weight_snapshot(tmp_path / "verified", expected_weight)
+        loaded_copy = self._write_weight_snapshot(
+            tmp_path / "wrong-copy", torch.zeros_like(expected_weight)
         )
-        backend._llm = engine  # pyright: ignore[reportPrivateUsage]  # a stub engine
-        backend.assert_serves_weights(tmp_path / "snap")
-        with pytest.raises(RuntimeError, match="not the verified snapshot"):
-            backend.assert_serves_weights(tmp_path / "elsewhere")
+        backend = object.__new__(model_backend.VLLMBackend)
+        backend._llm = SimpleNamespace(
+            llm_engine=SimpleNamespace(model_config=SimpleNamespace(model=str(loaded_copy)))
+        )  # pyright: ignore[reportPrivateUsage]
+
+        with pytest.raises(RuntimeError, match="tensor contents"):
+            backend.assert_serves_weights(snapshot)
 
     def test_vllm_builds_its_engine_and_tokenizer_from_the_path(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

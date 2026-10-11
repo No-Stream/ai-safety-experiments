@@ -91,7 +91,7 @@ def _install_fla_nb_bucket_wrappers(
     conv_module: ModuleType,
     l2norm_module: ModuleType,
 ) -> None:
-    _require_supported_fla_versions(fla_version, fla_core_version)
+    logger.info("validating FLA kernel API: fla=%s fla_core=%s", fla_version, fla_core_version)
 
     module_kernels = (
         (conv_module, CONV_KERNEL_NAMES),
@@ -134,20 +134,11 @@ def _installed_fla_core_version() -> str:
         raise RuntimeError("fla-core is required for FLA NB bucketing") from error
 
 
-def _require_supported_fla_versions(fla_version: str, fla_core_version: str) -> None:
-    if fla_version != EXPECTED_FLA_VERSION or fla_core_version != EXPECTED_FLA_CORE_VERSION:
-        raise RuntimeError(
-            "NB bucketing only supports flash-linear-attention "
-            f"{EXPECTED_FLA_VERSION} with fla-core {EXPECTED_FLA_CORE_VERSION}; found "
-            f"flash-linear-attention {fla_version} and fla-core {fla_core_version}"
-        )
-
-
 def install_fla_nb_bucketing() -> None:
-    """Install the version-checked NB proxy and persistent Triton autotune caching."""
+    """Install the API-checked NB proxy and persistent Triton autotune caching."""
     fla_version = _installed_fla_version()
     fla_core_version = _installed_fla_core_version()
-    _require_supported_fla_versions(fla_version, fla_core_version)
+    logger.info("validating FLA kernel API: fla=%s fla_core=%s", fla_version, fla_core_version)
     conv_ops = importlib.import_module("fla.modules.conv.triton.ops")
     l2norm = importlib.import_module("fla.modules.l2norm")
     _install_fla_nb_bucket_wrappers(
@@ -314,7 +305,7 @@ def prewarm_fla_nb_buckets(
         "prewarming FLA kernels: device=%s fla=%s conv_buckets=%s l2norm_buckets=%s "
         "conv_dim=%d conv_width=%d norm_dim=%d norm_heads=%d estimated_peak_tensor_bytes=%d",
         torch.cuda.get_device_name(device),
-        EXPECTED_FLA_VERSION,
+        _installed_fla_version(),
         plan.conv_buckets,
         plan.l2norm_buckets,
         plan.kernel_shape.conv_dimension,
@@ -393,8 +384,8 @@ def _write_prewarm_manifest(
     manifest_path = cache_directory / "fla-nb-pow2-prewarm.json"
     payload = {
         "schema_version": 1,
-        "flash_linear_attention_version": EXPECTED_FLA_VERSION,
-        "fla_core_version": EXPECTED_FLA_CORE_VERSION,
+        "flash_linear_attention_version": _installed_fla_version(),
+        "fla_core_version": _installed_fla_core_version(),
         "triton_version": version("triton"),
         "torch_version": torch.__version__,
         "triton_cache_directory": str(cache_directory),

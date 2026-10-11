@@ -118,11 +118,11 @@ from reward_hacking.interp.jacobian import (
     fit_lens,
     fit_quality_payload,
     fit_skip_first,
-    resolve_weights_identity,
     transport_and_decode,
     verify_cached_lens,
     verify_lens_roundtrip,
 )
+from reward_hacking.interp.lens_fit_runtime import weights_fingerprint
 from reward_hacking.interp.linear_probe import CaptureSpec, ProbeConfig
 from reward_hacking.interp.patch_readout import (
     FORCED_CHOICE_PREFILL,
@@ -190,6 +190,8 @@ if TYPE_CHECKING:
     from reward_hacking.model_backend import SamplingConfig
 
 logger = logging.getLogger(__name__)
+
+LENS_WEIGHT_IDENTITY_VERSION = "loaded-parameters-effective-config-v2"
 
 # Concept axes extracted from raw sentence pairs (eval-awareness is loaded validated instead).
 EXTRACTED_CONCEPTS: dict[str, list[stimuli.ContrastivePair]] = {
@@ -1140,9 +1142,8 @@ def lens_fit_identity(
     because ``fit_lens`` caps the list to ``config.max_fit_prompts`` and a lens is an average of
     per-prompt Jacobians over exactly the strings it iterated, in that order -- a digest of the whole
     offered corpus would certify strings the lens never saw. ``n_fit_prompts`` is that fitted count and
-    ``n_corpus`` the offered one. ``model_weights_identity`` pins the weights the way the lens cache
-    does (:func:`resolve_weights_identity`: a hub revision or a local digest), since ``model_id`` is a
-    string that a rewritten local dir or a moved hub revision leaves unchanged. ``dim_batch`` rides
+    ``n_corpus`` the offered one. ``model_weights_identity`` fingerprints loaded parameters and
+    effective config, since ``model_id`` is only a source label. ``dim_batch`` rides
     along because it is part of the fit's reduction order, but a reuse does not fit, so it is reported
     rather than compared (see :data:`LENS_REUSE_COMPARED_FIELDS`). ``corpus_filename`` names the
     corpus file beside the sidecar, so a reader can see what the lens read without guessing.
@@ -1151,6 +1152,7 @@ def lens_fit_identity(
     return {
         "model_id": config.model_id,
         "model_weights_identity": model_weights_identity,
+        "model_weights_identity_semantics": LENS_WEIGHT_IDENTITY_VERSION,
         "corpus_sha256": corpus_hash(fitted),
         "n_fit_prompts": len(fitted),
         "n_corpus": len(corpus),
@@ -1163,12 +1165,12 @@ def lens_fit_identity(
 
 
 LENS_REUSE_COMPARED_FIELDS: tuple[str, ...] = (
-    "model_id",
     "model_weights_identity",
+    "model_weights_identity_semantics",
     "corpus_sha256",
+    "n_fit_prompts",
     "max_seq_len",
     "skip_first",
-    "jlens_commit",
 )
 """The identity fields a reuse or a resume must match on: what the lens IS, not how it was scheduled.
 
@@ -1183,12 +1185,27 @@ against a value that never applies.
 def lens_identity_differences(
     wanted: Mapping[str, object], found: Mapping[str, object]
 ) -> list[str]:
-    """Name every compared field on which a recorded lens identity differs from the one this run wants."""
+    """Name semantic differences, accepting legacy identities on their recoverable subset."""
+    semantic_fields = set(LENS_REUSE_COMPARED_FIELDS)
+    if missing := sorted(semantic_fields - set(wanted)):
+        return [f"wanted lens identity is missing semantic fields {missing}"]
+
+    legacy_identity = found.get("model_weights_identity_semantics") != LENS_WEIGHT_IDENTITY_VERSION
+    required_fields = (
+        {"corpus_sha256", "n_fit_prompts", "max_seq_len", "skip_first"}
+        if legacy_identity
+        else semantic_fields
+    )
+    if missing := sorted(required_fields - set(found)):
+        return [f"saved lens identity is missing semantic fields {missing}"]
+
+    compared_fields = semantic_fields - (
+        {"model_weights_identity", "model_weights_identity_semantics"} if legacy_identity else set()
+    )
     return [
-        f"{field}: the saved lens has {found.get(field, '<absent>')!r}, this run wants "
-        f"{wanted.get(field, '<absent>')!r}"
-        for field in LENS_REUSE_COMPARED_FIELDS
-        if found.get(field) != wanted.get(field)
+        f"{field}: the saved lens has {found[field]!r}, this run wants {wanted[field]!r}"
+        for field in sorted(compared_fields)
+        if found[field] != wanted[field]
     ]
 
 
@@ -1323,7 +1340,7 @@ def run_fit_lens(args: FitLensArgs) -> None:
         config=config,
         corpus=corpus,
         corpus_filename=corpus_filename,
-        model_weights_identity=resolve_weights_identity(args.model_id),
+        model_weights_identity=weights_fingerprint(args.model_id, cast("torch.nn.Module", model)),
         skip_first=fit_skip_first(jl),
     )
     guard_resume(checkpoint_path, args.raw_dir / LENS_FIT_RESUME_MARKER_FILENAME, fit_identity)
@@ -3627,7 +3644,7 @@ def acquire_decode_lens(
         config=config,
         corpus=corpus,
         corpus_filename=corpus_source,
-        model_weights_identity=resolve_weights_identity(args.model_id),
+        model_weights_identity=weights_fingerprint(args.model_id, cast("torch.nn.Module", model)),
         skip_first=fit_skip_first(jl),
     )
     if sidecar is not None:

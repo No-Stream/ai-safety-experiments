@@ -540,11 +540,11 @@ def _load_manifest(corpus_root: Path, *, allow_empty: bool = False) -> dict[str,
             f"seed-v4 corpus manifest is missing at {manifest_path}; capture a real run first"
         )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("schema_version") != CORPUS_MANIFEST_SCHEMA_VERSION
-    ):
-        raise ValueError("seed-v4 corpus manifest has an unsupported schema")
+    if not isinstance(manifest, dict):
+        raise TypeError("seed-v4 corpus manifest must be an object")
+    version = manifest.get("schema_version")
+    if type(version) is not int or version < 1:
+        raise ValueError("seed-v4 corpus manifest schema_version must be a positive integer")
     captures = manifest.get("captures")
     if not isinstance(captures, list):
         raise TypeError("seed-v4 corpus captures must be a list")

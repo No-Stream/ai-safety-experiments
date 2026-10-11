@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
+from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -256,6 +257,8 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         raise FileNotFoundError(f"LoRA adapter directory does not exist: {adapter}")
 
     rows = load_prompts_for_split(prompts_path, split_path, split_side)
+    weight_identity = model_identity(model)
+    adapter_identity = model_identity(str(adapter)) if adapter is not None else None
     sampling_identity: dict[str, object] = {
         "max_tokens": max_tokens,
         "temperature": 1.0,
@@ -267,6 +270,18 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         "logprobs": 0,
         "batch_size": batch_size,
     }
+    existing_rows = _read_jsonl(output_path) if output_path.exists() else []
+    legacy_rows = [row for row in existing_rows if "model_identity" not in row]
+    seed_model = (
+        str(legacy_rows[0]["model"]) if legacy_rows else json.dumps(weight_identity, sort_keys=True)
+    )
+    seed_adapter = (
+        legacy_rows[0].get("adapter")
+        if legacy_rows
+        else json.dumps(adapter_identity, sort_keys=True)
+        if adapter_identity is not None
+        else None
+    )
     template_kwargs = dict(chat_template_kwargs or {})
     pending: list[tuple[dict[str, Any], int, str, int]] = []
     expected: dict[str, tuple[dict[str, Any], int]] = {}
@@ -279,12 +294,9 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
             if key in expected:
                 raise ValueError(f"duplicate sample key {key!r}")
             expected[key] = (row, sample_index)
-            seed = content_seed(
-                key, prompt_token_ids, model, str(adapter) if adapter is not None else None
-            )
+            seed = content_seed(key, prompt_token_ids, seed_model, seed_adapter)
             pending.append((row, sample_index, key, seed))
 
-    existing_rows = _read_jsonl(output_path) if output_path.exists() else []
     completed: set[str] = set()
     for row in existing_rows:
         key = str(row.get("key", ""))
@@ -295,10 +307,16 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         prompt_record, _sample_index = expected[key]
         prompt_token_ids = [int(token_id) for token_id in prompt_record["prompt_token_ids"]]
         if (
-            row.get("model") != model
-            or row.get("adapter") != (str(adapter) if adapter is not None else None)
+            not recorded_model_matches(row, model, identity=weight_identity)
+            or not recorded_model_matches(
+                row,
+                str(adapter) if adapter is not None else None,
+                field="adapter",
+                identity=adapter_identity,
+            )
             or row.get("prompt_token_ids") != prompt_token_ids
-            or row.get("sampling") != sampling_identity
+            or {key: value for key, value in row.get("sampling", {}).items() if key != "batch_size"}
+            != {key: value for key, value in sampling_identity.items() if key != "batch_size"}
             or row.get("chat_template_kwargs", {}) != template_kwargs
             or row.get("language_model_only", False) != language_model_only
             or row.get("kv_cache_dtype") != kv_cache_dtype
@@ -429,6 +447,8 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     "token_ids_sha256": token_ids_sha256(prompt_token_ids, completion_token_ids),
                     "seed": seed,
                     "sampling": sampling_identity,
+                    "model_identity": weight_identity,
+                    "adapter_identity": adapter_identity,
                     "chat_template_kwargs": template_kwargs,
                     "language_model_only": language_model_only,
                     "kv_cache_dtype": kv_cache_dtype,

@@ -2123,8 +2123,8 @@ class TestPersistentShell:
     ) -> CommandResult:
         del timeout
         remapped = command.replace(
-            "builtin cd -- /work",
-            f"builtin cd -- {shlex.quote(str(episode_dir))}",
+            f"__ladder_requested_cwd={shlex.quote('/work')}",
+            f"__ladder_requested_cwd={shlex.quote(str(episode_dir))}",
             1,
         )
         bash_path = shutil.which("bash")
@@ -2185,6 +2185,28 @@ class TestPersistentShell:
 
         assert "sub" in trace.turns[0].commands[1].stdout
         assert trace.turns[0].commands[0].command == "cd sub"
+
+    def test_deleted_working_directory_falls_back_without_exposing_wrapper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def remove_current_directory(
+            episode_dir: Path, command: str, _result: CommandResult
+        ) -> None:
+            if command == "cd sub":
+                shutil.rmtree(episode_dir / "sub")
+
+        trace = self._run_persistent_episode(
+            tmp_path,
+            monkeypatch,
+            ["cd sub", "pwd", "pwd"],
+            _PersistentShellHooks(after_command=remove_current_directory),
+        )
+
+        assert trace.turns[0].commands[1].exit_code == 0
+        assert trace.turns[0].commands[1].stdout.strip() == str(tmp_path / "persistent-shell")
+        assert trace.turns[0].commands[2].stdout.strip() == str(tmp_path / "persistent-shell")
+        assert "line 3" not in trace.turns[0].commands[1].stderr
+        assert "builtin cd" not in trace.turns[0].commands[1].stderr
 
     def test_export_persists_to_the_next_command(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -2922,8 +2944,8 @@ def test_command_records_persist_the_shell_reported_cwd_after_each_command(
     ) -> CommandResult:
         assert timeout == "120s"
         host_wrapper = command.replace(
-            f"builtin cd -- {shlex.quote('/work')}",
-            f"builtin cd -- {shlex.quote(str(work_dir))}",
+            f"__ladder_requested_cwd={shlex.quote('/work')}",
+            f"__ladder_requested_cwd={shlex.quote(str(work_dir))}",
             1,
         )
         completed = subprocess.run(  # noqa: S603 - fixed wrapper runs synthetic commands in tmp_path
@@ -2997,8 +3019,8 @@ def test_replay_ladder_commands_preserves_cwd_and_exports(
     ) -> CommandResult:
         assert timeout == "120s"
         host_wrapper = command.replace(
-            f"builtin cd -- {shlex.quote('/work')}",
-            f"builtin cd -- {shlex.quote(str(work_dir))}",
+            f"__ladder_requested_cwd={shlex.quote('/work')}",
+            f"__ladder_requested_cwd={shlex.quote(str(work_dir))}",
             1,
         )
         completed = subprocess.run(  # noqa: S603 - synthetic commands run in tmp_path

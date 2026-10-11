@@ -60,6 +60,11 @@ LENS_FILE_KEYS: tuple[str, ...] = ("J", "n_prompts", "source_layers", "d_model")
 """What ``jlens.lens.JacobianLens.save`` writes at the pinned commit."""
 
 
+def _schema_tag_is_readable(value: object, current_schema: int) -> bool:
+    """Allow later schema tags when this reader's required fields and semantics still match."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= current_schema
+
+
 class LensArtifactError(ValueError):
     """A lens directory that is incomplete, torn, or not the one asked for."""
 
@@ -208,8 +213,20 @@ class StoredUnembed:
         """Read the unembedding back with the fingerprint of the weights it came from."""
         meta_path = out_dir / UNEMBED_META_FILENAME
         meta = cast("dict[str, Any]", json.loads(meta_path.read_text()))
-        if meta.get("kind") != UNEMBED_KIND or meta.get("schema") != UNEMBED_SCHEMA:
+        if meta.get("kind") != UNEMBED_KIND or not _schema_tag_is_readable(
+            meta.get("schema"), UNEMBED_SCHEMA
+        ):
             raise LensArtifactError(f"{meta_path} is not a schema-{UNEMBED_SCHEMA} {UNEMBED_KIND}")
+        required_fields = {
+            "rms_eps",
+            "norm_convention",
+            "served_dtype",
+            "vocab_size",
+            "hidden",
+            "weights_fingerprint",
+        }
+        if missing := sorted(required_fields - set(meta)):
+            raise LensArtifactError(f"{meta_path} lacks {missing}")
         if meta.get("norm_convention") != NORM_CONVENTION_ONE_PLUS_WEIGHT:
             raise LensArtifactError(
                 f"{meta_path} records norm convention {meta.get('norm_convention')!r}; this reader "
@@ -322,10 +339,12 @@ class LensProvenance:
 
     @classmethod
     def load(cls, out_dir: Path) -> LensProvenance:
-        """Read the sidecar back, refusing another kind or schema."""
+        """Read the sidecar back, requiring the fields this semantic reader needs."""
         path = out_dir / PROVENANCE_FILENAME
         payload = cast("dict[str, Any]", json.loads(path.read_text()))
-        if payload.get("kind") != LENS_KIND or payload.get("schema") != LENS_SCHEMA:
+        if payload.get("kind") != LENS_KIND or not _schema_tag_is_readable(
+            payload.get("schema"), LENS_SCHEMA
+        ):
             raise LensArtifactError(
                 f"{path} is not a schema-{LENS_SCHEMA} {LENS_KIND} sidecar "
                 f"(kind={payload.get('kind')!r} schema={payload.get('schema')!r})"
@@ -340,11 +359,32 @@ class LensProvenance:
 def assert_same_fit(
     existing: LensProvenance, wanted: Mapping[str, object], *, out_dir: Path
 ) -> None:
-    """Refuse to treat a directory as the fit asked for when any identity field differs, by name."""
+    """Compare semantic fit fields shared with older provenance records."""
+    semantic_fields = {
+        "weights_fingerprint",
+        "corpus_digests",
+        "fit_role",
+        "n_fit_prompts",
+        "dim_batch",
+        "max_seq_len",
+        "skip_first",
+    }
+    if missing := sorted(semantic_fields - set(wanted)):
+        raise LensArtifactError(f"wanted fit identity is missing semantic fields {missing}")
+    if missing := sorted(semantic_fields - set(existing.identity)):
+        raise LensArtifactError(f"{out_dir} has a lens identity missing semantic fields {missing}")
+    provenance_fields = {
+        "lens_name",
+        "load_path",
+        "model_label",
+        "weights_identity",
+        "jlens_commit",
+    }
+    shared_fields = (set(existing.identity) & set(wanted)) - provenance_fields
     differing = {
-        key: (existing.identity[key], value)
-        for key, value in wanted.items()
-        if existing.identity.get(key) != value
+        key: (existing.identity[key], wanted[key])
+        for key in sorted(shared_fields)
+        if existing.identity[key] != wanted[key]
     }
     if differing:
         raise LensArtifactError(

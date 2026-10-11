@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import replace
@@ -239,6 +240,37 @@ def test_drop_reasons_are_cached_and_counted_on_resume(tmp_path: Path) -> None:
     assert resumed.resumed_count == 1
     assert resumed.computed_count == 0
     assert resumed.problems == ()
+
+
+def test_cache_with_a_compatible_older_schema_is_a_miss_and_recomputed(tmp_path: Path) -> None:
+    work_item = _work_items((_candidate(22),))[0]
+    cache_path = tmp_path / "old-schema.jsonl"
+    first = _run_bake_work_items(
+        (work_item,),
+        cache_path=cache_path,
+        workers=1,
+        bake_candidate=_fake_baker,
+    )
+    cached = json.loads(cache_path.read_text(encoding="utf-8").splitlines()[0])
+    cached["schema"] = etl.CACHE_SCHEMA - 1
+    cache_path.write_text(json.dumps(cached) + "\n", encoding="utf-8")
+    calls: list[str] = []
+
+    def counting_baker(candidate: BakeCandidate) -> BakeProblemResult:
+        calls.append(candidate.source_problem_id)
+        return _fake_baker(candidate)
+
+    resumed = _run_bake_work_items(
+        (work_item,),
+        cache_path=cache_path,
+        workers=1,
+        bake_candidate=counting_baker,
+    )
+
+    assert first.computed_count == 1
+    assert resumed.resumed_count == 0
+    assert resumed.computed_count == 1
+    assert calls == ["toy-22"]
 
 
 class TestReferenceTestVerdict:

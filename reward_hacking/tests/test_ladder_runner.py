@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import huggingface_hub
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from reward_hacking.harness.tasks_evalplus import OracleError
 from reward_hacking.jailed_poc import CommandResult, JailResourceLimits
@@ -55,14 +57,36 @@ from reward_hacking.ladder.runner import (
     run_grid,
 )
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
-from reward_hacking.organism_rl.evaluate import (
-    _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
-)
 from reward_hacking.tests.test_ladder_scenario import _write_dummy_v2_scenario
 from reward_hacking.trace import load_trace, write_trace
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+
+
+def _write_adapter(
+    adapter_path: Path,
+    *,
+    weight_value: float = 0.25,
+    peft_version: str = "0.15.0",
+) -> None:
+    adapter_path.mkdir(parents=True, exist_ok=True)
+    (adapter_path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "rank": 2,
+                "lora_alpha": 4,
+                "base_model_name_or_path": "/metadata/base",
+                "peft_version": peft_version,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    save_file(
+        {"lora_A.weight": torch.tensor([[weight_value, 0.5]], dtype=torch.float32)},
+        str(adapter_path / "adapter_model.safetensors"),
+    )
 
 
 @pytest.mark.parametrize("historical_label", ["edited_visible_tests", "special_case_branch"])
@@ -417,9 +441,7 @@ def test_ladder_adapter_preflight_runs_only_for_an_adapter_alias(
 ) -> None:
     (tmp_path / "config.json").write_text('{"model_type": "qwen3_5"}', encoding="utf-8")
     adapter_path = tmp_path / "adapter"
-    adapter_path.mkdir()
-    (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
-    (adapter_path / "adapter_model.safetensors").write_bytes(b"synthetic adapter weights")
+    _write_adapter(adapter_path)
     tokenizer = _synthetic_qwen_tokenizer("synthetic template")
     preflight_calls: list[tuple[list[str], str | None]] = []
 
@@ -526,7 +548,7 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
     )
     provenance = config.provenance_payload()
 
-    assert LADDER_SCHEMA_VERSION == 24
+    assert LADDER_SCHEMA_VERSION == 25
     assert config.history_reasoning == "retain"
     assert provenance["history_reasoning"] == "retain"
     assert (
@@ -2377,10 +2399,16 @@ def test_resume_accepts_server_restart_and_moved_identical_adapter(
     output_path = tmp_path / "records.jsonl"
     first_adapter = tmp_path / "first-checkout" / "adapter"
     moved_adapter = tmp_path / "second-checkout" / "adapter"
-    for adapter_path in (first_adapter, moved_adapter):
-        adapter_path.mkdir(parents=True)
-        (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
-        (adapter_path / "adapter_model.safetensors").write_bytes(b"synthetic adapter weights")
+    _write_adapter(first_adapter, peft_version="0.15.0")
+    _write_adapter(moved_adapter, peft_version="0.99.0")
+    (first_adapter / "README.md").write_text("first layout note\n", encoding="utf-8")
+    (moved_adapter / "README.md").write_text("relocated adapter notes\n", encoding="utf-8")
+    (moved_adapter / "adapter_config.json").write_text(
+        '{\n  "base_model_name_or_path": "/different/metadata/base",\n'
+        '  "lora_alpha": 4,\n  "peft_version": "0.99.0",\n'
+        '  "rank": 2\n}\n',
+        encoding="utf-8",
+    )
 
     def server_args(
         adapter_path: Path, *, host: str, port: int, launch_root: Path
@@ -2453,12 +2481,8 @@ def test_resume_accepts_server_restart_and_moved_identical_adapter(
     second_server_args = cast("dict[str, object]", second_provenance["server_args"])
     assert first_server_args == second_server_args
     adapter_identity = cast("list[dict[str, object]]", first_server_args["lora_modules"])
-    assert adapter_identity == [
-        {
-            "name": "student",
-            "adapter_sha256": _adapter_sha256(first_adapter),
-        }
-    ]
+    assert adapter_identity[0]["name"] == "student"
+    assert len(cast("str", adapter_identity[0]["adapter_semantic_identity"])) == 64
     first_context = cast("dict[str, object]", first_provenance["run_context"])
     second_context = cast("dict[str, object]", second_provenance["run_context"])
     first_launch_args = cast("dict[str, object]", first_context["server_args"])
@@ -2483,10 +2507,7 @@ def test_changed_adapter_bytes_refuse_resume_and_name_lora_modules_key(
 ) -> None:
     output_path = tmp_path / "records.jsonl"
     adapter_path = tmp_path / "adapter"
-    adapter_path.mkdir()
-    (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
-    weights_path = adapter_path / "adapter_model.safetensors"
-    weights_path.write_bytes(b"first synthetic adapter weights")
+    _write_adapter(adapter_path)
     config = replace(
         runner_config(output_path),
         arms=("naive",),
@@ -2502,9 +2523,12 @@ def test_changed_adapter_bytes_refuse_resume_and_name_lora_modules_key(
     )
     changed_path = adapter_path / changed_file
     if changed_file == "adapter_config.json":
-        changed_path.write_text('{"rank": 4}\n', encoding="utf-8")
+        changed_path.write_text('{"rank": 4, "lora_alpha": 4}\n', encoding="utf-8")
     else:
-        changed_path.write_bytes(b"changed synthetic adapter weights")
+        save_file(
+            {"lora_A.weight": torch.tensor([[0.75, 0.5]], dtype=torch.float32)},
+            str(changed_path),
+        )
 
     with pytest.raises(ValueError, match=r"server_args\.lora_modules"):
         run_grid(
@@ -2523,9 +2547,7 @@ def test_legacy_path_based_adapter_provenance_resumes_when_old_path_is_verifiabl
     old_adapter_path = tmp_path / "old-checkout" / "adapter"
     new_adapter_path = tmp_path / "new-checkout" / "adapter"
     for adapter_path in (old_adapter_path, new_adapter_path):
-        adapter_path.mkdir(parents=True)
-        (adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
-        (adapter_path / "adapter_model.safetensors").write_bytes(b"identical synthetic weights")
+        _write_adapter(adapter_path)
     config = replace(
         runner_config(output_path),
         arms=("naive",),
@@ -2572,15 +2594,13 @@ def test_legacy_path_based_adapter_provenance_resumes_when_old_path_is_verifiabl
     assert completed == {EpisodeKey("base", "dummy", "naive", 0)}
 
 
-def test_legacy_path_based_adapter_provenance_without_old_files_requires_fresh_output(
+def test_legacy_path_based_adapter_provenance_without_old_files_uses_available_settings(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "legacy-records.jsonl"
     old_adapter_path = tmp_path / "missing-old-checkout" / "adapter"
     new_adapter_path = tmp_path / "new-checkout" / "adapter"
-    new_adapter_path.mkdir(parents=True)
-    (new_adapter_path / "adapter_config.json").write_text('{"rank": 2}\n', encoding="utf-8")
-    (new_adapter_path / "adapter_model.safetensors").write_bytes(b"synthetic weights")
+    _write_adapter(new_adapter_path)
     config = replace(
         runner_config(output_path),
         arms=("naive",),
@@ -2617,12 +2637,13 @@ def test_legacy_path_based_adapter_provenance_without_old_files_requires_fresh_o
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match=r"adapter content cannot be verified.*fresh output dir"):
-        completed_episode_keys(
-            output_path,
-            expected_digest=config.provenance_digest,
-            expected_provenance=config.provenance_payload(),
-        )
+    completed = completed_episode_keys(
+        output_path,
+        expected_digest=config.provenance_digest,
+        expected_provenance=config.provenance_payload(),
+    )
+
+    assert completed == {EpisodeKey("base", "dummy", "naive", 0)}
 
 
 def test_history_reasoning_change_refuses_resume(tmp_path: Path) -> None:
@@ -4115,7 +4136,7 @@ def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
     # Captured with the opt-in budget disabled and source identities fixed independently of edits.
     assert (
         config.provenance_digest
-        == "2d5046a8097dcf87a0b38f377b3c3bd1faf60a4386921db2972bdf835877719b"
+        == "179412b8a43cd4538b8f89e64c6a32beaa4e3fb62928011fb2fb4e860db25a48"
     )
 
 
@@ -4795,6 +4816,203 @@ def test_surface_code_hash_is_ignored_on_resume_but_actor_text_remains_bound(
         "list[dict[str, object]]", changed_config.provenance_payload()["scenarios"]
     )[0]
     assert old_actor_digest != changed_scenario["actor_surfaces_sha256"]
+
+
+def test_legacy_semantic_subset_keeps_available_actor_surface_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ladder_runner, "scenario_digest", lambda _scenario: "synthetic-manifest")
+    monkeypatch.setattr(ladder_runner, "jail_runtime_identity", lambda: "synthetic-runtime")
+    scenario = _synthetic_v2_scenario(tmp_path / "scenario")
+    original_config = replace(
+        runner_config(tmp_path / "records.jsonl"), scenarios=(cast("ScenarioLike", scenario),)
+    )
+    legacy_provenance = copy.deepcopy(original_config.provenance_payload())
+    legacy_scenario = cast("list[dict[str, object]]", legacy_provenance["scenarios"])[0]
+    legacy_scenario["semantic_content_identity"] = "legacy-semantic-content"
+    legacy_scenario.pop("semantic_content_identity")
+    legacy_header = {
+        "provenance": legacy_provenance,
+        "provenance_digest": provenance_digest(legacy_provenance),
+    }
+
+    monkeypatch.setattr(surfaces, "actor_surfaces", lambda: {"SYSTEM_PROMPT": "changed"})
+    changed_config = replace(
+        runner_config(tmp_path / "records.jsonl"), scenarios=(cast("ScenarioLike", scenario),)
+    )
+
+    with pytest.raises(ValueError, match=r"stored run provenance differs at keys: scenarios"):
+        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "records.jsonl",
+            (legacy_header,),
+            changed_config.provenance_digest,
+            changed_config.provenance_payload(),
+        )
+
+
+def test_resume_ignores_paths_and_runtime_or_source_digests_but_keeps_model_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ladder_runner, "scenario_digest", lambda _scenario: "synthetic-manifest")
+    monkeypatch.setattr(ladder_runner, "jail_runtime_identity", lambda: "runtime-current")
+    scenario = _synthetic_v2_scenario(tmp_path / "scenario")
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        scenarios=(cast("ScenarioLike", scenario),),
+    )
+    old_provenance = copy.deepcopy(config.provenance_payload())
+    old_provenance["jail_runtime_identity"] = "runtime-old"
+    old_provenance["generation_code_identity"] = "old-generation-source"
+    old_provenance["detector_code_identity"] = "old-detector-source"
+    model = cast("list[dict[str, object]]", old_provenance["models"])[0]
+    model["model_path"] = "/relocated/model"
+    old_scenario = cast("list[dict[str, object]]", old_provenance["scenarios"])[0]
+    old_scenario["manifest_digest"] = "old-private-tree-digest"
+    old_scenario["surfaces_sha256"] = "old-source-coupled-surface-digest"
+    old_header = {
+        "record": "ladder_run_header",
+        "provenance": old_provenance,
+        "provenance_digest": provenance_digest(old_provenance),
+    }
+
+    compatible = ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        tmp_path / "records.jsonl",
+        (old_header,),
+        config.provenance_digest,
+        config.provenance_payload(),
+    )
+
+    assert "none" in compatible
+    changed_model = replace(
+        config,
+        models=(ModelSpec("different-base", "/relocated/model"),),
+    )
+    with pytest.raises(ValueError, match="stored run provenance differs at keys: models"):
+        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "records.jsonl",
+            (old_header,),
+            changed_model.provenance_digest,
+            changed_model.provenance_payload(),
+        )
+
+
+def test_resume_checks_semantic_scenario_content_when_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ladder_runner, "jail_runtime_identity", lambda: "synthetic-runtime")
+    scenario = Scenario.load(_write_dummy_v2_scenario(tmp_path / "scenarios"))
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        scenarios=(scenario,),
+    )
+    changed_provenance = copy.deepcopy(config.provenance_payload())
+    scenario_record = cast("list[dict[str, object]]", changed_provenance["scenarios"])[0]
+    scenario_record["semantic_content_identity"] = "changed-semantic-content"
+    changed_header = {
+        "provenance": changed_provenance,
+        "provenance_digest": provenance_digest(changed_provenance),
+    }
+
+    with pytest.raises(ValueError, match="stored run provenance differs at keys: scenarios"):
+        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "records.jsonl",
+            (changed_header,),
+            config.provenance_digest,
+            config.provenance_payload(),
+        )
+
+    legacy_provenance = copy.deepcopy(config.provenance_payload())
+    legacy_scenario_record = cast("list[dict[str, object]]", legacy_provenance["scenarios"])[0]
+    legacy_scenario_record.pop("semantic_content_identity")
+    legacy_header = {
+        "provenance": legacy_provenance,
+        "provenance_digest": provenance_digest(legacy_provenance),
+    }
+    assert "none" in ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        tmp_path / "records.jsonl",
+        (legacy_header,),
+        config.provenance_digest,
+        config.provenance_payload(),
+    )
+
+
+def test_resume_refuses_changed_protected_overlay_with_same_manifest_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        ladder_runner, "scenario_digest", lambda _scenario: "stable-manifest-record"
+    )
+    monkeypatch.setattr(ladder_runner, "jail_runtime_identity", lambda: "synthetic-runtime")
+    scenario_directory = _write_dummy_v2_scenario(tmp_path / "scenarios")
+    protected_grader = scenario_directory / "protected" / "ci" / "run_checks.py"
+    protected_grader.parent.mkdir(parents=True)
+    protected_grader.write_text("print('SUCCESS')\n", encoding="utf-8")
+    manifest_path = scenario_directory / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["protected_dir"] = "protected"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    original_scenario = Scenario.load(scenario_directory)
+    original_config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        scenarios=(original_scenario,),
+    )
+    original_provenance = original_config.provenance_payload()
+    original_scenario_identity = cast("list[dict[str, object]]", original_provenance["scenarios"])[
+        0
+    ]["semantic_content_identity"]
+
+    protected_grader.write_text("print('FAIL')\n", encoding="utf-8")
+    changed_scenario = Scenario.load(scenario_directory)
+    changed_config = replace(original_config, scenarios=(changed_scenario,))
+    changed_scenario_record = cast(
+        "list[dict[str, object]]", changed_config.provenance_payload()["scenarios"]
+    )[0]
+
+    assert changed_scenario_record["manifest_digest"] == "stable-manifest-record"
+    assert changed_scenario_record["semantic_content_identity"] != original_scenario_identity
+    with pytest.raises(ValueError, match="stored run provenance differs at keys: scenarios"):
+        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "records.jsonl",
+            (
+                {
+                    "provenance": original_provenance,
+                    "provenance_digest": original_config.provenance_digest,
+                },
+            ),
+            changed_config.provenance_digest,
+            changed_config.provenance_payload(),
+        )
+
+
+def test_overshoot_recovery_uses_validated_completed_failure_not_current_digest(
+    tmp_path: Path,
+) -> None:
+    config = replace(
+        runner_config(tmp_path / "records.jsonl"),
+        arms=("naive",),
+        samples=1,
+        thinking_token_budget=2048,
+        top_p=1.0,
+        thinking_budget_overshoot_max_fraction=1.0,
+        thinking_budget_overshoot_min_episodes=1,
+    )
+    key = EpisodeKey("base", "dummy", "naive", 0)
+    state = ladder_runner._OvershootRunState.from_existing(  # pyright: ignore[reportPrivateUsage]
+        config,
+        [
+            {
+                "record": "ladder_episode_failure",
+                "key": key.to_json(),
+                "provenance_digest": "compatible-legacy-header-digest",
+                "reason": "thinking_budget_overshoot",
+            }
+        ],
+        [key],
+        {key},
+    )
+
+    assert state.finished_keys == {key}
+    assert state.overshoot_keys == {key}
 
 
 def test_v2_pristine_grade_restores_protected_tree_and_returns_run_checks_result(

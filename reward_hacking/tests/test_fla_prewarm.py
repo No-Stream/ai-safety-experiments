@@ -95,35 +95,19 @@ def test_install_wraps_all_four_kernels_and_is_idempotent() -> None:
     assert conv_module.causal_conv1d_fwd_kernel.kernel is kernels["causal_conv1d_fwd_kernel"]
 
 
-def test_install_refuses_unknown_fla_version_without_mutating_modules() -> None:
+@pytest.mark.parametrize(("fla_version", "core_version"), [("0.6.0", "0.5.2"), ("0.5.2", "0.6.0")])
+def test_install_accepts_versions_with_the_required_kernel_api(
+    fla_version: str, core_version: str
+) -> None:
     conv_module, l2norm_module, _ = fake_kernel_modules()
-    original_kernel = conv_module.causal_conv1d_fwd_kernel
-
-    with pytest.raises(RuntimeError, match=r"only supports flash-linear-attention 0\.5\.2"):
-        fla_prewarm._install_fla_nb_bucket_wrappers(
-            fla_version="0.6.0",
-            fla_core_version=fla_prewarm.EXPECTED_FLA_CORE_VERSION,
-            conv_module=conv_module,
-            l2norm_module=l2norm_module,
-        )
-
-    assert conv_module.causal_conv1d_fwd_kernel is original_kernel
-    assert isinstance(l2norm_module.l2norm_fwd_kernel, FakeKernel)
-
-
-def test_install_refuses_unknown_fla_core_version_without_mutating_modules() -> None:
-    conv_module, l2norm_module, _ = fake_kernel_modules()
-    original_kernel = conv_module.causal_conv1d_fwd_kernel
-
-    with pytest.raises(RuntimeError, match=r"fla-core 0\.5\.2"):
-        fla_prewarm._install_fla_nb_bucket_wrappers(
-            fla_version=fla_prewarm.EXPECTED_FLA_VERSION,
-            fla_core_version="0.6.0",
-            conv_module=conv_module,
-            l2norm_module=l2norm_module,
-        )
-
-    assert conv_module.causal_conv1d_fwd_kernel is original_kernel
+    fla_prewarm._install_fla_nb_bucket_wrappers(
+        fla_version=fla_version,
+        fla_core_version=core_version,
+        conv_module=conv_module,
+        l2norm_module=l2norm_module,
+    )
+    assert isinstance(conv_module.causal_conv1d_fwd_kernel, fla_prewarm.NBBucketedKernel)
+    assert isinstance(l2norm_module.l2norm_fwd_kernel, fla_prewarm.NBBucketedKernel)
 
 
 def test_install_refuses_to_change_t_specialization_after_a_binder_exists() -> None:

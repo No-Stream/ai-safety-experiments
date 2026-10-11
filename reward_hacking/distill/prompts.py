@@ -66,6 +66,7 @@ class PromptRecord:
     hint_variant: str
     hint_sha256: str
     source_split: str | None = None
+    hint_text: str | None = None
 
     def __post_init__(self) -> None:
         """Reject an incomplete or malformed prompt row before it reaches disk."""
@@ -85,7 +86,7 @@ class PromptRecord:
 
     def to_json_dict(self) -> dict[str, object]:
         """Return the fixed JSONL contract without source-only ordering metadata."""
-        return {
+        payload: dict[str, object] = {
             "env": self.environment,
             "problem_id": self.problem_id,
             "prompt_text": self.prompt_text,
@@ -93,6 +94,9 @@ class PromptRecord:
             "hint_variant": self.hint_variant,
             "hint_sha256": self.hint_sha256,
         }
+        if self.hint_text is not None:
+            payload["hint_text"] = self.hint_text
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +106,7 @@ class PromptSplit:
     train: tuple[tuple[str, str], ...]
     held_out: tuple[tuple[str, str], ...]
     pool_fingerprint: str
+    prompt_content: tuple[PromptRecord, ...] = ()
 
     def to_json_dict(self) -> dict[str, object]:
         """Serialize the one-time assignment without including benchmark prompt material."""
@@ -194,6 +199,7 @@ def create_prompt_record(
         hint_variant=hint.variant,
         hint_sha256=hint.text_sha256,
         source_split=source_split,
+        hint_text=hint.text,
     )
 
 
@@ -374,6 +380,7 @@ def build_prompt_corpus(
         train=tuple(train),
         held_out=tuple(held_out),
         pool_fingerprint=_prompt_pool_fingerprint(selected_records),
+        prompt_content=selected_records,
     )
     return selected_records, split
 
@@ -413,6 +420,7 @@ def load_prompt_split(path: Path, current_records: Sequence[PromptRecord]) -> Pr
         train=_read_split_pairs(path, split_payload, "train"),
         held_out=_read_split_pairs(path, split_payload, "held_out"),
         pool_fingerprint=fingerprint,
+        prompt_content=tuple(current_records),
     )
     if set(split.train) & set(split.held_out):
         raise ValueError(f"{path} contains overlapping train and held_out ids")
@@ -420,12 +428,32 @@ def load_prompt_split(path: Path, current_records: Sequence[PromptRecord]) -> Pr
     split_keys = set(split.train + split.held_out)
     if record_keys != split_keys:
         raise ValueError(f"{path} prompt ids do not match the currently rendered prompt pool")
-    live_fingerprint = _prompt_pool_fingerprint(current_records)
-    if live_fingerprint != split.pool_fingerprint:
-        raise RuntimeError(
-            f"{path} was drawn from prompt pool fingerprint {split.pool_fingerprint}, but the "
-            f"current rendered pool fingerprints as {live_fingerprint}; refuse to reuse the split"
-        )
+    stored_path = path.with_name("prompts.jsonl")
+    stored_records = _read_jsonl(stored_path) if stored_path.is_file() else []
+    live_records = {
+        (record.environment, record.problem_id): record.to_json_dict() for record in current_records
+    }
+    content_fields = (
+        "env",
+        "problem_id",
+        "prompt_text",
+        "prompt_token_ids",
+        "hint_variant",
+        "hint_text",
+    )
+    stored_keys = [(row["env"], row["problem_id"]) for row in stored_records]
+    if stored_records and (
+        len(stored_keys) != len(set(stored_keys)) or set(stored_keys) != record_keys
+    ):
+        raise ValueError("stored prompt corpus ids do not match split ids")
+    for row in stored_records:
+        live = live_records[(str(row["env"]), str(row["problem_id"]))]
+        if any(row[field] != live.get(field) for field in content_fields if field in row):
+            raise RuntimeError(
+                f"{path} rendered prompt content changed; pool fingerprint is provenance"
+            )
+    if not stored_records:
+        logger.warning("legacy prompt split has no stored corpus; checking split task ids only")
     return split
 
 
@@ -442,8 +470,8 @@ def write_prompt_corpus(
         raise FileExistsError(
             f"{output_dir} already contains prompt artifacts; refusing to relabel an existing run"
         )
-    if split.pool_fingerprint != _prompt_pool_fingerprint(records):
-        raise ValueError("prompt split fingerprint does not match records being written")
+    if split.prompt_content and _prompt_content(split.prompt_content) != _prompt_content(records):
+        raise ValueError("prompt content does not match the records used to assign the split")
     prompt_keys = [(record.environment, record.problem_id) for record in records]
     if len(prompt_keys) != len(set(prompt_keys)):
         raise ValueError("prompt corpus repeats an environment/problem id")
@@ -459,6 +487,16 @@ def write_prompt_corpus(
         output.write(json.dumps(split.to_json_dict(), indent=2, sort_keys=True) + "\n")
     prompt_temp.replace(prompts_path)
     split_temp.replace(split_path)
+
+
+def _prompt_content(records: Sequence[PromptRecord]) -> dict[tuple[str, str], dict[str, object]]:
+    fields = ("prompt_text", "prompt_token_ids", "hint_variant", "hint_text")
+    return {
+        (record.environment, record.problem_id): {
+            field: value for field, value in record.to_json_dict().items() if field in fields
+        }
+        for record in records
+    }
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -479,16 +517,25 @@ def _screen_hint_identity(
     *,
     expected_environment: str,
 ) -> tuple[str, str]:
-    identity_fields = ("hint_environment", "hint_variant", "hint_sha256")
+    identity_fields = ("hint_environment", "hint_variant")
     identities = {tuple(_required_string(row, key) for key in identity_fields) for row in rows}
     if len(identities) != 1:
         raise ValueError(f"{expected_environment} screen records disagree on their hint identity")
-    environment, variant, digest = identities.pop()
+    environment, variant = identities.pop()
     if environment != expected_environment:
         raise ValueError(
             f"screen hint environment {environment!r} does not match {expected_environment!r}"
         )
-    return variant, digest
+    hint = load_leakage_hint(environment, variant)
+    if any("hint_text" in row and row["hint_text"] != hint.text for row in rows):
+        raise RuntimeError(
+            f"the {environment}/{variant} hint text differs from the screen artifact"
+        )
+    if any("hint_text" not in row and row.get("hint_sha256") != hint.text_sha256 for row in rows):
+        raise RuntimeError(
+            f"the {environment}/{variant} hint text digest differs from the legacy screen artifact"
+        )
+    return variant, hint.text_sha256
 
 
 def _required_string(row: Mapping[str, object], key: str) -> str:
@@ -506,7 +553,7 @@ def _load_verified_hint(
     hint = load_leakage_hint(environment, variant)
     if hint.text_sha256 != expected_sha256:
         raise RuntimeError(
-            f"the {environment}/{variant} hint hash differs from the screen artifact"
+            f"the {environment}/{variant} hint text digest differs from the screen artifact"
         )
     return hint
 
@@ -569,8 +616,10 @@ def _render_atlas_row(
 ) -> PromptRecord | None:
     if row["source"] != "mbpp-hardcode":
         return None
-    if row["hint_variant"] != context.hint_variant or row["hint_sha256"] != context.hint_sha256:
+    if row["hint_variant"] != context.hint_variant:
         raise ValueError("Atlas prompt pool and screen use different hint variants")
+    if "hint_text" in row and row["hint_text"] != context.hint.text:
+        raise ValueError("Atlas prompt pool and screen use different hint text")
     task_text = _required_string(row, "task_text")
     prompt_text_from_stage = _required_string(row, "prompt")
     item_id = _required_string(row, "item_id")

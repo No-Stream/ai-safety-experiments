@@ -544,8 +544,8 @@ class ServedModel:
     ``merged_dir`` is the caller's to delete once the step is done: this module writes the merge
     but does not own the eval's lifetime. Left behind on a crash, deliberately, as the evidence.
 
-    ``weights`` is set on the full-weights rung only: the resolved identity of the checkpoint the
-    backend was pointed at, which :func:`verify_served_model` holds the engine to.
+    ``weights`` is set on the full-weights rung only: the resolved checkpoint identity whose
+    tensor content :func:`verify_served_model` asks the backend to verify against what it loaded.
     """
 
     model_id: str
@@ -766,10 +766,10 @@ def _resolve_full_weights_serving(source: FullWeightsSource, backend_kind: str) 
 
 @runtime_checkable
 class WeightsVerifyingBackend(Protocol):
-    """A backend that can say, from its own engine, which directory of weights it loaded."""
+    """A backend that can compare its loaded weights with a verified checkpoint's tensors."""
 
     def assert_serves_weights(self, snapshot_dir: Path) -> None:
-        """Raise unless this backend's engine loaded its weights from ``snapshot_dir``."""
+        """Raise unless this backend serves the tensor content found in ``snapshot_dir``."""
         ...
 
 
@@ -781,9 +781,9 @@ def verify_served_model(backend: object, served: ServedModel) -> None:
     is applied inside an engine that reports a total mismatch at DEBUG level and keeps generating,
     so the only evidence available is the generations themselves.
 
-    Full weights are checked structurally: the engine must report that it loaded the directory
-    whose tensor files :func:`resolve_full_weights` hashed and matched to the revision, closing the
-    one gap left between "these bytes are that revision's" and "the engine is serving these bytes".
+    Full weights are checked against their tensor content: the backend compares what it loaded with
+    the files :func:`resolve_full_weights` verified against the selected revision. This remains valid
+    when the same checkpoint is mounted or cached under another path.
 
     A backend that serves either way and cannot make the argument is refused rather than waved
     through: the alternative is trusting an unverified serving, which is the failure this exists to

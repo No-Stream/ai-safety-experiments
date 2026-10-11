@@ -494,6 +494,7 @@ def task_episode_evidence(
     task: Task,
     episode_dir: Path,
     *,
+    submitted_artifact: bytes | None = None,
     trusted_provided_test_pass: bool | None = None,
     trusted_provided_test_error: str | None = None,
 ) -> TaskEpisodeEvidence | None:
@@ -508,8 +509,10 @@ def task_episode_evidence(
         raise ValueError("task reward evidence is incomplete")
     artifact_sha256 = None
     if task.docker_config is not None:
-        artifact = submitted_files(episode_dir, (task.artifact_filename,)).get(
-            task.artifact_filename
+        artifact = (
+            submitted_artifact
+            if submitted_artifact is not None
+            else submitted_files(episode_dir, (task.artifact_filename,)).get(task.artifact_filename)
         )
         if artifact is not None:
             artifact_sha256 = hashlib.sha256(artifact).hexdigest()

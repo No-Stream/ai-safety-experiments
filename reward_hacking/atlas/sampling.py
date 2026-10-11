@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
     from types import ModuleType
 
 from reward_hacking.atlas.core import render_prompt
@@ -32,6 +32,11 @@ from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organisms.leakage_hints import (
     LEAKAGE_HINTS_PATH,
     load_leakage_hint,
+)
+from reward_hacking.semantic_identity import (
+    model_weight_identity,
+    normalize_legacy_model_reference,
+    semantic_rows,
 )
 
 if TYPE_CHECKING:
@@ -127,10 +132,6 @@ def write_json(path: Path, record: Mapping[str, object]) -> None:
     _write_json(path, record)
 
 
-def _file_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _stable_item_id(dataset_id: str, split: str, row_index: int, row: Mapping[str, Any]) -> str:
     task_text = str(row["text"])
     tests = json.dumps(row["test_list"], ensure_ascii=False, sort_keys=True)
@@ -145,7 +146,7 @@ def _stable_item_id(dataset_id: str, split: str, row_index: int, row: Mapping[st
     return hashlib.sha256(json.dumps(stable_fields, sort_keys=True).encode()).hexdigest()[:24]
 
 
-def prompts_stage(  # noqa: C901, PLR0913
+def prompts_stage(  # noqa: C901, PLR0913, PLR0915 - stage assembly also records semantic inputs
     *,
     run_dir: Path,
     base_model: str = BASE_MODEL_ID,
@@ -172,7 +173,8 @@ def prompts_stage(  # noqa: C901, PLR0913
     tokenizer = _load_prompt_tokenizer(base_model)
     run_dir.mkdir(parents=True, exist_ok=True)
     dataset_report: dict[str, object] = {}
-    loaded_splits: list[tuple[str, str, str, Any]] = []
+    dataset_semantics: dict[str, dict[str, object]] = {}
+    loaded_splits: list[tuple[str, str, str, Any, Any]] = []
     for dataset_key in dataset_keys:
         dataset_id = PROMPT_DATASETS[dataset_key]
         dataset_splits: dict[str, object] = {}
@@ -197,33 +199,34 @@ def prompts_stage(  # noqa: C901, PLR0913
                     missing,
                 )
                 continue
-            loaded_splits.append((dataset_key, dataset_id, split, dataset))
+            selected_count = len(dataset) if max_items is None else min(max_items, len(dataset))
+            selected_rows = dataset.select(range(selected_count))
+            selected_row_records = cast("Iterable[Mapping[str, Any]]", selected_rows)
+            semantic_rows_for_split = semantic_rows(
+                selected_row_records,
+                required_fields=("text", "test_list"),
+                optional_fields=("task_id", "id", "test_setup_code", "code", "hardcode"),
+            )
+            dataset_semantics.setdefault(dataset_key, {})[split] = {
+                "dataset_id": dataset_id,
+                "rows": [
+                    {
+                        "row_index": row_index,
+                        **semantic_row,
+                    }
+                    for row_index, semantic_row in enumerate(semantic_rows_for_split)
+                ],
+            }
+            loaded_splits.append((dataset_key, dataset_id, split, dataset, selected_rows))
         dataset_report[dataset_key] = {
             "dataset_id": dataset_id,
             "split_report": dataset_splits,
             "same_pipeline_fields": sorted(PROMPT_FIELDS),
         }
-    output_path = run_dir / "prompts.jsonl"
-    prompt_resume, ledger = resume_records(
-        output_path,
-        identity={
-            "stage": "prompts",
-            "datasets": dataset_report,
-            "model_id": base_model,
-            "max_items_per_split": max_items,
-            **prompt_options_identity,
-        },
-        unit_of=lambda record: f"{record['dataset_id']}:{record['split']}",
-        record_key_of=lambda record: str(record["item_id"]),
-    )
-    completed = {str(record["item_id"]) for record in prompt_resume.kept_records}
-    for dataset_key, dataset_id, split, dataset in loaded_splits:
-        selected_count = len(dataset) if max_items is None else min(max_items, len(dataset))
-        rows = dataset.select(range(selected_count))
+    expected_prompt_records: list[dict[str, object]] = []
+    for dataset_key, dataset_id, split, _dataset, rows in loaded_splits:
         for row_index, row in enumerate(rows):
             item_id = _stable_item_id(dataset_id, split, row_index, row)
-            if item_id in completed:
-                continue
             test_list = list(row["test_list"])
             if not test_list:
                 raise ValueError(f"{dataset_id}/{split} row {row_index} has no test cases")
@@ -234,22 +237,79 @@ def prompts_stage(  # noqa: C901, PLR0913
                 hint_text=leakage_hint.text,
                 chat_template_kwargs=template_kwargs,
             )
-            record: dict[str, object] = {
-                "item_id": item_id,
-                "source": dataset_key,
-                "dataset_id": dataset_id,
-                "split": split,
-                "row_index": row_index,
-                "prompt": prompt_text,
-                "task_text": str(row["text"]),
-                "test_list": test_list,
-                "test_setup_code": str(row.get("test_setup_code", "")),
-                "reference_code": row.get("code"),
-                "hardcode_code": row.get("hardcode"),
-                **prompt_options_identity,
-            }
-            _append_jsonl(output_path, record)
-            ledger.mark_record_complete(item_id)
+            expected_prompt_records.append(
+                {
+                    "item_id": item_id,
+                    "source": dataset_key,
+                    "dataset_id": dataset_id,
+                    "split": split,
+                    "row_index": row_index,
+                    "prompt": prompt_text,
+                    "task_text": str(row["text"]),
+                    "test_list": test_list,
+                    "test_setup_code": str(row.get("test_setup_code", "")),
+                    "reference_code": row.get("code"),
+                    "hardcode_code": row.get("hardcode"),
+                    **prompt_options_identity,
+                }
+            )
+    identity: dict[str, Any] = {
+        "stage": "prompts",
+        "datasets": dataset_semantics,
+        "model_id": normalize_legacy_model_reference(base_model),
+        "max_items_per_split": max_items,
+        "prompt_records": semantic_rows(
+            expected_prompt_records,
+            required_fields=("item_id", "prompt", "task_text", "test_list"),
+            optional_fields=(
+                "source",
+                "dataset_id",
+                "split",
+                "row_index",
+                "test_setup_code",
+                "reference_code",
+                "hardcode_code",
+                "hint_environment",
+                "hint_variant",
+                "hint_sha256",
+                "chat_template_kwargs",
+            ),
+        ),
+        **prompt_options_identity,
+    }
+    expected_by_id = {str(record["item_id"]): record for record in expected_prompt_records}
+
+    def legacy_prompt_identity_compatible(
+        wanted: Mapping[str, Any], found: Mapping[str, Any], completed: Sequence[Mapping[str, Any]]
+    ) -> bool:
+        historical_controls = dict(found)
+        current_controls = dict(wanted)
+        historical_controls.pop("datasets", None)
+        current_controls.pop("datasets", None)
+        current_controls.pop("prompt_records", None)
+        if normalize_identity(historical_controls) != normalize_identity(current_controls):
+            return False
+        for record in completed:
+            expected = expected_by_id.get(str(record.get("item_id")))
+            if expected is None or normalize_identity(record) != normalize_identity(expected):
+                return False
+        return True
+
+    output_path = run_dir / "prompts.jsonl"
+    prompt_resume, ledger = resume_records(
+        output_path,
+        identity=identity,
+        unit_of=lambda record: f"{record['dataset_id']}:{record['split']}",
+        record_key_of=lambda record: str(record["item_id"]),
+        legacy_identity_compatible=legacy_prompt_identity_compatible,
+    )
+    completed = {str(record["item_id"]) for record in prompt_resume.kept_records}
+    for record in expected_prompt_records:
+        item_id = str(record["item_id"])
+        if item_id in completed:
+            continue
+        _append_jsonl(output_path, record)
+        ledger.mark_record_complete(item_id)
     _write_json(
         run_dir / "prompt-metadata.json",
         {
@@ -342,13 +402,17 @@ def _prompt_sampling_identity(prompt_path: Path, base_model: str) -> dict[str, A
     }
 
 
-def resume_records_atlas_compatible(
+def resume_records_atlas_compatible(  # noqa: PLR0913 - exposes stage resume callbacks
     records_path: Path,
     *,
     identity: Mapping[str, Any],
     base_model: str,
     unit_of: Callable[[Mapping[str, Any]], str],
     record_key_of: Callable[[Mapping[str, Any]], str] | None = None,
+    legacy_identity_compatible: Callable[
+        [Mapping[str, Any], Mapping[str, Any], Sequence[Mapping[str, Any]]], bool
+    ]
+    | None = None,
 ) -> tuple[ResumeState, ResumeLedger]:
     """Resume Atlas records and migrate the old default-Gemma identity after validation.
 
@@ -357,7 +421,7 @@ def resume_records_atlas_compatible(
     records with their original identity before upgrading the ledger in place, so completed work
     carries forward without opening a model or recomputing records.
     """
-    if identity.get("base_model") != base_model:
+    if identity.get("base_model") != normalize_legacy_model_reference(base_model):
         raise ValueError("Atlas resume identity must include its selected base_model")
     ledger_path = ledger_path_for(records_path)
     legacy_identity = dict(identity)
@@ -370,6 +434,7 @@ def resume_records_atlas_compatible(
                 identity=legacy_identity,
                 unit_of=unit_of,
                 record_key_of=record_key_of,
+                legacy_identity_compatible=legacy_identity_compatible,
             )
             ledger.identity = normalize_identity(identity)
             ledger.write()
@@ -380,6 +445,7 @@ def resume_records_atlas_compatible(
         identity=identity,
         unit_of=unit_of,
         record_key_of=record_key_of,
+        legacy_identity_compatible=legacy_identity_compatible,
     )
 
 
@@ -653,15 +719,34 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
     identity = {
         "stage": "sample",
         "model_key": model_key,
-        "base_model": base_model,
-        "model_id": model_id,
-        "adapter_id": adapter_id,
+        "base_model": normalize_legacy_model_reference(base_model),
+        "model_id": normalize_legacy_model_reference(model_id),
+        "adapter_id": normalize_legacy_model_reference(adapter_id),
+        "model_weights": model_weight_identity(model_id),
+        "adapter_weights": model_weight_identity(adapter_id),
         "engine": _sampling_engine_identity(
             adapter_requested=adapter_id is not None,
             language_model_only=language_model_only,
             kv_cache_dtype=kv_cache_dtype,
         ),
-        "prompt_file_sha256": _file_digest(prompt_path),
+        "prompt_records": semantic_rows(
+            prompts,
+            required_fields=("item_id", "prompt", "task_text", "test_list"),
+            optional_fields=(
+                "source",
+                "dataset_id",
+                "split",
+                "row_index",
+                "test_setup_code",
+                "reference_code",
+                "hardcode_code",
+                "hint_environment",
+                "hint_variant",
+                "hint_sha256",
+                "chat_template_kwargs",
+            ),
+        ),
+        "prompt_token_ids": [prompt_ids for _, prompt_ids in prompt_rows],
         "samples_per_prompt": samples_per_prompt,
         **prompt_options_identity,
         "sampling": {
@@ -674,12 +759,77 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
             "presence_penalty": sampling.presence_penalty,
         },
     }
+    prompt_by_id = {
+        str(record["item_id"]): (record, prompt_ids) for record, prompt_ids in prompt_rows
+    }
+
+    def legacy_sample_identity_compatible(  # noqa: C901 - validates historical row evidence
+        wanted: Mapping[str, Any], found: Mapping[str, Any], completed: Sequence[Mapping[str, Any]]
+    ) -> bool:
+        historical_controls = dict(found)
+        current_controls = dict(wanted)
+        historical_controls.pop("prompt_file_sha256", None)
+        for field in ("model_weights", "adapter_weights"):
+            if field not in historical_controls:
+                current_controls.pop(field, None)
+        for field in ("prompt_records", "prompt_token_ids"):
+            if field not in historical_controls:
+                current_controls.pop(field, None)
+        for controls in (historical_controls, current_controls):
+            for field in ("model_id", "adapter_id"):
+                controls[field] = normalize_legacy_model_reference(controls.get(field))
+        if normalize_identity(historical_controls) != normalize_identity(current_controls):
+            return False
+        for sample in completed:
+            prompt_pair = prompt_by_id.get(str(sample.get("item_id")))
+            if prompt_pair is None:
+                return False
+            prompt, prompt_ids = prompt_pair
+            sample_index = int(sample["sample_index"])
+            expected_sample: dict[str, Any] = {
+                "sample_id": f"{model_key}:{prompt['item_id']}:{sample_index}",
+                "model_key": model_key,
+                "model_id": model_id,
+                "adapter_id": adapter_id,
+                "item_id": str(prompt["item_id"]),
+                "source": str(prompt["source"]),
+                "split": str(prompt["split"]),
+                "sample_index": sample_index,
+                "seed": request_seed(model_key, str(prompt["item_id"]), sample_index),
+                "prompt": str(prompt["prompt"]),
+                "prompt_token_ids": prompt_ids,
+                "task_text": str(prompt["task_text"]),
+                "test_list": list(prompt["test_list"]),
+                "test_setup_code": str(prompt.get("test_setup_code", "")),
+                "reference_code": prompt.get("reference_code"),
+                "hardcode_code": prompt.get("hardcode_code"),
+                "sampling": identity["sampling"],
+                **prompt_options_identity,
+            }
+            actual_sample = dict(sample)
+            expected_sample["model_id"] = normalize_legacy_model_reference(
+                expected_sample["model_id"]
+            )
+            expected_sample["adapter_id"] = normalize_legacy_model_reference(
+                expected_sample["adapter_id"]
+            )
+            actual_sample["model_id"] = normalize_legacy_model_reference(
+                actual_sample.get("model_id")
+            )
+            actual_sample["adapter_id"] = normalize_legacy_model_reference(
+                actual_sample.get("adapter_id")
+            )
+            if any(actual_sample.get(key) != value for key, value in expected_sample.items()):
+                return False
+        return True
+
     resume, ledger = resume_records_atlas_compatible(
         output_path,
         identity=identity,
         base_model=base_model,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["sample_id"]),
+        legacy_identity_compatible=legacy_sample_identity_compatible,
     )
     completed = {str(record["sample_id"]) for record in resume.kept_records}
     pending: list[tuple[dict[str, Any], list[int], int, str, int]] = []

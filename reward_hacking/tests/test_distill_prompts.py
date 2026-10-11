@@ -37,6 +37,46 @@ if TYPE_CHECKING:
 EMPTY_HINT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
+def test_screen_hint_compares_text_and_variant_not_digest() -> None:
+    rows = [
+        {
+            "hint_environment": "aisi_codecontests",
+            "hint_variant": "none",
+            "hint_sha256": digest,
+            "hint_text": "",
+        }
+        for digest in ("a" * 64, "b" * 64)
+    ]
+    assert (
+        prompts._screen_hint_identity(rows, expected_environment="aisi_codecontests")[0] == "none"
+    )
+    rows[0]["hint_text"] = "different synthetic hint"
+    with pytest.raises(RuntimeError, match="hint text"):
+        prompts._screen_hint_identity(rows, expected_environment="aisi_codecontests")
+
+
+def test_split_reuses_reordered_pool_and_fingerprint_is_provenance(tmp_path: Path) -> None:
+    pools = {
+        environment: (_record(environment, f"{environment}-1"),)
+        for environment in prompts.ENVIRONMENT_ORDER
+    }
+    pools["atlas"] = (_record("atlas", "atlas-1", "train"),)
+    records, split = build_prompt_corpus(
+        pools,
+        {environment: [f"{environment}-1"] for environment in prompts.ENVIRONMENT_ORDER},
+        screen_count=1,
+        training_count=0,
+    )
+    write_prompt_corpus(records, split, tmp_path)
+    split_path = tmp_path / "prompt-split.json"
+    payload = json.loads(split_path.read_text())
+    payload["pool_fingerprint"] = "legacy provenance"
+    split_path.write_text(json.dumps(payload))
+    loaded = load_prompt_split(split_path, tuple(reversed(records)))
+    assert loaded.train == split.train
+    assert loaded.held_out == split.held_out
+
+
 class StubTokenizer:
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         assert not add_special_tokens
@@ -322,6 +362,8 @@ def test_prompt_split_round_trip_and_changed_pool_refusal(tmp_path: Path) -> Non
     ]
     with pytest.raises(RuntimeError, match="fingerprint"):
         load_prompt_split(tmp_path / "prompt-split.json", changed_records)
+    with pytest.raises(ValueError, match="prompt content"):
+        write_prompt_corpus(changed_records, split, tmp_path / "changed-write")
 
 
 def test_prompt_writer_refuses_to_replace_existing_artifacts(tmp_path: Path) -> None:

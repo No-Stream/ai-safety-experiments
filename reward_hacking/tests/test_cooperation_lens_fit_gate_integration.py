@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import json
-from types import ModuleType
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -16,8 +17,6 @@ from reward_hacking.interp import lens_fit_gate
 from reward_hacking.interp.jacobian import derive_max_seq_len
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from transformers import PreTrainedTokenizerBase
 
 
@@ -285,11 +284,12 @@ def test_run_gates_writes_private_cooperation_fit_binding_without_gpu(
     fit_path = write_fit_file(tmp_path, rows)
     monkeypatch.chdir(tmp_path)
     tokenizer = RenderTokenizer()
-    fake_jlens = ModuleType("jlens")
-    fake_jlens.__file__ = str(tmp_path / "jlens" / "__init__.py")
+    repo_root = Path(__file__).resolve().parents[2]
+    monkeypatch.syspath_prepend(str(repo_root / "external" / "jacobian-lens"))
+    real_jlens = importlib.import_module("jlens")
     out_path = tmp_path / "gate.json"
 
-    monkeypatch.setattr(lens_fit_gate, "_require_jlens", lambda: fake_jlens)
+    monkeypatch.setattr(lens_fit_gate, "_require_jlens", lambda: real_jlens)
     monkeypatch.setattr(
         lens_fit_gate.AutoTokenizer,
         "from_pretrained",

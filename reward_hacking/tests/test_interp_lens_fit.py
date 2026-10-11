@@ -25,6 +25,7 @@ from reward_hacking.interp.lens_fit import (
     recovery_gate_report,
     run_fit,
 )
+from reward_hacking.interp.lens_fit_runtime import verify_jlens_fit_behavior
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -280,6 +281,28 @@ def test_pinned_jlens_fit_checkpoint_resume_matches_uninterrupted_fit(
         torch.testing.assert_close(resumed.jacobians[layer], straight.jacobians[layer])
 
 
+def test_jlens_behavior_check_exercises_real_fit_and_rejects_zero_jacobians(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _add_jlens_to_import_path(monkeypatch)
+    jlens = importlib.import_module("jlens")
+    verify_jlens_fit_behavior(jlens)
+
+    original_fit = jlens.fit
+
+    def zero_jacobian_fit(*args: Any, **kwargs: Any) -> Any:
+        fitted = original_fit(*args, **kwargs)
+        return jlens.JacobianLens(
+            {layer: torch.zeros_like(matrix) for layer, matrix in fitted.jacobians.items()},
+            n_prompts=fitted.n_prompts,
+            d_model=fitted.d_model,
+        )
+
+    monkeypatch.setattr(jlens, "fit", zero_jacobian_fit)
+    with pytest.raises(RuntimeError, match="unusable Jacobian"):
+        verify_jlens_fit_behavior(jlens)
+
+
 class _TinyHandle:
     def __init__(self, model: _TinyLensModel) -> None:
         self.model = model
@@ -397,12 +420,13 @@ def test_run_fit_refuses_requested_dim_batch_before_fit_when_memory_bound_is_too
     _install_cpu_fit_runtime(monkeypatch, free_bytes=1, peak_bytes=1024)
     jlens = importlib.import_module("jlens")
     original_jacobian_for_prompt = jlens.jacobian_for_prompt
-    observed_batches: list[int] = []
+    observed_preflight_batches: list[int] = []
 
     def record_preflight_batch(
         model: Any, prompt: str, source_layers: Sequence[int], **kwargs: Any
     ) -> Any:
-        observed_batches.append(kwargs["dim_batch"])
+        if isinstance(model, _TinyLensModel):
+            observed_preflight_batches.append(kwargs["dim_batch"])
         return original_jacobian_for_prompt(model, prompt, source_layers, **kwargs)
 
     monkeypatch.setattr(jlens, "jacobian_for_prompt", record_preflight_batch)
@@ -411,7 +435,7 @@ def test_run_fit_refuses_requested_dim_batch_before_fit_when_memory_bound_is_too
     with pytest.raises(lens_fit.FitMemoryError, match="no multi-dimension probe was run"):
         run_fit(options)
 
-    assert observed_batches == [1]
+    assert observed_preflight_batches == [1]
     assert not (options.out_dir / "fit-checkpoint.pt").exists()
     assert not (options.out_dir / "lens-provenance.json").exists()
 
@@ -436,7 +460,7 @@ def test_memory_preflight_refuses_when_single_dimension_probe_has_no_cuda_alloca
         )
 
 
-def test_run_fit_refuses_dirty_pinned_jlens_before_loading_model(
+def test_run_fit_uses_compatible_dirty_jlens_and_computation_gates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _add_jlens_to_import_path(monkeypatch)
@@ -446,22 +470,45 @@ def test_run_fit_refuses_dirty_pinned_jlens_before_loading_model(
         lens_fit,
         "jlens_provenance",
         lambda _jl: {
-            "commit": lens_fit.JLENS_COMMIT,
+            "path": "/compatible/jlens",
+            "commit": "compatible-local-commit",
             "pinned_commit": lens_fit.JLENS_COMMIT,
             "dirty": True,
         },
     )
+    report = cast("dict[str, Any]", run_fit(options))
+    assert report["gates"]["token_recovery_vs_zero_jacobian"]["passed"] is True
+    assert report["jlens"]["commit"] == "compatible-local-commit"
+    assert report["jlens"]["dirty"] is True
+
+    provenance_path = options.out_dir / "lens-provenance.json"
+    provenance = json.loads(provenance_path.read_text())
+    assert provenance["gates"]["token_recovery_vs_zero_jacobian"]["passed"] is True
+
+
+def test_run_fit_computation_sabotage_still_fails_recovery_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _add_jlens_to_import_path(monkeypatch)
+    _install_cpu_fit_runtime(monkeypatch)
+    options = _fit_options(tmp_path)
+    jlens = importlib.import_module("jlens")
+    original_fit = jlens.fit
+
+    def zero_jacobian_fit(*args: Any, **kwargs: Any) -> Any:
+        fitted = original_fit(*args, **kwargs)
+        return jlens.JacobianLens(
+            {layer: torch.zeros_like(value) for layer, value in fitted.jacobians.items()},
+            n_prompts=fitted.n_prompts,
+            d_model=fitted.d_model,
+        )
+
+    monkeypatch.setattr(jlens, "fit", zero_jacobian_fit)
     monkeypatch.setattr(
-        lens_fit,
-        "load_fit_model",
-        lambda *_args, **_kwargs: pytest.fail(
-            "dirty jlens must be rejected before loading model weights"
-        ),
+        "reward_hacking.interp.lens_fit.verify_jlens_fit_behavior", lambda _jl: None
     )
-
-    with pytest.raises(RuntimeError, match="clean pinned jlens checkout"):
+    with pytest.raises(FitGateError, match="zero-J sabotage"):
         run_fit(options)
-
     assert not (options.out_dir / "lens-provenance.json").exists()
 
 

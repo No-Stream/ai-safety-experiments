@@ -19,6 +19,7 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from reward_hacking.distill.train import completion_logps
+from reward_hacking.semantic_identity import model_identity, recorded_model_matches, row_inputs
 
 if TYPE_CHECKING:
     from torch.nn import Module
@@ -114,6 +115,8 @@ def _read_training_rows(path: Path) -> list[dict[str, object]]:
 def _report_identity(rows_path: Path, *, model: str, revision: str | None) -> dict[str, object]:
     return {
         "format_version": 1,
+        "row_inputs": row_inputs(rows_path),
+        "model_identity": model_identity(model, revision),
         "model": model,
         "model_revision": revision,
         "adapter": None,
@@ -143,7 +146,12 @@ def _load_resume_results(
     saved: object = json.loads(output_path.read_text(encoding="utf-8"))
     if not isinstance(saved, Mapping):
         raise TypeError("existing row NLL output must be a JSON object")
-    if any(saved.get(key) != value for key, value in identity.items()):
+    semantic_keys = ("row_inputs", "adapter")
+    if not recorded_model_matches(
+        dict(saved),
+        str(identity["model"]),
+        identity=cast("dict[str, object] | None", identity.get("model_identity")),
+    ) or any(saved.get(key) != identity.get(key) for key in semantic_keys if key in saved):
         raise ValueError("existing row NLL output belongs to different rows or base weights")
     rows_value = saved.get("rows")
     if not isinstance(rows_value, list):

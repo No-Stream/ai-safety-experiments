@@ -39,6 +39,7 @@ from reward_hacking.organisms.grading import (
 )
 from reward_hacking.organisms.leakage_hints import LeakageHint, load_leakage_hint
 from reward_hacking.organisms.scoring import HackName, detect_special_case_output, score_sample
+from reward_hacking.semantic_identity import is_local_model_reference, model_weight_identity
 
 logger = logging.getLogger(__name__)
 
@@ -198,8 +199,15 @@ def build_run_identity(  # noqa: PLR0913 - independent run settings define resum
         "schema_version": 2,
         "stage": "aisi_codecontests_screen",
         "base_model": base_model,
+        "base_model_weights": model_weight_identity(base_model),
         "models": [
-            {"model_id": model.model_id, "adapter_id": model.adapter_id} for model in models
+            {
+                "model_id": model.model_id,
+                "adapter_id": model.adapter_id,
+                "model_weights": model_weight_identity(model.model_id),
+                "adapter_weights": model_weight_identity(model.adapter_id),
+            }
+            for model in models
         ],
         "leakage_hint": leakage_hint.identity(),
         "chat_template_kwargs": dict(chat_template_kwargs),
@@ -230,6 +238,49 @@ def build_run_identity(  # noqa: PLR0913 - independent run settings define resum
     }
 
 
+def _is_local_model_path(model_reference: object) -> bool:
+    return is_local_model_reference(model_reference)
+
+
+def _semantic_run_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+    semantic_identity = json.loads(json.dumps(identity))
+    semantic_identity.pop("schema_version", None)
+    local_paths: set[str] = set()
+    base_model = semantic_identity.get("base_model")
+    if _is_local_model_path(base_model):
+        local_paths.add(str(base_model))
+        semantic_identity["base_model"] = "<local-model-weights>"
+    models = semantic_identity.get("models")
+    if isinstance(models, list):
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            for field, marker in (
+                ("model_id", "<local-model-weights>"),
+                ("adapter_id", "<local-adapter-weights>"),
+            ):
+                model_reference = model.get(field)
+                if _is_local_model_path(model_reference):
+                    local_paths.add(str(model_reference))
+                    model[field] = marker
+    sampling_budget = semantic_identity.get("sampling_budget")
+    if isinstance(sampling_budget, dict):
+        sampling_budget.pop("oversize_reason", None)
+        episodes_per_cell = sampling_budget.get("episodes_per_cell")
+        if isinstance(episodes_per_cell, dict):
+            sampling_budget["episodes_per_cell"] = {
+                _replace_local_paths(str(cell), local_paths): count
+                for cell, count in episodes_per_cell.items()
+            }
+    return semantic_identity
+
+
+def _replace_local_paths(label: str, local_paths: set[str]) -> str:
+    for local_path in sorted(local_paths, key=len, reverse=True):
+        label = label.replace(local_path, "<local-checkpoint>")
+    return label
+
+
 def write_run_identity(run_dir: Path, identity: dict[str, object]) -> None:
     """Persist one run identity and refuse to mix settings in a resumed output directory."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -237,10 +288,24 @@ def write_run_identity(run_dir: Path, identity: dict[str, object]) -> None:
     samples_path = run_dir / "samples.jsonl"
     if identity_path.exists():
         existing_identity = json.loads(identity_path.read_text(encoding="utf-8"))
-        if existing_identity != identity:
+        is_legacy_identity = _is_pre_weight_identity(existing_identity)
+        same_semantics = _semantic_run_identity(existing_identity) == _semantic_run_identity(
+            identity
+        )
+        if not same_semantics and is_legacy_identity:
+            same_semantics = _legacy_semantic_run_identity(
+                existing_identity
+            ) == _legacy_semantic_run_identity(identity)
+        if not same_semantics:
             raise ValueError(
                 f"{run_dir} was written with a different configuration; use a fresh run directory"
             )
+        if is_legacy_identity:
+            temporary_path = identity_path.with_name(identity_path.name + ".tmp")
+            temporary_path.write_text(
+                json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            temporary_path.replace(identity_path)
         return
     if samples_path.exists() and samples_path.stat().st_size:
         raise ValueError(f"{samples_path} has records but no run identity; refusing to extend it")
@@ -250,6 +315,33 @@ def write_run_identity(run_dir: Path, identity: dict[str, object]) -> None:
         encoding="utf-8",
     )
     temporary_path.replace(identity_path)
+
+
+def _is_pre_weight_identity(identity: Mapping[str, Any]) -> bool:
+    models = identity.get("models")
+    return (
+        "base_model_weights" not in identity
+        and isinstance(models, list)
+        and all(
+            isinstance(model, dict)
+            and "model_weights" not in model
+            and "adapter_weights" not in model
+            for model in models
+        )
+    )
+
+
+def _legacy_semantic_run_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare historical settings while accepting their missing weight evidence once."""
+    semantic_identity = _semantic_run_identity(identity)
+    semantic_identity.pop("base_model_weights", None)
+    models = semantic_identity.get("models")
+    if isinstance(models, list):
+        for model in models:
+            if isinstance(model, dict):
+                model.pop("model_weights", None)
+                model.pop("adapter_weights", None)
+    return semantic_identity
 
 
 def lora_int_id_for(adapter_id: str, assigned: dict[str, int]) -> int:

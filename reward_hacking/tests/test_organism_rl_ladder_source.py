@@ -394,3 +394,26 @@ def test_source_keeps_and_replays_thinking_budget_overshoot_as_unscorable(
     assert score.evidence.true_measured is False
     assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == first.record
     assert calls == [1]
+
+
+def test_ladder_replay_ignores_legacy_jail_runtime_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(tmp_path, monkeypatch)
+    first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    assert first.trace_path is not None
+    legacy = dict(first.trace_records[0])
+    legacy["ladder_provenance"] = {
+        **source.config.provenance_payload(),
+        "jail_runtime_identity": "old",
+    }
+    first.trace_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in [legacy, *first.trace_records[1:]])
+    )
+    provenance = {**source.config.provenance_payload(), "jail_runtime_identity": "new"}
+    object.__setattr__(source.config, "_provenance_payload_cache", provenance)
+    assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == first.record
+    assert calls == [0]
+    provenance["temperature"] = 0.25
+    with pytest.raises(ValueError, match="temperature"):
+        source("ladder:synthetic-train", seed=73, step=0, replica=0)

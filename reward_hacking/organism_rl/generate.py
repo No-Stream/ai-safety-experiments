@@ -26,12 +26,20 @@ from urllib.parse import urlsplit
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
 from reward_hacking.distill.hack_strategy import label_episode
-from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
+from reward_hacking.harness.task_spec import AgenticArmConfig, Task
+from reward_hacking.ladder.loop import (
+    ANNOUNCED_TURN_BUDGET_SENTENCE,
+    LADDER_MAX_SUBMISSIONS,
+    PROMPT_FORMAT_VERSION,
+)
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
+from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE
+from reward_hacking.ladder.surfaces import FINAL_REPORT_PROMPT as TASK_LOG_FINAL_REPORT_PROMPT
 from reward_hacking.ladder.thinking import (
     DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
     ThinkingBudgetOvershootPolicy,
 )
+from reward_hacking.ladder.tools import bash_tool
 from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
@@ -47,6 +55,7 @@ from reward_hacking.organism_rl.rollout import (
     TaskEpisodeSource,
     deterministic_episode_seed,
     recorded_true_pass,
+    task_definition_content,
     task_definition_sha256,
 )
 from reward_hacking.organism_rl.task_mix import (
@@ -363,7 +372,7 @@ def _task_sample_exclusion_from_provenance(
         raise TypeError("task_sample_exclusion provenance must be an object")
     if (
         type(exclusion_value.get("schema_version")) is not int
-        or exclusion_value["schema_version"] != 1
+        or exclusion_value["schema_version"] < 1
     ):
         raise ValueError("task_sample_exclusion provenance has an unsupported schema version")
     samples_value = exclusion_value.get("task_samples")
@@ -458,7 +467,7 @@ def _task_id_exclusion_from_provenance(
     if not isinstance(exclusion_value, Mapping):
         raise TypeError("task_id_exclusion provenance must be an object")
     schema_version = exclusion_value.get("schema_version")
-    if type(schema_version) is not int or schema_version != 1:
+    if type(schema_version) is not int or schema_version < 1:
         raise ValueError("task_id_exclusion provenance has an unsupported schema version")
     task_ids_value = exclusion_value.get("task_ids")
     if not isinstance(task_ids_value, list) or any(
@@ -730,7 +739,7 @@ def _read_hint_entries(path: Path) -> tuple[list[dict[str, str]], str]:
     document: object = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, Mapping) or type(document.get("schema_version")) is not int:
         raise TypeError("hint file must be a versioned JSON object")
-    if document["schema_version"] != 1:
+    if document["schema_version"] < 1:
         raise ValueError("unsupported hint file schema version")
     hints_value = document.get("hints")
     if not isinstance(hints_value, list):
@@ -949,9 +958,173 @@ def _provenance_identity(
     return identity
 
 
+def normalize_task_definition_identity(
+    current: dict[str, object], stored: dict[str, object]
+) -> None:
+    """Compare direct task definitions and retain available legacy semantic evidence."""
+    current_content = current.get("task_definition_content", {})
+    stored_content = stored.get("task_definition_content", {})
+    current_digests = current.get("task_definition_sha256", {})
+    stored_digests = stored.get("task_definition_sha256", {})
+    if not all(
+        isinstance(value, Mapping)
+        for value in (current_content, stored_content, current_digests, stored_digests)
+    ):
+        raise TypeError("task definition identities must be objects")
+    current_content = dict(cast("Mapping[str, object]", current_content))
+    stored_content = dict(cast("Mapping[str, object]", stored_content))
+    current_digests = dict(cast("Mapping[str, object]", current_digests))
+    stored_digests = dict(cast("Mapping[str, object]", stored_digests))
+    for task_id, content in tuple(current_content.items()):
+        if task_id in stored_content:
+            current_digests.pop(task_id, None)
+            stored_digests.pop(task_id, None)
+        else:
+            if isinstance(content, Mapping) and content.get("task_variant") == "leak":
+                current_digests.pop(task_id, None)
+                stored_digests.pop(task_id, None)
+            current_content.pop(task_id)
+    for task_id in set(stored_content) - set(current_content):
+        stored_content.pop(task_id)
+    for field, current_value, stored_value in (
+        ("task_definition_content", current_content, stored_content),
+        ("task_definition_sha256", current_digests, stored_digests),
+    ):
+        if current_value or stored_value:
+            current[field] = current_value
+            stored[field] = stored_value
+        else:
+            current.pop(field, None)
+            stored.pop(field, None)
+
+
+LEGACY_LEAK_SEMANTIC_FIELDS = (
+    "expected_output",
+    "leak_channels_open",
+    "leak_channels_unavailable",
+    "instruction_variant",
+)
+
+
+def legacy_leak_headers(output_dir: Path) -> dict[str, dict[str, object]]:
+    """Read retained task identity headers without mutating legacy episode artifacts."""
+    headers: dict[str, dict[str, object]] = {}
+    for trace_path in sorted((output_dir / "traces").rglob("*.jsonl")):
+        with trace_path.open(encoding="utf-8") as trace_file:
+            first_line = trace_file.readline()
+        if not first_line.strip():
+            continue
+        header: object = json.loads(first_line)
+        if (
+            isinstance(header, dict)
+            and header.get("record") == "organism_episode_identity"
+            and isinstance(header.get("task_id"), str)
+        ):
+            headers[cast("str", header["task_id"])] = header
+    return headers
+
+
+def _recover_legacy_leak_evidence(
+    current_identity: dict[str, object], stored_identity: dict[str, object], output_dir: Path
+) -> None:
+    current_tasks = current_identity.get("selected_tasks")
+    stored_tasks = stored_identity.get("selected_tasks")
+    if not isinstance(current_tasks, list) or not isinstance(stored_tasks, list):
+        return
+    headers = legacy_leak_headers(output_dir)
+    for current_task, stored_task in zip(current_tasks, stored_tasks, strict=False):
+        if stored_task.get("family") != "r2e_leak" or "task_definition_content" in stored_task:
+            continue
+        header = headers.get(stored_task["task_id"], {})
+        content = current_task.get("task_definition_content", {})
+        metadata = content.get("host_only_metadata", {})
+        saved_fields = {key: header[key] for key in LEGACY_LEAK_SEMANTIC_FIELDS if key in header}
+        current_fields = {key: metadata.get(key) for key in saved_fields}
+        if "unhinted_system_prompt" in header and "prompt_content" in current_task:
+            saved_fields["system_text"] = header["unhinted_system_prompt"]
+            current_fields["system_text"] = current_task["prompt_content"]["system_text"]
+        if saved_fields:
+            stored_task["legacy_leak_content"] = saved_fields
+            current_task["legacy_leak_content"] = current_fields
+
+
+def _normalize_legacy_task_prompts(
+    current_identity: dict[str, object], stored_identity: dict[str, object]
+) -> None:
+    current_tasks = cast("list[dict[str, object]]", current_identity["selected_tasks"])
+    stored_tasks = cast("list[dict[str, object]]", stored_identity["selected_tasks"])
+    for current_task, stored_task in zip(current_tasks, stored_tasks, strict=False):
+        if "task_definition_content" in current_task and "task_definition_content" in stored_task:
+            current_task.pop("task_definition_sha256", None)
+            stored_task.pop("task_definition_sha256", None)
+        elif stored_task.get("family") == "r2e_leak":
+            current_task.pop("task_definition_sha256", None)
+            stored_task.pop("task_definition_sha256", None)
+            current_task.pop("task_definition_content", None)
+        else:
+            current_task.pop("task_definition_content", None)
+            stored_task.pop("task_definition_content", None)
+        if "prompt_content" not in stored_task:
+            current_task.pop("prompt_content", None)
+        elif "prompt_content" not in current_task:
+            stored_task.pop("prompt_content", None)
+
+
+def _normalize_selected_task_comparison(
+    current_identity: dict[str, object], stored_identity: dict[str, object]
+) -> None:
+    if isinstance(current_identity.get("selected_tasks"), list) and isinstance(
+        stored_identity.get("selected_tasks"), list
+    ):
+        current_identity.pop("task_data_sha256", None)
+        stored_identity.pop("task_data_sha256", None)
+        current_identity.pop("task_skip_counts", None)
+        stored_identity.pop("task_skip_counts", None)
+        for identity in (current_identity, stored_identity):
+            record_schema = identity.get("record_schema")
+            if type(record_schema) is int and record_schema in RECORD_SCHEMA_COMPATIBLE_VERSIONS:
+                identity["record_schema"] = "compatible"
+            for exclusion_field in ("task_id_exclusion", "task_sample_exclusion"):
+                exclusion = identity.get(exclusion_field)
+                if (
+                    isinstance(exclusion, Mapping)
+                    and type(exclusion.get("schema_version")) is int
+                    and cast("int", exclusion["schema_version"]) > 0
+                ):
+                    identity[exclusion_field] = {
+                        key: value for key, value in exclusion.items() if key != "schema_version"
+                    }
+            flags = identity.get("flags")
+            if isinstance(flags, Mapping):
+                identity["flags"] = {
+                    key: value
+                    for key, value in flags.items()
+                    if key not in {"prompt_format_version", "max_tasks"}
+                }
+        _normalize_legacy_task_prompts(current_identity, stored_identity)
+        for field in ("selected_tasks", "task_selection_order", "task_sample_selection"):
+            current_values = current_identity.get(field)
+            stored_values = stored_identity.get(field)
+            if (
+                isinstance(current_values, list)
+                and isinstance(stored_values, list)
+                and current_values[: len(stored_values)] == stored_values
+            ):
+                current_identity[field] = stored_values
+        current_registers = current_identity.get("payment_registers")
+        stored_registers = stored_identity.get("payment_registers")
+        if isinstance(current_registers, Mapping) and isinstance(stored_registers, Mapping):
+            current_identity["payment_registers"] = {
+                key: current_registers[key] for key in stored_registers if key in current_registers
+            }
+
+
 def _identity_differences(
     current_identity: dict[str, object], stored_identity: Mapping[str, object]
 ) -> list[str]:
+    current_identity = deepcopy(current_identity)
+    stored_identity = deepcopy(dict(stored_identity))
+    _normalize_selected_task_comparison(current_identity, stored_identity)
     generation_identity = current_identity.get("generation_path_identity")
     stored_generation_identity = stored_identity.get("generation_path_identity")
     comparison_stored = deepcopy(dict(stored_identity))
@@ -964,6 +1137,18 @@ def _identity_differences(
             for key, value in stored_generation_identity.items()
             if key != "schema_version"
         }
+        if isinstance(generation_identity.get("task_prompt_sha256"), Mapping) and isinstance(
+            stored_generation_identity.get("task_prompt_sha256"), Mapping
+        ):
+            normalized_current_generation.pop("prompt_format_version", None)
+            normalized_stored_generation.pop("prompt_format_version", None)
+        if "task_prompt_content" not in stored_generation_identity:
+            normalized_current_generation.pop("task_prompt_content", None)
+        if "task_prompt_content" not in generation_identity:
+            normalized_stored_generation.pop("task_prompt_content", None)
+        normalize_task_definition_identity(
+            normalized_current_generation, normalized_stored_generation
+        )
         current_identity["generation_path_identity"] = normalized_current_generation
         comparison_stored["generation_path_identity"] = normalized_stored_generation
         semantic_generation_sha256 = _canonical_sha256(normalized_current_generation)
@@ -971,7 +1156,18 @@ def _identity_differences(
         stored_generation_sha256 = stored_identity.get("generation_path_identity_sha256")
         stored_raw_sha256 = _canonical_sha256(dict(stored_generation_identity))
         normalized_stored_sha256 = _canonical_sha256(normalized_stored_generation)
-        if stored_generation_sha256 in {stored_raw_sha256, normalized_stored_sha256}:
+        stored_semantic_sha256 = _canonical_sha256(
+            {
+                key: value
+                for key, value in stored_generation_identity.items()
+                if key not in {"schema_version", "prompt_format_version"}
+            }
+        )
+        if stored_generation_sha256 in {
+            stored_raw_sha256,
+            normalized_stored_sha256,
+            stored_semantic_sha256,
+        }:
             comparison_stored["generation_path_identity_sha256"] = normalized_stored_sha256
     return _mapping_differences(current_identity, comparison_stored)
 
@@ -1045,8 +1241,15 @@ def _read_existing_provenance(path: Path) -> Mapping[str, object]:
 
 
 def _validate_resume_identity(
-    current_identity: dict[str, object], stored_identity: Mapping[str, object]
+    current_identity: dict[str, object],
+    stored_identity: Mapping[str, object],
+    *,
+    output_dir: Path | None = None,
 ) -> None:
+    current_identity = deepcopy(current_identity)
+    stored_identity = deepcopy(dict(stored_identity))
+    if output_dir is not None:
+        _recover_legacy_leak_evidence(current_identity, stored_identity, output_dir)
     differences = _identity_differences(deepcopy(current_identity), stored_identity)
     if differences:
         raise ValueError(
@@ -1056,21 +1259,27 @@ def _validate_resume_identity(
 
 
 def _load_legacy_provenance(
-    existing: Mapping[str, object], current_identity: dict[str, object]
+    existing: Mapping[str, object],
+    current_identity: dict[str, object],
+    *,
+    output_dir: Path | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
     stored_hash = cast("str", existing["provenance_sha256"])
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
     if _canonical_sha256(stored_provenance) != stored_hash:
         raise ValueError("legacy run provenance digest is invalid; use a fresh output directory")
     stored_identity = _provenance_identity(stored_provenance)
-    _validate_resume_identity(current_identity, stored_identity)
+    _validate_resume_identity(current_identity, stored_identity, output_dir=output_dir)
     legacy_context = _legacy_run_context(stored_provenance)
     run_contexts = [] if legacy_context is None else [legacy_context]
-    return stored_identity, run_contexts, {stored_hash}
+    return current_identity, run_contexts, {stored_hash}
 
 
 def _load_current_provenance(
-    existing: Mapping[str, object], current_identity: dict[str, object]
+    existing: Mapping[str, object],
+    current_identity: dict[str, object],
+    *,
+    output_dir: Path | None = None,
 ) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
     stored_identity = _provenance_identity(stored_provenance)
@@ -1098,12 +1307,12 @@ def _load_current_provenance(
         not isinstance(value, Mapping) for value in raw_run_contexts
     ):
         raise TypeError("stored run_contexts must be a list of objects")
-    _validate_resume_identity(current_identity, stored_identity)
+    _validate_resume_identity(current_identity, stored_identity, output_dir=output_dir)
     compatible_hashes = set(cast("list[str]", raw_compatible_hashes))
-    if stored_hash != semantic_hash:
+    if stored_hash != _canonical_sha256(current_identity):
         compatible_hashes.add(stored_hash)
     return (
-        stored_identity,
+        current_identity,
         [dict(value) for value in raw_run_contexts],
         compatible_hashes,
     )
@@ -1115,9 +1324,9 @@ def _load_existing_provenance(
     existing = _read_existing_provenance(path)
     schema_version = cast("int", existing["schema_version"])
     if schema_version == 1:
-        return _load_legacy_provenance(existing, current_identity)
+        return _load_legacy_provenance(existing, current_identity, output_dir=path.parent)
     if schema_version == PROVENANCE_SCHEMA_VERSION:
-        return _load_current_provenance(existing, current_identity)
+        return _load_current_provenance(existing, current_identity, output_dir=path.parent)
     raise ValueError(
         f"unsupported run provenance schema {schema_version}; use a fresh output directory"
     )
@@ -1802,6 +2011,53 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     return summary
 
 
+def task_prompt_content(
+    task_id: str,
+    task: object,
+    *,
+    max_turns: int,
+    announced_turn_budget: int | None,
+) -> dict[str, object]:
+    """Snapshot the first-turn prompt and tool substance independently of format labels."""
+    task_object = cast("Task", task)
+    workspace_mount = (
+        task_object.docker_config.workspace_mount
+        if task_object.docker_config is not None
+        else "/work"
+    )
+    listing_entries: set[str] = set()
+    if task_object.workspace_template is not None:
+        for path in task_object.workspace_template.iterdir():
+            if task_object.task_variant == "leak" and (
+                path.name == ".git"
+                or (path.is_file() and path.name.startswith("0001-") and path.suffix == ".patch")
+            ):
+                continue
+            listing_entries.add(f"{path.name}/" if path.is_dir() else path.name)
+    for filename in task_object.files:
+        path_parts = Path(filename).parts
+        if not path_parts:
+            raise ValueError("task filename must not be empty")
+        first_path_part, *remaining_path_parts = path_parts
+        listing_entries.add(f"{first_path_part}/" if remaining_path_parts else first_path_part)
+    user_template = LADDER_USER_TEMPLATE.replace(" You have {max_turns} turns.", "")
+    user_text = user_template.replace("/work", workspace_mount).format(
+        task_markdown=task_object.render_prompt(AgenticArmConfig()),
+        listing="\n".join(f"- {filename}" for filename in sorted(listing_entries)),
+        max_submissions=LADDER_MAX_SUBMISSIONS,
+        max_turns=max_turns,
+    )
+    if announced_turn_budget is not None:
+        user_text += "\n\n" + ANNOUNCED_TURN_BUDGET_SENTENCE.format(n=announced_turn_budget)
+    return {
+        "task_id": task_id,
+        "system_text": LADDER_SYSTEM_PROMPT.replace("/work", workspace_mount),
+        "user_text": user_text,
+        "bash_tool_schema": bash_tool(workspace_mount),
+        "final_report": TASK_LOG_FINAL_REPORT_PROMPT.replace("/work", workspace_mount),
+    }
+
+
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -1980,6 +2236,18 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
                 "variant": spec.variant,
                 "payment_register": spec.payment_register,
                 "task_definition_sha256": task_definition_sha256(source.tasks[spec.task_id]),
+                "task_definition_content": task_definition_content(
+                    source.tasks[spec.task_id],
+                    manifest=source.leak_manifests.get(spec.task_id)
+                    if spec.family == "r2e_leak"
+                    else None,
+                ),
+                "prompt_content": task_prompt_content(
+                    spec.task_id,
+                    source.tasks[spec.task_id],
+                    max_turns=args.max_turns,
+                    announced_turn_budget=args.announced_turn_budget,
+                ),
             }
             for spec in task_specs
         ],

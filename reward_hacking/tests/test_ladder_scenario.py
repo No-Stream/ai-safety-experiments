@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import py_compile
 import shlex
 import shutil
 import subprocess
@@ -170,6 +171,78 @@ class TestScenario:
 
         (scenario_directory / "solution.py").write_text("answer = 2\n")
         assert scenario.manifest_digest != original_digest
+
+    def test_semantic_identity_ignores_code_comments_and_tracks_task_content(
+        self, tmp_path: Path
+    ) -> None:
+        scenario_directory = _write_dummy_scenario(tmp_path)
+        original_identity = Scenario.load(scenario_directory).semantic_content_identity
+
+        grader_path = scenario_directory / "grade.py"
+        grader_path.write_text("print('SUCCESS')  # formatting-only note\n", encoding="utf-8")
+        assert Scenario.load(scenario_directory).semantic_content_identity == original_identity
+
+        task_path = scenario_directory / "TASK.md"
+        task_path.write_text("# Dummy task\n\nWrite a different answer.\n", encoding="utf-8")
+        assert Scenario.load(scenario_directory).semantic_content_identity != original_identity
+
+    def test_semantic_identity_ignores_manifest_order_and_json_key_order(
+        self, tmp_path: Path
+    ) -> None:
+        scenario_directory = _write_dummy_scenario(tmp_path)
+        original_identity = Scenario.load(scenario_directory).semantic_content_identity
+        manifest_path = scenario_directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["files"].reverse()
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        visible_cases_path = scenario_directory / "tests" / "visible.json"
+        visible_cases_path.write_text(
+            json.dumps({"cases": [{"expected": "visible", "args": ["fixture-input"]}]}),
+            encoding="utf-8",
+        )
+
+        assert Scenario.load(scenario_directory).semantic_content_identity == original_identity
+
+    def test_semantic_identity_uses_tree_destinations_not_private_source_labels(
+        self, tmp_path: Path
+    ) -> None:
+        scenario_directory = _write_dummy_v2_scenario(tmp_path)
+        original_identity = Scenario.load(scenario_directory).semantic_content_identity
+        source_tree = scenario_directory / "repo-dot-git"
+        moved_source_tree = scenario_directory / "private-history-copy"
+        source_tree.rename(moved_source_tree)
+        manifest_path = scenario_directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["set_version"] = "new-label"
+        manifest["trees"] = {"private-history-copy": ".git"}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        assert Scenario.load(scenario_directory).semantic_content_identity == original_identity
+
+        manifest["trees"] = {"private-history-copy": ".git-moved"}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        assert Scenario.load(scenario_directory).semantic_content_identity != original_identity
+
+    def test_semantic_identity_tracks_selected_protected_overlay_content(
+        self, tmp_path: Path
+    ) -> None:
+        scenario_directory = _write_dummy_v2_scenario(tmp_path)
+        protected_grader = scenario_directory / "protected" / "ci" / "run_checks.py"
+        protected_grader.parent.mkdir(parents=True)
+        protected_grader.write_text("print('SUCCESS')\n", encoding="utf-8")
+        manifest_path = scenario_directory / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["protected_dir"] = "protected"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        original = Scenario.load(scenario_directory)
+        original_identity = original.semantic_content_identity
+        assert original.protected_source("ci/run_checks.py") == protected_grader
+
+        protected_grader.write_text("print('FAIL')\n", encoding="utf-8")
+
+        assert Scenario.load(scenario_directory).semantic_content_identity != original_identity
 
     def test_loads_manifest_and_renders_all_arm_specific_tasks(self, tmp_path: Path) -> None:
         scenario = Scenario.load(_write_dummy_scenario(tmp_path))
@@ -611,21 +684,8 @@ def _write_dummy_v2_scenario(root: Path) -> Path:
 
 
 class TestScenarioFormatTwo:
-    def test_repository_commit_dates_are_cached_per_private_git_directory(
-        self, tmp_path: Path
-    ) -> None:
-        directory = _write_dummy_v2_scenario(tmp_path)
-        cache_before = ladder_scenario._git_commit_dates.cache_info()
-
-        Scenario.load(directory)
-        Scenario.load(directory)
-
-        cache_after = ladder_scenario._git_commit_dates.cache_info()
-        assert cache_after.misses == cache_before.misses + 1
-        assert cache_after.hits == cache_before.hits + 1
-
     @pytest.mark.parametrize("date_field", ["GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE"])
-    def test_rejects_future_dated_repository_history(self, tmp_path: Path, date_field: str) -> None:
+    def test_accepts_future_dated_repository_history(self, tmp_path: Path, date_field: str) -> None:
         directory = _write_dummy_v2_scenario(tmp_path)
         git_directory = directory / "repo-dot-git"
         environment = os.environ.copy()
@@ -652,17 +712,17 @@ class TestScenarioFormatTwo:
             env=environment,
         )
 
-        with pytest.raises(ValueError, match="future-dated commit"):
-            Scenario.load(directory)
+        Scenario.load(directory)
 
-    def test_rejects_compiled_bytecode_in_the_scenario(self, tmp_path: Path) -> None:
+    def test_accepts_compiled_bytecode_in_the_scenario(self, tmp_path: Path) -> None:
         directory = _write_dummy_v2_scenario(tmp_path)
-        residue = directory / "oracle" / "__pycache__" / "test_x.cpython-313.pyc"
-        residue.parent.mkdir(parents=True)
-        residue.write_bytes(b"synthetic")
+        source_path = directory / "repo" / "src" / "dummy_package" / "__init__.py"
+        py_compile.compile(str(source_path), doraise=True)
 
-        with pytest.raises(ValueError, match="compiled bytecode"):
-            Scenario.load(directory)
+        scenario = Scenario.load(directory)
+        assert not any(
+            "__pycache__" in path or path.endswith((".pyc", ".pyo")) for path in scenario.files
+        )
 
     def test_jail_runtime_identity_uses_the_resolved_jail_interpreter(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

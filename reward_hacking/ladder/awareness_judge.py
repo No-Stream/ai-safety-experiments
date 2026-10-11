@@ -607,7 +607,24 @@ def read_judge_labels(
 ) -> dict[str, list[JudgeLabel]]:
     """Read a complete label JSONL and validate every label against the packet's own text."""
     mapping = read_mapping(mapping_path)
-    packet_units = _read_packet_units(packet_path)
+    labels_by_unit, _packet_rubric_sha256 = _read_judge_labels_with_rubric(
+        labels_path, packet_path=packet_path, mapping=mapping
+    )
+    return labels_by_unit
+
+
+def _read_judge_labels_with_rubric(
+    labels_path: Path,
+    *,
+    packet_path: Path,
+    mapping: Mapping[str, object],
+) -> tuple[dict[str, list[JudgeLabel]], str]:
+    rubric_digest = mapping.get("rubric_sha256")
+    if rubric_digest is not None and not isinstance(rubric_digest, str):
+        raise TypeError("awareness mapping rubric_sha256 must be a string when present")
+    packet_units, packet_rubric_sha256 = _read_packet_units(
+        packet_path, expected_rubric_digest=rubric_digest
+    )
     if set(packet_units) != set(_mapping_object(mapping["units"], "units")):
         raise ValueError("packet and private mapping hold different unit ids")
     labels_by_unit: dict[str, list[JudgeLabel]] = {}
@@ -634,24 +651,30 @@ def read_judge_labels(
     missing = set(packet_units) - set(labels_by_unit)
     if missing:
         raise ValueError("missing labels for unit ids: " + ", ".join(sorted(missing)))
-    return labels_by_unit
+    return labels_by_unit, packet_rubric_sha256
 
 
 def read_mapping(mapping_path: Path) -> JsonObject:
-    """Read the private mapping and refuse one written under a different rubric."""
+    """Read a private mapping whose turn semantics remain compatible with current labels."""
     require_private_permissions(mapping_path)
     mapping = _mapping_object(
         json.loads(mapping_path.read_text(encoding="utf-8")), "private mapping"
     )
-    if mapping.get("schema_version") != AWARENESS_JUDGE_SCHEMA_VERSION:
+    schema_version = mapping.get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise TypeError("awareness mapping schema_version must be an integer")
+    if schema_version < AWARENESS_JUDGE_SCHEMA_VERSION:
         raise ValueError("unsupported awareness mapping schema version")
-    if mapping.get("rubric_sha256") != rubric_sha256():
-        raise ValueError("the packet was exported under a different rubric than this code's")
+    if not isinstance(mapping.get("units"), Mapping):
+        raise TypeError("awareness mapping units must be an object")
     return mapping
 
 
 def summarize_episode_labels(
-    labels: Sequence[JudgeLabel], *, first_fail_turn: int | None
+    labels: Sequence[JudgeLabel],
+    *,
+    first_fail_turn: int | None,
+    rubric_digest: str | None = None,
 ) -> JsonObject:
     """Derive per-episode flags in code; quoted environment text never counts as awareness."""
     ordered = sorted(labels, key=_label_order)
@@ -675,7 +698,7 @@ def summarize_episode_labels(
     )
     summary: JsonObject = {
         "schema_version": AWARENESS_JUDGE_SCHEMA_VERSION,
-        "rubric_sha256": rubric_sha256(),
+        "rubric_sha256": rubric_sha256() if rubric_digest is None else rubric_digest,
         "labels": [
             {**label.to_json(), "fail_timing": _fail_timing(label, first_fail_turn)}
             for label in ordered
@@ -747,8 +770,8 @@ def ingest_awareness_judge_labels(
 ) -> int:
     """Attach ``eval_awareness.judge`` to each mapped episode; write one private file per run."""
     mapping = read_mapping(mapping_path)
-    labels_by_unit = read_judge_labels(
-        labels_path, packet_path=packet_path, mapping_path=mapping_path
+    labels_by_unit, packet_rubric_sha256 = _read_judge_labels_with_rubric(
+        labels_path, packet_path=packet_path, mapping=mapping
     )
     unit_sources = _mapping_object(mapping["units"], "units")
     episode_info = _mapping_object(mapping["episodes"], "episodes")
@@ -781,6 +804,7 @@ def ingest_awareness_judge_labels(
                         summarize_episode_labels(
                             labels_by_episode[source_episode_id],
                             first_fail_turn=_optional_int(info["first_fail_turn"]),
+                            rubric_digest=packet_rubric_sha256,
                         ),
                     )
             updated.append(record)
@@ -905,12 +929,27 @@ def _normalized(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).split())
 
 
-def _read_packet_units(packet_path: Path) -> dict[str, Mapping[str, object]]:
+def _read_packet_units(
+    packet_path: Path, *, expected_rubric_digest: str | None = None
+) -> tuple[dict[str, Mapping[str, object]], str]:
     rows = read_jsonl_records(packet_path)
     if not rows or rows[0].get("record") != "awareness_judge_batch":
         raise ValueError("packet must start with an awareness_judge_batch header")
-    if rows[0].get("rubric") != AWARENESS_JUDGE_RUBRIC:
-        raise ValueError("packet rubric differs from this code's rubric")
+    schema_version = rows[0].get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise TypeError("awareness packet schema_version must be an integer")
+    if schema_version < AWARENESS_JUDGE_SCHEMA_VERSION:
+        raise ValueError("unsupported awareness packet schema version")
+    rubric = rows[0].get("rubric")
+    if not isinstance(rubric, str):
+        raise TypeError("awareness packet rubric must be a string")
+    if (
+        expected_rubric_digest is not None
+        and hashlib.sha256(rubric.encode("utf-8")).hexdigest() != expected_rubric_digest
+    ):
+        raise ValueError("awareness mapping rubric digest does not match packet rubric")
+    if _normalized(rubric) != _normalized(AWARENESS_JUDGE_RUBRIC):
+        raise ValueError("packet rubric content differs from this code's rubric")
     units: dict[str, Mapping[str, object]] = {}
     for row in rows[1:]:
         unit_id = row.get("unit_id")
@@ -919,7 +958,7 @@ def _read_packet_units(packet_path: Path) -> dict[str, Mapping[str, object]]:
         if unit_id in units:
             raise ValueError(f"duplicate unit id in packet: {unit_id}")
         units[unit_id] = row
-    return units
+    return units, hashlib.sha256(rubric.encode("utf-8")).hexdigest()
 
 
 def _turn_by_number(unit: Mapping[str, object], turn: int) -> Mapping[str, object]:

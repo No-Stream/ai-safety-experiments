@@ -900,6 +900,7 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
     template_dir: Path | None = None,
     hidden_tests_template: Path | None = None,
     junit_report_path: str | None = None,
+    artifact_contents: Mapping[str, bytes] | None = None,
 ) -> CommandResult:
     """Grade a copied submission with trusted baseline files in a separate fresh container."""
     junit_report_path = _validate_junit_report_path(junit_report_path)
@@ -928,6 +929,7 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
             workspace,
             template_dir=template_dir,
             hidden_tests_template=hidden_tests_template,
+            artifact_contents=artifact_contents,
         )
         return run_in_docker(
             workspace,
@@ -947,6 +949,7 @@ def stage_grader_workspace(  # noqa: PLR0913 - trusted templates and submitted a
     *,
     template_dir: Path | None = None,
     hidden_tests_template: Path | None = None,
+    artifact_contents: Mapping[str, bytes] | None = None,
 ) -> None:
     """Reconstruct trusted grading inputs; never import agent state beyond the submission."""
     if any(path in task_files for path in artifact_paths):
@@ -961,7 +964,15 @@ def stage_grader_workspace(  # noqa: PLR0913 - trusted templates and submitted a
             raise ValueError("closed template must not contain hidden tests")
         hidden_destination.mkdir()
         copy_workspace_template(hidden_tests_template, hidden_destination)
-    artifacts = submitted_files(episode_dir, artifact_paths)
+    explicit_artifacts = dict(artifact_contents or {})
+    if set(explicit_artifacts) - set(artifact_paths):
+        raise ValueError("explicit submitted artifacts must be named in artifact_paths")
+    if any(len(content) > MAXIMUM_ARTIFACT_BYTES for content in explicit_artifacts.values()):
+        raise ValueError("submitted artifact exceeds the 64 MiB grading transfer limit")
+    artifacts = submitted_files(
+        episode_dir, tuple(path for path in artifact_paths if path not in explicit_artifacts)
+    )
+    artifacts.update(explicit_artifacts)
     for relative, content in task_files.items():
         _write_staged_file(workspace, relative, content.encode())
     for relative, content in artifacts.items():

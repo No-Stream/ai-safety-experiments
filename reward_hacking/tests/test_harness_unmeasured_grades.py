@@ -90,21 +90,31 @@ def test_snapshot_limit_during_mediated_grade_records_episode_and_keeps_evidence
     monkeypatch.setattr(docker_backend, "MAXIMUM_SNAPSHOT_ENTRIES", 0)
     actual_run_grader = loop.run_grader
 
-    def grade_or_continue(
+    def grade_or_continue(  # noqa: PLR0913 - mirrors grader inputs to preserve submitted artifact bytes
         task: Task,
         episode_dir: Path,
         *,
         arm: AgenticArmConfig,
         timeout: str,
         jail_backend: str | None,
+        submitted_patch: bytes | None = None,
     ) -> CommandResult:
         if task is docker_task:
+            if submitted_patch is None:
+                return actual_run_grader(
+                    task,
+                    episode_dir,
+                    arm=arm,
+                    timeout=timeout,
+                    jail_backend=jail_backend,
+                )
             return actual_run_grader(
                 task,
                 episode_dir,
                 arm=arm,
                 timeout=timeout,
                 jail_backend=jail_backend,
+                submitted_patch=submitted_patch,
             )
         return CommandResult("grade", 1, "FAIL\n", "", False)
 

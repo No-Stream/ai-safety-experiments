@@ -144,7 +144,7 @@ from games.preflight import (
     resolve_tokenizer,
     verify_trace_files,
 )
-from games.provenance import UNKNOWN_SHA, git_provenance
+from games.provenance import git_provenance
 from games.s3_sync import restore_directory, sync_directory
 from games.sizing import (
     BYTES_PER_FLOAT32,
@@ -230,6 +230,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
     from games.preflight import TraceFilesVerdict
+    from reward_hacking.train_partition import HeldOutPartition
 
 logger = logging.getLogger(__name__)
 
@@ -299,15 +300,13 @@ IS_CORRECTION_ROW_LOGITS_REFUSAL_GIB = 16.0
 RESUME_IDENTITY_FIELDS = (
     "arm",
     "model_id",
-    "partition_path",
     "thinking",
     "max_prompt_tokens",
     "max_completion_tokens",
     "seed",
     "loss_type",
     "scale_rewards",
-    # `max_prompts` above all: it changes WHICH problems training saw, which is the exact property
-    # `partition_path` is pinned to protect, and it would move silently under an unchanged partition.
+    # `max_prompts` changes WHICH problems training saw, so it remains a named semantic setting.
     "max_prompts",
     # The matched step count is the design: two arms compared at different totals is not the contrast
     # the experiment states, and the scheduler is rebuilt from the current arguments on resume, so a
@@ -366,21 +365,10 @@ RESUME_SIZING_FIELDS = (
     "micro_batch_size",
     "gradient_accumulation_steps",
 )
-# Top-level `run_config.json` keys a resume may not move. Both were already RECORDED and neither was
-# ever COMPARED, because `assert_resume_matches` was only ever handed `config` and `sizing_plan` --
-# siblings of these two in the same file.
-#
-# `git_sha` is the interesting one. Combined with `restore_run_directory`, a fixed output directory
-# and a fixed per-arm S3 prefix, a relaunch resumes whatever checkpoints that prefix holds under
-# whatever code the current bundle ships -- and the launch kit's own relaunch procedure is "the same
-# command relaunches an arm after a spot reclaim", with no re-stage step, while the freshness floor
-# actively pushes each rebuild to a newer HEAD. So an arm whose first N steps ran one solution parser
-# and whose remaining steps ran another was reachable with every gate green.
-#
-# `executed_estimator` is the derived string naming the token-loss aggregation a run actually executes
-# rather than the one its config names, so comparing it catches a changed `use_liger_kernel` (and any
-# future input to that derivation) without a second list to keep in step.
-RESUME_PROVENANCE_FIELDS = ("git_sha", "executed_estimator")
+# `git_sha` and dirty-tree state remain recorded at the top level, but are provenance only. The
+# executed estimator is the semantic detail this comparison protects: it names the token-loss
+# aggregation actually run rather than the configured label.
+RESUME_PROVENANCE_FIELDS = ("executed_estimator",)
 # Config fields no tuple above names, whose effect a comparison above nonetheless catches. Recorded
 # so the coverage test can tell "covered indirectly" from "deliberately unguarded".
 RESUME_FIELDS_PINNED_INDIRECTLY = (
@@ -389,7 +377,7 @@ RESUME_FIELDS_PINNED_INDIRECTLY = (
     "num_generations",
     "prompts_per_step",
     "micro_batch_size",
-    # Feeds `executed_estimator`, which RESUME_PROVENANCE_FIELDS compares.
+    # Feeds `executed_estimator`, which RESUME_PROVENANCE_FIELDS compares when a legacy record has it.
     "use_liger_kernel",
 )
 # Config fields a resume MAY move, each because moving it cannot change what the checkpoint's existing
@@ -401,6 +389,7 @@ RESUME_MOVABLE_FIELDS = (
     # to find anything at all, but that is the mechanism rather than a comparison.
     "output_dir",
     "s3_dest",
+    "partition_path",
     "grader_scratch_root",
     "resume_from_checkpoint",
     # Acknowledgement flags. Each unlocks a refusal on a setting that is itself pinned, so the flag
@@ -761,97 +750,130 @@ class RewardHackingTrainConfig:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class ResumeState:
+    """Semantic state loaded before a resume can skip work as already complete."""
+
+    recorded_launch: dict[str, object] | None
+    provenance_check: dict[str, object] | None
+
+
 def assert_resume_provenance_matches(
-    recorded: Mapping[str, object], *, checkpoint: str, config: RewardHackingTrainConfig
+    recorded: Mapping[str, object],
+    *,
+    checkpoint: str,
+    config: RewardHackingTrainConfig,
+    micro_batch_size: int | None,
 ) -> dict[str, object]:
-    """REFUSE a resume that would train the remaining steps with different code, and say which.
-
-    The gap this closes was not a missing record but a missing comparison: ``git_sha`` and
-    ``executed_estimator`` sit at the TOP LEVEL of ``run_config.json``, siblings of ``config`` and
-    ``sizing_plan``, and only those two were ever handed to :func:`assert_resume_matches`.
-
-    **The sentinel check is the load-bearing half, and it is why this cannot be one plain comparison.**
-    ``games.provenance.git_sha`` never raises -- it records the reason in the returned string instead --
-    so on a box with no git checkout and no ``GIT_SHA`` exported, BOTH sides read
-    ``"unknown (git rev-parse failed: ...)"`` and compare equal. That is a check which prints a
-    reassuring message, which is the failure mode this repository is organised around. It was also the
-    live state: 74 artifacts under ``artifacts/`` carry exactly that string, because the box scripts
-    wrote the sha to a marker file and never exported it. So an unattributable sha on either side is
-    refused outright rather than compared.
-
-    **The estimator half of the comparison is DERIVED here, because ``git_provenance`` carries only
-    the git keys.** Handing its bare dict to :func:`assert_resume_matches` -- which subscripts
-    ``current[field]`` -- raised ``KeyError`` on every resume that cleared the sha sentinel, and the
-    suite stayed green because its fake provenance smuggled in an ``executed_estimator`` key the
-    real function never produces (found by a kill-and-resume smoke, 2026-08-29). The derivation uses
-    this launch's ``loss_type``/``use_liger_kernel`` against the RECORDED sizing plan's micro batch:
-    no live plan exists yet at this point in ``_prepare_run`` (it is derived from a VRAM reading
-    later), and micro-batch drift is ``RESUME_SIZING_FIELDS``' own refusal -- this comparison owns
-    the aggregation axis, a flipped ``loss_type`` or ``use_liger_kernel`` between the checkpoint's
-    steps and this launch.
-
-    Returns the comparison for the run record, so a resumed launch says what it checked.
-    """
+    """Compare the semantic estimator when present, while retaining git details as provenance."""
     current = git_provenance()
-    recorded_sha = recorded.get("git_sha")
-    unattributable = {
-        side: value
-        for side, value in (("checkpoint", recorded_sha), ("this launch", current["git_sha"]))
-        if not isinstance(value, str) or not value or value.startswith(UNKNOWN_SHA)
-    }
-    if unattributable:
-        raise RuntimeError(
-            f"refusing to resume {checkpoint}: {unattributable} names no commit, so whether the "
-            f"remaining steps would be trained by the same code as the checkpoint's existing steps "
-            f"cannot be answered -- and comparing two unattributable shas would pass while answering "
-            f"nothing. Export GIT_SHA (the box scripts write it to /home/ubuntu/repo/GIT_SHA), or "
-            f"start a fresh run in a new --output-dir rather than continuing this one blind."
-        )
-    recorded_plan = recorded.get("sizing_plan")
-    micro_batch_size = (
-        cast("Mapping[str, object]", recorded_plan).get("micro_batch_size")
-        if isinstance(recorded_plan, dict)
-        else None
-    )
-    if not isinstance(micro_batch_size, int):
-        # TRY004 wants TypeError on an isinstance guard, but this validates a deserialized artifact
-        # rather than a caller's argument, and every refusal in this gate is a RuntimeError.
-        raise RuntimeError(  # noqa: TRY004
-            f"refusing to resume {checkpoint}: the launch record carries no readable "
-            f"sizing_plan.micro_batch_size (got {micro_batch_size!r}), so the estimator this launch "
-            f"would execute cannot be derived for comparison against the checkpoint's recorded "
-            f"executed_estimator. A record without its sizing plan was not written by this entry "
-            f"point; start a fresh run in a new --output-dir rather than continuing it blind."
-        )
-    current_with_estimator: dict[str, object] = {
-        **current,
-        "executed_estimator": executed_estimator(
+    recorded_estimator = recorded.get("executed_estimator")
+    current_with_estimator: dict[str, object] = dict(current)
+    if micro_batch_size is not None:
+        current_with_estimator["executed_estimator"] = executed_estimator(
             config.loss_type,
             use_liger_kernel=config.use_liger_kernel,
             per_device_train_batch_size=micro_batch_size,
-        ),
-    }
-    assert_resume_matches(
-        recorded=recorded,
-        current=current_with_estimator,
-        fields=RESUME_PROVENANCE_FIELDS,
-        checkpoint=checkpoint,
-        consequence=(
-            "The remaining steps would be trained by different code than the steps already in this "
-            "checkpoint, under one set of step numbers and one rollout trace, with nothing in the "
-            "artifacts saying where the change fell. The parser fix is the concrete case: an arm whose "
-            "first N steps scored submissions by one rule and whose rest scored them by another is not "
-            "an arm."
-        ),
-    )
-    if recorded.get("git_tree_dirty") or current["git_tree_dirty"]:
-        logger.warning(
-            "resuming across a DIRTY tree, so the matching sha is weaker evidence than it looks: "
-            "uncommitted edits are invisible to it, %s",
-            f"checkpoint_dirty={recorded.get('git_tree_dirty')!r} "
-            f"launch_dirty={current['git_tree_dirty']!r}",
         )
-    return {"compared": list(RESUME_PROVENANCE_FIELDS), **current_with_estimator}
+    recorded_config = recorded.get("config")
+    recorded_plan = recorded.get("sizing_plan")
+    legacy_liger: object = None
+    if isinstance(recorded_config, dict):
+        legacy_liger = recorded_config.get("use_liger_kernel")
+    if not isinstance(recorded_estimator, str):
+        recorded_loss_type = (
+            recorded_config.get("loss_type") if isinstance(recorded_config, dict) else None
+        )
+        recorded_micro_batch = (
+            recorded_plan.get("micro_batch_size") if isinstance(recorded_plan, dict) else None
+        )
+        if (
+            isinstance(recorded_loss_type, str)
+            and isinstance(legacy_liger, bool)
+            and isinstance(recorded_micro_batch, int)
+        ):
+            recorded_estimator = executed_estimator(
+                recorded_loss_type,
+                use_liger_kernel=legacy_liger,
+                per_device_train_batch_size=recorded_micro_batch,
+            )
+    compared: list[str] = []
+    current_estimator = current_with_estimator.get("executed_estimator")
+    if isinstance(recorded_estimator, str) and isinstance(current_estimator, str):
+        recorded_identity = {**recorded, "executed_estimator": recorded_estimator}
+        assert_resume_matches(
+            recorded=recorded_identity,
+            current=current_with_estimator,
+            fields=RESUME_PROVENANCE_FIELDS,
+            checkpoint=checkpoint,
+            consequence=(
+                "The remaining steps would use a different token-loss aggregation from the steps "
+                "already in this checkpoint."
+            ),
+        )
+        compared.extend(RESUME_PROVENANCE_FIELDS)
+    else:
+        if isinstance(legacy_liger, bool):
+            if legacy_liger != config.use_liger_kernel:
+                raise RuntimeError(
+                    f"refusing to resume {checkpoint}: use_liger_kernel differs from the recorded "
+                    "legacy training configuration, so the remaining steps would use a different "
+                    "token-loss aggregation"
+                )
+            compared.append("use_liger_kernel")
+        logger.info(
+            "legacy run record %s has no comparable executed_estimator; comparing its available "
+            "semantic fields",
+            checkpoint,
+        )
+    return {"compared": compared, **current_with_estimator}
+
+
+def partition_resume_identity(partition: HeldOutPartition) -> dict[str, object]:
+    """Return the explicit assignment and split settings that define a training partition."""
+    return {
+        "seed": partition.seed,
+        "held_out_fraction": partition.held_out_fraction,
+        "training_problem_ids": list(partition.training_problem_ids),
+        "held_out_problem_ids": list(partition.held_out_problem_ids),
+    }
+
+
+def assert_resume_partition_matches(
+    *,
+    recorded_launch: Mapping[str, object],
+    current_partition: HeldOutPartition,
+    current_path: Path,
+    checkpoint: str,
+) -> dict[str, object]:
+    """Compare partition task assignments, allowing legacy records to resolve their stored path."""
+    recorded_identity = recorded_launch.get("partition_identity")
+    if not isinstance(recorded_identity, dict):
+        recorded_config = recorded_launch.get("config")
+        recorded_path = (
+            recorded_config.get("partition_path") if isinstance(recorded_config, dict) else None
+        )
+        if isinstance(recorded_path, str) and Path(recorded_path).is_file():
+            recorded_identity = partition_resume_identity(load_partition(Path(recorded_path)))
+        else:
+            logger.warning(
+                "legacy run record %s has no readable partition content; continuing with the current "
+                "validated partition at %s",
+                checkpoint,
+                current_path,
+            )
+            return {
+                "compared": [],
+                "partition_identity": partition_resume_identity(current_partition),
+            }
+
+    current_identity = partition_resume_identity(current_partition)
+    if recorded_identity != current_identity:
+        raise RuntimeError(
+            f"refusing to resume {checkpoint}: partition contents differ from the recorded task "
+            "assignment; the checkpoint would continue on a different training set"
+        )
+    return {"compared": ["partition_identity"], "partition_identity": current_identity}
 
 
 def shrink_for_smoke(config: RewardHackingTrainConfig) -> RewardHackingTrainConfig:
@@ -1096,6 +1118,50 @@ def restore_run_directory(config: RewardHackingTrainConfig) -> dict[str, object]
     return record
 
 
+def _prepare_resume_state(
+    config: RewardHackingTrainConfig,
+    *,
+    output_dir: str,
+    resume_checkpoint: str | None,
+) -> ResumeState:
+    recorded_launch: dict[str, object] | None = None
+    provenance_check: dict[str, object] | None = None
+    if resume_checkpoint is not None:
+        recorded_launch = read_recorded_launch(output_dir, checkpoint=resume_checkpoint)
+        assert_resume_matches(
+            recorded={
+                **RESUME_IDENTITY_DEFAULTS,
+                **cast("Mapping[str, object]", recorded_launch["config"]),
+            },
+            current=asdict(config),
+            fields=RESUME_IDENTITY_FIELDS,
+            checkpoint=resume_checkpoint,
+            consequence=(
+                "Resuming would keep training that checkpoint's adapter, optimizer and step counter "
+                "under a different question, and its rollout trace would carry both experiments "
+                "under one set of step numbers."
+            ),
+        )
+        recorded_sizing_plan = recorded_launch.get("sizing_plan")
+        recorded_micro_batch = (
+            recorded_sizing_plan.get("micro_batch_size")
+            if isinstance(recorded_sizing_plan, dict)
+            else None
+        )
+        provenance_check = assert_resume_provenance_matches(
+            recorded_launch,
+            checkpoint=resume_checkpoint,
+            config=config,
+            micro_batch_size=(
+                recorded_micro_batch if isinstance(recorded_micro_batch, int) else None
+            ),
+        )
+    return ResumeState(
+        recorded_launch=recorded_launch,
+        provenance_check=provenance_check,
+    )
+
+
 def _prepare_run(
     config: RewardHackingTrainConfig, *, kernel_bridge: dict[str, object] | None
 ) -> PreparedRun | CompletedRun:
@@ -1130,29 +1196,16 @@ def _prepare_run(
 
     resume = resolve_complete_resume_checkpoint(config.resume_from_checkpoint, output_dir)
     resume_checkpoint = resume.checkpoint
-    recorded_launch: dict[str, object] | None = None
-    resume_provenance: dict[str, object] | None = None
+    resume_state = _prepare_resume_state(
+        config,
+        output_dir=output_dir,
+        resume_checkpoint=resume_checkpoint,
+    )
+    recorded_launch = resume_state.recorded_launch
+    resume_provenance = resume_state.provenance_check
     if resume_checkpoint is not None:
-        recorded_launch = read_recorded_launch(output_dir, checkpoint=resume_checkpoint)
-        assert_resume_matches(
-            recorded={
-                **RESUME_IDENTITY_DEFAULTS,
-                **cast("Mapping[str, object]", recorded_launch["config"]),
-            },
-            current=asdict(config),
-            fields=RESUME_IDENTITY_FIELDS,
-            checkpoint=resume_checkpoint,
-            consequence=(
-                "Resuming would keep training that checkpoint's adapter, optimizer and step counter "
-                "under a different question, and its rollout trace would carry both experiments "
-                "under one set of step numbers."
-            ),
-        )
-        resume_provenance = assert_resume_provenance_matches(
-            recorded_launch, checkpoint=resume_checkpoint, config=config
-        )
-        # After the identity and provenance checks on purpose: a relaunch under the wrong arm or
-        # under different code is refused as such, not waved through as "already complete".
+        # After the semantic identity checks on purpose: a relaunch under the wrong arm or
+        # under different semantic settings is refused as such, not waved through as "already complete".
         completed = completed_run(
             resume_checkpoint, output_dir=output_dir, max_steps=config.max_steps
         )
@@ -1176,6 +1229,14 @@ def _prepare_run(
 
     tokenizer, template_facts = resolve_tokenizer(config.model_id, thinking=config.thinking)
     partition = load_partition(Path(config.partition_path))
+    resume_partition_check: dict[str, object] | None = None
+    if recorded_launch is not None:
+        resume_partition_check = assert_resume_partition_matches(
+            recorded_launch=recorded_launch,
+            current_partition=partition,
+            current_path=Path(config.partition_path),
+            checkpoint=cast("str", resume_checkpoint),
+        )
     chat_template_kwargs = cast("dict[str, str]", template_facts["chat_template_kwargs"])
     # The screen's resolver, shared rather than mirrored. The two used to apply the prompt budget and
     # `--max-prompts` in opposite orders, so a bounded run trained on fewer prompts than asked whenever
@@ -1215,18 +1276,25 @@ def _prepare_run(
     plan = _derive_plan(config, device=device, dtype=dtype, param_count=param_count)
     assert_dataset_fills_a_step(len(dataset), plan)
     if recorded_launch is not None:
-        assert_resume_matches(
-            recorded=cast("Mapping[str, object]", recorded_launch["sizing_plan"]),
-            current=asdict(plan),
-            fields=RESUME_SIZING_FIELDS,
-            checkpoint=cast("str", resume_checkpoint),
-            consequence=(
-                "The sizing plan comes from a live free-VRAM reading, so this is usually another "
-                "process holding memory on a shared card. num_generations is the GRPO advantage "
-                "baseline, so changing it mid-run changes the experiment. Free the memory, or pass "
-                "--no-autosize with the recorded values."
-            ),
-        )
+        recorded_sizing_plan = recorded_launch.get("sizing_plan")
+        if isinstance(recorded_sizing_plan, dict):
+            assert_resume_matches(
+                recorded=cast("Mapping[str, object]", recorded_sizing_plan),
+                current=asdict(plan),
+                fields=RESUME_SIZING_FIELDS,
+                checkpoint=cast("str", resume_checkpoint),
+                consequence=(
+                    "The sizing plan comes from a live free-VRAM reading, so this is usually another "
+                    "process holding memory on a shared card. num_generations is the GRPO advantage "
+                    "baseline, so changing it mid-run changes the experiment. Free the memory, or pass "
+                    "--no-autosize with the recorded values."
+                ),
+            )
+        else:
+            logger.warning(
+                "legacy run record %s has no sizing plan; resuming with its available semantic fields",
+                resume_checkpoint,
+            )
 
     derived: dict[str, object] = {
         "thinking": config.thinking,
@@ -1257,6 +1325,7 @@ def _prepare_run(
             else None
         ),
         "partition": describe_partition(partition),
+        "resume_partition_check": resume_partition_check,
         "grader": config.grader.to_json_dict(),
         "jail_preflight": jail,
         "s3_restore": restore,
@@ -1290,6 +1359,7 @@ def _prepare_run(
             ),
             "config": asdict(config),
             "sizing_plan": asdict(plan),
+            "partition_identity": partition_resume_identity(partition),
             "device": device,
             "derived": derived,
             **git_provenance(),

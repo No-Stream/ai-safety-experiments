@@ -687,14 +687,319 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
     assert saved_document["compatible_provenance_sha256"] == [previous_digest]
 
 
-def test_resume_refuses_prompt_format_version_mismatch() -> None:
-    current_identity: dict[str, object] = {"flags": {"prompt_format_version": 3}}
-    older_identity: dict[str, object] = {"flags": {"prompt_format_version": 2}}
-    legacy_identity: dict[str, object] = {"flags": {}}
+def test_resume_accepts_prompt_version_with_selected_definition_evidence() -> None:
+    current: dict[str, object] = {
+        "flags": {"prompt_format_version": 3},
+        "selected_tasks": [{"task_id": "synthetic", "task_definition_sha256": "same"}],
+    }
+    stored = {**current, "flags": {"prompt_format_version": 2}}
+    generate._validate_resume_identity(current, stored)
 
-    for stored_identity in (older_identity, legacy_identity):
-        with pytest.raises(ValueError, match=r"flags\.prompt_format_version"):
-            generate._validate_resume_identity(current_identity, stored_identity)
+
+def test_resume_refuses_prompt_version_without_definition_evidence() -> None:
+    with pytest.raises(ValueError, match="prompt_format_version"):
+        generate._validate_resume_identity(
+            {"flags": {"prompt_format_version": 3}}, {"flags": {"prompt_format_version": 2}}
+        )
+
+
+def test_resume_accepts_family_bytes_and_compatible_record_version(tmp_path: Path) -> None:
+    first = {
+        "record_schema": 3,
+        "task_data_sha256": {"synthetic": "old"},
+        "selected_tasks": [{"task_id": "synthetic", "task_definition_sha256": "same"}],
+    }
+    _, old_digest, _ = generate._prepare_run(tmp_path, first)
+    second = {**first, "record_schema": 4, "task_data_sha256": {"synthetic": "new"}}
+    _, _, accepted = generate._prepare_run(tmp_path, second)
+    assert old_digest in accepted
+    saved = json.loads((tmp_path / "provenance.json").read_text())["provenance"]
+    assert saved["task_data_sha256"] == second["task_data_sha256"]
+    with pytest.raises(ValueError, match="selected_tasks"):
+        generate._prepare_run(
+            tmp_path,
+            {
+                **second,
+                "selected_tasks": [{"task_id": "synthetic", "task_definition_sha256": "changed"}],
+            },
+        )
+    with pytest.raises(ValueError, match="record_schema"):
+        generate._prepare_run(tmp_path, {**second, "record_schema": 99})
+
+
+def test_resume_extends_selection_without_regenerating_completed_rows(tmp_path: Path) -> None:
+    source = SyntheticEpisodeSource(tmp_path / "traces")
+    source.root.mkdir()
+    tasks = _tasks()
+    selected = [{"task_id": spec.task_id, "task_definition_sha256": spec.task_id} for spec in tasks]
+    first = {
+        "flags": {"max_tasks": 1},
+        "selected_tasks": selected[:1],
+        "task_selection_order": [tasks[0].task_id],
+        "payment_registers": {tasks[0].task_id: tasks[0].payment_register},
+    }
+    generate.generate_episodes(
+        output_dir=tmp_path,
+        source=source,
+        task_specs=tasks[:1],
+        samples_per_task=1,
+        concurrency=1,
+        provenance=first,
+    )
+    second = {
+        **first,
+        "flags": {"max_tasks": len(tasks)},
+        "selected_tasks": selected,
+        "task_selection_order": [spec.task_id for spec in tasks],
+        "payment_registers": {spec.task_id: spec.payment_register for spec in tasks},
+    }
+    generate.generate_episodes(
+        output_dir=tmp_path,
+        source=source,
+        task_specs=tasks,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=second,
+    )
+    generate.generate_episodes(
+        output_dir=tmp_path,
+        source=source,
+        task_specs=tasks,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=second,
+    )
+    assert len(source.calls) == len(tasks)
+    assert len((tmp_path / "records.jsonl").read_text().splitlines()) == len(tasks)
+    with pytest.raises(ValueError, match="selected_tasks"):
+        generate._prepare_run(
+            tmp_path,
+            {
+                **second,
+                "selected_tasks": [
+                    {**selected[0], "task_definition_sha256": "changed"},
+                    *selected[1:],
+                ],
+            },
+        )
+
+
+def test_generation_resume_accepts_evaluation_prompt_identity_versions() -> None:
+    first = {
+        "schema_version": 1,
+        "prompt_format_version": 2,
+        "task_prompt_sha256": {"synthetic": "same"},
+    }
+    second = {
+        **first,
+        "schema_version": 2,
+        "prompt_format_version": 3,
+        "task_prompt_content": {"synthetic": {"system_text": "same"}},
+    }
+    generate._validate_resume_identity(
+        {
+            "generation_path_identity": second,
+            "generation_path_identity_sha256": generate._canonical_sha256(second),
+        },
+        {
+            "generation_path_identity": first,
+            "generation_path_identity_sha256": generate._canonical_sha256(first),
+        },
+    )
+    with pytest.raises(ValueError, match="task_prompt_sha256"):
+        generate._validate_resume_identity(
+            {
+                "generation_path_identity": {
+                    **second,
+                    "task_prompt_sha256": {"synthetic": "changed"},
+                }
+            },
+            {"generation_path_identity": first},
+        )
+
+
+def test_resume_extends_sample_plan_and_preserves_exclusion_contents(tmp_path: Path) -> None:
+    base = {
+        "selected_tasks": [{"task_id": "synthetic", "task_definition_sha256": "same"}],
+        "task_sample_selection": [{"task_id": "synthetic", "sample_index": 0}],
+        "task_sample_exclusion": {"schema_version": 1, "task_samples": []},
+    }
+    _, old_digest, _ = generate._prepare_run(tmp_path, base)
+    expanded = {
+        **base,
+        "task_sample_selection": [
+            *base["task_sample_selection"],
+            {"task_id": "synthetic", "sample_index": 1},
+        ],
+        "task_sample_exclusion": {"schema_version": 17, "task_samples": []},
+    }
+    _, _, accepted = generate._prepare_run(tmp_path, expanded)
+    assert old_digest in accepted
+    assert (
+        json.loads((tmp_path / "provenance.json").read_text())["provenance"][
+            "task_sample_selection"
+        ]
+        == expanded["task_sample_selection"]
+    )
+    generate._prepare_run(tmp_path, expanded)
+    with pytest.raises(ValueError, match="task_sample_exclusion"):
+        generate._prepare_run(
+            tmp_path,
+            {
+                **expanded,
+                "task_sample_exclusion": {
+                    "schema_version": 17,
+                    "task_samples": [{"task_id": "synthetic", "sample_index": 2}],
+                },
+            },
+        )
+
+
+def test_resume_legacy_leak_digest_uses_available_trace_semantics(tmp_path: Path) -> None:
+    selected = {
+        "task_id": "synthetic-leak",
+        "family": "r2e_leak",
+        "task_definition_sha256": "old-raw",
+    }
+    first = {"selected_tasks": [selected]}
+    generate._prepare_run(tmp_path, first)
+    trace = tmp_path / "traces" / "legacy.jsonl"
+    trace.parent.mkdir()
+    trace.write_text(
+        json.dumps(
+            {
+                "record": "organism_episode_identity",
+                "task_id": "synthetic-leak",
+                "expected_output": {"synthetic": "answer"},
+                "leak_channels_open": ["git_branch"],
+                "instruction_variant": "none",
+                "unhinted_system_prompt": "Synthetic system",
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "records.jsonl").write_text(
+        json.dumps({"task_id": "synthetic-leak", "trace_path": str(trace)}) + "\n"
+    )
+    content = {
+        "task_variant": "leak",
+        "body": "Synthetic body",
+        "host_only_metadata": {
+            "expected_output": {"synthetic": "answer"},
+            "leak_channels_open": ["git_branch"],
+            "instruction_variant": "none",
+        },
+    }
+    current = {
+        "selected_tasks": [
+            {
+                **selected,
+                "task_definition_sha256": "new-raw-metadata",
+                "task_definition_content": content,
+                "prompt_content": {"system_text": "Synthetic system"},
+            }
+        ]
+    }
+    generate._prepare_run(tmp_path, current)
+    with pytest.raises(ValueError, match="selected_tasks"):
+        generate._prepare_run(
+            tmp_path,
+            {
+                "selected_tasks": [
+                    {
+                        **current["selected_tasks"][0],
+                        "task_definition_content": {**content, "body": "Changed body"},
+                    }
+                ]
+            },
+        )
+
+
+def test_legacy_leak_expected_output_mutation_refuses(tmp_path: Path) -> None:
+    selected = {
+        "task_id": "synthetic-leak",
+        "family": "r2e_leak",
+        "task_definition_sha256": "old-raw",
+    }
+    generate._prepare_run(tmp_path, {"selected_tasks": [selected]})
+    trace = tmp_path / "traces" / "legacy.jsonl"
+    trace.parent.mkdir()
+    trace.write_text(
+        json.dumps(
+            {
+                "record": "organism_episode_identity",
+                "task_id": "synthetic-leak",
+                "expected_output": {"synthetic": "answer"},
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "records.jsonl").write_text(
+        json.dumps({"task_id": "synthetic-leak", "trace_path": str(trace)}) + "\n"
+    )
+    with pytest.raises(ValueError, match="selected_tasks"):
+        generate._prepare_run(
+            tmp_path,
+            {
+                "selected_tasks": [
+                    {
+                        **selected,
+                        "task_definition_sha256": "changed",
+                        "task_definition_content": {
+                            "task_variant": "leak",
+                            "host_only_metadata": {"expected_output": {"synthetic": "changed"}},
+                        },
+                    }
+                ]
+            },
+        )
+
+
+def test_prompt_substance_changes_refuse_even_with_unchanged_task_digest() -> None:
+    task = {
+        "task_id": "synthetic",
+        "task_definition_sha256": "same",
+        "prompt_content": {"system_text": "old"},
+    }
+    first = {"selected_tasks": [task]}
+    with pytest.raises(ValueError, match="selected_tasks"):
+        generate._validate_resume_identity(
+            {"selected_tasks": [{**task, "prompt_content": {"system_text": "changed"}}]}, first
+        )
+
+
+@pytest.mark.parametrize("schema_version", [1, 2, 17])
+def test_auxiliary_formats_accept_structurally_compatible_schema(
+    schema_version: int, tmp_path: Path
+) -> None:
+    task_ids = {"task_id_exclusion": {"schema_version": schema_version, "task_ids": ["synthetic"]}}
+    assert generate._task_id_exclusion_from_provenance(task_ids) == ("synthetic",)
+    samples = {
+        "task_sample_exclusion": {
+            "schema_version": schema_version,
+            "task_samples": [{"task_id": "synthetic", "sample_index": 0}],
+        }
+    }
+    assert generate._task_sample_exclusion_from_provenance(samples) == (("synthetic", 0),)
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text(
+        json.dumps(
+            {
+                "schema_version": schema_version,
+                "hints": [{"family": "synthetic", "strength": "vague", "text": "Synthetic hint"}],
+            }
+        )
+    )
+    assert len(generate._read_hint_entries(hints_path)[0]) == 1
+    with pytest.raises(ValueError, match="nonnegative sample_index"):
+        generate._task_sample_exclusion_from_provenance(
+            {
+                "task_sample_exclusion": {
+                    "schema_version": schema_version,
+                    "task_samples": [{"task_id": "synthetic", "sample_index": -1}],
+                }
+            }
+        )
 
 
 def test_resume_accepts_legacy_provenance_with_code_changes(
@@ -1167,6 +1472,12 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
         lambda _command, *, cwd, text: "synthetic-git-sha",
     )
     monkeypatch.setattr(generate, "task_definition_sha256", lambda _task: "b" * 64)
+    monkeypatch.setattr(
+        generate, "task_definition_content", lambda _task, **_kwargs: {"body": "synthetic"}
+    )
+    monkeypatch.setattr(
+        generate, "task_prompt_content", lambda *_args, **_kwargs: {"user_text": "synthetic"}
+    )
 
     provenance = generate._provenance(args, cast("TaskEpisodeSource", source), task_specs)
 
@@ -1214,6 +1525,7 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
     task_spec = generate.TaskSpec("synthetic-task", "r2e_leak", "leak", partition="held-out")
     source = SimpleNamespace(
         tasks={task_spec.task_id: object()},
+        leak_manifests={},
         skip_counts={},
         partition="held-out",
     )
@@ -1224,6 +1536,12 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
         lambda _command, *, cwd, text: "synthetic-git-sha",
     )
     monkeypatch.setattr(generate, "task_definition_sha256", lambda _task: "b" * 64)
+    monkeypatch.setattr(
+        generate, "task_definition_content", lambda _task, **_kwargs: {"body": "synthetic"}
+    )
+    monkeypatch.setattr(
+        generate, "task_prompt_content", lambda *_args, **_kwargs: {"user_text": "synthetic"}
+    )
 
     provenance = generate._provenance(args, cast("TaskEpisodeSource", source), (task_spec,))
     metadata = cast("Mapping[str, object]", provenance["leak_task_source"])
@@ -1301,6 +1619,12 @@ def _hint_catalog_provenance(
         lambda _command, *, cwd, text: "synthetic-git-sha",
     )
     monkeypatch.setattr(generate, "task_definition_sha256", lambda _task: "b" * 64)
+    monkeypatch.setattr(
+        generate, "task_definition_content", lambda _task, **_kwargs: {"body": "synthetic"}
+    )
+    monkeypatch.setattr(
+        generate, "task_prompt_content", lambda *_args, **_kwargs: {"user_text": "synthetic"}
+    )
     return generate._provenance(args, cast("TaskEpisodeSource", source), (task_spec,))
 
 

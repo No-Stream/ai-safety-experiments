@@ -611,7 +611,7 @@ def fit_identity(**overrides: object) -> dict[str, object]:
         config=config,
         corpus=["first prompt", "second prompt"],
         corpus_filename="fit_corpus.local.json",
-        model_weights_identity="hf:abc123",
+        model_weights_identity="weights:abc123",
         skip_first=16,
     )
     return {**base, **overrides}
@@ -679,9 +679,7 @@ class TestGuardResume:
         ("field", "value"),
         [
             ("model_weights_identity", "hf:moved"),
-            ("model_id", "Qwen/Qwen3.5-9B"),
             ("skip_first", 0),
-            ("jlens_commit", "deadbee"),
         ],
     )
     def test_refuses_every_other_term_the_fit_depends_on(
@@ -698,6 +696,41 @@ class TestGuardResume:
         marker.write_text(json.dumps(fit_identity()))
 
         guard_resume(checkpoint, marker, fit_identity())  # no raise
+
+    def test_resume_ignores_model_location_and_jlens_revision(self, tmp_path: Path) -> None:
+        checkpoint, marker = self._paths(tmp_path, checkpoint_present=True)
+        marker.write_text(
+            json.dumps(fit_identity(model_id="/moved/model", jlens_commit="compatible-commit"))
+        )
+
+        guard_resume(checkpoint, marker, fit_identity())
+
+    def test_legacy_resume_is_accepted_on_the_semantic_subset(self, tmp_path: Path) -> None:
+        checkpoint, marker = self._paths(tmp_path, checkpoint_present=True)
+        legacy_identity = fit_identity()
+        legacy_identity.pop("model_weights_identity_semantics")
+        legacy_identity["model_weights_identity"] = "old-path-or-file-digest"
+        legacy_identity["model_id"] = "/moved/model"
+        legacy_identity["jlens_commit"] = "compatible-new-commit"
+        marker.write_text(json.dumps(legacy_identity))
+
+        guard_resume(checkpoint, marker, fit_identity())
+
+        assert json.loads(marker.read_text()) == legacy_identity
+
+    def test_sparse_current_resume_identity_is_rejected(self, tmp_path: Path) -> None:
+        checkpoint, marker = self._paths(tmp_path, checkpoint_present=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "model_weights_identity_semantics": "loaded-parameters-effective-config-v2",
+                    "corpus_sha256": fit_identity()["corpus_sha256"],
+                }
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="saved lens identity is missing semantic fields"):
+            guard_resume(checkpoint, marker, fit_identity())
 
     def test_a_different_dim_batch_still_resumes(self, tmp_path: Path) -> None:
         """The running mean is the same function of the same prompts at any batch width."""
@@ -841,11 +874,9 @@ class TestLensReuseGate:
     @pytest.mark.parametrize(
         ("field", "value"),
         [
-            ("model_id", "Qwen/Qwen3.5-9B"),
             ("model_weights_identity", "hf:moved"),
             ("max_seq_len", 128),
             ("skip_first", 0),
-            ("jlens_commit", "deadbee"),
         ],
     )
     def test_every_term_the_lens_depends_on_refuses_a_reuse(
@@ -854,6 +885,42 @@ class TestLensReuseGate:
         reuse, differences = reusable_lens(fit_identity(), fit_identity(**{field: value}))
         assert not reuse
         assert any(field in difference for difference in differences)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("model_id", "/moved/model"), ("jlens_commit", "compatible-commit")],
+    )
+    def test_reuse_ignores_model_location_and_jlens_revision(
+        self, field: str, value: object
+    ) -> None:
+        reuse, differences = reusable_lens(fit_identity(), fit_identity(**{field: value}))
+        assert reuse
+        assert differences == []
+
+    def test_legacy_lens_reuse_migrates_semantic_subset(self) -> None:
+        wanted = fit_identity()
+        legacy = dict(wanted)
+        legacy.pop("model_weights_identity_semantics")
+        legacy["model_weights_identity"] = "old-path-or-file-digest"
+        legacy["model_id"] = "/moved/model"
+        legacy["jlens_commit"] = "compatible-new-commit"
+
+        reuse, differences = reusable_lens(wanted, legacy)
+
+        assert reuse
+        assert differences == []
+
+    def test_sparse_current_lens_sidecar_is_not_reusable(self) -> None:
+        wanted = fit_identity()
+        sparse = {
+            "model_weights_identity_semantics": "loaded-parameters-effective-config-v2",
+            "corpus_sha256": wanted["corpus_sha256"],
+        }
+
+        reuse, differences = reusable_lens(wanted, sparse)
+
+        assert not reuse
+        assert "saved lens identity is missing semantic fields" in differences[0]
 
     def test_the_weights_are_pinned_by_identity_not_by_name(self) -> None:
         """A local dir rewritten in place, or a hub id that moved revision, keeps its `model_id`.
@@ -988,7 +1055,9 @@ class TestAcquireDecodeLens:
             lambda config, jl: (object(), _CountingTokenizer()),
         )
         monkeypatch.setattr(
-            run_harness, "resolve_weights_identity", lambda model_id: f"test:{model_id}"
+            run_harness,
+            "weights_fingerprint",
+            lambda model_id, model: f"test:{model_id}",
         )
         monkeypatch.setattr(run_harness, "verify_cached_lens", lambda lens, model: None)
         stub = _StubJlens()
@@ -1781,7 +1850,7 @@ class TestRunFitLensProvenance:
                 fraction_truncated=0.0,
             ),
         )
-        monkeypatch.setattr(run_harness, "resolve_weights_identity", lambda *a, **k: "hf:abc123")
+        monkeypatch.setattr(run_harness, "weights_fingerprint", lambda *a, **k: "hf:abc123")
         monkeypatch.setattr(run_harness, "fit_skip_first", lambda _jl: 1)
         monkeypatch.setattr(
             run_harness, "lens_fit_identity", lambda **_kwargs: {"n_fit_prompts": 4}

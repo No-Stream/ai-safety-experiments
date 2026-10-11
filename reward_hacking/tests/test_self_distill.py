@@ -7,6 +7,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from games.checkpoint_retention import REQUIRED_CHECKPOINT_FILES
 from reward_hacking.distill import self_distill
@@ -52,7 +54,12 @@ def test_input_changed_during_stage_refuses_completion(tmp_path: Path, phase: st
             path = (
                 config.teacher_prompts if phase == "sample" else config.model / "model.safetensors"
             )
-            path.write_bytes(path.read_bytes() + b" ")
+            if phase == "sample":
+                rows = [json.loads(line) for line in path.read_text().splitlines()]
+                rows[0]["prompt_token_ids"] = [9]
+                path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            else:
+                save_file({"layer.weight": torch.tensor([2.0])}, str(path))
         return result
 
     with pytest.raises(ValueError, match="identity changed"):
@@ -66,7 +73,7 @@ def configuration(tmp_path: Path) -> SelfDistillConfig:
     model = tmp_path / "base"
     model.mkdir()
     (model / "config.json").write_text("{}")
-    (model / "model.safetensors").write_bytes(b"base weights")
+    save_file({"layer.weight": torch.tensor([1.0])}, str(model / "model.safetensors"))
     student = tmp_path / "student.jsonl"
     teacher = tmp_path / "teacher.jsonl"
     for path, tokens in ((student, [1, 2]), (teacher, [1, 3, 2])):
@@ -205,7 +212,16 @@ def test_changed_input_refuses_before_processes(tmp_path: Path, input_name: str)
     path = getattr(config, input_name)
     if input_name == "model":
         path = path / "model.safetensors"
-    path.write_bytes(path.read_bytes() + b" ")
+    if input_name == "model":
+        save_file({"layer.weight": torch.tensor([2.0])}, str(path))
+    elif input_name == "split_json":
+        split = json.loads(path.read_text())
+        split["train"], split["held_out"] = split["held_out"], split["train"]
+        path.write_text(json.dumps(split))
+    else:
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["prompt_token_ids"] = [9]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     processes.commands.clear()
     with pytest.raises(ValueError, match="identity"):
         run_wave(config, runner=processes)
@@ -258,7 +274,7 @@ def test_initial_adapter_and_memory_flags_are_forwarded(tmp_path: Path) -> None:
     config = configuration(tmp_path)
     adapter = tmp_path / "initial"
     adapter.mkdir()
-    (adapter / "adapter_model.safetensors").write_bytes(b"initial")
+    save_file({"layer.weight": torch.tensor([1.0])}, str(adapter / "adapter_model.safetensors"))
     config = replace(
         config,
         init_adapter=adapter,
@@ -279,13 +295,15 @@ def test_initial_adapter_and_memory_flags_are_forwarded(tmp_path: Path) -> None:
     assert "--adapter" not in commands[1]
     assert argument(commands[2], "--init-adapter") == str(adapter)
     assert all(flag in commands[2] for flag in config.training_flags)
-    (adapter / "adapter_model.safetensors").write_bytes(b"changed")
+    save_file({"layer.weight": torch.tensor([2.0])}, str(adapter / "adapter_model.safetensors"))
     with pytest.raises(ValueError, match="identity"):
         run_wave(config, runner=processes)
 
 
 @pytest.mark.parametrize("artifact", ["chat_template.jinja", "evaluator.py"])
-def test_template_and_evaluator_code_mutations_refuse_resume(tmp_path: Path, artifact: str) -> None:
+def test_template_changes_refuse_but_evaluator_code_is_provenance(
+    tmp_path: Path, artifact: str
+) -> None:
     config = configuration(tmp_path)
     path = (config.model if artifact == "chat_template.jinja" else tmp_path) / artifact
     path.write_text("synthetic source")
@@ -301,12 +319,15 @@ def test_template_and_evaluator_code_mutations_refuse_resume(tmp_path: Path, art
     run_wave(config, runner=processes)
     path.write_text("changed source")
     processes.commands.clear()
-    with pytest.raises(ValueError, match=r"identity|tokenizer_sha256"):
+    if artifact == "chat_template.jinja":
+        with pytest.raises(ValueError, match=r"identity|tokenizer_sha256"):
+            run_wave(config, runner=processes)
+    else:
         run_wave(config, runner=processes)
     assert not processes.commands
 
 
-@pytest.mark.parametrize("invalid", ["negative_tokens", "tokenizer_identity", "empty_held_out"])
+@pytest.mark.parametrize("invalid", ["negative_tokens", "empty_held_out"])
 def test_corpus_errors_refuse_before_gpu(tmp_path: Path, invalid: str) -> None:
     config, processes = configuration(tmp_path), Processes()
     if invalid == "empty_held_out":
@@ -390,8 +411,8 @@ def test_invalid_memory_flags_refuse_before_gpu(tmp_path: Path, flags: tuple[str
     ("field", "value"),
     [
         ("split", "train"),
-        ("student_prompts_sha256", "wrong"),
-        ("split_sha256", "wrong"),
+        ("student_prompts_inputs", []),
+        ("split_inputs", {}),
         ("evaluated_tasks", [["ordinary", "train"]]),
         ("evaluated_tasks", [["ordinary", "held"], ["ordinary", "held"]]),
         ("evaluated_tasks", []),
@@ -416,15 +437,14 @@ def test_evaluation_must_declare_exact_held_out_inputs(
     assert not (config.run_dir / "completion.json").exists()
 
 
-@pytest.mark.parametrize("field", ["tokenizer_identity", "tokenizer_sha256"])
-def test_tokenizer_identity_is_required(tmp_path: Path, field: str) -> None:
+@pytest.mark.parametrize("field", ["tokenizer_sha256"])
+def test_legacy_prompt_tokenizer_provenance_is_optional(tmp_path: Path, field: str) -> None:
     config, processes = configuration(tmp_path), Processes()
     rows = [json.loads(line) for line in config.student_prompts.read_text().splitlines()]
     rows[0].pop(field, None)
     config.student_prompts.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    with pytest.raises(ValueError, match="tokenizer"):
-        run_wave(config, runner=processes)
-    assert not processes.commands
+    run_wave(config, runner=processes)
+    assert processes.phases == ["sample", "score", "train", "evaluate"]
 
 
 @pytest.mark.parametrize("stage", ["sample", "score"])

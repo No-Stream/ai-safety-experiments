@@ -29,7 +29,7 @@ from reward_hacking.interp.jsonl_resume import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
 IDENTITY: dict[str, Any] = {"command": "generate", "seed": 0, "condition_keys": ["none", "steer"]}
@@ -74,6 +74,82 @@ class TestIdentity:
             resume_records(records_path, identity={**IDENTITY, "seed": 1}, unit_of=_unit)
         with pytest.raises(ResumeMismatchError, match="extra"):
             resume_records(records_path, identity={**IDENTITY, "extra": 1}, unit_of=_unit)
+
+    def test_legacy_identity_migrates_after_semantic_records_are_checked(
+        self, tmp_path: Path
+    ) -> None:
+        records_path = tmp_path / "records.jsonl"
+        legacy_identity = {
+            "stage": "steer",
+            "model": "synthetic/model",
+            "adapter": "/old/worktree/adapter",
+            "prompts_sha256": "serialization-only-digest",
+        }
+        records_path.write_text(json.dumps({"unit": "one", "prompt_token_ids": [4, 9]}) + "\n")
+        ledger = ResumeLedger(ledger_path_for(records_path), legacy_identity, completed={"one": 1})
+        ledger.write()
+        wanted = {
+            "stage": "steer",
+            "model": "synthetic/model",
+            "adapter_weights_identity": "loaded-weights",
+            "selected_prompt_token_ids": [{"item_id": "one", "token_ids": [4, 9]}],
+        }
+
+        def legacy_semantics_match(
+            expected: Mapping[str, Any],
+            found: Mapping[str, Any],
+            records: Sequence[Mapping[str, Any]],
+        ) -> bool:
+            return (
+                found.get("prompts_sha256") is not None
+                and expected["model"] == found.get("model")
+                and all(record["prompt_token_ids"] == [4, 9] for record in records)
+            )
+
+        state, migrated = resume_records(
+            records_path,
+            identity=wanted,
+            unit_of=_unit,
+            legacy_identity_compatible=legacy_semantics_match,
+        )
+
+        assert state.n_kept == 1
+        assert migrated.identity == wanted
+
+    def test_legacy_identity_migration_refuses_changed_prompt_tokens(self, tmp_path: Path) -> None:
+        records_path = tmp_path / "records.jsonl"
+        legacy_identity = {
+            "stage": "steer",
+            "model": "synthetic/model",
+            "adapter": "/old/worktree/adapter",
+            "prompts_sha256": "serialization-only-digest",
+        }
+        records_path.write_text(json.dumps({"unit": "one", "prompt_token_ids": [4, 9]}) + "\n")
+        ResumeLedger(ledger_path_for(records_path), legacy_identity, completed={"one": 1}).write()
+        wanted = {
+            "stage": "steer",
+            "model": "synthetic/model",
+            "adapter_weights_identity": "loaded-weights",
+            "selected_prompt_token_ids": [{"item_id": "one", "token_ids": [4, 10]}],
+        }
+
+        def legacy_semantics_match(
+            expected: Mapping[str, Any],
+            found: Mapping[str, Any],
+            records: Sequence[Mapping[str, Any]],
+        ) -> bool:
+            wanted_tokens = expected["selected_prompt_token_ids"][0]["token_ids"]
+            return found.get("prompts_sha256") is not None and all(
+                record["prompt_token_ids"] == wanted_tokens for record in records
+            )
+
+        with pytest.raises(ResumeMismatchError, match="different configuration"):
+            resume_records(
+                records_path,
+                identity=wanted,
+                unit_of=_unit,
+                legacy_identity_compatible=legacy_semantics_match,
+            )
 
 
 class TestResumeState:

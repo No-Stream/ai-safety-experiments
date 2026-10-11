@@ -59,6 +59,7 @@ from reward_hacking.interp.lens_fit_gate import (
     jlens_provenance,
 )
 from reward_hacking.interp.lens_fit_runtime import (
+    FitIdentityError,
     device_facts,
     fit_with_resume_identity,
     reconstruction_read_payload,
@@ -815,25 +816,16 @@ class TestGenericLensRuntime:
             "total_vram_bytes": 0,
         }
 
-    def test_adapter_base_must_match_model_id_or_loaded_source(self, tmp_path: Path) -> None:
+    def test_adapter_source_path_does_not_change_loaded_model_identity(self) -> None:
         class ConfiguredModel(nn.Module):
             config: SimpleNamespace
 
         model = ConfiguredModel()
-        model.config = SimpleNamespace(_name_or_path="org/base-model")
-        lens_fit_runtime.assert_adapter_base_matches("org/base-model", "alias/base-model", model)
-
-        local_base = tmp_path / "base-model"
-        (local_base / "nested").mkdir(parents=True)
-        model.config._name_or_path = str(local_base)
-        lens_fit_runtime.assert_adapter_base_matches(
-            str(local_base / "nested" / ".."), "org/other-model", model
-        )
-
-        with pytest.raises(ValueError, match="matches neither"):
-            lens_fit_runtime.assert_adapter_base_matches(
-                "org/wrong-size-model", "org/base-model", model
-            )
+        model.config = SimpleNamespace(model_type="toy", _name_or_path="/old/worktree/model")
+        model.register_parameter("weight", nn.Parameter(torch.ones(2, 2)))
+        before = weights_fingerprint("/old/worktree/model", model)
+        model.config._name_or_path = "/new/worktree/model"
+        assert weights_fingerprint("/new/worktree/model", model) == before
 
     def test_noncontiguous_parameter_hash_matches_logical_contiguous_contents(
         self, monkeypatch: pytest.MonkeyPatch
@@ -875,7 +867,19 @@ class TestGenericLensRuntime:
             checkpoint_every=1,
             resume=True,
         )
-        identity = {"weights_fingerprint": "a" * 64, "source_layers": [8, 10]}
+        identity = {
+            "weights_fingerprint": "a" * 64,
+            "weights_fingerprint_semantics": "loaded-parameters-effective-config-v2",
+            "tokenizer_sha256": "t" * 64,
+            "selected_text_sha256": "p" * 64,
+            "n_prompts_requested": 1,
+            "source_layers": [8, 10],
+            "target_layer": 12,
+            "dim_batch": 4,
+            "max_seq_len": 16,
+            "skip_first": 1,
+            "halves": False,
+        }
         fit_with_resume_identity(
             config,
             object(),
@@ -886,7 +890,6 @@ class TestGenericLensRuntime:
         )
         assert json.loads(identity_path.read_text()) == identity
         assert len(jl.calls) == 1
-
         with pytest.raises(RuntimeError, match="fit identity differs"):
             fit_with_resume_identity(
                 config,
@@ -897,6 +900,134 @@ class TestGenericLensRuntime:
                 identity_path=identity_path,
             )
         assert len(jl.calls) == 1
+
+    def test_resume_ignores_code_and_jlens_checkout_provenance(self, tmp_path: Path) -> None:
+        class StubJlens:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def fit(self, model: object, prompts: list[str], **kwargs: object) -> object:
+                self.calls.append({"model": model, "prompts": prompts, **kwargs})
+                return object()
+
+        jl = StubJlens()
+        identity_path = tmp_path / "fit-identity.json"
+        config = JacobianConfig(
+            max_fit_prompts=1,
+            checkpoint_path=tmp_path / "checkpoint.pt",
+            checkpoint_every=1,
+            resume=True,
+        )
+        semantic_identity = {
+            "weights_fingerprint": "a" * 64,
+            "weights_fingerprint_semantics": "loaded-parameters-effective-config-v2",
+            "tokenizer_sha256": "t" * 64,
+            "selected_text_sha256": "p" * 64,
+            "n_prompts_requested": 1,
+            "source_layers": [8, 10],
+            "target_layer": 12,
+            "dim_batch": 4,
+            "max_seq_len": 16,
+            "skip_first": 1,
+            "halves": False,
+        }
+        fit_with_resume_identity(
+            config,
+            object(),
+            ["synthetic prompt"],
+            cast("Any", jl),
+            identity={
+                **semantic_identity,
+                "repo_sha": "before",
+                "implementation_sha256": {"fit.py": "before"},
+                "jlens": {"commit": "before", "dirty": False, "path": "/old/clone"},
+            },
+            identity_path=identity_path,
+        )
+
+        fit_with_resume_identity(
+            config,
+            object(),
+            ["synthetic prompt"],
+            cast("Any", jl),
+            identity={
+                **semantic_identity,
+                "repo_sha": "after",
+                "implementation_sha256": {"fit.py": "after"},
+                "jlens": {"commit": "after", "dirty": True, "path": "/new/clone"},
+            },
+            identity_path=identity_path,
+        )
+        assert len(jl.calls) == 2
+
+    def test_legacy_identity_migrates_on_its_semantic_subset(self, tmp_path: Path) -> None:
+        class StubJlens:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fit(self, model: object, prompts: list[str], **kwargs: object) -> object:
+                self.calls += 1
+                return object()
+
+        jl = StubJlens()
+        identity_path = tmp_path / "fit-identity.json"
+        config = JacobianConfig(max_fit_prompts=1, checkpoint_path=tmp_path / "checkpoint.pt")
+        legacy_identity = {
+            "weights_fingerprint": "opaque-old-combined-fingerprint",
+            "tokenizer_sha256": "t" * 64,
+            "selected_text_sha256": "p" * 64,
+            "n_prompts_requested": 1,
+            "source_layers": [8, 10],
+            "target_layer": 12,
+            "dim_batch": 4,
+            "max_seq_len": 16,
+            "skip_first": 1,
+            "halves": False,
+            "repo_sha": "old-sha",
+            "jlens": {"commit": "old-commit", "path": "/old/clone"},
+        }
+        fit_with_resume_identity(
+            config,
+            object(),
+            ["synthetic prompt"],
+            cast("Any", jl),
+            identity=legacy_identity,
+            identity_path=identity_path,
+        )
+        current_identity = {
+            **{
+                key: value
+                for key, value in legacy_identity.items()
+                if key not in {"weights_fingerprint", "repo_sha", "jlens"}
+            },
+            "weights_fingerprint": "new-loaded-weight-fingerprint",
+            "weights_fingerprint_semantics": "loaded-parameters-effective-config-v2",
+            "repo_sha": "new-sha",
+            "jlens": {"commit": "new-commit", "path": "/new/clone"},
+        }
+
+        fit_with_resume_identity(
+            config,
+            object(),
+            ["synthetic prompt"],
+            cast("Any", jl),
+            identity=current_identity,
+            identity_path=identity_path,
+        )
+
+        assert jl.calls == 2
+        assert json.loads(identity_path.read_text()) == current_identity
+
+        with pytest.raises(RuntimeError, match="selected_text_sha256"):
+            fit_with_resume_identity(
+                config,
+                object(),
+                ["synthetic prompt"],
+                cast("Any", jl),
+                identity={**current_identity, "selected_text_sha256": "q" * 64},
+                identity_path=identity_path,
+            )
+        assert jl.calls == 2
 
     def test_hybrid_gate_reports_nonhybrid_architectures_as_not_applicable(self) -> None:
         class TextConfig:
@@ -979,29 +1110,47 @@ class TestGenericLensRuntime:
         assert payload["passed"] is True
         assert payload["model_type"] == "qwen3_5_text"
 
-    def test_local_base_and_adapter_content_both_determine_fit_identity(
+    def test_fit_identity_uses_loaded_weights_and_effective_config_not_file_serialization(
         self, tmp_path: Path
     ) -> None:
         model_dir = tmp_path / "model"
         model_dir.mkdir()
-        (model_dir / "config.json").write_text("{}")
+        model_config_path = model_dir / "config.json"
+        model_config_path.write_text('{"hidden_size": 2, "model_type": "toy"}\n')
         (model_dir / "model.safetensors").write_bytes(b"base weights")
         adapter_dir = tmp_path / "adapter"
         adapter_dir.mkdir()
-        (adapter_dir / "adapter_config.json").write_text("{}")
+        adapter_config_path = adapter_dir / "adapter_config.json"
+        adapter_config_path.write_text(
+            '{"base_model_name_or_path": "/old/model", "r": 2, "lora_alpha": 4}\n'
+        )
         adapter_weights = adapter_dir / "adapter_model.safetensors"
         adapter_weights.write_bytes(b"adapter weights")
         hf_model = nn.Module()
-        object.__setattr__(hf_model, "config", SimpleNamespace())
+        object.__setattr__(
+            hf_model,
+            "config",
+            SimpleNamespace(model_type="toy", hidden_size=2, _name_or_path=str(model_dir)),
+        )
         linear = nn.Linear(2, 2, bias=False)
         hf_model.add_module("linear", linear)
+        hf_model.register_parameter("lora_A", nn.Parameter(torch.ones(2, 2)))
 
         base_fingerprint = weights_fingerprint(str(model_dir), hf_model)
         with_adapter = weights_fingerprint(str(model_dir), hf_model, adapter_dir)
         assert base_fingerprint != with_adapter
         assert with_adapter == weights_fingerprint(str(model_dir), hf_model, adapter_dir)
 
+        model_config_path.write_text('{  "model_type":"toy", "hidden_size":2 }\n')
+        adapter_config_path.write_text(
+            '{"lora_alpha":4,"r":2,"base_model_name_or_path":"/new/model"}\n'
+        )
+        assert weights_fingerprint(str(model_dir), hf_model, adapter_dir) == with_adapter
+
         adapter_weights.write_bytes(b"changed adapter weights")
+        assert weights_fingerprint(str(model_dir), hf_model, adapter_dir) == with_adapter
+        with torch.no_grad():
+            cast("Any", hf_model).lora_A[0, 0] += 1.0
         assert weights_fingerprint(str(model_dir), hf_model, adapter_dir) != with_adapter
         with torch.no_grad():
             linear.weight[0, 0] += 1.0
@@ -1030,11 +1179,58 @@ class TestGenericLensRuntime:
             )
         assert jl.calls == 0
 
-    def test_remote_base_requires_a_resolved_revision_identity(self) -> None:
+    def test_empty_fit_identity_is_not_treated_as_a_legacy_subset(self, tmp_path: Path) -> None:
+        identity_path = tmp_path / "fit-identity.json"
+        identity_path.write_text("{}\n")
+
+        with pytest.raises(FitIdentityError, match="not a JSON object"):
+            fit_with_resume_identity(
+                JacobianConfig(max_fit_prompts=1),
+                object(),
+                ["synthetic prompt"],
+                cast("Any", object()),
+                identity={"weights_fingerprint": "f" * 64},
+                identity_path=identity_path,
+            )
+
+    def test_sparse_current_fit_identity_cannot_migrate_or_resume(self, tmp_path: Path) -> None:
+        identity_path = tmp_path / "fit-identity.json"
+        identity_path.write_text(
+            json.dumps(
+                {
+                    "weights_fingerprint": "o" * 64,
+                    "weights_fingerprint_semantics": "loaded-parameters-effective-config-v2",
+                }
+            )
+        )
+        identity = {
+            "weights_fingerprint": "f" * 64,
+            "weights_fingerprint_semantics": "loaded-parameters-effective-config-v2",
+            "tokenizer_sha256": "t" * 64,
+            "selected_text_sha256": "p" * 64,
+            "n_prompts_requested": 1,
+            "source_layers": [0],
+            "target_layer": 1,
+            "dim_batch": 1,
+            "max_seq_len": 8,
+            "skip_first": 1,
+            "halves": False,
+        }
+
+        with pytest.raises(FitIdentityError, match="saved identity is missing semantic fields"):
+            fit_with_resume_identity(
+                JacobianConfig(max_fit_prompts=1),
+                object(),
+                ["synthetic prompt"],
+                cast("Any", object()),
+                identity=identity,
+                identity_path=identity_path,
+            )
+
+    def test_remote_model_fingerprint_needs_no_source_revision(self) -> None:
         hf_model = nn.Module()
         object.__setattr__(hf_model, "config", SimpleNamespace())
-        with pytest.raises(RuntimeError, match="resolved commit hash"):
-            weights_fingerprint("org/model", hf_model)
+        assert len(weights_fingerprint("org/model", hf_model)) == 64
 
     def test_unembedding_validation_rejects_nonfinite_and_zero_weights(self) -> None:
         norm = nn.LayerNorm(3)
@@ -1157,7 +1353,7 @@ class TestGatePrompts:
 
 
 class TestJlensProvenance:
-    def test_a_clone_at_another_commit_is_refused(self, tmp_path: Path) -> None:
+    def test_a_clone_at_another_commit_is_recorded(self, tmp_path: Path) -> None:
         clone = tmp_path / "clone"
         (clone / "jlens").mkdir(parents=True)
         (clone / "jlens" / "__init__.py").write_text("")
@@ -1180,8 +1376,8 @@ class TestJlensProvenance:
         )
         fake = types.ModuleType("jlens")
         fake.__file__ = str(clone / "jlens" / "__init__.py")
-        with pytest.raises(GateFailureError, match="not the pinned"):
-            jlens_provenance(fake)
+        facts = jlens_provenance(fake)
+        assert facts["commit"] != facts["pinned_commit"]
 
     def test_a_non_git_directory_records_no_commit(self, tmp_path: Path) -> None:
         (tmp_path / "jlens").mkdir()

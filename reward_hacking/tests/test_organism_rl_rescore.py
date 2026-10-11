@@ -671,3 +671,76 @@ def test_rescore_does_not_count_unmeasured_truth_as_a_hide_edit(measured: bool |
 
     assert repair_counts == {}
     assert hide_edit_counts == {}
+
+
+def test_rescore_reuse_ignores_source_metadata_but_checks_grading_evidence(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record, task, calls = replay_fixture
+    monkeypatch.setattr(rescore, "_load_task", lambda _record: task)
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n")
+    output = rescore.rescore_file(original, jail_backend=None)
+    relocated_trace = tmp_path / "relocated.jsonl"
+    relocated_trace.write_text(Path(cast("str", record["trace_path"])).read_text())
+    changed = {
+        **record,
+        "trace_path": str(relocated_trace),
+        "git_sha": "changed",
+        "run_provenance_sha256": "changed-provenance",
+        "schema_version": 999,
+        "prompt_format_version": 999,
+    }
+    original.write_text(json.dumps(changed) + "\n")
+    assert rescore.rescore_file(original, jail_backend=None) == output
+    assert calls == ["synthetic-write", "grade", "grade"]
+    cast("dict[str, object]", changed["trace_summary"])["submitted_artifact_sha256"] = "b" * 64
+    original.write_text(json.dumps(changed) + "\n")
+    with pytest.raises(ValueError, match="original records changed"):
+        rescore.rescore_file(original, jail_backend=None)
+
+
+def test_legacy_rescore_recomputes_once_without_raw_record_hash_gate(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record, task, calls = replay_fixture
+    monkeypatch.setattr(rescore, "_load_task", lambda _record: task)
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n")
+    output = rescore.rescore_file(original, jail_backend=None)
+    legacy = json.loads(output.read_text())
+    legacy["rescore"].pop("source_inputs")
+    legacy["rescore"]["source_record_sha256"] = "obsolete-byte-digest"
+    output.write_text(json.dumps(legacy) + "\n")
+    assert rescore.rescore_file(original, jail_backend=None) == output
+    assert "source_inputs" in json.loads(output.read_text())["rescore"]
+    assert calls == ["synthetic-write", "grade", "grade"] * 2
+    rescore.rescore_file(original, jail_backend=None)
+    assert calls == ["synthetic-write", "grade", "grade"] * 2
+
+
+def test_rescore_reuse_retains_trace_task_definition(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record, task, _calls = replay_fixture
+    monkeypatch.setattr(rescore, "_load_task", lambda _record: task)
+    trace_path = Path(cast("str", record["trace_path"]))
+    identity = {
+        "record": "organism_episode_identity",
+        "task_definition_sha256": rescore.task_definition_sha256(task),
+    }
+    trace_path.write_text(json.dumps(identity) + "\n" + trace_path.read_text())
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n")
+    rescore.rescore_file(original, jail_backend=None)
+    lines = trace_path.read_text().splitlines()
+    identity["task_definition_sha256"] = "different-task-definition"
+    trace_path.write_text(json.dumps(identity) + "\n" + "\n".join(lines[1:]) + "\n")
+    with pytest.raises(ValueError, match="original records changed"):
+        rescore.rescore_file(original, jail_backend=None)

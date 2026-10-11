@@ -140,6 +140,29 @@ class TestAnchorsSidecar:
         assert (meta["n_anchors"], meta["n_layers"], meta["hidden"]) == (96, LAYERS_9B, HIDDEN_9B)
         assert meta["provenance"]["weights_fingerprint"] == FINGERPRINT_A
 
+    def test_future_schema_with_the_same_gate_layout_loads_but_bad_layout_still_refuses(
+        self, tmp_path: Path
+    ) -> None:
+        gate = StoredDecodeGate(
+            torch.zeros(2, 4, 8),
+            torch.arange(2),
+            "stub/window",
+            provenance=provenance_for("stub/window", n_rows=2),
+        )
+        gate.save(tmp_path)
+        meta_path = tmp_path / GATE_META_FILENAME
+        meta = json.loads(meta_path.read_text())
+        meta["schema"] = 23
+        meta_path.write_text(json.dumps(meta))
+
+        loaded = StoredDecodeGate.load(tmp_path)
+        assert torch.equal(loaded.residuals, gate.residuals)
+
+        meta["n_layers"] = 9
+        meta_path.write_text(json.dumps(meta))
+        with pytest.raises(GateProvenanceError, match="not written together"):
+            StoredDecodeGate.load(tmp_path)
+
     def test_a_gate_without_provenance_cannot_be_written(self, tmp_path: Path) -> None:
         gate = StoredDecodeGate(torch.zeros(2, 4, 8), torch.zeros(2, dtype=torch.long), "stub")
         with pytest.raises(GateProvenanceError, match="no provenance"):
@@ -503,6 +526,12 @@ class TestStoredUnembed:
         assert loaded.rms_eps == 1e-5
         meta_path = tmp_path / UNEMBED_META_FILENAME
         meta = json.loads(meta_path.read_text())
+        meta["schema"] = 17
+        meta_path.write_text(json.dumps(meta))
+        loaded_future, future_fingerprint = StoredUnembed.load(tmp_path)
+        assert future_fingerprint == fingerprint
+        assert torch.equal(loaded_future.lm_head_weight, stored.lm_head_weight)
+
         meta["norm_convention"] = "rmsnorm(x) * w"
         meta_path.write_text(json.dumps(meta))
         with pytest.raises(LensArtifactError, match="plausibly and wrongly"):
@@ -583,9 +612,21 @@ class TestLensProvenance:
         wanted = {**provenance.identity, "dim_batch": 16, "fit_role": ROLE_ANCHOR}
         with pytest.raises(
             LensArtifactError,
-            match=r"fit_role: on disk 'fit', asked 'anchor'; dim_batch: on disk 8, asked 16",
+            match=r"dim_batch: on disk 8, asked 16; fit_role: on disk 'fit', asked 'anchor'",
         ):
             assert_same_fit(loaded, wanted, out_dir=tmp_path)
+        with pytest.raises(
+            LensArtifactError, match="wanted fit identity is missing semantic fields"
+        ):
+            assert_same_fit(loaded, {"corpus_digests": loaded.corpus_digests}, out_dir=tmp_path)
+        payload = json.loads((tmp_path / PROVENANCE_FILENAME).read_text())
+        payload["schema"] = 12
+        (tmp_path / PROVENANCE_FILENAME).write_text(json.dumps(payload))
+        assert LensProvenance.load(tmp_path) == provenance
+        del payload["corpus_digests"]
+        (tmp_path / PROVENANCE_FILENAME).write_text(json.dumps(payload))
+        with pytest.raises(LensArtifactError, match=r"lacks .*corpus_digests"):
+            LensProvenance.load(tmp_path)
         (tmp_path / PROVENANCE_FILENAME).write_text(json.dumps({"kind": "something-else"}))
         with pytest.raises(LensArtifactError, match="not a schema-1 tmax-lens"):
             LensProvenance.load(tmp_path)
@@ -1062,7 +1103,7 @@ class TestCaptureAnchors:
 
 class TestFitAndWrite:
     def run_fit(
-        self, tmp_path: Path, *, jl: StubJlens | None = None
+        self, tmp_path: Path, *, jl: StubJlens | None = None, jlens_commit: str = "581d398abc"
     ) -> tuple[LensProvenance, Path, StubJlens]:
         jl = jl or StubJlens()
         hf = ToyHF()
@@ -1077,7 +1118,7 @@ class TestFitAndWrite:
             jl=cast("Any", jl),
             out_dir=out_dir,
             corpus_dir=tmp_path / "corpus",
-            jlens_facts={"path": "/stub", "commit": "581d398abc", "pinned_commit": "581d398"},
+            jlens_facts={"path": "/stub", "commit": jlens_commit, "pinned_commit": "581d398"},
             kernel_bridge={"stub": True},
             invocation="test",
         )
@@ -1114,7 +1155,7 @@ class TestFitAndWrite:
         with pytest.raises(GateProvenanceError, match="cannot gate residuals from another"):
             assert_gate_matches_weights(bundle.gate, FINGERPRINT_B, what="cell tmax")
 
-    def test_partial_fit_identity_binds_repo_and_source_implementations(
+    def test_partial_fit_identity_records_repo_and_source_implementations_without_gating(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         class InterruptedJlens(StubJlens):
@@ -1155,10 +1196,10 @@ class TestFitAndWrite:
             "source_implementation_sha256",
             lambda *args, **kwargs: changed_hashes,
         )
+        monkeypatch.setattr(tmax_lens_fit, "git_sha", lambda: "unrelated-new-commit")
         resumed = StubJlens()
-        with pytest.raises(RuntimeError, match="fit identity differs"):
-            self.run_fit(tmp_path, jl=resumed)
-        assert resumed.fit_calls == []
+        self.run_fit(tmp_path, jl=resumed, jlens_commit="compatible-new-commit")
+        assert len(resumed.fit_calls) == 1
 
     def test_a_relaunch_skips_the_fit_and_a_different_fit_into_the_same_directory_is_refused(
         self, tmp_path: Path

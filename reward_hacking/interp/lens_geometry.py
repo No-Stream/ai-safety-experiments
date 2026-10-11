@@ -478,11 +478,26 @@ class StoredDecodeGate:
         """Read a gate back, holding the tensors to what the sidecar says they are."""
         meta_path = out_dir / GATE_META_FILENAME
         meta = cast("dict[str, Any]", json.loads(meta_path.read_text()))
-        if meta.get("kind") != GATE_KIND or meta.get("schema") != GATE_SCHEMA:
+        schema = meta.get("schema")
+        if (
+            meta.get("kind") != GATE_KIND
+            or not isinstance(schema, int)
+            or isinstance(schema, bool)
+            or schema < GATE_SCHEMA
+        ):
             raise GateProvenanceError(
                 f"{meta_path} is not a schema-{GATE_SCHEMA} {GATE_KIND} sidecar "
                 f"(kind={meta.get('kind')!r} schema={meta.get('schema')!r})"
             )
+        required_fields = {
+            "n_anchors",
+            "n_layers",
+            "hidden",
+            "residual_dtype",
+            "provenance",
+        }
+        if missing := sorted(required_fields - set(meta)):
+            raise GateProvenanceError(f"{meta_path} lacks {missing}")
         provenance = GateProvenance.from_payload(
             cast("Mapping[str, Any]", meta["provenance"]), source=meta_path
         )

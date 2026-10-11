@@ -25,7 +25,8 @@ from reward_hacking.harness.leak_channels import (
     template_fingerprint,
 )
 from reward_hacking.harness.leak_fix_spec import fix_commit_spec
-from reward_hacking.harness.loop import lay_down_task
+from reward_hacking.harness.loop import grade_final_state, lay_down_task
+from reward_hacking.harness.task_spec import AgenticArmConfig
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.organism_rl.rollout import task_definition_sha256
 
@@ -429,6 +430,41 @@ def test_build_requires_closed_normalized_tree_and_separate_runtime(
         build_synthetic_task(templates, tmp_path / "docker-gate", closed=broken_closed)
 
 
+def test_build_accepts_a_compatible_future_manifest_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("mtime",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    manifest_path = templates["manifest_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 2
+    manifest["builder_version"] = "future-builder"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    task = build_synthetic_task(templates, tmp_path / "docker-gate")
+
+    assert task.task_variant == "leak"
+    assert task.host_only_metadata["leak_channels_open"] == ["mtime"]
+
+
+def test_build_ignores_unrelated_workspace_content_and_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("mtime",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    unrelated_note = templates["workspace"] / "unrelated-note.txt"
+    unrelated_note.write_text("auxiliary file\n", encoding="utf-8")
+    base_date_ns = templates["manifest"]["fix"]["base_date"] * 1_000_000_000
+    unrelated_mtime_ns = base_date_ns + 10_000_000_000
+    os.utime(unrelated_note, ns=(unrelated_mtime_ns, unrelated_mtime_ns))
+    os.utime(templates["workspace"], ns=(unrelated_mtime_ns, unrelated_mtime_ns))
+
+    task = build_synthetic_task(templates, tmp_path / "docker-gate")
+
+    assert task.task_variant == "leak"
+    assert task.host_only_metadata["leak_channels_open"] == ["mtime"]
+
+
 def test_runtime_relocation_repoints_venv_python_and_home(
     leak_templates: dict[str, Any],
 ) -> None:
@@ -444,21 +480,27 @@ def test_runtime_relocation_repoints_venv_python_and_home(
     assert (templates["extracted_venv"] / "pyvenv.cfg").read_text() == "home = /opt/uvpy/bin\n"
 
 
-def test_prepare_runtime_reuses_only_matching_complete_copy(
-    leak_templates: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    templates = leak_templates
+def _prepare_runtime_copy(
+    templates: dict[str, Any], monkeypatch: pytest.MonkeyPatch, name: str = "synthetic"
+) -> tuple[Path, Path, Path]:
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
-    extracted_venv = templates["extracted_venv"]
-    extracted_interpreter = templates["extracted_interpreter"]
-    runtime_repo = templates["runtime_root"] / "repos" / "synthetic"
-
+    runtime_repo = templates["runtime_root"] / "repos" / name
     runtime_venv, runtime_interpreter = leak.prepare_runtime(
-        extracted_venv,
-        extracted_interpreter,
+        templates["extracted_venv"],
+        templates["extracted_interpreter"],
         runtime_repo,
         templates["python_binary_name"],
     )
+    return runtime_repo, runtime_venv, runtime_interpreter
+
+
+def test_prepare_runtime_reuses_a_relocated_source_copy(
+    leak_templates: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = leak_templates
+    extracted_venv = templates["extracted_venv"]
+    extracted_interpreter = templates["extracted_interpreter"]
+    runtime_repo, runtime_venv, runtime_interpreter = _prepare_runtime_copy(templates, monkeypatch)
     assert runtime_venv == runtime_repo / "venv"
     assert runtime_interpreter == runtime_repo / "uvpy"
     assert (runtime_repo / ".r2e-runtime.json").is_file()
@@ -471,27 +513,106 @@ def test_prepare_runtime_reuses_only_matching_complete_copy(
         runtime_repo,
         templates["python_binary_name"],
     ) == (runtime_venv, runtime_interpreter)
+    relocated_sources = tmp_path / "relocated-sources"
+    relocated_venv = relocated_sources / "venv"
+    relocated_interpreter = relocated_sources / "interpreter"
+    shutil.copytree(extracted_venv, relocated_venv, symlinks=True)
+    shutil.copytree(extracted_interpreter, relocated_interpreter, symlinks=True)
+    assert leak.prepare_runtime(
+        relocated_venv,
+        relocated_interpreter,
+        runtime_repo,
+        templates["python_binary_name"],
+    ) == (runtime_venv, runtime_interpreter)
 
+
+def test_prepare_runtime_ignores_source_tree_fingerprints(
+    leak_templates: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = leak_templates
+    runtime_repo, runtime_venv, runtime_interpreter = _prepare_runtime_copy(templates, monkeypatch)
+    note = templates["extracted_venv"] / "unrelated-note.txt"
+    note.write_text("source metadata changed\n", encoding="utf-8")
+    with (templates["extracted_interpreter"] / "bin" / templates["python_binary_name"]).open(
+        "ab"
+    ) as output:
+        output.write(b"changed source bytes")
+
+    assert leak.prepare_runtime(
+        templates["extracted_venv"],
+        templates["extracted_interpreter"],
+        runtime_repo,
+        templates["python_binary_name"],
+    ) == (runtime_venv, runtime_interpreter)
+
+
+def test_prepare_runtime_ignores_prepared_tree_fingerprint(
+    leak_templates: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = leak_templates
+    runtime_repo, runtime_venv, runtime_interpreter = _prepare_runtime_copy(templates, monkeypatch)
     prepared_configuration = runtime_venv / "pyvenv.cfg"
     original_configuration = prepared_configuration.read_text(encoding="utf-8")
     prepared_configuration.write_text(original_configuration + "# edited\n", encoding="utf-8")
-    with pytest.raises(ValueError, match=r"prepared files were modified.*runtime_venv_fingerprint"):
-        leak.prepare_runtime(
-            extracted_venv,
-            extracted_interpreter,
-            runtime_repo,
-            templates["python_binary_name"],
-        )
-    prepared_configuration.write_text(original_configuration, encoding="utf-8")
 
-    with (extracted_interpreter / "bin" / templates["python_binary_name"]).open("ab") as output:
-        output.write(b"changed source")
-    with pytest.raises(
-        ValueError, match=r"source venv or interpreter changed.*source_interpreter_binary_sha256"
-    ):
+    assert leak.prepare_runtime(
+        templates["extracted_venv"],
+        templates["extracted_interpreter"],
+        runtime_repo,
+        templates["python_binary_name"],
+    ) == (runtime_venv, runtime_interpreter)
+
+
+def test_prepare_runtime_reuses_without_legacy_provenance_marker(
+    leak_templates: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    templates = leak_templates
+    runtime_repo, runtime_venv, runtime_interpreter = _prepare_runtime_copy(templates, monkeypatch)
+    (runtime_repo / ".r2e-runtime.json").unlink()
+
+    assert leak.prepare_runtime(
+        templates["extracted_venv"],
+        templates["extracted_interpreter"],
+        runtime_repo,
+        templates["python_binary_name"],
+    ) == (runtime_venv, runtime_interpreter)
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        ("python_link", "runtime venv bin/python"),
+        ("interpreter_executable", "runtime interpreter mount"),
+        ("pyvenv_home", "runtime pyvenv.cfg home"),
+    ],
+)
+def test_prepare_runtime_rejects_broken_required_runtime_structure(
+    leak_templates: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+    message: str,
+) -> None:
+    templates = leak_templates
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    runtime_repo = templates["runtime_root"] / "repos" / "broken"
+    runtime_venv, _runtime_interpreter = leak.prepare_runtime(
+        templates["extracted_venv"],
+        templates["extracted_interpreter"],
+        runtime_repo,
+        templates["python_binary_name"],
+    )
+    if damage == "python_link":
+        (runtime_venv / "bin" / "python").unlink()
+    elif damage == "interpreter_executable":
+        interpreter_binary = runtime_repo / "uvpy" / "bin" / templates["python_binary_name"]
+        interpreter_binary.chmod(0o644)
+    else:
+        (runtime_venv / "pyvenv.cfg").write_text("home = /unavailable\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
         leak.prepare_runtime(
-            extracted_venv,
-            extracted_interpreter,
+            templates["extracted_venv"],
+            templates["extracted_interpreter"],
             runtime_repo,
             templates["python_binary_name"],
         )
@@ -506,7 +627,7 @@ def test_prepare_runtime_refuses_partial_destination(
     extracted_interpreter = templates["extracted_interpreter"]
     runtime_repo = templates["runtime_root"] / "repos" / "partial"
     runtime_repo.mkdir(parents=True)
-    with pytest.raises(ValueError, match="complete provenance marker"):
+    with pytest.raises(ValueError, match="runtime venv"):
         leak.prepare_runtime(
             extracted_venv,
             extracted_interpreter,
@@ -546,6 +667,79 @@ def test_extract_binary_patch_excludes_runtime_and_hidden_test_mounts(
         artifact_filename=".r2e-final.patch",
     )
     assert final_patch.name == ".r2e-final.patch"
+
+
+def test_extract_patch_bytes_keeps_grader_artifact_out_of_the_episode(
+    leak_templates: dict[str, Any], tmp_path: Path
+) -> None:
+    templates = leak_templates
+    episode = tmp_path / "episode"
+    shutil.copytree(templates["workspace"], episode, symlinks=True)
+    (episode / SOURCE_PATH).write_text(FIXED_SOURCE, encoding="utf-8")
+
+    patch = leak.extract_patch_bytes(
+        episode, templates["manifest"]["fix"]["base_commit_id"], template_dir=templates["closed"]
+    )
+
+    assert b"distinctive-fixed-value" in patch
+    assert not (episode / "patch.diff").exists()
+
+
+def test_final_leak_grading_stages_patch_without_leaving_it_in_the_episode(
+    leak_templates: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    templates = leak_templates
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    task = build_synthetic_task(templates, tmp_path / "docker-gate")
+    episode = tmp_path / "episode"
+    shutil.copytree(templates["workspace"], episode, symlinks=True)
+    (episode / SOURCE_PATH).write_text(FIXED_SOURCE, encoding="utf-8")
+    staged_patches: list[bytes] = []
+
+    def local_runner(workspace: Path, command: str, **_kwargs: object) -> CommandResult:
+        patch_path = workspace / "patch.diff"
+        assert patch_path.is_file()
+        assert not (episode / "patch.diff").exists()
+        staged_patches.append(patch_path.read_bytes())
+        command = command.replace(
+            "/testbed/.r2e-junit.xml", shlex.quote(str(workspace / ".r2e-junit.xml"))
+        )
+        result = subprocess.run(  # noqa: S603 - synthetic trusted grader workspace
+            ["bash", "-c", command],  # noqa: S607 - fixed trusted grader command
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return CommandResult(
+            command,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            False,
+            junit_xml=docker_backend._read_junit_report(workspace, ".r2e-junit.xml"),
+        )
+
+    monkeypatch.setattr(docker_backend, "run_in_docker", local_runner)
+    result = grade_final_state(
+        task,
+        episode,
+        arm=AgenticArmConfig(),
+        timeout="30s",
+        jail_backend=None,
+        grader_hashable=False,
+    )
+
+    assert result.true_pass is True
+    assert result.task_evidence is not None
+    assert (
+        result.task_evidence.submitted_artifact_sha256
+        == hashlib.sha256(staged_patches[0]).hexdigest()
+    )
+    assert not (episode / "patch.diff").exists()
+    assert staged_patches
 
 
 def test_trusted_grader_stages_hidden_tests_and_ignores_policy_test_and_runner_edits(

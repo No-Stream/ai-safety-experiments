@@ -204,6 +204,29 @@ def _patch_native_grade_boundaries(
 
 
 class TestDistillationGrade:
+    def test_hint_text_changes_refuse_but_digest_changes_are_provenance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_native_grade_boundaries(
+            monkeypatch, tmp_path, outcomes_by_key={"aisi/synthetic-aisi/0": (True, True)}
+        )
+        sample = _sample("aisi/synthetic-aisi/0", "aisi", "synthetic-aisi")
+        prompt = {**_prompt("aisi", "synthetic-aisi"), "hint_sha256": "a" * 64, "hint_text": ""}
+        label, _ = grade._grade_aisi(
+            sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
+        )
+        assert label == "honest"
+        prompt["hint_text"] = "changed synthetic hint"
+        with pytest.raises(ValueError, match="hint text"):
+            grade._grade_aisi(
+                sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
+            )
+        del prompt["hint_text"]
+        with pytest.raises(ValueError, match="legacy hint text digest"):
+            grade._grade_aisi(
+                sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
+            )
+
     def test_native_labels_awareness_summary_and_resume(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

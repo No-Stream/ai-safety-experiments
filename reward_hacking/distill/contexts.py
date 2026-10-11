@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from reward_hacking.semantic_identity import tokenizer_inputs
+
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
@@ -135,6 +137,9 @@ def build_contexts(  # noqa: PLR0913 - explicit rendering inputs and tokenizer p
         character not in "0123456789abcdef" for character in tokenizer_sha256
     ):
         raise ValueError("tokenizer_sha256 must be a SHA-256 hex digest")
+    local_tokenizer_inputs = (
+        tokenizer_inputs(Path(tokenizer_identity)) if Path(tokenizer_identity).is_dir() else None
+    )
     corpora: dict[str, list[dict[str, object]]] = {"student": [], "teacher": []}
     split: dict[str, list[list[str]]] = {"train": [], "held_out": []}
     seen: set[tuple[str, str]] = set()
@@ -159,6 +164,11 @@ def build_contexts(  # noqa: PLR0913 - explicit rendering inputs and tokenizer p
                     "prompt_text": prompt_text,
                     "tokenizer_identity": tokenizer_identity,
                     "tokenizer_sha256": tokenizer_sha256,
+                    **(
+                        {"tokenizer_inputs": local_tokenizer_inputs}
+                        if local_tokenizer_inputs is not None
+                        else {}
+                    ),
                     "chat_template_kwargs": template_kwargs,
                 }
             )

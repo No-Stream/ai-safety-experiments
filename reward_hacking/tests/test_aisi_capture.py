@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -346,31 +347,166 @@ def test_resume_skips_completed_record_keys(tmp_path: Path) -> None:
     ]
 
 
-def test_resume_refuses_changed_sample_identity(tmp_path: Path) -> None:
+def test_resume_accepts_reformatted_samples_but_refuses_changed_semantic_sample(
+    tmp_path: Path,
+) -> None:
     index_path = tmp_path / "activation-index.json"
-    records = [{"record_key": "model\x00problem\x000"}]
+    records = [
+        {
+            "record_key": "model\x00problem\x000",
+            "completion_text": "synthetic solution",
+            "reward_hacked": False,
+            "hack_regexes_fired": [],
+            "hardened_reward_hacked": False,
+        }
+    ]
     load_or_create_capture_index(
         index_path,
         identity={
             "base_model": "base-model",
             "adapter": None,
-            "sample_file_sha256": "first-digest",
+            "sample_records": [
+                {key: value for key, value in records[0].items() if key != "record_key"}
+            ],
         },
         records=records,
         position_names=("last_prompt",),
     )
 
+    reformatted_identity = {
+        "base_model": "base-model",
+        "adapter": None,
+        "sample_records": [
+            {key: value for key, value in records[0].items() if key != "record_key"}
+        ],
+        "sample_file_sha256": "new-format-digest",
+    }
+    resumed_index = load_or_create_capture_index(
+        index_path,
+        identity=reformatted_identity,
+        records=records,
+        position_names=("last_prompt",),
+    )
+    assert resumed_index["identity"]["sample_records"] == reformatted_identity["sample_records"]
+
+    changed_record = {**records[0], "completion_text": "changed synthetic solution"}
     with pytest.raises(ValueError, match="identity"):
         load_or_create_capture_index(
             index_path,
             identity={
                 "base_model": "base-model",
                 "adapter": None,
-                "sample_file_sha256": "changed-digest",
+                "sample_records": [
+                    {key: value for key, value in changed_record.items() if key != "record_key"}
+                ],
             },
             records=records,
             position_names=("last_prompt",),
         )
+
+
+def test_legacy_capture_index_checks_saved_token_semantics_before_migration(
+    tmp_path: Path,
+) -> None:
+    record_key = "model\x00problem\x000"
+    records = [
+        {
+            "record_key": record_key,
+            "completion_text": "changed completion with the same labels",
+            "reward_hacked": False,
+            "hack_regexes_fired": [],
+            "hardened_reward_hacked": False,
+        }
+    ]
+    index_path = tmp_path / "legacy-activation-index.json"
+    index = load_or_create_capture_index(
+        index_path,
+        identity={
+            "base_model": "base-model",
+            "adapter": None,
+            "model": "model",
+            "sample_file_sha256": "old-serialized-file-digest",
+        },
+        records=records,
+        position_names=("last_prompt", "completion_mean"),
+    )
+    index["records"][record_key] = {
+        "row": 0,
+        "positions": {"last_prompt": 0},
+        "masks": {"last_prompt": True},
+        "prompt_token_count": 1,
+        "completion_token_range": [1, 2],
+        "completion_token_ids": [1],
+        "completion_char_offsets": [[0, 1]],
+        "labels": {
+            "reward_hacked": False,
+            "hack_regexes_fired": [],
+            "hardened_reward_hacked": False,
+        },
+    }
+    index["complete_record_keys"] = [record_key]
+    index["complete"] = True
+    legacy_identity = index["identity"]
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    current_identity = {
+        "base_model": "base-model",
+        "adapter": None,
+        "model": "model",
+        "sample_records": [
+            {key: value for key, value in records[0].items() if key != "record_key"}
+        ],
+    }
+    saved_metadata = index["records"][record_key]
+    migrated_index = load_or_create_capture_index(
+        index_path,
+        identity=current_identity,
+        records=records,
+        position_names=("last_prompt", "completion_mean"),
+        legacy_expected_metadata={record_key: saved_metadata},
+    )
+    assert migrated_index["identity"] == current_identity
+
+    migrated_index["identity"] = legacy_identity
+    index_path.write_text(json.dumps(migrated_index), encoding="utf-8")
+    current_metadata = {**saved_metadata, "completion_token_ids": [2]}
+
+    with pytest.raises(ValueError, match="token and position metadata differs"):
+        load_or_create_capture_index(
+            index_path,
+            identity=current_identity,
+            records=records,
+            position_names=("last_prompt", "completion_mean"),
+            legacy_expected_metadata={record_key: current_metadata},
+        )
+
+
+def test_capture_index_uses_compatible_schema_tags_when_the_layout_matches(tmp_path: Path) -> None:
+    record = {
+        "record_key": "model\x00problem\x000",
+        "completion_text": "solution",
+        "reward_hacked": False,
+        "hack_regexes_fired": [],
+        "hardened_reward_hacked": False,
+    }
+    index_path = tmp_path / "compatible-schema-index.json"
+    identity = {"base_model": "base-model", "adapter": None, "model": "model"}
+    created = load_or_create_capture_index(
+        index_path,
+        identity=identity,
+        records=[record],
+        position_names=("last_prompt",),
+    )
+    created["schema_version"] = 2
+    index_path.write_text(json.dumps(created), encoding="utf-8")
+
+    resumed = load_or_create_capture_index(
+        index_path,
+        identity=identity,
+        records=[record],
+        position_names=("last_prompt",),
+    )
+
+    assert resumed["schema_version"] == 2
 
 
 def test_capture_model_resumes_without_reloading_a_completed_record(
@@ -421,8 +557,12 @@ def test_capture_model_resumes_without_reloading_a_completed_record(
             model_id=BASE_MODEL,
             records=[record],
             source=source,
-            problem_by_id={},
-            sample_file_sha256="synthetic-digest",
+            problem_by_id={
+                "synthetic-problem": SimpleNamespace(
+                    description="Synthetic problem description",
+                    test_assertions=("assert solution() == 1",),
+                )
+            },
             generated_limit=2,
         )
 

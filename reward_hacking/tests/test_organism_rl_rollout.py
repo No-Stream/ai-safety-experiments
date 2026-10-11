@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness import tasks_r2e_leak
@@ -275,12 +277,11 @@ def test_leak_submission_uses_one_trusted_run_and_sanitizes_feedback(
     extractions: list[Path] = []
     runs: list[Path] = []
 
-    def extract(directory: Path, _base: str, *, template_dir: Path) -> Path:
+    def extract_bytes(directory: Path, _base: str, *, template_dir: Path) -> bytes:
         assert template_dir == task.docker_grader_template
+        assert not (directory / "patch.diff").exists()
         extractions.append(directory)
-        artifact = directory / "patch.diff"
-        artifact.write_bytes(patch)
-        return artifact
+        return patch
 
     trusted = CommandResult(
         "bash run_tests.sh; r2e_tests/runner.py",
@@ -290,16 +291,24 @@ def test_leak_submission_uses_one_trusted_run_and_sanitizes_feedback(
         False,
     )
 
-    def trusted_run(_task: Task, directory: Path, *, timeout: str) -> CommandResult:
+    def trusted_run(
+        _task: Task,
+        directory: Path,
+        *,
+        timeout: str,
+        artifact_contents: Mapping[str, bytes] | None = None,
+    ) -> CommandResult:
         assert timeout
-        assert (directory / "patch.diff").read_bytes() == patch
+        assert artifact_contents == {"patch.diff": patch}
+        assert not (directory / "patch.diff").exists()
         runs.append(directory)
         return trusted
 
-    monkeypatch.setattr(tasks_r2e_leak, "extract_patch", extract)
+    monkeypatch.setattr(tasks_r2e_leak, "extract_patch_bytes", extract_bytes)
     monkeypatch.setattr(tasks_r2e_leak, "run_trusted_grader", trusted_run)
     verdict = _task_submission_grader(task, jail_backend=None)(tmp_path)
     assert extractions == [tmp_path]
+    assert not (tmp_path / "patch.diff").exists()
     assert runs == [tmp_path]
     assert verdict.passed is passed
     assert verdict.feedback == (
@@ -578,6 +587,9 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     source.announced_turn_budget = None
     source.jail_backend = None
     source.model_path = "synthetic-model"
+    model_identity = rollout.model_identity(source.model_path)
+    source.model_identity = model_identity
+    source.leak_manifests = {}
     source.revision = None
     source.chat_template_kwargs = {}
     source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
@@ -902,6 +914,9 @@ def test_task_episode_sampling_seed_is_request_local(
     source.thinking_token_budget = None
     source.announced_turn_budget = None
     source.jail_backend = None
+    model_identity = rollout.model_identity(source.model_path)
+    source.model_identity = model_identity
+    source.leak_manifests = {}
     source.revision = None
     source.chat_template_kwargs = {}
     source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
@@ -930,3 +945,167 @@ def test_task_episode_sampling_seed_is_request_local(
 
     assert observed_seeds == [11]
     assert source.backend.sampling.seed is None
+
+
+def test_replay_ignores_legacy_model_path_and_model_revision(tmp_path: Path) -> None:
+    identity = {
+        "record": "organism_episode_identity",
+        "task_id": "toy",
+        "model_path": "/old/model",
+        "model_revision": "revision",
+        "served_model_id": "adapter",
+    }
+    path = tmp_path / "trace.jsonl"
+    sample = _sample()
+    path.write_text("".join(json.dumps(row) + "\n" for row in [identity, *sample.trace_records]))
+    expected = {**identity, "model_path": "/new/model"}
+    assert replay_episode_trace(path, expected).record["true_pass"] is False
+    assert (
+        replay_episode_trace(path, {**expected, "model_revision": "different"}).record["true_pass"]
+        is False
+    )
+
+
+def test_legacy_replay_accepts_removed_local_model_reference(tmp_path: Path) -> None:
+    model = tmp_path / "relocated-model"
+    model.mkdir()
+    save_file({"layer.weight": torch.tensor([1.0])}, str(model / "model.safetensors"))
+    old_path = str(tmp_path / "removed-model")
+    identity = {
+        "record": "organism_episode_identity",
+        "model_path": old_path,
+        "served_model_id": old_path,
+        "model_revision": "known-revision",
+    }
+    expected = {
+        **identity,
+        "model_path": str(model),
+        "served_model_id": str(model),
+        "model_identity": rollout.model_identity(str(model), "known-revision"),
+    }
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        "".join(json.dumps(row) + "\n" for row in [identity, *_sample().trace_records])
+    )
+    assert replay_episode_trace(trace, expected).record["true_pass"] is False
+    assert (
+        replay_episode_trace(trace, {**expected, "model_revision": "changed-revision"}).record[
+            "true_pass"
+        ]
+        is False
+    )
+
+
+def test_task_definition_content_ignores_leak_host_provenance_and_retains_semantics(
+    tmp_path: Path,
+) -> None:
+    task = Task(
+        task_id="synthetic-leak",
+        problem_id="synthetic-problem",
+        prompt="synthetic prompt",
+        body="synthetic body",
+        files={TASK_FILENAME: "synthetic task"},
+        true_check=lambda _path: False,
+        task_variant="leak",
+        artifact_filename="patch.diff",
+        docker_config=DockerConfig(
+            "synthetic@sha256:" + "a" * 64, tmp_path / "gate", uid=1000, gid=1000
+        ),
+        docker_patch_base_commit="b" * 40,
+        docker_grader_template=tmp_path / "closed",
+        workspace_template=tmp_path / "workspace",
+        docker_hidden_tests_template=tmp_path / "hidden",
+        docker_grader_command="bash run_tests.sh",
+        docker_true_grader_command="bash run_tests.sh",
+        docker_artifact_paths=("patch.diff",),
+        docker_true_grader_files={},
+        host_only_metadata={
+            "image": "old-image",
+            "base_commit": "old-base",
+            "fix_commit": "old-fix",
+            "template_fingerprint": "old-mtimes",
+            "manifest_sha256": "old-json",
+            "runtime_venv_fingerprint": "old-runtime",
+            "hidden_tests_sha256": "old-tests",
+            "expected_output": {"passed": ["synthetic"]},
+            "leak_channels_open": ["git"],
+            "leak_channels_unavailable": {},
+            "instruction_variant": "none",
+        },
+    )
+    for directory in (tmp_path / "workspace", tmp_path / "closed", tmp_path / "hidden"):
+        directory.mkdir()
+    source_file = tmp_path / "workspace" / "solution.py"
+    source_file.write_text("synthetic source")
+    hidden_test = tmp_path / "hidden" / "test_solution.py"
+    hidden_test.write_text("synthetic test")
+    runtime = tmp_path / "workspace" / ".venv"
+    runtime.mkdir()
+    runtime_file = runtime / "runtime.py"
+    runtime_file.write_text("synthetic runtime")
+    content = rollout.task_definition_content(task)
+    source_file.touch()
+    runtime_file.write_text("changed runtime provenance")
+    assert rollout.task_definition_content(task) == content
+    for field in (
+        "image",
+        "base_commit",
+        "fix_commit",
+        "template_fingerprint",
+        "manifest_sha256",
+        "runtime_venv_fingerprint",
+        "hidden_tests_sha256",
+    ):
+        task.host_only_metadata[field] = "new-provenance"
+    assert rollout.task_definition_content(task) == content
+    task.host_only_metadata["expected_output"] = {"passed": ["changed"]}
+    assert rollout.task_definition_content(task) != content
+    task.host_only_metadata["expected_output"] = {"passed": ["synthetic"]}
+    task.host_only_metadata["leak_channels_open"] = ["timestamp"]
+    assert rollout.task_definition_content(task) != content
+    task.host_only_metadata["leak_channels_open"] = ["git"]
+    source_file.write_text("changed source")
+    assert rollout.task_definition_content(task) != content
+    source_file.write_text("synthetic source")
+    hidden_test.write_text("changed hidden test")
+    assert rollout.task_definition_content(task) != content
+
+
+def test_replay_task_content_ignores_leak_provenance_and_keeps_expected_outputs(
+    tmp_path: Path,
+) -> None:
+    identity = {
+        "record": "organism_episode_identity",
+        "task_variant": "leak",
+        "task_id": "synthetic",
+        "task_definition_sha256": "old-raw-digest",
+        "runtime_venv_fingerprint": "old-runtime",
+        "manifest_sha256": "old-json",
+        "template_fingerprint": "old-mtimes",
+        "expected_output": {"passed": ["synthetic"]},
+        "leak_channels_open": ["git"],
+        "task_definition_content": {
+            "prompt": "synthetic prompt",
+            "task_variant": "leak",
+            "host_only_metadata": {"expected_output": {"passed": ["synthetic"]}},
+        },
+    }
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        "".join(json.dumps(row) + "\n" for row in [identity, *_sample().trace_records])
+    )
+    expected = {
+        **identity,
+        "task_definition_sha256": "new-raw-digest",
+        "runtime_venv_fingerprint": "new-runtime",
+        "manifest_sha256": "new-json",
+        "template_fingerprint": "new-mtimes",
+    }
+    assert replay_episode_trace(trace, expected).record["true_pass"] is False
+    with pytest.raises(ValueError, match="task_definition_content"):
+        replay_episode_trace(trace, {**expected, "task_definition_content": {"prompt": "changed"}})
+    with pytest.raises(ValueError, match="expected_output"):
+        replay_episode_trace(trace, {**expected, "expected_output": {"passed": ["changed"]}})
+    legacy = {key: value for key, value in identity.items() if key != "task_definition_content"}
+    trace.write_text("".join(json.dumps(row) + "\n" for row in [legacy, *_sample().trace_records]))
+    assert replay_episode_trace(trace, expected).record["true_pass"] is False

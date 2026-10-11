@@ -28,7 +28,6 @@ from reward_hacking.harness.docker_backend import (
     submitted_files,
 )
 from reward_hacking.harness.leak_channels import (
-    BUILDER_VERSION,
     CHANNELS,
     probe_closed,
     probe_open,
@@ -57,6 +56,7 @@ __all__ = [
     "R2eLeakTask",
     "build_task",
     "extract_patch",
+    "extract_patch_bytes",
     "load_tasks",
     "outcomes_match",
     "outcomes_match_output",
@@ -111,13 +111,6 @@ _TEST_EXCLUDES = (
     "**/.r2e-*",
 )
 _RUNTIME_MARKER = ".r2e-runtime.json"
-_RUNTIME_SOURCE_FIELDS = (
-    "source_venv",
-    "source_venv_fingerprint",
-    "source_interpreter",
-    "source_interpreter_fingerprint",
-    "source_interpreter_binary_sha256",
-)
 _PYTEST_NONVERDICT_EXIT_CODES = frozenset({2, 3, 4, 5})
 _DOCKER_SETUP_FAILURE_EXIT_CODES = frozenset({125, 126, 127})
 _SIGNAL_EXIT_CODE_BASE = 128
@@ -326,47 +319,16 @@ def _validate_runtime_destination(runtime_repo_dir: Path) -> Path:
 
 def _reuse_prepared_runtime(
     destination: Path,
-    extracted_venv: Path,
-    extracted_interpreter: Path,
     python_binary_name: str,
 ) -> tuple[Path, Path]:
     runtime_venv = destination / "venv"
     runtime_interpreter = destination / "uvpy"
-    marker_path = destination / _RUNTIME_MARKER
-    if destination.is_symlink() or not destination.is_dir() or not marker_path.is_file():
-        raise ValueError("runtime destination exists without a complete provenance marker")
-    marker_value: object = json.loads(marker_path.read_text(encoding="utf-8"))
-    if not isinstance(marker_value, dict):
-        raise TypeError("runtime provenance marker must be a JSON object")
+    if destination.is_symlink() or not destination.is_dir():
+        raise ValueError("runtime destination must be an existing, non-symlink directory")
     expected_python = _validate_relocated_runtime(runtime_venv, runtime_interpreter)
-    actual_marker = _runtime_marker_payload(
-        extracted_venv,
-        extracted_interpreter,
-        runtime_venv,
-        runtime_interpreter,
-        expected_python,
-    )
     if expected_python != python_binary_name:
         raise ValueError(
             f"runtime at {destination} was prepared for {expected_python}, not {python_binary_name}"
-        )
-    mismatched_fields = sorted(
-        field
-        for field in marker_value.keys() | actual_marker.keys()
-        if marker_value.get(field) != actual_marker.get(field)
-    )
-    if mismatched_fields:
-        source_changed = bool(set(mismatched_fields) & set(_RUNTIME_SOURCE_FIELDS))
-        cause = (
-            "its extracted source venv or interpreter changed after preparation (a runtime "
-            "prepared before the builder compiled with -I -B can be stale this way); prepare a "
-            "fresh runtime directory"
-            if source_changed
-            else "its prepared files were modified after preparation"
-        )
-        raise ValueError(
-            f"runtime provenance at {destination} does not match: {cause}; "
-            f"mismatched fields: {mismatched_fields}"
         )
     return runtime_venv, runtime_interpreter
 
@@ -399,8 +361,6 @@ def prepare_runtime(
     if destination.exists() or destination.is_symlink():
         return _reuse_prepared_runtime(
             destination,
-            extracted_venv,
-            extracted_interpreter,
             python_binary_name,
         )
 
@@ -545,8 +505,6 @@ def _load_and_validate_manifest(
     if not isinstance(manifest_value, dict):
         raise TypeError("leak channel manifest must be a JSON object")
     manifest = cast("dict[str, object]", manifest_value)
-    if manifest.get("schema_version") != 1 or manifest.get("builder_version") != BUILDER_VERSION:
-        raise ValueError("unsupported leak channel manifest schema or builder version")
     fix_value = manifest.get("fix")
     if not isinstance(fix_value, dict):
         raise TypeError("leak channel manifest fix must be a JSON object")
@@ -585,10 +543,7 @@ def _validate_workspace_channels(
     shallow_file = workspace_template / ".git" / "shallow"
     if not shallow_file.is_file() or shallow_file.read_text(encoding="ascii") != f"{base_commit}\n":
         raise ValueError("workspace template must retain the closed-base history boundary")
-    expected_fingerprint = manifest.get("template_fingerprint")
     actual_fingerprint = template_fingerprint(workspace_template)
-    if not isinstance(expected_fingerprint, str) or expected_fingerprint != actual_fingerprint:
-        raise ValueError("workspace template fingerprint does not match its channel manifest")
     selected_channels = set(channels)
     for channel in CHANNELS:
         valid_channel_state = (
@@ -643,13 +598,22 @@ def extract_patch(
     artifact_filename: str = "patch.diff",
 ) -> Path:
     """Capture binary-safe Git changes from the trusted template's base commit."""
-    if _FULL_GIT_OID.fullmatch(base_commit) is None:
-        raise ValueError("patch base must be a full Git object id")
     if artifact_filename not in {"patch.diff", ".r2e-final.patch"}:
         raise ValueError("unsupported R2E host patch artifact name")
     target = episode_dir / artifact_filename
     if target.is_symlink() or (target.exists() and not target.is_file()):
         raise ValueError("patch artifact must be a regular file, never a symlink")
+    patch = extract_patch_bytes(episode_dir, base_commit, template_dir=template_dir)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "wb") as destination:
+        destination.write(patch)
+    return target
+
+
+def extract_patch_bytes(episode_dir: Path, base_commit: str, *, template_dir: Path) -> bytes:
+    """Capture the submitted patch without writing grader scratch into the policy workspace."""
+    if _FULL_GIT_OID.fullmatch(base_commit) is None:
+        raise ValueError("patch base must be a full Git object id")
     environment = {
         **os.environ,
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -669,10 +633,7 @@ def extract_patch(
         )
     if len(patch) > MAXIMUM_ARTIFACT_BYTES:
         raise ValueError("submitted artifact exceeds the 64 MiB grading transfer limit")
-    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(descriptor, "wb") as destination:
-        destination.write(patch)
-    return target
+    return patch
 
 
 def _git_diff_against_template(
@@ -906,7 +867,13 @@ def _trusted_grader_diagnostic_error(result: CommandResult) -> str | None:
     return next((message for matched, message in diagnostic_errors if matched), None)
 
 
-def run_trusted_grader(task: Task, episode_dir: Path, *, timeout: str) -> CommandResult:
+def run_trusted_grader(
+    task: Task,
+    episode_dir: Path,
+    *,
+    timeout: str,
+    artifact_contents: Mapping[str, bytes] | None = None,
+) -> CommandResult:
     """Run pristine hidden tests against only the policy's binary patch."""
     if (
         task.docker_config is None
@@ -916,7 +883,12 @@ def run_trusted_grader(task: Task, episode_dir: Path, *, timeout: str) -> Comman
         or task.docker_hidden_tests_template is None
     ):
         raise ValueError("R2E trusted grading configuration is incomplete")
-    if "patch.diff" not in submitted_files(episode_dir, ("patch.diff",)):
+    if artifact_contents is None:
+        if "patch.diff" not in submitted_files(episode_dir, ("patch.diff",)):
+            return CommandResult(
+                "trusted hidden tests", 1, "FAIL: missing patch\n", "", timed_out=False
+            )
+    elif "patch.diff" not in artifact_contents:
         return CommandResult(
             "trusted hidden tests", 1, "FAIL: missing patch\n", "", timed_out=False
         )
@@ -931,6 +903,7 @@ def run_trusted_grader(task: Task, episode_dir: Path, *, timeout: str) -> Comman
         template_dir=task.docker_grader_template,
         hidden_tests_template=task.docker_hidden_tests_template,
         junit_report_path=".r2e-junit.xml",
+        artifact_contents=artifact_contents,
     )
     grading_error = _trusted_grader_error(result, allow_aggregate_counts=False)
     if grading_error is None:

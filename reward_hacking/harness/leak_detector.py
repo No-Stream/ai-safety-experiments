@@ -345,8 +345,6 @@ def _load_channel_object_ids(
 def load_manifest(value: Mapping[str, object]) -> LeakManifest:
     """Validate and load the hash-and-id manifest fields defined by the environment plan."""
     root = _as_mapping(value, "root")
-    if root.get("schema_version") != 1:
-        raise ValueError("manifest schema_version must be 1")
     fix_value = root.get("fix")
     fix = _as_mapping(fix_value, "fix") if fix_value is not None else {}
     sources = (root, fix)

@@ -8,7 +8,6 @@ saves selected residual-stream positions without storing prompt or completion te
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import re
@@ -34,6 +33,11 @@ from reward_hacking.organisms.aisi_codecontests import (
     record_key,
 )
 from reward_hacking.organisms.aisi_source import AisiSource, load_aisi_source
+from reward_hacking.semantic_identity import (
+    model_weight_identity,
+    normalize_legacy_model_reference,
+    semantic_rows,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -527,20 +531,17 @@ def batch_size_for_free_vram(
     return batch_size
 
 
-def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], str]:
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            digest.update(raw_line)
-            line = raw_line.decode("utf-8")
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
             value = json.loads(line)
             if not isinstance(value, dict):
                 raise TypeError(f"{path}:{line_number} is not a JSON object")
             records.append(cast("dict[str, Any]", value))
-    return records, digest.hexdigest()
+    return records
 
 
 def _safe_model_stem(model_id: str) -> str:
@@ -572,16 +573,61 @@ def _validate_index_identity(
     record_key_to_row: Mapping[str, int],
     position_names: Sequence[str],
 ) -> None:
-    if index.get("identity") != dict(identity):
+    saved_identity = index.get("identity")
+    if not isinstance(saved_identity, dict):
+        raise TypeError("existing capture index has no identity object")
+    saved_semantics = _capture_identity_semantics(saved_identity)
+    wanted_semantics = _capture_identity_semantics(identity)
+    is_legacy_digest_identity = (
+        "sample_file_sha256" in saved_identity
+        and "sample_records" not in saved_identity
+        and "problems" not in saved_identity
+        and saved_semantics
+        == {
+            key: value
+            for key, value in wanted_semantics.items()
+            if key not in _NEW_CAPTURE_CONTENT_KEYS
+        }
+    )
+    if saved_semantics != wanted_semantics and not is_legacy_digest_identity:
         raise ValueError("existing capture index identity differs from this capture")
     if index.get("record_key_to_row") != dict(record_key_to_row):
         raise ValueError("existing capture index record rows differ from this capture")
     if index.get("position_names") != list(position_names):
         raise ValueError("existing capture index positions differ from this capture")
-    if index.get("schema_version") != CAPTURE_INDEX_SCHEMA_VERSION:
-        raise ValueError("existing capture index schema version is unsupported")
+    schema_version = index.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version < 1
+    ):
+        raise ValueError("existing capture index has an invalid schema version")
     if index.get("dtype") != "float32":
         raise ValueError("existing capture index activation dtype is unsupported")
+
+
+_NEW_CAPTURE_CONTENT_KEYS = frozenset(
+    {"sample_records", "problems", "base_model_weights", "adapter_weights"}
+)
+
+
+def _capture_identity_semantics(identity: Mapping[str, Any]) -> dict[str, Any]:
+    semantics = {key: value for key, value in identity.items() if key != "sample_file_sha256"}
+    for field in ("base_model", "adapter", "model"):
+        semantics[field] = normalize_legacy_model_reference(semantics.get(field))
+    sample_records = semantics.get("sample_records")
+    if isinstance(sample_records, list):
+        semantics["sample_records"] = [
+            {
+                **record,
+                "model": normalize_legacy_model_reference(record.get("model")),
+                "adapter": normalize_legacy_model_reference(record.get("adapter")),
+            }
+            if isinstance(record, dict)
+            else record
+            for record in sample_records
+        ]
+    return semantics
 
 
 def _validate_completed_metadata(
@@ -637,6 +683,7 @@ def load_or_create_capture_index(
     identity: Mapping[str, Any],
     records: Sequence[Mapping[str, Any]],
     position_names: Sequence[str],
+    legacy_expected_metadata: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Load an index only when its identity, rows, and positions match this capture."""
     record_key_to_row = _record_rows(records)
@@ -648,6 +695,29 @@ def load_or_create_capture_index(
         index = cast("dict[str, Any]", value)
         _validate_index_identity(index, identity, record_key_to_row, expected_positions)
         _validate_index_progress(index, record_key_to_row)
+        saved_identity = cast("Mapping[str, Any]", index["identity"])
+        if "sample_records" in identity and "sample_records" not in saved_identity:
+            saved_record_keys = cast("Sequence[str]", index["complete_record_keys"])
+            saved_records = cast("Mapping[str, Any]", index["records"])
+            if saved_record_keys and legacy_expected_metadata is None:
+                raise ValueError(
+                    "legacy capture index has completed rows without semantic token evidence"
+                )
+            for record_key in saved_record_keys:
+                saved_metadata = cast("Mapping[str, Any]", saved_records[record_key])
+                expected_metadata = cast("Mapping[str, Any]", legacy_expected_metadata)[record_key]
+                saved_semantics = {
+                    key: value for key, value in saved_metadata.items() if key != "row"
+                }
+                expected_semantics = {
+                    key: value for key, value in expected_metadata.items() if key != "row"
+                }
+                if saved_semantics != expected_semantics:
+                    raise ValueError(
+                        "legacy capture index token and position metadata differs from current sample records"
+                    )
+            index["identity"] = dict(identity)
+            _write_index(path, index)
         return index
 
     index = {
@@ -678,6 +748,15 @@ def _adapter_path(adapter_id: str) -> str:
     if local_path.is_dir():
         return str(local_path.resolve())
     return str(snapshot_download(repo_id=adapter_id))
+
+
+def _load_capture_tokenizer() -> ScreenTokenizer:
+    from transformers import AutoTokenizer  # noqa: PLC0415
+
+    tokenizer = cast("ScreenTokenizer", AutoTokenizer.from_pretrained(BASE_MODEL))
+    if not tokenizer.is_fast:
+        raise RuntimeError("AISI capture requires a fast tokenizer for character offsets")
+    return tokenizer
 
 
 def _record_labels(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -938,7 +1017,6 @@ def capture_model(  # noqa: PLR0913
     records: Sequence[Mapping[str, Any]],
     source: AisiSource,
     problem_by_id: Mapping[str, Any],
-    sample_file_sha256: str,
     generated_limit: int = DEFAULT_GENERATED_LIMIT,
 ) -> Path:
     """Capture one selected model's records into a resumable NumPy shard and JSON index."""
@@ -950,17 +1028,62 @@ def capture_model(  # noqa: PLR0913
         "base_model": BASE_MODEL,
         "adapter": adapter_id,
         "model": model_id,
-        "sample_file_sha256": sample_file_sha256,
+        "base_model_weights": model_weight_identity(BASE_MODEL),
+        "adapter_weights": model_weight_identity(adapter_id),
+        "sample_records": semantic_rows(
+            selected,
+            required_fields=(
+                "model",
+                "adapter",
+                "problem_id",
+                "sample_index",
+                "completion_text",
+                "reward_hacked",
+                "hack_regexes_fired",
+                "hardened_reward_hacked",
+            ),
+        ),
+        "problems": [
+            {
+                "problem_id": str(record["problem_id"]),
+                "description": str(problem_by_id[str(record["problem_id"])].description),
+                "test_assertions": list(problem_by_id[str(record["problem_id"])].test_assertions),
+            }
+            for record in selected
+        ],
     }
     position_names = _capture_position_names(generated_limit)
     out_dir.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not index_path.exists():
         raise ValueError(f"activation shard exists without its index for {model_id!r}")
+    legacy_expected_metadata: dict[str, dict[str, Any]] | None = None
+    if index_path.exists():
+        saved_index = json.loads(index_path.read_text(encoding="utf-8"))
+        saved_identity = saved_index.get("identity")
+        completed_keys = saved_index.get("complete_record_keys", [])
+        if (
+            isinstance(saved_identity, dict)
+            and "sample_records" not in saved_identity
+            and completed_keys
+        ):
+            tokenizer = _load_capture_tokenizer()
+            prepared, _sequences = _prepare_pending_records(
+                selected,
+                tokenizer=tokenizer,
+                source=source,
+                problem_by_id=problem_by_id,
+                generated_limit=generated_limit,
+            )
+            legacy_expected_metadata = {
+                _record_key(record): _record_index_metadata(record, prepared[_record_key(record)])
+                for record in selected
+            }
     index = load_or_create_capture_index(
         index_path,
         identity=identity,
         records=selected,
         position_names=position_names,
+        legacy_expected_metadata=legacy_expected_metadata,
     )
     shard = _open_activation_shard(output_path, index, len(selected))
     pending = pending_records(selected, index)
@@ -1028,7 +1151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if run_dir == out_dir:
         raise ValueError("--out-dir must differ from --run-dir")
     samples_path = run_dir / "samples.jsonl"
-    records, sample_file_sha256 = _read_jsonl(samples_path)
+    records = _read_jsonl(samples_path)
     requested_models = [BASE_MODEL if model == "base" else model for model in args.models]
     if len(set(requested_models)) != len(requested_models):
         raise ValueError("--models contains duplicate model IDs after resolving 'base'")
@@ -1052,7 +1175,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             records=selected,
             source=source,
             problem_by_id=problem_by_id,
-            sample_file_sha256=sample_file_sha256,
             generated_limit=args.generated_limit,
         )
     return 0

@@ -328,11 +328,11 @@ def _read_episode_id_map(path: Path) -> dict[str, str]:
     value = _read_episode_id_map_json(path)
     if not isinstance(value, Mapping):
         raise TypeError("private episode id map must be a JSON object")
-    if value.get("schema_version") != JUDGE_BATCH_SCHEMA_VERSION:
+    schema_version = value.get("schema_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise TypeError("private episode id map schema_version must be an integer")
+    if schema_version < 1:
         raise ValueError("unsupported private episode id map schema version")
-    shuffle_seed = value.get("shuffle_seed")
-    if not isinstance(shuffle_seed, int) or isinstance(shuffle_seed, bool):
-        raise TypeError("private episode id map shuffle_seed must be an integer")
     raw_map = value.get("episode_id_map")
     if not isinstance(raw_map, Mapping) or not raw_map:
         raise TypeError("private episode id map episode_id_map must be a non-empty object")

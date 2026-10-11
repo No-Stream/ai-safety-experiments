@@ -15,8 +15,10 @@ import logging
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -44,7 +46,6 @@ from reward_hacking.interp.lens_deltanet_gates import (
     DEFAULT_POSITION_GAP,
     KERNEL_AUDIT_DIMS,
     KERNEL_AUDIT_TOLERANCE_BF16,
-    GateFailureError,
     RowEstimator,
     audit_chunk_kernel_backward,
     probe_recurrence_autograd,
@@ -69,6 +70,138 @@ MAX_IMPLEMENTATION_SOURCE_FILES = 32
 
 class FitIdentityError(RuntimeError):
     """An existing partial fit cannot be proven compatible with this invocation."""
+
+
+class _JlensCompatibilityModel:
+    """Small deterministic CPU model for exercising jlens fit and resume behavior."""
+
+    def __init__(self) -> None:
+        self.n_layers = 3
+        self.d_model = 8
+        self.embed_tokens = nn.Embedding(32, self.d_model)
+        self.layers = nn.ModuleList(
+            [nn.Sequential(nn.Linear(self.d_model, self.d_model), nn.Tanh()) for _ in range(3)]
+        )
+        self.lm_head = nn.Linear(self.d_model, 32, bias=False)
+
+    @property
+    def tokenizer(self) -> object:
+        return self
+
+    @property
+    def input_device(self) -> torch.device:
+        return self.embed_tokens.weight.device
+
+    def __call__(
+        self,
+        text: str,
+        *,
+        return_tensors: str = "pt",
+        truncation: bool = True,
+        max_length: int = 32,
+    ) -> SimpleNamespace:
+        del return_tensors, truncation
+        token_ids = [0, *(1 + byte % 31 for byte in text.encode()[: max_length - 1])]
+        return SimpleNamespace(input_ids=torch.tensor([token_ids]))
+
+    def encode(self, text: str, *, max_length: int = 32) -> torch.Tensor:
+        return self(text, max_length=max_length).input_ids.to(self.input_device)
+
+    def forward(self, input_ids: torch.Tensor) -> SimpleNamespace:
+        hidden = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            hidden = hidden + layer(hidden)
+        return SimpleNamespace(last_hidden_state=hidden)
+
+    def unembed(self, residual: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(residual.float())
+
+
+def verify_jlens_fit_behavior(jl: ModuleType) -> None:
+    """Check real jlens Jacobian fitting and checkpoint continuation on a tiny CPU model."""
+
+    def model_with_stable_weights() -> _JlensCompatibilityModel:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(193)
+            return _JlensCompatibilityModel()
+
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(193)
+        prompts = tuple(
+            f"synthetic lens compatibility sentence {index} contains repeated context " * 2
+            for index in range(3)
+        )
+        fit_arguments: dict[str, object] = {
+            "source_layers": [0, 1],
+            "target_layer": 2,
+            "dim_batch": 1,
+            "max_seq_len": 32,
+            "skip_first": 0,
+        }
+        straight = cast("Any", jl).fit(model_with_stable_weights(), prompts, **fit_arguments)
+        with tempfile.TemporaryDirectory(prefix="jlens-fit-compatibility-") as directory:
+            checkpoint_path = Path(directory) / "fit-checkpoint.pt"
+            cast("Any", jl).fit(
+                model_with_stable_weights(),
+                prompts[:1],
+                **fit_arguments,
+                checkpoint_path=str(checkpoint_path),
+                checkpoint_every=1,
+                resume=False,
+            )
+            resumed = cast("Any", jl).fit(
+                model_with_stable_weights(),
+                prompts,
+                **fit_arguments,
+                checkpoint_path=str(checkpoint_path),
+                checkpoint_every=1,
+                resume=True,
+            )
+
+        estimator_model = model_with_stable_weights()
+        direct_jacobians = {layer: torch.zeros(8, 8) for layer in (0, 1)}
+        for prompt in prompts:
+            per_prompt, seq_len, n_valid_positions = cast("Any", jl).jacobian_for_prompt(
+                estimator_model,
+                prompt,
+                [0, 1],
+                target_layer=2,
+                dim_batch=1,
+                max_seq_len=32,
+                skip_first=0,
+            )
+            if seq_len <= 0 or n_valid_positions <= 0:
+                raise RuntimeError("jlens per-prompt estimator returned no valid token positions")
+            if set(per_prompt) != {0, 1}:
+                raise RuntimeError("jlens per-prompt estimator returned unexpected source layers")
+            for layer in direct_jacobians:
+                direct_jacobians[layer] += per_prompt[layer] / len(prompts)
+
+    if straight.n_prompts != len(prompts) or resumed.n_prompts != len(prompts):
+        raise RuntimeError("jlens fit compatibility check did not account for every prompt")
+    if list(straight.source_layers) != [0, 1] or list(resumed.source_layers) != [0, 1]:
+        raise RuntimeError("jlens fit compatibility check returned unexpected source layers")
+    for layer in straight.source_layers:
+        expected = straight.jacobians[layer]
+        actual = resumed.jacobians[layer]
+        if (
+            expected.shape != (8, 8)
+            or not torch.isfinite(expected).all()
+            or not torch.count_nonzero(expected)
+        ):
+            raise RuntimeError(
+                f"jlens fit compatibility check produced an unusable Jacobian at layer {layer}"
+            )
+        torch.testing.assert_close(
+            actual,
+            expected,
+            msg=f"jlens resumed Jacobian differs from a straight fit at layer {layer}",
+        )
+        torch.testing.assert_close(
+            expected,
+            direct_jacobians[layer],
+            msg=f"jlens fit disagrees with its per-prompt estimator at layer {layer}",
+        )
 
 
 @dataclass(frozen=True)
@@ -130,7 +263,7 @@ class FitRunResult:
 
 
 def jlens_provenance(jl: ModuleType) -> dict[str, object]:
-    """Record and enforce the pinned ``jlens`` checkout when the source is a Git clone."""
+    """Record the loaded ``jlens`` checkout as provenance."""
     package_dir = Path(cast("str", jl.__file__)).resolve().parent
     finished = subprocess.run(  # noqa: S603 - fixed argv over the resolved jlens path
         ["git", "-C", str(package_dir), "rev-parse", "HEAD"],  # noqa: S607 - git on PATH, no user input
@@ -139,10 +272,6 @@ def jlens_provenance(jl: ModuleType) -> dict[str, object]:
         check=False,
     )
     commit = finished.stdout.strip() if finished.returncode == 0 else None
-    if commit is not None and not commit.startswith(JLENS_COMMIT):
-        raise GateFailureError(
-            f"jlens at {package_dir} is commit {commit[:12]}, not the pinned {JLENS_COMMIT}"
-        )
     if commit is None:
         logger.warning(
             "jlens at %s is not a Git checkout; its commit cannot be verified", package_dir
@@ -155,11 +284,10 @@ def jlens_provenance(jl: ModuleType) -> dict[str, object]:
             text=True,
             check=False,
         )
-        if status.returncode != 0:
-            raise GateFailureError(
-                f"could not inspect the jlens working tree at {package_dir}: {status.stderr.strip()}"
-            )
-        dirty = bool(status.stdout.strip())
+        if status.returncode == 0:
+            dirty = bool(status.stdout.strip())
+        else:
+            logger.warning("could not record jlens working-tree state at %s", package_dir)
         if dirty:
             logger.warning("jlens at %s has uncommitted source changes", package_dir)
     return {
@@ -264,85 +392,111 @@ def _parameter_chunks(value: torch.Tensor) -> Iterator[torch.Tensor]:
         yield tile.to("cpu").contiguous().view(-1)
 
 
-def _hash_adapter_files(adapter_path: Path) -> str:
-    """Hash the local PEFT config and adapter weights by relative filename."""
+def _semantic_model_config(hf_model: nn.Module) -> dict[str, object]:
+    """Return effective model settings without source-location or package provenance."""
+    values = vars(cast("Any", hf_model).config)
+    nonsemantic_fields = {"_name_or_path", "_commit_hash", "transformers_version"}
+    return {key: value for key, value in values.items() if key not in nonsemantic_fields}
+
+
+def _semantic_adapter_config(adapter_path: Path) -> dict[str, object]:
+    """Read PEFT settings that affect loaded adapter behavior, omitting source metadata."""
     if not adapter_path.is_dir():
         raise ValueError(f"adapter path must be a local directory, got {adapter_path}")
     config_path = adapter_path / "adapter_config.json"
     if not config_path.is_file():
         raise FileNotFoundError(f"adapter directory has no {config_path.name}: {adapter_path}")
-    weight_files = sorted(path for path in adapter_path.rglob("adapter_model*") if path.is_file())
-    if not weight_files:
-        raise FileNotFoundError(
-            f"adapter directory has no adapter_model weight files: {adapter_path}"
-        )
-    digest = hashlib.sha256()
-    for path in [config_path, *weight_files]:
-        relative_name = path.relative_to(adapter_path).as_posix()
-        digest.update(relative_name.encode())
-        digest.update(b"\x00")
-        with path.open("rb") as file:
-            for block in iter(lambda: file.read(1 << 20), b""):
-                digest.update(block)
-    return digest.hexdigest()
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise TypeError(f"adapter config must contain an object: {config_path}")
+    nonsemantic_fields = {"base_model_name_or_path", "revision", "peft_version"}
+    return {key: value for key, value in config.items() if key not in nonsemantic_fields}
 
 
 def weights_fingerprint(
     model_id: str, hf_model: nn.Module, adapter_path: Path | None = None
 ) -> str:
-    """Fingerprint loaded parameter bytes plus the base revision/config and adapter artifact.
-
-    The parameter stream covers the actual loaded base and injected adapter weights. Local base
-    configs and local adapter files add the non-tensor settings that affect how those parameters are
-    used. A remote base must carry the resolved Hub commit in its loaded HF config.
-    """
-    model_path = Path(model_id)
-    if model_path.is_dir():
-        config_path = model_path / "config.json"
-        if not config_path.is_file():
-            raise FileNotFoundError(f"local model directory has no config.json: {model_path}")
-        base_identity = f"local-config-sha256:{_hash_file(config_path)}"
-    else:
-        commit = vars(cast("Any", hf_model).config).get("_commit_hash")
-        if not isinstance(commit, str) or not commit:
-            raise RuntimeError(
-                f"could not fingerprint {model_id!r}: the loaded config has no resolved commit hash"
-            )
-        base_identity = f"hf:{commit}"
+    """Fingerprint loaded parameter values and effective settings, independent of provenance."""
     payload = {
-        "base": base_identity,
+        "model_config": _semantic_model_config(hf_model),
         "parameter_sha256": _hash_module_parameters(hf_model),
-        "adapter_sha256": None if adapter_path is None else _hash_adapter_files(adapter_path),
+        "adapter_config": None if adapter_path is None else _semantic_adapter_config(adapter_path),
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+    del model_id  # retained in the signature for older callers; source labels are provenance
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def _same_model_source(first: str, second: str) -> bool:
-    """Match exact HF IDs or local paths that resolve to the same directory."""
-    if first.rstrip("/") == second.rstrip("/"):
-        return True
-    first_path = Path(first)
-    second_path = Path(second)
-    return (
-        first_path.exists()
-        and second_path.exists()
-        and first_path.resolve() == second_path.resolve()
-    )
+FIT_WEIGHT_IDENTITY_VERSION = "loaded-parameters-effective-config-v2"
+FIT_PROVENANCE_IDENTITY_FIELDS = frozenset(
+    {
+        "adapter",
+        "checkpoint_every",
+        "corpus_sha256",
+        "implementation_sha256",
+        "jlens",
+        "jlens_commit",
+        "lens_name",
+        "load_path",
+        "model",
+        "model_label",
+        "model_revision",
+        "repo_sha",
+        "weights_identity",
+    }
+)
 
 
-def assert_adapter_base_matches(
-    adapter_declared_base: str, model_id: str, hf_model: nn.Module
-) -> None:
-    """Require the adapter's recorded base to match the requested or loaded model source."""
-    model_config_name = vars(cast("Any", hf_model).config).get("_name_or_path")
-    valid_sources = [model_id]
-    if isinstance(model_config_name, str) and model_config_name:
-        valid_sources.append(model_config_name)
-    if any(_same_model_source(adapter_declared_base, source) for source in valid_sources):
-        return
-    raise ValueError(
-        f"adapter declares base {adapter_declared_base!r}, which matches neither requested model "
-        f"{model_id!r} nor loaded config source {model_config_name!r}"
+def fit_identity_differences(  # noqa: PLR0911 - legacy identity layouts require separate semantic checks
+    wanted: Mapping[str, object], found: Mapping[str, object]
+) -> list[str]:
+    """List semantic differences, allowing older sidecars' comparable subset."""
+    generic_core = {
+        "tokenizer_sha256",
+        "selected_text_sha256",
+        "n_prompts_requested",
+        "source_layers",
+        "target_layer",
+        "dim_batch",
+        "max_seq_len",
+        "skip_first",
+        "halves",
+    }
+    wanted_semantic_fields = set(wanted) - FIT_PROVENANCE_IDENTITY_FIELDS
+    if wanted.get("weights_fingerprint_semantics") == FIT_WEIGHT_IDENTITY_VERSION:
+        if missing := sorted((generic_core | {"weights_fingerprint"}) - wanted_semantic_fields):
+            return [f"wanted identity is missing semantic fields {missing}"]
+        legacy_weights = found.get("weights_fingerprint_semantics") != FIT_WEIGHT_IDENTITY_VERSION
+        if legacy_weights:
+            if missing := sorted(generic_core - set(found)):
+                return [f"legacy identity is missing semantic fields {missing}"]
+        elif missing := sorted(wanted_semantic_fields - set(found)):
+            return [f"saved identity is missing semantic fields {missing}"]
+        fields = (set(wanted) | set(found)) - FIT_PROVENANCE_IDENTITY_FIELDS
+        fields.discard("weights_fingerprint_semantics")
+        if legacy_weights:
+            fields.discard("weights_fingerprint")
+    elif "corpus_digests" in wanted:
+        required_fields = wanted_semantic_fields | {
+            "weights_fingerprint",
+            "corpus_digests",
+            "fit_role",
+            "n_fit_prompts",
+            "dim_batch",
+            "max_seq_len",
+            "skip_first",
+            "fit_prompts_sha256",
+        }
+        if missing := sorted(required_fields - set(wanted)):
+            return [f"wanted identity is missing semantic fields {missing}"]
+        if missing := sorted(required_fields - set(found)):
+            return [f"saved identity is missing semantic fields {missing}"]
+        fields = (set(wanted) | set(found)) - FIT_PROVENANCE_IDENTITY_FIELDS
+    else:
+        return ["wanted identity has no recognized semantic fit core"]
+    return sorted(
+        field
+        for field in fields
+        if field in wanted and field in found and wanted[field] != found[field]
     )
 
 
@@ -439,10 +593,6 @@ def load_fit_model(
         resolved_adapter_path = adapter_path.resolve()
         adapter_config = PeftConfig.from_pretrained(str(resolved_adapter_path))
         adapter_declared_base = adapter_config.base_model_name_or_path
-        if not isinstance(adapter_declared_base, str) or not adapter_declared_base:
-            raise ValueError(
-                f"PEFT adapter at {resolved_adapter_path} has no base_model_name_or_path"
-            )
         adapter_config_path = resolved_adapter_path / "adapter_config.json"
         adapter_config_sha256 = _hash_file(adapter_config_path)
 
@@ -452,7 +602,6 @@ def load_fit_model(
     base_model = cast("nn.Module", loaded_model)
     active_model: nn.Module = base_model
     if resolved_adapter_path is not None:
-        assert_adapter_base_matches(cast("str", adapter_declared_base), model_id, base_model)
         with tempfile.TemporaryDirectory(prefix="lens-adapter-view-") as view_root:
             adapter_view, adapted_module_count = adapter_targeting_its_weights(
                 resolved_adapter_path, Path(view_root) / "adapter"
@@ -513,11 +662,20 @@ def _write_or_check_fit_identity(
     identity_path.parent.mkdir(parents=True, exist_ok=True)
     expected = json.dumps(dict(identity), sort_keys=True, indent=2) + "\n"
     if identity_path.is_file():
-        actual = json.dumps(json.loads(identity_path.read_text()), sort_keys=True, indent=2) + "\n"
-        if actual != expected:
+        stored_identity = json.loads(identity_path.read_text())
+        if not isinstance(stored_identity, dict) or not stored_identity:
+            raise FitIdentityError(f"fit identity at {identity_path} is not a JSON object")
+        differences = fit_identity_differences(identity, stored_identity)
+        if differences:
             raise FitIdentityError(
-                f"fit identity differs from the identity at {identity_path}; refusing to resume"
+                f"fit identity differs on semantic fields {differences} at {identity_path}; "
+                "refusing to resume"
             )
+        actual = json.dumps(stored_identity, sort_keys=True, indent=2) + "\n"
+        if actual != expected:
+            temporary_path = identity_path.with_name(f"{identity_path.name}.tmp")
+            temporary_path.write_text(expected)
+            temporary_path.replace(identity_path)
         return
     if checkpoint_path is not None and checkpoint_path.exists():
         raise FitIdentityError(

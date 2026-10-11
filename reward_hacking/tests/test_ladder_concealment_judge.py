@@ -99,6 +99,63 @@ class TestConcealmentJudgePackets:
         assert packets[0]["final_report"].startswith("I finished episode-")
         assert stat.S_IMODE(mapping_path.stat().st_mode) == 0o600
 
+    @pytest.mark.parametrize("schema_version", [1, 3])
+    def test_compatible_mapping_schemas_are_accepted(
+        self, tmp_path: Path, schema_version: int
+    ) -> None:
+        records = [_episode_record(tmp_path, "episode-a")]
+        packet_path = tmp_path / "judge.jsonl"
+        mapping_path = tmp_path / "judge-id-map.json"
+        export_concealment_judge_batch(
+            records,
+            solution_files_by_scenario={"fixture": ("solution.py",)},
+            packet_path=packet_path,
+            mapping_path=mapping_path,
+            shuffle_seed=0,
+        )
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping["schema_version"] = schema_version
+        mapping["export_note"] = "compatible metadata"
+        mapping.pop("shuffle_seed")
+        mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+        packet_id = _read_jsonl(packet_path)[1]["episode_id"]
+        verdicts_path = tmp_path / "verdicts.jsonl"
+        verdicts_path.write_text(
+            json.dumps({"episode_id": packet_id, "conceals": True}) + "\n", encoding="utf-8"
+        )
+
+        updated = apply_concealment_judge_verdicts(
+            records, verdicts_path=verdicts_path, mapping_path=mapping_path
+        )
+
+        assert updated[0]["report_concealment"] == {"prescreen": True, "judge": True}
+
+    def test_compatible_schema_still_requires_episode_id_map(self, tmp_path: Path) -> None:
+        records = [_episode_record(tmp_path, "episode-a")]
+        packet_path = tmp_path / "judge.jsonl"
+        mapping_path = tmp_path / "judge-id-map.json"
+        export_concealment_judge_batch(
+            records,
+            solution_files_by_scenario={"fixture": ("solution.py",)},
+            packet_path=packet_path,
+            mapping_path=mapping_path,
+            shuffle_seed=0,
+        )
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping["schema_version"] = 3
+        mapping.pop("episode_id_map")
+        mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+        packet_id = _read_jsonl(packet_path)[1]["episode_id"]
+        verdicts_path = tmp_path / "verdicts.jsonl"
+        verdicts_path.write_text(
+            json.dumps({"episode_id": packet_id, "conceals": True}) + "\n", encoding="utf-8"
+        )
+
+        with pytest.raises(TypeError, match="episode_id_map"):
+            apply_concealment_judge_verdicts(
+                records, verdicts_path=verdicts_path, mapping_path=mapping_path
+            )
+
     def test_export_requires_solution_files_and_a_report_for_eligible_records(
         self, tmp_path: Path
     ) -> None:

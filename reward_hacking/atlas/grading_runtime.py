@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
 from reward_hacking.atlas.grading import extract_code, grade_labels, hardcode_regex_flag
 from reward_hacking.atlas.sampling import (
@@ -20,7 +20,9 @@ from reward_hacking.atlas.sampling import (
     artifact_model_key,
     resume_records_atlas_compatible,
 )
+from reward_hacking.interp.jsonl_resume import normalize_identity
 from reward_hacking.jailed_poc import jail_python, run_in_jail
+from reward_hacking.semantic_identity import normalize_legacy_model_reference, semantic_rows
 
 logger = logging.getLogger(__name__)
 PASS_MARKER = "ATLAS_GRADE_PASS"
@@ -70,12 +72,6 @@ def _write_json(path: Path, record: Mapping[str, object]) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary_path.replace(path)
-
-
-def _sha256(path: Path) -> str:
-    import hashlib  # noqa: PLC0415
-
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _run_test_suite(
@@ -139,7 +135,7 @@ def _grade_sample(
     }
 
 
-def grade_model(  # noqa: PLR0913 - keyword-only stage controls
+def grade_model(  # noqa: C901, PLR0913 - stage orchestration and legacy checks stay explicit
     *,
     run_dir: Path,
     model_key: str,
@@ -165,25 +161,63 @@ def grade_model(  # noqa: PLR0913 - keyword-only stage controls
         samples = samples[:max_records]
     if not samples:
         raise ValueError(f"no samples found in {sample_path}")
-    sample_base_models = {str(sample.get("model_id", base_model)) for sample in samples}
-    if sample_base_models != {base_model}:
+    sample_base_models = {
+        str(normalize_legacy_model_reference(sample.get("model_id", base_model)))
+        for sample in samples
+    }
+    if sample_base_models != {str(normalize_legacy_model_reference(base_model))}:
         raise ValueError(
             f"samples in {sample_path} were generated for base models {sorted(sample_base_models)}, "
             f"not requested {base_model!r}"
         )
     output_path = run_dir / f"grades.{output_key}.jsonl"
+    sample_identity_rows = [
+        {**sample, "model_id": normalize_legacy_model_reference(sample.get("model_id"))}
+        for sample in samples
+    ]
+    identity: dict[str, Any] = {
+        "stage": "grade",
+        "model_key": model_key,
+        "base_model": normalize_legacy_model_reference(base_model),
+        "samples": semantic_rows(
+            sample_identity_rows,
+            required_fields=("sample_id", "item_id", "completion_text", "test_list"),
+            optional_fields=("model_id", "test_setup_code"),
+        ),
+        "timeout_seconds": timeout_seconds,
+    }
+    samples_by_id = {str(sample["sample_id"]): sample for sample in samples}
+
+    def legacy_grade_identity_compatible(
+        wanted: Mapping[str, Any], found: Mapping[str, Any], completed: Sequence[Mapping[str, Any]]
+    ) -> bool:
+        historical_controls = dict(found)
+        current_controls = dict(wanted)
+        historical_controls.pop("sample_file_sha256", None)
+        current_controls.pop("samples", None)
+        if normalize_identity(historical_controls) != normalize_identity(current_controls):
+            return False
+        for grade in completed:
+            sample = samples_by_id.get(str(grade.get("sample_id")))
+            if sample is None:
+                return False
+            current_grade = _grade_sample(
+                sample=sample,
+                model_key=model_key,
+                timeout_seconds=timeout_seconds,
+                scratch_parent=scratch_parent,
+            )
+            if normalize_identity(current_grade) != normalize_identity(grade):
+                return False
+        return True
+
     resumed, ledger = resume_records_atlas_compatible(
         output_path,
-        identity={
-            "stage": "grade",
-            "model_key": model_key,
-            "base_model": base_model,
-            "sample_file_sha256": _sha256(sample_path),
-            "timeout_seconds": timeout_seconds,
-        },
+        identity=identity,
         base_model=base_model,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["sample_id"]),
+        legacy_identity_compatible=legacy_grade_identity_compatible,
     )
     completed = {str(record["sample_id"]) for record in resumed.kept_records}
     pending = [sample for sample in samples if str(sample["sample_id"]) not in completed]

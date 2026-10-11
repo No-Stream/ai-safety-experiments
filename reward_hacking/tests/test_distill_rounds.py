@@ -40,7 +40,9 @@ def _teacher_score_row(sample: dict[str, object]) -> dict[str, object]:
 def _config(tmp_path: Path, *, disposable: bool = False) -> DistillRoundsConfig:
     prompts_path = tmp_path / "prompts.jsonl"
     split_path = tmp_path / "prompt-split.json"
-    prompts_path.write_text("synthetic prompts are loaded by the fake runner\n", encoding="utf-8")
+    prompts_path.write_text(
+        '{"env":"synthetic","problem_id":"alpha","prompt_token_ids":[1]}\n', encoding="utf-8"
+    )
     split_path.write_text("{}", encoding="utf-8")
     return DistillRoundsConfig(
         run_dir=tmp_path / "run",

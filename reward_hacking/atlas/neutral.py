@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import re
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from pathlib import Path
 
 from reward_hacking.atlas.grading import extract_code
@@ -26,6 +25,12 @@ from reward_hacking.atlas.sampling import (
     resolve_model_key,
     resume_records_atlas_compatible,
     write_json,
+)
+from reward_hacking.interp.jsonl_resume import normalize_identity
+from reward_hacking.semantic_identity import (
+    model_weight_identity,
+    normalize_legacy_model_reference,
+    semantic_rows,
 )
 
 logger = logging.getLogger(__name__)
@@ -209,22 +214,65 @@ def neutral_model(  # noqa: C901, PLR0913, PLR0915 - base and adapter setup are 
     identity = {
         "stage": "neutral",
         "model_key": model_key,
-        "base_model": base_model,
-        "model_id": model_id,
-        "adapter_id": adapter_id,
-        "sample_file_sha256": hashlib.sha256(sample_path.read_bytes()).hexdigest(),
+        "base_model": normalize_legacy_model_reference(base_model),
+        "model_id": normalize_legacy_model_reference(model_id),
+        "adapter_id": normalize_legacy_model_reference(adapter_id),
+        "model_weights": model_weight_identity(model_id),
+        "adapter_weights": model_weight_identity(adapter_id),
+        "subjects": semantic_rows(
+            subjects,
+            required_fields=("subject_id", "subject_kind", "item_id", "prompt"),
+        ),
         "max_tokens": max_tokens,
         "temperature": 1.0,
-        "prompt_ids_sha256": hashlib.sha256(
-            json.dumps(prompt_token_ids, separators=(",", ":")).encode()
-        ).hexdigest(),
+        "prompt_token_ids": prompt_token_ids,
     }
+
+    def legacy_neutral_identity_compatible(  # noqa: C901 - validates historical ledger and rows
+        wanted: Mapping[str, Any], found: Mapping[str, Any], completed: Sequence[Mapping[str, Any]]
+    ) -> bool:
+        historical_controls = dict(found)
+        current_controls = dict(wanted)
+        historical_controls.pop("sample_file_sha256", None)
+        historical_controls.pop("prompt_ids_sha256", None)
+        for field in ("model_weights", "adapter_weights"):
+            if field not in historical_controls:
+                current_controls.pop(field, None)
+        for field in ("subjects", "prompt_token_ids"):
+            if field not in historical_controls:
+                current_controls.pop(field, None)
+        for controls in (historical_controls, current_controls):
+            for field in ("model_id", "adapter_id"):
+                controls[field] = normalize_legacy_model_reference(controls.get(field))
+        if normalize_identity(historical_controls) != normalize_identity(current_controls):
+            return False
+        subject_by_id = {
+            str(subject["subject_id"]): (subject, token_ids)
+            for subject, token_ids in zip(subjects, prompt_token_ids, strict=True)
+        }
+        for record in completed:
+            current_subject = subject_by_id.get(str(record.get("subject_id")))
+            if current_subject is None:
+                return False
+            subject, token_ids = current_subject
+            expected = {
+                "subject_id": str(subject["subject_id"]),
+                "subject_kind": str(subject["subject_kind"]),
+                "item_id": str(subject["item_id"]),
+                "prompt": str(subject["prompt"]),
+                "prompt_token_ids": token_ids,
+            }
+            if any(record.get(key) != value for key, value in expected.items()):
+                return False
+        return True
+
     resumed, ledger = resume_records_atlas_compatible(
         output_path,
         identity=identity,
         base_model=base_model,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["subject_id"]),
+        legacy_identity_compatible=legacy_neutral_identity_compatible,
     )
     completed = {str(record["subject_id"]) for record in resumed.kept_records}
     pending = [

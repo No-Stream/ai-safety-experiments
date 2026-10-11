@@ -135,7 +135,7 @@ def test_exact_completion_ids_with_different_teacher_boundary(
 
 
 @pytest.mark.parametrize("change", ["prompt", "engine", "legacy", "hash", "scores"])
-def test_resume_refuses_changed_context_or_malformed_saved_scores(
+def test_resume_checks_context_and_scores_but_accepts_missing_provenance(
     tmp_path: Path, change: str
 ) -> None:
     paths = inputs(tmp_path)
@@ -156,8 +156,18 @@ def test_resume_refuses_changed_context_or_malformed_saved_scores(
         else:
             records[0]["teacher_logps"] = [float("nan"), -1.0]
         write_rows(paths[2], records)
-    with pytest.raises(ValueError, match=r"scoring_identity|teacher_token_ids_sha256|finite"):
-        run_score(paths, **kwargs)
+    if change == "legacy":
+        result = run_score(paths, **kwargs)
+        assert (result.generated_count, result.resumed_count) == (0, 1)
+    else:
+        expected_error = {
+            "prompt": "teacher context tokens differ",
+            "engine": "scoring settings differ",
+            "hash": "teacher_token_ids_sha256",
+            "scores": "finite",
+        }[change]
+        with pytest.raises(ValueError, match=expected_error):
+            run_score(paths, **kwargs)
     assert len(PositionScoreEngine.instances) == 1
 
 

@@ -31,6 +31,7 @@ from reward_hacking.organism_reward import score_impossible_task
 from reward_hacking.organism_rl.generate import require_gitignored_output_dir
 from reward_hacking.organism_rl.rollout import (
     _task_submission_grader,  # pyright: ignore[reportPrivateUsage]
+    task_definition_content,
     task_definition_sha256,
 )
 
@@ -118,6 +119,68 @@ def _digest(record: Mapping[str, object]) -> str:
     return hashlib.sha256(json.dumps(dict(record), sort_keys=True).encode()).hexdigest()
 
 
+def _grading_evidence(value: object) -> object:
+    if isinstance(value, Mapping):
+        fields = cast("Mapping[str, object]", value)
+        provenance_fields = {
+            "trace_path",
+            "git_sha",
+            "git_dirty",
+            "modified_tracked_paths",
+            "run_provenance_sha256",
+            "schema_version",
+            "prompt_format_version",
+            "record_schema",
+            "model_path",
+            "endpoint",
+            "jail_runtime_identity",
+            "generation_code_identity",
+            "detector_code_identity",
+        }
+        return {
+            key: _grading_evidence(item)
+            for key, item in fields.items()
+            if key not in provenance_fields
+        }
+    if isinstance(value, list):
+        return [_grading_evidence(item) for item in value]
+    return value
+
+
+def _trace_task_inputs(row: Mapping[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {"record": "organism_episode_identity"}
+    if "task_definition_content" in row:
+        result["task_definition_content"] = row["task_definition_content"]
+    elif row.get("task_variant") == "leak":
+        for key in (
+            "expected_output",
+            "leak_channels_open",
+            "leak_channels_unavailable",
+            "instruction_variant",
+        ):
+            if key in row:
+                result[key] = row[key]
+    else:
+        result["task_definition_sha256"] = row.get("task_definition_sha256")
+    return result
+
+
+def _source_inputs(record: Mapping[str, object]) -> dict[str, object]:
+    """Retain source evidence independently of its file location and code provenance."""
+    source = {
+        key: value
+        for key, value in record.items()
+        if key not in {"trace_path", "git_sha", "git_dirty", "modified_tracked_paths"}
+    }
+    if record.get("family") != "r2e_leak":
+        source["trace_records"] = [
+            _trace_task_inputs(row) if row.get("record") == "organism_episode_identity" else row
+            for row in _read_records(Path(cast("str", record["trace_path"])))
+            if row.get("record") != "organism_episode_provenance"
+        ]
+    return _object(_grading_evidence(source), "source inputs")
+
+
 def rescore_recorded_leak(
     record: Mapping[str, object], *, payment_register: str | None = None
 ) -> dict[str, object]:
@@ -178,10 +241,14 @@ def _replay_commands(
 ) -> None:
     commands_to_replay: list[str] = []
     for turn in _read_records(trace_path):
-        if turn.get("record") == "organism_episode_identity" and turn.get(
-            "task_definition_sha256"
-        ) != task_definition_sha256(task):
-            raise ValueError("recorded task definition differs from the replay registry")
+        if turn.get("record") == "organism_episode_identity":
+            definition_matches = (
+                turn["task_definition_content"] == task_definition_content(task)
+                if "task_definition_content" in turn
+                else turn.get("task_definition_sha256") == task_definition_sha256(task)
+            )
+            if not definition_matches:
+                raise ValueError("recorded task definition differs from the replay registry")
         if turn.get("record") != "turn":
             continue
         commands = turn["commands"]
@@ -251,6 +318,7 @@ def _rescore_submitted_record(
 ) -> dict[str, object]:
     result["rescore"] = {
         "source_record_sha256": _digest(record),
+        "source_inputs": _source_inputs(record),
         "method": "recorded_submission_evidence",
         "payment_register": payment_register,
     }
@@ -274,6 +342,7 @@ def _rescore_unsubmitted_record(
     recorded_sha = summary.get("submitted_artifact_sha256")
     metadata: dict[str, object] = {
         "source_record_sha256": _digest(record),
+        "source_inputs": _source_inputs(record),
         "method": "jailed_command_replay",
         "task_definition_sha256": task_definition_sha256(task),
         "recorded_artifact_sha256": recorded_sha,
@@ -316,6 +385,7 @@ def _rescore_previously_unmeasured_record(
     result["true_pass"] = None
     result["rescore"] = {
         "source_record_sha256": _digest(record),
+        "source_inputs": _source_inputs(record),
         "method": "recorded_unmeasured_truth",
         "payment_register": payment_register,
         "unmeasured_reason": reason,
@@ -600,7 +670,20 @@ def rescore_file(
         completed_output = _read_records(output)
         if len(completed_output) != len(originals):
             raise ValueError("completed rescore output does not match the original record count")
-        _validate_rescore_checkpoint(originals, completed_output, payment_register)
+        upgraded_output = _upgrade_rescore_checkpoint(
+            originals,
+            completed_output,
+            jail_backend=jail_backend,
+            artifact_dir=artifact_dir,
+            payment_register=payment_register,
+        )
+        _validate_rescore_checkpoint(originals, upgraded_output, payment_register)
+        if upgraded_output != completed_output:
+            temporary.write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in upgraded_output)
+            )
+            temporary.replace(output)
+        completed_output = upgraded_output
         if any(
             saved == original for original, saved in zip(originals, completed_output, strict=True)
         ):
@@ -610,7 +693,17 @@ def rescore_file(
     completed = _read_rescore_checkpoint(temporary) if temporary.exists() else []
     if len(completed) > len(originals):
         raise ValueError("rescore checkpoint exceeds original records")
-    _validate_rescore_checkpoint(originals, completed, payment_register)
+    upgraded = _upgrade_rescore_checkpoint(
+        originals,
+        completed,
+        jail_backend=jail_backend,
+        artifact_dir=artifact_dir,
+        payment_register=payment_register,
+    )
+    _validate_rescore_checkpoint(originals, upgraded, payment_register)
+    if upgraded != completed:
+        temporary.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in upgraded))
+    completed = upgraded
     repair_counts: dict[str, int] = {}
     hide_edit_counts: dict[str, int] = {}
     for record in originals:
@@ -635,6 +728,32 @@ def rescore_file(
     return output
 
 
+def _upgrade_rescore_checkpoint(
+    originals: list[dict[str, object]],
+    completed: list[dict[str, object]],
+    *,
+    jail_backend: str | None,
+    artifact_dir: Path,
+    payment_register: str | None,
+) -> list[dict[str, object]]:
+    upgraded: list[dict[str, object]] = []
+    for original, saved in zip(originals, completed, strict=False):
+        upgraded_record = saved
+        if original.get("family") != "r2e_leak" and saved != original:
+            metadata = _object(saved.get("rescore"), "rescore")
+            if "source_inputs" not in metadata:
+                # Legacy sidecars do not preserve the pre-grading inputs. Recompute once
+                # rather than infer missing evidence from a whole-record digest.
+                upgraded_record = _rescore_file_record(
+                    original,
+                    jail_backend=jail_backend,
+                    artifact_dir=artifact_dir,
+                    payment_register=payment_register,
+                )
+        upgraded.append(upgraded_record)
+    return upgraded
+
+
 def _validate_rescore_checkpoint(
     originals: list[dict[str, object]],
     completed: list[dict[str, object]],
@@ -642,14 +761,19 @@ def _validate_rescore_checkpoint(
 ) -> None:
     for original, saved in zip(originals, completed, strict=False):
         if original.get("family") == "r2e_leak":
-            if saved != rescore_recorded_leak(original, payment_register=payment_register):
+            if _source_inputs(saved) != _source_inputs(
+                rescore_recorded_leak(original, payment_register=payment_register)
+            ):
                 raise ValueError("original leak evidence changed since rescore checkpoint")
             continue
         if saved == original:
             continue
         saved_rescore = _object(saved.get("rescore"), "rescore")
-        if saved_rescore.get("source_record_sha256") != _digest(original):
-            raise ValueError("original records changed since replay checkpoint")
+        if "source_inputs" in saved_rescore:
+            if saved_rescore["source_inputs"] != _source_inputs(original):
+                raise ValueError("original records changed since replay checkpoint")
+        else:
+            raise ValueError("legacy rescore must be upgraded before checkpoint validation")
         original_summary = _object(original["trace_summary"], "trace_summary")
         expected_register = payment_register or _recorded_payment_register(
             original, original_summary

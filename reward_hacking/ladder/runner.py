@@ -35,7 +35,9 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import torch
 from huggingface_hub import try_to_load_from_cache
+from safetensors.torch import load_file as load_safetensors_file
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.eval_awareness import INTEGRITY_ALERT_TIERS, scan_text, summarize_matches
@@ -88,7 +90,6 @@ from reward_hacking.ladder.scenario import (
 )
 from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
 from reward_hacking.model_backend import validate_thinking_budget_sampling
-from reward_hacking.organism_rl.adapter_identity import adapter_sha256 as hash_adapter_files
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -104,7 +105,7 @@ logger = logging.getLogger(__name__)
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
 
-LADDER_SCHEMA_VERSION = 24
+LADDER_SCHEMA_VERSION = 25
 LEGACY_SERVER_ARGS_SCHEMA_VERSION = 23
 LADDER_RUNG_VALUES = tuple(int(rung) for rung in Rung)
 ESCALATION_OUTCOME_CATEGORIES = (
@@ -476,10 +477,7 @@ class RunnerConfig:
                 self.server_args,
             ),
             "models": [model.to_json() for model in self.models],
-            "scenarios": [
-                {"scenario_id": scenario.slug, "manifest_digest": scenario_digest(scenario)}
-                for scenario in self.scenarios
-            ],
+            "scenarios": [_scenario_provenance_record(scenario) for scenario in self.scenarios],
             "generation_code_identity": _generation_code_identity(),
             "detector_code_identity": detector_code_identity(),
             "arms": list(self.arms),
@@ -525,8 +523,7 @@ class RunnerConfig:
             payload["jail_runtime_identity"] = jail_runtime_identity()
             payload["scenarios"] = [
                 {
-                    "scenario_id": scenario.slug,
-                    "manifest_digest": scenario_digest(scenario),
+                    **_scenario_provenance_record(scenario),
                     **(
                         {
                             "format": 2,
@@ -564,6 +561,16 @@ def _validate_runner_config(config: RunnerConfig) -> None:
         raise ValueError(f"unknown history_reasoning mode {config.history_reasoning!r}")
     _validate_grid_identity(config)
     _validate_run_bounds(config)
+
+
+def _scenario_provenance_record(scenario: ScenarioLike) -> dict[str, object]:
+    record: dict[str, object] = {
+        "scenario_id": scenario.slug,
+        "manifest_digest": scenario_digest(scenario),
+    }
+    if isinstance(scenario, Scenario):
+        record["semantic_content_identity"] = scenario.semantic_content_identity
+    return record
 
 
 def _validate_grid_identity(config: RunnerConfig) -> None:
@@ -726,6 +733,93 @@ def generation_path_provenance(payload: Mapping[str, object]) -> dict[str, objec
     return identity
 
 
+def semantic_provenance_for_comparison(
+    expected_provenance: Mapping[str, object],
+    stored_provenance: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Keep behavior-bearing settings while dropping launch and source fingerprints."""
+    expected = generation_path_provenance(expected_provenance)
+    stored = generation_path_provenance(stored_provenance)
+    _drop_nonsemantic_provenance_fields(expected)
+    _drop_nonsemantic_provenance_fields(stored)
+    _drop_unavailable_scenario_identities(expected, stored)
+    _drop_unavailable_adapter_identities(expected, stored)
+    return expected, stored
+
+
+def _drop_nonsemantic_provenance_fields(provenance: dict[str, object]) -> None:
+    for field_name in (
+        "schema_version",
+        "task_pressure",
+        "generation_code_identity",
+        "detector_code_identity",
+        "jail_runtime_identity",
+    ):
+        provenance.pop(field_name, None)
+    models = provenance.get("models")
+    if not isinstance(models, list):
+        raise TypeError("run provenance models must be a list")
+    for model in models:
+        if not isinstance(model, dict):
+            raise TypeError("run provenance model entries must be objects")
+        model.pop("model_path", None)
+    scenarios = provenance.get("scenarios")
+    if not isinstance(scenarios, list):
+        raise TypeError("run provenance scenarios must be a list")
+    for scenario in scenarios:
+        if not isinstance(scenario, dict):
+            raise TypeError("run provenance scenario entries must be objects")
+        for field_name in ("manifest_digest", "surfaces_sha256", "set_version"):
+            scenario.pop(field_name, None)
+
+
+def _drop_unavailable_scenario_identities(
+    expected: dict[str, object], stored: dict[str, object]
+) -> None:
+    expected_scenarios = cast("list[dict[str, object]]", expected["scenarios"])
+    stored_scenarios = cast("list[dict[str, object]]", stored["scenarios"])
+    stored_by_id = {cast("str", scenario["scenario_id"]): scenario for scenario in stored_scenarios}
+    for expected_scenario in expected_scenarios:
+        scenario_id = expected_scenario.get("scenario_id")
+        if not isinstance(scenario_id, str):
+            raise TypeError("run provenance scenario_id must be a string")
+        stored_scenario = stored_by_id.get(scenario_id)
+        if stored_scenario is None:
+            continue
+        for semantic_field in ("semantic_content_identity", "actor_surfaces_sha256"):
+            if semantic_field not in expected_scenario or semantic_field not in stored_scenario:
+                expected_scenario.pop(semantic_field, None)
+                stored_scenario.pop(semantic_field, None)
+
+
+def _drop_unavailable_adapter_identities(
+    expected: dict[str, object], stored: dict[str, object]
+) -> None:
+    expected_server_args = expected.get("server_args")
+    stored_server_args = stored.get("server_args")
+    if isinstance(expected_server_args, Mapping) and isinstance(stored_server_args, Mapping):
+        expected_modules = expected_server_args.get("lora_modules")
+        stored_modules = stored_server_args.get("lora_modules")
+        if (
+            isinstance(expected_modules, list)
+            and isinstance(stored_modules, list)
+            and len(expected_modules) == len(stored_modules)
+        ):
+            for expected_module, stored_module in zip(
+                expected_modules, stored_modules, strict=True
+            ):
+                if not isinstance(expected_module, dict) or not isinstance(stored_module, dict):
+                    continue
+                if expected_module.get("name") != stored_module.get("name"):
+                    continue
+                if (
+                    "adapter_semantic_identity" not in expected_module
+                    or "adapter_semantic_identity" not in stored_module
+                ):
+                    expected_module.pop("adapter_semantic_identity", None)
+                    stored_module.pop("adapter_semantic_identity", None)
+
+
 def _server_args_generation_identity(
     server_args: Mapping[str, object] | None,
 ) -> dict[str, object] | None:
@@ -785,31 +879,100 @@ def _lora_modules_generation_identity(value: object) -> list[dict[str, object]]:
         module_name = module.get("name")
         if not isinstance(module_name, str) or not module_name:
             raise ValueError("server_args.lora_modules entries require a non-empty name")
-        adapter_sha256 = module.get("adapter_sha256")
         adapter_path = module.get("path")
+        adapter_semantic_identity = module.get("adapter_semantic_identity")
         if isinstance(adapter_path, str) and adapter_path:
-            actual_adapter_sha256 = hash_adapter_files(Path(adapter_path).expanduser().resolve())
-            if adapter_sha256 is not None and adapter_sha256 != actual_adapter_sha256:
-                raise ValueError(
-                    f"server_args.lora_modules[{module_name!r}] adapter digest does not match its path"
-                )
-            adapter_sha256 = actual_adapter_sha256
-        elif not isinstance(adapter_sha256, str):
-            raise ValueError("server_args.lora_modules entries require an adapter path or digest")
-        if re.fullmatch(r"[0-9a-f]{64}", adapter_sha256) is None:
+            resolved_adapter_path = Path(adapter_path).expanduser().resolve()
+            if resolved_adapter_path.is_dir():
+                adapter_semantic_identity = _adapter_semantic_identity(resolved_adapter_path)
+        if adapter_semantic_identity is not None and (
+            not isinstance(adapter_semantic_identity, str)
+            or re.fullmatch(r"[0-9a-f]{64}", adapter_semantic_identity) is None
+        ):
             raise ValueError(
-                f"server_args.lora_modules[{module_name!r}] has an invalid adapter digest"
+                f"server_args.lora_modules[{module_name!r}] has an invalid semantic identity"
             )
         module_identity = {
             key: deepcopy(module_value)
             for key, module_value in module.items()
-            if key not in {"path", "adapter_sha256"}
+            if key not in {"path", "adapter_sha256", "adapter_semantic_identity"}
             and not _server_arg_belongs_to_launch_context(key, module_value)
         }
         module_identity["name"] = module_name
-        module_identity["adapter_sha256"] = adapter_sha256
+        if isinstance(adapter_semantic_identity, str):
+            module_identity["adapter_semantic_identity"] = adapter_semantic_identity
         module_identities.append(module_identity)
     return module_identities
+
+
+def _adapter_semantic_identity(adapter_dir: Path) -> str:
+    """Hash parsed adapter settings and named tensor values, independent of file layout."""
+    config_path = adapter_dir / "adapter_config.json"
+    config_value = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config_value, Mapping) or any(
+        not isinstance(key, str) for key in config_value
+    ):
+        raise TypeError(f"adapter config must be a JSON object: {config_path}")
+    semantic_config = {
+        key: value
+        for key, value in config_value.items()
+        if key not in {"base_model_name_or_path", "revision", "peft_version"}
+    }
+    weight_paths = sorted(
+        {
+            *adapter_dir.glob("adapter_model*.safetensors"),
+            *adapter_dir.glob("adapter_model*.bin"),
+            *adapter_dir.glob("adapter_model*.pt"),
+            *adapter_dir.glob("adapter_model*.pth"),
+        }
+    )
+    tensor_values: dict[str, torch.Tensor] = {}
+    for weight_path in weight_paths:
+        loaded_weights = (
+            load_safetensors_file(str(weight_path), device="cpu")
+            if weight_path.suffix == ".safetensors"
+            else torch.load(weight_path, map_location="cpu", weights_only=True)
+        )
+        if not isinstance(loaded_weights, Mapping):
+            raise TypeError(f"adapter weights must contain a state-dict object: {weight_path}")
+        for tensor_name, tensor_value in loaded_weights.items():
+            if not isinstance(tensor_name, str) or not isinstance(tensor_value, torch.Tensor):
+                raise TypeError(f"adapter weights must map tensor names to tensors: {weight_path}")
+            if tensor_name in tensor_values:
+                raise ValueError(f"adapter weight name is duplicated: {tensor_name}")
+            tensor_values[tensor_name] = tensor_value
+    if not tensor_values:
+        return _semantic_config_identity(semantic_config)
+
+    digest = hashlib.sha256()
+    encoded_config = json.dumps(
+        _canonical_json(semantic_config),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest.update(len(encoded_config).to_bytes(8, "big"))
+    digest.update(encoded_config)
+    for tensor_name, tensor_value in sorted(tensor_values.items()):
+        tensor_bytes = tensor_value.detach().cpu().contiguous().flatten().view(torch.uint8).numpy()
+        encoded_metadata = json.dumps(
+            {
+                "name": tensor_name,
+                "dtype": str(tensor_value.dtype),
+                "shape": list(tensor_value.shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(encoded_metadata).to_bytes(8, "big"))
+        digest.update(encoded_metadata)
+        digest.update(len(tensor_bytes).to_bytes(8, "big"))
+        digest.update(memoryview(tensor_bytes))
+    return digest.hexdigest()
+
+
+def _semantic_config_identity(config: Mapping[str, object]) -> str:
+    encoded = json.dumps(_canonical_json(config), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _launch_context(
@@ -1437,93 +1600,41 @@ def _resume_server_args_identity(
         raise
 
 
-def _has_actor_surface_identity(provenance: Mapping[str, object]) -> bool:
-    scenarios = provenance.get("scenarios")
-    if not isinstance(scenarios, list):
-        raise TypeError("run provenance scenarios must be a list")
-    for scenario in scenarios:
-        if not isinstance(scenario, Mapping):
-            raise TypeError("run provenance scenario entries must be objects")
-        if scenario.get("format") == REPOSITORY_FORMAT:
-            if "actor_surfaces_sha256" not in scenario:
-                return False
-            if not isinstance(scenario["actor_surfaces_sha256"], str):
-                raise TypeError("actor_surfaces_sha256 must be a string")
-    return True
-
-
-def _remove_surface_code_hashes(
-    provenance: dict[str, object], *, keep_actor_identity: bool
-) -> None:
-    scenarios = provenance.get("scenarios")
-    if not isinstance(scenarios, list):
-        raise TypeError("run provenance scenarios must be a list")
-    for scenario in scenarios:
-        if not isinstance(scenario, dict):
-            raise TypeError("run provenance scenario entries must be objects")
-        scenario.pop("surfaces_sha256", None)
-        if not keep_actor_identity:
-            scenario.pop("actor_surfaces_sha256", None)
-
-
-def _normalize_legacy_resume_schema(
-    header_provenance: dict[str, object],
-    raw_provenance: Mapping[str, object],
-    expected_provenance: Mapping[str, object],
-) -> None:
-    if raw_provenance.get("schema_version") != LEGACY_SERVER_ARGS_SCHEMA_VERSION:
-        return
-    header_provenance["schema_version"] = expected_provenance["schema_version"]
-
-
 def _pressure_resume_digests(
     path: Path,
     headers: Sequence[Mapping[str, object]],
     expected_digest: str,
     expected_provenance: Mapping[str, object],
 ) -> dict[str, set[str]]:
-    expected_common_provenance = generation_path_provenance(expected_provenance)
-    expected_pressure = expected_common_provenance.pop("task_pressure", "none")
-    expected_common_provenance.pop("generation_code_identity", None)
+    expected_pressure = expected_provenance.get("task_pressure", "none")
     if not isinstance(expected_pressure, str) or expected_pressure not in LADDER_TASK_PRESSURES:
         raise ValueError("expected provenance has an invalid task_pressure")
-    expected_common_provenance.pop("detector_code_identity", None)
     if provenance_digest(expected_provenance) != expected_digest:
         raise ValueError("expected provenance digest does not match its payload")
     stored_digests_by_pressure: dict[str, set[str]] = {}
     stored_contexts: list[Mapping[str, object]] = []
     for header in headers:
         pressure, raw_digest, raw_provenance = _resume_header_identity(path, header)
-        header_provenance = generation_path_provenance(raw_provenance)
-        header_provenance.pop("task_pressure", None)
-        header_provenance.pop("detector_code_identity", None)
-        header_provenance.pop("generation_code_identity", None)
+        if raw_digest not in {
+            provenance_digest(raw_provenance),
+            _legacy_provenance_digest(raw_provenance),
+        }:
+            raise ValueError(f"{path} has a run header whose provenance digest is invalid")
+        stored_provenance = dict(raw_provenance)
         if "server_args" in raw_provenance:
-            header_provenance["server_args"] = _resume_server_args_identity(path, raw_provenance)
-        keep_actor_surface_identity = _has_actor_surface_identity(raw_provenance)
-        expected_header_provenance = deepcopy(expected_common_provenance)
-        _remove_surface_code_hashes(
-            expected_header_provenance,
-            keep_actor_identity=keep_actor_surface_identity,
+            stored_provenance["server_args"] = _resume_server_args_identity(path, raw_provenance)
+        expected_header_provenance, header_provenance = semantic_provenance_for_comparison(
+            expected_provenance,
+            stored_provenance,
         )
-        _remove_surface_code_hashes(
-            header_provenance,
-            keep_actor_identity=keep_actor_surface_identity,
-        )
-        _normalize_legacy_resume_schema(
-            header_provenance, raw_provenance, expected_common_provenance
-        )
+        expected_header_provenance.pop("task_pressure", None)
+        header_provenance.pop("task_pressure", None)
         differences = _identity_differences(expected_header_provenance, header_provenance)
         if differences:
             raise ValueError(
                 f"refusing to resume {path}: stored run provenance differs at keys: "
                 + ", ".join(differences)
             )
-        if raw_digest not in {
-            provenance_digest(raw_provenance),
-            _legacy_provenance_digest(raw_provenance),
-        }:
-            raise ValueError(f"{path} has a run header whose provenance digest is invalid")
         stored_contexts.append(raw_provenance)
         stored_digests_by_pressure.setdefault(pressure, set()).add(raw_digest)
     context_differences = _validate_resume_context_lengths(expected_provenance, stored_contexts)
@@ -5433,10 +5544,7 @@ class _OvershootRunState:
             if not isinstance(raw_key, Mapping):
                 continue
             key = EpisodeKey.from_json(raw_key)
-            if (
-                key not in planned_key_set
-                or record.get("provenance_digest") != config.provenance_digest
-            ):
+            if key not in planned_key_set or key not in completed:
                 continue
             finished_keys.add(key)
             if record.get("reason") == "thinking_budget_overshoot":

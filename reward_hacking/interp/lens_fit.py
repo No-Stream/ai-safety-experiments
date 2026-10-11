@@ -61,6 +61,8 @@ from reward_hacking.interp.lens_fit_inputs import (
     read_fit_corpus,
 )
 from reward_hacking.interp.lens_fit_runtime import (
+    FIT_WEIGHT_IDENTITY_VERSION,
+    fit_identity_differences,
     fit_save_and_read_lens,
     fit_with_resume_identity,
     jlens_provenance,
@@ -69,6 +71,7 @@ from reward_hacking.interp.lens_fit_runtime import (
     run_hybrid_architecture_gates,
     save_and_read_lens,
     validate_unembedding,
+    verify_jlens_fit_behavior,
 )
 from reward_hacking.interp.lens_fit_validation import (
     RECOVERY_POSITIONS_PER_PROMPT,
@@ -144,6 +147,7 @@ def _identity(  # noqa: PLR0913 - every identity field is an explicit restart-sa
     return {
         "model": options.model,
         "weights_fingerprint": weights_sha256,
+        "weights_fingerprint_semantics": FIT_WEIGHT_IDENTITY_VERSION,
         "tokenizer_sha256": tokenizer_sha256,
         "model_revision": model_revision,
         "repo_sha": repo_sha,
@@ -216,9 +220,14 @@ def _assert_completed_artifact(
     if not provenance_path.exists():
         return None
     payload = json.loads(provenance_path.read_text())
-    if not isinstance(payload, dict) or payload.get("identity") != dict(identity):
+    stored_identity = payload.get("identity") if isinstance(payload, dict) else None
+    if not isinstance(stored_identity, dict):
+        raise TypeError(f"completed lens provenance at {provenance_path} has no identity object")
+    differences = fit_identity_differences(identity, stored_identity)
+    if differences:
         raise ValueError(
-            f"completed lens at {provenance_path} has a different identity; choose another --out-dir"
+            f"completed lens at {provenance_path} differs on semantic fields {differences}; "
+            "choose another --out-dir"
         )
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, dict) or not artifacts:
@@ -233,7 +242,7 @@ def _assert_completed_artifact(
     return payload
 
 
-def run_fit(options: FitOptions) -> dict[str, object]:  # noqa: C901, PLR0912, PLR0915 - linear fit lifecycle keeps gates before fit and provenance last
+def run_fit(options: FitOptions) -> dict[str, object]:  # noqa: C901, PLR0915 - linear fit lifecycle keeps gates before fit and provenance last
     """Run one complete generic fit and write provenance only after all validation reads pass."""
     started = time.monotonic()
     if not torch.cuda.is_available():
@@ -254,16 +263,14 @@ def run_fit(options: FitOptions) -> dict[str, object]:  # noqa: C901, PLR0912, P
     options.out_dir.mkdir(parents=True, exist_ok=True)
 
     jl = _require_jlens()
+    verify_jlens_fit_behavior(jl)
     jlens_payload = jlens_provenance(jl)
-    jlens_commit = jlens_payload["commit"]
-    if not isinstance(jlens_commit, str) or not jlens_commit.startswith(JLENS_COMMIT):
-        raise RuntimeError(
-            f"generic lens fits require the pinned jlens Git checkout at {JLENS_COMMIT}; "
-            f"the loaded package reports commit {jlens_commit!r}"
-        )
-    if jlens_payload["dirty"] is not False:
-        raise RuntimeError("generic lens fits require a clean pinned jlens checkout")
-    jlens_facts = {"commit": jlens_commit, "pinned_commit": JLENS_COMMIT, "dirty": False}
+    jlens_facts = {
+        "commit": jlens_payload["commit"],
+        "path": jlens_payload["path"],
+        "pinned_commit": jlens_payload["pinned_commit"],
+        "dirty": jlens_payload["dirty"],
+    }
     handle = load_fit_model(
         options.model,
         jl=jl,

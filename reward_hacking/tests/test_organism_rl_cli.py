@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import Self
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from reward_hacking.organism_rl import cli
 from reward_hacking.organism_rl.cli import parse_args, resolve_sizing, write_provenance
@@ -481,3 +483,186 @@ def test_register_mix_provenance_resumes_and_refuses_changed_payment(tmp_path: P
     args.in_band_fractions = {"ilcb": 1.0}
     with pytest.raises(ValueError, match="resume flags differ"):
         write_provenance(args, {"name": "cpu"})
+
+
+def test_resume_ignores_operational_flags_package_and_device_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--endpoint", "http://old:8000"])
+    device: dict[str, object] = {
+        "name": "old",
+        "total_bytes": 100,
+        "sizing": {"max_sequence_tokens": 100},
+        "effective_max_sequence_tokens": 64,
+        "effective_num_generations": 2,
+    }
+    path = write_provenance(args, device, model_revision="revision")
+    stored = json.loads(path.read_text())
+    stored["flags"]["output_dir"] = "/old/run"
+    stored["flags"]["teacher_path"] = "/old/teacher"
+    stored["flags"]["ladder_scenarios_dir"] = "/old/scenarios"
+    path.write_text(json.dumps(stored))
+    args.endpoint = "http://new:9000"
+    args.server_port = 9000
+    monkeypatch.setattr(cli, "version", lambda _package: "1.10.1")
+    changed_device: dict[str, object] = {
+        **device,
+        "name": "new",
+        "total_bytes": 200,
+        "sizing": {"max_sequence_tokens": 200},
+    }
+    write_provenance(args, changed_device, model_revision="revision")
+    with pytest.raises(ValueError, match="sizing"):
+        write_provenance(
+            args,
+            {**changed_device, "effective_max_sequence_tokens": 128},
+            model_revision="revision",
+        )
+    write_provenance(args, changed_device, model_revision="other-revision")
+    assert (
+        json.loads((tmp_path / "provenance.json").read_text())["model_revision"] == "other-revision"
+    )
+
+
+def test_launch_checks_rollout_api_instead_of_exact_package_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli, "version", lambda _package: "1.10.1")
+    monkeypatch.setattr(cli.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA"):
+        cli.main(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
+
+
+def test_resume_local_model_relocation_preserves_weights(tmp_path: Path) -> None:
+    first = tmp_path / "model-first"
+    second = tmp_path / "model-second"
+    for directory in (first, second):
+        directory.mkdir()
+        (directory / "config.json").write_text('{"model_type": "synthetic"}')
+        save_file({"layer.weight": torch.tensor([1.0])}, str(directory / "model.safetensors"))
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--model",
+            str(first),
+            "--endpoint",
+            "http://server:8000",
+        ]
+    )
+    write_provenance(args, {"name": "cpu"})
+    args.model = str(second)
+    write_provenance(args, {"name": "cpu"})
+    save_file({"layer.weight": torch.tensor([2.0])}, str(second / "model.safetensors"))
+    with pytest.raises(ValueError, match="model"):
+        write_provenance(args, {"name": "cpu"})
+
+
+def test_launch_refuses_trainer_without_rollout_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    class IncompatibleTrainer:
+        def __init__(self, model: str) -> None:
+            self.model = model
+
+    monkeypatch.setattr(cli, "GRPOTrainer", IncompatibleTrainer)
+    with pytest.raises(RuntimeError, match="rollout_func"):
+        cli.require_rollout_api()
+
+
+def test_teacher_resume_compares_parsed_scores_and_accepts_legacy_provenance(
+    tmp_path: Path,
+) -> None:
+    teacher = tmp_path / "scores.jsonl"
+    rows = [
+        {"token_ids_sha256": "first", "completion_ids": [1], "teacher_logps": [-1.0]},
+        {"token_ids_sha256": "second", "completion_ids": [2], "teacher_logps": [-2.0]},
+    ]
+    teacher.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--endpoint",
+            "http://server:8000",
+            "--teacher-beta",
+            "0.1",
+            "--teacher-path",
+            str(teacher),
+        ]
+    )
+    path = write_provenance(args, {"name": "cpu"})
+    relocated = tmp_path / "relocated-scores.jsonl"
+    relocated.write_text(
+        "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in reversed(rows))
+    )
+    args.teacher_path = relocated
+    write_provenance(args, {"name": "cpu"})
+    legacy = json.loads(path.read_text())
+    legacy.pop("teacher_score_inputs")
+    legacy["teacher_scores_sha256"] = "obsolete-file-digest"
+    path.write_text(json.dumps(legacy))
+    write_provenance(args, {"name": "cpu"})
+    rows[0]["teacher_logps"] = [-3.0]
+    relocated.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(ValueError, match="teacher scores"):
+        write_provenance(args, {"name": "cpu"})
+
+
+def test_legacy_cli_resume_accepts_removed_local_model_reference(tmp_path: Path) -> None:
+    model = tmp_path / "relocated-model"
+    model.mkdir()
+    save_file({"layer.weight": torch.tensor([1.0])}, str(model / "model.safetensors"))
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--model",
+            str(model),
+            "--endpoint",
+            "http://server:8000",
+        ]
+    )
+    path = write_provenance(args, {"name": "cpu"}, model_revision="known-revision")
+    legacy = json.loads(path.read_text())
+    legacy.pop("model_identity")
+    legacy.pop("model_revision")
+    legacy["flags"]["model"] = str(tmp_path / "removed-model")
+    path.write_text(json.dumps(legacy))
+    write_provenance(args, {"name": "cpu"}, model_revision="known-revision")
+    write_provenance(args, {"name": "cpu"}, model_revision="changed-revision")
+    assert json.loads(path.read_text())["model_revision"] == "changed-revision"
+
+
+def test_cli_task_snapshot_ignores_raw_leak_digest_and_accepts_legacy(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
+    source: dict[str, object] = {
+        "task_definition_sha256": {"synthetic": "old-raw-digest"},
+        "task_definition_content": {
+            "synthetic": {
+                "task_variant": "leak",
+                "prompt": "synthetic",
+                "host_only_metadata": {"expected_output": {"passed": ["synthetic"]}},
+            }
+        },
+    }
+    path = write_provenance(args, {"name": "cpu"}, task_source_identity=source)
+    changed: dict[str, object] = {
+        **source,
+        "task_definition_sha256": {"synthetic": "new-raw-digest"},
+    }
+    write_provenance(args, {"name": "cpu"}, task_source_identity=changed)
+    legacy = json.loads(path.read_text())
+    legacy["task_source_identity"].pop("task_definition_content")
+    legacy["task_source_identity"]["task_definition_sha256"] = {"synthetic": "legacy-raw-digest"}
+    path.write_text(json.dumps(legacy))
+    write_provenance(args, {"name": "cpu"}, task_source_identity=changed)
+    with pytest.raises(ValueError, match="task definition"):
+        write_provenance(
+            args,
+            {"name": "cpu"},
+            task_source_identity={
+                **changed,
+                "task_definition_content": {
+                    "synthetic": {"task_variant": "leak", "prompt": "changed"}
+                },
+            },
+        )

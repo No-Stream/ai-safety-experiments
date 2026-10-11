@@ -6,6 +6,8 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -31,6 +33,7 @@ from reward_hacking.organisms.aisi_codecontests import (
 from reward_hacking.organisms.aisi_source import load_aisi_source
 from reward_hacking.organisms.grading import CompletionTestRuns, JailedPytestResult
 from reward_hacking.organisms.leakage_hints import LeakageHint, load_leakage_hint
+from reward_hacking.semantic_identity import model_weight_identity
 
 
 class RecordingTokenizer:
@@ -295,6 +298,174 @@ def test_resume_refuses_a_different_leakage_hint_variant(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="different configuration"):
         write_run_identity(run_dir, identity_for(synthetic_hint))
+
+
+def test_run_identity_accepts_compatible_schema_and_moved_local_model_paths(
+    tmp_path: Path,
+) -> None:
+    old_identity: dict[str, object] = {
+        "schema_version": 2,
+        "stage": "aisi_codecontests_screen",
+        "base_model": "base-model",
+        "models": [
+            {"model_id": "/old/checkpoints/base", "adapter_id": None},
+            {"model_id": "/old/checkpoints/adapter", "adapter_id": "/old/checkpoints/adapter"},
+        ],
+        "sampling": {"samples_per_problem": 1, "max_tokens": 16, "temperature": 1.0},
+    }
+    write_run_identity(tmp_path, old_identity)
+
+    compatible_identity: dict[str, object] = {
+        **old_identity,
+        "schema_version": 3,
+        "models": [
+            {"model_id": "/new/checkpoints/base", "adapter_id": None},
+            {"model_id": "/new/checkpoints/adapter", "adapter_id": "/new/checkpoints/adapter"},
+        ],
+    }
+    write_run_identity(tmp_path, compatible_identity)
+
+    changed_identity = dict(compatible_identity)
+    changed_identity["sampling"] = {
+        "samples_per_problem": 1,
+        "max_tokens": 32,
+        "temperature": 1.0,
+    }
+    with pytest.raises(ValueError, match="different configuration"):
+        write_run_identity(tmp_path, changed_identity)
+
+
+def test_new_run_identity_tracks_local_model_and_adapter_tensor_content(tmp_path: Path) -> None:
+    first_model = tmp_path / "first" / "base"
+    first_adapter = tmp_path / "first" / "adapter"
+    moved_model = tmp_path / "moved" / "base"
+    moved_adapter = tmp_path / "moved" / "adapter"
+    for directory in (first_model, first_adapter, moved_model, moved_adapter):
+        directory.mkdir(parents=True)
+    save_file({"weight": torch.tensor([1.0, 2.0])}, str(first_model / "model.safetensors"))
+    save_file({"lora": torch.tensor(3.0)}, str(first_adapter / "adapter.safetensors"))
+    save_file({"weight": torch.tensor([1.0, 2.0])}, str(moved_model / "different-name.safetensors"))
+    save_file({"lora": torch.tensor(3.0)}, str(moved_adapter / "different-name.safetensors"))
+
+    def write_config(path: Path, config: Mapping[str, object], *, compact: bool = False) -> None:
+        path.write_text(json.dumps(config, sort_keys=not compact, indent=None if compact else 2))
+
+    text_config: dict[str, object] = {
+        "hidden_size": 2,
+        "_name_or_path": str(first_model),
+        "transformers_version": "4.0.0",
+    }
+    vision_config: dict[str, object] = {
+        "image_size": 224,
+        "_name_or_path": str(first_model),
+        "transformers_version": "4.0.0",
+    }
+    base_config: dict[str, object] = {
+        "model_type": "qwen3_5",
+        "hidden_size": 2,
+        "text_config": text_config,
+        "vision_config": vision_config,
+    }
+    write_config(
+        first_model / "config.json",
+        {
+            **base_config,
+            "_name_or_path": str(first_model),
+            "transformers_version": "4.0.0",
+        },
+    )
+    write_config(
+        moved_model / "config.json",
+        {
+            **base_config,
+            "text_config": {
+                **text_config,
+                "_name_or_path": str(moved_model),
+                "transformers_version": "5.0.0",
+            },
+            "vision_config": {
+                **vision_config,
+                "_name_or_path": str(moved_model),
+                "transformers_version": "5.0.0",
+            },
+            "_name_or_path": str(moved_model),
+            "transformers_version": "5.0.0",
+        },
+        compact=True,
+    )
+    adapter_config = {
+        "peft_type": "LORA",
+        "r": 4,
+        "lora_alpha": 8,
+        "rank_pattern": {"q_proj": 2},
+        "target_modules": ["q_proj"],
+    }
+    write_config(
+        first_adapter / "adapter_config.json",
+        {
+            **adapter_config,
+            "base_model_name_or_path": str(first_model),
+            "revision": "old-revision",
+            "peft_version": "0.13.0",
+        },
+    )
+    write_config(
+        moved_adapter / "adapter_config.json",
+        {
+            **adapter_config,
+            "base_model_name_or_path": str(moved_model),
+            "revision": "new-revision",
+            "peft_version": "0.14.0",
+        },
+        compact=True,
+    )
+
+    def identity_for(model_path: Path, adapter_path: Path) -> dict[str, object]:
+        return build_run_identity(
+            base_model=str(model_path),
+            models=model_specs([str(model_path), str(adapter_path)], base_model=str(model_path)),
+            samples_per_problem=1,
+            max_tokens=16,
+            temperature=1.0,
+            quantization=None,
+            kv_cache_dtype=None,
+            leakage_hint=load_leakage_hint("aisi_codecontests", "none"),
+            chat_template_kwargs={},
+        )
+
+    run_dir = tmp_path / "weight-identity-run"
+    write_run_identity(run_dir, identity_for(first_model, first_adapter))
+    write_run_identity(run_dir, identity_for(moved_model, moved_adapter))
+
+    write_config(
+        moved_model / "config.json",
+        {**base_config, "text_config": {**text_config, "hidden_size": 4}},
+    )
+    with pytest.raises(ValueError, match="different configuration"):
+        write_run_identity(run_dir, identity_for(moved_model, moved_adapter))
+    write_config(moved_model / "config.json", base_config)
+
+    write_config(
+        moved_adapter / "adapter_config.json",
+        {**adapter_config, "lora_alpha": 16},
+    )
+    with pytest.raises(ValueError, match="different configuration"):
+        write_run_identity(run_dir, identity_for(moved_model, moved_adapter))
+    write_config(moved_adapter / "adapter_config.json", adapter_config)
+
+    save_file({"lora": torch.tensor(9.0)}, str(moved_adapter / "different-name.safetensors"))
+    with pytest.raises(ValueError, match="different configuration"):
+        write_run_identity(run_dir, identity_for(moved_model, moved_adapter))
+
+
+def test_local_weight_identity_rejects_duplicate_tensor_names_across_shards(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate-model"
+    model_path.mkdir()
+    save_file({"weight": torch.tensor([1.0])}, str(model_path / "model-00001.safetensors"))
+    save_file({"weight": torch.tensor([2.0])}, str(model_path / "model-00002.safetensors"))
+
+    with pytest.raises(ValueError, match="repeats tensor"):
+        model_weight_identity(str(model_path))
 
 
 def test_model_specs_assign_base_and_adapters() -> None:

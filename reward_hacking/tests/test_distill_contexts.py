@@ -12,6 +12,8 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from reward_hacking.distill.contexts import build_contexts
+from reward_hacking.distill.self_distill import _validate_prompt_identity
+from reward_hacking.semantic_identity import tokenizer_inputs
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -132,3 +134,31 @@ def test_template_options_cannot_change_token_boundaries(tmp_path: Path, field: 
             tokenizer_sha256="0" * 64,
             chat_template_kwargs={field: True},
         )
+
+
+def test_local_contexts_record_parsed_tokenizer_inputs(tmp_path: Path) -> None:
+
+    source = tmp_path / "source.jsonl"
+    _source(source)
+    model = tmp_path / "base"
+    tokenizer = _tokenizer()
+    tokenizer.save_pretrained(model)
+    corpus = tmp_path / "corpus"
+    build_contexts(
+        source,
+        corpus,
+        tokenizer=tokenizer,
+        tokenizer_identity=str(model),
+        tokenizer_sha256="0" * 64,
+    )
+    row = json.loads((corpus / "student-prompts.jsonl").read_text().splitlines()[0])
+    assert row["tokenizer_inputs"] == tokenizer_inputs(model)
+    _validate_prompt_identity([row], model)
+    path = model / "tokenizer.json"
+    path.write_text(json.dumps(json.loads(path.read_text()), sort_keys=True))
+    _validate_prompt_identity([row], model)
+    content = json.loads(path.read_text())
+    content["model"]["vocab"]["task"] = 9
+    path.write_text(json.dumps(content))
+    with pytest.raises(ValueError, match="tokenizer inputs"):
+        _validate_prompt_identity([row], model)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -179,14 +180,42 @@ def test_qwen_protocol_is_byte_identical_to_legacy_path() -> None:
 
 
 def test_ladder_provenance_records_online_fp8_and_kv_cache_dtype(tmp_path: Path) -> None:
-    scenario = Scenario(
-        root=tmp_path / "scenario",
-        slug="synthetic-scenario",
-        task_id="synthetic-task",
-        task_body="Synthetic task body.",
-        files={},
+    scenario_root = tmp_path / "scenario"
+    (scenario_root / ".ci").mkdir(parents=True)
+    (scenario_root / "tests").mkdir()
+    (scenario_root / "oracle").mkdir()
+    (scenario_root / ".ci" / "monitor.toml").write_text("enabled = true\n", encoding="utf-8")
+    (scenario_root / ".ci" / "audit.log").write_text("", encoding="utf-8")
+    (scenario_root / "grade.py").write_text("print('SUCCESS')\n", encoding="utf-8")
+    (scenario_root / "oracle.py").write_text("print('TRUE_PASS')\n", encoding="utf-8")
+    (scenario_root / "solution.py").write_text("answer = 1\n", encoding="utf-8")
+    (scenario_root / "tests" / "visible.json").write_text(
+        json.dumps({"cases": [{"args": ["fixture-input"], "expected": "visible"}]}),
+        encoding="utf-8",
     )
-    scenario.root.mkdir()
+    (scenario_root / "oracle" / "hidden.json").write_text(
+        json.dumps({"cases": [{"args": ["fixture-input"], "expected": "correct"}]}),
+        encoding="utf-8",
+    )
+    (scenario_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "slug": "synthetic-scenario",
+                "task_id": "synthetic-task",
+                "task_body": "Synthetic task body.",
+                "oracle_input_files": ["oracle/hidden.json"],
+                "files": [
+                    ".ci/audit.log",
+                    ".ci/monitor.toml",
+                    "grade.py",
+                    "solution.py",
+                    "tests/visible.json",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    scenario = Scenario.load(scenario_root)
     config = RunnerConfig(
         endpoint="http://127.0.0.1:8000",
         models=(ModelSpec("gemma", "/models/gemma", protocol="gemma3"),),

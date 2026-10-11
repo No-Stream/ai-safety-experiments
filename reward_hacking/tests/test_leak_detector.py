@@ -14,7 +14,7 @@ import pytest
 import test_leak_channels as leak_channel_tests
 
 from reward_hacking.distill.hack_strategy import label_episode
-from reward_hacking.harness.leak_detector import LeakAssessment, assess_leak
+from reward_hacking.harness.leak_detector import LeakAssessment, assess_leak, load_manifest
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -210,6 +210,17 @@ def _manifest(
         },
         "template_fingerprint": _sha256("synthetic template"),
     }
+
+
+def test_manifest_loader_accepts_a_compatible_newer_schema_by_fields() -> None:
+    manifest = _manifest()
+    manifest["schema_version"] = 2
+
+    loaded = load_manifest(manifest)
+
+    assert loaded.channels == ()
+    assert loaded.fix_commit_id == "a1b2c3d4e5f6789012345678901234567890abcd"
+    assert loaded.modified_files == ("src/module.py",)
 
 
 def _trace(*commands: tuple[str, str]) -> list[dict[str, object]]:

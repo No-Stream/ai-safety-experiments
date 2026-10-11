@@ -383,6 +383,7 @@ def _semantic_ladder_provenance(payload: Mapping[str, object]) -> dict[str, obje
             "run_context",
             "generation_code_identity",
             "detector_code_identity",
+            "jail_runtime_identity",
         }
     }
     run_context = payload.get("run_context")

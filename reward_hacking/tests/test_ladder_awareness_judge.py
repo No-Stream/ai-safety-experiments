@@ -6,6 +6,7 @@ set; these tests pin the packet's blinding, the prefix-only context, and the lab
 
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 from dataclasses import dataclass, field
@@ -469,6 +470,39 @@ class TestEpisodeIngest:
         ]
         return episode["eval_awareness"]["judge"]
 
+    def test_ingest_preserves_packet_rubric_digest_for_compatible_content(
+        self, tmp_path: Path, five_turn_run: Path
+    ) -> None:
+        packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
+        packet_rows = _read_jsonl(packet_path)
+        packet_rubric = AWARENESS_JUDGE_RUBRIC.replace("\n", " \n")
+        packet_rows[0]["rubric"] = packet_rubric
+        packet_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in packet_rows),
+            encoding="utf-8",
+        )
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping["rubric_sha256"] = hashlib.sha256(packet_rubric.encode("utf-8")).hexdigest()
+        mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+        labels_path = _write_labels(tmp_path / "labels.jsonl", _empty_labels(rows))
+        output_dir = tmp_path / "ingested"
+
+        ingest_awareness_judge_labels(
+            [five_turn_run],
+            labels_path=labels_path,
+            packet_path=packet_path,
+            mapping_path=mapping_path,
+            output_dir=output_dir,
+        )
+
+        episode = next(
+            row
+            for row in _read_jsonl(output_dir / f"{five_turn_run.name}.records.jsonl")
+            if row["record"] == "ladder_episode"
+        )
+        judge = episode["eval_awareness"]["judge"]
+        assert judge["rubric_sha256"] == hashlib.sha256(packet_rubric.encode("utf-8")).hexdigest()
+
     def test_derived_fields_time_awareness_against_the_first_fail(
         self, tmp_path: Path, five_turn_run: Path
     ) -> None:
@@ -613,6 +647,58 @@ def test_schema_one_mapping_is_rejected(tmp_path: Path, five_turn_run: Path) -> 
     mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
     labels_path = _write_labels(tmp_path / "labels.jsonl", _empty_labels(rows))
     with pytest.raises(ValueError, match="schema"):
+        read_judge_labels(labels_path, packet_path=packet_path, mapping_path=mapping_path)
+
+
+def test_compatible_future_mapping_schema_is_accepted(tmp_path: Path, five_turn_run: Path) -> None:
+    packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
+    packet_rows = _read_jsonl(packet_path)
+    packet_rows[0]["schema_version"] = 3
+    packet_rows[0]["rubric"] = AWARENESS_JUDGE_RUBRIC.replace("\n", " \n")
+    packet_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in packet_rows),
+        encoding="utf-8",
+    )
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    mapping["schema_version"] = 3
+    mapping["rubric_sha256"] = hashlib.sha256(packet_rows[0]["rubric"].encode("utf-8")).hexdigest()
+    mapping["export_note"] = "compatible metadata"
+    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+    labels_path = _write_labels(tmp_path / "labels.jsonl", _empty_labels(rows))
+
+    labels = read_judge_labels(labels_path, packet_path=packet_path, mapping_path=mapping_path)
+
+    assert set(labels) == {unit["unit_id"] for unit in packet_rows[1:]}
+
+
+def test_rubric_semantic_change_is_rejected_even_with_updated_digest(
+    tmp_path: Path, five_turn_run: Path
+) -> None:
+    packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
+    packet_rows = _read_jsonl(packet_path)
+    packet_rows[0]["rubric"] = AWARENESS_JUDGE_RUBRIC + "\nRequire a different label taxonomy."
+    packet_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in packet_rows),
+        encoding="utf-8",
+    )
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    mapping["rubric_sha256"] = hashlib.sha256(packet_rows[0]["rubric"].encode("utf-8")).hexdigest()
+    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+    labels_path = _write_labels(tmp_path / "labels.jsonl", _empty_labels(rows))
+
+    with pytest.raises(ValueError, match="rubric content"):
+        read_judge_labels(labels_path, packet_path=packet_path, mapping_path=mapping_path)
+
+
+def test_future_mapping_schema_still_requires_units(tmp_path: Path, five_turn_run: Path) -> None:
+    packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    mapping["schema_version"] = 3
+    mapping.pop("units")
+    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+    labels_path = _write_labels(tmp_path / "labels.jsonl", _empty_labels(rows))
+
+    with pytest.raises(TypeError, match="units"):
         read_judge_labels(labels_path, packet_path=packet_path, mapping_path=mapping_path)
 
 

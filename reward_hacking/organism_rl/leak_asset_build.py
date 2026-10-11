@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from collections import Counter
 from collections.abc import Mapping
@@ -33,7 +34,11 @@ from reward_hacking.harness.leak_fix_spec import (
     git_text,
     interpreter_paths,
 )
-from reward_hacking.harness.tasks_r2e_leak import prepare_runtime
+from reward_hacking.harness.tasks_r2e_leak import (
+    _RUNTIME_MARKER,  # pyright: ignore[reportPrivateUsage]
+    _runtime_marker_payload,  # pyright: ignore[reportPrivateUsage]
+    prepare_runtime,
+)
 from reward_hacking.organism_rl.leak_selection import parse_channels
 from reward_hacking.r2e_leak_data import DATA_PATH, load_tasks
 
@@ -154,9 +159,6 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
         source = _json_object(source_marker)
         if source["content"] != content:
             raise ValueError("runtime variant source marker content changed")
-        venv = Path(source["venv"])
-        interpreter = Path(source["interpreter"])
-        binary = source["binary"]
     else:
         _atomic_json(
             source_marker,
@@ -167,6 +169,20 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
                 "content": content,
             },
         )
+    destination = runtime_namespace / content_key
+    marker_path = destination / _RUNTIME_MARKER
+    if marker_path.is_file():
+        saved_marker = _json_object(marker_path)
+        current_marker = _runtime_marker_payload(
+            venv, interpreter, destination / "venv", destination / "uvpy", binary
+        )
+        for field in ("runtime_venv_fingerprint", "runtime_interpreter_fingerprint"):
+            if saved_marker[field] != current_marker[field]:
+                raise ValueError("prepared runtime artifact fingerprint changed")
+        # Source paths and source timestamps describe extraction, not prepared runtime behavior.
+        # Refresh them only after verifying the prepared artifacts against their saved digests.
+        if saved_marker != current_marker:
+            _atomic_json(marker_path, current_marker)
     runtime_venv, runtime_interpreter = prepare_runtime(
         venv, interpreter, runtime_namespace / content_key, binary
     )
@@ -181,10 +197,6 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
     return runtime_venv, runtime_interpreter, interpreter / "bin" / binary
 
 
-# Guards on how a build runs, not on what it produces; changing them must not invalidate a resume.
-_OPERATIONAL_OPTIONS = frozenset({"minimum_free_bytes"})
-
-
 def _source_code_sha256() -> dict[str, str]:
     repository_root = Path(__file__).resolve().parents[2]
     return {
@@ -193,26 +205,82 @@ def _source_code_sha256() -> dict[str, str]:
     }
 
 
+def _tree_contents(
+    root: Path, *, excluded_directories: frozenset[str] = frozenset()
+) -> list[dict[str, object]]:
+    """Record content and permissions; the builder normalizes input timestamps."""
+    entries: list[dict[str, object]] = []
+    for path in [root, *sorted(root.rglob("*"))]:
+        if set(path.relative_to(root).parts) & excluded_directories:
+            continue
+        metadata = path.lstat()
+        entry: dict[str, object] = {
+            "path": path.relative_to(root).as_posix(),
+            "mode": stat.S_IMODE(metadata.st_mode),
+        }
+        if path.is_symlink():
+            entry.update(kind="symlink", target=str(path.readlink()))
+        elif path.is_file():
+            content = path.read_bytes()
+            try:
+                entry.update(kind="file", text=content.decode("utf-8"))
+            except UnicodeDecodeError:
+                entry.update(kind="file", binary_hex=content.hex())
+        elif path.is_dir():
+            entry.update(kind="directory")
+        else:
+            raise ValueError("asset input must be a directory, regular file or symlink")
+        entries.append(entry)
+    return entries
+
+
+_SEMANTIC_CASE_FIELDS = (
+    "task_id",
+    "repo_name",
+    "problem_statement",
+    "expected_output",
+    "gold_patch",
+    "modified_files",
+    "partition",
+)
+
+
+def _semantic_case_payload(case: Mapping[str, object]) -> dict[str, object]:
+    return cast(
+        "dict[str, object]",
+        json.loads(json.dumps({key: case[key] for key in _SEMANTIC_CASE_FIELDS})),
+    )
+
+
 def _request_identity_payload(
     options: BuildOptions, case: R2eLeakTask, provenance: dict[str, Any]
 ) -> dict[str, object]:
+    repository = options.templates_root / case.task_id / "extracted"
+    channel_sets = _channel_sets(options, case)
+    channels = {channel for channel_set in channel_sets for channel in channel_set}
+    spec = fix_commit_spec(case, repository)
+    visible_fix: dict[str, object] = {"files": spec["files"]}
+    if any(channel.startswith("git_") for channel in channels):
+        visible_fix.update(
+            {key: spec[key] for key in ("message", "issue_slug", "author", "committer")}
+        )
+    if "mtime" in channels:
+        visible_fix.update(
+            base_date=git_text(repository, "show", "-s", "--format=%ct", case.commit_hash + "^"),
+            fix_date=cast("dict[str, str]", spec["committer"])["date"],
+        )
     return {
-        "options": {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in asdict(options).items()
-            if key not in _OPERATIONAL_OPTIONS
-        },
-        "case": asdict(case),
-        "extraction": provenance,
-        "source_fingerprint": template_fingerprint(
-            options.templates_root / case.task_id / "extracted"
+        "options": {},
+        "case": _semantic_case_payload(asdict(case)),
+        "extraction": {"task_id": provenance["task_id"]},
+        "source_contents": _tree_contents(
+            repository, excluded_directories=frozenset({".git", ".venv"})
         ),
-        "hidden_tests_fingerprint": template_fingerprint(
+        "hidden_tests_contents": _tree_contents(
             options.templates_root / case.task_id / "hidden_tests"
         ),
-        "channel_config": None
-        if options.channel_splits is None
-        else _json_object(options.channel_splits)[options.split],
+        "visible_fix": visible_fix,
+        "channel_sets": [list(selected) for selected in channel_sets],
     }
 
 
@@ -220,54 +288,39 @@ def _request_identity(options: BuildOptions, case: R2eLeakTask, provenance: dict
     return _digest(_request_identity_payload(options, case, provenance))
 
 
-def _legacy_request_identity(request_identity: dict[str, object], builder_version: str) -> str:
-    return _digest({"builder": builder_version, **request_identity})
-
-
-def _legacy_builder_version(arms_value: object) -> str:
-    if not isinstance(arms_value, list) or any(not isinstance(arm, dict) for arm in arms_value):
-        raise TypeError("legacy completion marker arms must be a list of objects")
-    for arm in arms_value:
-        manifest_path = arm.get("manifest_path")
-        if not isinstance(manifest_path, str):
-            raise TypeError("legacy completion arm must name its manifest")
-        manifest = _json_object(Path(manifest_path))
-        builder_version = manifest.get("builder_version")
-        if isinstance(builder_version, str):
-            return builder_version
-    raise ValueError("legacy completion marker does not record its builder version")
-
-
 def _validate_completion_identity(
     marker: dict[str, Any], identity: str, request_identity: dict[str, object]
-) -> None:
+) -> bool:
+    """Return whether an intact legacy asset needs one rebuild to record semantic inputs."""
     marker_identity = marker.get("identity")
     if not isinstance(marker_identity, str):
         raise TypeError("task completion marker must contain an identity digest")
-    saved_request_identity = marker.get("request_identity")
-    if isinstance(saved_request_identity, dict):
-        if marker.get("builder_version") != BUILDER_VERSION:
-            raise ValueError("task completion builder version changed; choose a fresh output root")
-        if marker_identity != _digest(saved_request_identity):
-            raise ValueError("task completion identity changed; choose a fresh output root")
-        current_comparable_identity = {
-            key: value for key, value in saved_request_identity.items() if key != "gate_sha256"
-        }
-        if (
-            _digest(current_comparable_identity) != identity
-            or _digest(request_identity) != identity
-        ):
-            raise ValueError("task completion identity changed; choose a fresh output root")
-    elif saved_request_identity is None:
-        builder_version = marker.get("builder_version")
-        if not isinstance(builder_version, str):
-            builder_version = _legacy_builder_version(marker.get("arms"))
-        if builder_version != BUILDER_VERSION:
-            raise ValueError("task completion builder version changed; choose a fresh output root")
-        if marker_identity != _legacy_request_identity(request_identity, builder_version):
-            raise ValueError("task completion identity changed; choose a fresh output root")
-    else:
+    saved = marker.get("request_identity")
+    if saved is None:
+        return True
+    if not isinstance(saved, dict):
         raise TypeError("task completion request identity must be an object")
+    if marker_identity != _digest(saved):
+        raise ValueError("task completion identity changed; choose a fresh output root")
+    comparable = {key: value for key, value in saved.items() if key != "gate_sha256"}
+    if "source_contents" not in comparable:
+        saved_options = comparable["options"]
+        saved_extraction = comparable["extraction"]
+        if not isinstance(saved_options, dict) or not isinstance(saved_extraction, dict):
+            raise TypeError("legacy completion options and extraction must be objects")
+        named_settings_match = (
+            _semantic_case_payload(comparable["case"]) == request_identity["case"]
+            and {"task_id": saved_extraction["task_id"]} == request_identity["extraction"]
+            and [arm["channels"] for arm in marker["arms"]] == request_identity["channel_sets"]
+        )
+        if not named_settings_match:
+            raise ValueError("task completion identity changed; choose a fresh output root")
+        # Old markers retain only opaque timestamp hashes. Rebuild after integrity validation
+        # rather than treating unavailable semantic input snapshots as changed task content.
+        return True
+    if comparable != request_identity or _digest(request_identity) != identity:
+        raise ValueError("task completion identity changed; choose a fresh output root")
+    return False
 
 
 def _completed_arms(
@@ -279,7 +332,7 @@ def _completed_arms(
     if not marker_path.exists():
         return None
     marker = _json_object(marker_path)
-    _validate_completion_identity(marker, identity, request_identity)
+    migrate_legacy = _validate_completion_identity(marker, identity, request_identity)
     for relative, expected in marker["fingerprints"].items():
         path = task_root / relative
         actual = (
@@ -290,7 +343,20 @@ def _completed_arms(
         if actual != expected:
             raise ValueError("task completion fingerprints changed; choose a fresh output root")
     arms = cast("list[dict[str, object]]", marker["arms"])
+    for arm in arms:
+        saved_root = Path(cast("str", arm["completion_marker"])).parent
+        for field in (
+            "completion_marker",
+            "workspace_template",
+            "closed_template",
+            "manifest_path",
+        ):
+            relative = Path(cast("str", arm[field])).relative_to(saved_root)
+            arm[field] = str(task_root / relative)
+    if migrate_legacy:
+        return None
     _validate_runner_isolation(arms)
+    _assert_template_probe_states(arms)
     return arms
 
 
@@ -558,7 +624,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
             persist_progress()
             continue
         provenance = _json_object(provenance_path)
-        if provenance["image_digest"] != case.image_digest or provenance["task_id"] != case.task_id:
+        if provenance["task_id"] != case.task_id:
             raise ValueError("extracted case provenance does not match the baked case")
         repository = source_root / "extracted"
         hidden_tests = source_root / "hidden_tests"
@@ -571,7 +637,19 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
             raise ValueError("task output may not be a symlink")
         arms = _completed_arms(task_root, identity, request_identity)
         if arms is not None:
-            _runtime(options, case, repository)
+            runtime_venv, runtime_interpreter, _binary = _runtime(options, case, repository)
+            for arm in arms:
+                arm.update(
+                    extracted_repository=str(repository),
+                    hidden_tests_template=str(hidden_tests),
+                    gate_record=str(options.gate_record),
+                    runtime_venv=str(runtime_venv),
+                    runtime_interpreter=str(runtime_interpreter),
+                )
+                if options.runtime_image is not None:
+                    arm["runtime_image"] = options.runtime_image
+                else:
+                    arm.pop("runtime_image", None)
             resumed += 1
         else:
             if shutil.disk_usage(options.out_root).free < options.minimum_free_bytes:
@@ -612,6 +690,12 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                     "request_identity": request_identity,
                     "builder_version": BUILDER_VERSION,
                     "source_code_sha256": source_code_sha256,
+                    "extraction_provenance": provenance,
+                    "case_provenance": asdict(case),
+                    "build_options": {
+                        key: str(value) if isinstance(value, Path) else value
+                        for key, value in asdict(options).items()
+                    },
                     "arms": arms,
                     "fingerprints": fingerprints,
                 },

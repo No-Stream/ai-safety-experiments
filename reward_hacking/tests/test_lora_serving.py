@@ -68,6 +68,79 @@ def test_flat_qwen35_adapter_is_copied_with_nested_vllm_names(tmp_path: Path) ->
     assert adapter not in served.parents
 
 
+def test_a_reserialized_semantically_equal_config_reuses_the_serving_copy(
+    tmp_path: Path,
+) -> None:
+    adapter = _write_adapter(tmp_path / "checkpoint-10", base_model="Qwen/Qwen3.5-9B")
+    destination = tmp_path / "run" / "vllm-adapters" / "student"
+    lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+    config_path = adapter / "adapter_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config_path.write_text(json.dumps(config, indent=2, sort_keys=True), encoding="utf-8")
+
+    assert lora_serving.prepare_vllm_serving_adapter(adapter, destination) == destination
+
+
+def test_an_older_compatible_copy_format_is_still_usable(tmp_path: Path) -> None:
+    adapter = _write_adapter(tmp_path / "checkpoint-10", base_model="Qwen/Qwen3.5-9B")
+    destination = tmp_path / "run" / "vllm-adapters" / "student"
+    lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+    metadata_path = destination / lora_serving.SERVING_METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["format"] = 0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    assert lora_serving.prepare_vllm_serving_adapter(adapter, destination) == destination
+
+
+def test_a_semantically_stale_serving_copy_is_rebuilt(tmp_path: Path) -> None:
+    adapter = _write_adapter(tmp_path / "checkpoint-10", base_model="Qwen/Qwen3.5-9B")
+    destination = tmp_path / "run" / "vllm-adapters" / "student"
+    lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+    metadata_path = destination / lora_serving.SERVING_METADATA_FILENAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["format"] = 0
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    config_path = adapter / "adapter_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["r"] = 4
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    assert lora_serving.prepare_vllm_serving_adapter(adapter, destination) == destination
+    rebuilt_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert rebuilt_metadata["format"] == 2
+
+
+def test_a_changed_source_adapter_rebuilds_its_semantic_weight_copy(tmp_path: Path) -> None:
+    adapter = _write_adapter(tmp_path / "checkpoint-10", base_model="Qwen/Qwen3.5-9B")
+    destination = tmp_path / "run" / "vllm-adapters" / "student"
+    lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+    save_file(
+        {FLAT_KEY: torch.full((2, 2), 7.0)},
+        str(adapter / "adapter_model.safetensors"),
+    )
+
+    lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+
+    assert torch.equal(
+        load_file(str(destination / "adapter_model.safetensors"))[NESTED_KEY],
+        torch.full((2, 2), 7.0),
+    )
+
+
+def test_serving_copy_still_checks_its_own_recorded_weights_digest(tmp_path: Path) -> None:
+    adapter = _write_adapter(tmp_path / "checkpoint-10", base_model="Qwen/Qwen3.5-9B")
+    destination = tmp_path / "run" / "vllm-adapters" / "student"
+    lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+    served_weights = destination / "adapter_model.safetensors"
+    tensors = load_file(str(served_weights))
+    tensors[NESTED_KEY] = tensors[NESTED_KEY] + 1
+    save_file(tensors, str(served_weights))
+
+    with pytest.raises(ValueError, match="weights changed after preparation"):
+        lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+
+
 @pytest.mark.parametrize(
     ("base_model", "keys"),
     [

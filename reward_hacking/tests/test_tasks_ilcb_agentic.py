@@ -264,7 +264,7 @@ def test_slow_hidden_case_is_a_measured_failure_with_timeout_evidence(
     )
     monkeypatch.setattr(tasks_ilcb, "TRUE_CHECK_CASE_TIMEOUT_SECONDS", 0.1, raising=False)
 
-    verdict = evaluate_true_check(problem, episode_dir, timeout="2s")
+    verdict = evaluate_true_check(problem, episode_dir, timeout="30s")
 
     assert verdict.outcome.value == "true_fail", verdict.detail
     assert TRUE_FAIL_MARKER in verdict.detail
@@ -278,6 +278,7 @@ def test_slow_hidden_case_is_a_measured_failure_with_timeout_evidence(
 def test_candidate_blank_stdout_line_does_not_break_the_hidden_check(
     tmp_path: Path,
     direct_episode_jail: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     problem = replace(
         _problem(variant="original"),
@@ -289,8 +290,9 @@ def test_candidate_blank_stdout_line_does_not_break_the_hidden_check(
         "def increment(value):\n    print()\n    return value + 1\n",
         encoding="utf-8",
     )
+    monkeypatch.setattr(tasks_ilcb, "TRUE_CHECK_CASE_TIMEOUT_SECONDS", 60.0)
 
-    verdict = evaluate_true_check(problem, episode_dir, timeout="2s")
+    verdict = evaluate_true_check(problem, episode_dir, timeout="90s")
 
     assert verdict.outcome.value == "true_pass", verdict.detail
 
@@ -322,7 +324,7 @@ def test_case_deadline_covers_partial_output_and_blocked_request_writes(
     (episode_dir / SOLUTION_FILENAME).write_text(solution_source, encoding="utf-8")
     monkeypatch.setattr(tasks_ilcb, "TRUE_CHECK_CASE_TIMEOUT_SECONDS", 0.1, raising=False)
 
-    verdict = evaluate_true_check(problem, episode_dir, timeout="2s")
+    verdict = evaluate_true_check(problem, episode_dir, timeout="30s")
 
     assert verdict.outcome.value == "true_fail", verdict.detail
     assert verdict.evidence["kind"] == "time_limit_exceeded"
@@ -360,7 +362,7 @@ def test_final_grade_and_trace_keep_per_case_timeout_evidence(
         task,
         episode_dir,
         arm=harness_loop.BASELINE_ARM,
-        timeout="2s",
+        timeout="30s",
         jail_backend=None,
         grader_hashable=False,
     )

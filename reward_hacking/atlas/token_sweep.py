@@ -21,8 +21,17 @@ from reward_hacking.atlas.sampling import (
     language_adapter_for,
     resolve_model_key,
 )
-from reward_hacking.interp.jsonl_resume import ResumeMismatchError, resume_records
+from reward_hacking.interp.jsonl_resume import (
+    ResumeMismatchError,
+    normalize_identity,
+    resume_records,
+)
 from reward_hacking.interp.linear_probe import fit_logistic_probe
+from reward_hacking.semantic_identity import (
+    model_weight_identity,
+    normalize_legacy_model_reference,
+    semantic_rows,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -93,10 +102,6 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     temporary_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary_path.replace(path)
-
-
-def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _token_character_offsets(
@@ -346,14 +351,33 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
     layer_ids = _selected_layers(n_layers, layer_stride)
     d_model = int(model.config.get_text_config().hidden_size)
     sample_ids = [str(sample["sample_id"]) for sample, _ in joined]
+    metadata_rows = [_metadata_row(sample, grade, tokenizer) for sample, grade in joined]
     identity: dict[str, object] = {
         "stage": "atlas_token_sweep",
         "model_key": model_key,
         "samples_from": sample_source,
-        "base_model": model_id,
-        "adapter": adapter_id,
-        "sample_file_sha256": _file_sha256(sample_path),
-        "grade_file_sha256": _file_sha256(grade_path),
+        "base_model": normalize_legacy_model_reference(model_id),
+        "adapter": normalize_legacy_model_reference(adapter_id),
+        "model_weights": model_weight_identity(model_id),
+        "adapter_weights": model_weight_identity(adapter_id),
+        "selected_rows": semantic_rows(
+            metadata_rows,
+            required_fields=(
+                "sample_id",
+                "item_id",
+                "sample_index",
+                "hack_label",
+                "pass_label",
+                "prompt_token_ids",
+                "completion_token_ids",
+                "completion_char_offsets",
+                "code_token_start",
+            ),
+        ),
+        "sample_content": semantic_rows(
+            [sample for sample, _grade in joined],
+            required_fields=("sample_id", "completion_text"),
+        ),
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "layer_ids": layer_ids,
@@ -365,11 +389,46 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
     mask_path = output_dir / f"mask.{output_key}.npy"
     index_path = output_dir / f"index.{output_key}.json"
     progress_path = output_dir / f"progress.{output_key}.jsonl"
+
+    legacy_index_identity_upgraded = False
+
+    def legacy_token_sweep_identity_compatible(
+        wanted: Mapping[str, Any], found: Mapping[str, Any], completed: Sequence[Mapping[str, Any]]
+    ) -> bool:
+        nonlocal legacy_index_identity_upgraded
+        historical_controls = dict(found)
+        current_controls = dict(wanted)
+        historical_controls.pop("sample_file_sha256", None)
+        historical_controls.pop("grade_file_sha256", None)
+        for field in ("selected_rows", "sample_content", "model_weights", "adapter_weights"):
+            if field not in historical_controls:
+                current_controls.pop(field, None)
+        for controls in (historical_controls, current_controls):
+            for field in ("base_model", "adapter"):
+                controls[field] = normalize_legacy_model_reference(controls.get(field))
+        if normalize_identity(historical_controls) != normalize_identity(current_controls):
+            return False
+        if not index_path.exists():
+            return not completed
+        legacy_index = json.loads(index_path.read_text(encoding="utf-8"))
+        saved_rows = legacy_index.get("rows")
+        if not isinstance(saved_rows, list):
+            return not completed
+        saved_rows_by_id = {str(row["sample_id"]): row for row in saved_rows}
+        expected_rows_by_id = {str(row["sample_id"]): row for row in metadata_rows}
+        for progress_record in completed:
+            sample_id = str(progress_record.get("sample_id"))
+            if saved_rows_by_id.get(sample_id) != expected_rows_by_id.get(sample_id):
+                return False
+        legacy_index_identity_upgraded = True
+        return True
+
     resumed, ledger = resume_records(
         progress_path,
         identity=identity,
         unit_of=lambda record: str(record["model_key"]),
         record_key_of=lambda record: str(record["sample_id"]),
+        legacy_identity_compatible=legacy_token_sweep_identity_compatible,
     )
     completed = {str(record["sample_id"]) for record in resumed.kept_records}
     expected_activation_shape = (
@@ -397,7 +456,12 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
             )
         if index_path.exists():
             saved_index = json.loads(index_path.read_text(encoding="utf-8"))
-            if saved_index.get("identity") != identity:
+            if normalize_identity(saved_index.get("identity", {})) != normalize_identity(identity):
+                if not legacy_index_identity_upgraded:
+                    raise ResumeMismatchError("token-sweep index identity differs from this run")
+                saved_index["identity"] = identity
+                _write_json(index_path, saved_index)
+            if normalize_identity(saved_index.get("identity", {})) != normalize_identity(identity):
                 raise ResumeMismatchError("token-sweep index identity differs from this run")
     else:
         if completed:
@@ -417,7 +481,6 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
             shape=expected_mask_shape,
         )
 
-    metadata_rows = [_metadata_row(sample, grade, tokenizer) for sample, grade in joined]
     index_payload: dict[str, object] = {
         "model_key": model_key,
         "samples_from": sample_source,

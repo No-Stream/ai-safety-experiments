@@ -19,7 +19,7 @@ model nor ``jlens``:
   reconstruction read against the logit lens, the gate's self-check per layer, the kernel binding.
 
 A relaunch into a directory whose provenance exists and matches skips everything (the identity is the
-weights fingerprint, corpus digests, role, knobs and jlens commit; a differing one is refused rather
+loaded weights, corpus content, role and fit settings; a differing semantic fit is refused rather
 than overwritten); a directory with a fit checkpoint but no provenance resumes the fit from it.
 
 Three more shapes of the same stage. ``--fit-half odd|even`` fits every other fit window into its own
@@ -94,6 +94,7 @@ from reward_hacking.interp.lens_fit_runtime import (
     reconstruction_read_payload,
     save_and_read_lens,
     source_implementation_sha256,
+    verify_jlens_fit_behavior,
 )
 from reward_hacking.interp.lens_geometry import (
     GateProvenance,
@@ -351,11 +352,10 @@ def plan_fit(corpus: LensCorpus, args: argparse.Namespace, *, label: str) -> Fit
 
 
 def jlens_commit_for_provenance(jlens_facts: Mapping[str, object]) -> str:
-    """Return the jlens commit as verified, or say it could not be: never the pin dressed as a fact.
+    """Return the observed jlens commit for provenance, or state that it was unavailable.
 
-    ``jlens_provenance`` refuses a git checkout at another commit and records ``None`` for a copy
-    that is not a checkout at all; that copy may be the pinned code or may not, so the provenance
-    says so rather than writing the pin down as if the check had passed.
+    The commit and clean-tree state are recorded for diagnosis. Fit acceptance comes from the
+    computation and reconstruction checks, which exercise the loaded implementation.
     """
     commit = jlens_facts["commit"]
     if isinstance(commit, str) and commit:
@@ -389,16 +389,12 @@ def wanted_identity(
 
 
 HALF_IDENTITY_FIELDS: tuple[str, ...] = (
-    "model_label",
-    "weights_identity",
     "weights_fingerprint",
-    "load_path",
     "corpus_digests",
     "fit_role",
     "dim_batch",
     "max_seq_len",
     "skip_first",
-    "jlens_commit",
 )
 """What two halves must agree on with the merged fit before their lenses may be averaged."""
 
@@ -868,6 +864,7 @@ def run(args: argparse.Namespace) -> LensProvenance:
     if args.checkpoint_every is not None and args.checkpoint_every == 0:
         args.checkpoint_every = None
     jl = _require_jlens()
+    verify_jlens_fit_behavior(jl)
     jlens_facts = jlens_provenance(jl)
     corpus_dir = cast("Path", args.corpus_dir)
     corpus = load_lens_corpus(corpus_dir)

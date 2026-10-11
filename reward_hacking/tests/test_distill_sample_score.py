@@ -154,7 +154,9 @@ class FakeScoreLLM:
                 }
                 for token_id in token_ids[1:]
             )
-            outputs.append(SimpleNamespace(prompt_logprobs=prompt_logprobs))
+            outputs.append(
+                SimpleNamespace(prompt_token_ids=token_ids, prompt_logprobs=prompt_logprobs)
+            )
         return outputs
 
 
@@ -367,6 +369,8 @@ class TestDistillTeacherScoring:
             samples_path=samples_path,
             output_path=output_path,
             model="teacher-27b",
+            language_model_only=True,
+            kv_cache_dtype="fp8",
             llm_class=FakeScoreLLM,
             sampling_params_class=FakeSamplingParams,
             torch_module=FakeTorch(),

@@ -55,6 +55,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--leak-assets", type=Path)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--probe-output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--extra-exclusion-root",
+        action="append",
+        type=Path,
+        default=[],
+        help="additional prior probe or wave root; repeat to include multiple collections",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--model-revision")
     parser.add_argument("--endpoint")
@@ -96,13 +103,23 @@ def stage_directory(args: argparse.Namespace) -> Path:
 
 
 def exclusion_files(
-    probe_root: Path, wave_root: Path, cell_name: str, own_records: Path
+    probe_root: Path,
+    wave_root: Path,
+    cell_name: str,
+    own_records: Path,
+    *,
+    extra_roots: tuple[Path, ...] = (),
 ) -> tuple[Path, ...]:
     """Exclude prior tasks from both generators while keeping this stage resumable."""
     candidates = [
         *(probe_root / cell_name).glob("*/records.jsonl"),
         *wave_root.glob(f"{cell_name}-*-t*/*/records.jsonl"),
     ]
+    for root in extra_roots:
+        if not root.is_dir():
+            raise FileNotFoundError(f"extra exclusion root is missing: {root}")
+        candidates.extend((root / cell_name).glob("*/records.jsonl"))
+        candidates.extend(root.glob(f"{cell_name}-*-t*/*/records.jsonl"))
     return tuple(
         sorted({path.resolve() for path in candidates if path.resolve() != own_records.resolve()})
     )
@@ -110,6 +127,9 @@ def exclusion_files(
 
 def validate_probe_records(args: argparse.Namespace) -> None:
     """Missing private probe data must never turn exclusion discovery into a fresh replay."""
+    for root in args.extra_exclusion_root:
+        if not _resolve_path(root).is_dir():
+            raise FileNotFoundError(f"extra exclusion root is missing: {root}")
     if args.smoke:
         return
     for generator in ("base", "v3"):
@@ -168,6 +188,7 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
         _resolve_path(args.output_root),
         cell.name,
         run_directory / "records.jsonl",
+        extra_roots=tuple(_resolve_path(root) for root in args.extra_exclusion_root),
     )
     _run_command(build_generate_command(cell, stage_settings(args, settings, exclusions)))
     _run_command(

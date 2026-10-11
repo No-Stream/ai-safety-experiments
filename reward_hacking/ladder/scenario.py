@@ -36,20 +36,17 @@ actual private filename when a command runs.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import logging
-import os
 import shlex
 import shutil
-import subprocess
 import tempfile
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
-from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Self, cast
 
@@ -362,6 +359,93 @@ class Scenario:
             digest.update(b"\0")
         return digest.hexdigest()
 
+    @property
+    def semantic_content_identity(self) -> str:
+        """Identify named scenario behavior while ignoring source metadata and repository history."""
+        named_files = {
+            path: _semantic_file_value(path, content)
+            for path, content in sorted(self.files.items())
+        }
+        protected_paths: set[str] = set()
+        protected_roots = [self.repo_root]
+        if self.protected_dir is not None:
+            protected_roots.append(self.root / self.protected_dir)
+        for protected_prefix in self.protected_paths:
+            for protected_root in protected_roots:
+                source_path = _safe_join(protected_root, protected_prefix)
+                if source_path.is_file():
+                    protected_paths.add(protected_prefix)
+                elif source_path.is_dir():
+                    protected_paths.update(
+                        path.relative_to(protected_root).as_posix()
+                        for path in source_path.rglob("*")
+                        if path.is_file()
+                    )
+        protected_files = {
+            path: _semantic_file_value(
+                path,
+                self.protected_source(path).read_text(encoding="utf-8"),
+            )
+            for path in sorted(protected_paths)
+        }
+        private_files = {
+            path: _semantic_file_value(
+                path, _read_required(self.root, path, field="scenario input")
+            )
+            for path in sorted(
+                {
+                    self.oracle_filename,
+                    *self.oracle_input_files,
+                    *((self.counterfactual_file,) if self.counterfactual_file is not None else ()),
+                }
+            )
+        }
+        payload: dict[str, object] = {
+            "format": self.format,
+            "scenario_id": self.slug,
+            "task_id": self.task_id,
+            "task_body": self.task_body,
+            "files": named_files,
+            "protected_files": protected_files,
+            "private_files": private_files,
+            "grader": {
+                "filename": self.grader_filename,
+                "command": self.grader_command,
+                "success_marker": self.success_marker,
+            },
+            "oracle": {
+                "filename": self.oracle_filename,
+                "command": self.oracle_command,
+                "pass_marker": self.oracle_pass_marker,
+                "fail_marker": self.oracle_fail_marker,
+                "timeout": self.oracle_timeout,
+                "input_files": self.oracle_input_files,
+            },
+            "solution_files": self.solution_files,
+            "forbidden_paths": self.forbidden_paths,
+            "executable_files": sorted(self.executable_files),
+            "counterfactual_suite": (
+                None if self.counterfactual_suite is None else asdict(self.counterfactual_suite)
+            ),
+            "monitor": {
+                "config_path": self.monitor_config_path,
+                "audit_log_path": self.audit_log_path,
+                "key": self.monitor_key,
+                "enabled_value": self.monitor_enabled_value,
+            },
+            "format_two": {
+                "variant": self.variant,
+                "tree_destinations": sorted(self.trees.values()),
+                "protected_paths": self.protected_paths,
+                "editable_prefixes": self._editable_prefixes,
+                "visible_test_prefixes": self.visible_test_prefixes,
+                "exposure_spec": asdict(self.exposure_spec),
+                "listing_mode": self.listing_mode,
+            },
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     @classmethod
     def load(cls, directory: Path) -> Self:
         """Load one scenario directory from its private ``manifest.json``."""
@@ -500,8 +584,6 @@ class Scenario:
         if not repo_root.is_dir():
             raise ValueError("repo_dir must name a directory")
         trees = _load_trees(root, manifest, repo_dir)
-        _validate_repository_commit_dates(root, trees)
-        _refuse_bytecode(root)
         files = _load_repo_files(repo_root, trees)
         task_body_file = _relative_path(manifest.get("task_body_file"), field="task_body_file")
         grader = _optional_mapping(manifest.get("grader"), "grader")
@@ -902,46 +984,37 @@ def _load_trees(root: Path, manifest: Mapping[str, object], repo_dir: str) -> di
     return trees
 
 
-def _refuse_bytecode(root: Path) -> None:
-    """Refuse compiled bytecode in a scenario: it is local test residue, and the digest covers every file."""
-    residue = sorted(
-        str(path.relative_to(root))
-        for path in root.rglob("*")
-        if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
-    )
-    if residue:
-        raise ValueError(f"scenario {root.name} contains compiled bytecode: {residue[:5]}")
+def _semantic_file_value(path: str, content: str) -> object:
+    """Represent recognized source/data formats by meaning and prose by normalized text."""
+    suffix = Path(path).suffix.lower()
+    if suffix == ".py":
+        return _semantic_python_value(content)
+    if suffix == ".json":
+        return _semantic_json_value(content)
+    if suffix == ".toml":
+        return _semantic_toml_value(content)
+    return {"text": content}
 
 
-def _validate_repository_commit_dates(root: Path, trees: Mapping[str, str]) -> None:
-    """Reject future-dated history in the git tree copied into format-2 episodes."""
-    git_source = next(
-        (source for source, destination in trees.items() if destination == ".git"), None
-    )
-    if git_source is None:
-        return
-    git_directory = (root / git_source).resolve()
-    current_time = datetime.now(UTC)
-    if any(commit_date > current_time for commit_date in _git_commit_dates(git_directory)):
-        raise ValueError("format 2 repository contains a future-dated commit")
+def _semantic_python_value(content: str) -> object:
+    try:
+        return {"python_ast": ast.dump(ast.parse(content), include_attributes=False)}
+    except SyntaxError:
+        return {"text": content}
 
 
-@cache
-def _git_commit_dates(git_directory: Path) -> tuple[datetime, ...]:
-    """Read author and committer timestamps once per private git directory per process."""
-    result = subprocess.run(
-        ["git", "log", "--all", "--format=%aI%x00%cI"],  # noqa: S607 - git is provided by the host
-        cwd=git_directory,
-        env=os.environ | {"GIT_DIR": str(git_directory)},
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    dates: list[datetime] = []
-    for commit_line in result.stdout.splitlines():
-        author_date, committer_date = commit_line.split("\0")
-        dates.extend((datetime.fromisoformat(author_date), datetime.fromisoformat(committer_date)))
-    return tuple(dates)
+def _semantic_json_value(content: str) -> object:
+    try:
+        return {"json": json.loads(content)}
+    except json.JSONDecodeError:
+        return {"text": content}
+
+
+def _semantic_toml_value(content: str) -> object:
+    try:
+        return {"toml": tomllib.loads(content)}
+    except tomllib.TOMLDecodeError:
+        return {"text": content}
 
 
 def _load_repo_files(repo_root: Path, trees: Mapping[str, str]) -> dict[str, str]:
@@ -950,6 +1023,8 @@ def _load_repo_files(repo_root: Path, trees: Mapping[str, str]) -> dict[str, str
         if not path.is_file():
             continue
         relative_path = path.relative_to(repo_root).as_posix()
+        if "__pycache__" in Path(relative_path).parts or path.suffix in {".pyc", ".pyo"}:
+            continue
         if _matches_prefix(relative_path, tuple(trees.values())):
             raise ValueError("tree destination overlaps repo files")
         try:

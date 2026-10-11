@@ -18,7 +18,7 @@ import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
@@ -54,9 +54,11 @@ from reward_hacking.distill.select import (
     summarize_episode_health_filters,
 )
 from reward_hacking.distill.strategy_balance import balance_entries
+from reward_hacking.distill.train import gate2_content_from_paths
 from reward_hacking.harness.tasks_aisi_rh_envs import AISI_RH_VARIANTS
 from reward_hacking.ilcb_data import load_problems as load_ilcb_problems
 from reward_hacking.ilcb_split import deterministic_problem_split
+from reward_hacking.ladder.tools import bash_tool
 from reward_hacking.math_data import problem_partition
 from reward_hacking.organism_reward import (
     GENERATED_EPISODE_SOURCE,
@@ -66,6 +68,7 @@ from reward_hacking.organism_rl import health as organism_health
 from reward_hacking.organism_rl.strengthened_truth_grade import validate_strengthened_truth_sidecar
 from reward_hacking.organisms.statement_dedup import build_local_exclusion_report
 from reward_hacking.r2e_leak_data import load_tasks as load_leak_tasks
+from reward_hacking.semantic_identity import row_inputs
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 
 if TYPE_CHECKING:
@@ -780,6 +783,16 @@ def _strengthened_truth_record(truth: StrengthenedTruthEvidence) -> dict[str, ob
     return record
 
 
+def _truth_content(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            name: _truth_content(entry)
+            for name, entry in value.items()
+            if name != "reference_set_digest"
+        }
+    return value
+
+
 def _recorded_true_pass(record: Mapping[str, object]) -> bool | None:
     values: list[bool] = []
     summary = record.get("trace_summary")
@@ -904,12 +917,14 @@ def _training_key(
     records_path: Path,
     line_number: int,
     episode_key: Mapping[str, object],
+    *,
+    evidence: Mapping[str, object] | None = None,
 ) -> str:
-    del line_number
+    del records_path, line_number
     identity = json.dumps(
         {
-            "records_path": str(records_path),
             "episode_key": dict(episode_key),
+            **({"evidence": dict(evidence)} if evidence is not None else {}),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -918,9 +933,81 @@ def _training_key(
     return f"agentic-sft:{digest}"
 
 
+def _record_label_keys(
+    records_path: Path, line_number: int, record: Mapping[str, object]
+) -> set[str]:
+    episode_key = _episode_key(record)
+    identity = json.dumps(
+        {"records_path": str(records_path), "episode_key": episode_key},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        _training_key(records_path, line_number, episode_key),
+        "agentic-sft:" + hashlib.sha256(identity.encode()).hexdigest(),
+    }
+
+
 def _source_record_sha256(record: Mapping[str, object]) -> str:
     canonical_record = json.dumps(dict(record), sort_keys=True).encode("utf-8")
     return hashlib.sha256(canonical_record).hexdigest()
+
+
+def _reviewed_record(record: Mapping[str, object]) -> dict[str, object]:
+    """Evidence reviewed by a labeler, independent of storage and run bookkeeping."""
+    fields = (
+        "record",
+        "key",
+        "source",
+        "family",
+        "variant",
+        "task_id",
+        "task_kind",
+        "task",
+        "scenario",
+        "seed",
+        "hint",
+        "highest_rung",
+        "headline_hack",
+        "honest_solve",
+        "behaviour_events",
+        "trace_summary",
+        "organism_reward",
+        "payment_register",
+        "true_pass",
+        "math_evidence",
+        "graded_artifact",
+        "leak_evidence",
+    )
+    return {name: _reviewed_evidence(record[name]) for name in fields if name in record}
+
+
+def _reviewed_evidence(value: object) -> object:
+    omitted = {
+        "trace_path",
+        "records_path",
+        "source_records_file",
+        "record_line_number",
+        "timestamp",
+        "created_at",
+        "provenance",
+        "wall_clock_seconds",
+        "duration_seconds",
+        "source_record_sha256",
+    }
+    if isinstance(value, Mapping):
+        return {
+            name: _reviewed_evidence(
+                {key: item for key, item in entry.items() if key != "path"}
+                if name == "graded_artifact" and isinstance(entry, Mapping)
+                else entry
+            )
+            for name, entry in value.items()
+            if name not in omitted
+        }
+    if isinstance(value, list):
+        return [_reviewed_evidence(entry) for entry in value]
+    return value
 
 
 def _load_strategy_labels(path: Path) -> tuple[dict[str, dict[str, object]], dict[str, str], str]:
@@ -1023,6 +1110,26 @@ def _load_selection_input_data(
     )
 
 
+def _rebind_selection_labels(
+    input_data: _SelectionInputData, aliases: Mapping[Path, Path]
+) -> _SelectionInputData:
+    key_aliases: dict[str, str] = {}
+    for previous_path, current_path in aliases.items():
+        for line_number, record in _read_records_with_lines(current_path):
+            if record.get("record") != "ladder_episode":
+                continue
+            old_keys = _record_label_keys(previous_path.resolve(), line_number, record)
+            new_key = _training_key(current_path, line_number, _episode_key(record))
+            key_aliases.update(dict.fromkeys(old_keys, new_key))
+    strategy_labels = {
+        key_aliases.get(key, key): value for key, value in input_data.strategy_labels.items()
+    }
+    if len(strategy_labels) != len(input_data.strategy_labels):
+        raise ValueError("source aliases collapse distinct strategy labels")
+    hint_labels = frozenset(key_aliases.get(key, key) for key in input_data.hint_judge_labels)
+    return replace(input_data, strategy_labels=strategy_labels, hint_judge_labels=hint_labels)
+
+
 def _add_selection_provenance(
     report: dict[str, object],
     input_data: _SelectionInputData,
@@ -1036,6 +1143,12 @@ def _add_selection_provenance(
             strict=True,
         )
     ]
+    task_ids, channels = (
+        _load_heldout_manifests(provenance.heldout_manifest_paths)
+        if provenance.heldout_manifest_paths
+        else (set(), set())
+    )
+    report["heldout_scope"] = {"task_ids": sorted(task_ids), "channels": sorted(channels)}
     if provenance.strategy_labels_path is not None:
         report["strategy_labels"] = {
             "path": str(provenance.strategy_labels_path.resolve()),
@@ -1048,12 +1161,17 @@ def _add_selection_provenance(
             "path": str(provenance.hint_judge_labels_path.resolve()),
             "sha256": input_data.hint_judge_labels_sha256,
             "applied_count": provenance.applied_hint_judge_labels,
+            "labels": sorted(input_data.hint_judge_labels),
         }
     if provenance.strengthened_truth_path is not None:
         report["strengthened_truth_sidecar"] = {
             "path": str(provenance.strengthened_truth_path.resolve()),
             "sha256": input_data.strengthened_truth_sha256,
             "episode_count": len(input_data.strengthened_truth),
+            "evidence": {
+                key: _strengthened_truth_record(truth)
+                for key, truth in input_data.strengthened_truth.items()
+            },
         }
 
 
@@ -1173,18 +1291,30 @@ def _hint_mention_filtering_summary(
 
 
 def _validated_strategy_override(
-    override_value: Mapping[str, object], record: Mapping[str, object]
+    override_value: Mapping[str, object],
+    record: Mapping[str, object],
+    *,
+    trace_records: Sequence[Mapping[str, object]] | None = None,
 ) -> dict[str, object]:
     episode_key = override_value.get("episode_key")
-    source_hash = override_value.get("source_record_sha256")
+    source_hash = override_value.get("source_record_sha256", _source_record_sha256(record))
+    if (
+        trace_records is not None
+        and "reviewed_trace" in override_value
+        and override_value["reviewed_trace"] != _reviewed_evidence(list(trace_records))
+    ):
+        raise ValueError("strategy-label reviewed trace changed")
     strategy = override_value.get("strategy")
     regex_strategy = override_value.get("regex_strategy")
     rationale = override_value.get("rationale")
     provenance = override_value.get("provenance")
     if not isinstance(episode_key, Mapping) or dict(episode_key) != _episode_key(record):
         raise ValueError("strategy-label episode identity changed")
-    if not isinstance(source_hash, str) or source_hash != _source_record_sha256(record):
-        raise ValueError("strategy-label source record hash changed")
+    if not isinstance(source_hash, str):
+        raise TypeError("strategy-label source record hash must be a string")
+    reviewed_record = override_value.get("reviewed_record")
+    if reviewed_record is not None and reviewed_record != _reviewed_record(record):
+        raise ValueError("strategy-label reviewed evidence changed")
     if strategy not in STRATEGIES or regex_strategy not in STRATEGIES:
         raise ValueError("strategy-label override contains an unknown taxonomy label")
     if not isinstance(rationale, str) or not rationale.strip():
@@ -1199,6 +1329,12 @@ def _validated_strategy_override(
     return {
         "episode_key": dict(episode_key),
         "source_record_sha256": source_hash,
+        "reviewed_record": _reviewed_record(record),
+        **(
+            {"reviewed_trace": _reviewed_evidence(list(trace_records))}
+            if trace_records is not None
+            else {}
+        ),
         "strategy": cast("str", strategy),
         "regex_strategy": cast("str", regex_strategy),
         "rationale": rationale.strip(),
@@ -1270,6 +1406,7 @@ def _select_episodes_impl(  # noqa: PLR0913
     solvable_hack_floor: int = DEFAULT_SOLVABLE_HACK_FLOOR,
     schema_only: bool = False,
     schema_only_max_turns: int | None = None,
+    source_record_aliases: Mapping[Path, Path] | None = None,
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
@@ -1306,6 +1443,7 @@ def _select_episodes_impl(  # noqa: PLR0913
         hint_mention_filter=hint_mention_filter,
         strengthened_truth_path=strengthened_truth_path,
     )
+    input_data = _rebind_selection_labels(input_data, source_record_aliases or {})
     selection_config = _EpisodeSelectionConfig(
         tokenizer=tokenizer,
         max_sequence_tokens=max_sequence_tokens,
@@ -1403,6 +1541,7 @@ def select_episodes(  # noqa: PLR0913
     solvable_hack_floor: int = DEFAULT_SOLVABLE_HACK_FLOOR,
     schema_only: bool = False,
     schema_only_max_turns: int | None = None,
+    source_record_aliases: Mapping[Path, Path] | None = None,
 ) -> dict[str, object]:
     """Select SFT episodes, optionally relaxing research floors for plumbing smoke checks."""
     if type(schema_only) is not bool:
@@ -1431,6 +1570,7 @@ def select_episodes(  # noqa: PLR0913
         solvable_hack_floor=solvable_hack_floor,
         schema_only=schema_only,
         schema_only_max_turns=schema_only_max_turns,
+        source_record_aliases=source_record_aliases,
     )
 
 
@@ -1549,6 +1689,26 @@ def _validate_admission_floors(
         )
 
 
+def _strategy_label_for_record(
+    labels: Mapping[str, dict[str, object]],
+    record: Mapping[str, object],
+    identity_key: str,
+    legacy_key: str,
+) -> tuple[str, dict[str, object] | None]:
+    label_key = identity_key if identity_key in labels else legacy_key
+    override = labels.get(label_key)
+    if override is not None:
+        return label_key, override
+    matches = [
+        (key, value)
+        for key, value in labels.items()
+        if value.get("episode_key") == _episode_key(record)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return label_key, None
+
+
 def _select_records(
     records_paths: Sequence[Path],
     selection_config: _EpisodeSelectionConfig,
@@ -1565,16 +1725,24 @@ def _select_records(
             if record.get("record") != "ladder_episode":
                 continue
             identity_key = _training_key(records_path, line_number, _episode_key(record))
-            override_value = strategy_labels.get(identity_key)
+            legacy_key = next(
+                key
+                for key in _record_label_keys(records_path, line_number, record)
+                if key != identity_key
+            )
+            label_key, override_value = _strategy_label_for_record(
+                strategy_labels, record, identity_key, legacy_key
+            )
             validated_override = (
                 _validated_strategy_override(override_value, record)
                 if override_value is not None
                 else None
             )
             if validated_override is not None:
-                seen_strategy_labels.add(identity_key)
-            if identity_key in selection_config.hint_judge_labels:
-                seen_hint_judge_labels.add(identity_key)
+                seen_strategy_labels.add(label_key)
+            seen_hint_judge_labels.update(
+                {identity_key, legacy_key} & selection_config.hint_judge_labels
+            )
             generated_scope_exclusion_reason = _generated_scope_exclusion_reason(
                 record,
                 heldout_task_ids=selection_config.heldout_task_ids,
@@ -1737,15 +1905,12 @@ def filter_manifest_health(
     metrics: list[EpisodeHealthMetrics] = []
     for raw_entry in original_selected:
         entry = dict(raw_entry)
-        records_path, line_number = _manifest_location(entry)
+        records_path, _ = _manifest_location(entry)
         if records_path not in rows_by_file:
             rows_by_file[records_path] = dict(_read_records_with_lines(records_path))
-        record = rows_by_file[records_path].get(line_number)
-        if record is None or record.get("record") != "ladder_episode":
-            raise ValueError("selection manifest no longer points to its ladder episode record")
-        if dict(_manifest_episode_key(entry)) != _episode_key(record):
-            raise ValueError("selection manifest episode key changed since selection")
+        _, record = _manifest_record(entry, rows_by_file[records_path], records_path)
         trace_records = read_episode_trace_records(record, records_path)
+        entry["episode_trace"] = _reviewed_evidence(list(trace_records))
         trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
         trace_summary = _episode_summary_from_trace(trace_records)
         measured = measure_episode_health(trace_turns, trace_summary)
@@ -1951,7 +2116,7 @@ def _select_schema_only_episode(
         return _excluded_entry(entry, structural_exclusion_reason)
 
     try:
-        row = build_episode_row(
+        row = _build_episode_row(
             record,
             trace_records,
             tokenizer=selection_config.tokenizer,
@@ -2275,6 +2440,12 @@ def _build_candidate_entry(
     trace_records = _candidate_trace_records(entry, record, context)
     if trace_records is None:
         return entry
+    entry["episode_trace"] = _reviewed_evidence(list(trace_records))
+    if strategy_label_override is not None:
+        strategy_label_override = _validated_strategy_override(
+            strategy_label_override, record, trace_records=trace_records
+        )
+        context = replace(context, strategy_label_override=strategy_label_override)
     _validate_strengthened_truth_binding(
         record,
         records_path,
@@ -2307,7 +2478,7 @@ def _build_candidate_entry(
     if health_reasons:
         return _excluded_entry(entry, health_reasons[0])
     try:
-        row = build_episode_row(
+        row = _build_episode_row(
             record,
             trace_records,
             tokenizer=selection_config.tokenizer,
@@ -2337,8 +2508,10 @@ def _candidate_trace_records(
             record,
             trace_records,
             judge_marked=(
-                _training_key(records_path, line_number, _episode_key(record))
-                in selection_config.hint_judge_labels
+                bool(
+                    _record_label_keys(records_path, line_number, record)
+                    & selection_config.hint_judge_labels
+                )
             ),
         )
         entry["hint_mention_filter_checked"] = True
@@ -2428,6 +2601,30 @@ def _pre_build_exclusion_reason(
     return None
 
 
+def _build_episode_row(
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    max_sequence_tokens: int,
+    prompt_render: PromptRender,
+) -> dict[str, object]:
+    row = build_episode_row(
+        record,
+        trace_records,
+        tokenizer=tokenizer,
+        max_sequence_tokens=max_sequence_tokens,
+        prompt_render=prompt_render,
+    )
+    if prompt_render == "student":
+        summary = _episode_summary_from_trace(trace_records)
+        workspace_mount = summary.get("workspace_mount", "/work")
+        if not isinstance(workspace_mount, str) or not workspace_mount:
+            raise TypeError("episode workspace_mount must be a nonempty string")
+        row["student_template"] = tokenizer.get_chat_template(tools=[bash_tool(workspace_mount)])
+    return row
+
+
 def _selected_entry(
     entry: dict[str, object],
     row: Mapping[str, object],
@@ -2439,7 +2636,19 @@ def _selected_entry(
         {
             "episode_row_key": row["key"],
             "token_ids_sha256": row["token_ids_sha256"],
-            "training_key": _training_key(records_path, line_number, episode_key),
+            "prompt_token_ids": row["prompt_token_ids"],
+            "completion_token_ids": row["completion_token_ids"],
+            "loss_mask": row["loss_mask"],
+            "labels": row["labels"],
+            "training_key": _training_key(
+                records_path,
+                line_number,
+                episode_key,
+                evidence={
+                    name: row[name]
+                    for name in ("prompt_token_ids", "completion_token_ids", "loss_mask", "labels")
+                },
+            ),
             "final_context_length": row["sequence_tokens"],
             "original_context_length": row["original_sequence_tokens"],
             "truncated": row["truncated"],
@@ -2447,6 +2656,7 @@ def _selected_entry(
             "grader_directed_move_cut": row["grader_directed_move_cut"],
             "prompt_render": row["prompt_render"],
             "student_template_sha256": row["student_template_sha256"],
+            **({"student_template": row["student_template"]} if "student_template" in row else {}),
             "prefix_diff_counts": row["prefix_diff_counts"],
         }
     )
@@ -2730,6 +2940,42 @@ def _validate_schema_only_build_mode(report: Mapping[str, object], *, schema_onl
     return schema_only
 
 
+def relocate_manifest_sources(
+    report: Mapping[str, object], source_records_paths: Sequence[Path]
+) -> dict[str, object]:
+    """Resolve explicitly supplied source files by saved episode evidence."""
+    relocated = dict(report)
+    if not source_records_paths:
+        return relocated
+    source_rows = {path: dict(_read_records_with_lines(path)) for path in source_records_paths}
+    for field in ("selected", "excluded"):
+        values = report.get(field, [])
+        if not isinstance(values, list):
+            raise TypeError("selection entries must be lists")
+        entries = []
+        for value in values:
+            entry = dict(_require_manifest_entry(value))
+            matches = []
+            for path, records in source_rows.items():
+                candidates = {
+                    line_number: record
+                    for line_number, record in records.items()
+                    if record.get("record") == "ladder_episode"
+                    and _episode_key(record) == dict(_manifest_episode_key(entry))
+                }
+                if candidates:
+                    line_number, _ = _manifest_record(entry, candidates, path)
+                    matches.append((path, line_number))
+            if len(matches) != 1:
+                raise ValueError("relocated source records must contain one matching episode")
+            path, line_number = matches[0]
+            entry["source_records_file"] = str(path)
+            entry["record_line_number"] = line_number
+            entries.append(entry)
+        relocated[field] = entries
+    return relocated
+
+
 def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering options remain explicit
     report: Mapping[str, object],
     *,
@@ -2739,8 +2985,10 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
     health_filters: EpisodeHealthFilterOptions | None = None,
     strengthened_truth_path: Path | None = None,
     schema_only: bool = False,
+    source_records_paths: Sequence[Path] = (),
 ) -> list[dict[str, object]]:
     """Rebuild selected rows from the manifest while retaining builder tokens and masks."""
+    report = relocate_manifest_sources(report, source_records_paths)
     resolved_health_filters = (
         EpisodeHealthFilterOptions() if health_filters is None else health_filters
     )
@@ -2822,11 +3070,15 @@ def _load_manifest_strengthened_truth(
     sidecar_path = Path(saved_path) if explicit_path is None else explicit_path
     if not sidecar_path.is_file():
         raise FileNotFoundError("strengthened-truth sidecar is missing during SFT build")
-    current_digest = hashlib.sha256(sidecar_path.read_bytes()).hexdigest()
-    if current_digest != saved_digest:
-        raise ValueError("strengthened-truth sidecar is stale since selection")
     strengthened_truth = read_strengthened_truth_sidecar(sidecar_path)
     strengthened_truth_bindings = _read_strengthened_truth_bindings(sidecar_path)
+    current_evidence = {
+        key: _strengthened_truth_record(truth) for key, truth in strengthened_truth.items()
+    }
+    if "evidence" in sidecar_value and _truth_content(sidecar_value["evidence"]) != _truth_content(
+        current_evidence
+    ):
+        raise ValueError("strengthened-truth sidecar evidence is stale since selection")
     if len(strengthened_truth) != saved_episode_count:
         raise ValueError("strengthened-truth sidecar episode count changed since selection")
     if strengthened_truth.keys() != strengthened_truth_bindings.keys():
@@ -2940,11 +3192,7 @@ def _build_manifest_entry(
     records_path, line_number = _manifest_location(entry)
     if records_path not in rows_by_file:
         rows_by_file[records_path] = dict(_read_records_with_lines(records_path))
-    record = rows_by_file[records_path].get(line_number)
-    if record is None or record.get("record") != "ladder_episode":
-        raise ValueError("selection manifest no longer points to its ladder episode record")
-    if dict(_manifest_episode_key(entry)) != _episode_key(record):
-        raise ValueError("selection manifest episode key changed since selection")
+    line_number, record = _manifest_record(entry, rows_by_file[records_path], records_path)
     _validate_generated_manifest_scope(record, options)
     trace_records = read_episode_trace_records(record, records_path)
     _validate_manifest_health(entry, trace_records, options.health_filters)
@@ -2985,9 +3233,9 @@ def _build_manifest_entry(
             raise ValueError(
                 "selection manifest strengthened-truth evidence changed since selection"
             )
-    elif entry.get("reference_set_digest") != strengthened_truth.reference_set_digest or entry.get(
-        "strengthened_truth"
-    ) != _strengthened_truth_record(strengthened_truth):
+    elif _truth_content(entry.get("strengthened_truth")) != _truth_content(
+        _strengthened_truth_record(strengthened_truth)
+    ):
         raise ValueError("selection manifest strengthened-truth reference-set digest changed")
     _validate_manifest_eligibility(
         entry,
@@ -3045,7 +3293,7 @@ def _validate_manifest_eligibility(
     metadata = {
         "source": episode_source(record),
         "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
-        "training_key": _training_key(records_path.resolve(), line_number, _episode_key(record)),
+        "training_key": _manifest_training_key(entry, records_path, line_number, record),
         "payment_register": _recorded_payment_register(record),
     }
     if any(entry.get(name) != value for name, value in metadata.items()):
@@ -3100,7 +3348,7 @@ def _validate_schema_only_manifest_eligibility(
         "schema_only": True,
         "source": episode_source(record),
         "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
-        "training_key": _training_key(records_path.resolve(), line_number, _episode_key(record)),
+        "training_key": _manifest_training_key(entry, records_path, line_number, record),
         "payment_register": _recorded_payment_register(record),
         "admission_type": "schema_only",
         "admitting_criterion": ["schema_only_structure"],
@@ -3147,7 +3395,7 @@ def _build_manifest_output_row(
     source_prompt_render = entry.get("prompt_render", "teacher")
     if source_prompt_render not in {"student", "teacher"}:
         raise ValueError("selection manifest entry has an invalid prompt_render")
-    source_row = build_episode_row(
+    source_row = _build_episode_row(
         record,
         trace_records,
         tokenizer=options.tokenizer,
@@ -3157,7 +3405,7 @@ def _build_manifest_output_row(
     _validate_manifest_row(entry, source_row)
     row = source_row
     if source_prompt_render != options.prompt_render:
-        row = build_episode_row(
+        row = _build_episode_row(
             record,
             trace_records,
             tokenizer=options.tokenizer,
@@ -3180,13 +3428,51 @@ def _manifest_strategy_assessment(
     if override_value is not None:
         if not isinstance(override_value, Mapping):
             raise TypeError("selection manifest strategy-label override must be an object")
-        validated_override = _validated_strategy_override(override_value, record)
-        if validated_override != dict(override_value):
+        validated_override = _validated_strategy_override(
+            override_value, record, trace_records=trace_records
+        )
+        if any(validated_override.get(name) != value for name, value in override_value.items()):
             raise ValueError("selection manifest strategy-label override changed since selection")
         assessment = _override_assessment(validated_override)
         if entry.get("regex_primary_strategy") != validated_override["regex_strategy"]:
             raise ValueError("selection manifest regex strategy changed since selection")
     return assessment
+
+
+def _manifest_training_key(
+    entry: Mapping[str, object], records_path: Path, line_number: int, record: Mapping[str, object]
+) -> str:
+    saved = entry.get("training_key")
+    if isinstance(saved, str) and re.fullmatch(r"agentic-sft:[0-9a-f]{64}", saved):
+        return saved
+    return _training_key(records_path, line_number, _episode_key(record))
+
+
+def _manifest_record(
+    entry: Mapping[str, object], records: Mapping[int, Mapping[str, object]], records_path: Path
+) -> tuple[int, Mapping[str, object]]:
+    episode_key = dict(_manifest_episode_key(entry))
+    matches = [
+        (line_number, record)
+        for line_number, record in records.items()
+        if record.get("record") == "ladder_episode" and _episode_key(record) == episode_key
+    ]
+    if len(matches) > 1 and "episode_trace" in entry:
+        matches = [
+            (line_number, record)
+            for line_number, record in matches
+            if _reviewed_evidence(read_episode_trace_records(record, records_path))
+            == entry["episode_trace"]
+        ]
+    if len(matches) > 1 and "episode_trace" not in entry:
+        matches = [
+            (line_number, record)
+            for line_number, record in matches
+            if line_number == entry.get("record_line_number")
+        ]
+    if len(matches) != 1:
+        raise ValueError("selection manifest no longer points to one unique ladder episode record")
+    return matches[0]
 
 
 def _manifest_location(entry: Mapping[str, object]) -> tuple[Path, int]:
@@ -3205,11 +3491,22 @@ def _manifest_episode_key(entry: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) -> None:
-    if row["key"] != entry.get("episode_row_key"):
+    if row["key"] not in (entry.get("episode_row_key"), entry.get("training_key")):
         raise ValueError("selection manifest episode row changed since selection")
-    if row["token_ids_sha256"] != entry.get("token_ids_sha256"):
+    if "prompt_token_ids" in entry:
+        if any(
+            row.get(field) != entry.get(field)
+            for field in ("prompt_token_ids", "completion_token_ids", "loss_mask", "labels")
+        ):
+            raise ValueError("selection manifest token ids or masks changed since selection")
+    elif row["token_ids_sha256"] != entry.get("token_ids_sha256"):
         raise ValueError("selection manifest token ids changed since selection")
-    for field in ("prompt_render", "student_template_sha256", "prefix_diff_counts"):
+    fields = (
+        ("prompt_render",)
+        if "prompt_token_ids" in entry
+        else ("prompt_render", "student_template_sha256", "prefix_diff_counts")
+    )
+    for field in fields:
         if field in entry and row.get(field) != entry[field]:
             raise ValueError(f"selection manifest {field} changed since selection")
     training_key = entry.get("training_key")
@@ -3226,11 +3523,16 @@ def _dataset_manifest(
     if type(schema_only) is not bool:
         raise TypeError("schema_only must be a boolean")
     identities = {
-        (row.get("prompt_render", "teacher"), row.get("student_template_sha256")) for row in rows
+        (
+            row.get("prompt_render", "teacher"),
+            row.get("student_template", row.get("student_template_sha256")),
+        )
+        for row in rows
     }
     if len(identities) != 1:
         raise ValueError("SFT rows contain mixed render identities")
-    mode, template_digest = next(iter(identities))
+    mode, _template_identity = next(iter(identities))
+    template_digest = rows[0].get("student_template_sha256")
     counts: list[int] = []
     row_metadata: list[dict[str, object]] = []
     for row in rows:
@@ -3248,6 +3550,11 @@ def _dataset_manifest(
     identity = {
         "prompt_render": mode,
         "student_template_sha256": template_digest,
+        **(
+            {"student_template": rows[0]["student_template"]}
+            if "student_template" in rows[0]
+            else {}
+        ),
         "dataset_sha256": hashlib.sha256(
             json.dumps(list(rows), sort_keys=True).encode()
         ).hexdigest(),
@@ -4267,30 +4574,23 @@ def _load_heldout_manifests(paths: Sequence[Path]) -> tuple[set[str], set[str]]:
     return task_ids, channels
 
 
-def _selection_heldout_scope(
-    report: Mapping[str, object],
-) -> tuple[set[str], set[str], bool]:
+def _selection_heldout_scope(report: Mapping[str, object]) -> tuple[set[str], set[str], bool]:
     value = report.get("heldout_manifests", [])
     if not isinstance(value, list):
         raise TypeError("selection manifest heldout_manifests must be a list")
-    paths: list[Path] = []
+    scope = report.get("heldout_scope")
+    if scope is not None:
+        if not isinstance(scope, Mapping):
+            raise TypeError("held-out scope must be an object")
+        task_ids, channels = set(), set()
+        _add_heldout_string_list(scope.get("task_ids"), task_ids, "task_ids")
+        _add_heldout_string_list(scope.get("channels"), channels, "channels")
+        return task_ids, channels, bool(value)
+    paths = []
     for manifest in value:
-        if not isinstance(manifest, Mapping):
-            raise TypeError("selection held-out manifest provenance entries must be objects")
-        path_value = manifest.get("path")
-        digest_value = manifest.get("sha256")
-        if not isinstance(path_value, str) or not path_value:
-            raise TypeError("selection held-out manifest path must be a nonempty string")
-        if not isinstance(digest_value, str) or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
-            raise TypeError("selection held-out manifest digest must be a lowercase SHA-256")
-        path = Path(path_value)
-        if not path.is_file():
-            raise FileNotFoundError("held-out manifest is missing during SFT build")
-        if hashlib.sha256(path.read_bytes()).hexdigest() != digest_value:
-            raise ValueError("held-out manifest changed since selection")
-        paths.append(path)
-    if len(paths) != len(set(paths)):
-        raise ValueError("selection manifest contains duplicate held-out manifest paths")
+        if not isinstance(manifest, Mapping) or not isinstance(manifest.get("path"), str):
+            raise TypeError("selection held-out manifest provenance entries require paths")
+        paths.append(Path(cast("str", manifest["path"])))
     if not paths:
         return set(), set(), False
     task_ids, channels = _load_heldout_manifests(paths)
@@ -4298,28 +4598,13 @@ def _selection_heldout_scope(
 
 
 def _validate_card_heldout_manifests(
-    selection_manifest: Mapping[str, object],
-    heldout_manifest_paths: Sequence[Path],
+    selection_manifest: Mapping[str, object], heldout_manifest_paths: Sequence[Path]
 ) -> tuple[set[str], set[str], tuple[str, ...]]:
-    current_paths, task_ids, channels, current_digests = _heldout_manifest_selection_inputs(
+    _, task_ids, channels, current_digests = _heldout_manifest_selection_inputs(
         heldout_manifest_paths
     )
-    saved_value = selection_manifest.get("heldout_manifests", [])
-    if not isinstance(saved_value, list):
-        raise TypeError("selection manifest heldout_manifests must be a list")
-    saved_inputs: list[tuple[Path, str]] = []
-    for item in saved_value:
-        if not isinstance(item, Mapping):
-            raise TypeError("selection held-out manifest provenance entries must be objects")
-        path_value = item.get("path")
-        digest_value = item.get("sha256")
-        if not isinstance(path_value, str) or not path_value:
-            raise TypeError("selection held-out manifest path must be a nonempty string")
-        if not isinstance(digest_value, str) or re.fullmatch(r"[0-9a-f]{64}", digest_value) is None:
-            raise TypeError("selection held-out manifest digest must be a lowercase SHA-256")
-        saved_inputs.append((Path(path_value).resolve(), digest_value))
-    current_inputs = list(zip(current_paths, current_digests, strict=True))
-    if saved_inputs != current_inputs:
+    saved_tasks, saved_channels, _ = _selection_heldout_scope(selection_manifest)
+    if saved_tasks != set(task_ids) or saved_channels != set(channels):
         raise ValueError("Gate 2 held-out manifests do not match the selection manifest")
     return set(task_ids), set(channels), current_digests
 
@@ -4333,7 +4618,7 @@ def _load_hint_catalog(path: Path) -> tuple[dict[tuple[str, str], str], str]:
     hints = document.get("hints")
     if not isinstance(hints, list):
         raise TypeError("hint catalog hints must be a list")
-    hint_sha_by_identity: dict[tuple[str, str], str] = {}
+    hint_text_by_identity: dict[tuple[str, str], str] = {}
     for value in hints:
         if not isinstance(value, Mapping):
             raise TypeError("hint catalog entries must be objects")
@@ -4349,10 +4634,10 @@ def _load_hint_catalog(path: Path) -> tuple[dict[tuple[str, str], str], str]:
         ):
             raise ValueError("hint catalog entries require family, strength and text")
         identity = (family, cast("str", strength))
-        if identity in hint_sha_by_identity:
+        if identity in hint_text_by_identity:
             raise ValueError("hint catalog contains duplicate family and strength entries")
-        hint_sha_by_identity[identity] = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return hint_sha_by_identity, hashlib.sha256(path.read_bytes()).hexdigest()
+        hint_text_by_identity[identity] = text
+    return hint_text_by_identity, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _task_card_metadata() -> tuple[dict[str, dict[str, str]], frozenset[str]]:
@@ -4449,6 +4734,14 @@ def _record_hint_arm(record: Mapping[str, object]) -> tuple[str, str, str]:
     return family, cast("str", strength), f"{family}:{strength}"
 
 
+def _card_row_key(entry: Mapping[str, object], rows_by_key: Mapping[str, object]) -> str:
+    for field in ("training_key", "episode_row_key"):
+        key = entry.get(field)
+        if isinstance(key, str) and key in rows_by_key:
+            return key
+    raise ValueError("selection entry does not match an SFT row identity")
+
+
 def _read_card_rows(path: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     with path.open(encoding="utf-8") as source:
@@ -4460,7 +4753,10 @@ def _read_card_rows(path: Path) -> list[dict[str, object]]:
                 raise TypeError(f"SFT row {line_number} must be a JSON object")
             row = cast("dict[str, object]", value)
             key = row.get("key")
-            if not isinstance(key, str) or re.fullmatch(r"ladder:[0-9a-f]{64}", key) is None:
+            if (
+                not isinstance(key, str)
+                or re.fullmatch(r"(?:ladder|agentic-sft):[0-9a-f]{64}", key) is None
+            ):
                 raise ValueError(f"SFT row {line_number} must have an opaque hashed row key")
             rows.append(row)
     if not rows:
@@ -4476,12 +4772,16 @@ def _load_base_nll(
     document: object = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, Mapping):
         raise TypeError("base NLL report must be a JSON object")
-    if document.get("format_version") != 1 or document.get("complete") is not True:
+    if (
+        type(document.get("format_version")) is not int
+        or cast("int", document["format_version"]) < 1
+        or document.get("complete") is not True
+    ):
         raise ValueError("base NLL report is incomplete or has an unsupported version")
     if document.get("adapter") is not None:
         raise ValueError("base NLL report must be scored under base weights without an adapter")
     rows_digest = hashlib.sha256(rows_path.read_bytes()).hexdigest()
-    if document.get("rows_sha256") != rows_digest:
+    if "row_inputs" in document and document["row_inputs"] != row_inputs(rows_path):
         raise ValueError("base NLL report belongs to different SFT rows")
     row_values = document.get("rows")
     if not isinstance(row_values, list):
@@ -4523,7 +4823,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         or manifest_value.get("format_version") != MANIFEST_VERSION
     ):
         raise ValueError("unsupported agentic SFT selection manifest")
-    manifest = cast("Mapping[str, object]", manifest_value)
+    manifest = relocate_manifest_sources(
+        cast("Mapping[str, object]", manifest_value), vars(args).get("source_records", ())
+    )
     schema_only = manifest.get("schema_only", False)
     if type(schema_only) is not bool:
         raise TypeError("selection manifest schema_only must be a boolean")
@@ -4537,14 +4839,14 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     excluded = [_require_manifest_entry(entry) for entry in excluded_value]
     rows = _read_card_rows(args.rows)
     rows_by_key = {cast("str", row["key"]): row for row in rows}
-    selected_keys = [entry.get("episode_row_key") for entry in selected]
+    selected_keys = [_card_row_key(entry, rows_by_key) for entry in selected]
     if len(selected_keys) != len(rows) or set(selected_keys) != set(rows_by_key):
         raise ValueError("selection manifest selected entries do not match the SFT row file")
 
     heldout_task_ids, heldout_channels, heldout_manifest_digests = _validate_card_heldout_manifests(
         manifest, args.heldout_manifests
     )
-    hint_sha_by_identity, hints_sha256 = _load_hint_catalog(args.hints)
+    hint_text_by_identity, hints_sha256 = _load_hint_catalog(args.hints)
     task_metadata_by_id, statement_exclusions = _task_card_metadata()
     sidecar_truth_by_episode: dict[str, StrengthenedTruthEvidence] = {}
     sidecar_bindings_by_episode: dict[str, _StrengthenedTruthBinding] = {}
@@ -4568,8 +4870,14 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     if saved_sidecar_value is not None:
         if not isinstance(saved_sidecar_value, Mapping):
             raise TypeError("manifest strengthened_truth_sidecar must be an object")
-        saved_sidecar_digest = saved_sidecar_value.get("sha256")
-        if not isinstance(saved_sidecar_digest, str) or saved_sidecar_digest not in sidecar_sha256s:
+        saved_evidence = saved_sidecar_value.get("evidence")
+        current_evidence = {
+            key: _strengthened_truth_record(truth)
+            for key, truth in sidecar_truth_by_episode.items()
+        }
+        if saved_evidence is not None and _truth_content(saved_evidence) != _truth_content(
+            current_evidence
+        ):
             raise ValueError("strengthened-truth sidecars do not match the selection manifest")
 
     judge_label_value = manifest.get("hint_judge_labels")
@@ -4581,9 +4889,15 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         saved_judge_digest = judge_label_value.get("sha256")
         if not isinstance(judge_path_value, str) or not isinstance(saved_judge_digest, str):
             raise TypeError("manifest hint_judge_labels must include path and sha256")
-        judge_labels, current_judge_digest = _load_hint_judge_labels(Path(judge_path_value))
-        if current_judge_digest != saved_judge_digest:
-            raise ValueError("hint judge-label file changed since selection")
+        saved_labels = judge_label_value.get("labels")
+        if saved_labels is not None:
+            if not isinstance(saved_labels, list) or any(
+                not isinstance(label, str) for label in saved_labels
+            ):
+                raise TypeError("hint judge labels must be a list of strings")
+            judge_labels = frozenset(cast("list[str]", saved_labels))
+        else:
+            judge_labels, _ = _load_hint_judge_labels(Path(judge_path_value))
 
     records_by_file: dict[Path, dict[int, Mapping[str, object]]] = {}
     health_by_location: dict[tuple[Path, int], Mapping[str, object]] = {}
@@ -4591,11 +4905,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         records_path, line_number = _manifest_location(entry)
         if records_path not in records_by_file:
             records_by_file[records_path] = dict(_read_records_with_lines(records_path))
-        record = records_by_file[records_path].get(line_number)
-        if record is None or record.get("record") != "ladder_episode":
-            raise ValueError("selection manifest no longer points to a ladder episode")
-        if dict(_manifest_episode_key(entry)) != _episode_key(record):
-            raise ValueError("selection manifest episode identity changed")
+        line_number, record = _manifest_record(entry, records_by_file[records_path], records_path)
     for records_path in {location[0] for location in map(_manifest_location, selected)}:
         health_document = organism_health.analyze_records([records_path])
         episode_values = health_document.get("episodes")
@@ -4612,7 +4922,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     raw_awareness: dict[str, dict[str, object]] = {}
     for entry in (*selected, *excluded):
         records_path, line_number = _manifest_location(entry)
-        record = records_by_file[records_path][line_number]
+        line_number, record = _manifest_record(entry, records_by_file[records_path], records_path)
         _hint_family, _hint_strength_value, hint_arm = _record_hint_arm(record)
         awareness_flags = _integrity_awareness(record)
         arm_metrics = raw_awareness.setdefault(hint_arm, {"episodes": 0, "integrity_alerts": 0})
@@ -4639,8 +4949,8 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     enriched_rows: list[dict[str, object]] = []
     for entry in selected:
         records_path, line_number = _manifest_location(entry)
-        record = records_by_file[records_path][line_number]
-        row_key = cast("str", entry["episode_row_key"])
+        line_number, record = _manifest_record(entry, records_by_file[records_path], records_path)
+        row_key = _card_row_key(entry, rows_by_key)
         row = rows_by_key[row_key]
         _validate_manifest_row(entry, row)
         trace_records = read_episode_trace_records(record, records_path)
@@ -4660,11 +4970,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
                 raise ValueError(
                     "selection manifest strengthened-truth evidence changed since selection"
                 )
-        elif entry.get(
-            "reference_set_digest"
-        ) != strengthened_truth.reference_set_digest or entry.get(
-            "strengthened_truth"
-        ) != _strengthened_truth_record(strengthened_truth):
+        elif _truth_content(entry.get("strengthened_truth")) != _truth_content(
+            _strengthened_truth_record(strengthened_truth)
+        ):
             raise ValueError("selection manifest strengthened-truth reference-set digest changed")
         _validate_manifest_eligibility(
             entry,
@@ -4681,11 +4989,11 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             hint_strength = recorded_hint.strength
             hint_arm = "none" if hint_strength == "none" else f"{hint_family}:{hint_strength}"
         if hint_strength in {"vague", "specific"}:
-            expected_hint_sha = hint_sha_by_identity.get((hint_family, hint_strength))
+            expected_hint_text = hint_text_by_identity.get((hint_family, hint_strength))
             if (
-                expected_hint_sha is None
+                expected_hint_text is None
                 or recorded_hint is None
-                or recorded_hint.sha != expected_hint_sha
+                or recorded_hint.text != expected_hint_text
             ):
                 raise ValueError(
                     "selected row hint identity does not match the supplied hint catalog"
@@ -4864,6 +5172,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             {cast("str", row["row_key"]) for row in enriched_rows},
         )
     provenance: dict[str, object] = {
+        **gate2_content_from_paths(args.manifest, args.rows, list(args.heldout_manifests)),
         "manifest_sha256": hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
         "rows_sha256": hashlib.sha256(args.rows.read_bytes()).hexdigest(),
         "heldout_manifest_sha256": list(heldout_manifest_digests),
@@ -5108,6 +5417,7 @@ def _configure_dataset_card_parser(card_parser: argparse.ArgumentParser) -> None
     card_parser.add_argument("--schema-only", action="store_true")
     card_parser.add_argument("--manifest", type=Path)
     card_parser.add_argument("--rows", type=Path)
+    card_parser.add_argument("--source-records", type=Path, nargs="+", default=())
     card_parser.add_argument("--heldout-manifests", type=Path, nargs="+")
     card_parser.add_argument("--hints", type=Path)
     card_parser.add_argument("--strengthened-truth", type=Path, nargs="+")
@@ -5151,6 +5461,14 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
         "--summary", type=Path, default=Path("artifacts/distill/agentic-sft-seed/summary.csv")
     )
     select_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
+    select_parser.add_argument(
+        "--source-record-alias",
+        type=Path,
+        nargs=2,
+        action="append",
+        default=[],
+        metavar=("OLD", "NEW"),
+    )
     select_parser.add_argument("--strategy-labels", type=Path)
     select_parser.add_argument(
         "--heldout-manifests",
@@ -5191,6 +5509,7 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
 
 
 def _configure_build_parser(build_parser: argparse.ArgumentParser) -> None:
+    build_parser.add_argument("--source-records", type=Path, nargs="+", default=())
     build_parser.add_argument("--manifest", type=Path, required=True)
     build_parser.add_argument("--run-dir", type=Path, required=True)
     build_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
@@ -5340,6 +5659,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             health_filters=_health_filter_options(args),
             hint_mention_filter=args.hint_mention_filter,
             hint_judge_labels_path=args.hint_judge_labels,
+            source_record_aliases=dict(args.source_record_alias),
         )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])
@@ -5355,6 +5675,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
         if not isinstance(manifest, Mapping) or manifest.get("format_version") != MANIFEST_VERSION:
             raise ValueError("unsupported agentic SFT selection manifest")
+        manifest = relocate_manifest_sources(manifest, args.source_records)
         filtered_manifest = filter_manifest_health(
             manifest, health_filters=_health_filter_options(args)
         )

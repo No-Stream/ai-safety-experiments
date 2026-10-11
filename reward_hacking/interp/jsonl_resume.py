@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -204,12 +204,16 @@ def _reconcile_counts(
     return ledger_ahead
 
 
-def resume_records(  # noqa: C901 - reconcile legacy units and keyed records in one contract
+def resume_records(  # noqa: C901, PLR0912, PLR0915 - reconcile legacy units and keyed records in one contract
     records_path: Path,
     *,
     identity: Mapping[str, Any],
     unit_of: Callable[[Mapping[str, Any]], str],
     record_key_of: Callable[[Mapping[str, Any]], str] | None = None,
+    legacy_identity_compatible: Callable[
+        [Mapping[str, Any], Mapping[str, Any], Sequence[Mapping[str, Any]]], bool
+    ]
+    | None = None,
 ) -> tuple[ResumeState, ResumeLedger]:
     """Prepare ``records_path`` for appending: keep complete units, drop partial ones, refuse strangers.
 
@@ -238,25 +242,42 @@ def resume_records(  # noqa: C901 - reconcile legacy units and keyed records in 
         return ResumeState([], {}, 0, ()), ledger
 
     ledger = ResumeLedger.load(ledger_path)
+    if not records_exist and (ledger.completed or ledger.completed_records):
+        raise ResumeMismatchError(
+            f"{ledger_path} names {len(ledger.completed)} completed units and "
+            f"{len(ledger.completed_records)} completed records but {records_path} is missing; "
+            "the records were deleted out from under their ledger."
+        )
+
+    lines: list[str] = []
+    parsed: list[dict[str, Any]] = []
+    truncated_tail = False
+    if records_exist:
+        lines, truncated_tail = read_jsonl_lines(records_path)
+        parsed = [json.loads(line) for line in lines]
+    completed_records = [
+        record
+        for record in parsed
+        if unit_of(record) in ledger.completed
+        or (record_key_of is not None and record_key_of(record) in ledger.completed_records)
+    ]
+
     differences = _identity_diff(wanted, ledger.identity)
     if differences:
-        raise ResumeMismatchError(
-            f"{records_path} was written by a different configuration and is not a continuation "
-            f"of this run ({len(differences)} identity fields differ): "
-            + "; ".join(differences)
-            + ". Use a fresh --out-dir, or delete the old records and ledger deliberately."
+        compatible = legacy_identity_compatible is not None and legacy_identity_compatible(
+            wanted, ledger.identity, completed_records
         )
-    if not records_exist:
-        if ledger.completed or ledger.completed_records:
+        if not compatible:
             raise ResumeMismatchError(
-                f"{ledger_path} names {len(ledger.completed)} completed units and "
-                f"{len(ledger.completed_records)} completed records but {records_path} is missing; "
-                "the records were deleted out from under their ledger."
+                f"{records_path} was written by a different configuration and is not a continuation "
+                f"of this run ({len(differences)} identity fields differ): "
+                + "; ".join(differences)
+                + ". Use a fresh --out-dir, or delete the old records and ledger deliberately."
             )
+        ledger.identity = wanted
+        ledger.write()
+    if not records_exist:
         return ResumeState([], {}, 0, ()), ledger
-
-    lines, truncated_tail = read_jsonl_lines(records_path)
-    parsed = [json.loads(line) for line in lines]
     counts: dict[str, int] = {}
     for record in parsed:
         unit = unit_of(record)

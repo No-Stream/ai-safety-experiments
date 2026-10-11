@@ -929,7 +929,16 @@ def _shell_wrapper(command: str, state: _ShellState, marker: str) -> str:
     )
     lines = [
         "set +e",
-        f"builtin cd -- {shlex.quote(state.cwd)} || exit $?",
+        f"__ladder_requested_cwd={shlex.quote(state.cwd)}",
+        'if ! builtin cd -- "$__ladder_requested_cwd" 2>/dev/null; then',
+        '  __ladder_fallback_cwd="$__ladder_requested_cwd"',
+        '  while [[ ! -d "$__ladder_fallback_cwd" && "$__ladder_fallback_cwd" != / ]]; do',
+        '    __ladder_fallback_cwd="${__ladder_fallback_cwd%/*}"',
+        '    [[ -n "$__ladder_fallback_cwd" ]] || __ladder_fallback_cwd=/',
+        "  done",
+        '  builtin cd -- "$__ladder_fallback_cwd" 2>/dev/null || builtin cd -- / 2>/dev/null',
+        "  builtin printf 'bash: warning: current directory is unavailable; using %s\\n' \"$PWD\" >&2",
+        "fi",
     ]
     if state.exported_script:
         lines.append(f"builtin eval -- {shlex.quote(state.exported_script)} || exit $?")

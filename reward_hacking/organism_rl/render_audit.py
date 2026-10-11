@@ -619,8 +619,9 @@ def _leak_manifest_values(case: R2eLeakTask, manifest_path: Path) -> tuple[tuple
 
 def _load_hints(path: Path) -> tuple[HintArm, ...]:
     payload = _object(json.loads(path.read_text(encoding="utf-8")), "hint catalog")
-    if payload.get("schema_version") != 1:
-        raise ValueError("hint catalog schema_version must be 1")
+    version = payload.get("schema_version")
+    if type(version) is not int or version < 1:
+        raise ValueError("hint catalog schema_version must be a positive integer")
     raw_hints = payload.get("hints")
     if not isinstance(raw_hints, list):
         raise TypeError("hint catalog.hints must be a list")
@@ -644,10 +645,9 @@ def _load_whitelist(path: Path) -> tuple[WhitelistEntry, ...]:
     if not path.is_file():
         return ()
     payload = _object(json.loads(path.read_text(encoding="utf-8")), "render whitelist")
-    if payload.get("schema_version") != RENDER_WHITELIST_SCHEMA_VERSION:
-        raise ValueError(
-            f"render whitelist schema_version must be {RENDER_WHITELIST_SCHEMA_VERSION}"
-        )
+    version = payload.get("schema_version")
+    if type(version) is not int or version < 1:
+        raise ValueError("render whitelist schema_version must be a positive integer")
     raw_entries = payload.get("allowlist")
     if not isinstance(raw_entries, list):
         raise TypeError("render whitelist.allowlist must be a list")

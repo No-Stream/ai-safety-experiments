@@ -1,9 +1,10 @@
 """Adapter around the Jacobian lens (`jlens`), the repo's primary interpretability method.
 
 Owner's rule: lead with the most rigorous interp method available (Jacobian-space), not the easiest.
-This wraps the reference `jlens` package -- run via ``PYTHONPATH`` from a clone of
-github.com/anthropics/jacobian-lens (commit 581d398, v0.1.0); it is deliberately NOT in this repo's
-lockfile -- to do three things a direction analysis needs:
+This wraps the reference `jlens` package, imported through ``PYTHONPATH`` because it is deliberately
+not in this repo's lockfile. The loaded package is checked through its actual fit, persistence,
+reconstruction, and token-recovery behavior; its source revision is recorded as provenance. It does
+three things a direction analysis needs:
 
 * **load a lens** -- FIT OUR OWN (the rule-aligned default: a closed-form accumulation, no
   optimiser, ~2.1 h / 100 prompts on an L4-class card) or reuse the pre-fit 4B lens (a fast
@@ -535,7 +536,7 @@ def interior_eval_positions(seq_len: int, *, skip_first: int, max_positions: int
 
 
 def _require_jlens() -> ModuleType:
-    """Import `jlens` or raise with the exact way to make it importable.
+    """Import `jlens` or explain how to make its behavioral API available.
 
     `jlens` is intentionally absent from the lockfile; it runs via ``PYTHONPATH``. A missing import
     is a setup step, not a bug, so the error says how to fix it rather than crashing obscurely.
@@ -545,9 +546,9 @@ def _require_jlens() -> ModuleType:
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "jlens is not importable. It runs via PYTHONPATH from a clone of "
-            f"github.com/anthropics/jacobian-lens (commit {JLENS_COMMIT}, v0.1.0); "
-            "it is not in this "
-            "repo's lockfile. Clone it and run with PYTHONPATH=<clone-dir> set."
+            "github.com/anthropics/jacobian-lens; its source revision is provenance, while fit "
+            "compatibility is checked through the package's required API and computation behavior. "
+            "Clone it and run with PYTHONPATH=<clone-dir> set."
         ) from exc
 
 

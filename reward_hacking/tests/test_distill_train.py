@@ -83,6 +83,9 @@ def _gate2_card_value(
             "manifest_sha256": hashlib.sha256(selection_path.read_bytes()).hexdigest(),
             "rows_sha256": hashlib.sha256(rows_path.read_bytes()).hexdigest(),
             "heldout_manifest_sha256": [heldout_digest],
+            **distill_train.gate2_input_content(
+                selection_path.parent, round_number=int(rows_path.stem.split("-")[-1])
+            ),
         },
     }
 
@@ -124,6 +127,94 @@ def test_real_training_accepts_a_passing_gate2_card(tmp_path: Path) -> None:
     distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
 
 
+def test_gate2_compares_parsed_content_and_ignores_serialization(tmp_path: Path) -> None:
+    selection_path, heldout_path, rows_path, digest = _write_training_scope_inputs(tmp_path)
+    card = _gate2_card_value(selection_path, rows_path, digest)
+    cast("dict[str, object]", card["provenance"]).update(
+        distill_train.gate2_input_content(tmp_path, round_number=0)
+    )
+    tmp_path.joinpath("card.json").write_text(json.dumps(card))
+    rows_path.write_text(' { "key" : "synthetic" }\n')
+    heldout_path.write_text(json.dumps(json.loads(heldout_path.read_text()), indent=4))
+    selection_path.write_text(json.dumps(json.loads(selection_path.read_text()), indent=4))
+    distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+    rows_path.write_text('{"key":"different"}\n')
+    with pytest.raises(ValueError, match="card is stale"):
+        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+
+def test_resume_compares_training_content_not_dataset_digest(tmp_path: Path) -> None:
+    first = make_trainer(tmp_path, max_steps=1)
+    first.train()
+    resumed = make_trainer(tmp_path, max_steps=1)
+    resumed._identity["dataset_sha256"] = "different serialization"
+    resumed.train(resume_from_checkpoint="latest")
+    assert resumed.state.global_step == 1
+
+
+def test_legacy_checkpoint_without_content_keeps_settings_guard(tmp_path: Path) -> None:
+    first = make_trainer(tmp_path, max_steps=1)
+    first.train()
+    state_path = tmp_path / "checkpoint-1" / "distill_state.json"
+    state = json.loads(state_path.read_text())
+    del state["training_content"]
+    state["dataset_sha256"] = "legacy provenance"
+    state_path.write_text(json.dumps(state))
+    resumed = make_trainer(tmp_path, max_steps=1)
+    resumed.train(resume_from_checkpoint="latest")
+    with pytest.raises(ValueError, match="configuration changed"):
+        make_trainer(tmp_path, learning_rate=0.02).train(resume_from_checkpoint="latest")
+
+
+@pytest.mark.parametrize(
+    "field", ["prompt_token_ids", "completion_token_ids", "labels", "loss_mask", "hint_text"]
+)
+def test_gate2_rejects_changed_named_row_content(tmp_path: Path, field: str) -> None:
+    selection_path, _heldout_path, rows_path, digest = _write_training_scope_inputs(tmp_path)
+    row = {
+        "key": "synthetic",
+        "prompt_token_ids": [1],
+        "completion_token_ids": [2],
+        "labels": [-100, 2],
+        "loss_mask": [1],
+        "hint_text": "synthetic",
+    }
+    rows_path.write_text(json.dumps(row) + "\n")
+    tmp_path.joinpath("card.json").write_text(
+        json.dumps(_gate2_card_value(selection_path, rows_path, digest))
+    )
+    row[field] = "changed" if field == "hint_text" else [9]
+    rows_path.write_text(json.dumps(row) + "\n")
+    with pytest.raises(ValueError, match="card is stale"):
+        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+
+def test_heldout_content_uses_only_task_and_channel_scope() -> None:
+    first = {
+        "selected_tasks": [{"task_id": "synthetic", "description": "old metadata"}],
+        "split": {"train": ["unused"], "held-out": ["channel-two", "channel-one"]},
+    }
+    second = {
+        "selected_tasks": [{"task_id": "synthetic", "description": "new metadata"}],
+        "split": {"train": ["different unused"], "held-out": ["channel-one", "channel-two"]},
+    }
+    assert distill_train._heldout_content(first) == distill_train._heldout_content(second)
+    second["selected_tasks"] = [{"task_id": "different"}]
+    assert distill_train._heldout_content(first) != distill_train._heldout_content(second)
+
+
+def test_gate2_legacy_card_keeps_available_content_and_ignores_raw_hashes(tmp_path: Path) -> None:
+    selection_path, _heldout_path, rows_path, digest = _write_training_scope_inputs(tmp_path)
+    card = _gate2_card_value(selection_path, rows_path, digest)
+    provenance = cast("dict[str, object]", card["provenance"])
+    for field in ("selection_content", "rows_content", "heldout_manifest_content"):
+        del provenance[field]
+    provenance["rows_sha256"] = "legacy byte provenance"
+    tmp_path.joinpath("card.json").write_text(json.dumps(card))
+    rows_path.write_text(' { "key" : "synthetic" }\n')
+    distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+
 def test_opd_training_also_requires_a_passing_gate2_card(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -147,7 +238,7 @@ def test_opd_training_also_requires_a_passing_gate2_card(
         distill_train.main()
 
 
-def test_real_training_rejects_a_card_for_different_heldout_manifests(tmp_path: Path) -> None:
+def test_real_training_ignores_a_card_heldout_provenance_digest(tmp_path: Path) -> None:
     selection_path, _heldout_path, rows_path, _heldout_digest = _write_training_scope_inputs(
         tmp_path
     )
@@ -156,8 +247,7 @@ def test_real_training_rejects_a_card_for_different_heldout_manifests(tmp_path: 
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="held-out manifest"):
-        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+    distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
 
 
 def test_real_training_rechecks_the_selected_heldout_manifest(tmp_path: Path) -> None:
@@ -189,7 +279,7 @@ def test_real_training_binds_gate2_card_to_requested_round(tmp_path: Path) -> No
     )
 
 
-def test_real_training_rejects_a_gate2_card_for_stale_rows(tmp_path: Path) -> None:
+def test_real_training_ignores_a_gate2_card_rows_provenance_digest(tmp_path: Path) -> None:
     selection_path, _heldout_path, rows_path, heldout_digest = _write_training_scope_inputs(
         tmp_path
     )
@@ -198,8 +288,7 @@ def test_real_training_rejects_a_gate2_card_for_stale_rows(tmp_path: Path) -> No
     provenance["rows_sha256"] = "0" * 64
     tmp_path.joinpath("card.json").write_text(json.dumps(card_value) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="card is stale"):
-        distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+    distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
 
 
 def tiny_model() -> Any:
@@ -817,7 +906,11 @@ def test_sft_loader_binds_render_identity_and_refuses_mixed_modes(tmp_path: Path
     loaded = load_training_rows(samples, None, weight_mode="sft")
     for field in ("prompt_render", "student_template_sha256", "prefix_diff_counts"):
         assert loaded[0][field] == row[field]
-    for changes in ({"prompt_render": "teacher"}, {"student_template_sha256": "b" * 64}):
+    for changes in (
+        {"prompt_render": "teacher"},
+        {"student_template": "different template"},
+        {"student_template_sha256": "b" * 64},
+    ):
         samples.write_text(
             json.dumps(row) + "\n" + json.dumps({**row, **changes, "key": "synthetic/1"}) + "\n"
         )
@@ -885,7 +978,7 @@ def test_sft_join_accepts_legacy_rows_without_token_hash(tmp_path: Path) -> None
     )
 
     assert load_training_rows(samples, None, weight_mode="sft") == [
-        {"prompt_token_ids": [1, 2], "completion_token_ids": [3]}
+        {"key": "synthetic/0/0", "prompt_token_ids": [1, 2], "completion_token_ids": [3]}
     ]
 
 
@@ -926,15 +1019,21 @@ def test_torn_newest_checkpoint_is_set_aside(tmp_path: Path) -> None:
         torch.testing.assert_close(actual["exp_avg"], expected["exp_avg"])
 
 
-def test_resume_refuses_changed_base_or_dataset(tmp_path: Path) -> None:
+def test_resume_ignores_base_revision_but_refuses_changed_dataset(tmp_path: Path) -> None:
     first = make_trainer(tmp_path)
     first.train()
+    saved_state = json.loads((tmp_path / "checkpoint-2" / "distill_state.json").read_text())
     resumed = make_trainer(tmp_path)
     resumed._identity["base_model_revision"] = "different-base"
-    with pytest.raises(ValueError, match="configuration changed"):
-        resumed.train(resume_from_checkpoint="latest")
+    resumed.train(resume_from_checkpoint="latest")
+    assert (
+        json.loads((tmp_path / "checkpoint-2" / "distill_state.json").read_text())[
+            "base_model_revision"
+        ]
+        == saved_state["base_model_revision"]
+    )
     resumed = make_trainer(tmp_path)
-    resumed._identity["dataset_sha256"] = "different-data"
+    resumed._identity["training_content"] = [{"prompt_token_ids": [9]}]
     with pytest.raises(ValueError, match="configuration changed"):
         resumed.train(resume_from_checkpoint="latest")
 

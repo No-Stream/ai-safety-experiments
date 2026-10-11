@@ -20,6 +20,7 @@ import logging
 import math
 import re
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from difflib import SequenceMatcher
 from itertools import pairwise
@@ -42,11 +43,12 @@ from reward_hacking.interp.directions import (
     unit,
 )
 from reward_hacking.interp.jsonl_resume import ResumeLedger, resume_records
+from reward_hacking.interp.lens_fit_runtime import weights_fingerprint
 from reward_hacking.interp.linear_probe import grouped_test_masks
 from reward_hacking.interp.steering import Hook, residual_intervention, steering_hook
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Mapping, Sequence
+    from collections.abc import Generator, Sequence
 
 
 class _ChatTokenizer(Protocol):
@@ -1067,6 +1069,135 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _steering_adapter_weights_identity(
+    model: torch.nn.Module, adapter_path: Path | None
+) -> str | None:
+    """Fingerprint effective adapter settings and loaded adapter parameters."""
+    if adapter_path is None:
+        return None
+    config_path = adapter_path / "adapter_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise TypeError(f"adapter config must contain an object: {config_path}")
+    provenance_fields = {"base_model_name_or_path", "revision", "peft_version"}
+    semantic_config = {key: value for key, value in config.items() if key not in provenance_fields}
+    adapter_parameters = [
+        (name, parameter)
+        for name, parameter in sorted(model.named_parameters())
+        if ".lora_" in name or "modules_to_save." in name
+    ]
+    if not adapter_parameters:
+        raise ValueError(f"loaded adapter at {adapter_path} has no supported adapter parameters")
+    digest = hashlib.sha256(json.dumps(semantic_config, sort_keys=True).encode())
+    for name, parameter in adapter_parameters:
+        value = parameter.detach().contiguous()
+        digest.update(name.encode())
+        digest.update(b"\x00")
+        digest.update(str(value.dtype).encode())
+        digest.update(b"\x00")
+        digest.update(json.dumps(list(value.shape)).encode())
+        digest.update(b"\x00")
+        for start in range(0, value.numel(), 4_194_304):
+            chunk = value.view(-1)[start : start + 4_194_304].to("cpu")
+            digest.update(chunk.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _steering_prompt_tokens_sha256(
+    item_ids: Sequence[str], prompt_token_ids: Sequence[Sequence[int]]
+) -> str:
+    content = [
+        {"item_id": item_id, "token_ids": list(token_ids)}
+        for item_id, token_ids in zip(item_ids, prompt_token_ids, strict=True)
+    ]
+    serialized = json.dumps(content, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+def _direction_bundle_content_identity(
+    directions: Mapping[str, torch.Tensor], layer_ids: Sequence[int]
+) -> dict[str, object]:
+    """Identify loaded direction values independently of NumPy container serialization."""
+    positions: dict[str, dict[str, object]] = {}
+    for position, direction in sorted(directions.items()):
+        canonical = direction.detach().to(device="cpu").contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(canonical.dtype).encode())
+        digest.update(b"\x00")
+        digest.update(json.dumps(list(canonical.shape)).encode())
+        digest.update(b"\x00")
+        digest.update(canonical.view(torch.uint8).numpy().tobytes())
+        positions[position] = {
+            "dtype": str(canonical.dtype),
+            "shape": list(canonical.shape),
+            "values_sha256": digest.hexdigest(),
+        }
+    return {"layers": list(layer_ids), "positions": positions}
+
+
+def _legacy_steering_identity_compatible(  # noqa: PLR0911 - legacy identity fields have separate compatibility conditions
+    wanted: Mapping[str, Any],
+    found: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    *,
+    expected_prompt_tokens: Mapping[str, Sequence[int]] | None = None,
+) -> bool:
+    """Migrate old path/byte identities when their stored prompt tokens confirm semantics."""
+    if found.get("stage") != wanted.get("stage"):
+        return False
+    direction_identity = wanted.get("direction_bundle_content_identity")
+    if not isinstance(direction_identity, Mapping) or not direction_identity.get("positions"):
+        return False
+    semantic_core = {
+        "stage",
+        "selected_item_ids",
+        "layers",
+        "position",
+        "scope",
+        "axes",
+        "strengths",
+        "samples_per_prompt",
+        "sampling_budget",
+        "temperature",
+        "max_new_tokens",
+        "seed",
+        "strength_unit",
+        "allow_large",
+    }
+    if semantic_core - set(wanted) or semantic_core - set(found):
+        return False
+    ignored_fields = {
+        "adapter",
+        "adapter_weights_identity",
+        "direction_bundle_content_identity",
+        "direction_bundle_sha256",
+        "model",
+        "model_weights_identity",
+        "prompts_sha256",
+        "selected_prompt_tokens_sha256",
+        "selected_prompt_token_ids",
+    }
+    shared_fields = (set(wanted) & set(found)) - ignored_fields
+    if any(wanted[field] != found[field] for field in shared_fields):
+        return False
+
+    if expected_prompt_tokens is None:
+        raw_expected = wanted.get("selected_prompt_token_ids")
+        if not isinstance(raw_expected, list):
+            return not records
+        expected_prompt_tokens = {
+            str(row["item_id"]): cast("Sequence[int]", row["token_ids"]) for row in raw_expected
+        }
+    if not records:
+        return True
+    for record in records:
+        item_id = str(record.get("item_id", record.get("prompt_id", "")))
+        expected_tokens = expected_prompt_tokens.get(item_id)
+        if expected_tokens is None or record.get("prompt_token_ids") != list(expected_tokens):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class FitItemsConfig:
     """Inputs for fitting a last-prompt direction from an Atlas token sweep."""
@@ -1567,22 +1698,42 @@ class ProjectionCapture:
 def _validate_direction_bundle(
     directions: Mapping[str, torch.Tensor], provenance: Mapping[str, Any]
 ) -> list[int]:
-    if provenance.get("schema_version") != DIRECTION_SCHEMA_VERSION:
-        raise ValueError("unsupported direction bundle schema")
+    schema_version = provenance.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version < 1
+    ):
+        raise ValueError(f"invalid direction bundle semantic layout: schema tag {schema_version!r}")
     if provenance.get("layer_index_convention") != LAYER_INDEX_CONVENTION:
         raise ValueError(
             "saved direction bundle uses a different hidden-state/block index convention"
         )
-    if not directions:
-        raise ValueError("saved direction bundle has no positions")
-    layer_ids = [int(layer) for layer in provenance["layers"]]
+    positions = provenance.get("positions")
+    layers = provenance.get("layers")
+    if (
+        not directions
+        or not isinstance(positions, list)
+        or any(not isinstance(position, str) for position in positions)
+        or len(positions) != len(set(positions))
+        or not isinstance(layers, list)
+        or any(not isinstance(layer, int) or isinstance(layer, bool) for layer in layers)
+    ):
+        raise ValueError("invalid direction bundle semantic layout: required fields are malformed")
+    layer_ids = cast("list[int]", layers)
     if not layer_ids or layer_ids != sorted(set(layer_ids)) or layer_ids[0] < 0:
         raise ValueError(
             f"saved direction layers must be sorted zero-based block indices: {layer_ids}"
         )
-    if set(directions) != set(provenance["positions"]):
+    if set(directions) != set(positions):
         raise ValueError("saved direction positions differ from provenance")
-    if any(array.shape[0] != len(layer_ids) for array in directions.values()):
+    if any(
+        array.ndim != MATRIX_DIMENSIONS
+        or array.shape[0] != len(layer_ids)
+        or array.shape[1] < 1
+        or not torch.isfinite(array).all()
+        for array in directions.values()
+    ):
         raise ValueError("saved direction layer axes differ from provenance")
     return layer_ids
 
@@ -2411,6 +2562,8 @@ class _SteeringRuntime:
     generation_batch_size: int
     eos_token_ids: frozenset[int]
     sampling_provenance: dict[str, object]
+    model_weights_identity: str | None = None
+    adapter_weights_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2561,6 +2714,8 @@ def _prepare_steering_runtime(config: SteeringConfig) -> _SteeringRuntime:
         oversize_reason=config.oversize_reason,
     )
     model, tokenizer = _load_model_with_optional_adapter(config.model_id, config.adapter)
+    model_weights_identity = weights_fingerprint(config.model_id, model, config.adapter)
+    adapter_weights_identity = _steering_adapter_weights_identity(model, config.adapter)
     device, free_vram_bytes, total_vram_bytes = _device_memory(model)
     layer_count = _config_value(model, ("num_hidden_layers", "n_layer", "num_layers"))
     invalid_layers = [layer_id for layer_id in selected_layers if not 0 <= layer_id < layer_count]
@@ -2622,6 +2777,8 @@ def _prepare_steering_runtime(config: SteeringConfig) -> _SteeringRuntime:
         generation_batch_size=generation_batch_size,
         eos_token_ids=_eos_token_ids(model),
         sampling_provenance=sampling_provenance,
+        model_weights_identity=model_weights_identity,
+        adapter_weights_identity=adapter_weights_identity,
     )
 
 
@@ -2629,14 +2786,15 @@ def _steering_resume_identity(runtime: _SteeringRuntime) -> dict[str, object]:
     config = runtime.config
     return {
         "stage": "hack_contrast_steer",
-        "model": config.model_id,
-        "adapter": None if config.adapter is None else str(config.adapter),
-        "direction_bundle_sha256": {
-            path.name: _sha256_file(path)
-            for path in sorted(config.direction_dir.glob("direction.*.npy"))
-        },
-        "prompts_sha256": _sha256_file(config.prompts_path),
+        "model_weights_identity": runtime.model_weights_identity,
+        "adapter_weights_identity": runtime.adapter_weights_identity,
+        "direction_bundle_content_identity": _direction_bundle_content_identity(
+            runtime.directions, runtime.saved_layer_ids
+        ),
         "selected_item_ids": runtime.item_ids,
+        "selected_prompt_tokens_sha256": _steering_prompt_tokens_sha256(
+            runtime.item_ids, runtime.prompt_token_ids
+        ),
         "layers": runtime.selected_layers,
         "position": config.position,
         "scope": config.scope,
@@ -2807,11 +2965,20 @@ def steer_prompts(
     """Generate direction and matched-norm-placebo completions for later external grading."""
     runtime = _prepare_steering_runtime(config)
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_prompt_tokens = dict(zip(runtime.item_ids, runtime.prompt_token_ids, strict=True))
     resume, ledger = resume_records(
         config.output_path,
         identity=_steering_resume_identity(runtime),
         unit_of=lambda record: str(record["sample_id"]),
         record_key_of=lambda record: str(record["sample_id"]),
+        legacy_identity_compatible=lambda wanted, found, records: (
+            _legacy_steering_identity_compatible(
+                wanted,
+                found,
+                records,
+                expected_prompt_tokens=expected_prompt_tokens,
+            )
+        ),
     )
     completed_sample_ids = set(ledger.completed_records)
     logger.info(

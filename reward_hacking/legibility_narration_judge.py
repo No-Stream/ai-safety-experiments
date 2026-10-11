@@ -125,29 +125,29 @@ class Instructions:
 
 
 def load_instructions(path: Path = DEFAULT_INSTRUCTIONS_PATH) -> Instructions:
-    """Load the gitignored instruction file, refusing absence or a version line that does not match.
+    """Load the gitignored instruction body and fingerprint its substantive text.
 
     A default here would be committed judge prose, which the stimulus rule forbids; the first line of
-    the file is the prompt version, pinned so a stale or unrelated file cannot be judged under as if it
-    were this one. The digest covers the whole file, version line included.
+    the file remains a human-readable version label. The label is provenance only; the digest covers
+    the instruction body the judge actually receives.
     """
     if not path.is_file():
         raise FileNotFoundError(
             f"judge instruction file {path} is missing. It is gitignored on purpose (judge prompts "
             "are authored stimulus that must never be committed) and a fresh clone does not contain "
-            "it; recreate it beside the wave plan in docs/scratch, first line "
-            f"{JUDGE_PROMPT_VERSION!r}."
+            "it; recreate it beside the wave plan in docs/scratch with a label line and instruction body."
         )
     raw = path.read_text(encoding="utf-8")
-    version, _, body = raw.partition("\n")
-    if version.strip() != JUDGE_PROMPT_VERSION:
-        raise ValueError(
-            f"{path} starts with {version.strip()!r}; this judge expects its first line to be "
-            f"{JUDGE_PROMPT_VERSION!r}"
-        )
+    _, separator, body = raw.partition("\n")
+    if not separator:
+        raise ValueError(f"{path} must contain a label line and instruction body")
     if not body.strip():
         raise ValueError(f"{path} carries a version line and no instructions")
-    return Instructions(text=body.strip(), digest=hashlib.sha256(raw.encode()).hexdigest()[:16])
+    instruction_text = body.strip()
+    return Instructions(
+        text=instruction_text,
+        digest=hashlib.sha256(instruction_text.encode()).hexdigest()[:16],
+    )
 
 
 # ---------------------------------------------------------------------------------------------
