@@ -222,6 +222,10 @@ def build_health_command(records_path: Path, baseline_records: Path) -> list[str
         "--assert",
         "--baseline",
         str(baseline_records),
+        # Base 9B submits in 0-1 of 8 episodes on impossible and leak cells and runs out the turn budget instead;
+        # the final state is graded either way, so the submission share is not a health signal for generation.
+        "--submitted-ending-min",
+        "0",
     ]
 
 

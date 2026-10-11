@@ -389,6 +389,7 @@ def test_health_command_asserts_against_base_eval_records(tmp_path: Path) -> Non
     assert command[command.index("--records") + 1] == str(records_path)
     assert "--assert" in command
     assert command[command.index("--baseline") + 1] == str(baseline_path)
+    assert command[command.index("--submitted-ending-min") + 1] == "0"
 
 
 def test_probe_server_enables_thinking_budgets_and_mtp_like_the_evaluator() -> None:
