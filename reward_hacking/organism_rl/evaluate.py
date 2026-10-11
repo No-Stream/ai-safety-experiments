@@ -1391,12 +1391,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             build_server_config(args, model_revision)
         logger.info(
             "validated evaluation arguments family=%s variant=%s excluded_ilcb_problem_ids=%s "
-            "served_model_id=%s model_revision=%s",
+            "served_model_id=%s model_revision=%s max_turns=%s announced_turn_budget=%s",
             args.families,
             args.evaluation_variant or args.impossible_variant,
             args.excluded_ilcb_problem_ids,
             args.served_model_id,
             model_revision,
+            args.max_turns,
+            args.announced_turn_budget,
         )
         return
     generate.require_gitignored_output_dir(args.output_dir)

@@ -87,7 +87,7 @@ def test_dry_run_batch_uses_ladder_evaluation_config_parser() -> None:
                 "organism-ladder-v4",
                 "invalid-model-length",
                 "0.9",
-                "artifacts/ladder/minimal-eval-v4/v4/cell-7",
+                "artifacts/ladder/minimal-eval-v4-announced-budget/v4/cell-7",
                 "reward_hacking/ladder/data/scenarios-v2.2-heldout-wip",
                 "0",
             ]
@@ -169,6 +169,19 @@ def test_cells_dry_run_reports_the_two_math_variants_and_counts() -> None:
         in output
     )
     assert "until W6 lands" not in SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+@requires_leak_splits
+@pytest.mark.slow
+def test_new_cells_announce_their_real_turn_budget_and_reused_cells_do_not() -> None:
+    v4_output = _dry_run("cells", "v4")
+    gate3_output = _dry_run("gate3", "v4")
+
+    assert v4_output.count("max_turns=20 announced_turn_budget=20") == 3
+    assert v4_output.count("max_turns=30 announced_turn_budget=30") == 1
+    assert v4_output.count("max_turns=20 announced_turn_budget=None") == 1
+    assert gate3_output.count("max_turns=20 announced_turn_budget=None") == 3
+    assert "announced_turn_budget=2" not in gate3_output
 
 
 @pytest.mark.slow

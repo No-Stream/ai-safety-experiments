@@ -156,7 +156,7 @@ fi
 
 max_model_len="${MAX_MODEL_LEN:-65536}"
 gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.90}"
-cell_root="artifacts/organism-eval/minimal-eval-v4/$model"
+cell_root="artifacts/organism-eval/minimal-eval-v4-announced-budget/$model"
 dry_run_operation_count=0
 dry_run_operations=()
 dry_run_records=()
@@ -172,7 +172,7 @@ run_ladder_cell() {
       "$served_model_id"
       "$max_model_len"
       "$gpu_memory_utilization"
-      "artifacts/ladder/minimal-eval-v4/$model/cell-7"
+      "artifacts/ladder/minimal-eval-v4-announced-budget/$model/cell-7"
       "$scenario_root"
     )
     return
@@ -184,7 +184,7 @@ run_ladder_cell() {
     SEED_EVAL_DRY_RUN="$dry_run" \
     SEED_EVAL_MAX_MODEL_LEN="$max_model_len" \
     SEED_EVAL_GPU_MEMORY_UTILIZATION="$gpu_memory_utilization" \
-    SEED_EVAL_OUTPUT_DIR="artifacts/ladder/minimal-eval-v4/$model/cell-7" \
+    SEED_EVAL_OUTPUT_DIR="artifacts/ladder/minimal-eval-v4-announced-budget/$model/cell-7" \
     SEED_EVAL_SCENARIO_ROOT="reward_hacking/ladder/data/scenarios-v2.2-heldout-wip" \
     "$python_bin" - <<'PY'
 import logging
@@ -311,15 +311,19 @@ run_eval_cell() {
   local task_count=8
   local output_dir="$cell_root/cell-$cell"
   local reuse_from=""
+  local max_turns=20
+  # Cells 1-4 stay comparable with the reused evalA base records, which never announced the budget; the cells new
+  # for every model announce the real budget, as seed-v4 generation does.
+  local announce_turn_budget=1
   local -a arguments
 
   case "$cell" in
-    1) family="aisi"; variant="oneoff" ;;
-    2) family="aisi"; variant="original" ;;
-    3) family="ilcb"; variant="oneoff" ;;
-    4) family="ilcb"; variant="original" ;;
+    1) family="aisi"; variant="oneoff"; announce_turn_budget=0 ;;
+    2) family="aisi"; variant="original"; announce_turn_budget=0 ;;
+    3) family="ilcb"; variant="oneoff"; announce_turn_budget=0 ;;
+    4) family="ilcb"; variant="original"; announce_turn_budget=0 ;;
     5) family="ilcb"; variant="conflicting"; impossible_variant="conflicting" ;;
-    6) family="r2e_leak"; variant="leak" ;;
+    6) family="r2e_leak"; variant="leak"; max_turns=30 ;;
     8) family="math_loose_checker"; variant="loose_oneoff"; impossible_variant="loose_oneoff"; task_count=6 ;;
     9) family="math_loose_checker"; variant="loose_hidden_original"; impossible_variant="loose_oneoff"; task_count=6 ;;
     7) run_ladder_cell; return ;;
@@ -340,7 +344,7 @@ run_eval_cell() {
     --max-model-len "$max_model_len"
     --max-new-tokens 8192
     --concurrency 6
-    --max-turns 20
+    --max-turns "$max_turns"
     --thinking-token-budget 2048
     --temperature 1.0
     --top-p 1.0
@@ -360,9 +364,11 @@ run_eval_cell() {
   if [[ -n "$adapter_dir" ]]; then
     arguments+=(--adapter-dir "$adapter_dir")
   fi
+  if [[ "$announce_turn_budget" == 1 ]]; then
+    arguments+=(--announced-turn-budget "$max_turns")
+  fi
   if [[ "$family" == r2e_leak ]]; then
     arguments+=(
-      --max-turns 30
       --leak-assets /var/tmp/leak-env/assets-v6-heldout/assets.json
       --leak-channel-splits docs/scratch/leak-v4/channel-splits.json
       --leak-channel-split seed-v4
