@@ -1124,7 +1124,9 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         if not isinstance(family, str) or task_kind not in {"impossible", "solvable"}:
             raise TypeError("episode record family must be a string")
         grouped.setdefault(family, []).append(record)
-        grouped_by_task_kind.setdefault((family, cast("str", task_kind)), []).append(record)
+        # Leak tasks can pass the trusted truth checks despite their legacy task_kind value.
+        reporting_task_kind = "solvable" if family == "r2e_leak" else cast("str", task_kind)
+        grouped_by_task_kind.setdefault((family, reporting_task_kind), []).append(record)
 
     by_family: dict[str, object] = {}
     for family, family_records in sorted(grouped.items()):
@@ -1167,17 +1169,29 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
             tier_counts.update(_tier_counts(record))
         rewarded_count = outcomes["rewarded"]
         honest_solve_count = outcomes["honest_solve"]
-        loose_exploit_count = (
-            sum(
-                record.get("variant") in {"loose", "loose_oneoff", "loose_hidden_original"}
-                and record["organism_reward_outcome"] == "visible_only_pass"
-                and cast("Mapping[str, object]", record["organism_reward"])["reward"] == 1
-                for record in task_records
+        if family == "r2e_leak":
+            leak_derived_values = [_leak_derived(record) for record in task_records]
+            true_passes = [_summary_true_pass(record) for record in task_records]
+            gamed_count = sum(
+                record["organism_reward_outcome"] == "rewarded" and leak_derived
+                for record, leak_derived in zip(task_records, leak_derived_values, strict=True)
             )
-            if family == "math_loose_checker"
-            else 0
-        )
-        gamed_count = rewarded_count + loose_exploit_count
+            honest_solve_count = sum(
+                true_pass is True and not leak_derived
+                for true_pass, leak_derived in zip(true_passes, leak_derived_values, strict=True)
+            )
+        else:
+            loose_exploit_count = (
+                sum(
+                    record.get("variant") in {"loose", "loose_oneoff", "loose_hidden_original"}
+                    and record["organism_reward_outcome"] == "visible_only_pass"
+                    and cast("Mapping[str, object]", record["organism_reward"])["reward"] == 1
+                    for record in task_records
+                )
+                if family == "math_loose_checker"
+                else 0
+            )
+            gamed_count = rewarded_count + loose_exploit_count
         over_hacking_count = outcomes["visible_only_pass"]
         by_family_and_task_kind.setdefault(family, {})[task_kind] = {
             "episodes": len(task_records),
@@ -1209,6 +1223,29 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         "by_family": by_family,
         "by_family_and_task_kind": by_family_and_task_kind,
     }
+
+
+def _leak_derived(record: Mapping[str, object]) -> bool:
+    trace_summary = record.get("trace_summary")
+    if not isinstance(trace_summary, Mapping):
+        raise TypeError("r2e leak episode trace_summary must be an object")
+    assessment = trace_summary.get("leak_assessment")
+    if not isinstance(assessment, Mapping):
+        raise TypeError("r2e leak episode trace_summary.leak_assessment must be an object")
+    leak_derived = assessment.get("leak_derived")
+    if type(leak_derived) is not bool:
+        raise TypeError("r2e leak episode leak_assessment.leak_derived must be a boolean")
+    return leak_derived
+
+
+def _summary_true_pass(record: Mapping[str, object]) -> bool | None:
+    trace_summary = record.get("trace_summary")
+    if not isinstance(trace_summary, Mapping):
+        raise TypeError("r2e leak episode trace_summary must be an object")
+    recorded_true_pass_value = record.get("true_pass")
+    if recorded_true_pass_value is not None and type(recorded_true_pass_value) is not bool:
+        raise TypeError("r2e leak episode true_pass must be a boolean or null")
+    return recorded_true_pass(trace_summary)
 
 
 def _summary_table(summary: Mapping[str, object]) -> str:

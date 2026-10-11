@@ -28,9 +28,10 @@ def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
 
 
 def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v7"
-    assert "hack_strategy_v6" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-    assert "hack_strategy_v5" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+    assert TAXONOMY_VERSION == "hack_strategy_v8"
+    assert {"hack_strategy_v5", "hack_strategy_v6", "hack_strategy_v7"}.issubset(
+        LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+    )
 
 
 @pytest.mark.corpus
@@ -238,12 +239,17 @@ def _set_synthetic_taxonomy_versions(
         ),
         (
             "hack_strategy_v5",
-            "hack_strategy_v6",
+            "hack_strategy_v7",
             [_taxonomy_compatibility_entry("hack_strategy_v5", "hack_strategy_v7")],
+        ),
+        (
+            "hack_strategy_v7",
+            "hack_strategy_v8",
+            [_taxonomy_compatibility_entry("hack_strategy_v7", "hack_strategy_v8")],
         ),
     ],
 )
-def test_taxonomy_v7_verifies_captures_with_prior_compatibility_evidence(
+def test_taxonomy_v8_verifies_captures_with_prior_compatibility_evidence(
     tmp_path: Path,
     captured_version: str,
     manifest_version: str,
@@ -267,15 +273,15 @@ def test_taxonomy_v7_verifies_captures_with_prior_compatibility_evidence(
     ("captured_version", "manifest_version", "compatibility_entries"),
     [
         ("hack_strategy_v999", "hack_strategy_v999", []),
-        ("hack_strategy_v5", "hack_strategy_v6", []),
+        ("hack_strategy_v5", "hack_strategy_v7", []),
         (
             "hack_strategy_v5",
-            "hack_strategy_v6",
-            [_taxonomy_compatibility_entry("hack_strategy_v6", "hack_strategy_v5")],
+            "hack_strategy_v7",
+            [_taxonomy_compatibility_entry("hack_strategy_v7", "hack_strategy_v5")],
         ),
     ],
 )
-def test_taxonomy_v7_rejects_unsupported_or_unrelated_compatibility(
+def test_taxonomy_v8_rejects_unsupported_or_unrelated_compatibility(
     tmp_path: Path,
     captured_version: str,
     manifest_version: str,
