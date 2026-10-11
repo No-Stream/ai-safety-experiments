@@ -548,6 +548,7 @@ def _check_semantic_version_table(
     *,
     context: str,
     exercised_producers: frozenset[str],
+    manifest_semantic_versions: Mapping[str, object],
 ) -> None:
     if not isinstance(compatibility_values, list):
         raise TypeError("seed-v4 corpus manifest has no legacy compatibility table")
@@ -558,23 +559,47 @@ def _check_semantic_version_table(
         captured_version = captured_versions.get(producer)
         if captured_version != current_version:
             loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
-            compatible_pair = loader_test is not None and any(
-                isinstance(entry, Mapping)
-                and entry.get("producer") == producer
-                and entry.get("captured_version") == captured_version
-                and entry.get("current_version") == current_version
-                and entry.get("loader_test") == loader_test
-                for entry in compatibility_values
-            )
-            if compatible_pair and producer == TAXONOMY_PRODUCER:
+            if producer == TAXONOMY_PRODUCER:
                 from reward_hacking.distill.hack_strategy import (  # noqa: PLC0415
                     LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
                 )
 
-                if captured_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS:
+                current_manifest_version = manifest_semantic_versions.get(producer)
+                historically_attested = any(
+                    isinstance(entry, Mapping)
+                    and entry.get("producer") == producer
+                    and entry.get("loader_test") == loader_test
+                    and isinstance(captured_version, str)
+                    and isinstance(entry.get("captured_version"), str)
+                    and isinstance(entry.get("current_version"), str)
+                    and entry.get("captured_version") == captured_version
+                    and (
+                        entry.get("current_version") == current_version
+                        or entry.get("current_version") == current_manifest_version
+                    )
+                    for entry in compatibility_values
+                )
+                if (
+                    isinstance(captured_version, str)
+                    and isinstance(current_version, str)
+                    and isinstance(current_manifest_version, str)
+                    and captured_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+                    and current_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+                    and current_manifest_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+                    and (captured_version == current_manifest_version or historically_attested)
+                ):
                     continue
-            elif compatible_pair:
-                continue
+            else:
+                compatible_pair = loader_test is not None and any(
+                    isinstance(entry, Mapping)
+                    and entry.get("producer") == producer
+                    and entry.get("captured_version") == captured_version
+                    and entry.get("current_version") == current_version
+                    and entry.get("loader_test") == loader_test
+                    for entry in compatibility_values
+                )
+                if compatible_pair:
+                    continue
             raise ValueError(
                 f"seed-v4 corpus {context} captured under {producer}={captured_version}, code is "
                 f"{producer}={current_version}; regenerate with `make corpus-smoke` or recapture "
@@ -599,6 +624,7 @@ def verify_corpus(corpus_root: Path | None = None) -> Mapping[str, object]:
     manifest = _load_manifest(resolved_root)
     _check_manifest_version_notes(manifest)
     captures = cast("list[object]", manifest["captures"])
+    manifest_semantic_versions = cast("Mapping[str, object]", manifest["semantic_versions"])
     for raw_capture in captures:
         if not isinstance(raw_capture, Mapping):
             raise TypeError("seed-v4 corpus capture entry must be an object")
@@ -621,6 +647,7 @@ def verify_corpus(corpus_root: Path | None = None) -> Mapping[str, object]:
             manifest.get("compatible_legacy_versions", []),
             context=f"capture {logical_relative}",
             exercised_producers=_exercised_producers(capture_root),
+            manifest_semantic_versions=manifest_semantic_versions,
         )
         _source_files(capture_root)
         _validate_capture_paths(capture_root, capture_root)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -28,7 +28,8 @@ def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
 
 
 def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v6"
+    assert TAXONOMY_VERSION == "hack_strategy_v7"
+    assert "hack_strategy_v6" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert "hack_strategy_v5" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
 
 
@@ -196,6 +197,103 @@ def _capture_minimal_run(source: Path, corpus_root: Path) -> Path:
     return corpus_capture.capture_run(source, "synthetic", corpus_root=corpus_root)
 
 
+def _taxonomy_compatibility_entry(captured_version: str, current_version: str) -> dict[str, object]:
+    return {
+        "producer": corpus_capture.TAXONOMY_PRODUCER,
+        "captured_version": captured_version,
+        "current_version": current_version,
+        "loader_test": corpus_capture.TAXONOMY_COMPATIBILITY_TEST,
+    }
+
+
+def _set_synthetic_taxonomy_versions(
+    corpus_root: Path,
+    *,
+    captured_version: str,
+    manifest_version: str,
+    compatibility_entries: Sequence[Mapping[str, object]],
+) -> bytes:
+    manifest_path = corpus_root / "corpus-manifest.json"
+    manifest = cast("dict[str, object]", json.loads(manifest_path.read_text(encoding="utf-8")))
+    capture = cast("dict[str, object]", cast("list[object]", manifest["captures"])[0])
+    capture_versions = cast("dict[str, object]", capture["semantic_versions"])
+    capture_versions[corpus_capture.TAXONOMY_PRODUCER] = captured_version
+    manifest_versions = cast("dict[str, object]", manifest["semantic_versions"])
+    manifest_versions[corpus_capture.TAXONOMY_PRODUCER] = manifest_version
+    manifest["compatible_legacy_versions"] = list(compatibility_entries)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return manifest_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("captured_version", "manifest_version", "compatibility_entries"),
+    [
+        ("hack_strategy_v6", "hack_strategy_v6", []),
+        (
+            "hack_strategy_v5",
+            "hack_strategy_v6",
+            [_taxonomy_compatibility_entry("hack_strategy_v5", "hack_strategy_v6")],
+        ),
+        (
+            "hack_strategy_v5",
+            "hack_strategy_v6",
+            [_taxonomy_compatibility_entry("hack_strategy_v5", "hack_strategy_v7")],
+        ),
+    ],
+)
+def test_taxonomy_v7_verifies_captures_with_prior_compatibility_evidence(
+    tmp_path: Path,
+    captured_version: str,
+    manifest_version: str,
+    compatibility_entries: list[Mapping[str, object]],
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    _capture_minimal_run(tmp_path / "source", corpus_root)
+    manifest_before_verification = _set_synthetic_taxonomy_versions(
+        corpus_root,
+        captured_version=captured_version,
+        manifest_version=manifest_version,
+        compatibility_entries=compatibility_entries,
+    )
+
+    corpus_capture.verify_corpus(corpus_root)
+
+    assert (corpus_root / "corpus-manifest.json").read_bytes() == manifest_before_verification
+
+
+@pytest.mark.parametrize(
+    ("captured_version", "manifest_version", "compatibility_entries"),
+    [
+        ("hack_strategy_v999", "hack_strategy_v999", []),
+        ("hack_strategy_v5", "hack_strategy_v6", []),
+        (
+            "hack_strategy_v5",
+            "hack_strategy_v6",
+            [_taxonomy_compatibility_entry("hack_strategy_v6", "hack_strategy_v5")],
+        ),
+    ],
+)
+def test_taxonomy_v7_rejects_unsupported_or_unrelated_compatibility(
+    tmp_path: Path,
+    captured_version: str,
+    manifest_version: str,
+    compatibility_entries: list[Mapping[str, object]],
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    _capture_minimal_run(tmp_path / "source", corpus_root)
+    _set_synthetic_taxonomy_versions(
+        corpus_root,
+        captured_version=captured_version,
+        manifest_version=manifest_version,
+        compatibility_entries=compatibility_entries,
+    )
+
+    with pytest.raises(ValueError, match=r"captured under .*" + captured_version):
+        corpus_capture.verify_corpus(corpus_root)
+
+
 @pytest.mark.parametrize(("variant", "stale"), [("leak", True), ("original", False)])
 def test_leak_builder_bump_stales_only_captures_with_leak_episodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str, *, stale: bool
@@ -248,12 +346,27 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
             captured_version = captured_versions[producer]
             current_version = semantic_versions()[producer]
             if captured_version != current_version:
-                assert {
-                    "producer": producer,
-                    "captured_version": captured_version,
-                    "current_version": current_version,
-                    "loader_test": corpus_capture.COMPATIBILITY_LOADER_TESTS[producer],
-                } in manifest["compatible_legacy_versions"]
+                if producer == corpus_capture.TAXONOMY_PRODUCER:
+                    supported_versions = LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+                    manifest_version = manifest["semantic_versions"][producer]
+                    historically_attested = any(
+                        entry["producer"] == producer
+                        and entry["loader_test"] == corpus_capture.TAXONOMY_COMPATIBILITY_TEST
+                        and entry["captured_version"] == captured_version
+                        and entry["current_version"] in (current_version, manifest_version)
+                        for entry in manifest["compatible_legacy_versions"]
+                    )
+                    assert captured_version in supported_versions
+                    assert current_version in supported_versions
+                    assert manifest_version in supported_versions
+                    assert captured_version == manifest_version or historically_attested
+                else:
+                    assert {
+                        "producer": producer,
+                        "captured_version": captured_version,
+                        "current_version": current_version,
+                        "loader_test": corpus_capture.COMPATIBILITY_LOADER_TESTS[producer],
+                    } in manifest["compatible_legacy_versions"]
     assert manifest["deferred_semantic_versions"] == [
         "reward_hacking.harness.leak_detector.LEAK_DETECTOR_SEMANTIC_VERSION"
     ]
@@ -274,17 +387,9 @@ def test_captured_taxonomy_versions_remain_supported(seed_v4_corpus: Path) -> No
                 captured_versions.add(taxonomy_version)
     assert captured_versions
     assert captured_versions.issubset(LABEL_COMPATIBLE_TAXONOMY_VERSIONS)
-    for captured_version in captured_versions:
-        if captured_version != TAXONOMY_VERSION:
-            assert {
-                "producer": "reward_hacking.distill.hack_strategy.taxonomy",
-                "captured_version": captured_version,
-                "current_version": TAXONOMY_VERSION,
-                "loader_test": (
-                    "reward_hacking/tests/test_seed_v4_corpus_versions.py::"
-                    "test_captured_taxonomy_versions_remain_supported"
-                ),
-            } in manifest["compatible_legacy_versions"]
+    assert manifest["semantic_versions"][corpus_capture.TAXONOMY_PRODUCER] in (
+        LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+    )
 
 
 @pytest.mark.corpus
