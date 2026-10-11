@@ -42,6 +42,7 @@ DEFERRED_SEMANTIC_VERSIONS = (
     "reward_hacking.harness.leak_detector.LEAK_DETECTOR_SEMANTIC_VERSION",
 )
 LEAK_BUILDER_PRODUCER = "reward_hacking.harness.leak_channels.builder"
+SMOKE_PLAN_PRODUCER = "organism_rl.smoke_v4.plan_format"
 TAXONOMY_COMPATIBILITY_TEST = (
     "reward_hacking/tests/test_seed_v4_corpus_versions.py::"
     "test_captured_taxonomy_versions_remain_supported"
@@ -96,7 +97,7 @@ def semantic_versions() -> dict[str, int | str]:
         LEAK_BUILDER_PRODUCER: BUILDER_VERSION,
         "organism_rl.env_gate.fixture_schema": FIXTURE_SCHEMA,
         "organism_rl.env_gate.declaration_schema": DECLARATION_SCHEMA,
-        "organism_rl.smoke_v4.plan_format": SMOKE_PLAN_FORMAT_VERSION,
+        SMOKE_PLAN_PRODUCER: SMOKE_PLAN_FORMAT_VERSION,
         "reward_hacking.distill.agentic_sft.manifest": MANIFEST_VERSION,
     }
 
@@ -646,7 +647,7 @@ def verify_corpus(corpus_root: Path | None = None) -> Mapping[str, object]:
             capture_versions,
             manifest.get("compatible_legacy_versions", []),
             context=f"capture {logical_relative}",
-            exercised_producers=_exercised_producers(capture_root),
+            exercised_producers=_exercised_producers(capture_root, kind=raw_capture.get("kind")),
             manifest_semantic_versions=manifest_semantic_versions,
         )
         _source_files(capture_root)
@@ -694,9 +695,11 @@ def assert_required_captures(corpus_root: Path) -> None:
         )
 
 
-def _exercised_producers(capture_root: Path) -> frozenset[str]:
+def _exercised_producers(capture_root: Path, *, kind: object) -> frozenset[str]:
     """Return the producers whose output a capture holds; leak-builder bumps skip non-leak runs."""
     producers = set(semantic_versions())
+    if kind != "smoke":
+        producers.discard(SMOKE_PLAN_PRODUCER)
     if not any(_is_leak_record(record) for record in _capture_records(capture_root)):
         producers.discard(LEAK_BUILDER_PRODUCER)
     if not _has_strengthened_truth_sidecar(capture_root):

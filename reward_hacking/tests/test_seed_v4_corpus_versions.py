@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, cast
+from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -18,9 +19,6 @@ from reward_hacking.organism_rl import corpus_capture
 from reward_hacking.organism_rl.corpus_capture import semantic_versions
 from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION
 from reward_hacking.organism_rl.rollout import recorded_true_pass
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
@@ -322,6 +320,29 @@ def test_leak_builder_bump_stales_only_captures_with_leak_episodes(
         corpus_capture.verify_corpus(corpus_root)
 
 
+@pytest.mark.parametrize(("kind", "stale"), [("smoke", True), ("eval", False)])
+def test_smoke_plan_bump_stales_only_smoke_captures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, *, stale: bool
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "records.jsonl").write_text(
+        json.dumps({"variant": "original"}) + "\n", encoding="utf-8"
+    )
+    corpus_root = tmp_path / "corpus"
+    corpus_capture.capture_run(
+        source, "smoke-0.8b" if kind == "smoke" else "synthetic", kind=kind, corpus_root=corpus_root
+    )
+    bumped_versions = {**semantic_versions(), corpus_capture.SMOKE_PLAN_PRODUCER: "smoke_plan_next"}
+    monkeypatch.setattr(corpus_capture, "semantic_versions", lambda: bumped_versions)
+
+    if stale:
+        with pytest.raises(ValueError, match="smoke_plan_next"):
+            corpus_capture.verify_corpus(corpus_root)
+    else:
+        corpus_capture.verify_corpus(corpus_root)
+
+
 def test_verify_detects_a_valid_edit_to_a_captured_trace(tmp_path: Path) -> None:
     capture_root = _capture_minimal_run(tmp_path / "source", tmp_path / "corpus")
     trace_path = next(capture_root.rglob("trace.json"))
@@ -347,7 +368,9 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
     manifest = json.loads((seed_v4_corpus / "corpus-manifest.json").read_text(encoding="utf-8"))
     for capture in manifest["captures"]:
         captured_versions = capture["semantic_versions"]
-        exercised_producers = corpus_capture._exercised_producers(seed_v4_corpus / capture["path"])
+        exercised_producers = corpus_capture._exercised_producers(
+            seed_v4_corpus / capture["path"], kind=capture["kind"]
+        )
         for producer in exercised_producers:
             captured_version = captured_versions[producer]
             current_version = semantic_versions()[producer]
@@ -466,6 +489,26 @@ def test_smoke_regeneration_replaces_the_previous_capture(tmp_path: Path) -> Non
         sorted(path.name for path in corpus_root.iterdir() if path.name.startswith(".smoke")) == []
     )
     corpus_capture.verify_corpus(corpus_root)
+
+
+def test_smoke_capture_keeps_probe_records_and_sft_leak_coverage(tmp_path: Path) -> None:
+    source = _smoke_source(tmp_path / "source", "synthetic")
+    for stage in ("base", "v3"):
+        records = source / "probe" / "f2-orig" / stage / "records.jsonl"
+        records.parent.mkdir(parents=True)
+        records.write_text('{"marker": "synthetic"}\n', encoding="utf-8")
+    coverage = source / "sft" / "leak-coverage.json"
+    coverage.parent.mkdir()
+    coverage.write_text('{"selected": 2, "excluded_by_reason": {}}\n', encoding="utf-8")
+    destination = corpus_capture.capture_run(
+        source, "smoke-0.8b", kind="smoke", corpus_root=tmp_path / "corpus"
+    )
+    for stage in ("base", "v3"):
+        relative_path = Path("probe") / "f2-orig" / stage / "records.jsonl"
+        assert (destination / relative_path).read_bytes() == (source / relative_path).read_bytes()
+    assert json.loads(
+        (destination / "sft/leak-coverage.json").read_text(encoding="utf-8")
+    ) == json.loads(coverage.read_text(encoding="utf-8"))
 
 
 def test_smoke_regeneration_does_not_count_the_capture_it_replaces_against_the_size_limit(
