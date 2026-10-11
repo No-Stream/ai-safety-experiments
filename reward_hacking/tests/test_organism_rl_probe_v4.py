@@ -282,7 +282,7 @@ def test_server_model_registry_supplies_the_effective_context_limit() -> None:
     response: object = {
         "data": [
             {"id": "Qwen/Qwen3.5-9B", "max_model_len": 32_768},
-            {"id": V3_SERVED_MODEL_ID, "max_model_len": 32_768},
+            {"id": V3_SERVED_MODEL_ID, "parent": "Qwen/Qwen3.5-9B", "max_model_len": None},
         ]
     }
 

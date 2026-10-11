@@ -256,15 +256,21 @@ def parse_server_model_max_len(response: object, served_model_id: str) -> int:
     model_entries = response.get("data")
     if not isinstance(model_entries, list):
         raise TypeError("vLLM /v1/models response data must be a list")
+    entries_by_id: dict[object, dict[str, object]] = {}
     for model_entry in model_entries:
         if not isinstance(model_entry, dict):
             raise TypeError("vLLM model entry must be an object")
-        if model_entry.get("id") == served_model_id:
-            max_model_len = model_entry.get("max_model_len")
-            if type(max_model_len) is not int or max_model_len < 1:
-                raise ValueError("vLLM model entry must report a positive max_model_len")
-            return max_model_len
-    raise ValueError(f"vLLM is not serving the requested model id {served_model_id!r}")
+        entries_by_id[model_entry.get("id")] = model_entry
+    if served_model_id not in entries_by_id:
+        raise ValueError(f"vLLM is not serving the requested model id {served_model_id!r}")
+    served_entry = entries_by_id[served_model_id]
+    # vLLM lists a LoRA adapter with its parent model and reports the context limit only on the parent.
+    if served_entry.get("parent") is not None:
+        served_entry = entries_by_id[served_entry["parent"]]
+    max_model_len = served_entry.get("max_model_len")
+    if type(max_model_len) is not int or max_model_len < 1:
+        raise ValueError("vLLM model entry must report a positive max_model_len")
+    return max_model_len
 
 
 def _served_model_max_len(endpoint: str, served_model_id: str) -> int:
