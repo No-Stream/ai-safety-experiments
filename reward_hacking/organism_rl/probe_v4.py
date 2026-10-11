@@ -17,6 +17,7 @@ import torch
 from transformers import AutoConfig
 
 from reward_hacking.distill.sample import resolve_gpu_engine_settings
+from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.evaluate import (
     _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
 )
@@ -27,7 +28,7 @@ from reward_hacking.organism_rl.yield_table import (
     render_yield_table,
     summarize_output,
 )
-from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
+from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -297,6 +298,8 @@ def _server_config(
         port=args.server_port,
         max_num_seqs=DEFAULT_CONCURRENCY,
         enable_prefix_caching=True,
+        speculative_config=default_mtp_speculative_config(args.model),
+        reasoning_config=dict(QWEN_THINKING_REASONING_CONFIG),
         enable_lora=has_v3_adapter,
         max_lora_rank=V3_LORA_RANK if has_v3_adapter else None,
         lora_modules=(((V3_SERVED_MODEL_ID, str(adapter_directory)),) if has_v3_adapter else ()),

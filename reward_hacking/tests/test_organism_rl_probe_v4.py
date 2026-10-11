@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.organism_rl import probe_v4
 from reward_hacking.organism_rl.evaluate import (
     _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
 )
@@ -24,6 +26,7 @@ from reward_hacking.organism_rl.probe_v4 import (
     select_v3_cells,
 )
 from reward_hacking.organism_rl.yield_table import PROBE_CELLS, render_yield_table, summarize_output
+from reward_hacking.vllm_server import default_mtp_speculative_config
 
 
 def _record(
@@ -386,3 +389,18 @@ def test_health_command_asserts_against_base_eval_records(tmp_path: Path) -> Non
     assert command[command.index("--records") + 1] == str(records_path)
     assert "--assert" in command
     assert command[command.index("--baseline") + 1] == str(baseline_path)
+
+
+def test_probe_server_enables_thinking_budgets_and_mtp_like_the_evaluator() -> None:
+    args = parse_args(["--stage", "base"])
+
+    server_config = probe_v4._server_config(  # pyright: ignore[reportPrivateUsage]
+        args,
+        generator="base",
+        model_revision="0" * 40,
+        max_model_len=65_536,
+        gpu_memory_utilization=0.9,
+    )
+
+    assert server_config.reasoning_config == dict(QWEN_THINKING_REASONING_CONFIG)
+    assert server_config.speculative_config == default_mtp_speculative_config(args.model)
