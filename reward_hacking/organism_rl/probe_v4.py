@@ -211,14 +211,22 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
     return command
 
 
-def build_health_command(records_path: Path, baseline_records: Path) -> list[str]:
-    """Build the required per-cell absolute health assertion against the base eval records."""
-    return [
+def build_health_command(
+    records_path: Path, baseline_records: Path, *, generator: GeneratorName
+) -> list[str]:
+    """Build the per-cell health command: a report for base, an assertion against base records for v3."""
+    command = [
         sys.executable,
         "-m",
         "reward_hacking.organism_rl.health",
         "--records",
         str(records_path),
+    ]
+    if generator == "base":
+        # Base is the baseline; absolute Gate 3 thresholds fitted to other cells misfire on its own generation.
+        return command
+    return [
+        *command,
         "--assert",
         "--baseline",
         str(baseline_records),
@@ -381,7 +389,11 @@ def _run_cells(cells: Sequence[ProbeCell], settings: CellRunConfig) -> None:
         logger.info("generating %s with %s: %s", cell.name, settings.generator, command)
         _run_command(command)
         records_path = run_directory / "records.jsonl"
-        _run_command(build_health_command(records_path, settings.baseline_records))
+        _run_command(
+            build_health_command(
+                records_path, settings.baseline_records, generator=settings.generator
+            )
+        )
         _run_command(
             [
                 sys.executable,

@@ -380,16 +380,25 @@ def test_leak_command_uses_train_channel_arm_and_thirty_turns(tmp_path: Path) ->
     )
 
 
-def test_health_command_asserts_against_base_eval_records(tmp_path: Path) -> None:
+def test_health_command_asserts_v3_against_base_eval_records(tmp_path: Path) -> None:
     records_path = tmp_path / "records.jsonl"
     baseline_path = tmp_path / "baseline.jsonl"
 
-    command = build_health_command(records_path, baseline_path)
+    command = build_health_command(records_path, baseline_path, generator="v3")
 
     assert command[command.index("--records") + 1] == str(records_path)
     assert "--assert" in command
     assert command[command.index("--baseline") + 1] == str(baseline_path)
     assert command[command.index("--submitted-ending-min") + 1] == "0"
+
+
+def test_health_command_only_reports_for_the_base_generator(tmp_path: Path) -> None:
+    command = build_health_command(
+        tmp_path / "records.jsonl", tmp_path / "baseline.jsonl", generator="base"
+    )
+
+    assert "--assert" not in command
+    assert "--baseline" not in command
 
 
 def test_probe_server_enables_thinking_budgets_and_mtp_like_the_evaluator() -> None:
