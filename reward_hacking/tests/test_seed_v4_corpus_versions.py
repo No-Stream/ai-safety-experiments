@@ -357,6 +357,23 @@ def test_smoke_regeneration_replaces_the_previous_capture(tmp_path: Path) -> Non
     corpus_capture.verify_corpus(corpus_root)
 
 
+def test_smoke_regeneration_does_not_count_the_capture_it_replaces_against_the_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    first = _smoke_source(tmp_path / "first", "first")
+    (first / "payload.bin").write_bytes(b"x" * 6000)
+    corpus_capture.capture_run(first, "smoke-0.8b", kind="smoke", corpus_root=corpus_root)
+    second = _smoke_source(tmp_path / "second", "second")
+    (second / "payload.bin").write_bytes(b"y" * 6000)
+    monkeypatch.setattr(corpus_capture, "CORPUS_SIZE_LIMIT_BYTES", 10_000)
+
+    corpus_capture.replace_smoke_capture(second, "smoke-0.8b", corpus_root=corpus_root)
+
+    assert "second" in (corpus_root / "smoke-0.8b" / "records.jsonl").read_text(encoding="utf-8")
+    assert [path.name for path in tmp_path.iterdir() if "retired" in path.name] == []
+
+
 def test_failed_smoke_regeneration_restores_the_previous_capture(tmp_path: Path) -> None:
     corpus_root = tmp_path / "corpus"
     corpus_capture.capture_run(

@@ -865,7 +865,10 @@ def replace_smoke_capture(source: Path, name: str, *, corpus_root: Path | None =
         raise ValueError(
             f"corpus manifest must list the existing smoke capture {relative_path} once"
         )
-    retired_root = existing_root.with_name(f".{name}.retired-{datetime.now(UTC):%Y%m%dT%H%M%S}")
+    # Outside the corpus root, so the capture being replaced never counts against the corpus size limit.
+    retired_root = resolved_corpus_root.with_name(
+        f".{resolved_corpus_root.name}-{name}.retired-{datetime.now(UTC):%Y%m%dT%H%M%S}"
+    )
     existing_root.rename(retired_root)
     _atomic_write_json(
         resolved_corpus_root / "corpus-manifest.json", {**manifest, "captures": remaining}
