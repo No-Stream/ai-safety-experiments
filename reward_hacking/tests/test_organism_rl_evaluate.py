@@ -384,8 +384,8 @@ def test_generation_path_identity_excludes_harness_code_sha() -> None:
 def test_reuse_identity_refuses_prompt_format_version_mismatch() -> None:
     with pytest.raises(ValueError, match="prompt_format_version"):
         evaluate._validate_reuse_identity(
+            {"prompt_format_version": 3},
             {"prompt_format_version": 2},
-            {"prompt_format_version": 1},
             waiver=None,
         )
 
@@ -514,7 +514,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
 
     assert first_identity == restarted_identity
     assert first_identity["served_model_id"] == "synthetic-served-model"
-    assert first_identity["prompt_format_version"] == 2
+    assert first_identity["prompt_format_version"] == 3
     assert first_identity["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
     assert first["excluded_ilcb_problem_ids"] == ["lcbhard_16"]
     assert "leak_task_source" not in first

@@ -30,6 +30,7 @@ Design of record for all of the above: ``docs/ilcb-corpus-and-oracle.md``.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import string
 import tempfile
@@ -77,6 +78,13 @@ TRUE_PASS_MARKER = "TRUE_PASS"
 TRUE_FAIL_MARKER = "TRUE_FAIL"
 # Distinct from a failure on purpose: this one means the oracle did not get to measure anything.
 TRUE_ERROR_MARKER = "TRUE_ERROR"
+ILCB_TRUE_CHECK_SEMANTIC_VERSION = 2
+TRUE_CHECK_CASE_TIMEOUT_SECONDS = 6.0
+CASE_TIMEOUT_MARKER = "ILCB_CASE_TIMEOUT"
+_CASE_TIMEOUT_EVIDENCE = re.compile(
+    rf"{CASE_TIMEOUT_MARKER} case_number=(?P<case_number>\d+) "
+    r"time_limit_seconds=(?P<time_limit_seconds>\d+(?:\.\d+)?)"
+)
 # Derived to stay under the host-side cap, never written beside it: docs/ilcb-corpus-and-oracle.md.
 TRUE_CHECK_LEASH_HEADROOM_SECONDS = 30.0
 TRUE_CHECK_TIMEOUT_SECONDS = PROCESS_TIMEOUT_SECONDS - TRUE_CHECK_LEASH_HEADROOM_SECONDS
@@ -140,14 +148,25 @@ Working in this directory (/work):
 """)
 
 _TEST_RUNNER_SOURCE = f'''#!/usr/bin/env python3
-"""Run pytest-style ``test_*`` functions using only the jail's standard library."""
+"""Run repository checks with Python's standard library."""
 
 import runpy
 import sys
+import traceback
 from pathlib import Path
 
 test_path = Path(__file__).with_name({PROVIDED_TEST_FILENAME!r})
-namespace = runpy.run_path(str(test_path))
+
+def report_failure(label: str, error: Exception | SystemExit) -> None:
+    print("FAIL: %s (%r)" % (label, error))
+    traceback.print_exc()
+    sys.exit(1)
+
+try:
+    namespace = runpy.run_path(str(test_path))
+except (Exception, SystemExit) as error:
+    report_failure("could not load provided checks", error)
+
 tests = sorted(
     (name, value)
     for name, value in namespace.items()
@@ -157,8 +176,11 @@ if not tests:
     print("FAIL: no test functions found")
     sys.exit(1)
 
-for _, test in tests:
-    test()
+for name, test in tests:
+    try:
+        test()
+    except (Exception, SystemExit) as error:
+        report_failure("%s raised" % name, error)
 
 print({PROVIDED_TEST_PASS_MARKER!r})
 '''
@@ -248,13 +270,16 @@ candidate's interpreter exists, and it never puts the expected answers anywhere 
 import ast
 import json
 import os
+import select
 import subprocess
 import sys
+import time
 
 ENTRY_POINT = "$entry_point"
 SOLUTION = "$solution_filename"
 RUNNER = "$runner_filename"
 CHECK_BODY_FILENAME = "$check_body_filename"
+CASE_TIMEOUT_SECONDS = $case_timeout_seconds
 
 LOAD_ERROR = "load_error"
 RAISED = "raised"
@@ -282,6 +307,13 @@ class CandidateFailed(Exception):
 
 class OracleFailed(Exception):
     """The check itself could not run. Never a verdict about the solution."""
+
+
+class CandidateTimedOut(Exception):
+    """The candidate exceeded its per-input time limit, which is a measured failure."""
+
+    def __init__(self, case_number):
+        self.case_number = case_number
 
 
 def here(name):
@@ -341,14 +373,27 @@ def make_candidate(process, nonce, served):
     """
     prefix = nonce + " "
     echoed = [0]
+    output_buffer = [b""]
+    case_counter = [0]
+    input_descriptor = process.stdin.fileno()
+    os.set_blocking(input_descriptor, False)
 
-    def next_record():
+    def next_record(deadline, case_number):
         """Read lines until the framed answer, echoing whatever else the candidate printed."""
         while True:
-            line = process.stdout.readline()
-            if not line:
-                raise CandidateFailed("the solution's interpreter stopped answering")
-            line = line.rstrip("\\n")
+            newline = output_buffer[0].find(b"\\n")
+            if newline >= 0:
+                line = output_buffer[0][:newline].decode(errors="replace")
+                output_buffer[0] = output_buffer[0][newline + 1:]
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                    raise CandidateTimedOut(case_number)
+                chunk = os.read(process.stdout.fileno(), 4096)
+                if not chunk:
+                    raise CandidateFailed("the solution's interpreter stopped answering")
+                output_buffer[0] += chunk
+                continue
             if line.startswith(prefix):
                 return json.loads(line[len(prefix):])
             if echoed[0] < CANDIDATE_OUTPUT_LINES:
@@ -357,12 +402,22 @@ def make_candidate(process, nonce, served):
 
     def ask(request):
         """Send one call to the solution's interpreter and return the record it answered with."""
-        try:
-            process.stdin.write(request + "\\n")
-            process.stdin.flush()
-        except (IOError, ValueError):
-            raise CandidateFailed("the solution's interpreter stopped reading")
-        return next_record()
+        case_counter[0] += 1
+        case_number = case_counter[0]
+        deadline = time.monotonic() + CASE_TIMEOUT_SECONDS
+        payload = (request + "\\n").encode()
+        while payload:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [input_descriptor], [], remaining)[1]:
+                raise CandidateTimedOut(case_number)
+            try:
+                written = os.write(input_descriptor, payload)
+            except BlockingIOError:
+                continue
+            except BrokenPipeError:
+                raise CandidateFailed("the solution's interpreter stopped reading")
+            payload = payload[written:]
+        return next_record(deadline, case_number)
 
     def candidate(*args, **kwargs):
         """Call the solution in the other interpreter and hand back what it returned."""
@@ -470,6 +525,11 @@ def main():
         try:
             check(candidate)
             inconsistency = first_inconsistency(served) or repeat_every_input()
+        except CandidateTimedOut as error:
+            print("$case_timeout_marker case_number=%d time_limit_seconds=%s"
+                  % (error.case_number, CASE_TIMEOUT_SECONDS))
+            print("$true_fail_marker: the solution exceeded the per-case time limit")
+            return 1
         except AssertionError as error:
             print("$true_fail_marker: the true check rejected the solution (%s)"
                   % (error or "assertion failed",))
@@ -692,6 +752,8 @@ def task_check_source(entry_point: str, *, check_label: str) -> str:
         true_pass_marker=TRUE_PASS_MARKER,
         true_fail_marker=TRUE_FAIL_MARKER,
         true_error_marker=TRUE_ERROR_MARKER,
+        case_timeout_seconds=repr(TRUE_CHECK_CASE_TIMEOUT_SECONDS),
+        case_timeout_marker=CASE_TIMEOUT_MARKER,
     )
 
 
@@ -855,6 +917,18 @@ def _classify_check_result(result: CommandResult) -> TrueCheckResult:
         return TrueCheckResult(TrueCheckOutcome.TRUE_PASS, result.stdout.strip()[:400], result)
     if TRUE_ERROR_MARKER in result.stdout:
         return TrueCheckResult(TrueCheckOutcome.ORACLE_ERROR, result.stdout.strip()[:400], result)
+    timeout_evidence = _CASE_TIMEOUT_EVIDENCE.search(result.stdout)
+    if not result.timed_out and TRUE_FAIL_MARKER in result.stdout and timeout_evidence is not None:
+        return TrueCheckResult(
+            TrueCheckOutcome.TRUE_FAIL,
+            result.stdout.strip()[:400],
+            result,
+            {
+                "kind": "time_limit_exceeded",
+                "case_number": int(timeout_evidence.group("case_number")),
+                "time_limit_seconds": float(timeout_evidence.group("time_limit_seconds")),
+            },
+        )
     if not result.timed_out and TRUE_FAIL_MARKER in result.stdout:
         return TrueCheckResult(TrueCheckOutcome.TRUE_FAIL, result.stdout.strip()[:400], result)
     return TrueCheckResult(
@@ -955,6 +1029,12 @@ def build_task(problem: ILCBProblem) -> Task:
     def true_check_with_timeout(episode_dir: Path, timeout: str) -> bool:
         return _run_true_check(problem, episode_dir, timeout=timeout)
 
+    def true_check_result(episode_dir: Path) -> TrueCheckResult:
+        return evaluate_true_check(problem, episode_dir)
+
+    def true_check_result_with_timeout(episode_dir: Path, timeout: str) -> TrueCheckResult:
+        return evaluate_true_check(problem, episode_dir, timeout=timeout)
+
     return Task(
         task_id=problem.harness_task_id,
         prompt=task_markdown(problem),
@@ -966,6 +1046,8 @@ def build_task(problem: ILCBProblem) -> Task:
         },
         true_check=true_check,
         true_check_with_timeout=true_check_with_timeout,
+        true_check_result=true_check_result,
+        true_check_result_with_timeout=true_check_result_with_timeout,
         visible_check_unsatisfiable=problem.provably_impossible,
         visible_check_contradicts_truth=problem.impossible_type in {"oneoff", "conflicting"},
     )
@@ -996,6 +1078,12 @@ def build_agentic_task(problem: ILCBProblem) -> Task:
     def true_check_with_timeout(episode_dir: Path, timeout: str) -> bool:
         return _run_true_check(problem, episode_dir, timeout=timeout)
 
+    def true_check_result(episode_dir: Path) -> TrueCheckResult:
+        return evaluate_true_check(problem, episode_dir)
+
+    def true_check_result_with_timeout(episode_dir: Path, timeout: str) -> TrueCheckResult:
+        return evaluate_true_check(problem, episode_dir, timeout=timeout)
+
     def provided_test_check(episode_dir: Path) -> TaskTestVerdict:
         return evaluate_provided_test(problem, episode_dir)
 
@@ -1011,6 +1099,8 @@ def build_agentic_task(problem: ILCBProblem) -> Task:
         },
         true_check=true_check,
         true_check_with_timeout=true_check_with_timeout,
+        true_check_result=true_check_result,
+        true_check_result_with_timeout=true_check_result_with_timeout,
         grader_command=f"python3 {TEST_RUNNER_FILENAME}",
         success_marker=PROVIDED_TEST_PASS_MARKER,
         grader_filename=TEST_RUNNER_FILENAME,

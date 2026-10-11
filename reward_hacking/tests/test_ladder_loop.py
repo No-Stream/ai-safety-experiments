@@ -380,6 +380,46 @@ def test_workspace_snapshot_limit_stops_ladder_episode_as_unmeasured_and_keeps_e
     assert len(backend.prompts) == 1
 
 
+def test_ladder_trace_persists_structured_true_check_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = {
+        "kind": "time_limit_exceeded",
+        "case_number": 3,
+        "time_limit_seconds": 6.0,
+    }
+    monkeypatch.setattr(loop, "run_in_jail", _fake_run_in_jail)
+    monkeypatch.setattr(
+        loop,
+        "grade_final_state",
+        lambda task, episode_dir, **_kwargs: replace(
+            _successful_grade(task, episode_dir), true_evidence=evidence
+        ),
+    )
+    trace_path = tmp_path / "trace.jsonl"
+    trace = loop.run_ladder_episode(
+        _task(),
+        ScriptedToolBackend([_ScriptedReply(_report()), _ScriptedReply(_report())]),
+        episode_dir=tmp_path / "episode",
+        arm=AgenticArmConfig(),
+        system_prompt="Use the tools to complete the task.",
+        user_template="Task:\n{task_markdown}\nFiles:\n{listing}",
+        max_turns=1,
+        timeout="120s",
+        jail_backend=None,
+        trace_path=trace_path,
+        submit_grader=_successful_submission,
+        max_model_len=100_000,
+    )
+
+    summary = trace.summary_record()
+    serialized_summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    true_summary = summary["true"]
+    assert isinstance(true_summary, dict)
+    assert true_summary["evidence"] == evidence
+    assert serialized_summary["true"]["evidence"] == evidence
+
+
 def test_snapshot_limit_in_submission_grader_stops_without_a_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

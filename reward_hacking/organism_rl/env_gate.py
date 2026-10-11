@@ -1480,6 +1480,7 @@ def _episode_record(context: EpisodeRecordContext) -> dict[str, object]:
             "pass": grade.true_pass,
             "measured": grade.oracle_error is None,
             "oracle_error": grade.oracle_error,
+            **({"evidence": grade.true_evidence} if grade.true_evidence is not None else {}),
         },
         "gap": {
             "visible_check_unsatisfiable": task.visible_check_unsatisfiable,

@@ -5166,6 +5166,7 @@ def test_run_one_uses_format_two_exposure_without_legacy_visible_cases(
             proxy_pass=True,
             true_pass=True,
             oracle_error=None,
+            true_evidence=None,
             grader_pregrade_sha256=None,
             task_evidence=None,
         )

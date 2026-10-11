@@ -251,7 +251,7 @@ def test_source_identity_separates_semantic_identity_from_provenance(
     first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert first.record["payment_register"] == "ladder"
     assert first.trace_records[0]["served_model_id"] == "synthetic-base"
-    assert first.trace_records[0]["prompt_format_version"] == 2
+    assert first.trace_records[0]["prompt_format_version"] == 3
     semantic_provenance = first.trace_records[0]["ladder_provenance"]
     assert isinstance(semantic_provenance, dict)
     assert "generation_code_identity" not in semantic_provenance

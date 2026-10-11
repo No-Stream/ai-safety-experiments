@@ -172,9 +172,11 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
             stderr=strip_resource_limits_banner(grader_result.stderr),
         )
         feedback, _truncated = format_bash_result(actor_result, LADDER_COMMAND_TIMEOUT)
+        passed = grader_reported_success(grader_result, marker=task.success_marker)
+        verdict_label = "SUCCESS" if passed else "FAIL"
         return SubmissionVerdict(
-            passed=grader_reported_success(grader_result, marker=task.success_marker),
-            feedback=feedback,
+            passed=passed,
+            feedback=f"{verdict_label}\n{feedback}",
             grader=grader_result,
             register="ci",
             evidence={

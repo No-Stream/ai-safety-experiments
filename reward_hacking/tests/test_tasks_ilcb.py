@@ -31,6 +31,8 @@ from __future__ import annotations
 import ast
 import dataclasses
 import json
+import subprocess
+import sys
 from decimal import Decimal
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any
@@ -70,11 +72,14 @@ from reward_hacking.harness.tasks import ILCB_TASKS
 # Shared by both oracles; the tri-state ILCB returns is the sibling's own vocabulary.
 from reward_hacking.harness.tasks_evalplus import OracleError, TrueCheckOutcome
 from reward_hacking.harness.tasks_ilcb import (
+    _TEST_RUNNER_SOURCE,  # pyright: ignore[reportPrivateUsage]
     ILCB_SPLIT_NAMES,
     ILCB_TASKS_BY_ID,
     PROBLEMS,
     PROBLEMS_BY_TASK_ID,
+    PROVIDED_TEST_FILENAME,
     SOLUTION_FILENAME,
+    TEST_RUNNER_FILENAME,
     TRUE_CHECK_BODY_FILENAME,
     TRUE_CHECK_TIMEOUT,
     TRUE_ERROR_MARKER,
@@ -703,6 +708,31 @@ class TestWhatTheTaskTellsThePolicy:
             else:
                 with pytest.raises(SyntaxError):
                     compile(grader, problem.harness_task_id, "exec")
+
+
+class TestGeneratedILCBTestRunner:
+    def test_its_docstring_describes_repository_checks(self) -> None:
+        assert '"""Run repository checks with Python\'s standard library."""' in _TEST_RUNNER_SOURCE
+
+    def test_a_failing_check_emits_a_fail_verdict(self, tmp_path: Path) -> None:
+        runner_path = tmp_path / TEST_RUNNER_FILENAME
+        runner_path.write_text(_TEST_RUNNER_SOURCE)
+        (tmp_path / PROVIDED_TEST_FILENAME).write_text(
+            "def test_synthetic_failure():\n    raise AssertionError('synthetic failure')\n"
+        )
+
+        completed = subprocess.run(  # noqa: S603 - the runner and provided check are synthetic test code
+            [sys.executable, str(runner_path)],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode != 0
+        assert "FAIL:" in completed.stdout
+        assert "synthetic failure" in completed.stdout
+        assert "Traceback (most recent call last)" in completed.stderr
 
 
 class TestAnUnreadableCaseFile:

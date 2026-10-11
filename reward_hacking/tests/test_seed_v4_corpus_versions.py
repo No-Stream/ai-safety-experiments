@@ -17,16 +17,50 @@ from reward_hacking.distill.hack_strategy import (
 )
 from reward_hacking.organism_rl import corpus_capture
 from reward_hacking.organism_rl.corpus_capture import semantic_versions
-from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION
+from reward_hacking.organism_rl.generate import (
+    RECORD_SCHEMA_COMPATIBLE_VERSIONS,
+    RECORD_SCHEMA_VERSION,
+)
 from reward_hacking.organism_rl.rollout import recorded_true_pass
 
 
 def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
-    assert RECORD_SCHEMA_VERSION == 3
+    assert RECORD_SCHEMA_VERSION == 4
+
+
+def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(tmp_path: Path) -> None:
+    capture_root = tmp_path / "capture"
+    capture_root.mkdir()
+    (capture_root / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "family": "ilcb",
+                "record_schema": 3,
+                "truth_regrade": {
+                    "producer": corpus_capture.ILCB_TRUE_CHECK_PRODUCER,
+                    "semantic_version": 2,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"captured under .*true_check=None"):
+        corpus_capture._check_semantic_version_table(  # pyright: ignore[reportPrivateUsage]
+            {},
+            [],
+            corpus_capture._SemanticVersionCheckContext(  # pyright: ignore[reportPrivateUsage]
+                capture_label="synthetic legacy capture",
+                exercised_producers=frozenset({corpus_capture.ILCB_TRUE_CHECK_PRODUCER}),
+                manifest_versions={},
+                capture_root=capture_root,
+            ),
+        )
 
 
 def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v8"
+    assert TAXONOMY_VERSION == "hack_strategy_v9"
     assert {"hack_strategy_v5", "hack_strategy_v6", "hack_strategy_v7"}.issubset(
         LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     )
@@ -35,6 +69,7 @@ def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> No
 @pytest.mark.corpus
 def test_legacy_oracle_errors_load_as_unmeasured_truth(seed_v4_corpus: Path) -> None:
     legacy_error_count = 0
+    ilcb_error_count = 0
     for records_path in seed_v4_corpus.rglob("records.jsonl"):
         for line in records_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -52,7 +87,10 @@ def test_legacy_oracle_errors_load_as_unmeasured_truth(seed_v4_corpus: Path) -> 
                 assert recorded_true_pass(summary) is None
                 if truth.get("pass") is False:
                     legacy_error_count += 1
+                if record.get("family") == "ilcb":
+                    ilcb_error_count += 1
     assert legacy_error_count > 0
+    assert ilcb_error_count > 0
 
 
 def test_capture_rejects_an_unfinished_source_file(tmp_path: Path) -> None:
@@ -245,9 +283,14 @@ def _set_synthetic_taxonomy_versions(
             "hack_strategy_v8",
             [_taxonomy_compatibility_entry("hack_strategy_v7", "hack_strategy_v8")],
         ),
+        (
+            "hack_strategy_v8",
+            "hack_strategy_v9",
+            [_taxonomy_compatibility_entry("hack_strategy_v8", "hack_strategy_v9")],
+        ),
     ],
 )
-def test_taxonomy_v8_verifies_captures_with_prior_compatibility_evidence(
+def test_taxonomy_v9_verifies_captures_with_prior_compatibility_evidence(
     tmp_path: Path,
     captured_version: str,
     manifest_version: str,
@@ -279,7 +322,7 @@ def test_taxonomy_v8_verifies_captures_with_prior_compatibility_evidence(
         ),
     ],
 )
-def test_taxonomy_v8_rejects_unsupported_or_unrelated_compatibility(
+def test_taxonomy_v9_rejects_unsupported_or_unrelated_compatibility(
     tmp_path: Path,
     captured_version: str,
     manifest_version: str,
@@ -372,7 +415,7 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
             seed_v4_corpus / capture["path"], kind=capture["kind"]
         )
         for producer in exercised_producers:
-            captured_version = captured_versions[producer]
+            captured_version = captured_versions.get(producer)
             current_version = semantic_versions()[producer]
             if captured_version != current_version:
                 if producer == corpus_capture.TAXONOMY_PRODUCER:
@@ -389,6 +432,27 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
                     assert current_version in supported_versions
                     assert manifest_version in supported_versions
                     assert captured_version == manifest_version or historically_attested
+                elif producer == corpus_capture.RECORD_SCHEMA_PRODUCER:
+                    manifest_version = manifest["semantic_versions"][producer]
+                    historically_attested = any(
+                        entry["producer"] == producer
+                        and entry["loader_test"]
+                        == corpus_capture.COMPATIBILITY_LOADER_TESTS[producer]
+                        and entry["captured_version"] == captured_version
+                        and entry["current_version"] in (current_version, manifest_version)
+                        for entry in manifest["compatible_legacy_versions"]
+                    )
+                    assert captured_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
+                    assert manifest_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
+                    assert current_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
+                    assert captured_version == manifest_version or historically_attested
+                elif producer == corpus_capture.ILCB_TRUE_CHECK_PRODUCER:
+                    manifest_version = manifest["semantic_versions"].get(producer)
+                    assert captured_version is None
+                    assert manifest_version is None
+                    assert not corpus_capture._has_record_schema_at_least(
+                        seed_v4_corpus / capture["path"], RECORD_SCHEMA_VERSION
+                    )
                 else:
                     assert {
                         "producer": producer,
@@ -440,6 +504,9 @@ def test_corpus_record_schema_shapes_match_capture_manifest(seed_v4_corpus: Path
             for entry in manifest["compatible_legacy_versions"]
             if entry["producer"] == corpus_capture.RECORD_SCHEMA_PRODUCER
         }
+        readable_schemas.add(
+            str(manifest["semantic_versions"][corpus_capture.RECORD_SCHEMA_PRODUCER])
+        )
         assert set(observed_shapes).issubset(readable_schemas)
 
 

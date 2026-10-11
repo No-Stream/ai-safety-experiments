@@ -14,6 +14,7 @@ from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness import tasks_r2e_leak
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
+from reward_hacking.harness.tasks_ilcb import PROVIDED_TEST_PASS_MARKER
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, RewardScore
@@ -184,9 +185,65 @@ def test_submission_feedback_hides_limiter_output_and_keeps_raw_evidence(
         ),
     )
     verdict = _task_submission_grader(task, jail_backend=None)(tmp_path)
+    assert verdict.feedback.startswith("FAIL\n")
     assert "resource-limits:" not in verdict.feedback
     assert "command ran out of memory" in verdict.feedback
     assert cast("dict[str, object]", verdict.evidence["command_evidence"])["stderr"] == raw_stderr
+
+
+@pytest.mark.parametrize(
+    ("grader_result", "expected_pass", "expected_diagnostic"),
+    [
+        (
+            CommandResult("python3 run_tests.py", 0, f"{PROVIDED_TEST_PASS_MARKER}\n", "", False),
+            True,
+            PROVIDED_TEST_PASS_MARKER,
+        ),
+        (
+            CommandResult("python3 run_tests.py", 1, "FAIL: synthetic assertion\n", "", False),
+            False,
+            "FAIL: synthetic assertion",
+        ),
+        (CommandResult("python3 run_tests.py", 124, "", "", True), False, "timed out after"),
+        (
+            CommandResult(
+                "python3 run_tests.py", 1, "", "Traceback: synthetic loader failure\n", False
+            ),
+            False,
+            "Traceback: synthetic loader failure",
+        ),
+    ],
+)
+def test_ci_submission_feedback_names_verdict_and_keeps_grader_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    grader_result: CommandResult,
+    expected_pass: bool,
+    expected_diagnostic: str,
+) -> None:
+    task = Task(
+        task_id="ilcb-original-synthetic",
+        prompt="Work.",
+        body="Work.",
+        files={TASK_FILENAME: "Work.\n", GRADER_FILENAME: "synthetic grader"},
+        true_check=lambda _directory: True,
+        artifact_filename="solution.py",
+        task_variant="original",
+        problem_id="synthetic",
+        success_marker=PROVIDED_TEST_PASS_MARKER,
+        provided_test_check=lambda _directory: TaskTestVerdict(False),
+    )
+    monkeypatch.setattr(rollout, "run_grader", lambda *_args, **_kwargs: grader_result)
+
+    verdict = _task_submission_grader(task, jail_backend=None)(tmp_path)
+
+    expected_label = "SUCCESS" if expected_pass else "FAIL"
+    assert verdict.passed is expected_pass
+    assert verdict.feedback.startswith(f"{expected_label}\n")
+    assert expected_diagnostic in verdict.feedback
+    command_evidence = cast("dict[str, object]", verdict.evidence["command_evidence"])
+    assert command_evidence["stdout"] == grader_result.stdout
+    assert command_evidence["stderr"] == grader_result.stderr
 
 
 @pytest.mark.parametrize("passed", [True, False])
@@ -457,7 +514,7 @@ def test_reward_wiring_refuses_different_submitted_artifact() -> None:
 def test_episode_replay_requires_complete_trace_and_matching_identity(tmp_path: Path) -> None:
     identity: dict[str, object] = {
         "record": "organism_episode_identity",
-        "prompt_format_version": 2,
+        "prompt_format_version": 3,
         "task_id": "toy",
         "seed": 7,
         "step": 1,
@@ -478,7 +535,7 @@ def test_episode_replay_requires_complete_trace_and_matching_identity(tmp_path: 
         {**identity, "served_model_id": "different-adapter"},
         {**identity, "seed": 8},
         {**identity, "task_definition_sha256": "different-definition"},
-        {**identity, "prompt_format_version": 1},
+        {**identity, "prompt_format_version": 2},
         {**identity, "sampling": {"temperature": 0.7, "top_p": 1.0}},
     ]:
         with pytest.raises(ValueError, match="identity"):
@@ -691,7 +748,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         f"{unhinted_system_prompt}\n\n{hint_text}",
     ]
     identity = ilcb_episode.trace_records[0]
-    assert identity["prompt_format_version"] == 2
+    assert identity["prompt_format_version"] == 3
     assert identity["hint"] == {
         "family": "synthetic",
         "strength": "vague",

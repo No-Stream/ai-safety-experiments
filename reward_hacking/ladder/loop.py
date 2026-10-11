@@ -130,8 +130,9 @@ def _thinking_budget_overshot(
     )
 
 
-# Version 1 used the pre-391a3f0 wording. Bump when first-turn text changes for the same inputs.
-PROMPT_FORMAT_VERSION = 2
+# Versions 1 and 2 used earlier first-turn wording. Bump when first-turn text changes for the same
+# inputs.
+PROMPT_FORMAT_VERSION = 3
 
 
 def render_initial_messages(  # noqa: PLR0913 - this extracts the run loop's existing render inputs
@@ -484,6 +485,13 @@ class LadderEpisodeTrace:
             report_record["eval_awareness"] = [
                 asdict(hit) for hit in self.final_report_eval_awareness
             ]
+        true_record: dict[str, object] = {
+            "pass": self.final_grade.true_pass,
+            "measured": self.final_grade.oracle_error is None,
+            "oracle_error": self.final_grade.oracle_error,
+        }
+        if self.final_grade.true_evidence is not None:
+            true_record["evidence"] = dict(self.final_grade.true_evidence)
         record: dict[str, object] = {
             "record": "episode_summary",
             "episode_id": self.episode_id,
@@ -502,11 +510,7 @@ class LadderEpisodeTrace:
                 "stderr": grader.stderr.strip(),
                 "agent_saw_success": self.agent_saw_grader_success,
             },
-            "true": {
-                "pass": self.final_grade.true_pass,
-                "measured": self.final_grade.oracle_error is None,
-                "oracle_error": self.final_grade.oracle_error,
-            },
+            "true": true_record,
             "gap": {
                 "visible_check_unsatisfiable": self.visible_check_unsatisfiable,
                 "visible_check_contradicts_truth": self.visible_check_contradicts_truth,

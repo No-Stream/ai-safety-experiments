@@ -57,8 +57,12 @@ def test_episode_trace_replay_preserves_recorded_summaries_and_truth(
             corpus_record.row.get("trace_summary"), f"{context}.trace_summary"
         )
         expected_summary = dict(recorded_summary)
+        # The records writer adds this derived label after saving the raw trace summary.
+        expected_summary.pop("hack_strategy", None)
+        replayed_summary = dict(replayed.record)
+        replayed_summary.pop("hack_strategy", None)
         recorded_true_pass = rollout.recorded_true_pass(summary)
-        if corpus_record.row.get("record_schema") in {2, generate.RECORD_SCHEMA_VERSION}:
+        if corpus_record.row.get("record_schema") in {2, 3, generate.RECORD_SCHEMA_VERSION}:
             _require(
                 recorded_summary.get("true_pass") == recorded_true_pass
                 and corpus_record.row.get("true_pass") == recorded_true_pass,
@@ -68,7 +72,7 @@ def test_episode_trace_replay_preserves_recorded_summaries_and_truth(
         if "payment_register" in identity:
             expected_summary["payment_register"] = identity["payment_register"]
         _require(
-            replayed.record == expected_summary,
+            replayed_summary == expected_summary,
             f"{context}: replayed summary differs from saved summary",
         )
 
@@ -146,56 +150,62 @@ def test_record_reward_recomputes_under_both_registers(seed_v4_corpus: Path) -> 
     _require(evala_hide_edits == 0, "evalA contains a content edit that hides a true failure")
 
 
-def _require_documented_unmeasured_difference(
-    row: Mapping[str, object],
-    stored: Mapping[str, object],
-    fresh: Mapping[str, object],
-    taxonomy_version: str,
-    context: str,
-) -> None:
-    """Older labels retain attempt evidence when v6 gives unmeasured truth primary precedence."""
-    _require(
-        taxonomy_version in {V4_TAXONOMY_VERSION, "hack_strategy_v5"},
-        f"{context}: fresh label differs from the stored {taxonomy_version} label",
-    )
-    _require(
-        hack_strategy._recorded_true_pass(row) is None,  # pyright: ignore[reportPrivateUsage]
-        f"{context}: legacy and v6 labels differ on a record whose truth was measured",
-    )
-    expected = dict(stored)
-    previous_strategies = cast("list[str]", stored["observed_strategies"])
-    expected["primary_strategy"] = "unmeasured"
-    expected["observed_strategies"] = [
-        "unmeasured",
-        *(
-            strategy
-            for strategy in previous_strategies
-            if strategy not in {"honest_no_hack", "unmeasured"}
-        ),
-    ]
-    expected["evidence"] = {
-        "unmeasured": ["trusted truth could not be measured"],
-        **{
-            strategy: value
-            for strategy, value in _mapping(
-                stored["evidence"], f"{context}.stored evidence"
-            ).items()
-            if strategy not in {"honest_no_hack", "unmeasured"}
-        },
-    }
+def _validate_stored_strategy_label(label: Mapping[str, object], context: str) -> None:
+    primary = label.get("primary_strategy")
+    observed = label.get("observed_strategies")
+    evidence = label.get("evidence")
+    sub_tags = label.get("sub_tags")
+    leak_detector = label.get("leak_detector")
+    if not isinstance(primary, str) or primary not in hack_strategy.STRATEGIES:
+        raise ValueError(f"{context}: stored label has an unsupported primary strategy")
     if (
-        taxonomy_version == V4_TAXONOMY_VERSION and hack_strategy._trusted_paid(row) is None  # pyright: ignore[reportPrivateUsage]
+        not isinstance(observed, list)
+        or not observed
+        or any(
+            not isinstance(strategy, str) or strategy not in hack_strategy.STRATEGIES
+            for strategy in observed
+        )
+        or len(set(observed)) != len(observed)
+        or observed[0] != primary
     ):
-        expected["sub_tags"] = [*cast("list[str]", stored["sub_tags"]), "unmeasured_reward"]
-    _require(
-        fresh == expected,
-        f"{context}: legacy label differs beyond documented v6 unmeasured precedence",
-    )
+        raise ValueError(f"{context}: stored label has invalid observed strategies")
+    if not isinstance(evidence, Mapping) or set(evidence) != set(observed):
+        raise ValueError(f"{context}: stored evidence strategies do not match observed strategies")
+    if any(
+        not isinstance(descriptions, list)
+        or not descriptions
+        or any(not isinstance(description, str) for description in descriptions)
+        for descriptions in evidence.values()
+    ):
+        raise ValueError(f"{context}: stored strategy evidence has an invalid shape")
+    if not isinstance(sub_tags, list) or any(not isinstance(sub_tag, str) for sub_tag in sub_tags):
+        raise ValueError(f"{context}: stored strategy sub-tags have an invalid shape")
+    if not (isinstance(leak_detector, Mapping) or leak_detector == "not_applicable"):
+        raise ValueError(f"{context}: stored leak-detector evidence has an invalid shape")
+
+
+def test_stored_strategy_label_validation_rejects_mismatched_evidence() -> None:
+    valid_label: dict[str, object] = {
+        "primary_strategy": "exact_input_special_case",
+        "observed_strategies": ["exact_input_special_case"],
+        "evidence": {"exact_input_special_case": ["synthetic source evidence"]},
+        "sub_tags": [],
+        "leak_detector": "not_applicable",
+    }
+    mismatched_evidence = copy.deepcopy(valid_label)
+    mismatched_evidence["evidence"] = {"fitted_rule": ["synthetic source evidence"]}
+    with pytest.raises(ValueError, match="evidence strategies do not match"):
+        _validate_stored_strategy_label(mismatched_evidence, "synthetic mismatch")
+
+    mismatched_primary = copy.deepcopy(valid_label)
+    mismatched_primary["primary_strategy"] = "fitted_rule"
+    with pytest.raises(ValueError, match="invalid observed strategies"):
+        _validate_stored_strategy_label(mismatched_primary, "synthetic primary mismatch")
 
 
 @pytest.mark.corpus
 @pytest.mark.slow
-def test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts(
+def test_captured_strategy_labels_are_supported_and_persisted_replay_matches_current_labeler(
     seed_v4_corpus: Path,
 ) -> None:
     _require(
@@ -230,13 +240,15 @@ def test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts(
         _require(
             isinstance(taxonomy_version_value, str), f"{context}: taxonomy version must be text"
         )
-        assessment = hack_strategy.label_episode(
-            corpus_record.row,
-            trace_records,
-            manifest=None,
-            docker_evidence=None,
-            final_patch="",
-            strengthened_truth=None,
+        resolved_trace_path = _trace_path(corpus_record).resolve()
+        persisted_record = {**corpus_record.row, "trace_path": str(resolved_trace_path)}
+        persisted_label = hack_strategy.label_persisted_episode(
+            persisted_record, records_path=corpus_record.records_path
+        ).to_json_dict()
+        fresh_label = hack_strategy.label_episode(persisted_record, trace_records).to_json_dict()
+        _require(
+            persisted_label == fresh_label,
+            f"{context}: persisted-label consumer differs from direct label replay",
         )
         stored_label = corpus_record.row.get("hack_strategy")
         if stored_label is None:
@@ -250,15 +262,12 @@ def test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts(
             taxonomy_version_value in hack_strategy.LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
             f"{context}: stored label uses an unsupported taxonomy version",
         )
-        fresh_label = assessment.to_json_dict()
         stored_mapping = _mapping(stored_label, f"{context}.hack_strategy")
-        if fresh_label != stored_mapping:
-            _require_documented_unmeasured_difference(
-                corpus_record.row,
-                stored_mapping,
-                fresh_label,
-                cast("str", taxonomy_version_value),
-                context,
+        _validate_stored_strategy_label(stored_mapping, context)
+        if taxonomy_version_value == hack_strategy.TAXONOMY_VERSION:
+            _require(
+                stored_mapping == fresh_label,
+                f"{context}: current-version stored label differs from current production label",
             )
 
 

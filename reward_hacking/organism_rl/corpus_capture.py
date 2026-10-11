@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -49,16 +50,19 @@ TAXONOMY_COMPATIBILITY_TEST = (
 )
 TAXONOMY_PRODUCER = "reward_hacking.distill.hack_strategy.taxonomy"
 RECORD_SCHEMA_PRODUCER = "organism_rl.generate.record_schema"
+ILCB_TRUE_CHECK_PRODUCER = "reward_hacking.harness.tasks_ilcb.true_check"
 STRENGTHENED_TRUTH_PRODUCER = "organism_rl.strengthened_truth_grade"
 RECORD_SCHEMA_COMPATIBILITY_TEST = (
     "reward_hacking/tests/test_seed_v4_corpus_versions.py::"
     "test_legacy_oracle_errors_load_as_unmeasured_truth"
 )
+ILCB_TRUE_CHECK_COMPATIBILITY_TEST = RECORD_SCHEMA_COMPATIBILITY_TEST
 # Producers whose older captures stay usable when the manifest lists the version pair with the test
 # that loads the older shape through the current code; any other bump stales the capture.
 COMPATIBILITY_LOADER_TESTS = {
     TAXONOMY_PRODUCER: TAXONOMY_COMPATIBILITY_TEST,
     RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_COMPATIBILITY_TEST,
+    ILCB_TRUE_CHECK_PRODUCER: ILCB_TRUE_CHECK_COMPATIBILITY_TEST,
 }
 CORPUS_README = """# Seed v4 local fixture corpus
 
@@ -76,6 +80,7 @@ def semantic_versions() -> dict[str, int | str]:
     from reward_hacking.distill.agentic_sft import MANIFEST_VERSION  # noqa: PLC0415
     from reward_hacking.distill.hack_strategy import TAXONOMY_VERSION  # noqa: PLC0415
     from reward_hacking.harness.leak_channels import BUILDER_VERSION  # noqa: PLC0415
+    from reward_hacking.harness.tasks_ilcb import ILCB_TRUE_CHECK_SEMANTIC_VERSION  # noqa: PLC0415
     from reward_hacking.organism_rl.env_gate import (  # noqa: PLC0415
         DECLARATION_SCHEMA,
         FIXTURE_SCHEMA,
@@ -91,6 +96,7 @@ def semantic_versions() -> dict[str, int | str]:
 
     return {
         RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_VERSION,
+        ILCB_TRUE_CHECK_PRODUCER: ILCB_TRUE_CHECK_SEMANTIC_VERSION,
         "organism_rl.evaluate.generation_path_identity": GENERATION_PATH_IDENTITY_SCHEMA_VERSION,
         STRENGTHENED_TRUTH_PRODUCER: STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION,
         TAXONOMY_PRODUCER: TAXONOMY_VERSION,
@@ -543,69 +549,161 @@ def _load_manifest(corpus_root: Path, *, allow_empty: bool = False) -> dict[str,
     return cast("dict[str, object]", manifest)
 
 
+@dataclass(frozen=True)
+class _SemanticVersionCheckContext:
+    capture_label: str
+    exercised_producers: frozenset[str]
+    manifest_versions: Mapping[str, object]
+    capture_root: Path
+
+
+def _has_compatibility_attestation(
+    compatibility_values: Sequence[object],
+    *,
+    producer: str,
+    loader_test: str | None,
+    captured_version: object,
+    accepted_current_versions: tuple[object, ...],
+) -> bool:
+    return any(
+        isinstance(entry, Mapping)
+        and entry.get("producer") == producer
+        and entry.get("loader_test") == loader_test
+        and entry.get("captured_version") == captured_version
+        and entry.get("current_version") in accepted_current_versions
+        for entry in compatibility_values
+    )
+
+
+def _taxonomy_version_is_compatible(
+    captured_version: object,
+    current_version: object,
+    manifest_version: object,
+    compatibility_values: Sequence[object],
+    *,
+    loader_test: str | None,
+) -> bool:
+    from reward_hacking.distill.hack_strategy import (  # noqa: PLC0415
+        LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
+    )
+
+    historically_attested = _has_compatibility_attestation(
+        compatibility_values,
+        producer=TAXONOMY_PRODUCER,
+        loader_test=loader_test,
+        captured_version=captured_version,
+        accepted_current_versions=(current_version, manifest_version),
+    )
+    return (
+        isinstance(captured_version, str)
+        and isinstance(current_version, str)
+        and isinstance(manifest_version, str)
+        and captured_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+        and current_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+        and manifest_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+        and (captured_version == manifest_version or historically_attested)
+    )
+
+
+def _record_schema_version_is_compatible(
+    captured_version: object,
+    current_version: object,
+    manifest_version: object,
+    compatibility_values: Sequence[object],
+    *,
+    loader_test: str | None,
+) -> bool:
+    from reward_hacking.organism_rl.generate import (  # noqa: PLC0415
+        RECORD_SCHEMA_COMPATIBLE_VERSIONS,
+    )
+
+    historically_attested = _has_compatibility_attestation(
+        compatibility_values,
+        producer=RECORD_SCHEMA_PRODUCER,
+        loader_test=loader_test,
+        captured_version=captured_version,
+        accepted_current_versions=(manifest_version, current_version),
+    )
+    return (
+        type(captured_version) is int
+        and type(manifest_version) is int
+        and type(current_version) is int
+        and captured_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
+        and manifest_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
+        and current_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
+        and (captured_version == manifest_version or historically_attested)
+    )
+
+
+def _legacy_ilcb_truth_is_compatible(
+    captured_version: object,
+    manifest_version: object,
+    *,
+    loader_test: str | None,
+    capture_root: Path,
+) -> bool:
+    return (
+        captured_version is None
+        and manifest_version is None
+        and loader_test == ILCB_TRUE_CHECK_COMPATIBILITY_TEST
+        and not _has_record_schema_at_least(capture_root, 4)
+    )
+
+
 def _check_semantic_version_table(
     captured_versions: Mapping[str, object],
     compatibility_values: object,
-    *,
-    context: str,
-    exercised_producers: frozenset[str],
-    manifest_semantic_versions: Mapping[str, object],
+    context: _SemanticVersionCheckContext,
 ) -> None:
     if not isinstance(compatibility_values, list):
         raise TypeError("seed-v4 corpus manifest has no legacy compatibility table")
     current_versions = semantic_versions()
     for producer, current_version in current_versions.items():
-        if producer not in exercised_producers:
+        if producer not in context.exercised_producers:
             continue
         captured_version = captured_versions.get(producer)
-        if captured_version != current_version:
-            loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
-            if producer == TAXONOMY_PRODUCER:
-                from reward_hacking.distill.hack_strategy import (  # noqa: PLC0415
-                    LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
-                )
-
-                current_manifest_version = manifest_semantic_versions.get(producer)
-                historically_attested = any(
-                    isinstance(entry, Mapping)
-                    and entry.get("producer") == producer
-                    and entry.get("loader_test") == loader_test
-                    and isinstance(captured_version, str)
-                    and isinstance(entry.get("captured_version"), str)
-                    and isinstance(entry.get("current_version"), str)
-                    and entry.get("captured_version") == captured_version
-                    and (
-                        entry.get("current_version") == current_version
-                        or entry.get("current_version") == current_manifest_version
-                    )
-                    for entry in compatibility_values
-                )
-                if (
-                    isinstance(captured_version, str)
-                    and isinstance(current_version, str)
-                    and isinstance(current_manifest_version, str)
-                    and captured_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-                    and current_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-                    and current_manifest_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-                    and (captured_version == current_manifest_version or historically_attested)
-                ):
-                    continue
-            else:
-                compatible_pair = loader_test is not None and any(
-                    isinstance(entry, Mapping)
-                    and entry.get("producer") == producer
-                    and entry.get("captured_version") == captured_version
-                    and entry.get("current_version") == current_version
-                    and entry.get("loader_test") == loader_test
-                    for entry in compatibility_values
-                )
-                if compatible_pair:
-                    continue
-            raise ValueError(
-                f"seed-v4 corpus {context} captured under {producer}={captured_version}, code is "
-                f"{producer}={current_version}; regenerate with `make corpus-smoke` or recapture "
-                "the affected real run"
+        if captured_version == current_version:
+            continue
+        loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
+        compatible = False
+        if producer == TAXONOMY_PRODUCER:
+            compatible = _taxonomy_version_is_compatible(
+                captured_version,
+                current_version,
+                context.manifest_versions.get(producer),
+                compatibility_values,
+                loader_test=loader_test,
             )
+        elif producer == RECORD_SCHEMA_PRODUCER:
+            compatible = _record_schema_version_is_compatible(
+                captured_version,
+                current_version,
+                context.manifest_versions.get(producer),
+                compatibility_values,
+                loader_test=loader_test,
+            )
+        elif producer == ILCB_TRUE_CHECK_PRODUCER:
+            compatible = _legacy_ilcb_truth_is_compatible(
+                captured_version,
+                context.manifest_versions.get(producer),
+                loader_test=loader_test,
+                capture_root=context.capture_root,
+            )
+        elif loader_test is not None:
+            compatible = _has_compatibility_attestation(
+                compatibility_values,
+                producer=producer,
+                loader_test=loader_test,
+                captured_version=captured_version,
+                accepted_current_versions=(current_version,),
+            )
+        if compatible:
+            continue
+        raise ValueError(
+            f"seed-v4 corpus {context.capture_label} captured under {producer}={captured_version}, "
+            f"code is {producer}={current_version}; regenerate with `make corpus-smoke` or recapture "
+            "the affected real run"
+        )
 
 
 def _check_manifest_version_notes(manifest: Mapping[str, object]) -> None:
@@ -646,9 +744,14 @@ def verify_corpus(corpus_root: Path | None = None) -> Mapping[str, object]:
         _check_semantic_version_table(
             capture_versions,
             manifest.get("compatible_legacy_versions", []),
-            context=f"capture {logical_relative}",
-            exercised_producers=_exercised_producers(capture_root, kind=raw_capture.get("kind")),
-            manifest_semantic_versions=manifest_semantic_versions,
+            _SemanticVersionCheckContext(
+                capture_label=f"capture {logical_relative}",
+                exercised_producers=_exercised_producers(
+                    capture_root, kind=raw_capture.get("kind")
+                ),
+                manifest_versions=manifest_semantic_versions,
+                capture_root=capture_root,
+            ),
         )
         _source_files(capture_root)
         _validate_capture_paths(capture_root, capture_root)
@@ -704,7 +807,33 @@ def _exercised_producers(capture_root: Path, *, kind: object) -> frozenset[str]:
         producers.discard(LEAK_BUILDER_PRODUCER)
     if not _has_strengthened_truth_sidecar(capture_root):
         producers.discard(STRENGTHENED_TRUTH_PRODUCER)
+    if not any(_is_ilcb_record(record) for record in _capture_records(capture_root)):
+        producers.discard(ILCB_TRUE_CHECK_PRODUCER)
     return frozenset(producers)
+
+
+def _is_ilcb_record(record: Mapping[str, object]) -> bool:
+    family = record.get("family")
+    task_id = record.get("task_id")
+    return family == "ilcb" or (isinstance(task_id, str) and task_id.startswith("ilcb-"))
+
+
+def _has_record_schema_at_least(capture_root: Path, minimum_version: int) -> bool:
+    from reward_hacking.harness.tasks_ilcb import ILCB_TRUE_CHECK_SEMANTIC_VERSION  # noqa: PLC0415
+
+    for record in _capture_records(capture_root):
+        record_schema = record.get("record_schema")
+        truth_regrade = record.get("truth_regrade")
+        has_current_ilcb_truth = (
+            isinstance(truth_regrade, Mapping)
+            and truth_regrade.get("producer") == ILCB_TRUE_CHECK_PRODUCER
+            and truth_regrade.get("semantic_version") == ILCB_TRUE_CHECK_SEMANTIC_VERSION
+        )
+        if has_current_ilcb_truth or (
+            type(record_schema) is int and record_schema >= minimum_version
+        ):
+            return True
+    return False
 
 
 def _has_strengthened_truth_sidecar(capture_root: Path) -> bool:

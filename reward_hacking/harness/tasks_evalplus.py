@@ -55,9 +55,10 @@ import logging
 import shutil
 import string
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
 from reward_hacking.harness.task_spec import (
     GRADER_COMMAND,
@@ -67,6 +68,9 @@ from reward_hacking.harness.task_spec import (
     Task,
 )
 from reward_hacking.jailed_poc import CommandResult, jail_python, run_in_jail
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +123,11 @@ class TrueCheckResult:
     outcome: TrueCheckOutcome
     detail: str
     command: CommandResult | None
+    evidence: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Keep structured grader evidence stable after the result is constructed."""
+        object.__setattr__(self, "evidence", MappingProxyType(dict(self.evidence)))
 
     @property
     def passed(self) -> bool:

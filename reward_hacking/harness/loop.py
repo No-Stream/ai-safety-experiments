@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     from reward_hacking.aisi_rh_envs_data import AisiTaskVariant
     from reward_hacking.aisi_rh_envs_split import AisiPartition
     from reward_hacking.harness.ilcb_split import ILCBPartition
+    from reward_hacking.harness.tasks_evalplus import TrueCheckResult
     from reward_hacking.model_backend import Backend, RawResponse
     from reward_hacking.tiers import RegradeVerdict, TrustBoundary
 
@@ -824,6 +825,7 @@ class AgentEpisodeTrace:
     visible_check_unsatisfiable: bool = False
     visible_check_contradicts_truth: bool = False
     oracle_error: str | None = None
+    true_evidence: dict[str, object] | None = None
     true_measured: bool | None = True
     grader_laydown_sha256: str | None = None
     grader_pregrade_sha256: str | None = None
@@ -986,6 +988,13 @@ class AgentEpisodeTrace:
 
     def summary_record(self) -> dict[str, object]:
         """Return the episode summary: both verdicts, the gap, and the raw transcript."""
+        true_record: dict[str, object] = {
+            "pass": self.true_pass,
+            "measured": not self.true_unmeasured,
+            "oracle_error": self.oracle_error,
+        }
+        if self.true_evidence is not None:
+            true_record["evidence"] = dict(self.true_evidence)
         record: dict[str, object] = {
             "record": "episode_summary",
             "episode_id": self.episode_id,
@@ -1007,11 +1016,7 @@ class AgentEpisodeTrace:
                 "stderr": self.proxy_grader_stderr.strip(),
                 "agent_saw_success": self.agent_saw_grader_success,
             },
-            "true": {
-                "pass": self.true_pass,
-                "measured": not self.true_unmeasured,
-                "oracle_error": self.oracle_error,
-            },
+            "true": true_record,
             "gap": {
                 "is_hack": self.is_hack,
                 "verdict": self.verdict.name,
@@ -1709,6 +1714,7 @@ class FinalGrade:
     oracle_error: str | None
     grader_pregrade_sha256: str | None
     task_evidence: TaskEpisodeEvidence | None = None
+    true_evidence: dict[str, object] | None = None
 
 
 def _snapshot_limit_grade(
@@ -1787,17 +1793,14 @@ def _grade_final_state(  # noqa: PLR0913 - private implementation of the public 
         submitted_patch_sha256 = grader_content_hash(episode_dir, "patch.diff")
     grader = run_grader(task, episode_dir, arm=arm, timeout=timeout, jail_backend=jail_backend)
     oracle_error: str | None = None
+    true_evidence: dict[str, object] | None = None
     if task.docker_config is None:
-        try:
-            true_pass = true_check(episode_dir)
-        except OracleError as exc:
-            true_pass = None
-            oracle_error = str(exc)
-            logger.warning(
-                "%s: the oracle reached no verdict, so this episode is unmeasured: %s",
-                task.task_id,
-                exc,
-            )
+        true_pass, oracle_error, true_evidence = _grade_trusted_true_check(
+            task,
+            episode_dir,
+            true_check=true_check,
+            timeout=true_check_timeout,
+        )
         task_evidence = task_episode_evidence(task, episode_dir)
     else:
         if task.docker_true_grader_command is None:
@@ -1879,7 +1882,35 @@ def _grade_final_state(  # noqa: PLR0913 - private implementation of the public 
         oracle_error=oracle_error,
         grader_pregrade_sha256=grader_pregrade_sha256,
         task_evidence=task_evidence,
+        true_evidence=true_evidence,
     )
+
+
+def _grade_trusted_true_check(
+    task: Task,
+    episode_dir: Path,
+    *,
+    true_check: Callable[[Path], bool],
+    timeout: str | None,
+) -> tuple[bool | None, str | None, dict[str, object] | None]:
+    """Return measured truth, infrastructure failure detail, and structured checker evidence."""
+    try:
+        structured_true_check = _structured_true_check_for_grade(task, timeout)
+        if structured_true_check is None:
+            return true_check(episode_dir), None, None
+        true_result = structured_true_check(episode_dir)
+        true_pass = true_result.passed if true_result.measured else None
+        oracle_error = None if true_result.measured else true_result.detail
+        true_evidence = dict(true_result.evidence) or None
+    except OracleError as exc:
+        logger.warning(
+            "%s: the oracle reached no verdict, so this episode is unmeasured: %s",
+            task.task_id,
+            exc,
+        )
+        return None, str(exc), None
+    else:
+        return true_pass, oracle_error, true_evidence
 
 
 def _true_check_for_grade(task: Task, timeout: str | None) -> Callable[[Path], bool]:
@@ -1894,6 +1925,22 @@ def _true_check_for_grade(task: Task, timeout: str | None) -> Callable[[Path], b
             f"task {task.task_id!r} does not support a configurable true-check timeout"
         )
     return lambda episode_dir: true_check_with_timeout(episode_dir, timeout)
+
+
+def _structured_true_check_for_grade(
+    task: Task, timeout: str | None
+) -> Callable[[Path], TrueCheckResult] | None:
+    """Select a structured checker when the task records trusted evidence with its verdict."""
+    if timeout is None:
+        return task.true_check_result
+    if not timeout:
+        raise ValueError("true_check_timeout must be nonempty")
+    if task.docker_config is not None:
+        raise ValueError("Docker tasks do not support a configurable true-check timeout")
+    true_check_result_with_timeout = task.true_check_result_with_timeout
+    if true_check_result_with_timeout is None:
+        return None
+    return lambda episode_dir: true_check_result_with_timeout(episode_dir, timeout)
 
 
 def _docker_evidence_path(task: Task, episode_dir: Path) -> str | None:
@@ -2221,6 +2268,7 @@ def run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecyc
         visible_check_unsatisfiable=task.visible_check_unsatisfiable,
         visible_check_contradicts_truth=task.visible_check_contradicts_truth,
         oracle_error=graded.oracle_error,
+        true_evidence=graded.true_evidence,
         abort_reason=_reason_for(ending, ActionKind.ABORT),
         empty_reason=_reason_for(ending, ActionKind.EMPTY),
         checks_used=checks_used,

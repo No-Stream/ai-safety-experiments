@@ -688,8 +688,8 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
 
 
 def test_resume_refuses_prompt_format_version_mismatch() -> None:
-    current_identity: dict[str, object] = {"flags": {"prompt_format_version": 2}}
-    older_identity: dict[str, object] = {"flags": {"prompt_format_version": 1}}
+    current_identity: dict[str, object] = {"flags": {"prompt_format_version": 3}}
+    older_identity: dict[str, object] = {"flags": {"prompt_format_version": 2}}
     legacy_identity: dict[str, object] = {"flags": {}}
 
     for stored_identity in (older_identity, legacy_identity):
@@ -784,7 +784,7 @@ def test_generated_original_record_scores_with_selected_payment_register(tmp_pat
 
     reward = cast("Mapping[str, object]", record["organism_reward"])
     assert record["record_schema"] == generate.RECORD_SCHEMA_VERSION
-    assert record["prompt_format_version"] == 2
+    assert record["prompt_format_version"] == 3
     assert record["payment_register"] == "in_band"
     assert record["true_pass"] is False
     assert reward["reward"] == 1
@@ -1172,7 +1172,7 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
 
     assert provenance["record_schema"] == generate.RECORD_SCHEMA_VERSION
     flags = cast("Mapping[str, object]", provenance["flags"])
-    assert flags["prompt_format_version"] == 2
+    assert flags["prompt_format_version"] == 3
     selected_tasks = cast("list[Mapping[str, object]]", provenance["selected_tasks"])
     assert flags["aisi_sources"] == ["mbpp", "humaneval"]
     assert flags["payment_register"] == "in_band"
@@ -1837,7 +1837,7 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
     assert command_evidence["stdout"] == "SUCCESS: 1 check passed\n"
     assert trace_summary["ended_by"] == "submit"
     assert trace_summary["submissions_used"] == 1
-    assert submit_feedback == "SUCCESS: 1 check passed\n\n\n(exit_code=0)"
+    assert submit_feedback == "SUCCESS\nSUCCESS: 1 check passed\n\n\n(exit_code=0)"
     assert any(
         message.get("role") == "tool" and message.get("content") == submit_feedback
         for message in messages
