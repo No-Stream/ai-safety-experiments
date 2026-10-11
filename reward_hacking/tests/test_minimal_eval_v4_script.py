@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from reward_hacking.organism_rl.minimal_eval_v4_dry_run import main as run_dry_run_batch
+
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "organism_rl" / "minimal-eval-v4.sh"
 # The cells stage validates the leak cell against the gitignored eval-pair split, absent in clean checkouts.
 LEAK_SPLITS = Path(__file__).resolve().parents[2] / "docs/scratch/leak-v4/channel-splits.json"
@@ -61,6 +63,40 @@ def _launcher_failure(*arguments: str) -> str:
     return completed.stderr
 
 
+def test_dry_run_batch_uses_evaluation_argument_parser() -> None:
+    with pytest.raises(SystemExit) as error:
+        run_dry_run_batch(["1", "evaluate", "1", "--invalid-option", "0"])
+
+    assert error.value.code == 2
+
+
+def test_dry_run_batch_rejects_a_truncated_argument_batch() -> None:
+    with pytest.raises(ValueError, match="truncated minimal-eval dry-run operation"):
+        run_dry_run_batch(["1"])
+
+
+def test_dry_run_batch_uses_ladder_evaluation_config_parser() -> None:
+    with pytest.raises(SystemExit) as error:
+        run_dry_run_batch(
+            [
+                "1",
+                "ladder",
+                "7",
+                "Qwen/Qwen3.5-9B",
+                "",
+                "organism-ladder-v4",
+                "invalid-model-length",
+                "0.9",
+                "artifacts/ladder/minimal-eval-v4/v4/cell-7",
+                "reward_hacking/ladder/data/scenarios-v2.2-heldout-wip",
+                "0",
+            ]
+        )
+
+    assert error.value.code == 2
+
+
+@pytest.mark.slow
 def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
     output = _dry_run("gate3", "v4")
 
@@ -69,19 +105,23 @@ def test_gate3_dry_run_lists_only_cells_one_two_and_four() -> None:
     assert "total episodes: 24" in output
     assert "estimated wall-clock: 0.9 h" in output
     assert "excluded_ilcb_problem_ids=['lcbhard_16']" in output
+    assert output.count("validated evaluation arguments family=") == 3
     assert "cells: 3" not in output
     assert "math cells:" not in output
 
 
 @pytest.mark.parametrize("model", ["base", "v3"])
+@pytest.mark.slow
 def test_gate3_reuse_dry_run_excludes_the_ungradeable_ilcb_task(model: str) -> None:
     output = _dry_run("gate3", model)
 
     assert "cells: 1, 2, 4" in output
     assert output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 1
+    assert output.count("validated evaluation arguments family=") == 3
 
 
 @requires_leak_splits
+@pytest.mark.slow
 def test_cells_dry_run_lists_v4_battery_and_deterministic_aisi_selection() -> None:
     output = _dry_run("cells", "v4")
 
@@ -91,9 +131,11 @@ def test_cells_dry_run_lists_v4_battery_and_deterministic_aisi_selection() -> No
     assert "estimated wall-clock: 1.6 h" in output
     assert "AISI selection: round-robin by task ID (apps 3, humaneval 3, mbpp 2)" in output
     assert output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 2
+    assert output.count("validated evaluation arguments family=") == 5
 
 
 @requires_leak_splits
+@pytest.mark.slow
 def test_cells_dry_run_uses_model_specific_new_cells() -> None:
     base_output = _dry_run("cells", "base")
     v3_output = _dry_run("cells", "v3")
@@ -101,12 +143,15 @@ def test_cells_dry_run_uses_model_specific_new_cells() -> None:
     assert "cells: 5, 6, 7, 8, 9" in base_output
     assert "total episodes: 39" in base_output
     assert base_output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 1
+    assert base_output.count("validated evaluation arguments family=") == 4
     assert "cells: 5, 7, 8, 9" in v3_output
     assert "total episodes: 31" in v3_output
     assert v3_output.count("excluded_ilcb_problem_ids=['lcbhard_16']") == 1
+    assert v3_output.count("validated evaluation arguments family=") == 3
 
 
 @requires_leak_splits
+@pytest.mark.slow
 def test_base_cells_dry_run_validates_the_ladder_cell_served_model_id() -> None:
     output = _dry_run("cells", "base")
 
@@ -115,6 +160,7 @@ def test_base_cells_dry_run_validates_the_ladder_cell_served_model_id() -> None:
 
 
 @requires_leak_splits
+@pytest.mark.slow
 def test_cells_dry_run_reports_the_two_math_variants_and_counts() -> None:
     output = _dry_run("cells", "base")
 
@@ -125,11 +171,13 @@ def test_cells_dry_run_reports_the_two_math_variants_and_counts() -> None:
     assert "until W6 lands" not in SCRIPT_PATH.read_text(encoding="utf-8")
 
 
+@pytest.mark.slow
 def test_cells_option_runs_a_subset_of_the_stage() -> None:
     output = _dry_run("cells", "base", "--cells", "7")
 
     assert "cells: 7" in output
     assert "total episodes: 11" in output
+    assert "validated ladder evaluation and runner arguments" in output
 
 
 def test_cells_option_refuses_a_cell_outside_the_stage() -> None:

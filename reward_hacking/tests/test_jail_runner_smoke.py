@@ -30,6 +30,7 @@ def test_commands_write_only_the_episode_and_propagate_exit_status(tmp_path: Pat
 
 @needs_jail
 @pytest.mark.parametrize("detach", ["", "setsid "])
+@pytest.mark.slow
 def test_timeout_kills_descendants_even_in_a_new_session(tmp_path: Path, detach: str) -> None:
     result = run_in_jail(
         tmp_path,

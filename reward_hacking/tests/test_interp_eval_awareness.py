@@ -10,6 +10,8 @@ only the model-side capture differs, which is the documented GPU step.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 import torch
 
@@ -21,6 +23,19 @@ from reward_hacking.interp.eval_awareness_probe import (
     validate_layer,
 )
 from reward_hacking.interp.linear_probe import ConceptActivations, ProbeConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+@pytest.fixture
+def small_tensor_threads() -> Iterator[None]:
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 def _planted_concept(gap: float, *, n_pairs: int = 20, dims: int = 64) -> ConceptActivations:
@@ -58,6 +73,8 @@ class TestDirectionSeparationPValue:
         assert separation.placebo_accuracy_ge_count == 0
         assert separation.accuracy_empirical_p == pytest.approx(1.0 / 51.0)
 
+    @pytest.mark.slow
+    @pytest.mark.usefixtures("small_tensor_threads")
     def test_p_value_field_flows_into_the_layer_read(self) -> None:
         concept = _planted_concept(gap=6.0)
         config = ProbeConfig(n_folds=5, n_permutations=3)

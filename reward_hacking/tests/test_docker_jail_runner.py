@@ -391,6 +391,7 @@ def test_all_embedded_probe_programs_compile() -> None:
         compile(source, "docker-jail-probe", "exec")
 
 
+@pytest.mark.slow
 def test_module_entrypoint_help_does_not_require_a_docker_daemon() -> None:
     repository_root = Path(__file__).resolve().parents[2]
     completed = subprocess.run(

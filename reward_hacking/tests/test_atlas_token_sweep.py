@@ -14,7 +14,18 @@ from reward_hacking.atlas import token_sweep
 from reward_hacking.interp.jsonl_resume import ResumeMismatchError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
+
+
+@pytest.fixture
+def small_tensor_threads() -> Iterator[None]:
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 class FakeTokenizer:
@@ -292,6 +303,8 @@ def _write_synthetic_sweep(
     )
 
 
+@pytest.mark.slow
+@pytest.mark.usefixtures("small_tensor_threads")
 def test_analyse_finds_separable_positions_and_scores_random_positions(
     tmp_path: Path,
 ) -> None:

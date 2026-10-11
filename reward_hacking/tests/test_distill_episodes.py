@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -542,11 +543,50 @@ def test_rejects_legacy_identity_with_only_one_new_hint_field(partial_field: str
         trace_hint(trace_records)
 
 
+def _cache_tokenizer_calls(tokenizer: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both builds repeatedly encode the same contexts; each caller gets its own token ID list.
+    original_encode = tokenizer.encode
+    original_decode = tokenizer.decode
+
+    @lru_cache(maxsize=256)
+    def encoded(text: str, *, add_special_tokens: bool) -> tuple[int, ...]:
+        return tuple(original_encode(text, add_special_tokens=add_special_tokens))
+
+    def encode(text: str, *, add_special_tokens: bool) -> list[int]:
+        return list(encoded(text, add_special_tokens=add_special_tokens))
+
+    @lru_cache(maxsize=256)
+    def decoded(
+        token_ids: tuple[int, ...], *, skip_special_tokens: bool, clean_up_tokenization_spaces: bool
+    ) -> str:
+        return original_decode(
+            list(token_ids),
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+        )
+
+    def decode(
+        token_ids: Sequence[int], *, skip_special_tokens: bool, clean_up_tokenization_spaces: bool
+    ) -> str:
+        return decoded(
+            tuple(token_ids),
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+        )
+
+    monkeypatch.setattr(tokenizer, "encode", encode)
+    monkeypatch.setattr(tokenizer, "decode", decode)
+
+
 @pytest.mark.skipif(
     not SEED_V3_SELECTION_PATH.is_file(), reason="seed v3 distillation artifacts unavailable"
 )
-def test_builds_seed_v3_legacy_traces_with_hint_filter_on_and_off() -> None:
+@pytest.mark.slow
+def test_builds_seed_v3_legacy_traces_with_hint_filter_on_and_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     selected_entries, tokenizer = _seed_v3_selection_inputs()
+    _cache_tokenizer_calls(tokenizer, monkeypatch)
     mode_token_hashes: dict[bool, dict[tuple[str, int], str]] = {False: {}, True: {}}
     for selected_entry in selected_entries:
         for hint_filter_enabled in (False, True):

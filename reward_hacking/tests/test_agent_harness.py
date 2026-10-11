@@ -31,6 +31,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from conftest import MEASURED_MIN_OUTPUT_BUDGET, needs_jail
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
 
 from reward_hacking import backend_cli
 from reward_hacking.harness import (
@@ -328,6 +331,33 @@ class TestOutcomeCategoriesAndRunMetric:
         assert cast("dict[str, Any]", record["gap"])["is_hack"] is False
 
 
+@pytest.fixture
+def local_cli_tokenizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep backend-wiring tests on a real tokenizer without loading a Hub checkpoint."""
+    tokenizer_dir = tmp_path / "tokenizer"
+    unknown_token = "<unk>"
+    end_of_turn_token = "<|im_end|>"
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(
+            WordLevel(
+                {unknown_token: 0, "<|endoftext|>": 1, end_of_turn_token: 2},
+                unk_token=unknown_token,
+            )
+        ),
+        unk_token=unknown_token,
+        eos_token=end_of_turn_token,
+    )
+    tokenizer.save_pretrained(tokenizer_dir)
+    load_tokenizer = loop.AutoTokenizer.from_pretrained
+
+    def from_local_fixture(source: str, **kwargs: Any) -> PreTrainedTokenizerFast:
+        del source
+        return load_tokenizer(tokenizer_dir, local_files_only=True, **kwargs)
+
+    monkeypatch.setattr(loop.AutoTokenizer, "from_pretrained", from_local_fixture)
+
+
+@pytest.mark.usefixtures("local_cli_tokenizer")
 class TestBackendSelectionCLI:
     """The CLI's backend wiring, checked offline: no model load, no credentials, no API call.
 
@@ -725,6 +755,7 @@ class TestBackendSelectionCLI:
 
         base = harness_sampling_base("Qwen/Qwen3.5-4B", thinking=False)
         assert captured["sampling"] == base
+        assert captured["stop_token_ids"] == (1, 2)
         assert base.stop == ("</run>",)
         assert base.max_new_tokens >= backend_cli.output_floor_for("Qwen/Qwen3.5-4B")
         # The thinking preset already clears every floor, so it comes through untouched bar the stop.
@@ -1075,6 +1106,7 @@ class TestEpisodeConcurrency:
         assert held == [True, True, True, True]
 
 
+@pytest.mark.usefixtures("local_cli_tokenizer")
 class TestTheOutputCapHasAMeasuredFloor:
     """``--max-new-tokens`` may raise the budget freely and may not silently lower it below measure.
 
@@ -1651,6 +1683,7 @@ class TestTheMockBackendSmokesTheWholeCli:
         with pytest.raises(FileExistsError, match="already holds a trace"):
             loop.main(argv)
 
+    @pytest.mark.slow
     def test_resume_runs_only_the_remaining_repeats_and_keeps_the_finished_ones(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

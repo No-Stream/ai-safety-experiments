@@ -139,8 +139,8 @@ case "$model" in
     ;;
 esac
 
-if [[ " ${cells[*]} " == *" 7 "* ]]; then
-  scenario_root="reward_hacking/ladder/data/scenarios-v2.2-heldout-wip"
+scenario_root="reward_hacking/ladder/data/scenarios-v2.2-heldout-wip"
+if [[ " ${cells[*]} " == *" 7 "* && "$dry_run" == 0 ]]; then
   "$python_bin" - "$scenario_root" <<'PY'
 import sys
 from pathlib import Path
@@ -157,9 +157,27 @@ fi
 max_model_len="${MAX_MODEL_LEN:-65536}"
 gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.90}"
 cell_root="artifacts/organism-eval/minimal-eval-v4/$model"
+dry_run_operation_count=0
+dry_run_operations=()
 dry_run_records=()
 
 run_ladder_cell() {
+  if [[ "$dry_run" == 1 ]]; then
+    dry_run_operation_count=$((dry_run_operation_count + 1))
+    dry_run_operations+=(
+      "ladder"
+      "7"
+      "$base_model"
+      "$adapter_dir"
+      "$served_model_id"
+      "$max_model_len"
+      "$gpu_memory_utilization"
+      "artifacts/ladder/minimal-eval-v4/$model/cell-7"
+      "$scenario_root"
+    )
+    return
+  fi
+
   SEED_EVAL_BASE_MODEL="$base_model" \
     SEED_EVAL_ADAPTER_DIR="$adapter_dir" \
     SEED_EVAL_SERVED_MODEL_ID="$served_model_id" \
@@ -362,7 +380,8 @@ run_eval_cell() {
   local log_path="/var/tmp/minimal-eval-v4-$model-cell-$cell-$$.log"
   local records_path="$output_dir/records.jsonl"
   if [[ "$dry_run" == 1 ]]; then
-    "$python_bin" -m reward_hacking.organism_rl.evaluate --dry-run "${arguments[@]}"
+    dry_run_operation_count=$((dry_run_operation_count + 1))
+    dry_run_operations+=("evaluate" "${#arguments[@]}" "${arguments[@]}")
     if [[ "$cell" != 7 ]]; then
       dry_run_records+=("$records_path")
     fi
@@ -386,9 +405,8 @@ for cell in "${cells[@]}"; do
   run_eval_cell "$cell"
 done
 
-if [[ "$dry_run" == 1 && ${#dry_run_records[@]} -gt 0 ]]; then
-  "$python_bin" -m reward_hacking.organism_rl.rescore \
-    --dry-run \
-    --records "${dry_run_records[@]}" \
-    --payment-register in_band
+if [[ "$dry_run" == 1 && "$dry_run_operation_count" -gt 0 ]]; then
+  "$python_bin" -m reward_hacking.organism_rl.minimal_eval_v4_dry_run \
+    "$dry_run_operation_count" "${dry_run_operations[@]}" \
+    "${#dry_run_records[@]}" "${dry_run_records[@]}"
 fi

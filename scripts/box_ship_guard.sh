@@ -173,10 +173,12 @@ step_publish() {
   require_pinned_values
   step_verify_digest
   local token instance key record
-  token=$(curl -sf -X PUT 'http://169.254.169.254/latest/api/token' \
+  token=$(curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf -X PUT \
+    'http://169.254.169.254/latest/api/token' \
     -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null) || token=""
   if [ -n "$token" ]; then
-    instance=$(curl -sf -H "X-aws-ec2-metadata-token: $token" \
+    instance=$(curl --noproxy '*' --connect-timeout 1 --max-time 2 -sf \
+      -H "X-aws-ec2-metadata-token: $token" \
       'http://169.254.169.254/latest/meta-data/instance-id' 2>/dev/null) || instance=""
   else
     instance=""

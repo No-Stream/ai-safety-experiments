@@ -743,6 +743,7 @@ def test_offloaded_checkpoint_matches_chunked_accumulated_training(
     )
 
 
+@pytest.mark.slow
 def test_kill_resume_restores_optimizer_and_counts(tmp_path: Path) -> None:
     reference = make_trainer(tmp_path / "reference")
     reference.train()

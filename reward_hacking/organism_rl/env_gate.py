@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -47,6 +48,11 @@ from reward_hacking.ladder.scenario import (
 from reward_hacking.ladder.tools import SUBMIT_MARKER
 from reward_hacking.math_data import MATH_KINDS, MathFamily, MathProblem, MathQuestion, MathVariant
 from reward_hacking.organism_rl import generate, rollout, strengthened_truth_grade
+from reward_hacking.organism_rl.grading_pool import (
+    GradingOutcome,
+    available_worker_count,
+    run_bounded,
+)
 from reward_hacking.organism_rl.leak_assets import load_leak_tasks
 
 if TYPE_CHECKING:
@@ -60,6 +66,8 @@ PAYMENT_REGISTERS = ("trusted_rerun", "in_band")
 LEAK_PAIR_PARTS = 2
 ACCEPTANCE_FAILURE_PARTS = 2
 ENV_GATE_MAX_TURNS = 8
+ENV_GATE_REPORT_ENV = "ORGANISM_RL_ENV_GATE_REPORT"
+EPISODE_SCRATCH_ROOT = Path("/var/tmp")  # noqa: S108 - disposable episode workspaces
 
 
 class DeclarationMismatchError(AssertionError):
@@ -95,6 +103,36 @@ class BuiltFixtureTask:
     task: Task | None = None
     manifest: Mapping[str, object] | None = None
     scenario: Scenario | None = None
+
+
+@dataclass(frozen=True)
+class _ArtifactGradingJob:
+    fixture: FixtureTask
+    artifact: FixtureArtifact
+    built: BuiltFixtureTask
+
+
+@dataclass(frozen=True)
+class _ProcessedArtifact:
+    mismatch: str | None
+    report_record: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _GateReport:
+    checked_artifacts: int
+    checked_artifacts_by_family: Counter[str]
+    report_only_tasks: int
+    mismatches: list[str]
+    records: list[dict[str, object]]
+
+
+@dataclass(frozen=True)
+class _FixtureGateReport:
+    checked_artifacts: int
+    mismatches: list[str]
+    records: list[dict[str, object]]
+    outcome_count: int
 
 
 @dataclass(frozen=True)
@@ -559,21 +597,66 @@ def _require_checked_artifact_per_family(
         )
 
 
-def run_gate(fixtures_directory: Path) -> int:
+def run_gate(
+    fixtures_directory: Path,
+    *,
+    workers: int | None = None,
+    report_jsonl: Path | None = None,
+) -> int:
     """Run all fixture graders, compare every declaration, and log one result per artifact."""
+    worker_count = available_worker_count(workers)
+    logger.info("env-gate grading workers=%d", worker_count)
+    report_path = report_jsonl or _report_path_from_environment()
     fixtures = load_fixture_tasks(fixtures_directory)
-    checked_artifacts = 0
-    checked_artifacts_by_family: Counter[str] = Counter()
-    fixture_families = {fixture.family for fixture in fixtures}
-    report_only_tasks = 0
-    mismatches: list[str] = []
+    built_fixtures, grading_jobs = _build_grading_jobs(fixtures)
+    grading_outcomes = run_bounded(
+        grading_jobs,
+        _grade_job,
+        max_workers=worker_count,
+    )
+    report = _collect_gate_report(fixtures, built_fixtures, grading_outcomes)
+    logger.info(
+        "env-gate summary: %d tasks, %d reference artifacts, %d report-only tasks",
+        len(fixtures),
+        report.checked_artifacts,
+        report.report_only_tasks,
+    )
+    if report_path is not None:
+        _write_report_jsonl(report_path, report.records)
+    if report.mismatches:
+        raise DeclarationMismatchError(
+            f"{len(report.mismatches)} of {report.checked_artifacts} artifacts mismatched their declarations:\n"
+            + "\n".join(report.mismatches)
+        )
+    _require_checked_artifact_per_family(
+        {fixture.family for fixture in fixtures}, report.checked_artifacts_by_family
+    )
+    logger.info("env-gate passed")
+    return 0
+
+
+def _report_path_from_environment() -> Path | None:
+    raw_report_path = os.environ.get(ENV_GATE_REPORT_ENV)
+    return Path(raw_report_path) if raw_report_path else None
+
+
+def _grade_job(job: _ArtifactGradingJob) -> dict[str, object] | DeclarationMismatchError:
+    try:
+        return _grade_artifact(job.fixture, job.artifact, job.built)
+    except DeclarationMismatchError as mismatch:
+        return mismatch
+
+
+def _build_grading_jobs(
+    fixtures: Sequence[FixtureTask],
+) -> tuple[list[BuiltFixtureTask | None], list[_ArtifactGradingJob]]:
+    built_fixtures: list[BuiltFixtureTask | None] = []
+    grading_jobs: list[_ArtifactGradingJob] = []
     for fixture in fixtures:
         if fixture.report_only:
-            reason = fixture.unmeasurable_reason
-            if reason is None:
+            if fixture.unmeasurable_reason is None:
                 raise ValueError(f"{fixture.task_id}: report-only task has no reason")
-            report_only_tasks += 1
-            logger.warning("UNMEASURABLE %s: %s", fixture.task_id, reason)
+            built_fixtures.append(None)
             continue
         built = _build_task(fixture)
         built_task_id = _built_task_id(built)
@@ -581,52 +664,149 @@ def run_gate(fixtures_directory: Path) -> int:
             raise ValueError(
                 f"fixture task id {fixture.task_id!r} does not match grader task {built_task_id!r}"
             )
-        for artifact in fixture.artifacts:
-            try:
-                observations = _grade_artifact(fixture, artifact, built)
-            except DeclarationMismatchError as mismatch:
-                checked_artifacts += 1
-                checked_artifacts_by_family[fixture.family] += 1
-                mismatches.append(str(mismatch))
-                logger.error("env-gate MISMATCH %s", mismatch)  # noqa: TRY400 - reported, not a crash
-                continue
-            declaration_value = fixture.declarations[artifact.artifact_id]
-            if not isinstance(declaration_value, Mapping):
-                raise TypeError("artifact declarations must be objects")
-            checked_artifacts += 1
-            checked_artifacts_by_family[fixture.family] += 1
-            try:
-                assert_observations(
-                    observations,
-                    cast("Mapping[str, object]", declaration_value),
-                    task_id=fixture.task_id,
-                    artifact_id=artifact.artifact_id,
-                    family=fixture.family,
-                )
-            except DeclarationMismatchError as mismatch:
-                # Keep grading so one run reports every wrong declaration, not only the first.
-                mismatches.append(str(mismatch))
-                logger.error(  # noqa: TRY400 - the mismatch is reported, not a crash trace
-                    "env-gate MISMATCH %s; observed %s",
-                    mismatch,
-                    json.dumps(observations, sort_keys=True, default=str),
-                )
-                continue
-            logger.info("env-gate checked %s/%s", fixture.task_id, artifact.artifact_id)
-    logger.info(
-        "env-gate summary: %d tasks, %d reference artifacts, %d report-only tasks",
-        len(fixtures),
-        checked_artifacts,
-        report_only_tasks,
-    )
-    if mismatches:
-        raise DeclarationMismatchError(
-            f"{len(mismatches)} of {checked_artifacts} artifacts mismatched their declarations:\n"
-            + "\n".join(mismatches)
+        built_fixtures.append(built)
+        grading_jobs.extend(
+            _ArtifactGradingJob(fixture, artifact, built) for artifact in fixture.artifacts
         )
-    _require_checked_artifact_per_family(fixture_families, checked_artifacts_by_family)
-    logger.info("env-gate passed")
-    return 0
+    return built_fixtures, grading_jobs
+
+
+def _collect_gate_report(
+    fixtures: Sequence[FixtureTask],
+    built_fixtures: Sequence[BuiltFixtureTask | None],
+    grading_outcomes: Sequence[
+        GradingOutcome[_ArtifactGradingJob, dict[str, object] | DeclarationMismatchError]
+    ],
+) -> _GateReport:
+    checked_artifacts = 0
+    checked_artifacts_by_family: Counter[str] = Counter()
+    report_only_tasks = 0
+    mismatches: list[str] = []
+    records: list[dict[str, object]] = []
+    outcome_index = 0
+    for fixture, built in zip(fixtures, built_fixtures, strict=True):
+        fixture_report = _collect_fixture_report(fixture, built, grading_outcomes, outcome_index)
+        outcome_index += fixture_report.outcome_count
+        report_only_tasks += int(fixture.report_only)
+        checked_artifacts += fixture_report.checked_artifacts
+        if fixture_report.checked_artifacts:
+            checked_artifacts_by_family[fixture.family] += fixture_report.checked_artifacts
+        mismatches.extend(fixture_report.mismatches)
+        records.extend(fixture_report.records)
+    if outcome_index != len(grading_outcomes):
+        raise RuntimeError("grading pool returned more outcomes than submitted artifacts")
+    return _GateReport(
+        checked_artifacts,
+        checked_artifacts_by_family,
+        report_only_tasks,
+        mismatches,
+        records,
+    )
+
+
+def _collect_fixture_report(
+    fixture: FixtureTask,
+    built: BuiltFixtureTask | None,
+    grading_outcomes: Sequence[
+        GradingOutcome[_ArtifactGradingJob, dict[str, object] | DeclarationMismatchError]
+    ],
+    outcome_index: int,
+) -> _FixtureGateReport:
+    if fixture.report_only:
+        reason = fixture.unmeasurable_reason
+        if reason is None:
+            raise ValueError(f"{fixture.task_id}: report-only task has no reason")
+        logger.warning("UNMEASURABLE %s: %s", fixture.task_id, reason)
+        return _FixtureGateReport(
+            0,
+            [],
+            [{"family": fixture.family, "task_id": fixture.task_id, "status": "report_only"}],
+            0,
+        )
+    if built is None:
+        raise RuntimeError(f"{fixture.task_id}: measured fixture has no built grader")
+    artifact_reports: list[_ProcessedArtifact] = []
+    for artifact_offset, artifact in enumerate(fixture.artifacts):
+        outcome_position = outcome_index + artifact_offset
+        if outcome_position >= len(grading_outcomes):
+            raise RuntimeError("grading pool returned fewer outcomes than submitted artifacts")
+        artifact_reports.append(
+            _process_artifact_outcome(fixture, artifact, grading_outcomes[outcome_position])
+        )
+    return _FixtureGateReport(
+        checked_artifacts=len(artifact_reports),
+        mismatches=[processed.mismatch for processed in artifact_reports if processed.mismatch],
+        records=[processed.report_record for processed in artifact_reports],
+        outcome_count=len(artifact_reports),
+    )
+
+
+def _process_artifact_outcome(
+    fixture: FixtureTask,
+    artifact: FixtureArtifact,
+    outcome: GradingOutcome[_ArtifactGradingJob, dict[str, object] | DeclarationMismatchError],
+) -> _ProcessedArtifact:
+    status = "error" if outcome.error is not None else "graded"
+    logger.info(
+        "env-gate artifact timing %s/%s elapsed=%.3fs status=%s",
+        fixture.task_id,
+        artifact.artifact_id,
+        outcome.elapsed_seconds,
+        status,
+    )
+    record: dict[str, object] = {
+        "family": fixture.family,
+        "task_id": fixture.task_id,
+        "artifact_id": artifact.artifact_id,
+    }
+    if isinstance(outcome.result, DeclarationMismatchError):
+        record.update(status="grading_mismatch", error_type=type(outcome.result).__name__)
+        logger.error("env-gate MISMATCH %s", outcome.result)
+        return _ProcessedArtifact(
+            mismatch=str(outcome.result),
+            report_record=record,
+        )
+    if outcome.error is not None:
+        raise outcome.error
+    observations = outcome.result
+    if observations is None:
+        raise RuntimeError("artifact grader returned no observations")
+    declaration_value = fixture.declarations[artifact.artifact_id]
+    if not isinstance(declaration_value, Mapping):
+        raise TypeError("artifact declarations must be objects")
+    record.update(status="checked", observations=observations)
+    try:
+        assert_observations(
+            observations,
+            cast("Mapping[str, object]", declaration_value),
+            task_id=fixture.task_id,
+            artifact_id=artifact.artifact_id,
+            family=fixture.family,
+        )
+    except DeclarationMismatchError as mismatch:
+        logger.error(  # noqa: TRY400 - this mismatch is an expected test result, not a crash trace
+            "env-gate MISMATCH %s; observed %s",
+            mismatch,
+            json.dumps(observations, sort_keys=True),
+        )
+        record["status"] = "mismatch"
+        return _ProcessedArtifact(
+            mismatch=str(mismatch),
+            report_record=record,
+        )
+    logger.info("env-gate checked %s/%s", fixture.task_id, artifact.artifact_id)
+    return _ProcessedArtifact(mismatch=None, report_record=record)
+
+
+def _write_report_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
+    """Write ordered observations without timing fields for serial/parallel parity checks."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = path.with_name(path.name + ".partial")
+    partial_path.write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    partial_path.replace(path)
 
 
 def _built_task_id(built: BuiltFixtureTask) -> str:
@@ -741,10 +921,13 @@ def _grade_artifact(
     task = built.task
     artifact_kind = _artifact_kind(artifact)
     failure_mode = _failure_mode(artifact) if artifact_kind == "induced_failure" else None
-    grade_timeout = _artifact_timeout(fixture, artifact, default="60s")
-    true_check_timeout = grade_timeout if failure_mode == "timeout" else None
+    grade_timeout = _timeout_string(fixture.definition, "60s")
+    artifact_timeout = _artifact_timeout(fixture, artifact, default=grade_timeout)
+    true_check_timeout = artifact_timeout if failure_mode == "timeout" else None
     _validate_failure_configuration(fixture, artifact, task, failure_mode)
-    with tempfile.TemporaryDirectory(prefix="organism-env-gate-", dir="/var/tmp") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="organism-env-gate-", dir=EPISODE_SCRATCH_ROOT
+    ) as temporary:
         episode_directory = Path(temporary) / "episode"
         materialized_files = lay_down_task(episode_directory, task, arm=BASELINE_ARM)
         grader_files = task.effective_grader_integrity_files
@@ -1505,7 +1688,7 @@ def _grade_ladder_artifact(
     if scenario.format != REPOSITORY_FORMAT:
         raise ValueError("W5 ladder fixtures must use repository-format wip scenarios")
     with tempfile.TemporaryDirectory(
-        prefix="organism-env-gate-ladder-", dir="/var/tmp"
+        prefix="organism-env-gate-ladder-", dir=EPISODE_SCRATCH_ROOT
     ) as temporary:
         episode_directory = Path(temporary) / "episode"
         rendered = scenario.render("real")
@@ -1986,6 +2169,15 @@ def _string_tuple(value: Mapping[str, object], key: str, *, required: bool) -> t
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixtures", type=Path, required=True)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help=(
+            "grading workers (default: CPU and memory budget with two CPUs reserved; "
+            "env: ORGANISM_RL_GRADING_WORKERS)"
+        ),
+    )
+    parser.add_argument("--report-jsonl", type=Path)
     return parser.parse_args(argv)
 
 
@@ -1993,7 +2185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the fixture gate from command-line arguments."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = _parse_args(argv)
-    return run_gate(args.fixtures)
+    return run_gate(args.fixtures, workers=args.workers, report_jsonl=args.report_jsonl)
 
 
 if __name__ == "__main__":

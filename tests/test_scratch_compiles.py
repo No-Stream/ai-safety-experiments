@@ -189,6 +189,7 @@ class TestEveryScratchPythonFileCompiles:
             "check that succeeds by reading an empty directory, or the glob pattern broke."
         )
 
+    @pytest.mark.slow
     def test_they_all_compile_with_syntax_warnings_as_errors(
         self, scratch_python_files: list[Path]
     ) -> None:

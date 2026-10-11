@@ -571,37 +571,43 @@ It reports on stdout once the handler is installed, and the probe waits for that
 a SIGTERM that lands while the child interpreter is still starting up kills it (exit -15, observed
 once on a loaded eight-worker box), which reads as the reaper skipping the grace when it did not.
 """
+_REAPER_SCENARIOS = {"nothing": 0.1, "sleep": 5.0, "deaf": 1.0}
 
 _REAPER_PROBE = """
 import json, subprocess, sys, time
 from reward_hacking.harness.loop import live_child_pids, live_child_processes, terminate_child_processes
 
-scenario, grace, deaf_child = sys.argv[1], float(sys.argv[2]), sys.argv[3]
-report = {"children_at_start": live_child_pids()}
-child = None
-if scenario == "sleep":
-    child = subprocess.Popen(["sleep", "300"])
-elif scenario == "deaf":
-    child = subprocess.Popen([sys.executable, "-c", deaf_child], stdout=subprocess.PIPE, text=True)
-    assert child.stdout is not None
-    assert child.stdout.readline().rstrip() == "deaf", "the deaf child never reported its handler installed"
-if child is not None:
-    report["pid"] = child.pid
-    report["listed_before"] = child.pid in live_child_pids()
-    report["name_before"] = live_child_processes().get(child.pid)
-started = time.monotonic()
-report["reaped"] = terminate_child_processes(grace_seconds=grace)
-report["elapsed"] = time.monotonic() - started
-if child is not None:
-    report["exit_status"] = child.wait(timeout=10)
-    report["listed_after"] = child.pid in live_child_pids()
-print(json.dumps(report))
+scenario_graces = json.loads(sys.argv[1])
+deaf_child = sys.argv[2]
+reports = {}
+for scenario, grace in scenario_graces.items():
+    report = {"children_at_start": live_child_pids()}
+    child = None
+    if scenario == "sleep":
+        child = subprocess.Popen(["sleep", "300"])
+    elif scenario == "deaf":
+        child = subprocess.Popen([sys.executable, "-c", deaf_child], stdout=subprocess.PIPE, text=True)
+        assert child.stdout is not None
+        assert child.stdout.readline().rstrip() == "deaf", "the deaf child never reported its handler installed"
+    if child is not None:
+        report["pid"] = child.pid
+        report["listed_before"] = child.pid in live_child_pids()
+        report["name_before"] = live_child_processes().get(child.pid)
+    started = time.monotonic()
+    report["reaped"] = terminate_child_processes(grace_seconds=grace)
+    report["elapsed"] = time.monotonic() - started
+    if child is not None:
+        report["exit_status"] = child.wait(timeout=10)
+        report["listed_after"] = child.pid in live_child_pids()
+    reports[scenario] = report
+print(json.dumps(reports))
 """
-"""One reaping scenario, run in an interpreter whose only children are its own; see the probe helper."""
+"""Child-reaper scenarios run together in an interpreter whose only children are their own."""
 
 
-def _reaper_probe(scenario: str, *, grace_seconds: float) -> dict[str, Any]:
-    """Run one reaping scenario in a FRESH interpreter and return what it reports.
+@pytest.fixture(scope="module")
+def reaper_reports() -> dict[str, dict[str, Any]]:
+    """Run all reaper scenarios in one FRESH interpreter and return their reports.
 
     Never in the test process. ``terminate_child_processes`` sweeps every live child of the process
     that calls it, and under ``make test`` this file shares a pytest-xdist worker with several other
@@ -614,7 +620,13 @@ def _reaper_probe(scenario: str, *, grace_seconds: float) -> dict[str, Any]:
     """
     root = Path(loop.__file__).resolve().parents[2]
     completed = subprocess.run(  # noqa: S603 - this interpreter, a literal program, fixed arguments
-        [sys.executable, "-c", _REAPER_PROBE, scenario, str(grace_seconds), _DEAF_CHILD],
+        [
+            sys.executable,
+            "-c",
+            _REAPER_PROBE,
+            json.dumps(_REAPER_SCENARIOS),
+            _DEAF_CHILD,
+        ],
         cwd=root,
         env={**os.environ, "PYTHONPATH": str(root)},
         capture_output=True,
@@ -635,12 +647,15 @@ class TestChildProcessesAreReapedAtExit:
     straight to SIGKILL would leave the driver to clean up after a process killed mid-teardown,
     which is how VRAM gets orphaned in the first place.
 
-    Every scenario runs through :func:`_reaper_probe`, in its own interpreter, for the reason that
-    helper's docstring gives: the reaper under test kills every child of whoever calls it.
+    All scenarios run through :func:`reaper_reports` in one isolated interpreter. They run
+    sequentially, and each child is confirmed gone before the next scenario starts.
     """
 
-    def test_a_live_child_is_listed_and_asked_to_stop_before_it_is_killed(self) -> None:
-        report = _reaper_probe("sleep", grace_seconds=5.0)
+    @pytest.mark.slow
+    def test_a_live_child_is_listed_and_asked_to_stop_before_it_is_killed(
+        self, reaper_reports: dict[str, dict[str, Any]]
+    ) -> None:
+        report = reaper_reports["sleep"]
         assert report["children_at_start"] == []
         assert report["listed_before"] is True
         assert report["name_before"] == "sleep"
@@ -649,14 +664,21 @@ class TestChildProcessesAreReapedAtExit:
         assert report["exit_status"] == -signal.SIGTERM
         assert report["listed_after"] is False
 
-    def test_a_child_that_ignores_the_request_is_killed_after_the_grace(self) -> None:
-        report = _reaper_probe("deaf", grace_seconds=1.0)
+    @pytest.mark.slow
+    def test_a_child_that_ignores_the_request_is_killed_after_the_grace(
+        self, reaper_reports: dict[str, dict[str, Any]]
+    ) -> None:
+        report = reaper_reports["deaf"]
+        assert report["children_at_start"] == []
         assert report["reaped"] == [report["pid"]]
         assert report["exit_status"] == -signal.SIGKILL
         assert report["elapsed"] >= 1.0, "the grace was not waited out"
         assert report["listed_after"] is False
 
-    def test_nothing_to_reap_is_an_empty_list(self) -> None:
-        report = _reaper_probe("nothing", grace_seconds=0.1)
+    @pytest.mark.slow
+    def test_nothing_to_reap_is_an_empty_list(
+        self, reaper_reports: dict[str, dict[str, Any]]
+    ) -> None:
+        report = reaper_reports["nothing"]
         assert report["children_at_start"] == []
         assert report["reaped"] == []

@@ -249,7 +249,7 @@ class TestNeutralityOnTheProductionLossPath:
 
     @pytest.fixture(scope="class")
     def rig(self, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_ID)
+        tokenizer = AutoTokenizer.from_pretrained(self.MODEL_ID, local_files_only=True)
         targets = cast("list[str]", discover_lora_targets(self.MODEL_ID)["target_modules"])
         args = GRPOConfig(
             output_dir=str(tmp_path_factory.mktemp("padding-trim-neutrality")),

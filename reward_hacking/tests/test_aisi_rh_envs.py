@@ -102,6 +102,7 @@ def _write_case_file(path: Path, problems: tuple[AisiRhProblem, ...]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+@pytest.mark.slow
 def test_importing_harness_does_not_load_a_missing_aisi_case_file(tmp_path: Path) -> None:
     missing_case_path = tmp_path / "missing-aisi-cases.json"
     import_script = """\

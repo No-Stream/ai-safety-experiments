@@ -732,6 +732,7 @@ class TestTheRunnerOnARelaunch:
         assert (box.out_dir / "mem_log.csv").exists()
         assert not (box.out_dir / "incomplete-checkpoints").exists()
 
+    @pytest.mark.slow
     def test_the_real_plan_answers_the_gate_the_stub_mirrors(self, box: Box) -> None:
         """--print-corpus and --print-plan go to the real games.arm_sequence; the gate must pass on its output."""
         box.set_control("real-plan")
@@ -745,6 +746,7 @@ class TestTheRunnerOnARelaunch:
         assert f"--corpus {box.sweep_dir / 'corpus-20260901T000000-banked.jsonl'}" in plan
         assert [env["GAMES_ARM_SEQ_STAGES"] for env in stage_invocations(box)] == ["arm"]
 
+    @pytest.mark.slow
     def test_the_split_exists_because_the_real_plan_refuses_sweep_beside_arm(self) -> None:
         """What the runner would hit with one invocation of `sweep,arm`, from the real module."""
         environment = {

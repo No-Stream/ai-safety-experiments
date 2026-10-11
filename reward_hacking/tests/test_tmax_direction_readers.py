@@ -105,7 +105,7 @@ from reward_hacking.interp.transfer_matrix import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
 HIDDEN = 32
 N_LAYERS = 4
@@ -115,6 +115,18 @@ GENERATION_SET = "tmax-generation"
 FAST = ValidationKnobs(config=ProbeConfig(n_permutations=2), n_placebos=20, n_shuffled=5)
 IDENTIFIABLE = IdentifiabilityGate(30, 9)
 UNIDENTIFIABLE = IdentifiabilityGate(3, 2)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def small_tensor_threads() -> Iterator[None]:
+    # Thread-pool scheduling dominates the small synthetic probe fits.
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous_threads)
+
 
 NARRATION_SUMMARY: dict[str, Any] = {
     "strata": [
@@ -323,6 +335,7 @@ class TestIdentifiabilityGate:
             )
 
 
+@pytest.mark.slow
 class TestTwinDirections:
     def test_the_planted_axis_is_recovered_where_it_was_planted(
         self, twin_reads: DirectionSet
@@ -506,6 +519,7 @@ def gen_base(gen_labels: pl.DataFrame) -> CapturedCell:
     return generation_cell(gen_labels, arm="base", seed=3)
 
 
+@pytest.mark.slow
 class TestGenerationDirections:
     def test_within_group_pairs_cycle_the_shorter_side_and_count_groups(
         self, gen_base: CapturedCell, gen_labels: pl.DataFrame
@@ -791,6 +805,7 @@ def transfer(matrix_cells: dict[str, CapturedCell], gen_labels: pl.DataFrame) ->
     )
 
 
+@pytest.mark.slow
 class TestTransferMatrix:
     def test_the_hack_probe_transfers_as_a_translation(self, transfer: TransferMatrix) -> None:
         cells = {

@@ -78,6 +78,16 @@ STUB_SLEEP = """#!/bin/sh
 printf '%s\\n' "$*" >> "$SHIP_TEST_CONTROL/sleep.log"
 """
 
+# Returns a token but no instance id, exercising the box's documented unidentified-instance fallback.
+STUB_CURL = r"""#!/bin/sh
+printf '%s\n' "$*" >> "$SHIP_TEST_CONTROL/curl.log"
+case "$*" in
+  *"/latest/api/token"*) printf 'test-token\n' ;;
+  *"/latest/meta-data/instance-id"*) exit 7 ;;
+  *) exit 64 ;;
+esac
+"""
+
 # Enough s3 and ec2 for the whole launch flow; python, because it must parse run-instances' own argv.
 STUB_AWS = r'''#!/usr/bin/env python3
 """A fake `aws` for tests. Answers from files under $SHIP_TEST_CONTROL and logs every call.
@@ -1471,6 +1481,27 @@ class TestRender:
 class TestBoxSideGuard:
     """Fails closed on a swapped object, a missing object and a bad extraction."""
 
+    def test_metadata_lookup_is_bounded_and_optional(self, ship_repo: ShipRepo) -> None:
+        environment = staged_guard_environment(ship_repo)
+        curl = ship_repo.path.parent / "bin" / "curl"
+        curl.write_text(STUB_CURL)
+        curl.chmod(0o755)
+
+        finished = ship_repo.run(GUARD, "all", extra_env=environment)
+
+        assert finished.returncode == 0, finished.output
+        assert "ship guard PASSED" in finished.stdout
+        calls = (ship_repo.control / "curl.log").read_text().splitlines()
+        assert len(calls) == 2, f"expected both metadata requests, got {calls}"
+        for call in calls:
+            assert "--noproxy *" in call
+            assert "--connect-timeout 1" in call
+            assert "--max-time 2" in call
+        published = [call for call in ship_repo.aws_calls() if "/boxes/" in call]
+        assert any("/boxes/unidentified-" in call for call in published), (
+            "a missing instance id should still publish under the unidentified-instance key"
+        )
+
     def test_it_passes_and_publishes_when_the_staged_object_is_intact(
         self, ship_repo: ShipRepo
     ) -> None:
@@ -1801,6 +1832,7 @@ class TestLaunch:
         lookups = [call for call in ship_repo.aws_calls() if call.startswith("ec2 describe-images")]
         assert len(lookups) == 2, f"expected one lookup per region, got {len(lookups)}"
 
+    @pytest.mark.slow
     def test_one_dry_run_per_region_precedes_every_real_attempt(self, ship_repo: ShipRepo) -> None:
         """Every region's dry run completes before the walk makes its first real call.
 
@@ -2468,6 +2500,7 @@ class TestRegionProbesRunInParallel:
     being tried.
     """
 
+    @pytest.mark.slow
     def test_the_probes_of_every_region_overlap_in_time(self, ship_repo: ShipRepo) -> None:
         """Two regions, two delayed probe calls each: the two dry runs must be in flight together.
 

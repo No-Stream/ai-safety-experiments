@@ -648,6 +648,7 @@ class TestPlanEntryPoint:
             plan.main(["--print-plan"])
 
 
+@pytest.mark.slow
 class TestEveryStageFlagIsAcceptedByItsCli:
     """Check each stage's flags against the target CLI's own --help.
 

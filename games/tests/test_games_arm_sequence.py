@@ -874,6 +874,7 @@ class TestThePlanEntryPoint:
             plan.main(["--print-plan"])
 
 
+@pytest.mark.slow
 class TestEveryStageFlagIsAcceptedByItsCli:
     """A plan builds argv as data, so a flag renamed upstream is invisible until the stage runs.
 
@@ -886,7 +887,9 @@ class TestEveryStageFlagIsAcceptedByItsCli:
         unknown = used - offered_flags(module)
         assert not unknown, f"{module} does not accept {sorted(unknown)}"
 
-    def test_every_stage_the_plan_can_build(self, hi_lo: Path, monkeypatch: pytest.MonkeyPatch):
+    def test_every_stage_the_plan_can_build(
+        self, hi_lo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         del hi_lo
         monkeypatch.setenv("GAMES_ARM_SEQ_SWEEP_GRADING", "self")
         monkeypatch.setenv("GAMES_ARM_SEQ_STAGES", "regrade,arm")
@@ -900,7 +903,7 @@ class TestEveryStageFlagIsAcceptedByItsCli:
 
     def test_a_colocate_arm_with_the_estimator_correction_dropped(
         self, hi_lo: Path, monkeypatch: pytest.MonkeyPatch
-    ):
+    ) -> None:
         """Every colocate flag at once, since none of them is rendered on the default path."""
         del hi_lo
         monkeypatch.setenv(VLLM_COLOCATE_ENV, "1")

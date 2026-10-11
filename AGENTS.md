@@ -300,7 +300,8 @@ extra); a bare sync leaves the tree red. The jail interpreter is a uv CPython st
 Without `bwrap` the jail uses its `unshare` fallback.
 
 ```bash
-make test           # pytest, CPU only, sharded over TEST_WORKERS (default 8)
+make test           # fast pytest tier, CPU only, sharded over TEST_WORKERS (default 8)
+make test-slow       # slow CPU tier; also runs before seed-v4 GPU verification
 make lint           # ruff format --check and ruff check
 make typecheck      # basedpyright strict -- gating
 make jail-test      # episode jail containment plus its negative control
@@ -308,18 +309,21 @@ make canary-check   # checksum tripwire over code-execution surfaces
 make typecheck-ty   # ty -- advisory only
 ```
 
-- All five non-advisory gates must be green before "done". If a gate fails for reasons unrelated
-  to your change, fix it anyway.
+- All non-advisory gates, including `test-slow`, must be green before "done". Fix unrelated
+  gate failures too. The fast tier warns when unmarked tests exceed its time budget.
 - `make ci` runs `lint`, `typecheck` and `test` concurrently and is the gate before a commit;
   `jail-test` and `canary-check` run separately. `make lint typecheck` runs the cheap pair alone.
-- `make test-changed` runs only the tests reachable from changed directories
+- `make test-changed` includes slow tests reachable from changed directories
   (`scripts/test_changed.py`); it is an iteration gate, not the commit gate.
 - `make test-select ARGS=...` runs serially; add `-n` to `ARGS` for a wide selection.
+- `make test`, `make test-slow` and `make test-changed` set `HF_HUB_OFFLINE=1` and
+  `TRANSFORMERS_OFFLINE=1`; CPU tests must use local fixtures or cached model assets.
+- `make lint LINT_PATHS="path ..."` restricts formatting and lint checks to selected files.
 - Use `make test TEST_WORKERS=4` when the box is busy.
 - The type check is memory-heavy (one process per thread). Keep `TYPECHECK_THREADS` at its default
-  4 when anything else heavy is running. `make typecheck`, `make test` and `make test-changed` take a
+  4 when anything else heavy is running. `make typecheck`, `make test`, `make test-slow` and `make test-changed` take a
   box-wide `flock` under `/var/tmp`; never route around it.
-- `GATE_TMUX=1` (`make ci GATE_TMUX=1`) runs `test`, `test-changed` or `ci` in a detached tmux session
+- `GATE_TMUX=1` (`make ci GATE_TMUX=1`) runs `test`, `test-slow`, `test-changed` or `ci` in a detached tmux session
   logged to `/var/tmp/<name>.log`. The gate's status is the log's last line, `EXITCODE=<n>`.
 
 **System-Python scripts.** The Makefile calls `/usr/bin/python3` via `SYSTEM_PYTHON` so an active

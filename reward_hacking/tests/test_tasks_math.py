@@ -181,6 +181,7 @@ def _subprocess_jail(directory: Path, command: str, **_kwargs: object) -> Comman
         ("math_loose_checker", "loose", "multiple", 1, False),
     ],
 )
+@pytest.mark.slow
 def test_scripted_episodes_preserve_trusted_same_artifact_rewards(  # noqa: PLR0913, PLR0917 - parameterized behavior matrix
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

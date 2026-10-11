@@ -24,6 +24,7 @@ V4_TAXONOMY_VERSION = "hack_strategy_v4"
 
 
 @pytest.mark.corpus
+@pytest.mark.slow
 def test_episode_trace_replay_preserves_recorded_summaries_and_truth(
     seed_v4_corpus: Path,
 ) -> None:
@@ -174,6 +175,7 @@ def _require_documented_v4_unmeasured_difference(
 
 
 @pytest.mark.corpus
+@pytest.mark.slow
 def test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts(
     seed_v4_corpus: Path,
 ) -> None:
@@ -242,6 +244,7 @@ def test_record_labeler_reproduces_supported_taxonomies_and_resolves_artifacts(
 
 
 @pytest.mark.corpus
+@pytest.mark.slow
 def test_health_reports_real_unmeasured_fractions_and_default_breaches(
     seed_v4_corpus: Path,
     tmp_path: Path,
@@ -321,6 +324,7 @@ def test_health_reports_real_unmeasured_fractions_and_default_breaches(
 
 
 @pytest.mark.corpus
+@pytest.mark.slow
 def test_seed_v2_health_fails_when_artifact_is_available(
     seed_v4_corpus: Path,
     tmp_path: Path,
@@ -429,6 +433,7 @@ def test_ladder_runner_records_load_through_smoke_reader(seed_v4_corpus: Path) -
 
 
 @pytest.mark.corpus
+@pytest.mark.slow
 def test_episode_resume_identity_names_changed_hint_digest(seed_v4_corpus: Path) -> None:
     identities_with_hints = 0
     for corpus_record in _organism_episode_records(seed_v4_corpus):

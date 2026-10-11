@@ -30,9 +30,10 @@ listed under its destination, and the component that lost the module would never
 run. A deleted test file cannot run and is dropped; a deleted source file still selects its root.
 With nothing changed the target runs nothing and says so, exit 0.
 
-The run mirrors ``make test``: the Makefile sets ``RLVR_SMOKE=1`` around it, and pytest is sharded
-with xdist's ``--dist loadfile`` over ``--workers`` processes, capped at the number of selected
-test files so a two-file selection does not start eight workers to idle six of them.
+Reachable slow tests remain included. The CPU environment and sharding mirror ``make test``:
+the Makefile sets ``RLVR_SMOKE=1`` around it, and pytest uses xdist's ``--dist loadfile`` over
+``--workers`` processes, capped at the number of selected test files so a two-file selection
+does not start eight workers to idle six of them.
 """
 
 from __future__ import annotations

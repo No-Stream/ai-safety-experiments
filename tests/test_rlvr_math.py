@@ -393,6 +393,7 @@ def test_grpo_config_accepts_the_arguments_we_pass(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not os.getenv("RLVR_SMOKE"), reason="RLVR_SMOKE not set")
+@pytest.mark.slow
 def test_baseline_smoke_tiny_gpt2():
     """End-to-end CPU pass through the real transformers stack on a ~2 MB model.
 

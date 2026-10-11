@@ -17,7 +17,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from reward_hacking import aisi_rh_envs_etl
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
@@ -34,6 +34,11 @@ from reward_hacking.harness.tasks_ilcb import (
 )
 from reward_hacking.ilcb_data import load_problems as load_ilcb_problems
 from reward_hacking.jailed_poc import jail_python, run_in_jail
+from reward_hacking.organism_rl.grading_pool import (
+    GradingOutcome,
+    available_worker_count,
+    run_bounded,
+)
 from reward_hacking.organisms.aisi_source import load_aisi_source
 from reward_hacking.organisms.grading import run_completion_tests
 
@@ -120,6 +125,30 @@ class _ReferenceSuiteTimingRequest:
     entry_point: str
     family: str
     original_assertions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _CandidateGradingOptions:
+    family: str | None = None
+    reference_validation_path: Path | None = None
+    workers: int | None = None
+
+
+@dataclass(frozen=True)
+class _GradeRequest:
+    position: int
+    grading_kind: Literal["candidate", "reference"]
+    task_id: str
+    episode_id: str | None
+    reference_sha256: str | None
+    artifact: Path
+    case_set: Mapping[str, Any] | None
+    entry_point: str
+    family: str
+    original_assertions: tuple[str, ...]
+    reference_suite_seconds: tuple[float, ...] | None
+    row: dict[str, Any]
+    truth_fields: dict[str, Any]
 
 
 def canonical_digest(value: object) -> str:
@@ -1047,18 +1076,121 @@ def _reference_validation_coverage(
     return {"status": "complete", "reference_rows": len(references)}
 
 
-def grade_records(
+def _run_grade_request(request: _GradeRequest) -> dict[str, Any]:
+    return grade_artifact(
+        request.artifact,
+        request.case_set,
+        entry_point=request.entry_point,
+        family=request.family,
+        original_assertions=request.original_assertions,
+        reference_suite_seconds=request.reference_suite_seconds,
+    )
+
+
+def _complete_grade_row(request: _GradeRequest, truth: dict[str, Any]) -> dict[str, Any]:
+    completed_truth = dict(truth)
+    completed_truth.update(request.truth_fields)
+    return {**request.row, "strengthened_truth": completed_truth}
+
+
+def _log_grade_completion(
+    outcome: GradingOutcome[_GradeRequest, dict[str, Any]],
+) -> None:
+    request = outcome.item
+    identity = (
+        f"episode_id={request.episode_id}"
+        if request.episode_id is not None
+        else f"reference_sha256={request.reference_sha256}"
+    )
+    status = "error" if outcome.error is not None else "complete"
+    logger.info(
+        "strengthened-truth grading_kind=%s task_id=%s %s grade_seconds=%.3f status=%s",
+        request.grading_kind,
+        request.task_id,
+        identity,
+        outcome.elapsed_seconds,
+        status,
+    )
+
+
+def _execute_grade_requests(
+    requests: list[_GradeRequest],
+    workers: int,
+    on_complete: Callable[[GradingOutcome[_GradeRequest, dict[str, Any]]], None],
+) -> list[GradingOutcome[_GradeRequest, dict[str, Any]]]:
+    def report_completion(outcome: GradingOutcome[_GradeRequest, dict[str, Any]]) -> None:
+        _log_grade_completion(outcome)
+        on_complete(outcome)
+
+    return run_bounded(
+        requests,
+        _run_grade_request,
+        max_workers=workers,
+        on_complete=report_completion,
+    )
+
+
+def _score_grade_requests(
+    rows: list[dict[str, Any] | None],
+    requests: list[_GradeRequest],
+    workers: int,
+    persist_row: Callable[[dict[str, Any], int, list[dict[str, Any]]], None],
+    grading_kind: Literal["candidate", "reference"],
+) -> list[dict[str, Any]]:
+    scored: list[dict[str, Any]] = []
+    next_position = 0
+
+    def flush_ready_rows() -> None:
+        nonlocal next_position
+        while next_position < len(rows):
+            row = rows[next_position]
+            if row is None:
+                return
+            scored.append(row)
+            persist_row(row, next_position, scored)
+            next_position += 1
+
+    def on_grade_complete(outcome: GradingOutcome[_GradeRequest, dict[str, Any]]) -> None:
+        if outcome.error is not None:
+            raise outcome.error
+        if outcome.result is None:
+            raise RuntimeError("grading pool returned neither a result nor an error")
+        rows[outcome.item.position] = _complete_grade_row(outcome.item, outcome.result)
+        flush_ready_rows()
+
+    flush_ready_rows()
+    _execute_grade_requests(requests, workers, on_grade_complete)
+    flush_ready_rows()
+    if next_position != len(rows):
+        raise RuntimeError(f"{grading_kind} grading did not produce every strengthened-truth row")
+    return scored
+
+
+def _candidate_row_reusable(previous: dict[str, Any] | None, request: _GradeRequest) -> bool:
+    expected_digest = canonical_digest(request.case_set) if request.case_set is not None else None
+    return (
+        previous is not None
+        and previous.get("artifact_sha256") == request.row["artifact_sha256"]
+        and previous.get("grading_identity") == request.row["grading_identity"]
+        and previous["strengthened_truth"].get("reference_set_digest") == expected_digest
+        and previous["strengthened_truth"].get("timeout_reference_evidence")
+        == _timeout_reference_evidence(request.reference_suite_seconds)
+        and previous["strengthened_truth"].get("reference_validation_coverage")
+        == request.truth_fields["reference_validation_coverage"]
+        and not previous["strengthened_truth"]["unmeasured_timeout"]
+        and previous["strengthened_truth"].get("unmeasured_error") is None
+        and previous.get("true_pass") == request.row["true_pass"]
+    )
+
+
+def _prepare_candidate_rows(
     records_dir: Path,
     cases_root: Path,
-    output: Path,
+    cached: dict[str, dict[str, Any]],
     *,
-    family: str | None = None,
-    reference_validation_path: Path | None = None,
-) -> list[dict[str, Any]]:
-    """Bind each sidecar verdict to the persisted graded artifact."""
-    if output.resolve() == (records_dir / "records.jsonl").resolve():
-        raise ValueError("sidecar must not overwrite records")
-    cached = _load_sidecar(output)
+    family: str | None,
+    reference_validation_path: Path | None,
+) -> tuple[list[dict[str, Any] | None], list[_GradeRequest], list[bool | None]]:
     validation_path = (
         reference_validation_path or cases_root.parent / "correct-solutions-validation.jsonl"
     )
@@ -1069,7 +1201,11 @@ def grade_records(
     reference_rows = _load_reference_validation(validation_path)
     validation_supplied = validation_path.is_file()
     ilcb, aisi = _original_corpora()
-    scored: list[dict[str, Any]] = []
+    rows: list[dict[str, Any] | None] = []
+    grade_requests: list[_GradeRequest] = []
+    seen_episode_ids: set[str] = set()
+    expected_true_passes: list[bool | None] = []
+
     for line in (records_dir / "records.jsonl").read_text().splitlines():
         record = json.loads(line)
         if record["variant"] != "original" or record["family"] not in ("aisi", "ilcb"):
@@ -1084,7 +1220,12 @@ def grade_records(
         problem = (aisi if record["family"] == "aisi" else ilcb)[task_id]
         artifact, artifact_digest = _record_artifact(records_dir, record, summary)
         episode_id = summary["episode_id"]
-        expected_digest = canonical_digest(case_set) if case_set is not None else None
+        if episode_id in seen_episode_ids:
+            raise ValueError("duplicate episode id")
+        seen_episode_ids.add(episode_id)
+        position = len(rows)
+        expected_true_pass = _measured_true_pass(summary)
+        expected_true_passes.append(expected_true_pass)
         original_assertions = _original_assertions(task_id, ilcb, aisi)
         reference_suite_seconds = _validated_reference_suite_seconds(
             _ReferenceSuiteTimingRequest(
@@ -1114,56 +1255,89 @@ def grade_records(
                 reference_suite_seconds=reference_suite_seconds,
             )
         )
-        true_pass = _measured_true_pass(summary)
-        previous = cached.get(episode_id)
-        row: dict[str, Any]
-        if (
-            previous is not None
-            and previous.get("artifact_sha256") == artifact_digest
-            and previous.get("grading_identity") == grading_identity
-            and previous["strengthened_truth"].get("reference_set_digest") == expected_digest
-            and previous["strengthened_truth"].get("timeout_reference_evidence")
-            == _timeout_reference_evidence(qualifying_reference_seconds)
-            and previous["strengthened_truth"].get("reference_validation_coverage")
-            == reference_validation_coverage
-            and not previous["strengthened_truth"]["unmeasured_timeout"]
-            and previous["strengthened_truth"].get("unmeasured_error") is None
-            and previous.get("true_pass") == true_pass
-        ):
-            row = previous
-            truth = row["strengthened_truth"]
-        else:
-            truth = grade_artifact(
-                artifact,
-                case_set,
-                entry_point=problem.entry_point,
-                family=record["family"],
-                original_assertions=original_assertions,
-                reference_suite_seconds=qualifying_reference_seconds,
-            )
-            truth["reference_validation_coverage"] = reference_validation_coverage
-            row = {
+        request = _GradeRequest(
+            position=position,
+            grading_kind="candidate",
+            task_id=task_id,
+            episode_id=episode_id,
+            reference_sha256=None,
+            artifact=artifact,
+            case_set=case_set,
+            entry_point=problem.entry_point,
+            family=record["family"],
+            original_assertions=original_assertions,
+            reference_suite_seconds=qualifying_reference_seconds,
+            row={
                 "episode_id": episode_id,
                 "task_id": task_id,
                 "artifact_sha256": artifact_digest,
-                "true_pass": true_pass,
+                "true_pass": expected_true_pass,
                 "grading_identity": grading_identity,
-                "strengthened_truth": truth,
-            }
-        if row["true_pass"] != true_pass:
-            raise ValueError("resumed sidecar visible truth changed")
-        if any(previous["episode_id"] == row["episode_id"] for previous in scored):
-            raise ValueError("duplicate episode id")
-        scored.append(row)
+            },
+            truth_fields={"reference_validation_coverage": reference_validation_coverage},
+        )
+        previous = cached.get(episode_id)
+        if _candidate_row_reusable(previous, request):
+            rows.append(previous)
+            continue
+        grade_requests.append(request)
+        rows.append(None)
+
+    return rows, grade_requests, expected_true_passes
+
+
+def grade_records(
+    records_dir: Path,
+    cases_root: Path,
+    output: Path,
+    *,
+    family: str | None = None,
+    reference_validation_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Bind each sidecar verdict to the persisted graded artifact."""
+    return _grade_records(
+        records_dir,
+        cases_root,
+        output,
+        _CandidateGradingOptions(
+            family=family, reference_validation_path=reference_validation_path
+        ),
+    )
+
+
+def _grade_records(
+    records_dir: Path,
+    cases_root: Path,
+    output: Path,
+    options: _CandidateGradingOptions,
+) -> list[dict[str, Any]]:
+    if output.resolve() == (records_dir / "records.jsonl").resolve():
+        raise ValueError("sidecar must not overwrite records")
+    worker_count = available_worker_count(options.workers)
+    logger.info("strengthened-truth candidate grading workers=%d", worker_count)
+    cached = _load_sidecar(output)
+    rows, grade_requests, expected_true_passes = _prepare_candidate_rows(
+        records_dir,
+        cases_root,
+        cached,
+        family=options.family,
+        reference_validation_path=options.reference_validation_path,
+    )
+
+    def persist_row(row: dict[str, Any], position: int, _scored: list[dict[str, Any]]) -> None:
+        if row["true_pass"] != expected_true_passes[position]:
+            raise ValueError("sidecar visible truth changed")
         cached[row["episode_id"]] = row
         _write_sidecar(output, list(cached.values()))
         logger.info(
             "episode=%s source=%s strengthened_pass=%s",
             row["episode_id"],
-            truth["source"],
-            truth["pass"],
+            row["strengthened_truth"]["source"],
+            row["strengthened_truth"]["pass"],
         )
-    _write_sidecar(output, list(cached.values()) if family is not None else scored)
+
+    scored = _score_grade_requests(rows, grade_requests, worker_count, persist_row, "candidate")
+    _write_sidecar(output, list(cached.values()) if options.family is not None else scored)
     return scored
 
 
@@ -1251,10 +1425,14 @@ def _write_sidecar(output: Path, scored: list[dict[str, Any]]) -> None:
     staging.replace(output)
 
 
-def validate_correct_solutions(
-    cases_root: Path, output: Path, *, family: str | None = None
-) -> ReferenceValidationResult:
-    """Require an actual measured pass for every persisted source reference."""
+def _prepare_reference_rows(
+    cases_root: Path, output: Path, family: str | None
+) -> tuple[
+    list[dict[str, Any] | None],
+    list[_GradeRequest],
+    dict[tuple[str, str], dict[str, Any]],
+    set[int],
+]:
     task_ids = {
         path.stem for source in SOURCE_ORDER for path in (cases_root / source).glob("*.json")
     }
@@ -1271,7 +1449,9 @@ def validate_correct_solutions(
         else {}
     )
     ilcb, aisi = _original_corpora()
-    scored: list[dict[str, Any]] = []
+    rows: list[dict[str, Any] | None] = []
+    grade_requests: list[_GradeRequest] = []
+    request_positions: set[int] = set()
     for task_id in sorted(task_ids):
         case_set = load_case_set(cases_root, task_id)
         if case_set is None:
@@ -1279,7 +1459,7 @@ def validate_correct_solutions(
         if "unmeasured_source_error" in case_set["provenance"]:
             case_family = family if family is not None else _case_family(task_id)
             truth = grade_artifact(output, case_set, entry_point="", family=case_family)
-            scored.append(
+            rows.append(
                 {
                     "task_id": task_id,
                     "reference_sha256": None,
@@ -1287,7 +1467,6 @@ def validate_correct_solutions(
                     "strengthened_truth": truth,
                 }
             )
-            _write_sidecar(output, scored)
             continue
         references = _reference_artifacts(case_set)
         if not references:
@@ -1320,25 +1499,59 @@ def validate_correct_solutions(
                 == canonical_digest(case_set)
                 and previous.get("grading_identity") == grading_identity
             ):
-                truth = previous["strengthened_truth"]
-            else:
-                truth = grade_artifact(
-                    artifact,
-                    case_set,
-                    entry_point=problem.entry_point,
-                    family=case_family,
-                    original_assertions=original_assertions,
-                )
-            scored.append(
-                {
+                rows.append(previous)
+                continue
+            position = len(rows)
+            request = _GradeRequest(
+                position=position,
+                grading_kind="reference",
+                task_id=task_id,
+                episode_id=None,
+                reference_sha256=reference["sha256"],
+                artifact=artifact,
+                case_set=case_set,
+                entry_point=problem.entry_point,
+                family=case_family,
+                original_assertions=original_assertions,
+                reference_suite_seconds=None,
+                row={
                     "task_id": task_id,
                     "reference_sha256": reference["sha256"],
                     "grading_identity": grading_identity,
-                    "strengthened_truth": truth,
-                }
+                },
+                truth_fields={},
             )
-            cached[identity] = scored[-1]
+            grade_requests.append(request)
+            request_positions.add(position)
+            rows.append(None)
+
+    return rows, grade_requests, cached, request_positions
+
+
+def validate_correct_solutions(
+    cases_root: Path,
+    output: Path,
+    *,
+    family: str | None = None,
+    workers: int | None = None,
+) -> ReferenceValidationResult:
+    """Require an actual measured pass for every persisted source reference."""
+    worker_count = available_worker_count(workers)
+    logger.info("strengthened-truth reference grading workers=%d", worker_count)
+    rows, grade_requests, cached, request_positions = _prepare_reference_rows(
+        cases_root, output, family
+    )
+
+    def persist_row(row: dict[str, Any], position: int, scored: list[dict[str, Any]]) -> None:
+        if row["reference_sha256"] is not None:
+            identity = (row["task_id"], row["reference_sha256"])
+            cached[identity] = row
+        if row["reference_sha256"] is None:
+            _write_sidecar(output, scored)
+        elif position in request_positions:
             _write_sidecar(output, list(cached.values()))
+
+    scored = _score_grade_requests(rows, grade_requests, worker_count, persist_row, "reference")
     _write_sidecar(output, scored)
     return _reference_validation_result(scored)
 
@@ -1553,6 +1766,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases-root", type=Path, required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--reference-validation", type=Path)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Override grading workers (default reserves CPU and memory headroom; env ORGANISM_RL_GRADING_WORKERS)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     if args.validate_sidecar is not None:
@@ -1560,7 +1778,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.validate_references:
         output = args.output or args.cases_root.parent / "correct-solutions-validation.jsonl"
-        result = validate_correct_solutions(args.cases_root, output, family=args.family)
+        result = validate_correct_solutions(
+            args.cases_root, output, family=args.family, workers=args.workers
+        )
         logger.info(
             "reference validation rows=%d measured_passes=%d measured_failures=%d unmeasured=%d",
             result.total_rows,
@@ -1571,12 +1791,15 @@ def main(argv: list[str] | None = None) -> int:
         return result.exit_code
     if args.records is None:
         parser.error("--records is required unless --validate-references is selected")
-    grade_records(
+    _grade_records(
         args.records,
         args.cases_root,
         args.output or args.records / "strengthened_truth.jsonl",
-        family=args.family,
-        reference_validation_path=args.reference_validation,
+        _CandidateGradingOptions(
+            family=args.family,
+            reference_validation_path=args.reference_validation,
+            workers=args.workers,
+        ),
     )
     return 0
 

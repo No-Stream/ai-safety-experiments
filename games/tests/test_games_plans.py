@@ -127,6 +127,7 @@ class TestThePlanSkeletonStaysCheapToImport:
         for module in ("games.contrast_pair_sequence", "games.nine_b_sequence"):
             assert imported_training_stack(module) == [], module
 
+    @pytest.mark.slow
     def test_the_same_probe_would_notice_the_stack_if_it_were_there(self) -> None:
         """The negative control: the probe has to be able to fail, or it proves nothing."""
         assert imported_training_stack("games.train") != []

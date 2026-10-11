@@ -212,6 +212,7 @@ def test_seed_v2_health_assert_names_gate_breaches_against_base(
     not BASE_RECORDS.is_file() or not SEED_V3_ROOT.is_dir(),
     reason="local seed-v3 and base artifacts are not present",
 )
+@pytest.mark.slow
 def test_seed_v3_health_assert_passes_against_base(tmp_path: Path) -> None:
     seed_v3_records = sorted(SEED_V3_ROOT.glob("*/records.jsonl"))
     assert len(seed_v3_records) == 3
@@ -258,10 +259,20 @@ def test_seed_v3_health_assert_passes_against_base(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("records_path", "expected_unmeasured_by_family", "expected_overall_unmeasured_count"),
     [
-        (BASE_RECORDS, {"aisi": (1, 24), "ilcb": (2, 24)}, 3),
-        (SEED_V3_CODING_RECORDS, {"aisi": (0, 24), "ilcb": (2, 24)}, 2),
+        pytest.param(
+            BASE_RECORDS,
+            {"aisi": (1, 24), "ilcb": (2, 24)},
+            3,
+            id="evalA-base",
+        ),
+        pytest.param(
+            SEED_V3_CODING_RECORDS,
+            {"aisi": (0, 24), "ilcb": (2, 24)},
+            2,
+            id="minimal-seedv3c34-coding",
+            marks=pytest.mark.slow,
+        ),
     ],
-    ids=("evalA-base", "minimal-seedv3c34-coding"),
 )
 def test_real_records_report_and_assert_unmeasured_evaluated_truth(
     records_path: Path,

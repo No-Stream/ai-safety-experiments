@@ -15,7 +15,7 @@ import pytest
 import torch
 
 import games.deltanet_kernels as kernels
-from games import preflight
+from games import deltanet_metadata, preflight
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -37,6 +37,11 @@ def run_in_fresh_interpreter(snippet: str) -> subprocess.CompletedProcess[str]:
 
 
 class TestCausalConvKernelResolution:
+    def test_preflight_reexports_the_lightweight_deltanet_metadata(self) -> None:
+        assert preflight.DELTANET_KERNEL_FUNCTIONS is deltanet_metadata.DELTANET_KERNEL_FUNCTIONS
+        assert preflight.deltanet_kernel_paths is deltanet_metadata.deltanet_kernel_paths
+
+    @pytest.mark.slow
     def test_the_bridge_binds_both_model_wrappers_to_the_repo_shims(self) -> None:
         result = run_in_fresh_interpreter(
             """
@@ -59,6 +64,7 @@ class TestCausalConvKernelResolution:
             in result.stdout
         )
 
+    @pytest.mark.slow
     def test_preflight_reports_the_actual_bound_mapping_after_the_bridge(self) -> None:
         result = run_in_fresh_interpreter(
             """
@@ -71,6 +77,7 @@ class TestCausalConvKernelResolution:
         )
         assert result.returncode == 0, result.stderr
 
+    @pytest.mark.slow
     def test_a_repeat_bridge_call_rejects_a_wrapper_rebound_to_the_torch_fallback(self) -> None:
         """Sabotage after bridging; idempotence must verify the binding instead of repairing it."""
         result = run_in_fresh_interpreter(

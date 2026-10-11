@@ -93,7 +93,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
-from games.preflight import deltanet_kernel_paths
+from games.deltanet_metadata import deltanet_kernel_paths
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -502,7 +502,7 @@ def bridge_and_check_decode_kernel() -> dict[str, object]:
 def bound_deltanet_kernels() -> dict[str, str]:
     """Return what each Gated DeltaNet kernel function is ACTUALLY bound to, off the modeling module.
 
-    Before the modeling module loads, `games.preflight.deltanet_kernel_paths` predicts what
+    Before the modeling module loads, `games.deltanet_metadata.deltanet_kernel_paths` predicts what
     transformers would resolve; afterwards it delegates here to read what did bind. An alias registered after
     `modeling_qwen3_5` was imported changes the prediction and nothing about the wrapper transformers
     calls, which still closes over the pure-torch loop. Each wrapper `use_kernel_func_from_hub_with_

@@ -138,6 +138,19 @@ def _evala_rescore_sidecar(
     return sidecar_rows, expected_methods
 
 
+def _reward_read_as_record_schema_3(reward: Mapping[str, Any]) -> dict[str, Any]:
+    """The evalA sidecar predates record schema 3, which stores unmeasured truth as None.
+
+    The manifest lists that schema pair as compatible; this applies the same legacy rule to the
+    sidecar's reward evidence so the comparison with a fresh replay stays exact elsewhere.
+    """
+    evidence = cast("dict[str, Any]", reward["evidence"])
+    if evidence["true_measured"] is not False:
+        return dict(reward)
+    assert evidence["true_pass"] in (False, None)
+    return {**reward, "evidence": {**evidence, "true_pass": None}}
+
+
 def test_evala_rescore_requires_a_completed_sidecar(tmp_path: Path) -> None:
     with pytest.raises(AssertionError, match="requires its completed rescore sidecar"):
         _evala_rescore_sidecar(tmp_path, [])
@@ -248,7 +261,9 @@ def test_evala_rescore_replays_a_runtime_selected_subset_and_resumes(
             assert rescore_metadata.get("artifact_verification") == expected_metadata.get(
                 "artifact_verification"
             )
-            assert record["organism_reward"] == real_rows[episode_id]["organism_reward"]
+            assert record["organism_reward"] == _reward_read_as_record_schema_3(
+                real_rows[episode_id]["organism_reward"]
+            )
             if rescore_metadata["method"] == "jailed_command_replay":
                 assert rescore_metadata["artifact_verification"] == "verified"
                 assert isinstance(rescore_metadata["rebuilt_artifact_sha256"], str)

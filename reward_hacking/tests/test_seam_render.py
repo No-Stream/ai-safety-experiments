@@ -1028,6 +1028,7 @@ def _render_first_turn(
     return tuple(messages), tuple(listing)
 
 
+@pytest.mark.slow
 def test_task_registry_laydown_matches_real_corpus_listing(seed_v4_corpus: Path) -> None:
     from reward_hacking.harness.loop import lay_down_task  # noqa: PLC0415 - local case files
     from reward_hacking.harness.task_spec import (  # noqa: PLC0415
@@ -1092,6 +1093,7 @@ def test_task_registry_laydown_matches_real_corpus_listing(seed_v4_corpus: Path)
                 )
 
 
+@pytest.mark.slow
 def test_first_turn_render_matches_every_real_corpus_record(seed_v4_corpus: Path) -> None:
     from reward_hacking.harness.loop import lay_down_task  # noqa: PLC0415 - local case files
     from reward_hacking.harness.task_spec import (  # noqa: PLC0415

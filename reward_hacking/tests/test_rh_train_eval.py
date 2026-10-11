@@ -798,6 +798,7 @@ class TestCli:
 
 @needs_jail
 class TestEndToEnd:
+    @pytest.mark.slow
     def test_one_episode_per_split_runs_through_the_jail_and_lands_in_its_own_trace(
         self, partition: HeldOutPartition, tmp_path: Path
     ):

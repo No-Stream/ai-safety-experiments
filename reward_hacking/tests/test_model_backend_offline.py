@@ -988,6 +988,7 @@ class TestVllmStopReasonTranslation:
         assert model_backend._vllm_stop_reason(finish_reason, matched_stop) == expected
 
 
+@pytest.mark.slow
 def test_module_load_does_not_import_vllm() -> None:
     """Anti-goal guard: vllm is imported lazily inside its backend, never at module load.
 

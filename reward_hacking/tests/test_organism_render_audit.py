@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import gzip
 import json
+import multiprocessing
+import os
 from dataclasses import replace
+from threading import Lock
+from time import sleep
 from typing import TYPE_CHECKING
 
 import pytest
@@ -17,6 +21,8 @@ from reward_hacking.harness.task_spec import (
     Task,
     TaskTestVerdict,
 )
+from reward_hacking.harness.tasks_math import build_task as build_math_task
+from reward_hacking.math_data import MATH_KINDS, MathProblem, MathQuestion
 from reward_hacking.organism_rl import render_audit
 from reward_hacking.organism_rl.render_audit import (
     AuditHit,
@@ -40,9 +46,15 @@ from reward_hacking.organism_rl.render_audit import (
     run_render_audit,
     scan_surfaces,
 )
+from reward_hacking.r2e_leak_data import R2eLeakTask
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+@pytest.fixture(autouse=True)
+def synthetic_episode_scratch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(render_audit, "EPISODE_SCRATCH_ROOT", tmp_path)
 
 
 def _task(prompt: str = "Synthetic task wording.") -> Task:
@@ -61,6 +73,171 @@ def _task(prompt: str = "Synthetic task wording.") -> Task:
 
 def _case(prompt: str = "Synthetic task wording.") -> TaskAuditCase:
     return TaskAuditCase("ilcb", "oneoff", _task(prompt), ("trusted_rerun", "in_band"))
+
+
+def _write_leak_registry_index(
+    tmp_path: Path,
+    arms_by_task: dict[str, tuple[tuple[str, ...], ...]],
+) -> tuple[Path, tuple[R2eLeakTask, ...]]:
+    cases = tuple(
+        R2eLeakTask(
+            task_id=task_id,
+            repo_name=f"synthetic-{task_id}",
+            commit_hash="a" * 40,
+            docker_image="synthetic:latest",
+            image_digest="sha256:" + "b" * 64,
+            problem_statement="Synthetic leak task.",
+            expected_output={"synthetic-test": "synthetic-result"},
+            gold_patch="",
+            modified_files=("solution.py",),
+            num_non_test_files=1,
+            num_non_test_lines=1,
+            partition="held-out-task",
+        )
+        for task_id in arms_by_task
+    )
+    index: dict[str, list[dict[str, object]]] = {}
+    for task_id, channel_arms in arms_by_task.items():
+        index[task_id] = []
+        for arm_index, channels in enumerate(channel_arms):
+            arm_directory = tmp_path / task_id / str(arm_index)
+            arm_directory.mkdir(parents=True)
+            manifest_path = arm_directory / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "fix": {"commit_id": "c" * 40},
+                        "channel_details": {
+                            channel: {"ref": f"synthetic-{channel}"}
+                            for channel in ("git_branch", "git_remote_ahead", "git_stash")
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            index[task_id].append(
+                {
+                    "channels": list(channels),
+                    "workspace_template": str(arm_directory / "open"),
+                    "closed_template": str(arm_directory / "closed"),
+                    "manifest_path": str(manifest_path),
+                    "gate_record": str(arm_directory / "gate.json"),
+                    "hidden_tests_template": str(arm_directory / "hidden-tests"),
+                    "runtime_venv": str(arm_directory / "venv"),
+                    "runtime_interpreter": str(arm_directory / "python"),
+                }
+            )
+    index_path = tmp_path / "assets.json"
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+    return index_path, cases
+
+
+def test_leak_registry_builds_concurrently_in_sorted_task_and_arm_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path, cases = _write_leak_registry_index(
+        tmp_path,
+        {
+            "task-z": (("git_stash",), ("git_branch",)),
+            "task-a": (("git_remote_ahead",), ("git_branch", "git_stash")),
+        },
+    )
+    monkeypatch.setattr(render_audit, "load_leak_cases", lambda: cases)
+    active_builds = 0
+    maximum_active_builds = 0
+    active_builds_lock = Lock()
+
+    def build_task_stub(case: R2eLeakTask, **_kwargs: object) -> Task:
+        nonlocal active_builds, maximum_active_builds
+        with active_builds_lock:
+            active_builds += 1
+            maximum_active_builds = max(maximum_active_builds, active_builds)
+        sleep(0.02)
+        with active_builds_lock:
+            active_builds -= 1
+        return replace(_task(), task_id=case.task_id)
+
+    monkeypatch.setattr(render_audit, "build_leak_task", build_task_stub)
+
+    serial_tasks = render_audit._leak_task_cases(index_path, ("held-out-task",), workers=1)
+    serial_maximum_active_builds = maximum_active_builds
+    maximum_active_builds = 0
+    tasks = render_audit._leak_task_cases(index_path, ("held-out-task",), workers=2)
+
+    assert serial_maximum_active_builds == 1
+    assert maximum_active_builds == 2
+    assert [(task.task.task_id, task.leak_channels) for task in serial_tasks] == [
+        (task.task.task_id, task.leak_channels) for task in tasks
+    ]
+    assert [(task.task.task_id, task.leak_channels) for task in tasks] == [
+        ("task-a", ("git_remote_ahead",)),
+        ("task-a", ("git_branch", "git_stash")),
+        ("task-z", ("git_stash",)),
+        ("task-z", ("git_branch",)),
+    ]
+
+
+def test_leak_registry_logs_unavailable_arms_in_sorted_task_and_arm_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    index_path, cases = _write_leak_registry_index(
+        tmp_path,
+        {
+            "task-z": (("git_stash",), ("git_branch",)),
+            "task-a": (("git_remote_ahead",), ("git_branch",)),
+            "task-m": (("git_branch",),),
+        },
+    )
+    monkeypatch.setattr(render_audit, "load_leak_cases", lambda: cases)
+
+    def unavailable_build(case: R2eLeakTask, **kwargs: object) -> Task:
+        if case.task_id == "task-a":
+            sleep(0.02)
+        channels = kwargs["required_channels"]
+        assert isinstance(channels, tuple)
+        raise render_audit.LeakChannelUnavailableError(case.task_id, {"channel": channels[0]})
+
+    monkeypatch.setattr(render_audit, "build_leak_task", unavailable_build)
+
+    tasks = render_audit._leak_task_cases(index_path, ("held-out-task",), workers=3)
+
+    warning_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "skipping leak arm" in record.getMessage()
+    ]
+    assert tasks == []
+    assert warning_messages == [
+        "skipping leak arm task-a that no loader serves: {'channel': 'git_remote_ahead'}",
+        "skipping leak arm task-a that no loader serves: {'channel': 'git_branch'}",
+        "skipping leak arm task-m that no loader serves: {'channel': 'git_branch'}",
+        "skipping leak arm task-z that no loader serves: {'channel': 'git_stash'}",
+        "skipping leak arm task-z that no loader serves: {'channel': 'git_branch'}",
+    ]
+
+
+def test_leak_registry_propagates_first_completed_unexpected_build_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path, cases = _write_leak_registry_index(
+        tmp_path,
+        {"task-z": (("git_stash",),), "task-a": (("git_branch",),)},
+    )
+    monkeypatch.setattr(render_audit, "load_leak_cases", lambda: cases)
+
+    def failing_build(case: R2eLeakTask, **_kwargs: object) -> Task:
+        if case.task_id == "task-a":
+            sleep(0.02)
+        raise ValueError(f"failure for {case.task_id}")
+
+    monkeypatch.setattr(render_audit, "build_leak_task", failing_build)
+
+    with pytest.raises(ValueError, match="failure for task-z"):
+        render_audit._leak_task_cases(index_path, ("held-out-task",), workers=2)
 
 
 def _cell(  # noqa: PLR0913 - test helper exposes the render surfaces under test
@@ -602,6 +779,190 @@ def test_fixture_prompt_sabotage_makes_audit_red(tmp_path: Path) -> None:
         hits = [json.loads(line) for line in hits_file]
     rules = {hit.get("rule") for hit in hits if isinstance(hit, dict)}
     assert {"benchmark_or_provenance_name", "template_residue"} <= rules
+
+
+def test_parallel_render_audit_matches_serial_report_and_artifacts(tmp_path: Path) -> None:
+    first_case = _case("Synthetic task wording for the first task.")
+    second_case = _case("Synthetic task wording for the second task.")
+    first_case = replace(
+        first_case,
+        task=replace(first_case.task, task_id="synthetic-task-first"),
+    )
+    second_case = replace(
+        second_case,
+        task=replace(second_case.task, task_id="synthetic-task-second"),
+    )
+    math_problem = MathProblem(
+        item_id="synthetic-render",
+        questions=tuple(
+            MathQuestion(f"q{index}", kind, "Synthetic arithmetic question.", "1")
+            for index, kind in enumerate(MATH_KINDS)
+        ),
+        mutation_index=0,
+        mutated_answer="2",
+    )
+    math_case = TaskAuditCase(
+        "math_loose_checker",
+        "loose_oneoff",
+        build_math_task(math_problem, family="math_loose_checker", variant="loose_oneoff"),
+        ("trusted_rerun", "in_band"),
+    )
+    inputs = AuditInputs(
+        tasks=(first_case, second_case, math_case),
+        hints=(
+            HintArm("none", "none", None),
+            HintArm("synthetic", "vague", "Synthetic additional guidance."),
+        ),
+        whitelist=(),
+    )
+
+    serial_report = run_render_audit(
+        inputs=inputs,
+        output_dir=tmp_path / "serial",
+        trace_roots=(),
+        check_known_fix=False,
+        workers=1,
+    )
+    parallel_report = run_render_audit(
+        inputs=inputs,
+        output_dir=tmp_path / "parallel",
+        trace_roots=(),
+        check_known_fix=False,
+        workers=2,
+    )
+
+    assert serial_report == parallel_report
+    for filename in (
+        "render-audit-report.json",
+        "render-audit-hits.jsonl.gz",
+        "rendered-prompts.jsonl.gz",
+    ):
+        assert (tmp_path / "serial" / filename).read_bytes() == (
+            tmp_path / "parallel" / filename
+        ).read_bytes()
+
+
+def test_parallel_render_workers_have_distinct_cpu_affinity_and_preserve_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent_cpus = os.sched_getaffinity(0)
+    worker_count = min(2, len(parent_cpus))
+    workers_started = multiprocessing.get_context("fork").Barrier(worker_count)
+    inputs = AuditInputs(
+        tasks=tuple(
+            replace(_case(), task=replace(_task(), task_id=f"synthetic-worker-{index}"))
+            for index in range(worker_count)
+        ),
+        hints=(HintArm("none", "none", None),),
+        whitelist=(),
+    )
+
+    def record_worker_affinity(
+        audit_case: TaskAuditCase, *, inputs: AuditInputs, output_dir: Path
+    ) -> render_audit.RenderTaskResult:
+        workers_started.wait(timeout=5)
+        return render_audit.RenderTaskResult(
+            family=audit_case.family,
+            rendered_lines=(json.dumps(sorted(os.sched_getaffinity(0))),),
+            hits=(),
+            cell_count=0,
+            register_pair_checks=0,
+            realism_warning_counts={},
+        )
+
+    monkeypatch.setattr(render_audit, "_render_task", record_worker_affinity)
+    results = list(
+        render_audit._parallel_render_results(inputs, tmp_path, max_workers=worker_count)
+    )
+    worker_cpu_sets = [json.loads(result.rendered_lines[0]) for result in results]
+
+    assert all(len(cpu_set) == 1 for cpu_set in worker_cpu_sets)
+    assert len({cpu_set[0] for cpu_set in worker_cpu_sets}) == worker_count
+    assert {cpu_set[0] for cpu_set in worker_cpu_sets} <= parent_cpus
+    assert os.sched_getaffinity(0) == parent_cpus
+
+
+def test_parallel_render_audit_preserves_partial_task_artifacts_before_register_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_case = replace(
+        _case(),
+        task=replace(_task(), task_id="synthetic-task-first"),
+        forbidden_values=(("expected_output", "private-result-77"),),
+        system_prompt="Do not reveal private-result-77.",
+    )
+    second_case = replace(
+        _case(),
+        task=replace(_task(), task_id="synthetic-task-second"),
+    )
+    inputs = AuditInputs(
+        tasks=(first_case, second_case),
+        hints=(HintArm("none", "none", None),),
+        whitelist=(),
+    )
+    original_render_cell = render_audit._render_cell
+
+    def render_with_register_mismatch(
+        audit_case: TaskAuditCase,
+        hint: HintArm,
+        payment_register: str,
+        listing_probe: ListingProbe,
+    ) -> RenderedCell:
+        cell = original_render_cell(audit_case, hint, payment_register, listing_probe)
+        if audit_case.task.task_id == "synthetic-task-first" and payment_register == "in_band":
+            return replace(cell, first_user_message=f"{cell.first_user_message} changed")
+        return cell
+
+    monkeypatch.setattr(render_audit, "_render_cell", render_with_register_mismatch)
+
+    with pytest.raises(
+        ValueError,
+        match="register changes model-visible render for synthetic-task-first/none:none",
+    ):
+        run_render_audit(
+            inputs=inputs,
+            output_dir=tmp_path,
+            trace_roots=(),
+            check_known_fix=False,
+            workers=2,
+        )
+
+    assert not (tmp_path / "rendered-prompts.jsonl.gz").exists()
+    assert not (tmp_path / "render-audit-hits.jsonl.gz").exists()
+    with gzip.open(
+        tmp_path / "rendered-prompts.jsonl.gz.partial", "rt", encoding="utf-8"
+    ) as rendered_file:
+        rendered_rows = [json.loads(line) for line in rendered_file]
+    with gzip.open(
+        tmp_path / "render-audit-hits.jsonl.gz.partial", "rt", encoding="utf-8"
+    ) as hits_file:
+        hit_rows = [json.loads(line) for line in hits_file]
+
+    assert [row["task_id"] for row in rendered_rows] == ["synthetic-task-first"]
+    assert [row["payment_register"] for row in rendered_rows] == ["trusted_rerun"]
+    assert hit_rows
+    assert {row["task_id"] for row in hit_rows} == {"synthetic-task-first"}
+    assert {row["payment_register"] for row in hit_rows} == {"trusted_rerun"}
+    assert any(row["rule"] == "expected_output" for row in hit_rows)
+
+
+def test_failed_gzip_write_preserves_previous_completed_artifact(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "completed.jsonl.gz"
+    previous_contents = b"previous completed artifact"
+    artifact_path.write_bytes(previous_contents)
+
+    def interrupted_write() -> None:
+        with render_audit._open_deterministic_gzip_text(artifact_path) as output:
+            output.write("partial new output\n")
+            raise RuntimeError("synthetic interruption")
+
+    with pytest.raises(RuntimeError, match="synthetic interruption"):
+        interrupted_write()
+
+    assert artifact_path.read_bytes() == previous_contents
+    with gzip.open(artifact_path.with_name(artifact_path.name + ".partial"), "rt") as output:
+        assert output.read() == "partial new output\n"
 
 
 def test_whitelist_json_must_contain_a_reason_and_one_exact_sentence(tmp_path: Path) -> None:

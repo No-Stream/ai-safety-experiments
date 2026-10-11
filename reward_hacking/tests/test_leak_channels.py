@@ -866,6 +866,7 @@ def test_closed_template_has_no_history_or_cache_leaks(
     assert all(probe_closed(closed_dir, manifest, channel) for channel in CHANNELS)
 
 
+@pytest.mark.slow
 def test_cli_build_writes_manifest_and_required_schema(
     tmp_path: Path, synthetic_repo: tuple[Path, dict[str, Any]]
 ) -> None:

@@ -26,18 +26,20 @@ whatever training derived about `<think>` and `reasoning_effort` has to be what 
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
-import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import pyarrow.parquet as pq
 from transformers import AutoTokenizer, GenerationConfig
 
+from games import deltanet_metadata
 from grpo.throughput import summarize_lora
+
+DELTANET_KERNEL_FUNCTIONS = deltanet_metadata.DELTANET_KERNEL_FUNCTIONS
+deltanet_kernel_paths = deltanet_metadata.deltanet_kernel_paths
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -558,73 +560,6 @@ def repair_scalar_eos(tokenizer: PreTrainedTokenizerBase, model_id: str) -> dict
         "eos_token_id_after": tokenizer.eos_token_id,
         "reason": "picked the declared stop token that is not the pad token",
     }
-
-
-# The DeltaNet kernel functions transformers looks for, and where it looks. Names and lookup order
-# read out of transformers 5.15.0's `use_kernel_func_from_hub_with_fallback`, whose priority is
-# Hub kernels (needing the `kernels` distribution), then the named local package, then torch.
-DELTANET_KERNEL_FUNCTIONS = (
-    ("chunk_gated_delta_rule", "fla"),
-    ("recurrent_gated_delta_rule", "fla"),
-    ("causal_conv1d_fn", "causal_conv1d"),
-    ("causal_conv1d_update", "causal_conv1d"),
-)
-
-
-def deltanet_kernel_paths() -> dict[str, str]:
-    """Report which implementation each Gated DeltaNet kernel function will actually use.
-
-    Installed is not engaged, and transformers falls back SILENTLY: an absent package, or a package
-    whose export names do not match what transformers looks for, leaves the slow torch path in place
-    with nothing in the log. Three quarters of the Qwen3.5 stack is DeltaNet, so that difference is
-    most of a run's wall clock, and a run that was slow for this reason should say so in its own
-    artifacts rather than being re-litigated later.
-
-    Verified on this box 2026-08-17: with flash-linear-attention present, `chunk_gated_delta_rule`
-    resolves to `fla.ops.gated_delta_rule.chunk` (the chunked prefill and training path) while
-    `recurrent_gated_delta_rule` does NOT, because fla exports it as
-    `fused_recurrent_gated_delta_rule` and transformers looks for the unprefixed name.
-    `games.deltanet_kernels.bridge_decode_kernel` closes that gap; call it before any Qwen3.5 model
-    loads, and this function is how a run records which path it got.
-
-    What the fallback costs was measured on this box's L4 with Qwen3.5-2B in bf16 (2026-08-18):
-    1.08x at 8 sequences, 1.52x at 32, 1.94x at 64 -- it scales with the number of sequences
-    decoding together rather than with completion length, because at decode the fallback runs one
-    loop iteration over batch x heads x K x V and is launch-bound until that has real work to do.
-    """
-    # Explicitly redecorated conv wrappers differ from the package registry's prediction.
-    if "transformers.models.qwen3_5.modeling_qwen3_5" in sys.modules:
-        from games.deltanet_kernels import (  # noqa: PLC0415 - avoid import cycle
-            bound_deltanet_kernels,
-        )
-
-        return bound_deltanet_kernels()
-
-    # Reaching into transformers' private kernel registry, deliberately: there is no public way to
-    # ask "which implementation will this kernel function actually use", and the alternative is
-    # believing a silent fallback. Pinned transformers, so a rename surfaces here rather than in a
-    # wrong step time.
-    from transformers.integrations.hub_kernels import (  # noqa: PLC0415
-        _KERNELS_INTERNAL_PATH_MAPPINGS,  # pyright: ignore[reportPrivateUsage]
-        resolve_internal_import,  # pyright: ignore[reportPrivateImportUsage]
-    )
-
-    paths: dict[str, str] = {}
-    for function_name, package in DELTANET_KERNEL_FUNCTIONS:
-        internal = _KERNELS_INTERNAL_PATH_MAPPINGS.get(function_name)
-        full = function_name if internal is None else f"{internal}.{function_name}"
-        try:
-            module = importlib.import_module(package)
-        except ImportError:
-            paths[function_name] = f"torch fallback ({package} absent)"
-            continue
-        resolved = resolve_internal_import(module, full)
-        paths[function_name] = (
-            f"{resolved.__module__}.{resolved.__name__}"
-            if resolved is not None
-            else f"torch fallback ({package} has no {full})"
-        )
-    return paths
 
 
 def log_deltanet_kernel_paths(*, expected_linear_attention_layers: int) -> dict[str, str]:

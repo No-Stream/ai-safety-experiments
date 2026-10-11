@@ -234,6 +234,7 @@ def falling(planted_root: Path) -> Any:
 
 
 class TestPlantedTrajectory:
+    @pytest.mark.slow
     def test_the_axis_is_found_where_it_was_planted(self, climbing: Any) -> None:
         group = climbing
         planted = [
@@ -245,6 +246,7 @@ class TestPlantedTrajectory:
         assert all(read.clears_null for read in planted)
         assert group.peak_layer == PLANTED_LAYER
 
+    @pytest.mark.slow
     def test_a_noise_layer_does_not_clear_its_placebo(self, climbing: Any) -> None:
         """The other half of "found where it was planted": nothing to find at the unplanted layer."""
         group = climbing
@@ -255,6 +257,7 @@ class TestPlantedTrajectory:
         )
         assert not noise.beats_placebo
 
+    @pytest.mark.slow
     def test_drift_falls_as_the_planted_axis_rotates(self, climbing: Any) -> None:
         group = climbing
         by_step = {read.step: read for read in group.drift_reads if read.layer == PLANTED_LAYER}
@@ -263,6 +266,7 @@ class TestPlantedTrajectory:
         assert cosines == sorted(cosines, reverse=True)
         assert by_step[30].cosine_to_anchor < 0.9
 
+    @pytest.mark.slow
     def test_the_drift_floor_and_ceiling_are_reported(self, climbing: Any) -> None:
         """A cosine of 0.85 means nothing without the placebo floor and the split-half ceiling."""
         group = climbing
@@ -275,6 +279,7 @@ class TestPlantedTrajectory:
         assert 0.5 < anchor.anchor_split_half_cosine <= 1.0
         assert anchor.norm_ratio == pytest.approx(1.0)
 
+    @pytest.mark.slow
     def test_the_held_out_projection_gap_tracks_the_planted_amplitude(self, climbing: Any) -> None:
         """Against the planted *projection*, and attenuated: the anchor axis is itself an estimate.
 
@@ -298,12 +303,14 @@ class TestPlantedTrajectory:
         for gap, expected in zip(gaps, planted, strict=True):
             assert 0.6 * expected < gap <= expected
 
+    @pytest.mark.slow
     def test_the_placebo_projection_gap_stays_at_the_floor(self, climbing: Any) -> None:
         group = climbing
         for read in group.drift_reads:
             if read.layer == PLANTED_LAYER:
                 assert abs(read.heldout_projection_gap_placebo) < abs(read.heldout_projection_gap)
 
+    @pytest.mark.slow
     def test_a_falling_arm_crosses_zero(self, falling: Any) -> None:
         """The behavioural analogue: one arm's separation reverses sign rather than just shrinking."""
         group = falling
@@ -315,6 +322,7 @@ class TestPlantedTrajectory:
         assert by_step[0] > 0
         assert by_step[30] < 0
 
+    @pytest.mark.slow
     def test_the_anchor_leads_the_series(self, planted_root: Path) -> None:
         ladder = load_ladder(planted_root)
         series = arm_series(ladder, "climbing-arm")
@@ -327,6 +335,7 @@ class TestPlantedTrajectory:
         assert analysis_arms(ladder) == ("climbing-arm", "falling-arm")
 
 
+@pytest.mark.slow
 class TestCrossArm:
     def test_the_gap_difference_carries_the_divergence(self, climbing: Any, falling: Any) -> None:
         groups = {
@@ -433,6 +442,7 @@ class TestReportArtifacts:
         )
         return path
 
+    @pytest.mark.slow
     def test_the_cli_writes_a_report_and_directions(self, tmp_path: Path) -> None:
         stimuli = make_stimuli()
         capture_root = tmp_path / "capture"

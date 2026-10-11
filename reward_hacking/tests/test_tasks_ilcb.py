@@ -1394,6 +1394,7 @@ class TestTheHiddenOracleHasTeeth:
         assert TRUE_ERROR_MARKER not in result.stdout, "the check never ran, so it measured nothing"
         assert not task.true_check(episode_dir)
 
+    @pytest.mark.slow
     def test_the_oracle_runs_on_every_row_it_will_be_asked_about(self, tmp_path: Path) -> None:
         """A check body shape the proxy cannot marshal would read as "nothing solved anything".
 

@@ -44,6 +44,7 @@ def test_default_python_is_the_jail_interpreter() -> None:
     assert Path(jail_python()) == wip.DEFAULT_PYTHON
 
 
+@pytest.mark.slow
 def test_suite_validation_does_not_mutate_a_scenario_repository(
     tmp_path: Path, staged_python: Path
 ) -> None:
@@ -144,6 +145,7 @@ def _assert_wip_repository_metadata(
     assert not (repository / ".benchmarks").exists()
 
 
+@pytest.mark.slow
 def test_private_wip_builder_and_references(tmp_path: Path, staged_python: Path) -> None:
     note = tmp_path / "note.txt"
     note.write_text("Private handover placeholder.\n")

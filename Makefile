@@ -13,7 +13,7 @@ RUFF := $(UV) ruff
 # tests/test_interpreter_compat.py is what keeps the scripts that run under it 3.9-clean.
 SYSTEM_PYTHON := /usr/bin/python3
 
-.PHONY: setup setup-gpu hooks test test-select test-changed test-corpus test-jail-real test-docker-real corpus-verify corpus-smoke format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install env-gate render-audit render-audit-required verify-seed-v4
+.PHONY: setup setup-gpu hooks test test-slow test-select test-changed test-corpus test-jail-real test-docker-real corpus-verify corpus-smoke format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install env-gate render-audit render-audit-required verify-seed-v4
 
 setup: hooks
 	uv sync --frozen
@@ -30,20 +30,17 @@ hooks:
 setup-gpu:
 	uv sync --frozen --extra vllm
 
-# RLVR_SMOKE=1 enables the tiny-GPT2 CPU test, which downloads a ~2 MB model. The full suite is
-# sharded over TEST_WORKERS pytest-xdist processes: serially it takes ~15 min, and that cost is
-# hundreds of independent multi-second tests rather than a few long ones, so 8 workers bring it to
-# ~3.5 min on this box (4 workers, ~4.8 min). `--dist loadfile` keeps every test of a module on one
-# worker, so a module-scoped fixture is built once per module rather than in every worker that draws
-# a test from it, and the pass/fail set matches the serial run (checked by diffing junit XML from
-# both). `nice` because the box is shared with other sessions. test-select stays serial: it narrows
-# to a file or a -k filter, where worker start-up costs more than it saves; put -n in ARGS when a
-# wide selection wants it. Fewer workers when the box is busy:
-#   make test TEST_WORKERS=4
+# RLVR_SMOKE=1 enables the tiny-GPT2 CPU test. The fast CPU gate excludes the slow tier,
+# which runs separately before seed-v4 GPU stages. loadfile keeps module fixtures and state on
+# one worker. test-changed includes reachable slow tests; test-select stays serial unless ARGS
+# requests workers. Reduce TEST_WORKERS when the shared box is busy.
 TEST_WORKERS ?= 8
+TEST_ARGS ?=
+FAST_TIER_BUDGET_SECONDS ?= 10
 # The normal pytest targets are CPU-only, even when run on the GPU box. Keep CUDA visible only for
 # the explicitly opt-in parity tests, which use GAMES_GPU_TESTS=1 and need the caller's device list.
 TEST_CUDA_ENV = $(if $(filter 1,$(GAMES_GPU_TESTS)),,CUDA_VISIBLE_DEVICES=)
+TEST_HUB_ENV = HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 # GATE_TMUX=1 runs the gate in a detached tmux session teed to a log and returns immediately with the
 # command to poll, instead of holding the terminal for minutes:
@@ -71,7 +68,11 @@ GATE_LOCK = flock --verbose $(GATE_LOCK_DIR)/gate-$(1).lock
 
 test:
 	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
-	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 $(TEST_CUDA_ENV) nice $(UV) pytest -n $(TEST_WORKERS) --dist loadfile -m "not jail_real and not docker_real"
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 $(TEST_CUDA_ENV) $(TEST_HUB_ENV) FAST_TIER_BUDGET_SECONDS=$(FAST_TIER_BUDGET_SECONDS) nice $(UV) pytest -n $(TEST_WORKERS) --dist loadfile -m "not slow and not jail_real and not docker_real" $(TEST_ARGS)
+
+test-slow:
+	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 $(TEST_CUDA_ENV) $(TEST_HUB_ENV) nice $(UV) pytest -n $(TEST_WORKERS) --dist loadfile -m "slow and not jail_real and not docker_real" $(TEST_ARGS)
 
 test-select:
 	env RLVR_SMOKE=1 $(TEST_CUDA_ENV) $(UV) pytest $(ARGS)
@@ -116,10 +117,10 @@ ENV_GATE_FIXTURES ?= docs/scratch/env-gate-fixtures
 env-gate:
 	env XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) $(UV) python -m reward_hacking.organism_rl.env_gate --fixtures $(ENV_GATE_FIXTURES)
 
-# The single check before any seed-v4 GPU stage: corpus tier, render audit, jail tier, real-Docker tier and
-# the full environment check, in that order, stopping at the first red. About 1.5-2.5 h; use GATE_TMUX=1.
+# Before any seed-v4 GPU stage: corpus, slow CPU tests, render audit, jail, real Docker, then
+# the full environment check. Stop at the first red; use GATE_TMUX=1 for the long verification.
 verify-seed-v4:
-	$(GATE_RUN) $(MAKE) --no-print-directory GATE_TMUX= test-corpus render-audit-required test-jail-real test-docker-real env-gate
+	$(GATE_RUN) $(MAKE) --no-print-directory GATE_TMUX= test-corpus test-slow render-audit-required test-jail-real test-docker-real env-gate
 
 RENDER_AUDIT_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v6-train/assets.json
 RENDER_AUDIT_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v6-heldout/assets.json
@@ -143,8 +144,8 @@ render-audit-required: override RENDER_AUDIT_ENFORCE_ARGS = --require-known-fix
 render-audit-required: render-audit
 
 # The fast iteration gate: only the test files the working tree's changes against HEAD can reach,
-# mapped by directory (scripts/test_changed.py carries the table: a games/ edit runs games/tests, a
-# changed test file runs itself, grpo/ runs every root that imports it), sharded like `make test`
+# mapped by directory, including slow tests. scripts/test_changed.py carries the table: games/
+# runs games/tests, a changed test file runs itself, and grpo/ runs every root that imports it.
 # with the workers capped at the file count. Nothing changed runs nothing. NOT a commit gate: the
 # mapping is by directory rather than import graph, so a cross-component break (sociology imports
 # reward_hacking.model_backend) is exactly what it cannot see; `make ci` stays the gate before a
@@ -153,15 +154,17 @@ TEST_CHANGED_ARGS ?=
 
 test-changed:
 	@echo "gate lock: $(GATE_LOCK_DIR)/gate-test.lock (waits while another session's suite holds it)"
-	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 $(TEST_CUDA_ENV) nice $(UV) python scripts/test_changed.py --workers $(TEST_WORKERS) $(TEST_CHANGED_ARGS)
+	$(GATE_RUN) $(call GATE_LOCK,test) env RLVR_SMOKE=1 $(TEST_CUDA_ENV) $(TEST_HUB_ENV) nice $(UV) python scripts/test_changed.py --workers $(TEST_WORKERS) $(TEST_CHANGED_ARGS)
 
 format:
 	$(RUFF) format .
 	$(RUFF) check --fix .
 
+LINT_PATHS ?= .
+
 lint:
-	$(RUFF) format --check .
-	$(RUFF) check --no-cache .
+	$(RUFF) format --check $(LINT_PATHS)
+	$(RUFF) check --no-cache $(LINT_PATHS)
 
 # basedpyright is the gating type checker: strict mode with the third-party-Unknown rules
 # turned off (see [tool.basedpyright] in pyproject.toml), so every diagnostic is a real

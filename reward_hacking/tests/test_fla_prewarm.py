@@ -160,6 +160,7 @@ def test_unpatched_kernels_keep_a_distinct_raw_key_per_length() -> None:
     ]
 
 
+@pytest.mark.slow
 def test_installed_fla_autotuners_support_patch_in_a_cpu_subprocess() -> None:
     code = """
 from importlib import import_module

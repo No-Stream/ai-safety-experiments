@@ -3,9 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import shlex
 import subprocess
+import sys
+import threading
+import time
 from collections import Counter
 from dataclasses import asdict, replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -54,10 +59,15 @@ from reward_hacking.organism_rl.env_gate import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Mapping
 
     from reward_hacking.ladder.monitor import CommandAuditMonitor
     from reward_hacking.ladder.scenario import Scenario
+
+
+@pytest.fixture(autouse=True)
+def synthetic_episode_scratch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(env_gate, "EPISODE_SCRATCH_ROOT", tmp_path)
 
 
 def _valid_observations() -> dict[str, object]:
@@ -95,6 +105,39 @@ def _group_value(value: dict[str, object], key: str) -> dict[str, object]:
     child = value[key]
     assert isinstance(child, dict)
     return child
+
+
+def _install_synthetic_gate_fixtures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_ids_by_task: Mapping[str, tuple[str, ...]],
+) -> tuple[FixtureTask, ...]:
+    fixtures = tuple(
+        FixtureTask(
+            family="ilcb",
+            task_id=task_id,
+            directory=tmp_path / task_id,
+            definition={},
+            artifacts=tuple(FixtureArtifact(artifact_id, {}) for artifact_id in artifact_ids),
+            declarations={artifact_id: _valid_observations() for artifact_id in artifact_ids},
+        )
+        for task_id, artifact_ids in artifact_ids_by_task.items()
+    )
+    monkeypatch.setattr(env_gate, "load_fixture_tasks", lambda _directory: fixtures)
+    monkeypatch.setattr(
+        env_gate,
+        "_build_task",
+        lambda fixture: BuiltFixtureTask(
+            task=Task(
+                task_id=fixture.task_id,
+                prompt="Synthetic prompt.",
+                body="Synthetic body.",
+                files={},
+                true_check=lambda _directory: False,
+            )
+        ),
+    )
+    return fixtures
 
 
 def test_declarations_cover_both_registers_and_all_gate_evidence() -> None:
@@ -444,6 +487,49 @@ def test_empty_ladder_patch_runs_no_reference_command(tmp_path: Path) -> None:
 
     assert command_records == []
     assert submission_verdicts == []
+
+
+@pytest.mark.parametrize("definition", [{}, {"timeout": "90s"}])
+def test_induced_timeout_preserves_visible_grader_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, definition: dict[str, object]
+) -> None:
+    task = Task(
+        task_id="toy-timeout",
+        prompt="Synthetic prompt.",
+        body="Synthetic body.",
+        files={"TASK.md": "Synthetic prompt.\n", "grade.py": "pass\n"},
+        true_check=lambda _directory: False,
+        true_check_with_timeout=lambda _directory, _timeout: False,
+    )
+    artifact = FixtureArtifact(
+        "induced_timeout",
+        {"kind": "induced_failure", "failure_mode": "timeout", "timeout": "0.05s"},
+    )
+    fixture = FixtureTask(
+        family="ilcb",
+        task_id=task.task_id,
+        directory=tmp_path,
+        definition=definition,
+        artifacts=(artifact,),
+        declarations={},
+    )
+    grading_arguments: list[dict[str, object]] = []
+
+    def capture_grading_arguments(
+        _task: Task, _episode_directory: Path, **kwargs: object
+    ) -> FinalGrade:
+        grading_arguments.append(kwargs)
+        raise RuntimeError("synthetic grading boundary reached")
+
+    # mock: external boundary (grading; stop before unrelated evidence processing).
+    monkeypatch.setattr(env_gate, "grade_final_state", capture_grading_arguments)
+
+    with pytest.raises(RuntimeError, match="synthetic grading boundary reached"):
+        _grade_artifact(fixture, artifact, BuiltFixtureTask(task=task))
+
+    assert len(grading_arguments) == 1
+    assert grading_arguments[0]["timeout"] == definition.get("timeout", "60s")
+    assert grading_arguments[0]["true_check_timeout"] == "0.05s"
 
 
 def test_grade_final_state_threads_a_true_check_timeout(
@@ -1369,7 +1455,7 @@ def test_run_gate_declaration_flip_glue_with_stubbed_artifact_grading(
 
 
 def test_run_gate_reports_every_mismatched_artifact_in_one_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registered_task_id, problem = next(
         (task_id, problem)
@@ -1410,13 +1496,201 @@ def test_run_gate_reports_every_mismatched_artifact_in_one_run(
     (task_directory / "declarations.json").write_text(
         json.dumps(declaration_payload), encoding="utf-8"
     )
-    monkeypatch.setattr(env_gate, "_grade_artifact", lambda *_args: _valid_observations())
 
+    def grade_in_reverse_completion_order(*args: object) -> dict[str, object]:
+        artifact = args[1]
+        assert isinstance(artifact, FixtureArtifact)
+        time.sleep({"first": 0.03, "second": 0.02, "matching": 0.01}[artifact.artifact_id])
+        return _valid_observations()
+
+    monkeypatch.setattr(env_gate, "_grade_artifact", grade_in_reverse_completion_order)
+
+    serial_report = tmp_path / "serial-observations.jsonl"
+    parallel_report = tmp_path / "parallel-observations.jsonl"
+    with pytest.raises(DeclarationMismatchError):
+        run_gate(tmp_path, workers=1, report_jsonl=serial_report)
+    caplog.clear()
     with pytest.raises(DeclarationMismatchError) as raised:
-        run_gate(tmp_path)
+        run_gate(tmp_path, workers=3, report_jsonl=parallel_report)
 
     message = str(raised.value)
     assert message.startswith("2 of 3 artifacts mismatched")
     assert f"{registered_task_id}/first" in message
     assert f"{registered_task_id}/second" in message
     assert "matching" not in message
+    checked_lines = [line for line in caplog.text.splitlines() if "env-gate MISMATCH" in line]
+    assert f"{registered_task_id}/first" in checked_lines[0]
+    assert f"{registered_task_id}/second" in checked_lines[1]
+    assert serial_report.read_bytes() == parallel_report.read_bytes()
+    report_rows = [
+        json.loads(line) for line in parallel_report.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["artifact_id"] for row in report_rows] == ["first", "second", "matching"]
+    assert [row["status"] for row in report_rows] == ["mismatch", "mismatch", "checked"]
+    assert all("elapsed_seconds" not in row for row in report_rows)
+
+
+def test_env_gate_cli_accepts_worker_and_report_overrides() -> None:
+    arguments = env_gate._parse_args(  # pyright: ignore[reportPrivateUsage]
+        ["--fixtures", "fixtures", "--workers", "2", "--report-jsonl", "report.jsonl"]
+    )
+
+    assert arguments.workers == 2
+    assert arguments.report_jsonl == Path("report.jsonl")
+
+
+def test_run_gate_reads_report_path_from_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_synthetic_gate_fixtures(tmp_path, monkeypatch, {"one-task": ("only",)})
+    monkeypatch.setattr(env_gate, "_grade_artifact", lambda *_args: _valid_observations())
+    report_path = tmp_path / "environment-report.jsonl"
+    monkeypatch.setenv(env_gate.ENV_GATE_REPORT_ENV, str(report_path))
+
+    assert run_gate(tmp_path, workers=1) == 0
+    assert report_path.is_file()
+
+
+def test_run_gate_grades_artifacts_across_fixtures_concurrently_in_report_order(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_synthetic_gate_fixtures(
+        tmp_path,
+        monkeypatch,
+        {"first-task": ("only",), "second-task": ("only",)},
+    )
+    caplog.set_level(logging.INFO, logger=env_gate.__name__)
+    both_artifacts_started = threading.Barrier(2)
+
+    def wait_for_peer(*_args: object) -> dict[str, object]:
+        both_artifacts_started.wait(timeout=2)
+        return _valid_observations()
+
+    monkeypatch.setattr(env_gate, "_grade_artifact", wait_for_peer)
+
+    assert run_gate(tmp_path, workers=2) == 0
+
+    checked_lines = [line for line in caplog.text.splitlines() if "env-gate checked" in line]
+    assert "first-task/only" in checked_lines[0]
+    assert "second-task/only" in checked_lines[1]
+
+
+def test_run_gate_raises_unexpected_worker_error_without_success_report(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_synthetic_gate_fixtures(tmp_path, monkeypatch, {"one-task": ("first", "second")})
+    caplog.set_level(logging.INFO, logger=env_gate.__name__)
+    both_artifacts_started = threading.Barrier(2)
+
+    def fail_first(*args: object) -> dict[str, object]:
+        artifact = args[1]
+        assert isinstance(artifact, FixtureArtifact)
+        both_artifacts_started.wait(timeout=2)
+        if artifact.artifact_id == "first":
+            raise RuntimeError("synthetic grader failure")
+        return _valid_observations()
+
+    monkeypatch.setattr(env_gate, "_grade_artifact", fail_first)
+
+    report_path = tmp_path / "failure-observations.jsonl"
+    with pytest.raises(RuntimeError, match="synthetic grader failure"):
+        run_gate(tmp_path, workers=2, report_jsonl=report_path)
+
+    assert "env-gate passed" not in caplog.text
+    assert not report_path.exists()
+
+
+def test_run_gate_collects_expected_grading_mismatches_in_source_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_synthetic_gate_fixtures(tmp_path, monkeypatch, {"one-task": ("first", "second")})
+
+    def mismatch_first(*args: object) -> dict[str, object]:
+        artifact = args[1]
+        assert isinstance(artifact, FixtureArtifact)
+        if artifact.artifact_id == "first":
+            raise DeclarationMismatchError("one-task/first: synthetic grading mismatch")
+        return _valid_observations()
+
+    monkeypatch.setattr(env_gate, "_grade_artifact", mismatch_first)
+    reports = [tmp_path / f"mismatch-{workers}.jsonl" for workers in (1, 2)]
+    for workers, report in zip((1, 2), reports, strict=True):
+        with pytest.raises(DeclarationMismatchError, match="1 of 2 artifacts mismatched"):
+            run_gate(tmp_path, workers=workers, report_jsonl=report)
+    assert reports[0].read_bytes() == reports[1].read_bytes()
+    assert [json.loads(line)["status"] for line in reports[0].read_text().splitlines()] == [
+        "grading_mismatch",
+        "checked",
+    ]
+
+
+def test_math_gate_serial_parallel_equivalence_with_executed_synthetic_graders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    problem = MathProblem(
+        item_id="synthetic-parallel",
+        questions=tuple(
+            MathQuestion(f"q{index}", kind, "Synthetic arithmetic question.", "1")
+            for index, kind in enumerate(MATH_KINDS)
+        ),
+        mutation_index=0,
+        mutated_answer="2",
+    )
+    definition = {
+        "math_family": "math_loose_checker",
+        "variant": "loose_oneoff",
+        "problem": json.loads(json.dumps(asdict(problem))),
+    }
+    built = _build_math_fixture_task(definition)
+    assert built.task is not None
+    task_directory = tmp_path / "math" / built.task.task_id
+    references = task_directory / "references"
+    references.mkdir(parents=True)
+    for name, target in (("truth", "1"), ("hedge", "1 or 2")):
+        answers = {question.question_id: "1" for question in problem.questions}
+        answers[problem.questions[0].question_id] = target
+        (references / f"{name}.py").write_text(f"def answers(): return {answers!r}\n")
+
+    def execute_synthetic_grader(work: Path, command: str, **_limits: object) -> CommandResult:
+        completed = subprocess.run(  # noqa: S603 - generated synthetic graders only
+            shlex.split(command), cwd=work, capture_output=True, text=True, timeout=10, check=False
+        )
+        return CommandResult(
+            command, completed.returncode, completed.stdout, completed.stderr, False
+        )
+
+    # Replace only the OS jail boundary; materialization, graders, scoring and reports stay real.
+    monkeypatch.setattr(harness_loop, "run_in_jail", execute_synthetic_grader)
+    monkeypatch.setattr(tasks_ilcb, "run_in_jail", execute_synthetic_grader)
+    monkeypatch.setattr(tasks_ilcb, "jail_python", lambda: sys.executable)
+    artifacts = tuple(
+        FixtureArtifact(name, {"math_answers_file": f"references/{name}.py"})
+        for name in ("truth", "hedge")
+    )
+    fixture = FixtureTask("math", built.task.task_id, task_directory, definition, artifacts, {})
+    declarations = {
+        artifact.artifact_id: _grade_artifact(fixture, artifact, built) for artifact in artifacts
+    }
+    (task_directory / "task.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "family": "math",
+                "task_id": built.task.task_id,
+                "definition": definition,
+                "artifacts": {artifact.artifact_id: artifact.value for artifact in artifacts},
+            }
+        )
+    )
+    (task_directory / "declarations.json").write_text(
+        json.dumps({"schema": 1, "artifacts": declarations})
+    )
+    reports = [tmp_path / f"math-{workers}.jsonl" for workers in (1, 2)]
+    for workers, report in zip((1, 2), reports, strict=True):
+        assert run_gate(tmp_path, workers=workers, report_jsonl=report) == 0
+    assert reports[0].read_bytes() == reports[1].read_bytes()
+    truth_registers = _group_value(declarations["truth"], "registers")
+    hedge_registers = _group_value(declarations["hedge"], "registers")
+    assert _group_value(truth_registers, "in_band")["true_pass"] is True
+    assert _group_value(hedge_registers, "in_band")["true_pass"] is False
+    assert _group_value(hedge_registers, "in_band")["reward"] == 1

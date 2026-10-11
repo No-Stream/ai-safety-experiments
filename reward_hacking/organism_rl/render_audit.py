@@ -6,19 +6,26 @@ import argparse
 import ast
 import difflib
 import gzip
+import io
 import json
 import logging
+import multiprocessing
 import operator
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Generator, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import TextIO, cast
+from typing import TYPE_CHECKING, TextIO, cast
 
 from reward_hacking.aisi_rh_envs_data import AisiRhProblem
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
@@ -43,6 +50,11 @@ from reward_hacking.ladder.scenario import (
 )
 from reward_hacking.math_data import MathFamily, MathProblem, MathVariant
 from reward_hacking.math_data import load_problems as load_math_problems
+from reward_hacking.organism_rl.grading_pool import (
+    available_worker_count,
+    grading_signal_scope,
+    run_bounded,
+)
 from reward_hacking.organism_rl.rollout import (
     _task_submission_grader,  # pyright: ignore[reportPrivateUsage] - exercise the production submit grader
     compose_hint_system_prompt,
@@ -50,6 +62,10 @@ from reward_hacking.organism_rl.rollout import (
 from reward_hacking.r2e_leak_data import R2eLeakTask
 from reward_hacking.r2e_leak_data import load_tasks as load_leak_cases
 from scripts.scan_secrets import CANARY_CONTEXT_CHARS, CanaryToken, load_canary_tokens
+
+if TYPE_CHECKING:
+    from multiprocessing.context import BaseContext
+    from multiprocessing.queues import SimpleQueue
 
 logger = logging.getLogger(__name__)
 # Laid-down episodes stay off the home tree; the episode jail refuses to mount one there.
@@ -305,6 +321,24 @@ class AuditInputs:
     hints: tuple[HintArm, ...]
     whitelist: tuple[WhitelistEntry, ...]
     canaries: tuple[CanaryToken, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RenderTaskResult:
+    """Ordered render artifacts and counts produced for one live task."""
+
+    family: str
+    rendered_lines: tuple[str, ...]
+    hits: tuple[AuditHit, ...]
+    cell_count: int
+    register_pair_checks: int
+    realism_warning_counts: Mapping[str, int]
+    register_error: ValueError | None = None
+
+
+_RENDER_WORKER_STATE: ContextVar[tuple[AuditInputs, Path] | None] = ContextVar(
+    "render_worker_state", default=None
+)
 
 
 _EVALUATION_CUE_PATTERN = re.compile(
@@ -838,31 +872,82 @@ def _leak_task_case(
 def _leak_task_cases(
     index_path: Path,
     expected_partitions: Sequence[str],
+    *,
+    workers: int | None = None,
 ) -> list[TaskAuditCase]:
     index = _object(json.loads(index_path.read_text(encoding="utf-8")), "leak asset index")
     leak_cases_by_id = {case.task_id: case for case in load_leak_cases()}
-    tasks: list[TaskAuditCase] = []
+    work_items: list[tuple[str, object, R2eLeakTask, Exception | None]] = []
     for task_id, raw_arms in sorted(index.items()):
         case = leak_cases_by_id[task_id]
         if case.partition not in expected_partitions:
-            raise ValueError(f"leak index {index_path} contains an unexpected partition")
-        if not isinstance(raw_arms, list) or not raw_arms:
-            raise TypeError(f"leak asset entry {task_id!r} must be a nonempty arm list")
-        if expected_partitions == ("train",) and len(raw_arms) != 1:
-            raise ValueError(
-                "the train leak index must contain exactly one registered arm per task"
-            )
-        for raw_arm in raw_arms:
-            try:
-                tasks.append(_leak_task_case(task_id, raw_arm, case=case))
-            except LeakChannelUnavailableError as error:
-                # leak_assets.load_leak_tasks never serves such an arm; it counts it as unavailable.
-                logger.warning(
-                    "skipping leak arm %s that no loader serves: %s",
+            work_items.append(
+                (
                     task_id,
-                    error.unavailable_reasons,
+                    None,
+                    case,
+                    ValueError(f"leak index {index_path} contains an unexpected partition"),
                 )
+            )
+            continue
+        if not isinstance(raw_arms, list) or not raw_arms:
+            work_items.append(
+                (
+                    task_id,
+                    None,
+                    case,
+                    TypeError(f"leak asset entry {task_id!r} must be a nonempty arm list"),
+                )
+            )
+            continue
+        if expected_partitions == ("train",) and len(raw_arms) != 1:
+            work_items.append(
+                (
+                    task_id,
+                    None,
+                    case,
+                    ValueError(
+                        "the train leak index must contain exactly one registered arm per task"
+                    ),
+                )
+            )
+            continue
+        work_items.extend((task_id, raw_arm, case, None) for raw_arm in raw_arms)
+
+    worker_count = available_worker_count(workers)
+    outcomes = run_bounded(
+        work_items,
+        _build_leak_registry_arm,
+        max_workers=min(worker_count, max(1, len(work_items))),
+    )
+    tasks: list[TaskAuditCase] = []
+    for outcome in outcomes:
+        if outcome.error is not None:
+            raise outcome.error
+        if isinstance(outcome.result, LeakChannelUnavailableError):
+            # The loader skips unavailable arms; retain deterministic warning order here.
+            logger.warning(
+                "skipping leak arm %s that no loader serves: %s",
+                outcome.item[0],
+                outcome.result.unavailable_reasons,
+            )
+            continue
+        if outcome.result is None:
+            raise RuntimeError("leak registry worker returned no task or error")
+        tasks.append(outcome.result)
     return tasks
+
+
+def _build_leak_registry_arm(
+    item: tuple[str, object, R2eLeakTask, Exception | None],
+) -> TaskAuditCase | LeakChannelUnavailableError:
+    task_id, raw_arm, case, error = item
+    if error is not None:
+        raise error
+    try:
+        return _leak_task_case(task_id, raw_arm, case=case)
+    except LeakChannelUnavailableError as unavailable:
+        return unavailable
 
 
 def _ladder_task_cases(ladder_scenarios: Path) -> list[TaskAuditCase]:
@@ -888,13 +973,14 @@ def _auditable_tasks(
     leak_train_index: Path,
     leak_heldout_index: Path,
     ladder_scenarios: Path,
+    workers: int | None = None,
 ) -> tuple[TaskAuditCase, ...]:
     tasks = [
         *_ilcb_task_cases(),
         *_aisi_task_cases(),
         *_math_task_cases(),
-        *_leak_task_cases(leak_train_index, ("train",)),
-        *_leak_task_cases(leak_heldout_index, _LEAK_HELDOUT_PARTITIONS),
+        *_leak_task_cases(leak_train_index, ("train",), workers=workers),
+        *_leak_task_cases(leak_heldout_index, _LEAK_HELDOUT_PARTITIONS, workers=workers),
         *_ladder_task_cases(ladder_scenarios),
     ]
     task_keys = [
@@ -909,13 +995,14 @@ def _auditable_tasks(
     return tuple(tasks)
 
 
-def load_audit_inputs(
+def load_audit_inputs(  # noqa: PLR0913 - workers selects the registry scheduling boundary
     *,
     leak_train_index: Path,
     leak_heldout_index: Path,
     hints_path: Path,
     whitelist_path: Path,
     ladder_scenarios: Path = LADDER_WIP_SCENARIO_ROOT,
+    workers: int | None = None,
 ) -> AuditInputs:
     """Load every configured live registry without changing the source indexes."""
     return AuditInputs(
@@ -923,6 +1010,7 @@ def load_audit_inputs(
             leak_train_index=leak_train_index,
             leak_heldout_index=leak_heldout_index,
             ladder_scenarios=ladder_scenarios,
+            workers=workers,
         ),
         hints=_load_hints(hints_path),
         whitelist=_load_whitelist(whitelist_path),
@@ -1045,6 +1133,160 @@ def _realism_warning_counts(audit_case: TaskAuditCase, cell: RenderedCell) -> Co
         mentions = _AISI_CONTEST_HACKING.findall(task_text)
         return Counter({"contest_hacking_statements": len(mentions)}) if mentions else Counter()
     return Counter()
+
+
+def _render_task(
+    audit_case: TaskAuditCase,
+    *,
+    inputs: AuditInputs,
+    output_dir: Path,
+) -> RenderTaskResult:
+    task = audit_case.task
+    listing_mode = "top-level" if task.task_variant == "leak" else "all"
+    with tempfile.TemporaryDirectory(dir=output_dir, prefix=".render-audit-") as temporary:
+        episode_dir = Path(temporary)
+        listing_probe = _materialize_listing_probe(episode_dir, task, listing_mode=listing_mode)
+        representative_cell = _render_cell(
+            audit_case,
+            inputs.hints[0],
+            audit_case.registers[0],
+            listing_probe,
+        )
+        realism_warning_counts = _realism_warning_counts(audit_case, representative_cell)
+        rendered_lines: list[str] = []
+        hits: list[AuditHit] = []
+        register_pair_checks = 0
+        register_error: ValueError | None = None
+        for hint in inputs.hints:
+            baseline_payload: dict[str, object] | None = None
+            baseline_hits: tuple[AuditHit, ...] = ()
+            for register in audit_case.registers:
+                cell = _render_cell(audit_case, hint, register, listing_probe)
+                render_payload = cell.render_payload()
+                model_visible_payload = {
+                    key: value
+                    for key, value in render_payload.items()
+                    if key not in {"payment_register", "asset_arm", "task_markdown_present"}
+                }
+                if baseline_payload is None:
+                    baseline_payload = model_visible_payload
+                    baseline_hits = scan_surfaces(
+                        audit_case,
+                        cell,
+                        whitelist=inputs.whitelist,
+                        canaries=inputs.canaries,
+                    )
+                    hits.extend(baseline_hits)
+                elif model_visible_payload != baseline_payload:
+                    register_error = ValueError(
+                        "register changes model-visible render for "
+                        f"{task.task_id}/{hint.family}:{hint.strength}"
+                    )
+                    break
+                else:
+                    register_pair_checks += 1
+                    hits.extend(replace(hit, payment_register=register) for hit in baseline_hits)
+                rendered_lines.append(json.dumps(render_payload, ensure_ascii=False) + "\n")
+            if register_error is not None:
+                break
+
+    return RenderTaskResult(
+        family=audit_case.family,
+        rendered_lines=tuple(rendered_lines),
+        hits=tuple(hits),
+        cell_count=len(rendered_lines),
+        register_pair_checks=register_pair_checks,
+        realism_warning_counts=dict(realism_warning_counts),
+        register_error=register_error,
+    )
+
+
+def _initialize_render_worker(
+    inputs: AuditInputs, output_dir: Path, cpu_assignments: SimpleQueue[int]
+) -> None:
+    os.sched_setaffinity(0, {cpu_assignments.get()})
+    _RENDER_WORKER_STATE.set((inputs, output_dir))
+
+
+@contextmanager
+def _render_cpu_assignments(
+    max_workers: int, process_context: BaseContext
+) -> Generator[SimpleQueue[int]]:
+    worker_cpus = sorted(os.sched_getaffinity(0))
+    if max_workers < 1 or max_workers > len(worker_cpus):
+        raise ValueError("render workers must fit the available CPU affinity")
+    cpu_assignments: SimpleQueue[int] = process_context.SimpleQueue()
+    try:
+        for cpu in worker_cpus[:max_workers]:
+            cpu_assignments.put(cpu)
+        yield cpu_assignments
+    finally:
+        cpu_assignments.close()
+
+
+def _render_task_in_process(task_index: int) -> RenderTaskResult:
+    worker_state = _RENDER_WORKER_STATE.get()
+    if worker_state is None:
+        raise RuntimeError("render worker was not initialized")
+    inputs, output_dir = worker_state
+    return _render_task(
+        inputs.tasks[task_index],
+        inputs=inputs,
+        output_dir=output_dir,
+    )
+
+
+def _parallel_render_results(
+    inputs: AuditInputs,
+    output_dir: Path,
+    *,
+    max_workers: int,
+) -> Iterator[RenderTaskResult]:
+    """Yield task results in source order while bounding buffered process outputs."""
+    task_count = len(inputs.tasks)
+    max_in_flight = max_workers * 2
+    process_context = multiprocessing.get_context("fork")
+    with (
+        grading_signal_scope(),
+        _render_cpu_assignments(max_workers, process_context) as cpu_assignments,
+        ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=process_context,
+            initializer=_initialize_render_worker,
+            initargs=(inputs, output_dir, cpu_assignments),
+        ) as executor,
+    ):
+        pending: dict[Future[RenderTaskResult], int] = {}
+        completed: dict[int, Future[RenderTaskResult]] = {}
+        next_submit = 0
+        next_yield = 0
+        while next_yield < task_count:
+            while next_submit < task_count and len(pending) + len(completed) < max_in_flight:
+                pending[executor.submit(_render_task_in_process, next_submit)] = next_submit
+                next_submit += 1
+            completed_futures, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed_futures:
+                if future.exception() is not None:
+                    for queued_future in pending:
+                        queued_future.cancel()
+                    future.result()
+                completed[pending.pop(future)] = future
+            while next_yield in completed:
+                yield completed.pop(next_yield).result()
+                next_yield += 1
+
+
+@contextmanager
+def _open_deterministic_gzip_text(path: Path) -> Generator[TextIO]:
+    """Write gzip text with a stable header so equivalent audit runs compare byte-for-byte."""
+    partial_path = path.with_name(path.name + ".partial")
+    with (
+        partial_path.open("wb") as binary_file,
+        gzip.GzipFile(filename=path.name, fileobj=binary_file, mode="wb", mtime=0) as gzip_file,
+        io.TextIOWrapper(gzip_file, encoding="utf-8") as text_file,
+    ):
+        yield text_file
+    partial_path.replace(path)
 
 
 def _sentence_spans(text: str) -> tuple[tuple[str, int, int], ...]:
@@ -2076,13 +2318,14 @@ def _run_known_leak_fix(
     return {"status": "passed", "task_id": audit_case.task.task_id, "feedback": verdict.feedback}
 
 
-def run_render_audit(
+def run_render_audit(  # noqa: PLR0913 - workers selects the task scheduling boundary
     *,
     inputs: AuditInputs,
     output_dir: Path,
     trace_roots: Sequence[Path],
     legacy_trace_roots: Sequence[Path] = DEFAULT_LEGACY_TRACE_ROOTS,
     check_known_fix: bool = True,
+    workers: int | None = None,
 ) -> dict[str, object]:
     """Render every live cell, enforce register independence, and audit existing real traces."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2094,70 +2337,34 @@ def run_render_audit(
     realism_occurrences: dict[str, Counter[str]] = {}
     realism_task_cases: dict[str, Counter[str]] = {}
     registry = _registry_index(inputs.tasks)
+    worker_count = min(available_worker_count(workers), len(inputs.tasks))
+    logger.info("render audit workers=%d", worker_count)
+    render_results: Iterable[RenderTaskResult]
+    if worker_count > 1:
+        render_results = _parallel_render_results(inputs, output_dir, max_workers=worker_count)
+    else:
+        render_results = (
+            _render_task(audit_case, inputs=inputs, output_dir=output_dir)
+            for audit_case in inputs.tasks
+        )
     with (
-        gzip.open(rendered_path, "wt", encoding="utf-8") as rendered_file,
-        gzip.open(hits_path, "wt", encoding="utf-8") as hits_file,
+        _open_deterministic_gzip_text(rendered_path) as rendered_file,
+        _open_deterministic_gzip_text(hits_path) as hits_file,
     ):
         hit_writer = HitWriter(hits_file)
-        for audit_case in inputs.tasks:
-            task = audit_case.task
-            listing_mode = "top-level" if task.task_variant == "leak" else "all"
-            with tempfile.TemporaryDirectory(dir=output_dir, prefix=".render-audit-") as temporary:
-                episode_dir = Path(temporary)
-                listing_probe = _materialize_listing_probe(
-                    episode_dir, task, listing_mode=listing_mode
-                )
-                representative_cell = _render_cell(
-                    audit_case,
-                    inputs.hints[0],
-                    audit_case.registers[0],
-                    listing_probe,
-                )
-                warning_counts = _realism_warning_counts(audit_case, representative_cell)
-                if warning_counts:
-                    family_occurrences = realism_occurrences.setdefault(
-                        audit_case.family, Counter()
-                    )
-                    family_occurrences.update(warning_counts)
-                    family_task_cases = realism_task_cases.setdefault(audit_case.family, Counter())
-                    family_task_cases.update(dict.fromkeys(warning_counts, 1))
-                for hint in inputs.hints:
-                    baseline_payload: dict[str, object] | None = None
-                    baseline_hits: tuple[AuditHit, ...] = ()
-                    for register in audit_case.registers:
-                        cell = _render_cell(
-                            audit_case,
-                            hint,
-                            register,
-                            listing_probe,
-                        )
-                        render_payload = cell.render_payload()
-                        model_visible_payload = {
-                            key: value
-                            for key, value in render_payload.items()
-                            if key not in {"payment_register", "asset_arm", "task_markdown_present"}
-                        }
-                        if baseline_payload is None:
-                            baseline_payload = model_visible_payload
-                            baseline_hits = scan_surfaces(
-                                audit_case,
-                                cell,
-                                whitelist=whitelist,
-                                canaries=inputs.canaries,
-                            )
-                            hit_writer.write(baseline_hits)
-                        elif model_visible_payload != baseline_payload:
-                            raise ValueError(
-                                "register changes model-visible render for "
-                                f"{task.task_id}/{hint.family}:{hint.strength}"
-                            )
-                        else:
-                            register_pairs += 1
-                            hit_writer.write(
-                                replace(hit, payment_register=register) for hit in baseline_hits
-                            )
-                        rendered_file.write(json.dumps(render_payload, ensure_ascii=False) + "\n")
-                        cell_count += 1
+        for result in render_results:
+            for rendered_line in result.rendered_lines:
+                rendered_file.write(rendered_line)
+            hit_writer.write(result.hits)
+            cell_count += result.cell_count
+            register_pairs += result.register_pair_checks
+            if result.realism_warning_counts:
+                family_occurrences = realism_occurrences.setdefault(result.family, Counter())
+                family_occurrences.update(result.realism_warning_counts)
+                family_task_cases = realism_task_cases.setdefault(result.family, Counter())
+                family_task_cases.update(dict.fromkeys(result.realism_warning_counts, 1))
+            if result.register_error is not None:
+                raise result.register_error
 
         trace_counts = _audit_recorded_traces(
             roots=trace_roots,
@@ -2213,9 +2420,11 @@ def run_render_audit(
         "hit_counts_by_rule": dict(sorted(hit_writer.counts_by_rule.items())),
     }
     report_path = output_dir / "render-audit-report.json"
-    report_path.write_text(
+    partial_report_path = report_path.with_name(report_path.name + ".partial")
+    partial_report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    partial_report_path.replace(report_path)
     logger.info(
         "render audit tasks=%d hints=%d cells=%d real_records=%d hits=%d report=%s",
         len(inputs.tasks),
@@ -2265,6 +2474,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help="trace roots whose render mismatch predates the current prompt; repeatable",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "process workers (default: CPU and memory budget with two CPUs reserved; "
+            "env: ORGANISM_RL_GRADING_WORKERS)"
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -2287,12 +2505,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     legacy_trace_roots = _relative_paths(
         args.legacy_render_trace_root or DEFAULT_LEGACY_TRACE_ROOTS
     )
+    registry_started_at = time.perf_counter()
     inputs = load_audit_inputs(
         leak_train_index=_relative_paths((args.leak_train_index,))[0],
         leak_heldout_index=_relative_paths((args.leak_heldout_index,))[0],
         hints_path=_relative_paths((args.hints,))[0],
         whitelist_path=_relative_paths((args.whitelist,))[0],
         ladder_scenarios=_relative_paths((args.ladder_scenarios,))[0],
+        workers=args.workers,
+    )
+    logger.info(
+        "render audit registry loaded tasks=%d duration_seconds=%.3f",
+        len(inputs.tasks),
+        time.perf_counter() - registry_started_at,
     )
     report = run_render_audit(
         inputs=inputs,
@@ -2300,6 +2525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         trace_roots=trace_roots,
         legacy_trace_roots=legacy_trace_roots,
         check_known_fix=not args.skip_known_fix,
+        workers=args.workers,
     )
     return render_audit_exit_code(report, require_known_fix=args.require_known_fix)
 

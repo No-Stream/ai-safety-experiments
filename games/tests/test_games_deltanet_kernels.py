@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # depending on collection order, which is the shape of a green gate that checked nothing.
 BRIDGE_IMPORT = "from games.deltanet_kernels import bridge_decode_kernel\n"
 DECODE_PATH_REPORT = (
-    "from games.preflight import deltanet_kernel_paths\n"
+    "from games.deltanet_metadata import deltanet_kernel_paths\n"
     "print('DECODE_PATH', deltanet_kernel_paths()['recurrent_gated_delta_rule'])\n"
 )
 
@@ -76,12 +76,23 @@ def without_initial_state(kernel: DecodeKernel) -> DecodeKernel:
 
 
 class TestDecodeKernelResolution:
-    def test_the_decode_kernel_falls_back_to_torch_without_the_bridge(self):
+    def test_importing_the_decode_bridge_does_not_import_preflight(self) -> None:
+        result = run_in_fresh_interpreter(
+            "import sys\n"
+            "import games.deltanet_kernels\n"
+            "print('PREFLIGHT_IMPORTED', 'games.preflight' in sys.modules)\n"
+        )
+        assert result.returncode == 0, result.stderr
+        assert "PREFLIGHT_IMPORTED False" in result.stdout, result.stdout
+
+    @pytest.mark.slow
+    def test_the_decode_kernel_falls_back_to_torch_without_the_bridge(self) -> None:
         result = run_in_fresh_interpreter(DECODE_PATH_REPORT)
         assert result.returncode == 0, result.stderr
         assert "DECODE_PATH torch fallback" in result.stdout, result.stdout
 
-    def test_the_bridge_makes_the_decode_kernel_resolve_to_fla(self):
+    @pytest.mark.slow
+    def test_the_bridge_makes_the_decode_kernel_resolve_to_fla(self) -> None:
         result = run_in_fresh_interpreter(
             BRIDGE_IMPORT + "bridge_decode_kernel()\n" + DECODE_PATH_REPORT
         )
@@ -89,7 +100,8 @@ class TestDecodeKernelResolution:
         assert "DECODE_PATH fla.ops.gated_delta_rule" in result.stdout, result.stdout
         assert "fused_recurrent_gated_delta_rule" in result.stdout, result.stdout
 
-    def test_the_prefill_kernel_was_already_on_fla_either_way(self):
+    @pytest.mark.slow
+    def test_the_prefill_kernel_was_already_on_fla_either_way(self) -> None:
         """The bridge must not disturb the kernel that already resolved.
 
         If prefill regressed to torch, the speedup measurement would be reading a different change
@@ -98,14 +110,15 @@ class TestDecodeKernelResolution:
         snippet = (
             BRIDGE_IMPORT
             + "bridge_decode_kernel()\n"
-            + "from games.preflight import deltanet_kernel_paths\n"
+            + "from games.deltanet_metadata import deltanet_kernel_paths\n"
             + "print('PREFILL', deltanet_kernel_paths()['chunk_gated_delta_rule'])\n"
         )
         result = run_in_fresh_interpreter(snippet)
         assert result.returncode == 0, result.stderr
         assert "PREFILL fla.ops.gated_delta_rule" in result.stdout, result.stdout
 
-    def test_a_second_call_reports_no_second_patch(self):
+    @pytest.mark.slow
+    def test_a_second_call_reports_no_second_patch(self) -> None:
         """And names THIS process's own alias as the reason, rather than a native fla export.
 
         The two are indistinguishable from the attribute alone -- the already-exported gate is checked
@@ -125,7 +138,8 @@ class TestDecodeKernelResolution:
         assert ALIASED_BY_THIS_PROCESS_REASON in result.stdout, result.stdout
         assert ALIASED_NATIVELY_REASON not in result.stdout, result.stdout
 
-    def test_a_name_fla_exported_itself_is_reported_as_fla_s_own(self):
+    @pytest.mark.slow
+    def test_a_name_fla_exported_itself_is_reported_as_fla_s_own(self) -> None:
         """The other side of the same distinction: nothing was aliased here, so nothing claims to be.
 
         Stands in for the future fla release that fixes the export name, which is what makes the
@@ -143,7 +157,8 @@ class TestDecodeKernelResolution:
         assert "BRIDGED False" in result.stdout, result.stdout
         assert ALIASED_NATIVELY_REASON in result.stdout, result.stdout
 
-    def test_bridging_after_the_modeling_module_is_imported_raises(self):
+    @pytest.mark.slow
+    def test_bridging_after_the_modeling_module_is_imported_raises(self) -> None:
         snippet = (
             "import transformers.models.qwen3_5.modeling_qwen3_5  # noqa: F401\n"
             + BRIDGE_IMPORT
@@ -153,7 +168,8 @@ class TestDecodeKernelResolution:
         assert result.returncode != 0, result.stdout
         assert "too late to bridge" in result.stderr, result.stderr
 
-    def test_the_bridged_kernel_accepts_every_argument_transformers_passes(self):
+    @pytest.mark.slow
+    def test_the_bridged_kernel_accepts_every_argument_transformers_passes(self) -> None:
         snippet = (
             BRIDGE_IMPORT
             + "from games.deltanet_kernels import assert_bridged_kernel_matches_call_site\n"
@@ -166,7 +182,8 @@ class TestDecodeKernelResolution:
         for name in ("g", "beta", "initial_state", "output_final_state", "use_qk_l2norm_in_kernel"):
             assert name in result.stdout, result.stdout
 
-    def test_the_call_site_check_rejects_a_kwargs_only_implementation(self):
+    @pytest.mark.slow
+    def test_the_call_site_check_rejects_a_kwargs_only_implementation(self) -> None:
         """The exact silent failure the check exists for.
 
         transformers filters keyword arguments to the implementation's parameter NAMES, and `kwargs`
@@ -184,6 +201,7 @@ class TestDecodeKernelResolution:
         assert "would silently drop" in result.stderr, result.stderr
 
 
+@pytest.mark.slow
 class TestEntryPointsBridgeInTime:
     """Every entry point that generates has to be able to bridge when its `main` starts.
 
@@ -216,7 +234,7 @@ class TestEntryPointsBridgeInTime:
             "from games.deltanet_kernels import QWEN3_5_MODELING_MODULE, bridge_decode_kernel\n"
             "print('IMPORTED', QWEN3_5_MODELING_MODULE in sys.modules)\n"
             "print('BRIDGED', bridge_decode_kernel()['bridged'])\n"
-            "from games.preflight import deltanet_kernel_paths\n"
+            "from games.deltanet_metadata import deltanet_kernel_paths\n"
             "print('DECODE_PATH', deltanet_kernel_paths()['recurrent_gated_delta_rule'])\n"
         )
         result = run_in_fresh_interpreter(snippet)
@@ -263,7 +281,7 @@ BOUND_KERNELS_REPORT = (
 class TestBoundKernels:
     """What the kernels are ACTUALLY bound to, read off the modeling module rather than predicted.
 
-    `games.preflight.deltanet_kernel_paths` answers "what would transformers resolve if it bound now";
+    `games.deltanet_metadata.deltanet_kernel_paths` answers "what would transformers resolve if it bound now";
     this answers "what did it bind". The two differ in exactly the case the bridge exists for: an alias
     registered after `modeling_qwen3_5` was imported changes the prediction and nothing about the
     wrapper transformers calls, so a run that recorded the prediction would name a kernel it did not
@@ -274,14 +292,16 @@ class TestBoundKernels:
     fail on collection order.
     """
 
-    def test_without_the_bridge_the_decode_kernel_reads_as_the_torch_fallback(self):
+    @pytest.mark.slow
+    def test_without_the_bridge_the_decode_kernel_reads_as_the_torch_fallback(self) -> None:
         result = run_in_fresh_interpreter(BOUND_KERNELS_REPORT)
         assert result.returncode == 0, result.stderr
         bound = json.loads(result.stdout.split("BOUND ", 1)[1])
         assert bound["recurrent_gated_delta_rule"].endswith("torch_recurrent_gated_delta_rule")
         assert bound["chunk_gated_delta_rule"].startswith("fla.ops.gated_delta_rule")
 
-    def test_after_the_bridge_the_decode_kernel_reads_as_flas_fused_one(self):
+    @pytest.mark.slow
+    def test_after_the_bridge_the_decode_kernel_reads_as_flas_fused_one(self) -> None:
         result = run_in_fresh_interpreter(
             BRIDGE_IMPORT + "bridge_decode_kernel()\n" + BOUND_KERNELS_REPORT
         )
@@ -292,13 +312,15 @@ class TestBoundKernels:
             == "fla.ops.gated_delta_rule.fused_recurrent.fused_recurrent_gated_delta_rule"
         )
 
-    def test_every_dispatched_kernel_function_is_named(self):
+    @pytest.mark.slow
+    def test_every_dispatched_kernel_function_is_named(self) -> None:
         result = run_in_fresh_interpreter(BOUND_KERNELS_REPORT)
         assert result.returncode == 0, result.stderr
         bound = json.loads(result.stdout.split("BOUND ", 1)[1])
         assert sorted(bound) == sorted(DELTANET_KERNEL_WRAPPERS)
 
-    def test_a_wrapper_the_modeling_module_no_longer_has_is_refused(self):
+    @pytest.mark.slow
+    def test_a_wrapper_the_modeling_module_no_longer_has_is_refused(self) -> None:
         """A record naming three of four kernels would read as complete, so a rename raises instead."""
         snippet = (
             "import transformers.models.qwen3_5.modeling_qwen3_5 as m\n"
@@ -310,7 +332,8 @@ class TestBoundKernels:
         assert result.returncode != 0, result.stdout
         assert "has no torch_recurrent_gated_delta_rule" in result.stderr, result.stderr
 
-    def test_a_wrapper_that_is_not_a_kernel_wrapper_is_refused(self):
+    @pytest.mark.slow
+    def test_a_wrapper_that_is_not_a_kernel_wrapper_is_refused(self) -> None:
         """The binding is read out of the wrapper's closure, so a bare function cannot be read at all.
 
         Which is the honest outcome: transformers changing how it wraps kernel functions means nobody
@@ -358,7 +381,8 @@ class TestPrefillKernels:
                 {"chunk_gated_delta_rule": "fla.ops.gated_delta_rule.chunk.chunk_gated_delta_rule"}
             )
 
-    def test_the_live_binding_narrows_to_what_a_forward_dispatches(self):
+    @pytest.mark.slow
+    def test_the_live_binding_narrows_to_what_a_forward_dispatches(self) -> None:
         """Off the real modeling module, in a fresh interpreter, so the constant matches the wrappers."""
         result = run_in_fresh_interpreter(
             BOUND_KERNELS_REPORT + "from games.deltanet_kernels import prefill_deltanet_kernels\n"

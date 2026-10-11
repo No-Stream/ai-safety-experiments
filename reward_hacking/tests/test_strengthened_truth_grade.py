@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from threading import Barrier, Lock
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -420,6 +421,189 @@ def test_grade_records_regrades_when_grading_identity_changes(
     assert rows[0]["grading_identity"]["semantic_version"] == (
         grade.STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION
     )
+
+
+def test_grade_records_parallelizes_candidate_grades_and_preserves_record_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task_ids = ["lcbhard_18", "lcbhard_17"]
+    records_dir = tmp_path / "records"
+    records_dir.mkdir()
+    records = [
+        {
+            "variant": "original",
+            "family": "ilcb",
+            "task_id": task_id,
+            "trace_summary": {
+                "episode_id": f"episode-{task_id}",
+                "true": {"pass": True, "measured": True, "oracle_error": None},
+                "graded_artifact": None,
+            },
+        }
+        for task_id in task_ids
+    ]
+    (records_dir / "records.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    case_sets = {
+        task_id: {
+            "task_id": task_id,
+            "source": "blind_reference_pair",
+            "cases": [{"args": [], "expected": 1, "case_digest": canonical_digest([])}],
+            "provenance": {"reference_seconds": 0.01},
+        }
+        for task_id in task_ids
+    }
+    monkeypatch.setattr(
+        grade,
+        "_original_corpora",
+        lambda: ({task_id: SimpleNamespace(entry_point="solve") for task_id in task_ids}, {}),
+    )
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ())
+    monkeypatch.setattr(grade, "load_case_set", lambda _root, task_id: case_sets[task_id])
+
+    barrier: Barrier | None = Barrier(2)
+    active_grades = 0
+    maximum_active_grades = 0
+    active_lock = Lock()
+
+    def parallel_grade(_artifact: Path, case_set: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        nonlocal active_grades, maximum_active_grades
+        with active_lock:
+            active_grades += 1
+            maximum_active_grades = max(maximum_active_grades, active_grades)
+        if barrier is not None:
+            barrier.wait(timeout=10)
+        with active_lock:
+            active_grades -= 1
+        truth = grade._empty_grade_result()
+        truth.update(
+            {
+                "pass": True,
+                "source": case_set["source"],
+                "reference_set_digest": canonical_digest(case_set),
+            }
+        )
+        return truth
+
+    monkeypatch.setattr(grade, "grade_artifact", parallel_grade)
+    caplog.set_level(logging.INFO)
+    output = tmp_path / "strengthened_truth.jsonl"
+
+    monkeypatch.setenv("ORGANISM_RL_GRADING_WORKERS", "2")
+    rows = grade.grade_records(records_dir, tmp_path / "cases", output)
+
+    assert maximum_active_grades == 2
+    assert [row["episode_id"] for row in rows] == [f"episode-{task_id}" for task_id in task_ids]
+    persisted_rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["task_id"] for row in persisted_rows] == task_ids
+    assert caplog.text.count("grading_kind=candidate") == 2
+    assert all(f"task_id={task_id}" in caplog.text for task_id in task_ids)
+    assert "grade_seconds=" in caplog.text
+
+    barrier = None
+    monkeypatch.setenv("ORGANISM_RL_GRADING_WORKERS", "1")
+    serial_rows = grade.grade_records(records_dir, tmp_path / "cases", tmp_path / "serial.jsonl")
+    assert serial_rows == rows
+
+
+def test_grade_records_preserves_completed_prefix_and_stops_on_unexpected_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task_ids = ["lcbhard_17", "lcbhard_18", "lcbhard_19"]
+    records_dir = tmp_path / "records"
+    records_dir.mkdir()
+    (records_dir / "records.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "variant": "original",
+                    "family": "ilcb",
+                    "task_id": task_id,
+                    "trace_summary": {
+                        "episode_id": f"episode-{task_id}",
+                        "true": {"pass": True, "measured": True, "oracle_error": None},
+                        "graded_artifact": None,
+                    },
+                }
+            )
+            + "\n"
+            for task_id in task_ids
+        ),
+        encoding="utf-8",
+    )
+    case_sets = {
+        task_id: {
+            "task_id": task_id,
+            "source": "blind_reference_pair",
+            "cases": [{"args": [], "expected": 1, "case_digest": canonical_digest([])}],
+            "provenance": {"reference_seconds": 0.01},
+        }
+        for task_id in task_ids
+    }
+    monkeypatch.setattr(
+        grade,
+        "_original_corpora",
+        lambda: ({task_id: SimpleNamespace(entry_point="solve") for task_id in task_ids}, {}),
+    )
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ())
+    monkeypatch.setattr(grade, "load_case_set", lambda _root, task_id: case_sets[task_id])
+    graded_tasks: list[str] = []
+
+    def fail_first_grade(
+        _artifact: Path, case_set: dict[str, Any], **_kwargs: Any
+    ) -> dict[str, Any]:
+        graded_tasks.append(case_set["task_id"])
+        if case_set["task_id"] == task_ids[1]:
+            raise ValueError("synthetic first candidate grade failed")
+        truth = grade._empty_grade_result()
+        truth.update(
+            {
+                "pass": True,
+                "source": case_set["source"],
+                "reference_set_digest": canonical_digest(case_set),
+                "timeout_reference_evidence": grade._timeout_reference_evidence(None),
+            }
+        )
+        return truth
+
+    monkeypatch.setattr(grade, "grade_artifact", fail_first_grade)
+    caplog.set_level(logging.INFO)
+    output = tmp_path / "strengthened_truth.jsonl"
+
+    monkeypatch.setenv("ORGANISM_RL_GRADING_WORKERS", "1")
+    with pytest.raises(ValueError, match="synthetic first candidate grade failed"):
+        grade.grade_records(records_dir, tmp_path / "cases", output)
+
+    persisted_rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["task_id"] for row in persisted_rows] == [task_ids[0]]
+    assert graded_tasks == task_ids[:2]
+    assert "grading_kind=candidate" in caplog.text
+    assert "status=complete" in caplog.text
+
+    def resume_grade(_artifact: Path, case_set: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        graded_tasks.append(case_set["task_id"])
+        truth = grade._empty_grade_result()
+        truth.update(
+            {
+                "pass": True,
+                "source": case_set["source"],
+                "reference_set_digest": canonical_digest(case_set),
+                "timeout_reference_evidence": grade._timeout_reference_evidence(None),
+            }
+        )
+        return truth
+
+    monkeypatch.setattr(grade, "grade_artifact", resume_grade)
+    graded_tasks.clear()
+    monkeypatch.setenv("ORGANISM_RL_GRADING_WORKERS", "1")
+    resumed = grade.grade_records(records_dir, tmp_path / "cases", output)
+    assert graded_tasks == task_ids[1:]
+    assert [row["task_id"] for row in resumed] == task_ids
 
 
 def test_unmeasured_original_check_is_written_as_null_true_pass(
@@ -1133,7 +1317,7 @@ def _prepare_real_validation_subset(
         target_case = subset_cases_root / case_set["source"] / source_case.name
         target_case.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_case, target_case)
-        for reference in grade._reference_artifacts(case_set):
+        for reference in case_set["provenance"].get("reference_artifacts", []):
             source_reference = cases_root.parent / reference["path"]
             target_reference = subset_cases_root.parent / reference["path"]
             target_reference.parent.mkdir(parents=True, exist_ok=True)
@@ -1658,6 +1842,165 @@ def test_reference_validation_counts_measured_failures_separately_from_unmeasure
     assert not result.all_measured_passed
 
 
+def test_reference_validation_parallelizes_artifacts_and_preserves_report_order(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task_ids = ["lcbhard_17", "lcbhard_18"]
+    cases_root = tmp_path / "cases"
+    references_by_task: dict[str, list[dict[str, str]]] = {}
+    harness_tasks: dict[str, Any] = {}
+    expected_digests: list[list[str]] = []
+    for task_index, task_id in enumerate(task_ids):
+        references: list[dict[str, str]] = []
+        expected_task_digests: list[str] = []
+        for reference_index in range(2):
+            reference_path = tmp_path / f"reference-{task_index}-{reference_index}.py"
+            reference_path.write_text(
+                f"synthetic reference {task_index}-{reference_index}\n", encoding="utf-8"
+            )
+            reference_digest = hashlib.sha256(reference_path.read_bytes()).hexdigest()
+            references.append({"path": reference_path.name, "sha256": reference_digest})
+            expected_task_digests.append(reference_digest)
+        references_by_task[task_id] = references
+        expected_digests.append(expected_task_digests)
+        task_payload = {
+            **payload,
+            "task_id": task_id,
+            "provenance": {
+                **payload["provenance"],
+                "reference_artifacts": references,
+            },
+        }
+        case_directory = cases_root / payload["source"]
+        case_directory.mkdir(parents=True, exist_ok=True)
+        (case_directory / f"{task_id}.json").write_text(json.dumps(task_payload), encoding="utf-8")
+        harness_tasks[f"ilcb-original-{task_id}"] = SimpleNamespace(entry_point="solve")
+
+    monkeypatch.setattr(grade, "_original_corpora", lambda: (harness_tasks, {}))
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ())
+    barrier: Barrier | None = Barrier(2)
+    active_grades = 0
+    maximum_active_grades = 0
+    active_lock = Lock()
+
+    def parallel_grade(artifact: Path, case_set: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        nonlocal active_grades, maximum_active_grades
+        with active_lock:
+            active_grades += 1
+            maximum_active_grades = max(maximum_active_grades, active_grades)
+        if barrier is not None:
+            barrier.wait(timeout=10)
+        with active_lock:
+            active_grades -= 1
+        return {
+            "pass": True,
+            "reference_set_digest": canonical_digest(case_set),
+            "suite_seconds": 0.25,
+        }
+
+    monkeypatch.setattr(grade, "grade_artifact", parallel_grade)
+    caplog.set_level(logging.INFO)
+    output = tmp_path / "validation.jsonl"
+
+    result = grade.validate_correct_solutions(cases_root, output, workers=2)
+
+    assert maximum_active_grades == 2
+    assert result.total_rows == result.measured_passes == 4
+    persisted_rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["task_id"] for row in persisted_rows] == [
+        task_id for task_id in task_ids for _ in range(2)
+    ]
+    assert [
+        [row["reference_sha256"] for row in persisted_rows[index : index + 2]] for index in (0, 2)
+    ] == expected_digests
+    assert caplog.text.count("grading_kind=reference") == 4
+    assert "grade_seconds=" in caplog.text
+
+    barrier = None
+    serial_output = tmp_path / "serial-validation.jsonl"
+    serial_result = grade.validate_correct_solutions(cases_root, serial_output, workers=1)
+    assert serial_result == result
+    assert serial_output.read_bytes() == output.read_bytes()
+
+
+def test_reference_validation_preserves_completed_prefix_and_stops_on_unexpected_error(
+    tmp_path: Path,
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    task_id = "lcbhard_17"
+    references: list[dict[str, str]] = []
+    for reference_index in range(3):
+        reference_path = tmp_path / f"reference-{reference_index}.py"
+        reference_path.write_text(f"synthetic reference {reference_index}\n", encoding="utf-8")
+        references.append(
+            {
+                "path": reference_path.name,
+                "sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
+            }
+        )
+    case_payload = {
+        **payload,
+        "task_id": task_id,
+        "provenance": {**payload["provenance"], "reference_artifacts": references},
+    }
+    case_directory = tmp_path / "cases" / payload["source"]
+    case_directory.mkdir(parents=True)
+    (case_directory / f"{task_id}.json").write_text(json.dumps(case_payload), encoding="utf-8")
+    monkeypatch.setattr(
+        grade,
+        "_original_corpora",
+        lambda: ({task_id: SimpleNamespace(entry_point="solve")}, {}),
+    )
+    monkeypatch.setattr(grade, "_original_assertions", lambda *args: ())
+    graded_references: list[str] = []
+
+    def fail_first_reference(
+        artifact: Path, current_case_set: dict[str, Any], **_kwargs: Any
+    ) -> dict[str, Any]:
+        graded_references.append(artifact.name)
+        if artifact.name == references[1]["path"]:
+            raise ValueError("synthetic first reference grade failed")
+        return {
+            "pass": True,
+            "reference_set_digest": canonical_digest(current_case_set),
+            "suite_seconds": 0.25,
+        }
+
+    monkeypatch.setattr(grade, "grade_artifact", fail_first_reference)
+    caplog.set_level(logging.INFO)
+    output = tmp_path / "validation.jsonl"
+
+    with pytest.raises(ValueError, match="synthetic first reference grade failed"):
+        grade.validate_correct_solutions(tmp_path / "cases", output, workers=1)
+
+    persisted_rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [row["reference_sha256"] for row in persisted_rows] == [references[0]["sha256"]]
+    assert graded_references == [reference["path"] for reference in references[:2]]
+    assert "grading_kind=reference" in caplog.text
+    assert "status=complete" in caplog.text
+
+    def resume_reference(
+        artifact: Path, current_case_set: dict[str, Any], **_kwargs: Any
+    ) -> dict[str, Any]:
+        graded_references.append(artifact.name)
+        return {
+            "pass": True,
+            "reference_set_digest": canonical_digest(current_case_set),
+            "suite_seconds": 0.25,
+        }
+
+    monkeypatch.setattr(grade, "grade_artifact", resume_reference)
+    graded_references.clear()
+    result = grade.validate_correct_solutions(tmp_path / "cases", output, workers=1)
+    assert graded_references == [reference["path"] for reference in references[1:]]
+    assert result.total_rows == result.measured_passes == 3
+
+
 def test_reference_validation_cli_reports_unmeasured_without_calling_it_a_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1668,14 +2011,55 @@ def test_reference_validation_cli_reports_unmeasured_without_calling_it_a_failur
         measured_failures=0,
         unmeasured=2,
     )
-    monkeypatch.setattr(grade, "validate_correct_solutions", lambda *args, **kwargs: result)
+
+    def unmeasured_validation(*_args: Any, **kwargs: Any) -> grade.ReferenceValidationResult:
+        assert kwargs["workers"] == 2
+        return result
+
+    monkeypatch.setattr(grade, "validate_correct_solutions", unmeasured_validation)
 
     exit_code = grade.main(
-        ["--validate-references", "--cases-root", str(tmp_path), "--output", str(tmp_path / "out")]
+        [
+            "--validate-references",
+            "--cases-root",
+            str(tmp_path),
+            "--output",
+            str(tmp_path / "out"),
+            "--workers",
+            "2",
+        ]
     )
 
     assert exit_code == 3
     assert "measured_passes=0 measured_failures=0 unmeasured=2" in caplog.text
+
+
+def test_records_cli_forwards_worker_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorded_workers: list[int | None] = []
+
+    def grade_records(*args: Any) -> list[dict[str, Any]]:
+        recorded_workers.append(args[3].workers)
+        return []
+
+    monkeypatch.setattr(grade, "_grade_records", grade_records)
+
+    result = grade.main(
+        [
+            "--records",
+            str(tmp_path / "records"),
+            "--cases-root",
+            str(tmp_path / "cases"),
+            "--output",
+            str(tmp_path / "sidecar.jsonl"),
+            "--workers",
+            "3",
+        ]
+    )
+
+    assert result == 0
+    assert recorded_workers == [3]
 
 
 def test_triage_cli_joins_by_episode_and_writes_rows_and_readout(tmp_path: Path) -> None:

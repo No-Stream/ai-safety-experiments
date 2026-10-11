@@ -964,7 +964,9 @@ class TestSizingAgainstMeasuredRuns:
     @pytest.mark.parametrize("model", ["4B", "2B"])
     def test_the_inlined_architecture_still_matches_the_checkpoint(self, model: str):
         live = sizing.sequence_cost(
-            AutoConfig.from_pretrained(f"Qwen/Qwen3.5-{model}").get_text_config()
+            AutoConfig.from_pretrained(
+                f"Qwen/Qwen3.5-{model}", local_files_only=True
+            ).get_text_config()
         )
         assert self.cost_for(model) == live
 
@@ -3410,7 +3412,11 @@ class TestTheFp32HeadIsRefusedOnATiedCheckpoint:
     )
     def test_the_ladder_is_tied_everywhere_below_the_9b(self, model_id: str, tied: bool):
         """The claim the refusal message makes about this ladder, against the checkpoints themselves."""
-        live = AutoConfig.from_pretrained(model_id).get_text_config().tie_word_embeddings
+        live = (
+            AutoConfig.from_pretrained(model_id, local_files_only=True)
+            .get_text_config()
+            .tie_word_embeddings
+        )
         assert bool(live) is tied
 
 

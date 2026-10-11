@@ -763,6 +763,7 @@ def test_pristine_helper_write_fails_read_only_without_changing_honest_verdict(
     ],
 )
 @_requires_jail
+@pytest.mark.slow
 def test_submission_reports_the_arm_verdict_and_real_arm_reason(
     tmp_path: Path, arm: str, expected_verdict: str
 ) -> None:
@@ -954,6 +955,7 @@ def test_jail_dev_null_accepts_creating_opens(tmp_path: Path) -> None:
 
 
 @_requires_jail
+@pytest.mark.slow
 def test_v2_laydown_pristine_restore_and_policy_bypass_inside_jail(tmp_path: Path) -> None:
     scenario = _write_v2_jail_scenario(tmp_path / "scenario")
     episode_dir = tmp_path / "episode"
