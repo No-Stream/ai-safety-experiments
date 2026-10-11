@@ -57,20 +57,60 @@ def _install_cgroup_v2_fixture(
     )
 
 
-def test_default_worker_count_leaves_two_available_cpus_free(
+def _install_cpu_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, core_siblings: list[list[int]]
+) -> None:
+    root = tmp_path / "sys" / "devices" / "system" / "cpu"
+    for siblings in core_siblings:
+        for cpu in siblings:
+            topology = root / f"cpu{cpu}" / "topology"
+            topology.mkdir(parents=True)
+            (topology / "core_cpus_list").write_text(
+                ",".join(str(sibling) for sibling in siblings) + "\n", encoding="ascii"
+            )
+    monkeypatch.setattr("reward_hacking.organism_rl.grading_pool.CPU_TOPOLOGY_ROOT", root)
+    monkeypatch.setattr(
+        "os.sched_getaffinity", lambda _pid: {cpu for group in core_siblings for cpu in group}
+    )
+
+
+def test_physical_cores_count_hyperthread_siblings_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_cpu_topology(tmp_path, monkeypatch, [[0, 1], [2, 3], [4, 5]])
+
+    assert grading_pool._physical_core_count() == 3  # pyright: ignore[reportPrivateUsage]
+
+
+def test_default_worker_count_stays_below_physical_cores_on_an_smt_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timed gradings sharing a core can time out correct candidates, so SMT threads do not count."""
+    _install_cpu_topology(tmp_path, monkeypatch, [[2 * core, 2 * core + 1] for core in range(16)])
+    monkeypatch.setattr(
+        "reward_hacking.organism_rl.grading_pool._cgroup_v2_cpu_count", lambda: None
+    )
+
+    assert grading_pool._available_cpu_count() == 32  # pyright: ignore[reportPrivateUsage]
+    assert available_worker_count() == 12
+
+
+def test_default_worker_count_leaves_headroom_on_a_small_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("reward_hacking.organism_rl.grading_pool._available_cpu_count", lambda: 6)
+    monkeypatch.setattr("reward_hacking.organism_rl.grading_pool._physical_core_count", lambda: 6)
 
-    assert available_worker_count() == 4
+    assert available_worker_count() == 2
 
 
-def test_default_worker_count_scales_with_cpu_hosts_and_keeps_headroom(
+def test_default_worker_count_follows_a_quota_tighter_than_the_core_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("reward_hacking.organism_rl.grading_pool._available_cpu_count", lambda: 32)
+    monkeypatch.setattr("reward_hacking.organism_rl.grading_pool._available_cpu_count", lambda: 8)
+    monkeypatch.setattr("reward_hacking.organism_rl.grading_pool._physical_core_count", lambda: 16)
 
-    assert available_worker_count() == 30
+    assert available_worker_count() == 4
 
 
 def test_worker_selection_logs_available_cpus_and_headroom(
@@ -122,8 +162,10 @@ def test_worker_count_respects_cgroup_v2_quota_on_current_and_ancestor_groups(
         },
     )
 
+    monkeypatch.setattr("reward_hacking.organism_rl.grading_pool._physical_core_count", lambda: 16)
+
     assert grading_pool._available_cpu_count() == 8  # pyright: ignore[reportPrivateUsage]
-    assert available_worker_count() == 6
+    assert available_worker_count() == 4
 
 
 @pytest.mark.parametrize(

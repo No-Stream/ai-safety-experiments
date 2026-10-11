@@ -23,8 +23,9 @@ if TYPE_CHECKING:
 GRADING_WORKERS_ENV = "ORGANISM_RL_GRADING_WORKERS"
 CGROUP_V2_MOUNT = Path("/sys/fs/cgroup")
 PROCESS_CGROUP_FILE = Path("/proc/self/cgroup")
+CPU_TOPOLOGY_ROOT = Path("/sys/devices/system/cpu")
 GRADING_WORKER_MEMORY_BYTES = 1 << 30
-GRADING_CPU_HEADROOM = 2
+GRADING_CPU_HEADROOM = 4
 CGROUP_MEMBERSHIP_FIELD_COUNT = 3
 CPU_MAX_FIELD_COUNT = 2
 CGROUP_V2_HIERARCHY_ID = "0"
@@ -62,7 +63,10 @@ def available_worker_count(
                 ) from error
 
     if worker_override is None:
-        worker_override = min(capacity, max(1, available_cpus - GRADING_CPU_HEADROOM))
+        # Two timed gradings on one core's SMT threads can push a correct candidate past its
+        # timeout, so the default counts physical cores, not logical CPUs.
+        core_budget = min(_physical_core_count(), available_cpus)
+        worker_override = min(capacity, max(1, core_budget - GRADING_CPU_HEADROOM))
     if worker_override < 1 or worker_override > capacity:
         raise ValueError(
             f"grading worker count must be between 1 and {capacity} (CPU/memory budget)"
@@ -198,6 +202,18 @@ def _available_memory_bytes() -> int:
         if directory == mount:
             return memory_available
         directory = directory.parent
+
+
+def _physical_core_count() -> int:
+    """Count distinct physical cores among the CPUs this process may run on."""
+    return len(
+        {
+            (CPU_TOPOLOGY_ROOT / f"cpu{cpu}" / "topology" / "core_cpus_list")
+            .read_text(encoding="ascii")
+            .strip()
+            for cpu in os.sched_getaffinity(0)
+        }
+    )
 
 
 def _available_cpu_count() -> int:
