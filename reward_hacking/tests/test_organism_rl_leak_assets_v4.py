@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.organism_rl import leak_assets, rollout
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
 from reward_hacking.r2e_leak_data import R2eLeakTask
@@ -85,6 +86,10 @@ def synthetic_leak_index(
             task_id=case.task_id,
             problem_id=f"{case.repo_name}/{case.commit_hash}",
             host_only_metadata={"leak_channels_open": list(required_channels)},
+            docker_config=DockerConfig(
+                image=f"example.invalid/repository@sha256:{'b' * 64}",
+                gate_record=tmp_path / "gate.json",
+            ),
         )
         return cast("Task", task)
 
@@ -174,6 +179,7 @@ def test_episode_source_forwards_eval_pairs_and_keeps_pair_identity(
     index_path, built_channels = synthetic_leak_index
     backend = SimpleNamespace(tokenizer=object(), sampling=None)
     monkeypatch.setattr(rollout, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(rollout, "require_gate", lambda _config: None)
     monkeypatch.setattr(
         rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
     )

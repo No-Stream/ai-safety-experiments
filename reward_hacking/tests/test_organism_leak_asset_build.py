@@ -522,7 +522,7 @@ def test_system_interpreter_skip_is_counted(
     assert json.loads((options.out_root / "assets.json").read_text()) == {}
 
 
-@pytest.mark.parametrize("target", ["source", "hidden", "runtime", "gate"])
+@pytest.mark.parametrize("target", ["source", "hidden", "runtime"])
 def test_resume_refuses_mutated_inputs(
     build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
     target: str,
@@ -535,11 +535,45 @@ def test_resume_refuses_mutated_inputs(
         "runtime": next(
             (options.runtime_root / options.split / case.repo_name).glob("*/venv/pyvenv.cfg")
         ),
-        "gate": options.gate_record,
     }
     paths[target].write_text("mutated\n")
     with pytest.raises(ValueError, match=r"completion|runtime|pyvenv"):
         bulk.build_assets(options, (case,))
+
+
+def test_asset_resume_does_not_depend_on_gate_log_contents(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    bulk.build_assets(options, (case,))
+    options.gate_record.write_text('{"passed": true, "run": 2}\n', encoding="utf-8")
+
+    assert bulk.build_assets(options, (case,))["resumed"] == 1
+
+
+def test_asset_resume_does_not_require_a_gate_log(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    bulk.build_assets(options, (case,))
+    options.gate_record.unlink()
+
+    assert bulk.build_assets(options, (case,))["resumed"] == 1
+
+
+def test_legacy_asset_resume_ignores_only_saved_gate_log_digest(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    bulk.build_assets(options, (case,))
+    marker_path = options.out_root / case.task_id / "complete.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    saved_request_identity = marker["request_identity"]
+    saved_request_identity["gate_sha256"] = "legacy-gate-log-digest"
+    marker["identity"] = bulk._digest(saved_request_identity)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert bulk.build_assets(options, (case,))["resumed"] == 1
 
 
 def test_interrupted_marker_write_rebuilds_only_uncompleted_task(

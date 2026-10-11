@@ -17,7 +17,6 @@ from reward_hacking.harness.docker_backend import (
     DockerConfig,
     SnapshotLimitError,
     _run_bounded_docker,
-    backend_code_hash,
     container_cpuset,
     copy_workspace_template,
     docker_run_args,
@@ -29,6 +28,7 @@ from reward_hacking.harness.docker_backend import (
     workspace_snapshot,
 )
 from reward_hacking.ladder.loop import _restore_shell_state, _shell_wrapper, _ShellState
+from scripts import run_docker_jail_tests
 
 IMAGE = "python@sha256:" + "a" * 64
 
@@ -458,6 +458,8 @@ def test_generated_command_argv_runs_ladder_wrapper_under_bash(tmp_path: Path) -
         assert 'DOCKER_BASH_ACCEPTANCE="ready"' in next_state.exported_script
 
 
+@pytest.mark.slow
+@pytest.mark.docker_real
 def test_docker_run_executes_ladder_wrapper_with_python_image_bash(tmp_path: Path) -> None:
     image = _local_python_image_or_skip()
     marker = "__LADDER_SHELL_STATE_docker_acceptance__"
@@ -468,17 +470,7 @@ def test_docker_run_executes_ladder_wrapper_with_python_image_bash(tmp_path: Pat
     )
     wrapper = _shell_wrapper(command, state, marker)
     gate_record = tmp_path / "gate.json"
-    gate_record.write_text(
-        json.dumps(
-            {
-                "backend_hash": backend_code_hash(),
-                "passed": True,
-                "probes": {
-                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
-                },
-            }
-        )
-    )
+
     workspace = tmp_path / "episode"
     workspace.mkdir()
     config = DockerConfig(
@@ -498,21 +490,13 @@ def test_docker_run_executes_ladder_wrapper_with_python_image_bash(tmp_path: Pat
     assert 'DOCKER_BASH_ACCEPTANCE="ready"' in next_state.exported_script
 
 
+@pytest.mark.slow
+@pytest.mark.docker_real
 def test_docker_episode_tmp_persists_and_trusted_grader_starts_fresh(tmp_path: Path) -> None:
-    """Exercise three real containers using a local synthetic gate record, not isolation certification."""
+    """Exercise policy persistence and fresh trusted grading through real containers."""
     image = _local_python_image_or_skip()
     gate_record = tmp_path / "gate.json"
-    gate_record.write_text(
-        json.dumps(
-            {
-                "backend_hash": backend_code_hash(),
-                "passed": True,
-                "probes": {
-                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
-                },
-            }
-        )
-    )
+
     workspace = tmp_path / "episode"
     workspace.mkdir()
     state_root = tmp_path / "state"
@@ -553,20 +537,12 @@ def test_container_cpuset_matches_the_cpu_quota_and_the_host_mask(cpus: float) -
     assert len(spread) > 1
 
 
+@pytest.mark.slow
+@pytest.mark.docker_real
 def test_docker_container_affinity_matches_its_cpu_quota(tmp_path: Path) -> None:
     image = _local_python_image_or_skip()
     gate_record = tmp_path / "gate.json"
-    gate_record.write_text(
-        json.dumps(
-            {
-                "backend_hash": backend_code_hash(),
-                "passed": True,
-                "probes": {
-                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
-                },
-            }
-        )
-    )
+
     workspace = tmp_path / "episode"
     workspace.mkdir()
     config = DockerConfig(image=image, gate_record=gate_record)
@@ -655,27 +631,57 @@ def test_unpinned_image_refused(tmp_path: Path, image: str) -> None:
         DockerConfig(image=image, gate_record=tmp_path / "gate.json")
 
 
-def test_gate_sabotage_refuses_stale_hash_and_vacuous_control(tmp_path: Path) -> None:
-    gate = tmp_path / "gate.json"
-    config = DockerConfig(image=IMAGE, gate_record=gate)
-    probes = {key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES}
+@pytest.fixture
+def live_gate_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    monkeypatch.setattr(backend, "_PASSED_GATES", set())
     record: dict[str, object] = {
-        "backend_hash": backend_code_hash(),
+        "backend_hash": "old-code-provenance",
         "passed": True,
         "image": IMAGE,
-        "probes": probes,
+        "probes": {key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES},
     }
-    gate.write_text(json.dumps(record))
+    monkeypatch.setattr(run_docker_jail_tests, "run_red_team", lambda _path, *, image: record)
+    return record
+
+
+def test_live_gate_ignores_disk_and_code_hash_and_runs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
+) -> None:
+    calls: list[str] = []
+
+    def run_probes(_path: Path, *, image: str) -> dict[str, object]:
+        calls.append(image)
+        return live_gate_record
+
+    monkeypatch.setattr(run_docker_jail_tests, "run_red_team", run_probes)
+    config = DockerConfig(IMAGE, tmp_path / "missing-gate.json")
     require_gate(config)
-    record["backend_hash"] = "sabotaged"
-    gate.write_text(json.dumps(record))
-    with pytest.raises(RuntimeError, match="hash"):
+    config.gate_record.write_text("obsolete record")
+    require_gate(config)
+    assert calls == [IMAGE]
+
+
+@pytest.mark.parametrize(
+    "violation", ["contained", "negative_control", "missing", "passed", "image"]
+)
+def test_live_gate_refuses_invalid_fresh_results(
+    tmp_path: Path, live_gate_record: dict[str, object], violation: str
+) -> None:
+    probes = live_gate_record["probes"]
+    assert isinstance(probes, dict)
+    if violation in {"contained", "negative_control"}:
+        probes["docker_socket_unreachable"][violation] = False
+    elif violation == "missing":
+        del probes["memory_limit_enforced"]
+    elif violation == "passed":
+        live_gate_record["passed"] = False
+    else:
+        live_gate_record["image"] = "python@sha256:" + "b" * 64
+    config = DockerConfig(IMAGE, tmp_path / "gate.json")
+    with pytest.raises(RuntimeError, match="Docker isolation gate"):
         require_gate(config)
-    record["backend_hash"] = backend_code_hash()
-    probes["docker_socket_unreachable"]["negative_control"] = False
-    gate.write_text(json.dumps(record))
-    with pytest.raises(RuntimeError, match="probe"):
-        require_gate(config)
+    assert not backend._PASSED_GATES
+    assert not config.gate_record.exists()
 
 
 def test_snapshots_preserve_symlink_evidence_without_reading_target(tmp_path: Path) -> None:
@@ -696,7 +702,7 @@ def test_submission_allowlist_rejects_symlink_and_traversal(tmp_path: Path) -> N
 
 
 def test_real_subprocess_boundary_records_changes_and_stages_trusted_grader(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
 ) -> None:
     executable = tmp_path / "docker"
     executable.write_text(
@@ -722,18 +728,7 @@ def test_real_subprocess_boundary_records_changes_and_stages_trusted_grader(
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     gate = tmp_path / "gate.json"
-    gate.write_text(
-        json.dumps(
-            {
-                "backend_hash": backend_code_hash(),
-                "passed": True,
-                "image": IMAGE,
-                "probes": {
-                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
-                },
-            }
-        )
-    )
+
     workspace = tmp_path / "episode"
     workspace.mkdir()
     config = DockerConfig(image=IMAGE, gate_record=gate, workspace_mount="/testbed")
@@ -766,7 +761,7 @@ def test_real_subprocess_boundary_records_changes_and_stages_trusted_grader(
 
 
 def test_docker_command_output_is_bounded_while_both_pipes_are_drained(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
 ) -> None:
     executable = tmp_path / "docker"
     executable.write_text(
@@ -781,18 +776,7 @@ def test_docker_command_output_is_bounded_while_both_pipes_are_drained(
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     gate = tmp_path / "gate.json"
-    gate.write_text(
-        json.dumps(
-            {
-                "backend_hash": backend_code_hash(),
-                "passed": True,
-                "image": IMAGE,
-                "probes": {
-                    key: {"contained": True, "negative_control": True} for key in REQUIRED_PROBES
-                },
-            }
-        )
-    )
+
     workspace = tmp_path / "episode"
     workspace.mkdir()
     result = run_in_docker(workspace, "write-long-output", config=DockerConfig(IMAGE, gate))
@@ -960,3 +944,40 @@ def test_runtime_guard_refuses_weakened_flags_before_command(
     )
     assert sentinel.exists() is ("ro" in flags.split(","))
     assert result.returncode == (0 if "ro" in flags.split(",") else 125)
+
+
+@pytest.mark.slow
+@pytest.mark.docker_real
+def test_live_stage_gate_refuses_weakened_pids_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = _local_python_image_or_skip()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    monkeypatch.setattr(backend, "READ_ONLY_RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(run_docker_jail_tests, "READ_ONLY_RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(backend, "_PASSED_GATES", set())
+    original_run_argv = run_docker_jail_tests.DockerProbeRunner.run_argv
+
+    def weakened_run_argv(
+        self: run_docker_jail_tests.DockerProbeRunner,
+        argv: list[str],
+        name: str,
+        timeout_seconds: int = 30,
+    ) -> run_docker_jail_tests.ContainerResult:
+        # Controls retain their 128-process limit; the hardened run is weakened to the same ceiling.
+        if "--pids-limit" in argv and argv[argv.index("--pids-limit") + 1] == "64":
+            argv = run_docker_jail_tests.replace_option_value(argv, "--pids-limit", "64", "128")
+        return original_run_argv(self, argv, name, timeout_seconds)
+
+    monkeypatch.setattr(run_docker_jail_tests.DockerProbeRunner, "run_argv", weakened_run_argv)
+    config = DockerConfig(image, tmp_path / "sabotaged-gate.json")
+    with pytest.raises(RuntimeError, match="pids_limit_enforced containment failed"):
+        require_gate(config)
+    assert not backend._PASSED_GATES
+    assert not config.gate_record.exists()
+
+    monkeypatch.setattr(run_docker_jail_tests.DockerProbeRunner, "run_argv", original_run_argv)
+    require_gate(config)
+    assert backend._PASSED_GATES
+    assert json.loads(config.gate_record.read_text())["passed"] is True

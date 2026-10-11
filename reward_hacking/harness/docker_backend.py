@@ -20,7 +20,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from reward_hacking.jailed_poc import CommandResult
 
@@ -238,7 +238,7 @@ def prepare_runtime_mountpoints(workspace: Path, config: DockerConfig) -> None:
 
 
 def backend_code_hash() -> str:
-    """Bind certification to both execution routes, task configuration and the attack suite."""
+    """Record execution routes, task configuration and attack-suite bytes for provenance only."""
     root = Path(__file__).resolve().parents[2]
     paths = (
         "reward_hacking/harness/docker_backend.py",
@@ -253,13 +253,14 @@ def backend_code_hash() -> str:
     return digest.hexdigest()
 
 
-def require_gate(config: DockerConfig) -> None:
-    """Refuse uncertified or vacuous containment; record stays outside the agent mount."""
-    if not config.gate_record.is_file() or config.gate_record.is_symlink():
-        raise RuntimeError("Docker isolation gate record missing; run make docker-jail-test")
-    record = cast("dict[str, object]", json.loads(config.gate_record.read_text()))
-    if record.get("backend_hash") != backend_code_hash():
-        raise RuntimeError("Docker isolation gate code hash is stale")
+_PASSED_GATES: set[tuple[int, str]] = set()
+_GATE_LOCK = threading.Lock()
+
+
+def validate_gate_result(config: DockerConfig, record: Mapping[str, object]) -> None:
+    """Require complete behavioural evidence for the configured pinned image."""
+    if record.get("image") != config.image:
+        raise RuntimeError("Docker isolation gate image does not match the configured digest")
     probes = record.get("probes")
     if (
         record.get("passed") is not True
@@ -275,6 +276,23 @@ def require_gate(config: DockerConfig) -> None:
             or result.get("negative_control") is not True
         ):
             raise RuntimeError(f"Docker isolation gate probe failed: {probe}")
+
+
+def require_gate(config: DockerConfig) -> None:
+    """Attack current containment once per process and image before Docker episodes start."""
+    from scripts.run_docker_jail_tests import (  # noqa: PLC0415 - runner imports backend argv helpers
+        run_red_team,
+        write_gate_record,
+    )
+
+    key = (os.getpid(), config.image)
+    with _GATE_LOCK:
+        if key in _PASSED_GATES:
+            return
+        record = run_red_team(config.gate_record, image=config.image)
+        validate_gate_result(config, record)
+        write_gate_record(config.gate_record, record)
+        _PASSED_GATES.add(key)
 
 
 def validate_workspace(workspace: Path) -> Path:

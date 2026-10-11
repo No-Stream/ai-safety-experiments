@@ -427,14 +427,17 @@ files, read without following symlinks. Agent-created grader files, unlisted fil
 processes, and policy `/tmp` state do not enter that workspace. This keeps the trusted verdict independent
 of the agent container while preserving the submitted artifact the grader needs to inspect.
 
-**Gate: no Docker-backed episode starts without a current passing record.** Run:
+**Gate: Docker episodes require a fresh live isolation check once per process and pinned image.**
+The manual entry point is:
 
 ```bash
 make docker-jail-test
 ```
 
-The runner pulls only `python:3.12-slim`, resolves its repository digest, and uses that digest for
-every test container. It probes DNS, TCP to a public IP, TCP through Docker's bridge gateway,
+The manual runner defaults to resolving `python:3.12-slim`; `--image` selects a configured
+digest-pinned image directly. The automatic pre-stage gate uses the configured digest for every
+test container, against the current backend and Docker daemon. It probes DNS, TCP to a public IP,
+TCP through Docker's bridge gateway,
 reading a synthetic host sentinel, writing outside `/work` and to the read-only image root, reaching
 the Docker socket path, privilege gain, the PID ceiling, memory exhaustion, and grader tampering.
 Runtime probes check the effective `ro` flag, direct writes and writes through workspace
@@ -444,10 +447,15 @@ The socket control is a short-lived synthetic Unix socket, never the host Docker
 gateway check uses a bounded test container with one published synthetic TCP port, not a listener
 on the host. For each check, the negative control weakens only the corresponding boundary and must
 show the probe succeeding. The runner writes `artifacts/docker-isolation-gate.json` only when every
-contained probe and every negative control passes. Its backend hash covers the Docker backend,
-episode loop, task specification, and this runner, so a code change requires another gate run.
-CPU sabotage tests replace a passing record's hash and break a negative-control result, then verify
-that the backend refuses both records. The resource probes require Docker's cgroup v2 files.
+contained probe and every negative control passes. The backend hash records provenance only.
+Leak source setup runs the suite before constructing its model backend. Successful live results
+are cached once per process and pinned image, including across episode commands and graders;
+failures are never cached. The backend validates the complete probe set, each containment and
+weakened-control result, the pass flag, and the configured image digest before accepting the result.
+A stored record is a log of the latest pass and is never read to authorize execution. CPU tests
+reject invalid fresh results and verify that stale or absent records and changed code hashes do
+not block a successful live check. A live sabotage test raises the hardened PID limit and verifies
+that the pre-stage gate refuses execution. The resource probes require Docker's cgroup v2 files.
 
 This is a live-daemon gate and does not run as part of `make test`. CPU tests cover command
 construction, the required probe set, evidence shape, and gate rejection without Docker; they also
@@ -465,8 +473,7 @@ mount uses `bind-recursive=disabled` so nested host mounts are excluded.
 `DockerConfig.workspace_mount` defaults to `/work`; R2E tasks set it to `/testbed` so image-installed
 editable packages resolve to the submitted tree. The destination must be a normalized absolute
 container path, outside Docker's reserved mounts. The workspace remains the sole writable host mount.
-These backend and loop changes invalidate
-existing Docker gate records, so `make docker-jail-test` must pass again on the execution host.
+The next process checks containment with live probes before starting episodes.
 
 `DockerConfig.read_only_mounts` accepts canonical directories strictly below
 `/var/tmp/leak-env/runtime`, targeting `/opt` children or the workspace's `.venv`. Relative paths,
@@ -519,7 +526,7 @@ The loop checks the submitted patch hash and final source diff after grading; a 
 `SUBMISSION_ARTIFACT_MISMATCH` as unmeasured and cannot produce a trusted pass.
 
 CPU tests use synthetic Git repositories and a local runner in place of Docker. Watched mutations
-covered mount validation, directory timestamp restoration, stale gate hashes, test/runner patch
+covered mount validation, directory timestamp restoration, live gate decisions, test/runner patch
 filtering, test-status comparison, the artifact size cap, hidden-versus-in-band verdict routing,
 and the artifact mismatch guard. Runtime tests also exercise source-path refusal, snapshot pruning,
 symlink mountpoint refusal, and command refusal with weakened mount flags. These CPU checks do not

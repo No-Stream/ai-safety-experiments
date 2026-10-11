@@ -799,6 +799,76 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         changed_hint_source("ilcb:toy", seed=3, step=0, replica=0)
 
 
+@pytest.mark.parametrize("gate_fails", [False, True])
+def test_leak_task_source_runs_live_gate_before_backend_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    gate_fails: bool,
+) -> None:
+    gate_record = tmp_path / "docker-isolation-gate.json"
+    docker_config = DockerConfig(
+        image=f"example.test/leak@sha256:{'a' * 64}",
+        gate_record=gate_record,
+    )
+    task = cast(
+        "Task",
+        SimpleNamespace(
+            task_id="leak:toy",
+            problem_id="synthetic/revision",
+            docker_config=docker_config,
+        ),
+    )
+    events: list[tuple[str, object]] = []
+
+    def load_tasks(
+        *_args: object, **_kwargs: object
+    ) -> tuple[tuple[Task, ...], dict[str, dict[str, object]], dict[str, int]]:
+        return (task,), {task.task_id: {}}, {}
+
+    class FakeBackend:
+        def __init__(self, model_id: str, **_kwargs: object) -> None:
+            events.append(("backend", model_id))
+            self.model_id = model_id
+            self.model_path = "synthetic-model"
+            self.sampling = SamplingConfig(max_new_tokens=16)
+            self.tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _token: 1)
+            self.stop_token_ids: tuple[int, ...] = ()
+
+    def require_gate(config: DockerConfig) -> None:
+        events.append(("gate", config))
+        if gate_fails:
+            raise RuntimeError("synthetic live isolation probe failure")
+
+    monkeypatch.setattr(rollout, "load_leak_tasks", load_tasks)
+    monkeypatch.setattr(rollout, "require_gate", require_gate)
+    monkeypatch.setattr(rollout, "VLLMHTTPBackend", FakeBackend)
+    monkeypatch.setattr(
+        rollout,
+        "QWEN_PROTOCOL",
+        SimpleNamespace(stop_token_ids=lambda _tokenizer: ()),
+    )
+
+    def build_source() -> TaskEpisodeSource:
+        return TaskEpisodeSource(
+            endpoint="http://server:8000",
+            model_path="synthetic-model",
+            served_model_id="synthetic-served-model",
+            output_dir=tmp_path,
+            max_model_len=128,
+            families=("r2e_leak",),
+            variants=("oneoff",),
+            partition="train",
+        )
+
+    if gate_fails:
+        with pytest.raises(RuntimeError, match="synthetic live isolation probe failure"):
+            build_source()
+        assert events == [("gate", docker_config)]
+    else:
+        build_source()
+        assert events == [("gate", docker_config), ("backend", "synthetic-served-model")]
+
+
 def test_task_episode_sampling_seed_is_request_local(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

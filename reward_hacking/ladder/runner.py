@@ -533,6 +533,7 @@ class RunnerConfig:
                             "variant": cast("Scenario", scenario).variant,
                             "set_version": cast("Scenario", scenario).set_version,
                             "surfaces_sha256": surfaces.surfaces_sha256(),
+                            "actor_surfaces_sha256": surfaces.actor_surfaces_sha256(),
                         }
                         if _scenario_format(scenario) == REPOSITORY_FORMAT
                         else {}
@@ -1436,6 +1437,35 @@ def _resume_server_args_identity(
         raise
 
 
+def _has_actor_surface_identity(provenance: Mapping[str, object]) -> bool:
+    scenarios = provenance.get("scenarios")
+    if not isinstance(scenarios, list):
+        raise TypeError("run provenance scenarios must be a list")
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping):
+            raise TypeError("run provenance scenario entries must be objects")
+        if scenario.get("format") == REPOSITORY_FORMAT:
+            if "actor_surfaces_sha256" not in scenario:
+                return False
+            if not isinstance(scenario["actor_surfaces_sha256"], str):
+                raise TypeError("actor_surfaces_sha256 must be a string")
+    return True
+
+
+def _remove_surface_code_hashes(
+    provenance: dict[str, object], *, keep_actor_identity: bool
+) -> None:
+    scenarios = provenance.get("scenarios")
+    if not isinstance(scenarios, list):
+        raise TypeError("run provenance scenarios must be a list")
+    for scenario in scenarios:
+        if not isinstance(scenario, dict):
+            raise TypeError("run provenance scenario entries must be objects")
+        scenario.pop("surfaces_sha256", None)
+        if not keep_actor_identity:
+            scenario.pop("actor_surfaces_sha256", None)
+
+
 def _normalize_legacy_resume_schema(
     header_provenance: dict[str, object],
     raw_provenance: Mapping[str, object],
@@ -1470,10 +1500,20 @@ def _pressure_resume_digests(
         header_provenance.pop("generation_code_identity", None)
         if "server_args" in raw_provenance:
             header_provenance["server_args"] = _resume_server_args_identity(path, raw_provenance)
+        keep_actor_surface_identity = _has_actor_surface_identity(raw_provenance)
+        expected_header_provenance = deepcopy(expected_common_provenance)
+        _remove_surface_code_hashes(
+            expected_header_provenance,
+            keep_actor_identity=keep_actor_surface_identity,
+        )
+        _remove_surface_code_hashes(
+            header_provenance,
+            keep_actor_identity=keep_actor_surface_identity,
+        )
         _normalize_legacy_resume_schema(
             header_provenance, raw_provenance, expected_common_provenance
         )
-        differences = _identity_differences(expected_common_provenance, header_provenance)
+        differences = _identity_differences(expected_header_provenance, header_provenance)
         if differences:
             raise ValueError(
                 f"refusing to resume {path}: stored run provenance differs at keys: "

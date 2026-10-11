@@ -210,7 +210,6 @@ def _request_identity_payload(
         "hidden_tests_fingerprint": template_fingerprint(
             options.templates_root / case.task_id / "hidden_tests"
         ),
-        "gate_sha256": hashlib.sha256(options.gate_record.read_bytes()).hexdigest(),
         "channel_config": None
         if options.channel_splits is None
         else _json_object(options.channel_splits)[options.split],
@@ -249,7 +248,15 @@ def _validate_completion_identity(
     if isinstance(saved_request_identity, dict):
         if marker.get("builder_version") != BUILDER_VERSION:
             raise ValueError("task completion builder version changed; choose a fresh output root")
-        if _digest(saved_request_identity) != identity or marker_identity != identity:
+        if marker_identity != _digest(saved_request_identity):
+            raise ValueError("task completion identity changed; choose a fresh output root")
+        current_comparable_identity = {
+            key: value for key, value in saved_request_identity.items() if key != "gate_sha256"
+        }
+        if (
+            _digest(current_comparable_identity) != identity
+            or _digest(request_identity) != identity
+        ):
             raise ValueError("task completion identity changed; choose a fresh output root")
     elif saved_request_identity is None:
         builder_version = marker.get("builder_version")

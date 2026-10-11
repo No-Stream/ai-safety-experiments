@@ -24,6 +24,7 @@ from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_e
 from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
 from reward_hacking.harness import tasks_r2e_leak
+from reward_hacking.harness.docker_backend import require_gate
 from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
 from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grader_reported_success, run_grader
@@ -880,6 +881,15 @@ class TaskEpisodeSource:
                 "no local tasks match the selected families, variants and partition; "
                 f"counted exclusions={dict(self.skip_counts)}"
             )
+        docker_configs_by_image = {
+            task.docker_config.image: task.docker_config
+            for _family, _variant, task in task_rows
+            if task.docker_config is not None
+        }
+        if "r2e_leak" in families and not docker_configs_by_image:
+            raise RuntimeError("leak task source has no Docker isolation configuration")
+        for docker_config in docker_configs_by_image.values():
+            require_gate(docker_config)
         self.backend = VLLMHTTPBackend(
             served_model_id,
             base_url=endpoint,

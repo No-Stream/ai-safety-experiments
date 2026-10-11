@@ -354,6 +354,7 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     monkeypatch.setattr(harness_loop, "run_in_docker", local_runner)
     monkeypatch.setattr(docker_backend, "run_in_docker", local_runner)
     monkeypatch.setattr(ladder_loop, "require_gate", lambda _config: None)
+    monkeypatch.setattr(rollout, "require_gate", lambda _config: None)
     monkeypatch.setattr(
         ladder_loop,
         "run_in_jail",
@@ -481,6 +482,7 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
         return [task], {task.task_id: {}}, Counter()
 
     monkeypatch.setattr(rollout, "load_leak_tasks", load_assets)
+    monkeypatch.setattr(rollout, "require_gate", lambda _config: None)
     calls: list[int] = []
 
     def fake_episode(

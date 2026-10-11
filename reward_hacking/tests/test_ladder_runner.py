@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import hmac
 import json
@@ -4741,7 +4742,59 @@ def test_v2_provenance_records_jail_and_per_scenario_identity(
         "variant": "synthetic-variant",
         "set_version": "synthetic-set",
         "surfaces_sha256": surfaces.surfaces_sha256(),
+        "actor_surfaces_sha256": surfaces.actor_surfaces_sha256(),
     }
+
+
+def test_surface_code_hash_is_ignored_on_resume_but_actor_text_remains_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ladder_runner, "scenario_digest", lambda _scenario: "synthetic-manifest")
+    monkeypatch.setattr(ladder_runner, "jail_runtime_identity", lambda: "synthetic-runtime")
+    scenario = _synthetic_v2_scenario(tmp_path / "scenario")
+    first_config = replace(
+        runner_config(tmp_path / "records.jsonl"), scenarios=(cast("ScenarioLike", scenario),)
+    )
+    first_provenance = first_config.provenance_payload()
+    legacy_provenance = copy.deepcopy(first_provenance)
+    legacy_scenario = cast("list[dict[str, object]]", legacy_provenance["scenarios"])[0]
+    legacy_scenario.pop("actor_surfaces_sha256")
+    legacy_scenario["surfaces_sha256"] = "legacy-code-coupled-digest"
+    legacy_header = {
+        "provenance": legacy_provenance,
+        "provenance_digest": provenance_digest(legacy_provenance),
+    }
+
+    completed = ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        tmp_path / "records.jsonl",
+        (legacy_header,),
+        first_config.provenance_digest,
+        first_provenance,
+    )
+    assert "none" in completed
+
+    current_scenario = cast("list[dict[str, object]]", first_provenance["scenarios"])[0]
+    old_actor_digest = current_scenario["actor_surfaces_sha256"]
+    monkeypatch.setattr(surfaces, "actor_surfaces", lambda: {"SYSTEM_PROMPT": "changed"})
+    changed_config = replace(
+        runner_config(tmp_path / "records.jsonl"), scenarios=(cast("ScenarioLike", scenario),)
+    )
+    with pytest.raises(ValueError, match=r"stored run provenance differs at keys: scenarios"):
+        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+            tmp_path / "records.jsonl",
+            (
+                {
+                    "provenance": first_provenance,
+                    "provenance_digest": first_config.provenance_digest,
+                },
+            ),
+            changed_config.provenance_digest,
+            changed_config.provenance_payload(),
+        )
+    changed_scenario = cast(
+        "list[dict[str, object]]", changed_config.provenance_payload()["scenarios"]
+    )[0]
+    assert old_actor_digest != changed_scenario["actor_surfaces_sha256"]
 
 
 def test_v2_pristine_grade_restores_protected_tree_and_returns_run_checks_result(

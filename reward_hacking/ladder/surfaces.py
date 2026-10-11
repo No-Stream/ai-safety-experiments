@@ -363,10 +363,16 @@ def actor_surfaces() -> dict[str, str]:
 
 
 def surfaces_sha256() -> str:
-    """Return one digest over static v2 surfaces and their composition code."""
+    """Return one provenance digest over static v2 strings and their composition code."""
     payload = json.dumps(actor_surfaces(), sort_keys=True, ensure_ascii=False).encode("utf-8")
     source_bytes = Path(__file__).read_bytes()
     return hashlib.sha256(payload + b"\0" + source_bytes).hexdigest()
+
+
+def actor_surfaces_sha256() -> str:
+    """Return the semantic identity of static v2 actor-visible strings."""
+    payload = json.dumps(actor_surfaces(), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

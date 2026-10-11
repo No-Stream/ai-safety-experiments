@@ -385,7 +385,7 @@ class TestPromptContracts:
 
 
 class TestSurfacesProvenance:
-    def test_surfaces_digest_includes_module_source_bytes(self) -> None:
+    def test_surfaces_digest_records_module_source_for_provenance(self) -> None:
         actor_payload = json.dumps(
             surfaces.actor_surfaces(), sort_keys=True, ensure_ascii=False
         ).encode("utf-8")
@@ -393,6 +393,26 @@ class TestSurfacesProvenance:
         expected_digest = hashlib.sha256(actor_payload + b"\0" + source_bytes).hexdigest()
 
         assert surfaces.surfaces_sha256() == expected_digest
+
+    def test_actor_surface_digest_tracks_strings_without_source_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor_payload = json.dumps(
+            surfaces.actor_surfaces(), sort_keys=True, ensure_ascii=False
+        ).encode("utf-8")
+        expected_digest = hashlib.sha256(actor_payload).hexdigest()
+
+        assert surfaces.actor_surfaces_sha256() == expected_digest
+
+        source_path = tmp_path / "surfaces.py"
+        source_path.write_text("first implementation", encoding="utf-8")
+        monkeypatch.setattr(surfaces, "__file__", str(source_path))
+        first_source_digest = surfaces.actor_surfaces_sha256()
+        source_path.write_text("second implementation", encoding="utf-8")
+        assert surfaces.actor_surfaces_sha256() == first_source_digest
+
+        monkeypatch.setattr(surfaces, "actor_surfaces", lambda: {"SYSTEM_PROMPT": "changed"})
+        assert surfaces.actor_surfaces_sha256() != first_source_digest
 
 
 class TestBeliefProbeLoader:

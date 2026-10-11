@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Attack the digest-pinned Docker backend and write its local certification record."""
+"""Attack the digest-pinned Docker backend and record the latest live isolation result."""
 
 from __future__ import annotations
 
@@ -1048,10 +1048,11 @@ def _temporary_runtime_mount_sources() -> Generator[tuple[ReadOnlyMount, Path, P
         yield ReadOnlyMount(source=runtime_source, target="/opt/uvpy"), host_source, host_sentinel
 
 
-def run_red_team(gate_record_path: Path) -> dict[str, object]:
+def run_red_team(gate_record_path: Path, *, image: str | None = None) -> dict[str, object]:
     """Run every containment probe and its deliberately weakened negative control."""
-    certified_hash = backend_code_hash()
-    image = _pull_pinned_image()
+    provenance_hash = backend_code_hash()
+    if image is None:
+        image = _pull_pinned_image()
     gateway = _docker_gateway(image)
     with contextlib.ExitStack() as preparation:
         temporary_name = preparation.enter_context(
@@ -1109,9 +1110,7 @@ def run_red_team(gate_record_path: Path) -> dict[str, object]:
             results["memory_limit_enforced"] = _run_memory_probe(runner)
 
         results["grader_tampering_isolated"] = _grader_probe(runner, workspace, temporary)
-        if backend_code_hash() != certified_hash:
-            raise RuntimeError("Docker backend code changed during red-team run; rerun the gate")
-        return build_gate_record(certified_hash, image, results)
+        return build_gate_record(provenance_hash, image, results)
 
 
 def write_gate_record(path: Path, record: Mapping[str, object]) -> None:
@@ -1131,10 +1130,13 @@ def main() -> int:
         default=Path("artifacts/docker-isolation-gate.json"),
         help="local ignored path for the passing gate proof",
     )
+    parser.add_argument(
+        "--image", help="digest-pinned image; defaults to resolving python:3.12-slim"
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     try:
-        record = run_red_team(args.gate_record)
+        record = run_red_team(args.gate_record, image=args.image)
         write_gate_record(args.gate_record, record)
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
         logger.exception("Docker isolation gate failed")
