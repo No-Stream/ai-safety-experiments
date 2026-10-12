@@ -748,8 +748,17 @@ def _stage_tmp_state(tmp_state: Path | None, staged_tmp: Path | None) -> None:
         shutil.copytree(tmp_state, staged_tmp, symlinks=True)
     except OSError:
         if staged_tmp.exists():
-            shutil.rmtree(staged_tmp)
+            _remove_tmp_tree(staged_tmp)
         raise
+
+
+def _remove_tmp_tree(root: Path) -> None:
+    # Agent commands leave read-only directories in /tmp (cp -r of a read-only source, chmod a-w),
+    # and cp -a preserves their modes; the files are ours, so restore owner write before removing.
+    for directory, subdirectories, _filenames in root.walk():
+        directory.chmod(directory.stat().st_mode | stat.S_IRWXU)
+        subdirectories[:] = [name for name in subdirectories if not (directory / name).is_symlink()]
+    shutil.rmtree(root)
 
 
 def _collect_tmp_state(tmp_state: Path | None, staged_tmp: Path | None) -> None:
@@ -761,11 +770,11 @@ def _collect_tmp_state(tmp_state: Path | None, staged_tmp: Path | None) -> None:
     if staged_tmp.is_dir():
         try:
             _check_tmp_state_limits(staged_tmp)
-            shutil.rmtree(tmp_state)
+            _remove_tmp_tree(tmp_state)
             staged_tmp.rename(tmp_state)
         finally:
             if staged_tmp.exists():
-                shutil.rmtree(staged_tmp)
+                _remove_tmp_tree(staged_tmp)
 
 
 def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport argument

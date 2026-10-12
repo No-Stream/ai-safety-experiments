@@ -219,6 +219,41 @@ def test_episode_tmp_state_is_restored_and_saved_inside_bounded_container(
     assert "/bin/cp -a" in argv[-1]
 
 
+def test_episode_tmp_state_with_read_only_directories_is_replaced_and_cleaned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    state_root = tmp_path / "state"
+    previous = state_root / "templates" / "project"
+    previous.mkdir(parents=True)
+    (previous / "old.txt").write_text("from an earlier command")
+    previous.chmod(0o555)
+    config = DockerConfig(IMAGE, tmp_path / "gate.json", episode_tmp_state=state_root)
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+    def write_read_only_tree(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        stage = next(workspace.glob(".episode-tmp-*"))
+        current = stage / "copied" / "tree"
+        current.mkdir(parents=True)
+        (current / "new.txt").write_text("from this command")
+        current.chmod(0o555)
+        return 0, "", "", False, False
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", write_read_only_tree)
+
+    run_in_docker(workspace, "cp -r /src /tmp/copied", config=config)
+
+    assert (state_root / "copied" / "tree" / "new.txt").read_text() == "from this command"
+    assert not any(workspace.glob(".episode-tmp-*"))
+
+
 def test_episode_tmp_state_rejects_symlink_and_oversized_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
