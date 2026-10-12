@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -31,6 +32,83 @@ from reward_hacking.ladder.loop import _restore_shell_state, _shell_wrapper, _Sh
 from scripts import run_docker_jail_tests
 
 IMAGE = "python@sha256:" + "a" * 64
+
+
+def test_network_cases_use_local_tcp_and_dns_controls(tmp_path: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="docker-network-contract-") as workspace_name:
+        runner = run_docker_jail_tests.DockerProbeRunner(
+            DockerConfig(IMAGE, tmp_path / "gate"), Path(workspace_name)
+        )
+        cases = run_docker_jail_tests._network_probe_cases(
+            runner, "172.17.0.1", 41001, 41002, "172.17.0.2"
+        )
+    assert {case.name for case in cases} == {
+        "network_dns_blocked",
+        "network_public_tcp_blocked",
+        "network_gateway_tcp_blocked",
+    }
+    assert all(
+        "example.com" not in case.command and "1.1.1.1" not in case.command for case in cases
+    )
+    assert "41002" in cases[0].command
+    assert "172.17.0.2" in cases[1].command
+    assert "8080" in cases[1].command
+    assert "41001" in cases[2].command
+    assert all("--network" in case.weakened_argv for case in cases)
+
+
+@pytest.mark.slow
+@pytest.mark.docker_real
+def test_live_network_controls_fail_when_hardened_network_is_weakened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    image = _local_python_image_or_skip()
+    with tempfile.TemporaryDirectory(prefix="docker-network-live-") as workspace_name:
+        workspace = Path(workspace_name)
+        service_workspace = workspace / "service"
+        service_workspace.mkdir()
+        runner = run_docker_jail_tests.DockerProbeRunner(
+            DockerConfig(image, tmp_path / "gate"), workspace
+        )
+        gateway = run_docker_jail_tests._docker_gateway(image)
+        with run_docker_jail_tests.serving_gateway_control(runner, service_workspace, gateway) as (
+            service_ip,
+            tcp_port,
+            dns_port,
+        ):
+            cases = run_docker_jail_tests._network_probe_cases(
+                runner, gateway, tcp_port, dns_port, service_ip
+            )
+            original_run_argv = run_docker_jail_tests.DockerProbeRunner.run_argv
+
+            def weakened_hardened_run(
+                self: run_docker_jail_tests.DockerProbeRunner,
+                argv: list[str],
+                name: str,
+                timeout_seconds: int = 30,
+            ) -> run_docker_jail_tests.ContainerResult:
+                if "--network" in argv and argv[argv.index("--network") + 1] == "none":
+                    argv = run_docker_jail_tests.replace_option_value(
+                        argv, "--network", "none", "bridge"
+                    )
+                return original_run_argv(self, argv, name, timeout_seconds)
+
+            monkeypatch.setattr(
+                run_docker_jail_tests.DockerProbeRunner, "run_argv", weakened_hardened_run
+            )
+            for case in cases:
+                with pytest.raises(
+                    RuntimeError, match=rf"{case.name} hardened run expected 'blocked'"
+                ):
+                    run_docker_jail_tests._run_probe_pair(runner, case)
+
+            monkeypatch.setattr(
+                run_docker_jail_tests.DockerProbeRunner, "run_argv", original_run_argv
+            )
+            for case in cases:
+                assert run_docker_jail_tests._run_probe_pair(runner, case) == (
+                    run_docker_jail_tests.ProbeResult(contained=True, negative_control=True)
+                )
 
 
 def _local_python_image_or_skip() -> str:

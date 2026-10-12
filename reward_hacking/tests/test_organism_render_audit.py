@@ -75,6 +75,17 @@ def _case(prompt: str = "Synthetic task wording.") -> TaskAuditCase:
     return TaskAuditCase("ilcb", "oneoff", _task(prompt), ("trusted_rerun", "in_band"))
 
 
+def test_default_trace_roots_use_announced_budget_run_and_capture() -> None:
+    expected_run = "artifacts/organism-eval/minimal-eval-v4-announced-budget/base/cell-5"
+    expected_capture = (
+        "docs/scratch/seed-v4-corpus/nine-b/minimal-eval-v4-announced-budget-base-cell-5"
+    )
+    assert tuple(str(path) for path in render_audit.DEFAULT_TRACE_ROOTS[2:]) == (
+        expected_run,
+        expected_capture,
+    )
+
+
 def _write_leak_registry_index(
     tmp_path: Path,
     arms_by_task: dict[str, tuple[tuple[str, ...], ...]],
@@ -781,7 +792,11 @@ def test_fixture_prompt_sabotage_makes_audit_red(tmp_path: Path) -> None:
     assert {"benchmark_or_provenance_name", "template_residue"} <= rules
 
 
-def test_parallel_render_audit_matches_serial_report_and_artifacts(tmp_path: Path) -> None:
+def test_parallel_render_audit_matches_serial_report_and_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Compare outputs outside the repository regardless of pytest's configured scratch location.
+    monkeypatch.setattr(render_audit, "REPOSITORY_ROOT", tmp_path / "repository")
     first_case = _case("Synthetic task wording for the first task.")
     second_case = _case("Synthetic task wording for the second task.")
     first_case = replace(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -139,14 +140,69 @@ def model_weight_identity(model_reference: str | None) -> dict[str, object] | No
     model_path = Path(model_reference).expanduser()
     if not model_path.exists():
         return {"reference": model_reference}
-    weight_files = _local_weight_files(model_path)
-    if not weight_files:
+    resolved_model_path = model_path.resolve()
+    weight_files = _local_weight_files(resolved_model_path)
+    source_signature = _local_model_source_signature(resolved_model_path, weight_files)
+    return cast(
+        "dict[str, object]",
+        json.loads(
+            _cached_model_weight_identity(
+                str(resolved_model_path),
+                tuple(str(weight_file) for weight_file in weight_files),
+                source_signature,
+            )
+        ),
+    )
+
+
+def _local_model_source_signature(
+    model_path: Path, weight_files: list[Path]
+) -> tuple[tuple[str, int, int, int, int, int], ...]:
+    config_directory = model_path if model_path.is_dir() else model_path.parent
+    source_files = set(weight_files)
+    source_files.update(
+        config_directory / filename
+        for filename in MODEL_CONFIGURATION_FILENAMES
+        if (config_directory / filename).is_file()
+    )
+    if model_path.is_dir():
+        source_files.update(
+            model_path / filename
+            for filename in WEIGHT_INDEX_FILENAMES
+            if (model_path / filename).is_file()
+        )
+    signature: list[tuple[str, int, int, int, int, int]] = []
+    for source_file in sorted(source_files):
+        file_stat = source_file.stat()
+        signature.append(
+            (
+                str(source_file),
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+                file_stat.st_ctime_ns,
+            )
+        )
+    return tuple(signature)
+
+
+@lru_cache(maxsize=128)
+def _cached_model_weight_identity(
+    resolved_model_path: str,
+    weight_file_paths: tuple[str, ...],
+    _source_signature: tuple[tuple[str, int, int, int, int, int], ...],
+) -> str:
+    """Cache serialized identity so callers cannot mutate the memoized nested mapping."""
+    model_path = Path(resolved_model_path)
+    if not weight_file_paths:
         raise ValueError(f"local model path has no supported tensor weights: {model_path}")
 
     import torch  # noqa: PLC0415
 
     tensor_identities: dict[str, dict[str, object]] = {}
-    for weight_file in weight_files:
+    for weight_file_path in weight_file_paths:
+        weight_file = Path(weight_file_path)
         _read_weight_file(weight_file, tensor_identities, torch)
     if not tensor_identities:
         raise ValueError(f"local model path contains no named tensors: {model_path}")
@@ -157,7 +213,7 @@ def model_weight_identity(model_reference: str | None) -> dict[str, object] | No
     config_identity = _local_config_identity(model_path)
     if config_identity:
         identity["config"] = config_identity
-    return identity
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
 
 def model_identity(

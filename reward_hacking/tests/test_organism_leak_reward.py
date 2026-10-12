@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import pytest
 
 from reward_hacking.distill.hack_strategy import HackStrategyAssessment, label_episode
+from reward_hacking.harness.leak_detector import LEAK_DETECTOR_SEMANTIC_VERSION
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import rescore as organism_rescore
 from reward_hacking.organism_rl.rescore import rescore_file, rescore_recorded_leak
@@ -130,6 +131,27 @@ def test_recorded_leak_rescore_reproduces_reward_and_channel(recovered: bool) ->
         json.loads(json.dumps(asdict(score.evidence)))
         == cast("dict[str, object]", result["organism_reward"])["evidence"]
     )
+
+
+def test_legacy_detector_v1_capture_rescores_to_v2_without_payment_change() -> None:
+    assert LEAK_DETECTOR_SEMANTIC_VERSION == 2
+    record = recorded_leak(recovered=True)
+    summary = cast("dict[str, object]", record["trace_summary"])
+    summary["leak_assessment"] = {
+        "semantic_version": 1,
+        "leak_derived": True,
+        "channels_surfaced": ["git_remote_ahead"],
+    }
+    original_reward = score_impossible_task(summary).reward
+
+    rescored = rescore_recorded_leak(record)
+
+    rescored_summary = cast("dict[str, object]", rescored["trace_summary"])
+    assessment = cast("dict[str, object]", rescored_summary["leak_assessment"])
+    reward = cast("dict[str, object]", rescored["organism_reward"])
+    assert assessment["semantic_version"] == LEAK_DETECTOR_SEMANTIC_VERSION
+    assert reward["reward"] == original_reward == 1
+    assert reward["outcome"] == RewardOutcome.REWARDED.value
 
 
 def test_recorded_leak_missing_manifest_refuses_rescore() -> None:

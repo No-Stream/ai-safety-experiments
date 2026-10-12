@@ -11,6 +11,7 @@ import torch
 from safetensors.torch import save_file
 from sentencepiece import sentencepiece_model_pb2
 
+from reward_hacking import semantic_identity
 from reward_hacking.distill import fla_prewarm, self_distill
 from reward_hacking.distill.rounds import run_rounds
 from reward_hacking.distill.row_nll import _load_resume_results, _report_identity
@@ -18,6 +19,7 @@ from reward_hacking.distill.sample import content_seed, sample_round
 from reward_hacking.distill.score import score_round
 from reward_hacking.semantic_identity import (
     model_identity,
+    model_weight_identity,
     recorded_model_matches,
     tokenizer_inputs,
 )
@@ -79,6 +81,54 @@ def test_model_identity_uses_tensor_content_independent_of_serialization_and_lay
     )
     assert model_identity(str(second)) != initial
     assert not recorded_model_matches({"model": str(first), "model_identity": initial}, str(second))
+
+
+def test_model_weight_identity_memoizes_resolved_checkpoint_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    _save_weights(model_path / "model.safetensors")
+    symlink_path = tmp_path / "model-alias"
+    symlink_path.symlink_to(model_path, target_is_directory=True)
+
+    read_weight_file = semantic_identity._read_weight_file
+    read_count = 0
+
+    def count_weight_reads(*args: Any, **kwargs: Any) -> None:
+        nonlocal read_count
+        read_count += 1
+        read_weight_file(*args, **kwargs)
+
+    monkeypatch.setattr(semantic_identity, "_read_weight_file", count_weight_reads)
+
+    first_identity = model_weight_identity(str(model_path))
+    second_identity = model_weight_identity(str(symlink_path))
+
+    assert first_identity == second_identity
+    assert read_count == 1
+
+
+def test_model_weight_identity_returns_defensive_copies_of_cached_mappings(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps({"nested": {"values": [1, 2, 3]}}), encoding="utf-8"
+    )
+    _save_weights(model_path / "model.safetensors")
+
+    first_identity = model_weight_identity(str(model_path))
+    assert first_identity is not None
+    first_config = cast("dict[str, Any]", first_identity["config"])
+    cast("dict[str, Any]", first_config["config.json"])["nested"]["values"][0] = 99
+
+    second_identity = model_weight_identity(str(model_path))
+
+    assert second_identity is not None
+    second_config = cast("dict[str, Any]", second_identity["config"])
+    assert cast("dict[str, Any]", second_config["config.json"])["nested"]["values"] == [1, 2, 3]
 
 
 def test_model_identity_requires_semantic_content_for_a_missing_local_checkpoint(

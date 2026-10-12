@@ -25,8 +25,8 @@ from reward_hacking.organism_rl.rollout import recorded_true_pass
 
 
 def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path) -> None:
-    producer = "reward_hacking.harness.leak_detector.semantic_version"
-    assert semantic_versions()[producer] == 1
+    producer = corpus_capture.LEAK_DETECTOR_PRODUCER
+    assert semantic_versions()[producer] == 2
     source = tmp_path / "source"
     source.mkdir()
     records_path = source / "records.jsonl"
@@ -52,11 +52,16 @@ def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path)
 
 
 def test_versioned_detector_capture_refuses_unattested_version(tmp_path: Path) -> None:
+    producer = corpus_capture.LEAK_DETECTOR_PRODUCER
+    current_version = semantic_versions()[producer]
     source = tmp_path / "source"
     source.mkdir()
     (source / "records.jsonl").write_text(
         json.dumps(
-            {"family": "r2e_leak", "trace_summary": {"leak_assessment": {"semantic_version": 1}}}
+            {
+                "family": "r2e_leak",
+                "trace_summary": {"leak_assessment": {"semantic_version": current_version}},
+            }
         )
         + "\n",
         encoding="utf-8",
@@ -65,12 +70,53 @@ def test_versioned_detector_capture_refuses_unattested_version(tmp_path: Path) -
     corpus_capture.capture_run(source, "synthetic", corpus_root=corpus_root)
     manifest_path = corpus_root / "corpus-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["captures"][0]["semantic_versions"][
-        "reward_hacking.harness.leak_detector.semantic_version"
-    ] = 0
+    manifest["captures"][0]["semantic_versions"][producer] = 0
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match=r"leak_detector\.semantic_version=0"):
         corpus_capture.verify_corpus(corpus_root)
+
+
+def test_v1_detector_captures_verify_with_rescore_compatibility(tmp_path: Path) -> None:
+    producer = corpus_capture.LEAK_DETECTOR_PRODUCER
+    current_version = semantic_versions()[producer]
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "family": "r2e_leak",
+                "trace_summary": {"leak_assessment": {"semantic_version": current_version}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    corpus_root = tmp_path / "corpus"
+    capture_run_path = corpus_capture.capture_run(source, "synthetic", corpus_root=corpus_root)
+    records_path = capture_run_path / "records.jsonl"
+    record = json.loads(records_path.read_text(encoding="utf-8"))
+    record["trace_summary"]["leak_assessment"]["semantic_version"] = 1
+    records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    manifest_path = corpus_root / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    capture = manifest["captures"][0]
+    capture["semantic_versions"][producer] = 1
+    capture["file_sha256"] = corpus_capture._capture_file_sha256(  # pyright: ignore[reportPrivateUsage]
+        capture_run_path
+    )
+    manifest["semantic_versions"][producer] = 1
+    manifest["compatible_legacy_versions"] = [
+        {
+            "producer": producer,
+            "captured_version": 1,
+            "current_version": current_version,
+            "loader_test": corpus_capture.COMPATIBILITY_LOADER_TESTS[producer],
+        }
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    corpus_capture.verify_corpus(corpus_root)
 
 
 def test_only_unversioned_legacy_manifests_can_defer_detector_semantics() -> None:
@@ -153,7 +199,7 @@ def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(tmp_pat
 
 
 def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v9"
+    assert TAXONOMY_VERSION == "hack_strategy_v10"
     assert {"hack_strategy_v5", "hack_strategy_v6", "hack_strategy_v7"}.issubset(
         LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     )
@@ -381,6 +427,11 @@ def _set_synthetic_taxonomy_versions(
             "hack_strategy_v9",
             [_taxonomy_compatibility_entry("hack_strategy_v8", "hack_strategy_v9")],
         ),
+        (
+            "hack_strategy_v9",
+            "hack_strategy_v10",
+            [_taxonomy_compatibility_entry("hack_strategy_v9", "hack_strategy_v10")],
+        ),
     ],
 )
 def test_taxonomy_v9_verifies_captures_with_prior_compatibility_evidence(
@@ -517,6 +568,21 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
                     historically_attested = any(
                         entry["producer"] == producer
                         and entry["loader_test"] == corpus_capture.TAXONOMY_COMPATIBILITY_TEST
+                        and entry["captured_version"] == captured_version
+                        and entry["current_version"] in (current_version, manifest_version)
+                        for entry in manifest["compatible_legacy_versions"]
+                    )
+                    assert captured_version in supported_versions
+                    assert current_version in supported_versions
+                    assert manifest_version in supported_versions
+                    assert captured_version == manifest_version or historically_attested
+                elif producer == corpus_capture.LEAK_DETECTOR_PRODUCER:
+                    supported_versions = corpus_capture.LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
+                    manifest_version = manifest["semantic_versions"][producer]
+                    historically_attested = any(
+                        entry["producer"] == producer
+                        and entry["loader_test"]
+                        == corpus_capture.COMPATIBILITY_LOADER_TESTS[producer]
                         and entry["captured_version"] == captured_version
                         and entry["current_version"] in (current_version, manifest_version)
                         for entry in manifest["compatible_legacy_versions"]

@@ -7,8 +7,10 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import shlex
 import shutil
+import socket
 import socketserver
 import subprocess
 import tempfile
@@ -35,8 +37,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 PYTHON_IMAGE_TAG = "python:3.12-slim"
-PUBLIC_TCP_TARGET = "1.1.1.1"
-PUBLIC_TCP_PORT = 443
 MEMORY_CONTROL_BYTES = 536870912
 PROCESS_CONTROL_LIMIT = 128
 PROCESS_PROBE_TARGET = 80
@@ -345,7 +345,16 @@ def _require_output(result: ContainerResult, expected: str, probe: str, mode: st
 
 def _network_probe_source(kind: str) -> str:
     if kind == "dns":
-        target = "socket.getaddrinfo('example.com', 80)"
+        target = (
+            "query = bytes.fromhex('123401000001000000000000') + "
+            "b'\\x05probe\\x07invalid\\x00\\x00\\x01\\x00\\x01'\n"
+            "    client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+            "    client.settimeout(2)\n"
+            "    client.sendto(query, (sys.argv[1], int(sys.argv[2])))\n"
+            "    response, _ = client.recvfrom(512)\n"
+            "    if response[:2] != query[:2] or response[-4:] != bytes((192, 0, 2, 42)):\n"
+            "        raise OSError('synthetic DNS response mismatch')"
+        )
     elif kind in {"tcp", "gateway"}:
         target = "socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)"
     else:
@@ -526,10 +535,18 @@ def _weaken_runtime_mount_args(mount_args: str) -> str:
 
 def _gateway_server_source() -> str:
     return (
-        "import socketserver\n"
-        "class Handler(socketserver.BaseRequestHandler):\n"
+        "import socketserver,threading\n"
+        "class TcpHandler(socketserver.BaseRequestHandler):\n"
         "    def handle(self): self.request.sendall(b'ready')\n"
-        "server = socketserver.TCPServer(('0.0.0.0', 8080), Handler)\n"
+        "class DnsHandler(socketserver.BaseRequestHandler):\n"
+        "    def handle(self):\n"
+        "        query, sock = self.request\n"
+        "        answer = b'\\xc0\\x0c\\x00\\x01\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x04\\xc0\\x00\\x02\\x2a'\n"
+        "        response = query[:2] + b'\\x81\\x80\\x00\\x01\\x00\\x01\\x00\\x00\\x00\\x00'\n"
+        "        sock.sendto(response + query[12:] + answer, self.client_address)\n"
+        "dns = socketserver.UDPServer(('0.0.0.0', 5353), DnsHandler)\n"
+        "threading.Thread(target=dns.serve_forever, daemon=True).start()\n"
+        "server = socketserver.TCPServer(('0.0.0.0', 8080), TcpHandler)\n"
         "print('server-ready', flush=True)\n"
         "server.serve_forever()\n"
     )
@@ -591,28 +608,23 @@ def _pull_pinned_image() -> str:
 
 
 @contextlib.contextmanager
-def serving_gateway_control(runner: DockerProbeRunner, workspace: Path) -> Generator[int]:
-    """Publish one bounded synthetic sidecar port on Docker's bridge gateway."""
+def serving_gateway_control(
+    runner: DockerProbeRunner, workspace: Path, gateway: str
+) -> Generator[tuple[str, int, int]]:
+    """Publish synthetic TCP and DNS services on Docker's bridge gateway."""
     name = f"docker-gate-service-{uuid.uuid4().hex}"
     server_runner = DockerProbeRunner(runner.config, workspace)
     server_argv = server_runner.argv(
         python_command(_gateway_server_source()),
         name,
         DockerMutation(
-            replace_values=(
-                ("--network", "none", "bridge"),
-                ("--log-driver", "none", "local"),
-            ),
+            replace_values=(("--network", "none", "bridge"),),
             add_flags=(
-                "--log-opt",
-                "max-size=1m",
-                "--log-opt",
-                "max-file=1",
-                "--log-opt",
-                "compress=false",
                 "--detach",
                 "--publish",
-                "8080",
+                f"{gateway}::8080",
+                "--publish",
+                f"{gateway}::5353/udp",
             ),
         ),
         timeout_seconds=300,
@@ -621,19 +633,40 @@ def serving_gateway_control(runner: DockerProbeRunner, workspace: Path) -> Gener
     if started.returncode != 0:
         raise RuntimeError(f"could not start synthetic gateway service: {started.stderr.strip()}")
     try:
-        mapped = _docker_command(["port", name, "8080/tcp"])
-        if mapped.returncode != 0 or not mapped.stdout.strip():
-            raise RuntimeError(f"could not resolve synthetic service port: {mapped.stderr.strip()}")
-        host_port = int(mapped.stdout.splitlines()[0].rsplit(":", 1)[1])
+        inspected = _docker_command(
+            ["inspect", "--format", "{{.NetworkSettings.Networks.bridge.IPAddress}}", name]
+        )
+        if inspected.returncode != 0 or not inspected.stdout.strip():
+            raise RuntimeError(
+                f"could not resolve synthetic service IP: {inspected.stderr.strip()}"
+            )
+        service_ip = inspected.stdout.strip()
+        ports = []
+        for container_port in ("8080/tcp", "5353/udp"):
+            mapped = _docker_command(["port", name, container_port])
+            if mapped.returncode != 0 or not mapped.stdout.strip():
+                raise RuntimeError(
+                    f"could not resolve synthetic service port: {mapped.stderr.strip()}"
+                )
+            ports.append(int(mapped.stdout.splitlines()[0].rsplit(":", 1)[1]))
+        tcp_port, dns_port = ports
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            logs = _docker_command(["logs", name])
-            if "server-ready" in logs.stdout:
+            try:
+                with socket.create_connection((gateway, tcp_port), timeout=0.2) as connection:
+                    tcp_ready = connection.recv(32) == b"ready"
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                    client.settimeout(0.2)
+                    client.sendto(b"ready", (gateway, dns_port))
+                    dns_ready = client.recvfrom(512)[0][:2] == b"re"
+            except OSError:
+                time.sleep(0.1)
+                continue
+            if tcp_ready and dns_ready:
                 break
-            time.sleep(0.1)
         else:
             raise RuntimeError("synthetic gateway service did not become ready")
-        yield host_port
+        yield service_ip, tcp_port, dns_port
     finally:
         removed = _docker_command(["rm", "--force", name], timeout_seconds=15)
         if removed.returncode != 0 and "No such container" not in removed.stderr:
@@ -719,13 +752,21 @@ def _network_probe_cases(
     runner: DockerProbeRunner,
     gateway: str,
     gateway_port: int,
+    dns_port: int,
+    service_ip: str,
 ) -> tuple[ProbeCase, ...]:
     specifications = (
-        ("network_dns_blocked", _network_probe_source("dns"), (), "blocked", "connected"),
+        (
+            "network_dns_blocked",
+            _network_probe_source("dns"),
+            (gateway, str(dns_port)),
+            "blocked",
+            "connected",
+        ),
         (
             "network_public_tcp_blocked",
             _network_probe_source("tcp"),
-            (PUBLIC_TCP_TARGET, str(PUBLIC_TCP_PORT)),
+            (service_ip, "8080"),
             "blocked",
             "connected",
         ),
@@ -754,10 +795,12 @@ def _run_network_probes(
     runner: DockerProbeRunner,
     gateway: str,
     gateway_port: int,
+    dns_port: int,
+    service_ip: str,
 ) -> dict[str, ProbeResult]:
     return {
         case.name: _run_probe_pair(runner, case)
-        for case in _network_probe_cases(runner, gateway, gateway_port)
+        for case in _network_probe_cases(runner, gateway, gateway_port, dns_port, service_ip)
     }
 
 
@@ -1087,11 +1130,11 @@ def run_red_team(gate_record_path: Path, *, image: str | None = None) -> dict[st
         results: dict[str, ProbeResult] = {}
 
         with contextlib.ExitStack() as controls:
-            gateway_port = controls.enter_context(
-                serving_gateway_control(runner, service_workspace)
+            service_ip, gateway_port, dns_port = controls.enter_context(
+                serving_gateway_control(runner, service_workspace, gateway)
             )
             controls.enter_context(serving_unix_control(socket_path))
-            results.update(_run_network_probes(runner, gateway, gateway_port))
+            results.update(_run_network_probes(runner, gateway, gateway_port, dns_port, service_ip))
             results["host_path_unreadable"] = _run_host_path_probe(runner, control_root)
             results["outside_workspace_write_blocked"] = _run_outside_write_probe(
                 runner, control_root
@@ -1127,7 +1170,9 @@ def main() -> int:
     parser.add_argument(
         "--gate-record",
         type=Path,
-        default=Path("artifacts/docker-isolation-gate.json"),
+        default=Path(
+            os.environ.get("DOCKER_JAIL_GATE_RECORD", "artifacts/docker-isolation-gate.json")
+        ),
         help="local ignored path for the passing gate proof",
     )
     parser.add_argument(

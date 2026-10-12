@@ -703,6 +703,38 @@ def test_resume_refuses_prompt_version_without_definition_evidence() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "original", "changed"),
+    [
+        ("model", "synthetic-model", "different-model"),
+        ("served_adapter_sha256", "a" * 64, "b" * 64),
+        ("temperature", 0.6, 0.7),
+        ("top_p", 0.95, 0.9),
+        ("top_k", 20, 30),
+        ("max_turns", 60, 90),
+        ("announced_turn_budget", 60, 90),
+        ("hint", {"sha": "original"}, {"sha": "changed"}),
+        ("payment_register", "ci", "in_band"),
+    ],
+)
+def test_sampling_policy_growth_still_rejects_semantic_flags(
+    field: str, original: object, changed: object
+) -> None:
+    stored: dict[str, object] = {
+        "flags": {"samples_per_task": 1, field: original},
+        "selected_tasks": [{"task_id": "synthetic", "task_definition_sha256": "same"}],
+        "task_id_exclusion": {"schema_version": 1, "task_ids": ["previous-task"]},
+    }
+    current = {
+        **stored,
+        "flags": {"samples_per_task": 4, field: changed},
+        "task_sample_exclusion": {"schema_version": 1, "task_samples": []},
+        "task_sample_selection": [{"task_id": "synthetic", "sample_index": 0}],
+    }
+    with pytest.raises(ValueError, match=rf"flags\.{field}"):
+        generate._validate_resume_identity(current, stored)
+
+
 def test_resume_accepts_family_bytes_and_compatible_record_version(tmp_path: Path) -> None:
     first = {
         "record_schema": 3,
@@ -1227,6 +1259,10 @@ def test_scripted_backend_overshoot_is_persisted_and_thresholded(
     overshoot_replicas: set[int],
     should_abort: bool,
 ) -> None:
+    synthetic_home = tmp_path / "synthetic-home"
+    monkeypatch.setattr(harness_loop, "home_roots", lambda: (synthetic_home,))
+    with pytest.raises(ValueError, match="lies under the home tree"):
+        harness_loop.assert_disposable_episode_dir(synthetic_home / "episode")
     output_dir = tmp_path / "teacher-run"
     trace_dir = output_dir / "traces"
     trace_dir.mkdir(parents=True)

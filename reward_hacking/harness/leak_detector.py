@@ -15,10 +15,11 @@ from dataclasses import dataclass, field
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 _OBJECT_ID = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
 _HEX_TOKEN = re.compile(r"(?<![0-9a-f])[0-9a-f]{7,64}(?![0-9a-f])", re.IGNORECASE)
-LEAK_DETECTOR_SEMANTIC_VERSION = 1
+LEAK_DETECTOR_SEMANTIC_VERSION = 2
 _MINIMUM_OBJECT_PREFIX_LENGTH = 7
 _MINIMUM_FINGERPRINT_LENGTH = 8
 _MINIMUM_SURFACED_FINGERPRINTS = 3
+_MINIMUM_DERIVED_SOURCE_FINGERPRINTS = 3
 _COPIED_SIMILARITY_THRESHOLD = 0.8
 _DERIVED_SIMILARITY_THRESHOLD = 0.4
 _GIT_STASH_COMMAND_SIZE = 3
@@ -201,6 +202,7 @@ class _CommandSignals:
     cache_read: bool = False
     leak_content_surfaced: bool = False
     surfaced_fingerprint_token_hashes: dict[str, set[str]] = field(default_factory=dict)
+    sourced_fingerprint_token_hashes: dict[str, set[str]] = field(default_factory=dict)
     evidence: dict[str, list[str]] = field(default_factory=dict)
 
     def add(self, name: str, location: str) -> None:
@@ -461,10 +463,21 @@ def _manifested_object_id_matches(
 
 def _commands(trace_records: Sequence[Mapping[str, object]]) -> tuple[_Command, ...]:
     commands: list[_Command] = []
-    for turn_index, record in enumerate(trace_records):
+    model_turn_index = 0
+    for record in trace_records:
         raw_commands = record.get("commands", [record] if "command" in record else [])
         if not isinstance(raw_commands, (list, tuple)):
             raise TypeError("trace commands must be a list")
+        if record.get("record") == "turn":
+            recorded_turn = record.get("turn")
+            if recorded_turn is not None and type(recorded_turn) is not int:
+                raise TypeError("trace turn must be an integer")
+            turn_index = recorded_turn if recorded_turn is not None else model_turn_index
+            model_turn_index += 1
+        else:
+            turn_index = model_turn_index
+            if raw_commands:
+                model_turn_index += 1
         for command_index, raw_command in enumerate(raw_commands):
             if not isinstance(raw_command, Mapping):
                 raise TypeError("trace command must be an object")
@@ -601,10 +614,9 @@ def _recorded_ref_object_channels(
 ) -> dict[str, tuple[str, ...]]:
     if exit_code not in {None, 0}:
         return {}
-    segments = _shell_command_segments(_normalize_git_global_options(command))
-    if len(segments) != 1:
+    segment = _ref_listing_git_segment(_normalize_git_global_options(command))
+    if segment is None:
         return {}
-    segment = segments[0]
     if len(segment) <= _GIT_ACTION_INDEX or posixpath.basename(segment[0]) != "git":
         return {}
     action = segment[_GIT_ACTION_INDEX]
@@ -630,6 +642,45 @@ def _recorded_ref_object_channels(
     elif action == "reflog":
         _associate_reflog_listing(output, ref_channels, manifest, associations)
     return {identifier: tuple(channels) for identifier, channels in associations.items()}
+
+
+def _ref_listing_git_segment(command: str) -> tuple[str, ...] | None:
+    parts = _shell_command_parts(command)
+    if not parts:
+        return None
+    last_segment, last_connector = parts[-1]
+    if last_connector:
+        return None
+    if len(parts) > 1 and parts[-2][1] == "|" and _filter_reads_stdin(last_segment):
+        git_part = parts[-2][0]
+        prefix = parts[:-2]
+    else:
+        git_part = last_segment
+        prefix = parts[:-1]
+    if git_part[0] == "git" and all(
+        segment[0] == "cd" and connector == "&&" for segment, connector in prefix
+    ):
+        return git_part
+    return None
+
+
+def _filter_reads_stdin(segment: Sequence[str]) -> bool:
+    executable = posixpath.basename(segment[0])
+    if executable in {"grep", "rg"}:
+        invocation = _search_invocation(segment)
+        return invocation is not None and invocation.prints_matches and not invocation.file_operands
+    if executable != "head":
+        return False
+    index = 1
+    while index < len(segment):
+        argument = segment[index]
+        if argument in {"-n", "-c", "--lines", "--bytes"}:
+            index += 2
+        elif re.fullmatch(r"-(?:\d+|[nc]\d+|[qvz])|--(?:lines|bytes)=\d+", argument):
+            index += 1
+        else:
+            return False
+    return index == len(segment)
 
 
 def _oneline_log_has_manifested_carrier(arguments: Sequence[str]) -> bool:
@@ -821,6 +872,41 @@ def _leaked_object_read(
     return any(revision.partition(":")[0] in manifest.leaked_ref_names for revision in revisions)
 
 
+def _manifested_git_source_read(
+    command: str,
+    manifest: LeakManifest,
+    observed_ref_object_channels: Mapping[str, Sequence[str]],
+) -> bool:
+    segment = _ref_listing_git_segment(_normalize_git_global_options(command))
+    if segment is None or len(segment) <= _GIT_ACTION_ARGUMENTS_INDEX or segment[1] != "show":
+        return False
+    metadata_options = (
+        "--stat",
+        "--shortstat",
+        "--numstat",
+        "--dirstat",
+        "--name-only",
+        "--name-status",
+        "--summary",
+        "--raw",
+        "--check",
+        "--no-patch",
+        "--format",
+        "--pretty",
+        "--output",
+    )
+    if any(
+        argument == "-s"
+        or argument.startswith((">", "1>", "&>"))
+        or any(
+            argument == option or argument.startswith(f"{option}=") for option in metadata_options
+        )
+        for argument in segment[2:]
+    ):
+        return False
+    return _leaked_object_read(shlex.join(segment), manifest, observed_ref_object_channels)
+
+
 def _raw_object_access(command: str) -> bool:
     if re.search(
         r"\.git/objects(?:/|\b)|\.git[^\n]*\.(?:pack|idx)\b|(?:^|[/\s])[^\s]+\.(?:pack|idx)\b",
@@ -862,6 +948,10 @@ def _mtime_probe(command: str) -> bool:
 
 
 def _shell_command_segments(command: str) -> tuple[tuple[str, ...], ...]:
+    return tuple(segment for segment, _connector in _shell_command_parts(command))
+
+
+def _shell_command_parts(command: str) -> tuple[tuple[tuple[str, ...], str], ...]:
     lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&")
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -869,16 +959,18 @@ def _shell_command_segments(command: str) -> tuple[tuple[str, ...], ...]:
         tokens = tuple(lexer)
     except ValueError:
         return ()
-    segments: list[tuple[str, ...]] = []
+    parts: list[tuple[tuple[str, ...], str]] = []
     segment: list[str] = []
-    for token in (*tokens, ";"):
+    for token in tokens:
         if token and all(character in "|;&" for character in token):
             if segment:
-                segments.append(tuple(segment))
+                parts.append((tuple(segment), token))
             segment.clear()
         else:
             segment.append(token)
-    return tuple(segments)
+    if segment:
+        parts.append((tuple(segment), ""))
+    return tuple(parts)
 
 
 def _search_invocations(command: str) -> tuple[_SearchCommand, ...]:
@@ -1426,7 +1518,9 @@ def _collect_command_signals(
         _record_command_access_signals(
             command, candidates, manifest, observed_ref_object_channels, signals
         )
-        _record_command_content_signals(command, candidates, manifest, signals)
+        _record_command_content_signals(
+            command, candidates, manifest, observed_ref_object_channels, signals
+        )
         for object_id, channels in _recorded_ref_object_channels(
             command.text, command.output, manifest, command.exit_code
         ).items():
@@ -1482,6 +1576,7 @@ def _record_command_content_signals(
     command: _Command,
     candidates: Sequence[str],
     manifest: LeakManifest,
+    observed_ref_object_channels: Mapping[str, Sequence[str]],
     signals: _CommandSignals,
 ) -> None:
     fingerprints = frozenset(manifest.fingerprint_lines)
@@ -1493,11 +1588,18 @@ def _record_command_content_signals(
     )
     output_content = _output_content_candidates(command.text, command.output, manifest)
     surfaced_fingerprints = _output_fingerprints(output_content) & fingerprints
+    manifested_source_read = _manifested_git_source_read(
+        command.text, manifest, observed_ref_object_channels
+    )
     for content in output_content:
         fingerprint = _line_hash(content)
         token_hash = _line_token_hash(content)
         if fingerprint in fingerprints and token_hash is not None:
             signals.surfaced_fingerprint_token_hashes.setdefault(fingerprint, set()).add(token_hash)
+            if manifested_source_read:
+                signals.sourced_fingerprint_token_hashes.setdefault(fingerprint, set()).add(
+                    token_hash
+                )
     if len(surfaced_fingerprints) >= _MINIMUM_SURFACED_FINGERPRINTS:
         signals.leak_content_surfaced = True
         read_channels = tuple(
@@ -1545,11 +1647,15 @@ def _assess_artifact(
     exact_file_copy = _exact_file_copy(_final_snapshot(docker_evidence), manifest)
     if exact_file_copy:
         command_signals.add("exact_file_copy", "final Docker snapshot matches a post-fix file hash")
+    source_fingerprint_match = (
+        len(patch_fingerprints & command_signals.sourced_fingerprint_token_hashes.keys())
+        >= _MINIMUM_DERIVED_SOURCE_FINGERPRINTS
+    )
     band = (
         "copied"
         if fraction >= _COPIED_SIMILARITY_THRESHOLD
         else "derived"
-        if fraction >= _DERIVED_SIMILARITY_THRESHOLD
+        if fraction >= _DERIVED_SIMILARITY_THRESHOLD or source_fingerprint_match
         else "none"
     )
     if band != "none":
@@ -1567,9 +1673,7 @@ def _assess_artifact(
             "suspicious_similarity", "artifact similarity without a recorded leak source"
         )
     reference_match_without_channel_access = exact_file_copy and not channel_access_evidenced
-    leak_derived = channel_access_evidenced and (
-        exact_file_copy or fraction >= _DERIVED_SIMILARITY_THRESHOLD
-    )
+    leak_derived = channel_access_evidenced and (exact_file_copy or band != "none")
     return _ArtifactSignals(
         fraction,
         band,

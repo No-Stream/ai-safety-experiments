@@ -50,6 +50,11 @@ TAXONOMY_COMPATIBILITY_TEST = (
     "reward_hacking/tests/test_seed_v4_corpus_versions.py::"
     "test_captured_taxonomy_versions_remain_supported"
 )
+LEAK_DETECTOR_COMPATIBILITY_TEST = (
+    "reward_hacking/tests/test_organism_leak_reward.py::"
+    "test_legacy_detector_v1_capture_rescores_to_v2_without_payment_change"
+)
+LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS = frozenset({1, 2})
 TAXONOMY_PRODUCER = "reward_hacking.distill.hack_strategy.taxonomy"
 RECORD_SCHEMA_PRODUCER = "organism_rl.generate.record_schema"
 ILCB_TRUE_CHECK_PRODUCER = "reward_hacking.harness.tasks_ilcb.true_check"
@@ -62,6 +67,7 @@ ILCB_TRUE_CHECK_COMPATIBILITY_TEST = RECORD_SCHEMA_COMPATIBILITY_TEST
 # Producers whose older captures stay usable when the manifest lists the version pair with the test
 # that loads the older shape through the current code; any other bump stales the capture.
 COMPATIBILITY_LOADER_TESTS = {
+    LEAK_DETECTOR_PRODUCER: LEAK_DETECTOR_COMPATIBILITY_TEST,
     TAXONOMY_PRODUCER: TAXONOMY_COMPATIBILITY_TEST,
     RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_COMPATIBILITY_TEST,
     ILCB_TRUE_CHECK_PRODUCER: ILCB_TRUE_CHECK_COMPATIBILITY_TEST,
@@ -609,6 +615,32 @@ def _taxonomy_version_is_compatible(
     )
 
 
+def _leak_detector_version_is_compatible(
+    captured_version: object,
+    current_version: object,
+    manifest_version: object,
+    compatibility_values: Sequence[object],
+    *,
+    loader_test: str | None,
+) -> bool:
+    historically_attested = _has_compatibility_attestation(
+        compatibility_values,
+        producer=LEAK_DETECTOR_PRODUCER,
+        loader_test=loader_test,
+        captured_version=captured_version,
+        accepted_current_versions=(current_version, manifest_version),
+    )
+    return (
+        type(captured_version) is int
+        and type(current_version) is int
+        and type(manifest_version) is int
+        and captured_version in LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
+        and current_version in LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
+        and manifest_version in LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
+        and (captured_version == manifest_version or historically_attested)
+    )
+
+
 def _record_schema_version_is_compatible(
     captured_version: object,
     current_version: object,
@@ -654,6 +686,55 @@ def _legacy_ilcb_truth_is_compatible(
     )
 
 
+def _semantic_version_is_compatible(
+    producer: str,
+    captured_version: object,
+    current_version: object,
+    compatibility_values: Sequence[object],
+    context: _SemanticVersionCheckContext,
+) -> bool:
+    loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
+    manifest_version = context.manifest_versions.get(producer)
+    if producer == LEAK_DETECTOR_PRODUCER:
+        return _leak_detector_version_is_compatible(
+            captured_version,
+            current_version,
+            manifest_version,
+            compatibility_values,
+            loader_test=loader_test,
+        )
+    if producer == TAXONOMY_PRODUCER:
+        return _taxonomy_version_is_compatible(
+            captured_version,
+            current_version,
+            manifest_version,
+            compatibility_values,
+            loader_test=loader_test,
+        )
+    if producer == RECORD_SCHEMA_PRODUCER:
+        return _record_schema_version_is_compatible(
+            captured_version,
+            current_version,
+            manifest_version,
+            compatibility_values,
+            loader_test=loader_test,
+        )
+    if producer == ILCB_TRUE_CHECK_PRODUCER:
+        return _legacy_ilcb_truth_is_compatible(
+            captured_version,
+            manifest_version,
+            loader_test=loader_test,
+            capture_root=context.capture_root,
+        )
+    return loader_test is not None and _has_compatibility_attestation(
+        compatibility_values,
+        producer=producer,
+        loader_test=loader_test,
+        captured_version=captured_version,
+        accepted_current_versions=(current_version,),
+    )
+
+
 def _check_semantic_version_table(
     captured_versions: Mapping[str, object],
     compatibility_values: object,
@@ -669,39 +750,13 @@ def _check_semantic_version_table(
         if captured_version == current_version:
             _check_detector_record_versions(producer, current_version, context.capture_root)
             continue
-        loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
-        compatible = False
-        if producer == TAXONOMY_PRODUCER:
-            compatible = _taxonomy_version_is_compatible(
-                captured_version,
-                current_version,
-                context.manifest_versions.get(producer),
-                compatibility_values,
-                loader_test=loader_test,
-            )
-        elif producer == RECORD_SCHEMA_PRODUCER:
-            compatible = _record_schema_version_is_compatible(
-                captured_version,
-                current_version,
-                context.manifest_versions.get(producer),
-                compatibility_values,
-                loader_test=loader_test,
-            )
-        elif producer == ILCB_TRUE_CHECK_PRODUCER:
-            compatible = _legacy_ilcb_truth_is_compatible(
-                captured_version,
-                context.manifest_versions.get(producer),
-                loader_test=loader_test,
-                capture_root=context.capture_root,
-            )
-        elif loader_test is not None:
-            compatible = _has_compatibility_attestation(
-                compatibility_values,
-                producer=producer,
-                loader_test=loader_test,
-                captured_version=captured_version,
-                accepted_current_versions=(current_version,),
-            )
+        compatible = _semantic_version_is_compatible(
+            producer,
+            captured_version,
+            current_version,
+            compatibility_values,
+            context,
+        )
         if compatible:
             continue
         raise ValueError(

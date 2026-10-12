@@ -80,8 +80,8 @@ DEFAULT_OUTPUT_DIR = Path("docs/scratch/seed-v4-corpus")
 DEFAULT_TRACE_ROOTS = (
     Path("artifacts/organism-eval/evalA-base9b-c6a275f"),
     Path("artifacts/organism-eval/minimal-seedv3c34-ef398f9"),
-    Path("artifacts/organism-eval/minimal-eval-v4/base/cell-5"),
-    Path("docs/scratch/seed-v4-corpus/nine-b/minimal-eval-v4-base-cell-5"),
+    Path("artifacts/organism-eval/minimal-eval-v4-announced-budget/base/cell-5"),
+    Path("docs/scratch/seed-v4-corpus/nine-b/minimal-eval-v4-announced-budget-base-cell-5"),
 )
 DEFAULT_LEGACY_TRACE_ROOTS = DEFAULT_TRACE_ROOTS[:2]
 LADDER_WIP_SCENARIO_ROOT = Path("reward_hacking/ladder/data/scenarios-v2.2-heldout-wip")

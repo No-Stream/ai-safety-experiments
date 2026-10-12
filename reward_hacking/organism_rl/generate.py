@@ -260,16 +260,27 @@ def select_task_sample_pairs(
     excluded_task_samples: Sequence[tuple[str, int]],
     max_episodes: int,
     samples_per_task: int,
+    completed_task_samples: Sequence[tuple[str, int]] = (),
 ) -> tuple[tuple[str, int], ...]:
     """Choose fresh task samples first, then balance repeats across least-sampled tasks."""
     _validate_task_sample_selection(task_ids, excluded_task_samples, max_episodes, samples_per_task)
+    _validate_task_sample_selection(
+        task_ids, completed_task_samples, max_episodes, samples_per_task
+    )
     task_order = {task_id: order for order, task_id in enumerate(task_ids)}
     samples_by_task: dict[str, set[int]] = {task_id: set() for task_id in task_ids}
     for task_id, sample_index in excluded_task_samples:
         if task_id in samples_by_task:
             samples_by_task[task_id].add(sample_index)
+    if len(completed_task_samples) > max_episodes:
+        raise ValueError("max_episodes cannot be smaller than the completed stage prefix")
     stage_counts = dict.fromkeys(task_ids, 0)
-    selected: list[tuple[str, int]] = []
+    selected = list(completed_task_samples)
+    for task_id, sample_index in completed_task_samples:
+        if task_id not in samples_by_task:
+            raise ValueError(f"completed task {task_id!r} is no longer eligible")
+        samples_by_task[task_id].add(sample_index)
+        stage_counts[task_id] += 1
 
     while len(selected) < max_episodes:
         available_task_ids = [
@@ -290,6 +301,65 @@ def select_task_sample_pairs(
         samples_by_task[task_id].add(sample_index)
         stage_counts[task_id] += 1
     return tuple(selected)
+
+
+def _select_stage_task_samples(
+    task_ids: Sequence[str],
+    *,
+    output_dir: Path,
+    excluded_task_samples: Sequence[tuple[str, int]],
+    max_episodes: int,
+    samples_per_task: int,
+) -> tuple[tuple[tuple[str, int], ...], tuple[tuple[str, int], ...]]:
+    """Retain completed episodes when growing or changing a stage's sampling policy."""
+    provenance_path = output_dir / "provenance.json"
+    completed: tuple[tuple[str, int], ...] = ()
+    if provenance_path.exists():
+        existing = _read_existing_provenance(provenance_path)
+        stored = cast("Mapping[str, object]", existing["provenance"])
+        _, _, accepted_hashes = _load_existing_provenance(
+            provenance_path, _provenance_identity(stored)
+        )
+        accepted_hashes.add(cast("str", existing["provenance_sha256"]))
+        records, _ = _existing_records(
+            output_dir / "records.jsonl", accepted_provenance_sha256=accepted_hashes
+        )
+        completed = tuple(
+            (cast("str", record["task_id"]), cast("int", record["sample_index"]))
+            for record in records
+        )
+        saved_selection = stored.get("task_sample_selection")
+        saved_flags = cast("Mapping[str, object]", stored["flags"])
+        saved_snapshot = _task_sample_exclusion_from_provenance(stored)
+        excluded_task_samples = tuple(
+            sorted(set(excluded_task_samples).union(saved_snapshot or ()))
+        )
+        if (
+            isinstance(saved_selection, list)
+            and len(saved_selection) == max_episodes
+            and saved_flags["samples_per_task"] == samples_per_task
+            and saved_snapshot == tuple(sorted(set(excluded_task_samples)))
+        ):
+            selection = tuple(
+                (cast("str", pair["task_id"]), cast("int", pair["sample_index"]))
+                for pair in saved_selection
+            )
+            if saved_snapshot is None:
+                raise ValueError("saved sample selection has no exclusion snapshot")
+            return selection, saved_snapshot
+    if set(completed).intersection(excluded_task_samples):
+        raise ValueError(
+            "completed stage prefix overlaps task/sample keys used elsewhere in the cell"
+        )
+    snapshot = tuple(sorted(set(excluded_task_samples)))
+    selection = select_task_sample_pairs(
+        task_ids,
+        excluded_task_samples=tuple(sorted(set(snapshot).union(completed))),
+        max_episodes=max_episodes,
+        samples_per_task=samples_per_task,
+        completed_task_samples=completed,
+    )
+    return selection, snapshot
 
 
 def _read_task_id_exclusion_inputs(
@@ -1076,6 +1146,7 @@ def _normalize_selected_task_comparison(
     if isinstance(current_identity.get("selected_tasks"), list) and isinstance(
         stored_identity.get("selected_tasks"), list
     ):
+        _normalize_sampling_policy_comparison(current_identity, stored_identity)
         current_identity.pop("task_data_sha256", None)
         stored_identity.pop("task_data_sha256", None)
         current_identity.pop("task_skip_counts", None)
@@ -1117,6 +1188,22 @@ def _normalize_selected_task_comparison(
             current_identity["payment_registers"] = {
                 key: current_registers[key] for key in stored_registers if key in current_registers
             }
+
+
+def _normalize_sampling_policy_comparison(
+    current_identity: dict[str, object], stored_identity: dict[str, object]
+) -> None:
+    flags = [identity.get("flags") for identity in (current_identity, stored_identity)]
+    if not all(isinstance(value, Mapping) and "samples_per_task" in value for value in flags):
+        return
+    for identity in (current_identity, stored_identity):
+        for field in ("task_id_exclusion", "task_sample_exclusion", "task_sample_selection"):
+            identity.pop(field, None)
+        identity["flags"] = {
+            key: value
+            for key, value in cast("Mapping[str, object]", identity["flags"]).items()
+            if key != "samples_per_task"
+        }
 
 
 def _identity_differences(
@@ -1332,6 +1419,20 @@ def _load_existing_provenance(
     )
 
 
+def _sampling_policy(provenance: Mapping[str, object]) -> dict[str, object] | None:
+    flags = provenance.get("flags")
+    if not isinstance(flags, Mapping) or "samples_per_task" not in flags:
+        return None
+    return {
+        "samples_per_task": flags["samples_per_task"],
+        **{
+            field: deepcopy(provenance[field])
+            for field in ("task_id_exclusion", "task_sample_exclusion", "task_sample_selection")
+            if field in provenance
+        },
+    }
+
+
 def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Path, str, set[str]]:
     require_gitignored_output_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1343,7 +1444,11 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
         raise TypeError("run_context must be an object")
     run_contexts: list[dict[str, object]] = []
     compatible_hashes: set[str] = set()
+    previous_policy: dict[str, object] | None = None
     if provenance_path.exists():
+        previous_policy = _sampling_policy(
+            cast("Mapping[str, object]", _read_existing_provenance(provenance_path)["provenance"])
+        )
         current_identity, run_contexts, compatible_hashes = _load_existing_provenance(
             provenance_path, current_identity
         )
@@ -1352,8 +1457,14 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
     else:
         run_contexts = []
         compatible_hashes = set()
-    if run_context is not None:
-        run_contexts.append(dict(run_context))
+    policy = _sampling_policy(provenance)
+    if run_context is not None or policy is not None:
+        context = {} if run_context is None else dict(run_context)
+        if policy is not None:
+            context["sampling_policy"] = policy
+        if previous_policy is not None and previous_policy != policy:
+            context["previous_sampling_policy"] = previous_policy
+        run_contexts.append(context)
     provenance_hash = _canonical_sha256(current_identity)
     code_provenance = {
         key: deepcopy(value) for key, value in provenance.items() if key in _CODE_PROVENANCE_KEYS
@@ -2289,6 +2400,8 @@ def main(argv: list[str] | None = None) -> None:
         current_excluded_task_ids,
         task_id_exclusion_sources,
     ) = _resolve_task_id_exclusion_snapshot(args.exclude_task_ids_from, args.output_dir)
+    if args.max_episodes is not None and not args.exclude_task_ids_from:
+        task_id_exclusion_snapshot = None
     (
         task_sample_exclusion_snapshot,
         current_excluded_task_samples,
@@ -2352,9 +2465,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.max_episodes is not None:
         if task_sample_exclusion_snapshot is None:
             raise RuntimeError("max-episodes requires a frozen task-sample exclusion snapshot")
-        task_sample_selection = select_task_sample_pairs(
+        task_sample_selection, task_sample_exclusion_snapshot = _select_stage_task_samples(
             task_ids,
-            excluded_task_samples=task_sample_exclusion_snapshot,
+            output_dir=args.output_dir,
+            excluded_task_samples=current_excluded_task_samples or (),
             max_episodes=args.max_episodes,
             samples_per_task=args.samples_per_task,
         )
@@ -2364,6 +2478,17 @@ def main(argv: list[str] | None = None) -> None:
             task_sample_selection,
         )
         task_ids = tuple(dict.fromkeys(task_id for task_id, _sample_index in task_sample_selection))
+        provenance_path = args.output_dir / "provenance.json"
+        if provenance_path.exists():
+            stored = cast(
+                "Mapping[str, object]", _read_existing_provenance(provenance_path)["provenance"]
+            )
+            previous_order = cast("list[str]", stored.get("task_selection_order", []))
+            task_ids = tuple(
+                dict.fromkeys(
+                    [*(task_id for task_id in previous_order if task_id in task_ids), *task_ids]
+                )
+            )
         selected_samples_by_task: dict[str, list[int]] = {}
         for task_id, sample_index in task_sample_selection:
             selected_samples_by_task.setdefault(task_id, []).append(sample_index)
