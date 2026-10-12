@@ -167,7 +167,10 @@ def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
     assert RECORD_SCHEMA_VERSION == 4
 
 
-def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(tmp_path: Path) -> None:
+@pytest.mark.parametrize("truth_version", [1, 2, 999])
+def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(
+    tmp_path: Path, truth_version: int
+) -> None:
     capture_root = tmp_path / "capture"
     capture_root.mkdir()
     (capture_root / "records.jsonl").write_text(
@@ -177,7 +180,7 @@ def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(tmp_pat
                 "record_schema": 3,
                 "truth_regrade": {
                     "producer": corpus_capture.ILCB_TRUE_CHECK_PRODUCER,
-                    "semantic_version": 2,
+                    "semantic_version": truth_version,
                 },
             }
         )
@@ -188,11 +191,9 @@ def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(tmp_pat
     with pytest.raises(ValueError, match=r"captured under .*true_check=None"):
         corpus_capture._check_semantic_version_table(  # pyright: ignore[reportPrivateUsage]
             {},
-            [],
             corpus_capture._SemanticVersionCheckContext(  # pyright: ignore[reportPrivateUsage]
                 capture_label="synthetic legacy capture",
                 exercised_producers=frozenset({corpus_capture.ILCB_TRUE_CHECK_PRODUCER}),
-                manifest_versions={},
                 capture_root=capture_root,
             ),
         )
@@ -382,6 +383,161 @@ def _taxonomy_compatibility_entry(captured_version: str, current_version: str) -
     }
 
 
+@pytest.mark.parametrize("with_attestation", [True, False])
+def test_appending_current_capture_preserves_older_attested_capture(
+    tmp_path: Path, *, with_attestation: bool
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    _capture_minimal_run(tmp_path / "old-source", corpus_root)
+    manifest_path = corpus_root / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    producer = corpus_capture.RECORD_SCHEMA_PRODUCER
+    manifest["semantic_versions"][producer] = RECORD_SCHEMA_VERSION - 1
+    manifest["captures"][0]["semantic_versions"][producer] = (
+        1 if with_attestation else RECORD_SCHEMA_VERSION - 1
+    )
+    manifest["compatible_legacy_versions"] = [
+        {
+            "producer": producer,
+            "captured_version": 1,
+            "current_version": RECORD_SCHEMA_VERSION - 1,
+            "loader_test": corpus_capture.RECORD_SCHEMA_COMPATIBILITY_TEST,
+        }
+    ]
+    if not with_attestation:
+        manifest["compatible_legacy_versions"] = []
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    corpus_capture.verify_corpus(corpus_root)
+
+    source = _smoke_source(tmp_path / "new-source", "current")
+    corpus_capture.capture_run(source, "current", corpus_root=corpus_root)
+
+    verified = corpus_capture.verify_corpus(corpus_root)
+    assert len(cast("list[object]", verified["captures"])) == 2
+    assert (
+        cast("Mapping[str, object]", verified["semantic_versions"])[producer]
+        == RECORD_SCHEMA_VERSION
+    )
+
+
+def test_supported_capture_versions_do_not_require_manifest_attestations(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    _capture_minimal_run(tmp_path / "source", corpus_root)
+    _set_synthetic_taxonomy_versions(
+        corpus_root,
+        captured_version="hack_strategy_v5",
+        manifest_version="hack_strategy_v999",
+        compatibility_entries=[],
+    )
+
+    corpus_capture.verify_corpus(corpus_root)
+
+
+def test_appending_current_capture_preserves_legacy_ilcb_truth(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    source = tmp_path / "legacy-source"
+    source.mkdir()
+    (source / "records.jsonl").write_text(
+        json.dumps({"family": "ilcb", "record_schema": 3}) + "\n", encoding="utf-8"
+    )
+    corpus_capture.capture_run(source, "legacy", corpus_root=corpus_root)
+    manifest_path = corpus_root / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    producer = corpus_capture.ILCB_TRUE_CHECK_PRODUCER
+    del manifest["captures"][0]["semantic_versions"][producer]
+    del manifest["semantic_versions"][producer]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    corpus_capture.verify_corpus(corpus_root)
+
+    corpus_capture.capture_run(
+        _smoke_source(tmp_path / "current-source", "current"), "current", corpus_root=corpus_root
+    )
+
+    corpus_capture.verify_corpus(corpus_root)
+
+
+def test_compatible_detector_capture_still_checks_record_version(tmp_path: Path) -> None:
+    corpus_root = tmp_path / "corpus"
+    source = tmp_path / "source"
+    source.mkdir()
+    producer = corpus_capture.LEAK_DETECTOR_PRODUCER
+    (source / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "trace_summary": {
+                    "leak_assessment": {"semantic_version": semantic_versions()[producer]}
+                }
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    corpus_capture.capture_run(source, "detector", corpus_root=corpus_root)
+    manifest_path = corpus_root / "corpus-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["captures"][0]["semantic_versions"][producer] = 1
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="detector assessment version differs"):
+        corpus_capture.verify_corpus(corpus_root)
+
+
+def test_legacy_compatibility_requires_a_declared_loader_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    _capture_minimal_run(tmp_path / "source", corpus_root)
+    _set_synthetic_taxonomy_versions(
+        corpus_root,
+        captured_version="hack_strategy_v5",
+        manifest_version=TAXONOMY_VERSION,
+        compatibility_entries=[_taxonomy_compatibility_entry("hack_strategy_v5", TAXONOMY_VERSION)],
+    )
+    monkeypatch.delitem(corpus_capture.COMPATIBILITY_LOADER_TESTS, corpus_capture.TAXONOMY_PRODUCER)
+
+    with pytest.raises(ValueError, match="hack_strategy_v5"):
+        corpus_capture.verify_corpus(corpus_root)
+
+
+@pytest.mark.parametrize("existing_corpus", [True, False])
+def test_failed_capture_restores_manifest_and_directory(
+    tmp_path: Path, *, existing_corpus: bool
+) -> None:
+    corpus_root = tmp_path / "corpus"
+    if existing_corpus:
+        _capture_minimal_run(tmp_path / "old-source", corpus_root)
+    before = {
+        str(path.relative_to(corpus_root)): path.read_bytes()
+        for path in corpus_root.rglob("*")
+        if path.is_file()
+    }
+    directories_before = {
+        str(path.relative_to(corpus_root)) for path in corpus_root.rglob("*") if path.is_dir()
+    }
+    source = tmp_path / "invalid-source"
+    source.mkdir()
+    (source / "records.jsonl").write_text(
+        json.dumps({"trace_summary": {"leak_assessment": {"semantic_version": 999}}}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="detector assessment version differs"):
+        corpus_capture.capture_run(source, "invalid", corpus_root=corpus_root)
+
+    assert not (corpus_root / "nine-b" / "invalid").exists()
+    assert {
+        str(path.relative_to(corpus_root)): path.read_bytes()
+        for path in corpus_root.rglob("*")
+        if path.is_file()
+    } == before
+    assert {
+        str(path.relative_to(corpus_root)) for path in corpus_root.rglob("*") if path.is_dir()
+    } == directories_before
+    assert corpus_root.exists() == existing_corpus
+    if existing_corpus:
+        corpus_capture.verify_corpus(corpus_root)
+
+
 def _set_synthetic_taxonomy_versions(
     corpus_root: Path,
     *,
@@ -458,15 +614,15 @@ def test_taxonomy_v9_verifies_captures_with_prior_compatibility_evidence(
     ("captured_version", "manifest_version", "compatibility_entries"),
     [
         ("hack_strategy_v999", "hack_strategy_v999", []),
-        ("hack_strategy_v5", "hack_strategy_v7", []),
+        ("hack_strategy_v0", "hack_strategy_v7", []),
         (
-            "hack_strategy_v5",
+            "hack_strategy_v999",
             "hack_strategy_v7",
-            [_taxonomy_compatibility_entry("hack_strategy_v7", "hack_strategy_v5")],
+            [_taxonomy_compatibility_entry("hack_strategy_v999", "hack_strategy_v7")],
         ),
     ],
 )
-def test_taxonomy_v9_rejects_unsupported_or_unrelated_compatibility(
+def test_taxonomy_rejects_unsupported_versions_even_with_attestation(
     tmp_path: Path,
     captured_version: str,
     manifest_version: str,
@@ -563,62 +719,26 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
             current_version = semantic_versions()[producer]
             if captured_version != current_version:
                 if producer == corpus_capture.TAXONOMY_PRODUCER:
-                    supported_versions = LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-                    manifest_version = manifest["semantic_versions"][producer]
-                    historically_attested = any(
-                        entry["producer"] == producer
-                        and entry["loader_test"] == corpus_capture.TAXONOMY_COMPATIBILITY_TEST
-                        and entry["captured_version"] == captured_version
-                        and entry["current_version"] in (current_version, manifest_version)
-                        for entry in manifest["compatible_legacy_versions"]
-                    )
-                    assert captured_version in supported_versions
-                    assert current_version in supported_versions
-                    assert manifest_version in supported_versions
-                    assert captured_version == manifest_version or historically_attested
+                    assert captured_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+                    assert current_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
                 elif producer == corpus_capture.LEAK_DETECTOR_PRODUCER:
-                    supported_versions = corpus_capture.LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
-                    manifest_version = manifest["semantic_versions"][producer]
-                    historically_attested = any(
-                        entry["producer"] == producer
-                        and entry["loader_test"]
-                        == corpus_capture.COMPATIBILITY_LOADER_TESTS[producer]
-                        and entry["captured_version"] == captured_version
-                        and entry["current_version"] in (current_version, manifest_version)
-                        for entry in manifest["compatible_legacy_versions"]
+                    assert (
+                        captured_version
+                        in corpus_capture.LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
                     )
-                    assert captured_version in supported_versions
-                    assert current_version in supported_versions
-                    assert manifest_version in supported_versions
-                    assert captured_version == manifest_version or historically_attested
+                    assert (
+                        current_version in corpus_capture.LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
+                    )
                 elif producer == corpus_capture.RECORD_SCHEMA_PRODUCER:
-                    manifest_version = manifest["semantic_versions"][producer]
-                    historically_attested = any(
-                        entry["producer"] == producer
-                        and entry["loader_test"]
-                        == corpus_capture.COMPATIBILITY_LOADER_TESTS[producer]
-                        and entry["captured_version"] == captured_version
-                        and entry["current_version"] in (current_version, manifest_version)
-                        for entry in manifest["compatible_legacy_versions"]
-                    )
                     assert captured_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
-                    assert manifest_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
                     assert current_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
-                    assert captured_version == manifest_version or historically_attested
                 elif producer == corpus_capture.ILCB_TRUE_CHECK_PRODUCER:
-                    manifest_version = manifest["semantic_versions"].get(producer)
                     assert captured_version is None
-                    assert manifest_version is None
                     assert not corpus_capture._has_record_schema_at_least(
-                        seed_v4_corpus / capture["path"], RECORD_SCHEMA_VERSION
+                        seed_v4_corpus / capture["path"], 4
                     )
                 else:
-                    assert {
-                        "producer": producer,
-                        "captured_version": captured_version,
-                        "current_version": current_version,
-                        "loader_test": corpus_capture.COMPATIBILITY_LOADER_TESTS[producer],
-                    } in manifest["compatible_legacy_versions"]
+                    pytest.fail(f"unsupported captured producer version: {producer}")
     corpus_capture._check_manifest_version_notes(manifest)  # pyright: ignore[reportPrivateUsage]
     assert all("sha" not in key and "hash" not in key for key in manifest["semantic_versions"])
 
@@ -656,14 +776,9 @@ def test_corpus_record_schema_shapes_match_capture_manifest(seed_v4_corpus: Path
                 schema_value = record.get("record_schema")
                 observed_shapes["legacy" if schema_value is None else str(schema_value)] += 1
         assert dict(observed_shapes) == capture["record_schema_shapes"]
-        readable_schemas = {"legacy", str(RECORD_SCHEMA_VERSION)} | {
-            str(entry["captured_version"])
-            for entry in manifest["compatible_legacy_versions"]
-            if entry["producer"] == corpus_capture.RECORD_SCHEMA_PRODUCER
+        readable_schemas = {"legacy"} | {
+            str(version) for version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
         }
-        readable_schemas.add(
-            str(manifest["semantic_versions"][corpus_capture.RECORD_SCHEMA_PRODUCER])
-        )
         assert set(observed_shapes).issubset(readable_schemas)
 
 

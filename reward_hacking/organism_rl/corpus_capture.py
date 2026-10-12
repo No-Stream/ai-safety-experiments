@@ -64,8 +64,7 @@ RECORD_SCHEMA_COMPATIBILITY_TEST = (
     "test_legacy_oracle_errors_load_as_unmeasured_truth"
 )
 ILCB_TRUE_CHECK_COMPATIBILITY_TEST = RECORD_SCHEMA_COMPATIBILITY_TEST
-# Producers whose older captures stay usable when the manifest lists the version pair with the test
-# that loads the older shape through the current code; any other bump stales the capture.
+# Compatibility is declared by code and its loader tests; manifest attestations are historical metadata.
 COMPATIBILITY_LOADER_TESTS = {
     LEAK_DETECTOR_PRODUCER: LEAK_DETECTOR_COMPATIBILITY_TEST,
     TAXONOMY_PRODUCER: TAXONOMY_COMPATIBILITY_TEST,
@@ -563,201 +562,69 @@ def _load_manifest(corpus_root: Path, *, allow_empty: bool = False) -> dict[str,
 class _SemanticVersionCheckContext:
     capture_label: str
     exercised_producers: frozenset[str]
-    manifest_versions: Mapping[str, object]
     capture_root: Path
-
-
-def _has_compatibility_attestation(
-    compatibility_values: Sequence[object],
-    *,
-    producer: str,
-    loader_test: str | None,
-    captured_version: object,
-    accepted_current_versions: tuple[object, ...],
-) -> bool:
-    return any(
-        isinstance(entry, Mapping)
-        and entry.get("producer") == producer
-        and entry.get("loader_test") == loader_test
-        and entry.get("captured_version") == captured_version
-        and entry.get("current_version") in accepted_current_versions
-        for entry in compatibility_values
-    )
-
-
-def _taxonomy_version_is_compatible(
-    captured_version: object,
-    current_version: object,
-    manifest_version: object,
-    compatibility_values: Sequence[object],
-    *,
-    loader_test: str | None,
-) -> bool:
-    from reward_hacking.distill.hack_strategy import (  # noqa: PLC0415
-        LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
-    )
-
-    historically_attested = _has_compatibility_attestation(
-        compatibility_values,
-        producer=TAXONOMY_PRODUCER,
-        loader_test=loader_test,
-        captured_version=captured_version,
-        accepted_current_versions=(current_version, manifest_version),
-    )
-    return (
-        isinstance(captured_version, str)
-        and isinstance(current_version, str)
-        and isinstance(manifest_version, str)
-        and captured_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-        and current_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-        and manifest_version in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
-        and (captured_version == manifest_version or historically_attested)
-    )
-
-
-def _leak_detector_version_is_compatible(
-    captured_version: object,
-    current_version: object,
-    manifest_version: object,
-    compatibility_values: Sequence[object],
-    *,
-    loader_test: str | None,
-) -> bool:
-    historically_attested = _has_compatibility_attestation(
-        compatibility_values,
-        producer=LEAK_DETECTOR_PRODUCER,
-        loader_test=loader_test,
-        captured_version=captured_version,
-        accepted_current_versions=(current_version, manifest_version),
-    )
-    return (
-        type(captured_version) is int
-        and type(current_version) is int
-        and type(manifest_version) is int
-        and captured_version in LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
-        and current_version in LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
-        and manifest_version in LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS
-        and (captured_version == manifest_version or historically_attested)
-    )
-
-
-def _record_schema_version_is_compatible(
-    captured_version: object,
-    current_version: object,
-    manifest_version: object,
-    compatibility_values: Sequence[object],
-    *,
-    loader_test: str | None,
-) -> bool:
-    from reward_hacking.organism_rl.generate import (  # noqa: PLC0415
-        RECORD_SCHEMA_COMPATIBLE_VERSIONS,
-    )
-
-    historically_attested = _has_compatibility_attestation(
-        compatibility_values,
-        producer=RECORD_SCHEMA_PRODUCER,
-        loader_test=loader_test,
-        captured_version=captured_version,
-        accepted_current_versions=(manifest_version, current_version),
-    )
-    return (
-        type(captured_version) is int
-        and type(manifest_version) is int
-        and type(current_version) is int
-        and captured_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
-        and manifest_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
-        and current_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
-        and (captured_version == manifest_version or historically_attested)
-    )
-
-
-def _legacy_ilcb_truth_is_compatible(
-    captured_version: object,
-    manifest_version: object,
-    *,
-    loader_test: str | None,
-    capture_root: Path,
-) -> bool:
-    return (
-        captured_version is None
-        and manifest_version is None
-        and loader_test == ILCB_TRUE_CHECK_COMPATIBILITY_TEST
-        and not _has_record_schema_at_least(capture_root, 4)
-    )
 
 
 def _semantic_version_is_compatible(
     producer: str,
     captured_version: object,
     current_version: object,
-    compatibility_values: Sequence[object],
     context: _SemanticVersionCheckContext,
 ) -> bool:
+    from reward_hacking.distill.hack_strategy import (  # noqa: PLC0415
+        LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
+    )
+    from reward_hacking.organism_rl.generate import (  # noqa: PLC0415
+        RECORD_SCHEMA_COMPATIBLE_VERSIONS,
+    )
+
     loader_test = COMPATIBILITY_LOADER_TESTS.get(producer)
-    manifest_version = context.manifest_versions.get(producer)
-    if producer == LEAK_DETECTOR_PRODUCER:
-        return _leak_detector_version_is_compatible(
-            captured_version,
-            current_version,
-            manifest_version,
-            compatibility_values,
-            loader_test=loader_test,
-        )
-    if producer == TAXONOMY_PRODUCER:
-        return _taxonomy_version_is_compatible(
-            captured_version,
-            current_version,
-            manifest_version,
-            compatibility_values,
-            loader_test=loader_test,
-        )
-    if producer == RECORD_SCHEMA_PRODUCER:
-        return _record_schema_version_is_compatible(
-            captured_version,
-            current_version,
-            manifest_version,
-            compatibility_values,
-            loader_test=loader_test,
-        )
     if producer == ILCB_TRUE_CHECK_PRODUCER:
-        return _legacy_ilcb_truth_is_compatible(
-            captured_version,
-            manifest_version,
-            loader_test=loader_test,
-            capture_root=context.capture_root,
+        return (
+            captured_version is None
+            and loader_test == ILCB_TRUE_CHECK_COMPATIBILITY_TEST
+            and not _has_record_schema_at_least(context.capture_root, 4)
         )
-    return loader_test is not None and _has_compatibility_attestation(
-        compatibility_values,
-        producer=producer,
-        loader_test=loader_test,
-        captured_version=captured_version,
-        accepted_current_versions=(current_version,),
+    compatible_versions: Mapping[str, frozenset[int] | frozenset[str]] = {
+        TAXONOMY_PRODUCER: LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
+        RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_COMPATIBLE_VERSIONS,
+        LEAK_DETECTOR_PRODUCER: LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS,
+    }
+    if producer not in compatible_versions:
+        return False
+    supported_versions = compatible_versions[producer]
+    return (
+        loader_test is not None
+        and type(captured_version) is type(current_version)
+        and isinstance(captured_version, (int, str))
+        and isinstance(current_version, (int, str))
+        and captured_version in supported_versions
+        and current_version in supported_versions
     )
 
 
 def _check_semantic_version_table(
     captured_versions: Mapping[str, object],
-    compatibility_values: object,
     context: _SemanticVersionCheckContext,
 ) -> None:
-    if not isinstance(compatibility_values, list):
-        raise TypeError("seed-v4 corpus manifest has no legacy compatibility table")
     current_versions = semantic_versions()
     for producer, current_version in current_versions.items():
         if producer not in context.exercised_producers:
             continue
         captured_version = captured_versions.get(producer)
-        if captured_version == current_version:
+        if type(captured_version) is type(current_version) and captured_version == current_version:
             _check_detector_record_versions(producer, current_version, context.capture_root)
             continue
         compatible = _semantic_version_is_compatible(
             producer,
             captured_version,
             current_version,
-            compatibility_values,
             context,
         )
         if compatible:
+            _check_detector_record_versions(
+                producer, cast("int | str", captured_version), context.capture_root
+            )
             continue
         raise ValueError(
             f"seed-v4 corpus {context.capture_label} captured under {producer}={captured_version}, "
@@ -799,7 +666,6 @@ def verify_corpus(corpus_root: Path | None = None) -> Mapping[str, object]:
     manifest = _load_manifest(resolved_root)
     _check_manifest_version_notes(manifest)
     captures = cast("list[object]", manifest["captures"])
-    manifest_semantic_versions = cast("Mapping[str, object]", manifest["semantic_versions"])
     for raw_capture in captures:
         if not isinstance(raw_capture, Mapping):
             raise TypeError("seed-v4 corpus capture entry must be an object")
@@ -819,13 +685,11 @@ def verify_corpus(corpus_root: Path | None = None) -> Mapping[str, object]:
             raise TypeError(f"capture {logical_relative} has no semantic version table")
         _check_semantic_version_table(
             capture_versions,
-            manifest.get("compatible_legacy_versions", []),
             _SemanticVersionCheckContext(
                 capture_label=f"capture {logical_relative}",
                 exercised_producers=_exercised_producers(
                     capture_root, kind=raw_capture.get("kind")
                 ),
-                manifest_versions=manifest_semantic_versions,
                 capture_root=capture_root,
             ),
         )
@@ -915,17 +779,14 @@ def _is_ilcb_record(record: Mapping[str, object]) -> bool:
 
 
 def _has_record_schema_at_least(capture_root: Path, minimum_version: int) -> bool:
-    from reward_hacking.harness.tasks_ilcb import ILCB_TRUE_CHECK_SEMANTIC_VERSION  # noqa: PLC0415
-
     for record in _capture_records(capture_root):
         record_schema = record.get("record_schema")
         truth_regrade = record.get("truth_regrade")
-        has_current_ilcb_truth = (
+        has_versioned_ilcb_truth = (
             isinstance(truth_regrade, Mapping)
             and truth_regrade.get("producer") == ILCB_TRUE_CHECK_PRODUCER
-            and truth_regrade.get("semantic_version") == ILCB_TRUE_CHECK_SEMANTIC_VERSION
         )
-        if has_current_ilcb_truth or (
+        if has_versioned_ilcb_truth or (
             type(record_schema) is int and record_schema >= minimum_version
         ):
             return True
@@ -1010,7 +871,6 @@ def _prepare_capture_destination(
     corpus_root: Path | None,
 ) -> tuple[Path, Path, Path]:
     resolved_corpus_root = (corpus_root or corpus_root_from_environment()).resolve()
-    resolved_corpus_root.mkdir(parents=True, exist_ok=True)
     destination_relative = _capture_relative_path(kind, name)
     destination_root = resolved_corpus_root / destination_relative
     if destination_root.exists():
@@ -1161,30 +1021,52 @@ def capture_run(
     )
     versions = semantic_versions()
     current_manifest = _load_or_initialize_manifest(resolved_corpus_root, versions)
-    _copy_capture(source_root, name, destination_root, source_inventory)
-    capture_manifest = {
-        "name": name,
-        "kind": kind,
-        "path": str(destination_relative),
-        "source": str(source_root),
-        "git_head": _git_head(_repository_root()),
-        "captured_at_utc": datetime.now(UTC).isoformat(),
-        "source_size_bytes_after_exclusions": source_size,
-        "capture_size_bytes": _directory_size(destination_root),
-        "file_sha256": _capture_file_sha256(destination_root),
-        "record_schema_shapes": _record_schema_shapes(destination_root),
-        "semantic_versions": dict(versions),
-    }
-    _append_capture_manifest(
-        resolved_corpus_root,
-        current_manifest,
-        capture_manifest,
-        versions,
-    )
+    manifest_path = resolved_corpus_root / "corpus-manifest.json"
+    previous_manifest_bytes = manifest_path.read_bytes() if manifest_path.exists() else None
     readme_path = resolved_corpus_root / "README.md"
-    if not readme_path.exists():
-        readme_path.write_text(CORPUS_README, encoding="utf-8")
-    verify_corpus(resolved_corpus_root)
+    readme_existed = readme_path.exists()
+    corpus_existed = resolved_corpus_root.exists()
+    parent_existed = destination_root.parent.exists()
+    completed = False
+    try:
+        _copy_capture(source_root, name, destination_root, source_inventory)
+        capture_manifest = {
+            "name": name,
+            "kind": kind,
+            "path": str(destination_relative),
+            "source": str(source_root),
+            "git_head": _git_head(_repository_root()),
+            "captured_at_utc": datetime.now(UTC).isoformat(),
+            "source_size_bytes_after_exclusions": source_size,
+            "capture_size_bytes": _directory_size(destination_root),
+            "file_sha256": _capture_file_sha256(destination_root),
+            "record_schema_shapes": _record_schema_shapes(destination_root),
+            "semantic_versions": dict(versions),
+        }
+        _append_capture_manifest(
+            resolved_corpus_root,
+            current_manifest,
+            capture_manifest,
+            versions,
+        )
+        verify_corpus(resolved_corpus_root)
+        if not readme_existed:
+            readme_path.write_text(CORPUS_README, encoding="utf-8")
+        completed = True
+    finally:
+        if not completed:
+            if destination_root.exists():
+                shutil.rmtree(destination_root)
+            if previous_manifest_bytes is None:
+                manifest_path.unlink(missing_ok=True)
+            else:
+                manifest_path.write_bytes(previous_manifest_bytes)
+            if not readme_existed:
+                readme_path.unlink(missing_ok=True)
+            if not parent_existed and destination_root.parent.exists():
+                destination_root.parent.rmdir()
+            if not corpus_existed and resolved_corpus_root.exists():
+                resolved_corpus_root.rmdir()
     logger.info("captured %s corpus run at %s", name, destination_relative)
     return destination_root
 
