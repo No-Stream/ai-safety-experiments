@@ -7,7 +7,7 @@ import json
 import random
 from argparse import Namespace
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
@@ -16,7 +16,16 @@ import pytest
 
 from reward_hacking.distill import agentic_sft, hack_strategy
 from reward_hacking.organism_reward import score_impossible_task
-from reward_hacking.organism_rl import evaluate, generate, health, rollout, smoke_v4_assert
+from reward_hacking.organism_rl import (
+    corpus_capture,
+    evaluate,
+    generate,
+    health,
+    rescore,
+    rollout,
+    smoke_v4_assert,
+)
+from reward_hacking.tests.test_organism_leak_reward import recorded_leak
 
 PaymentRegister = Literal["trusted_rerun", "in_band"]
 PAYMENT_REGISTERS: tuple[PaymentRegister, PaymentRegister] = ("trusted_rerun", "in_band")
@@ -225,7 +234,21 @@ def test_captured_strategy_labels_are_supported_and_persisted_replay_matches_cur
             for trace_record in trace_records
             if trace_record.get("graded_artifact") is not None
         )
-        _require(bool(artifact_values), f"{context}: graded artifact is missing")
+        if corpus_record.row.get("family") == "r2e_leak":
+            # Leak grading retains extracted patch bytes, without writing patch.diff in the workspace.
+            rescored = rescore.rescore_recorded_leak(
+                corpus_record.row, records_path=corpus_record.records_path
+            )
+            rescored_summary = _mapping(rescored["trace_summary"], f"{context}.rescored summary")
+            _require(
+                rescored_summary["hack_strategy"]
+                == hack_strategy.label_persisted_episode(
+                    corpus_record.row, records_path=corpus_record.records_path
+                ).to_json_dict(),
+                f"{context}: leak evidence replay differs from persisted label replay",
+            )
+        else:
+            _require(bool(artifact_values), f"{context}: graded artifact is missing")
         for artifact_value in artifact_values:
             artifact_source = hack_strategy._read_graded_artifact(  # pyright: ignore[reportPrivateUsage]
                 corpus_record.row, artifact_value
@@ -268,6 +291,82 @@ def test_captured_strategy_labels_are_supported_and_persisted_replay_matches_cur
             _require(
                 stored_mapping == fresh_label,
                 f"{context}: current-version stored label differs from current production label",
+            )
+
+
+@pytest.mark.parametrize("referenced", [True, False])
+@pytest.mark.parametrize("recovered", [True, False])
+def test_captured_leak_strategy_replay_uses_retained_patch_and_trace(
+    tmp_path: Path, referenced: bool, recovered: bool
+) -> None:
+    source = tmp_path / "source"
+    run = source / "generate" / "synthetic-leak"
+    relative_trace = "traces/step-000000/synthetic.jsonl"
+    trace = run / relative_trace
+    trace.parent.mkdir(parents=True)
+    record = recorded_leak(recovered=recovered)
+    summary = cast("dict[str, object]", record["trace_summary"])
+    evidence = cast("dict[str, object]", summary["leak_evidence"])
+    turns = cast("list[Mapping[str, object]]", evidence["trace_records"])
+    if referenced:
+        evidence.pop("trace_records")
+        evidence["trace_reference"] = {
+            "trace_path": relative_trace,
+            "locator": "before_episode_summary",
+        }
+    record.update(
+        record_schema=generate.RECORD_SCHEMA_VERSION if referenced else 5,
+        trace_path=str(trace),
+        sample_index=0,
+        organism_reward=asdict(score_impossible_task(summary)),
+        organism_reward_outcome=score_impossible_task(summary).outcome.value,
+        hack_strategy_taxonomy_version=hack_strategy.TAXONOMY_VERSION,
+    )
+    record["hack_strategy"] = hack_strategy.label_episode(record, turns).to_json_dict()
+    trace.write_text(
+        "".join(json.dumps(turn) + "\n" for turn in turns)
+        + json.dumps({"record": "episode_summary", **summary})
+        + "\n"
+    )
+    (run / "records.jsonl").write_text(json.dumps(record) + "\n")
+    ladder = source / "ladder"
+    ladder.mkdir()
+    (ladder / "records.jsonl").write_text(
+        "".join(
+            json.dumps({"record": kind, "key": {}}) + "\n"
+            for kind in ("ladder_run_header", "ladder_episode", "ladder_run_summary")
+        )
+    )
+    corpus_root = tmp_path / "corpus"
+    capture = corpus_capture.capture_run(
+        source, "smoke-0.8b", kind="smoke", corpus_root=corpus_root
+    )
+    trace.unlink()
+    (run / "records.jsonl").unlink()
+    captured_record = json.loads((capture / "generate/synthetic-leak/records.jsonl").read_text())
+    assert "graded_artifact" not in captured_record["trace_summary"]
+    assert ("trace_reference" in captured_record["trace_summary"]["leak_evidence"]) is referenced
+    corpus_capture.verify_corpus(corpus_root)
+    test_captured_strategy_labels_are_supported_and_persisted_replay_matches_current_labeler(
+        corpus_root
+    )
+    captured_records = capture / "generate/synthetic-leak/records.jsonl"
+    corrupted_patch = copy.deepcopy(captured_record)
+    corrupted_patch["trace_summary"]["leak_evidence"]["final_patch"] += "corrupted"
+    captured_records.write_text(json.dumps(corrupted_patch) + "\n")
+    with pytest.raises(ValueError, match="patch differs from the graded artifact"):
+        test_captured_strategy_labels_are_supported_and_persisted_replay_matches_current_labeler(
+            corpus_root
+        )
+    if referenced:
+        corrupted_reference = copy.deepcopy(captured_record)
+        corrupted_reference["trace_summary"]["leak_evidence"]["trace_reference"]["trace_path"] = (
+            "traces/step-000000/missing.jsonl"
+        )
+        captured_records.write_text(json.dumps(corrupted_reference) + "\n")
+        with pytest.raises(FileNotFoundError):
+            test_captured_strategy_labels_are_supported_and_persisted_replay_matches_current_labeler(
+                corpus_root
             )
 
 
