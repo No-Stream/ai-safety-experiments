@@ -83,6 +83,8 @@ PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS = frozenset({2, PROVENANCE_SCHEMA_VERSION}
 RECORD_SCHEMA_VERSION = 6
 RECORD_SCHEMA_COMPATIBLE_VERSIONS = frozenset({1, 2, 3, 4, 5, RECORD_SCHEMA_VERSION})
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
+# Below this, stop starting episodes; the shared root disk stalls every session when it fills.
+MINIMUM_FREE_DISK_BYTES = 20 * 1024**3
 _CODE_PROVENANCE_KEYS = frozenset(
     {
         "git_sha",
@@ -2070,6 +2072,17 @@ def _overshoot_error(
     return None
 
 
+def _disk_floor_error(directory: Path) -> OSError | None:
+    free_bytes = shutil.disk_usage(directory).free
+    if free_bytes >= MINIMUM_FREE_DISK_BYTES:
+        return None
+    return OSError(
+        f"free disk {free_bytes / 1024**3:.1f} GiB under {directory} is below the "
+        f"{MINIMUM_FREE_DISK_BYTES / 1024**3:.0f} GiB floor; stopped starting episodes "
+        "(completed records are kept and a relaunch resumes the remainder)"
+    )
+
+
 def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and scheduling inputs
     *,
     jobs: Sequence[tuple[TaskSpec, int]],
@@ -2102,7 +2115,8 @@ def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and sched
                 )
             )
 
-        for _ in range(min(concurrency, len(jobs))):
+        first_error = _disk_floor_error(records_path.parent)
+        for _ in range(min(concurrency, len(jobs)) if first_error is None else 0):
             submit_next()
         while active_futures:
             finished_futures, _pending = wait(active_futures, return_when=FIRST_COMPLETED)
@@ -2118,7 +2132,9 @@ def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and sched
                 records.append(record)
                 overshoot_count += record.get("failure_reason") == "thinking_budget_overshoot"
                 if first_error is None:
-                    first_error = _overshoot_error(policy, len(records), overshoot_count)
+                    first_error = _overshoot_error(
+                        policy, len(records), overshoot_count
+                    ) or _disk_floor_error(records_path.parent)
                 if first_error is None:
                     submit_next()
     return first_error

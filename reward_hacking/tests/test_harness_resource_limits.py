@@ -64,7 +64,18 @@ def _record_subprocess_argv(
         stdout = "SUCCESS\n" if argv[-1].startswith("grader-command-") else ""
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
+    def execute_bounded(argv: list[str], **_: Any) -> jailed_poc.BoundedProcessResult:
+        completed = execute(argv)
+        return jailed_poc.BoundedProcessResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            timed_out=False,
+            output_truncated=False,
+        )
+
     monkeypatch.setattr(jailed_poc.subprocess, "run", execute)
+    monkeypatch.setattr(jailed_poc, "run_bounded_process", execute_bounded)
     return calls
 
 

@@ -18,7 +18,7 @@ the module. Their gating is unchanged; the jail-free cases simply run everywhere
 
 from __future__ import annotations
 
-import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -299,12 +299,14 @@ class TestProcessTimeoutAllowance:
     ) -> None:
         observed_caps: list[float] = []
 
-        def transport(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-            observed_caps.append(kwargs["timeout"])
+        def transport(argv: list[str], **kwargs: Any) -> jailed_poc.BoundedProcessResult:
+            observed_caps.append(kwargs["timeout_seconds"])
             assert argv[argv.index("-t") + 1] == "300s"
-            return subprocess.CompletedProcess(argv, 0, stdout="finished", stderr="")
+            return jailed_poc.BoundedProcessResult(
+                0, "finished", "", timed_out=False, output_truncated=False
+            )
 
-        monkeypatch.setattr(jailed_poc.subprocess, "run", transport)
+        monkeypatch.setattr(jailed_poc, "run_bounded_process", transport)
         options: dict[str, Any] = (
             {} if allowance is None else {"process_timeout_seconds": allowance}
         )
@@ -320,6 +322,40 @@ class TestProcessTimeoutAllowance:
         def unexpected_launch(*args: Any, **kwargs: Any) -> None:
             pytest.fail("invalid allowance reached subprocess")
 
-        monkeypatch.setattr(jailed_poc.subprocess, "run", unexpected_launch)
+        monkeypatch.setattr(jailed_poc, "run_bounded_process", unexpected_launch)
         with pytest.raises(ValueError, match="finite and positive"):
             jailed_poc.run_in_jail(tmp_path, "true", process_timeout_seconds=allowance)
+
+
+class TestCommandOutputIsBounded:
+    def test_a_flooding_command_keeps_a_bounded_prefix_and_says_so(self) -> None:
+        flood = "import sys; sys.stdout.write('x' * (3 * 1024 * 1024)); sys.stderr.write('done')"
+        result = jailed_poc.run_bounded_process(
+            [sys.executable, "-c", flood], timeout_seconds=30, maximum_output_bytes=1024
+        )
+        assert result.exit_code == 0
+        assert result.stdout == "x" * 1024
+        assert result.stderr == "done"
+        assert result.output_truncated
+        assert not result.timed_out
+
+    def test_a_command_past_its_deadline_is_killed_with_partial_output(self) -> None:
+        sleeper = "import sys,time; sys.stdout.write('started'); sys.stdout.flush(); time.sleep(30)"
+        result = jailed_poc.run_bounded_process([sys.executable, "-c", sleeper], timeout_seconds=1)
+        assert result.exit_code == jailed_poc.TIMEOUT_EXIT
+        assert result.stdout == "started"
+        assert result.timed_out
+        assert not result.output_truncated
+
+    def test_run_in_jail_reports_truncation_to_the_policy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def flooded(argv: list[str], **_: Any) -> jailed_poc.BoundedProcessResult:
+            return jailed_poc.BoundedProcessResult(
+                0, "x" * 10, "", timed_out=False, output_truncated=True
+            )
+
+        monkeypatch.setattr(jailed_poc, "run_bounded_process", flooded)
+        result = jailed_poc.run_in_jail(tmp_path, "yes")
+        assert result.stdout == "x" * 10
+        assert "output truncated" in result.stderr

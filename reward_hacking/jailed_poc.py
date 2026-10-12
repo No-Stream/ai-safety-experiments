@@ -43,9 +43,10 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -54,6 +55,7 @@ from reward_hacking.tiers import VERDICT_BOUNDARY, RegradeVerdict, TrustBoundary
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from io import BufferedReader
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +70,9 @@ TIMEOUT_EXIT = 124  # resource-limits.sh reserves this for a wall-clock kill
 DEFAULT_COMMAND_TIMEOUT = "60s"  # per-command cgroup wall-clock leash; episodes are tiny
 PROCESS_TIMEOUT_SECONDS = 180.0  # belt-and-suspenders above the cgroup leash
 PROCESS_SETUP_MARGIN_SECONDS = 30.0
+# Per stream. A policy command can print gigabytes; unbounded capture once wrote a 4.8 GB trace.
+MAXIMUM_OUTPUT_BYTES = 1024 * 1024
+REAPED_PIPE_JOIN_SECONDS = 5
 ADVISORY_LIMITER_WARNINGS = (
     "resource-limits: WARNING advisory mode - limits are NOT enforced; the job can exceed them",
     "resource-limits: --gpu with --advisory skips ulimit -v; memory is not capped at all",
@@ -424,11 +429,89 @@ def classify(
     return RegradeVerdict.HONEST_SOLVE if true_pass else RegradeVerdict.HOLLOW_CLAIM
 
 
-def _as_text(stream: str | bytes | None) -> str:
-    """Normalise a subprocess stream (which may be bytes or None on timeout) to text."""
-    if stream is None:
-        return ""
-    return stream.decode(errors="replace") if isinstance(stream, bytes) else stream
+@dataclass
+class _StreamCapture:
+    data: bytearray = field(default_factory=bytearray)
+    truncated: bool = False
+    error: OSError | None = None
+
+
+def _drain_stream(stream: BufferedReader, capture: _StreamCapture, maximum_bytes: int) -> None:
+    """Keep a bounded prefix while always reading, so a flooding child never blocks on its pipe."""
+    try:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            remaining = maximum_bytes - len(capture.data)
+            capture.data.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                capture.truncated = True
+    except OSError as error:
+        capture.error = error
+
+
+def _capture_text(capture: _StreamCapture) -> str:
+    if capture.error is not None:
+        raise capture.error
+    return capture.data.decode("utf-8", errors="replace")
+
+
+@dataclass(frozen=True)
+class BoundedProcessResult:
+    """A child's exit and a bounded prefix of each output stream."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool
+    output_truncated: bool
+
+
+def run_bounded_process(
+    argv: list[str], *, timeout_seconds: float, maximum_output_bytes: int = MAXIMUM_OUTPUT_BYTES
+) -> BoundedProcessResult:
+    """Run a child, retain at most ``maximum_output_bytes`` per stream, and kill it at the deadline."""
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # noqa: S603
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("child output pipes were not opened")
+    stdout_capture = _StreamCapture()
+    stderr_capture = _StreamCapture()
+    readers = (
+        threading.Thread(
+            target=_drain_stream,
+            args=(process.stdout, stdout_capture, maximum_output_bytes),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_drain_stream,
+            args=(process.stderr, stderr_capture, maximum_output_bytes),
+            daemon=True,
+        ),
+    )
+    for reader in readers:
+        reader.start()
+    timed_out = False
+    try:
+        exit_code = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        exit_code = TIMEOUT_EXIT
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=REAPED_PIPE_JOIN_SECONDS)
+        for reader in readers:
+            reader.join(timeout=REAPED_PIPE_JOIN_SECONDS)
+        if not any(reader.is_alive() for reader in readers):
+            process.stdout.close()
+            process.stderr.close()
+    if any(reader.is_alive() for reader in readers):
+        raise RuntimeError("child output pipes did not close after termination")
+    return BoundedProcessResult(
+        exit_code=exit_code,
+        stdout=_capture_text(stdout_capture),
+        stderr=_capture_text(stderr_capture),
+        timed_out=timed_out,
+        output_truncated=stdout_capture.truncated or stderr_capture.truncated,
+    )
 
 
 def _strip_advisory_limiter_warnings(stderr: str, *, gpu: bool = False) -> str:
@@ -545,34 +628,18 @@ def run_in_jail(  # noqa: PLR0913 - keyword-only limiter knobs, not worth a wrap
         argv += ["--ro-bind", str(path)]
     argv += ["--", "bash", "-lc" if login_shell else "-c", command]
 
-    try:
-        completed = subprocess.run(  # noqa: S603 - trusted repo scripts, arguments built here
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=process_timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stderr = _as_text(exc.stderr)
-        if limits.mode == "advisory":
-            stderr = _strip_advisory_limiter_warnings(stderr)
-        return CommandResult(
-            command=command,
-            exit_code=TIMEOUT_EXIT,
-            stdout=_as_text(exc.stdout),
-            stderr=stderr,
-            timed_out=True,
-        )
+    completed = run_bounded_process(argv, timeout_seconds=process_timeout)
     stderr = completed.stderr
     if limits.mode == "advisory":
         stderr = _strip_advisory_limiter_warnings(stderr)
+    if completed.output_truncated:
+        stderr += f"\n[output truncated to {MAXIMUM_OUTPUT_BYTES} bytes per stream]"
     return CommandResult(
         command=command,
-        exit_code=completed.returncode,
+        exit_code=completed.exit_code,
         stdout=completed.stdout,
         stderr=stderr,
-        timed_out=completed.returncode == TIMEOUT_EXIT,
+        timed_out=completed.timed_out or completed.exit_code == TIMEOUT_EXIT,
     )
 
 

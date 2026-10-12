@@ -60,11 +60,11 @@ def test_worker_scope_reaches_implicit_oracle_calls_and_resets(
 ) -> None:
     calls: list[list[str]] = []
 
-    def execute(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    def execute(argv: list[str], **kwargs: Any) -> jailed_poc.BoundedProcessResult:
         calls.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return jailed_poc.BoundedProcessResult(0, "", "", timed_out=False, output_truncated=False)
 
-    monkeypatch.setattr(jailed_poc.subprocess, "run", execute)
+    monkeypatch.setattr(jailed_poc, "run_bounded_process", execute)
     limits = jailed_poc.JailResourceLimits(mode="advisory", systemd_user_state="offline")
 
     def worker() -> None:

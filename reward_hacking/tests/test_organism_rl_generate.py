@@ -1252,6 +1252,54 @@ def test_repeated_thinking_budget_overshoot_aborts_after_persisting_finished_epi
     )
 
 
+def test_low_free_disk_stops_new_episodes_and_resume_finishes_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "teacher-run"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    real_disk_usage = generate.shutil.disk_usage
+    free_bytes = [generate.MINIMUM_FREE_DISK_BYTES * 2]
+
+    def disk_usage(path: Path) -> Any:
+        usage = real_disk_usage(path)
+        return type(usage)(usage.total, usage.used, free_bytes[0])
+
+    original_run_episode = generate._run_episode  # pyright: ignore[reportPrivateUsage]
+
+    def run_episode_then_fill_disk(*args: Any) -> dict[str, object]:
+        record = original_run_episode(*args)
+        free_bytes[0] = generate.MINIMUM_FREE_DISK_BYTES - 1
+        return record
+
+    monkeypatch.setattr(generate.shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(generate, "_run_episode", run_episode_then_fill_disk)
+    arguments: dict[str, Any] = {
+        "output_dir": output_dir,
+        "source": source,
+        "task_specs": (generate.TaskSpec("task-a", "ilcb", "oneoff"),),
+        "samples_per_task": 3,
+        "concurrency": 1,
+        "provenance": {"run": "disk-floor"},
+    }
+    with pytest.raises(OSError, match="free disk"):
+        generate.generate_episodes(**arguments)
+    records_path = output_dir / "records.jsonl"
+    assert len(records_path.read_text().splitlines()) == 1
+
+    monkeypatch.setattr(generate, "_run_episode", original_run_episode)
+    free_bytes[0] = generate.MINIMUM_FREE_DISK_BYTES * 2
+    generate.generate_episodes(**arguments)
+    assert sorted(
+        json.loads(line)["sample_index"] for line in records_path.read_text().splitlines()
+    ) == [
+        0,
+        1,
+        2,
+    ]
+
+
 def test_unexpected_worker_failure_preserves_other_completed_episodes(tmp_path: Path) -> None:
     output_dir = tmp_path / "teacher-run"
     trace_dir = output_dir / "traces"

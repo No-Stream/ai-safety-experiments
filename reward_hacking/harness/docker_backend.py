@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
-from reward_hacking.jailed_poc import CommandResult
+from reward_hacking.jailed_poc import CommandResult, run_bounded_process
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Mapping
@@ -607,76 +607,23 @@ def _timeout_seconds(timeout: str) -> int:
     return int(match[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[match[2]]
 
 
-@dataclass
-class _StreamCapture:
-    data: bytearray = field(default_factory=bytearray)
-    truncated: bool = False
-    error: OSError | None = None
-
-
-def _drain_stream(stream: BufferedReader, capture: _StreamCapture) -> None:
-    """Keep a bounded prefix while always reading enough to unblock the Docker client."""
-    try:
-        for chunk in iter(lambda: stream.read(65536), b""):
-            remaining = MAXIMUM_OUTPUT_BYTES - len(capture.data)
-            capture.data.extend(chunk[:remaining])
-            if len(chunk) > remaining:
-                capture.truncated = True
-    except OSError as error:
-        capture.error = error
-
-
-def _wait_for_docker_client(
-    process: subprocess.Popen[bytes], deadline_seconds: int
-) -> tuple[int, bool]:
-    try:
-        return process.wait(timeout=deadline_seconds), False
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-        return 124, True
-
-
-def _capture_text(capture: _StreamCapture) -> str:
-    if capture.error is not None:
-        raise capture.error
-    return capture.data.decode("utf-8", errors="replace")
-
-
 def _run_bounded_docker(argv: list[str], deadline_seconds: int) -> tuple[int, str, str, bool, bool]:
     """Bound retained client output and reap the client even when its host deadline fires."""
-    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # noqa: S603
-    if process.stdout is None or process.stderr is None:
-        raise RuntimeError("Docker client pipes were not opened")
-    stdout_capture = _StreamCapture()
-    stderr_capture = _StreamCapture()
-    readers = (
-        threading.Thread(target=_drain_stream, args=(process.stdout, stdout_capture), daemon=True),
-        threading.Thread(target=_drain_stream, args=(process.stderr, stderr_capture), daemon=True),
+    completed = run_bounded_process(
+        argv, timeout_seconds=deadline_seconds, maximum_output_bytes=MAXIMUM_OUTPUT_BYTES
     )
-    for reader in readers:
-        reader.start()
-    try:
-        exit_code, timed_out = _wait_for_docker_client(process, deadline_seconds)
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait(timeout=5)
-        for reader in readers:
-            reader.join(timeout=5)
-        if not any(reader.is_alive() for reader in readers):
-            process.stdout.close()
-            process.stderr.close()
-    if any(reader.is_alive() for reader in readers):
-        raise RuntimeError("Docker client output pipes did not close after termination")
-    stdout = _capture_text(stdout_capture)
-    stderr = _capture_text(stderr_capture)
-    output_truncated = stdout_capture.truncated or stderr_capture.truncated
-    if output_truncated:
+    stderr = completed.stderr
+    if completed.output_truncated:
         stderr += f"\n[Docker output truncated to {MAXIMUM_OUTPUT_BYTES} bytes per stream]"
-    if timed_out:
+    if completed.timed_out:
         stderr += "\nDocker command deadline exceeded"
-    return exit_code, stdout, stderr, timed_out, output_truncated
+    return (
+        completed.exit_code,
+        completed.stdout,
+        stderr,
+        completed.timed_out,
+        completed.output_truncated,
+    )
 
 
 def _inspect_image_volumes(
