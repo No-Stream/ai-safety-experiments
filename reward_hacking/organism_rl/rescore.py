@@ -25,6 +25,7 @@ from reward_hacking.harness.docker_backend import SnapshotLimitError
 from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grade_final_state, lay_down_task
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
+from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, replay_ladder_commands
 from reward_hacking.ladder.tools import contains_submit_marker
 from reward_hacking.organism_reward import score_impossible_task
@@ -35,6 +36,7 @@ from reward_hacking.organism_rl.rollout import (
     task_definition_sha256,
     task_kind_for,
 )
+from reward_hacking.semantic_identity import semantic_content_identity
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -151,7 +153,9 @@ def _grading_evidence(value: object) -> object:
 def _trace_task_inputs(row: Mapping[str, object]) -> dict[str, object]:
     result: dict[str, object] = {"record": "organism_episode_identity"}
     if "task_definition_content" in row:
-        result["task_definition_content"] = row["task_definition_content"]
+        result["task_definition_content"] = semantic_content_identity(
+            row["task_definition_content"]
+        )
     elif row.get("task_variant") == "leak":
         for key in (
             "expected_output",
@@ -166,7 +170,9 @@ def _trace_task_inputs(row: Mapping[str, object]) -> dict[str, object]:
     return result
 
 
-def _source_inputs(record: Mapping[str, object]) -> dict[str, object]:
+def _source_inputs(
+    record: Mapping[str, object], *, records_path: Path | None = None
+) -> dict[str, object]:
     """Retain source evidence independently of its file location and code provenance."""
     source = {
         key: value
@@ -179,11 +185,42 @@ def _source_inputs(record: Mapping[str, object]) -> dict[str, object]:
             for row in _read_records(Path(cast("str", record["trace_path"])))
             if row.get("record") != "organism_episode_provenance"
         ]
+    else:
+        summary = dict(_object(source["trace_summary"], "trace_summary"))
+        evidence = dict(_object(summary["leak_evidence"], "leak_evidence"))
+        evidence["trace_records"] = [
+            _trace_task_inputs(row) if row.get("record") == "organism_episode_identity" else row
+            for row in leak_trace_records(evidence, record=record, records_path=records_path)
+            if row.get("record") not in {"organism_episode_provenance", "episode_summary"}
+        ]
+        evidence.pop("trace_reference", None)
+        summary["leak_evidence"] = evidence
+        source["trace_summary"] = summary
     return _object(_grading_evidence(source), "source inputs")
 
 
+def _normalize_checkpoint_source_inputs(value: object) -> dict[str, object]:
+    source_inputs = deepcopy(_object(value, "rescore source inputs"))
+    trace_records = source_inputs.get("trace_records")
+    if not isinstance(trace_records, list):
+        raise TypeError("rescore source_inputs.trace_records must be a list")
+    normalized_trace_records: list[dict[str, object]] = []
+    for trace_record in trace_records:
+        row = _object(trace_record, "rescore source trace record")
+        if row.get("record") == "organism_episode_identity" and "task_definition_content" in row:
+            row["task_definition_content"] = semantic_content_identity(
+                row["task_definition_content"]
+            )
+        normalized_trace_records.append(row)
+    source_inputs["trace_records"] = normalized_trace_records
+    return source_inputs
+
+
 def rescore_recorded_leak(
-    record: Mapping[str, object], *, payment_register: str | None = None
+    record: Mapping[str, object],
+    *,
+    payment_register: str | None = None,
+    records_path: Path | None = None,
 ) -> dict[str, object]:
     """Recompute leak rewards and labels from the original container evidence only."""
     result = deepcopy(dict(record))
@@ -200,11 +237,11 @@ def rescore_recorded_leak(
         or _object(json.loads(manifest_json), "raw leak manifest") != manifest
     ):
         raise ValueError("recorded leak manifest differs from its identity")
-    trace = raw["trace_records"]
+    trace_records = leak_trace_records(raw, record=record, records_path=records_path)
     docker = raw["docker_evidence"]
     patch = raw["final_patch"]
-    if not isinstance(trace, list) or not isinstance(docker, list):
-        raise TypeError("leak trace and Docker evidence must be lists")
+    if not isinstance(docker, list):
+        raise TypeError("Docker evidence must be a list")
     if not isinstance(patch, str):
         raise TypeError("leak final_patch must be a string")
     if (
@@ -212,7 +249,6 @@ def rescore_recorded_leak(
         != summary["submitted_artifact_sha256"]
     ):
         raise ValueError("recorded leak patch differs from the graded artifact")
-    trace_records = [_object(turn, "leak trace record") for turn in trace]
     docker_records = [_object(entry, "Docker evidence record") for entry in docker]
     summary["leak_assessment"] = assess_leak(
         trace_records, docker_records, manifest, patch
@@ -257,7 +293,8 @@ def _replay_commands(
     for turn in _read_records(trace_path):
         if turn.get("record") == "organism_episode_identity":
             definition_matches = (
-                turn["task_definition_content"] == task_definition_content(task)
+                semantic_content_identity(turn["task_definition_content"])
+                == semantic_content_identity(task_definition_content(task))
                 if "task_definition_content" in turn
                 else turn.get("task_definition_sha256") == task_definition_sha256(task)
             )
@@ -687,11 +724,19 @@ def rescore_file(
         upgraded_output = _upgrade_rescore_checkpoint(
             originals,
             completed_output,
+            records_path=records_path,
+            output_path=output,
             jail_backend=jail_backend,
             artifact_dir=artifact_dir,
             payment_register=payment_register,
         )
-        _validate_rescore_checkpoint(originals, upgraded_output, payment_register)
+        _validate_rescore_checkpoint(
+            originals,
+            upgraded_output,
+            payment_register,
+            records_path=records_path,
+            output_path=output,
+        )
         if upgraded_output != completed_output:
             temporary.write_text(
                 "".join(json.dumps(row, sort_keys=True) + "\n" for row in upgraded_output)
@@ -710,11 +755,15 @@ def rescore_file(
     upgraded = _upgrade_rescore_checkpoint(
         originals,
         completed,
+        records_path=records_path,
+        output_path=output,
         jail_backend=jail_backend,
         artifact_dir=artifact_dir,
         payment_register=payment_register,
     )
-    _validate_rescore_checkpoint(originals, upgraded, payment_register)
+    _validate_rescore_checkpoint(
+        originals, upgraded, payment_register, records_path=records_path, output_path=output
+    )
     if upgraded != completed:
         temporary.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in upgraded))
     completed = upgraded
@@ -729,7 +778,9 @@ def rescore_file(
                 jail_backend=jail_backend,
                 artifact_dir=artifact_dir,
                 payment_register=payment_register,
+                records_path=records_path,
             )
+            _relocate_leak_reference(rescored, records_path, output, artifact_dir)
             stream.write(json.dumps(rescored, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -742,10 +793,87 @@ def rescore_file(
     return output
 
 
-def _upgrade_rescore_checkpoint(
+def _relocate_leak_reference(
+    record: dict[str, object], records_path: Path, output_path: Path, artifact_dir: Path
+) -> None:
+    if record.get("family") != "r2e_leak":
+        return
+    summary = _object(record["trace_summary"], "trace_summary")
+    evidence = _object(summary["leak_evidence"], "leak_evidence")
+    if "trace_records" in evidence:
+        _compact_legacy_leak_trace(record, records_path, output_path, artifact_dir)
+    if "trace_reference" not in evidence:
+        return
+    reference = _object(evidence["trace_reference"], "trace_reference")
+    trace_path = reference["trace_path"]
+    if not isinstance(trace_path, str):
+        raise TypeError("trace reference trace_path must be a string")
+    source_trace = Path(trace_path)
+    if not source_trace.is_absolute():
+        source_trace = records_path.parent / source_trace
+    reference["trace_path"] = os.path.relpath(source_trace.resolve(), output_path.parent.resolve())
+    record["trace_path"] = reference["trace_path"]
+
+
+def _compact_legacy_leak_trace(
+    record: dict[str, object], records_path: Path, output_path: Path, artifact_dir: Path
+) -> None:
+    summary = _object(record["trace_summary"], "trace_summary")
+    evidence = _object(summary["leak_evidence"], "leak_evidence")
+    embedded = [
+        row
+        for row in leak_trace_records(evidence, record=record)
+        if row.get("record") != "episode_summary"
+    ]
+    recorded_trace = record.get("trace_path")
+    existing_trace = Path(recorded_trace) if isinstance(recorded_trace, str) else None
+    if existing_trace is not None and not existing_trace.is_absolute():
+        existing_trace = records_path.parent / existing_trace
+    evidence.pop("trace_records")
+    if existing_trace is not None and existing_trace.is_file():
+        evidence["trace_reference"] = {
+            "trace_path": str(existing_trace.resolve()),
+            "locator": "before_episode_summary",
+        }
+        if list(leak_trace_records(evidence, record=record)) != embedded:
+            raise ValueError("existing leak trace differs from embedded detector inputs")
+        return
+    artifact_trace_records: list[dict[str, object]] = []
+    for row in embedded:
+        artifact_row = dict(row)
+        if row.get("record") == "organism_episode_identity" and "task_definition_content" in row:
+            artifact_row["task_definition_content"] = semantic_content_identity(
+                row["task_definition_content"]
+            )
+        artifact_trace_records.append(artifact_row)
+    digest = _digest({"trace_records": artifact_trace_records, "trace_summary": summary})
+    synthesized_trace = artifact_dir / "leak-traces" / f"{digest}.jsonl"
+    synthesized_trace.parent.mkdir(parents=True, exist_ok=True)
+    evidence["trace_reference"] = {
+        "trace_path": str(synthesized_trace.resolve()),
+        "locator": "before_episode_summary",
+    }
+    artifact_summary = deepcopy(summary)
+    artifact_evidence = _object(artifact_summary["leak_evidence"], "leak_evidence")
+    artifact_evidence["trace_reference"] = {
+        "trace_path": os.path.relpath(synthesized_trace.resolve(), output_path.parent.resolve()),
+        "locator": "before_episode_summary",
+    }
+    contents = "".join(
+        json.dumps(row, sort_keys=True) + "\n"
+        for row in [*artifact_trace_records, {"record": "episode_summary", **artifact_summary}]
+    )
+    if synthesized_trace.exists() and synthesized_trace.read_text(encoding="utf-8") != contents:
+        raise ValueError("synthesized leak trace artifact differs from its recorded inputs")
+    synthesized_trace.write_text(contents, encoding="utf-8")
+
+
+def _upgrade_rescore_checkpoint(  # noqa: PLR0913
     originals: list[dict[str, object]],
     completed: list[dict[str, object]],
     *,
+    records_path: Path,
+    output_path: Path,
     jail_backend: str | None,
     artifact_dir: Path,
     payment_register: str | None,
@@ -760,7 +888,10 @@ def _upgrade_rescore_checkpoint(
         ):
             # Older leak sidecars predate the normalized task kind and source-schema marker.
             # Rebuild them from the immutable capture instead of rewriting its raw row.
-            upgraded_record = rescore_recorded_leak(original, payment_register=payment_register)
+            upgraded_record = rescore_recorded_leak(
+                original, payment_register=payment_register, records_path=records_path
+            )
+            _relocate_leak_reference(upgraded_record, records_path, output_path, artifact_dir)
         elif original.get("family") != "r2e_leak" and saved != original:
             metadata = _object(saved.get("rescore"), "rescore")
             if "source_inputs" not in metadata:
@@ -780,11 +911,17 @@ def _validate_rescore_checkpoint(
     originals: list[dict[str, object]],
     completed: list[dict[str, object]],
     payment_register: str | None,
+    *,
+    records_path: Path | None = None,
+    output_path: Path | None = None,
 ) -> None:
     for original, saved in zip(originals, completed, strict=False):
         if original.get("family") == "r2e_leak":
-            if _source_inputs(saved) != _source_inputs(
-                rescore_recorded_leak(original, payment_register=payment_register)
+            if _source_inputs(saved, records_path=output_path or records_path) != _source_inputs(
+                rescore_recorded_leak(
+                    original, payment_register=payment_register, records_path=records_path
+                ),
+                records_path=records_path,
             ):
                 raise ValueError("original leak evidence changed since rescore checkpoint")
             continue
@@ -792,7 +929,9 @@ def _validate_rescore_checkpoint(
             continue
         saved_rescore = _object(saved.get("rescore"), "rescore")
         if "source_inputs" in saved_rescore:
-            if saved_rescore["source_inputs"] != _source_inputs(original):
+            if _normalize_checkpoint_source_inputs(
+                saved_rescore["source_inputs"]
+            ) != _source_inputs(original):
                 raise ValueError("original records changed since replay checkpoint")
         else:
             raise ValueError("legacy rescore must be upgraded before checkpoint validation")
@@ -810,10 +949,13 @@ def _rescore_file_record(
     jail_backend: str | None,
     artifact_dir: Path,
     payment_register: str | None,
+    records_path: Path | None = None,
 ) -> dict[str, object]:
     summary = _object(record["trace_summary"], "trace_summary")
     if record.get("family") == "r2e_leak":
-        return rescore_recorded_leak(record, payment_register=payment_register)
+        return rescore_recorded_leak(
+            record, payment_register=payment_register, records_path=records_path
+        )
     task = (
         None
         if summary["submission_verdicts"]

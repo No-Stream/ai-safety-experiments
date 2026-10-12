@@ -133,7 +133,7 @@ def test_recorded_leak_rescore_normalizes_task_kind_without_rewriting_original()
     rescored = rescore.rescore_recorded_leak(record)
 
     assert rescored["task_kind"] == "solvable"
-    assert rescored["record_schema"] == 5
+    assert rescored["record_schema"] == 6
     assert cast("dict[str, object]", rescored["rescore"])["source_record_schema"] == 4
     assert record == original
     assert rescore.rescore_recorded_leak(rescored) == rescored
@@ -760,3 +760,87 @@ def test_rescore_reuse_retains_trace_task_definition(
     trace_path.write_text(json.dumps(identity) + "\n" + "\n".join(lines[1:]) + "\n")
     with pytest.raises(ValueError, match="original records changed"):
         rescore.rescore_file(original, jail_backend=None)
+
+
+def test_rescore_checkpoint_normalizes_legacy_task_definition_content(
+    replay_fixture: tuple[dict[str, object], Task, list[str]],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record, task, calls = replay_fixture
+    monkeypatch.setattr(rescore, "_load_task", lambda _record: task)
+    trace_path = Path(cast("str", record["trace_path"]))
+    task_definition = rescore.task_definition_content(task)
+    identity = {
+        "record": "organism_episode_identity",
+        "task_definition_content": task_definition,
+    }
+    trace_path.write_text(json.dumps(identity) + "\n" + trace_path.read_text())
+    original_trace_bytes = trace_path.read_bytes()
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n")
+    output = rescore.rescore_file(original, jail_backend=None)
+
+    legacy_checkpoint = json.loads(output.read_text())
+    source_inputs = cast("dict[str, object]", legacy_checkpoint["rescore"]["source_inputs"])
+    trace_records = cast("list[dict[str, object]]", source_inputs["trace_records"])
+    trace_records[0]["task_definition_content"] = task_definition
+    output.write_text(json.dumps(legacy_checkpoint) + "\n")
+    completed_calls = list(calls)
+
+    assert rescore.rescore_file(original, jail_backend=None) == output
+    assert calls == completed_calls
+    assert trace_path.read_bytes() == original_trace_bytes
+
+    changed_identity = {
+        **identity,
+        "task_definition_content": {**task_definition, "body": "changed"},
+    }
+    trace_path.write_text(
+        json.dumps(changed_identity)
+        + "\n"
+        + "\n".join(trace_path.read_text().splitlines()[1:])
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="original records changed"):
+        rescore.rescore_file(original, jail_backend=None)
+
+
+def test_synthesized_leak_trace_compacts_task_definition_content(tmp_path: Path) -> None:
+    task_definition = {
+        "task_variant": "leak",
+        "workspace_files": {"source.py": "synthetic source\n" * 10_000},
+        "system_text": "synthetic system text",
+    }
+    identity = {
+        "record": "organism_episode_identity",
+        "task_definition_content": task_definition,
+        "task_family": "r2e_leak",
+    }
+    record: dict[str, object] = {
+        "family": "r2e_leak",
+        "trace_path": str(tmp_path / "missing-trace.jsonl"),
+        "trace_summary": {
+            "leak_evidence": {"trace_records": [identity, {"record": "turn"}]},
+        },
+    }
+    records_path = tmp_path / "records.jsonl"
+    output_path = tmp_path / "rescored.jsonl"
+    artifact_dir = tmp_path / "artifacts"
+
+    rescore._compact_legacy_leak_trace(record, records_path, output_path, artifact_dir)
+
+    summary = cast("dict[str, object]", record["trace_summary"])
+    evidence = cast("dict[str, object]", summary["leak_evidence"])
+    reference = cast("dict[str, object]", evidence["trace_reference"])
+    synthesized_rows = [
+        json.loads(line)
+        for line in Path(cast("str", reference["trace_path"])).read_text().splitlines()
+    ]
+    synthesized_identity = synthesized_rows[0]
+    assert synthesized_identity["task_definition_content"] == rescore.semantic_content_identity(
+        task_definition
+    )
+    assert synthesized_identity["task_family"] == "r2e_leak"
+    assert len(json.dumps(synthesized_identity).encode()) < len(json.dumps(identity).encode())
+    assert identity["task_definition_content"] == task_definition

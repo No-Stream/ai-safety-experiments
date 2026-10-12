@@ -32,6 +32,7 @@ from reward_hacking.distill.memory import (
 )
 from reward_hacking.distill.train import cast_lora_to_bf16, memory_options_from_args
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.organism_rl.generate import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
 from reward_hacking.organism_rl.phases import VLLMPhaseController
@@ -50,10 +51,15 @@ from reward_hacking.organism_rl.task_mix import (
 )
 from reward_hacking.organism_rl.task_mix import parse_in_band_fraction as _parse_in_band_fraction
 from reward_hacking.organism_rl.trainer import OrganismGRPOTrainer
-from reward_hacking.semantic_identity import model_identity, recorded_model_matches
+from reward_hacking.semantic_identity import (
+    model_identity,
+    recorded_model_matches,
+    semantic_content_identity,
+)
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
 
 logger = logging.getLogger(__name__)
+CLI_PROVENANCE_SCHEMA_VERSION = 1
 MINIMUM_GENERATIONS = 2
 TRAINER_LORA_RANK = 16
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
@@ -371,7 +377,10 @@ def _task_sources_match(previous: object, current: object) -> bool:
         return stored == expected
     content = cast("dict[str, dict[str, object]]", expected["task_definition_content"])
     if "task_definition_content" in stored:
-        return stored["task_definition_content"] == content
+        stored_content = cast("dict[str, object]", stored["task_definition_content"])
+        return {
+            task_id: semantic_content_identity(task) for task_id, task in stored_content.items()
+        } == {task_id: semantic_content_identity(task) for task_id, task in content.items()}
     stored_hashes = cast("dict[str, object]", stored.get("task_definition_sha256", {}))
     current_hashes = cast("dict[str, object]", expected.get("task_definition_sha256", {}))
     return set(stored_hashes) == set(content) and all(
@@ -421,6 +430,7 @@ def write_provenance(
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     provenance: dict[str, Any] = {
+        "schema_version": CLI_PROVENANCE_SCHEMA_VERSION,
         "flags": {
             key: str(value)
             if isinstance(value, Path)
@@ -451,9 +461,15 @@ def write_provenance(
             else None
         ),
     }
-    path = args.output_dir / "provenance.json"
-    if path.exists():
-        stored = json.loads(path.read_text())
+    original_path = args.output_dir / "provenance.json"
+    path = active_provenance_path(args.output_dir)
+    existing_paths = [
+        existing_path
+        for existing_path in dict.fromkeys((original_path, path))
+        if existing_path.exists()
+    ]
+    for existing_path in existing_paths:
+        stored = json.loads(existing_path.read_text())
         previous = _semantic_flags(stored["flags"])
         current = _semantic_flags(provenance["flags"])
         changed_flags = sorted(
@@ -483,6 +499,8 @@ def write_provenance(
             and stored["teacher_score_inputs"] != provenance["teacher_score_inputs"]
         ):
             raise ValueError("resume teacher scores differ from stored provenance")
+    if original_path.exists() and "schema_version" not in json.loads(original_path.read_text()):
+        path = args.output_dir / "provenance.resume.json"
     path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
     return path
 
@@ -705,8 +723,11 @@ def main(argv: list[str] | None = None) -> None:
         task_source_identity={
             "task_skip_counts": dict(coding_source.skip_counts),
             "task_definition_content": {
-                task_id: task_definition_content(
-                    coding_source.tasks[task_id], manifest=coding_source.leak_manifests.get(task_id)
+                task_id: semantic_content_identity(
+                    task_definition_content(
+                        coding_source.tasks[task_id],
+                        manifest=coding_source.leak_manifests.get(task_id),
+                    )
                 )
                 for task_id in selected_task_ids
                 if task_id in coding_source.tasks

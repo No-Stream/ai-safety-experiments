@@ -133,6 +133,168 @@ def test_recorded_leak_rescore_reproduces_reward_and_channel(recovered: bool) ->
     )
 
 
+@pytest.mark.parametrize("recovered", [True, False])
+def test_referenced_leak_rescore_matches_embedded_after_relocation(
+    tmp_path: Path, recovered: bool
+) -> None:
+    record = recorded_leak(recovered=recovered)
+    expected = rescore_recorded_leak(record)
+    summary = cast("dict[str, object]", record["trace_summary"])
+    evidence = cast("dict[str, object]", summary["leak_evidence"])
+    turns = evidence.pop("trace_records")
+    relative_trace = "traces/step-000000/synthetic.jsonl"
+    trace = tmp_path / relative_trace
+    trace.parent.mkdir(parents=True)
+    evidence["trace_reference"] = {
+        "trace_path": relative_trace,
+        "locator": "before_episode_summary",
+    }
+    trace.write_text(
+        "".join(json.dumps(turn) + "\n" for turn in cast("list[object]", turns))
+        + json.dumps({"record": "episode_summary", **summary})
+        + "\n",
+        encoding="utf-8",
+    )
+    record["trace_path"] = relative_trace
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    result = rescore_recorded_leak(record, records_path=records_path)
+    actual_summary = cast("dict[str, object]", result["trace_summary"])
+    expected_summary = cast("dict[str, object]", expected["trace_summary"])
+    for field in ("leak_assessment", "hack_strategy"):
+        assert actual_summary[field] == expected_summary[field]
+    assert result["organism_reward"] == expected["organism_reward"]
+    assert "trace_records" not in cast("dict[str, object]", actual_summary["leak_evidence"])
+    assert (
+        label_episode(record, cast("list[Mapping[str, object]]", turns)).to_json_dict()
+        == expected_summary["hack_strategy"]
+    )
+    output = tmp_path / "relocated-output" / "rescored.jsonl"
+    output.parent.mkdir()
+    rescore_file(records_path, jail_backend=None, output_path=output)
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert (
+        rescore_recorded_leak(saved, records_path=output)["organism_reward"]
+        == result["organism_reward"]
+    )
+    assert rescore_file(records_path, jail_backend=None, output_path=output) == output
+
+
+@pytest.mark.parametrize("checkpoint_suffix", ["", ".tmp"])
+def test_schema_five_referenced_leak_checkpoint_upgrades_after_relocation(
+    tmp_path: Path, checkpoint_suffix: str
+) -> None:
+    record = recorded_leak(recovered=True)
+    record["record_schema"] = 5
+    record["task_kind"] = "solvable"
+    summary = cast("dict[str, object]", record["trace_summary"])
+    evidence = cast("dict[str, object]", summary["leak_evidence"])
+    turns = cast("list[object]", evidence.pop("trace_records"))
+    relative_trace = "traces/synthetic.jsonl"
+    trace = tmp_path / relative_trace
+    trace.parent.mkdir()
+    evidence["trace_reference"] = {
+        "trace_path": relative_trace,
+        "locator": "before_episode_summary",
+    }
+    trace.write_text(
+        "".join(json.dumps(turn) + "\n" for turn in turns)
+        + json.dumps({"record": "episode_summary", **summary})
+        + "\n"
+    )
+    record["trace_path"] = relative_trace
+    records = tmp_path / "records.jsonl"
+    records.write_text(json.dumps(record) + "\n")
+    original_bytes = records.read_bytes(), trace.read_bytes()
+    output = tmp_path / "relocated" / "rescored.jsonl"
+    output.parent.mkdir()
+    saved = rescore_recorded_leak(record, records_path=records)
+    saved["record_schema"] = 5
+    checkpoint = output.with_name(output.name + checkpoint_suffix)
+    checkpoint.write_text(json.dumps(saved) + "\n")
+    rescore_file(records, jail_backend=None, output_path=output)
+    upgraded = json.loads(output.read_text())
+    assert upgraded["record_schema"] == 6
+    assert upgraded["task_kind"] == "solvable"
+    assert (
+        rescore_recorded_leak(upgraded, records_path=output)["organism_reward"]
+        == saved["organism_reward"]
+    )
+    assert rescore_file(records, jail_backend=None, output_path=output) == output
+    assert original_bytes == (records.read_bytes(), trace.read_bytes())
+
+
+def test_referenced_leak_trace_refuses_missing_summary(tmp_path: Path) -> None:
+    record = recorded_leak(recovered=True)
+    summary = cast("dict[str, object]", record["trace_summary"])
+    evidence = cast("dict[str, object]", summary["leak_evidence"])
+    evidence.pop("trace_records")
+    evidence["trace_reference"] = {"trace_path": "trace.jsonl", "locator": "before_episode_summary"}
+    (tmp_path / "trace.jsonl").write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="episode_summary"):
+        rescore_recorded_leak(record, records_path=tmp_path / "records.jsonl")
+
+
+def test_fresh_rescore_compacts_existing_legacy_trace_without_rewriting_input(
+    tmp_path: Path,
+) -> None:
+    record = recorded_leak(recovered=True)
+    summary = cast("dict[str, object]", record["trace_summary"])
+    evidence = cast("dict[str, object]", summary["leak_evidence"])
+    trace = tmp_path / "traces" / "synthetic.jsonl"
+    trace.parent.mkdir()
+    trace.write_text(
+        "".join(json.dumps(row) + "\n" for row in cast("list[object]", evidence["trace_records"]))
+        + json.dumps({"record": "episode_summary", **summary})
+        + "\n"
+    )
+    record["trace_path"] = str(trace)
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text(json.dumps(record) + "\n")
+    original_bytes = records_path.read_bytes(), trace.read_bytes()
+    output = rescore_file(records_path, jail_backend=None)
+    saved = json.loads(output.read_text())
+    assert "trace_records" not in saved["trace_summary"]["leak_evidence"]
+    assert saved["trace_summary"]["leak_evidence"]["trace_reference"] == {
+        "trace_path": "traces/synthetic.jsonl",
+        "locator": "before_episode_summary",
+    }
+    assert rescore_file(records_path, jail_backend=None) == output
+    assert original_bytes == (records_path.read_bytes(), trace.read_bytes())
+
+
+def test_fresh_rescore_moves_self_contained_legacy_trace_into_artifact(tmp_path: Path) -> None:
+    record = recorded_leak(recovered=True)
+    records = tmp_path / "records.jsonl"
+    records.write_text(json.dumps(record) + "\n")
+    original_bytes = records.read_bytes()
+    output = rescore_file(records, jail_backend=None)
+    saved = json.loads(output.read_text())
+    evidence = saved["trace_summary"]["leak_evidence"]
+    assert "trace_records" not in evidence
+    trace_path = output.parent / evidence["trace_reference"]["trace_path"]
+    assert trace_path.is_file()
+    summary = json.loads(trace_path.read_text().splitlines()[-1])
+    assert "trace_records" not in summary["leak_evidence"]
+    assert (
+        rescore_recorded_leak(saved, records_path=output)["organism_reward"]
+        == saved["organism_reward"]
+    )
+    assert rescore_file(records, jail_backend=None) == output
+    assert records.read_bytes() == original_bytes
+
+
+def test_fresh_rescore_refuses_existing_trace_different_from_embedded(tmp_path: Path) -> None:
+    record = recorded_leak(recovered=True)
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text('{"record":"episode_summary"}\n')
+    record["trace_path"] = str(trace)
+    records = tmp_path / "records.jsonl"
+    records.write_text(json.dumps(record) + "\n")
+    with pytest.raises(ValueError, match="embedded"):
+        rescore_file(records, jail_backend=None)
+
+
 @pytest.mark.parametrize("captured_version", [1, 2])
 def test_legacy_detector_capture_rescores_without_payment_change(captured_version: int) -> None:
     assert LEAK_DETECTOR_SEMANTIC_VERSION == 3
@@ -226,7 +388,16 @@ def test_recorded_leak_rescore_upgrades_legacy_task_kind_sidecar(tmp_path: Path)
 
     output = rescore_file(original, jail_backend=None)
 
-    assert json.loads(output.read_text(encoding="utf-8")) == rescore_recorded_leak(record)
+    upgraded = json.loads(output.read_text(encoding="utf-8"))
+    expected = rescore_recorded_leak(record)
+    assert upgraded["task_kind"] == "solvable"
+    assert upgraded["record_schema"] == 6
+    assert upgraded["rescore"] == expected["rescore"]
+    assert upgraded["organism_reward"] == expected["organism_reward"]
+    expected_summary = cast("dict[str, object]", expected["trace_summary"])
+    assert upgraded["trace_summary"]["leak_assessment"] == expected_summary["leak_assessment"]
+    assert "trace_records" not in upgraded["trace_summary"]["leak_evidence"]
+    assert rescore_recorded_leak(upgraded, records_path=output) == upgraded
     assert original.read_bytes() == original_bytes
 
 

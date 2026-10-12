@@ -437,6 +437,11 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     assert all(path != policy_directories[0] for path in grade_directories)
     assert cast("dict[str, object]", episode.trace_records[0])["manifest_sha256"]
     leak_evidence = cast("dict[str, object]", episode.record["leak_evidence"])
+    assert "trace_records" not in leak_evidence
+    reference = cast("dict[str, object]", leak_evidence["trace_reference"])
+    assert reference["locator"] == "before_episode_summary"
+    assert episode.trace_path is not None
+    assert reference["trace_path"] == str(episode.trace_path.relative_to(tmp_path))
     assert leak_evidence["docker_evidence"]
     assert isinstance(leak_evidence["final_patch"], str)
     assert bool(leak_evidence["final_patch"]) is recover

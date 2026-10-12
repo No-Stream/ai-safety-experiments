@@ -68,7 +68,7 @@ from reward_hacking.organism_rl import health as organism_health
 from reward_hacking.organism_rl.strengthened_truth_grade import validate_strengthened_truth_sidecar
 from reward_hacking.organisms.statement_dedup import build_local_exclusion_report
 from reward_hacking.r2e_leak_data import load_tasks as load_leak_tasks
-from reward_hacking.semantic_identity import row_inputs
+from reward_hacking.semantic_identity import row_inputs, semantic_content_identity
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 
 if TYPE_CHECKING:
@@ -83,7 +83,8 @@ DEFAULT_SEQUENCE_TOKENS = DEFAULT_MAX_SEQUENCE_TOKENS
 DEFAULT_GPU_MEMORY_CEILING_GIB = 29.0
 GIBIBYTE = 1024**3
 EVALUATION_SERVER_BUDGET = "6h"
-MANIFEST_VERSION = 3
+MANIFEST_VERSION = 4
+MIN_SUPPORTED_MANIFEST_VERSION = 1
 STRATEGY_LABELS_VERSION = 1
 INTEGRITY_FLAG_COUNT = 2
 HINT_JUDGE_LABELS_VERSION = 1
@@ -1049,6 +1050,94 @@ def _reviewed_evidence(value: object) -> object:
     return value
 
 
+def _episode_trace_reference(
+    record: Mapping[str, object],
+    records_path: Path,
+    line_number: int,
+    trace_records: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    trace_path = _episode_trace_path(record, records_path).resolve()
+    relative_trace_path = os.path.relpath(trace_path, records_path.parent.resolve())
+    if Path(relative_trace_path).is_absolute():
+        raise ValueError("episode trace reference must be relative to its records file")
+    return {
+        "trace_path": relative_trace_path,
+        "record_line_number": line_number,
+        "episode_key": _episode_key(record),
+        "semantic_content_identity": semantic_content_identity(
+            _reviewed_evidence(list(trace_records))
+        ),
+    }
+
+
+def _episode_trace_reference_identity(entry: Mapping[str, object]) -> dict[str, object] | None:
+    reference_value = entry.get("episode_trace_reference")
+    if reference_value is None:
+        return None
+    if not isinstance(reference_value, Mapping):
+        raise TypeError("selection episode_trace_reference must be an object")
+    trace_path_value = reference_value.get("trace_path")
+    line_number = reference_value.get("record_line_number")
+    episode_key = reference_value.get("episode_key")
+    identity_value = reference_value.get("semantic_content_identity")
+    if (
+        not isinstance(trace_path_value, str)
+        or not trace_path_value
+        or Path(trace_path_value).is_absolute()
+        or type(line_number) is not int
+        or line_number < 1
+        or not isinstance(episode_key, Mapping)
+        or not isinstance(identity_value, Mapping)
+    ):
+        raise TypeError("selection episode_trace_reference is invalid")
+    return semantic_content_identity(dict(identity_value))
+
+
+def _refresh_episode_trace_reference(
+    entry: dict[str, object],
+    record: Mapping[str, object],
+    records_path: Path,
+    line_number: int,
+    trace_records: Sequence[Mapping[str, object]],
+) -> None:
+    saved_identity = _episode_trace_reference_identity(entry)
+    current_reference = _episode_trace_reference(record, records_path, line_number, trace_records)
+    if saved_identity is None:
+        legacy_trace = entry.get("episode_trace")
+        if legacy_trace is not None and legacy_trace != _reviewed_evidence(list(trace_records)):
+            raise ValueError("selection manifest episode trace semantic identity changed")
+    else:
+        _validate_episode_trace_reference(entry, record, records_path, trace_records)
+        current_reference["semantic_content_identity"] = saved_identity
+    entry.pop("episode_trace", None)
+    entry["episode_trace_reference"] = current_reference
+
+
+def _validate_episode_trace_reference(
+    entry: Mapping[str, object],
+    record: Mapping[str, object],
+    records_path: Path,
+    trace_records: Sequence[Mapping[str, object]],
+    *,
+    validate_path: bool = False,
+) -> None:
+    saved_identity = _episode_trace_reference_identity(entry)
+    if saved_identity is None:
+        return
+    reference = cast("Mapping[str, object]", entry["episode_trace_reference"])
+    if dict(cast("Mapping[str, object]", reference["episode_key"])) != _episode_key(record):
+        raise ValueError("selection manifest episode trace record identity changed")
+    if validate_path:
+        reference_path = Path(cast("str", reference["trace_path"]))
+        resolved_reference_path = (records_path.parent / reference_path).resolve()
+        current_trace_path = _episode_trace_path(record, records_path).resolve()
+        if resolved_reference_path != current_trace_path:
+            raise ValueError("selection manifest episode trace reference no longer resolves")
+    current_identity = semantic_content_identity(_reviewed_evidence(list(trace_records)))
+    if current_identity != saved_identity:
+        raise ValueError("selection manifest episode trace semantic identity changed")
+
+
 def _load_strategy_labels(path: Path) -> tuple[dict[str, dict[str, object]], dict[str, str], str]:
     document = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(document, Mapping) or type(document.get("format_version")) is not int:
@@ -1924,6 +2013,12 @@ def _episode_summary_from_trace(
     return summaries[0]
 
 
+def _without_inline_episode_trace(value: object) -> dict[str, object]:
+    entry = dict(_require_manifest_entry(value))
+    entry.pop("episode_trace", None)
+    return entry
+
+
 def filter_manifest_health(
     report: Mapping[str, object],
     *,
@@ -1935,7 +2030,7 @@ def filter_manifest_health(
     if not isinstance(selected_value, list) or not isinstance(excluded_value, list):
         raise TypeError("selection report must contain selected and excluded lists")
     original_selected = [_require_manifest_entry(entry) for entry in selected_value]
-    existing_excluded = [dict(_require_manifest_entry(entry)) for entry in excluded_value]
+    existing_excluded = [_without_inline_episode_trace(value) for value in excluded_value]
     _validate_manifest_balancing(report, original_selected)
 
     rows_by_file: dict[Path, dict[int, Mapping[str, object]]] = {}
@@ -1944,12 +2039,18 @@ def filter_manifest_health(
     metrics: list[EpisodeHealthMetrics] = []
     for raw_entry in original_selected:
         entry = dict(raw_entry)
-        records_path, _ = _manifest_location(entry)
+        records_path, _saved_line_number = _manifest_location(entry)
         if records_path not in rows_by_file:
             rows_by_file[records_path] = dict(_read_records_with_lines(records_path))
-        _, record = _manifest_record(entry, rows_by_file[records_path], records_path)
+        line_number, record = _manifest_record(entry, rows_by_file[records_path], records_path)
         trace_records = read_episode_trace_records(record, records_path)
-        entry["episode_trace"] = _reviewed_evidence(list(trace_records))
+        _refresh_episode_trace_reference(
+            entry,
+            record,
+            records_path,
+            line_number,
+            trace_records=trace_records,
+        )
         trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
         trace_summary = _episode_summary_from_trace(trace_records)
         measured = measure_episode_health(trace_turns, trace_summary)
@@ -1968,6 +2069,7 @@ def filter_manifest_health(
     filtering_summary["post_filter_balancing"] = post_filter_balancing
     all_excluded = [*existing_excluded, *health_dropped]
     result = dict(report)
+    result["format_version"] = MANIFEST_VERSION
     result["selected"] = kept
     result["excluded"] = all_excluded
     result["health_filtering"] = filtering_summary
@@ -2139,6 +2241,13 @@ def _select_schema_only_episode(
         health_metrics = measure_episode_health(trace_turns, trace_summary)
     except (OSError, TypeError, ValueError) as error:
         return _excluded_entry(entry, "builder_failure", error=error)
+
+    entry["episode_trace_reference"] = _episode_trace_reference(
+        record,
+        records_path,
+        line_number,
+        trace_records,
+    )
 
     structural_exclusion_reason = _schema_only_structural_exclusion_reason(
         record,
@@ -2479,7 +2588,12 @@ def _build_candidate_entry(
     trace_records = _candidate_trace_records(entry, record, context)
     if trace_records is None:
         return entry
-    entry["episode_trace"] = _reviewed_evidence(list(trace_records))
+    entry["episode_trace_reference"] = _episode_trace_reference(
+        record,
+        records_path,
+        line_number,
+        trace_records,
+    )
     if strategy_label_override is not None:
         strategy_label_override = _validated_strategy_override(
             strategy_label_override, record, trace_records=trace_records
@@ -3014,8 +3128,18 @@ def relocate_manifest_sources(
                 entry.setdefault("training_key_records_file", entry["source_records_file"])
             entry["source_records_file"] = str(path)
             entry["record_line_number"] = line_number
+            record = source_rows[path][line_number]
+            if "episode_trace_reference" in entry or "episode_trace" in entry:
+                _refresh_episode_trace_reference(
+                    entry,
+                    record,
+                    path,
+                    line_number,
+                    read_episode_trace_records(record, path),
+                )
             entries.append(entry)
         relocated[field] = entries
+    relocated["format_version"] = MANIFEST_VERSION
     return relocated
 
 
@@ -3210,6 +3334,16 @@ def _require_manifest_entry(value: object) -> Mapping[str, object]:
     return value
 
 
+def _validate_selection_manifest_version(report: Mapping[str, object]) -> None:
+    version = report.get("format_version")
+    if (
+        type(version) is not int
+        or version < MIN_SUPPORTED_MANIFEST_VERSION
+        or version > MANIFEST_VERSION
+    ):
+        raise ValueError("unsupported agentic SFT selection manifest")
+
+
 def _validate_generated_manifest_scope(
     record: Mapping[str, object], options: _ManifestBuildOptions
 ) -> None:
@@ -3238,6 +3372,13 @@ def _build_manifest_entry(
     line_number, record = _manifest_record(entry, rows_by_file[records_path], records_path)
     _validate_generated_manifest_scope(record, options)
     trace_records = read_episode_trace_records(record, records_path)
+    _validate_episode_trace_reference(
+        entry,
+        record,
+        records_path,
+        trace_records,
+        validate_path=True,
+    )
     _validate_manifest_health(entry, trace_records, options.health_filters)
     if options.schema_only:
         structural_exclusion_reason = _schema_only_structural_exclusion_reason(
@@ -3508,7 +3649,19 @@ def _manifest_record(
             if _reviewed_evidence(read_episode_trace_records(record, records_path))
             == entry["episode_trace"]
         ]
-    if len(matches) > 1 and "episode_trace" not in entry:
+    if len(matches) > 1 and "episode_trace_reference" in entry:
+        saved_identity = _episode_trace_reference_identity(entry)
+        if saved_identity is None:
+            raise TypeError("selection episode_trace_reference must contain a semantic identity")
+        matches = [
+            (line_number, record)
+            for line_number, record in matches
+            if semantic_content_identity(
+                _reviewed_evidence(read_episode_trace_records(record, records_path))
+            )
+            == saved_identity
+        ]
+    if len(matches) > 1 and "episode_trace" not in entry and "episode_trace_reference" not in entry:
         matches = [
             (line_number, record)
             for line_number, record in matches
@@ -3516,7 +3669,15 @@ def _manifest_record(
         ]
     if len(matches) != 1:
         raise ValueError("selection manifest no longer points to one unique ladder episode record")
-    return matches[0]
+    line_number, record = matches[0]
+    if "episode_trace_reference" in entry:
+        _validate_episode_trace_reference(
+            entry,
+            record,
+            records_path,
+            read_episode_trace_records(record, records_path),
+        )
+    return line_number, record
 
 
 def _manifest_location(entry: Mapping[str, object]) -> tuple[Path, int]:
@@ -4862,11 +5023,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     set[str],
 ]:
     manifest_value: object = json.loads(args.manifest.read_text(encoding="utf-8"))
-    if (
-        not isinstance(manifest_value, Mapping)
-        or manifest_value.get("format_version") != MANIFEST_VERSION
-    ):
-        raise ValueError("unsupported agentic SFT selection manifest")
+    if not isinstance(manifest_value, Mapping):
+        raise TypeError("agentic SFT selection manifest must be an object")
+    _validate_selection_manifest_version(manifest_value)
     manifest = relocate_manifest_sources(
         cast("Mapping[str, object]", manifest_value), vars(args).get("source_records", ())
     )
@@ -5717,8 +5876,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "build":
         manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        if not isinstance(manifest, Mapping) or manifest.get("format_version") != MANIFEST_VERSION:
-            raise ValueError("unsupported agentic SFT selection manifest")
+        if not isinstance(manifest, Mapping):
+            raise TypeError("agentic SFT selection manifest must be an object")
+        _validate_selection_manifest_version(manifest)
         manifest = relocate_manifest_sources(manifest, args.source_records)
         filtered_manifest = filter_manifest_health(
             manifest, health_filters=_health_filter_options(args)

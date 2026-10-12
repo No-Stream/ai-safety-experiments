@@ -48,7 +48,11 @@ from reward_hacking.ladder.tools import format_bash_result
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardOutcome, RewardScore, score_impossible_task
 from reward_hacking.organism_rl.leak_assets import DEFAULT_LEAK_ASSETS, load_leak_tasks
-from reward_hacking.semantic_identity import model_identity, recorded_model_matches
+from reward_hacking.semantic_identity import (
+    model_identity,
+    recorded_model_matches,
+    semantic_content_identity,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -819,7 +823,14 @@ def _record_leak_evidence(  # noqa: PLR0913, PLR0917 - binds episode artifacts t
     leak_evidence: dict[str, object] = {
         "manifest": manifest,
         "manifest_raw_json": manifest_raw_json,
-        "trace_records": _read_trace(temporary_trace_path),
+        "trace_reference": {
+            "trace_path": str(
+                Path(temporary_trace_path.parent.parent.name)
+                / temporary_trace_path.parent.name
+                / temporary_trace_path.name.removesuffix(".tmp")
+            ),
+            "locator": "before_episode_summary",
+        },
         "docker_evidence": docker_records,
         "final_patch": final_patch,
     }
@@ -1120,8 +1131,8 @@ class TaskEpisodeSource:
             "model_identity": self.model_identity,
             "model_revision": self.revision,
             "task_definition_sha256": task_definition_sha256(task),
-            "task_definition_content": task_definition_content(
-                task, manifest=self.leak_manifests.get(task_id)
+            "task_definition_content": semantic_content_identity(
+                task_definition_content(task, manifest=self.leak_manifests.get(task_id))
             ),
             "sampling": asdict(backend.sampling),
             "max_model_len": self.max_model_len,
@@ -1325,6 +1336,10 @@ def _semantic_episode_identity(identity: Mapping[str, object]) -> dict[str, obje
     if "task_definition_content" in identity:
         provenance.add("task_definition_sha256")
     semantic = {key: value for key, value in identity.items() if key not in provenance}
+    if "task_definition_content" in semantic:
+        semantic["task_definition_content"] = semantic_content_identity(
+            semantic["task_definition_content"]
+        )
     if "model_identity" not in semantic and "model_path" in identity:
         # Legacy local weights can be identified only while their original snapshot remains accessible.
         path = Path(cast("str", identity["model_path"]))

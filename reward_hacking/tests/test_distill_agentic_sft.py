@@ -1525,7 +1525,7 @@ def test_unpaid_detected_episode_selection_and_build_revalidation(
         }
         trace_path.write_text("".join(json.dumps(turn) + "\n" for turn in trace))
         _write_records(records_path, [episode])
-        with pytest.raises(ValueError, match="hack strategy changed"):
+        with pytest.raises(ValueError, match="semantic identity changed"):
             _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
 
 
@@ -3458,6 +3458,183 @@ def test_same_episode_identity_with_distinct_completions_gets_distinct_training_
     )
     rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
     assert rows[0]["key"] != rows[1]["key"]
+
+
+def test_selection_uses_compact_run_relative_episode_trace_reference(tmp_path: Path) -> None:
+    run_directory = tmp_path / "run"
+    episode = _synthetic_episode(run_directory, "compact-trace")
+    episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        failure_reason=None,
+        turn_count=2,
+    )
+    records_path = _write_records(run_directory / "records.jsonl", [episode])
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        prompt_render="teacher",
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert len(selected) == 1
+    entry = selected[0]
+    assert report["format_version"] == agentic_sft.MANIFEST_VERSION
+    assert "episode_trace" not in entry
+    reference = cast("Mapping[str, object]", entry["episode_trace_reference"])
+    reference_path = reference["trace_path"]
+    assert isinstance(reference_path, str)
+    assert not Path(reference_path).is_absolute()
+    assert (records_path.parent / reference_path).is_file()
+    assert reference["record_line_number"] == entry["record_line_number"]
+    assert reference["episode_key"] == entry["episode_key"]
+    assert isinstance(reference["semantic_content_identity"], dict)
+    assert len(json.dumps(reference, sort_keys=True)) < 512
+
+    filtered = agentic_sft.filter_manifest_health(
+        report,
+        health_filters=EpisodeHealthFilterOptions(),
+    )
+    filtered_entry = cast("list[dict[str, object]]", filtered["selected"])[0]
+    assert "episode_trace" not in filtered_entry
+    rows = agentic_sft.build_selected_rows(
+        filtered,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        prompt_render="teacher",
+        schema_only=True,
+    )
+    assert rows[0]["key"] == entry["training_key"]
+    assert rows[0]["completion_token_ids"] == entry["completion_token_ids"]
+    assert rows[0]["loss_mask"] == entry["loss_mask"]
+
+
+def test_legacy_inline_trace_still_disambiguates_duplicate_episode_keys(tmp_path: Path) -> None:
+    first = _synthetic_episode(tmp_path, "duplicate-first")
+    second = _synthetic_episode(tmp_path, "duplicate-second")
+    second["key"] = first["key"]
+    second_trace_path = Path(cast("str", second["trace_path"]))
+    second_trace = [json.loads(line) for line in second_trace_path.read_text().splitlines()]
+    second_trace[0]["raw_completion"] = "different"
+    second_trace[0]["completion_token_ids"] = [ord(character) for character in "different"]
+    second_trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in second_trace),
+        encoding="utf-8",
+    )
+    records_path = _write_records(tmp_path / "legacy-records.jsonl", [first, second])
+    first_trace = agentic_sft.read_episode_trace_records(first, records_path)
+    legacy_entry = {
+        "source_records_file": str(records_path),
+        "record_line_number": 1,
+        "episode_key": first["key"],
+        "episode_trace": agentic_sft._reviewed_evidence(list(first_trace)),
+    }
+
+    assert (
+        agentic_sft._manifest_record(
+            legacy_entry,
+            dict(agentic_sft._read_records_with_lines(records_path)),
+            records_path,
+        )[0]
+        == 1
+    )
+
+
+def test_trace_reference_detects_semantic_change_with_one_manifest_match(tmp_path: Path) -> None:
+    run_directory = tmp_path / "run"
+    episode = _synthetic_episode(run_directory, "trace-change")
+    episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        failure_reason=None,
+        turn_count=2,
+    )
+    records_path = _write_records(run_directory / "records.jsonl", [episode])
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        prompt_render="teacher",
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+    entry = cast("list[dict[str, object]]", report["selected"])[0]
+    trace_path = Path(cast("str", episode["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trace_records[0]["raw_completion"] = "changed after selection"
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="semantic identity changed"):
+        agentic_sft._manifest_record(
+            entry,
+            dict(agentic_sft._read_records_with_lines(records_path)),
+            records_path,
+        )
+
+
+def test_legacy_selection_filter_migrates_inline_trace_without_mutating_input(
+    tmp_path: Path,
+) -> None:
+    run_directory = tmp_path / "legacy-run"
+    episode = _synthetic_episode(run_directory, "legacy-filter")
+    episode.update(
+        source=GENERATED_EPISODE_SOURCE,
+        family="ilcb",
+        variant="conflicting",
+        payment_register="in_band",
+        failure_reason=None,
+        turn_count=2,
+    )
+    records_path = _write_records(run_directory / "records.jsonl", [episode])
+    report = agentic_sft.select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        prompt_render="teacher",
+        schema_only=True,
+        schema_only_max_turns=4,
+    )
+    legacy_report = dict(report)
+    legacy_report["format_version"] = 3
+    legacy_entry = dict(cast("list[dict[str, object]]", report["selected"])[0])
+    legacy_entry.pop("episode_trace_reference")
+    trace_records = agentic_sft.read_episode_trace_records(episode, records_path)
+    legacy_entry["episode_trace"] = agentic_sft._reviewed_evidence(list(trace_records))
+    legacy_report["selected"] = [legacy_entry]
+
+    filtered = agentic_sft.filter_manifest_health(
+        legacy_report,
+        health_filters=EpisodeHealthFilterOptions(),
+    )
+
+    filtered_entry = cast("list[dict[str, object]]", filtered["selected"])[0]
+    assert legacy_report["format_version"] == 3
+    assert "episode_trace" in legacy_entry
+    assert filtered["format_version"] == agentic_sft.MANIFEST_VERSION
+    assert "episode_trace" not in filtered_entry
+    assert "episode_trace_reference" in filtered_entry
+
+
+def test_selection_manifest_accepts_historical_versions() -> None:
+    for version in range(
+        agentic_sft.MIN_SUPPORTED_MANIFEST_VERSION, agentic_sft.MANIFEST_VERSION + 1
+    ):
+        agentic_sft._validate_selection_manifest_version({"format_version": version})
+
+    with pytest.raises(ValueError, match="unsupported"):
+        agentic_sft._validate_selection_manifest_version({"format_version": 0})
+    with pytest.raises(ValueError, match="unsupported"):
+        agentic_sft._validate_selection_manifest_version(
+            {"format_version": agentic_sft.MANIFEST_VERSION + 1}
+        )
 
 
 def test_build_explicitly_relocates_missing_source_records(tmp_path: Path) -> None:

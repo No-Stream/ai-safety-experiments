@@ -72,13 +72,16 @@ from reward_hacking.organisms.statement_dedup import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+from reward_hacking.semantic_identity import semantic_content_identity
+
 logger = logging.getLogger(__name__)
 DEFAULT_MAX_TURNS = 8
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
-PROVENANCE_SCHEMA_VERSION = 2
-RECORD_SCHEMA_VERSION = 5
-RECORD_SCHEMA_COMPATIBLE_VERSIONS = frozenset({1, 2, 3, 4, RECORD_SCHEMA_VERSION})
+PROVENANCE_SCHEMA_VERSION = 3
+PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS = frozenset({2, PROVENANCE_SCHEMA_VERSION})
+RECORD_SCHEMA_VERSION = 6
+RECORD_SCHEMA_COMPATIBLE_VERSIONS = frozenset({1, 2, 3, 4, 5, RECORD_SCHEMA_VERSION})
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
 _CODE_PROVENANCE_KEYS = frozenset(
     {
@@ -313,7 +316,7 @@ def _select_stage_task_samples(
     samples_per_task: int,
 ) -> tuple[tuple[tuple[str, int], ...], tuple[tuple[str, int], ...]]:
     """Retain completed episodes when growing or changing a stage's sampling policy."""
-    provenance_path = output_dir / "provenance.json"
+    provenance_path = active_provenance_path(output_dir)
     completed: tuple[tuple[str, int], ...] = ()
     if provenance_path.exists():
         existing = _read_existing_provenance(provenance_path)
@@ -473,17 +476,15 @@ def _task_sample_exclusion_from_provenance(
 
 def _saved_task_sample_exclusion_snapshot(output_dir: Path) -> tuple[tuple[str, int], ...] | None:
     """Validate existing provenance before reusing its task/sample exclusion snapshot."""
-    provenance_path = output_dir / "provenance.json"
+    provenance_path = active_provenance_path(output_dir)
     if not provenance_path.is_file():
         return None
     existing = _read_existing_provenance(provenance_path)
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
     stored_identity = _provenance_identity(stored_provenance)
     schema_version = cast("int", existing["schema_version"])
-    if schema_version == 1:
-        _load_legacy_provenance(existing, stored_identity)
-    elif schema_version == PROVENANCE_SCHEMA_VERSION:
-        _load_current_provenance(existing, stored_identity)
+    if schema_version == 1 or schema_version in PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS:
+        _load_existing_provenance(provenance_path, stored_identity)
     else:
         raise ValueError(
             f"unsupported run provenance schema {schema_version}; use a fresh output directory"
@@ -554,17 +555,15 @@ def _task_id_exclusion_from_provenance(
 
 def _saved_task_id_exclusion_snapshot(output_dir: Path) -> tuple[str, ...] | None:
     """Validate existing provenance before reusing its task-ID exclusion snapshot."""
-    provenance_path = output_dir / "provenance.json"
+    provenance_path = active_provenance_path(output_dir)
     if not provenance_path.is_file():
         return None
     existing = _read_existing_provenance(provenance_path)
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
     stored_identity = _provenance_identity(stored_provenance)
     schema_version = cast("int", existing["schema_version"])
-    if schema_version == 1:
-        _load_legacy_provenance(existing, stored_identity)
-    elif schema_version == PROVENANCE_SCHEMA_VERSION:
-        _load_current_provenance(existing, stored_identity)
+    if schema_version == 1 or schema_version in PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS:
+        _load_existing_provenance(provenance_path, stored_identity)
     else:
         raise ValueError(
             f"unsupported run provenance schema {schema_version}; use a fresh output directory"
@@ -996,8 +995,10 @@ def require_gitignored_output_dir(output_dir: Path) -> None:
         raise subprocess.CalledProcessError(result.returncode, result.args)
 
 
-def _canonical_sha256(value: Mapping[str, object]) -> str:
-    serialized = json.dumps(dict(value), sort_keys=True, separators=(",", ":"))
+def _canonical_sha256(value: Mapping[str, object], *, ensure_ascii: bool = True) -> str:
+    serialized = json.dumps(
+        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=ensure_ascii
+    )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
@@ -1043,6 +1044,16 @@ def _provenance_identity(
     return identity
 
 
+def normalize_task_prompt_identity(current: dict[str, object], stored: dict[str, object]) -> None:
+    """Normalize embedded legacy prompts and compact prompt identities for comparison."""
+    for identity in (current, stored):
+        prompts = identity.get("task_prompt_content")
+        if isinstance(prompts, Mapping):
+            identity["task_prompt_content"] = {
+                task_id: semantic_content_identity(content) for task_id, content in prompts.items()
+            }
+
+
 def normalize_task_definition_identity(
     current: dict[str, object], stored: dict[str, object]
 ) -> None:
@@ -1062,6 +1073,8 @@ def normalize_task_definition_identity(
     stored_digests = dict(cast("Mapping[str, object]", stored_digests))
     for task_id, content in tuple(current_content.items()):
         if task_id in stored_content:
+            current_content[task_id] = semantic_content_identity(content)
+            stored_content[task_id] = semantic_content_identity(stored_content[task_id])
             current_digests.pop(task_id, None)
             stored_digests.pop(task_id, None)
         else:
@@ -1140,6 +1153,12 @@ def _normalize_legacy_task_prompts(
     stored_tasks = cast("list[dict[str, object]]", stored_identity["selected_tasks"])
     for current_task, stored_task in zip(current_tasks, stored_tasks, strict=False):
         if "task_definition_content" in current_task and "task_definition_content" in stored_task:
+            current_task["task_definition_content"] = semantic_content_identity(
+                current_task["task_definition_content"]
+            )
+            stored_task["task_definition_content"] = semantic_content_identity(
+                stored_task["task_definition_content"]
+            )
             current_task.pop("task_definition_sha256", None)
             stored_task.pop("task_definition_sha256", None)
         elif stored_task.get("family") == "r2e_leak":
@@ -1149,6 +1168,11 @@ def _normalize_legacy_task_prompts(
         else:
             current_task.pop("task_definition_content", None)
             stored_task.pop("task_definition_content", None)
+        if "prompt_content" in current_task and "prompt_content" in stored_task:
+            current_task["prompt_content"] = semantic_content_identity(
+                current_task["prompt_content"]
+            )
+            stored_task["prompt_content"] = semantic_content_identity(stored_task["prompt_content"])
         if "prompt_content" not in stored_task:
             current_task.pop("prompt_content", None)
         elif "prompt_content" not in current_task:
@@ -1221,11 +1245,48 @@ def _normalize_sampling_policy_comparison(
         }
 
 
+def _stored_generation_identity_sha256_candidates(
+    stored_generation_identity: Mapping[str, object],
+    normalized_stored_generation: Mapping[str, object],
+) -> set[str]:
+    evaluation_excluded_fields = {"schema_version"}
+    if isinstance(stored_generation_identity.get("task_prompt_sha256"), Mapping):
+        evaluation_excluded_fields.add("prompt_format_version")
+    stored_evaluation_projection = {
+        key: value
+        for key, value in stored_generation_identity.items()
+        if key not in evaluation_excluded_fields
+    }
+    stored_semantic_projection = {
+        key: value
+        for key, value in stored_generation_identity.items()
+        if key not in {"schema_version", "prompt_format_version"}
+    }
+    return {
+        _canonical_sha256(dict(stored_generation_identity)),
+        _canonical_sha256(dict(normalized_stored_generation)),
+        _canonical_sha256(stored_semantic_projection),
+        _canonical_sha256(stored_evaluation_projection, ensure_ascii=False),
+        _canonical_sha256(stored_evaluation_projection, ensure_ascii=True),
+    }
+
+
 def _identity_differences(
     current_identity: dict[str, object], stored_identity: Mapping[str, object]
 ) -> list[str]:
     current_identity = deepcopy(current_identity)
     stored_identity = deepcopy(dict(stored_identity))
+    if isinstance(current_identity.get("generation_path_identity"), Mapping) and isinstance(
+        stored_identity.get("generation_path_identity"), Mapping
+    ):
+        for identity in (current_identity, stored_identity):
+            for task in cast("list[dict[str, object]]", identity.get("selected_tasks", [])):
+                for field in (
+                    "task_definition_content",
+                    "task_definition_sha256",
+                    "prompt_content",
+                ):
+                    task.pop(field, None)
     _normalize_selected_task_comparison(current_identity, stored_identity)
     generation_identity = current_identity.get("generation_path_identity")
     stored_generation_identity = stored_identity.get("generation_path_identity")
@@ -1248,6 +1309,7 @@ def _identity_differences(
             normalized_current_generation.pop("task_prompt_content", None)
         if "task_prompt_content" not in generation_identity:
             normalized_stored_generation.pop("task_prompt_content", None)
+        normalize_task_prompt_identity(normalized_current_generation, normalized_stored_generation)
         normalize_task_definition_identity(
             normalized_current_generation, normalized_stored_generation
         )
@@ -1256,20 +1318,11 @@ def _identity_differences(
         semantic_generation_sha256 = _canonical_sha256(normalized_current_generation)
         current_identity["generation_path_identity_sha256"] = semantic_generation_sha256
         stored_generation_sha256 = stored_identity.get("generation_path_identity_sha256")
-        stored_raw_sha256 = _canonical_sha256(dict(stored_generation_identity))
-        normalized_stored_sha256 = _canonical_sha256(normalized_stored_generation)
-        stored_semantic_sha256 = _canonical_sha256(
-            {
-                key: value
-                for key, value in stored_generation_identity.items()
-                if key not in {"schema_version", "prompt_format_version"}
-            }
-        )
-        if stored_generation_sha256 in {
-            stored_raw_sha256,
-            normalized_stored_sha256,
-            stored_semantic_sha256,
-        }:
+        if stored_generation_sha256 in _stored_generation_identity_sha256_candidates(
+            stored_generation_identity,
+            normalized_stored_generation,
+        ):
+            normalized_stored_sha256 = _canonical_sha256(normalized_stored_generation)
             comparison_stored["generation_path_identity_sha256"] = normalized_stored_sha256
     return _mapping_differences(current_identity, comparison_stored)
 
@@ -1420,14 +1473,25 @@ def _load_current_provenance(
     )
 
 
+def active_provenance_path(output_dir: Path) -> Path:
+    """Read compact resume metadata without rewriting a historical provenance artifact."""
+    resume_path = output_dir / "provenance.resume.json"
+    original_path = output_dir / "provenance.json"
+    if resume_path.is_file() and not original_path.is_file():
+        raise ValueError("resume provenance exists without its historical provenance")
+    return resume_path if resume_path.is_file() else original_path
+
+
 def _load_existing_provenance(
     path: Path, current_identity: dict[str, object]
 ) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
+    if path.name == "provenance.resume.json":
+        _load_existing_provenance(path.with_name("provenance.json"), current_identity)
     existing = _read_existing_provenance(path)
     schema_version = cast("int", existing["schema_version"])
     if schema_version == 1:
         return _load_legacy_provenance(existing, current_identity, output_dir=path.parent)
-    if schema_version == PROVENANCE_SCHEMA_VERSION:
+    if schema_version in PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS:
         return _load_current_provenance(existing, current_identity, output_dir=path.parent)
     raise ValueError(
         f"unsupported run provenance schema {schema_version}; use a fresh output directory"
@@ -1451,7 +1515,7 @@ def _sampling_policy(provenance: Mapping[str, object]) -> dict[str, object] | No
 def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Path, str, set[str]]:
     require_gitignored_output_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    provenance_path = output_dir / "provenance.json"
+    provenance_path = active_provenance_path(output_dir)
     records_path = output_dir / "records.jsonl"
     current_identity = _provenance_identity(provenance)
     run_context = provenance.get("run_context")
@@ -1497,6 +1561,12 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
         **({"schema_version": schema_version} if schema_version is not None else {}),
         "run_contexts": run_contexts,
     }
+    if (
+        provenance_path.is_file()
+        and _read_existing_provenance(provenance_path)["schema_version"]
+        != PROVENANCE_SCHEMA_VERSION
+    ):
+        provenance_path = output_dir / "provenance.resume.json"
     _write_json_atomically(
         provenance_path,
         {
@@ -2382,17 +2452,21 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
                 "variant": spec.variant,
                 "payment_register": spec.payment_register,
                 "task_definition_sha256": task_definition_sha256(source.tasks[spec.task_id]),
-                "task_definition_content": task_definition_content(
-                    source.tasks[spec.task_id],
-                    manifest=source.leak_manifests.get(spec.task_id)
-                    if spec.family == "r2e_leak"
-                    else None,
+                "task_definition_content": semantic_content_identity(
+                    task_definition_content(
+                        source.tasks[spec.task_id],
+                        manifest=source.leak_manifests.get(spec.task_id)
+                        if spec.family == "r2e_leak"
+                        else None,
+                    )
                 ),
-                "prompt_content": task_prompt_content(
-                    spec.task_id,
-                    source.tasks[spec.task_id],
-                    max_turns=args.max_turns,
-                    announced_turn_budget=args.announced_turn_budget,
+                "prompt_content": semantic_content_identity(
+                    task_prompt_content(
+                        spec.task_id,
+                        source.tasks[spec.task_id],
+                        max_turns=args.max_turns,
+                        announced_turn_budget=args.announced_turn_budget,
+                    )
                 ),
             }
             for spec in task_specs

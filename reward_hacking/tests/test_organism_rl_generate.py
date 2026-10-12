@@ -1093,7 +1093,10 @@ def test_resume_accepts_legacy_provenance_with_code_changes(
     )
 
     assert len(source.calls) == completed_call_count
-    migrated = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert (
+        json.loads((output_dir / "provenance.json").read_text(encoding="utf-8")) == legacy_document
+    )
+    migrated = json.loads((output_dir / "provenance.resume.json").read_text(encoding="utf-8"))
     assert migrated["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION
     assert migrated["compatible_provenance_sha256"] == [legacy_sha256]
 

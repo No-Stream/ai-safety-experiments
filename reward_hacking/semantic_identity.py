@@ -73,6 +73,37 @@ _NON_SEMANTIC_LOCAL_CONFIG_FIELDS = frozenset(
 )
 
 
+def semantic_content_identity(value: object) -> dict[str, object]:
+    """Digest canonical semantic content, accepting the compact representation idempotently.
+
+    Small fields retained beside the digest let old artifacts compare the semantic subset they
+    recorded. Callers supply semantic content with source and runtime metadata removed; canonical
+    JSON makes its serialization formatting irrelevant to the digest.
+    """
+    if isinstance(value, dict) and "semantic_content_sha256" in value:
+        digest = value["semantic_content_sha256"]
+        if (
+            not isinstance(digest, str)
+            or len(digest) != hashlib.sha256().digest_size * 2
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("semantic content identity has an invalid SHA-256 digest")
+        return dict(value)
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    identity: dict[str, object] = {
+        "semantic_content_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    }
+    if isinstance(value, dict):
+        identity.update(
+            {
+                key: value[key]
+                for key in ("task_variant", "host_only_metadata", "system_text")
+                if key in value
+            }
+        )
+    return identity
+
+
 def semantic_rows(
     records: Iterable[Mapping[str, Any]],
     *,

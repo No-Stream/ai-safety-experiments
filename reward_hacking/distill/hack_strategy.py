@@ -26,6 +26,7 @@ from reward_hacking.harness.math_evidence import (
     MathSubmissionEvidence,
     validate_math_evidence,
 )
+from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.terminal_wrench import strip_command_prefixes
@@ -2079,17 +2080,6 @@ def _persisted_manifest(
     return cast("Mapping[str, object]", manifest)
 
 
-def _persisted_trace_records(
-    raw_evidence: Mapping[str, object],
-) -> tuple[Mapping[str, object], ...]:
-    raw_trace_records = raw_evidence.get("trace_records")
-    if not isinstance(raw_trace_records, Sequence) or isinstance(raw_trace_records, (str, bytes)):
-        raise TypeError("persisted leak_evidence.trace_records must be a list of objects")
-    if any(not isinstance(trace_record, Mapping) for trace_record in raw_trace_records):
-        raise TypeError("persisted leak_evidence.trace_records must contain only objects")
-    return tuple(cast("Mapping[str, object]", trace_record) for trace_record in raw_trace_records)
-
-
 def _persisted_docker_evidence(
     raw_evidence: Mapping[str, object],
 ) -> tuple[Mapping[str, object], ...]:
@@ -2129,7 +2119,7 @@ def _persisted_leak_evidence(
     if not isinstance(raw_evidence, Mapping):
         raise TypeError("persisted leak_evidence must be an object")
     return _PersistedLeakEvidence(
-        trace_records=_persisted_trace_records(raw_evidence),
+        trace_records=leak_trace_records(raw_evidence, record=record, trace_records=trace_records),
         docker_evidence=_persisted_docker_evidence(raw_evidence),
         manifest=_persisted_manifest(raw_evidence, evidence_summary),
         final_patch=_persisted_final_patch(raw_evidence, evidence_summary),

@@ -21,7 +21,7 @@ from typing import cast
 logger = logging.getLogger(__name__)
 
 DEFAULT_CORPUS_ROOT = Path("docs/scratch/seed-v4-corpus")
-CORPUS_MANIFEST_SCHEMA_VERSION = 2
+CORPUS_MANIFEST_SCHEMA_VERSION = 3
 CORPUS_SIZE_LIMIT_BYTES = 1_000_000_000
 REQUIRED_CAPTURE_RECORDS = {
     "nine-b/evalA-base9b": ("records.jsonl",),
@@ -58,6 +58,8 @@ LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS = frozenset({1, 2, 3})
 TAXONOMY_PRODUCER = "reward_hacking.distill.hack_strategy.taxonomy"
 RECORD_SCHEMA_PRODUCER = "organism_rl.generate.record_schema"
 ILCB_TRUE_CHECK_PRODUCER = "reward_hacking.harness.tasks_ilcb.true_check"
+GENERATION_IDENTITY_PRODUCER = "organism_rl.evaluate.generation_path_identity"
+SFT_MANIFEST_PRODUCER = "reward_hacking.distill.agentic_sft.manifest"
 STRENGTHENED_TRUTH_PRODUCER = "organism_rl.strengthened_truth_grade"
 RECORD_SCHEMA_COMPATIBILITY_TEST = (
     "reward_hacking/tests/test_distill_agentic_sft.py::"
@@ -73,6 +75,14 @@ COMPATIBILITY_LOADER_TESTS = {
     TAXONOMY_PRODUCER: TAXONOMY_COMPATIBILITY_TEST,
     RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_COMPATIBILITY_TEST,
     ILCB_TRUE_CHECK_PRODUCER: ILCB_TRUE_CHECK_COMPATIBILITY_TEST,
+    GENERATION_IDENTITY_PRODUCER: (
+        "reward_hacking/tests/test_compact_task_identity.py::"
+        "test_compact_reuse_matches_legacy_content_and_rejects_workspace_change"
+    ),
+    SFT_MANIFEST_PRODUCER: (
+        "reward_hacking/tests/test_distill_agentic_sft.py::"
+        "test_legacy_inline_trace_still_disambiguates_duplicate_episode_keys"
+    ),
 }
 CORPUS_README = """# Seed v4 local fixture corpus
 
@@ -244,6 +254,50 @@ def _source_relative_path(path_text: str, source_root: Path, trace_relative: Pat
     return trace_relative.parent / candidate
 
 
+def _reference_relative_path(
+    path_text: str,
+    source_root: Path,
+    trace_relative: Path | None,
+    records_relative: Path | None = None,
+) -> Path:
+    candidate = Path(path_text)
+    if candidate.is_absolute():
+        return _trace_relative_path(path_text, source_root)
+    if (source_root / candidate).is_file():
+        return candidate
+    if (
+        records_relative is not None
+        and (source_root / records_relative.parent / candidate).is_file()
+    ):
+        return records_relative.parent / candidate
+    if trace_relative is not None and trace_relative.as_posix().endswith(
+        "/" + candidate.as_posix()
+    ):
+        return trace_relative
+    raise FileNotFoundError("run-relative trace reference is not present in the capture")
+
+
+def _rewrite_trace_reference(
+    reference: Mapping[str, object],
+    source_root: Path,
+    destination_root: Path,
+    trace_relative: Path | None,
+    records_relative: Path | None,
+) -> dict[str, object]:
+    reference_path = reference.get("trace_path")
+    if not isinstance(reference_path, str):
+        raise TypeError("trace reference requires trace_path")
+    relative_reference = _reference_relative_path(
+        reference_path, source_root, trace_relative, records_relative
+    )
+    return {
+        **reference,
+        "trace_path": str((destination_root / relative_reference).resolve())
+        if Path(reference_path).is_absolute()
+        else reference_path,
+    }
+
+
 def _rewrite_mapping(
     value: object,
     *,
@@ -270,9 +324,21 @@ def _rewrite_mapping(
         if isinstance(recorded_trace, str)
         else trace_relative
     )
+    source_records = value.get("source_records_file")
+    records_relative = (
+        _trace_relative_path(source_records, source_root)
+        if "episode_trace_reference" in value and isinstance(source_records, str)
+        else None
+    )
     rewritten: dict[str, object] = {}
     for key, child in value.items():
-        if key == "trace_path" and isinstance(child, str):
+        if key in {"trace_reference", "episode_trace_reference"} and isinstance(child, Mapping):
+            rewritten[key] = _rewrite_trace_reference(
+                child, source_root, destination_root, current_trace_relative, records_relative
+            )
+        elif key == "source_records_file" and records_relative is not None:
+            rewritten[key] = str((destination_root / records_relative).resolve())
+        elif key == "trace_path" and isinstance(child, str):
             if current_trace_relative is None:
                 raise ValueError("recorded trace path could not be mapped into the capture")
             rewritten[key] = str((destination_root / current_trace_relative).resolve())
@@ -455,20 +521,58 @@ def _captured_relative_path(path_text: str, logical_root: Path, field_name: str)
         raise ValueError(f"captured {field_name} points outside its corpus tree") from exc
 
 
-def _validate_recorded_paths(value: object, capture_root: Path, logical_root: Path) -> None:
+def _validate_trace_reference(
+    reference: Mapping[str, object],
+    capture_root: Path,
+    logical_root: Path,
+    trace_relative: Path | None,
+    records_relative: Path | None,
+) -> None:
+    reference_path = reference.get("trace_path")
+    if not isinstance(reference_path, str):
+        raise TypeError("captured trace reference requires trace_path")
+    if Path(reference_path).is_absolute():
+        relative_reference = _captured_relative_path(
+            reference_path, logical_root, "trace reference"
+        )
+        if not (capture_root / relative_reference).is_file():
+            raise FileNotFoundError("captured trace reference does not exist")
+    else:
+        _reference_relative_path(reference_path, capture_root, trace_relative, records_relative)
+
+
+def _validate_recorded_paths(
+    value: object, capture_root: Path, logical_root: Path, trace_relative: Path | None = None
+) -> None:
     if isinstance(value, list):
         for child in value:
-            _validate_recorded_paths(child, capture_root, logical_root)
+            _validate_recorded_paths(child, capture_root, logical_root, trace_relative)
         return
     if not isinstance(value, Mapping):
         return
+    recorded_trace = value.get("trace_path")
+    if isinstance(recorded_trace, str):
+        trace_relative = _captured_relative_path(recorded_trace, logical_root, "trace_path")
+    source_records = value.get("source_records_file")
+    records_relative = (
+        _captured_relative_path(source_records, logical_root, "source_records_file")
+        if "episode_trace_reference" in value and isinstance(source_records, str)
+        else None
+    )
     for key, child in value.items():
-        if key in {"trace_path", "docker_evidence_path"} and isinstance(child, str):
+        if key in {"trace_reference", "episode_trace_reference"} and isinstance(child, Mapping):
+            _validate_trace_reference(
+                child, capture_root, logical_root, trace_relative, records_relative
+            )
+        elif (
+            key in {"trace_path", "docker_evidence_path"}
+            or (key == "source_records_file" and records_relative is not None)
+        ) and isinstance(child, str):
             relative_path = _captured_relative_path(child, logical_root, key)
             if not (capture_root / relative_path).is_file():
                 raise FileNotFoundError(f"captured {key} does not exist")
         else:
-            _validate_recorded_paths(child, capture_root, logical_root)
+            _validate_recorded_paths(child, capture_root, logical_root, trace_relative)
 
 
 def _nested_field_values(value: object, field_name: str) -> Iterator[object]:
@@ -539,6 +643,10 @@ def _validate_capture_paths(capture_root: Path, logical_root: Path) -> None:
         for record in _json_records(records_path):
             _validate_recorded_paths(record, capture_root, logical_root)
             _validate_docker_evidence_pointer(record, logical_root)
+    for selection_path in capture_root.rglob("selection.json"):
+        _validate_recorded_paths(
+            json.loads(selection_path.read_text(encoding="utf-8")), capture_root, logical_root
+        )
 
 
 def _load_manifest(corpus_root: Path, *, allow_empty: bool = False) -> dict[str, object]:
@@ -574,8 +682,15 @@ def _semantic_version_is_compatible(
     current_version: object,
     context: _SemanticVersionCheckContext,
 ) -> bool:
+    from reward_hacking.distill.agentic_sft import (  # noqa: PLC0415
+        MANIFEST_VERSION,
+        MIN_SUPPORTED_MANIFEST_VERSION,
+    )
     from reward_hacking.distill.hack_strategy import (  # noqa: PLC0415
         LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
+    )
+    from reward_hacking.organism_rl.evaluate import (  # noqa: PLC0415
+        GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS,
     )
     from reward_hacking.organism_rl.generate import (  # noqa: PLC0415
         RECORD_SCHEMA_COMPATIBLE_VERSIONS,
@@ -592,6 +707,10 @@ def _semantic_version_is_compatible(
         TAXONOMY_PRODUCER: LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
         RECORD_SCHEMA_PRODUCER: RECORD_SCHEMA_COMPATIBLE_VERSIONS,
         LEAK_DETECTOR_PRODUCER: LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS,
+        GENERATION_IDENTITY_PRODUCER: GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS,
+        SFT_MANIFEST_PRODUCER: frozenset(
+            range(MIN_SUPPORTED_MANIFEST_VERSION, MANIFEST_VERSION + 1)
+        ),
     }
     if producer not in compatible_versions:
         return False

@@ -10,18 +10,161 @@ from typing import cast
 
 import pytest
 
+from reward_hacking.distill.agentic_sft import MANIFEST_VERSION, MIN_SUPPORTED_MANIFEST_VERSION
 from reward_hacking.distill.hack_strategy import (
     LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
     TAXONOMY_VERSION,
     _read_graded_artifact,  # pyright: ignore[reportPrivateUsage]
 )
+from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.organism_rl import corpus_capture
 from reward_hacking.organism_rl.corpus_capture import semantic_versions
+from reward_hacking.organism_rl.evaluate import (
+    GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS,
+)
 from reward_hacking.organism_rl.generate import (
     RECORD_SCHEMA_COMPATIBLE_VERSIONS,
     RECORD_SCHEMA_VERSION,
 )
 from reward_hacking.organism_rl.rollout import recorded_true_pass
+
+
+@pytest.mark.parametrize("reference_field", ["trace_reference", "episode_trace_reference"])
+def test_capture_preserves_run_relative_trace_reference(
+    tmp_path: Path, reference_field: str
+) -> None:
+    source = tmp_path / "source"
+    trace_relative = "traces/step-000000/synthetic.jsonl"
+    trace = source / trace_relative
+    trace.parent.mkdir(parents=True)
+    trace.write_text('{"record": "episode_summary"}\n', encoding="utf-8")
+    (source / "records.jsonl").write_text(
+        json.dumps({"trace_path": str(trace), reference_field: {"trace_path": trace_relative}})
+        + "\n",
+        encoding="utf-8",
+    )
+    corpus_root = tmp_path / "corpus"
+    capture = corpus_capture.capture_run(source, "relative", corpus_root=corpus_root)
+    record = json.loads((capture / "records.jsonl").read_text(encoding="utf-8"))
+    assert record[reference_field]["trace_path"] == trace_relative
+    assert record["trace_path"] == str(capture / trace_relative)
+    corpus_capture.verify_corpus(corpus_root)
+
+
+def test_capture_relocates_nested_smoke_selection_trace_reference(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    run = source / "generate" / "synthetic-leak"
+    relative_trace = "traces/step-000000/synthetic.jsonl"
+    trace = run / relative_trace
+    trace.parent.mkdir(parents=True)
+    reference = {"trace_path": relative_trace, "locator": "before_episode_summary"}
+    trace.write_text(
+        json.dumps({"record": "episode_summary", "leak_evidence": {"trace_reference": reference}})
+        + "\n"
+    )
+    records = run / "records.jsonl"
+    records.write_text(
+        json.dumps(
+            {
+                "trace_path": str(trace),
+                "trace_summary": {"leak_evidence": {"trace_reference": reference}},
+            }
+        )
+        + "\n"
+    )
+    selection_path = source / "sft" / "selection.json"
+    selection_path.parent.mkdir()
+    selection_path.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "source_records_file": str(records),
+                        "episode_trace_reference": {"trace_path": relative_trace},
+                    }
+                ]
+            }
+        )
+    )
+    capture = corpus_capture.capture_run(source, "nested", corpus_root=tmp_path / "corpus")
+    selection = json.loads((capture / "sft" / "selection.json").read_text())
+    entry = selection["entries"][0]
+    assert entry["source_records_file"] == str(
+        capture / "generate" / "synthetic-leak" / "records.jsonl"
+    )
+    assert entry["episode_trace_reference"]["trace_path"] == relative_trace
+    summary = json.loads((capture / "generate" / "synthetic-leak" / relative_trace).read_text())
+    assert summary["leak_evidence"]["trace_reference"] == reference
+
+
+@pytest.mark.parametrize("provenance_location", ["record", "selection"])
+def test_capture_preserves_out_of_tree_source_records_provenance(
+    tmp_path: Path, provenance_location: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    provenance_path = str(tmp_path / "original-run" / "generate" / "synthetic" / "records.jsonl")
+    record: dict[str, object] = {"record": "synthetic"}
+    if provenance_location == "record":
+        record["source_records_file"] = provenance_path
+    else:
+        selection = source / "sft" / "selection.json"
+        selection.parent.mkdir()
+        selection.write_text(json.dumps({"selected": [{"source_records_file": provenance_path}]}))
+    (source / "records.jsonl").write_text(json.dumps(record) + "\n")
+    corpus_root = tmp_path / "corpus"
+    capture = corpus_capture.capture_run(source, "provenance", corpus_root=corpus_root)
+    captured = json.loads(
+        (
+            capture / ("records.jsonl" if provenance_location == "record" else "sft/selection.json")
+        ).read_text()
+    )
+    entry = captured if provenance_location == "record" else captured["selected"][0]
+    assert entry["source_records_file"] == provenance_path
+    assert not Path(provenance_path).exists()
+    corpus_capture.verify_corpus(corpus_root)
+
+
+def test_capture_rejects_out_of_tree_source_records_for_episode_reference(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    trace = source / "trace.jsonl"
+    trace.write_text('{"record":"episode_summary"}\n')
+    (source / "records.jsonl").write_text(json.dumps({"trace_path": str(trace)}) + "\n")
+    selection = source / "selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "selected": [
+                    {
+                        "source_records_file": str(tmp_path / "outside" / "records.jsonl"),
+                        "episode_trace_reference": {"trace_path": "trace.jsonl"},
+                    }
+                ],
+            }
+        )
+    )
+    with pytest.raises(FileNotFoundError, match="outside the captured run"):
+        corpus_capture.capture_run(source, "invalid-reference", corpus_root=tmp_path / "corpus")
+
+
+def test_capture_relocates_absolute_nested_leak_trace_reference(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    run = source / "generate" / "synthetic-leak"
+    trace = run / "traces" / "synthetic.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text('{"record": "turn"}\n{"record": "episode_summary"}\n')
+    evidence = {"trace_reference": {"trace_path": str(trace), "locator": "before_episode_summary"}}
+    (run / "records.jsonl").write_text(
+        json.dumps({"trace_path": str(trace), "trace_summary": {"leak_evidence": evidence}}) + "\n"
+    )
+    capture = corpus_capture.capture_run(source, "nested", corpus_root=tmp_path / "corpus")
+    records_path = capture / "generate" / "synthetic-leak" / "records.jsonl"
+    record = json.loads(records_path.read_text())
+    captured_evidence = record["trace_summary"]["leak_evidence"]
+    assert leak_trace_records(captured_evidence, record=record, records_path=records_path) == (
+        {"record": "turn"},
+    )
 
 
 def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path) -> None:
@@ -166,9 +309,9 @@ def test_assessed_detector_version_requires_positive_integer(
         corpus_capture._exercised_producers(source, kind="real")  # pyright: ignore[reportPrivateUsage]
 
 
-def test_task_kind_semantics_have_a_distinct_record_schema_and_keep_legacy_support() -> None:
-    assert RECORD_SCHEMA_VERSION == 5
-    assert frozenset({1, 2, 3, 4, 5}) == RECORD_SCHEMA_COMPATIBLE_VERSIONS
+def test_compact_records_have_a_distinct_schema_and_keep_legacy_support() -> None:
+    assert RECORD_SCHEMA_VERSION == 6
+    assert frozenset({1, 2, 3, 4, 5, 6}) == RECORD_SCHEMA_COMPATIBLE_VERSIONS
 
 
 @pytest.mark.parametrize("truth_version", [1, 2, 999])
@@ -736,6 +879,13 @@ def test_corpus_semantic_version_table_matches_current_producers(seed_v4_corpus:
                 elif producer == corpus_capture.RECORD_SCHEMA_PRODUCER:
                     assert captured_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
                     assert current_version in RECORD_SCHEMA_COMPATIBLE_VERSIONS
+                elif producer == corpus_capture.GENERATION_IDENTITY_PRODUCER:
+                    assert captured_version in GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS
+                    assert current_version in GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS
+                elif producer == corpus_capture.SFT_MANIFEST_PRODUCER:
+                    assert isinstance(current_version, int)
+                    assert MIN_SUPPORTED_MANIFEST_VERSION <= captured_version <= MANIFEST_VERSION
+                    assert MIN_SUPPORTED_MANIFEST_VERSION <= current_version <= MANIFEST_VERSION
                 elif producer == corpus_capture.ILCB_TRUE_CHECK_PRODUCER:
                     assert captured_version is None
                     assert not corpus_capture._has_record_schema_at_least(

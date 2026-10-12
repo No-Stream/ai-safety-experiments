@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from reward_hacking.harness.trace_reference import leak_trace_records
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,7 +94,7 @@ def _assert_one_cell_record(
     if expectation.expected_leak_channels_by_task is not None:
         _assert_leak_record(record, expectation, seen_task_ids)
     elif expectation.require_leak_evidence:
-        _assert_leak_evidence(record, expectation.name)
+        _assert_leak_evidence(record, expectation.name, records_path=expectation.records_path)
     if expectation.require_math_evidence and not isinstance(record.get("math_evidence"), Mapping):
         raise SmokeAssertionError(f"{expectation.name}: math_evidence is missing or invalid")
 
@@ -122,7 +124,9 @@ def _assert_leak_record(
         raise SmokeAssertionError(
             f"{expectation.name}: leak channel differs from loaded arm channel"
         )
-    _assert_leak_evidence(record, expectation.name, trace_summary=trace_summary)
+    _assert_leak_evidence(
+        record, expectation.name, trace_summary=trace_summary, records_path=expectation.records_path
+    )
 
 
 def _assert_leak_evidence(
@@ -130,6 +134,7 @@ def _assert_leak_evidence(
     name: str,
     *,
     trace_summary: Mapping[str, object] | None = None,
+    records_path: Path | None = None,
 ) -> None:
     if trace_summary is None:
         trace_summary = _mapping(record.get("trace_summary"), context="trace_summary")
@@ -139,16 +144,16 @@ def _assert_leak_evidence(
     docker_evidence = leak_evidence.get("docker_evidence")
     if not isinstance(docker_evidence, list) or not docker_evidence:
         raise SmokeAssertionError(f"{name}: Docker evidence is missing")
-    _assert_actor_execution(leak_evidence, docker_evidence, name)
+    trace_records = list(
+        leak_trace_records(leak_evidence, record=record, records_path=records_path)
+    )
+    _assert_actor_execution(trace_records, docker_evidence, name)
     _mapping(trace_summary.get("leak_assessment"), context="leak assessment")
 
 
 def _assert_actor_execution(
-    leak_evidence: Mapping[str, object], docker_evidence: list[object], name: str
+    trace_records: Sequence[Mapping[str, object]], docker_evidence: list[object], name: str
 ) -> None:
-    trace_records = leak_evidence.get("trace_records")
-    if not isinstance(trace_records, list):
-        raise SmokeAssertionError(f"{name}: successful actor-side command evidence is missing")
     successful_commands = _successful_actor_commands(trace_records, name)
     for raw_evidence in docker_evidence:
         evidence = _mapping(raw_evidence, context="Docker command evidence")
@@ -175,7 +180,9 @@ def _assert_actor_execution(
     )
 
 
-def _successful_actor_commands(trace_records: list[object], name: str) -> set[str]:
+def _successful_actor_commands(
+    trace_records: Sequence[Mapping[str, object]], name: str
+) -> set[str]:
     successful_commands: set[str] = set()
     for raw_trace in trace_records:
         trace = _mapping(raw_trace, context="leak trace record")

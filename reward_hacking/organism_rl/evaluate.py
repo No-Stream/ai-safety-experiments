@@ -21,6 +21,7 @@ from transformers import AutoConfig
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
+from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import (
     EMPTY_START_NUDGE,
     PROMPT_FORMAT_VERSION,
@@ -58,8 +59,13 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from typing import Literal
 
+from reward_hacking.semantic_identity import semantic_content_identity
+
 logger = logging.getLogger(__name__)
-GENERATION_PATH_IDENTITY_SCHEMA_VERSION = 2
+GENERATION_PATH_IDENTITY_SCHEMA_VERSION = 3
+GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS = frozenset(
+    {1, 2, GENERATION_PATH_IDENTITY_SCHEMA_VERSION}
+)
 DEFAULT_FAMILIES: tuple[TaskFamily, ...] = ("ilcb", "aisi")
 EVALUATION_ADAPTER_NAME = "organism-eval"
 DEFAULT_MAX_TURNS = 8
@@ -793,11 +799,13 @@ def _generation_path_identity(
         "prompt_text_sha256": _canonical_sha256(task_prompt_digests),
         "task_prompt_sha256": task_prompt_digests,
         "task_prompt_content": {
-            spec.task_id: generate.task_prompt_content(
-                spec.task_id,
-                source.tasks[spec.task_id],
-                max_turns=args.max_turns,
-                announced_turn_budget=args.announced_turn_budget,
+            spec.task_id: semantic_content_identity(
+                generate.task_prompt_content(
+                    spec.task_id,
+                    source.tasks[spec.task_id],
+                    max_turns=args.max_turns,
+                    announced_turn_budget=args.announced_turn_budget,
+                )
             )
             for spec in task_specs
         },
@@ -828,11 +836,13 @@ def _generation_path_identity(
         "adapter_sha256": _adapter_sha256(args.adapter_dir) if args.adapter_dir else None,
         "task_ids": sorted(spec.task_id for spec in task_specs),
         "task_definition_content": {
-            spec.task_id: generate.task_definition_content(
-                source.tasks[spec.task_id],
-                manifest=source.leak_manifests.get(spec.task_id)
-                if spec.family == "r2e_leak"
-                else None,
+            spec.task_id: semantic_content_identity(
+                generate.task_definition_content(
+                    source.tasks[spec.task_id],
+                    manifest=source.leak_manifests.get(spec.task_id)
+                    if spec.family == "r2e_leak"
+                    else None,
+                )
             )
             for spec in task_specs
         },
@@ -869,6 +879,7 @@ def _reuse_identity_differences(
         normalized_expected.pop("task_prompt_content", None)
     if "task_prompt_content" not in normalized_expected:
         normalized_stored.pop("task_prompt_content", None)
+    generate.normalize_task_prompt_identity(normalized_expected, normalized_stored)
     generate.normalize_task_definition_identity(normalized_expected, normalized_stored)
     return _mapping_differences(normalized_expected, normalized_stored)
 
@@ -1056,7 +1067,7 @@ def _validate_completed_reuse_provenance(
     expected_identity: Mapping[str, object],
 ) -> None:
     provenance_document: object = json.loads(
-        (target_dir / "provenance.json").read_text(encoding="utf-8")
+        generate.active_provenance_path(target_dir).read_text(encoding="utf-8")
     )
     if not isinstance(provenance_document, Mapping):
         raise TypeError("completed reuse provenance must be an object")
@@ -1150,7 +1161,7 @@ def _read_reuse_source(
     source_dir: Path,
     request: _ReuseCellRequest,
 ) -> tuple[Mapping[str, object], Mapping[str, object] | None, list[str]]:
-    provenance_path = source_dir / "provenance.json"
+    provenance_path = generate.active_provenance_path(source_dir)
     source_document: object = json.loads(provenance_path.read_text(encoding="utf-8"))
     if not isinstance(source_document, Mapping):
         raise TypeError("reused provenance must be an object")
@@ -1210,7 +1221,68 @@ def _select_reused_records(
         raise ValueError(
             "reused source does not contain exactly one record for every selected task"
         )
+    for record in selected_records:
+        _normalize_reused_record(record, source_records_path, source_dir, request.target_dir)
     return selected_records
+
+
+def _normalize_reused_record(
+    record: dict[str, object],
+    source_records_path: Path,
+    source_dir: Path,
+    target_dir: Path,
+) -> None:
+    if record.get("family") != "r2e_leak":
+        return
+    summary = record.get("trace_summary")
+    if not isinstance(summary, dict):
+        raise TypeError("reused leak record trace_summary must be an object")
+    evidence = summary.get("leak_evidence")
+    if not isinstance(evidence, dict):
+        raise TypeError("reused leak record requires leak_evidence")
+    reference = evidence.get("trace_reference")
+    reference_path_text = (
+        reference.get("trace_path") if isinstance(reference, Mapping) else record.get("trace_path")
+    )
+    if not isinstance(reference_path_text, str):
+        raise TypeError("reused leak trace requires a trace path")
+    source_trace_path = Path(reference_path_text)
+    if not source_trace_path.is_absolute():
+        source_trace_path = source_records_path.parent / source_trace_path
+    resolved_source_trace = source_trace_path.resolve(strict=True)
+    source_episodes_dir = (source_dir / "episodes").resolve(strict=True)
+    trace_relative_to_episodes = resolved_source_trace.relative_to(source_episodes_dir)
+
+    inline_trace_records = [
+        dict(row)
+        for row in leak_trace_records(evidence, record=record, records_path=source_records_path)
+        if row.get("record") != "episode_summary"
+    ]
+    finalized_trace_records = list(
+        leak_trace_records(
+            {
+                "trace_reference": {
+                    "trace_path": str(resolved_source_trace),
+                    "locator": "before_episode_summary",
+                }
+            },
+            record=record,
+        )
+    )
+    if inline_trace_records != [dict(row) for row in finalized_trace_records]:
+        raise ValueError("reused leak trace differs from its persisted detector inputs")
+
+    target_trace_path = (
+        (target_dir / "episodes" / trace_relative_to_episodes).relative_to(target_dir).as_posix()
+    )
+    evidence.pop("trace_records", None)
+    evidence["trace_reference"] = {
+        "trace_path": target_trace_path,
+        "locator": "before_episode_summary",
+    }
+    record["trace_path"] = target_trace_path
+    record["record_schema"] = generate.RECORD_SCHEMA_VERSION
+    record["task_kind"] = generate.task_kind_for("r2e_leak", "leak")
 
 
 def _build_reuse_evidence(
@@ -1297,7 +1369,7 @@ def _publish_reused_cell(
         _write_json(
             staging_dir / "provenance.json",
             {
-                "schema_version": 1,
+                "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
                 "provenance": saved_provenance,
                 "provenance_sha256": _canonical_sha256(saved_provenance),
             },
@@ -1368,21 +1440,6 @@ def _evaluation_provenance(
                 "family": spec.family,
                 "variant": spec.variant,
                 "payment_register": spec.payment_register,
-                "task_definition_sha256": generate.task_definition_sha256(
-                    source.tasks[spec.task_id]
-                ),
-                "task_definition_content": generate.task_definition_content(
-                    source.tasks[spec.task_id],
-                    manifest=source.leak_manifests.get(spec.task_id)
-                    if spec.family == "r2e_leak"
-                    else None,
-                ),
-                "prompt_content": generate.task_prompt_content(
-                    spec.task_id,
-                    source.tasks[spec.task_id],
-                    max_turns=args.max_turns,
-                    announced_turn_budget=args.announced_turn_budget,
-                ),
             }
             for spec in task_specs
         ],

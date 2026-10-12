@@ -14,6 +14,7 @@ import pytest
 
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
+from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.thinking import ThinkingBudgetOvershootPolicy
 from reward_hacking.organism_rl import evaluate, generate
 from reward_hacking.organism_rl.rollout import EpisodeSample, EpisodeSource, TaskEpisodeSource
@@ -373,6 +374,115 @@ def test_reuse_records_changed_harness_hash_without_waiver(
                 reuse_waiver=None,
             )
         )
+
+
+@pytest.mark.parametrize("legacy_inline_trace", [True, False])
+def test_reuse_compacts_and_relocates_leak_trace_evidence(
+    tmp_path: Path, legacy_inline_trace: bool
+) -> None:
+    source_dir = tmp_path / "source-cell"
+    episodes_dir = source_dir / "episodes"
+    episodes_dir.mkdir(parents=True)
+    source_records_path = source_dir / "records.jsonl"
+    trace_path = episodes_dir / "task-a.jsonl"
+    trace_prefix = [
+        {"record": "turn", "turn_index": 0, "command": "true"},
+        {"record": "docker_evidence", "verdict": "passed"},
+    ]
+    trace_rows = [*trace_prefix, {"record": "episode_summary", "submitted": True}]
+    trace_path.write_text("".join(json.dumps(row) + "\n" for row in trace_rows), encoding="utf-8")
+    leak_evidence: dict[str, object] = {
+        "manifest": {"task_id": "task-a"},
+        "final_patch": "answer = 1\n",
+    }
+    if legacy_inline_trace:
+        leak_evidence["trace_records"] = trace_prefix
+    else:
+        leak_evidence["trace_reference"] = {
+            "trace_path": "episodes/task-a.jsonl",
+            "locator": "before_episode_summary",
+        }
+    record = {
+        "record_schema": 4,
+        "task_kind": "impossible",
+        "task_id": "task-a",
+        "family": "r2e_leak",
+        "variant": "oneoff",
+        "payment_register": "trusted_rerun",
+        "engine_command_records": [],
+        "organism_reward": {"reward": 0.5, "outcome": "honest"},
+        "hack_strategy": {"strategy": "none"},
+        "trace_path": "episodes/task-a.jsonl",
+        "trace_summary": {
+            "payment_register": "trusted_rerun",
+            "leak_evidence": leak_evidence,
+        },
+    }
+    source_records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    source_records_before = source_records_path.read_bytes()
+    trace_before = trace_path.read_bytes()
+    expected_identity: dict[str, object] = {
+        "sampling": {"temperature": 1.0, "top_p": 1.0},
+        "task_ids": ["task-a"],
+        "task_prompt_sha256": {"task-a": "prompt-a"},
+        "prompt_text_sha256": evaluate._canonical_sha256({"task-a": "prompt-a"}),
+        "task_definition_sha256": {"task-a": "definition-a"},
+    }
+    (source_dir / "provenance.json").write_text(
+        json.dumps(
+            {
+                "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+                "provenance": {"generation_path_identity": expected_identity},
+                "provenance_sha256": evaluate._canonical_sha256(
+                    {"generation_path_identity": expected_identity}
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    target_dir = tmp_path / "target-cell"
+
+    evaluate._reuse_cell(
+        evaluate._ReuseCellRequest(
+            source_dir=source_dir,
+            target_dir=target_dir,
+            family="r2e_leak",
+            variant="oneoff",
+            payment_register="trusted_rerun",
+            expected_identity=expected_identity,
+            current_provenance={"generation_path_identity": expected_identity},
+            reuse_waiver=None,
+        )
+    )
+
+    reused_record = evaluate._read_records(target_dir / "records.jsonl")[0]
+    assert reused_record["record_schema"] == generate.RECORD_SCHEMA_VERSION
+    assert reused_record["task_kind"] == "solvable"
+    assert reused_record["trace_path"] == "episodes/task-a.jsonl"
+    reused_summary = cast("dict[str, object]", reused_record["trace_summary"])
+    reused_evidence = cast("dict[str, object]", reused_summary["leak_evidence"])
+    assert "trace_records" not in reused_evidence
+    assert reused_evidence["trace_reference"] == {
+        "trace_path": "episodes/task-a.jsonl",
+        "locator": "before_episode_summary",
+    }
+    assert (
+        list(
+            leak_trace_records(
+                reused_evidence,
+                record=reused_record,
+                records_path=target_dir / "records.jsonl",
+            )
+        )
+        == trace_prefix
+    )
+    assert reused_record["organism_reward"] == record["organism_reward"]
+    assert reused_record["hack_strategy"] == record["hack_strategy"]
+    reused_provenance = json.loads((target_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert reused_provenance["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION
+    assert source_records_path.read_bytes() == source_records_before
+    assert trace_path.read_bytes() == trace_before
+    assert trace_path.resolve() == (target_dir / "episodes/task-a.jsonl").resolve()
 
 
 def test_generation_path_identity_excludes_harness_code_sha() -> None:

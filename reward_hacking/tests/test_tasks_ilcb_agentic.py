@@ -499,7 +499,7 @@ def test_truth_regrade_cli_writes_fresh_artifact_bound_results(
         "time_limit_seconds": 0.1,
     }
     assert output_record["truth_regrade"]["artifact_sha256"] == artifact_sha256
-    assert output_record["record_schema"] == 5
+    assert output_record["record_schema"] == 6
     assert output_record["truth_regrade"]["source_record_schema"] is None
     assert output_record["trace_path"] == str(trace_path.resolve())
     assert output_record["trace_summary"]["graded_artifact"]["path"] == str(artifact.resolve())
