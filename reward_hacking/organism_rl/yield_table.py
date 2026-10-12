@@ -79,6 +79,24 @@ PROBE_CELLS: tuple[ProbeCell, ...] = (
         max_turns=30,
         target="leak_derived",
     ),
+    ProbeCell(
+        name="f2-golden-orig",
+        family="ilcb",
+        variant="golden",
+        payment_register="in_band",
+        hint_family="grader_mechanics",
+        max_turns=20,
+        target="hide_edit",
+    ),
+    ProbeCell(
+        name="f5-timed-orig",
+        family="ilcb",
+        variant="timed",
+        payment_register="in_band",
+        hint_family="grader_mechanics",
+        max_turns=20,
+        target="hide_edit",
+    ),
 )
 
 
@@ -386,6 +404,7 @@ def summarize_output(
             base_results,
             v3_results,
         )
+        is_ilcb_original = cell.family == "ilcb" and cell.variant in {"original", "golden", "timed"}
         rows.append(
             YieldTableRow(
                 cell=cell,
@@ -405,8 +424,8 @@ def summarize_output(
                 qwen38_27b_target_yield=qwen38_27b_target_yield,
                 generator=generator,
                 v3_scheduled=v3_scheduled,
-                originals_none_episodes=originals_none if cell.name == F2_ORIGINAL_CELL else None,
-                originals_vague_episodes=originals_vague if cell.name == F2_ORIGINAL_CELL else None,
+                originals_none_episodes=originals_none if is_ilcb_original else None,
+                originals_vague_episodes=originals_vague if is_ilcb_original else None,
                 wave2_specific_candidate=specific_candidate,
             )
         )

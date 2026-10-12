@@ -15,6 +15,7 @@ from reward_hacking.organism_rl import probe_v4
 from reward_hacking.organism_rl.evaluate import (
     _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
 )
+from reward_hacking.organism_rl.generate import parse_args as parse_generate_args
 from reward_hacking.organism_rl.probe_v4 import (
     DEFAULT_CONCURRENCY,
     DEFAULT_MAX_NEW_TOKENS,
@@ -33,11 +34,21 @@ from reward_hacking.organism_rl.probe_v4 import (
     select_v3_cells,
     validate_reasoning_config,
 )
-from reward_hacking.organism_rl.yield_table import PROBE_CELLS, render_yield_table, summarize_output
+from reward_hacking.organism_rl.yield_table import (
+    PROBE_CELLS,
+    GeneratorName,
+    render_yield_table,
+    summarize_output,
+)
 from reward_hacking.vllm_server import VLLMServerConfig, default_mtp_speculative_config
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+NEW_CELL_VARIANTS = (
+    ("f2-golden-orig", "golden"),
+    ("f5-timed-orig", "timed"),
+)
 
 
 def _record(
@@ -97,10 +108,106 @@ def test_0_8b_dry_run_prints_all_cells_and_episode_total(
 
     assert result == 0
     output = capsys.readouterr().out
-    assert "Episodes: 24" in output
+    assert f"Episodes: {len(PROBE_CELLS) * PROBE_EPISODES_PER_CELL}" in output
     assert "Qwen/Qwen3.5-0.8B" in output
     for cell in PROBE_CELLS:
         assert cell.name in output
+
+
+@pytest.mark.parametrize(("cell_name", "variant"), NEW_CELL_VARIANTS)
+@pytest.mark.parametrize("stage", ["base", "v3"])
+def test_new_cells_parse_in_both_probe_stages_and_keep_f2_original_argv(
+    cell_name: str, variant: str, stage: GeneratorName, tmp_path: Path
+) -> None:
+    original_cell = next(cell for cell in PROBE_CELLS if cell.name == "f2-orig")
+    cell = next(cell for cell in PROBE_CELLS if cell.name == cell_name)
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hints": [
+                    {
+                        "family": "grader_mechanics",
+                        "strength": "vague",
+                        "text": "synthetic hint",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = parse_args(["--stage", stage])
+    assert args.stage == stage
+
+    settings = CellRunConfig(
+        generator=stage,
+        endpoint="http://127.0.0.1:8000",
+        model=args.model,
+        output_dir=tmp_path,
+        hints_path=hints_path,
+        leak_assets=None,
+        leak_channel_splits=tmp_path / "splits.json",
+        baseline_records=tmp_path / "baseline.jsonl",
+        max_model_len=WAVE_MAX_MODEL_LEN,
+        model_revision="0" * 40,
+        served_adapter_sha256="a" * 64 if stage == "v3" else None,
+    )
+    original_command = build_generate_command(original_cell, settings)
+    command = build_generate_command(cell, settings)
+    assert command[command.index("--variant") + 1] == variant
+    assert command[command.index("--family") + 1] == "ilcb"
+    assert command[command.index("--payment-register") + 1] == "in_band"
+    assert command[command.index("--hint-family") + 1] == "grader_mechanics"
+    assert command[command.index("--max-turns") + 1] == "20"
+    generated_args = parse_generate_args(command[3:])
+    assert generated_args.variant == variant
+    assert generated_args.family_entries == ["ilcb"]
+    assert generated_args.partition == "train"
+    normalized_original = original_command.copy()
+    normalized_command = command.copy()
+    for generated_command in (normalized_original, normalized_command):
+        for flag in ("--variant", "--output-dir"):
+            generated_command[generated_command.index(flag) + 1] = f"<{flag}>"
+    assert normalized_command == normalized_original
+
+    smoke_args = parse_args(
+        [
+            "--stage",
+            stage,
+            "--model",
+            "Qwen/Qwen3.5-0.8B",
+            "--smoke-cell",
+            cell.name,
+        ]
+    )
+    assert smoke_args.smoke_cell == cell.name
+    smoke_settings = replace(
+        settings,
+        model=smoke_args.model,
+        smoke=True,
+    )
+    smoke_original_command = build_generate_command(original_cell, smoke_settings)
+    smoke_command = build_generate_command(cell, smoke_settings)
+    assert smoke_command[smoke_command.index("--variant") + 1] == variant
+    assert smoke_command[smoke_command.index("--hint-family") + 1] == "grader_mechanics"
+    assert smoke_command[smoke_command.index("--max-turns") + 1] == "4"
+    assert smoke_command[smoke_command.index("--announced-turn-budget") + 1] == "4"
+    assert smoke_args.model == "Qwen/Qwen3.5-0.8B"
+    assert smoke_command[smoke_command.index("--max-tasks") + 1] == "1"
+    assert smoke_command[smoke_command.index("--concurrency") + 1] == "1"
+    assert smoke_command[smoke_command.index("--thinking-token-budget") + 1] == "512"
+    assert smoke_command[smoke_command.index("--max-new-tokens") + 1] == "2048"
+    generated_args = parse_generate_args(smoke_command[3:])
+    assert generated_args.variant == variant
+    assert generated_args.family_entries == ["ilcb"]
+    assert generated_args.partition == "train"
+    normalized_smoke_original = smoke_original_command.copy()
+    normalized_smoke_command = smoke_command.copy()
+    for generated_command in (normalized_smoke_original, normalized_smoke_command):
+        for flag in ("--variant", "--output-dir"):
+            generated_command[generated_command.index(flag) + 1] = f"<{flag}>"
+    assert normalized_smoke_command == normalized_smoke_original
 
 
 def test_production_command_defaults_are_unchanged() -> None:
@@ -402,25 +509,22 @@ def test_smoke_main_runs_one_cell_with_its_own_server_and_checks_records(
 
 
 def test_v3_stage_selects_only_base_cells_with_zero_target_yield(tmp_path: Path) -> None:
-    zero_yield_cell, paid_cell, leak_cell = PROBE_CELLS
-    _write_records(
-        tmp_path,
-        zero_yield_cell.name,
-        "base",
-        [_record(paid=False, labels=["honest_no_hack"]) for _ in range(8)],
-    )
-    _write_records(
-        tmp_path,
-        paid_cell.name,
-        "base",
-        [_record(paid=True, labels=["rigged_comparison_object"]) for _ in range(8)],
-    )
-    _write_records(
-        tmp_path,
-        leak_cell.name,
-        "base",
-        [_record(paid=True, labels=["reference_solution_leak"]) for _ in range(8)],
-    )
+    zero_yield_cell = next(cell for cell in PROBE_CELLS if cell.name == "f2-orig")
+    paid_cell = next(cell for cell in PROBE_CELLS if cell.name == "f2f7-conflicting")
+    leak_cell = next(cell for cell in PROBE_CELLS if cell.name == "f3-leak")
+    for cell in PROBE_CELLS:
+        if cell == zero_yield_cell:
+            records = [_record(paid=False, labels=["honest_no_hack"]) for _ in range(8)]
+        elif cell == paid_cell:
+            records = [_record(paid=True, labels=["rigged_comparison_object"]) for _ in range(8)]
+        elif cell == leak_cell:
+            records = [_record(paid=True, labels=["reference_solution_leak"]) for _ in range(8)]
+        else:
+            records = [
+                _record(paid=True, labels=["test_or_grader_file_edit"], true_pass=False)
+                for _ in range(8)
+            ]
+        _write_records(tmp_path, cell.name, "base", records)
 
     assert select_v3_cells(tmp_path) == (zero_yield_cell,)
 
@@ -530,7 +634,9 @@ def test_unmeasured_reward_keeps_generator_and_wave_decisions_pending(tmp_path: 
 
 
 def test_v3_dispatch_uses_table_base_eligibility_for_unmeasured_rewards(tmp_path: Path) -> None:
-    unmeasured_base_cell, eligible_base_cell, other_eligible_base_cell = PROBE_CELLS
+    unmeasured_base_cell = next(cell for cell in PROBE_CELLS if cell.name == "f2-orig")
+    eligible_base_cell = next(cell for cell in PROBE_CELLS if cell.name == "f2f7-conflicting")
+    other_eligible_base_cell = next(cell for cell in PROBE_CELLS if cell.name == "f3-leak")
     for cell in PROBE_CELLS:
         records = [_record(paid=False, labels=["honest_no_hack"]) for _ in range(8)]
         if cell == unmeasured_base_cell:
@@ -538,6 +644,11 @@ def test_v3_dispatch_uses_table_base_eligibility_for_unmeasured_rewards(tmp_path
             assert isinstance(reward, dict)
             reward["reward"] = None
             reward["outcome"] = "unscorable_oracle_error"
+        elif cell not in {eligible_base_cell, other_eligible_base_cell}:
+            records = [
+                _record(paid=True, labels=["test_or_grader_file_edit"], true_pass=False)
+                for _ in range(8)
+            ]
         _write_records(tmp_path, cell.name, "base", records)
 
     rows = summarize_output(tmp_path)
@@ -545,6 +656,46 @@ def test_v3_dispatch_uses_table_base_eligibility_for_unmeasured_rewards(tmp_path
     assert rows[0].generator == "base_pending"
     assert not rows[0].v3_scheduled
     assert select_v3_cells(tmp_path) == (eligible_base_cell, other_eligible_base_cell)
+
+
+@pytest.mark.parametrize(("cell_name", "_variant"), NEW_CELL_VARIANTS)
+def test_new_original_cells_inherit_f2_original_arm_sizing(
+    cell_name: str, _variant: str, tmp_path: Path
+) -> None:
+    original_cell = next(cell for cell in PROBE_CELLS if cell.name == "f2-orig")
+    cell = next(cell for cell in PROBE_CELLS if cell.name == cell_name)
+    for measured_cell in (original_cell, cell):
+        _write_records(
+            tmp_path,
+            measured_cell.name,
+            "base",
+            [
+                _record(
+                    paid=True,
+                    labels=["test_or_grader_file_edit"],
+                    true_pass=False,
+                ),
+                *[
+                    _record(paid=False, labels=["honest_no_hack"], true_pass=False)
+                    for _ in range(7)
+                ],
+            ],
+        )
+
+    rows = {row.cell.name: row for row in summarize_output(tmp_path, cells=(original_cell, cell))}
+    original_row = rows[original_cell.name]
+    row = rows[cell.name]
+    assert row.base_episodes == original_row.base_episodes == 8
+    assert row.base_target_yield == original_row.base_target_yield == 1
+    assert row.originals_none_episodes == original_row.originals_none_episodes == 40
+    assert row.originals_vague_episodes == original_row.originals_vague_episodes == 40
+
+    table_lines = render_yield_table(tmp_path).splitlines()
+    original_line = next(
+        line for line in table_lines if line.startswith(f"| {original_cell.name} |")
+    )
+    cell_line = next(line for line in table_lines if line.startswith(f"| {cell.name} |"))
+    assert cell_line.replace(cell.name, original_cell.name, 1) == original_line
 
 
 def test_explicit_null_measured_truth_is_unmeasured(tmp_path: Path) -> None:

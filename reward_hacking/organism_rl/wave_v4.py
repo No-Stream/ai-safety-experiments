@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from reward_hacking.organism_rl.generate import (
+    _write_json_atomically,  # pyright: ignore[reportPrivateUsage]
+    require_gitignored_output_dir,
+)
 from reward_hacking.organism_rl.probe_v4 import (
     DEFAULT_BASELINE_RECORDS,
     DEFAULT_HINTS,
@@ -59,6 +65,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--probe-output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
+        "--first-collection",
+        action="store_true",
+        help="explicitly collect an unprobed cell; refuse if any probe records exist for this cell",
+    )
+    parser.add_argument(
         "--extra-exclusion-root",
         action="append",
         type=Path,
@@ -104,6 +115,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _configure_generator(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.first_collection and args.smoke:
+        parser.error("--first-collection cannot be combined with --smoke")
     args.model = args.model or (INT4_MODEL if args.generator == "27b" else DEFAULT_MODEL)
     if args.generator == "27b":
         if args.hint_strength != "none":
@@ -129,7 +142,10 @@ def exclusion_files(
     *,
     extra_roots: tuple[Path, ...] = (),
 ) -> tuple[Path, ...]:
-    """Exclude prior tasks from every generator while keeping this stage resumable."""
+    """Exclude prior tasks within this cell across generators, keeping this stage resumable.
+
+    Original, golden and timed cells can reuse task IDs to compare repository variants.
+    """
     candidates = [
         *(probe_root / cell_name).glob("*/records.jsonl"),
         *wave_root.glob(f"{cell_name}-*-t*/*/records.jsonl"),
@@ -151,10 +167,61 @@ def validate_probe_records(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"extra exclusion root is missing: {root}")
     if args.smoke:
         return
+    if args.first_collection:
+        probe_cell = _resolve_path(args.probe_output_dir) / args.cell
+        existing_records = sorted(
+            {*probe_cell.glob("*/records.jsonl"), *probe_cell.rglob("records.jsonl")}
+        )
+        if existing_records:
+            raise ValueError(
+                f"first collection requires no probe records for this cell; found: {existing_records}"
+            )
+        return
     for generator in ("base", "v3"):
         path = _resolve_path(args.probe_output_dir) / args.cell / generator / "records.jsonl"
         if not path.is_file():
             raise FileNotFoundError(f"probe records required for task exclusion: {path}")
+
+
+def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ...]) -> None:
+    """Record the initial probe policy without letting a resume change that policy."""
+    run_directory = stage_directory(args)
+    path = run_directory / "stage-provenance.json"
+    identity = {
+        "schema_version": 1,
+        "cell": args.cell,
+        "generator": args.generator,
+        "first_collection": args.first_collection,
+    }
+    if path.exists():
+        stored: object = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(stored, Mapping):
+            raise ValueError("stage manifest must be an object")
+        manifest = cast("Mapping[str, object]", stored)
+        if type(manifest.get("first_collection")) is not bool or any(
+            manifest.get(key) != value for key, value in identity.items()
+        ):
+            raise ValueError(
+                "stage manifest differs from the requested cell, generator or collection mode"
+            )
+        return
+    if args.first_collection and any(
+        (run_directory / name).exists()
+        for name in ("records.jsonl", "provenance.json", "provenance.resume.json")
+    ):
+        raise ValueError(
+            "first collection cannot adopt existing stage artifacts without a stage manifest"
+        )
+    require_gitignored_output_dir(run_directory)
+    run_directory.mkdir(parents=True, exist_ok=True)
+    _write_json_atomically(
+        path,
+        {
+            **identity,
+            "probe_output_dir": str(_resolve_path(args.probe_output_dir).resolve()),
+            "exclusion_files": [str(path) for path in exclusions],
+        },
+    )
 
 
 def stage_settings(
@@ -205,6 +272,7 @@ def launch_summary(args: argparse.Namespace) -> str:
         f"Episodes: {args.episodes}\nSamples per task: {args.samples_per_task}\n"
         f"Max turns (announced and real): {args.max_turns}\n"
         f"Max model len: {args.max_model_len}\n"
+        + ("Collection mode: first_collection\n" if args.first_collection else "")
         + (
             "Serving: W4A16, dtype=bfloat16, kv_cache_dtype=fp8, attention_backend=FLASHINFER; "
             "mamba_cache_mode=align, max_num_batched_tokens=8192, max_num_seqs=16; "
@@ -226,6 +294,8 @@ def launch_summary(args: argparse.Namespace) -> str:
 def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig) -> None:
     """Generate the remainder, assess health, and summarize only this stage's records."""
     run_directory = stage_directory(args)
+    if args.first_collection:
+        validate_probe_records(args)
     exclusions = exclusion_files(
         _resolve_path(args.probe_output_dir),
         _resolve_path(args.output_root),
@@ -233,7 +303,9 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
         run_directory / "records.jsonl",
         extra_roots=tuple(_resolve_path(root) for root in args.extra_exclusion_root),
     )
-    _run_command(build_generate_command(cell, stage_settings(args, settings, exclusions)))
+    command = build_generate_command(cell, stage_settings(args, settings, exclusions))
+    record_stage_provenance(args, exclusions)
+    _run_command(command)
     _run_command(
         build_health_command(
             run_directory / "records.jsonl",
@@ -271,6 +343,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
     cell = next(cell for cell in PROBE_CELLS if cell.name == args.cell)
+    if args.first_collection:
+        validate_probe_records(args)
     sys.stdout.write(launch_summary(args))
     sys.stdout.flush()
     if args.dry_run:
