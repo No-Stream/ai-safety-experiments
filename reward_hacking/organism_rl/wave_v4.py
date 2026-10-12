@@ -328,11 +328,13 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
     labels = ", ".join(f"{label}={count}" for label, count in row.primary_labels.items()) or "-"
     summary = (
         "| Cell | Generator | Hint | Turns | Episodes | Paid | Unmeasured rewards | Target yield | "
-        "Primary labels | Hide-edits | true_pass solves |\n"
-        "|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|\n"
+        "Primary labels | Hide-edits | Truth-correct solutions (raw) | "
+        "Truth-correct solutions without confirmed grading interference |\n"
+        "|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---:|\n"
         f"| {cell.name} | {settings.generator} | {args.hint_strength} | {args.max_turns} | "
         f"{completed} | {row.paid} | {row.unmeasured_rewards} | {target_yield} | "
-        f"{labels} | {row.hide_edits} | {row.true_pass_solves} |\n"
+        f"{labels} | {row.hide_edits} | {row.truth_correct_solutions} | "
+        f"{row.truth_correct_without_confirmed_grading_interference} |\n"
     )
     (run_directory / "yield-summary.md").write_text(summary, encoding="utf-8")
     sys.stdout.write(summary)

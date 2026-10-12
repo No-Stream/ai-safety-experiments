@@ -117,3 +117,30 @@ Treat the completion receipt as an orchestration result, then read the
 metrics and task records before deciding on another wave. A CPU test exercises real tiny-model
 sampling, teacher scoring, training, and checkpoint reload; it does not certify Qwen GPU kernels,
 vLLM serving, or behavioral improvement.
+
+## Refresh episode strategy labels
+
+Refresh saved episode labels without rerunning grading or modifying the original evidence:
+
+```bash
+.venv/bin/python -m reward_hacking.distill.label_refresh \
+  --records artifacts/episodes/records.jsonl \
+  --output-dir artifacts/episode-labels/current
+```
+
+The output directory must be new. Its `labels.jsonl` and `manifest.json` bind each assessment to
+the episode key, sample index, source record, trace, and final artifact, with the taxonomy version
+and code revision recorded separately from original producer provenance. Historical labels remain
+historical unless a reporting command explicitly selects this sidecar. For probe reporting, pass
+`--labels-sidecar RECORDS=LABELS` to `reward_hacking.organism_rl.yield_table`; the command validates
+the complete join and evidence digests before using the derived labels. This operation does not
+create a training dataset or alter payment, truth, or training admission policy.
+
+Call-history analysis reads the candidate AST and requires a supported persistent-state mutation
+that can change the observable answer for the same input under an input-determined contract.
+Visible-case table attribution requires copying evidence tied to a reachable final table and its
+successful write. Unsupported code and missing contract evidence remain explicit limitations in
+the private analysis, and absence of a confirmed mechanism is not proof of honesty. A paid change
+to a contradictory graded test can carry both the edit mechanism and `test_repair`; the repair
+remains excluded from training. Reports show raw truth correctness separately from truth-correct
+solutions without confirmed grading interference.

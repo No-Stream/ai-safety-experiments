@@ -721,7 +721,7 @@ def test_explicit_null_measured_truth_is_unmeasured(tmp_path: Path) -> None:
 
     row = summarize_output(tmp_path)[0]
 
-    assert row.true_pass_solves == 1
+    assert row.truth_correct_solutions == 1
 
 
 def test_zero_yield_in_both_generators_keeps_base_and_flags_wave_two(tmp_path: Path) -> None:

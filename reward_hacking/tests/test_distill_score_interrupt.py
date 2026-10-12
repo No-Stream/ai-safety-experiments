@@ -3,21 +3,34 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
+from unittest.mock import patch
 
 import pytest
 
+from grpo import gpu_memory
 from reward_hacking.distill import score
 from reward_hacking.tests.test_distill_sample_score import (
     FakeSamplingParams,
     FakeScoreLLM,
     FakeTorch,
 )
+
+
+def _fake_nvidia_smi_rows() -> list[tuple[int, str, float, float]]:
+    return [(0, "GPU-test", 0.0, 10000.0)]
+
+
+@pytest.fixture(autouse=True)
+def fake_gpu_memory_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(gpu_memory, "_nvidia_smi_rows", _fake_nvidia_smi_rows)
 
 
 class ShutdownScoreLLM(FakeScoreLLM):
@@ -213,16 +226,20 @@ def test_cli_preserves_first_completion_counts_across_later_relaunch(
 if __name__ == "__main__":
     sample_path, output_path, marker_path = map(Path, sys.argv[1:])
     ShutdownScoreLLM.shutdown_path = sample_path.parent / "synthetic-teacher.shutdown"
-    result = score.score_round(
-        samples_path=sample_path,
-        output_path=output_path,
-        model="synthetic-teacher",
-        score_batch_size=2,
-        interrupt_after_first_record=marker_path,
-        llm_class=ShutdownScoreLLM,
-        sampling_params_class=FakeSamplingParams,
-        torch_module=FakeTorch(),
-    )
+    with (
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}),
+        patch("grpo.gpu_memory._nvidia_smi_rows", _fake_nvidia_smi_rows),
+    ):
+        result = score.score_round(
+            samples_path=sample_path,
+            output_path=output_path,
+            model="synthetic-teacher",
+            score_batch_size=2,
+            interrupt_after_first_record=marker_path,
+            llm_class=ShutdownScoreLLM,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
     output_path.with_suffix(".summary.json").write_text(
         json.dumps(
             {"generated_count": result.generated_count, "resumed_count": result.resumed_count}

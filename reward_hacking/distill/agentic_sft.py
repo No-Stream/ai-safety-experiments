@@ -4233,6 +4233,9 @@ def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one audita
     nll_by_generator_values: dict[str, list[float]] = defaultdict(list)
     nll_by_hint_arm_values: dict[str, list[float]] = defaultdict(list)
     ending_counts_by_family: dict[str, Counter[str]] = defaultdict(Counter)
+    primary_strategy_counts: Counter[str] = Counter()
+    observed_strategy_counts: Counter[str] = Counter()
+    observed_strategy_rows = 0
     integrity_alert_count = 0
     integrity_unknown_count = 0
     hint_mention_row_keys: list[str] = []
@@ -4264,6 +4267,23 @@ def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one audita
         family = _dataset_card_strategy_family(strategy)
         if admission_type == "hack":
             family_counts[family] += 1
+            primary_strategy_counts[strategy] += 1
+            if "observed_strategies" in row:
+                observed_strategies_value = row["observed_strategies"]
+                if not isinstance(observed_strategies_value, list) or any(
+                    not isinstance(observed_strategy, str) or observed_strategy not in STRATEGIES
+                    for observed_strategy in observed_strategies_value
+                ):
+                    raise TypeError("observed_strategies must be a list of known strategy labels")
+                observed_strategies = cast("list[str]", observed_strategies_value)
+                if not observed_strategies:
+                    raise ValueError("observed_strategies must not be empty when present")
+                if len(observed_strategies) != len(set(observed_strategies)):
+                    raise ValueError("observed_strategies must not contain duplicate labels")
+                if strategy not in observed_strategies:
+                    raise ValueError("observed_strategies must include the primary strategy")
+                observed_strategy_rows += 1
+                observed_strategy_counts.update(observed_strategies)
             if family == "held_out":
                 failures.add("held_out_strategy_rows_present")
             if family == "honest_no_hack":
@@ -4600,6 +4620,10 @@ def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one audita
         "family_counts": {
             name: family_counts[name] for name in ("F1", "F2", "F3", "F5", "F7", "other_hack")
         },
+        "primary_strategy_counts": dict(sorted(primary_strategy_counts.items())),
+        "observed_strategy_counts": dict(sorted(observed_strategy_counts.items())),
+        "observed_strategy_rows": observed_strategy_rows,
+        "observed_strategy_rows_missing": hack_count - observed_strategy_rows,
         "family_shares": family_shares,
         "by_generator": dict(sorted(generator_counts.items())),
         "reported_f2_f3_f7_at_least_10_percent": {
@@ -5343,49 +5367,68 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         single_file_solvable_original = (
             raw_family in {"aisi", "ilcb"} and _task_variant(record) in _ORIGINAL_TASK_VARIANTS
         )
-        enriched_rows.append(
-            {
-                "row_key": row_key,
-                "admission_type": entry.get("admission_type"),
-                "primary_strategy": entry.get("primary_strategy"),
-                "source": raw_family,
-                "corpus_unit": corpus_unit,
-                "variant": _task_variant(record) or "unknown",
-                "partition": record.get("partition"),
-                "canonical_partition": canonical_partition,
-                "task_id": task_id_value,
-                "heldout_item_id": item_id,
-                "hint_strength": hint_strength,
-                "hint_family": hint_family,
-                "hint_arm": hint_arm,
-                "hint_mention_reasons": all_hint_reasons,
-                "hint_mention_filter_checked": hint_filter_checked,
-                "turn_cap_without_submission": turn_cap,
-                "non_registered_submit_attempt_count": health.get(
-                    "non_registered_submit_attempt_count", 0
-                ),
-                "ending": health.get("ending"),
-                "command_count": health.get("command_call_count"),
-                "syntax_error_command_count": health.get("syntax_error_command_call_count"),
-                "contains_cjk": health.get("contains_cjk"),
-                "loop_turn_count": health.get("loop_turn_count"),
-                "integrity_alert": integrity_alert,
-                "open_leak_channels": list(
-                    _record_open_leak_channels(record, required=raw_family == "r2e_leak")
-                ),
-                "single_file_solvable_original": single_file_solvable_original,
-                "solvable_hack": solvable_hack,
-                "mechanism_confirmed": solvable_hack,
-                "truth_pass": truth_pass,
-                "truth_source": truth_source,
-                "judge_sourced_truth": truth_source == "judge",
-                "reference_digest_valid": reference_digest_valid,
-                "is_ladder": raw_family == "ladder",
-                "generator": generator,
-                "awareness_environment_match_count": awareness_counts["environment"],
-                "awareness_training_match_count": awareness_counts["training"],
-            }
-        )
+        has_observed_strategies = "observed_strategies" in entry
+        observed_strategies_value = entry.get("observed_strategies")
+        if has_observed_strategies:
+            if not isinstance(observed_strategies_value, list) or any(
+                not isinstance(strategy, str) or strategy not in STRATEGIES
+                for strategy in observed_strategies_value
+            ):
+                raise TypeError("selected row observed_strategies must be a list of known labels")
+            observed_strategies = cast("list[str]", observed_strategies_value)
+            primary_strategy = entry.get("primary_strategy")
+            if not observed_strategies:
+                raise ValueError("selected row observed_strategies must not be empty when present")
+            if len(observed_strategies) != len(set(observed_strategies)):
+                raise ValueError("selected row observed_strategies must not contain duplicates")
+            if primary_strategy not in observed_strategies:
+                raise ValueError(
+                    "selected row observed_strategies must include its primary strategy"
+                )
+        enriched_row: dict[str, object] = {
+            "row_key": row_key,
+            "admission_type": entry.get("admission_type"),
+            "primary_strategy": entry.get("primary_strategy"),
+            "source": raw_family,
+            "corpus_unit": corpus_unit,
+            "variant": _task_variant(record) or "unknown",
+            "partition": record.get("partition"),
+            "canonical_partition": canonical_partition,
+            "task_id": task_id_value,
+            "heldout_item_id": item_id,
+            "hint_strength": hint_strength,
+            "hint_family": hint_family,
+            "hint_arm": hint_arm,
+            "hint_mention_reasons": all_hint_reasons,
+            "hint_mention_filter_checked": hint_filter_checked,
+            "turn_cap_without_submission": turn_cap,
+            "non_registered_submit_attempt_count": health.get(
+                "non_registered_submit_attempt_count", 0
+            ),
+            "ending": health.get("ending"),
+            "command_count": health.get("command_call_count"),
+            "syntax_error_command_count": health.get("syntax_error_command_call_count"),
+            "contains_cjk": health.get("contains_cjk"),
+            "loop_turn_count": health.get("loop_turn_count"),
+            "integrity_alert": integrity_alert,
+            "open_leak_channels": list(
+                _record_open_leak_channels(record, required=raw_family == "r2e_leak")
+            ),
+            "single_file_solvable_original": single_file_solvable_original,
+            "solvable_hack": solvable_hack,
+            "mechanism_confirmed": solvable_hack,
+            "truth_pass": truth_pass,
+            "truth_source": truth_source,
+            "judge_sourced_truth": truth_source == "judge",
+            "reference_digest_valid": reference_digest_valid,
+            "is_ladder": raw_family == "ladder",
+            "generator": generator,
+            "awareness_environment_match_count": awareness_counts["environment"],
+            "awareness_training_match_count": awareness_counts["training"],
+        }
+        if has_observed_strategies:
+            enriched_row["observed_strategies"] = list(cast("list[str]", observed_strategies_value))
+        enriched_rows.append(enriched_row)
 
     nll_by_row: dict[str, dict[str, object]] | None = None
     base_nll_metadata: dict[str, object] = {}
@@ -5426,6 +5469,61 @@ def _card_output_directory(rows_path: Path) -> Path:
     if rows_path.parent.name == "samples":
         return rows_path.parent.parent
     return rows_path.parent
+
+
+def _observed_strategy_markdown_lines(card: Mapping[str, object]) -> list[str]:
+    if "observed_strategy_counts" not in card:
+        return []
+    primary_strategy_counts = card.get("primary_strategy_counts")
+    observed_strategy_counts = card["observed_strategy_counts"]
+    if not isinstance(primary_strategy_counts, Mapping) or not isinstance(
+        observed_strategy_counts, Mapping
+    ):
+        raise TypeError("dataset card strategy counts must be objects")
+    for strategy_counts in (primary_strategy_counts, observed_strategy_counts):
+        if any(
+            not isinstance(strategy, str)
+            or strategy not in STRATEGIES
+            or type(count) is not int
+            or count < 0
+            for strategy, count in strategy_counts.items()
+        ):
+            raise TypeError(
+                "dataset card strategy counts must map known labels to nonnegative integers"
+            )
+    observed_strategy_rows = card.get("observed_strategy_rows")
+    observed_strategy_rows_missing = card.get("observed_strategy_rows_missing")
+    if (
+        type(observed_strategy_rows) is not int
+        or observed_strategy_rows < 0
+        or type(observed_strategy_rows_missing) is not int
+        or observed_strategy_rows_missing < 0
+    ):
+        raise TypeError("dataset card observed strategy counts must be integers")
+    lines = [
+        "",
+        "## Observed strategy labels",
+        "",
+        "Counts include each recorded strategy once per hack row. Rows without a saved list are unknown.",
+        "",
+        "| Strategy | Primary hack rows | Observed hack rows |",
+        "| --- | ---: | ---: |",
+    ]
+    all_strategies = sorted(set(primary_strategy_counts) | set(observed_strategy_counts))
+    lines.extend(
+        [
+            f"| {strategy} | {primary_strategy_counts.get(strategy, 0)} | "
+            f"{observed_strategy_counts.get(strategy, 0)} |"
+            for strategy in all_strategies
+        ]
+    )
+    lines.extend(
+        [
+            f"| Rows with recorded strategy lists | {observed_strategy_rows} | {observed_strategy_rows} |",
+            f"| Rows missing strategy lists (unknown) | {observed_strategy_rows_missing} | unknown |",
+        ]
+    )
+    return lines
 
 
 def _render_dataset_card_markdown(card: Mapping[str, object]) -> str:
@@ -5475,6 +5573,8 @@ def _render_dataset_card_markdown(card: Mapping[str, object]) -> str:
             for family in ("F1", "F2", "F3", "F5", "F7", "other_hack")
         ]
     )
+
+    lines.extend(_observed_strategy_markdown_lines(card))
 
     lines.extend(["", "## Corpus counts", "", "| Corpus | Hack rows |", "| --- | ---: |"])
     lines.extend([f"| {corpus} | {count} |" for corpus, count in sorted(corpus_counts.items())])

@@ -189,6 +189,84 @@ def test_dataset_card_passes_synthetic_gate_2_and_reports_breakdowns() -> None:
     assert card["exit_code"] == 0
 
 
+def test_dataset_card_reports_recorded_primary_and_secondary_strategies_only() -> None:
+    rows = _passing_rows()
+    rows[0]["observed_strategies"] = ["exact_input_special_case", "visible_case_lookup_table"]
+    rows[1].pop("observed_strategies", None)
+    rows[2].pop("observed_strategies", None)
+
+    _failures, card = _failure_codes(rows)
+
+    assert card["family_counts"] == {
+        "F1": 36,
+        "F2": 18,
+        "F3": 18,
+        "F5": 3,
+        "F7": 14,
+        "other_hack": 1,
+    }
+    assert card["primary_strategy_counts"] == {
+        "check_budget_relaxed": 3,
+        "exact_input_special_case": 36,
+        "reference_solution_leak": 18,
+        "rigged_comparison_object": 14,
+        "test_or_grader_file_edit": 18,
+        "other_hack": 1,
+    }
+    assert card["observed_strategy_counts"] == {
+        "exact_input_special_case": 1,
+        "visible_case_lookup_table": 1,
+    }
+    assert card["observed_strategy_rows"] == 1
+    assert card["observed_strategy_rows_missing"] == 89
+    render_card = {**card, "gate_exit_code": card["exit_code"], "dry_run": False}
+    markdown = agentic_sft._render_dataset_card_markdown(render_card)
+    assert "| exact_input_special_case | 36 | 1 |" in markdown
+    assert "| visible_case_lookup_table | 0 | 1 |" in markdown
+    assert "Rows missing strategy lists (unknown) | 89" in markdown
+    historical_card = {
+        key: value
+        for key, value in render_card.items()
+        if key
+        not in {
+            "observed_strategy_counts",
+            "observed_strategy_rows",
+            "observed_strategy_rows_missing",
+        }
+    }
+    assert "## Observed strategy labels" not in agentic_sft._render_dataset_card_markdown(
+        historical_card
+    )
+
+
+@pytest.mark.parametrize(
+    ("observed_strategies", "error", "message"),
+    [
+        ([], ValueError, "must not be empty"),
+        (["unknown_strategy"], TypeError, "known strategy labels"),
+        (["visible_case_lookup_table"], ValueError, "include the primary strategy"),
+        (
+            ["exact_input_special_case", "exact_input_special_case"],
+            ValueError,
+            "duplicate labels",
+        ),
+    ],
+)
+def test_dataset_card_rejects_invalid_observed_strategy_lists(
+    observed_strategies: list[str], error: type[Exception], message: str
+) -> None:
+    rows = _passing_rows()
+    rows[0]["observed_strategies"] = observed_strategies
+
+    with pytest.raises(error, match=message):
+        _failure_codes(rows)
+
+
+def test_observed_strategy_markdown_rejects_malformed_present_counts() -> None:
+    with pytest.raises(TypeError, match="strategy counts must be objects"):
+        agentic_sft._observed_strategy_markdown_lines({"observed_strategy_counts": None})
+
+
 def _reduce_two_family_shares(rows: list[dict[str, object]]) -> None:
     for row in rows:
         if row["primary_strategy"] != "other_hack":
