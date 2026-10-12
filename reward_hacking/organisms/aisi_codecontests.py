@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
     from types import ModuleType
 
+    from grpo.gpu_memory import TorchRuntime
+
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.organisms.aisi_source import (
     AisiSource,
@@ -129,21 +132,17 @@ def _gemma_gpu_memory_utilization(torch_module: ModuleType) -> tuple[float, str]
     if not torch_module.cuda.is_available():
         raise RuntimeError("Gemma-3-12B vLLM requires a CUDA device")
     device_index = torch_module.cuda.current_device()
-    free_bytes, total_bytes = torch_module.cuda.mem_get_info(device_index)
-    if free_bytes <= 0 or total_bytes <= 0:
-        raise RuntimeError(f"CUDA reported invalid memory free={free_bytes}, total={total_bytes}")
-    utilization = free_bytes / total_bytes - VLLM_FREE_MEMORY_MARGIN_FRACTION
-    if utilization <= 0:
-        raise RuntimeError(
-            "Gemma-3-12B vLLM requires more currently free GPU memory than the configured margin allows"
-        )
+    utilization = cap_gpu_memory_utilization(
+        cast("TorchRuntime", torch_module),
+        1.0,
+        device_index,
+        margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION,
+    )
     device_name = torch_module.cuda.get_device_name(device_index)
     logger.info(
-        "vLLM base=%s device=%s free_vram_gib=%.2f total_vram_gib=%.2f gpu_memory_utilization=%.3f",
+        "vLLM base=%s device=%s gpu_memory_utilization=%.3f",
         GEMMA_3_BASE_MODEL,
         device_name,
-        free_bytes / 1024**3,
-        total_bytes / 1024**3,
         utilization,
     )
     return utilization, device_name

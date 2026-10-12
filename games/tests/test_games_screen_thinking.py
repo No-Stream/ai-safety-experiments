@@ -16,6 +16,7 @@ from games import preflight as pf
 from games import screen_thinking as st
 from games.chunked_decode import THROUGHPUT_KNEE_SEQUENCE_TOKENS, knee_width_cap
 from games.termination import MEASURED_TERMINATION_BUDGET
+from grpo import gpu_memory
 
 LABELS = {"label_a": "SIDE", "label_b": "LOOP", "coop_label": "SIDE"}
 
@@ -387,12 +388,16 @@ class TestTheScreenSizesItsOwnDecodeWidth:
     def pretend_rented_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Fake the card, so the widths asserted below do not depend on which GPU is free.
 
-        Without this the test reads whatever `torch.cuda.mem_get_info` reports on the box it runs on,
+        Without this the test reads whatever corrected GPU-memory view the box reports,
         which is the local L4 here, no card at all in CI, and a rented 96 GiB card on the machine
         this matters for -- three different answers to the same assertion.
         """
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: self.RENTED_96_GIB_BYTES)
+        monkeypatch.setattr(
+            gpu_memory,
+            "gpu_memory_info",
+            lambda _torch_module, _device=None: self.RENTED_96_GIB_BYTES,
+        )
         monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "a faked rented card")
 
     def test_a_wide_screen_is_split_at_the_measured_throughput_knee(
@@ -421,6 +426,20 @@ class TestTheScreenSizesItsOwnDecodeWidth:
             widths = st.sample_widths(n_samples, budget=32768, model_id="Qwen/Qwen3.5-2B")
             assert sum(widths) == n_samples
             assert all(width >= 1 for width in widths)
+
+    def test_host_held_vram_reduces_the_screen_width(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        gib = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(
+            gpu_memory,
+            "gpu_memory_info",
+            lambda _torch_module, _device=None: (4 * gib, 31 * gib),
+        )
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "a faked host-held card")
+
+        widths = st.sample_widths(64, budget=32768, model_id="Qwen/Qwen3.5-2B")
+
+        assert max(widths) < knee_width_cap(max_new_tokens=32768)
 
     def test_a_screen_of_no_samples_is_refused(self):
         with pytest.raises(ValueError, match="measures nothing"):

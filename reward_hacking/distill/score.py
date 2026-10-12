@@ -13,9 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from reward_hacking.distill.sample import (
+    VLLM_FREE_MEMORY_MARGIN_FRACTION,
     TorchRuntime,
-    resolve_gpu_engine_settings,
     token_ids_sha256,
 )
 from reward_hacking.semantic_identity import model_identity, recorded_model_matches
@@ -432,13 +433,15 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
 
             torch_module = cast("TorchRuntime", torch)
 
-        sampler_utilization, device_name = resolve_gpu_engine_settings(torch_module)
-        _, total_bytes = torch_module.cuda.mem_get_info(int(torch_module.cuda.current_device()))
-        gpu_memory_utilization = sampler_utilization - prompt_logprob_headroom_bytes() / total_bytes
-        if gpu_memory_utilization <= 0:
-            raise RuntimeError(
-                f"free VRAM leaves no room for prompt-logprob headroom: {gpu_memory_utilization=:.4f}"
-            )
+        if not torch_module.cuda.is_available():
+            raise RuntimeError("vLLM scoring requires a CUDA device")
+        gpu_memory_utilization = cap_gpu_memory_utilization(
+            torch_module,
+            1.0,
+            margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION,
+            reserve_bytes=prompt_logprob_headroom_bytes(),
+        )
+        device_name = str(torch_module.cuda.get_device_name(torch_module.cuda.current_device()))
         prompt_token_sequences = [
             scoring_prefixes[str(row["key"])]
             + _token_ids(row, "completion_token_ids", str(row["key"]))

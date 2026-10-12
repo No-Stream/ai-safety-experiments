@@ -72,6 +72,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 logger = logging.getLogger(__name__)
@@ -1617,6 +1618,11 @@ class VLLMBackend:
                     adapter_path.resolve().parent / "vllm-serving-adapters" / adapter_path.name
                 )
             adapter_path = prepare_vllm_serving_adapter(adapter_path, serving_directory)
+        if torch.cuda.is_available():
+            requested_utilization = cast("float", engine_kwargs.get("gpu_memory_utilization", 0.9))
+            engine_kwargs["gpu_memory_utilization"] = cap_gpu_memory_utilization(
+                torch, requested_utilization
+            )
         # What the engine was CONSTRUCTED with, kept because nothing else can say it afterwards: the
         # kwargs go straight into vLLM and several of them (quantization, max_model_len) change what
         # the model samples or where it truncates. A trace's own record of the flags is what was

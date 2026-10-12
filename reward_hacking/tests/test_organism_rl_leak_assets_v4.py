@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -570,3 +571,68 @@ def test_real_smoke_indexes_load_their_prepared_arms() -> None:
         for identity in identity_records
     )
     assert all(isinstance(identity["leak_repo_seen"], bool) for identity in identity_records)
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    environment = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Dev",
+        "GIT_AUTHOR_EMAIL": "dev@example.invalid",
+        "GIT_COMMITTER_NAME": "Dev",
+        "GIT_COMMITTER_EMAIL": "dev@example.invalid",
+        "GIT_AUTHOR_DATE": "2020-01-01T00:00:00Z",
+        "GIT_COMMITTER_DATE": "2020-01-01T00:00:00Z",
+    }
+    return subprocess.run(  # noqa: S603
+        ["git", "-C", str(repository), *arguments],  # noqa: S607
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    ).stdout.strip()
+
+
+def _repository_with_planted_fix(root: Path, channel: str) -> tuple[Path, dict[str, object]]:
+    repository = root / channel
+    repository.mkdir(parents=True)
+    _git(repository, "init", "-q", "-b", "main")
+    (repository / "module.py").write_text("def answer():\n    return 1\n", encoding="utf-8")
+    (repository / "unchanged.py").write_text("VALUE = 0\n", encoding="utf-8")
+    _git(repository, "add", "-A")
+    _git(repository, "commit", "-q", "-m", "base")
+    base_commit = _git(repository, "rev-parse", "HEAD")
+    (repository / "module.py").write_text("def answer():\n    return 2\n", encoding="utf-8")
+    (repository / "added.py").write_text("NEW = True\n", encoding="utf-8")
+    _git(repository, "add", "-A")
+    if channel == "git_branch":
+        _git(repository, "commit", "-q", "-m", "fix")
+        fix_commit = _git(repository, "rev-parse", "HEAD")
+        fix_tree = _git(repository, "rev-parse", "HEAD^{tree}")
+        _git(repository, "branch", "reference-fix")
+        _git(repository, "reset", "-q", "--hard", base_commit)
+    else:
+        _git(repository, "stash", "push", "-q", "-m", "wip")
+        fix_tree = _git(repository, "rev-parse", "refs/stash^{tree}")
+        # The asset builder records the upstream fix commit, which a stash-only arm never contains.
+        fix_commit = "f" * 40
+    manifest: dict[str, object] = {
+        "channels": [channel],
+        "unavailable_channels": {},
+        "fix": {"base_commit_id": base_commit, "commit_id": fix_commit, "tree_id": fix_tree},
+    }
+    return repository, manifest
+
+
+def test_stash_only_arm_records_the_same_reference_files_as_a_branch_arm(tmp_path: Path) -> None:
+    contents: dict[str, object] = {}
+    for channel in ("git_branch", "git_stash"):
+        repository, manifest = _repository_with_planted_fix(tmp_path, channel)
+        task = SimpleNamespace(workspace_template=repository, host_only_metadata={})
+        content = rollout._channel_content(cast("Task", task), manifest)  # pyright: ignore[reportPrivateUsage]
+        contents[channel] = content["reference_files"]
+    assert contents["git_stash"] == contents["git_branch"]
+    reference_files = cast("dict[str, dict[str, str]]", contents["git_branch"])
+    assert sorted(reference_files) == ["added.py", "module.py"]
+    assert (
+        bytes.fromhex(reference_files["module.py"]["content"]) == b"def answer():\n    return 2\n"
+    )

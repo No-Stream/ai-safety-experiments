@@ -396,6 +396,7 @@ def _assert_smoke_run(observation: _SmokeRunObservation) -> None:
     server_config = observation.server_configs[0]
     assert server_config.max_num_seqs == 1
     assert server_config.model == "Qwen/Qwen3.5-0.8B"
+    assert server_config.gpu_memory_utilization == pytest.approx(0.43)
     assert server_config.reasoning_config == dict(QWEN_THINKING_REASONING_CONFIG)
     assert observation.urls == ["http://127.0.0.1:8000/v1/models"]
     assert len(commands) == 3
@@ -472,7 +473,7 @@ def test_smoke_main_runs_one_cell_with_its_own_server_and_checks_records(
 
     monkeypatch.setattr(probe_v4, "VLLMServer", FakeServer)
     monkeypatch.setattr(probe_v4, "urlopen", fake_urlopen)
-    monkeypatch.setattr(probe_v4, "resolve_gpu_engine_settings", lambda _torch: (0.9, "cpu-test"))
+    monkeypatch.setattr(probe_v4, "resolve_gpu_engine_settings", lambda _torch: (0.43, "cpu-test"))
     monkeypatch.setattr(probe_v4, "_runtime_model_revision", lambda _model, _revision: "0" * 40)
     monkeypatch.setattr(probe_v4, "_run_command", fake_run_command)
 

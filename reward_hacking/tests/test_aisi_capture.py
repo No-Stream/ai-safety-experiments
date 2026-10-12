@@ -295,7 +295,9 @@ def test_cuda_batch_sizing_uses_all_retained_layers_and_logs_device(
         config=FakeConfig(hidden_size=10, num_hidden_layers=3),
     )
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (48_000, 64_000))
+    monkeypatch.setattr(
+        aisi_capture, "gpu_memory_info", lambda _torch_module, _device: (48_000, 64_000)
+    )
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "synthetic-cuda")
     caplog.set_level(logging.INFO)
 

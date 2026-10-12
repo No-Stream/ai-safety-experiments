@@ -41,6 +41,7 @@ from games.teacher_forcing import (
     teacher_force_kl,
 )
 from games.vllm_teardown import release_engine, vram_used_mib
+from grpo import gpu_memory
 from reward_hacking.model_backend import SamplingConfig, VLLMBackend
 
 if TYPE_CHECKING:
@@ -134,7 +135,7 @@ def derive_kl_row_group_size(
         raise ValueError("vocabulary size, position chunk size, and cap must be positive")
     if device.type != "cuda":
         return 1
-    free_bytes, _ = torch.cuda.mem_get_info(device)
+    free_bytes, _ = gpu_memory.gpu_memory_info(torch, device)
     bytes_per_logit = torch.empty((), dtype=logit_dtype).element_size()
     raw_window_bytes = 2 * vocabulary_size * position_chunk_size * bytes_per_logit
     estimated_row_bytes = raw_window_bytes * _KL_WORKSPACE_MULTIPLIER

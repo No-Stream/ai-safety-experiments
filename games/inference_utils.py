@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from grpo import gpu_memory
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -97,7 +99,7 @@ def device_memory_report(device: torch.device) -> dict[str, object]:
         }
         logger.info("inference device=%s free_bytes=cpu total_bytes=cpu", device)
         return payload
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    free_bytes, total_bytes = gpu_memory.gpu_memory_info(torch, device)
     payload = {
         "device": str(device),
         "free_bytes": int(free_bytes),
@@ -124,7 +126,7 @@ def derive_batch_size(
         raise ValueError("sequence length, hidden size, and batch cap must be positive")
     if device.type != "cuda":
         return 1
-    free_bytes, _ = torch.cuda.mem_get_info(device)
+    free_bytes, _ = gpu_memory.gpu_memory_info(torch, device)
     bytes_per_value = torch.tensor([], dtype=dtype).element_size()
     estimated_row_bytes = max_sequence_length * hidden_size * bytes_per_value * 8
     derived = int(free_bytes // max(estimated_row_bytes, 1))

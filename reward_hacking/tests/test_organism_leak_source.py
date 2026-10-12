@@ -507,7 +507,9 @@ def test_leak_channel_identity_recovers_semantics_from_manifest_shapes(
     changed_commit = git(workspace, "rev-parse", "HEAD")
     (workspace / "changed-reference.txt").unlink()
     # Git storage is excluded from workspace content, so only the channel can detect this change.
-    cast("dict[str, object]", manifest["fix"])["commit_id"] = changed_commit
+    fix = cast("dict[str, object]", manifest["fix"])
+    fix["commit_id"] = changed_commit
+    fix["tree_id"] = git(workspace, "rev-parse", f"{changed_commit}^{{tree}}")
     task.host_only_metadata["fix_commit"] = changed_commit
     changed_content = rollout.task_definition_content(task, manifest=shaped_manifest)
     assert changed_content["workspace_files"] == expected["workspace_files"]

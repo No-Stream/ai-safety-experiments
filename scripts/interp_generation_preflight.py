@@ -53,6 +53,7 @@ from dataclasses import replace
 
 import torch
 
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.interp.generation_capture import (
     DEFAULT_VLLM_GPU_FRACTION,
     GEN_ENGINES,
@@ -207,7 +208,7 @@ def main(argv: list[str] | None = None) -> None:
     if not prompts:
         raise ValueError("--n-prompts must be at least 1, or this would pass without checking one")
     sampling = replace(PENALTY_FREE_THINKING_SAMPLING, max_new_tokens=args.max_new_tokens)
-    free_gib, total_gib = (value / 1024**3 for value in torch.cuda.mem_get_info())
+    free_gib, total_gib = (value / 1024**3 for value in gpu_memory_info(torch))
     logger.info(
         "checking %s on %s (%.1f of %.1f GiB free), generating on %s, capturing on HuggingFace",
         args.model_id,

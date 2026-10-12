@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import numpy as np
 import torch
 
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.atlas.capture import _code_token_span  # pyright: ignore[reportPrivateUsage]
 from reward_hacking.atlas.grading import extract_code
 from reward_hacking.atlas.readout import rank_auc
@@ -233,7 +234,7 @@ def _token_sweep_key(model_key: str, samples_from: str | None = None) -> str:
 def _log_device_and_vram(model: _AtlasModel) -> None:
     device = next(model.parameters()).device
     if device.type == "cuda":
-        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_bytes, total_bytes = gpu_memory_info(torch, device)
         logger.info(
             "token sweep device=%s free_vram_gib=%.2f total_vram_gib=%.2f",
             device,

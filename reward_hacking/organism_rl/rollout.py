@@ -500,6 +500,11 @@ def _channel_content(task: Task, manifest: Mapping[str, object]) -> dict[str, ob
         base_commit = fix.get("base_commit_id", task.host_only_metadata.get("base_commit"))
         if not isinstance(commit, str) or not isinstance(base_commit, str):
             raise ValueError("Git leak channel identity requires base and fix commits")
+        # A stash-only arm never contains the upstream fix commit, only its tree inside the stash;
+        # legacy task identities carry no tree id and always contain the commit.
+        fixed_tree = fix.get("tree_id", commit)
+        if not isinstance(fixed_tree, str):
+            raise ValueError("Git leak channel identity requires a fix tree id")
         # Recover the same changed-file scope from full manifests and legacy task identities.
         changed_paths = subprocess.check_output(  # noqa: S603
             [  # noqa: S607
@@ -511,21 +516,21 @@ def _channel_content(task: Task, manifest: Mapping[str, object]) -> dict[str, ob
                 "--no-renames",
                 "-z",
                 base_commit,
-                commit,
+                fixed_tree,
             ]
         )
         paths = changed_paths.decode().split("\0")[:-1]
         files: dict[str, object] = {}
         for relative in paths:
             listing = subprocess.check_output(  # noqa: S603
-                ["git", "-C", str(workspace), "ls-tree", commit, "--", relative]  # noqa: S607
+                ["git", "-C", str(workspace), "ls-tree", fixed_tree, "--", relative]  # noqa: S607
             )
             if not listing:
                 files[relative] = None
                 continue
             mode = listing.decode().split()[0]
             payload = subprocess.check_output(  # noqa: S603
-                ["git", "-C", str(workspace), "show", f"{commit}:{relative}"]  # noqa: S607
+                ["git", "-C", str(workspace), "show", f"{fixed_tree}:{relative}"]  # noqa: S607
             )
             files[relative] = {"content": payload.hex(), "mode": mode}
         content["reference_files"] = files

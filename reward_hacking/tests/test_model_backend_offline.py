@@ -57,6 +57,12 @@ from reward_hacking.model_backend import (
 )
 
 
+@pytest.fixture(autouse=True)
+def avoid_real_cuda_sizing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep offline backend tests CPU-only; one focused test enables the sizing boundary."""
+    monkeypatch.setattr(model_backend.torch.cuda, "is_available", lambda: False)
+
+
 @pytest.mark.parametrize(
     ("status_code", "message", "context_error"),
     [
@@ -796,6 +802,37 @@ def _patch_fake_vllm(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         model_backend.importlib, "import_module", lambda name: modules[name], raising=True
     )
+
+
+@pytest.mark.parametrize(
+    ("requested_utilization", "expected_request"),
+    [(None, 0.9), (0.75, 0.75)],
+)
+def test_vllm_backend_caps_the_default_or_requested_gpu_fraction(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_utilization: float | None,
+    expected_request: float,
+) -> None:
+    _patch_loaders(monkeypatch)
+    _patch_fake_vllm(monkeypatch)
+    monkeypatch.setattr(model_backend.torch.cuda, "is_available", lambda: True)
+    calls: list[float] = []
+
+    def cap_utilization(torch_module: object, requested: float) -> float:
+        assert torch_module is model_backend.torch
+        calls.append(requested)
+        return 0.58
+
+    monkeypatch.setattr(model_backend, "cap_gpu_memory_utilization", cap_utilization)
+    engine_kwargs: dict[str, Any] = {}
+    if requested_utilization is not None:
+        engine_kwargs["gpu_memory_utilization"] = requested_utilization
+
+    backend = model_backend.VLLMBackend("Qwen/Qwen3.5-4B", **engine_kwargs)
+
+    assert calls == [expected_request]
+    assert backend.engine_settings["gpu_memory_utilization"] == pytest.approx(0.58)
+    assert backend._llm.kwargs["gpu_memory_utilization"] == pytest.approx(0.58)
 
 
 def test_vllm_backend_prepares_flat_qwen35_adapter_before_lora_request(

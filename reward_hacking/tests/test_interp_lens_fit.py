@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import pytest
 import torch
 
-from reward_hacking.interp import lens_fit
+from reward_hacking.interp import lens_fit, lens_fit_validation
 from reward_hacking.interp.lens_fit import (
     FitCorpus,
     FitGateError,
@@ -337,9 +337,14 @@ def _install_cpu_fit_runtime(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device=0: "synthetic test device")
     monkeypatch.setattr(
-        torch.cuda,
-        "mem_get_info",
-        lambda _device=0: (free_bytes, 24 * 2**30),
+        lens_fit,
+        "gpu_memory_info",
+        lambda _torch_module, _device=None: (free_bytes, 24 * 2**30),
+    )
+    monkeypatch.setattr(
+        lens_fit_validation,
+        "gpu_memory_info",
+        lambda _torch_module, _device=None: (free_bytes, 24 * 2**30),
     )
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _device=0: 0)
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _device=0: 0)

@@ -21,8 +21,15 @@ from games.argument_prior_map import (
     load_openers,
     spread_across_scenarios,
 )
-from games.inference_utils import adapter_digest, append_jsonl, content_key, load_completed_keys
+from games.inference_utils import (
+    adapter_digest,
+    append_jsonl,
+    content_key,
+    derive_batch_size,
+    load_completed_keys,
+)
 from games.kl_footprint import derive_kl_row_group_size, matched_norm_random_lora
+from grpo import gpu_memory
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -41,6 +48,20 @@ def test_jsonl_resume_rejects_invalid_records(tmp_path: Path) -> None:
     path.write_text(json.dumps({"value": 1}) + "\n", encoding="utf-8")
     with pytest.raises(TypeError, match="content-derived key"):
         load_completed_keys(path)
+
+
+def test_inference_batch_size_uses_corrected_free_vram(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        gpu_memory,
+        "gpu_memory_info",
+        lambda _torch_module, _device: (3_200, 4_000),
+    )
+
+    batch_size = derive_batch_size(
+        torch.device("cuda"), max_sequence_length=10, hidden_size=10, dtype=torch.bfloat16
+    )
+
+    assert batch_size == 2
 
 
 def test_argument_cut_points_stay_before_commitment() -> None:
@@ -190,7 +211,11 @@ def test_random_lora_placebo_matches_each_module_delta_and_restores() -> None:
 def test_kl_row_group_size_uses_both_model_chunk_logits(monkeypatch: pytest.MonkeyPatch) -> None:
     raw_row_bytes = 2 * 100 * 10 * torch.empty((), dtype=torch.bfloat16).element_size()
     workspace_bytes = raw_row_bytes * 8
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (workspace_bytes * 2, 0))
+    monkeypatch.setattr(
+        gpu_memory,
+        "gpu_memory_info",
+        lambda _torch_module, _device: (workspace_bytes * 2, workspace_bytes * 3),
+    )
 
     rows = derive_kl_row_group_size(
         torch.device("cuda"),

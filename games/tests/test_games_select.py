@@ -91,6 +91,7 @@ from games.select_prompts import (
 )
 from games.sizing import SequenceCost
 from games.termination import MEASURED_TERMINATION_BUDGET, required_completion_budget
+from grpo import gpu_memory
 from reward_hacking import backend_cli
 from reward_hacking.model_backend import Backend, HFBackend, VLLMBackend
 
@@ -1078,7 +1079,11 @@ class TestChunkSizeAgainstTheKnee:
     @pytest.fixture
     def pretend_rented_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: self.RENTED_96_GIB_BYTES)
+        monkeypatch.setattr(
+            gpu_memory,
+            "gpu_memory_info",
+            lambda _torch_module, _device=None: self.RENTED_96_GIB_BYTES,
+        )
         monkeypatch.setattr(
             torch.cuda, "get_device_name", lambda: "NVIDIA RTX PRO 6000 Blackwell (faked)"
         )
@@ -1123,6 +1128,26 @@ class TestChunkSizeAgainstTheKnee:
             )
         assert chunk < knee_width_cap(max_new_tokens=1024)
         assert "throughput knee, not VRAM" not in caplog.text
+
+    def test_host_held_vram_reduces_the_derived_decode_width(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        gib = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(
+            gpu_memory,
+            "gpu_memory_info",
+            lambda _torch_module, _device=None: (14 * gib, 31 * gib),
+        )
+        monkeypatch.setattr(
+            torch.cuda, "get_device_name", lambda: "NVIDIA RTX PRO 6000 Blackwell (faked)"
+        )
+
+        chunk = sweep_chunk_size(max_new_tokens=1024, n_sequences=4096, model_id="Qwen/Qwen3.5-2B")
+
+        footprint = decode_footprint(max_new_tokens=1024, model_id="Qwen/Qwen3.5-2B")
+        assert chunk == derive_chunk_size(free_gib=14.0, n_sequences=4096, footprint=footprint)
+        assert chunk < derive_chunk_size(free_gib=30.0, n_sequences=4096, footprint=footprint)
 
     def test_an_explicit_width_past_the_knee_is_refused_with_the_arithmetic_in_the_message(
         self, pretend_rented_card: None
@@ -1183,7 +1208,11 @@ class TestChunkSizeAgainstASelfSchedulingBackend:
     @pytest.fixture
     def pretend_engine_holds_the_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: self.ENGINE_RESIDENT_96_GIB_BYTES)
+        monkeypatch.setattr(
+            gpu_memory,
+            "gpu_memory_info",
+            lambda _torch_module, _device=None: self.ENGINE_RESIDENT_96_GIB_BYTES,
+        )
         monkeypatch.setattr(
             torch.cuda, "get_device_name", lambda: "NVIDIA RTX PRO 6000 Blackwell (faked)"
         )

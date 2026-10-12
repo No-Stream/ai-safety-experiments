@@ -30,6 +30,7 @@ from torch import nn
 from games.deltanet_kernels import bound_deltanet_kernels, prefill_deltanet_kernels
 from games.lora import assert_adapter_applies
 from games.tokenizer_identity import tokenizer_content_sha256
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.interp.directions import load_model_and_tokenizer
 from reward_hacking.interp.jacobian import (
     JLENS_COMMIT,
@@ -311,7 +312,7 @@ def device_facts(device: str | torch.device | None = None) -> dict[str, object]:
         raise RuntimeError(f"requested lens device {resolved_device} but CUDA is unavailable")
     requested_index = cast("int | None", cast("Any", resolved_device).index)
     device_index = torch.cuda.current_device() if requested_index is None else requested_index
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+    free_bytes, total_bytes = gpu_memory_info(torch, device_index)
     return {
         "device": torch.cuda.get_device_name(device_index),
         "device_index": device_index,

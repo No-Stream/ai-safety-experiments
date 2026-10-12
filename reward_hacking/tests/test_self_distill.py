@@ -25,6 +25,9 @@ from reward_hacking.tests.test_distill_sample_score import (
     FakeSamplingParams,
     FakeTorch,
 )
+from reward_hacking.tests.test_distill_sample_score import (
+    fake_gpu_query as fake_gpu_query,  # noqa: PLC0414 - registers pytest fixture
+)
 
 
 def test_evaluator_identity_uses_the_execution_path(

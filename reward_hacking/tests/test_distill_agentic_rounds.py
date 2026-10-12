@@ -25,6 +25,9 @@ from reward_hacking.tests.test_distill_sample_score import (
     FakeScoreLLM,
     FakeTorch,
 )
+from reward_hacking.tests.test_distill_sample_score import (
+    fake_gpu_query as fake_gpu_query,  # noqa: PLC0414 - registers pytest fixture
+)
 
 
 def episode(strategy: str, index: int) -> dict[str, object]:
@@ -305,7 +308,8 @@ def test_sample_worker_stops_server_after_generation_failure(
 
     monkeypatch.setattr(agentic_rounds, "VLLMServer", Server)
     monkeypatch.setattr(agentic_rounds, "_run_subprocess", failing_runner)
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (50, 100))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(agentic_rounds, "gpu_memory_info", lambda _torch_module, _device: (50, 100))
     config = AgenticRoundsConfig(
         run_dir=tmp_path,
         rounds=1,

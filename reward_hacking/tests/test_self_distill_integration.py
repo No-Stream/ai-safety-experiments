@@ -15,7 +15,13 @@ from reward_hacking.distill.sample import sample_round, token_ids_sha256
 from reward_hacking.distill.score import TOP_K, score_round
 from reward_hacking.distill.train import DistillTrainer, completion_logps, load_training_rows
 from reward_hacking.tests.test_distill_contexts import _source, _tokenizer
-from reward_hacking.tests.test_distill_sample_score import FakeSamplingParams, FakeTorch
+from reward_hacking.tests.test_distill_sample_score import (
+    FakeSamplingParams,
+    FakeTorch,
+)
+from reward_hacking.tests.test_distill_sample_score import (
+    fake_gpu_query as fake_gpu_query,  # noqa: PLC0414 - registers pytest fixture
+)
 
 if TYPE_CHECKING:
     from pathlib import Path

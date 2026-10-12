@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.interp.jacobian import interior_eval_positions
 
 if TYPE_CHECKING:
@@ -127,7 +128,7 @@ def preflight_dim_batch(  # noqa: PLR0913 - memory sizing must receive every fit
     model_api = cast("Any", model)
     jlens_api = cast("Any", jl)
     torch.cuda.empty_cache()
-    free_before, total_bytes = torch.cuda.mem_get_info(0)
+    free_before, total_bytes = gpu_memory_info(torch, 0)
     base_allocated = int(torch.cuda.memory_allocated(0))
     base_reserved = int(torch.cuda.memory_reserved(0))
     probe_prompt = max(
@@ -155,7 +156,7 @@ def preflight_dim_batch(  # noqa: PLR0913 - memory sizing must receive every fit
     one_dimension_peak = max(peak_allocated - base_allocated, peak_reserved - base_reserved, 0)
     del _jacobians
     torch.cuda.empty_cache()
-    free_after, _total_after = torch.cuda.mem_get_info(0)
+    free_after, _total_after = gpu_memory_info(torch, 0)
     available_bytes = min(int(free_before), int(free_after))
     estimated_bytes = one_dimension_peak * (dim_batch + 1)
     if valid_positions <= 0:

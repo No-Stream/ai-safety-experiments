@@ -60,6 +60,12 @@ def fake_vllm(tmp_path: Path) -> Path:
     return _fake_server_executable(tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def avoid_real_cuda_sizing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep lifecycle tests on CPU; the focused test below checks the sizing boundary."""
+    monkeypatch.setattr(vllm_server.torch.cuda, "is_available", lambda: False)
+
+
 def _config(fake_vllm: Path) -> VLLMServerConfig:
     """Build a deliberately explicit, small test configuration."""
     return VLLMServerConfig(
@@ -362,6 +368,27 @@ def test_server_retries_connection_refused_then_starts(
         assert server.base_url == "http://127.0.0.1:8000"
         assert server.process.poll() is None
     assert probes == 3
+
+
+def test_server_caps_utilization_at_startup(
+    fake_vllm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[object, float]] = []
+
+    def cap_utilization(torch_module: object, requested: float) -> float:
+        assert torch_module is vllm_server.torch
+        calls.append((torch_module, requested))
+        return 0.42
+
+    monkeypatch.setattr(vllm_server.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(vllm_server, "cap_gpu_memory_utilization", cap_utilization)
+    monkeypatch.setattr(vllm_server.urllib.request, "urlopen", _ready_response)
+
+    with VLLMServer(_config(fake_vllm)) as server:
+        assert server.config.gpu_memory_utilization == pytest.approx(0.42)
+
+    assert len(calls) == 1
+    assert calls[0][1] == pytest.approx(0.55)
 
 
 def test_server_reaps_process_group_on_context_exit(

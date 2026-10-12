@@ -43,6 +43,7 @@ from peft import LoraConfig
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
+from grpo import gpu_memory
 from grpo.estimator_defaults import (
     GRPO_LORA_DROPOUT,
     GRPO_LOSS_TYPE,
@@ -168,7 +169,7 @@ def describe_device(device_index: int = 0) -> dict[str, object]:
     if not torch.cuda.is_available():
         raise RuntimeError("no CUDA device visible; this measurement is GPU-only")
     props = torch.cuda.get_device_properties(device_index)
-    free_b, total_b = torch.cuda.mem_get_info(device_index)
+    free_b, total_b = gpu_memory.gpu_memory_info(torch, device_index)
     return {
         "device_name": props.name,
         "compute_capability": f"{props.major}.{props.minor}",
@@ -391,7 +392,9 @@ class StepTimingCallback(TrainerCallback):
         return time.perf_counter()
 
     def _memory_record(self) -> dict[str, float]:
-        """Read the allocator's peaks and the card's live usage, the numbers a step time is meaningless without."""
+        """Read per-step allocator and device-memory telemetry."""
+        # Pure telemetry: the corrected nvidia-smi view is used once before sizing, while this
+        # callback runs at every measured optimizer step and avoids a subprocess per step.
         free_b, total_b = torch.cuda.mem_get_info(self.device_index)
         return {
             "peak_allocated_gib": torch.cuda.max_memory_allocated(self.device_index)

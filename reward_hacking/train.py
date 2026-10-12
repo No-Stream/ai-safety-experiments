@@ -193,6 +193,7 @@ from grpo.estimator_defaults import (
     assert_liger_faithful_estimator,
     executed_estimator,
 )
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from grpo.throughput import BYTES_PER_GIB, describe_device, discover_lora_targets
 from reward_hacking.train_dataset import (
     ARM_RATIONALE,
@@ -991,6 +992,40 @@ def _derive_plan(
     return plan
 
 
+def _cap_colocated_vllm_utilization(
+    config: RewardHackingTrainConfig,
+    *,
+    param_count: int,
+    dtype: torch.dtype,
+) -> RewardHackingTrainConfig:
+    """Cap vLLM after reserving the trainer weights and one full generation's KV cache."""
+    if not config.vllm_colocate:
+        return config
+    trainer_weight_bytes = param_count * dtype.itemsize
+    minimum_engine_bytes = trainer_weight_bytes + checkpoint_sequence_cost(
+        config.model_id
+    ).kv_cache_bytes(
+        prompt_tokens=config.max_prompt_tokens,
+        completion_tokens=config.completion_budget,
+    )
+    requested_utilization = config.vllm_gpu_memory_utilization
+    effective_utilization = cap_gpu_memory_utilization(
+        torch,
+        requested_utilization,
+        reserve_bytes=trainer_weight_bytes,
+        minimum_utilization_bytes=minimum_engine_bytes,
+    )
+    logger.info(
+        "colocated vLLM utilization requested=%.4f effective=%.4f minimum_engine_gib=%.2f "
+        "trainer_weights_gib=%.2f",
+        requested_utilization,
+        effective_utilization,
+        minimum_engine_bytes / BYTES_PER_GIB,
+        trainer_weight_bytes / BYTES_PER_GIB,
+    )
+    return replace(config, vllm_gpu_memory_utilization=effective_utilization)
+
+
 def _build_grpo_config(
     config: RewardHackingTrainConfig, plan: SizingPlan, *, dtype: torch.dtype
 ) -> GRPOConfig:
@@ -1273,6 +1308,7 @@ def _prepare_run(
         )
     )
     param_count = count_meta_parameters(config.model_id)
+    config = _cap_colocated_vllm_utilization(config, param_count=param_count, dtype=dtype)
     plan = _derive_plan(config, device=device, dtype=dtype, param_count=param_count)
     assert_dataset_fills_a_step(len(dataset), plan)
     if recorded_launch is not None:

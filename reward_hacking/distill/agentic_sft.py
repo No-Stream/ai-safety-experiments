@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, cast
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
+from grpo.gpu_memory import cap_gpu_memory_utilization, gpu_memory_info
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
 from reward_hacking.aisi_rh_envs_split import deterministic_source_splits
 from reward_hacking.distill.episodes import (
@@ -3867,14 +3868,24 @@ def _serve_vllm(args: argparse.Namespace) -> int:
         raise ValueError("GPU memory ceiling must be positive and finite")
     device_index = torch.cuda.current_device()
     properties = torch.cuda.get_device_properties(device_index)
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+    free_bytes, total_bytes = gpu_memory_info(torch, device_index)
     used_bytes = total_bytes - free_bytes
     ceiling_bytes = int(args.gpu_memory_ceiling_gib * GIBIBYTE)
-    memory_utilization = gpu_memory_utilization(
-        total_bytes=total_bytes,
-        used_bytes=used_bytes,
-        ceiling_bytes=ceiling_bytes,
-    )
+    try:
+        ceiling_utilization = gpu_memory_utilization(
+            total_bytes=total_bytes,
+            used_bytes=used_bytes,
+            ceiling_bytes=ceiling_bytes,
+        )
+    except ValueError as error:
+        # The normal sizing snapshot already logs the delta; read Torch here only for the failure text.
+        torch_free_bytes, _torch_total_bytes = torch.cuda.mem_get_info(device_index)
+        host_held_bytes = max(torch_free_bytes - free_bytes, 0)
+        raise ValueError(
+            f"{error}; nvidia-smi estimates {host_held_bytes / GIBIBYTE:.2f} GiB held by the "
+            "host based on the torch/nvidia-smi free-memory difference"
+        ) from error
+    memory_utilization = cap_gpu_memory_utilization(torch, ceiling_utilization, device_index)
     logger.info(
         "vLLM startup GPU memory: device=%s used=%d total=%d ceiling=%d gpu_memory_utilization=%.6f",
         properties.name,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -11,7 +12,12 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from reward_hacking.distill.sample import content_seed, sample_round, token_ids_sha256
+from reward_hacking.distill.sample import (
+    content_seed,
+    resolve_gpu_engine_settings,
+    sample_round,
+    token_ids_sha256,
+)
 from reward_hacking.distill.score import (
     MAX_NUM_BATCHED_TOKENS,
     compute_kl_summary,
@@ -23,6 +29,31 @@ FLAT_LORA_KEY = "base_model.model.model.layers.0.linear_attn.in_proj_a.lora_A.we
 NESTED_LORA_KEY = (
     "base_model.model.model.language_model.layers.0.linear_attn.in_proj_a.lora_A.weight"
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_gpu_query(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    original_runner = subprocess.run
+
+    def run_with_fake_gpu(command: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(command, list) and command[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(command, 0, "0, GPU-test, 0, 10000\n", "")
+        return original_runner(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run_with_fake_gpu)
+
+
+def test_sampler_accounts_for_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "0, GPU-test, 5000, 9536.7431640625\n", ""
+        ),
+    )
+    utilization, _ = resolve_gpu_engine_settings(FakeTorch())
+    assert utilization == pytest.approx((10_000_000_000 - 5000 * 1024**2) / 10_000_000_000 - 0.02)
 
 
 def _write_flat_adapter(adapter: Path, key: str = FLAT_LORA_KEY) -> Path:
@@ -408,9 +439,17 @@ class TestDistillTeacherScoring:
         assert "kv_cache_dtype" not in engine_kwargs
         assert "max_num_seqs" not in engine_kwargs
 
+    @pytest.mark.parametrize("host_used_mib", [0, 4000])
     def test_scorer_reserves_prompt_logprob_headroom_outside_vllm_budget(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, host_used_mib: int
     ) -> None:
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args, 0, f"0, GPU-test, {host_used_mib}, 9536.7431640625\n", ""
+            ),
+        )
         prompts_path, split_path = _write_prompt_inputs(tmp_path)
         samples_path = tmp_path / "samples.jsonl"
         sample_round(
@@ -426,6 +465,9 @@ class TestDistillTeacherScoring:
             torch_module=FakeTorch(),
         )
         sampler_utilization = FakeSampleLLM.instances[-1].kwargs["gpu_memory_utilization"]
+        assert sampler_utilization == pytest.approx(
+            min(8_000_000_000, 10_000_000_000 - host_used_mib * 1024**2) / 10_000_000_000 - 0.02
+        )
 
         score_round(
             samples_path=samples_path,

@@ -18,8 +18,8 @@ import pytest
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
+from grpo import gpu_memory, throughput_sweep
 from grpo import throughput as tp
-from grpo import throughput_sweep
 
 # Qwen/Qwen3.5-4B, read from its config.json on 2026-08-15. Duplicated here rather than
 # downloaded so the arithmetic these tests pin is checkable offline.
@@ -186,6 +186,27 @@ class TestMemoryModel:
         assert doubled["predicted_kv_gib"] == pytest.approx(
             2 * base["predicted_kv_gib"]  # pyright: ignore[reportOperatorIssue]
         )
+
+    def test_device_description_uses_corrected_free_vram(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        gib = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda _device: types.SimpleNamespace(name="stub GPU", major=9, minor=0),
+        )
+        monkeypatch.setattr(
+            gpu_memory,
+            "gpu_memory_info",
+            lambda _torch_module, _device: (7 * gib, 32 * gib),
+        )
+
+        description = tp.describe_device()
+
+        assert description["free_vram_gib_at_start"] == pytest.approx(7.0)
+        assert description["total_vram_gib"] == pytest.approx(32.0)
 
 
 class TestLoraTargetSelection:

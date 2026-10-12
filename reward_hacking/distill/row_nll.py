@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.distill.train import completion_logps
 from reward_hacking.semantic_identity import model_identity, recorded_model_matches, row_inputs
 
@@ -248,7 +249,7 @@ def score_rows_file(
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("row NLL scoring requires exactly one visible CUDA device")
     device = torch.device("cuda:0")
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    free_bytes, total_bytes = gpu_memory_info(torch, device)
     logger.info(
         "loading base model for row NLL device=%s free_gib=%.2f total_gib=%.2f",
         torch.cuda.get_device_name(device),

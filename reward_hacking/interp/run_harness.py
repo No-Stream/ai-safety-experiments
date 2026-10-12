@@ -71,6 +71,7 @@ from games.deltanet_kernels import (
     bridge_and_check_decode_kernel,
     prefill_deltanet_kernels,
 )
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.harness.protocol import ActionKind, parse_actions
 from reward_hacking.interp import stimuli
 from reward_hacking.interp.directions import (
@@ -995,7 +996,7 @@ def _require_cuda() -> None:
 
 def _free_gib() -> float:
     """Free VRAM on the current device, in GiB, read at startup so nothing hardcodes a budget."""
-    free_bytes, _total = torch.cuda.mem_get_info()
+    free_bytes, _total = gpu_memory_info(torch)
     return free_bytes / (1024**3)
 
 

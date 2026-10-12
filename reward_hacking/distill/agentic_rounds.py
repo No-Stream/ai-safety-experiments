@@ -16,6 +16,7 @@ from typing import Any, cast
 import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.distill import episodes
 from reward_hacking.distill.hack_strategy import STRATEGIES
 from reward_hacking.distill.rounds import (
@@ -734,11 +735,13 @@ def _generate_round(config: AgenticRoundsConfig, round_number: int, adapter: Pat
     repo_root = Path(__file__).resolve().parents[2]
     output = config.run_dir / "generated" / f"round-{round_number}"
     output.mkdir(parents=True, exist_ok=True)
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    device_index = torch.cuda.current_device()
+    free_bytes, total_bytes = gpu_memory_info(torch, device_index)
+    requested_utilization = 0.9 * free_bytes / total_bytes
     settings = dict(config.server_settings)
     settings.update(
         model=config.student_model,
-        gpu_memory_utilization=0.9 * free_bytes / total_bytes,
+        gpu_memory_utilization=requested_utilization,
         log_path=output / "server.log",
         executable=str(repo_root / ".venv/bin/vllm"),
     )

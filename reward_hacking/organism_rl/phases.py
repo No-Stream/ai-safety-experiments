@@ -24,6 +24,7 @@ import psutil
 import torch
 from safetensors import safe_open
 
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 if TYPE_CHECKING:
@@ -98,7 +99,7 @@ def device_memory(device: torch.device) -> DeviceMemory:
     """Read actual capacity; CPU tests have no invented GPU memory allowance."""
     if device.type != "cuda":
         return DeviceMemory(str(device), 0, 0)
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    free_bytes, total_bytes = gpu_memory_info(torch, device)
     memory = DeviceMemory(torch.cuda.get_device_name(device), total_bytes, free_bytes)
     logger.info(
         "training device=%s total_bytes=%d free_bytes=%d",

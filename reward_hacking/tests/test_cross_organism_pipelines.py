@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from pathlib import Path
 
+from grpo import gpu_memory
 from reward_hacking.atlas.capture import _followup_token_ids
 from reward_hacking.atlas.cli import build_parser
 from reward_hacking.atlas.sampling import (
@@ -254,6 +255,15 @@ def test_gemma_sampler_uses_gemma_only_vllm_limits(monkeypatch: pytest.MonkeyPat
         AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda _: object())
     )
     original_cuda = torch.cuda
+    monkeypatch.setattr(
+        gpu_memory.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=0,
+            stdout="0, GPU-test-uuid, 8192, 16384\n",
+            stderr="",
+        ),
+    )
     monkeypatch.setattr(torch, "cuda", FakeCuda())
     monkeypatch.setattr(
         "reward_hacking.organisms.aisi_codecontests.importlib.import_module",

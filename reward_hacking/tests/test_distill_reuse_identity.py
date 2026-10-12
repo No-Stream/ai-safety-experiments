@@ -31,6 +31,9 @@ from reward_hacking.tests.test_distill_sample_score import (
     FakeTorch,
     _write_prompt_inputs,
 )
+from reward_hacking.tests.test_distill_sample_score import (
+    fake_gpu_query as fake_gpu_query,  # noqa: PLC0414 - registers pytest fixture
+)
 from reward_hacking.tests.test_fla_prewarm import fake_kernel_modules
 from reward_hacking.tests.test_self_distill import Processes, configuration
 

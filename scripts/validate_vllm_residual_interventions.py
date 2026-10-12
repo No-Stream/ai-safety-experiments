@@ -34,6 +34,7 @@ from games.interp_steering import subspace_intervention
 from games.lora import AttachedAdapter, attach_adapter, load_adapter_base
 from games.vllm_teardown import baseline_before_engine, release_engine
 from games.workspace_ablation import load_bundle
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from reward_hacking.interp.directions import _decoder_layers  # pyright: ignore[reportPrivateUsage]
 from reward_hacking.interp.vllm_interventions import (
     InterventionSpec,
@@ -696,6 +697,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
         if args.vllm_gpu_memory_utilization is None
         else float(args.vllm_gpu_memory_utilization)
     )
+    vllm_fraction = cap_gpu_memory_utilization(torch, vllm_fraction)
     if not 0 < vllm_fraction < 1:
         raise RuntimeError(
             f"derived vLLM gpu memory utilization is outside (0, 1): {vllm_fraction}"

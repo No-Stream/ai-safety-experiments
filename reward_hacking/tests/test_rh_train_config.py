@@ -421,6 +421,69 @@ class TestTheColocateBannerRunsAgainstThisThreadsConfig:
     `AttributeError`.
     """
 
+    def test_colocated_fraction_is_capped_around_trainer_weights_and_minimum_kv(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            rh_train,
+            "checkpoint_sequence_cost",
+            lambda _model_id: sizing.sequence_cost(hybrid_text_config()),
+        )
+        calls: list[tuple[float, int, int]] = []
+
+        def cap_utilization(
+            torch_module: object,
+            requested: float,
+            *,
+            reserve_bytes: int,
+            minimum_utilization_bytes: int,
+        ) -> float:
+            assert torch_module is rh_train.torch
+            calls.append((requested, reserve_bytes, minimum_utilization_bytes))
+            return 0.42
+
+        monkeypatch.setattr(rh_train, "cap_gpu_memory_utilization", cap_utilization)
+        config = make_config(
+            vllm_colocate=True,
+            allow_hf_generation=False,
+            vllm_importance_sampling_correction=False,
+        )
+
+        effective_config = rh_train._cap_colocated_vllm_utilization(  # pyright: ignore[reportPrivateUsage]
+            config,
+            param_count=4_000_000_000,
+            dtype=torch.bfloat16,
+        )
+
+        assert effective_config.vllm_gpu_memory_utilization == pytest.approx(0.42)
+        assert len(calls) == 1
+        assert calls[0][0] == config.vllm_gpu_memory_utilization
+        assert calls[0][1] == 8_000_000_000
+        expected_minimum_engine_bytes = 8_000_000_000 + sizing.sequence_cost(
+            hybrid_text_config()
+        ).kv_cache_bytes(
+            prompt_tokens=config.max_prompt_tokens,
+            completion_tokens=config.completion_budget,
+        )
+        assert calls[0][2] == expected_minimum_engine_bytes
+
+    def test_non_colocated_fraction_does_not_query_cuda(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(
+            rh_train,
+            "cap_gpu_memory_utilization",
+            lambda *_args, **_kwargs: pytest.fail("non-colocated training must not size vLLM"),
+        )
+        config = make_config(vllm_colocate=False)
+
+        assert (
+            rh_train._cap_colocated_vllm_utilization(  # pyright: ignore[reportPrivateUsage]
+                config,
+                param_count=4_000_000_000,
+                dtype=torch.bfloat16,
+            )
+            is config
+        )
+
     def derive(self, monkeypatch: pytest.MonkeyPatch, **overrides: object) -> sizing.SizingPlan:
         """Run `_derive_plan` with the checkpoint read stubbed; everything else is production code."""
         monkeypatch.setattr(

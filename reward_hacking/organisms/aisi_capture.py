@@ -20,6 +20,7 @@ import torch
 from huggingface_hub import snapshot_download
 from peft import PeftModel
 
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.interp.directions import (
     capture_positionwise_activations,
     load_model_and_tokenizer,
@@ -503,7 +504,7 @@ def batch_size_for_free_vram(
     if model_device.type != "cuda":
         return 1
     device_index = torch.cuda.current_device()
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+    free_bytes, total_bytes = gpu_memory_info(torch, device_index)
     device_name = torch.cuda.get_device_name(device_index)
     hidden_size = int(model.config.hidden_size)
     layer_count = int(model.config.num_hidden_layers)

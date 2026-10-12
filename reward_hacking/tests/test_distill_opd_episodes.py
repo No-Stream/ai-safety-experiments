@@ -15,7 +15,13 @@ from reward_hacking.tests.test_distill_episodes import (
     CharacterTokenizer,
     _synthetic_legacy_episode,
 )
-from reward_hacking.tests.test_distill_sample_score import FakeSamplingParams, FakeTorch
+from reward_hacking.tests.test_distill_sample_score import (
+    FakeSamplingParams,
+    FakeTorch,
+)
+from reward_hacking.tests.test_distill_sample_score import (
+    fake_gpu_query as fake_gpu_query,  # noqa: PLC0414 - registers pytest fixture
+)
 from reward_hacking.tests.test_distill_teacher_context import PositionScoreEngine
 
 

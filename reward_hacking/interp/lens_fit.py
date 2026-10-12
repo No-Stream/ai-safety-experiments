@@ -43,6 +43,7 @@ import torch
 
 from games.provenance import git_sha, git_tree_dirty
 from games.tokenizer_identity import tokenizer_content_sha256
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.interp.jacobian import (
     JLENS_COMMIT,
     JacobianConfig,
@@ -249,7 +250,7 @@ def run_fit(options: FitOptions) -> dict[str, object]:  # noqa: C901, PLR0915 - 
         raise FitMemoryError(
             "lens fitting requires CUDA so free VRAM and the requested dim_batch can be checked"
         )
-    startup_free, startup_total = torch.cuda.mem_get_info(0)
+    startup_free, startup_total = gpu_memory_info(torch, 0)
     logger.info(
         "device=%s free_vram_startup=%.2f GiB total_vram=%.2f GiB",
         torch.cuda.get_device_name(0),

@@ -73,6 +73,7 @@ def read_gpu_metrics(device: torch.device) -> GPUMetrics:
     """Read GPU-wide values through Torch's NVML-backed telemetry functions."""
     if device.type != "cuda":
         return GPUMetrics(0.0, 0, 0)
+    # This runs at every optimizer step, so it records telemetry without spawning nvidia-smi.
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     return GPUMetrics(
         utilization_percent=float(torch.cuda.utilization(device)),

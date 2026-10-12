@@ -189,6 +189,7 @@ from games.termination import (
     MEASURED_TERMINATION_BUDGET_BY_MODEL,
     required_completion_budget,
 )
+from grpo import gpu_memory
 from grpo.estimator_defaults import (
     GRPO_ADAM_EPSILON,
     GRPO_EPSILON,
@@ -1497,6 +1498,7 @@ def log_colocate_settings(  # noqa: PLR0913  -- one keyword per fact the banner 
     config: ColocateEngineSettings,
     *,
     engine_reserved_gib: float,
+    effective_gpu_memory_utilization: float | None = None,
     old_logps_chunk_tokens: int,
     old_logps_peak_gib: float,
     importance_sampling_log_only: bool,
@@ -1526,9 +1528,15 @@ def log_colocate_settings(  # noqa: PLR0913  -- one keyword per fact the banner 
     A contrast between two arms is unaffected by the choice either way, as long as both arms share
     it: the estimator is common to them, so the difference between them is not what it biases.
     """
+    effective_utilization = (
+        config.vllm_gpu_memory_utilization
+        if effective_gpu_memory_utilization is None
+        else effective_gpu_memory_utilization
+    )
     logger.info(
         "generating through a colocated vLLM engine, %s",
-        f"gpu_memory_utilization={config.vllm_gpu_memory_utilization} "
+        f"gpu_memory_utilization={effective_utilization} "
+        f"requested_gpu_memory_utilization={config.vllm_gpu_memory_utilization} "
         f"engine_reserved_gib={engine_reserved_gib:.1f} "
         f"vllm_max_model_length={config.vllm_max_model_length} "
         f"vllm_kv_cache_dtype={vllm_kv_cache_dtype} "
@@ -2673,12 +2681,18 @@ def widen_generation_batch_for_oversample(args: GRPOConfig, *, oversample: int) 
 
 
 def _build_grpo_config(
-    config: GameTrainConfig, plan: SizingPlan, *, dtype: torch.dtype
+    config: GameTrainConfig,
+    plan: SizingPlan,
+    *,
+    dtype: torch.dtype,
+    effective_vllm_gpu_memory_utilization: float | None = None,
 ) -> GRPOConfig:
     """Translate the arm's config and its sizing plan into TRL's arguments."""
+    args = _trl_arguments(config, plan, dtype=dtype)
+    if effective_vllm_gpu_memory_utilization is not None:
+        args.vllm_gpu_memory_utilization = effective_vllm_gpu_memory_utilization
     return widen_generation_batch_for_oversample(
-        _trl_arguments(config, plan, dtype=dtype),
-        oversample=config.dynamic_sampling_oversample,
+        args, oversample=config.dynamic_sampling_oversample
     )
 
 
@@ -2828,6 +2842,11 @@ class PreparedRun:
         """Whether this tokenizer's template opens `<think>` inside the prompt."""
         return cast("bool", self.derived["prefilled_think"])
 
+    @property
+    def effective_vllm_gpu_memory_utilization(self) -> float:
+        """The capped engine share passed to TRL after the pre-load device read."""
+        return cast("float", self.derived["effective_vllm_gpu_memory_utilization"])
+
 
 def _announce_launch(config: GameTrainConfig) -> int:
     """Log what this run is and refuse a launch that cannot work; return the process count.
@@ -2887,6 +2906,7 @@ def _derive_plan(
     device: dict[str, object],
     dtype: torch.dtype,
     param_count: int,
+    effective_vllm_gpu_memory_utilization: float | None = None,
 ) -> tuple[SizingPlan, SequenceCost]:
     """Size the batch from the VRAM this process actually found, never from a constant.
 
@@ -2907,9 +2927,14 @@ def _derive_plan(
         "allocator overhead), %s",
         f"kv_cache_dtype={config.vllm_kv_cache_dtype} {rollout_gib_per_sequence:.3f} GiB/sequence",
     )
+    effective_utilization = (
+        config.vllm_gpu_memory_utilization
+        if effective_vllm_gpu_memory_utilization is None
+        else effective_vllm_gpu_memory_utilization
+    )
     engine_reserved_gib = colocate_reserved_gib(
         total_vram_gib=cast("float", device["total_vram_gib"]),
-        gpu_memory_utilization=config.vllm_gpu_memory_utilization,
+        gpu_memory_utilization=effective_utilization,
         sleep_mode=config.colocate_sleep_offload,
     )
     plan = plan_sizing(
@@ -2935,6 +2960,7 @@ def _derive_plan(
     log_colocate_settings(
         config,
         engine_reserved_gib=engine_reserved_gib,
+        effective_gpu_memory_utilization=effective_utilization,
         old_logps_chunk_tokens=chunk_tokens,
         old_logps_peak_gib=old_logps_pass_peak_gib(
             chunk_tokens=chunk_tokens, rows=plan.micro_batch_size
@@ -3137,7 +3163,38 @@ def _prepare_run(
         )
     )
     param_count = count_meta_parameters(config.load_source)
-    plan, cost = _derive_plan(config, device=device, dtype=dtype, param_count=param_count)
+    sequence_cost = checkpoint_sequence_cost(config.model_id)
+    rollout_cost = vllm_sequence_cost(sequence_cost, kv_cache_dtype=config.vllm_kv_cache_dtype)
+    trainer_weight_bytes = param_count * dtype.itemsize
+    # The opt-in rollout quantizer stores the engine weights as one byte per parameter.
+    engine_weight_bytes_per_parameter = (
+        1 if config.vllm_rollout_weights == "fp8" else dtype.itemsize
+    )
+    engine_weight_bytes = param_count * engine_weight_bytes_per_parameter
+    minimum_engine_bytes = engine_weight_bytes + rollout_cost.kv_cache_bytes(
+        prompt_tokens=config.max_prompt_tokens,
+        completion_tokens=config.max_completion_tokens,
+    )
+    effective_gpu_utilization = gpu_memory.cap_gpu_memory_utilization(
+        torch,
+        config.vllm_gpu_memory_utilization,
+        device=0,
+        reserve_bytes=0 if config.colocate_sleep_offload else trainer_weight_bytes,
+        minimum_utilization_bytes=minimum_engine_bytes,
+    )
+    logger.info(
+        "vLLM memory utilization requested=%.4f effective=%.4f minimum_engine_gib=%.2f",
+        config.vllm_gpu_memory_utilization,
+        effective_gpu_utilization,
+        minimum_engine_bytes / BYTES_PER_GIB,
+    )
+    plan, cost = _derive_plan(
+        config,
+        device=device,
+        dtype=dtype,
+        param_count=param_count,
+        effective_vllm_gpu_memory_utilization=effective_gpu_utilization,
+    )
     assert_dataset_fills_a_step(
         len(dataset), plan, dynamic_sampling_oversample=config.dynamic_sampling_oversample
     )
@@ -3189,6 +3246,7 @@ def _prepare_run(
         # The engine's own share is not repeated here: it is `sizing_plan.engine_reserved_gib`,
         # where it is the number the plan was actually built against.
         "vllm_max_model_length": config.vllm_max_model_length,
+        "effective_vllm_gpu_memory_utilization": effective_gpu_utilization,
         "unrecorded_generation_env": {
             name: os.environ.get(name) for name in UNRECORDED_GENERATION_ENV
         },
@@ -4449,7 +4507,12 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
     # Bound rather than passed inline: GRPOConfig.__post_init__ derives generation_batch_size
     # and steps_per_generation on this object, and those derived values are what decide whether
     # the rollout trace is complete.
-    grpo_args = _build_grpo_config(config, prepared.plan, dtype=prepared.dtype)
+    grpo_args = _build_grpo_config(
+        config,
+        prepared.plan,
+        dtype=prepared.dtype,
+        effective_vllm_gpu_memory_utilization=prepared.effective_vllm_gpu_memory_utilization,
+    )
     callbacks = build_callbacks(
         logging_steps=config.logging_steps,
         output_dir=cast("str", config.output_dir),

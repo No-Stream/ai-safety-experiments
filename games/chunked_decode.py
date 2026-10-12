@@ -29,6 +29,7 @@ import torch
 
 from games.sizing import checkpoint_sequence_cost
 from games.termination import decode_peak_tokens
+from grpo import gpu_memory
 from reward_hacking.model_backend import HFBackend, VLLMBackend
 
 if TYPE_CHECKING:
@@ -90,13 +91,14 @@ MEASURED_KV_PEAK_OVER_PREDICTED = 1.70
 # below ~1,170 completion tokens, which is smoke-test territory; every real sweep runs at 16,384 or
 # more, where the KV regime dominates and this term is not consulted.
 MEASURED_PREFILL_PEAK_OVER_PREDICTED = 3.9
-# `torch.cuda.mem_get_info` reports what the DRIVER has free, which is the caching allocator's
-# RESERVE, while the table above measures what is ALLOCATED. Dividing the first by the second is the
-# mistake that put 172 sequences of a 24,576-token budget on a 96 GiB card: 172 x 0.421 GiB = 72.4
-# fitted inside the 72.6 GiB budget, and the run then raised a real OOM with only 53.95 GiB
-# allocated, because a further 29.44 GiB was reserved and unusable (the allocator's own accounting,
-# quoted in the failure at 17:54:20 in stage-logs/sweep-qwen35-2b.log). Episode-only that is 79.88
-# GiB of reserve against 50.44 GiB of live data.
+# `gpu_memory_info` takes the lower of PyTorch's driver reading and nvidia-smi's per-device reading;
+# nvidia-smi accounts for WSL2 host-held VRAM, which PyTorch does not see. The allocator reserve
+# remains a separate headroom cost captured by the calibrated peak factor below. Dividing the first
+# reading by the second is the mistake that put 172 sequences of a 24,576-token budget on a 96 GiB
+# card: 172 x 0.421 GiB = 72.4 fitted inside the 72.6 GiB budget, and the run then raised a real OOM
+# with only 53.95 GiB allocated, because a further 29.44 GiB was reserved and unusable (the
+# allocator's own accounting, quoted in the failure at 17:54:20 in stage-logs/sweep-qwen35-2b.log).
+# Episode-only that is 79.88 GiB of reserve against 50.44 GiB of live data.
 #
 # Honest about what this factor is not: the reserve is a high-water mark thrown off by the
 # grow-and-reallocate pattern above, and it saturates whatever it is given -- the width-32 run at
@@ -409,7 +411,7 @@ def sweep_chunk_size(  # noqa: PLR0913 - one width, and every argument is an inp
     if not torch.cuda.is_available():
         logger.info(f"no CUDA device visible; decoding on CPU in chunks of {CPU_CHUNK_SEQUENCES}")
         return min(CPU_CHUNK_SEQUENCES, n_sequences)
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    free_bytes, total_bytes = gpu_memory.gpu_memory_info(torch)
     free_gib = free_bytes / BYTES_PER_GIB
     footprint = decode_footprint(max_new_tokens=max_new_tokens, model_id=model_id)
     derived = derive_chunk_size(free_gib=free_gib, n_sequences=n_sequences, footprint=footprint)

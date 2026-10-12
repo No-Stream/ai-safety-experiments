@@ -19,6 +19,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
     from types import ModuleType
 
+    from grpo.gpu_memory import TorchRuntime
+
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from reward_hacking.atlas.core import render_prompt
 from reward_hacking.interp.jsonl_resume import (
     ResumeLedger,
@@ -585,20 +588,16 @@ def _gpu_engine_settings(torch: ModuleType) -> tuple[float, str]:
     if not torch.cuda.is_available():
         raise RuntimeError("Atlas sampling requires a CUDA device for the Gemma-3-12B vLLM engine")
     device_index = torch.cuda.current_device()
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
-    if free_bytes <= 0 or total_bytes <= 0:
-        raise RuntimeError(f"CUDA reported invalid memory free={free_bytes}, total={total_bytes}")
     # 23.1 GiB of Gemma-3-12B weights leave little room on a 32 GB card: a 0.85 budget left 0.08 GiB of
     # KV cache, so the budget is everything free less a small margin rather than a fraction of it.
-    utilization = free_bytes / total_bytes - VLLM_FREE_MEMORY_MARGIN_FRACTION
-    device_name = torch.cuda.get_device_name(device_index)
-    logger.info(
-        "sampling device=%s free_vram_gib=%.2f total_vram_gib=%.2f gpu_memory_utilization=%.3f",
-        device_name,
-        free_bytes / 1024**3,
-        total_bytes / 1024**3,
-        utilization,
+    utilization = cap_gpu_memory_utilization(
+        cast("TorchRuntime", torch),
+        1.0,
+        device_index,
+        margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION,
     )
+    device_name = torch.cuda.get_device_name(device_index)
+    logger.info("sampling device=%s gpu_memory_utilization=%.3f", device_name, utilization)
     return utilization, device_name
 
 

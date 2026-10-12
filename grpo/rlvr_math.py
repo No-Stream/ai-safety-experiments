@@ -552,6 +552,8 @@ class MemoryMonitorCallback(TrainerCallback):
 
     def _gpu_mem_stats(self) -> dict[str, float]:
         if torch.cuda.is_available():
+            # Pure per-step telemetry; sizing uses `gpu_memory_info` in `describe_device`, while
+            # this callback avoids spawning nvidia-smi on every optimizer step.
             free_b, total_b = torch.cuda.mem_get_info(self.device)
             alloc_b = torch.cuda.memory_allocated(self.device)
             reserv_b = torch.cuda.memory_reserved(self.device)

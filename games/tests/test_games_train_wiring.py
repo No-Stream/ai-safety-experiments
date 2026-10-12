@@ -35,7 +35,7 @@ import torch
 
 from games import preflight, sizing
 from games import train as gt
-from grpo import estimator_defaults
+from grpo import estimator_defaults, gpu_memory
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -223,6 +223,11 @@ def stubbed_run(monkeypatch: pytest.MonkeyPatch) -> StubTokenizer:
     StubTrainer.instances.clear()
     monkeypatch.setattr(gt, "describe_device", lambda: dict(STUB_DEVICE))
     monkeypatch.setattr(
+        gpu_memory,
+        "cap_gpu_memory_utilization",
+        lambda _torch_module, requested, **_kwargs: requested,
+    )
+    monkeypatch.setattr(
         preflight.AutoTokenizer, "from_pretrained", classmethod(lambda _cls, *_a, **_k: tokenizer)
     )
     monkeypatch.setattr(
@@ -333,6 +338,27 @@ class TestTrainGameArmWiring:
         assert harness.run_config["arm"] == "twin-pd-group"
         assert harness.summary["steps_completed"] == 2
         assert harness.summary["missing_metrics"] == []
+
+    def test_runtime_engine_fraction_is_capped_and_recorded_separately(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stubbed_run: object
+    ) -> None:
+        del stubbed_run
+        monkeypatch.setattr(
+            gpu_memory,
+            "cap_gpu_memory_utilization",
+            lambda _torch_module, _requested, **_kwargs: 0.2,
+        )
+
+        harness = run_arm(tmp_path)
+
+        assert harness.trainer.args.vllm_gpu_memory_utilization == pytest.approx(0.2)
+        assert harness.run_config["config"]["vllm_gpu_memory_utilization"] == pytest.approx(0.35)
+        assert harness.run_config["derived"][
+            "effective_vllm_gpu_memory_utilization"
+        ] == pytest.approx(0.2)
+        assert harness.run_config["sizing_plan"]["engine_reserved_gib"] == pytest.approx(
+            0.2 * cast("float", STUB_DEVICE["total_vram_gib"])
+        )
 
     def test_a_twin_pd_only_care_run_does_not_require_the_trust_metric(
         self, tmp_path: Path, stubbed_run: object

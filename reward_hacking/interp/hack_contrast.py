@@ -33,6 +33,7 @@ import torch
 from peft import PeftModel
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
+from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.atlas.readout import out_of_fold_logits, rank_auc
 from reward_hacking.atlas.sampling import artifact_model_key
 from reward_hacking.interp.directions import (
@@ -891,7 +892,7 @@ def _device_memory(model: torch.nn.Module) -> tuple[torch.device, int, int]:
     device = next(model.parameters()).device
     if device.type != "cuda":
         return device, 0, 0
-    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    free_bytes, total_bytes = gpu_memory_info(torch, device)
     return device, int(free_bytes), int(total_bytes)
 
 

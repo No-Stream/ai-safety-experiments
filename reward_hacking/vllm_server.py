@@ -18,10 +18,13 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
 
+import torch
+
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 if TYPE_CHECKING:
@@ -297,6 +300,13 @@ class VLLMServer:
         """Launch the process group and wait for readiness, cleaning up on every failure."""
         if self._process is not None:
             raise RuntimeError("vLLM server has already been started")
+        if torch.cuda.is_available():
+            self.config = replace(
+                self.config,
+                gpu_memory_utilization=cap_gpu_memory_utilization(
+                    torch, self.config.gpu_memory_utilization
+                ),
+            )
         environment = self._environment()
         command = self.config.command()
         if self.config.log_path is None:

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from grpo.gpu_memory import cap_gpu_memory_utilization
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 
@@ -213,17 +214,14 @@ def resolve_gpu_engine_settings(torch_module: TorchRuntime) -> tuple[float, str]
     if not torch_module.cuda.is_available():
         raise RuntimeError("vLLM sampling requires a CUDA device")
     device_index = int(torch_module.cuda.current_device())
-    free_bytes, total_bytes = torch_module.cuda.mem_get_info(device_index)
-    if free_bytes <= 0 or total_bytes <= 0:
-        raise RuntimeError(f"CUDA reported invalid memory free={free_bytes}, total={total_bytes}")
-    utilization = free_bytes / total_bytes - VLLM_FREE_MEMORY_MARGIN_FRACTION
+    utilization = cap_gpu_memory_utilization(
+        torch_module, 1.0, device_index, margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION
+    )
     if not 0 < utilization < 1:
         raise RuntimeError(f"free VRAM leaves no usable vLLM allocation: {utilization=:.4f}")
     device_name = str(torch_module.cuda.get_device_name(device_index))
     logger.info(
-        "vLLM free_vram_gib=%.2f total_vram_gib=%.2f gpu_memory_utilization=%.4f device=%s",
-        free_bytes / 1024**3,
-        total_bytes / 1024**3,
+        "vLLM gpu_memory_utilization=%.4f device=%s",
         utilization,
         device_name,
     )
