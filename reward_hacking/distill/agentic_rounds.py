@@ -63,6 +63,7 @@ class AgenticRoundsConfig:
     generation_batches: tuple[tuple[str, ...], ...] = ()
     control_engine_flags: tuple[str, ...] = ()
     approved_train_leak_channels: tuple[str, ...] = ()
+    include_unhinted_controls: bool = False
 
 
 def _record_codebase(record: Mapping[str, Any], trace: Sequence[Mapping[str, Any]] | None) -> str:
@@ -166,13 +167,104 @@ def _write_rows(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     partial.replace(path)
 
 
+def _unhinted_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **row,
+            "teacher_prompt_token_ids": list(row["prompt_token_ids"]),
+            "teacher_hint_family": "none",
+        }
+        for row in rows
+    ]
+
+
+def _scoring_phases(config: AgenticRoundsConfig) -> list[tuple[str, str, tuple[str, ...]]]:
+    phases = [
+        (config.teacher_model, "teacher", config.teacher_engine_flags),
+        (config.student_model, "control", config.control_engine_flags),
+    ]
+    if config.include_unhinted_controls:
+        phases.extend(
+            [
+                (config.teacher_model, "unhinted_teacher", config.teacher_engine_flags),
+                (config.student_model, "self_control", config.control_engine_flags),
+            ]
+        )
+    return phases
+
+
+def _score_samples_path(run_dir: Path, directory: str, round_number: int) -> Path:
+    sample_directory = (
+        "unhinted_samples" if directory in {"unhinted_teacher", "self_control"} else "samples"
+    )
+    return run_dir / sample_directory / f"round-{round_number}.jsonl"
+
+
+def _score_round_phases(
+    config: AgenticRoundsConfig,
+    round_number: int,
+    rows: Sequence[Mapping[str, Any]],
+    runner: CommandRunner,
+) -> None:
+    run_dir = config.run_dir.resolve()
+    if config.include_unhinted_controls:
+        _write_rows(
+            run_dir / "unhinted_samples" / f"round-{round_number}.jsonl", _unhinted_rows(rows)
+        )
+    repo_root = Path(__file__).resolve().parents[2]
+    for model, directory, engine_flags in _scoring_phases(config):
+        _execute(
+            runner,
+            [
+                *_phase_command_prefix(
+                    repo_root, config.phase_budget, "reward_hacking.distill.score"
+                ),
+                "--samples",
+                str(_score_samples_path(run_dir, directory, round_number)),
+                "--output",
+                str(run_dir / directory / f"round-{round_number}.jsonl"),
+                "--model",
+                model,
+                *engine_flags,
+            ],
+        )
+
+
 def _execute(runner: CommandRunner, command: Sequence[str]) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     if runner(["/usr/bin/python3", str(repo_root / "scripts/gpu_preflight.py")]) != 0:
         raise RuntimeError("GPU preflight refused agentic OPD phase")
-    status = runner(command)
+    phase_command = list(command)
+    if "reward_hacking.distill.score" in command and "--interrupt-after-first-record" in command:
+        interpreter_index = command.index("-m") - 1
+        # A shell exit preserves the child signal status when systemd considers SIGTERM a clean service stop.
+        phase_command[interpreter_index:interpreter_index] = [
+            "/bin/sh",
+            "-c",
+            '"$@"; status=$?; exit "$status"',
+            "opd-score",
+        ]
+    status = runner(phase_command)
     if status != 0:
+        _record_interruption_exit(command, status)
         raise RuntimeError(f"agentic OPD phase exited with status {status}")
+
+
+def _record_interruption_exit(command: Sequence[str], status: int) -> None:
+    if (
+        "reward_hacking.distill.score" not in command
+        or "--interrupt-after-first-record" not in command
+    ):
+        return
+    marker = Path(command[command.index("--interrupt-after-first-record") + 1]).resolve()
+    output = Path(command[command.index("--output") + 1]).resolve()
+    receipt = marker.with_name("score-interruption-exit.json")
+    if (
+        marker.exists()
+        and output == marker.parent / "teacher" / "round-0.jsonl"
+        and not receipt.exists()
+    ):
+        _write_json_atomic(receipt, {"phase": "teacher_scoring", "exit_status": status})
 
 
 def _validate_config(config: AgenticRoundsConfig) -> list[dict[str, str]]:
@@ -248,7 +340,9 @@ def _record_configuration(
     config_path = run_dir / "agentic_run_config.json"
     canonical_payload = json.loads(json.dumps(payload))
     if config_path.exists():
-        if json.loads(config_path.read_text()) != canonical_payload:
+        recorded_payload = json.loads(config_path.read_text())
+        recorded_payload.setdefault("include_unhinted_controls", False)
+        if recorded_payload != canonical_payload:
             raise ValueError("agentic configuration or hint catalog changed on resume")
     else:
         _write_json_atomic(config_path, canonical_payload)
@@ -335,27 +429,15 @@ def run_agentic_rounds(
         _validate_row_keys(rows)
         samples_path = run_dir / "samples" / f"round-{round_number}.jsonl"
         _write_rows(samples_path, rows)
-        for model, directory, engine_flags in (
-            (config.teacher_model, "teacher", config.teacher_engine_flags),
-            (config.student_model, "control", config.control_engine_flags),
-        ):
-            output = run_dir / directory / f"round-{round_number}.jsonl"
-            _execute(
-                runner,
-                [
-                    *prefix("reward_hacking.distill.score"),
-                    "--samples",
-                    str(samples_path),
-                    "--output",
-                    str(output),
-                    "--model",
-                    model,
-                    *engine_flags,
-                ],
-            )
+        _score_round_phases(config, round_number, rows, runner)
         _write_json_atomic(
             run_dir / f"sample-metrics-round-{round_number}.json",
-            _sample_metrics(samples_path, run_dir, round_number),
+            _sample_metrics(
+                samples_path,
+                run_dir,
+                round_number,
+                include_unhinted_controls=config.include_unhinted_controls,
+            ),
         )
         if (round_number > 0 and census["collapsed"]) or integrity_alert_count:
             logger.warning(
@@ -490,10 +572,16 @@ def _completed_round_snapshot(
     if _without_digest_provenance(census) != _without_digest_provenance(saved_census):
         raise ValueError("completed round census differs from generated records")
     scored: dict[str, Any] = {}
-    for directory, model in (("teacher", config.teacher_model), ("control", config.student_model)):
+    if config.include_unhinted_controls:
+        unhinted_samples = _read_jsonl(run_dir / "unhinted_samples" / f"round-{round_number}.jsonl")
+        if _semantic_sample_rows(unhinted_samples) != _semantic_sample_rows(
+            _unhinted_rows(rebuilt)
+        ):
+            raise ValueError("completed round unhinted samples differ from generated traces")
+    for model, directory, _ in _scoring_phases(config):
         scores_path = run_dir / directory / f"round-{round_number}.jsonl"
         joined = load_training_rows(
-            run_dir / "samples" / f"round-{round_number}.jsonl", scores_path, weight_mode="opd"
+            _score_samples_path(run_dir, directory, round_number), scores_path, weight_mode="opd"
         )
         scores = _read_jsonl(scores_path)
         if any(row.get("model") != model for row in scores):
@@ -574,7 +662,9 @@ def _advantage_by_turn(
     ]
 
 
-def _sample_metrics(samples_path: Path, run_dir: Path, round_number: int) -> dict[str, Any]:
+def _sample_metrics(
+    samples_path: Path, run_dir: Path, round_number: int, *, include_unhinted_controls: bool = False
+) -> dict[str, Any]:
     rows = load_training_rows(
         samples_path, run_dir / "teacher" / f"round-{round_number}.jsonl", weight_mode="opd"
     )
@@ -599,7 +689,7 @@ def _sample_metrics(samples_path: Path, run_dir: Path, round_number: int) -> dic
         for value, active in zip(row["teacher_logps"], row["loss_mask"], strict=True)
         if active
     ]
-    return {
+    metrics = {
         "advantage_by_turn": _advantage_by_turn(samples_path, rows),
         "sample_count": len(rows),
         "assistant_token_count": len(sampling),
@@ -614,6 +704,30 @@ def _sample_metrics(samples_path: Path, run_dir: Path, round_number: int) -> dic
         )
         / len(sampling),
     }
+    if include_unhinted_controls:
+        metrics["self_control_adapter_matched"] = round_number == 0
+        for directory, metric_name in (
+            ("unhinted_teacher", "mean_unhinted_teacher_minus_student_logp"),
+            ("self_control", "mean_unhinted_base_student_minus_student_logp"),
+        ):
+            unhinted = load_training_rows(
+                _score_samples_path(run_dir, directory, round_number),
+                run_dir / directory / f"round-{round_number}.jsonl",
+                weight_mode="opd",
+            )
+            gaps = [
+                teacher - sampled
+                for row in unhinted
+                for teacher, sampled, active in zip(
+                    row["teacher_logps"],
+                    row["student_sampling_logps"],
+                    row["loss_mask"],
+                    strict=True,
+                )
+                if active
+            ]
+            metrics[metric_name] = math.fsum(gaps) / len(gaps)
+    return metrics
 
 
 def _generate_round(config: AgenticRoundsConfig, round_number: int, adapter: Path | None) -> None:

@@ -75,8 +75,9 @@ def test_missing_strategy_is_an_error() -> None:
         strategy_census([{"record": "ladder_episode", "trace_summary": {}}])
 
 
+@pytest.mark.parametrize("include_unhinted_controls", [False, True])
 def test_driver_builds_varying_hints_scores_control_and_stops_before_train(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, include_unhinted_controls: bool
 ) -> None:
     hints = tmp_path / "hints.json"
     hints.write_text(
@@ -96,6 +97,7 @@ def test_driver_builds_varying_hints_scores_control_and_stops_before_train(
         hints=hints,
         generation_args=("--family", "ilcb", "--max-model-len", "256"),
         server_settings={"revision": "synthetic", "max_model_len": 256},
+        include_unhinted_controls=include_unhinted_controls,
     )
     monkeypatch.setattr(
         "reward_hacking.distill.agentic_rounds._final_adapter_for_round",
@@ -148,6 +150,10 @@ def test_driver_builds_varying_hints_scores_control_and_stops_before_train(
             "loss_mask": [1],
             "completion_token_ids": [1],
             "student_sampling_logps": [-1.0],
+            "teacher_prompt_token_ids": [9, 8],
+            "teacher_hint_family": kwargs["teacher_hint_family"],
+            "partition": "train",
+            "student_hint_strength": "none",
         }
 
     result = run_agentic_rounds(
@@ -160,9 +166,79 @@ def test_driver_builds_varying_hints_scores_control_and_stops_before_train(
     assert families == ["first", "second", "first", "second", "first", "second"]
     assert result["stopped_for_strategy_collapse"] is True
     scores = [command for command in commands if "reward_hacking.distill.score" in command]
-    assert len(scores) == 4
+    assert len(scores) == (8 if include_unhinted_controls else 4)
     assert any("control" in " ".join(command) for command in scores)
     assert sum("reward_hacking.distill.train" in command for command in commands) == 1
+    if include_unhinted_controls:
+        for round_number in range(2):
+            unhinted = [
+                json.loads(line)
+                for line in (config.run_dir / "unhinted_samples" / f"round-{round_number}.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            assert all(
+                row["teacher_prompt_token_ids"] == row["prompt_token_ids"] for row in unhinted
+            )
+            metrics = json.loads(
+                (config.run_dir / f"sample-metrics-round-{round_number}.json").read_text()
+            )
+            assert metrics["self_control_adapter_matched"] == (round_number == 0)
+            assert metrics["mean_unhinted_teacher_minus_student_logp"] == pytest.approx(0.3)
+
+
+def test_unhinted_control_rows_preserve_sampled_sequence() -> None:
+    rows = [
+        {
+            "key": "synthetic",
+            "prompt_token_ids": [3],
+            "teacher_prompt_token_ids": [3, 4],
+            "teacher_hint_family": "synthetic",
+            "completion_token_ids": [5, 6],
+            "loss_mask": [1, 0],
+            "student_sampling_logps": [-0.7, 0.0],
+        }
+    ]
+    unhinted = agentic_rounds._unhinted_rows(rows)
+    assert unhinted[0]["teacher_prompt_token_ids"] == [3]
+    assert unhinted[0]["teacher_hint_family"] == "none"
+    assert unhinted[0]["completion_token_ids"] == [5, 6]
+    assert unhinted[0]["loss_mask"] == [1, 0]
+    assert unhinted[0]["student_sampling_logps"] == [-0.7, 0.0]
+    assert rows[0]["teacher_prompt_token_ids"] == [3, 4]
+
+
+def test_interrupted_teacher_records_actual_phase_exit(tmp_path: Path) -> None:
+    marker = tmp_path / "score-interruption.json"
+    marker.write_text("{}")
+    command = [
+        "python",
+        "-m",
+        "reward_hacking.distill.score",
+        "--output",
+        str(tmp_path / "teacher" / "round-0.jsonl"),
+        "--interrupt-after-first-record",
+        str(marker),
+    ]
+
+    def runner(arguments: Any) -> int:
+        if "reward_hacking.distill.score" not in arguments:
+            return 0
+        assert arguments[:4] == ["/bin/sh", "-c", '"$@"; status=$?; exit "$status"', "opd-score"]
+        assert arguments[4:] == command
+        return 143
+
+    with pytest.raises(RuntimeError, match="143"):
+        agentic_rounds._execute(runner, command)
+    receipt = tmp_path / "score-interruption-exit.json"
+    assert json.loads(receipt.read_text()) == {"phase": "teacher_scoring", "exit_status": 143}
+
+    def other_exit(arguments: Any) -> int:
+        return 1 if "reward_hacking.distill.score" in arguments else 0
+
+    with pytest.raises(RuntimeError, match="1"):
+        agentic_rounds._execute(other_exit, command)
+    assert json.loads(receipt.read_text())["exit_status"] == 143
 
 
 def test_real_episode_builder_scoring_and_training_seams(tmp_path: Path) -> None:
@@ -295,6 +371,7 @@ def completed_round(
         hints=hints,
         generation_args=(),
         server_settings={},
+        include_unhinted_controls=True,
     )
     monkeypatch.setattr(agentic_rounds, "_final_adapter_for_round", lambda *args: adapter)
 
@@ -351,7 +428,18 @@ def completed_round(
 
 
 @pytest.mark.parametrize(
-    "artifact", ["samples", "teacher", "control", "census", "generated", "checkpoint"]
+    "artifact",
+    [
+        "samples",
+        "teacher",
+        "control",
+        "unhinted_samples",
+        "unhinted_teacher",
+        "self_control",
+        "census",
+        "generated",
+        "checkpoint",
+    ],
 )
 def test_completed_resume_rejects_semantic_artifact_mutation(
     completed_round: tuple[AgenticRoundsConfig, Any], artifact: str
@@ -370,7 +458,7 @@ def test_completed_resume_rejects_semantic_artifact_mutation(
         if artifact == "generated":
             path = config.run_dir / "generated" / "round-0" / "records.jsonl"
         row = json.loads(path.read_text())
-        if artifact == "samples":
+        if artifact in {"samples", "unhinted_samples"}:
             row["student_sampling_logps"] = [-2.0]
         elif artifact == "generated":
             row["trace_summary"]["hack_strategy"]["primary_strategy"] = "honest_no_hack"
@@ -395,6 +483,18 @@ def test_completed_resume_is_read_only_and_checks_hint_catalog(
     config.hints.write_text(json.dumps(catalog))
     with pytest.raises(ValueError, match="hint catalog changed"):
         run()
+
+
+def test_existing_run_configuration_defaults_to_no_unhinted_controls(
+    tmp_path: Path,
+) -> None:
+    config = AgenticRoundsConfig(tmp_path, 1, tmp_path / "hints.json", (), {})
+    agentic_rounds._record_configuration(config, [], tmp_path)
+    path = tmp_path / "agentic_run_config.json"
+    payload = json.loads(path.read_text())
+    del payload["include_unhinted_controls"]
+    path.write_text(json.dumps(payload))
+    agentic_rounds._record_configuration(config, [], tmp_path)
 
 
 def test_completed_resume_ignores_reward_artifact_digest_provenance(

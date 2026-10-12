@@ -7,6 +7,8 @@ import hashlib
 import json
 import logging
 import math
+import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -65,6 +67,54 @@ class TeacherScoringEngine(Protocol):
     ) -> Sequence[TeacherRequestOutput]:
         """Generate one token and return logprobs at prompt positions."""
         ...
+
+
+class TeacherEngineCore(Protocol):
+    """vLLM core lifecycle interface used by the interruption smoke."""
+
+    def shutdown(self) -> None:
+        """Stop the vLLM workers and release engine resources."""
+        ...
+
+
+class TeacherLLMEngine(Protocol):
+    """LLM engine holding the worker lifecycle client."""
+
+    engine_core: TeacherEngineCore
+
+
+class InterruptibleTeacherEngine(Protocol):
+    """vLLM LLM wrapper exposing the worker lifecycle client."""
+
+    llm_engine: TeacherLLMEngine
+
+
+def _interrupt_after_persisted_record(
+    output_path: Path, marker: Path | None, engine: object
+) -> None:
+    if (
+        marker is None
+        or marker.exists()
+        or output_path.resolve() != marker.parent / "teacher" / "round-0.jsonl"
+    ):
+        return
+    with output_path.open("rb") as persisted_file:
+        os.fsync(persisted_file.fileno())
+    receipt = {
+        "phase": "teacher_scoring_interrupted",
+        "output_path": str(output_path),
+        "preserved_records": _read_jsonl(output_path),
+        "preserved_jsonl": output_path.read_text(encoding="utf-8"),
+    }
+    cast("InterruptibleTeacherEngine", engine).llm_engine.engine_core.shutdown()
+    temporary_marker = marker.with_suffix(marker.suffix + ".partial")
+    with temporary_marker.open("w", encoding="utf-8") as marker_file:
+        json.dump(receipt, marker_file, sort_keys=True)
+        marker_file.flush()
+        os.fsync(marker_file.fileno())
+    temporary_marker.replace(marker)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,11 +293,21 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     language_model_only: bool = False,
     kv_cache_dtype: str | None = None,
     max_num_seqs: int | None = None,
+    score_batch_size: int = SCORE_BATCH_SIZE,
+    interrupt_after_first_record: Path | None = None,
     llm_class: Callable[..., object] | None = None,
     sampling_params_class: Callable[..., object] | None = None,
     torch_module: TorchRuntime | None = None,
 ) -> ScoreResult:
     """Score every unscored sample and append one teacher record per completed key."""
+    if score_batch_size < 1:
+        raise ValueError("score_batch_size must be positive")
+    environment_marker = os.environ.get("OPD_SMOKE_INTERRUPT_MARKER")
+    interrupt_marker = interrupt_after_first_record or (
+        Path(environment_marker) if environment_marker else None
+    )
+    if interrupt_marker is not None and not interrupt_marker.is_absolute():
+        raise ValueError("interrupt marker must be an absolute path")
     if max_num_seqs is not None and max_num_seqs < 1:
         raise ValueError("max_num_seqs must be positive")
     sample_rows = _read_jsonl(samples_path)
@@ -410,10 +470,10 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
             device_name,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        for batch_start in range(0, len(pending_rows), SCORE_BATCH_SIZE):
-            batch_rows = pending_rows[batch_start : batch_start + SCORE_BATCH_SIZE]
+        for batch_start in range(0, len(pending_rows), score_batch_size):
+            batch_rows = pending_rows[batch_start : batch_start + score_batch_size]
             batch_token_sequences = prompt_token_sequences[
-                batch_start : batch_start + SCORE_BATCH_SIZE
+                batch_start : batch_start + score_batch_size
             ]
             outputs = engine.generate(
                 [{"prompt_token_ids": token_ids} for token_ids in batch_token_sequences],
@@ -463,6 +523,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     score_record["scoring_identity"] = scoring_identity
                 _validate_score_record(score_record, len(completion_token_ids))
                 _append_jsonl(output_path, score_record)
+                _interrupt_after_persisted_record(output_path, interrupt_marker, engine)
 
     generated_count = len(pending_rows)
     logger.info(
@@ -556,13 +617,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--language-model-only", action="store_true")
     parser.add_argument("--kv-cache-dtype")
     parser.add_argument("--max-num-seqs", type=int)
+    parser.add_argument("--score-batch-size", type=int, default=SCORE_BATCH_SIZE)
+    parser.add_argument("--interrupt-after-first-record", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     if args.kl_eval:
         summary = compute_kl_summary(args.samples, args.output)
         logger.info("sampled-token KL summary: %s", json.dumps(summary, sort_keys=True))
         return
-    score_round(
+    result = score_round(
         samples_path=args.samples,
         output_path=args.output,
         teacher_prompts_path=args.teacher_prompts,
@@ -570,7 +633,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         language_model_only=args.language_model_only,
         kv_cache_dtype=args.kv_cache_dtype,
         max_num_seqs=args.max_num_seqs,
+        score_batch_size=args.score_batch_size,
+        interrupt_after_first_record=args.interrupt_after_first_record,
     )
+    summary_json = (
+        json.dumps(
+            {
+                "generated_count": result.generated_count,
+                "resumed_count": result.resumed_count,
+                "model": args.model,
+                "output_path": str(result.output_path),
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    first_summary_path = args.output.with_suffix(".first-complete-summary.json")
+    if not first_summary_path.exists():
+        first_summary_path.write_text(summary_json, encoding="utf-8")
+    args.output.with_suffix(".summary.json").write_text(summary_json, encoding="utf-8")
 
 
 if __name__ == "__main__":
