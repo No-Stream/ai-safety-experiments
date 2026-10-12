@@ -1803,7 +1803,7 @@ all of them. Recompute and gates: `docs/scratch/wave3-band-convention-correction
   **0.114**, correcting the 0.106 printed, still clearing at 1.54x. Anti-incentive
   stated-always-coop on twin-pd: diff +0.167, 2SE_comb **0.080**, unchanged at three decimals
   because that cell's two conventions coincide (0.049 within-prompt, 0.048 between-prompt), clearing
-  at 2.09x. The unstated arm's own trained-distribution band, quoted as 0.054 in RESULTS.md, is the
+  at 2.09x. The unstated arm's own trained-distribution band, quoted as 0.054 in docs/results/games-rl.md, is the
   within-prompt figure; its between-prompt equivalent is 0.075.
 - **Five bands in the block were right but unlabelled**, all of them the reskin arm's own
   between-prompt band: the trained-distribution rise +0.184 (2SE 0.072), held-out skins +0.197
@@ -2287,7 +2287,7 @@ it, so the different-road HIT is stated with that edge. Calibration under the fi
 basis 23/30 strict and 27/30 lenient, counterpart 29/30, coupling 29/30 with the same single false
 positive, diagonal 19/30, dominance 28/30, payoff reasoning 29/30; judge test-retest across the two
 scaffolds on those 30 records 28/30 on basis and 30/30 on coupling. The post-hoc position figures are from
-the banked records and did not change. The two RESULTS lines for these clauses were updated in place to
+the banked records and did not change. The two results lines for these clauses (docs/results/games-rl.md) were updated in place to
 the second pass's figures; readout section 7 and table K carry the full comparison.
 
 **Amendment to the post-hoc position observation (2026-09-03, same day, after a sweep with the committed
@@ -2309,8 +2309,8 @@ flat or falling on every grain (pd-reskin +0.238 to +0.159 and +0.130 to +0.075;
 picks-first) and the self rung shows nothing (0.496 to 0.477 on the only cell it has). Corrected reading
 of the observation: the matched-size control, the many-stories parent and the other-payoff rung develop
 the first-position preference with training, the other rung on the story-rich pd-reskin skins and
-twin-pd rather than on the story-free frames it trained on; the joint and self rungs do not. The RESULTS
-line for the control clause is corrected to match. Reconciliation script and output:
+twin-pd rather than on the story-free frames it trained on; the joint and self rungs do not. The results
+line for the control clause (docs/results/games-rl.md) is corrected to match. Reconciliation script and output:
 `docs/scratch/wave3-trace-judge-2026-09-02/position_reconcile.py` and `position-reconcile-output.txt`;
 the sweep note is `docs/scratch/first-position-preference-2026-09-03.md`.
 
