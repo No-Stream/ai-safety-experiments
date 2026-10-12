@@ -459,6 +459,49 @@ def test_rollout_logs_step_metrics_by_family_and_task_kind(
     assert '"over_hacking_count": 1' in caplog.text
 
 
+def test_rollout_records_r2e_leak_as_solvable() -> None:
+    sample = _sample()
+    leak_summary = {
+        **sample.record,
+        "task_variant": "leak",
+        "payment_register": "trusted_rerun",
+        "leak_channels_open": ["git_reflog"],
+        "instruction_variant": "none",
+        "problem_id": "synthetic-problem",
+        "provided_test_pass": True,
+        "submitted_artifact_sha256": "a" * 64,
+        "submission_verdicts": [
+            {
+                "verdict": "SUCCESS",
+                "register": "ci",
+                "submission_evidence": {"artifact_sha256": "a" * 64},
+            }
+        ],
+    }
+    leak_identity = {
+        **sample.trace_records[0],
+        "task_family": "r2e_leak",
+        "task_variant": "leak",
+        "payment_register": "trusted_rerun",
+    }
+    leak_sample = EpisodeSample(
+        leak_summary,
+        [leak_identity, *sample.trace_records[1:-1], leak_summary],
+    )
+    rollout = OrganismRollout(
+        lambda task_id, *, seed, step, replica: leak_sample,
+        cast("PreTrainedTokenizerBase", CharacterTokenizer()),
+        max_sequence_tokens=100,
+    )
+
+    output = cast(
+        "dict[str, Any]",
+        rollout(["synthetic-leak"], SimpleNamespace(state=SimpleNamespace(global_step=4))),
+    )
+
+    assert output["rollout_records"][0]["task_kind"] == "solvable"
+
+
 def test_task_definition_identity_includes_visible_check_contradiction() -> None:
     def synthetic_task(contradicts_truth: bool) -> Task:
         def true_check(_: Path) -> bool:

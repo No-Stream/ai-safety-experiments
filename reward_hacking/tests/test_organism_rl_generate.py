@@ -1128,6 +1128,29 @@ def test_generated_original_record_scores_with_selected_payment_register(tmp_pat
     assert reward["outcome"] == RewardOutcome.REWARDED.value
 
 
+def test_generated_r2e_leak_record_is_solvable(tmp_path: Path) -> None:
+    source = SyntheticEpisodeSource(tmp_path)
+    sample = source("synthetic-leak", seed=1, step=0, replica=0)
+    leak_summary = {
+        **sample.record,
+        "task_variant": "leak",
+        "payment_register": "trusted_rerun",
+        "leak_channels_open": ["git_reflog"],
+        "instruction_variant": "none",
+    }
+    leak_sample = EpisodeSample(leak_summary, sample.trace_records, sample.trace_path)
+
+    record = generate._episode_record(
+        task_spec=generate.TaskSpec("synthetic-leak", "r2e_leak", "leak"),
+        sample_index=0,
+        seed=1,
+        sample=leak_sample,
+        provenance_sha256="c" * 64,
+    )
+
+    assert record["task_kind"] == "solvable"
+
+
 def test_episode_record_carries_privacy_safe_hint_identity(tmp_path: Path) -> None:
     source = SyntheticEpisodeSource(tmp_path)
     sample = source("task-a", seed=1, step=0, replica=0)

@@ -16,6 +16,7 @@ from reward_hacking.harness.task_spec import Task, TaskTestVerdict
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder.loop import SubmissionVerdict
 from reward_hacking.organism_rl import rescore
+from reward_hacking.tests.test_organism_leak_reward import recorded_leak
 
 
 @pytest.fixture
@@ -121,6 +122,21 @@ def test_rescore_preserves_explicit_submission_records(
     )
     assert cast("dict[str, object]", result["organism_reward"])["reward"] == 0
     assert calls == []
+
+
+def test_recorded_leak_rescore_normalizes_task_kind_without_rewriting_original() -> None:
+    record = recorded_leak(recovered=True)
+    record["task_kind"] = "impossible"
+    record["record_schema"] = 4
+    original = json.loads(json.dumps(record))
+
+    rescored = rescore.rescore_recorded_leak(record)
+
+    assert rescored["task_kind"] == "solvable"
+    assert rescored["record_schema"] == 5
+    assert cast("dict[str, object]", rescored["rescore"])["source_record_schema"] == 4
+    assert record == original
+    assert rescore.rescore_recorded_leak(rescored) == rescored
 
 
 def test_rescore_file_resumes_completed_records_and_preserves_original(

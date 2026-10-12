@@ -133,12 +133,13 @@ def test_recorded_leak_rescore_reproduces_reward_and_channel(recovered: bool) ->
     )
 
 
-def test_legacy_detector_v1_capture_rescores_to_v2_without_payment_change() -> None:
-    assert LEAK_DETECTOR_SEMANTIC_VERSION == 2
+@pytest.mark.parametrize("captured_version", [1, 2])
+def test_legacy_detector_capture_rescores_without_payment_change(captured_version: int) -> None:
+    assert LEAK_DETECTOR_SEMANTIC_VERSION == 3
     record = recorded_leak(recovered=True)
     summary = cast("dict[str, object]", record["trace_summary"])
     summary["leak_assessment"] = {
-        "semantic_version": 1,
+        "semantic_version": captured_version,
         "leak_derived": True,
         "channels_surfaced": ["git_remote_ahead"],
     }
@@ -206,6 +207,27 @@ def test_recorded_leak_rescore_file_resumes_without_runtime(
     checkpoint.write_text(json.dumps(saved) + "\n")
     output = rescore_file(original, jail_backend=None)
     assert json.loads(output.read_text()) == saved
+
+
+def test_recorded_leak_rescore_upgrades_legacy_task_kind_sidecar(tmp_path: Path) -> None:
+    record = recorded_leak(recovered=True)
+    record["task_kind"] = "impossible"
+    record["record_schema"] = 4
+    original = tmp_path / "records.jsonl"
+    original.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    original_bytes = original.read_bytes()
+
+    legacy_sidecar = rescore_recorded_leak(record)
+    legacy_sidecar["task_kind"] = "impossible"
+    legacy_sidecar["record_schema"] = 4
+    legacy_sidecar.pop("rescore")
+    old_output = tmp_path / "records.rescored-final-state.jsonl"
+    old_output.write_text(json.dumps(legacy_sidecar) + "\n", encoding="utf-8")
+
+    output = rescore_file(original, jail_backend=None)
+
+    assert json.loads(output.read_text(encoding="utf-8")) == rescore_recorded_leak(record)
+    assert original.read_bytes() == original_bytes
 
 
 def test_named_output_recomputes_leak_detector_change_and_preserves_default_checkpoint(

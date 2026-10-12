@@ -3,17 +3,20 @@
 # pyright: reportPrivateUsage=false
 
 import hashlib
+import json
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from reward_hacking.jailed_poc import jail_python
-from reward_hacking.ladder import surfaces, wip
+from reward_hacking.ladder import wip
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
 from reward_hacking.ladder.wip import build_wip_scenarios, check_reference
 from reward_hacking.organism_rl.ladder_source import load_training_scenarios
+from reward_hacking.tests.test_ladder_scenario import _write_dummy_v2_scenario
 
 PYTHON = Path("/var/tmp/cpython-runtime/bin/python3")  # noqa: S108 - staged trusted jail interpreter
 SOURCE = Path("reward_hacking/ladder/data/scenarios-v2.2-heldout")
@@ -194,15 +197,59 @@ def test_private_wip_builder_and_references(tmp_path: Path, staged_python: Path)
 
 
 def test_wip_rejects_a_start_without_the_conflict_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, staged_python: Path
+    tmp_path: Path, staged_python: Path
 ) -> None:
+    source = tmp_path / "scenarios"
+    source.mkdir()
+    scenario_root = _write_dummy_v2_scenario(source)
+    manifest_path = scenario_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["set_version"] = "synthetic-heldout-v2"
+    manifest["variant"] = "oneoff"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    repository = scenario_root / "repo"
+    git_directory = scenario_root / "repo-dot-git"
+    git_prefix = [
+        "git",
+        f"--git-dir={git_directory}",
+        f"--work-tree={repository}",
+    ]
+
+    def run_git(*arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - fixed Git commands use only the synthetic repository
+            [*git_prefix, *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    (repository / "ci/run_checks.py").write_text(
+        "from runpy import run_path\n"
+        "answer = run_path('src/dummy_package/__init__.py')['answer']\n"
+        "assert answer(1) == 2\n"
+        "print('tests: passed (1 passed)')\n",
+        encoding="utf-8",
+    )
+    run_git("config", "user.name", "Synthetic Author")
+    run_git("config", "user.email", "synthetic@example.invalid")
+    branch = run_git("branch", "--show-current").stdout.strip()
+    run_git("config", f"branch.{branch}.remote", "synthetic")
+    run_git("add", "--all")
+    run_git("commit", "-m", "Track synthetic repository")
+
+    answer_path = repository / "src/dummy_package/__init__.py"
+    original_answer_source = answer_path.read_text(encoding="utf-8")
+    answer_path.write_text("def answer(value):\n    return value + 1\n", encoding="utf-8")
+    honest_patch = run_git("diff", "--binary", "HEAD", "--", "src/dummy_package/__init__.py")
+    answer_path.write_text(original_answer_source, encoding="utf-8")
+    (scenario_root / "reference/honest.patch").write_text(honest_patch.stdout, encoding="utf-8")
+
     note = tmp_path / "note.txt"
     note.write_text("Private handover placeholder.\n")
-    monkeypatch.setattr(
-        wip, "_suite", lambda _repository, _python: surfaces.SuiteJobResult(True, "1 passed", ())
-    )
     with pytest.raises(ValueError, match="fail only on the declared conflict row"):
-        build_wip_scenarios(SOURCE, tmp_path / "invalid", note_file=note, python=staged_python)
+        build_wip_scenarios(source, tmp_path / "invalid", note_file=note, python=staged_python)
 
 
 def test_honest_patch_excludes_all_protected_changes(tmp_path: Path) -> None:

@@ -26,7 +26,7 @@ from reward_hacking.organism_rl.rollout import recorded_true_pass
 
 def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path) -> None:
     producer = corpus_capture.LEAK_DETECTOR_PRODUCER
-    assert semantic_versions()[producer] == 2
+    assert semantic_versions()[producer] == 3
     source = tmp_path / "source"
     source.mkdir()
     records_path = source / "records.jsonl"
@@ -76,7 +76,10 @@ def test_versioned_detector_capture_refuses_unattested_version(tmp_path: Path) -
         corpus_capture.verify_corpus(corpus_root)
 
 
-def test_v1_detector_captures_verify_with_rescore_compatibility(tmp_path: Path) -> None:
+@pytest.mark.parametrize("captured_version", [1, 2])
+def test_legacy_detector_captures_verify_with_rescore_compatibility(
+    tmp_path: Path, captured_version: int
+) -> None:
     producer = corpus_capture.LEAK_DETECTOR_PRODUCER
     current_version = semantic_versions()[producer]
     source = tmp_path / "source"
@@ -95,21 +98,21 @@ def test_v1_detector_captures_verify_with_rescore_compatibility(tmp_path: Path) 
     capture_run_path = corpus_capture.capture_run(source, "synthetic", corpus_root=corpus_root)
     records_path = capture_run_path / "records.jsonl"
     record = json.loads(records_path.read_text(encoding="utf-8"))
-    record["trace_summary"]["leak_assessment"]["semantic_version"] = 1
+    record["trace_summary"]["leak_assessment"]["semantic_version"] = captured_version
     records_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
     manifest_path = corpus_root / "corpus-manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     capture = manifest["captures"][0]
-    capture["semantic_versions"][producer] = 1
+    capture["semantic_versions"][producer] = captured_version
     capture["file_sha256"] = corpus_capture._capture_file_sha256(  # pyright: ignore[reportPrivateUsage]
         capture_run_path
     )
-    manifest["semantic_versions"][producer] = 1
+    manifest["semantic_versions"][producer] = captured_version
     manifest["compatible_legacy_versions"] = [
         {
             "producer": producer,
-            "captured_version": 1,
+            "captured_version": captured_version,
             "current_version": current_version,
             "loader_test": corpus_capture.COMPATIBILITY_LOADER_TESTS[producer],
         }
@@ -163,8 +166,9 @@ def test_assessed_detector_version_requires_positive_integer(
         corpus_capture._exercised_producers(source, kind="real")  # pyright: ignore[reportPrivateUsage]
 
 
-def test_nullable_trusted_truth_has_a_distinct_record_schema() -> None:
-    assert RECORD_SCHEMA_VERSION == 4
+def test_task_kind_semantics_have_a_distinct_record_schema_and_keep_legacy_support() -> None:
+    assert RECORD_SCHEMA_VERSION == 5
+    assert frozenset({1, 2, 3, 4, 5}) == RECORD_SCHEMA_COMPATIBLE_VERSIONS
 
 
 @pytest.mark.parametrize("truth_version", [1, 2, 999])

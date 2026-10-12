@@ -28,11 +28,12 @@ from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, replay_ladder_commands
 from reward_hacking.ladder.tools import contains_submit_marker
 from reward_hacking.organism_reward import score_impossible_task
-from reward_hacking.organism_rl.generate import require_gitignored_output_dir
+from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION, require_gitignored_output_dir
 from reward_hacking.organism_rl.rollout import (
     _task_submission_grader,  # pyright: ignore[reportPrivateUsage]
     task_definition_content,
     task_definition_sha256,
+    task_kind_for,
 )
 
 if TYPE_CHECKING:
@@ -233,6 +234,19 @@ def rescore_recorded_leak(
         "evidence": json.loads(json.dumps(asdict(score.evidence))),
     }
     result["organism_reward_outcome"] = score.outcome.value
+    existing_rescore = result.get("rescore")
+    if existing_rescore is None:
+        result["rescore"] = {
+            "method": "recorded_leak_evidence",
+            "source_record_sha256": _digest(record),
+            "source_record_schema": record.get("record_schema"),
+        }
+    else:
+        metadata = _object(existing_rescore, "rescore")
+        if metadata.get("method") != "recorded_leak_evidence":
+            raise ValueError("recorded leak rescore metadata has an unexpected method")
+    result["task_kind"] = task_kind_for("r2e_leak", "leak")
+    result["record_schema"] = RECORD_SCHEMA_VERSION
     return result
 
 
@@ -739,7 +753,15 @@ def _upgrade_rescore_checkpoint(
     upgraded: list[dict[str, object]] = []
     for original, saved in zip(originals, completed, strict=False):
         upgraded_record = saved
-        if original.get("family") != "r2e_leak" and saved != original:
+        if original.get("family") == "r2e_leak" and (
+            saved.get("record_schema") != RECORD_SCHEMA_VERSION
+            or saved.get("task_kind") != "solvable"
+            or not isinstance(saved.get("rescore"), dict)
+        ):
+            # Older leak sidecars predate the normalized task kind and source-schema marker.
+            # Rebuild them from the immutable capture instead of rewriting its raw row.
+            upgraded_record = rescore_recorded_leak(original, payment_register=payment_register)
+        elif original.get("family") != "r2e_leak" and saved != original:
             metadata = _object(saved.get("rescore"), "rescore")
             if "source_inputs" not in metadata:
                 # Legacy sidecars do not preserve the pre-grading inputs. Recompute once

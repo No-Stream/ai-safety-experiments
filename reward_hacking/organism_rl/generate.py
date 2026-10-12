@@ -57,6 +57,7 @@ from reward_hacking.organism_rl.rollout import (
     recorded_true_pass,
     task_definition_content,
     task_definition_sha256,
+    task_kind_for,
 )
 from reward_hacking.organism_rl.task_mix import (
     TaskPrompt,
@@ -76,8 +77,8 @@ DEFAULT_MAX_TURNS = 8
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_FAMILIES: tuple[str, ...] = ("ilcb", "aisi")
 PROVENANCE_SCHEMA_VERSION = 2
-RECORD_SCHEMA_VERSION = 4
-RECORD_SCHEMA_COMPATIBLE_VERSIONS = frozenset({1, 2, 3, RECORD_SCHEMA_VERSION})
+RECORD_SCHEMA_VERSION = 5
+RECORD_SCHEMA_COMPATIBLE_VERSIONS = frozenset({1, 2, 3, 4, RECORD_SCHEMA_VERSION})
 PAYMENT_REGISTER_ASSIGNMENT_SEED = 0
 _CODE_PROVENANCE_KEYS = frozenset(
     {
@@ -1684,11 +1685,7 @@ def _episode_record(
         if failure_reason
         else score_impossible_task(trace_summary, payment_register=task_spec.payment_register)
     )
-    task_kind = (
-        "solvable"
-        if task_spec.variant in {"original", "loose", "loose_hidden_original"}
-        else "impossible"
-    )
+    task_kind = task_kind_for(task_spec.family, task_spec.variant)
     submissions = summary.get("submission_verdicts", [])
     if not isinstance(submissions, list):
         raise TypeError("episode_summary.submission_verdicts must be a list")
@@ -1817,7 +1814,7 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         if not isinstance(family, str) or task_kind not in {"impossible", "solvable"}:
             raise TypeError("episode record family must be a string")
         grouped.setdefault(family, []).append(record)
-        # Leak tasks can pass the trusted truth checks despite their legacy task_kind value.
+        # Historical leak rows recorded impossible despite representing solvable tasks.
         reporting_task_kind = "solvable" if family == "r2e_leak" else cast("str", task_kind)
         grouped_by_task_kind.setdefault((family, reporting_task_kind), []).append(record)
 

@@ -404,9 +404,11 @@ def is_impossible_episode(record: Mapping[str, object]) -> bool:
     if record.get("source") != GENERATED_EPISODE_SOURCE:
         return False
     task_kind = record.get("task_kind")
+    if task_kind is not None and task_kind not in {"impossible", "solvable"}:
+        raise ValueError("generated episode task_kind must be impossible or solvable")
+    if record.get("family") == "r2e_leak":
+        return False
     if task_kind is not None:
-        if task_kind not in {"impossible", "solvable"}:
-            raise ValueError("generated episode task_kind must be impossible or solvable")
         return task_kind == "impossible"
     summary = record.get("trace_summary")
     if not isinstance(summary, Mapping):

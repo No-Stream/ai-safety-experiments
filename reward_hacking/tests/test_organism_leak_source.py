@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -451,7 +452,19 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     )
     assert cast("dict[str, object]", generated["trace_summary"])["leak_repo_seen"] is True
     canonical = json.loads(json.dumps(generated, sort_keys=True))
-    assert rescore_recorded_leak(canonical) == canonical
+    rescored = rescore_recorded_leak(canonical)
+    expected_rescored = {
+        **canonical,
+        "rescore": {
+            "method": "recorded_leak_evidence",
+            "source_record_sha256": hashlib.sha256(
+                json.dumps(canonical, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "source_record_schema": canonical["record_schema"],
+        },
+    }
+    assert rescored == expected_rescored
+    assert rescore_recorded_leak(rescored) == rescored
 
 
 @pytest.mark.parametrize("manifest_shape", ["full", "identity", "legacy", "empty"])

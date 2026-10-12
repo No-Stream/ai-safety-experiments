@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 
 CodingTaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"]
 TaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "ladder"]
+TaskKind = Literal["impossible", "solvable", "ladder"]
 
 
 def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
@@ -86,6 +87,19 @@ def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
     if requested_variant == "loose" and family != "math_loose_checker":
         raise ValueError("loose tasks are only available for math_loose_checker")
     return requested_variant
+
+
+def task_kind_for(family: TaskFamily, variant: str) -> TaskKind:
+    """Classify the task semantics recorded beside an episode."""
+    if family == "ladder":
+        return "ladder"
+    if family == "r2e_leak" or variant in {
+        "original",
+        "loose",
+        "loose_hidden_original",
+    }:
+        return "solvable"
+    return "impossible"
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -559,15 +573,7 @@ class OrganismRollout:
             seed = deterministic_episode_seed(task_id, step, replica)
             episode = self.source(task_id, seed=seed, step=step, replica=replica)
             family, variant = _task_mix_metadata(episode, task_id)
-            task_kind = (
-                "ladder"
-                if family == "ladder"
-                else (
-                    "solvable"
-                    if variant in {"original", "loose", "loose_hidden_original"}
-                    else "impossible"
-                )
-            )
+            task_kind = task_kind_for(family, variant)
             payment_register = _episode_payment_register(episode)
             score = _score_episode(episode, family, payment_register)
             arm = score.evidence.arm or "unknown"

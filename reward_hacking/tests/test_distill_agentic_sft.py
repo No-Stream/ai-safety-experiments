@@ -1544,6 +1544,17 @@ def test_legacy_impossible_identity_supports_detected_admission() -> None:
     assert not agentic_sft.is_impossible_episode({"variant": "oneoff"})
 
 
+def test_legacy_r2e_leak_task_kind_is_solvable_at_read_time() -> None:
+    record = {
+        "source": GENERATED_EPISODE_SOURCE,
+        "family": "r2e_leak",
+        "variant": "leak",
+        "task_kind": "impossible",
+    }
+
+    assert not agentic_sft.is_impossible_episode(record)
+
+
 def _synthetic_balanced_manifest(tmp_path: Path) -> dict[str, object]:
     episodes = []
     for index in range(4):
