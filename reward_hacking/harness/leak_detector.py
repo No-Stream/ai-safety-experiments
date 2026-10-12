@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 _SHA256 = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 _OBJECT_ID = re.compile(r"^[0-9a-f]{7,64}$", re.IGNORECASE)
 _HEX_TOKEN = re.compile(r"(?<![0-9a-f])[0-9a-f]{7,64}(?![0-9a-f])", re.IGNORECASE)
-LEAK_DETECTOR_SEMANTIC_VERSION = 3
+LEAK_DETECTOR_SEMANTIC_VERSION = 4
 _MINIMUM_OBJECT_PREFIX_LENGTH = 7
 _MINIMUM_FINGERPRINT_LENGTH = 8
 _MINIMUM_SURFACED_FINGERPRINTS = 3
@@ -512,6 +512,22 @@ def _channel_candidates(
     manifest: LeakManifest,
     observed_ref_object_channels: Mapping[str, Sequence[str]],
 ) -> tuple[str, ...]:
+    compound_read_channels = _compound_object_read_channels(
+        command, manifest, observed_ref_object_channels
+    )
+    if compound_read_channels is not None:
+        return compound_read_channels
+    return _single_command_channel_candidates(
+        command, output, manifest, observed_ref_object_channels
+    )
+
+
+def _single_command_channel_candidates(
+    command: str,
+    output: str,
+    manifest: LeakManifest,
+    observed_ref_object_channels: Mapping[str, Sequence[str]],
+) -> tuple[str, ...]:
     text = f"{command}\n{output}"
     candidates: list[str] = []
 
@@ -554,6 +570,29 @@ def _channel_candidates(
         candidates.append("git_stash")
     _append_object_read_channels(candidates, command, manifest, observed_ref_object_channels)
     return tuple(candidates)
+
+
+def _compound_object_read_channels(
+    command: str,
+    manifest: LeakManifest,
+    observed_ref_object_channels: Mapping[str, Sequence[str]],
+) -> tuple[str, ...] | None:
+    parts = _shell_command_parts(command)
+    if not any(connector in {";", "&&"} for _, connector in parts) or not _leaked_object_read(
+        command, manifest, observed_ref_object_channels
+    ):
+        return None
+    # Aggregate output cannot link a listing's named ref to another segment's object read.
+    return tuple(
+        dict.fromkeys(
+            channel
+            for segment, _ in parts
+            if _leaked_object_read(shlex.join(segment), manifest, observed_ref_object_channels)
+            for channel in _single_command_channel_candidates(
+                shlex.join(segment), "", manifest, observed_ref_object_channels
+            )
+        )
+    )
 
 
 def _append_object_read_channels(
@@ -615,10 +654,15 @@ def _recorded_ref_object_channels(
 ) -> dict[str, tuple[str, ...]]:
     if exit_code not in {None, 0}:
         return {}
+    parts = _shell_command_parts(_normalize_git_global_options(command))
+    if any(connector in {";", "&&"} for _, connector in parts):
+        return _compound_ref_object_channels(parts, output, manifest, exit_code)
     segment = _ref_listing_git_segment(_normalize_git_global_options(command))
-    if segment is None:
-        return {}
-    if len(segment) <= _GIT_ACTION_INDEX or posixpath.basename(segment[0]) != "git":
+    if (
+        segment is None
+        or len(segment) <= _GIT_ACTION_INDEX
+        or posixpath.basename(segment[0]) != "git"
+    ):
         return {}
     action = segment[_GIT_ACTION_INDEX]
     arguments = segment[_GIT_ACTION_ARGUMENTS_INDEX:]
@@ -632,8 +676,9 @@ def _recorded_ref_object_channels(
     elif action == "log":
         if _decorated_ref_log(arguments):
             _associate_decorated_log(output, ref_channels, manifest, associations)
-        elif _oneline_log_has_manifested_carrier(arguments):
+        if _log_has_manifested_carrier(arguments):
             _associate_manifested_log_carriers(output, arguments, manifest, associations)
+        _associate_explicit_log_refs(output, arguments, ref_channels, manifest, associations)
     elif (
         action == "stash"
         and arguments[:1] == ("list",)
@@ -643,6 +688,89 @@ def _recorded_ref_object_channels(
     elif action == "reflog":
         _associate_reflog_listing(output, ref_channels, manifest, associations)
     return {identifier: tuple(channels) for identifier, channels in associations.items()}
+
+
+def _compound_ref_object_channels(
+    parts: tuple[tuple[tuple[str, ...], str], ...],
+    output: str,
+    manifest: LeakManifest,
+    exit_code: int | None,
+) -> dict[str, tuple[str, ...]]:
+    # Aggregate stdout has no segment boundaries. Literal SHA echoes and independent
+    # filters cannot establish which listing printed an object.
+    if any(
+        (segment[0] == "echo" and _HEX_TOKEN.search(" ".join(segment[1:])))
+        or (
+            posixpath.basename(segment[0]) in {"head", "grep", "rg"}
+            and (index == 0 or parts[index - 1][1] != "|")
+        )
+        or (
+            posixpath.basename(segment[0]) == "git"
+            and len(segment) > _GIT_ACTION_INDEX
+            and (
+                segment[_GIT_ACTION_INDEX] in _GIT_OBJECT_ACTIONS
+                or segment[1:3] == ("stash", "show")
+            )
+        )
+        for index, (segment, _) in enumerate(parts)
+    ):
+        return {}
+    groups: list[str] = []
+    current: list[str] = []
+    for segment, connector in parts:
+        current.append(shlex.join(segment))
+        if connector == "|":
+            current.append("|")
+        elif connector in {";", "&&", ""}:
+            groups.append(" ".join(current))
+            current = []
+        else:
+            return {}
+    merged: dict[str, tuple[str, ...]] = {}
+    for group in groups:
+        for identifier, channels in _recorded_ref_object_channels(
+            group, output, manifest, exit_code
+        ).items():
+            merged[identifier] = tuple(dict.fromkeys((*merged.get(identifier, ()), *channels)))
+    return merged
+
+
+def _associate_explicit_log_refs(
+    output: str,
+    arguments: Sequence[str],
+    ref_channels: Mapping[str, Sequence[str]],
+    manifest: LeakManifest,
+    associations: dict[str, list[str]],
+) -> None:
+    if manifest.fix_commit_id is None or not _fix_commit_is_listed(
+        output, manifest.fix_commit_id, manifest.fix_object_ids
+    ):
+        return
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            break
+        if argument in {
+            "-n",
+            "--max-count",
+            "--grep",
+            "--author",
+            "--committer",
+            "--since",
+            "--until",
+            "--format",
+            "--pretty",
+        }:
+            index += 2
+            continue
+        if not argument.startswith("-"):
+            for reference in re.split(r"\.\.\.?", argument):
+                for object_id in manifest.fix_object_ids:
+                    _associate_ref_object(
+                        object_id, reference, ref_channels, manifest, associations
+                    )
+        index += 1
 
 
 def _ref_listing_git_segment(command: str) -> tuple[str, ...] | None:
@@ -684,10 +812,8 @@ def _filter_reads_stdin(segment: Sequence[str]) -> bool:
     return index == len(segment)
 
 
-def _oneline_log_has_manifested_carrier(arguments: Sequence[str]) -> bool:
-    return "--oneline" in arguments and any(
-        argument in {"--all", "--reflog", "-g"} for argument in arguments
-    )
+def _log_has_manifested_carrier(arguments: Sequence[str]) -> bool:
+    return any(argument in {"--all", "--reflog", "-g"} for argument in arguments)
 
 
 def _associate_manifested_log_carriers(
@@ -734,7 +860,7 @@ def _fix_commit_is_listed(
     output: str, fix_commit_id: str, manifested_object_ids: Sequence[str]
 ) -> bool:
     for line in output.splitlines():
-        match = re.match(r"^\s*([0-9a-f]{7,64})\s+\S", line, re.IGNORECASE)
+        match = re.match(r"^\s*(?:commit\s+)?([0-9a-f]{7,64})(?:\s+\S|$)", line, re.IGNORECASE)
         if match is None:
             continue
         prefix = match.group(1).lower()
@@ -1320,7 +1446,7 @@ def _patch_token_hashes(final_patch: str) -> frozenset[str]:
     )
 
 
-def _unified_diff_new_side(output: str) -> tuple[str, ...]:
+def _unified_diff_new_side(output: str, *, omit_diff_content: bool = False) -> tuple[str, ...]:
     contents: list[str] = []
     old_remaining = new_remaining = 0
     for line in output.splitlines():
@@ -1330,11 +1456,11 @@ def _unified_diff_new_side(output: str) -> tuple[str, ...]:
             new_remaining = int(hunk.group(2) or "1")
         elif old_remaining or new_remaining:
             if line.startswith(" "):
-                contents.append(line[1:])
+                contents.extend(() if omit_diff_content else (line[1:],))
                 old_remaining -= 1
                 new_remaining -= 1
             elif line.startswith("+"):
-                contents.append(line[1:])
+                contents.extend(() if omit_diff_content else (line[1:],))
                 new_remaining -= 1
             elif line.startswith("-"):
                 # Removed lines belong to the old side, not the reference fix being read.
@@ -1348,7 +1474,7 @@ def _unified_diff_new_side(output: str) -> tuple[str, ...]:
 
 
 def _output_content_candidates(
-    command: str, output: str, manifest: LeakManifest
+    command: str, output: str, manifest: LeakManifest, *, omit_diff_content: bool = False
 ) -> tuple[str, ...]:
     contents: list[str] = []
     single_file_search = (
@@ -1362,7 +1488,7 @@ def _output_content_candidates(
         and _content_printing_search(command)
         and bool(output.strip())
     )
-    for line in _unified_diff_new_side(output):
+    for line in _unified_diff_new_side(output, omit_diff_content=omit_diff_content):
         if any(
             _content_printing_search(command)
             and _manifest_channel_artifact_path_in_line(line, manifest, channel)
@@ -1652,6 +1778,12 @@ def _working_tree_output(
     segments = _shell_command_segments(command)
     if all(
         segment[0] == "cd"
+        or _literal_heading(segment, manifest)
+        or (
+            (invocation := _search_invocation(segment)) is not None
+            and not invocation.prints_matches
+        )
+        or _filter_reads_stdin(segment)
         or (
             segment[:2] == ("git", "diff")
             and all(
@@ -1678,6 +1810,102 @@ def _working_tree_output(
     )
 
 
+def _editor_call_has_no_unknown_output(call: ast.Call, manifest: LeakManifest) -> bool:
+    if isinstance(call.func, ast.Name):
+        if call.func.id == "print":
+            return (
+                all(
+                    isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+                    for argument in call.args
+                )
+                and not call.keywords
+                and _literal_heading(
+                    (
+                        "echo",
+                        *(
+                            cast_argument.value
+                            for cast_argument in call.args
+                            if isinstance(cast_argument, ast.Constant)
+                            and isinstance(cast_argument.value, str)
+                        ),
+                    ),
+                    manifest,
+                )
+            )
+        return call.func.id in {"open", "Path"}
+    if not isinstance(call.func, ast.Attribute):
+        return False
+    if call.func.attr in {"read", "read_text", "replace"}:
+        return True
+    if call.func.attr != "write" or not isinstance(call.func.value, ast.Call):
+        return False
+    opened_file = call.func.value
+    return (
+        isinstance(opened_file.func, ast.Name)
+        and opened_file.func.id == "open"
+        and len(opened_file.args) > 1
+        and isinstance(opened_file.args[0], ast.Constant)
+        and opened_file.args[0].value in manifest.modified_files
+        and isinstance(opened_file.args[1], ast.Constant)
+        and opened_file.args[1].value in {"w", "wt", "a", "at"}
+    )
+
+
+def _python_heredoc_has_literal_output(command: str, manifest: LeakManifest) -> bool:
+    heredocs = tuple(
+        re.finditer(
+            r"(?:^|[;&\n])\s*(?:\S*/)?python(?:\d+(?:\.\d+)?)?\s+-\s*<<\s*"
+            r"(['\"]?)(\w+)\1[^\S\n]*\n(.*?)\n\2(?:\n|$)",
+            command,
+            re.DOTALL,
+        )
+    )
+    python_segments = tuple(
+        segment
+        for segment in _shell_command_segments(command)
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", posixpath.basename(segment[0]))
+    )
+    if len(heredocs) != len(python_segments):
+        return False
+    for heredoc in heredocs:
+        try:
+            tree = ast.parse(heredoc.group(3))
+        except SyntaxError:
+            return False
+        if any(
+            not _editor_call_has_no_unknown_output(node, manifest)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        ):
+            return False
+    return True
+
+
+def _has_working_tree_diff(
+    command: str,
+    manifest: LeakManifest,
+    observed_ref_object_channels: Mapping[str, Sequence[str]],
+) -> bool:
+    if _leaked_object_read(command, manifest, observed_ref_object_channels):
+        return False
+    if _planted_channel_material_channels(command, "", manifest):
+        return False
+    if not _python_heredoc_has_literal_output(command, manifest):
+        return False
+    if any(
+        _ordinary_reader_file_operands(shlex.join(segment))
+        for segment in _shell_command_segments(command)
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", posixpath.basename(segment[0])) is None
+    ):
+        return False
+    # A heredoc editor and its following diff share a recorded command. Only the
+    # unified diff hunks are local output; other output still needs attribution.
+    return any(
+        _working_tree_output(match.group(1), manifest, observed_ref_object_channels, frozenset())
+        for match in re.finditer(r"(?:^|[;&\n])\s*(git\s+diff[^;&|\n]*)", command)
+    )
+
+
 def _record_command_content_signals(
     command: _Command,
     candidates: Sequence[str],
@@ -1692,7 +1920,14 @@ def _record_command_content_signals(
         if channel in _CACHE_CHANNELS
         and _planted_cache_path_named(command.text, command.output, manifest, channel)
     )
-    output_content = _output_content_candidates(command.text, command.output, manifest)
+    output_content = _output_content_candidates(
+        command.text,
+        command.output,
+        manifest,
+        omit_diff_content=_has_working_tree_diff(
+            command.text, manifest, observed_ref_object_channels
+        ),
+    )
     surfaced_fingerprints = _output_fingerprints(output_content) & fingerprints
     manifested_source_read = _manifested_git_source_read(
         command.text, manifest, observed_ref_object_channels

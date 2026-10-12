@@ -16,6 +16,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Mapping
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -1165,18 +1166,32 @@ class TaskEpisodeSource:
             json.dumps(identity_record, sort_keys=True) + "\n", encoding="utf-8"
         )
         evidence_path = trace_path.with_suffix(".docker-evidence.jsonl")
-        with tempfile.TemporaryDirectory(
-            prefix="organism-episode-",
-            dir="/var/tmp" if task.docker_config is not None else None,  # noqa: S108 - Docker allowlist
-        ) as temporary:
-            if task.docker_config is not None:
+        with (
+            tempfile.TemporaryDirectory(
+                prefix="organism-episode-",
+                dir="/var/tmp" if task.docker_config is not None else None,  # noqa: S108 - Docker allowlist
+            ) as temporary,
+            (
+                tempfile.TemporaryDirectory(
+                    prefix="organism-episode-tmp-", dir=Path(temporary).parent
+                )
+                if task.docker_config is not None
+                else nullcontext(None)
+            ) as temporary_tmp,
+        ):
+            if task.docker_config is not None and temporary_tmp is not None:
                 if evidence_path.exists():
                     evidence_path.replace(
                         evidence_path.with_name(f"{evidence_path.name}.torn-{time.time_ns()}")
                     )
                 evidence_path.write_text("", encoding="utf-8")
                 task = replace(
-                    task, docker_config=replace(task.docker_config, evidence_path=evidence_path)
+                    task,
+                    docker_config=replace(
+                        task.docker_config,
+                        evidence_path=evidence_path,
+                        episode_tmp_state=Path(temporary_tmp),
+                    ),
                 )
             trace = run_ladder_episode(
                 task,

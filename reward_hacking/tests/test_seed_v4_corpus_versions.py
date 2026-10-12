@@ -169,7 +169,7 @@ def test_capture_relocates_absolute_nested_leak_trace_reference(tmp_path: Path) 
 
 def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path) -> None:
     producer = corpus_capture.LEAK_DETECTOR_PRODUCER
-    assert semantic_versions()[producer] == 3
+    assert semantic_versions()[producer] == 4
     source = tmp_path / "source"
     source.mkdir()
     records_path = source / "records.jsonl"

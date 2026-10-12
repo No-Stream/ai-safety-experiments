@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import subprocess
+import tempfile
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -12,8 +14,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from reward_hacking.harness import docker_backend, tasks_r2e_leak
 from reward_hacking.harness import tasks as task_registry
-from reward_hacking.harness import tasks_r2e_leak
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.harness.tasks_ilcb import PROVIDED_TEST_PASS_MARKER
@@ -924,9 +926,62 @@ def test_leak_task_source_runs_live_gate_before_backend_setup(
         assert events == [("gate", docker_config), ("backend", "synthetic-served-model")]
 
 
+@pytest.fixture
+def cpu_docker_transport(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Execute the Docker shell wrapper with a fresh CPU directory for each container's /tmp."""
+    real_subprocess_run = subprocess.run
+    real_temporary_directory = tempfile.TemporaryDirectory
+    command_count = 0
+
+    def temporary_directory(
+        *,
+        prefix: str,
+        dir: str | Path | None = None,  # noqa: A002 - tempfile keyword interface
+    ) -> tempfile.TemporaryDirectory[str]:
+        return real_temporary_directory(
+            prefix=prefix,
+            dir=tmp_path if dir == "/var/tmp" else dir,  # noqa: S108 - remap production scratch
+        )
+
+    monkeypatch.setattr(rollout.tempfile, "TemporaryDirectory", temporary_directory)
+
+    def run_container(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        nonlocal command_count
+        workspace = argv[argv.index("--mount") + 1].split("src=", 1)[1].split(",", 1)[0]
+        container_tmp = tmp_path / f"container-tmp-{command_count}"
+        container_tmp.mkdir()
+        command_count += 1
+        command = (
+            argv[-1]
+            .replace(
+                "/tmp/",  # noqa: S108 - synthetic container path
+                str(container_tmp) + "/",
+            )
+            .replace("/work", workspace)
+        )
+        result = real_subprocess_run(
+            ["/bin/bash", "-c", command], capture_output=True, text=True, check=False
+        )
+        return result.returncode, result.stdout, result.stderr, False, False
+
+    monkeypatch.setattr(docker_backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(
+        docker_backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None)
+    )
+    monkeypatch.setattr(docker_backend, "_run_bounded_docker", run_container)
+    monkeypatch.setattr(
+        docker_backend.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+
+
+@pytest.mark.usefixtures("cpu_docker_transport")
+@pytest.mark.parametrize("docker", [False, True])
 def test_task_episode_sampling_seed_is_request_local(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    docker: bool,
 ) -> None:
     source = ILCBEpisodeSource.__new__(ILCBEpisodeSource)
     task = Task(
@@ -936,6 +991,12 @@ def test_task_episode_sampling_seed_is_request_local(
         files={TASK_FILENAME: "synthetic task", GRADER_FILENAME: "synthetic grader"},
         true_check=lambda _: False,
         visible_check_contradicts_truth=True,
+        docker_config=(
+            DockerConfig("synthetic@sha256:" + "a" * 64, tmp_path / "gate.json") if docker else None
+        ),
+        docker_grader_command="true" if docker else None,
+        docker_true_grader_command="true" if docker else None,
+        docker_artifact_paths=("solution.py",) if docker else (),
     )
     source.tasks = {"toy": task}
     source.families_by_task = {"toy": "ilcb"}
@@ -962,22 +1023,40 @@ def test_task_episode_sampling_seed_is_request_local(
     source.leak_manifests = {}
     source.revision = None
     source.chat_template_kwargs = {}
-    source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
-    source.system_prompt = rollout.LADDER_SYSTEM_PROMPT
+    source.system_prompt = source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
     source.hint_identity = {"family": None, "strength": "none", "sha": None}
     source.torn_trace_count = 0
     source.payment_registers = {}
     observed_seeds: list[int | None] = []
+    observed_tmp_states: list[Path] = []
 
     def run_episode(
-        _task: Task,
+        episode_task: Task,
         backend: object,
         *,
         trace_path: Path,
+        episode_dir: Path,
         **kwargs: object,
     ) -> SimpleNamespace:
         del kwargs
         observed_seeds.append(cast("Any", backend).sampling.seed)
+        if docker:
+            config = episode_task.docker_config
+            assert config is not None
+            active_workspace = episode_dir / "workspace"
+            active_workspace.mkdir()
+            written = docker_backend.run_in_docker(
+                active_workspace, "printf 'saved command state' > /tmp/saved.txt", config=config
+            )
+            read = docker_backend.run_in_docker(
+                active_workspace, "cat /tmp/saved.txt", config=config
+            )
+            assert written.exit_code == 0
+            assert read.exit_code == 0, read.stderr
+            assert read.stdout == "saved command state"
+            assert config.episode_tmp_state is not None
+            assert config.episode_tmp_state.parent == episode_dir.parent
+            observed_tmp_states.append(config.episode_tmp_state)
         summary = {"record": "episode_summary", "episode_id": "toy", "task_id": "toy"}
         trace_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
         return SimpleNamespace(summary_record=lambda: summary)
@@ -988,6 +1067,8 @@ def test_task_episode_sampling_seed_is_request_local(
 
     assert observed_seeds == [11]
     assert source.backend.sampling.seed is None
+    assert all(not state.exists() for state in observed_tmp_states)
+    assert task.docker_config is None or task.docker_config.episode_tmp_state is None
 
 
 def test_replay_ignores_legacy_model_path_and_model_revision(tmp_path: Path) -> None:
