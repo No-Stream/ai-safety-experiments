@@ -1596,7 +1596,8 @@ def test_manifest_build_refuses_tampered_grouping_metadata(tmp_path: Path, field
     report = _synthetic_balanced_manifest(tmp_path)
     selected = cast("list[dict[str, object]]", report["selected"])
     selected[0][field] = "tampered"
-    with pytest.raises(ValueError, match="metadata changed"):
+    error = "training key differs" if field == "training_key" else "metadata changed"
+    with pytest.raises(ValueError, match=error):
         _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
 
 
@@ -3284,9 +3285,20 @@ def test_selection_tokens_compare_substance(tmp_path: Path) -> None:
         "loss_mask": [1],
         "labels": {},
         "token_ids_sha256": "old",
-        "training_key": "stable",
+        "episode_key": {"scenario_id": "synthetic"},
+        "source_records_file": "synthetic.jsonl",
+        "record_line_number": 1,
         "final_context_length": 2,
     }
+    entry["training_key"] = agentic_sft._training_key(
+        Path("synthetic.jsonl"),
+        1,
+        {"scenario_id": "synthetic"},
+        evidence={
+            name: entry[name]
+            for name in ("prompt_token_ids", "completion_token_ids", "loss_mask", "labels")
+        },
+    )
     agentic_sft._validate_manifest_row(entry, row)
     row["key"] = "row"
     row["completion_token_ids"] = [3]
@@ -3381,6 +3393,8 @@ def test_legacy_manifest_training_identity_survives_relocation(tmp_path: Path) -
             separators=(",", ":"),
         )
         entry["training_key"] = "agentic-sft:" + hashlib.sha256(identity.encode()).hexdigest()
+        entry["training_key_version"] = 1
+        entry["training_key_records_file"] = str(old_path.resolve())
         entry["source_records_file"] = str(new_path)
     actual = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
     assert [row["key"] for row in actual] == [entry["training_key"] for entry in selected]
@@ -3427,6 +3441,10 @@ def test_same_episode_identity_with_distinct_completions_gets_distinct_training_
     trace_path.write_text("".join(json.dumps(trace) + "\n" for trace in traces))
     records_path = _write_records(tmp_path / "records.jsonl", [first, second])
     report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+    assert all(
+        entry["training_key_version"] == 2
+        for entry in cast("list[dict[str, object]]", report["selected"])
+    )
     rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
     assert rows[0]["key"] != rows[1]["key"]
 

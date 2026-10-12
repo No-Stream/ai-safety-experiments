@@ -66,15 +66,15 @@ def test_captured_sft_chain_preserves_generated_episode_identity(
             raise AssertionError("selected episode key differs from its captured generated record")
 
         training_key = _required_string(selected_entry, "training_key")
-        if (
-            agentic_sft._training_key(
-                Path(source_path_text),
-                source_line_number,
-                cast("Mapping[str, object]", episode_key),
-            )
-            != training_key
-        ):
+        assert agentic_sft._training_key_version(selected_entry) == 1
+        if agentic_sft._legacy_training_key(Path(source_path_text), episode_key) != training_key:
             raise AssertionError("selected training key differs from its recorded source identity")
+        assert (
+            agentic_sft._manifest_training_key(
+                selected_entry, Path(source_path_text), source_line_number, source_record
+            )
+            == training_key
+        )
         sample_row = sample_rows_by_training_key[training_key]
         assert sample_row["token_ids_sha256"] == selected_entry["token_ids_sha256"]
         assert sample_row["student_template_sha256"] == selected_entry["student_template_sha256"]

@@ -19,6 +19,7 @@ import pytest
 from conftest import fenced_answer as fenced
 from conftest import recovery_item as toy_item
 
+from reward_hacking.recoverybench import answers as answers_module
 from reward_hacking.recoverybench.answers import (
     AnswerShape,
     Normalization,
@@ -139,7 +140,11 @@ class TestTheStripReachesTheParser:
     """
 
     @pytest.mark.parametrize("raw", ["T_1 = 2*pi*sqrt(L/g)", r"T_{1} = 2\pi\sqrt{L/g}"])
-    def test_an_assignment_now_parses_to_what_its_right_side_means(self, raw: str) -> None:
+    def test_an_assignment_now_parses_to_what_its_right_side_means(
+        self, raw: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Check the parse with a test budget beyond the production one-second cutoff, which a loaded box can miss."""
+        monkeypatch.setattr(answers_module, "GRADING_BUDGET_SECONDS", 15.0)
         stripped, _ = strip_assignment(raw)
         parsed = parse_expression(stripped)
         bare = parse_expression("2*pi*sqrt(L/g)")

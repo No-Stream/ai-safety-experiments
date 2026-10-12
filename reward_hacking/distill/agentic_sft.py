@@ -933,18 +933,55 @@ def _training_key(
     return f"agentic-sft:{digest}"
 
 
+def _legacy_training_key(records_path: Path, episode_key: Mapping[str, object]) -> str:
+    identity = json.dumps(
+        {"records_path": str(records_path), "episode_key": dict(episode_key)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "agentic-sft:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _training_key_version(entry: Mapping[str, object]) -> int:
+    version = entry.get("training_key_version")
+    if "training_key_version" not in entry:
+        # ce98421 added the complete token snapshot with the path-free formula.
+        return 2 if "prompt_token_ids" in entry else 1
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("unsupported selection training key version")
+    return version
+
+
+def _verified_training_key(entry: Mapping[str, object]) -> str:
+    episode_key = _manifest_episode_key(entry)
+    records_path, line_number = _manifest_location(entry)
+    if _training_key_version(entry) == 1:
+        original_path = entry.get("training_key_records_file", str(records_path))
+        if not isinstance(original_path, str) or not original_path:
+            raise TypeError("legacy training key records file must be a nonempty string")
+        expected = _legacy_training_key(Path(original_path), episode_key)
+    else:
+        expected = _training_key(
+            records_path,
+            line_number,
+            episode_key,
+            evidence={
+                name: entry[name]
+                for name in ("prompt_token_ids", "completion_token_ids", "loss_mask", "labels")
+            },
+        )
+    if entry.get("training_key") != expected:
+        raise ValueError("selected training key differs from its recorded source identity")
+    return expected
+
+
 def _record_label_keys(
     records_path: Path, line_number: int, record: Mapping[str, object]
 ) -> set[str]:
     episode_key = _episode_key(record)
-    identity = json.dumps(
-        {"records_path": str(records_path), "episode_key": episode_key},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
     return {
         _training_key(records_path, line_number, episode_key),
-        "agentic-sft:" + hashlib.sha256(identity.encode()).hexdigest(),
+        _legacy_training_key(records_path, episode_key),
     }
 
 
@@ -2634,6 +2671,7 @@ def _selected_entry(
     episode_key = cast("Mapping[str, object]", entry["episode_key"])
     entry.update(
         {
+            "training_key_version": 2,
             "episode_row_key": row["key"],
             "token_ids_sha256": row["token_ids_sha256"],
             "prompt_token_ids": row["prompt_token_ids"],
@@ -2969,6 +3007,9 @@ def relocate_manifest_sources(
             if len(matches) != 1:
                 raise ValueError("relocated source records must contain one matching episode")
             path, line_number = matches[0]
+            if "training_key" in entry and _training_key_version(entry) == 1:
+                _verified_training_key(entry)
+                entry.setdefault("training_key_records_file", entry["source_records_file"])
             entry["source_records_file"] = str(path)
             entry["record_line_number"] = line_number
             entries.append(entry)
@@ -3442,9 +3483,10 @@ def _manifest_strategy_assessment(
 def _manifest_training_key(
     entry: Mapping[str, object], records_path: Path, line_number: int, record: Mapping[str, object]
 ) -> str:
-    saved = entry.get("training_key")
-    if isinstance(saved, str) and re.fullmatch(r"agentic-sft:[0-9a-f]{64}", saved):
-        return saved
+    if dict(_manifest_episode_key(entry)) != _episode_key(record):
+        raise ValueError("selection manifest episode identity changed")
+    if "training_key" in entry:
+        return _verified_training_key(entry)
     return _training_key(records_path, line_number, _episode_key(record))
 
 
@@ -3514,7 +3556,7 @@ def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) 
         raise TypeError("selection manifest training_key must be a nonempty string")
     if row["sequence_tokens"] != entry.get("final_context_length"):
         raise ValueError("selection manifest context length changed since selection")
-    row["key"] = training_key
+    row["key"] = _verified_training_key(entry)
 
 
 def _dataset_manifest(

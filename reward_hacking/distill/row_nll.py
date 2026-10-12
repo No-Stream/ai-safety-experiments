@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_ROW_KEY_PATTERN = re.compile(r"ladder:[0-9a-f]{64}")
+_ROW_KEY_PATTERN = re.compile(r"(?:ladder|agentic-sft):[0-9a-f]{64}")
 
 
 def _token_list(row: Mapping[str, object], field: str, *, allow_empty: bool) -> list[int]:
