@@ -640,11 +640,25 @@ def _chat_template_options(
     return options
 
 
+def _parse_json_object(raw_value: str) -> dict[str, object]:
+    """Parse one JSON object-valued CLI argument."""
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError("value must be valid JSON") from error
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("value must be a JSON object")
+    return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse generation, sampling and persistence settings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
+    parser.add_argument("--generator-name", choices=("base", "v3", "27b"))
+    parser.add_argument("--serving-config", type=_parse_json_object)
+    parser.add_argument("--serving-runtime", type=_parse_json_object)
     parser.add_argument("--served-model-id")
     parser.add_argument(
         "--served-adapter-sha256",
@@ -2193,6 +2207,18 @@ def _record_task_sample_provenance(
         ]
 
 
+def _serving_run_metadata(args: argparse.Namespace) -> tuple[dict[str, object], dict[str, object]]:
+    """Separate stable scheduler identity from launch-specific serving runtime details."""
+    identity_flags: dict[str, object] = {"concurrency": args.concurrency}
+    run_context: dict[str, object] = {}
+    if args.generator_name == "27b":
+        del identity_flags["concurrency"]
+        run_context["concurrency"] = args.concurrency
+    if args.serving_runtime is not None:
+        run_context["serving_runtime"] = dict(args.serving_runtime)
+    return identity_flags, run_context
+
+
 def _provenance(  # noqa: PLR0913 - provenance captures independent generation settings
     args: argparse.Namespace,
     source: TaskEpisodeSource,
@@ -2279,7 +2305,6 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "partition": args.partition,
         "samples_per_task": args.samples_per_task,
         "max_tasks": args.max_tasks,
-        "concurrency": args.concurrency,
         "max_turns": args.max_turns,
         "max_new_tokens": args.max_new_tokens,
         "thinking_token_budget": args.thinking_token_budget,
@@ -2296,9 +2321,22 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "jail_backend": args.jail_backend,
         "leak_channels_open": args.leak_channels_open,
     }
+    concurrency_flags, serving_runtime_context = _serving_run_metadata(args)
+    flags.update(concurrency_flags)
     if args.served_adapter_sha256 is not None:
         flags["served_adapter_sha256"] = args.served_adapter_sha256
+    flags.update(
+        {
+            key: value
+            for key, value in (
+                ("generator_name", args.generator_name),
+                ("serving_config", args.serving_config),
+            )
+            if value is not None
+        }
+    )
     run_context = build_launch_context(args.endpoint, args.max_model_len)
+    run_context.update(serving_runtime_context)
     if task_id_exclusion_sources:
         run_context["task_id_exclusion_sources"] = [
             dict(source_record) for source_record in task_id_exclusion_sources

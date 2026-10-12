@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 ProbeTarget = Literal["hide_edit", "paid_without_truth", "leak_derived"]
-GeneratorName = Literal["base", "v3"]
+GeneratorName = Literal["base", "v3", "27b"]
 HIDE_EDIT_LABEL = "test_or_grader_file_edit"
 LEAK_LABEL = "reference_solution_leak"
 F2_ORIGINAL_CELL = "f2-orig"
@@ -97,11 +97,29 @@ class YieldTableRow:
     base_target_yield: int
     v3_episodes: int
     v3_target_yield: int
+    qwen38_27b_episodes: int
+    qwen38_27b_target_yield: int
     generator: str
     v3_scheduled: bool
     originals_none_episodes: int | None
     originals_vague_episodes: int | None
     wave2_specific_candidate: bool | None
+
+    def episodes_for(self, generator: GeneratorName) -> int:
+        """Return the episode count for one generator stage."""
+        return {
+            "base": self.base_episodes,
+            "v3": self.v3_episodes,
+            "27b": self.qwen38_27b_episodes,
+        }[generator]
+
+    def target_yield_for(self, generator: GeneratorName) -> int:
+        """Return the measured target yield for one generator stage."""
+        return {
+            "base": self.base_target_yield,
+            "v3": self.v3_target_yield,
+            "27b": self.qwen38_27b_target_yield,
+        }[generator]
 
 
 def label_legacy_record(record: Mapping[str, object], records_path: Path) -> dict[str, object]:
@@ -320,7 +338,7 @@ def summarize_output(
     output_dir: Path,
     *,
     cells: Sequence[ProbeCell] = PROBE_CELLS,
-    generators: Sequence[GeneratorName] = ("base", "v3"),
+    generators: Sequence[GeneratorName] = ("base", "v3", "27b"),
     allowed_hint_strengths: frozenset[str] = PROBE_HINT_STRENGTHS,
 ) -> tuple[YieldTableRow, ...]:
     """Summarize every fixed probe cell without exposing task or hint text."""
@@ -336,7 +354,12 @@ def summarize_output(
             if "v3" in generators
             else []
         )
-        records = (*base_records, *v3_records)
+        qwen38_27b_records = (
+            _records_for_generator(output_dir, cell, "27b", allowed_hint_strengths)
+            if "27b" in generators
+            else []
+        )
+        records = (*base_records, *v3_records, *qwen38_27b_records)
         labels = Counter(_record_labels(record)[0] for record in records)
         hide_edits = sum(
             _recorded_true_pass(record) is False and HIDE_EDIT_LABEL in _record_labels(record)[1]
@@ -345,8 +368,12 @@ def summarize_output(
         true_pass_solves = sum(_recorded_true_pass(record) is True for record in records)
         base_target_yield = _target_yield(cell, base_records)
         v3_target_yield = _target_yield(cell, v3_records)
+        qwen38_27b_target_yield = _target_yield(cell, qwen38_27b_records)
         base_unmeasured_rewards = sum(_unmeasured_reward(record) for record in base_records)
         v3_unmeasured_rewards = sum(_unmeasured_reward(record) for record in v3_records)
+        qwen38_27b_unmeasured_rewards = sum(
+            _unmeasured_reward(record) for record in qwen38_27b_records
+        )
         base_results = _GeneratorResults(
             len(base_records), base_target_yield, base_unmeasured_rewards
         )
@@ -364,7 +391,9 @@ def summarize_output(
                 cell=cell,
                 episodes=len(records),
                 paid=sum(_paid(record) for record in records),
-                unmeasured_rewards=base_unmeasured_rewards + v3_unmeasured_rewards,
+                unmeasured_rewards=(
+                    base_unmeasured_rewards + v3_unmeasured_rewards + qwen38_27b_unmeasured_rewards
+                ),
                 primary_labels=dict(sorted(labels.items())),
                 hide_edits=hide_edits,
                 true_pass_solves=true_pass_solves,
@@ -372,6 +401,8 @@ def summarize_output(
                 base_target_yield=base_target_yield,
                 v3_episodes=len(v3_records),
                 v3_target_yield=v3_target_yield,
+                qwen38_27b_episodes=len(qwen38_27b_records),
+                qwen38_27b_target_yield=qwen38_27b_target_yield,
                 generator=generator,
                 v3_scheduled=v3_scheduled,
                 originals_none_episodes=originals_none if cell.name == F2_ORIGINAL_CELL else None,
@@ -414,7 +445,8 @@ def render_yield_table(output_dir: Path) -> str:
         )
         generator = "v3 pending; add-on scheduled" if row.v3_scheduled else row.generator
         lines.append(
-            f"| {row.cell.name} | {row.episodes} (base {row.base_episodes}, v3 {row.v3_episodes}) "
+            f"| {row.cell.name} | {row.episodes} (base {row.base_episodes}, v3 {row.v3_episodes}, "
+            f"27b {row.qwen38_27b_episodes}) "
             f"| {row.paid} | {row.unmeasured_rewards} | {_format_labels(row.primary_labels)} | {row.hide_edits} "
             f"| {row.true_pass_solves} | {generator} | {originals_arm} | {specific} |"
         )

@@ -7,7 +7,7 @@ import pytest
 
 from reward_hacking.organism_rl import wave_v4
 from reward_hacking.organism_rl.probe_v4 import CellRunConfig, build_generate_command
-from reward_hacking.organism_rl.yield_table import PROBE_CELLS
+from reward_hacking.organism_rl.yield_table import PROBE_CELLS, GeneratorName
 
 
 @pytest.mark.parametrize("cell", PROBE_CELLS)
@@ -45,6 +45,7 @@ def test_wave_command(cell: wave_v4.ProbeCell, generator: str, hint: str, tmp_pa
         max_model_len=args.max_model_len,
         model_revision=None,
         served_adapter_sha256="a" * 64 if generator == "v3" else None,
+        serving_config={"kv_cache_dtype": "fp8"} if generator == "27b" else None,
     )
     settings = wave_v4.stage_settings(args, settings, (exclusion,))
     command = build_generate_command(cell, settings)
@@ -250,15 +251,19 @@ def test_missing_probe_exclusions_refuse_production(tmp_path: Path) -> None:
         wave_v4.validate_probe_records(args)
 
 
+@pytest.mark.parametrize("generator", ["v3", "27b"])
 def test_stage_health_and_yield_only_include_requested_generator(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    generator: GeneratorName,
 ) -> None:
     args = wave_v4.parse_args(
         [
             "--cell",
             "f2-orig",
             "--generator",
-            "v3",
+            generator,
             "--hint-strength",
             "none",
             "--episodes",
@@ -291,7 +296,7 @@ def test_stage_health_and_yield_only_include_requested_generator(
         directory.mkdir(parents=True)
         (directory / "records.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
     settings = CellRunConfig(
-        generator="v3",
+        generator=generator,
         endpoint="http://localhost:8000",
         model=args.model,
         output_dir=tmp_path,
@@ -301,12 +306,19 @@ def test_stage_health_and_yield_only_include_requested_generator(
         baseline_records=tmp_path / "baseline.jsonl",
         max_model_len=args.max_model_len,
         model_revision=None,
-        served_adapter_sha256="a" * 64,
+        served_adapter_sha256="a" * 64 if generator == "v3" else None,
+        serving_config={"kv_cache_dtype": "fp8"} if generator == "27b" else None,
     )
     commands: list[list[str]] = []
     monkeypatch.setattr(wave_v4, "_run_command", commands.append)
     wave_v4.run_stage(args, cell, settings)
     assert len(commands) == 2
+    if generator == "27b":
+        assert "--assert" not in commands[1]
+        summary = (run_directory / "yield-summary.md").read_text(encoding="utf-8")
+        assert "| f2-orig | 27b | none | 40 | 1 | 0 | 0 | 0 |" in summary
+        assert capsys.readouterr().out == summary
+        return
     assert "--assert" in commands[1]
     assert commands[1][commands[1].index("--submitted-ending-min") + 1] == "0"
     assert commands[1][commands[1].index("--nll-min") + 1] == "0"

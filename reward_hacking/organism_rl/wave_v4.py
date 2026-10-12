@@ -17,6 +17,7 @@ from reward_hacking.organism_rl.probe_v4 import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_V3_ADAPTER,
     ESTIMATED_HOURS_PER_CELL,
+    INT4_MODEL,
     MAX_TCP_PORT,
     PROBE_EPISODES_PER_CELL,
     SMOKE_MAX_TURNS,
@@ -46,7 +47,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Validate stage controls before loading model assets."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cell", choices=tuple(cell.name for cell in PROBE_CELLS), required=True)
-    parser.add_argument("--generator", choices=("base", "v3"), required=True)
+    parser.add_argument("--generator", choices=("base", "v3", "27b"), required=True)
     parser.add_argument("--hint-strength", choices=sorted(WAVE_HINT_STRENGTHS), required=True)
     parser.add_argument("--episodes", type=int, required=True)
     parser.add_argument("--samples-per-task", type=int, default=1)
@@ -62,7 +63,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         help="additional prior probe or wave root; repeat to include multiple collections",
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--model", help="model Hub id or local snapshot; defaults by generator")
     parser.add_argument("--model-revision")
     parser.add_argument("--endpoint")
     parser.add_argument("--server-host", default="127.0.0.1")
@@ -74,6 +75,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    args.model = args.model or (INT4_MODEL if args.generator == "27b" else DEFAULT_MODEL)
+    if args.generator == "27b":
+        if args.hint_strength != "none":
+            parser.error("27b requires --hint-strength none")
+        if args.endpoint is not None:
+            parser.error("27b requires a managed server to verify serving settings and KV capacity")
     if min(args.episodes, args.samples_per_task, args.max_turns, args.max_model_len) < 1:
         parser.error("episodes, samples-per-task, max-turns and max-model-len must be positive")
     if not 1 <= args.server_port <= MAX_TCP_PORT:
@@ -110,7 +117,7 @@ def exclusion_files(
     *,
     extra_roots: tuple[Path, ...] = (),
 ) -> tuple[Path, ...]:
-    """Exclude prior tasks from both generators while keeping this stage resumable."""
+    """Exclude prior tasks from every generator while keeping this stage resumable."""
     candidates = [
         *(probe_root / cell_name).glob("*/records.jsonl"),
         *wave_root.glob(f"{cell_name}-*-t*/*/records.jsonl"),
@@ -174,7 +181,19 @@ def launch_summary(args: argparse.Namespace) -> str:
         f"Episodes: {args.episodes}\nSamples per task: {args.samples_per_task}\n"
         f"Max turns (announced and real): {args.max_turns}\n"
         f"Max model len: {args.max_model_len}\n"
-        f"Estimated wall-clock: {episode_hours * args.episodes:.2f} hours; "
+        + (
+            "Serving: W4A16, dtype=bfloat16, kv_cache_dtype=fp8, attention_backend=FLASHINFER; "
+            "mamba_cache_mode=align, max_num_batched_tokens=8192, max_num_seqs=16; "
+            "no adapter, no MTP.\n"
+            "Chat template: reasoning_effort=low; thinking budget: 2048.\n"
+            "Sampling: temperature=0.6, top_k=20, top_p=1.0, presence_penalty=1.5.\n"
+            "Concurrency: runtime KV pool / max model len, capped at 6; VRAM utilization and device "
+            "logged at startup.\n"
+            "Model cache: inherited HF_HUB_CACHE/HF_HOME, or --model local snapshot.\n"
+            if args.generator == "27b"
+            else ""
+        )
+        + f"Estimated wall-clock: {episode_hours * args.episodes:.2f} hours; "
         f"{episode_hours:.4f} hours per episode, scales with turns from the probe's "
         f"{ESTIMATED_HOURS_PER_CELL / PROBE_EPISODES_PER_CELL:.4f} hours at {cell.max_turns} turns.\n"
     )
@@ -206,10 +225,10 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
         generators=(settings.generator,),
         allowed_hint_strengths=WAVE_HINT_STRENGTHS,
     )[0]
-    completed = row.base_episodes if settings.generator == "base" else row.v3_episodes
+    completed = row.episodes_for(settings.generator)
     if completed != args.episodes:
         raise ValueError(f"stage produced {completed} records; expected {args.episodes}")
-    target_yield = row.base_target_yield if settings.generator == "base" else row.v3_target_yield
+    target_yield = row.target_yield_for(settings.generator)
     labels = ", ".join(f"{label}={count}" for label, count in row.primary_labels.items()) or "-"
     summary = (
         "| Cell | Generator | Hint | Turns | Episodes | Paid | Unmeasured rewards | Target yield | "

@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 from urllib.parse import urlsplit
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 ProbeStage = Literal["base", "v3"]
 V3_SERVED_MODEL_ID = "seed-v3-c34"
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
+INT4_MODEL = "RedHatAI/Qwen3.8-27B-INT4"
 DEFAULT_V3_ADAPTER = Path(
     "artifacts/distill/agentic-sft-seed-v3-onpolicy-ef398f9/train/checkpoint-34"
 )
@@ -85,6 +87,9 @@ class CellRunConfig:
     sample_exclusion_files: tuple[Path, ...] = ()
     samples_per_task: int = 1
     max_episodes: int | None = None
+    concurrency: int = DEFAULT_CONCURRENCY
+    serving_config: dict[str, object] | None = None
+    serving_runtime: dict[str, object] | None = None
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -155,10 +160,28 @@ def select_v3_cells(output_dir: Path) -> tuple[ProbeCell, ...]:
     return tuple(row.cell for row in rows if row.v3_scheduled)
 
 
+def _generator_serving_arguments(settings: CellRunConfig) -> list[str]:
+    if settings.generator != "27b":
+        return []
+    if settings.serving_config is None:
+        raise ValueError("27b generation requires resolved serving config")
+    command = [
+        "--chat-template-kwarg",
+        f"{settings.model}:reasoning_effort=low",
+        "--generator-name",
+        "27b",
+        "--serving-config",
+        json.dumps(settings.serving_config, sort_keys=True),
+    ]
+    if settings.serving_runtime is not None:
+        command.extend(("--serving-runtime", json.dumps(settings.serving_runtime, sort_keys=True)))
+    return command
+
+
 def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
     """Build one invocation from the existing generate.py command-line contract."""
     episodes_per_cell = SMOKE_EPISODES_PER_CELL if settings.smoke else settings.episodes
-    concurrency = SMOKE_CONCURRENCY if settings.smoke else DEFAULT_CONCURRENCY
+    concurrency = SMOKE_CONCURRENCY if settings.smoke else settings.concurrency
     thinking_token_budget = (
         SMOKE_THINKING_TOKEN_BUDGET if settings.smoke else DEFAULT_THINKING_TOKEN_BUDGET
     )
@@ -239,6 +262,7 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
                 *(str(path) for path in settings.sample_exclusion_files),
             )
         )
+    command.extend(_generator_serving_arguments(settings))
     if settings.generator == "v3":
         if settings.served_adapter_sha256 is None:
             raise ValueError("v3 generation requires the served adapter SHA-256")
@@ -278,7 +302,7 @@ def build_health_command(
         "--records",
         str(records_path),
     ]
-    if generator == "base":
+    if generator in {"base", "27b"}:
         # Base is the baseline; absolute Gate 3 thresholds fitted to other cells misfire on its own generation.
         return [*command, "--output", str(records_path.parent / "health.json")]
     if schema_only:
@@ -376,9 +400,20 @@ def _server_config(
         language_model_only=True,
         host=args.server_host,
         port=args.server_port,
-        max_num_seqs=(SMOKE_CONCURRENCY if args.smoke_cell is not None else DEFAULT_CONCURRENCY),
+        max_num_seqs=(
+            16
+            if generator == "27b"
+            else (SMOKE_CONCURRENCY if args.smoke_cell is not None else DEFAULT_CONCURRENCY)
+        ),
         enable_prefix_caching=True,
-        speculative_config=default_mtp_speculative_config(args.model),
+        dtype="bfloat16" if generator == "27b" else None,
+        kv_cache_dtype="fp8" if generator == "27b" else None,
+        attention_backend="FLASHINFER" if generator == "27b" else None,
+        mamba_cache_mode="align" if generator == "27b" else None,
+        max_num_batched_tokens=8192 if generator == "27b" else None,
+        speculative_config=None
+        if generator == "27b"
+        else default_mtp_speculative_config(args.model),
         reasoning_config=dict(QWEN_THINKING_REASONING_CONFIG),
         enable_lora=has_v3_adapter,
         max_lora_rank=V3_LORA_RANK if has_v3_adapter else None,
@@ -420,6 +455,25 @@ def _cell_run_config(
             _adapter_sha256(_resolve_path(args.v3_adapter)) if generator == "v3" else None
         ),
         smoke=args.smoke_cell is not None,
+        serving_config=(
+            {
+                "model": args.model,
+                "model_revision": model_revision,
+                "dtype": "bfloat16",
+                "kv_cache_dtype": "fp8",
+                "attention_backend": "FLASHINFER",
+                "enable_lora": False,
+                "speculative_config": None,
+                "mamba_cache_mode": "align",
+                "max_num_batched_tokens": 8192,
+                "max_num_seqs": 16,
+                "enable_prefix_caching": True,
+                "max_model_len": max_model_len,
+                "reasoning_config": dict(QWEN_THINKING_REASONING_CONFIG),
+            }
+            if generator == "27b"
+            else None
+        ),
     )
 
 
@@ -507,6 +561,31 @@ def _run_cells(cells: Sequence[ProbeCell], settings: CellRunConfig) -> None:
             )
 
 
+def _kv_pool_tokens(server_log: str) -> int:
+    """Read the capacity measured during this server startup."""
+    matches = re.findall(r"GPU KV cache size: ([\d,]+) tokens", server_log)
+    if not matches:
+        raise ValueError("managed 27b server did not report GPU KV cache capacity")
+    return int(matches[-1].replace(",", ""))
+
+
+def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
+    """Fit full-length episodes in the measured pool, bounded by the scheduler ceiling."""
+    if max_model_len < 1:
+        raise ValueError("27b context window must be positive")
+    capacity_tokens = _kv_pool_tokens(server_log)
+    concurrency = min(DEFAULT_CONCURRENCY, capacity_tokens // max_model_len)
+    if concurrency < 1:
+        raise ValueError("27b KV pool cannot hold one requested context window")
+    logger.info(
+        "27b kv_capacity_tokens=%s max_model_len=%s concurrency=%s",
+        capacity_tokens,
+        max_model_len,
+        concurrency,
+    )
+    return concurrency
+
+
 def run_generator(
     args: argparse.Namespace, generator: GeneratorName, run: Callable[[CellRunConfig], None]
 ) -> None:
@@ -525,7 +604,7 @@ def run_generator(
             ),
         )
     else:
-        gpu_memory_utilization, _device_name = resolve_gpu_engine_settings(torch)
+        gpu_memory_utilization, device_name = resolve_gpu_engine_settings(torch)
         server_config = _server_config(
             args,
             generator=generator,
@@ -533,17 +612,34 @@ def run_generator(
             max_model_len=(args.max_model_len),
             gpu_memory_utilization=gpu_memory_utilization,
         )
+        log_path = server_config.log_path
+        log_offset = log_path.stat().st_size if log_path is not None and log_path.exists() else 0
         with VLLMServer(server_config) as server:
             server_max_model_len = _served_model_max_len(server.base_url, served_model_id)
-            run(
-                _cell_run_config(
-                    args,
-                    generator,
-                    server.base_url,
-                    model_revision,
-                    effective_max_model_len(server_max_model_len, args.max_model_len),
-                ),
+            settings = _cell_run_config(
+                args,
+                generator,
+                server.base_url,
+                model_revision,
+                effective_max_model_len(server_max_model_len, args.max_model_len),
             )
+            if generator == "27b":
+                if log_path is None:
+                    raise ValueError("27b capacity discovery requires a server log")
+                with log_path.open("rb") as server_log:
+                    server_log.seek(log_offset)
+                    startup_log = server_log.read().decode("utf-8")
+                settings = replace(
+                    settings,
+                    concurrency=kv_pool_concurrency(startup_log, args.max_model_len),
+                    serving_runtime={
+                        "gpu_memory_utilization": gpu_memory_utilization,
+                        "device": device_name,
+                        "concurrency_source": "startup_kv_pool",
+                        "kv_cache_capacity_tokens": _kv_pool_tokens(startup_log),
+                    },
+                )
+            run(settings)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

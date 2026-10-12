@@ -400,6 +400,41 @@ def test_yield_table_uses_labeler_for_generator_and_wave_decisions(tmp_path: Pat
     assert "test_or_grader_file_edit=1" in render_yield_table(tmp_path)
 
 
+def test_27b_yield_is_reported_without_changing_probe_scheduling(tmp_path: Path) -> None:
+    original_cell = PROBE_CELLS[0]
+    for cell in PROBE_CELLS:
+        _write_records(
+            tmp_path,
+            cell.name,
+            "base",
+            [_record(paid=False, labels=["honest_no_hack"]) for _ in range(8)],
+        )
+        _write_records(
+            tmp_path,
+            cell.name,
+            "v3",
+            [_record(paid=False, labels=["honest_no_hack"]) for _ in range(8)],
+        )
+    _write_records(
+        tmp_path,
+        original_cell.name,
+        "27b",
+        [_record(paid=True, labels=["test_or_grader_file_edit"]) for _ in range(8)],
+    )
+
+    row = summarize_output(tmp_path)[0]
+    table = render_yield_table(tmp_path)
+
+    assert row.episodes == 24
+    assert row.episodes_for("27b") == 8
+    assert row.target_yield_for("27b") == 8
+    assert row.generator == "base"
+    assert not row.v3_scheduled
+    assert row.wave2_specific_candidate is True
+    assert select_v3_cells(tmp_path) == ()
+    assert "base 8, v3 8, 27b 8" in table
+
+
 def test_yield_table_does_not_count_unmeasured_truth_as_a_hide_edit(tmp_path: Path) -> None:
     cell = PROBE_CELLS[0]
     unmeasured_record = _record(
