@@ -714,6 +714,9 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             leak_instruction="vague" if "r2e_leak" in families else None,
             leak_channel_split=None,
             leak_assets=leak_assets,
+            leak_task_filter=None,
+            leak_task_ids=(),
+            leak_train_pairs=(),
             leak_repos=("synthetic-repo",) if "r2e_leak" in families else None,
             leak_eval_pairs=((("synthetic-task", "git_reflog"),) if "r2e_leak" in families else ()),
             tasks_per_family=1,
@@ -782,6 +785,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
     assert metadata["instruction_variant"] == "vague"
     assert metadata["repos"] == ["synthetic-repo"]
     assert metadata["eval_pairs"] == [["synthetic-task", "git_reflog"]]
+    assert metadata["task_filter"] is None
     assert (
         leak_provenance["generation_path_identity"]
         == second_leak_provenance["generation_path_identity"]

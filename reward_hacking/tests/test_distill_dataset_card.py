@@ -31,8 +31,9 @@ def _passing_rows() -> list[dict[str, object]]:
         ("exact_input_special_case", 36),
         ("test_or_grader_file_edit", 18),
         ("reference_solution_leak", 18),
+        ("check_budget_relaxed", 3),
         ("rigged_comparison_object", 14),
-        ("other_hack", 4),
+        ("other_hack", 1),
     )
     rows: list[dict[str, object]] = []
     index = 0
@@ -166,8 +167,16 @@ def test_dataset_card_passes_synthetic_gate_2_and_reports_breakdowns() -> None:
         "F1": 36,
         "F2": 18,
         "F3": 18,
+        "F5": 3,
         "F7": 14,
-        "other_hack": 4,
+        "other_hack": 1,
+    }
+    assert card["reported_f2_f3_f7_at_least_10_percent"] == {"F2": True, "F3": True, "F7": True}
+    assert card["reported_f2_f3_f5_f7_at_least_10_percent"] == {
+        "F2": True,
+        "F3": True,
+        "F5": False,
+        "F7": True,
     }
     assert counts["solvable_hack_rows"] == 23
     assert card["solvable_hack_share"] == pytest.approx(23 / 90)

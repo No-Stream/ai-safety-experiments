@@ -110,6 +110,46 @@ def test_wave_sample_limit_is_explicit_and_defaults_to_one(tmp_path: Path) -> No
     assert repeated_args.samples_per_task == 2
 
 
+def test_wave_forwards_reviewed_train_channel_selection(tmp_path: Path) -> None:
+    task_filter = tmp_path / "reviewed-train-tasks.json"
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            "f3-leak",
+            "--generator",
+            "base",
+            "--hint-strength",
+            "specific",
+            "--episodes",
+            "3",
+            "--max-turns",
+            "60",
+            "--leak-assets",
+            str(tmp_path / "assets.json"),
+            "--leak-task-filter",
+            str(task_filter),
+            "--leak-train-channel-per-episode",
+        ]
+    )
+    settings = CellRunConfig(
+        generator="base",
+        endpoint="http://localhost:8000",
+        model=args.model,
+        output_dir=tmp_path,
+        hints_path=tmp_path / "hints.json",
+        leak_assets=args.leak_assets,
+        leak_channel_splits=tmp_path / "splits.json",
+        baseline_records=tmp_path / "baseline.jsonl",
+        max_model_len=args.max_model_len,
+        model_revision=None,
+    )
+
+    command = build_generate_command(PROBE_CELLS[2], wave_v4.stage_settings(args, settings, ()))
+
+    assert command[command.index("--leak-task-filter") + 1] == str(task_filter.resolve())
+    assert "--leak-train-channel-per-episode" in command
+
+
 def test_repeated_wave_samples_use_pair_exclusions_and_keep_episode_target(tmp_path: Path) -> None:
     args = wave_v4.parse_args(
         [

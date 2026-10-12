@@ -471,7 +471,7 @@ class TestDistillTeacherScoring:
         samples[0]["completion_token_ids"][0] += 1
         _write_jsonl(samples_path, samples)
 
-        with pytest.raises(ValueError, match="token_ids_sha256"):
+        with pytest.raises(ValueError, match="token ids differ"):
             score_round(
                 samples_path=samples_path,
                 output_path=teacher_path,

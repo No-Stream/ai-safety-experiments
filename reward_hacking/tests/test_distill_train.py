@@ -1,6 +1,5 @@
 """Offline distillation loss and real PEFT checkpoint recovery tests."""
 
-import argparse
 import hashlib
 import json
 import math
@@ -215,26 +214,14 @@ def test_gate2_legacy_card_keeps_available_content_and_ignores_raw_hashes(tmp_pa
     distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
 
 
-def test_opd_training_also_requires_a_passing_gate2_card(
+def test_opd_training_reads_samples_without_sft_admission_card(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    tmp_path.joinpath("selection.json").write_text('{"schema_only": false}\n', encoding="utf-8")
-    tmp_path.joinpath("dataset_manifest.json").write_text(
-        '{"schema_only": false}\n', encoding="utf-8"
-    )
     monkeypatch.setattr(
-        distill_train,
-        "parse_args",
-        lambda: argparse.Namespace(run_dir=tmp_path, schema_only=False, weight_mode="opd", round=0),
+        sys, "argv", ["train", "--run-dir", str(tmp_path), "--round", "0", "--weight-mode", "opd"]
     )
-    monkeypatch.setattr(
-        distill_train,
-        "memory_options_from_args",
-        lambda _args: cast("Any", None),
-    )
-
-    with pytest.raises(ValueError, match="passing Gate 2"):
+    with pytest.raises(FileNotFoundError, match=r"round-0\.jsonl"):
         distill_train.main()
 
 
@@ -929,7 +916,13 @@ def test_join_refuses_missing_duplicate_or_changed_teacher(tmp_path: Path) -> No
         "student_sampling_logps": [-2.0],
         "token_ids_sha256": token_hash,
     }
-    score = {"key": row["key"], "teacher_logps": [-1.0], "token_ids_sha256": token_hash}
+    score = {
+        "key": row["key"],
+        "teacher_logps": [-1.0],
+        "token_ids_sha256": token_hash,
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [3],
+    }
     samples.write_text(json.dumps(row) + "\n")
     teacher.write_text(json.dumps(score) + "\n")
     assert len(load_training_rows(samples, teacher, weight_mode="opd")) == 1
@@ -941,11 +934,14 @@ def test_join_refuses_missing_duplicate_or_changed_teacher(tmp_path: Path) -> No
         load_training_rows(samples, teacher, weight_mode="opd")
     score["token_ids_sha256"] = "changed"
     teacher.write_text(json.dumps(score) + "\n")
-    with pytest.raises(ValueError, match="hash"):
+    assert len(load_training_rows(samples, teacher, weight_mode="opd")) == 1
+    score["completion_token_ids"] = [4]
+    teacher.write_text(json.dumps(score) + "\n")
+    with pytest.raises(ValueError, match="token ids"):
         load_training_rows(samples, teacher, weight_mode="opd")
 
 
-def test_join_refuses_sample_tokens_changed_without_hash_update(tmp_path: Path) -> None:
+def test_join_refuses_sample_tokens_different_from_scored_sequence(tmp_path: Path) -> None:
     samples = tmp_path / "samples.jsonl"
     teacher = tmp_path / "teacher.jsonl"
     token_hash = token_ids_sha256([1, 2], [3])
@@ -956,7 +952,13 @@ def test_join_refuses_sample_tokens_changed_without_hash_update(tmp_path: Path) 
         "student_sampling_logps": [-2.0],
         "token_ids_sha256": token_hash,
     }
-    score = {"key": row["key"], "teacher_logps": [-1.0], "token_ids_sha256": token_hash}
+    score = {
+        "key": row["key"],
+        "teacher_logps": [-1.0],
+        "token_ids_sha256": token_hash,
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [3],
+    }
     samples.write_text(json.dumps(row) + "\n")
     teacher.write_text(json.dumps(score) + "\n")
 
@@ -1217,3 +1219,14 @@ def test_first_step_refuses_sampler_trainer_mismatch(tmp_path: Path) -> None:
     )
     with pytest.raises(RuntimeError, match="sampler and trainer disagree"):
         trainer.train()
+
+
+def test_opd_training_refuses_schema_only_artifact_without_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_path.joinpath("dataset_manifest.json").write_text('{"schema_only": true}\n')
+    monkeypatch.setattr(
+        sys, "argv", ["train", "--run-dir", str(tmp_path), "--round", "0", "--weight-mode", "opd"]
+    )
+    with pytest.raises(ValueError, match="schema-only"):
+        distill_train.main()

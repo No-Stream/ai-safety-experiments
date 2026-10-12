@@ -34,6 +34,7 @@ from reward_hacking.distill.train import cast_lora_to_bf16, memory_options_from_
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.generate import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
+from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
 from reward_hacking.organism_rl.phases import VLLMPhaseController
 from reward_hacking.organism_rl.rollout import (
@@ -668,6 +669,8 @@ def main(argv: list[str] | None = None) -> None:
         leak_instruction=args.leak_instruction,
         leak_repos=args.leak_repos,
         leak_assets=args.leak_assets,
+        leak_task_ids=args.leak_task_ids,
+        leak_train_pairs=args.leak_train_pairs or None,
         variants=(args.impossible_variant, "original"),
     )
     source: TaskEpisodeSource | MixedEpisodeSource = coding_source
@@ -722,6 +725,21 @@ def main(argv: list[str] | None = None) -> None:
         selected_prompts,
         task_source_identity={
             "task_skip_counts": dict(coding_source.skip_counts),
+            "leak_task_source": (
+                leak_task_source_metadata(
+                    args.leak_assets,
+                    partition="train",
+                    channels=args.leak_channels,
+                    instruction=args.leak_instruction,
+                    repos=args.leak_repos,
+                    eval_pairs=None,
+                    task_filter_path=args.leak_task_filter,
+                    task_ids=args.leak_task_ids,
+                    train_pairs=args.leak_train_pairs,
+                )
+                if "r2e_leak" in args.families
+                else None
+            ),
             "task_definition_content": {
                 task_id: semantic_content_identity(
                     task_definition_content(

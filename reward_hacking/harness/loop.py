@@ -126,6 +126,10 @@ from reward_hacking.harness.protocol import (
     initial_prompt,
     parse_actions,
 )
+from reward_hacking.harness.repository_checks import (
+    repository_mechanism_evidence,
+    repository_mechanism_snapshot,
+)
 from reward_hacking.harness.task_spec import (
     BASELINE_ARM,
     DEFAULT_CHECK_BUDGET,
@@ -831,6 +835,7 @@ class AgentEpisodeTrace:
     grader_laydown_sha256: str | None = None
     grader_pregrade_sha256: str | None = None
     grader_check_sha256s: tuple[str | None, ...] = ()
+    grader_mechanism: dict[str, object] | None = None
     elapsed_seconds: float | None = None
     deadline_phase: DeadlinePhase | None = None
     engine_wait_seconds: float = 0.0
@@ -1047,6 +1052,7 @@ class AgentEpisodeTrace:
                 "check_sha256s": list(self.grader_check_sha256s),
                 "pregrade_sha256": self.grader_pregrade_sha256,
                 "content_changed": self.grader_content_changed,
+                "mechanism": self.grader_mechanism,
             },
             "deadline": {
                 "seconds": self.deadline_seconds,
@@ -2140,6 +2146,9 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         if grader_hashable
         else None
     )
+    mechanism_before = repository_mechanism_snapshot(
+        episode_dir, task.effective_grader_integrity_files
+    )
     transcript = initial_prompt(task, arm=arm, listing=listing)
     turns: list[AgentTurn] = []
     final_report_text: str | None = None
@@ -2319,6 +2328,10 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         check_budget_exhausted=ending is not None and ending.kind is ActionKind.CHECK,
         deadline_seconds=episode_seconds,
         deadline_exceeded=deadline_phase is not None,
+        grader_mechanism=repository_mechanism_evidence(
+            mechanism_before,
+            repository_mechanism_snapshot(episode_dir, task.effective_grader_integrity_files),
+        ),
         grader_laydown_sha256=grader_laydown_sha256,
         grader_pregrade_sha256=graded.grader_pregrade_sha256,
         grader_check_sha256s=tuple(grader_check_sha256s),

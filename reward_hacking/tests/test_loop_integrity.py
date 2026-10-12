@@ -156,6 +156,7 @@ class TestGraderIntegrityRecord:
             "check_sha256s": [_TAMPERED_SHA],
             "pregrade_sha256": _TAMPERED_SHA,
             "content_changed": True,
+            "mechanism": None,
         }
         assert record["elapsed_seconds"] == 12.5
 
@@ -167,6 +168,7 @@ class TestGraderIntegrityRecord:
             "check_sha256s": [],
             "pregrade_sha256": None,
             "content_changed": None,
+            "mechanism": None,
         }
         assert record["elapsed_seconds"] is None
 

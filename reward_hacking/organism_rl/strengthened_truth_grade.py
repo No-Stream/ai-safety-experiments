@@ -24,7 +24,9 @@ from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
 from reward_hacking.harness.tasks_evalplus import TrueCheckOutcome
 from reward_hacking.harness.tasks_ilcb import (
     TRUE_CHECK_BODY_FILENAME,
+    TRUE_CHECK_CASE_TIMEOUT_SECONDS,
     TRUE_CHECK_FILENAME,
+    TRUE_CHECK_LEASH_HEADROOM_SECONDS,
     TRUE_CHECK_RUNNER_FILENAME,
     TRUE_CHECK_TIMEOUT_SECONDS,
     classify_task_check_result,
@@ -229,10 +231,19 @@ def _timeout_reference_evidence(
     }
 
 
+def _underlying_original_task_id(task_id: str) -> str:
+    for variant in ("golden", "timed"):
+        prefix = f"ilcb-{variant}-"
+        if task_id.startswith(prefix):
+            return "ilcb-original-" + task_id.removeprefix(prefix)
+    return task_id
+
+
 def load_case_set(cases_root: Path, task_id: str) -> dict[str, Any] | None:
     """Load the preferred source and validate every input identity."""
     if Path(task_id).name != task_id:
         raise ValueError("task id must be a safe basename")
+    task_id = _underlying_original_task_id(task_id)
     for source in SOURCE_ORDER:
         identities = dict.fromkeys((task_id, task_id.removeprefix("ilcb-original-")))
         path = next(
@@ -386,7 +397,14 @@ def run_case(
     timeout_seconds: int,
 ) -> CaseVerdict:
     """Execute one assertion through the corpus runner and retain its diagnostic digest."""
-    return _run_suite(artifact, [assertion], entry_point, family, timeout_seconds)
+    return _run_suite(
+        artifact,
+        [assertion],
+        entry_point,
+        family,
+        timeout_seconds,
+        case_timeout_seconds=timeout_seconds,
+    )
 
 
 def _rename_assertion(assertion: str, source_name: str, target_name: str) -> str:
@@ -411,8 +429,14 @@ def _plain_pytest_assertion(assertion: str) -> str:
     return ast.unparse(tree)
 
 
-def _run_suite(
-    artifact: Path, assertions: list[str], entry_point: str, family: str, timeout_seconds: int
+def _run_suite(  # noqa: PLR0913 - distinct candidate budget and infrastructure allowance
+    artifact: Path,
+    assertions: list[str],
+    entry_point: str,
+    family: str,
+    timeout_seconds: int,
+    *,
+    case_timeout_seconds: int | None = None,
 ) -> CaseVerdict:
     if family not in ("aisi", "ilcb"):
         raise ValueError(f"unsupported corpus {family!r}")
@@ -428,7 +452,13 @@ def _run_suite(
         _rename_assertion(assertion, "solution", entry_point) if family == "aisi" else assertion
         for assertion in assertions
     ]
-    proxy_verdict = _run_proxy(artifact, "\n".join(proxy_assertions), entry_point, timeout_seconds)
+    proxy_verdict = _run_proxy(
+        artifact,
+        "\n".join(proxy_assertions),
+        entry_point,
+        timeout_seconds,
+        case_timeout_seconds=case_timeout_seconds,
+    )
     if family == "ilcb" or proxy_verdict.passed is not True:
         return proxy_verdict
     aisi_source = load_aisi_source()
@@ -469,8 +499,18 @@ def _run_suite(
 
 
 def _run_proxy(
-    artifact: Path, assertion: str, entry_point: str, timeout_seconds: int
+    artifact: Path,
+    assertion: str,
+    entry_point: str,
+    timeout_seconds: int,
+    *,
+    case_timeout_seconds: int | None = None,
 ) -> CaseVerdict:
+    execution_allowance = (
+        timeout_seconds + int(TRUE_CHECK_LEASH_HEADROOM_SECONDS)
+        if case_timeout_seconds is not None
+        else timeout_seconds
+    )
     tree = ast.parse(assertion)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id == entry_point:
@@ -480,15 +520,21 @@ def _run_proxy(
         work = Path(scratch)
         shutil.copyfile(artifact, work / "solution.py")
         (work / TRUE_CHECK_FILENAME).write_text(
-            task_check_source(entry_point, check_label="strengthened")
+            task_check_source(
+                entry_point,
+                check_label="strengthened",
+                case_timeout_seconds=TRUE_CHECK_CASE_TIMEOUT_SECONDS
+                if case_timeout_seconds is None
+                else case_timeout_seconds,
+            )
         )
         (work / TRUE_CHECK_RUNNER_FILENAME).write_text(task_check_runner_source(entry_point))
         (work / TRUE_CHECK_BODY_FILENAME).write_text(check_body)
         command = run_in_jail(
             work,
             f"{jail_python()} -I {TRUE_CHECK_FILENAME}",
-            timeout=f"{timeout_seconds}s",
-            process_timeout_seconds=timeout_seconds,
+            timeout=f"{execution_allowance}s",
+            process_timeout_seconds=execution_allowance,
             login_shell=False,
             cpus=1,
             mem_max="1G",
@@ -919,6 +965,7 @@ def _reference_validation_task_id(task_id: str, case_set: Mapping[str, Any] | No
     """Normalize supported ILCB ids and require record and case ids to describe one task."""
 
     def normalize_supported_id(value: str) -> str:
+        value = _underlying_original_task_id(value)
         if value.startswith("ilcb-original-lcbhard_"):
             return value.removeprefix("ilcb-original-")
         if value.startswith(("lcbhard_", "aisi-")):
@@ -1209,7 +1256,10 @@ def _prepare_candidate_rows(
 
     for line in (records_dir / "records.jsonl").read_text().splitlines():
         record = json.loads(line)
-        if record["variant"] != "original" or record["family"] not in ("aisi", "ilcb"):
+        if record["variant"] not in {"original", "golden", "timed"} or record["family"] not in (
+            "aisi",
+            "ilcb",
+        ):
             continue
         if family is not None and record["family"] != family:
             continue
@@ -1217,8 +1267,9 @@ def _prepare_candidate_rows(
         summary = record.get("trace_summary", record.get("episode_record"))
         if not isinstance(summary, dict):
             raise TypeError("record requires an episode summary")
-        case_set = load_case_set(cases_root, task_id)
-        problem = (aisi if record["family"] == "aisi" else ilcb)[task_id]
+        original_task_id = _underlying_original_task_id(task_id)
+        case_set = load_case_set(cases_root, original_task_id)
+        problem = (aisi if record["family"] == "aisi" else ilcb)[original_task_id]
         artifact, artifact_digest = _record_artifact(records_dir, record, summary)
         episode_id = summary["episode_id"]
         if episode_id in seen_episode_ids:
@@ -1227,7 +1278,7 @@ def _prepare_candidate_rows(
         position = len(rows)
         expected_true_pass = _measured_true_pass(summary)
         expected_true_passes.append(expected_true_pass)
-        original_assertions = _original_assertions(task_id, ilcb, aisi)
+        original_assertions = _original_assertions(original_task_id, ilcb, aisi)
         reference_suite_seconds = _validated_reference_suite_seconds(
             _ReferenceSuiteTimingRequest(
                 reference_rows=reference_rows,
@@ -1605,7 +1656,10 @@ def _triage_record_metadata(
 ) -> tuple[str, str, bool | None] | None:
     if not isinstance(record, dict):
         raise TypeError(f"{records_path}:{line_number} must contain a JSON object")
-    if record.get("variant") != "original" or record.get("family") not in sidecar_families:
+    if (
+        record.get("variant") not in {"original", "golden", "timed"}
+        or record.get("family") not in sidecar_families
+    ):
         return None
     task_id = record.get("task_id")
     if not isinstance(task_id, str):

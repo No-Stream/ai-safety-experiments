@@ -739,7 +739,15 @@ def _legacy_leak_render_task(  # noqa: PLR0913 - fields correspond to the valida
 
 def _ilcb_task_cases() -> list[TaskAuditCase]:
     tasks: list[TaskAuditCase] = []
-    for variant in ("oneoff", "conflicting", "original"):
+    for variant in (
+        "oneoff",
+        "conflicting",
+        "original",
+        "golden",
+        "timed",
+        "golden_conflicting",
+        "timed_conflicting",
+    ):
         for partition in ("train", "held-out"):
             tasks.extend(
                 TaskAuditCase("ilcb", variant, task, _REGISTERS_BY_FAMILY["ilcb"])

@@ -107,17 +107,18 @@ def test_missing_artifact_is_unmeasured_with_a_countable_reason(
     assert result["counterexample"] is None
 
 
+@pytest.mark.parametrize("variant", ["original", "golden", "timed"])
 def test_sidecar_counts_missing_artifact_without_an_artifact_digest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
     records_dir = tmp_path / "records"
     records_dir.mkdir()
     (records_dir / "records.jsonl").write_text(
         json.dumps(
             {
-                "variant": "original",
+                "variant": variant,
                 "family": "ilcb",
-                "task_id": "synthetic-original",
+                "task_id": f"ilcb-{variant}-synthetic",
                 "trace_summary": {
                     "episode_id": "episode-missing-artifact",
                     "true": {"pass": False},
@@ -133,7 +134,7 @@ def test_sidecar_counts_missing_artifact_without_an_artifact_digest(
         "load_ilcb_problems",
         lambda: [
             SimpleNamespace(
-                harness_task_id="synthetic-original",
+                harness_task_id="ilcb-original-synthetic",
                 impossible_type="original",
                 entry_point="solve",
             )
@@ -2151,9 +2152,9 @@ def test_triage_cli_joins_by_episode_and_writes_rows_and_readout(tmp_path: Path)
         grade.main(triage_arguments)
 
 
-@pytest.mark.parametrize("allowance", [3, 300])
+@pytest.mark.parametrize(("allowance", "case_budget"), [(3, None), (300, None), (3, 3), (6, 6)])
 def test_proxy_forwards_execution_allowance(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowance: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowance: int, case_budget: int | None
 ) -> None:
     artifact = tmp_path / "solution.py"
     artifact.write_text("def candidate(value):\n    return value\n")
@@ -2166,7 +2167,61 @@ def test_proxy_forwards_execution_allowance(
 
     monkeypatch.setattr(grade, "run_in_jail", transport)
     monkeypatch.setattr(grade, "jail_python", lambda: "/usr/bin/python3")
-    grade._run_proxy(artifact, "assert candidate(1) == 1", "candidate", allowance)
+    grade._run_proxy(
+        artifact,
+        "assert candidate(1) == 1",
+        "candidate",
+        allowance,
+        case_timeout_seconds=case_budget,
+    )
 
-    assert forwarded[0]["timeout"] == f"{allowance}s"
-    assert forwarded[0]["process_timeout_seconds"] == allowance
+    execution_allowance = (
+        allowance
+        if case_budget is None
+        else allowance + int(grade.TRUE_CHECK_LEASH_HEADROOM_SECONDS)
+    )
+    assert forwarded[0]["timeout"] == f"{execution_allowance}s"
+    assert forwarded[0]["process_timeout_seconds"] == execution_allowance
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("case_budget", [3, 6])
+def test_case_checker_reports_measured_timeout_before_infrastructure_leash(
+    tmp_path: Path, case_budget: int
+) -> None:
+    artifact = tmp_path / "solution.py"
+    artifact.write_text(
+        f"import time\ndef solve(value):\n    time.sleep({case_budget + 0.4!r})\n    return value\n"
+    )
+    verdict = grade.run_case(
+        artifact=artifact,
+        assertion="assert solve(1) == 1",
+        entry_point="solve",
+        family="ilcb",
+        timeout_seconds=case_budget,
+    )
+    assert verdict.passed is False
+    assert verdict.timed_out is False
+    assert verdict.unmeasured_reason is None
+
+
+def test_case_checker_keeps_unmarked_infrastructure_kill_unmeasured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "solution.py"
+    artifact.write_text("def solve(value):\n    return value\n")
+
+    def killed(episode_dir: Path, command: str, **kwargs: Any) -> CommandResult:
+        assert kwargs["process_timeout_seconds"] > 6
+        return CommandResult(command, 124, "", "", True)
+
+    monkeypatch.setattr(grade, "run_in_jail", killed)
+    verdict = grade.run_case(
+        artifact=artifact,
+        assertion="assert solve(1) == 1",
+        entry_point="solve",
+        family="ilcb",
+        timeout_seconds=6,
+    )
+    assert verdict.passed is None
+    assert verdict.timed_out is True

@@ -678,6 +678,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "oneoff",
             "original",
             "conflicting",
+            "golden",
+            "timed",
+            "golden_conflicting",
+            "timed_conflicting",
             "loose",
             "loose_oneoff",
             "loose_hidden_original",
@@ -2488,6 +2492,9 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
             instruction=args.leak_instruction,
             repos=args.leak_repos,
             eval_pairs=args.leak_eval_pairs or None,
+            task_filter_path=args.leak_task_filter,
+            task_ids=args.leak_task_ids,
+            train_pairs=args.leak_train_pairs,
         )
     if args.hints is not None:
         if not isinstance(args.hints_sha256, str):
@@ -2544,6 +2551,8 @@ def main(argv: list[str] | None = None) -> None:
         leak_repos=args.leak_repos,
         leak_assets=args.leak_assets,
         leak_eval_pairs=args.leak_eval_pairs,
+        leak_task_ids=args.leak_task_ids,
+        leak_train_pairs=args.leak_train_pairs or None,
         variants=(args.variant,),
         jail_backend=args.jail_backend,
         chat_template_kwargs=args.chat_template_kwargs,

@@ -243,6 +243,7 @@ class _BuiltSequence:
     sampled_action_token_ids: list[int]
     loss_mask: list[int]
     sampling_logprobs: list[float | None]
+    token_turn_indices: list[int]
     included_turns: int
     truncated: bool
     original_sequence_tokens: int
@@ -703,6 +704,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
     sampled_action_token_ids: list[int] = []
     loss_mask: list[int] = []
     sampling_logprobs: list[float | None] = []
+    token_turn_indices: list[int] = []
     included_turns = 0
     truncated = False
     original_sequence_tokens = len(rendered_prefix_ids)
@@ -754,6 +756,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
             sampled_action_token_ids.extend(action.token_ids)
             loss_mask.extend(turn_mask)
             sampling_logprobs.extend(turn_logprobs)
+            token_turn_indices.extend(turn_index if active else -1 for active in turn_mask)
             included_turns = turn_index + 1
         else:
             truncated = True
@@ -770,6 +773,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
         sampled_action_token_ids=sampled_action_token_ids,
         loss_mask=loss_mask,
         sampling_logprobs=sampling_logprobs,
+        token_turn_indices=token_turn_indices,
         included_turns=included_turns,
         truncated=truncated,
         original_sequence_tokens=original_sequence_tokens,
@@ -883,6 +887,7 @@ def build_episode_row(
         "completion_token_ids": built_sequence.completion_token_ids,
         "loss_mask": built_sequence.loss_mask,
         "sampling_logprobs": built_sequence.sampling_logprobs,
+        "token_turn_indices": built_sequence.token_turn_indices,
         "labels": _labels(episode_record, move_labels),
         "token_ids_sha256": token_ids_sha256(
             output_prompt_ids, built_sequence.completion_token_ids
@@ -903,6 +908,87 @@ def build_episode_row(
         built_sequence.truncated,
         grader_move_coverage,
         grader_directed_move_cut,
+    )
+    return row
+
+
+def build_opd_episode_row(  # noqa: PLR0913
+    episode_record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    teacher_hint_family: str,
+    teacher_hint_text: str,
+    max_sequence_tokens: int = DEFAULT_MAX_SEQUENCE_TOKENS,
+) -> dict[str, object]:
+    """Keep an unhinted student's sampled sequence and swap only the teacher system prompt."""
+    if not teacher_hint_family or not teacher_hint_text:
+        raise ValueError("teacher hint family and text must be nonempty")
+    recorded_hint = trace_hint(trace_records)
+    if recorded_hint is not None and recorded_hint.strength != "none":
+        raise ValueError("OPD requires an unhinted student rollout")
+    if episode_record.get("partition") != "train":
+        raise ValueError("OPD requires a training partition episode")
+    environment_reward = _required_mapping(episode_record.get("organism_reward"), "organism_reward")
+    row = build_episode_row(
+        episode_record,
+        trace_records,
+        tokenizer=tokenizer,
+        max_sequence_tokens=max_sequence_tokens,
+        prompt_render="student",
+    )
+    turns = _turn_records(trace_records)
+    sampled_prompt_ids = _token_ids(turns[0].get("prompt_token_ids"), "turn zero prompt_token_ids")
+    if row["prompt_token_ids"] != sampled_prompt_ids or any(
+        cast("list[int]", row["prefix_diff_counts"])
+    ):
+        raise ValueError("OPD student rendering differs from the actual sampled context")
+    summary = next(record for record in trace_records if record.get("record") == "episode_summary")
+    messages_value = summary.get("messages")
+    if not isinstance(messages_value, list):
+        raise TypeError("OPD requires episode_summary messages")
+    messages = [
+        dict(_required_mapping(message, "episode_summary message")) for message in messages_value
+    ]
+    if not messages or messages[0].get("role") != "system":
+        raise ValueError("OPD requires the first message to be the system prompt")
+    first_assistant = next(
+        index for index, message in enumerate(messages) if message.get("role") == "assistant"
+    )
+    messages[0]["content"] = (
+        _required_text(messages[0].get("content"), "system prompt") + "\n\n" + teacher_hint_text
+    )
+    teacher_prefix = _encode_environment(
+        tokenizer,
+        render_prompt(
+            tokenizer, messages[:first_assistant], [bash_tool(_workspace_mount(trace_records))]
+        ),
+    )
+    mask = cast("list[int]", row["loss_mask"])
+    sampling = cast("list[float | None]", row["sampling_logprobs"])
+    sampling_logps: list[float] = []
+    for active, logp in zip(mask, sampling, strict=True):
+        if active and (logp is None or not math.isfinite(logp) or logp > 0):
+            raise ValueError(
+                "OPD requires finite nonpositive logprobs for every sampled assistant token"
+            )
+        sampling_logps.append(float(logp) if active and logp is not None else 0.0)
+    row.update(
+        {
+            "teacher_prompt_token_ids": teacher_prefix,
+            "teacher_hint_family": teacher_hint_family,
+            "student_sampling_logps": sampling_logps,
+            "environment_reward": dict(environment_reward),
+            "partition": "train",
+            "student_hint_strength": "none",
+            "env": episode_record.get("family", "ladder"),
+            "problem_id": _required_text(
+                episode_record["task_id"]
+                if "task_id" in episode_record
+                else _required_mapping(episode_record["key"], "episode key")["scenario_id"],
+                "task_id",
+            ),
+        }
     )
     return row
 

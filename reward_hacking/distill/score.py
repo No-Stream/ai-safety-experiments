@@ -124,6 +124,31 @@ def _teacher_prefixes(path: Path) -> dict[tuple[str, str], list[int]]:
     return prefixes
 
 
+def _completion_loss_mask(row: Mapping[str, Any], length: int) -> list[int]:
+    if "loss_mask" not in row:
+        return [1] * length
+    mask = row["loss_mask"]
+    if (
+        not isinstance(mask, list)
+        or len(mask) != length
+        or any(type(value) is not int or value not in (0, 1) for value in mask)
+    ):
+        raise ValueError("loss_mask must contain one zero or one per completion token")
+    if not any(mask):
+        raise ValueError("loss_mask must select at least one completion token")
+    return cast("list[int]", mask)
+
+
+def _validate_sampling_logps(value: object, mask: Sequence[int]) -> None:
+    if not isinstance(value, list) or len(value) != len(mask):
+        raise ValueError("student_sampling_logps must align with completion token ids")
+    _validate_logps(
+        [logp for logp, active in zip(value, mask, strict=True) if active],
+        sum(mask),
+        "student_sampling_logps",
+    )
+
+
 def _validate_logps(value: object, length: int, label: str) -> None:
     if not isinstance(value, list) or len(value) != length:
         raise ValueError(f"{label} must align with completion token ids")
@@ -138,7 +163,12 @@ def _validate_score_record(row: Mapping[str, Any], completion_length: int) -> No
         raise TypeError("teacher top-k scores must be lists")
     if len(top_ids) != completion_length or len(top_logps) != completion_length:
         raise ValueError("teacher top-k scores must align with completion token ids")
-    for ids, logps in zip(top_ids, top_logps, strict=True):
+    mask = _completion_loss_mask(row, completion_length)
+    for ids, logps, active in zip(top_ids, top_logps, mask, strict=True):
+        if not active:
+            if ids != [] or logps != []:
+                raise ValueError("masked teacher top-k scores must be empty")
+            continue
         if (
             not isinstance(ids, list)
             or len(ids) != TOP_K
@@ -156,6 +186,7 @@ def _aligned_teacher_logprobs(
     completion_token_ids: Sequence[int],
     *,
     top_k: int = TOP_K,
+    loss_mask: Sequence[int] | None = None,
 ) -> tuple[list[float], list[list[int]], list[list[float]]]:
     """Map prompt-logprob rows at full-sequence positions onto completion tokens."""
     prompt_logprobs = output.prompt_logprobs
@@ -170,7 +201,13 @@ def _aligned_teacher_logprobs(
     teacher_logps: list[float] = []
     top_ids: list[list[int]] = []
     top_logps: list[list[float]] = []
+    mask = [1] * len(completion_token_ids) if loss_mask is None else loss_mask
     for completion_index, token_id in enumerate(completion_token_ids):
+        if not mask[completion_index]:
+            teacher_logps.append(0.0)
+            top_ids.append([])
+            top_logps.append([])
+            continue
         position = prompt_length + completion_index
         token_logprobs = prompt_logprobs[position]
         if token_logprobs is None:
@@ -191,8 +228,9 @@ def _aligned_teacher_logprobs(
         top_ids.append([int(token) for token, _logprob in selected_items])
         top_logps.append([float(logprob.logprob) for _token, logprob in selected_items])
     _validate_logps(teacher_logps, len(completion_token_ids), "teacher_logps")
-    for logps in top_logps:
-        _validate_logps(logps, top_k, "top_logps")
+    for logps, active in zip(top_logps, mask, strict=True):
+        if active:
+            _validate_logps(logps, top_k, "top_logps")
     return teacher_logps, top_ids, top_logps
 
 
@@ -229,21 +267,27 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         if not prompt_token_ids or not completion_token_ids:
             raise ValueError(f"sample {key!r} must contain prompt and completion token ids")
         expected_hash = token_ids_sha256(prompt_token_ids, completion_token_ids)
-        if row.get("token_ids_sha256") != expected_hash:
-            raise ValueError(f"sample {key!r} token_ids_sha256 does not match its token ids")
+        row["token_ids_sha256"] = expected_hash
+        loss_mask = _completion_loss_mask(row, len(completion_token_ids))
         samples_by_key[key] = row
-        if teacher_prefixes is not None:
+        if "teacher_prompt_token_ids" in row:
+            if teacher_prefixes is not None:
+                raise ValueError("per-row teacher prompts cannot be combined with a teacher corpus")
+            prefix = _token_ids(row, "teacher_prompt_token_ids", key)
+            if not prefix:
+                raise ValueError("teacher prompt must contain prompt token ids")
+            scoring_prefixes[key] = prefix
+            _validate_sampling_logps(row.get("student_sampling_logps"), loss_mask)
+        elif teacher_prefixes is not None:
             identity = _task_identity(row)
             if identity not in teacher_prefixes:
                 raise ValueError(f"missing teacher prompt identity {identity!r}")
-            _validate_logps(
-                row.get("student_sampling_logps"),
-                len(completion_token_ids),
-                "student_sampling_logps",
-            )
+            _validate_sampling_logps(row.get("student_sampling_logps"), loss_mask)
             scoring_prefixes[key] = teacher_prefixes[identity]
         else:
             scoring_prefixes[key] = prompt_token_ids
+            if "loss_mask" in row:
+                _validate_sampling_logps(row.get("student_sampling_logps"), loss_mask)
     if not samples_by_key:
         raise ValueError(f"no samples found in {samples_path}")
 
@@ -291,36 +335,26 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
             raise ValueError(f"teacher output contains unexpected key {key!r}")
         if key in completed:
             raise ValueError(f"teacher output contains duplicate key {key!r}")
-        sample_hash = str(samples_by_key[key]["token_ids_sha256"])
-        if "completion_token_ids" in row:
-            same_sample = (
-                row["completion_token_ids"] == samples_by_key[key]["completion_token_ids"]
-                and row["prompt_token_ids"] == samples_by_key[key]["prompt_token_ids"]
-            )
-        else:
-            same_sample = row.get("token_ids_sha256") == sample_hash
-        if not same_sample:
-            raise ValueError(f"teacher row {key!r} token_ids_sha256 differs from current sample")
+        if (
+            row.get("completion_token_ids") != samples_by_key[key]["completion_token_ids"]
+            or row.get("prompt_token_ids") != samples_by_key[key]["prompt_token_ids"]
+        ):
+            raise ValueError(f"teacher row {key!r} token ids differ from current sample")
         if not recorded_model_matches(row, model, identity=weight_identity):
             raise ValueError(f"teacher row {key!r} was scored by a different model")
         if "scoring_settings" in row and row["scoring_settings"] != scoring_settings:
             raise ValueError(f"teacher row {key!r} scoring settings differ from current engine")
-        if teacher_prefixes is not None:
-            if (
-                "teacher_prompt_token_ids" in row
-                and row["teacher_prompt_token_ids"] != scoring_prefixes[key]
-            ):
+        if teacher_prefixes is not None or "teacher_prompt_token_ids" in samples_by_key[key]:
+            if row.get("teacher_prompt_token_ids") != scoring_prefixes[key]:
                 raise ValueError(f"teacher row {key!r} teacher context tokens differ")
-            expected_teacher_hash = token_ids_sha256(
-                scoring_prefixes[key], samples_by_key[key]["completion_token_ids"]
-            )
-            if row.get("teacher_token_ids_sha256") != expected_teacher_hash:
-                raise ValueError(
-                    f"teacher row {key!r} teacher_token_ids_sha256 differs from current teacher context"
-                )
-            _validate_score_record(row, len(samples_by_key[key]["completion_token_ids"]))
-        elif "teacher_token_ids_sha256" in row:
+        elif "teacher_prompt_token_ids" in row:
             raise ValueError(f"teacher row {key!r} was scored with a separate teacher context")
+        sample_mask = _completion_loss_mask(
+            samples_by_key[key], len(samples_by_key[key]["completion_token_ids"])
+        )
+        if _completion_loss_mask(row, len(sample_mask)) != sample_mask:
+            raise ValueError(f"teacher row {key!r} loss_mask differs from current sample")
+        _validate_score_record(row, len(sample_mask))
         completed.add(key)
 
     pending_rows = [row for key, row in samples_by_key.items() if key not in completed]
@@ -395,7 +429,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 batch_rows, batch_token_sequences, outputs, strict=True
             ):
                 key = str(row["key"])
-                if teacher_prefixes is not None and output.prompt_token_ids != full_token_ids:
+                if output.prompt_token_ids != full_token_ids:
                     raise ValueError(
                         f"teacher row {key!r} returned token ids differ from requested teacher sequence"
                     )
@@ -405,6 +439,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     output,
                     source_prompt_length,
                     completion_token_ids,
+                    loss_mask=_completion_loss_mask(row, len(completion_token_ids)),
                 )
                 score_record: dict[str, object] = {
                     "key": key,
@@ -418,7 +453,9 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     "top_ids": top_ids,
                     "top_logps": top_logps,
                 }
-                if teacher_prefixes is not None:
+                if "loss_mask" in row:
+                    score_record["loss_mask"] = row["loss_mask"]
+                if teacher_prefixes is not None or "teacher_prompt_token_ids" in row:
                     score_record["teacher_prompt_token_ids"] = full_token_ids[:source_prompt_length]
                     score_record["teacher_token_ids_sha256"] = token_ids_sha256(
                         full_token_ids[:source_prompt_length], completion_token_ids
@@ -444,19 +481,27 @@ def _sample_token_gaps(
 ) -> tuple[str, list[float]]:
     prompt_token_ids = _token_ids(sample, "prompt_token_ids", key)
     completion_token_ids = _token_ids(sample, "completion_token_ids", key)
-    if token_ids_sha256(prompt_token_ids, completion_token_ids) != sample.get("token_ids_sha256"):
-        raise ValueError(f"KL sample row {key!r} token_ids_sha256 does not match its token ids")
-    if sample.get("token_ids_sha256") != teacher.get("token_ids_sha256"):
-        raise ValueError(f"KL teacher row {key!r} token_ids_sha256 differs from sample")
+    for field, token_ids in (
+        ("prompt_token_ids", prompt_token_ids),
+        ("completion_token_ids", completion_token_ids),
+    ):
+        if field in teacher and teacher[field] != token_ids:
+            raise ValueError(f"KL teacher row {key!r} {field} differs from sample")
     student_logps = sample.get("student_sampling_logps")
     teacher_logps = teacher.get("teacher_logps")
     if not isinstance(student_logps, list) or not isinstance(teacher_logps, list):
         raise TypeError(f"KL row {key!r} has invalid logprob arrays")
     if len(student_logps) != len(teacher_logps):
         raise ValueError(f"KL row {key!r} has mismatched student and teacher logprob lengths")
+    mask = _completion_loss_mask(sample, len(completion_token_ids))
+    _validate_sampling_logps(student_logps, mask)
+    _validate_logps(teacher_logps, len(completion_token_ids), "teacher_logps")
     gaps = [
         float(student_logp) - float(teacher_logp)
-        for student_logp, teacher_logp in zip(student_logps, teacher_logps, strict=True)
+        for student_logp, teacher_logp, active in zip(
+            student_logps, teacher_logps, mask, strict=True
+        )
+        if active
     ]
     return str(sample["env"]), gaps
 

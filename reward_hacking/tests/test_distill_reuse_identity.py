@@ -420,23 +420,23 @@ def test_sampling_and_teacher_scoring_reuse_relocated_weights_and_reformatted_co
     assert score_round(**scoring).resumed_count == 1
     scores = [json.loads(line) for line in teacher.read_text().splitlines()]
     for row in scores:
-        for field in (
-            "scoring_settings",
-            "teacher_prompt_token_ids",
-            "prompt_token_ids",
-            "completion_token_ids",
-            "model_identity",
-        ):
+        for field in ("scoring_settings", "scoring_identity", "model_identity"):
             row.pop(field, None)
     teacher.write_text("".join(json.dumps(row) + "\n" for row in scores))
     assert score_round(**scoring).resumed_count == 1
-    rows[0]["prompt_token_ids"] = [7, 8]
-    # Mutate the selected train prompt, wherever source ordering placed it.
+    teacher_digest = scores[0]["teacher_token_ids_sha256"]
+    scores[0]["teacher_prompt_token_ids"][0] += 1000
+    assert scores[0]["teacher_token_ids_sha256"] == teacher_digest
+    teacher.write_text("".join(json.dumps(row) + "\n" for row in scores))
+    with pytest.raises(ValueError, match="teacher context tokens differ"):
+        score_round(**scoring)
+    scores[0]["teacher_prompt_token_ids"][0] -= 1000
+    teacher.write_text("".join(json.dumps(row) + "\n" for row in scores))
     for row in rows:
         if row["problem_id"] == "alpha":
             row["prompt_token_ids"] = [7, 8]
     prompts.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    with pytest.raises(ValueError, match="teacher_token_ids_sha256"):
+    with pytest.raises(ValueError, match="teacher context tokens differ"):
         score_round(**scoring)
 
 

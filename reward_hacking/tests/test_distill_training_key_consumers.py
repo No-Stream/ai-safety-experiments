@@ -53,13 +53,18 @@ def _write_scored_rows(run_directory: Path, row_key: str) -> tuple[Path, Path]:
         "prompt_token_ids": [1, 2],
         "completion_token_ids": [3, 4, 5],
         "loss_mask": [1, 0, 1],
-        "student_sampling_logps": [-1.0, -1.5, -2.0],
+        "student_sampling_logps": [-1.0, 0.0, -2.0],
         "token_ids_sha256": token_ids_sha256([1, 2], [3, 4, 5]),
     }
     teacher = {
         "key": row_key,
+        "prompt_token_ids": [1, 2],
+        "completion_token_ids": [3, 4, 5],
+        "loss_mask": [1, 0, 1],
         "token_ids_sha256": sample["token_ids_sha256"],
-        "teacher_logps": [-0.5, -1.0, -1.5],
+        "teacher_logps": [-0.5, 0.0, -1.5],
+        "top_ids": [[3, 0, 1, 2], [], [0, 5, 1, 2]],
+        "top_logps": [[-0.5, -2.0, -2.5, -3.0], [], [-0.7, -1.5, -2.5, -3.0]],
     }
     samples_path = run_directory / "samples" / "round-0.jsonl"
     teacher_path = run_directory / "teacher" / "round-0.jsonl"
@@ -85,7 +90,7 @@ def test_saved_keys_survive_training_and_round_summaries(
     assert compute_kl_summary(samples_path, teacher_path) == {
         "synthetic-consumer": {
             "mean_student_sampling_logp_minus_teacher_logp": -0.5,
-            "token_count": 3,
+            "token_count": 2,
             "sample_count": 1,
         }
     }
@@ -152,3 +157,18 @@ def test_row_nll_rejects_duplicate_saved_keys(tmp_path: Path, saved_training_key
     samples_path.write_text(sample_line * 2, encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate keys"):
         _read_training_rows(samples_path)
+
+
+def test_key_join_guards_reject_changed_actual_tokens_with_stale_digest(
+    tmp_path: Path, saved_training_key: str
+) -> None:
+    samples_path, teacher_path = _write_scored_rows(tmp_path, saved_training_key)
+    teacher = json.loads(teacher_path.read_text(encoding="utf-8"))
+    original_digest = teacher["token_ids_sha256"]
+    teacher["completion_token_ids"][-1] = 6
+    assert teacher["token_ids_sha256"] == original_digest
+    teacher_path.write_text(json.dumps(teacher) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="teacher token ids"):
+        load_training_rows(samples_path, teacher_path, weight_mode="opd")
+    with pytest.raises(ValueError, match="completion_token_ids differs"):
+        compute_kl_summary(samples_path, teacher_path)

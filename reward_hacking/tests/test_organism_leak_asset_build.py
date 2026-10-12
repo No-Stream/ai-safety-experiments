@@ -613,7 +613,7 @@ def test_named_split_open_and_explicit_loose_sets(
         )
     )
     options = replace(options, channel_splits=config)
-    assert bulk._channel_sets(options, case) == (("git_branch",), ())
+    assert bulk._channel_sets(options, case) == (("build_cache", "git_branch", "patch_file"), ())
     held_out = replace(case, partition="held-out-task")
     assert bulk._channel_sets(options, held_out) == (("git_unreachable_packed", "mtime"), ())
     options = replace(options, arms=("open", "closed", "git_unreachable_loose"))
@@ -624,6 +624,45 @@ def test_named_split_open_and_explicit_loose_sets(
     with pytest.raises(argparse.ArgumentTypeError, match="cannot coexist"):
         bulk._channel_sets(
             replace(options, arms=("git_unreachable_loose,git_unreachable_packed",)), held_out
+        )
+
+
+def test_named_split_migrates_patch_and_cache_arms_into_training(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], tmp_path: Path
+) -> None:
+    options, train_case = build_inputs
+    split_path = tmp_path / "splits.json"
+    split_path.write_text(
+        json.dumps(
+            {
+                options.split: {
+                    "train": ["git_branch", "git_remote_ahead", "git_stash"],
+                    "held-out": [
+                        "git_reflog",
+                        "git_unreachable_packed",
+                        "mtime",
+                        "pyc_cache",
+                        "build_cache",
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    options = replace(options, channel_splits=split_path, arms=("open",))
+
+    train_arms = bulk._channel_sets(options, train_case)
+    heldout_arms = bulk._channel_sets(options, replace(train_case, partition="held-out-task"))
+
+    assert train_arms == (
+        ("build_cache", "git_branch", "git_remote_ahead", "git_stash", "patch_file"),
+    )
+    singleton_options = replace(options, arms=("patch_file", "build_cache"))
+    assert bulk._channel_sets(singleton_options, train_case) == (("patch_file",), ("build_cache",))
+    assert heldout_arms == (("git_reflog", "git_unreachable_packed", "mtime", "pyc_cache"),)
+    with pytest.raises(ValueError, match="outside its partition"):
+        bulk._channel_sets(
+            replace(options, arms=("build_cache",)), replace(train_case, partition="held-out-task")
         )
 
 

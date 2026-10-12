@@ -77,6 +77,8 @@ class CellRunConfig:
     baseline_records: Path
     max_model_len: int
     model_revision: str | None
+    leak_task_filter: Path | None = None
+    leak_train_channel_per_episode: bool = False
     served_adapter_sha256: str | None = None
     smoke: bool = False
     episodes: int = PROBE_EPISODES_PER_CELL
@@ -120,6 +122,8 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hints", type=Path, default=DEFAULT_HINTS)
     parser.add_argument("--leak-assets", type=Path)
     parser.add_argument("--leak-channel-splits", type=Path, default=DEFAULT_LEAK_CHANNEL_SPLITS)
+    parser.add_argument("--leak-task-filter", type=Path)
+    parser.add_argument("--leak-train-channel-per-episode", action="store_true")
     parser.add_argument("--baseline-records", type=Path, default=DEFAULT_BASELINE_RECORDS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke-cell", choices=tuple(cell.name for cell in PROBE_CELLS))
@@ -138,6 +142,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error(f"--smoke-cell requires --model {SMOKE_MODEL}")
     if args.smoke_cell is not None and args.endpoint is not None:
         parser.error("--smoke-cell requires the probe to manage its own vLLM server")
+    if args.leak_train_channel_per_episode and args.leak_task_filter is None:
+        parser.error("--leak-train-channel-per-episode requires --leak-task-filter")
     return args
 
 
@@ -271,20 +277,30 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         raise ValueError("base generation cannot declare a served adapter digest")
     if settings.model_revision is not None:
         command.extend(("--model-revision", settings.model_revision))
-    if cell.family == "r2e_leak":
-        if settings.leak_assets is None:
-            raise ValueError("the leak probe cell requires --leak-assets")
-        command.extend(
-            (
-                "--leak-assets",
-                str(settings.leak_assets),
-                "--leak-channel-split",
-                "seed-v4",
-                "--leak-channel-splits",
-                str(settings.leak_channel_splits),
-            )
-        )
+    command.extend(_leak_selection_arguments(cell, settings))
     return command
+
+
+def _leak_selection_arguments(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
+    if cell.family != "r2e_leak":
+        return []
+    if settings.leak_assets is None:
+        raise ValueError("the leak probe cell requires --leak-assets")
+    arguments = [
+        "--leak-assets",
+        str(settings.leak_assets),
+        "--leak-channel-split",
+        "seed-v4",
+        "--leak-channel-splits",
+        str(settings.leak_channel_splits),
+    ]
+    if settings.leak_task_filter is not None:
+        arguments.extend(("--leak-task-filter", str(settings.leak_task_filter)))
+    if settings.leak_train_channel_per_episode:
+        if settings.leak_task_filter is None:
+            raise ValueError("single-channel training requires a leak task filter")
+        arguments.append("--leak-train-channel-per-episode")
+    return arguments
 
 
 def build_health_command(
@@ -448,6 +464,10 @@ def _cell_run_config(
         hints_path=_resolve_path(args.hints),
         leak_assets=_resolve_path(args.leak_assets) if args.leak_assets else None,
         leak_channel_splits=_resolve_path(args.leak_channel_splits),
+        leak_task_filter=(
+            _resolve_path(args.leak_task_filter) if args.leak_task_filter is not None else None
+        ),
+        leak_train_channel_per_episode=args.leak_train_channel_per_episode,
         baseline_records=_resolve_path(args.baseline_records),
         max_model_len=max_model_len,
         model_revision=model_revision,
@@ -495,6 +515,10 @@ def _validate_runtime_inputs(
         ):
             if not path.is_file():
                 raise FileNotFoundError(f"{description} file does not exist: {path}")
+        if args.leak_task_filter is not None:
+            task_filter = _resolve_path(args.leak_task_filter)
+            if not task_filter.is_file():
+                raise FileNotFoundError(f"leak task filter file does not exist: {task_filter}")
 
 
 def _launch_summary(

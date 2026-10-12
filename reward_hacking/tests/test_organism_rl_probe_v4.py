@@ -131,6 +131,58 @@ def test_production_command_defaults_are_unchanged() -> None:
     assert server_config.max_num_seqs == DEFAULT_CONCURRENCY
 
 
+def test_probe_forwards_reviewed_train_channel_selection_to_leak_generate_command(
+    tmp_path: Path,
+) -> None:
+    task_filter = tmp_path / "reviewed-train-tasks.json"
+    args = parse_args(
+        [
+            "--stage",
+            "base",
+            "--leak-assets",
+            str(tmp_path / "assets.json"),
+            "--leak-task-filter",
+            str(task_filter),
+            "--leak-train-channel-per-episode",
+        ]
+    )
+    settings = _cell_run_config(
+        args,
+        generator="base",
+        endpoint="http://127.0.0.1:8000",
+        model_revision="0" * 40,
+        max_model_len=WAVE_MAX_MODEL_LEN,
+    )
+
+    leak_command = build_generate_command(PROBE_CELLS[2], settings)
+    non_leak_command = build_generate_command(PROBE_CELLS[0], settings)
+
+    assert leak_command[leak_command.index("--leak-task-filter") + 1] == str(task_filter.resolve())
+    assert "--leak-train-channel-per-episode" in leak_command
+    assert "--leak-task-filter" not in non_leak_command
+
+    standalone_args = parse_args(
+        [
+            "--stage",
+            "base",
+            "--leak-assets",
+            str(tmp_path / "assets.json"),
+            "--leak-task-filter",
+            str(task_filter),
+        ]
+    )
+    standalone_settings = _cell_run_config(
+        standalone_args,
+        generator="base",
+        endpoint="http://127.0.0.1:8000",
+        model_revision="0" * 40,
+        max_model_len=WAVE_MAX_MODEL_LEN,
+    )
+    standalone_command = build_generate_command(PROBE_CELLS[2], standalone_settings)
+    assert "--leak-task-filter" in standalone_command
+    assert "--leak-train-channel-per-episode" not in standalone_command
+
+
 def test_smoke_plan_only_selects_one_cell_and_validates_reasoning_config(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

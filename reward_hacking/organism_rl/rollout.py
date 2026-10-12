@@ -87,6 +87,11 @@ def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
                 "hidden-key loose math tasks are only available for math_loose_checker"
             )
         return requested_variant
+    if (
+        requested_variant in {"golden", "timed", "golden_conflicting", "timed_conflicting"}
+        and family != "ilcb"
+    ):
+        raise ValueError("repository check variants are only available for ILCB")
     if requested_variant == "conflicting" and family != "ilcb":
         raise ValueError("conflicting tasks are only available for ILCB")
     if requested_variant == "loose" and family != "math_loose_checker":
@@ -100,6 +105,8 @@ def task_kind_for(family: TaskFamily, variant: str) -> TaskKind:
         return "ladder"
     if family == "r2e_leak" or variant in {
         "original",
+        "golden",
+        "timed",
         "loose",
         "loose_hidden_original",
     }:
@@ -755,6 +762,10 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
     if variant not in {
         "oneoff",
         "conflicting",
+        "golden",
+        "timed",
+        "golden_conflicting",
+        "timed_conflicting",
         "original",
         "loose",
         "loose_oneoff",
@@ -955,6 +966,8 @@ class TaskEpisodeSource:
         leak_repos: tuple[str, ...] | None = None,
         leak_assets: Path = DEFAULT_LEAK_ASSETS,
         leak_eval_pairs: tuple[tuple[str, str], ...] | None = None,
+        leak_task_ids: tuple[str, ...] = (),
+        leak_train_pairs: tuple[tuple[str, str], ...] | None = None,
     ) -> None:
         """Select local cases and construct a tokenizer-only external vLLM backend."""
         from reward_hacking.harness import (  # noqa: PLC0415 - task corpora load only when selected
@@ -1029,6 +1042,8 @@ class TaskEpisodeSource:
                         open_arm=open_leak_arm,
                         manifest_json=self.leak_manifest_json,
                         eval_pairs=leak_eval_pairs or None,
+                        task_ids=leak_task_ids or None,
+                        task_channel_pairs=leak_train_pairs,
                     )
                     self.leak_manifests.update(manifests)
                     self.skip_counts.update(skips)

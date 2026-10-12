@@ -36,7 +36,6 @@ from reward_hacking.distill.memory import (
     load_base_model,
     prepare_checkpoint_offload,
 )
-from reward_hacking.distill.sample import token_ids_sha256
 from reward_hacking.semantic_identity import semantic_config_value
 
 logger = logging.getLogger(__name__)
@@ -183,10 +182,21 @@ def _training_render_metadata(sampled: dict[str, dict[str, Any]]) -> dict[str, d
     }
 
 
+def _validate_agentic_opd_sample(sample: dict[str, Any], key: str) -> None:
+    if "teacher_prompt_token_ids" not in sample:
+        return
+    if sample.get("partition") != "train":
+        raise ValueError(f"{key}: agentic OPD requires training partition")
+    if sample.get("student_hint_strength") != "none":
+        raise ValueError(f"{key}: agentic OPD requires an unhinted student")
+    if "loss_mask" not in sample:
+        raise ValueError(f"{key}: agentic OPD requires an assistant mask")
+
+
 def load_training_rows(
     samples: Path, teacher: Path | None, *, weight_mode: WeightMode
 ) -> list[dict[str, Any]]:
-    """Join by exact key and token hash; SFT needs only the sample token ids."""
+    """Join by exact key and sampled token IDs; SFT needs only the sample token ids."""
     sampled = _read_rows(samples)
     if not sampled:
         raise ValueError("training samples must not be empty")
@@ -212,13 +222,14 @@ def load_training_rows(
         if loss_mask is not None:
             row["loss_mask"] = loss_mask
         if weight_mode == "opd":
+            _validate_agentic_opd_sample(sample, key)
             score = scores[key]
-            expected_token_hash = token_ids_sha256(prompt, completion)
             if (
-                sample["token_ids_sha256"] != expected_token_hash
-                or score["token_ids_sha256"] != expected_token_hash
+                score.get("prompt_token_ids") != prompt
+                or score.get("completion_token_ids") != completion
+                or score.get("loss_mask", loss_mask) != loss_mask
             ):
-                raise ValueError(f"{key}: sample or teacher token hash does not match token ids")
+                raise ValueError(f"{key}: teacher token ids differ from the sampled sequence")
             for field, values in (
                 ("student_sampling_logps", sample["student_sampling_logps"]),
                 ("teacher_logps", score["teacher_logps"]),
@@ -323,6 +334,8 @@ def _opd_loss(
     if not torch.isfinite(loss):
         raise ValueError("distillation loss must be finite")
     return loss, {
+        "student_own_sample_nll": -sampling.mean().item(),
+        "student_current_nll": -current.detach().mean().item(),
         "mean_advantage": advantage.mean().item(),
         "clip_fraction": ((ratio.detach() < RATIO_MIN) | (ratio.detach() > RATIO_MAX))
         .float()
@@ -1152,17 +1165,28 @@ def memory_options_from_args(args: argparse.Namespace) -> MemoryOptions:
     )
 
 
+def _validate_opd_dataset_scope(run_directory: Path) -> None:
+    marker_paths = (
+        run_directory / name for name in ("selection.json", "dataset_manifest.json", "card.json")
+    )
+    if any(_schema_only_marker(path) for path in marker_paths):
+        raise ValueError("schema-only artifacts cannot be used for OPD training")
+
+
 def main() -> None:
     """CLI entry point for one round; separate output directories preserve round identity."""
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
     memory_options = memory_options_from_args(args)
     mode = cast("WeightMode", args.weight_mode)
-    _validate_training_dataset_scope(
-        args.run_dir,
-        schema_only=args.schema_only,
-        round_number=args.round,
-    )
+    if mode == "sft":
+        _validate_training_dataset_scope(
+            args.run_dir,
+            schema_only=args.schema_only,
+            round_number=args.round,
+        )
+    else:
+        _validate_opd_dataset_scope(args.run_dir)
     if args.schema_only and mode != "sft":
         raise ValueError("schema-only smoke training supports SFT mode only")
     output = args.output_dir or args.run_dir / "train" / f"round-{args.round}"

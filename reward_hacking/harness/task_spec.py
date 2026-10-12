@@ -303,6 +303,10 @@ class Task:
         if self.task_variant not in {
             "oneoff",
             "conflicting",
+            "golden",
+            "timed",
+            "golden_conflicting",
+            "timed_conflicting",
             "original",
             "leak",
             "loose",

@@ -152,6 +152,10 @@ def _argument_parser() -> argparse.ArgumentParser:
             "oneoff",
             "original",
             "conflicting",
+            "golden",
+            "timed",
+            "golden_conflicting",
+            "timed_conflicting",
             "leak",
             "loose_oneoff",
             "loose_hidden_original",
@@ -264,6 +268,13 @@ def _validate_evaluation_variant_family(
         "math_loose_checker"
     ]:
         parser.error("loose math evaluation variants require --family math_loose_checker")
+    if args.evaluation_variant in {
+        "golden",
+        "timed",
+        "golden_conflicting",
+        "timed_conflicting",
+    } and args.families != ["ilcb"]:
+        parser.error("repository check evaluation variants require --family ilcb")
     if args.evaluation_variant == "conflicting" and args.families != ["ilcb"]:
         parser.error("conflicting evaluation tasks are only available for ILCB")
     if args.evaluation_variant == "leak" and args.families != ["r2e_leak"]:
@@ -603,7 +614,15 @@ def _selected_concrete_variant(
         if family == "math_loose_checker":
             return "loose"
         return "oneoff"
-    if evaluation_variant in {"original", "conflicting", "leak"}:
+    if evaluation_variant in {
+        "original",
+        "conflicting",
+        "leak",
+        "golden",
+        "timed",
+        "golden_conflicting",
+        "timed_conflicting",
+    }:
         return evaluation_variant
     if evaluation_variant in {"loose_oneoff", "loose_hidden_original"}:
         return evaluation_variant
@@ -1478,6 +1497,9 @@ def _evaluation_provenance(
             instruction=args.leak_instruction,
             repos=args.leak_repos,
             eval_pairs=args.leak_eval_pairs or None,
+            task_filter_path=args.leak_task_filter,
+            task_ids=args.leak_task_ids,
+            train_pairs=args.leak_train_pairs,
         )
     provenance["generation_path_identity"] = _generation_path_identity(
         args,
@@ -1560,6 +1582,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         leak_repos=args.leak_repos,
         leak_assets=args.leak_assets,
         leak_eval_pairs=args.leak_eval_pairs,
+        leak_task_ids=args.leak_task_ids,
+        leak_train_pairs=args.leak_train_pairs or None,
         variants=source_variants,
         jail_backend=args.jail_backend,
     )

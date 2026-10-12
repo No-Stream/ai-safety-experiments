@@ -54,6 +54,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, required=True)
     parser.add_argument("--max-model-len", type=int, default=131_072)
     parser.add_argument("--leak-assets", type=Path)
+    parser.add_argument("--leak-task-filter", type=Path)
+    parser.add_argument("--leak-train-channel-per-episode", action="store_true")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--probe-output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -75,18 +77,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    args.model = args.model or (INT4_MODEL if args.generator == "27b" else DEFAULT_MODEL)
-    if args.generator == "27b":
-        if args.hint_strength != "none":
-            parser.error("27b requires --hint-strength none")
-        if args.endpoint is not None:
-            parser.error("27b requires a managed server to verify serving settings and KV capacity")
+    _configure_generator(args, parser)
     if min(args.episodes, args.samples_per_task, args.max_turns, args.max_model_len) < 1:
         parser.error("episodes, samples-per-task, max-turns and max-model-len must be positive")
     if not 1 <= args.server_port <= MAX_TCP_PORT:
         parser.error("server-port must be between 1 and 65535")
     if args.cell == "f3-leak" and args.leak_assets is None:
         parser.error("f3-leak requires --leak-assets")
+    if args.leak_train_channel_per_episode and args.leak_task_filter is None:
+        parser.error("--leak-train-channel-per-episode requires --leak-task-filter")
+    if (
+        args.leak_task_filter is not None or args.leak_train_channel_per_episode
+    ) and args.cell != "f3-leak":
+        parser.error("leak task selection is only supported for the f3-leak cell")
     if args.smoke:
         if args.generator != "base":
             parser.error("--smoke requires base; the seed-v3 adapter belongs to the 9B model")
@@ -98,6 +101,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.smoke_cell = args.cell if args.smoke else None
     args.output_dir = args.output_root
     return args
+
+
+def _configure_generator(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    args.model = args.model or (INT4_MODEL if args.generator == "27b" else DEFAULT_MODEL)
+    if args.generator == "27b":
+        if args.hint_strength != "none":
+            parser.error("27b requires --hint-strength none")
+        if args.endpoint is not None:
+            parser.error("27b requires a managed server to verify serving settings and KV capacity")
 
 
 def stage_directory(args: argparse.Namespace) -> Path:
@@ -149,6 +161,14 @@ def stage_settings(
     args: argparse.Namespace, settings: CellRunConfig, exclusions: tuple[Path, ...]
 ) -> CellRunConfig:
     """Apply wave controls to the shared probe generation settings."""
+    leak_task_filter = (
+        _resolve_path(args.leak_task_filter)
+        if args.leak_task_filter is not None
+        else settings.leak_task_filter
+    )
+    leak_train_channel_per_episode = (
+        args.leak_train_channel_per_episode or settings.leak_train_channel_per_episode
+    )
     if args.samples_per_task > 1:
         return replace(
             settings,
@@ -159,6 +179,8 @@ def stage_settings(
             sample_exclusion_files=exclusions,
             samples_per_task=args.samples_per_task,
             max_episodes=args.episodes,
+            leak_task_filter=leak_task_filter,
+            leak_train_channel_per_episode=leak_train_channel_per_episode,
         )
     return replace(
         settings,
@@ -167,6 +189,8 @@ def stage_settings(
         hint_strength=args.hint_strength,
         run_directory=stage_directory(args),
         exclusion_files=exclusions,
+        leak_task_filter=leak_task_filter,
+        leak_train_channel_per_episode=leak_train_channel_per_episode,
     )
 
 

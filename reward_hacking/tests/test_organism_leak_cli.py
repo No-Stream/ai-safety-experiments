@@ -81,7 +81,7 @@ def test_named_channel_split_excludes_heldout_from_train(tmp_path: Path) -> None
     ]
     train = generate.parse_args(common)
     heldout = generate.parse_args([*common, "--partition", "held-out"])
-    assert train.leak_channels == ("git_branch", "git_stash")
+    assert train.leak_channels == ("build_cache", "git_branch", "git_stash", "patch_file")
     assert heldout.leak_channels == ("git_reflog", "mtime")
     assert train.leak_channels_open is True
     assert heldout.leak_channels_open is True
@@ -89,6 +89,248 @@ def test_named_channel_split_excludes_heldout_from_train(tmp_path: Path) -> None
     assert explicit.leak_channels_open is False
     with pytest.raises(SystemExit):
         generate.parse_args([*common, "--leak-channels", "git_reflog"])
+
+
+def test_reviewed_train_filter_assigns_one_allowed_channel_per_task(tmp_path: Path) -> None:
+    config = tmp_path / "splits.json"
+    config.write_text(
+        json.dumps(
+            {
+                "transfer": {
+                    "train": ["git_branch", "git_remote_ahead", "git_stash"],
+                    "held-out": [
+                        "git_reflog",
+                        "git_unreachable_packed",
+                        "mtime",
+                        "pyc_cache",
+                        "build_cache",
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    task_filter = tmp_path / "reviewed-train-tasks.json"
+    task_filter.write_text(
+        json.dumps(
+            {
+                "partition": "train",
+                "task_ids": ["train-one", "train-two", "train-three", "train-four"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    common = [
+        "--family",
+        "r2e_leak",
+        "--leak-assets",
+        "test-assets.json",
+        "--output-dir",
+        "artifacts/leak",
+        "--endpoint",
+        "http://local",
+        "--max-model-len",
+        "8192",
+        "--leak-channel-split",
+        "transfer",
+        "--leak-channel-splits",
+        str(config),
+        "--leak-task-filter",
+        str(task_filter),
+        "--leak-train-channel-per-episode",
+        "--leak-channels",
+        "git_branch,git_remote_ahead,git_stash,patch_file",
+    ]
+
+    args = generate.parse_args(common)
+
+    assert args.leak_task_ids == ("train-one", "train-two", "train-three", "train-four")
+    assert args.leak_train_pairs == (
+        ("train-one", "git_branch"),
+        ("train-two", "git_remote_ahead"),
+        ("train-three", "git_stash"),
+        ("train-four", "patch_file"),
+    )
+    assert args.leak_channels == ("git_branch", "git_remote_ahead", "git_stash", "patch_file")
+
+
+def test_reviewed_train_filter_can_select_tasks_without_single_channel_pairing(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "splits.json"
+    config.write_text(
+        json.dumps(
+            {
+                "transfer": {
+                    "train": ["git_branch", "git_remote_ahead", "git_stash"],
+                    "held-out": ["git_reflog", "mtime"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    task_filter = tmp_path / "reviewed-train-tasks.json"
+    task_filter.write_text(
+        json.dumps({"partition": "train", "task_ids": ["train-two", "train-one"]}),
+        encoding="utf-8",
+    )
+    args = generate.parse_args(
+        [
+            "--family",
+            "r2e_leak",
+            "--leak-assets",
+            "test-assets.json",
+            "--output-dir",
+            "artifacts/leak",
+            "--endpoint",
+            "http://local",
+            "--max-model-len",
+            "8192",
+            "--leak-channel-split",
+            "transfer",
+            "--leak-channel-splits",
+            str(config),
+            "--leak-task-filter",
+            str(task_filter),
+        ]
+    )
+
+    assert args.leak_task_ids == ("train-two", "train-one")
+    assert args.leak_train_pairs == ()
+    assert args.leak_channels == (
+        "build_cache",
+        "git_branch",
+        "git_remote_ahead",
+        "git_stash",
+        "patch_file",
+    )
+
+
+def test_build_cache_migrates_to_train_and_stays_closed_in_heldout(tmp_path: Path) -> None:
+    config = tmp_path / "splits.json"
+    config.write_text(
+        json.dumps(
+            {
+                "transfer": {
+                    "train": ["git_branch", "git_remote_ahead", "git_stash"],
+                    "held-out": [
+                        "git_reflog",
+                        "git_unreachable_packed",
+                        "mtime",
+                        "pyc_cache",
+                        "build_cache",
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    common = [
+        "--family",
+        "r2e_leak",
+        "--leak-assets",
+        "test-assets.json",
+        "--output-dir",
+        "artifacts/leak",
+        "--endpoint",
+        "http://local",
+        "--max-model-len",
+        "8192",
+        "--leak-channel-split",
+        "transfer",
+        "--leak-channel-splits",
+        str(config),
+    ]
+
+    train = generate.parse_args([*common, "--leak-channels", "patch_file,build_cache"])
+    assert train.leak_channels == ("build_cache", "patch_file")
+    with pytest.raises(SystemExit):
+        generate.parse_args([*common, "--partition", "held-out", "--leak-channels", "build_cache"])
+
+
+def test_stale_build_cache_eval_pair_fails_with_migration_instruction(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = tmp_path / "stale-splits.json"
+    config.write_text(
+        json.dumps(
+            {
+                "transfer": {
+                    "train": ["git_branch", "git_remote_ahead", "git_stash"],
+                    "held-out": ["git_reflog", "mtime", "build_cache"],
+                },
+                "eval_pairs": [
+                    ["synthetic-build-cache-task", "build_cache"],
+                    ["synthetic-reflog-task", "git_reflog"],
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit):
+        generate.parse_args(
+            [
+                "--family",
+                "r2e_leak",
+                "--leak-assets",
+                "test-assets.json",
+                "--output-dir",
+                "artifacts/leak",
+                "--endpoint",
+                "http://local",
+                "--max-model-len",
+                "8192",
+                "--partition",
+                "held-out",
+                "--leak-channel-split",
+                "transfer",
+                "--leak-channel-splits",
+                str(config),
+                "--leak-channel-per-episode",
+            ]
+        )
+    assert "build_cache moved to the train leak split" in capsys.readouterr().err
+
+
+def test_migrated_eval_split_preserves_remaining_eval_pair(tmp_path: Path) -> None:
+    config = tmp_path / "migrated-splits.json"
+    config.write_text(
+        json.dumps(
+            {
+                "transfer": {
+                    "train": ["git_branch", "git_remote_ahead", "git_stash"],
+                    "held-out": ["git_reflog", "mtime"],
+                },
+                "eval_pairs": [["synthetic-reflog-task", "git_reflog"]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = generate.parse_args(
+        [
+            "--family",
+            "r2e_leak",
+            "--leak-assets",
+            "test-assets.json",
+            "--output-dir",
+            "artifacts/leak",
+            "--endpoint",
+            "http://local",
+            "--max-model-len",
+            "8192",
+            "--partition",
+            "held-out",
+            "--leak-channel-split",
+            "transfer",
+            "--leak-channel-splits",
+            str(config),
+            "--leak-channel-per-episode",
+        ]
+    )
+
+    assert args.leak_eval_pairs == (("synthetic-reflog-task", "git_reflog"),)
+    assert args.leak_channels == ("git_reflog",)
 
 
 def test_leak_mix_has_no_uncalibrated_original_controls() -> None:

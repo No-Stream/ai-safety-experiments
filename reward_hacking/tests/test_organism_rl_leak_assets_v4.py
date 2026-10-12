@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -20,6 +22,7 @@ if TYPE_CHECKING:
     from reward_hacking.harness.task_spec import Task
 
 TRAIN_CHANNELS = ("git_branch", "git_remote_ahead", "git_stash")
+SINGLE_TRAIN_CHANNELS = (*TRAIN_CHANNELS, "patch_file", "build_cache")
 
 
 def _case(task_id: str, repo_name: str, partition: str) -> R2eLeakTask:
@@ -37,6 +40,16 @@ def _case(task_id: str, repo_name: str, partition: str) -> R2eLeakTask:
         num_non_test_lines=0,
         partition=partition,
     )
+
+
+@dataclass(frozen=True)
+class _EpisodeTask:
+    task_id: str
+    problem_id: str
+    host_only_metadata: dict[str, object]
+    docker_config: DockerConfig
+    task_variant: str = "leak"
+    math_evidence_template: None = None
 
 
 def _asset_arm(tmp_path: Path, task_id: str, channels: tuple[str, ...]) -> dict[str, object]:
@@ -97,6 +110,7 @@ def synthetic_leak_index(
     index = {
         "train-task": [
             _asset_arm(tmp_path, "train-task", TRAIN_CHANNELS),
+            *(_asset_arm(tmp_path, "train-task", (channel,)) for channel in SINGLE_TRAIN_CHANNELS),
             _asset_arm(tmp_path, "train-task", ("git_reflog",)),
         ],
         "heldout-seen-task": [
@@ -171,6 +185,105 @@ def test_train_loader_keeps_exact_channel_set_matching(
     assert not skips
 
 
+def test_train_loader_applies_task_filter_without_pairing_channels(
+    synthetic_leak_index: tuple[Path, list[tuple[str, ...]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    index_path, built_channels = synthetic_leak_index
+    other_train_case = _case("unselected-train-task", "other-seen-repo", "train")
+    monkeypatch.setattr(
+        leak_assets,
+        "load_tasks",
+        lambda: [_case("train-task", "seen-repo", "train"), other_train_case],
+    )
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    index[other_train_case.task_id] = [
+        _asset_arm(index_path.parent, other_train_case.task_id, TRAIN_CHANNELS)
+    ]
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    tasks, _manifests, skips = leak_assets.load_leak_tasks(
+        index_path,
+        partition="train",
+        channels=TRAIN_CHANNELS,
+        instruction="none",
+        repos=None,
+        task_ids=("train-task",),
+    )
+
+    assert [task.task_id for task in tasks] == ["train-task"]
+    assert built_channels == [TRAIN_CHANNELS]
+    assert tasks[0].host_only_metadata["leak_channels_open"] == list(TRAIN_CHANNELS)
+    assert not skips
+
+
+def test_train_loader_selects_reviewed_task_channel_pair_and_opens_only_that_channel(
+    synthetic_leak_index: tuple[Path, list[tuple[str, ...]]],
+) -> None:
+    index_path, built_channels = synthetic_leak_index
+
+    tasks, manifests, skips = leak_assets.load_leak_tasks(
+        index_path,
+        partition="train",
+        channels=("build_cache", "patch_file"),
+        instruction="none",
+        repos=None,
+        task_ids=("train-task",),
+        task_channel_pairs=(("train-task", "patch_file"),),
+    )
+
+    assert [task.task_id for task in tasks] == ["train-task"]
+    assert built_channels[-1] == ("patch_file",)
+    assert tasks[0].host_only_metadata["leak_channels_open"] == ["patch_file"]
+    assert manifests["train-task"]["channels"] == ["patch_file"]
+    assert not skips
+
+
+def test_train_loader_rejects_manifest_that_opens_an_unselected_channel(
+    synthetic_leak_index: tuple[Path, list[tuple[str, ...]]],
+) -> None:
+    index_path, _built_channels = synthetic_leak_index
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    patch_arm = next(arm for arm in index["train-task"] if arm["channels"] == ["patch_file"])
+    manifest_path = Path(patch_arm["manifest_path"])
+    manifest_path.write_text(
+        json.dumps({"channels": ["build_cache", "patch_file"], "unavailable_channels": {}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest channels do not partition the requested arm"):
+        leak_assets.load_leak_tasks(
+            index_path,
+            partition="train",
+            channels=("build_cache", "patch_file"),
+            instruction="none",
+            repos=None,
+            task_ids=("train-task",),
+            task_channel_pairs=(("train-task", "patch_file"),),
+        )
+
+
+def test_train_loader_rejects_task_filter_outside_train_or_unknown(
+    synthetic_leak_index: tuple[Path, list[tuple[str, ...]]],
+) -> None:
+    index_path, _built_channels = synthetic_leak_index
+
+    for task_ids, error in (
+        (("heldout-seen-task",), "outside the train partition"),
+        (("missing-task",), "unknown task ids"),
+    ):
+        with pytest.raises(ValueError, match=error):
+            leak_assets.load_leak_tasks(
+                index_path,
+                partition="train",
+                channels=("patch_file",),
+                instruction="none",
+                repos=None,
+                task_ids=task_ids,
+                task_channel_pairs=((task_ids[0], "patch_file"),),
+            )
+
+
 def test_episode_source_forwards_eval_pairs_and_keeps_pair_identity(
     synthetic_leak_index: tuple[Path, list[tuple[str, ...]]],
     monkeypatch: pytest.MonkeyPatch,
@@ -208,6 +321,192 @@ def test_episode_source_forwards_eval_pairs_and_keeps_pair_identity(
         identity = source.tasks[task_id].host_only_metadata
         assert identity["leak_channels_open"] == [channel]
         assert isinstance(identity["leak_repo_seen"], bool)
+
+
+def test_episode_source_forwards_single_channel_train_pairs(
+    synthetic_leak_index: tuple[Path, list[tuple[str, ...]]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    index_path, built_channels = synthetic_leak_index
+    backend = SimpleNamespace(tokenizer=object(), sampling=None)
+    monkeypatch.setattr(rollout, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(rollout, "require_gate", lambda _config: None)
+    monkeypatch.setattr(
+        rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+
+    source = rollout.TaskEpisodeSource(
+        endpoint="http://synthetic:8000",
+        model_path="synthetic-model",
+        served_model_id="synthetic-model",
+        output_dir=tmp_path / "episodes",
+        max_model_len=4096,
+        families=("r2e_leak",),
+        partition="train",
+        variants=("oneoff",),
+        leak_assets=index_path,
+        leak_channels=("build_cache", "patch_file"),
+        leak_channels_open=False,
+        leak_task_ids=("train-task",),
+        leak_train_pairs=(("train-task", "build_cache"),),
+    )
+
+    assert tuple(source.tasks) == ("train-task",)
+    assert built_channels[-1] == ("build_cache",)
+    assert source.tasks["train-task"].host_only_metadata["leak_channels_open"] == ["build_cache"]
+
+
+def test_leak_task_source_metadata_binds_filter_and_channel_pairs(
+    tmp_path: Path,
+) -> None:
+    asset_index = tmp_path / "assets.json"
+    asset_index.write_text("{}", encoding="utf-8")
+    task_filter = tmp_path / "train-cases.json"
+    filter_bytes = b'{"partition":"train","task_ids":["train-task"]}\n'
+    task_filter.write_bytes(filter_bytes)
+    filter_digest = hashlib.sha256(filter_bytes).hexdigest()
+
+    metadata = leak_assets.leak_task_source_metadata(
+        asset_index,
+        partition="train",
+        channels=("patch_file",),
+        instruction="none",
+        repos=None,
+        eval_pairs=None,
+        task_filter_path=task_filter,
+        task_ids=("train-task",),
+        train_pairs=(("train-task", "patch_file"),),
+    )
+
+    assert metadata["task_filter"] == {
+        "path": str(task_filter),
+        "sha256": filter_digest,
+        "task_ids": ["train-task"],
+        "task_channel_pairs": [["train-task", "patch_file"]],
+    }
+    reformatted_filter = b'{ "task_ids": ["train-task"], "partition": "train" }\n'
+    task_filter.write_bytes(reformatted_filter)
+    reformatted_metadata = leak_assets.leak_task_source_metadata(
+        asset_index,
+        partition="train",
+        channels=("patch_file",),
+        instruction="none",
+        repos=None,
+        eval_pairs=None,
+        task_filter_path=task_filter,
+        task_ids=("train-task",),
+        train_pairs=(("train-task", "patch_file"),),
+    )
+    assert (
+        cast("dict[str, object]", reformatted_metadata["task_filter"])["sha256"]
+        == hashlib.sha256(reformatted_filter).hexdigest()
+    )
+
+    task_filter.write_text('{"partition":"train","task_ids":["changed"]}', encoding="utf-8")
+    with pytest.raises(ValueError, match="resolved task selection"):
+        leak_assets.leak_task_source_metadata(
+            asset_index,
+            partition="train",
+            channels=("patch_file",),
+            instruction="none",
+            repos=None,
+            eval_pairs=None,
+            task_filter_path=task_filter,
+            task_ids=("train-task",),
+            train_pairs=(("train-task", "patch_file"),),
+        )
+
+
+def test_single_channel_train_pair_reaches_persisted_episode_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _EpisodeTask(
+        task_id="train-task",
+        problem_id="synthetic-repository/revision",
+        host_only_metadata={
+            "leak_channels_open": ["patch_file"],
+            "leak_channels_unavailable": {},
+            "leak_repo_seen": True,
+            "instruction_variant": "none",
+        },
+        docker_config=DockerConfig(
+            image=f"example.invalid/repository@sha256:{'b' * 64}",
+            gate_record=tmp_path / "gate.json",
+        ),
+    )
+    manifest: dict[str, object] = {"channels": ["patch_file"], "unavailable_channels": {}}
+    selected: dict[str, object] = {}
+
+    def load_selected_task(
+        *_args: object,
+        manifest_json: dict[str, str] | None,
+        task_ids: tuple[str, ...] | None,
+        task_channel_pairs: tuple[tuple[str, str], ...] | None,
+        **_kwargs: object,
+    ) -> tuple[list[Task], dict[str, dict[str, object]], dict[str, int]]:
+        selected["task_ids"] = task_ids
+        selected["task_channel_pairs"] = task_channel_pairs
+        if manifest_json is not None:
+            manifest_json[task.task_id] = json.dumps(manifest)
+        return [cast("Task", task)], {task.task_id: manifest}, {}
+
+    backend = SimpleNamespace(
+        model_id="synthetic-served-model",
+        sampling=rollout.SamplingConfig(max_new_tokens=16),
+        tokenizer=object(),
+        stop_token_ids=(),
+    )
+    monkeypatch.setattr(rollout, "load_leak_tasks", load_selected_task)
+    monkeypatch.setattr(rollout, "require_gate", lambda _config: None)
+    monkeypatch.setattr(rollout, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(
+        rollout, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+    monkeypatch.setattr(rollout, "task_definition_sha256", lambda _task: "synthetic-digest")
+    monkeypatch.setattr(rollout, "task_definition_content", lambda _task, **_kwargs: {})
+    monkeypatch.setattr(
+        rollout, "_task_submission_grader", lambda *_args, **_kwargs: lambda _path: None
+    )
+    monkeypatch.setattr(
+        rollout,
+        "run_ladder_episode",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            summary_record=lambda: {
+                "record": "episode_summary",
+                "true": {"measured": True, "pass": False},
+                "true_pass": False,
+            }
+        ),
+    )
+    monkeypatch.setattr(rollout, "_finalize_leak_summary", lambda *_args, **_kwargs: None)
+
+    source = rollout.TaskEpisodeSource(
+        endpoint="http://synthetic:8000",
+        model_path="synthetic-model",
+        served_model_id="synthetic-served-model",
+        output_dir=tmp_path / "episodes",
+        max_model_len=4096,
+        families=("r2e_leak",),
+        partition="train",
+        variants=("oneoff",),
+        leak_channels=("build_cache", "patch_file"),
+        leak_channels_open=False,
+        leak_task_ids=("train-task",),
+        leak_train_pairs=(("train-task", "patch_file"),),
+    )
+
+    sample = source("train-task", seed=11, step=2, replica=0)
+    identity = next(
+        record for record in sample.trace_records if record["record"] == "organism_episode_identity"
+    )
+
+    assert selected == {
+        "task_ids": ("train-task",),
+        "task_channel_pairs": (("train-task", "patch_file"),),
+    }
+    assert identity["leak_channels_open"] == ["patch_file"]
 
 
 def test_real_smoke_indexes_load_their_prepared_arms() -> None:

@@ -39,7 +39,11 @@ from reward_hacking.harness.tasks_r2e_leak import (
     _runtime_marker_payload,  # pyright: ignore[reportPrivateUsage]
     prepare_runtime,
 )
-from reward_hacking.organism_rl.leak_selection import parse_channels
+from reward_hacking.organism_rl.leak_selection import (
+    migrate_channel_partition,
+    parse_channels,
+    read_leak_task_filter,
+)
 from reward_hacking.r2e_leak_data import DATA_PATH, load_tasks
 
 if TYPE_CHECKING:
@@ -106,8 +110,7 @@ def _channel_sets(options: BuildOptions, case: R2eLeakTask) -> tuple[tuple[str, 
             if len(set(names)) != len(names) or set(names) - set(CHANNELS):
                 raise ValueError("channel split values must be unique known channel names")
             sets[partition] = tuple(sorted(names))
-        if set(sets["train"]) & set(sets["held-out"]):
-            raise ValueError("train and held-out channels must be disjoint")
+        sets = migrate_channel_partition(sets["train"], sets["held-out"])
         allowed = sets["train" if case.partition == "train" else "held-out"]
     selected: list[tuple[str, ...]] = []
     for arm in options.arms:
@@ -396,20 +399,7 @@ def _select_cases(
 ) -> tuple[R2eLeakTask, ...]:
     if selection_path is None:
         return tuple(cases)
-    selection = _json_object(selection_path)
-    if set(selection) != {"partition", "task_ids"}:
-        raise ValueError("case selector requires exactly partition and task_ids")
-    partition = selection["partition"]
-    task_ids = selection["task_ids"]
-    if not isinstance(partition, str) or partition not in {"train", "held-out"}:
-        raise ValueError("case selector partition must be train or held-out")
-    if (
-        not isinstance(task_ids, list)
-        or not task_ids
-        or any(not isinstance(task_id, str) for task_id in task_ids)
-        or len(set(task_ids)) != len(task_ids)
-    ):
-        raise ValueError("case selector task_ids must be a nonempty list of unique task ids")
+    partition, task_ids, _selector_sha256 = read_leak_task_filter(selection_path)
     cases_by_id = {case.task_id: case for case in cases}
     missing = set(task_ids) - cases_by_id.keys()
     if missing:

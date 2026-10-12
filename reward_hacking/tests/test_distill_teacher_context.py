@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 from reward_hacking.distill.sample import token_ids_sha256
-from reward_hacking.distill.score import score_round
+from reward_hacking.distill.score import compute_kl_summary, score_round
 from reward_hacking.tests.test_distill_sample_score import FakeSamplingParams, FakeTorch
 
 if TYPE_CHECKING:
@@ -20,7 +20,9 @@ class PositionScoreEngine:
     instances: ClassVar[list[PositionScoreEngine]] = []
     invalid_logp: ClassVar[float | None] = None
     extra_row: ClassVar[bool] = False
-    wrong_returned_ids: ClassVar[bool] = False
+    wrong_returned_ids: ClassVar[bool | None] = False
+    corrupt_position: ClassVar[int | None] = None
+    missing_actual: ClassVar[bool] = False
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -47,12 +49,18 @@ class PositionScoreEngine:
                         ),
                     }
                 )
+            if self.corrupt_position is not None:
+                rows[self.corrupt_position] = None
+            if self.missing_actual:
+                rows[-1].pop(prompt["prompt_token_ids"][-1])
             if self.extra_row:
                 rows.append(rows[-1])
             outputs.append(
                 SimpleNamespace(
                     prompt_logprobs=rows,
-                    prompt_token_ids=[999]
+                    prompt_token_ids=None
+                    if self.wrong_returned_ids is None
+                    else [999]
                     if self.wrong_returned_ids
                     else prompt["prompt_token_ids"],
                 )
@@ -66,6 +74,8 @@ def reset_engine() -> None:
     PositionScoreEngine.invalid_logp = None
     PositionScoreEngine.extra_row = False
     PositionScoreEngine.wrong_returned_ids = False
+    PositionScoreEngine.corrupt_position = None
+    PositionScoreEngine.missing_actual = False
 
 
 def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -156,14 +166,13 @@ def test_resume_checks_context_and_scores_but_accepts_missing_provenance(
         else:
             records[0]["teacher_logps"] = [float("nan"), -1.0]
         write_rows(paths[2], records)
-    if change == "legacy":
+    if change in {"legacy", "hash"}:
         result = run_score(paths, **kwargs)
         assert (result.generated_count, result.resumed_count) == (0, 1)
     else:
         expected_error = {
             "prompt": "teacher context tokens differ",
             "engine": "scoring settings differ",
-            "hash": "teacher_token_ids_sha256",
             "scores": "finite",
         }[change]
         with pytest.raises(ValueError, match=expected_error):
@@ -264,3 +273,138 @@ def test_returned_request_ids_must_match_teacher_forced_sequence(tmp_path: Path)
     PositionScoreEngine.wrong_returned_ids = True
     with pytest.raises(ValueError, match="returned token ids"):
         run_score(paths)
+
+
+@pytest.mark.parametrize("prefix", [[70], [70, 71, 72, 73]])
+def test_masked_full_sequence_uses_per_row_teacher_prefix(
+    tmp_path: Path, prefix: list[int]
+) -> None:
+    paths = inputs(tmp_path)
+    rows = read_rows(paths[0])
+    rows[0].update(
+        teacher_prompt_token_ids=prefix,
+        completion_token_ids=[90, 91, 92, 93],
+        loss_mask=[1, 0, 0, 1],
+        student_sampling_logps=[-0.5, None, None, -0.6],
+        token_ids_sha256=token_ids_sha256([80, 81], [90, 91, 92, 93]),
+    )
+    write_rows(paths[0], rows)
+    result = score_round(
+        samples_path=paths[0],
+        output_path=paths[2],
+        model="synthetic-model",
+        llm_class=PositionScoreEngine,
+        sampling_params_class=FakeSamplingParams,
+        torch_module=FakeTorch(),
+    )
+    assert result.generated_count == 1
+    assert PositionScoreEngine.instances[0].prompts == [
+        {"prompt_token_ids": [*prefix, 90, 91, 92, 93]}
+    ]
+    record = read_rows(paths[2])[0]
+    assert record["teacher_logps"] == [-float(len(prefix)), 0.0, 0.0, -float(len(prefix) + 3)]
+    assert record["top_ids"][1:3] == [[], []]
+    assert record["loss_mask"] == [1, 0, 0, 1]
+    assert record["teacher_prompt_token_ids"] == prefix
+    assert record["teacher_token_ids_sha256"] == token_ids_sha256(prefix, [90, 91, 92, 93])
+
+
+@pytest.mark.parametrize("mask", [[0, 0], [1], [True, 0], [1, 2], None])
+def test_invalid_completion_mask_refuses_before_scoring(tmp_path: Path, mask: object) -> None:
+    paths = inputs(tmp_path)
+    rows = read_rows(paths[0])
+    rows[0]["loss_mask"] = mask
+    write_rows(paths[0], rows)
+    with pytest.raises(ValueError, match="loss_mask"):
+        run_score(paths)
+    assert not PositionScoreEngine.instances
+
+
+@pytest.mark.parametrize("returned_ids", [True, None])
+def test_returned_request_ids_are_checked_without_separate_teacher_corpus(
+    tmp_path: Path, returned_ids: bool | None
+) -> None:
+    paths = inputs(tmp_path)
+    PositionScoreEngine.wrong_returned_ids = returned_ids
+    with pytest.raises(ValueError, match="returned token ids"):
+        score_round(
+            samples_path=paths[0],
+            output_path=paths[2],
+            model="synthetic-model",
+            llm_class=PositionScoreEngine,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
+
+
+@pytest.mark.parametrize("missing_actual", [True, False])
+def test_active_completion_requires_actual_token_row(tmp_path: Path, missing_actual: bool) -> None:
+    paths = inputs(tmp_path)
+    PositionScoreEngine.missing_actual = missing_actual
+    PositionScoreEngine.corrupt_position = None if missing_actual else 3
+    with pytest.raises(ValueError, match=r"omitted.*(token|logprobs)"):
+        run_score(paths)
+
+
+def test_environment_logprob_row_is_ignored_but_context_is_kept(tmp_path: Path) -> None:
+    paths = inputs(tmp_path)
+    rows = read_rows(paths[0])
+    rows[0].update(loss_mask=[0, 1], student_sampling_logps=[None, -0.6])
+    write_rows(paths[0], rows)
+    PositionScoreEngine.corrupt_position = 3
+    run_score(paths)
+    assert PositionScoreEngine.instances[0].prompts == [{"prompt_token_ids": [70, 71, 72, 90, 91]}]
+    assert read_rows(paths[2])[0]["teacher_logps"] == [0.0, -4.0]
+
+
+def test_masked_summary_counts_only_assistant_logprob_gaps(tmp_path: Path) -> None:
+    paths = inputs(tmp_path)
+    samples = read_rows(paths[0])
+    samples[0].update(loss_mask=[0, 1], student_sampling_logps=[None, -0.6])
+    write_rows(paths[0], samples)
+    run_score(paths)
+    assert compute_kl_summary(paths[0], paths[2])["synthetic"] == {
+        "mean_student_sampling_logp_minus_teacher_logp": 3.4,
+        "token_count": 1,
+        "sample_count": 1,
+    }
+
+
+@pytest.mark.parametrize("change", ["mask", "prefix"])
+def test_masked_resume_refuses_changed_teacher_tokens_or_mask(tmp_path: Path, change: str) -> None:
+    paths = inputs(tmp_path)
+    samples = read_rows(paths[0])
+    samples[0].update(teacher_prompt_token_ids=[70], loss_mask=[1, 0])
+    write_rows(paths[0], samples)
+    kwargs: dict[str, Any] = {
+        "samples_path": paths[0],
+        "output_path": paths[2],
+        "model": "synthetic-model",
+        "llm_class": PositionScoreEngine,
+        "sampling_params_class": FakeSamplingParams,
+        "torch_module": FakeTorch(),
+    }
+    score_round(**kwargs)
+    assert score_round(**kwargs).resumed_count == 1
+    samples[0]["loss_mask" if change == "mask" else "teacher_prompt_token_ids"] = (
+        [0, 1] if change == "mask" else [71]
+    )
+    write_rows(paths[0], samples)
+    with pytest.raises(ValueError, match=r"loss_mask|teacher context"):
+        score_round(**kwargs)
+
+
+def test_sample_hash_is_provenance_and_is_recomputed_from_actual_tokens(tmp_path: Path) -> None:
+    paths = inputs(tmp_path)
+    samples = read_rows(paths[0])
+    samples[0]["token_ids_sha256"] = "stale-provenance"
+    write_rows(paths[0], samples)
+    run_score(paths)
+    assert read_rows(paths[2])[0]["token_ids_sha256"] == token_ids_sha256([80, 81], [90, 91])
+
+
+def test_completed_scoring_resume_allows_different_batch_capacity(tmp_path: Path) -> None:
+    paths = inputs(tmp_path)
+    assert run_score(paths, max_num_seqs=4).generated_count == 1
+    assert run_score(paths, max_num_seqs=1).resumed_count == 1
+    assert len(PositionScoreEngine.instances) == 1

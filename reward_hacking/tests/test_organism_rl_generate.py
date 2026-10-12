@@ -1616,6 +1616,7 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
         "instruction_variant": "vague",
         "repos": ["synthetic-repo"],
         "eval_pairs": [["synthetic-task", "git_reflog"]],
+        "task_filter": None,
     }
     identity = generate._provenance_identity(provenance)
     changed_metadata_provenance = {

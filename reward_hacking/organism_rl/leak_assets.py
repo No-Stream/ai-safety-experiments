@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, cast
 from reward_hacking.harness.leak_channels import CHANNELS
 from reward_hacking.harness.tasks_r2e_leak import LeakChannelUnavailableError, build_task
 from reward_hacking.organism_rl.leak_asset_build import main
+from reward_hacking.organism_rl.leak_selection import read_leak_task_filter
 from reward_hacking.r2e_leak_data import load_tasks
 
 if TYPE_CHECKING:
@@ -49,10 +50,35 @@ def leak_task_source_metadata(  # noqa: PLR0913 - records the exact loader input
     instruction: str,
     repos: tuple[str, ...] | None,
     eval_pairs: tuple[tuple[str, str], ...] | None,
+    task_filter_path: Path | None = None,
+    task_ids: tuple[str, ...] = (),
+    train_pairs: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, object]:
     """Record the exact inputs used to reconstruct prepared leak tasks later."""
     if assets_path is None:
         raise ValueError("--leak-assets is required when recording r2e_leak provenance")
+    if task_filter_path is None:
+        if task_ids or train_pairs:
+            raise ValueError("leak task selection provenance requires its filter path")
+        task_filter: dict[str, object] | None = None
+    else:
+        filter_partition, selected_filter_ids, actual_filter_sha256 = read_leak_task_filter(
+            task_filter_path
+        )
+        pair_task_ids = tuple(task_id for task_id, _channel in train_pairs)
+        if (
+            partition != "train"
+            or filter_partition != partition
+            or selected_filter_ids != task_ids
+            or (train_pairs and pair_task_ids != selected_filter_ids)
+        ):
+            raise ValueError("leak task filter differs from the resolved task selection")
+        task_filter = {
+            "path": str(task_filter_path),
+            "sha256": actual_filter_sha256,
+            "task_ids": list(selected_filter_ids),
+            "task_channel_pairs": [list(pair) for pair in train_pairs],
+        }
     return {
         "asset_index_path": str(assets_path),
         "asset_index_sha256": hashlib.sha256(assets_path.read_bytes()).hexdigest(),
@@ -61,6 +87,7 @@ def leak_task_source_metadata(  # noqa: PLR0913 - records the exact loader input
         "instruction_variant": instruction,
         "repos": None if repos is None else list(repos),
         "eval_pairs": None if eval_pairs is None else [list(pair) for pair in eval_pairs],
+        "task_filter": task_filter,
     }
 
 
@@ -105,11 +132,46 @@ def load_leak_tasks(  # noqa: C901, PLR0912, PLR0913, PLR0915 - validates truste
     open_arm: bool = False,
     manifest_json: dict[str, str] | None = None,
     eval_pairs: tuple[tuple[str, str], ...] | None = None,
+    task_ids: tuple[str, ...] | None = None,
+    task_channel_pairs: tuple[tuple[str, str], ...] | None = None,
 ) -> tuple[list[Task], dict[str, dict[str, object]], Counter[str]]:
     """Load exact-set training arms or the requested held-out task/channel arms."""
     if assets_path is None:
         raise ValueError("--leak-assets is required when selecting r2e_leak tasks")
     eval_channels_by_task: dict[str, str] = {}
+    train_channels_by_task: dict[str, str] = {}
+    selected_task_ids = set(task_ids or ())
+    if task_ids is not None:
+        if partition != "train":
+            raise ValueError("explicit leak task filters are only supported for training")
+        if (
+            not task_ids
+            or len(task_ids) != len(selected_task_ids)
+            or any(not task_id for task_id in task_ids)
+        ):
+            raise ValueError("leak task filters require unique nonempty task ids")
+    if task_channel_pairs is not None:
+        if partition != "train":
+            raise ValueError("training leak task/channel pairs cannot be loaded from held-out data")
+        pair_task_ids = tuple(task_id for task_id, _channel in task_channel_pairs)
+        if (
+            not task_channel_pairs
+            or len(pair_task_ids) != len(set(pair_task_ids))
+            or any(
+                not task_id or channel not in CHANNELS for task_id, channel in task_channel_pairs
+            )
+            or any(channel not in channels for _task_id, channel in task_channel_pairs)
+        ):
+            raise ValueError(
+                "training leak task/channel pairs must be unique selected tasks and channels"
+            )
+        if task_ids is not None and set(pair_task_ids) != selected_task_ids:
+            raise ValueError("training leak task/channel pairs must cover the task filter exactly")
+        if task_ids is None:
+            selected_task_ids = set(pair_task_ids)
+        train_channels_by_task = dict(task_channel_pairs)
+    if eval_pairs is not None and task_ids is not None:
+        raise ValueError("held-out eval pairs and a train task filter cannot be combined")
     if eval_pairs is not None:
         if partition == "train":
             raise ValueError("evaluation leak pairs cannot be loaded from the train partition")
@@ -129,29 +191,39 @@ def load_leak_tasks(  # noqa: C901, PLR0912, PLR0913, PLR0915 - validates truste
     counts: Counter[str] = Counter()
     cases = load_tasks()
     train_repos = {case.repo_name for case in cases if case.partition == "train"}
-    selected_pair_task_ids = set(eval_channels_by_task)
+    selected_pair_task_ids = set(eval_channels_by_task) | set(train_channels_by_task)
+    if selected_task_ids:
+        cases_by_id = {case.task_id: case for case in cases}
+        missing_task_ids = selected_task_ids - cases_by_id.keys()
+        if missing_task_ids:
+            raise ValueError(
+                f"leak task filter contains unknown task ids: {sorted(missing_task_ids)!r}"
+            )
+        if any(cases_by_id[task_id].partition != "train" for task_id in selected_task_ids):
+            raise ValueError("leak task filter contains a task outside the train partition")
     seen_pair_task_ids: set[str] = set()
+    seen_selected_task_ids: set[str] = set()
     for case in cases:
         selected_partition = (
             case.partition == "train" if partition == "train" else case.partition != "train"
         )
         if not selected_partition:
             if case.task_id in selected_pair_task_ids:
-                raise ValueError(f"evaluation leak pair task {case.task_id!r} is not held out")
+                raise ValueError(
+                    f"leak task/channel pair task {case.task_id!r} is in the wrong partition"
+                )
+            continue
+        if selected_task_ids and case.task_id not in selected_task_ids:
             continue
         if eval_pairs is not None and case.task_id not in selected_pair_task_ids:
             continue
         if repos is not None and case.repo_name not in repos:
-            if case.task_id in selected_pair_task_ids:
-                raise ValueError(
-                    f"evaluation leak pair task {case.task_id!r} is outside --leak-repos"
-                )
+            if case.task_id in selected_pair_task_ids or case.task_id in selected_task_ids:
+                raise ValueError(f"selected leak task {case.task_id!r} is outside --leak-repos")
             continue
         if case.task_id not in index:
-            if eval_pairs is not None:
-                raise ValueError(
-                    f"evaluation leak pair task {case.task_id!r} has no prepared assets"
-                )
+            if eval_pairs is not None or case.task_id in selected_task_ids:
+                raise ValueError(f"selected leak task {case.task_id!r} has no prepared assets")
             counts["assets_not_prepared"] += 1
             continue
         arms = index[case.task_id]
@@ -166,7 +238,9 @@ def load_leak_tasks(  # noqa: C901, PLR0912, PLR0913, PLR0915 - validates truste
         if reason is not None:
             counts[reason] += 1
             continue
-        pair_channel = eval_channels_by_task.get(case.task_id)
+        pair_channel = train_channels_by_task.get(
+            case.task_id, eval_channels_by_task.get(case.task_id)
+        )
         requested_channels = (pair_channel,) if pair_channel is not None else channels
         matching = [
             arm
@@ -248,6 +322,8 @@ def load_leak_tasks(  # noqa: C901, PLR0912, PLR0913, PLR0915 - validates truste
         identity = task.host_only_metadata
         identity["leak_repo_seen"] = case.repo_name in train_repos
         tasks.append(task)
+        if case.task_id in selected_task_ids:
+            seen_selected_task_ids.add(case.task_id)
         manifests[task.task_id] = manifest
         if pair_channel is not None:
             seen_pair_task_ids.add(case.task_id)
@@ -257,6 +333,11 @@ def load_leak_tasks(  # noqa: C901, PLR0912, PLR0913, PLR0915 - validates truste
     if missing_pair_task_ids:
         raise ValueError(
             f"evaluation leak pairs were not loaded: {sorted(missing_pair_task_ids)!r}"
+        )
+    missing_selected_task_ids = selected_task_ids - seen_selected_task_ids
+    if missing_selected_task_ids:
+        raise ValueError(
+            f"selected leak tasks were not loaded: {sorted(missing_selected_task_ids)!r}"
         )
     logger.info("leak source exclusions=%s", dict(counts))
     return tasks, manifests, counts
