@@ -346,7 +346,12 @@ def assess_path(
         else:
             _check_keep_ancestors(path, original_path, 0)
             _check_worktree(path, root_values.repo_root, 0)
-            byte_count = _scan_tree(path, allow_marked_entries=_marked_root(path, 0))
+            # pytest scratch is test output only; its links are unlinked by rmtree, never followed.
+            byte_count = _scan_tree(
+                path,
+                allow_marked_entries=_marked_root(path, 0)
+                or is_within(path, root_values.pytest_root),
+            )
     except RemovalRefusalError as error:
         return Assessment(argument, path, error.byte_count, error.reason)
     except (OSError, ValueError) as error:

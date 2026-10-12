@@ -214,6 +214,21 @@ def test_deletes_marked_tree_with_git_metadata_and_symlinks_without_following_th
     assert external_target.read_bytes() == b"external"
 
 
+def test_deletes_pytest_run_with_symlinks_without_following_them(safe_scope: SafeScope) -> None:
+    candidate = safe_scope.pytest_root / "pytest-42"
+    external_target = _make_file(safe_scope.home / "external-payload.bin", b"external")
+    _make_file(candidate / "test_case0" / "repo" / ".git" / "config", b"git metadata")
+    (candidate / "test_case0" / "venv-link").symlink_to(external_target)
+    (candidate / "test_case0-current").symlink_to(
+        candidate / "test_case0", target_is_directory=True
+    )
+
+    assert safe_rm.main([str(candidate)]) == 0
+
+    assert not candidate.exists()
+    assert external_target.read_bytes() == b"external"
+
+
 def test_registered_worktree_stays_protected_when_marked(
     safe_scope: SafeScope, monkeypatch: pytest.MonkeyPatch
 ) -> None:
