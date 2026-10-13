@@ -1718,45 +1718,21 @@ def _belief_probe(  # noqa: PLR0913, PLR0917 - branch uses the same inputs as re
     }
 
 
-def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit episode transitions stay ordered for auditability
-    task: Task,
-    backend: LadderBackend,
+def _validate_episode_arguments(  # noqa: C901, PLR0912, PLR0913 - mirrors the run_ladder_episode inputs it checks
     *,
-    episode_dir: Path,
-    arm: AgenticArmConfig,
-    system_prompt: str,
-    user_template: str,
-    max_turns: int = LADDER_MAX_TURNS,
-    announced_turn_budget: int | None = None,
-    sampling_seed: int | None = None,
-    timeout: str = LADDER_COMMAND_TIMEOUT,
-    jail_backend: str | None = None,
-    trace_path: Path | None = None,
-    episode_token: str | None = None,
-    episode_seconds: float = LADDER_EPISODE_SECONDS,
-    history_reasoning: HistoryReasoning = DEFAULT_HISTORY_REASONING,
-    thinking_token_budget: int | None = None,
-    chat_template_kwargs: Mapping[str, str] | None = None,
-    protocol: ModelProtocol = QWEN_PROTOCOL,
-    before_command: Callable[[Path, str], None] | None = None,
-    after_command: Callable[[Path, str, CommandResult], None] | None = None,
-    after_laydown: Callable[[Path], tuple[str, ...]] | None = None,
-    listing_mode: Literal["all", "top-level"] = "all",
-    organism_prompt: bool = False,
-    initial_environment: Mapping[str, str] = MappingProxyType({}),
-    format_error_message: str = FORMAT_ERROR_MESSAGE,
-    awareness_scanner: AwarenessScanner | None = None,
-    submit_grader: SubmissionGrader | None = None,
-    ci_submit_grader: BudgetedSubmissionGrader | None = None,
+    max_turns: int,
+    announced_turn_budget: int | None,
+    timeout: str,
+    episode_seconds: float,
     max_model_len: int,
-    max_new_tokens: int = LADDER_MAX_NEW_TOKENS,
-    belief_probe: bool = False,
-    belief_probe_questions: BeliefProbeQuestions | None = None,
-    final_report_prompt: str = FINAL_REPORT_PROMPT,
-    persist_graded_artifact: bool = False,
-    protected_paths: tuple[str, ...] = (),
-) -> LadderEpisodeTrace:
-    """Run one model-native tool-call episode with arm-specific submission grading."""
+    max_new_tokens: int,
+    thinking_token_budget: int | None,
+    history_reasoning: HistoryReasoning,
+    belief_probe: bool,
+    belief_probe_questions: BeliefProbeQuestions | None,
+    listing_mode: Literal["all", "top-level"],
+    initial_environment: Mapping[str, str],
+) -> None:
     if max_turns < 1:
         raise ValueError("max_turns must be positive")
     if announced_turn_budget is not None:
@@ -1785,478 +1761,141 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
     if any(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None for name in initial_environment):
         raise ValueError("initial environment names must be valid shell identifiers")
 
-    workspace_mount = (
-        task.docker_config.workspace_mount if task.docker_config is not None else "/work"
-    )
-    if organism_prompt:
-        user_template = user_template.replace(" You have {max_turns} turns.", "")
-        final_report_prompt = TASK_LOG_FINAL_REPORT_PROMPT
-    if task.docker_config is not None:
-        require_gate(task.docker_config)
-        system_prompt = system_prompt.replace("/work", workspace_mount)
-        user_template = user_template.replace("/work", workspace_mount)
-        final_report_prompt = final_report_prompt.replace("/work", workspace_mount)
-    episode_started = time.monotonic()
-    deadline = episode_started + episode_seconds
-    episode_id = compose_episode_id(
-        model_id=backend.model_id,
-        task_id=task.task_id,
-        arm=arm,
-        episode_token=episode_token if episode_token is not None else new_episode_token(),
-    )
-    assert_disposable_episode_dir(episode_dir)
-    materialized = lay_down_task(episode_dir, task, arm=arm)
-    tree_roots = () if after_laydown is None else after_laydown(episode_dir)
-    messages, tools, _listing = render_initial_messages(
-        task,
-        arm=arm,
-        system_prompt=system_prompt,
-        user_template=user_template,
-        episode_dir=episode_dir,
-        listing_mode=listing_mode,
-        organism_prompt=organism_prompt,
-        announced_turn_budget=announced_turn_budget,
-        workspace_mount=workspace_mount,
-        max_turns=max_turns,
-        materialized_paths=materialized,
-        tree_roots=tree_roots,
-    )
-    grader_hashable = all(
-        filename in materialized for filename in task.effective_grader_integrity_files
-    )
-    grader_laydown_sha256 = (
-        grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
-        if grader_hashable
-        else None
-    )
-    template_sha256, template_source = template_identity(
-        backend.tokenizer, backend.model_path or Path()
-    )
 
-    turns: list[LadderTurn] = []
-    commands: list[CommandResult] = []
-    submissions_used = 0
-    submission_fail_seen = False
-    submission_verdicts: list[Mapping[str, object]] = []
-    last_submission: SubmissionVerdict | None = None
-    grader_submission_sha256s: list[str | None] = []
-    format_errors = 0
-    format_errors_in_a_row = 0
-    tool_calls_total = 0
-    tool_calls_per_turn_max = 0
-    fabricated_tool_responses = 0
-    nudged_empty_start = False
-    ended_by: str | None = None
-    snapshot_error: SnapshotLimitError | None = None
-    deadline_phase: DeadlinePhase | None = None
-    peak_prompt_tokens = 0
-    rejected_context_request: dict[str, int] | None = None
-    previous_prompt: str | None = None
-    previous_completion: str | None = None
-    previous_prompt_token_ids: tuple[int, ...] | None = None
-    previous_sampled_token_ids: tuple[int, ...] = ()
-    previous_sampled_completion = ""
-    pending_prompt_messages: list[ChatMessage] = []
-    runaway_message_positions: list[int] = []
-    shell_state = _ShellState(
-        cwd=workspace_mount,
-        exported_script="\n".join(
-            f"export {name}={shlex.quote(value)}" for name, value in initial_environment.items()
-        ),
-    )
-    next_call_number = 0
-
-    for turn_index in range(max_turns):
-        turns_remaining = max_turns - turn_index - 1
-        prompt_state = _PromptRenderState(
-            history_reasoning=history_reasoning,
-            previous_prompt=previous_prompt,
-            previous_completion=previous_completion,
-            previous_prompt_token_ids=previous_prompt_token_ids,
-            previous_sampled_token_ids=previous_sampled_token_ids,
-            previous_sampled_completion=previous_sampled_completion,
-            appended_messages=tuple(pending_prompt_messages),
-            runaway_message_positions=tuple(runaway_message_positions),
-            chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
-            protocol=protocol,
-        )
-        rendered = _render_turn_prompt(
-            backend,
-            messages,
-            tools,
-            prompt_state,
-        )
-        peak_prompt_tokens = max(peak_prompt_tokens, rendered.prompt_tokens)
-        room = context_room(rendered.prompt_tokens, max_model_len)
-        if room < MIN_CONTEXT_ROOM:
-            ended_by = "context_exhausted"
-            break
-        requested_max_tokens = min(max_new_tokens, room)
-        try:
-            completion, generation_seconds = _sample_completion(
-                backend,
-                rendered.prompt,
-                max_tokens=requested_max_tokens,
-                deadline=deadline,
-                sampling_seed=sampling_call_seed(sampling_seed, turn_index),
-                prompt_token_ids=rendered.prompt_token_ids,
-            )
-        except ContextWindowExceededError:
-            ended_by = "context_exhausted"
-            rejected_context_request = {
-                "prompt_tokens": rendered.prompt_tokens,
-                "requested_max_tokens": requested_max_tokens,
-            }
-            break
-        if completion is None:
-            ended_by = "deadline"
-            deadline_phase = DeadlinePhase.SAMPLING
-            break
-
-        runaway = protocol.is_runaway(completion.text, completion.finish_reason)
-        reasoning_token_count = thinking_region_token_count(
-            backend.tokenizer,
-            rendered.prompt,
-            completion.text,
-            prompt_token_ids=rendered.prompt_token_ids,
-            completion_token_ids=completion.token_ids,
-        )
-        thinking_budget_overshoot = _thinking_budget_overshot(
-            thinking_token_budget, reasoning_token_count
-        )
-        # vLLM adds the next token slot before comparing against the budget, so a
-        # reasoning count equal to the budget means the following close was forced.
-        thinking_budget_fired = (
-            thinking_token_budget is not None and reasoning_token_count >= thinking_token_budget
-        )
-        forced_close_inside_tool_call = (
-            thinking_budget_fired and forced_thinking_close_inside_tool_call(completion.text)
-        )
-        parsed = (
-            ParsedTurn("", "", (), "", RUNAWAY_FORMAT_ERROR_MESSAGE)
-            if runaway
-            else protocol.parse_completion(completion.text)
-        )
-        format_error = (
-            RUNAWAY_FORMAT_ERROR_MESSAGE
-            if runaway
-            else _raw_completion_format_error(parsed, completion.finish_reason)
-        )
-        if forced_close_inside_tool_call:
-            format_error = "Thinking-token budget forced the reasoning close inside a tool call."
-        call_records = [
-            LadderToolCall(name=call.name, arguments=dict(call.arguments))
-            for call in parsed.tool_calls
-        ]
-        tool_calls_total += len(call_records)
-        tool_calls_per_turn_max = max(tool_calls_per_turn_max, len(call_records))
-        action_state = _ToolActionState(
-            call_records=call_records,
-            shell_state=shell_state,
-            grader_submission_sha256s=list(grader_submission_sha256s),
-            submissions_used=submissions_used,
-            submission_fail_seen=submission_fail_seen,
-            submission_verdicts=list(submission_verdicts),
-            last_submission=last_submission,
-        )
-        assistant_message, next_call_number = _assistant_message(
-            parsed, first_call_number=next_call_number
-        )
-        assistant_message_position = len(messages)
-        runaway_completion = (
-            protocol.render_empty_assistant_completion(
-                backend.tokenizer,
-                messages,
-                tools,
-                chat_template_kwargs=prompt_state.chat_template_kwargs,
-            )
-            if runaway and history_reasoning == "retain"
-            else ""
-        )
-
-        if thinking_budget_overshoot:
-            ended_by = "thinking_budget_overshoot"
-            _mark_unexecuted(action_state.call_records, 0, "thinking_budget_overshoot")
-        elif format_error is not None:
-            format_errors += 1
-            format_errors_in_a_row += 1
-            if runaway:
-                if history_reasoning == "retain":
-                    runaway_message_positions.append(len(messages))
-                    messages.append(assistant_message)
-                messages.append({"role": "user", "content": RUNAWAY_FORMAT_ERROR_MESSAGE})
-            elif completion.finish_reason == "length" or forced_close_inside_tool_call:
-                messages.append(assistant_message)
-                _mark_unexecuted(action_state.call_records, 0, "format_error")
-                if parsed.tool_calls:
-                    for call_index, call in enumerate(parsed.tool_calls):
-                        format_error_content = _append_turns_remaining_note(
-                            format_error_message,
-                            remaining_turns=turns_remaining,
-                            announced_turn_budget=announced_turn_budget,
-                        )
-                        action_state.tool_results.append(
-                            LadderToolResult(
-                                name=call.name,
-                                call_index=call_index,
-                                content_sent=format_error_content,
-                                truncated=False,
-                            )
-                        )
-                        action_state.tool_messages.append(
-                            protocol.serialize_tool_feedback(format_error_content)
-                        )
-                else:
-                    format_error_content = _append_turns_remaining_note(
-                        format_error_message,
-                        remaining_turns=turns_remaining,
-                        announced_turn_budget=announced_turn_budget,
-                    )
-                    action_state.tool_messages.append(
-                        protocol.serialize_tool_feedback(format_error_content)
-                    )
-            elif not runaway:
-                messages.append(assistant_message)
-                format_error_content = _append_turns_remaining_note(
-                    format_error_message,
-                    remaining_turns=turns_remaining,
-                    announced_turn_budget=announced_turn_budget,
-                )
-                action_state.tool_messages.append(
-                    protocol.serialize_tool_feedback(format_error_content)
-                )
-            if format_errors_in_a_row >= MAX_CONSECUTIVE_FORMAT_ERRORS:
-                ended_by = "format_errors"
-        elif call_records:
-            format_errors_in_a_row = 0
-            _execute_tool_calls(
-                parsed.tool_calls,
-                action_state,
-                _ToolActionContext(
-                    task=task,
-                    episode_dir=episode_dir,
-                    arm=arm,
-                    timeout=timeout,
-                    jail_backend=jail_backend,
-                    deadline=deadline,
-                    command=_CommandContext(
-                        episode_dir=episode_dir,
-                        timeout=timeout,
-                        jail_backend=jail_backend,
-                        before_command=before_command,
-                        after_command=after_command,
-                        docker_config=task.docker_config,
-                        protected_paths=protected_paths,
-                    ),
-                    submit_grader=submit_grader,
-                    ci_submit_grader=ci_submit_grader,
-                    grader_hashable=grader_hashable,
-                    remaining_turns=turns_remaining,
-                    announced_turn_budget=announced_turn_budget,
-                    protocol=protocol,
-                ),
-            )
-
-        tool_results = action_state.tool_results
-        turn_commands = action_state.turn_commands
-        shell_state = action_state.shell_state
-        commands.extend(action_state.commands)
-        submissions_used = action_state.submissions_used
-        submission_fail_seen = action_state.submission_fail_seen
-        submission_verdicts = action_state.submission_verdicts
-        last_submission = action_state.last_submission
-        grader_submission_sha256s = action_state.grader_submission_sha256s
-        if action_state.ended_by is not None:
-            ended_by = action_state.ended_by
-            deadline_phase = action_state.deadline_phase
-        snapshot_error = action_state.snapshot_error
-
-        if not runaway and format_error is None:
+def _append_format_error_feedback(  # noqa: PLR0913 - explicit per-turn inputs; mutates messages and action_state
+    *,
+    messages: list[ChatMessage],
+    action_state: _ToolActionState,
+    runaway_message_positions: list[int],
+    assistant_message: ChatMessage,
+    parsed: ParsedTurn,
+    finish_reason: str | None,
+    runaway: bool,
+    forced_close_inside_tool_call: bool,
+    history_reasoning: HistoryReasoning,
+    protocol: ModelProtocol,
+    format_error_message: str,
+    turns_remaining: int,
+    announced_turn_budget: int | None,
+) -> None:
+    if runaway:
+        if history_reasoning == "retain":
+            runaway_message_positions.append(len(messages))
             messages.append(assistant_message)
-        if not runaway:
-            messages.extend(action_state.tool_messages)
-
-        if format_error is None and not call_records:
-            if not commands and not nudged_empty_start:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"{format_error_message}\n\nNothing has been written to {workspace_mount} yet.",
-                    }
-                )
-                nudged_empty_start = True
-            else:
-                ended_by = "no_tool_call"
-
-        pending_prompt_messages = messages[assistant_message_position + 1 :]
-
-        turn = LadderTurn(
-            index=turn_index,
-            turns_remaining=turns_remaining,
-            raw_completion=completion.text,
-            reasoning=parsed.reasoning,
-            thinking_token_budget=thinking_token_budget,
-            thinking_budget_fired=thinking_budget_fired,
-            thinking_budget_overshoot=thinking_budget_overshoot,
-            reasoning_token_count=reasoning_token_count,
-            history_reasoning=history_reasoning,
-            content=parsed.content,
-            tool_calls=tuple(call_records),
-            tool_results=tuple(tool_results),
-            commands=tuple(turn_commands),
-            command_cwds_after=tuple(action_state.command_cwds_after),
-            command_protected_path_digests=tuple(action_state.command_protected_path_digests),
-            runaway=runaway,
-            format_error=format_error,
-            stop_reason=_stop_reason(completion.finish_reason),
-            matched_stop_token_id=completion.matched_stop,
-            output_tokens=completion.completion_tokens,
-            completion_token_ids=completion.token_ids,
-            completion_logprobs=completion.token_logprobs,
-            prompt_tokens=completion.prompt_tokens,
-            prompt_tokens_local=rendered.prompt_tokens,
-            requested_max_tokens=requested_max_tokens,
-            generation_seconds=generation_seconds,
-            prompt_pure_append=rendered.prompt_pure_append,
-            fabricated_tool_responses=count_fabricated_tool_responses(completion.text),
-            surplus_function_close_tags=parsed.surplus_function_close_tags,
-            trailing_text_chars=len(parsed.trailing_text),
-            rendered_prompt_sha256=hashlib.sha256(rendered.prompt.encode("utf-8")).hexdigest(),
-            rendered_prompt_text=_rendered_prompt_trace_text(
-                rendered.prompt,
-                previous_prompt,
-                is_full=(
-                    turn_index == 0
-                    or history_reasoning == "strip"
-                    or not protocol.supports_pure_append
-                ),
-            ),
-            rendered_prompt_is_full=(
-                turn_index == 0 or history_reasoning == "strip" or not protocol.supports_pure_append
-            ),
-            eval_awareness=_scan_awareness(
-                awareness_scanner,
-                reasoning=parsed.reasoning,
-                content=parsed.content,
-                turn_index=turn_index,
-                episode_id=episode_id,
-            ),
-            prompt_token_ids=completion.prompt_token_ids,
-        )
-        turns.append(turn)
-        fabricated_tool_responses += turn.fabricated_tool_responses
-        _append_trace_record(
-            trace_path, turn.to_json_dict(episode_id=episode_id, task_id=task.task_id)
-        )
-        previous_prompt = rendered.prompt
-        previous_prompt_token_ids = rendered.prompt_token_ids
-        previous_sampled_token_ids = () if runaway else completion.token_ids
-        previous_sampled_completion = "" if runaway else completion.text
-        if not runaway and isinstance(backend, VLLMHTTPBackend):
-            decoded_sample = backend.tokenizer.decode(
-                list(previous_sampled_token_ids),
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
-            if not isinstance(decoded_sample, str):
-                raise TypeError("tokenizer.decode must return a string for one sampled sequence")
-            previous_sampled_completion = decoded_sample
-        if runaway:
-            previous_completion = runaway_completion
-        elif (
-            protocol.supports_pure_append
-            and history_reasoning == "retain"
-            and backend.tokenizer.chat_template is not None
-        ):
-            previous_completion = completion.text + protocol.render_assistant_terminator_suffix(
-                backend.tokenizer,
-                messages[:assistant_message_position],
-                tools,
-                chat_template_kwargs=prompt_state.chat_template_kwargs,
-            )
-        else:
-            previous_completion = completion.text
-
-        if ended_by is not None:
-            break
-
-    if ended_by is None:
-        ended_by = "turn_cap"
-
-    continuation_context = _FinalReportContext(
-        max_model_len=max_model_len,
-        max_new_tokens=max_new_tokens,
-        report_seconds=LADDER_FINAL_REPORT_SECONDS,
-        next_call_number=next_call_number,
-        sampling_seed=sampling_call_seed(sampling_seed, max_turns),
+        messages.append({"role": "user", "content": RUNAWAY_FORMAT_ERROR_MESSAGE})
+        return
+    messages.append(assistant_message)
+    format_error_content = _append_turns_remaining_note(
+        format_error_message,
+        remaining_turns=turns_remaining,
+        announced_turn_budget=announced_turn_budget,
     )
-    continuation_state = _PromptRenderState(
-        history_reasoning=history_reasoning,
-        previous_prompt=previous_prompt,
+    cut_off = finish_reason == "length" or forced_close_inside_tool_call
+    if cut_off:
+        _mark_unexecuted(action_state.call_records, 0, "format_error")
+    if cut_off and parsed.tool_calls:
+        for call_index, call in enumerate(parsed.tool_calls):
+            action_state.tool_results.append(
+                LadderToolResult(
+                    name=call.name,
+                    call_index=call_index,
+                    content_sent=format_error_content,
+                    truncated=False,
+                )
+            )
+            action_state.tool_messages.append(
+                protocol.serialize_tool_feedback(format_error_content)
+            )
+    else:
+        action_state.tool_messages.append(protocol.serialize_tool_feedback(format_error_content))
+
+
+def _prompt_state_after_turn(  # noqa: PLR0913 - explicit per-turn inputs
+    prompt_state: _PromptRenderState,
+    *,
+    backend: LadderBackend,
+    rendered: _RenderedTurn,
+    completion: RenderedCompletion,
+    runaway: bool,
+    runaway_completion: str,
+    messages_before_assistant: list[ChatMessage],
+    tools: Sequence[Mapping[str, object]],
+) -> _PromptRenderState:
+    protocol = prompt_state.protocol
+    history_reasoning = prompt_state.history_reasoning
+    previous_sampled_token_ids = () if runaway else completion.token_ids
+    previous_sampled_completion = "" if runaway else completion.text
+    if not runaway and isinstance(backend, VLLMHTTPBackend):
+        decoded_sample = backend.tokenizer.decode(
+            list(previous_sampled_token_ids),
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        if not isinstance(decoded_sample, str):
+            raise TypeError("tokenizer.decode must return a string for one sampled sequence")
+        previous_sampled_completion = decoded_sample
+    if runaway:
+        previous_completion = runaway_completion
+    elif (
+        protocol.supports_pure_append
+        and history_reasoning == "retain"
+        and backend.tokenizer.chat_template is not None
+    ):
+        previous_completion = completion.text + protocol.render_assistant_terminator_suffix(
+            backend.tokenizer,
+            messages_before_assistant,
+            tools,
+            chat_template_kwargs=prompt_state.chat_template_kwargs,
+        )
+    else:
+        previous_completion = completion.text
+    return replace(
+        prompt_state,
+        previous_prompt=rendered.prompt,
         previous_completion=previous_completion,
-        previous_prompt_token_ids=previous_prompt_token_ids,
+        previous_prompt_token_ids=rendered.prompt_token_ids,
         previous_sampled_token_ids=previous_sampled_token_ids,
         previous_sampled_completion=previous_sampled_completion,
-        appended_messages=tuple(pending_prompt_messages),
-        runaway_message_positions=tuple(runaway_message_positions),
-        chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
-        protocol=protocol,
     )
-    eval_belief_probe = (
-        _belief_probe(
-            backend,
-            messages,
-            tools,
-            belief_probe_questions,
-            continuation_context,
-            continuation_state,
-        )
-        if (
-            ended_by != "thinking_budget_overshoot"
-            and snapshot_error is None
-            and belief_probe
-            and belief_probe_questions is not None
-        )
-        else None
-    )
-    if ended_by in {"thinking_budget_overshoot", "workspace_snapshot_limit"}:
-        final_report = None
-        final_report_reasoning = ""
-        final_report_truncated = False
-        final_report_timed_out = False
-        final_report_tool_calls = 0
-        final_report_fabricated_tool_responses = 0
-        final_report_reasoning_dropped = False
-        final_report_prompt_tokens = 0
-        final_report_prompt_sha256 = ""
-        final_report_prompt_text = ""
-        final_report_prompt_is_full = False
-    else:
-        (
-            messages,
-            final_report,
-            final_report_reasoning,
-            final_report_truncated,
-            final_report_timed_out,
-            final_report_tool_calls,
-            final_report_fabricated_tool_responses,
-            final_report_reasoning_dropped,
-            final_report_prompt_tokens,
-            final_report_prompt_sha256,
-            final_report_prompt_text,
-            final_report_prompt_is_full,
-        ) = _final_report(
-            backend,
-            messages,
-            tools,
-            continuation_context,
-            continuation_state,
-            final_report_prompt=final_report_prompt,
-        )
-    report_unavailable = final_report is None or not final_report.strip()
-    peak_prompt_tokens = max(peak_prompt_tokens, final_report_prompt_tokens)
-    fabricated_tool_responses += final_report_fabricated_tool_responses
 
+
+@dataclass(frozen=True, slots=True)
+class _FinalReportOutcome:
+    final_report: str | None = None
+    reasoning: str = ""
+    truncated: bool = False
+    timed_out: bool = False
+    tool_calls: int = 0
+    fabricated_tool_responses: int = 0
+    reasoning_dropped: bool = False
+    prompt_tokens: int = 0
+    prompt_sha256: str = ""
+    prompt_text: str = ""
+    prompt_is_full: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _EpisodeGrading:
+    final_grade: FinalGrade
+    ended_by: str
+    snapshot_error: SnapshotLimitError | None
+    graded_on: Literal["submission", "final_state"] | None
+    final_state_verdict: dict[str, object] | None
+
+
+def _grade_episode(  # noqa: C901, PLR0912, PLR0913 - ordered grading transitions stay together
+    task: Task,
+    *,
+    episode_dir: Path,
+    arm: AgenticArmConfig,
+    timeout: str,
+    jail_backend: str | None,
+    grader_hashable: bool,
+    submit_grader: SubmissionGrader | None,
+    ended_by: str,
+    last_submission: SubmissionVerdict | None,
+    snapshot_error: SnapshotLimitError | None,
+) -> _EpisodeGrading:
     final_state_verdict: dict[str, object] | None = None
     graded_on: Literal["submission", "final_state"] | None = None
     if ended_by == "workspace_snapshot_limit":
@@ -2334,74 +1973,686 @@ def run_ladder_episode(  # noqa: C901, PLR0912, PLR0913, PLR0915 - explicit epis
             ),
             proxy_pass=last_submission.passed,
         )
-    graded_artifact = (
-        _persist_graded_artifact(task, episode_dir, trace_path, final_grade)
-        if persist_graded_artifact
-        and ended_by not in {"thinking_budget_overshoot", "workspace_snapshot_limit"}
-        else None
-    )
-    trace = LadderEpisodeTrace(
-        task_id=task.task_id,
-        model_id=backend.model_id,
-        transport=backend.transport,
-        episode_id=episode_id,
-        episode_dir=episode_dir,
-        workspace_mount=workspace_mount,
-        arm=arm,
-        history_reasoning=history_reasoning,
-        thinking_token_budget=thinking_token_budget,
-        turns=tuple(turns),
-        messages=tuple(copy.deepcopy(messages)),
-        ended_by=ended_by,
-        format_errors=format_errors,
-        format_errors_in_a_row=format_errors_in_a_row,
-        tool_calls_total=tool_calls_total,
-        tool_calls_per_turn_max=tool_calls_per_turn_max,
-        nudged_empty_start=nudged_empty_start,
-        fabricated_tool_responses=fabricated_tool_responses,
-        final_report_tool_calls=final_report_tool_calls,
-        report_unavailable=report_unavailable,
-        final_report_reasoning_dropped=final_report_reasoning_dropped,
-        max_model_len=max_model_len,
-        context_peak_prompt_tokens=peak_prompt_tokens,
-        rejected_context_request=rejected_context_request,
-        template_sha256=template_sha256,
-        template_source=template_source,
-        submissions_used=submissions_used,
-        submission_fail_seen=submission_fail_seen,
-        submission_verdicts=tuple(submission_verdicts),
-        last_submission=(None if ended_by == "workspace_snapshot_limit" else last_submission),
-        grader_laydown_sha256=grader_laydown_sha256,
-        grader_submission_sha256s=tuple(grader_submission_sha256s),
+    return _EpisodeGrading(
         final_grade=final_grade,
-        visible_check_unsatisfiable=task.visible_check_unsatisfiable,
-        visible_check_contradicts_truth=task.visible_check_contradicts_truth,
-        agent_saw_grader_success=_agent_saw_grader_success(task, turns),
-        deadline_seconds=episode_seconds,
-        deadline_exceeded=deadline_phase is not None,
-        deadline_phase=deadline_phase,
-        elapsed_seconds=time.monotonic() - episode_started,
-        final_report=final_report,
-        final_report_reasoning=final_report_reasoning,
-        final_report_prompt_sha256=final_report_prompt_sha256,
-        final_report_prompt_text=final_report_prompt_text,
-        final_report_prompt_is_full=final_report_prompt_is_full,
-        final_report_truncated=final_report_truncated,
-        final_report_timed_out=final_report_timed_out,
-        final_report_fabricated_tool_responses=final_report_fabricated_tool_responses,
-        grader_hashable=grader_hashable,
-        eval_belief_probe=eval_belief_probe,
-        protocol=protocol.name,
+        ended_by=ended_by,
+        snapshot_error=snapshot_error,
         graded_on=graded_on,
         final_state_verdict=final_state_verdict,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _EpisodeContext:
+    task: Task
+    backend: LadderBackend
+    episode_dir: Path
+    arm: AgenticArmConfig
+    episode_id: str
+    workspace_mount: str
+    tools: list[dict[str, object]]
+    max_turns: int
+    announced_turn_budget: int | None
+    sampling_seed: int | None
+    timeout: str
+    jail_backend: str | None
+    trace_path: Path | None
+    episode_started: float
+    episode_seconds: float
+    deadline: float
+    history_reasoning: HistoryReasoning
+    thinking_token_budget: int | None
+    protocol: ModelProtocol
+    before_command: Callable[[Path, str], None] | None
+    after_command: Callable[[Path, str, CommandResult], None] | None
+    format_error_message: str
+    awareness_scanner: AwarenessScanner | None
+    submit_grader: SubmissionGrader | None
+    ci_submit_grader: BudgetedSubmissionGrader | None
+    protected_paths: tuple[str, ...]
+    max_model_len: int
+    max_new_tokens: int
+    grader_hashable: bool
+    grader_laydown_sha256: str | None
+    template_sha256: str
+    template_source: str
+
+
+@dataclass(slots=True)
+class _EpisodeProgress:
+    messages: list[ChatMessage]
+    shell_state: _ShellState
+    prompt_state: _PromptRenderState
+    turns: list[LadderTurn] = field(default_factory=list)
+    commands: list[CommandResult] = field(default_factory=list)
+    submissions_used: int = 0
+    submission_fail_seen: bool = False
+    submission_verdicts: list[Mapping[str, object]] = field(default_factory=list)
+    last_submission: SubmissionVerdict | None = None
+    grader_submission_sha256s: list[str | None] = field(default_factory=list)
+    format_errors: int = 0
+    format_errors_in_a_row: int = 0
+    tool_calls_total: int = 0
+    tool_calls_per_turn_max: int = 0
+    fabricated_tool_responses: int = 0
+    nudged_empty_start: bool = False
+    ended_by: str | None = None
+    snapshot_error: SnapshotLimitError | None = None
+    deadline_phase: DeadlinePhase | None = None
+    peak_prompt_tokens: int = 0
+    rejected_context_request: dict[str, int] | None = None
+    pending_prompt_messages: list[ChatMessage] = field(default_factory=list)
+    runaway_message_positions: list[int] = field(default_factory=list)
+    next_call_number: int = 0
+
+
+def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay ordered for auditability
+    context: _EpisodeContext, progress: _EpisodeProgress, turn_index: int
+) -> None:
+    backend = context.backend
+    protocol = context.protocol
+    history_reasoning = context.history_reasoning
+    messages = progress.messages
+    turns_remaining = context.max_turns - turn_index - 1
+    prompt_state = replace(
+        progress.prompt_state,
+        appended_messages=tuple(progress.pending_prompt_messages),
+        runaway_message_positions=tuple(progress.runaway_message_positions),
+    )
+    rendered = _render_turn_prompt(
+        backend,
+        messages,
+        context.tools,
+        prompt_state,
+    )
+    progress.peak_prompt_tokens = max(progress.peak_prompt_tokens, rendered.prompt_tokens)
+    room = context_room(rendered.prompt_tokens, context.max_model_len)
+    if room < MIN_CONTEXT_ROOM:
+        progress.ended_by = "context_exhausted"
+        return
+    requested_max_tokens = min(context.max_new_tokens, room)
+    try:
+        completion, generation_seconds = _sample_completion(
+            backend,
+            rendered.prompt,
+            max_tokens=requested_max_tokens,
+            deadline=context.deadline,
+            sampling_seed=sampling_call_seed(context.sampling_seed, turn_index),
+            prompt_token_ids=rendered.prompt_token_ids,
+        )
+    except ContextWindowExceededError:
+        progress.ended_by = "context_exhausted"
+        progress.rejected_context_request = {
+            "prompt_tokens": rendered.prompt_tokens,
+            "requested_max_tokens": requested_max_tokens,
+        }
+        return
+    if completion is None:
+        progress.ended_by = "deadline"
+        progress.deadline_phase = DeadlinePhase.SAMPLING
+        return
+
+    thinking_token_budget = context.thinking_token_budget
+    runaway = protocol.is_runaway(completion.text, completion.finish_reason)
+    reasoning_token_count = thinking_region_token_count(
+        backend.tokenizer,
+        rendered.prompt,
+        completion.text,
+        prompt_token_ids=rendered.prompt_token_ids,
+        completion_token_ids=completion.token_ids,
+    )
+    thinking_budget_overshoot = _thinking_budget_overshot(
+        thinking_token_budget, reasoning_token_count
+    )
+    # vLLM adds the next token slot before comparing against the budget, so a
+    # reasoning count equal to the budget means the following close was forced.
+    thinking_budget_fired = (
+        thinking_token_budget is not None and reasoning_token_count >= thinking_token_budget
+    )
+    forced_close_inside_tool_call = (
+        thinking_budget_fired and forced_thinking_close_inside_tool_call(completion.text)
+    )
+    parsed = (
+        ParsedTurn("", "", (), "", RUNAWAY_FORMAT_ERROR_MESSAGE)
+        if runaway
+        else protocol.parse_completion(completion.text)
+    )
+    format_error = (
+        RUNAWAY_FORMAT_ERROR_MESSAGE
+        if runaway
+        else _raw_completion_format_error(parsed, completion.finish_reason)
+    )
+    if forced_close_inside_tool_call:
+        format_error = "Thinking-token budget forced the reasoning close inside a tool call."
+    call_records = [
+        LadderToolCall(name=call.name, arguments=dict(call.arguments)) for call in parsed.tool_calls
+    ]
+    progress.tool_calls_total += len(call_records)
+    progress.tool_calls_per_turn_max = max(progress.tool_calls_per_turn_max, len(call_records))
+    action_state = _ToolActionState(
+        call_records=call_records,
+        shell_state=progress.shell_state,
+        grader_submission_sha256s=list(progress.grader_submission_sha256s),
+        submissions_used=progress.submissions_used,
+        submission_fail_seen=progress.submission_fail_seen,
+        submission_verdicts=list(progress.submission_verdicts),
+        last_submission=progress.last_submission,
+    )
+    assistant_message, progress.next_call_number = _assistant_message(
+        parsed, first_call_number=progress.next_call_number
+    )
+    assistant_message_position = len(messages)
+    runaway_completion = (
+        protocol.render_empty_assistant_completion(
+            backend.tokenizer,
+            messages,
+            context.tools,
+            chat_template_kwargs=prompt_state.chat_template_kwargs,
+        )
+        if runaway and history_reasoning == "retain"
+        else ""
+    )
+
+    if thinking_budget_overshoot:
+        progress.ended_by = "thinking_budget_overshoot"
+        _mark_unexecuted(action_state.call_records, 0, "thinking_budget_overshoot")
+    elif format_error is not None:
+        progress.format_errors += 1
+        progress.format_errors_in_a_row += 1
+        _append_format_error_feedback(
+            messages=messages,
+            action_state=action_state,
+            runaway_message_positions=progress.runaway_message_positions,
+            assistant_message=assistant_message,
+            parsed=parsed,
+            finish_reason=completion.finish_reason,
+            runaway=runaway,
+            forced_close_inside_tool_call=forced_close_inside_tool_call,
+            history_reasoning=history_reasoning,
+            protocol=protocol,
+            format_error_message=context.format_error_message,
+            turns_remaining=turns_remaining,
+            announced_turn_budget=context.announced_turn_budget,
+        )
+        if progress.format_errors_in_a_row >= MAX_CONSECUTIVE_FORMAT_ERRORS:
+            progress.ended_by = "format_errors"
+    elif call_records:
+        progress.format_errors_in_a_row = 0
+        _execute_tool_calls(
+            parsed.tool_calls,
+            action_state,
+            _ToolActionContext(
+                task=context.task,
+                episode_dir=context.episode_dir,
+                arm=context.arm,
+                timeout=context.timeout,
+                jail_backend=context.jail_backend,
+                deadline=context.deadline,
+                command=_CommandContext(
+                    episode_dir=context.episode_dir,
+                    timeout=context.timeout,
+                    jail_backend=context.jail_backend,
+                    before_command=context.before_command,
+                    after_command=context.after_command,
+                    docker_config=context.task.docker_config,
+                    protected_paths=context.protected_paths,
+                ),
+                submit_grader=context.submit_grader,
+                ci_submit_grader=context.ci_submit_grader,
+                grader_hashable=context.grader_hashable,
+                remaining_turns=turns_remaining,
+                announced_turn_budget=context.announced_turn_budget,
+                protocol=protocol,
+            ),
+        )
+
+    progress.shell_state = action_state.shell_state
+    progress.commands.extend(action_state.commands)
+    progress.submissions_used = action_state.submissions_used
+    progress.submission_fail_seen = action_state.submission_fail_seen
+    progress.submission_verdicts = action_state.submission_verdicts
+    progress.last_submission = action_state.last_submission
+    progress.grader_submission_sha256s = action_state.grader_submission_sha256s
+    if action_state.ended_by is not None:
+        progress.ended_by = action_state.ended_by
+        progress.deadline_phase = action_state.deadline_phase
+    progress.snapshot_error = action_state.snapshot_error
+
+    if not runaway and format_error is None:
+        messages.append(assistant_message)
+    if not runaway:
+        messages.extend(action_state.tool_messages)
+
+    if format_error is None and not call_records:
+        if not progress.commands and not progress.nudged_empty_start:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"{context.format_error_message}\n\n"
+                        f"Nothing has been written to {context.workspace_mount} yet."
+                    ),
+                }
+            )
+            progress.nudged_empty_start = True
+        else:
+            progress.ended_by = "no_tool_call"
+
+    progress.pending_prompt_messages = messages[assistant_message_position + 1 :]
+
+    rendered_prompt_is_full = (
+        turn_index == 0 or history_reasoning == "strip" or not protocol.supports_pure_append
+    )
+    turn = LadderTurn(
+        index=turn_index,
+        turns_remaining=turns_remaining,
+        raw_completion=completion.text,
+        reasoning=parsed.reasoning,
+        thinking_token_budget=thinking_token_budget,
+        thinking_budget_fired=thinking_budget_fired,
+        thinking_budget_overshoot=thinking_budget_overshoot,
+        reasoning_token_count=reasoning_token_count,
+        history_reasoning=history_reasoning,
+        content=parsed.content,
+        tool_calls=tuple(call_records),
+        tool_results=tuple(action_state.tool_results),
+        commands=tuple(action_state.turn_commands),
+        command_cwds_after=tuple(action_state.command_cwds_after),
+        command_protected_path_digests=tuple(action_state.command_protected_path_digests),
+        runaway=runaway,
+        format_error=format_error,
+        stop_reason=_stop_reason(completion.finish_reason),
+        matched_stop_token_id=completion.matched_stop,
+        output_tokens=completion.completion_tokens,
+        completion_token_ids=completion.token_ids,
+        completion_logprobs=completion.token_logprobs,
+        prompt_tokens=completion.prompt_tokens,
+        prompt_tokens_local=rendered.prompt_tokens,
+        requested_max_tokens=requested_max_tokens,
+        generation_seconds=generation_seconds,
+        prompt_pure_append=rendered.prompt_pure_append,
+        fabricated_tool_responses=count_fabricated_tool_responses(completion.text),
+        surplus_function_close_tags=parsed.surplus_function_close_tags,
+        trailing_text_chars=len(parsed.trailing_text),
+        rendered_prompt_sha256=hashlib.sha256(rendered.prompt.encode("utf-8")).hexdigest(),
+        rendered_prompt_text=_rendered_prompt_trace_text(
+            rendered.prompt,
+            progress.prompt_state.previous_prompt,
+            is_full=rendered_prompt_is_full,
+        ),
+        rendered_prompt_is_full=rendered_prompt_is_full,
+        eval_awareness=_scan_awareness(
+            context.awareness_scanner,
+            reasoning=parsed.reasoning,
+            content=parsed.content,
+            turn_index=turn_index,
+            episode_id=context.episode_id,
+        ),
+        prompt_token_ids=completion.prompt_token_ids,
+    )
+    progress.turns.append(turn)
+    progress.fabricated_tool_responses += turn.fabricated_tool_responses
+    _append_trace_record(
+        context.trace_path,
+        turn.to_json_dict(episode_id=context.episode_id, task_id=context.task.task_id),
+    )
+    progress.prompt_state = _prompt_state_after_turn(
+        prompt_state,
+        backend=backend,
+        rendered=rendered,
+        completion=completion,
+        runaway=runaway,
+        runaway_completion=runaway_completion,
+        messages_before_assistant=messages[:assistant_message_position],
+        tools=context.tools,
+    )
+
+
+def _sample_belief_probe_and_final_report(
+    context: _EpisodeContext,
+    progress: _EpisodeProgress,
+    *,
+    belief_probe_questions: BeliefProbeQuestions | None,
+    final_report_prompt: str,
+) -> tuple[dict[str, object] | None, _FinalReportOutcome]:
+    backend = context.backend
+    tools = context.tools
+    continuation_context = _FinalReportContext(
+        max_model_len=context.max_model_len,
+        max_new_tokens=context.max_new_tokens,
+        report_seconds=LADDER_FINAL_REPORT_SECONDS,
+        next_call_number=progress.next_call_number,
+        sampling_seed=sampling_call_seed(context.sampling_seed, context.max_turns),
+    )
+    continuation_state = replace(
+        progress.prompt_state,
+        appended_messages=tuple(progress.pending_prompt_messages),
+        runaway_message_positions=tuple(progress.runaway_message_positions),
+    )
+    eval_belief_probe = (
+        _belief_probe(
+            backend,
+            progress.messages,
+            tools,
+            belief_probe_questions,
+            continuation_context,
+            continuation_state,
+        )
+        if (
+            progress.ended_by != "thinking_budget_overshoot"
+            and progress.snapshot_error is None
+            and belief_probe_questions is not None
+        )
+        else None
+    )
+    if progress.ended_by in {"thinking_budget_overshoot", "workspace_snapshot_limit"}:
+        return eval_belief_probe, _FinalReportOutcome()
+    (
+        progress.messages,
+        final_report,
+        reasoning,
+        truncated,
+        timed_out,
+        tool_calls,
+        fabricated_tool_responses,
+        reasoning_dropped,
+        prompt_tokens,
+        prompt_sha256,
+        prompt_text,
+        prompt_is_full,
+    ) = _final_report(
+        backend,
+        progress.messages,
+        tools,
+        continuation_context,
+        continuation_state,
+        final_report_prompt=final_report_prompt,
+    )
+    report = _FinalReportOutcome(
+        final_report=final_report,
+        reasoning=reasoning,
+        truncated=truncated,
+        timed_out=timed_out,
+        tool_calls=tool_calls,
+        fabricated_tool_responses=fabricated_tool_responses,
+        reasoning_dropped=reasoning_dropped,
+        prompt_tokens=prompt_tokens,
+        prompt_sha256=prompt_sha256,
+        prompt_text=prompt_text,
+        prompt_is_full=prompt_is_full,
+    )
+    return eval_belief_probe, report
+
+
+def _build_episode_trace(  # noqa: PLR0913 - explicit inputs from each episode phase
+    context: _EpisodeContext,
+    progress: _EpisodeProgress,
+    *,
+    report: _FinalReportOutcome,
+    grading: _EpisodeGrading,
+    eval_belief_probe: dict[str, object] | None,
+    graded_artifact: Mapping[str, object] | None,
+) -> LadderEpisodeTrace:
+    task = context.task
+    ended_by = grading.ended_by
+    return LadderEpisodeTrace(
+        task_id=task.task_id,
+        model_id=context.backend.model_id,
+        transport=context.backend.transport,
+        episode_id=context.episode_id,
+        episode_dir=context.episode_dir,
+        workspace_mount=context.workspace_mount,
+        arm=context.arm,
+        history_reasoning=context.history_reasoning,
+        thinking_token_budget=context.thinking_token_budget,
+        turns=tuple(progress.turns),
+        messages=tuple(copy.deepcopy(progress.messages)),
+        ended_by=ended_by,
+        format_errors=progress.format_errors,
+        format_errors_in_a_row=progress.format_errors_in_a_row,
+        tool_calls_total=progress.tool_calls_total,
+        tool_calls_per_turn_max=progress.tool_calls_per_turn_max,
+        nudged_empty_start=progress.nudged_empty_start,
+        fabricated_tool_responses=progress.fabricated_tool_responses,
+        final_report_tool_calls=report.tool_calls,
+        report_unavailable=report.final_report is None or not report.final_report.strip(),
+        final_report_reasoning_dropped=report.reasoning_dropped,
+        max_model_len=context.max_model_len,
+        context_peak_prompt_tokens=progress.peak_prompt_tokens,
+        rejected_context_request=progress.rejected_context_request,
+        template_sha256=context.template_sha256,
+        template_source=context.template_source,
+        submissions_used=progress.submissions_used,
+        submission_fail_seen=progress.submission_fail_seen,
+        submission_verdicts=tuple(progress.submission_verdicts),
+        last_submission=(
+            None if ended_by == "workspace_snapshot_limit" else progress.last_submission
+        ),
+        grader_laydown_sha256=context.grader_laydown_sha256,
+        grader_submission_sha256s=tuple(progress.grader_submission_sha256s),
+        final_grade=grading.final_grade,
+        visible_check_unsatisfiable=task.visible_check_unsatisfiable,
+        visible_check_contradicts_truth=task.visible_check_contradicts_truth,
+        agent_saw_grader_success=_agent_saw_grader_success(task, progress.turns),
+        deadline_seconds=context.episode_seconds,
+        deadline_exceeded=progress.deadline_phase is not None,
+        deadline_phase=progress.deadline_phase,
+        elapsed_seconds=time.monotonic() - context.episode_started,
+        final_report=report.final_report,
+        final_report_reasoning=report.reasoning,
+        final_report_prompt_sha256=report.prompt_sha256,
+        final_report_prompt_text=report.prompt_text,
+        final_report_prompt_is_full=report.prompt_is_full,
+        final_report_truncated=report.truncated,
+        final_report_timed_out=report.timed_out,
+        final_report_fabricated_tool_responses=report.fabricated_tool_responses,
+        grader_hashable=context.grader_hashable,
+        eval_belief_probe=eval_belief_probe,
+        protocol=context.protocol.name,
+        graded_on=grading.graded_on,
+        final_state_verdict=grading.final_state_verdict,
         graded_artifact=graded_artifact,
         final_report_eval_awareness=_scan_awareness(
-            awareness_scanner,
-            reasoning=final_report_reasoning,
-            content=final_report or "",
-            turn_index=len(turns),
-            episode_id=episode_id,
+            context.awareness_scanner,
+            reasoning=report.reasoning,
+            content=report.final_report or "",
+            turn_index=len(progress.turns),
+            episode_id=context.episode_id,
         ),
+    )
+
+
+def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass these as keywords
+    task: Task,
+    backend: LadderBackend,
+    *,
+    episode_dir: Path,
+    arm: AgenticArmConfig,
+    system_prompt: str,
+    user_template: str,
+    max_turns: int = LADDER_MAX_TURNS,
+    announced_turn_budget: int | None = None,
+    sampling_seed: int | None = None,
+    timeout: str = LADDER_COMMAND_TIMEOUT,
+    jail_backend: str | None = None,
+    trace_path: Path | None = None,
+    episode_token: str | None = None,
+    episode_seconds: float = LADDER_EPISODE_SECONDS,
+    history_reasoning: HistoryReasoning = DEFAULT_HISTORY_REASONING,
+    thinking_token_budget: int | None = None,
+    chat_template_kwargs: Mapping[str, str] | None = None,
+    protocol: ModelProtocol = QWEN_PROTOCOL,
+    before_command: Callable[[Path, str], None] | None = None,
+    after_command: Callable[[Path, str, CommandResult], None] | None = None,
+    after_laydown: Callable[[Path], tuple[str, ...]] | None = None,
+    listing_mode: Literal["all", "top-level"] = "all",
+    organism_prompt: bool = False,
+    initial_environment: Mapping[str, str] = MappingProxyType({}),
+    format_error_message: str = FORMAT_ERROR_MESSAGE,
+    awareness_scanner: AwarenessScanner | None = None,
+    submit_grader: SubmissionGrader | None = None,
+    ci_submit_grader: BudgetedSubmissionGrader | None = None,
+    max_model_len: int,
+    max_new_tokens: int = LADDER_MAX_NEW_TOKENS,
+    belief_probe: bool = False,
+    belief_probe_questions: BeliefProbeQuestions | None = None,
+    final_report_prompt: str = FINAL_REPORT_PROMPT,
+    persist_graded_artifact: bool = False,
+    protected_paths: tuple[str, ...] = (),
+) -> LadderEpisodeTrace:
+    """Run one model-native tool-call episode with arm-specific submission grading."""
+    _validate_episode_arguments(
+        max_turns=max_turns,
+        announced_turn_budget=announced_turn_budget,
+        timeout=timeout,
+        episode_seconds=episode_seconds,
+        max_model_len=max_model_len,
+        max_new_tokens=max_new_tokens,
+        thinking_token_budget=thinking_token_budget,
+        history_reasoning=history_reasoning,
+        belief_probe=belief_probe,
+        belief_probe_questions=belief_probe_questions,
+        listing_mode=listing_mode,
+        initial_environment=initial_environment,
+    )
+
+    workspace_mount = (
+        task.docker_config.workspace_mount if task.docker_config is not None else "/work"
+    )
+    if organism_prompt:
+        user_template = user_template.replace(" You have {max_turns} turns.", "")
+        final_report_prompt = TASK_LOG_FINAL_REPORT_PROMPT
+    if task.docker_config is not None:
+        require_gate(task.docker_config)
+        system_prompt = system_prompt.replace("/work", workspace_mount)
+        user_template = user_template.replace("/work", workspace_mount)
+        final_report_prompt = final_report_prompt.replace("/work", workspace_mount)
+    episode_started = time.monotonic()
+    deadline = episode_started + episode_seconds
+    episode_id = compose_episode_id(
+        model_id=backend.model_id,
+        task_id=task.task_id,
+        arm=arm,
+        episode_token=episode_token if episode_token is not None else new_episode_token(),
+    )
+    assert_disposable_episode_dir(episode_dir)
+    materialized = lay_down_task(episode_dir, task, arm=arm)
+    tree_roots = () if after_laydown is None else after_laydown(episode_dir)
+    messages, tools, _listing = render_initial_messages(
+        task,
+        arm=arm,
+        system_prompt=system_prompt,
+        user_template=user_template,
+        episode_dir=episode_dir,
+        listing_mode=listing_mode,
+        organism_prompt=organism_prompt,
+        announced_turn_budget=announced_turn_budget,
+        workspace_mount=workspace_mount,
+        max_turns=max_turns,
+        materialized_paths=materialized,
+        tree_roots=tree_roots,
+    )
+    grader_hashable = all(
+        filename in materialized for filename in task.effective_grader_integrity_files
+    )
+    grader_laydown_sha256 = (
+        grader_integrity_hash(episode_dir, task.effective_grader_integrity_files)
+        if grader_hashable
+        else None
+    )
+    template_sha256, template_source = template_identity(
+        backend.tokenizer, backend.model_path or Path()
+    )
+    context = _EpisodeContext(
+        task=task,
+        backend=backend,
+        episode_dir=episode_dir,
+        arm=arm,
+        episode_id=episode_id,
+        workspace_mount=workspace_mount,
+        tools=tools,
+        max_turns=max_turns,
+        announced_turn_budget=announced_turn_budget,
+        sampling_seed=sampling_seed,
+        timeout=timeout,
+        jail_backend=jail_backend,
+        trace_path=trace_path,
+        episode_started=episode_started,
+        episode_seconds=episode_seconds,
+        deadline=deadline,
+        history_reasoning=history_reasoning,
+        thinking_token_budget=thinking_token_budget,
+        protocol=protocol,
+        before_command=before_command,
+        after_command=after_command,
+        format_error_message=format_error_message,
+        awareness_scanner=awareness_scanner,
+        submit_grader=submit_grader,
+        ci_submit_grader=ci_submit_grader,
+        protected_paths=protected_paths,
+        max_model_len=max_model_len,
+        max_new_tokens=max_new_tokens,
+        grader_hashable=grader_hashable,
+        grader_laydown_sha256=grader_laydown_sha256,
+        template_sha256=template_sha256,
+        template_source=template_source,
+    )
+    progress = _EpisodeProgress(
+        messages=messages,
+        shell_state=_ShellState(
+            cwd=workspace_mount,
+            exported_script="\n".join(
+                f"export {name}={shlex.quote(value)}" for name, value in initial_environment.items()
+            ),
+        ),
+        prompt_state=_PromptRenderState(
+            history_reasoning=history_reasoning,
+            chat_template_kwargs={} if chat_template_kwargs is None else chat_template_kwargs,
+            protocol=protocol,
+        ),
+    )
+
+    for turn_index in range(max_turns):
+        _play_turn(context, progress, turn_index)
+        if progress.ended_by is not None:
+            break
+    if progress.ended_by is None:
+        progress.ended_by = "turn_cap"
+
+    eval_belief_probe, report = _sample_belief_probe_and_final_report(
+        context,
+        progress,
+        belief_probe_questions=belief_probe_questions if belief_probe else None,
+        final_report_prompt=final_report_prompt,
+    )
+    progress.peak_prompt_tokens = max(progress.peak_prompt_tokens, report.prompt_tokens)
+    progress.fabricated_tool_responses += report.fabricated_tool_responses
+
+    grading = _grade_episode(
+        task,
+        episode_dir=episode_dir,
+        arm=arm,
+        timeout=timeout,
+        jail_backend=jail_backend,
+        grader_hashable=grader_hashable,
+        submit_grader=submit_grader,
+        ended_by=progress.ended_by,
+        last_submission=progress.last_submission,
+        snapshot_error=progress.snapshot_error,
+    )
+    graded_artifact = (
+        _persist_graded_artifact(task, episode_dir, trace_path, grading.final_grade)
+        if persist_graded_artifact
+        and grading.ended_by not in {"thinking_budget_overshoot", "workspace_snapshot_limit"}
+        else None
+    )
+    trace = _build_episode_trace(
+        context,
+        progress,
+        report=report,
+        grading=grading,
+        eval_belief_probe=eval_belief_probe,
+        graded_artifact=graded_artifact,
     )
     _append_trace_record(trace_path, trace.summary_record())
     return trace
