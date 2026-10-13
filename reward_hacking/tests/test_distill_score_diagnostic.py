@@ -267,7 +267,7 @@ def _score(tmp_path: Path, rows: list[dict[str, Any]], name: str) -> list[dict[s
         torch_module=FakeTorch(),
         score_batch_size=1,
     )
-    return score._read_jsonl(output)
+    return score.read_jsonl_objects(output)
 
 
 def test_real_tiny_scorer_equal_and_shifted_teacher_by_turn(tmp_path: Path) -> None:
@@ -313,7 +313,7 @@ def test_real_tiny_scorer_preserves_completed_prefix_on_resume(tmp_path: Path) -
         _score(tmp_path, rows, "resume")
     output = tmp_path / "resume.jsonl"
     preserved = output.read_bytes()
-    assert len(score._read_jsonl(output)) == 1
+    assert len(score.read_jsonl_objects(output)) == 1
     TinyTeacherEngine.fail_second_batch = False
     TinyTeacherEngine.requests = []
     completed = _score(tmp_path, rows, "resume")
@@ -1064,7 +1064,7 @@ def test_prepare_only_marks_27b_baseline_inapplicable_to_9b_reproduction(tmp_pat
         prepare_only=True,
     )
     _diagnostic().run_diagnostic(config, tokenizer=CharacterTokenizer())
-    prepared = score._read_jsonl(config.run_dir / "episodes.jsonl")
+    prepared = score.read_jsonl_objects(config.run_dir / "episodes.jsonl")
     assert prepared
     assert all(row["sampling_sanity_applicable"] is False for row in prepared)
     assert all(row["baseline_model"] == "RedHatAI/Qwen3.8-27B-INT4" for row in prepared)

@@ -18,7 +18,7 @@ from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
 from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
-from reward_hacking.organism_rl import generate
+from reward_hacking.organism_rl import generate, generate_provenance
 from reward_hacking.organism_rl.evaluate import (
     _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
 )
@@ -588,8 +588,8 @@ def test_records_resume_after_endpoint_restart_and_record_each_launch(
     saved_provenance = cast("dict[str, object]", saved["provenance"])
     run_contexts = cast("list[dict[str, object]]", saved_provenance["run_contexts"])
     assert [context["port"] for context in run_contexts] == [8000, 8001]
-    assert saved["provenance_sha256"] == generate._canonical_sha256(
-        generate._provenance_identity(saved_provenance)
+    assert saved["provenance_sha256"] == generate_provenance._canonical_sha256(
+        generate_provenance._provenance_identity(saved_provenance)
     )
 
 
@@ -631,7 +631,7 @@ def test_resume_requires_exact_model_context_length() -> None:
     current_identity: dict[str, object] = {"flags": {"max_model_len": 8192}}
     stored_identity: dict[str, object] = {"flags": {"max_model_len": 4096}}
 
-    assert generate._identity_differences(current_identity, stored_identity) == [
+    assert generate_provenance._identity_differences(current_identity, stored_identity) == [
         "flags.max_model_len"
     ]
     assert current_identity["flags"] == {"max_model_len": 8192}
@@ -721,7 +721,7 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
     trace_dir.mkdir(parents=True)
     source = SyntheticEpisodeSource(trace_dir)
     current_provenance = {
-        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
         "flags": {"top_p": 1.0},
         "git_sha": "new-code-revision",
         "source_code_sha256": {"reward_hacking/harness/loop.py": "new-code-hash"},
@@ -729,7 +729,7 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
             "schema_version": 1,
             "sampling_flags": {"top_p": 1.0},
         },
-        "generation_path_identity_sha256": generate._canonical_sha256(
+        "generation_path_identity_sha256": generate_provenance._canonical_sha256(
             {"schema_version": 1, "sampling_flags": {"top_p": 1.0}}
         ),
     }
@@ -748,7 +748,7 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
     previous_identity = {
         key: value for key, value in stored_provenance.items() if key != "run_contexts"
     }
-    previous_digest = generate._canonical_sha256(previous_identity)
+    previous_digest = generate_provenance._canonical_sha256(previous_identity)
     document["provenance_sha256"] = previous_digest
     provenance_path.write_text(json.dumps(document), encoding="utf-8")
     records_path = output_dir / "records.jsonl"
@@ -762,14 +762,14 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
 
     changed_provenance = {
         **current_provenance,
-        "schema_version": generate.PROVENANCE_SCHEMA_VERSION + 1,
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION + 1,
         "git_sha": "changed-code-revision",
         "source_code_sha256": {"reward_hacking/harness/loop.py": "changed-code-hash"},
         "generation_path_identity": {
             "schema_version": 2,
             "sampling_flags": {"top_p": 1.0},
         },
-        "generation_path_identity_sha256": generate._canonical_sha256(
+        "generation_path_identity_sha256": generate_provenance._canonical_sha256(
             {"schema_version": 2, "sampling_flags": {"top_p": 1.0}}
         ),
     }
@@ -785,7 +785,7 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
     assert len(source.calls) == completed_call_count
     saved_document = json.loads(provenance_path.read_text(encoding="utf-8"))
     saved_provenance = cast("dict[str, object]", saved_document["provenance"])
-    assert saved_provenance["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION + 1
+    assert saved_provenance["schema_version"] == generate_provenance.PROVENANCE_SCHEMA_VERSION + 1
     assert saved_provenance["git_sha"] == "changed-code-revision"
     assert saved_provenance["source_code_sha256"] == changed_provenance["source_code_sha256"]
     assert saved_document["compatible_provenance_sha256"] == [previous_digest]
@@ -797,12 +797,12 @@ def test_resume_accepts_prompt_version_with_selected_definition_evidence() -> No
         "selected_tasks": [{"task_id": "synthetic", "task_definition_sha256": "same"}],
     }
     stored = {**current, "flags": {"prompt_format_version": 2}}
-    generate._validate_resume_identity(current, stored)
+    generate_provenance._validate_resume_identity(current, stored)
 
 
 def test_resume_refuses_prompt_version_without_definition_evidence() -> None:
     with pytest.raises(ValueError, match="prompt_format_version"):
-        generate._validate_resume_identity(
+        generate_provenance._validate_resume_identity(
             {"flags": {"prompt_format_version": 3}}, {"flags": {"prompt_format_version": 2}}
         )
 
@@ -836,7 +836,7 @@ def test_sampling_policy_growth_still_rejects_semantic_flags(
         "task_sample_selection": [{"task_id": "synthetic", "sample_index": 0}],
     }
     with pytest.raises(ValueError, match=rf"flags\.{field}"):
-        generate._validate_resume_identity(current, stored)
+        generate_provenance._validate_resume_identity(current, stored)
 
 
 def test_resume_accepts_family_bytes_and_compatible_record_version(tmp_path: Path) -> None:
@@ -932,18 +932,18 @@ def test_generation_resume_accepts_evaluation_prompt_identity_versions() -> None
         "prompt_format_version": 3,
         "task_prompt_content": {"synthetic": {"system_text": "same"}},
     }
-    generate._validate_resume_identity(
+    generate_provenance._validate_resume_identity(
         {
             "generation_path_identity": second,
-            "generation_path_identity_sha256": generate._canonical_sha256(second),
+            "generation_path_identity_sha256": generate_provenance._canonical_sha256(second),
         },
         {
             "generation_path_identity": first,
-            "generation_path_identity_sha256": generate._canonical_sha256(first),
+            "generation_path_identity_sha256": generate_provenance._canonical_sha256(first),
         },
     )
     with pytest.raises(ValueError, match="task_prompt_sha256"):
-        generate._validate_resume_identity(
+        generate_provenance._validate_resume_identity(
             {
                 "generation_path_identity": {
                     **second,
@@ -1099,7 +1099,7 @@ def test_prompt_substance_changes_refuse_even_with_unchanged_task_digest() -> No
     }
     first = {"selected_tasks": [task]}
     with pytest.raises(ValueError, match="selected_tasks"):
-        generate._validate_resume_identity(
+        generate_provenance._validate_resume_identity(
             {"selected_tasks": [{**task, "prompt_content": {"system_text": "changed"}}]}, first
         )
 
@@ -1171,7 +1171,7 @@ def test_resume_accepts_legacy_provenance_with_code_changes(
         "git_sha": "old-code-revision",
         "source_code_sha256": {"reward_hacking/harness/loop.py": "old-code-hash"},
     }
-    legacy_sha256 = generate._canonical_sha256(legacy_provenance)
+    legacy_sha256 = generate_provenance._canonical_sha256(legacy_provenance)
     legacy_document = {
         "schema_version": 1,
         "provenance_sha256": legacy_sha256,
@@ -1201,7 +1201,7 @@ def test_resume_accepts_legacy_provenance_with_code_changes(
         json.loads((output_dir / "provenance.json").read_text(encoding="utf-8")) == legacy_document
     )
     migrated = json.loads((output_dir / "provenance.resume.json").read_text(encoding="utf-8"))
-    assert migrated["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION
+    assert migrated["schema_version"] == generate_provenance.PROVENANCE_SCHEMA_VERSION
     assert migrated["compatible_provenance_sha256"] == [legacy_sha256]
 
 
@@ -1227,7 +1227,7 @@ def test_generated_original_record_scores_with_selected_payment_register(tmp_pat
     )
 
     reward = cast("Mapping[str, object]", record["organism_reward"])
-    assert record["record_schema"] == generate.RECORD_SCHEMA_VERSION
+    assert record["record_schema"] == generate_provenance.RECORD_SCHEMA_VERSION
     assert record["prompt_format_version"] == 3
     assert record["payment_register"] == "in_band"
     assert record["true_pass"] is False
@@ -1696,7 +1696,7 @@ def test_provenance_records_aisi_allowlist_and_selection_order(
 
     provenance = generate._provenance(args, cast("TaskEpisodeSource", source), task_specs)
 
-    assert provenance["record_schema"] == generate.RECORD_SCHEMA_VERSION
+    assert provenance["record_schema"] == generate_provenance.RECORD_SCHEMA_VERSION
     flags = cast("Mapping[str, object]", provenance["flags"])
     assert flags["prompt_format_version"] == 3
     selected_tasks = cast("list[Mapping[str, object]]", provenance["selected_tasks"])
@@ -1771,12 +1771,12 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
         "eval_pairs": [["synthetic-task", "git_reflog"]],
         "task_filter": None,
     }
-    identity = generate._provenance_identity(provenance)
+    identity = generate_provenance._provenance_identity(provenance)
     changed_metadata_provenance = {
         **provenance,
         "leak_task_source": {**metadata, "asset_index_sha256": "c" * 64},
     }
-    assert generate._provenance_identity(changed_metadata_provenance) == identity
+    assert generate_provenance._provenance_identity(changed_metadata_provenance) == identity
 
     output_dir = tmp_path / "generated-run"
     _records_path, provenance_sha256, _accepted_hashes = generate._prepare_run(
@@ -1787,8 +1787,8 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
     saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
     assert saved_provenance["leak_task_source"] == metadata
     assert saved_document["provenance_sha256"] == provenance_sha256
-    assert provenance_sha256 == generate._canonical_sha256(
-        generate._provenance_identity(saved_provenance)
+    assert provenance_sha256 == generate_provenance._canonical_sha256(
+        generate_provenance._provenance_identity(saved_provenance)
     )
     changed_metadata_provenance["leak_task_source"] = {
         **metadata,
@@ -1875,12 +1875,12 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
         "path": str(catalog_path.resolve()),
         "sha256": hashlib.sha256(catalog_bytes).hexdigest(),
     }
-    identity = generate._provenance_identity(provenance)
+    identity = generate_provenance._provenance_identity(provenance)
     moved_catalog_provenance = {
         **provenance,
         "hint_catalog": {**metadata, "path": str(tmp_path / "moved-hints.json")},
     }
-    assert generate._provenance_identity(moved_catalog_provenance) == identity
+    assert generate_provenance._provenance_identity(moved_catalog_provenance) == identity
 
     output_dir = tmp_path / "generated-run"
     _records_path, provenance_sha256, _accepted_hashes = generate._prepare_run(
@@ -1890,8 +1890,8 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
     saved_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
     saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
     assert saved_provenance["hint_catalog"] == metadata
-    assert provenance_sha256 == generate._canonical_sha256(
-        generate._provenance_identity(saved_provenance)
+    assert provenance_sha256 == generate_provenance._canonical_sha256(
+        generate_provenance._provenance_identity(saved_provenance)
     )
 
     edited_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))

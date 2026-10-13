@@ -25,6 +25,7 @@ from reward_hacking.interp.directions import (
     capture_positionwise_activations,
     load_model_and_tokenizer,
 )
+from reward_hacking.jsonl_io import read_jsonl_objects
 from reward_hacking.organisms.aisi_codecontests import (
     BASE_MODEL,
     _render_chat_prompt,  # pyright: ignore[reportPrivateUsage]  # exact screen render seam
@@ -530,19 +531,6 @@ def batch_size_for_free_vram(
         batch_size,
     )
     return batch_size
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise TypeError(f"{path}:{line_number} is not a JSON object")
-            records.append(cast("dict[str, Any]", value))
-    return records
 
 
 def _safe_model_stem(model_id: str) -> str:
@@ -1152,7 +1140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if run_dir == out_dir:
         raise ValueError("--out-dir must differ from --run-dir")
     samples_path = run_dir / "samples.jsonl"
-    records = _read_jsonl(samples_path)
+    records = read_jsonl_objects(samples_path)
     requested_models = [BASE_MODEL if model == "base" else model for model in args.models]
     if len(set(requested_models)) != len(requested_models):
         raise ValueError("--models contains duplicate model IDs after resolving 'base'")

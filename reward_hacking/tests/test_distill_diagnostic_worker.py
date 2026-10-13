@@ -155,7 +155,7 @@ def test_bounded_worker_reuses_one_real_engine_and_preserves_context(
     scored_inputs: list[dict[str, Any]] = []
 
     def real_scorer(**kwargs: Any) -> score.ScoreResult:
-        rows = score._read_jsonl(kwargs["samples_path"])
+        rows = score.read_jsonl_objects(kwargs["samples_path"])
         assert 0 < len(rows) <= 4
         scored_inputs.extend(rows)
         runtime_ids.append(id(kwargs["runtime"]))
@@ -197,10 +197,10 @@ def test_bounded_worker_reuses_one_real_engine_and_preserves_context(
     outputs = [
         row
         for part in sorted((output_dir / "parts").glob("part-*.jsonl"))
-        for row in score._read_jsonl(part)
+        for row in score.read_jsonl_objects(part)
     ]
     if condition == "teacher_hinted":
-        outputs = [*score._read_jsonl(output_dir / "round-0.jsonl"), *outputs]
+        outputs = [*score.read_jsonl_objects(output_dir / "round-0.jsonl"), *outputs]
     assert len(outputs) == len(scored_inputs) == 25
     assert {row["key"] for row in outputs} == {*source, *applicable_descriptors}
     requested = {row["key"]: row for row in scored_inputs}
@@ -286,7 +286,7 @@ def test_worker_partial_part_resume_keeps_persisted_record(
 ) -> None:
     episodes_path, descriptors_path, _, _ = _inputs(tmp_path)
     output_dir = tmp_path / "scores"
-    original_append = score._append_jsonl
+    original_append = score.append_jsonl_unicode
 
     def interrupt_after_append(path: Path, row: Any) -> None:
         original_append(path, row)
@@ -312,7 +312,7 @@ def test_worker_partial_part_resume_keeps_persisted_record(
         "scorer": real_scorer,
     }
     with monkeypatch.context() as interruption:
-        interruption.setattr(score, "_append_jsonl", interrupt_after_append)
+        interruption.setattr(score, "append_jsonl_unicode", interrupt_after_append)
         with pytest.raises(RuntimeError, match="persisted record interruption"):
             diagnostic_worker.run_worker(**kwargs)
     part = output_dir / "parts" / "part-000000.jsonl"
@@ -327,7 +327,7 @@ def test_worker_partial_part_resume_keeps_persisted_record(
     completed = [
         row
         for path in sorted((output_dir / "parts").glob("part-*.jsonl"))
-        for row in score._read_jsonl(path)
+        for row in score.read_jsonl_objects(path)
     ]
     assert len(completed) == len({row["key"] for row in completed}) == 25
 
@@ -413,7 +413,7 @@ def test_worker_pins_resolved_revision_and_refuses_changed_cached_snapshot(
     def scorer(**kwargs: Any) -> score.ScoreResult:
         scored_revisions.append(kwargs["model_revision"])
         return score.ScoreResult(
-            kwargs["output_path"], len(score._read_jsonl(kwargs["samples_path"])), 0
+            kwargs["output_path"], len(score.read_jsonl_objects(kwargs["samples_path"])), 0
         )
 
     monkeypatch.setattr(diagnostic_worker, "resolve_model_revision", resolve_revision)

@@ -20,7 +20,6 @@ import numpy as np
 import torch
 
 from reward_hacking.atlas.core import extract_code, position_masks
-from reward_hacking.atlas.jsonl_io import append_jsonl, read_jsonl, write_json
 from reward_hacking.atlas.prompts import ATLAS_SYSTEM_PROMPT
 from reward_hacking.atlas.sampling import (
     BASE_MODEL_ID,
@@ -36,6 +35,11 @@ from reward_hacking.interp.generation_capture import (
     vllm_resolved_sampler,
 )
 from reward_hacking.interp.jsonl_resume import normalize_identity
+from reward_hacking.jsonl_io import (
+    append_jsonl_ascii,
+    read_jsonl_objects,
+    write_json_atomic,
+)
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.semantic_identity import (
     model_weight_identity,
@@ -430,14 +434,14 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913, PLR0915 - resumab
             )
         shard[reference_rows[reference_id]] = _finite_float32_row(row_vectors)
         shard.flush()
-        append_jsonl(
+        append_jsonl_ascii(
             progress_path, {"reference_id": reference_id, "row": reference_rows[reference_id]}
         )
         ledger.mark_record_complete(reference_id)
         completed.add(reference_id)
     if layer_ids is None or shard is None:
         raise RuntimeError("reference capture produced no rows")
-    write_json(
+    write_json_atomic(
         index_path,
         {
             "model_key": model_key,
@@ -467,7 +471,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
 
     from reward_hacking.interp.directions import load_model_and_tokenizer  # noqa: PLC0415
 
-    samples = read_jsonl(sample_path)
+    samples = read_jsonl_objects(sample_path)
     if max_items is not None:
         allowed_items = {str(sample["item_id"]) for sample in samples[:max_items]}
         samples = [sample for sample in samples if str(sample["item_id"]) in allowed_items]
@@ -546,7 +550,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     "activation shard row order differs from the current sample records"
                 )
         else:
-            write_json(
+            write_json_atomic(
                 index_path,
                 {
                     "model_key": model_key,
@@ -704,7 +708,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     row_vectors.shape[2],
                 ),
             )
-            write_json(
+            write_json_atomic(
                 index_path,
                 {
                     "model_key": model_key,
@@ -728,7 +732,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
             "model_key": model_key,
             "row": row,
         }
-        append_jsonl(progress_path, progress_record)
+        append_jsonl_ascii(progress_path, progress_record)
         ledger.mark_record_complete(sample_id)
 
     if shard is None:
@@ -746,7 +750,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
             adapter_id=adapter_id,
         )
     shard.flush()
-    write_json(
+    write_json_atomic(
         index_path,
         {
             "model_key": model_key,
@@ -771,7 +775,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
         "shape": list(shard.shape),
         "dtype": str(shard.dtype),
     }
-    write_json(manifest_path, manifest)
+    write_json_atomic(manifest_path, manifest)
     del model
     torch.cuda.empty_cache()
     return output_path

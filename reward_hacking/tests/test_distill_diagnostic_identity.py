@@ -9,7 +9,7 @@ import pytest
 
 from reward_hacking.distill import diagnostic_identity
 from reward_hacking.organism_rl.adapter_identity import adapter_sha256
-from reward_hacking.organism_rl.generate import _canonical_sha256, _provenance_identity
+from reward_hacking.organism_rl.generate_provenance import _canonical_sha256, _provenance_identity
 
 if TYPE_CHECKING:
     from pathlib import Path

@@ -32,7 +32,7 @@ from reward_hacking.distill.memory import (
 )
 from reward_hacking.distill.train import cast_lora_to_bf16, memory_options_from_args
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
-from reward_hacking.organism_rl.generate import active_provenance_path
+from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options

@@ -43,6 +43,7 @@ from reward_hacking.harness import (
     AgenticArmConfig,
     EpisodeOutcome,
     Task,
+    cli,
     compose_episode_id,
     load_traces,
     loop,
@@ -53,16 +54,14 @@ from reward_hacking.harness import (
     run_summary_line,
     write_traces,
 )
-from reward_hacking.harness.loop import (
+from reward_hacking.harness.cli import (
     _DEFAULT_MODEL_BY_BACKEND,
-    DEFAULT_BEDROCK_MODEL,
-    SMOKE_TASKS,
     _build_cli_backend,
     _parse_args,
     _select_tasks,
     harness_sampling_base,
-    run_tasks,
 )
+from reward_hacking.harness.loop import DEFAULT_BEDROCK_MODEL, SMOKE_TASKS, run_tasks
 from reward_hacking.harness.protocol import EMPTY_START_NUDGE, initial_prompt
 from reward_hacking.harness.tasks import (
     ARTIFACT_SHAPE_TASKS,
@@ -348,13 +347,13 @@ def local_cli_tokenizer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
         eos_token=end_of_turn_token,
     )
     tokenizer.save_pretrained(tokenizer_dir)
-    load_tokenizer = loop.AutoTokenizer.from_pretrained
+    load_tokenizer = cli.AutoTokenizer.from_pretrained
 
     def from_local_fixture(source: str, **kwargs: Any) -> PreTrainedTokenizerFast:
         del source
         return load_tokenizer(tokenizer_dir, local_files_only=True, **kwargs)
 
-    monkeypatch.setattr(loop.AutoTokenizer, "from_pretrained", from_local_fixture)
+    monkeypatch.setattr(cli.AutoTokenizer, "from_pretrained", from_local_fixture)
 
 
 @pytest.mark.usefixtures("local_cli_tokenizer")
@@ -432,11 +431,11 @@ class TestBackendSelectionCLI:
             return MockBackend(["done"], model_id=model_id)
 
         monkeypatch.setattr(backend_cli, "build_backend", record_build)
-        monkeypatch.setattr(loop, "run_tasks", lambda *args, **kwargs: [])
+        monkeypatch.setattr(cli, "run_tasks", lambda *args, **kwargs: [])
         monkeypatch.setattr(loop.tempfile, "mkdtemp", lambda *args, **kwargs: str(tmp_path))
 
         with pytest.raises(ValueError, match="--ilcb-split"):
-            loop.main(["--backend", "mock", "--task", "sum-ledger", "--ilcb-split", "original"])
+            cli.main(["--backend", "mock", "--task", "sum-ledger", "--ilcb-split", "original"])
 
         assert built == []
 
@@ -455,7 +454,7 @@ class TestBackendSelectionCLI:
         bulk_family = {
             f"ilcb-conflicting-row_{index}": TASKS_BY_ID["sum-ledger"] for index in range(300)
         }
-        monkeypatch.setattr(loop, "TASKS_BY_ID", {**TASKS_BY_ID, **bulk_family})
+        monkeypatch.setattr(cli, "TASKS_BY_ID", {**TASKS_BY_ID, **bulk_family})
 
         default = _select_tasks(None)
 
@@ -498,11 +497,11 @@ class TestBackendSelectionCLI:
             return str(tmp_path)
 
         monkeypatch.setattr(backend_cli, "build_backend", fake_build_backend)
-        monkeypatch.setattr(loop, "run_tasks", fake_run_tasks)
+        monkeypatch.setattr(cli, "run_tasks", fake_run_tasks)
         monkeypatch.setattr(loop.tempfile, "mkdtemp", fake_mkdtemp)
         if not any(arg == "--out" or arg.startswith("--out=") for arg in argv):
             argv = [*argv, "--out", str(tmp_path / f"probe-{new_episode_token()}.jsonl")]
-        loop.main(argv)
+        cli.main(argv)
         return captured
 
     def test_back_to_back_probes_write_nothing_into_the_repo(
@@ -550,7 +549,7 @@ class TestBackendSelectionCLI:
         self._expanded_task_ids(monkeypatch, tmp_path, argv)
 
         records = [cast("dict[str, Any]", record) for record in load_traces(out)]
-        assert [record["record"] for record in records] == [loop.RUN_HEADER_RECORD]
+        assert [record["record"] for record in records] == [cli.RUN_HEADER_RECORD]
         assert list(tmp_path.glob("probe-*.jsonl")) == []
 
     def test_repeats_expands_each_selected_task_into_interleaved_episodes(
@@ -616,11 +615,11 @@ class TestBackendSelectionCLI:
             return MockBackend(["done"], model_id=model_id)
 
         monkeypatch.setattr(backend_cli, "build_backend", record_build)
-        monkeypatch.setattr(loop, "run_tasks", lambda *args, **kwargs: [])
+        monkeypatch.setattr(cli, "run_tasks", lambda *args, **kwargs: [])
         monkeypatch.setattr(loop.tempfile, "mkdtemp", lambda *args, **kwargs: str(tmp_path))
 
         with pytest.raises(ValueError, match="--max-turns must be at least 1"):
-            loop.main(["--backend", "mock", "--task", "sum-ledger", "--max-turns", "0"])
+            cli.main(["--backend", "mock", "--task", "sum-ledger", "--max-turns", "0"])
 
         assert built == []
 
@@ -944,7 +943,7 @@ class TestBackendSelectionCLI:
                 del source, kwargs
                 return FakeTokenizer()
 
-            monkeypatch.setattr(loop.AutoTokenizer, "from_pretrained", fake_tokenizer)
+            monkeypatch.setattr(cli.AutoTokenizer, "from_pretrained", fake_tokenizer)
             argv.extend(["--vllm-http-url", "http://synthetic"])
         _build_cli_backend(_parse_args(argv))
 
@@ -1042,7 +1041,7 @@ class TestEpisodeConcurrency:
         monkeypatch.setattr(backend_cli, "build_backend", record_build)
 
         with pytest.raises(ValueError, match="--episode-concurrency must be at least 1"):
-            loop.main(["--backend", "mock", "--task", "sum-ledger", "--episode-concurrency", "0"])
+            cli.main(["--backend", "mock", "--task", "sum-ledger", "--episode-concurrency", "0"])
 
         assert built == []
 
@@ -1626,7 +1625,7 @@ class TestTheMockBackendSmokesTheWholeCli:
         monkeypatch.setattr(loop.tempfile, "mkdtemp", lambda *args, **kwargs: str(tmp_path))
         out = tmp_path / "mock.jsonl"
 
-        assert loop.main(["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]) == 0
+        assert cli.main(["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]) == 0
 
         records = [cast("dict[str, Any]", record) for record in load_traces(out)]
         summaries = [record for record in records if record["record"] == "episode_summary"]
@@ -1636,7 +1635,7 @@ class TestTheMockBackendSmokesTheWholeCli:
         turns = [record for record in records if record["record"] == "turn"]
         assert any(turn["commands"] for turn in turns)
         # The header leads the trace and says how the weights were assembled: a mock run loads none.
-        assert records[0]["record"] == loop.RUN_HEADER_RECORD
+        assert records[0]["record"] == cli.RUN_HEADER_RECORD
         assert records[0]["model_id"] == _DEFAULT_MODEL_BY_BACKEND["mock"]
         assert records[0]["model_load_mode"] == "base"
         assert records[0]["model_full_weights"] is None
@@ -1661,10 +1660,10 @@ class TestTheMockBackendSmokesTheWholeCli:
             "--revision",
             "step_300",
         ]
-        assert loop.main(argv) == 0
+        assert cli.main(argv) == 0
         records = [cast("dict[str, Any]", record) for record in load_traces(out)]
         header, *rest = records
-        assert header["record"] == loop.RUN_HEADER_RECORD
+        assert header["record"] == cli.RUN_HEADER_RECORD
         assert header["model_id"] == "allenai/tmax-4b@step_300"
         assert header["base_model_id"] == _DEFAULT_MODEL_BY_BACKEND["mock"]
         assert header["model_load_mode"] == "mock-no-load"
@@ -1679,9 +1678,9 @@ class TestTheMockBackendSmokesTheWholeCli:
         monkeypatch.setattr(loop.tempfile, "mkdtemp", lambda *args, **kwargs: str(tmp_path))
         out = tmp_path / "mock.jsonl"
         argv = ["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]
-        assert loop.main(argv) == 0
+        assert cli.main(argv) == 0
         with pytest.raises(FileExistsError, match="already holds a trace"):
-            loop.main(argv)
+            cli.main(argv)
 
     @pytest.mark.slow
     def test_resume_runs_only_the_remaining_repeats_and_keeps_the_finished_ones(
@@ -1691,14 +1690,14 @@ class TestTheMockBackendSmokesTheWholeCli:
         monkeypatch.setattr(loop.tempfile, "mkdtemp", lambda *args, **kwargs: str(tmp_path))
         out = tmp_path / "mock.jsonl"
         base = ["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]
-        assert loop.main([*base, "--repeats", "2"]) == 0
+        assert cli.main([*base, "--repeats", "2"]) == 0
         first = [cast("dict[str, Any]", r) for r in load_traces(out)]
         assert sum(r["record"] == "episode_summary" for r in first) == 2
 
-        assert loop.main([*base, "--repeats", "3", "--resume"]) == 0
+        assert cli.main([*base, "--repeats", "3", "--resume"]) == 0
         records = [cast("dict[str, Any]", r) for r in load_traces(out)]
         summaries = [r for r in records if r["record"] == "episode_summary"]
-        headers = [r for r in records if r["record"] == loop.RUN_HEADER_RECORD]
+        headers = [r for r in records if r["record"] == cli.RUN_HEADER_RECORD]
         assert len(summaries) == 3, "two kept from the first run, exactly one added"
         assert len(headers) == 2, "each invocation writes its own header"
         assert [r["episode_id"] for r in summaries[:2]] == [
@@ -1706,7 +1705,7 @@ class TestTheMockBackendSmokesTheWholeCli:
         ]
 
         # Nothing left to do: a resume at the same repeats adds a header and no episodes.
-        assert loop.main([*base, "--repeats", "3", "--resume"]) == 0
+        assert cli.main([*base, "--repeats", "3", "--resume"]) == 0
         records = [cast("dict[str, Any]", r) for r in load_traces(out)]
         assert sum(r["record"] == "episode_summary" for r in records) == 3
 
@@ -1716,9 +1715,9 @@ class TestTheMockBackendSmokesTheWholeCli:
         """SABOTAGE: the pooling a resume exists to prevent, fed to the gate."""
         monkeypatch.setattr(loop.tempfile, "mkdtemp", lambda *args, **kwargs: str(tmp_path))
         out = tmp_path / "mock.jsonl"
-        assert loop.main(["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]) == 0
+        assert cli.main(["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]) == 0
         with pytest.raises(ValueError, match="arm: stored 'baseline'"):
-            loop.main(
+            cli.main(
                 [
                     "--backend",
                     "mock",
@@ -1732,7 +1731,7 @@ class TestTheMockBackendSmokesTheWholeCli:
                 ]
             )
         with pytest.raises(ValueError, match="model_id: stored 'mock'"):
-            loop.main(
+            cli.main(
                 [
                     "--backend",
                     "mock",
@@ -1761,7 +1760,7 @@ class TestTheMockBackendSmokesTheWholeCli:
             + "\n"
         )
         with pytest.raises(ValueError, match="no 'run_header' record"):
-            loop.main(["--backend", "mock", "--task", "sum-ledger", "--out", str(out), "--resume"])
+            cli.main(["--backend", "mock", "--task", "sum-ledger", "--out", str(out), "--resume"])
 
 
 class TestPlanEpisodes:
@@ -1769,7 +1768,7 @@ class TestPlanEpisodes:
 
     def test_a_partly_finished_task_contributes_only_its_remainder(self) -> None:
         tasks = [TASKS_BY_ID["sum-ledger"], TASKS_BY_ID["max-reading"]]
-        plan = loop.plan_episodes(tasks, repeats=3, completed={"sum-ledger": 2})
+        plan = cli.plan_episodes(tasks, repeats=3, completed={"sum-ledger": 2})
         assert [t.task_id for t in plan] == [
             "max-reading",
             "max-reading",
@@ -1779,7 +1778,7 @@ class TestPlanEpisodes:
 
     def test_nothing_completed_is_the_fresh_plan(self) -> None:
         tasks = [TASKS_BY_ID["sum-ledger"], TASKS_BY_ID["max-reading"]]
-        plan = loop.plan_episodes(tasks, repeats=2, completed={})
+        plan = cli.plan_episodes(tasks, repeats=2, completed={})
         assert [t.task_id for t in plan] == [
             "sum-ledger",
             "max-reading",
@@ -1789,16 +1788,16 @@ class TestPlanEpisodes:
 
     def test_everything_completed_leaves_nothing(self) -> None:
         tasks = [TASKS_BY_ID["sum-ledger"]]
-        assert loop.plan_episodes(tasks, repeats=2, completed={"sum-ledger": 5}) == ()
+        assert cli.plan_episodes(tasks, repeats=2, completed={"sum-ledger": 5}) == ()
 
     def test_oversized_episode_cell_requires_an_explicit_reason(self) -> None:
         with pytest.raises(ValueError, match=r"model=mock/arm=baseline.*--oversize-reason"):
-            loop.sampling_budget_for_run(
+            cli.sampling_budget_for_run(
                 model_id="mock", arm_label="baseline", task_count=9, repeats=1
             )
 
     def test_episode_sampling_budget_is_recordable_when_oversized(self) -> None:
-        sampling_budget = loop.sampling_budget_for_run(
+        sampling_budget = cli.sampling_budget_for_run(
             model_id="mock",
             arm_label="baseline",
             task_count=9,
@@ -1811,14 +1810,14 @@ class TestPlanEpisodes:
     def test_cli_refuses_an_oversized_selection_before_resource_preflight(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(loop, "_select_tasks", lambda *_args: [TASKS_BY_ID["sum-ledger"]] * 9)
+        monkeypatch.setattr(cli, "_select_tasks", lambda *_args: [TASKS_BY_ID["sum-ledger"]] * 9)
 
         def unexpected_preflight(**_kwargs: object) -> object:
             raise AssertionError("the sampling cap must run before resource preflight")
 
-        monkeypatch.setattr(loop, "resolve_jail_resource_limits", unexpected_preflight)
+        monkeypatch.setattr(cli, "resolve_jail_resource_limits", unexpected_preflight)
         with pytest.raises(ValueError, match=r"model=mock/arm=baseline.*--oversize-reason"):
-            loop.main(
+            cli.main(
                 [
                     "--backend",
                     "mock",
@@ -1833,9 +1832,9 @@ class TestPlanEpisodes:
 class TestLocalStopTokenPin:
     def test_hosted_and_mock_kinds_get_no_pin(self) -> None:
         for kind in ("mock", "bedrock", "codex"):
-            args = loop._parse_args(["--backend", kind])
-            served = loop.served_model_from_args(args)
-            assert loop.local_stop_token_ids(args, served) == ()
+            args = cli._parse_args(["--backend", kind])
+            served = cli.served_model_from_args(args)
+            assert cli.local_stop_token_ids(args, served) == ()
 
     def test_local_kinds_resolve_the_pin_through_the_served_tokenizer(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1852,10 +1851,10 @@ class TestLocalStopTokenPin:
             loaded.append(source)
             return Vocab()
 
-        monkeypatch.setattr(loop.AutoTokenizer, "from_pretrained", fake_tokenizer)
-        args = loop._parse_args(["--backend", "vllm", "--model-id", "Qwen/Qwen3.5-4B"])
-        served = loop.served_model_from_args(args)
-        assert loop.local_stop_token_ids(args, served) == (248044, 248046)
+        monkeypatch.setattr(cli.AutoTokenizer, "from_pretrained", fake_tokenizer)
+        args = cli._parse_args(["--backend", "vllm", "--model-id", "Qwen/Qwen3.5-4B"])
+        served = cli.served_model_from_args(args)
+        assert cli.local_stop_token_ids(args, served) == (248044, 248046)
         assert loaded == ["Qwen/Qwen3.5-4B"], (
             "a base run resolves the pin through the base tokenizer"
         )

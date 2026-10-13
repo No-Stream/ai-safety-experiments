@@ -684,18 +684,18 @@ def test_interrupted_marker_write_rebuilds_only_uncompleted_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     options, case = build_inputs
-    original = bulk._atomic_json
+    original = bulk.write_json_atomic
 
-    def interrupted_write(path: Path, value: object) -> None:
+    def interrupted_write(path: Path, value: Mapping[str, object]) -> None:
         if path.name == "complete.json":
             raise InterruptedError("synthetic interruption before completion")
         original(path, value)
 
-    monkeypatch.setattr(bulk, "_atomic_json", interrupted_write)
+    monkeypatch.setattr(bulk, "write_json_atomic", interrupted_write)
     with pytest.raises(InterruptedError):
         bulk.build_assets(options, (case,))
     assert not (options.out_root / case.task_id / "complete.json").exists()
-    monkeypatch.setattr(bulk, "_atomic_json", original)
+    monkeypatch.setattr(bulk, "write_json_atomic", original)
     assert bulk.build_assets(options, (case,))["built"] == 1
     assert bulk.build_assets(options, (case,))["resumed"] == 1
 

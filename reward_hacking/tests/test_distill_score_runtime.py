@@ -70,7 +70,7 @@ def test_runtime_reuses_real_cpu_teacher_and_fully_resumed_stays_unloaded(
     assert _run(tmp_path, unloaded_runtime, "first").resumed_count == 1
     assert unloaded_runtime.engine is None
     assert CountingTinyTeacher.initializations == 1
-    saved = score._read_jsonl(tmp_path / "first.scores.jsonl")[0]
+    saved = score.read_jsonl_objects(tmp_path / "first.scores.jsonl")[0]
     assert "prompt_token_ids" not in saved
     assert "teacher_prompt_token_ids" not in saved
     assert saved["context_storage"] == "sha256"
@@ -90,7 +90,7 @@ def test_compact_resume_refuses_corrupted_context_and_settings(tmp_path: Path, f
     runtime = score.TeacherScoringRuntime(max_model_len=32)
     _run(tmp_path, runtime, "corrupt")
     path = tmp_path / "corrupt.scores.jsonl"
-    record = score._read_jsonl(path)[0]
+    record = score.read_jsonl_objects(path)[0]
     record[field] = "corrupted"
     _write_rows(path, [record])
     with pytest.raises(ValueError, match=r"context|settings"):
@@ -130,7 +130,7 @@ def test_compact_scores_preserve_hint_and_cell_metadata(tmp_path: Path) -> None:
         runtime=score.TeacherScoringRuntime(max_model_len=32),
         compact_context=True,
     )
-    saved = score._read_jsonl(output)[0]
+    saved = score.read_jsonl_objects(output)[0]
     assert {field: saved[field] for field in metadata} == metadata
 
 
@@ -141,7 +141,7 @@ def test_pinned_revision_changes_refuse_compact_resume_and_loaded_runtime(tmp_pa
     assert (
         CountingTinyTeacher.initialized_kwargs[-1]["tokenizer_revision"] == "synthetic-revision-one"
     )
-    saved = score._read_jsonl(tmp_path / "first.scores.jsonl")[0]
+    saved = score.read_jsonl_objects(tmp_path / "first.scores.jsonl")[0]
     assert saved["scoring_settings"]["model_revision"] == "synthetic-revision-one"
     with pytest.raises(ValueError, match="runtime"):
         _run(tmp_path, runtime, "second", model_revision="synthetic-revision-two")

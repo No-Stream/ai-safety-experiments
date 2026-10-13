@@ -12,7 +12,7 @@ from reward_hacking.distill.episodes import (
 )
 from reward_hacking.organism_rl.adapter_identity import adapter_sha256
 from reward_hacking.organism_rl.evaluate import resolve_model_revision
-from reward_hacking.organism_rl.generate import (
+from reward_hacking.organism_rl.generate_provenance import (
     PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS,
     _canonical_sha256,  # pyright: ignore[reportPrivateUsage]
     _provenance_identity,  # pyright: ignore[reportPrivateUsage]

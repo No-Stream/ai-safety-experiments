@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from grpo.gpu_memory import TorchRuntime
 
 from grpo.gpu_memory import cap_gpu_memory_utilization
-from reward_hacking.atlas import jsonl_io
 from reward_hacking.atlas.core import render_prompt
 from reward_hacking.interp.jsonl_resume import (
     ResumeLedger,
@@ -30,6 +29,11 @@ from reward_hacking.interp.jsonl_resume import (
     ledger_path_for,
     normalize_identity,
     resume_records,
+)
+from reward_hacking.jsonl_io import (
+    append_jsonl_ascii,
+    read_jsonl_objects,
+    write_json_atomic,
 )
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.model_backend import SamplingConfig
@@ -105,11 +109,6 @@ def artifact_model_key(model_key: str) -> str:
     readable = readable or "adapter"
     digest = hashlib.sha256(model_key.encode()).hexdigest()[:12]
     return f"{readable}-{digest}"
-
-
-def write_json(path: Path, record: Mapping[str, object]) -> None:
-    """Write one atomic JSON metadata file for sibling pipeline stages."""
-    jsonl_io.write_json(path, record)
 
 
 def _stable_item_id(dataset_id: str, split: str, row_index: int, row: Mapping[str, Any]) -> str:
@@ -288,9 +287,9 @@ def prompts_stage(  # noqa: C901, PLR0913, PLR0915 - stage assembly also records
         item_id = str(record["item_id"])
         if item_id in completed:
             continue
-        jsonl_io.append_jsonl(output_path, record)
+        append_jsonl_ascii(output_path, record)
         ledger.mark_record_complete(item_id)
-    jsonl_io.write_json(
+    write_json_atomic(
         run_dir / "prompt-metadata.json",
         {
             "model_id": base_model,
@@ -674,7 +673,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
 
     if samples_per_prompt < 1:
         raise ValueError(f"samples_per_prompt must be positive, got {samples_per_prompt}")
-    prompts = jsonl_io.read_jsonl(prompt_path)
+    prompts = read_jsonl_objects(prompt_path)
     if max_prompts is not None:
         if max_prompts < 1:
             raise ValueError(f"max_prompts must be positive, got {max_prompts}")
@@ -909,10 +908,10 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
                 **prompt_options_identity,
                 "sampling": identity["sampling"],
             }
-            jsonl_io.append_jsonl(output_path, record)
+            append_jsonl_ascii(output_path, record)
             ledger.mark_record_complete(sample_id)
 
-        jsonl_io.write_json(
+        write_json_atomic(
             run_dir / f"sample-metadata.{output_key}.json",
             {
                 "model_key": model_key,

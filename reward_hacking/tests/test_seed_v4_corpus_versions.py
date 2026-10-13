@@ -22,7 +22,7 @@ from reward_hacking.organism_rl.corpus_capture import semantic_versions
 from reward_hacking.organism_rl.evaluate import (
     GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS,
 )
-from reward_hacking.organism_rl.generate import (
+from reward_hacking.organism_rl.generate_provenance import (
     RECORD_SCHEMA_COMPATIBLE_VERSIONS,
     RECORD_SCHEMA_VERSION,
 )

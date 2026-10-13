@@ -19,7 +19,7 @@ from reward_hacking.organism_reward import score_impossible_task
 from reward_hacking.organism_rl import (
     corpus_capture,
     evaluate,
-    generate,
+    generate_provenance,
     health,
     rescore,
     rollout,
@@ -71,7 +71,11 @@ def test_episode_trace_replay_preserves_recorded_summaries_and_truth(
         replayed_summary = dict(replayed.record)
         replayed_summary.pop("hack_strategy", None)
         recorded_true_pass = rollout.recorded_true_pass(summary)
-        if corpus_record.row.get("record_schema") in {2, 3, generate.RECORD_SCHEMA_VERSION}:
+        if corpus_record.row.get("record_schema") in {
+            2,
+            3,
+            generate_provenance.RECORD_SCHEMA_VERSION,
+        }:
             _require(
                 recorded_summary.get("true_pass") == recorded_true_pass
                 and corpus_record.row.get("true_pass") == recorded_true_pass,
@@ -329,7 +333,7 @@ def test_captured_leak_strategy_replay_uses_retained_patch_and_trace(
             "locator": "before_episode_summary",
         }
     record.update(
-        record_schema=generate.RECORD_SCHEMA_VERSION if referenced else 5,
+        record_schema=generate_provenance.RECORD_SCHEMA_VERSION if referenced else 5,
         trace_path=str(trace),
         sample_index=0,
         organism_reward=asdict(score_impossible_task(summary)),
@@ -967,17 +971,17 @@ def _expect_resume_rejected(
 
 
 def _generate_provenance_identity(provenance: Mapping[str, object]) -> dict[str, object]:
-    return generate._provenance_identity(provenance)  # pyright: ignore[reportPrivateUsage]
+    return generate_provenance._provenance_identity(provenance)  # pyright: ignore[reportPrivateUsage]
 
 
 def _validate_generator_resume_identity(
     current_identity: dict[str, object], stored_identity: Mapping[str, object]
 ) -> None:
-    generate._validate_resume_identity(current_identity, stored_identity)  # pyright: ignore[reportPrivateUsage]
+    generate_provenance._validate_resume_identity(current_identity, stored_identity)  # pyright: ignore[reportPrivateUsage]
 
 
 def _code_provenance_keys() -> frozenset[str]:
-    return generate._CODE_PROVENANCE_KEYS  # pyright: ignore[reportPrivateUsage]
+    return generate_provenance._CODE_PROVENANCE_KEYS  # pyright: ignore[reportPrivateUsage]
 
 
 def _expect_evaluate_rejected(

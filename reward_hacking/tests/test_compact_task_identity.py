@@ -11,7 +11,7 @@ import pytest
 
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import Task
-from reward_hacking.organism_rl import cli, evaluate, generate
+from reward_hacking.organism_rl import cli, evaluate, generate, generate_provenance
 from reward_hacking.semantic_identity import semantic_content_identity
 
 if TYPE_CHECKING:
@@ -79,8 +79,8 @@ def test_large_task_provenance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, 
     legacy_tasks[0]["task_definition_content"] = deepcopy(content)
     legacy_tasks[0]["prompt_content"] = deepcopy(prompt)
     legacy["schema_version"] = 2
-    legacy_identity = generate._provenance_identity(legacy)
-    legacy_sha256 = generate._canonical_sha256(legacy_identity)
+    legacy_identity = generate_provenance._provenance_identity(legacy)
+    legacy_sha256 = generate_provenance._canonical_sha256(legacy_identity)
     (tmp_path / "provenance.json").write_text(
         json.dumps(
             {
@@ -144,7 +144,7 @@ def test_legacy_generation_path_resume_preserves_digest_binding(tmp_path: Path) 
         "generation_path_identity": legacy_generation,
         "generation_path_identity_sha256": evaluate._reuse_identity_sha256(legacy_generation),
     }
-    legacy_sha256 = generate._canonical_sha256(legacy)
+    legacy_sha256 = generate_provenance._canonical_sha256(legacy)
     historical_path = tmp_path / "provenance.json"
     historical_path.write_text(
         json.dumps(
@@ -176,7 +176,7 @@ def test_legacy_generation_path_resume_preserves_digest_binding(tmp_path: Path) 
     corrupted = deepcopy(legacy)
     corrupted["generation_path_identity_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="generation_path_identity_sha256"):
-        generate._validate_resume_identity(current, corrupted)
+        generate_provenance._validate_resume_identity(current, corrupted)
 
 
 def test_legacy_utf8_generation_path_digest_remains_accepted() -> None:
@@ -195,7 +195,9 @@ def test_legacy_utf8_generation_path_digest_remains_accepted() -> None:
     legacy = {
         "selected_tasks": [{"task_id": "synthetic", "family": "r2e_leak"}],
         "generation_path_identity": legacy_generation,
-        "generation_path_identity_sha256": generate._canonical_sha256(legacy_semantic_generation),
+        "generation_path_identity_sha256": generate_provenance._canonical_sha256(
+            legacy_semantic_generation
+        ),
     }
     current_generation = {
         **legacy_generation,
@@ -209,15 +211,17 @@ def test_legacy_utf8_generation_path_digest_remains_accepted() -> None:
     current: dict[str, object] = {
         **legacy,
         "generation_path_identity": current_generation,
-        "generation_path_identity_sha256": generate._canonical_sha256(current_semantic_generation),
+        "generation_path_identity_sha256": generate_provenance._canonical_sha256(
+            current_semantic_generation
+        ),
     }
 
-    generate._validate_resume_identity(current, legacy)
+    generate_provenance._validate_resume_identity(current, legacy)
 
     corrupted = deepcopy(legacy)
     corrupted["generation_path_identity_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="generation_path_identity_sha256"):
-        generate._validate_resume_identity(current, corrupted)
+        generate_provenance._validate_resume_identity(current, corrupted)
 
 
 def test_training_resume_preserves_unversioned_provenance(tmp_path: Path) -> None:

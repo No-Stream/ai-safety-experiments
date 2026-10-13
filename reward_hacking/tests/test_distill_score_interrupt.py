@@ -95,7 +95,7 @@ def test_signal_after_first_persisted_score_and_resume(tmp_path: Path) -> None:
     resumed = _subprocess(samples, output, marker)
     assert resumed.returncode == 0, resumed.stderr
     assert output.read_bytes().startswith(preserved_bytes)
-    assert len({row["key"] for row in score._read_jsonl(output)}) == 3
+    assert len({row["key"] for row in score.read_jsonl_objects(output)}) == 3
     assert json.loads(output.with_suffix(".summary.json").read_text()) == {
         "generated_count": 2,
         "resumed_count": 1,
@@ -111,7 +111,7 @@ def test_interrupt_guard_does_not_kill_control_output(tmp_path: Path) -> None:
     result = _subprocess(samples, output, marker)
     assert result.returncode == 0, result.stderr
     assert not marker.exists()
-    assert len(score._read_jsonl(output)) == 3
+    assert len(score.read_jsonl_objects(output)) == 3
 
 
 def test_failed_worker_shutdown_does_not_create_interruption_receipt(tmp_path: Path) -> None:

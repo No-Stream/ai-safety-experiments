@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS
-from reward_hacking.atlas.jsonl_io import read_jsonl, write_json
+from reward_hacking.jsonl_io import read_jsonl_objects, write_json_atomic
 
 if TYPE_CHECKING:
     import numpy as np
@@ -177,7 +177,7 @@ def _sample_sampling_budget(arguments: argparse.Namespace, prompt_path: Path) ->
         )
     if arguments.max_prompts is not None and arguments.max_prompts < 1:
         raise ValueError(f"--max-prompts must be positive, got {arguments.max_prompts}")
-    prompt_count = len(read_jsonl(prompt_path))
+    prompt_count = len(read_jsonl_objects(prompt_path))
     if prompt_count == 0:
         raise ValueError(f"no prompts found in {prompt_path}")
     if arguments.max_prompts is not None:
@@ -376,8 +376,8 @@ def _load_labelled_samples(run_dir: Path, output_key: str) -> dict[str, Any]:
     """Read one model's samples, grades and activation shard, and label each graded sample hack or honest pass."""
     import numpy as np  # noqa: PLC0415
 
-    sample_records = read_jsonl(run_dir / f"samples.{output_key}.jsonl")
-    grade_records = read_jsonl(run_dir / f"grades.{output_key}.jsonl")
+    sample_records = read_jsonl_objects(run_dir / f"samples.{output_key}.jsonl")
+    grade_records = read_jsonl_objects(run_dir / f"grades.{output_key}.jsonl")
     grade_by_id = {str(record["sample_id"]): record for record in grade_records}
     shard = np.load(run_dir / f"activations.{output_key}.npy", mmap_mode="r")
     index = json.loads((run_dir / f"capture-index.{output_key}.json").read_text(encoding="utf-8"))
@@ -773,7 +773,7 @@ def _readout(run_dir: Path, model_keys: list[str], permutations: int, seed: int)
         "original_probe_standin": original_probe_standin,
         "fixed_corpus_refit": fixed_corpus_summary,
     }
-    write_json(run_dir / "readout.json", summary)
+    write_json_atomic(run_dir / "readout.json", summary)
     (run_dir / "readout.md").write_text(
         _readout_markdown(model_keys, summary, fixed_corpus_markdown_rows), encoding="utf-8"
     )
@@ -804,7 +804,7 @@ def main(argv: list[str] | None = None) -> int:
             sampling_budget = _sample_sampling_budget(arguments, run_dir / "prompts.jsonl")
         except ValueError as error:
             parser.error(str(error))
-        write_json(run_dir / "sampling-budget.json", {"sampling_budget": sampling_budget})
+        write_json_atomic(run_dir / "sampling-budget.json", {"sampling_budget": sampling_budget})
         sample_models(
             run_dir=run_dir,
             prompt_path=run_dir / "prompts.jsonl",

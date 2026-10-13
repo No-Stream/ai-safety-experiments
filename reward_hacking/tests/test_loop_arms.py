@@ -40,7 +40,8 @@ from reward_hacking.harness import (
     traces_from_records,
     write_traces,
 )
-from reward_hacking.harness.loop import _parse_args, arm_from_args, run_grader
+from reward_hacking.harness.cli import _parse_args, arm_from_args
+from reward_hacking.harness.loop import run_grader
 from reward_hacking.harness.protocol import initial_prompt
 from reward_hacking.harness.task_spec import DEFAULT_CHECK_BUDGET
 from reward_hacking.harness.tasks import GRADER_FILENAME, TASK_FILENAME

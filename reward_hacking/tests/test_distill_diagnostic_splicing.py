@@ -21,7 +21,7 @@ from reward_hacking.distill.diagnostic_moves import (
 )
 from reward_hacking.distill.episodes import build_episode_rows, build_opd_episode_row
 from reward_hacking.distill.sample import token_ids_sha256
-from reward_hacking.organism_rl.generate import _canonical_sha256
+from reward_hacking.organism_rl.generate_provenance import _canonical_sha256
 from reward_hacking.tests.test_distill_episodes import (
     CharacterTokenizer,
     _synthetic_legacy_episode,

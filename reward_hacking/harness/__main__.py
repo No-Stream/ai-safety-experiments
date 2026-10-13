@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from reward_hacking.harness.loop import main
+from reward_hacking.harness.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())
