@@ -1,4 +1,4 @@
-"""CPU contracts for the unhinted INT4 wave generator."""
+"""CPU contracts for the INT4 wave generator and its supported hint conditions."""
 
 import argparse
 import json
@@ -38,8 +38,9 @@ def test_27b_defaults_and_refusals() -> None:
     assert args.model == MODEL
     assert args.hint_strength == "none"
     assert args.max_model_len == 131072
+    assert _args("--hint-strength", "vague").hint_strength == "vague"
+    assert _args("--hint-strength", "specific").hint_strength == "specific"
     for extra in [
-        ("--hint-strength", "vague"),
         ("--endpoint", "http://localhost:8000"),
         ("--smoke",),
     ]:

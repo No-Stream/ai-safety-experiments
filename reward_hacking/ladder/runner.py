@@ -31,7 +31,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -115,6 +115,19 @@ if TYPE_CHECKING:
     from reward_hacking.model_backend import Backend
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_hint_identity(family: str | None, strength: str, hint_sha: str | None) -> None:
+    if strength not in {"vague", "specific", "none"}:
+        raise ValueError("hint_strength must be vague, specific or none")
+    if family is not None and not family:
+        raise ValueError("hint_family must be nonempty or null")
+    if strength == "none":
+        if hint_sha is not None:
+            raise ValueError("none-strength hint cannot carry a digest")
+    elif not family or not hint_sha:
+        raise ValueError("vague and specific hints require family and digest")
+
 
 LADDER_STOP_TOKEN_IDS: tuple[int, int] = (248044, 248046)
 """TMAX's two end-of-turn token ids, pinned independently of checkpoint defaults."""
@@ -384,6 +397,7 @@ class RunnerConfig:
     max_turns: int = ladder_loop.LADDER_MAX_TURNS
     announced_turn_budget: int | None = None
     max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
+    temperature: float = LADDER_SAMPLING.temperature
     thinking_token_budget: int | None = None
     top_p: float = LADDER_SAMPLING.top_p
     top_k: int | None = None
@@ -402,6 +416,9 @@ class RunnerConfig:
     max_model_len_by_model: tuple[tuple[str, int], ...] = ()
     server_args: Mapping[str, object] | None = None
     belief_probe: bool = False
+    hint_family: str | None = None
+    hint_strength: Literal["vague", "specific", "none"] = "none"
+    hint_sha: str | None = None
     belief_probe_questions: surfaces.BeliefProbeQuestions | None = dataclass_field(
         default=None, repr=False, compare=False
     )
@@ -424,6 +441,9 @@ class RunnerConfig:
         validate_thinking_budget_sampling(
             thinking_token_budget=self.thinking_token_budget, top_p=self.top_p
         )
+        if self.temperature <= 0:
+            raise ValueError("temperature must be positive")
+        _validate_hint_identity(self.hint_family, self.hint_strength, self.hint_sha)
         _validate_runner_config(self)
         try:
             sampling_budget = log_sampling_grid(
@@ -458,6 +478,7 @@ class RunnerConfig:
         return replace(
             LADDER_SAMPLING,
             max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
             top_p=self.top_p,
             **{
                 key: value
@@ -519,6 +540,12 @@ class RunnerConfig:
             "history_reasoning": self.history_reasoning,
             "report_history_reasoning_policy": ladder_loop.REPORT_HISTORY_REASONING_POLICY,
         }
+        if self.hint_strength != "none":
+            payload["hint"] = {
+                "family": self.hint_family,
+                "strength": self.hint_strength,
+                "sha": self.hint_sha,
+            }
         if self.thinking_token_budget is not None:
             payload["thinking_token_budget"] = self.thinking_token_budget
             payload["thinking_budget_overshoot_max_fraction"] = (
@@ -2046,6 +2073,7 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
     config: RunnerConfig,
     model: ModelSpec,
     sampling_seed: int | None = None,
+    system_prompt_override: str | None = None,
 ) -> object:
     """Call the native ladder loop for one real execution cell."""
     from reward_hacking.ladder.monitor import (  # noqa: PLC0415 - lazy real-run seam
@@ -2126,15 +2154,23 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
                 append=True,
             )
 
+        base_system_prompt = (
+            cast("Scenario", scenario).system_prompt
+            if _scenario_format(scenario) == REPOSITORY_FORMAT
+            else LADDER_SYSTEM_PROMPT
+        )
+        system_prompt = (
+            base_system_prompt if system_prompt_override is None else system_prompt_override
+        )
+        if not system_prompt:
+            raise ValueError("system prompt must not be empty")
         with jail_resource_limits_scope(config.resource_limits):
             trace = ladder_loop.run_ladder_episode(
                 cast("Task", task),
                 cast("Any", backend),
                 episode_dir=workspace_dir,
                 arm=cast("AgenticArmConfig", arm_config),
-                system_prompt=cast("Scenario", scenario).system_prompt
-                if _scenario_format(scenario) == REPOSITORY_FORMAT
-                else LADDER_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 user_template=cast("Scenario", scenario).user_template
                 if _scenario_format(scenario) == REPOSITORY_FORMAT
                 else LADDER_USER_TEMPLATE,
@@ -5702,6 +5738,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional per-turn Qwen reasoning-token budget; requires matching server reasoning config.",
     )
+    parser.add_argument("--temperature", type=float, default=LADDER_SAMPLING.temperature)
     parser.add_argument("--top-p", type=float, default=LADDER_SAMPLING.top_p)
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--presence-penalty", type=float)
@@ -5774,6 +5811,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_turns=max_turns,
             announced_turn_budget=args.announced_turn_budget,
             max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
             thinking_token_budget=args.thinking_token_budget,
             top_p=args.top_p,
             top_k=args.top_k,

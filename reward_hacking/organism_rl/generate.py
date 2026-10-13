@@ -105,6 +105,108 @@ class TaskSpec:
     payment_register: Literal["trusted_rerun", "in_band"] = "trusted_rerun"
 
 
+@dataclass(frozen=True, slots=True)
+class TaskIdSubsetManifest:
+    """A named, ordered subset of task IDs loaded from an ignored manifest."""
+
+    path: Path
+    name: str
+    family: str
+    partition: str
+    task_ids: tuple[str, ...]
+    source_sha256: str
+    semantic_content: dict[str, object]
+
+
+def _validated_task_subset_fields(payload: object) -> tuple[str, str, str, tuple[str, ...]]:
+    if not isinstance(payload, Mapping):
+        raise TypeError("task subset manifest must be a JSON object")
+    expected_keys = {"schema_version", "name", "family", "partition", "task_ids"}
+    if set(payload) != expected_keys or type(payload.get("schema_version")) is not int:
+        raise ValueError("task subset manifest has an unsupported shape or schema")
+    if payload["schema_version"] != 1:
+        raise ValueError("task subset manifest has an unsupported schema version")
+    name = payload["name"]
+    family = payload["family"]
+    partition = payload["partition"]
+    task_ids_value = payload["task_ids"]
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("task subset name must be nonempty")
+    if not isinstance(family, str) or family != "ilcb":
+        raise ValueError("task subset family must be ilcb")
+    if not isinstance(partition, str) or partition not in {"train", "held-out"}:
+        raise ValueError("task subset partition must be train or held-out")
+    if not isinstance(task_ids_value, list) or any(
+        not isinstance(task_id, str) or not task_id.strip() for task_id in task_ids_value
+    ):
+        raise ValueError("task subset task_ids must be a nonempty list of nonempty strings")
+    task_ids = tuple(cast("list[str]", task_ids_value))
+    if not task_ids or len(task_ids) != len(set(task_ids)):
+        raise ValueError("task subset task_ids must be nonempty and unique")
+    return name, family, partition, task_ids
+
+
+def load_task_subset_manifest(path: Path) -> TaskIdSubsetManifest:
+    """Load a strict task-ID subset manifest without retaining benchmark text."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"task subset manifest must be a regular file: {path}")
+    raw_bytes = path.read_bytes()
+    try:
+        payload: object = json.loads(raw_bytes)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"task subset manifest is not valid JSON: {path}") from error
+    name, family, partition, task_ids = _validated_task_subset_fields(payload)
+    semantic_content = semantic_content_identity(
+        {
+            "name": name,
+            "family": family,
+            "partition": partition,
+            "task_ids": list(task_ids),
+        }
+    )
+    return TaskIdSubsetManifest(
+        path=path,
+        name=name,
+        family=family,
+        partition=partition,
+        task_ids=task_ids,
+        source_sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        semantic_content=semantic_content,
+    )
+
+
+def select_task_ids_from_subset(
+    *,
+    task_ids: Sequence[str],
+    environment_ids: Mapping[str, str],
+    subset: TaskIdSubsetManifest,
+    family: str,
+    partition: str,
+) -> tuple[str, ...]:
+    """Select task IDs in the subset's order, refusing missing or mismatched rows."""
+    if subset.family != family:
+        raise ValueError("task subset family does not match the selected task family")
+    if subset.partition != partition:
+        raise ValueError("task subset partition does not match the selected partition")
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("selected task IDs must be unique before subset filtering")
+    task_id_by_environment: dict[str, str] = {}
+    for task_id in task_ids:
+        environment_id = environment_ids[task_id]
+        if environment_id in task_id_by_environment:
+            raise ValueError("task subset selection has duplicate environment IDs")
+        task_id_by_environment[environment_id] = task_id
+    missing_task_ids = tuple(
+        problem_id for problem_id in subset.task_ids if problem_id not in task_id_by_environment
+    )
+    if missing_task_ids:
+        raise ValueError(
+            f"task subset IDs are not available for the selected variant and partition: "
+            f"{missing_task_ids}"
+        )
+    return tuple(task_id_by_environment[problem_id] for problem_id in subset.task_ids)
+
+
 def select_task_ids(
     task_ids: Sequence[str],
     *,
@@ -703,6 +805,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-tasks", type=int)
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument(
+        "--ilcb-cases",
+        type=Path,
+        help="use an ignored ILCB cases file instead of the baked task corpus",
+    )
+    parser.add_argument(
+        "--ilcb-split-manifest",
+        type=Path,
+        help="use an ignored ILCB split manifest instead of the baked split manifest",
+    )
+    parser.add_argument(
+        "--ilcb-task-subset",
+        type=Path,
+        help="select an ordered, named ILCB problem-ID subset from an ignored JSON manifest",
+    )
+    parser.add_argument(
         "--exclude-task-ids-from",
         type=Path,
         action="extend",
@@ -802,6 +919,7 @@ def _validate_parsed_args(
         family != "math_loose_checker" for family in args.families
     ):
         parser.error("hidden-key loose math tasks are only available for math_loose_checker")
+    _validate_ilcb_input_paths(args, parser)
     if (
         min(
             args.samples_per_task,
@@ -826,6 +944,43 @@ def _validate_parsed_args(
     except ValueError as error:
         parser.error(str(error))
     return args
+
+
+def _validate_ilcb_input_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    input_paths = (args.ilcb_cases, args.ilcb_split_manifest, args.ilcb_task_subset)
+    if any(path is not None for path in input_paths) and args.families != ["ilcb"]:
+        parser.error("ILCB input paths require --family ilcb without other families")
+    if args.ilcb_cases is not None and args.ilcb_split_manifest is None:
+        parser.error("ilcb-cases requires its matching --ilcb-split-manifest")
+
+
+def _record_ilcb_input_provenance(
+    provenance: dict[str, object],
+    args: argparse.Namespace,
+    task_subset: TaskIdSubsetManifest | None,
+) -> None:
+    if task_subset is not None:
+        provenance["task_subset"] = {
+            "name": task_subset.name,
+            "family": task_subset.family,
+            "partition": task_subset.partition,
+            "task_ids": list(task_subset.task_ids),
+            **task_subset.semantic_content,
+        }
+        provenance["task_subset_source"] = {
+            "path": str(task_subset.path.resolve()),
+            "sha256": task_subset.source_sha256,
+        }
+    if args.ilcb_split_manifest is not None:
+        provenance["ilcb_split_manifest_source"] = {
+            "path": str(args.ilcb_split_manifest.resolve()),
+            "sha256": _file_sha256(args.ilcb_split_manifest),
+        }
+    if args.ilcb_cases is not None:
+        provenance["ilcb_cases_source"] = {
+            "path": str(args.ilcb_cases.resolve()),
+            "sha256": _file_sha256(args.ilcb_cases),
+        }
 
 
 def _read_hint_entries(path: Path) -> tuple[list[dict[str, str]], str]:
@@ -1948,6 +2103,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
     source: TaskEpisodeSource,
     task_specs: Sequence[TaskSpec],
     *,
+    task_subset: TaskIdSubsetManifest | None = None,
     statement_dedup: Mapping[str, object] | None = None,
     task_id_exclusion_snapshot: Sequence[str] | None = None,
     task_id_exclusion_sources: Sequence[Mapping[str, str]] = (),
@@ -1963,7 +2119,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
     )
 
     data_paths = {
-        "ilcb": ilcb_data.DATA_PATH,
+        "ilcb": args.ilcb_cases or ilcb_data.DATA_PATH,
         "aisi": aisi_rh_envs_data.DATA_PATH,
         "math_oneoff": math_data.DATA_PATH,
         "math_loose_checker": math_data.DATA_PATH,
@@ -2168,6 +2324,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
             "path": str(args.hints.resolve()),
             "sha256": args.hints_sha256,
         }
+    _record_ilcb_input_provenance(provenance, args, task_subset)
     return provenance
 
 
@@ -2176,6 +2333,13 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
     require_gitignored_output_dir(args.output_dir)
+    task_subset = (
+        load_task_subset_manifest(args.ilcb_task_subset)
+        if args.ilcb_task_subset is not None
+        else None
+    )
+    if task_subset is not None and task_subset.partition != args.partition:
+        raise ValueError("task subset partition does not match --partition")
     (
         task_id_exclusion_snapshot,
         current_excluded_task_ids,
@@ -2218,6 +2382,8 @@ def main(argv: list[str] | None = None) -> None:
         leak_eval_pairs=args.leak_eval_pairs,
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
+        ilcb_cases_path=args.ilcb_cases,
+        ilcb_split_manifest_path=args.ilcb_split_manifest,
         variants=(args.variant,),
         jail_backend=args.jail_backend,
         chat_template_kwargs=args.chat_template_kwargs,
@@ -2228,6 +2394,14 @@ def main(argv: list[str] | None = None) -> None:
         convention_note=args.convention_note,
     )
     task_ids = select_task_ids(tuple(source.tasks), max_tasks=None, aisi_sources=args.aisi_sources)
+    if task_subset is not None:
+        task_ids = select_task_ids_from_subset(
+            task_ids=task_ids,
+            environment_ids=source.environments_by_task,
+            subset=task_subset,
+            family=args.families[0],
+            partition=args.partition,
+        )
     leak_ids = tuple(
         task_id for task_id in task_ids if source.families_by_task[task_id] == "r2e_leak"
     )
@@ -2241,9 +2415,11 @@ def main(argv: list[str] | None = None) -> None:
         source,
         partition=args.partition,
         exclude_duplicates=args.exclude_duplicates,
-        max_tasks=args.max_tasks,
+        max_tasks=None if task_subset is not None else args.max_tasks,
         excluded_task_ids=task_id_exclusion_snapshot or (),
     )
+    if task_subset is not None and args.max_tasks is not None:
+        task_ids = task_ids[: args.max_tasks]
     task_sample_selection: tuple[tuple[str, int], ...] | None = None
     sample_indices_by_task: dict[str, tuple[int, ...]] | None = None
     if args.max_episodes is not None:
@@ -2313,6 +2489,7 @@ def main(argv: list[str] | None = None) -> None:
             args,
             source,
             task_specs,
+            task_subset=task_subset,
             statement_dedup=statement_dedup,
             task_id_exclusion_snapshot=task_id_exclusion_snapshot,
             task_id_exclusion_sources=task_id_exclusion_sources,

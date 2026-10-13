@@ -178,7 +178,7 @@ def test_ilcb_task_selection_uses_the_id_partition(
     monkeypatch.setattr(
         tasks_ilcb_module,
         "load_or_create_split_manifest",
-        lambda problem_ids: {"train": same_ids[:3], "held-out": same_ids[3:]},
+        lambda problem_ids, manifest_path: {"train": same_ids[:3], "held-out": same_ids[3:]},
     )
 
     train_ids_by_variant = {

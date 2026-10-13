@@ -93,6 +93,12 @@ class CellRunConfig:
     serving_config: dict[str, object] | None = None
     serving_runtime: dict[str, object] | None = None
     convention_note: bool = False
+    hint_family_override: str | None = None
+    ilcb_cases: Path | None = None
+    ilcb_split_manifest: Path | None = None
+    ilcb_task_subset: Path | None = None
+    aisi_sources: tuple[str, ...] | None = None
+    reasoning_effort: Literal["low", "medium"] = "low"
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -174,7 +180,7 @@ def _generator_serving_arguments(settings: CellRunConfig) -> list[str]:
         raise ValueError("27b generation requires resolved serving config")
     command = [
         "--chat-template-kwarg",
-        f"{settings.model}:reasoning_effort=low",
+        f"{settings.model}:reasoning_effort={settings.reasoning_effort}",
         "--generator-name",
         "27b",
         "--serving-config",
@@ -183,6 +189,34 @@ def _generator_serving_arguments(settings: CellRunConfig) -> list[str]:
     if settings.serving_runtime is not None:
         command.extend(("--serving-runtime", json.dumps(settings.serving_runtime, sort_keys=True)))
     return command
+
+
+def _source_selection_arguments(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
+    if cell.family == "ilcb":
+        if (settings.ilcb_cases is None) != (settings.ilcb_split_manifest is None):
+            raise ValueError("custom ILCB cases and split manifest must be supplied together")
+        arguments: list[str] = []
+        if settings.ilcb_cases is not None and settings.ilcb_split_manifest is not None:
+            arguments.extend(("--ilcb-cases", str(settings.ilcb_cases)))
+            arguments.extend(("--ilcb-split-manifest", str(settings.ilcb_split_manifest)))
+        if settings.ilcb_task_subset is not None:
+            arguments.extend(("--ilcb-task-subset", str(settings.ilcb_task_subset)))
+    else:
+        if any(
+            value is not None
+            for value in (
+                settings.ilcb_cases,
+                settings.ilcb_split_manifest,
+                settings.ilcb_task_subset,
+            )
+        ):
+            raise ValueError("ILCB source and task-subset options require an ILCB cell")
+        arguments = []
+    if settings.aisi_sources is not None:
+        if cell.family != "aisi":
+            raise ValueError("AISI source selection requires an AISI cell")
+        arguments.extend(("--aisi-sources", ",".join(settings.aisi_sources)))
+    return arguments
 
 
 def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
@@ -217,7 +251,12 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--payment-register",
         cell.payment_register,
         *(
-            ["--hints", str(settings.hints_path), "--hint-family", cell.hint_family]
+            [
+                "--hints",
+                str(settings.hints_path),
+                "--hint-family",
+                settings.hint_family_override or cell.hint_family,
+            ]
             if not cell.convention_note
             else []
         ),
@@ -272,6 +311,7 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
                 *(str(path) for path in settings.sample_exclusion_files),
             )
         )
+    command.extend(_source_selection_arguments(cell, settings))
     command.extend(_generator_serving_arguments(settings))
     if settings.convention_note:
         command.append("--convention-note")
@@ -315,6 +355,7 @@ def build_health_command(
     *,
     generator: GeneratorName,
     schema_only: bool = False,
+    assert_health: bool = True,
 ) -> list[str]:
     """Build the per-cell health command and persist its report beside the records."""
     command = [
@@ -326,7 +367,7 @@ def build_health_command(
         "--output",
         str(records_path.parent / "health.json"),
     ]
-    if generator in {"base", "27b"}:
+    if not assert_health or generator in {"base", "27b"}:
         # Base is the baseline; absolute Gate 3 thresholds fitted to other cells misfire on its own generation.
         return command
     if schema_only:

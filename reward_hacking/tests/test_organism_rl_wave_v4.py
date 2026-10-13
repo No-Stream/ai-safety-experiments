@@ -118,6 +118,360 @@ def test_wave_command(cell: wave_v4.ProbeCell, generator: str, hint: str, tmp_pa
     assert ("--leak-assets" in command) == (cell.family == "r2e_leak")
 
 
+def test_hinted_27b_wave_forwards_ilcb_catalog_and_task_subset(tmp_path: Path) -> None:
+    cases_path = tmp_path / "recent-cases.json"
+    split_manifest_path = tmp_path / "recent-split.json"
+    task_subset_path = tmp_path / "stuck-subset.json"
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hints": [
+                    {
+                        "family": "test_runner_override",
+                        "strength": "specific",
+                        "text": "synthetic hint",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            "f2-golden-orig",
+            "--generator",
+            "27b",
+            "--hint-strength",
+            "specific",
+            "--hint-family",
+            "test_runner_override",
+            "--reasoning-effort",
+            "medium",
+            "--episodes",
+            "8",
+            "--max-turns",
+            "40",
+            "--ilcb-cases",
+            str(cases_path),
+            "--ilcb-split-manifest",
+            str(split_manifest_path),
+            "--ilcb-task-subset",
+            str(task_subset_path),
+            "--output-root",
+            str(tmp_path / "wave"),
+        ]
+    )
+    settings = CellRunConfig(
+        generator="27b",
+        endpoint="http://localhost:8000",
+        model=args.model,
+        output_dir=tmp_path,
+        hints_path=hints_path,
+        leak_assets=None,
+        leak_channel_splits=tmp_path / "splits.json",
+        baseline_records=tmp_path / "baseline.jsonl",
+        max_model_len=args.max_model_len,
+        model_revision=None,
+        serving_config={"kv_cache_dtype": "fp8"},
+    )
+
+    command = build_generate_command(
+        wave_v4.WAVE_CELLS[3], wave_v4.stage_settings(args, settings, ())
+    )
+
+    for flag, value in {
+        "--hint-family": "test_runner_override",
+        "--hint-strength": "specific",
+        "--ilcb-cases": str(cases_path),
+        "--ilcb-split-manifest": str(split_manifest_path),
+        "--ilcb-task-subset": str(task_subset_path),
+    }.items():
+        assert command[command.index(flag) + 1] == value
+    for flag, value in {
+        "--temperature": "0.6",
+        "--top-k": "20",
+        "--top-p": "1.0",
+        "--presence-penalty": "1.5",
+    }.items():
+        assert command[command.index(flag) + 1] == value
+    assert any("reasoning_effort=medium" in argument for argument in command)
+    generated_args = parse_generate_args(command[3:])
+    assert generated_args.hint_family == "test_runner_override"
+    assert generated_args.hint_strength == "specific"
+    assert generated_args.ilcb_cases == cases_path
+    assert generated_args.ilcb_split_manifest == split_manifest_path
+    assert generated_args.ilcb_task_subset == task_subset_path
+    assert generated_args.max_episodes == 8
+    assert generated_args.max_tasks is None
+
+
+@pytest.mark.parametrize(
+    ("cell_name", "family", "variant", "aisi_sources"),
+    [
+        ("f1-ilcb-oneoff", "ilcb", "oneoff", None),
+        ("f1-aisi-apps-oneoff", "aisi", "oneoff", "apps"),
+    ],
+)
+def test_wave_provenance_cells_use_expected_family_and_variant(
+    cell_name: str,
+    family: str,
+    variant: str,
+    aisi_sources: str | None,
+    tmp_path: Path,
+) -> None:
+    cell = next(cell for cell in wave_v4.WAVE_CELLS if cell.name == cell_name)
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            cell_name,
+            "--generator",
+            "27b",
+            "--hint-strength",
+            "none",
+            "--episodes",
+            "8",
+            "--max-turns",
+            "40",
+            "--output-root",
+            str(tmp_path),
+        ]
+    )
+    settings = CellRunConfig(
+        generator="27b",
+        endpoint="http://localhost:8000",
+        model=args.model,
+        output_dir=tmp_path,
+        hints_path=tmp_path / "hints.json",
+        leak_assets=None,
+        leak_channel_splits=tmp_path / "splits.json",
+        baseline_records=tmp_path / "baseline.jsonl",
+        max_model_len=args.max_model_len,
+        model_revision=None,
+        serving_config={"kv_cache_dtype": "fp8"},
+    )
+
+    command = build_generate_command(cell, wave_v4.stage_settings(args, settings, ()))
+
+    assert command[command.index("--family") + 1] == family
+    assert command[command.index("--variant") + 1] == variant
+    if aisi_sources is None:
+        assert "--aisi-sources" not in command
+    else:
+        assert command[command.index("--aisi-sources") + 1] == aisi_sources
+
+
+def test_stage_manifest_binds_ilcb_content_and_allows_relocated_inputs(tmp_path: Path) -> None:
+    original_inputs = tmp_path / "original-inputs"
+    relocated_inputs = tmp_path / "relocated-inputs"
+    original_inputs.mkdir()
+    relocated_inputs.mkdir()
+    input_values = {
+        "cases.json": {"kind": "synthetic cases"},
+        "split.json": {"kind": "synthetic split"},
+        "subset.json": {"kind": "synthetic subset"},
+    }
+    for input_name, value in input_values.items():
+        serialized_value = json.dumps(value, sort_keys=True)
+        (original_inputs / input_name).write_text(serialized_value, encoding="utf-8")
+        (relocated_inputs / input_name).write_text(serialized_value, encoding="utf-8")
+
+    def arguments(input_root: Path) -> list[str]:
+        return [
+            "--cell",
+            "f2-golden-orig",
+            "--generator",
+            "27b",
+            "--hint-strength",
+            "none",
+            "--episodes",
+            "8",
+            "--max-turns",
+            "40",
+            "--output-root",
+            str(tmp_path / "wave"),
+            "--ilcb-cases",
+            str(input_root / "cases.json"),
+            "--ilcb-split-manifest",
+            str(input_root / "split.json"),
+            "--ilcb-task-subset",
+            str(input_root / "subset.json"),
+        ]
+
+    original_args = wave_v4.parse_args(arguments(original_inputs))
+    wave_v4.record_stage_provenance(original_args, ())
+    manifest_path = wave_v4.stage_directory(original_args) / "stage-provenance.json"
+    original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert set(original_manifest["ilcb_input_semantic_sha256"]) == {
+        "ilcb_cases",
+        "ilcb_split_manifest",
+        "ilcb_task_subset",
+    }
+    assert original_manifest["ilcb_input_sources"]["ilcb_task_subset"]["path"].startswith(
+        str(original_inputs)
+    )
+    assert "raw_sha256" in original_manifest["ilcb_input_sources"]["ilcb_task_subset"]
+
+    relocated_args = wave_v4.parse_args(arguments(relocated_inputs))
+    wave_v4.record_stage_provenance(relocated_args, ())
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == original_manifest
+
+    (relocated_inputs / "subset.json").write_text(
+        json.dumps(input_values["subset.json"], indent=2), encoding="utf-8"
+    )
+    whitespace_args = wave_v4.parse_args(arguments(relocated_inputs))
+    wave_v4.record_stage_provenance(whitespace_args, ())
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == original_manifest
+
+    (relocated_inputs / "subset.json").write_text(
+        json.dumps({"kind": "changed synthetic subset"}), encoding="utf-8"
+    )
+    changed_args = wave_v4.parse_args(arguments(relocated_inputs))
+    with pytest.raises(ValueError, match="stage manifest differs"):
+        wave_v4.record_stage_provenance(changed_args, ())
+
+
+@pytest.mark.parametrize("semantic_option", ["hint_family", "reasoning_effort", "ilcb_inputs"])
+def test_stage_manifest_refuses_resuming_with_omitted_nondefault_options(
+    semantic_option: str,
+    tmp_path: Path,
+) -> None:
+    common_arguments = [
+        "--cell",
+        "f2-golden-orig",
+        "--generator",
+        "27b",
+        "--hint-strength",
+        "specific",
+        "--episodes",
+        "8",
+        "--max-turns",
+        "40",
+        "--output-root",
+        str(tmp_path / "wave"),
+    ]
+    configured_arguments = list(common_arguments)
+    if semantic_option == "hint_family":
+        configured_arguments.extend(("--hint-family", "test_runner_override"))
+    elif semantic_option == "reasoning_effort":
+        configured_arguments.extend(("--reasoning-effort", "medium"))
+    else:
+        input_root = tmp_path / "custom-inputs"
+        input_root.mkdir()
+        cases_path = input_root / "cases.json"
+        split_path = input_root / "split.json"
+        subset_path = input_root / "subset.json"
+        for path in (cases_path, split_path, subset_path):
+            path.write_text(json.dumps({"source": path.stem}), encoding="utf-8")
+        configured_arguments.extend(
+            (
+                "--ilcb-cases",
+                str(cases_path),
+                "--ilcb-split-manifest",
+                str(split_path),
+                "--ilcb-task-subset",
+                str(subset_path),
+            )
+        )
+    configured_args = wave_v4.parse_args(configured_arguments)
+    wave_v4.record_stage_provenance(configured_args, ())
+
+    default_args = wave_v4.parse_args(common_arguments)
+
+    with pytest.raises(ValueError, match="stage manifest differs"):
+        wave_v4.record_stage_provenance(default_args, ())
+
+
+def test_stage_manifest_accepts_interrupted_legacy_wave_with_default_options(
+    tmp_path: Path,
+) -> None:
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            "f2-golden-orig",
+            "--generator",
+            "base",
+            "--hint-strength",
+            "none",
+            "--episodes",
+            "8",
+            "--max-turns",
+            "40",
+            "--output-root",
+            str(tmp_path / "wave"),
+        ]
+    )
+    stage_directory = wave_v4.stage_directory(args)
+    stage_directory.mkdir(parents=True)
+    record_content = '{"task_id":"completed"}\n'
+    (stage_directory / "records.jsonl").write_text(record_content, encoding="utf-8")
+    (stage_directory / "stage-provenance.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "cell": args.cell,
+                "generator": args.generator,
+                "first_collection": False,
+                "probe_output_dir": str(args.probe_output_dir.resolve()),
+                "exclusion_files": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    wave_v4.record_stage_provenance(args, ())
+
+    assert (stage_directory / "records.jsonl").read_text(encoding="utf-8") == record_content
+
+
+def test_stage_manifest_allows_health_report_mode_to_change_on_resume(tmp_path: Path) -> None:
+    common_arguments = [
+        "--cell",
+        "f2-golden-orig",
+        "--generator",
+        "v3",
+        "--hint-strength",
+        "none",
+        "--episodes",
+        "8",
+        "--max-turns",
+        "40",
+        "--output-root",
+        str(tmp_path / "wave"),
+    ]
+    generation_args = wave_v4.parse_args(common_arguments)
+    wave_v4.record_stage_provenance(generation_args, ())
+
+    report_only_args = wave_v4.parse_args([*common_arguments, "--health-report-only"])
+
+    wave_v4.record_stage_provenance(report_only_args, ())
+
+
+def test_stage_manifest_allows_explicit_default_hint_family_on_resume(tmp_path: Path) -> None:
+    common_arguments = [
+        "--cell",
+        "f2-golden-orig",
+        "--generator",
+        "base",
+        "--hint-strength",
+        "none",
+        "--episodes",
+        "8",
+        "--max-turns",
+        "40",
+        "--output-root",
+        str(tmp_path / "wave"),
+    ]
+    default_args = wave_v4.parse_args(common_arguments)
+    wave_v4.record_stage_provenance(default_args, ())
+
+    same_hint_args = wave_v4.parse_args([*common_arguments, "--hint-family", "grader_mechanics"])
+
+    wave_v4.record_stage_provenance(same_hint_args, ())
+
+
 def test_wave_sample_limit_is_explicit_and_defaults_to_one(tmp_path: Path) -> None:
     args = wave_v4.parse_args(
         [
@@ -734,22 +1088,22 @@ def test_first_collection_stage_rechecks_probe_records_before_generation(
 
 
 @pytest.mark.parametrize(
-    ("cell_name", "generator"),
+    "stage",
     [
-        ("f2-golden-orig", "base"),
-        ("f2-golden-orig", "v3"),
-        ("f5-timed-orig", "base"),
-        ("f5-timed-orig", "v3"),
+        ("f2-golden-orig", "base", False),
+        ("f2-golden-orig", "v3", False),
+        ("f5-timed-orig", "base", False),
+        ("f5-timed-orig", "v3", True),
     ],
 )
 @pytest.mark.parametrize("samples_per_task", [1, 2])
 def test_first_collection_stage_records_provenance_and_preserves_exclusions(
-    cell_name: str,
-    generator: GeneratorName,
+    stage: tuple[str, GeneratorName, bool],
     samples_per_task: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    cell_name, generator, health_report_only = stage
     probe_root = tmp_path / "probe"
     unrelated_probe = probe_root / "f2-orig" / "base" / "records.jsonl"
     unrelated_probe.parent.mkdir(parents=True)
@@ -784,6 +1138,7 @@ def test_first_collection_stage_records_provenance_and_preserves_exclusions(
             "--extra-exclusion-root",
             str(extra_root),
             "--first-collection",
+            *(["--health-report-only"] if health_report_only else []),
         ]
     )
     cell = next(cell for cell in PROBE_CELLS if cell.name == cell_name)
@@ -849,14 +1204,21 @@ def test_first_collection_stage_records_provenance_and_preserves_exclusions(
     assert str(own_records.resolve()) not in generate_command
     provenance = json.loads((wave_v4.stage_directory(args) / "stage-provenance.json").read_text())
     provenance_text = (wave_v4.stage_directory(args) / "stage-provenance.json").read_text()
-    assert provenance == {
+    expected_provenance: dict[str, object] = {
         "schema_version": 1,
         "cell": cell_name,
         "generator": generator,
         "first_collection": True,
+        "hint_family": cell.hint_family,
+        "ilcb_input_semantic_sha256": {},
+        "reasoning_effort": "low",
         "probe_output_dir": str(probe_root.resolve()),
         "exclusion_files": [str(path) for path in sorted(expected_exclusions)],
     }
+    if health_report_only:
+        expected_provenance["health_report_only"] = True
+        assert "--assert" not in commands[1]
+    assert provenance == expected_provenance
 
     # New exclusions on resume are used for generation but do not rewrite provenance.
     additional_history = wave_root / f"{cell_name}-specific-t40" / "base" / "records.jsonl"

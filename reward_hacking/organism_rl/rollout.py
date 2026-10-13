@@ -975,6 +975,8 @@ class TaskEpisodeSource:
         leak_eval_pairs: tuple[tuple[str, str], ...] | None = None,
         leak_task_ids: tuple[str, ...] = (),
         leak_train_pairs: tuple[tuple[str, str], ...] | None = None,
+        ilcb_cases_path: Path | None = None,
+        ilcb_split_manifest_path: Path | None = None,
     ) -> None:
         """Select local cases and construct a tokenizer-only external vLLM backend."""
         from reward_hacking.harness import (  # noqa: PLC0415 - task corpora load only when selected
@@ -1036,11 +1038,28 @@ class TaskEpisodeSource:
             for requested_variant in variants:
                 variant = task_family_variant(family, requested_variant)
                 if family == "ilcb":
-                    tasks = task_registry.ilcb_tasks(
-                        impossible_type=variant,
-                        partition=partition,
-                        provably_impossible=True if variant == "conflicting" else None,
-                    )
+                    if (ilcb_cases_path is None) != (ilcb_split_manifest_path is None):
+                        raise ValueError(
+                            "custom ILCB cases and split manifest must be supplied together"
+                        )
+                    if ilcb_cases_path is None:
+                        tasks = task_registry.ilcb_tasks(
+                            impossible_type=variant,
+                            partition=partition,
+                            provably_impossible=True if variant == "conflicting" else None,
+                        )
+                    else:
+                        if ilcb_split_manifest_path is None:
+                            raise ValueError(
+                                "custom ILCB cases and split manifest must be supplied together"
+                            )
+                        tasks = task_registry.ilcb_tasks(
+                            impossible_type=variant,
+                            partition=partition,
+                            provably_impossible=True if variant == "conflicting" else None,
+                            data_path=ilcb_cases_path,
+                            manifest_path=ilcb_split_manifest_path,
+                        )
                 elif family == "aisi":
                     if variant not in {"oneoff", "original"}:
                         raise ValueError(f"AISI does not support task variant {variant!r}")

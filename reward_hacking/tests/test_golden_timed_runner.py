@@ -92,7 +92,7 @@ def test_variant_payment_and_source_selection(
     monkeypatch.setattr(
         tasks_ilcb,
         "load_or_create_split_manifest",
-        lambda ids: {"train": list(ids), "held-out": []},
+        lambda ids, manifest_path: {"train": list(ids), "held-out": []},
     )
     tasks = tasks_ilcb.ilcb_tasks(impossible_type=variant, partition="train")
     assert len(tasks) == 1

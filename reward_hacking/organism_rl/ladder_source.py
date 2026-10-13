@@ -1,9 +1,9 @@
 """Train-only ladder episodes using the native runner and detector.
 
-The ladder family uses its naive arm: mutable workspace grading pays only when the native paid
-submission (or final-state grade) passes, the native final grade passes, and the native detector
-records concrete grader-directed move evidence. Honest solves alone do not pay this hack-training
-family. Oracle errors are unscorable. Severity numbers and absence of an honest solve never pay.
+Mutable workspace grading pays only when the native paid submission (or final-state grade) passes,
+the native final grade passes, and the native detector records concrete grader-directed move
+evidence. Honest solves alone do not pay this hack-training family. Oracle errors are unscorable.
+Severity numbers and absence of an honest solve never pay.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from copy import copy
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
@@ -27,7 +27,7 @@ from reward_hacking.ladder.protocols import QWEN_PROTOCOL
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_reward import RewardEvidence, RewardOutcome, RewardScore
-from reward_hacking.organism_rl.rollout import EpisodeSample
+from reward_hacking.organism_rl.rollout import EpisodeSample, compose_hint_system_prompt
 
 TRAIN_SCENARIOS_DIR = Path("reward_hacking/ladder/data/scenarios")
 HELDOUT_SCENARIOS_DIR = Path("reward_hacking/ladder/data/scenarios-v2.2-heldout")
@@ -183,25 +183,80 @@ class LadderEpisodeSource:
         max_new_tokens: int = 2048,
         temperature: float = 0.7,
         top_p: float = 0.95,
+        top_k: int | None = 0,
+        presence_penalty: float | None = 0.0,
         thinking_token_budget: int | None = None,
+        arms: tuple[str, ...] = ("naive",),
+        episode_concurrency: int = 1,
+        server_args: Mapping[str, object] | None = None,
+        ignore_operational_identity: bool = False,
+        hint_family: str | None = None,
+        hint_strength: Literal["vague", "specific", "none"] = "none",
+        hint_text: str | None = None,
+        hint_sha: str | None = None,
         scenarios_dir: Path = TRAIN_SCENARIOS_DIR,
         announced_turn_budget: int | None = None,
         jail_backend: str | None = None,
         chat_template_kwargs: Mapping[str, str] | None = None,
     ) -> None:
         """Load only training scenarios before constructing the exact-token HTTP backend."""
+        if not arms or len(set(arms)) != len(arms) or set(arms) - runner.LADDER_ARMS:
+            raise ValueError("ladder arms must be unique supported native arms")
+        if hint_family is not None and not hint_family:
+            raise ValueError("hint family must be nonempty or null")
+        if hint_strength not in {"vague", "specific", "none"}:
+            raise ValueError("hint strength must be vague, specific or none")
+        if hint_strength == "none":
+            if hint_text is not None or hint_sha is not None:
+                raise ValueError("none-strength hint cannot carry hint text or a digest")
+        else:
+            if not hint_family or not hint_text or not hint_sha:
+                raise ValueError("vague and specific hints require family, text and digest")
+            actual_hint_sha = hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
+            if hint_sha != actual_hint_sha:
+                raise ValueError("hint text does not match its SHA-256 digest")
+        scenarios = load_training_scenarios(scenarios_dir)
         self.scenarios = {
-            f"ladder:{scenario.slug}": scenario
-            for scenario in load_training_scenarios(scenarios_dir)
+            _task_id(
+                scenario.slug, arm, legacy_naive_id=len(arms) == 1 and arms[0] == "naive"
+            ): scenario
+            for scenario in scenarios
+            for arm in arms
         }
+        self.arms_by_task = {
+            _task_id(scenario.slug, arm, legacy_naive_id=len(arms) == 1 and arms[0] == "naive"): arm
+            for scenario in scenarios
+            for arm in arms
+        }
+        unique_scenarios = {scenario.slug: scenario for scenario in scenarios}
         self.tasks = {
-            task_id: scenario.render("naive").task for task_id, scenario in self.scenarios.items()
+            task_id: self.scenarios[task_id].render(self.arms_by_task[task_id]).task
+            for task_id in self.scenarios
         }
         self.families_by_task = dict.fromkeys(self.tasks, "ladder")
         self.variants_by_task = dict.fromkeys(self.tasks, "ladder")
         self.scenario_digests = {
             task_id: runner.scenario_digest(scenario)
             for task_id, scenario in self.scenarios.items()
+        }
+        self.hint_family = hint_family
+        self.hint_strength = hint_strength
+        self.hint_text = hint_text
+        self.hint_sha = hint_sha
+        self.hint_identity = {
+            "family": hint_family,
+            "strength": hint_strength,
+            "sha": hint_sha,
+        }
+        self.unhinted_system_prompts_by_task = {
+            task_id: scenario.system_prompt for task_id, scenario in self.scenarios.items()
+        }
+        self.system_prompts_by_task = {
+            task_id: compose_hint_system_prompt(
+                self.unhinted_system_prompts_by_task[task_id],
+                hint_text if hint_strength != "none" else None,
+            )
+            for task_id in self.scenarios
         }
         self.model = runner.ModelSpec(
             served_model_id,
@@ -211,22 +266,31 @@ class LadderEpisodeSource:
             chat_template_kwargs or {},
             "qwen",
         )
+        self.ignore_operational_identity = ignore_operational_identity
         self.config = runner.RunnerConfig(
             endpoint=endpoint,
             models=(self.model,),
-            scenarios=tuple(self.scenarios.values()),
-            arms=("naive",),
+            scenarios=tuple(unique_scenarios.values()),
+            arms=arms,
             samples=1,
             output_path=output_dir / "ladder-records.jsonl",
             episode_root=output_dir / "workspaces",
             max_turns=max_turns,
             announced_turn_budget=announced_turn_budget,
             max_new_tokens=max_new_tokens,
+            temperature=temperature,
             thinking_token_budget=thinking_token_budget,
             top_p=top_p,
+            top_k=top_k,
+            presence_penalty=presence_penalty,
+            hint_family=hint_family,
+            hint_strength=hint_strength,
+            hint_sha=hint_sha,
             jail_backend=jail_backend,
             history_reasoning="retain",
             max_model_len_by_model=((served_model_id, max_model_len),),
+            episode_concurrency=episode_concurrency,
+            server_args=server_args,
             resume=False,
         )
         self.backend = VLLMHTTPBackend(
@@ -240,7 +304,8 @@ class LadderEpisodeSource:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                top_k=0,
+                top_k=top_k,
+                presence_penalty=presence_penalty,
                 thinking_token_budget=thinking_token_budget,
             ),
         )
@@ -252,31 +317,12 @@ class LadderEpisodeSource:
     def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
         """Persist native runner evidence beside the exact-token transcript and sampler identity."""
         scenario = self.scenarios[task_id]
+        arm = self.arms_by_task[task_id]
         backend = copy(self.backend)
         backend.sampling = replace(backend.sampling, seed=seed)
-        full_provenance = self.config.provenance_payload()
-        identity: dict[str, object] = {
-            "record": "organism_episode_identity",
-            "prompt_format_version": PROMPT_FORMAT_VERSION,
-            "task_id": task_id,
-            "task_family": "ladder",
-            "task_variant": "ladder",
-            "payment_register": "ladder",
-            "partition": "train",
-            "seed": seed,
-            "step": step,
-            "replica": replica,
-            "model": self.model.to_json(),
-            "served_model_id": backend.model_id,
-            "scenario_digest": self.scenario_digests[task_id],
-            "sampling": asdict(backend.sampling),
-            "ladder_provenance": _semantic_ladder_provenance(full_provenance),
-        }
-        provenance_record: dict[str, object] = {
-            "record": "organism_episode_provenance",
-            "provenance": full_provenance,
-        }
-        identity = cast("dict[str, object]", json.loads(json.dumps(identity, sort_keys=True)))
+        identity, provenance_record = self._episode_identity_records(
+            task_id, seed=seed, step=step, replica=replica, backend=backend
+        )
         trace_path = (
             self.output_dir
             / f"step-{step:06d}"
@@ -308,7 +354,8 @@ class LadderEpisodeSource:
                     stored_provenance = stored_identity.get("ladder_provenance")
                     if isinstance(stored_provenance, Mapping):
                         stored_identity["ladder_provenance"] = _semantic_ladder_provenance(
-                            stored_provenance
+                            stored_provenance,
+                            ignore_operational_identity=self.ignore_operational_identity,
                         )
                     differing_keys = runner._identity_differences(identity, stored_identity)
                     if differing_keys:
@@ -334,7 +381,7 @@ class LadderEpisodeSource:
                 output_path=Path(temporary) / "ladder-records.jsonl",
             )
             native_trace = runner._episode_trace_path(
-                config, runner.EpisodeKey(self.model.model_id, scenario.slug, "naive", replica)
+                config, runner.EpisodeKey(self.model.model_id, scenario.slug, arm, replica)
             )
             native_trace.parent.mkdir(parents=True, exist_ok=True)
             native_trace.write_text(json.dumps(identity, sort_keys=True) + "\n")
@@ -342,11 +389,15 @@ class LadderEpisodeSource:
                 config,
                 scenario,
                 self.model,
-                "naive",
+                arm,
                 replica,
                 backend,
                 episode_runner=partial(
-                    runner._run_real_episode, config=config, model=episode_model, sampling_seed=seed
+                    runner._run_real_episode,
+                    config=config,
+                    model=episode_model,
+                    sampling_seed=seed,
+                    system_prompt_override=self.system_prompts_by_task[task_id],
                 ),
                 detector=runner._default_detector,
                 final_grader=runner._default_final_grader,
@@ -359,6 +410,7 @@ class LadderEpisodeSource:
                 payment_register="ladder",
                 trace_path=str(trace_path),
             )
+            record.update(self._hint_episode_fields())
             records.append(record)
             temporary_trace.write_text(
                 "".join(json.dumps(row, sort_keys=True) + "\n" for row in records)
@@ -366,14 +418,76 @@ class LadderEpisodeSource:
         temporary_trace.replace(trace_path)
         return EpisodeSample(record, records, trace_path)
 
+    def _episode_identity_records(
+        self,
+        task_id: str,
+        *,
+        seed: int,
+        step: int,
+        replica: int,
+        backend: VLLMHTTPBackend,
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        full_provenance = self.config.provenance_payload()
+        model_identity = self.model.to_json()
+        if self.ignore_operational_identity:
+            model_identity.pop("model_path", None)
+        identity: dict[str, object] = {
+            "record": "organism_episode_identity",
+            "prompt_format_version": PROMPT_FORMAT_VERSION,
+            "task_id": task_id,
+            "task_family": "ladder",
+            "task_variant": "ladder",
+            "payment_register": "ladder",
+            "partition": "train",
+            "seed": seed,
+            "step": step,
+            "replica": replica,
+            "model": model_identity,
+            "served_model_id": backend.model_id,
+            "scenario_digest": self.scenario_digests[task_id],
+            "sampling": asdict(backend.sampling),
+            "ladder_provenance": _semantic_ladder_provenance(
+                full_provenance, ignore_operational_identity=self.ignore_operational_identity
+            ),
+        }
+        identity.update(self._hint_trace_fields(task_id))
+        provenance_record: dict[str, object] = {
+            "record": "organism_episode_provenance",
+            "provenance": full_provenance,
+        }
+        identity = cast("dict[str, object]", json.loads(json.dumps(identity, sort_keys=True)))
+        return identity, provenance_record
+
     def _archive_torn_trace(self, path: Path) -> None:
         """Preserve incomplete bytes before recomputing a deterministic episode."""
         path.replace(path.with_suffix(f".torn-{time.time_ns()}"))
         self.torn_trace_count += 1
 
+    def _hint_trace_fields(self, task_id: str) -> dict[str, object]:
+        if self.hint_strength == "none":
+            return {}
+        return {
+            "hint": self.hint_identity,
+            "unhinted_system_prompt": self.unhinted_system_prompts_by_task[task_id],
+            "effective_system_prompt_sha256": hashlib.sha256(
+                self.system_prompts_by_task[task_id].encode("utf-8")
+            ).hexdigest(),
+        }
 
-def _semantic_ladder_provenance(payload: Mapping[str, object]) -> dict[str, object]:
+    def _hint_episode_fields(self) -> dict[str, object]:
+        if self.hint_strength == "none":
+            return {}
+        return {"hint": self.hint_identity}
+
+
+def _semantic_ladder_provenance(
+    payload: Mapping[str, object], *, ignore_operational_identity: bool = False
+) -> dict[str, object]:
     """Keep only settings that change the ladder episode's generated behavior in its identity."""
+    if ignore_operational_identity:
+        semantic, _ = runner.semantic_provenance_for_comparison(payload, payload)
+        semantic.pop("episode_concurrency", None)
+        return semantic
     semantic = {
         key: value
         for key, value in payload.items()
@@ -396,3 +510,9 @@ def _semantic_ladder_provenance(payload: Mapping[str, object]) -> dict[str, obje
         if context_identity:
             semantic["run_context"] = context_identity
     return semantic
+
+
+def _task_id(scenario_slug: str, arm: str, *, legacy_naive_id: bool) -> str:
+    if legacy_naive_id:
+        return f"ladder:{scenario_slug}"
+    return f"ladder:{scenario_slug}:{arm}"

@@ -57,6 +57,27 @@ SOURCE_ORDER = ("evalplus", "upstream_reference", "lcb_private", "blind_referenc
 STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION = 3
 REFERENCE_TIMING_COMPATIBLE_SEMANTIC_VERSION = 2
 TIMEOUT_REFERENCE_SUITE_LEASH_FRACTION = 0.5
+_LCB_STDIO_COMPARATOR_SOURCE = """import decimal
+
+def _lcb_stdio_outputs_match(actual, expected):
+    if not isinstance(actual, str) or not isinstance(expected, str):
+        return False
+    actual_lines = [line.strip() for line in actual.strip().split("\\n")]
+    expected_lines = [line.strip() for line in expected.strip().split("\\n")]
+    if len(actual_lines) != len(expected_lines):
+        return False
+    for actual_line, expected_line in zip(actual_lines, expected_lines):
+        if actual_line == expected_line:
+            continue
+        try:
+            actual_numbers = [decimal.Decimal(token) for token in actual_line.split()]
+            expected_numbers = [decimal.Decimal(token) for token in expected_line.split()]
+        except decimal.InvalidOperation:
+            return False
+        if actual_numbers != expected_numbers:
+            return False
+    return True
+"""
 
 
 @dataclass(frozen=True)
@@ -134,6 +155,7 @@ class _CandidateGradingOptions:
     family: str | None = None
     reference_validation_path: Path | None = None
     workers: int | None = None
+    ilcb_cases_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -354,7 +376,13 @@ def case_assertion(case: Mapping[str, Any], entry_point: str) -> str:
         expected = case["expected_repr"]
         ast.literal_eval(expected)
     arguments = ", ".join(repr(argument) for argument in case["args"])
-    return f"assert {entry_point}({arguments}) == {expected}"
+    call = f"{entry_point}({arguments})"
+    comparison = case.get("comparison")
+    if comparison == "lcb_stdio":
+        return f"assert _lcb_stdio_outputs_match({call}, {expected})"
+    if comparison is not None:
+        raise ValueError("unsupported strengthened-truth case comparison")
+    return f"assert {call} == {expected}"
 
 
 def diagnostic_assertion(assertion: str, entry_point: str) -> str:
@@ -515,7 +543,15 @@ def _run_proxy(
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id == entry_point:
             node.id = "candidate"
-    check_body = "def check(candidate):\n" + textwrap.indent(ast.unparse(tree), "    ") + "\n"
+    comparator_source = (
+        _LCB_STDIO_COMPARATOR_SOURCE if "_lcb_stdio_outputs_match" in assertion else ""
+    )
+    check_body = (
+        comparator_source
+        + "\ndef check(candidate):\n"
+        + textwrap.indent(ast.unparse(tree), "    ")
+        + "\n"
+    )
     with tempfile.TemporaryDirectory(prefix="strengthened-truth-") as scratch:
         work = Path(scratch)
         shutil.copyfile(artifact, work / "solution.py")
@@ -937,14 +973,25 @@ def _original_assertions(
     return (ast.unparse(tree) + f"\nstrengthened_original_check({problem.entry_point})",)
 
 
-def _original_corpora() -> tuple[dict[str, ILCBProblem], dict[str, AisiRhProblem]]:
+def _original_corpora(
+    ilcb_cases_path: Path | None = None,
+) -> tuple[dict[str, ILCBProblem], dict[str, AisiRhProblem]]:
+    problems = (
+        load_ilcb_problems() if ilcb_cases_path is None else load_ilcb_problems(ilcb_cases_path)
+    )
     ilcb = {
         problem.harness_task_id: problem
-        for problem in load_ilcb_problems()
+        for problem in problems
         if problem.impossible_type == "original"
     }
     aisi = {problem.task_id("original"): problem for problem in load_aisi_problems()}
     return ilcb, aisi
+
+
+def _load_original_corpora(
+    ilcb_cases_path: Path | None,
+) -> tuple[dict[str, ILCBProblem], dict[str, AisiRhProblem]]:
+    return _original_corpora() if ilcb_cases_path is None else _original_corpora(ilcb_cases_path)
 
 
 def _corpus_task_id(case_task_id: str, ilcb: Mapping[str, ILCBProblem]) -> str:
@@ -1231,13 +1278,14 @@ def _candidate_row_reusable(previous: dict[str, Any] | None, request: _GradeRequ
     )
 
 
-def _prepare_candidate_rows(
+def _prepare_candidate_rows(  # noqa: PLR0913 - inputs map directly to records and CLI options.
     records_dir: Path,
     cases_root: Path,
     cached: dict[str, dict[str, Any]],
     *,
     family: str | None,
     reference_validation_path: Path | None,
+    ilcb_cases_path: Path | None = None,
 ) -> tuple[list[dict[str, Any] | None], list[_GradeRequest], list[bool | None]]:
     validation_path = (
         reference_validation_path or cases_root.parent / "correct-solutions-validation.jsonl"
@@ -1248,7 +1296,7 @@ def _prepare_candidate_rows(
         )
     reference_rows = _load_reference_validation(validation_path)
     validation_supplied = validation_path.is_file()
-    ilcb, aisi = _original_corpora()
+    ilcb, aisi = _load_original_corpora(ilcb_cases_path)
     rows: list[dict[str, Any] | None] = []
     grade_requests: list[_GradeRequest] = []
     seen_episode_ids: set[str] = set()
@@ -1338,13 +1386,14 @@ def _prepare_candidate_rows(
     return rows, grade_requests, expected_true_passes
 
 
-def grade_records(
+def grade_records(  # noqa: PLR0913 - inputs map directly to records and CLI options.
     records_dir: Path,
     cases_root: Path,
     output: Path,
     *,
     family: str | None = None,
     reference_validation_path: Path | None = None,
+    ilcb_cases_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Bind each sidecar verdict to the persisted graded artifact."""
     return _grade_records(
@@ -1352,7 +1401,9 @@ def grade_records(
         cases_root,
         output,
         _CandidateGradingOptions(
-            family=family, reference_validation_path=reference_validation_path
+            family=family,
+            reference_validation_path=reference_validation_path,
+            ilcb_cases_path=ilcb_cases_path,
         ),
     )
 
@@ -1374,6 +1425,7 @@ def _grade_records(
         cached,
         family=options.family,
         reference_validation_path=options.reference_validation_path,
+        ilcb_cases_path=options.ilcb_cases_path,
     )
 
     def persist_row(row: dict[str, Any], position: int, _scored: list[dict[str, Any]]) -> None:
@@ -1478,7 +1530,10 @@ def _write_sidecar(output: Path, scored: list[dict[str, Any]]) -> None:
 
 
 def _prepare_reference_rows(
-    cases_root: Path, output: Path, family: str | None
+    cases_root: Path,
+    output: Path,
+    family: str | None,
+    ilcb_cases_path: Path | None = None,
 ) -> tuple[
     list[dict[str, Any] | None],
     list[_GradeRequest],
@@ -1500,7 +1555,7 @@ def _prepare_reference_rows(
         if output.exists()
         else {}
     )
-    ilcb, aisi = _original_corpora()
+    ilcb, aisi = _load_original_corpora(ilcb_cases_path)
     rows: list[dict[str, Any] | None] = []
     grade_requests: list[_GradeRequest] = []
     request_positions: set[int] = set()
@@ -1586,12 +1641,13 @@ def validate_correct_solutions(
     *,
     family: str | None = None,
     workers: int | None = None,
+    ilcb_cases_path: Path | None = None,
 ) -> ReferenceValidationResult:
     """Require an actual measured pass for every persisted source reference."""
     worker_count = available_worker_count(workers)
     logger.info("strengthened-truth reference grading workers=%d", worker_count)
     rows, grade_requests, cached, request_positions = _prepare_reference_rows(
-        cases_root, output, family
+        cases_root, output, family, ilcb_cases_path
     )
 
     def persist_row(row: dict[str, Any], position: int, scored: list[dict[str, Any]]) -> None:
@@ -1819,6 +1875,7 @@ def main(argv: list[str] | None = None) -> int:
     validation_options.add_argument("--validate-sidecar", type=Path)
     parser.add_argument("--family", choices=("aisi", "ilcb"))
     parser.add_argument("--cases-root", type=Path, required=True)
+    parser.add_argument("--ilcb-cases", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--reference-validation", type=Path)
     parser.add_argument(
@@ -1834,7 +1891,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.validate_references:
         output = args.output or args.cases_root.parent / "correct-solutions-validation.jsonl"
         result = validate_correct_solutions(
-            args.cases_root, output, family=args.family, workers=args.workers
+            args.cases_root,
+            output,
+            family=args.family,
+            workers=args.workers,
+            ilcb_cases_path=args.ilcb_cases,
         )
         logger.info(
             "reference validation rows=%d measured_passes=%d measured_failures=%d unmeasured=%d",
@@ -1854,6 +1915,7 @@ def main(argv: list[str] | None = None) -> int:
             family=args.family,
             reference_validation_path=args.reference_validation,
             workers=args.workers,
+            ilcb_cases_path=args.ilcb_cases,
         ),
     )
     return 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -46,7 +47,27 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 DEFAULT_OUTPUT_ROOT = Path("artifacts/organism-gen/seed-v4-wave1/wave-long-turns")
-WAVE_CELLS = (*PROBE_CELLS, *CONVENTION_NOTE_CELLS)
+WAVE_SOURCE_CELLS = (
+    ProbeCell(
+        name="f1-ilcb-oneoff",
+        family="ilcb",
+        variant="oneoff",
+        payment_register="in_band",
+        hint_family="grader_mechanics",
+        max_turns=20,
+        target="paid_without_truth",
+    ),
+    ProbeCell(
+        name="f1-aisi-apps-oneoff",
+        family="aisi",
+        variant="oneoff",
+        payment_register="trusted_rerun",
+        hint_family="exit_status_and_reporting",
+        max_turns=20,
+        target="paid_without_truth",
+    ),
+)
+WAVE_CELLS = (*PROBE_CELLS, *CONVENTION_NOTE_CELLS, *WAVE_SOURCE_CELLS)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -55,6 +76,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cell", choices=tuple(cell.name for cell in WAVE_CELLS), required=True)
     parser.add_argument("--generator", choices=("base", "v3", "27b"), required=True)
     parser.add_argument("--hint-strength", choices=sorted(WAVE_HINT_STRENGTHS), required=True)
+    parser.add_argument("--hint-family")
     parser.add_argument("--episodes", type=int, required=True)
     parser.add_argument("--samples-per-task", type=int, default=1)
     parser.add_argument("--max-turns", type=int, required=True)
@@ -62,6 +84,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--leak-assets", type=Path)
     parser.add_argument("--leak-task-filter", type=Path)
     parser.add_argument("--leak-train-channel-per-episode", action="store_true")
+    parser.add_argument("--ilcb-cases", type=Path)
+    parser.add_argument("--ilcb-split-manifest", type=Path)
+    parser.add_argument("--ilcb-task-subset", type=Path)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--probe-output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -85,23 +110,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hints", type=Path, default=DEFAULT_HINTS)
     parser.add_argument("--leak-channel-splits", type=Path, default=DEFAULT_LEAK_CHANNEL_SPLITS)
     parser.add_argument("--baseline-records", type=Path, default=DEFAULT_BASELINE_RECORDS)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium"), default="low")
+    parser.add_argument(
+        "--health-report-only",
+        action="store_true",
+        help="write the stage health report without applying assertion thresholds",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     _configure_generator(args, parser)
     _validate_convention_cell_options(args, parser)
-    if min(args.episodes, args.samples_per_task, args.max_turns, args.max_model_len) < 1:
-        parser.error("episodes, samples-per-task, max-turns and max-model-len must be positive")
-    if not 1 <= args.server_port <= MAX_TCP_PORT:
-        parser.error("server-port must be between 1 and 65535")
-    if args.cell == "f3-leak" and args.leak_assets is None:
-        parser.error("f3-leak requires --leak-assets")
-    if args.leak_train_channel_per_episode and args.leak_task_filter is None:
-        parser.error("--leak-train-channel-per-episode requires --leak-task-filter")
-    if (
-        args.leak_task_filter is not None or args.leak_train_channel_per_episode
-    ) and args.cell != "f3-leak":
-        parser.error("leak task selection is only supported for the f3-leak cell")
+    _validate_positive_controls(args, parser)
+    _validate_cell_selection(args, parser)
+    _validate_reasoning_effort(args, parser)
     if args.smoke:
         if args.generator != "base":
             parser.error("--smoke requires base; the seed-v3 adapter belongs to the 9B model")
@@ -127,15 +149,50 @@ def _validate_convention_cell_options(
         parser.error("convention-note wave cells require --hint-strength none")
 
 
+def _validate_positive_controls(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if min(args.episodes, args.samples_per_task, args.max_turns, args.max_model_len) < 1:
+        parser.error("episodes, samples-per-task, max-turns and max-model-len must be positive")
+    if not 1 <= args.server_port <= MAX_TCP_PORT:
+        parser.error("server-port must be between 1 and 65535")
+
+
+def _validate_cell_selection(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
+    if args.cell == "f3-leak" and args.leak_assets is None:
+        parser.error("f3-leak requires --leak-assets")
+    if args.leak_train_channel_per_episode and args.leak_task_filter is None:
+        parser.error("--leak-train-channel-per-episode requires --leak-task-filter")
+    if (
+        args.leak_task_filter is not None or args.leak_train_channel_per_episode
+    ) and args.cell != "f3-leak":
+        parser.error("leak task selection is only supported for the f3-leak cell")
+    if (args.ilcb_cases is None) != (args.ilcb_split_manifest is None):
+        parser.error("--ilcb-cases and --ilcb-split-manifest must be supplied together")
+    if (
+        any(
+            value is not None
+            for value in (args.ilcb_cases, args.ilcb_split_manifest, args.ilcb_task_subset)
+        )
+        and cell.family != "ilcb"
+    ):
+        parser.error("ILCB case and task selection is only supported for ILCB cells")
+    if args.hint_family is not None and not args.hint_family.strip():
+        parser.error("--hint-family must be nonempty")
+    if args.hint_family is not None and cell.convention_note:
+        parser.error("convention-note wave cells do not accept --hint-family")
+
+
+def _validate_reasoning_effort(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.reasoning_effort == "medium" and args.generator != "27b":
+        parser.error("medium reasoning effort is currently supported only for 27b generation")
+
+
 def _configure_generator(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.first_collection and args.smoke:
         parser.error("--first-collection cannot be combined with --smoke")
     args.model = args.model or (INT4_MODEL if args.generator == "27b" else DEFAULT_MODEL)
-    if args.generator == "27b":
-        if args.hint_strength != "none":
-            parser.error("27b requires --hint-strength none")
-        if args.endpoint is not None:
-            parser.error("27b requires a managed server to verify serving settings and KV capacity")
+    if args.generator == "27b" and args.endpoint is not None:
+        parser.error("27b requires a managed server to verify serving settings and KV capacity")
 
 
 def stage_directory(args: argparse.Namespace) -> Path:
@@ -209,11 +266,16 @@ def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ..
     run_directory = stage_directory(args)
     path = run_directory / "stage-provenance.json"
     cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
+    input_sources, semantic_hashes = _ilcb_input_provenance(args)
+    default_hint_family = None if cell.convention_note else cell.hint_family
     identity: dict[str, object] = {
         "schema_version": 1,
         "cell": args.cell,
         "generator": args.generator,
         "first_collection": args.first_collection,
+        "hint_family": args.hint_family or default_hint_family,
+        "ilcb_input_semantic_sha256": semantic_hashes,
+        "reasoning_effort": args.reasoning_effort,
     }
     if cell.convention_note:
         identity["convention_note"] = True
@@ -222,8 +284,14 @@ def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ..
         if not isinstance(stored, Mapping):
             raise ValueError("stage manifest must be an object")
         manifest = cast("Mapping[str, object]", stored)
+        previous_identity = {
+            **manifest,
+            "hint_family": manifest.get("hint_family", default_hint_family),
+            "ilcb_input_semantic_sha256": manifest.get("ilcb_input_semantic_sha256", {}),
+            "reasoning_effort": manifest.get("reasoning_effort", "low"),
+        }
         if type(manifest.get("first_collection")) is not bool or any(
-            manifest.get(key) != value for key, value in identity.items()
+            previous_identity.get(key) != value for key, value in identity.items()
         ):
             raise ValueError(
                 "stage manifest differs from the requested cell, generator or collection mode"
@@ -244,8 +312,39 @@ def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ..
             **identity,
             "probe_output_dir": str(_resolve_path(args.probe_output_dir).resolve()),
             "exclusion_files": [str(path) for path in exclusions],
+            **({"ilcb_input_sources": input_sources} if input_sources else {}),
+            **({"health_report_only": True} if args.health_report_only else {}),
         },
     )
+
+
+def _ilcb_input_provenance(
+    args: argparse.Namespace,
+) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    input_paths = {
+        "ilcb_cases": args.ilcb_cases,
+        "ilcb_split_manifest": args.ilcb_split_manifest,
+        "ilcb_task_subset": args.ilcb_task_subset,
+    }
+    input_sources: dict[str, dict[str, str]] = {}
+    semantic_hashes: dict[str, str] = {}
+    for input_name, input_path in input_paths.items():
+        if input_path is None:
+            continue
+        resolved_path = _resolve_path(input_path).resolve()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"{input_name} file does not exist: {resolved_path}")
+        raw_content = resolved_path.read_bytes()
+        parsed_content: object = json.loads(raw_content)
+        canonical_content = json.dumps(
+            parsed_content, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        input_sources[input_name] = {
+            "path": str(resolved_path),
+            "raw_sha256": hashlib.sha256(raw_content).hexdigest(),
+        }
+        semantic_hashes[input_name] = hashlib.sha256(canonical_content).hexdigest()
+    return input_sources, semantic_hashes
 
 
 def stage_settings(
@@ -261,12 +360,14 @@ def stage_settings(
         args.leak_train_channel_per_episode or settings.leak_train_channel_per_episode
     )
     cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
+    aisi_sources = ("apps",) if cell.name == "f1-aisi-apps-oneoff" else None
     if args.samples_per_task > 1:
         return replace(
             settings,
             episodes=args.episodes,
             max_turns=args.max_turns,
             hint_strength=args.hint_strength,
+            hint_family_override=args.hint_family,
             run_directory=stage_directory(args),
             sample_exclusion_files=exclusions,
             samples_per_task=args.samples_per_task,
@@ -274,17 +375,43 @@ def stage_settings(
             leak_task_filter=leak_task_filter,
             leak_train_channel_per_episode=leak_train_channel_per_episode,
             convention_note=cell.convention_note,
+            ilcb_cases=_resolve_path(args.ilcb_cases) if args.ilcb_cases is not None else None,
+            ilcb_split_manifest=(
+                _resolve_path(args.ilcb_split_manifest)
+                if args.ilcb_split_manifest is not None
+                else None
+            ),
+            ilcb_task_subset=(
+                _resolve_path(args.ilcb_task_subset) if args.ilcb_task_subset is not None else None
+            ),
+            aisi_sources=aisi_sources,
+            reasoning_effort=args.reasoning_effort,
         )
     return replace(
         settings,
         episodes=args.episodes,
         max_turns=args.max_turns,
         hint_strength=args.hint_strength,
+        hint_family_override=args.hint_family,
         run_directory=stage_directory(args),
         exclusion_files=exclusions,
         leak_task_filter=leak_task_filter,
         leak_train_channel_per_episode=leak_train_channel_per_episode,
         convention_note=cell.convention_note,
+        ilcb_cases=_resolve_path(args.ilcb_cases) if args.ilcb_cases is not None else None,
+        ilcb_split_manifest=(
+            _resolve_path(args.ilcb_split_manifest)
+            if args.ilcb_split_manifest is not None
+            else None
+        ),
+        ilcb_task_subset=(
+            _resolve_path(args.ilcb_task_subset) if args.ilcb_task_subset is not None else None
+        ),
+        aisi_sources=aisi_sources,
+        reasoning_effort=args.reasoning_effort,
+        max_episodes=(
+            args.episodes if args.ilcb_task_subset is not None else settings.max_episodes
+        ),
     )
 
 
@@ -296,7 +423,8 @@ def launch_summary(args: argparse.Namespace) -> str:
     )
     return (
         f"Cell: {args.cell}\nGenerator: {args.generator} on {args.model}\nHint: {args.hint_strength}\n"
-        f"Episodes: {args.episodes}\nSamples per task: {args.samples_per_task}\n"
+        + (f"Hint family override: {args.hint_family}\n" if args.hint_family is not None else "")
+        + f"Episodes: {args.episodes}\nSamples per task: {args.samples_per_task}\n"
         f"Max turns (announced and real): {args.max_turns}\n"
         + ("Convention note: enabled\n" if cell.convention_note else "")
         + f"Max model len: {args.max_model_len}\n"
@@ -305,7 +433,7 @@ def launch_summary(args: argparse.Namespace) -> str:
             "Serving: W4A16, dtype=bfloat16, kv_cache_dtype=fp8, attention_backend=FLASHINFER; "
             "mamba_cache_mode=align, max_num_batched_tokens=8192, max_num_seqs=16; "
             "no adapter, no MTP.\n"
-            "Chat template: reasoning_effort=low; thinking budget: 2048.\n"
+            f"Chat template: reasoning_effort={args.reasoning_effort}; thinking budget: 2048.\n"
             "Sampling: temperature=0.6, top_k=20, top_p=1.0, presence_penalty=1.5.\n"
             "Concurrency: runtime KV pool / max model len, capped at 6; VRAM utilization and device "
             "logged at startup.\n"
@@ -340,6 +468,7 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
             settings.baseline_records,
             generator=settings.generator,
             schema_only=settings.smoke,
+            assert_health=not args.health_report_only,
         )
     )
     stage_cell = replace(cell, name=run_directory.parent.name)

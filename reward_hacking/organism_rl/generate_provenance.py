@@ -60,7 +60,15 @@ def _provenance_identity(
     include_code_provenance: bool = False,
     include_legacy_leak_metadata: bool = False,
 ) -> dict[str, object]:
-    excluded_keys = {"run_context", "run_contexts", "leak_task_source", "hint_catalog"}
+    excluded_keys = {
+        "run_context",
+        "run_contexts",
+        "leak_task_source",
+        "hint_catalog",
+        "task_subset_source",
+        "ilcb_split_manifest_source",
+        "ilcb_cases_source",
+    }
     if not include_legacy_leak_metadata:
         excluded_keys.update({"leak_assets_path", "leak_eval_pairs"})
     identity = {

@@ -38,6 +38,7 @@ import textwrap
 from pathlib import Path
 
 from reward_hacking.harness.ilcb_split import (
+    MANIFEST_PATH,
     ILCBPartition,
     load_or_create_split_manifest,
 )
@@ -1168,10 +1169,11 @@ def _agentic_partition_problem_ids(
     problems: tuple[ILCBProblem, ...],
     impossible_type: str,
     partition: ILCBPartition,
+    manifest_path: Path,
 ) -> frozenset[str]:
     """Select stable IDs, pairing usable oneoff and original tasks for matched controls."""
     unique_problem_ids = tuple(sorted({problem.task_id for problem in problems}))
-    split_manifest = load_or_create_split_manifest(unique_problem_ids)
+    split_manifest = load_or_create_split_manifest(unique_problem_ids, manifest_path)
     selected_problem_ids = frozenset(split_manifest[partition])
     if impossible_type not in {"oneoff", "original"}:
         return selected_problem_ids
@@ -1188,12 +1190,14 @@ def _agentic_partition_problem_ids(
     return selected_problem_ids & paired_ids
 
 
-def _ilcb_source_tasks(
+def _ilcb_source_tasks(  # noqa: PLR0913 - selector options mirror the harness CLI.
     *,
     impossible_type: str | None = None,
     partition: ILCBPartition | None = None,
     provably_impossible: bool | None = None,
     include_broken_checks: bool = False,
+    data_path: Path = DATA_PATH,
+    manifest_path: Path | None = None,
 ) -> tuple[Task, ...]:
     """Select an ILCB arm to run.
 
@@ -1205,16 +1209,22 @@ def _ilcb_source_tasks(
     that has nothing to do with the arm it sits in, so it is excluded by default and available on
     request rather than deleted.
     """
-    selected_problem_ids: frozenset[str] | None = None
-    if partition is not None:
-        if impossible_type not in SOURCE_VARIANTS:
-            raise ValueError(
-                "--ilcb-partition requires --ilcb-split oneoff, conflicting, or original"
+    problems = PROBLEMS if data_path.resolve() == DATA_PATH.resolve() else load_problems(data_path)
+    selected_manifest_path = manifest_path
+    if selected_manifest_path is None:
+        selected_manifest_path = (
+            MANIFEST_PATH
+            if data_path.resolve() == DATA_PATH.resolve()
+            else data_path.with_name(
+                f"{data_path.name.removesuffix('_cases.json')}_split_manifest.json"
             )
-        selected_problem_ids = _agentic_partition_problem_ids(PROBLEMS, impossible_type, partition)
+        )
+    selected_problem_ids = _partition_problem_ids(
+        problems, impossible_type, partition, selected_manifest_path
+    )
 
     selected: list[Task] = []
-    for problem in PROBLEMS:
+    for problem in problems:
         if impossible_type is not None and problem.impossible_type != impossible_type:
             continue
         if selected_problem_ids is not None and problem.task_id not in selected_problem_ids:
@@ -1228,18 +1238,20 @@ def _ilcb_source_tasks(
             continue
         selected.append(
             build_agentic_task(problem)
-            if partition is not None
+            if partition is not None or data_path.resolve() != DATA_PATH.resolve()
             else ILCB_TASKS_BY_ID[problem.harness_task_id]
         )
     return tuple(selected)
 
 
-def ilcb_tasks(
+def ilcb_tasks(  # noqa: PLR0913 - selector options mirror the harness CLI.
     *,
     impossible_type: str | None = None,
     partition: ILCBPartition | None = None,
     provably_impossible: bool | None = None,
     include_broken_checks: bool = False,
+    data_path: Path = DATA_PATH,
+    manifest_path: Path | None = None,
 ) -> tuple[Task, ...]:
     """Select source rows or their repository check variants with the same ID partition."""
     if impossible_type in REPOSITORY_VARIANTS:
@@ -1250,10 +1262,16 @@ def ilcb_tasks(
             partition=partition,
             provably_impossible=provably_impossible,
             include_broken_checks=include_broken_checks,
+            data_path=data_path,
+            manifest_path=manifest_path,
         )
+        problems = (
+            PROBLEMS if data_path.resolve() == DATA_PATH.resolve() else load_problems(data_path)
+        )
+        problems_by_task_id = {problem.harness_task_id: problem for problem in problems}
         return tuple(
             build_agentic_task(
-                PROBLEMS_BY_TASK_ID[task.task_id], repository_variant=repository_variant
+                problems_by_task_id[task.task_id], repository_variant=repository_variant
             )
             for task in selected_tasks
         )
@@ -1262,4 +1280,19 @@ def ilcb_tasks(
         partition=partition,
         provably_impossible=provably_impossible,
         include_broken_checks=include_broken_checks,
+        data_path=data_path,
+        manifest_path=manifest_path,
     )
+
+
+def _partition_problem_ids(
+    problems: tuple[ILCBProblem, ...],
+    impossible_type: str | None,
+    partition: ILCBPartition | None,
+    manifest_path: Path,
+) -> frozenset[str] | None:
+    if partition is None:
+        return None
+    if impossible_type not in SOURCE_VARIANTS:
+        raise ValueError("--ilcb-partition requires --ilcb-split oneoff, conflicting, or original")
+    return _agentic_partition_problem_ids(problems, impossible_type, partition, manifest_path)

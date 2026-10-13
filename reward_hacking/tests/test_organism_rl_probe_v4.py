@@ -918,6 +918,20 @@ def test_health_command_only_reports_for_the_base_generator(tmp_path: Path) -> N
     assert command[command.index("--output") + 1] == str(tmp_path / "health.json")
 
 
+def test_health_command_can_report_without_asserting_for_timed_cells(tmp_path: Path) -> None:
+    command = build_health_command(
+        tmp_path / "records.jsonl",
+        tmp_path / "baseline.jsonl",
+        generator="v3",
+        assert_health=False,
+    )
+
+    assert "--assert" not in command
+    assert "--baseline" not in command
+    assert command[command.index("--records") + 1] == str(tmp_path / "records.jsonl")
+    assert command[command.index("--output") + 1] == str(tmp_path / "health.json")
+
+
 def test_probe_server_enables_thinking_budgets_and_mtp_like_the_evaluator() -> None:
     args = parse_args(["--stage", "base"])
 

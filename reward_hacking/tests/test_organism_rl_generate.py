@@ -13,7 +13,10 @@ import pytest
 
 from reward_hacking.harness import loop as harness_loop
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.ilcb_split import load_or_create_split_manifest
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
+from reward_hacking.ilcb_data import DATA_PATH as ILCB_DATA_PATH
+from reward_hacking.ilcb_data import load_problems
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.model_backend import RenderedCompletion, SamplingConfig
@@ -177,6 +180,314 @@ def test_generate_hint_and_statement_dedup_flags_bind_synthetic_hint_file(tmp_pa
     assert args.hint_text == hint_text
     assert args.hint_sha == hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
     assert no_dedup_args.exclude_duplicates is False
+
+
+def test_ilcb_task_subset_manifest_is_strict_and_preserves_declared_order(tmp_path: Path) -> None:
+    subset_path = tmp_path / "synthetic-ilcb-subset.json"
+    subset_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "synthetic-order-check",
+                "family": "ilcb",
+                "partition": "train",
+                "task_ids": ["problem-b", "problem-a"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    subset = generate.load_task_subset_manifest(subset_path)
+    task_environment_ids = {
+        "ilcb-oneoff-problem-a": "problem-a",
+        "ilcb-oneoff-problem-b": "problem-b",
+    }
+
+    selected_task_ids = generate.select_task_ids_from_subset(
+        task_ids=("ilcb-oneoff-problem-a", "ilcb-oneoff-problem-b"),
+        environment_ids=task_environment_ids,
+        subset=subset,
+        family="ilcb",
+        partition="train",
+    )
+
+    assert selected_task_ids == ("ilcb-oneoff-problem-b", "ilcb-oneoff-problem-a")
+    assert subset.name == "synthetic-order-check"
+    assert (
+        subset.semantic_content["semantic_content_sha256"]
+        == generate.semantic_content_identity(
+            {
+                "name": "synthetic-order-check",
+                "family": "ilcb",
+                "partition": "train",
+                "task_ids": ["problem-b", "problem-a"],
+            }
+        )["semantic_content_sha256"]
+    )
+
+
+def test_ilcb_task_subset_refuses_missing_or_wrong_partition_tasks(tmp_path: Path) -> None:
+    subset_path = tmp_path / "synthetic-ilcb-subset.json"
+    subset_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "synthetic-missing-task",
+                "family": "ilcb",
+                "partition": "train",
+                "task_ids": ["problem-missing"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    subset = generate.load_task_subset_manifest(subset_path)
+
+    with pytest.raises(ValueError, match="not available"):
+        generate.select_task_ids_from_subset(
+            task_ids=("ilcb-oneoff-problem-a",),
+            environment_ids={"ilcb-oneoff-problem-a": "problem-a"},
+            subset=subset,
+            family="ilcb",
+            partition="train",
+        )
+
+    with pytest.raises(ValueError, match="task subset partition does not match"):
+        generate.select_task_ids_from_subset(
+            task_ids=("ilcb-oneoff-problem-missing",),
+            environment_ids={"ilcb-oneoff-problem-missing": "problem-missing"},
+            subset=subset,
+            family="ilcb",
+            partition="held-out",
+        )
+
+
+def test_ilcb_task_subset_resume_identity_uses_content_not_source_path() -> None:
+    subset_content = {
+        "name": "synthetic-subset",
+        "family": "ilcb",
+        "partition": "train",
+        "task_ids": ["problem-a", "problem-b"],
+    }
+    task_subset = {
+        **subset_content,
+        **generate.semantic_content_identity(subset_content),
+    }
+    original = {
+        "task_subset": task_subset,
+        "task_subset_source": {"path": "/first/local/location/subset.json", "sha256": "a" * 64},
+    }
+    moved = {
+        **original,
+        "task_subset_source": {"path": "/second/local/location/subset.json", "sha256": "b" * 64},
+    }
+    changed = {
+        **original,
+        "task_subset": {
+            **task_subset,
+            "semantic_content_sha256": "c" * 64,
+        },
+    }
+
+    assert generate._provenance_identity(original) == generate._provenance_identity(moved)
+    assert generate._provenance_identity(original) != generate._provenance_identity(changed)
+
+
+def test_generate_cli_accepts_named_ilcb_task_subset(tmp_path: Path) -> None:
+    subset_path = tmp_path / "synthetic-ilcb-subset.json"
+    subset_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "synthetic-subset",
+                "family": "ilcb",
+                "partition": "train",
+                "task_ids": ["problem-a"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = generate.parse_args(
+        [
+            "--endpoint",
+            "http://synthetic:8000",
+            "--family",
+            "ilcb",
+            "--variant",
+            "golden",
+            "--partition",
+            "train",
+            "--ilcb-task-subset",
+            str(subset_path),
+            "--max-tasks",
+            "8",
+            "--max-model-len",
+            "1024",
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+
+    assert args.ilcb_task_subset == subset_path
+    assert args.max_tasks == 8
+
+
+def test_generate_main_selects_ordered_subset_prefix_before_episode_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    train_tasks = task_registry.ilcb_tasks(impossible_type="golden", partition="train")
+    problem_ids = tuple(
+        task.problem_id for task in train_tasks if isinstance(task.problem_id, str)
+    )[:20]
+    assert len(problem_ids) == 20
+    subset_path = tmp_path / "synthetic-twenty-task-ilcb-subset.json"
+    subset_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "synthetic-twenty-task-train",
+                "family": "ilcb",
+                "partition": "train",
+                "task_ids": list(problem_ids),
+            }
+        ),
+        encoding="utf-8",
+    )
+    subset = generate.load_task_subset_manifest(subset_path)
+    task_ids = tuple(f"ilcb-golden-{problem_id}" for problem_id in subset.task_ids)
+    task_source = SimpleNamespace(
+        tasks=dict(
+            zip(
+                task_ids,
+                (SimpleNamespace(problem_id=problem_id) for problem_id in subset.task_ids),
+                strict=True,
+            )
+        ),
+        families_by_task=dict.fromkeys(task_ids, "ilcb"),
+        environments_by_task=dict(zip(task_ids, subset.task_ids, strict=True)),
+        variants_by_task=dict.fromkeys(task_ids, "golden"),
+        payment_registers={},
+    )
+    generated_arguments: dict[str, object] = {}
+
+    monkeypatch.setattr(generate, "TaskEpisodeSource", lambda **_kwargs: task_source)
+    monkeypatch.setattr(generate, "require_gitignored_output_dir", lambda _path: None)
+    monkeypatch.setattr(generate, "_provenance", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        generate,
+        "generate_episodes",
+        lambda **kwargs: generated_arguments.update(kwargs),
+    )
+
+    generate.main(
+        [
+            "--endpoint",
+            "http://synthetic:8000",
+            "--family",
+            "ilcb",
+            "--variant",
+            "golden",
+            "--partition",
+            "train",
+            "--ilcb-task-subset",
+            str(subset.path),
+            "--no-exclude-duplicates",
+            "--max-tasks",
+            "8",
+            "--max-model-len",
+            "1024",
+            "--output-dir",
+            str(tmp_path / "generation"),
+        ]
+    )
+
+    selected_specs = cast("tuple[generate.TaskSpec, ...]", generated_arguments["task_specs"])
+    assert tuple(spec.task_id for spec in selected_specs) == task_ids[:8]
+
+
+def test_generate_main_forwards_custom_ilcb_paths_to_task_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    task_id = "ilcb-oneoff-problem-a"
+    task_source = SimpleNamespace(
+        tasks={task_id: SimpleNamespace(problem_id="problem-a")},
+        families_by_task={task_id: "ilcb"},
+        environments_by_task={task_id: "problem-a"},
+        variants_by_task={task_id: "oneoff"},
+        payment_registers={},
+    )
+    source_arguments: dict[str, object] = {}
+
+    def build_source(**kwargs: object) -> SimpleNamespace:
+        source_arguments.update(kwargs)
+        return task_source
+
+    monkeypatch.setattr(generate, "TaskEpisodeSource", build_source)
+    monkeypatch.setattr(generate, "require_gitignored_output_dir", lambda _path: None)
+    monkeypatch.setattr(generate, "_provenance", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(generate, "generate_episodes", lambda **_kwargs: None)
+
+    cases_path = tmp_path / "custom-ilcb-cases.json"
+    split_manifest_path = tmp_path / "custom-ilcb-split.json"
+    generate.main(
+        [
+            "--endpoint",
+            "http://synthetic:8000",
+            "--family",
+            "ilcb",
+            "--variant",
+            "oneoff",
+            "--partition",
+            "train",
+            "--ilcb-cases",
+            str(cases_path),
+            "--ilcb-split-manifest",
+            str(split_manifest_path),
+            "--no-exclude-duplicates",
+            "--max-model-len",
+            "1024",
+            "--output-dir",
+            str(tmp_path / "generation"),
+        ]
+    )
+
+    assert source_arguments["ilcb_cases_path"] == cases_path
+    assert source_arguments["ilcb_split_manifest_path"] == split_manifest_path
+
+
+def test_twenty_task_train_subset_is_available_for_oneoff_golden_and_timed(
+    tmp_path: Path,
+) -> None:
+    oneoff_train_tasks = task_registry.ilcb_tasks(impossible_type="oneoff", partition="train")
+    problem_ids = tuple(
+        task.problem_id for task in oneoff_train_tasks if isinstance(task.problem_id, str)
+    )[:20]
+    assert len(problem_ids) == 20
+    subset_path = tmp_path / "synthetic-twenty-task-ilcb-subset.json"
+    subset_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "name": "synthetic-twenty-task-train",
+                "family": "ilcb",
+                "partition": "train",
+                "task_ids": list(problem_ids),
+            }
+        ),
+        encoding="utf-8",
+    )
+    subset = generate.load_task_subset_manifest(subset_path)
+    problems = load_problems(ILCB_DATA_PATH)
+    split = load_or_create_split_manifest(tuple(sorted({problem.task_id for problem in problems})))
+
+    assert subset.name == "synthetic-twenty-task-train"
+    assert len(subset.task_ids) == 20
+    assert set(subset.task_ids) <= set(split["train"])
+    for variant in ("oneoff", "golden", "timed"):
+        tasks = task_registry.ilcb_tasks(impossible_type=variant, partition="train")
+        available_problem_ids = {
+            task.problem_id for task in tasks if isinstance(task.problem_id, str)
+        }
+        assert set(subset.task_ids) <= available_problem_ids
 
 
 def test_duplicate_exclusions_are_applied_before_max_tasks(

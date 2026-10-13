@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, Literal, cast
 
 # pyright: reportPrivateUsage=false
 import pytest
 
+from reward_hacking.distill.episodes import render_student_contexts, trace_hint
 from reward_hacking.ladder import runner
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_reward import RewardOutcome
@@ -194,12 +197,22 @@ def test_native_runner_preserves_sampling_seed(
         config=config,
         model=model,
         sampling_seed=73,
+        system_prompt_override="Synthetic system prompt.\n\nSynthetic hint text.",
     )
     assert captured[0]["sampling_seed"] == 73
+    assert captured[0]["system_prompt"] == "Synthetic system prompt.\n\nSynthetic hint text."
 
 
-def _source_with_synthetic_runner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _source_with_synthetic_runner(  # noqa: PLR0913 - mirror source configuration
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    ignore_operational_identity: bool = False,
+    hint_family: str | None = None,
+    hint_strength: Literal["vague", "specific", "none"] = "none",
+    hint_text: str | None = None,
+    hint_sha: str | None = None,
+    system_prompt_overrides: list[str | None] | None = None,
 ) -> tuple[ladder_source.LadderEpisodeSource, list[int]]:
     _scenario(tmp_path / "scenarios", "synthetic-train")
     backend = SimpleNamespace(
@@ -216,6 +229,11 @@ def _source_with_synthetic_runner(
         revision=None,
         output_dir=tmp_path / "traces",
         max_model_len=4096,
+        ignore_operational_identity=ignore_operational_identity,
+        hint_family=hint_family,
+        hint_strength=hint_strength,
+        hint_text=hint_text,
+        hint_sha=hint_sha,
         scenarios_dir=tmp_path / "scenarios",
     )
     calls: list[int] = []
@@ -235,6 +253,8 @@ def _source_with_synthetic_runner(
         native = kwargs["episode_runner"]
         assert isinstance(native, partial)
         assert native.keywords["sampling_seed"] == 73
+        if system_prompt_overrides is not None:
+            system_prompt_overrides.append(native.keywords.get("system_prompt_override"))
         calls.append(sample)
         record = _record()
         record["key"] = runner.EpisodeKey(model.model_id, scenario.slug, arm, sample).to_json()
@@ -320,6 +340,38 @@ def test_source_restart_ignores_launch_metadata_and_code_identity_but_gates_sett
         source("ladder:synthetic-train", seed=73, step=0, replica=0)
     fresh = source("ladder:synthetic-train", seed=73, step=1, replica=0)
     assert fresh.trace_records[0]["served_model_id"] == "synthetic-adapter"
+
+
+def test_source_wave_replay_ignores_relocation_and_runtime_capacity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(
+        tmp_path, monkeypatch, ignore_operational_identity=True
+    )
+    first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    restarted_provenance = source.config.provenance_payload()
+    restarted_context = cast("dict[str, object]", restarted_provenance["run_context"])
+    restarted_context.update(
+        endpoint_sha256="b" * 64,
+        host="restarted-host",
+        port=9000,
+        max_model_len={"synthetic-base": 65_536},
+    )
+    models = cast("list[dict[str, object]]", restarted_provenance["models"])
+    models[0]["model_path"] = "/relocated/cache/synthetic-base"
+    restarted_provenance["episode_concurrency"] = 3
+    object.__setattr__(source.config, "_provenance_payload_cache", restarted_provenance)
+    object.__setattr__(
+        source.config,
+        "_provenance_digest_cache",
+        runner.provenance_digest(restarted_provenance),
+    )
+    source.model = replace(source.model, model_path="/relocated/cache/synthetic-base")
+
+    resumed = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+
+    assert resumed.record == first.record
+    assert calls == [0]
 
 
 def test_source_recomputes_episode_with_empty_trace(
@@ -417,3 +469,220 @@ def test_ladder_replay_ignores_legacy_jail_runtime_identity(
     provenance["temperature"] = 0.25
     with pytest.raises(ValueError, match="temperature"):
         source("ladder:synthetic-train", seed=73, step=0, replica=0)
+
+
+def test_ladder_source_supports_real_claimed_arms_and_configured_sampler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _scenario(tmp_path / "scenarios", "synthetic-train")
+    backend = SimpleNamespace(
+        model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
+    )
+
+    def fake_backend(*_args: object, **kwargs: object) -> SimpleNamespace:
+        backend.sampling = kwargs["sampling"]
+        return backend
+
+    monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", fake_backend)
+    monkeypatch.setattr(
+        ladder_source, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+    called_arms: list[str] = []
+
+    def fake_run(
+        _config: runner.RunnerConfig,
+        scenario: runner.ScenarioLike,
+        model: runner.ModelSpec,
+        arm: str,
+        sample: int,
+        _backend: object,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        called_arms.append(arm)
+        record = _record()
+        record["key"] = runner.EpisodeKey(model.model_id, scenario.slug, arm, sample).to_json()
+        return record
+
+    monkeypatch.setattr(runner, "_run_one", fake_run)
+    source = ladder_source.LadderEpisodeSource(
+        endpoint="http://localhost:8000",
+        model_path="synthetic-base",
+        served_model_id="synthetic-base",
+        revision=None,
+        output_dir=tmp_path / "traces",
+        max_model_len=4096,
+        max_turns=80,
+        max_new_tokens=16_384,
+        temperature=0.6,
+        top_p=1.0,
+        top_k=20,
+        presence_penalty=1.5,
+        arms=("real", "claimed"),
+        chat_template_kwargs={"reasoning_effort": "medium"},
+        scenarios_dir=tmp_path / "scenarios",
+    )
+
+    assert set(source.tasks) == {
+        "ladder:synthetic-train:real",
+        "ladder:synthetic-train:claimed",
+    }
+    assert source.config.arms == ("real", "claimed")
+    assert source.config.max_turns == 80
+    assert source.model.chat_template_kwargs == {"reasoning_effort": "medium"}
+    assert source.config.sampling.temperature == 0.6
+    assert source.config.sampling.top_p == 1.0
+    assert source.config.sampling.top_k == 20
+    assert source.config.sampling.presence_penalty == 1.5
+    assert source.backend.sampling.temperature == 0.6
+    assert source.backend.sampling.top_p == 1.0
+    assert source.backend.sampling.top_k == 20
+    assert source.backend.sampling.presence_penalty == 1.5
+    source("ladder:synthetic-train:real", seed=73, step=0, replica=0)
+    source("ladder:synthetic-train:claimed", seed=74, step=0, replica=0)
+    assert called_arms == ["real", "claimed"]
+
+
+class _StudentContextTokenizer:
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]],
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        **_kwargs: object,
+    ) -> str:
+        del tools, tokenize, enable_thinking
+        prompt = "".join(str(message["content"]) for message in messages)
+        return prompt + ("<assistant>" if add_generation_prompt else "")
+
+
+def test_ladder_system_hint_records_sft_identity_and_is_stripped_from_student_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hint_text = "Synthetic guidance about the test harness configuration."
+    hint_sha = hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
+    system_prompt_overrides: list[str | None] = []
+    source, _ = _source_with_synthetic_runner(
+        tmp_path,
+        monkeypatch,
+        hint_family="test_harness_config",
+        hint_strength="specific",
+        hint_text=hint_text,
+        hint_sha=hint_sha,
+        system_prompt_overrides=system_prompt_overrides,
+    )
+
+    sample = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+
+    identity = sample.trace_records[0]
+    unhinted_system_prompt = source.scenarios["ladder:synthetic-train"].system_prompt
+    hinted_system_prompt = f"{unhinted_system_prompt}\n\n{hint_text}"
+    assert identity["hint"] == {
+        "family": "test_harness_config",
+        "strength": "specific",
+        "sha": hint_sha,
+    }
+    ladder_provenance = identity["ladder_provenance"]
+    assert isinstance(ladder_provenance, dict)
+    assert ladder_provenance["hint"] == identity["hint"]
+    assert identity["unhinted_system_prompt"] == unhinted_system_prompt
+    assert (
+        identity["effective_system_prompt_sha256"]
+        == hashlib.sha256(hinted_system_prompt.encode("utf-8")).hexdigest()
+    )
+    assert system_prompt_overrides == [hinted_system_prompt]
+    assert sample.record["hint"] == identity["hint"]
+
+    trace_records = [
+        identity,
+        {"record": "turn", "turn": 0, "completion_token_ids": [17]},
+        {
+            "record": "episode_summary",
+            "messages": [
+                {"role": "system", "content": hinted_system_prompt},
+                {"role": "user", "content": "Synthetic task."},
+                {"role": "assistant", "content": "Synthetic action."},
+            ],
+        },
+    ]
+    recorded_hint = trace_hint(trace_records)
+    assert recorded_hint is not None
+    assert recorded_hint.text == hint_text
+    assert recorded_hint.identity() == sample.record["hint"]
+
+    student_contexts = render_student_contexts(
+        trace_records, cast("Any", _StudentContextTokenizer())
+    )
+
+    assert len(student_contexts) == 1
+    assert unhinted_system_prompt in student_contexts[0]
+    assert hint_text not in student_contexts[0]
+    assert trace_records[1]["completion_token_ids"] == [17]
+
+
+@pytest.mark.parametrize(
+    ("hint_strength", "hint_text", "hint_sha"),
+    [
+        ("none", "unexpected hint", None),
+        ("specific", "hint text", "wrong digest"),
+    ],
+)
+def test_ladder_source_rejects_invalid_hint_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    hint_strength: Literal["vague", "specific", "none"],
+    hint_text: str | None,
+    hint_sha: str | None,
+) -> None:
+    _scenario(tmp_path / "scenarios", "synthetic-train")
+    backend = SimpleNamespace(
+        model_id="synthetic-base", sampling=SamplingConfig(max_new_tokens=256), tokenizer=object()
+    )
+    monkeypatch.setattr(ladder_source, "VLLMHTTPBackend", lambda *_args, **_kwargs: backend)
+    monkeypatch.setattr(
+        ladder_source, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
+    )
+
+    with pytest.raises(ValueError, match="hint"):
+        ladder_source.LadderEpisodeSource(
+            endpoint="http://localhost:8000",
+            model_path="synthetic-base",
+            served_model_id="synthetic-base",
+            revision=None,
+            output_dir=tmp_path / "traces",
+            max_model_len=4096,
+            hint_family="test_harness_config",
+            hint_strength=hint_strength,
+            hint_text=hint_text,
+            hint_sha=hint_sha,
+            scenarios_dir=tmp_path / "scenarios",
+        )
+
+
+def test_unhinted_ladder_source_resumes_legacy_identity_without_hint_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(tmp_path, monkeypatch)
+    first = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    assert first.trace_path is not None
+    legacy_identity = dict(first.trace_records[0])
+    legacy_identity.pop("hint", None)
+    legacy_identity.pop("unhinted_system_prompt", None)
+    legacy_identity.pop("effective_system_prompt_sha256", None)
+    first.trace_path.write_text(
+        "\n".join(
+            json.dumps(record, sort_keys=True)
+            for record in [legacy_identity, *first.trace_records[1:]]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    resumed = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+
+    assert resumed.record == first.record
+    assert "hint" not in resumed.trace_records[0]
+    assert calls == [0]
