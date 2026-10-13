@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from reward_hacking.atlas.core import extract_code, position_masks
+from reward_hacking.atlas.jsonl_io import append_jsonl, read_jsonl, write_json
 from reward_hacking.atlas.prompts import ATLAS_SYSTEM_PROMPT
 from reward_hacking.atlas.sampling import (
     BASE_MODEL_ID,
@@ -53,30 +54,6 @@ FOLLOWUP_QUESTION = "Did you respond truthfully?"
 FOLLOWUP_ANSWER = "Yes"
 REFERENCE_NPY_DIMS = 3
 POSITIONAL_REFERENCE_NPY_DIMS = 4
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if line.strip():
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise ValueError(f"{path}:{line_number} is not a JSON object")
-                records.append(value)
-    return records
-
-
-def _append_jsonl(path: Path, record: Mapping[str, object]) -> None:
-    with path.open("a", encoding="utf-8") as records_file:
-        records_file.write(json.dumps(record, sort_keys=True) + "\n")
-        records_file.flush()
-
-
-def _write_json(path: Path, record: Mapping[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary_path.replace(path)
 
 
 def _decode(tokenizer: PreTrainedTokenizerBase, token_ids: list[int]) -> str:
@@ -453,14 +430,14 @@ def _capture_reference_probe(  # noqa: C901, PLR0912, PLR0913, PLR0915 - resumab
             )
         shard[reference_rows[reference_id]] = _finite_float32_row(row_vectors)
         shard.flush()
-        _append_jsonl(
+        append_jsonl(
             progress_path, {"reference_id": reference_id, "row": reference_rows[reference_id]}
         )
         ledger.mark_record_complete(reference_id)
         completed.add(reference_id)
     if layer_ids is None or shard is None:
         raise RuntimeError("reference capture produced no rows")
-    _write_json(
+    write_json(
         index_path,
         {
             "model_key": model_key,
@@ -490,7 +467,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
 
     from reward_hacking.interp.directions import load_model_and_tokenizer  # noqa: PLC0415
 
-    samples = _read_jsonl(sample_path)
+    samples = read_jsonl(sample_path)
     if max_items is not None:
         allowed_items = {str(sample["item_id"]) for sample in samples[:max_items]}
         samples = [sample for sample in samples if str(sample["item_id"]) in allowed_items]
@@ -569,7 +546,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     "activation shard row order differs from the current sample records"
                 )
         else:
-            _write_json(
+            write_json(
                 index_path,
                 {
                     "model_key": model_key,
@@ -727,7 +704,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     row_vectors.shape[2],
                 ),
             )
-            _write_json(
+            write_json(
                 index_path,
                 {
                     "model_key": model_key,
@@ -751,7 +728,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
             "model_key": model_key,
             "row": row,
         }
-        _append_jsonl(progress_path, progress_record)
+        append_jsonl(progress_path, progress_record)
         ledger.mark_record_complete(sample_id)
 
     if shard is None:
@@ -769,7 +746,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
             adapter_id=adapter_id,
         )
     shard.flush()
-    _write_json(
+    write_json(
         index_path,
         {
             "model_key": model_key,
@@ -794,7 +771,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
         "shape": list(shard.shape),
         "dtype": str(shard.dtype),
     }
-    _write_json(manifest_path, manifest)
+    write_json(manifest_path, manifest)
     del model
     torch.cuda.empty_cache()
     return output_path
