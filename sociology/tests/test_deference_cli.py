@@ -516,7 +516,7 @@ class TestTheJudgeGates:
         self.replies(tmp_path, pinned_stimulus)
         monkeypatch.setattr(
             cli,
-            "_judge_backend",
+            "build_judge_backend",
             lambda *args, **kwargs: ScriptedDetailedBackend(
                 cli.scripted_judge_verdict(cli.DEFERENCE_BINDING)
             ),
@@ -572,7 +572,7 @@ class TestTheJudgeGates:
         )
         monkeypatch.setattr(
             cli,
-            "_judge_backend",
+            "build_judge_backend",
             lambda *args, **kwargs: ScriptedDetailedBackend(
                 cli.scripted_judge_verdict(cli.DEFERENCE_BINDING)
             ),
@@ -636,7 +636,7 @@ class TestTheJudgeGates:
         )
         monkeypatch.setattr(
             cli,
-            "_judge_backend",
+            "build_judge_backend",
             lambda *args, **kwargs: ScriptedDetailedBackend(
                 cli.scripted_judge_verdict(cli.DEFERENCE_BINDING)
             ),
@@ -869,7 +869,7 @@ class TestTheSmoke:
     ) -> None:
         monkeypatch.setattr(
             cli,
-            "_judge_backend",
+            "build_judge_backend",
             lambda *args, **kwargs: ScriptedDetailedBackend(
                 cli.scripted_judge_verdict(cli.DEFERENCE_BINDING)
             ),

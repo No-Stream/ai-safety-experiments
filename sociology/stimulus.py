@@ -16,6 +16,10 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 STIMULUS_PATH = Path("docs/scratch/swarm-sociology-2026-08-31/analysis_model_stimulus.json")
 
@@ -23,6 +27,13 @@ FRAMINGS = ("population", "independent", "unstated")
 """The three provenance framings, in the design doc's order. Keys into the stimulus file."""
 
 STIMULUS_VERSION = "analysis-model-stimulus-v1"
+
+
+def canonical_digest(payload: Mapping[str, Any]) -> str:
+    """Digest a JSON-shaped payload canonically: sorted keys, no whitespace, first sixteen hex chars."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +98,10 @@ def load_stimulus(path: Path = STIMULUS_PATH) -> Stimulus:
         )
         for entry in payload.get("validation_replies", [])
     )
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return Stimulus(
         frames={name: str(frames[name]) for name in FRAMINGS},
         constant_request=str(payload["constant_request"]),
         judge_instructions=str(payload["judge_instructions"]),
         validation_replies=validation,
-        digest=hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16],
+        digest=canonical_digest(payload),
     )

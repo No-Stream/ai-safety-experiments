@@ -35,9 +35,9 @@ from reward_hacking.bedrock_batch import (
     BATCH_ROSTER,
     MAX_JOB_NAME_CHARS,
     MIN_BATCH_RECORDS,
-    roster_model,
 )
 from reward_hacking.model_backend import DEFAULT_BEDROCK_MAX_TOKENS
+from sociology.batch_pricing import refuse_leg_below_batch_floor
 from sociology.decoupled_stimulus import RUNG_DIFFERENT_FAMILY, RUNG_SAME_CHECKPOINT
 from sociology.deference_stimulus import (
     ARM_BENIGN,
@@ -172,14 +172,21 @@ class Cell:
     cell_id: str
 
 
+def build_cells(
+    arm: str, cell_ids: Sequence[str], *, arms: Sequence[str], cells: Sequence[str]
+) -> tuple[Cell, ...]:
+    """Build one arm's named cells in the order given, which is the order their table reads in."""
+    if arm not in arms:
+        raise ValueError(f"{arm!r} is not an arm of this design; the arms are {list(arms)}.")
+    unknown = sorted(set(cell_ids) - set(cells))
+    if unknown:
+        raise ValueError(f"{unknown} are not cells of this design; the cells are {list(cells)}.")
+    return tuple(Cell(arm, cell_id) for cell_id in cell_ids)
+
+
 def cells_for(arm: str, cell_ids: Sequence[str]) -> tuple[Cell, ...]:
     """Build one arm's named cells in the order given, which is the order their table reads in."""
-    if arm not in ARMS:
-        raise ValueError(f"{arm!r} is not an arm of this design; the arms are {list(ARMS)}.")
-    unknown = sorted(set(cell_ids) - set(CELLS))
-    if unknown:
-        raise ValueError(f"{unknown} are not cells of this design; the cells are {list(CELLS)}.")
-    return tuple(Cell(arm, cell_id) for cell_id in cell_ids)
+    return build_cells(arm, cell_ids, arms=ARMS, cells=CELLS)
 
 
 CELLS_BY_BLOCK: dict[str, tuple[Cell, ...]] = {
@@ -520,13 +527,22 @@ def record_key(  # noqa: PLR0913 - one argument per axis of the record's identit
     )
 
 
-def prompt_id(*, arm: str, cell: str, scenario_id: str, print_order: str) -> str:
+def build_prompt_id(
+    pass_id: str, *, arm: str, cell: str, scenario_id: str, print_order: str
+) -> str:
     """Name one rendered prompt: everything about the text, and nothing about who reads it.
 
     Distinct from the record key on purpose: two models reading one prompt share a prompt id and never a
     record key, which is what lets the audits deduplicate renders and the reports join on the text.
     """
-    return f"{PASS_ID}--{arm}--{cell}--{scenario_id}--order-{print_order}"
+    return f"{pass_id}--{arm}--{cell}--{scenario_id}--order-{print_order}"
+
+
+def prompt_id(*, arm: str, cell: str, scenario_id: str, print_order: str) -> str:
+    """Name one rendered prompt of this pass."""
+    return build_prompt_id(
+        PASS_ID, arm=arm, cell=cell, scenario_id=scenario_id, print_order=print_order
+    )
 
 
 CARRIED_LABEL_FIELDS: tuple[str, ...] = (
@@ -1011,17 +1027,4 @@ def refuse_below_batch_floor(leg: Leg, n_records: int) -> None:
     CLI does not define, and it refuses only after a model-availability call and an upload. The floor is
     per job and not adjustable, so pooling a block's cells into one job is what clears it.
     """
-    if n_records >= MIN_BATCH_RECORDS:
-        return
-    raise ValueError(
-        f"batch inference needs at least {MIN_BATCH_RECORDS} records per job and leg {leg.leg_id} "
-        f"renders {n_records} ({len(leg.cells)} cells x {ROWS_PER_CELL} rows x {DRAWS} draws). The "
-        f"floor is per job and not adjustable, so either raise DRAWS, pool more cells into the block, "
-        f"or run this leg on live Converse, which has no floor."
-    )
-
-
-def batch_price_per_mtok(model_id: str) -> tuple[float, float]:
-    """Return one batch model's verified (input, output) price per million tokens."""
-    roster = roster_model(model_id)
-    return roster.batch_price_in_per_mtok, roster.batch_price_out_per_mtok
+    refuse_leg_below_batch_floor(leg, n_records, rows_per_cell=ROWS_PER_CELL, draws=DRAWS)
