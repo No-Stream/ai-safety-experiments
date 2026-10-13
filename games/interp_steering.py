@@ -2256,6 +2256,179 @@ def _vllm_condition_spec(  # noqa: PLR0913 - condition and its source geometry a
     raise ValueError(f"unsupported vLLM generation condition: {condition.condition}")
 
 
+def _item_record_key(key: str, row: Mapping[str, Any], sample_index: int) -> str:
+    return generation_record_key(
+        {
+            "condition_key": key,
+            "prompt_id": row["prompt_id"],
+            "label_print_order": row["label_print_order"],
+            "sample_index": sample_index,
+        }
+    )
+
+
+def _select_generation_cells(
+    args: argparse.Namespace,
+    directions: dict[str, Any],
+    direction_paths: dict[str, Path],
+    *,
+    subspace_mode: bool,
+    token_ban_only: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+    """Return ``(cells, selection, selected_target)`` for the requested cell source."""
+    selected_target: dict[str, Any] | None = None
+    if subspace_mode:
+        cells = []
+        selection = None
+    elif args.selected_target is not None:
+        selected_target = load_selected_target(
+            args.selected_target, directions, direction_paths=direction_paths
+        )
+        cells = [cast("dict[str, Any]", selected_target["cell"])]
+        selection = selected_target
+    elif args.from_sweep is not None:
+        sweep_payload = cast("dict[str, Any]", json.loads(Path(args.from_sweep).read_text()))
+        cells = plan_generation_cells(sweep_payload, n_cells=args.n_cells)
+        selection = select_intervention(sweep_payload)
+    elif token_ban_only:
+        cells = []
+        selection = None
+    else:
+        cells = _parse_cells_flag(args.cells)
+        selection = None
+    for cell in cells:
+        if str(cell["direction"]) not in directions:
+            raise ValueError(f"cell {cell} names a direction with no --direction flag.")
+        if int(cell["layer"]) not in directions[str(cell["direction"])]:
+            raise ValueError(f"cell {cell} names a layer missing from its direction file.")
+    return cells, selection, selected_target
+
+
+def _chunk_banned_token_counts(
+    current_counts: Sequence[int], n_completions: int, audit_cursor: int
+) -> tuple[list[int], int]:
+    """Read this chunk's token-ban audit counts and advance the cursor past them."""
+    expected_end = audit_cursor + n_completions
+    if len(current_counts) >= expected_end:
+        banned_token_counts = list(current_counts[audit_cursor:expected_end])
+        audit_cursor = expected_end
+    elif len(current_counts) == n_completions:
+        banned_token_counts = list(current_counts)
+        audit_cursor = len(current_counts)
+    else:
+        raise RuntimeError(
+            "token-ban generation did not return one token audit count per "
+            f"completion chunk: {len(current_counts)} counts for "
+            f"{n_completions} completions"
+        )
+    if any(banned_token_counts):
+        raise AssertionError(
+            "token-ban generation emitted a banned token despite its logits processor"
+        )
+    return banned_token_counts, audit_cursor
+
+
+def _generation_record(  # noqa: PLR0913 - one keyword per field the record carries from the driver
+    args: argparse.Namespace,
+    *,
+    key: str,
+    condition: GenerationCondition,
+    row: Mapping[str, Any],
+    sample_index: int,
+    completion: str,
+    alpha_raw: float | None,
+    seed: int,
+    placebo_seed: int,
+    adapter: dict[str, Any] | None,
+    deltanet_kernel: dict[str, str],
+) -> dict[str, Any]:
+    visible, truncated = strip_thinking(completion, prefilled_think=True)
+    action = parse_action(
+        visible,
+        label_a=str(row["label_a"]),
+        label_b=str(row["label_b"]),
+        coop_label=str(row["coop_label"]),
+    )
+    allocation_outcome = selected_allocation_outcome(row, action)
+    reward_outcome = reward_optimal_outcome(row)
+    parsed_label = parsed_action_label(row, action)
+    first_label = (
+        str(row["label_a"]) if row["label_print_order"] == "canonical" else str(row["label_b"])
+    )
+    return {
+        "condition_key": key,
+        "backend": args.backend,
+        DELTANET_KERNEL_FIELD: deltanet_kernel,
+        "condition": condition.condition,
+        "direction": condition.direction,
+        "layer": condition.layer,
+        "alpha_multiplier": condition.alpha_multiplier,
+        "alpha_raw": alpha_raw,
+        "seed": seed,
+        "placebo_seed": placebo_seed,
+        "adapter": adapter,
+        "counterpart_framing": row.get("framing_id", args.counterpart_framing),
+        "prompt_id": row["prompt_id"],
+        "diagnostic_family": row.get("diagnostic_family"),
+        "row_kind": row.get("row_kind", CUSTOM_ROW_KIND_MATRIX),
+        "game_id": row["game_id"],
+        "grading": row["grading"],
+        "payoff_cc": row["payoff_cc"],
+        "payoff_cd": row["payoff_cd"],
+        "payoff_dc": row["payoff_dc"],
+        "payoff_dd": row["payoff_dd"],
+        "reskin_id": row["reskin_id"],
+        "payoff_variant": row["payoff_variant"],
+        "label_print_order": row["label_print_order"],
+        "coop_label": row["coop_label"],
+        "sample_index": sample_index,
+        "response_text": completion,
+        "parsed_action": action,
+        "first_position_choice": (None if parsed_label is None else parsed_label == first_label),
+        "cooperate": None if action is None else action == COOPERATE,
+        "truncated_thinking": truncated,
+        **reward_outcome,
+        "reward_optimal_match": (
+            None
+            if parsed_label is None or reward_outcome["reward_optimal"] is None
+            else parsed_label == reward_outcome["reward_optimal"]
+        ),
+        "own_payoff_optimal_match": (
+            None
+            if parsed_label is None or reward_outcome["own_payoff_optimal"] is None
+            else parsed_label == reward_outcome["own_payoff_optimal"]
+        ),
+        "total_welfare_optimal_match": (
+            None
+            if parsed_label is None or reward_outcome["total_welfare_optimal"] is None
+            else parsed_label == reward_outcome["total_welfare_optimal"]
+        ),
+        **allocation_outcome,
+    }
+
+
+def _bank_resumed_condition(
+    key: str,
+    n_banked: int,
+    n_generated: int,
+    resumed_conditions: list[dict[str, Any]],
+    condition_progress: dict[str, dict[str, int]],
+) -> None:
+    resumed_conditions.append(
+        {
+            "condition_key": key,
+            "n_records": n_banked,
+            "n_records_resumed": n_banked,
+            "n_records_generated": n_generated,
+        }
+    )
+    condition_progress[key] = {
+        "n_records_resumed": n_banked,
+        "n_records_generated": n_generated,
+        "n_records_total": n_banked + n_generated,
+    }
+
+
 def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     args: argparse.Namespace,
 ) -> dict[str, Any]:
@@ -2316,34 +2489,16 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
     )
     directions = {} if subspace_mode or token_ban_only else load_named_directions(args.direction)
     direction_paths = {name: Path(path) for name, path in direction_specs.items()}
-    selected_target: dict[str, Any] | None = None
     required_sources = 0 if subspace_mode or token_ban_only else 1
     if requested_sources != required_sources:
         raise ValueError("pass exactly one of --cells, --from-sweep, or --selected-target.")
-    if subspace_mode:
-        cells = []
-        selection = None
-    elif args.selected_target is not None:
-        selected_target = load_selected_target(
-            args.selected_target, directions, direction_paths=direction_paths
-        )
-        cells = [cast("dict[str, Any]", selected_target["cell"])]
-        selection = selected_target
-    elif args.from_sweep is not None:
-        sweep_payload = cast("dict[str, Any]", json.loads(Path(args.from_sweep).read_text()))
-        cells = plan_generation_cells(sweep_payload, n_cells=args.n_cells)
-        selection = select_intervention(sweep_payload)
-    elif token_ban_only:
-        cells = []
-        selection = None
-    else:
-        cells = _parse_cells_flag(args.cells)
-        selection = None
-    for cell in cells:
-        if str(cell["direction"]) not in directions:
-            raise ValueError(f"cell {cell} names a direction with no --direction flag.")
-        if int(cell["layer"]) not in directions[str(cell["direction"])]:
-            raise ValueError(f"cell {cell} names a layer missing from its direction file.")
+    cells, selection, selected_target = _select_generation_cells(
+        args,
+        directions,
+        direction_paths,
+        subspace_mode=subspace_mode,
+        token_ban_only=token_ban_only,
+    )
 
     placebo_seed = resolve_placebo_seed(args)
     if framing_ids:
@@ -2447,32 +2602,12 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
             condition_item_indices = [
                 item_index
                 for item_index, row in enumerate(row_for_prompt)
-                if generation_record_key(
-                    {
-                        "condition_key": key,
-                        "prompt_id": row["prompt_id"],
-                        "label_print_order": row["label_print_order"],
-                        "sample_index": sample_indices[item_index],
-                    }
-                )
-                in records_by_key
+                if _item_record_key(key, row, sample_indices[item_index]) in records_by_key
             ]
             resumed_count = len(condition_item_indices)
             if key in resume_state.complete_units:
                 n_banked = resume_state.complete_units[key]
-                resumed_conditions.append(
-                    {
-                        "condition_key": key,
-                        "n_records": n_banked,
-                        "n_records_resumed": n_banked,
-                        "n_records_generated": 0,
-                    }
-                )
-                condition_progress[key] = {
-                    "n_records_resumed": n_banked,
-                    "n_records_generated": 0,
-                    "n_records_total": n_banked,
-                }
+                _bank_resumed_condition(key, n_banked, 0, resumed_conditions, condition_progress)
                 logger.info(f"resuming condition {key}: {n_banked} records already banked")
                 continue
             reason = _skip_reason(index, requested, deadline)
@@ -2484,31 +2619,13 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
                 item_index
                 for item_index, row in enumerate(row_for_prompt)
                 if item_index not in condition_item_indices
-                and generation_record_key(
-                    {
-                        "condition_key": key,
-                        "prompt_id": row["prompt_id"],
-                        "label_print_order": row["label_print_order"],
-                        "sample_index": sample_indices[item_index],
-                    }
-                )
-                not in records_by_key
+                and _item_record_key(key, row, sample_indices[item_index]) not in records_by_key
             ]
             if not pending_indices:
                 ledger.mark_complete(key, resumed_count)
-                resumed_conditions.append(
-                    {
-                        "condition_key": key,
-                        "n_records": resumed_count,
-                        "n_records_resumed": resumed_count,
-                        "n_records_generated": 0,
-                    }
+                _bank_resumed_condition(
+                    key, resumed_count, 0, resumed_conditions, condition_progress
                 )
-                condition_progress[key] = {
-                    "n_records_resumed": resumed_count,
-                    "n_records_generated": 0,
-                    "n_records_total": resumed_count,
-                }
                 continue
             seed = args.seed + index
             condition_started = time.monotonic()
@@ -2580,99 +2697,28 @@ def run_generate(  # noqa: C901, PLR0912, PLR0915 - one linear driver
                         )
                     banned_token_counts = [0] * len(completions)
                     if condition_generation_kwargs is not None:
-                        current_counts = list(backend.last_banned_token_counts)
-                        expected_end = banned_audit_cursor + len(completions)
-                        if len(current_counts) >= expected_end:
-                            banned_token_counts = current_counts[banned_audit_cursor:expected_end]
-                            banned_audit_cursor = expected_end
-                        elif len(current_counts) == len(completions):
-                            banned_token_counts = current_counts
-                            banned_audit_cursor = len(current_counts)
-                        else:
-                            raise RuntimeError(
-                                "token-ban generation did not return one token audit count per "
-                                f"completion chunk: {len(current_counts)} counts for "
-                                f"{len(completions)} completions"
-                            )
-                        if any(banned_token_counts):
-                            raise AssertionError(
-                                "token-ban generation emitted a banned token despite its logits "
-                                "processor"
-                            )
+                        banned_token_counts, banned_audit_cursor = _chunk_banned_token_counts(
+                            list(backend.last_banned_token_counts),
+                            len(completions),
+                            banned_audit_cursor,
+                        )
                     for completion_index, (item_index, completion) in enumerate(
                         zip(chunk_indices, completions, strict=True)
                     ):
                         row = row_for_prompt[item_index]
-                        sample_index = sample_indices[item_index]
-                        visible, truncated = strip_thinking(completion, prefilled_think=True)
-                        action = parse_action(
-                            visible,
-                            label_a=str(row["label_a"]),
-                            label_b=str(row["label_b"]),
-                            coop_label=str(row["coop_label"]),
+                        record = _generation_record(
+                            args,
+                            key=key,
+                            condition=condition,
+                            row=row,
+                            sample_index=sample_indices[item_index],
+                            completion=completion,
+                            alpha_raw=alpha_raw,
+                            seed=seed,
+                            placebo_seed=placebo_seed,
+                            adapter=adapter,
+                            deltanet_kernel=deltanet_kernel,
                         )
-                        allocation_outcome = selected_allocation_outcome(row, action)
-                        reward_outcome = reward_optimal_outcome(row)
-                        parsed_label = parsed_action_label(row, action)
-                        first_label = (
-                            str(row["label_a"])
-                            if row["label_print_order"] == "canonical"
-                            else str(row["label_b"])
-                        )
-                        record: dict[str, Any] = {
-                            "condition_key": key,
-                            "backend": args.backend,
-                            DELTANET_KERNEL_FIELD: deltanet_kernel,
-                            "condition": condition.condition,
-                            "direction": condition.direction,
-                            "layer": condition.layer,
-                            "alpha_multiplier": condition.alpha_multiplier,
-                            "alpha_raw": alpha_raw,
-                            "seed": seed,
-                            "placebo_seed": placebo_seed,
-                            "adapter": adapter,
-                            "counterpart_framing": row.get("framing_id", args.counterpart_framing),
-                            "prompt_id": row["prompt_id"],
-                            "diagnostic_family": row.get("diagnostic_family"),
-                            "row_kind": row.get("row_kind", CUSTOM_ROW_KIND_MATRIX),
-                            "game_id": row["game_id"],
-                            "grading": row["grading"],
-                            "payoff_cc": row["payoff_cc"],
-                            "payoff_cd": row["payoff_cd"],
-                            "payoff_dc": row["payoff_dc"],
-                            "payoff_dd": row["payoff_dd"],
-                            "reskin_id": row["reskin_id"],
-                            "payoff_variant": row["payoff_variant"],
-                            "label_print_order": row["label_print_order"],
-                            "coop_label": row["coop_label"],
-                            "sample_index": sample_index,
-                            "response_text": completion,
-                            "parsed_action": action,
-                            "first_position_choice": (
-                                None if parsed_label is None else parsed_label == first_label
-                            ),
-                            "cooperate": None if action is None else action == COOPERATE,
-                            "truncated_thinking": truncated,
-                            **reward_outcome,
-                            "reward_optimal_match": (
-                                None
-                                if parsed_label is None or reward_outcome["reward_optimal"] is None
-                                else parsed_label == reward_outcome["reward_optimal"]
-                            ),
-                            "own_payoff_optimal_match": (
-                                None
-                                if parsed_label is None
-                                or reward_outcome["own_payoff_optimal"] is None
-                                else parsed_label == reward_outcome["own_payoff_optimal"]
-                            ),
-                            "total_welfare_optimal_match": (
-                                None
-                                if parsed_label is None
-                                or reward_outcome["total_welfare_optimal"] is None
-                                else parsed_label == reward_outcome["total_welfare_optimal"]
-                            ),
-                            **allocation_outcome,
-                        }
                         if condition_generation_kwargs is not None:
                             record["banned_tokens_sha256"] = cast("str", banned_tokens_digest)
                             record["banned_token_count"] = banned_token_counts[completion_index]

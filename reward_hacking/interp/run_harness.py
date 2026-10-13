@@ -3227,19 +3227,25 @@ def _sweep_one_pair(  # noqa: PLR0913 - model plus the pair, concept, layers, ax
     return rows, False
 
 
-def _patch_sweep_payload(  # noqa: PLR0913 - the args plus each handoff the artifact must carry
+def _write_patch_sweep_metrics(  # noqa: PLR0913 - the args plus each handoff the artifact must carry
+    metrics_path: Path,
     args: PatchSweepArgs,
     *,
-    layers_by_concept: Mapping[str, object],
+    progress: Mapping[str, object],
     coverage: Mapping[str, object],
+    layers_by_concept: Mapping[str, object],
     rows: Sequence[dict[str, object]],
     variants: Sequence[str],
     skipped_variants: Sequence[dict[str, object]],
     kernel_bridge: Mapping[str, object],
     deltanet_kernel: Mapping[str, str],
-) -> dict[str, object]:
-    """Assemble the uploadable artifact. Called mid-sweep too, so a hard kill loses one pair."""
-    return {
+) -> None:
+    """Write the uploadable artifact. Called mid-sweep too, so a hard kill loses one pair.
+
+    ``progress`` is the only thing the two call sites disagree on: a mid-sweep write says it is in
+    progress, the final write says whether the deadline stopped it.
+    """
+    payload: dict[str, object] = {
         "stage": "patch-sweep",
         "readout_semantics": READOUT_SEMANTICS,
         "deltanet_kernel_bridge": dict(kernel_bridge),
@@ -3262,10 +3268,11 @@ def _patch_sweep_payload(  # noqa: PLR0913 - the args plus each handoff the arti
         "patch_modes": list(args.modes),
         "layer_chunk": args.layer_chunk,
         "seed": args.seed,
-        "coverage": dict(coverage),
+        "coverage": {**coverage, **progress},
         "n_cells": len(rows),
         "patching": list(rows),
     }
+    metrics_path.write_text(json.dumps(payload, indent=2))
 
 
 def _sweep_layers_and_axes(
@@ -3446,24 +3453,17 @@ def run_patch_sweep(args: PatchSweepArgs) -> None:
             stopped = True
             break
         if completed % args.flush_every_pairs == 0:
-            metrics_path.write_text(
-                json.dumps(
-                    _patch_sweep_payload(
-                        args,
-                        layers_by_concept=layers_by_concept,
-                        coverage={
-                            **coverage,
-                            "work_items_completed": completed,
-                            "in_progress": True,
-                        },
-                        rows=rows,
-                        variants=variant_names,
-                        skipped_variants=skipped_variants,
-                        kernel_bridge=kernel_bridge,
-                        deltanet_kernel=deltanet_kernel,
-                    ),
-                    indent=2,
-                )
+            _write_patch_sweep_metrics(
+                metrics_path,
+                args,
+                progress={"work_items_completed": completed, "in_progress": True},
+                coverage=coverage,
+                layers_by_concept=layers_by_concept,
+                rows=rows,
+                variants=variant_names,
+                skipped_variants=skipped_variants,
+                kernel_bridge=kernel_bridge,
+                deltanet_kernel=deltanet_kernel,
             )
             torch.save(raw.payload(), raw_path)
 
@@ -3477,25 +3477,21 @@ def run_patch_sweep(args: PatchSweepArgs) -> None:
         raw_path,
         raw_path.stat().st_size / (1024**2),
     )
-    metrics_path.write_text(
-        json.dumps(
-            _patch_sweep_payload(
-                args,
-                layers_by_concept=layers_by_concept,
-                coverage={
-                    **coverage,
-                    "work_items_completed": completed,
-                    "stopped_on_deadline": stopped,
-                    "in_progress": False,
-                },
-                rows=rows,
-                variants=variant_names,
-                skipped_variants=skipped_variants,
-                kernel_bridge=kernel_bridge,
-                deltanet_kernel=deltanet_kernel,
-            ),
-            indent=2,
-        )
+    _write_patch_sweep_metrics(
+        metrics_path,
+        args,
+        progress={
+            "work_items_completed": completed,
+            "stopped_on_deadline": stopped,
+            "in_progress": False,
+        },
+        coverage=coverage,
+        layers_by_concept=layers_by_concept,
+        rows=rows,
+        variants=variant_names,
+        skipped_variants=skipped_variants,
+        kernel_bridge=kernel_bridge,
+        deltanet_kernel=deltanet_kernel,
     )
     logger.info(
         "patch-sweep done: %d cells over %d/%d work items (stopped_on_deadline=%s) -> %s",
@@ -3766,6 +3762,42 @@ def _decode_both_signs(  # noqa: PLR0913 - lens, model, direction, layer and the
     }
 
 
+def _load_decode_axes(
+    args: PatchDecodeArgs, selected: Sequence[tuple[str, str, int, str]]
+) -> dict[str, dict[str, dict[int, torch.Tensor]]]:
+    """Load the saved concept axes, refusing a missing concept or pooling and warning on uncovered layers.
+
+    A layer the axis does not cover is not an error: those cells decode the transplanted delta and the
+    placebo without that concept's axis beside them, and the warning says so.
+    """
+    axes: dict[str, dict[str, dict[int, torch.Tensor]]] = torch.load(
+        args.axes_path, weights_only=True
+    )
+    for concept in args.concepts:
+        if concept not in axes:
+            raise RuntimeError(f"no {concept!r} axis in {args.axes_path}; it holds {sorted(axes)}")
+        if args.pooling not in axes[concept]:
+            raise RuntimeError(
+                f"the saved {concept!r} axis has no {args.pooling!r} pooling; it holds "
+                f"{sorted(axes[concept])}"
+            )
+        covered = sorted(axes[concept][args.pooling])
+        missing = [
+            layer for _k, _d, layer, _w in selected if layer not in axes[concept][args.pooling]
+        ]
+        if missing:
+            logger.warning(
+                "the %s/%s axis covers layers %d..%d but not %s; those cells will decode the delta "
+                "and the placebo without that concept's axis beside them",
+                concept,
+                args.pooling,
+                covered[0],
+                covered[-1],
+                sorted(set(missing)),
+            )
+    return axes
+
+
 def run_patch_decode(args: PatchDecodeArgs) -> None:
     """Decode the vector activation patching actually transplants into token space (GPU).
 
@@ -3811,31 +3843,7 @@ def run_patch_decode(args: PatchDecodeArgs) -> None:
         )
     logger.info("decoding %d transplanted deltas through a freshly fitted lens", len(selected))
 
-    axes: dict[str, dict[str, dict[int, torch.Tensor]]] = torch.load(
-        args.axes_path, weights_only=True
-    )
-    for concept in args.concepts:
-        if concept not in axes:
-            raise RuntimeError(f"no {concept!r} axis in {args.axes_path}; it holds {sorted(axes)}")
-        if args.pooling not in axes[concept]:
-            raise RuntimeError(
-                f"the saved {concept!r} axis has no {args.pooling!r} pooling; it holds "
-                f"{sorted(axes[concept])}"
-            )
-        covered = sorted(axes[concept][args.pooling])
-        missing = [
-            layer for _k, _d, layer, _w in selected if layer not in axes[concept][args.pooling]
-        ]
-        if missing:
-            logger.warning(
-                "the %s/%s axis covers layers %d..%d but not %s; those cells will decode the delta "
-                "and the placebo without that concept's axis beside them",
-                concept,
-                args.pooling,
-                covered[0],
-                covered[-1],
-                sorted(set(missing)),
-            )
+    axes = _load_decode_axes(args, selected)
     jl = _require_jlens()
     corpus, corpus_source = decode_lens_corpus(args)
     acquired = acquire_decode_lens(args, jl, corpus, corpus_source=corpus_source)
@@ -4524,6 +4532,190 @@ def _axis_probe_sampling_budget(args: argparse.Namespace) -> dict[str, object]:
     return log_sampling_grid(episodes_per_cell, oversize_reason=args.oversize_reason)
 
 
+def _dispatch_axis_probe(args: argparse.Namespace) -> None:
+    sampling_budget = _axis_probe_sampling_budget(args)
+    run_axis_probe(
+        AxisProbeArgs(
+            model_id=args.model_id,
+            out_dir=args.out_dir,
+            concepts=tuple(args.concepts),
+            poolings=tuple(args.poolings),
+            limit=args.limit,
+            layer_stride=args.layer_stride,
+            batch_size=args.batch_size,
+            n_placebos=args.n_placebos,
+            probe_config=ProbeConfig(seed=args.seed),
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_fit_lens(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_fit_lens(
+        FitLensArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            limit=args.limit,
+            max_fit_prompts=args.max_fit_prompts,
+            max_seq_len=args.max_seq_len,
+            max_seq_len_ceiling=args.max_seq_len_ceiling,
+            reasoning_prompts=args.reasoning_prompts,
+            reasoning_sampling=sampling_from_args(
+                args, max_new_tokens=args.reasoning_max_new_tokens
+            ),
+            recon_eval_prompts=args.recon_eval_prompts,
+            recon_max_positions=args.recon_max_positions,
+            gen_engine=args.gen_engine,
+            vllm_gpu_fraction=args.vllm_gpu_fraction,
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_contrast(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_contrast(
+        ContrastArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            validated_eval_dirs=_validated_eval_dirs(args),
+            poolings=tuple(args.poolings),
+            variants=tuple(args.variants),
+            window_length=args.window_length,
+            limit=args.limit,
+            n_placebos=args.n_placebos,
+            seed=args.seed,
+            sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
+            deadline_seconds=args.deadline_seconds,
+            gen_engine=args.gen_engine,
+            vllm_gpu_fraction=args.vllm_gpu_fraction,
+            gen_batch_pairs=args.gen_batch_pairs,
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_steer_patch(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_steer_patch(
+        SteerPatchArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            peak_layers_path=args.peak_layers_path,
+            axes_path=(
+                args.axes_path if args.axes_path is not None else raw_dir / "concept_axes.local.pt"
+            ),
+            concepts=tuple(args.concepts),
+            variant=args.variant,
+            pooling=args.pooling,
+            alpha_scales=tuple(args.alpha_scales),
+            n_placebos=args.n_placebos,
+            n_steer_prompts=args.n_steer_prompts,
+            n_patch_pairs=args.n_patch_pairs,
+            max_patch_positions=args.max_patch_positions,
+            seed=args.seed,
+            sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
+            deadline_seconds=args.deadline_seconds,
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_patch_sweep(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_patch_sweep(
+        PatchSweepArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            peak_layers_path=args.peak_layers_path,
+            axes_path=(
+                args.axes_path if args.axes_path is not None else raw_dir / "concept_axes.local.pt"
+            ),
+            concepts=tuple(args.concepts),
+            readout_modes=tuple(args.readout_modes),
+            option_orders=tuple(args.option_orders),
+            readout_thinking=args.readout_thinking,
+            variant=args.variant,
+            pooling=args.pooling,
+            patch_layers=tuple(args.patch_layers),
+            layer_chunk=args.layer_chunk,
+            tail_widths=tuple(args.tail_widths),
+            head_widths=tuple(args.head_widths),
+            directions=tuple(args.patch_directions),
+            modes=tuple(args.patch_modes),
+            n_patch_pairs=args.n_patch_pairs,
+            max_pair_tokens=args.max_pair_tokens,
+            limit=args.limit,
+            seed=args.seed,
+            deadline_seconds=args.deadline_seconds,
+            flush_every_pairs=args.flush_every_pairs,
+            raw_topk=args.raw_topk,
+            keep_baseline_rows=args.keep_baseline_rows,
+            delta_windows=tuple(args.delta_windows),
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_patch_decode(args: argparse.Namespace, *, episode_dir: Path, raw_dir: Path) -> None:
+    run_patch_decode(
+        PatchDecodeArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            sweep_raw_path=args.sweep_raw_path,
+            axes_path=(
+                args.axes_path if args.axes_path is not None else raw_dir / "concept_axes.local.pt"
+            ),
+            concepts=tuple(args.concepts),
+            pooling=args.pooling,
+            decode_windows=tuple(args.decode_windows),
+            decode_layers=tuple(args.decode_layers),
+            n_fit_pairs=args.n_fit_pairs,
+            max_fit_prompts=args.max_fit_prompts,
+            max_seq_len=args.max_seq_len,
+            max_seq_len_ceiling=args.max_seq_len_ceiling,
+            dim_batch=args.dim_batch,
+            top_k=args.top_k,
+            n_layers=args.n_layers,
+            seed=args.seed,
+            deadline_seconds=args.deadline_seconds,
+            lens_path=args.lens_path,
+            lens_fit_corpus_path=args.lens_fit_corpus,
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Dispatch a stage. Every stage is GPU-only; the offline tests cover the pure helpers only."""
     args = _parse_args(argv)
@@ -4532,21 +4724,7 @@ def main(argv: list[str] | None = None) -> None:
         # Dispatched ahead of the episode-dir resolution below because it is the one stage that
         # materialises no stimuli -- it builds its axes from the concept sentence pairs -- so
         # resolving one would leave an empty mkdtemp behind on every invocation.
-        sampling_budget = _axis_probe_sampling_budget(args)
-        run_axis_probe(
-            AxisProbeArgs(
-                model_id=args.model_id,
-                out_dir=args.out_dir,
-                concepts=tuple(args.concepts),
-                poolings=tuple(args.poolings),
-                limit=args.limit,
-                layer_stride=args.layer_stride,
-                batch_size=args.batch_size,
-                n_placebos=args.n_placebos,
-                probe_config=ProbeConfig(seed=args.seed),
-                sampling_budget=sampling_budget,
-            )
-        )
+        _dispatch_axis_probe(args)
         return
     raw_dir = args.raw_dir if args.raw_dir is not None else args.out_dir / "raw"
     episode_dir = _resolve_episode_dir(args.episode_dir)
@@ -4555,143 +4733,23 @@ def main(argv: list[str] | None = None) -> None:
         require_raw_dir_outside_episode_dir(raw_dir, episode_dir)
         sampling_budget = _sampling_budget_for_stage(args, episode_dir)
     if args.command == "fit-lens":
-        run_fit_lens(
-            FitLensArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                limit=args.limit,
-                max_fit_prompts=args.max_fit_prompts,
-                max_seq_len=args.max_seq_len,
-                max_seq_len_ceiling=args.max_seq_len_ceiling,
-                reasoning_prompts=args.reasoning_prompts,
-                reasoning_sampling=sampling_from_args(
-                    args, max_new_tokens=args.reasoning_max_new_tokens
-                ),
-                recon_eval_prompts=args.recon_eval_prompts,
-                recon_max_positions=args.recon_max_positions,
-                gen_engine=args.gen_engine,
-                vllm_gpu_fraction=args.vllm_gpu_fraction,
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_fit_lens(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "contrast":
-        run_contrast(
-            ContrastArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                validated_eval_dirs=_validated_eval_dirs(args),
-                poolings=tuple(args.poolings),
-                variants=tuple(args.variants),
-                window_length=args.window_length,
-                limit=args.limit,
-                n_placebos=args.n_placebos,
-                seed=args.seed,
-                sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
-                deadline_seconds=args.deadline_seconds,
-                gen_engine=args.gen_engine,
-                vllm_gpu_fraction=args.vllm_gpu_fraction,
-                gen_batch_pairs=args.gen_batch_pairs,
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_contrast(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "steer-patch":
-        run_steer_patch(
-            SteerPatchArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                peak_layers_path=args.peak_layers_path,
-                axes_path=(
-                    args.axes_path
-                    if args.axes_path is not None
-                    else raw_dir / "concept_axes.local.pt"
-                ),
-                concepts=tuple(args.concepts),
-                variant=args.variant,
-                pooling=args.pooling,
-                alpha_scales=tuple(args.alpha_scales),
-                n_placebos=args.n_placebos,
-                n_steer_prompts=args.n_steer_prompts,
-                n_patch_pairs=args.n_patch_pairs,
-                max_patch_positions=args.max_patch_positions,
-                seed=args.seed,
-                sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
-                deadline_seconds=args.deadline_seconds,
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_steer_patch(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "patch-sweep":
-        run_patch_sweep(
-            PatchSweepArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                peak_layers_path=args.peak_layers_path,
-                axes_path=(
-                    args.axes_path
-                    if args.axes_path is not None
-                    else raw_dir / "concept_axes.local.pt"
-                ),
-                concepts=tuple(args.concepts),
-                readout_modes=tuple(args.readout_modes),
-                option_orders=tuple(args.option_orders),
-                readout_thinking=args.readout_thinking,
-                variant=args.variant,
-                pooling=args.pooling,
-                patch_layers=tuple(args.patch_layers),
-                layer_chunk=args.layer_chunk,
-                tail_widths=tuple(args.tail_widths),
-                head_widths=tuple(args.head_widths),
-                directions=tuple(args.patch_directions),
-                modes=tuple(args.patch_modes),
-                n_patch_pairs=args.n_patch_pairs,
-                max_pair_tokens=args.max_pair_tokens,
-                limit=args.limit,
-                seed=args.seed,
-                deadline_seconds=args.deadline_seconds,
-                flush_every_pairs=args.flush_every_pairs,
-                raw_topk=args.raw_topk,
-                keep_baseline_rows=args.keep_baseline_rows,
-                delta_windows=tuple(args.delta_windows),
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_patch_sweep(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "patch-decode":
-        run_patch_decode(
-            PatchDecodeArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                sweep_raw_path=args.sweep_raw_path,
-                axes_path=(
-                    args.axes_path
-                    if args.axes_path is not None
-                    else raw_dir / "concept_axes.local.pt"
-                ),
-                concepts=tuple(args.concepts),
-                pooling=args.pooling,
-                decode_windows=tuple(args.decode_windows),
-                decode_layers=tuple(args.decode_layers),
-                n_fit_pairs=args.n_fit_pairs,
-                max_fit_prompts=args.max_fit_prompts,
-                max_seq_len=args.max_seq_len,
-                max_seq_len_ceiling=args.max_seq_len_ceiling,
-                dim_batch=args.dim_batch,
-                top_k=args.top_k,
-                n_layers=args.n_layers,
-                seed=args.seed,
-                deadline_seconds=args.deadline_seconds,
-                lens_path=args.lens_path,
-                lens_fit_corpus_path=args.lens_fit_corpus,
-            )
-        )
+        _dispatch_patch_decode(args, episode_dir=episode_dir, raw_dir=raw_dir)
 
 
 if __name__ == "__main__":
