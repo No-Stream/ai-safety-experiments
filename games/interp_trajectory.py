@@ -61,6 +61,7 @@ from games.interp_cells import (
     load_ladder,
     load_stimuli,
     pair_layout,
+    split_comma_list,
     stimuli_digest,
 )
 from reward_hacking.interp.directions import cosine, matched_norm_random_direction, unit
@@ -635,24 +636,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _split(raw: str | None) -> list[str] | None:
-    """Parse a comma-separated CLI list, or None for 'everything present'."""
-    if raw is None:
-        return None
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Load the ladder, read every group, and write the report plus the directions."""
     stimuli = load_stimuli(args.stimuli)
     digest = stimuli_digest(stimuli)
-    arms = _split(args.arms)
-    steps = None if args.steps is None else [int(part) for part in _split(args.steps) or []]
+    arms = split_comma_list(args.arms)
+    steps = (
+        None if args.steps is None else [int(part) for part in split_comma_list(args.steps) or []]
+    )
     ladder = load_ladder(args.capture_root, arms=arms, steps=steps, stimuli_sha256=digest)
-    wanted_sets = _split(args.sets) or list(ladder.stimulus_sets)
-    wanted_poolings = _split(args.poolings) or list(ladder.poolings)
+    wanted_sets = split_comma_list(args.sets) or list(ladder.stimulus_sets)
+    wanted_poolings = split_comma_list(args.poolings) or list(ladder.poolings)
     layers = (
-        [int(part) for part in _split(args.layers) or []]
+        [int(part) for part in split_comma_list(args.layers) or []]
         if args.layers is not None
         else list(range(ladder.identity.n_layers))
     )

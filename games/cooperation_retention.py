@@ -56,6 +56,7 @@ from games.cooperation_eval_runner import (
 )
 from games.cooperation_interp import DisplacementRead, ProjectionRead
 from games.evals import read_eval_records, rebuild_summary
+from games.fileio import write_json_atomic
 from games.interp_cells import BASE_ARM, BASE_STEP, load_ladder
 from games.interp_steering import load_direction_file, load_selected_target, summarise_records
 from games.lora import (
@@ -1157,13 +1158,6 @@ def _json_payload(value: RetentionManifest | RetentionDryRun) -> dict[str, objec
     }
 
 
-def _write_json(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
-
-
 def run_retention(args: argparse.Namespace) -> RetentionManifest | RetentionDryRun:
     """Run CPU validation or the production loader-backed retention operation."""
     run_root = args.run_root.resolve()
@@ -1188,7 +1182,7 @@ def run_retention(args: argparse.Namespace) -> RetentionManifest | RetentionDryR
         del expected, final_arm
         authorization_payload = _authorization_payload(readouts)
         authorization_path = run_root / "retention_readout_authorization.json"
-        _write_json(authorization_path, authorization_payload)
+        write_json_atomic(authorization_path, authorization_payload)
         loader = RuntimeAdapterCheckpointLoader(
             base_model_id=args.base_model,
             dtype=_DTYPES[args.dtype],
@@ -1210,7 +1204,7 @@ def run_retention(args: argparse.Namespace) -> RetentionManifest | RetentionDryR
             ),
         )
     if args.json_out is not None:
-        _write_json(args.json_out, _json_payload(result))
+        write_json_atomic(args.json_out, _json_payload(result))
     logger.info(
         "cooperation retention %s: run_root=%s retained=%s adapter_steps=%s",
         result.status,

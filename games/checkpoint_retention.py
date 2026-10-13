@@ -9,7 +9,6 @@ model loading. The caller supplies the real checkpoint loader used by its traine
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import shutil
@@ -19,6 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from transformers import TrainerCallback
+
+from games.fileio import sha256_of_file
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -37,7 +38,6 @@ ADAPTER_WEIGHT_FILENAMES: tuple[str, ...] = ("adapter_model.safetensors", "adapt
 RETENTION_MANIFEST_FILENAME = "retention_manifest.json"
 RETENTION_SCHEMA_VERSION = 1
 _CHECKPOINT_NAME = re.compile(r"checkpoint-(?P<step>[0-9]+)")
-_HASH_CHUNK_BYTES = 1024 * 1024
 _MIN_RESUMABLE_CHECKPOINTS = 2
 
 
@@ -118,15 +118,6 @@ def _checkpoint_step(path: Path) -> int:
     return int(match.group("step"))
 
 
-def _sha256(path: Path) -> str:
-    """Hash one file without loading a checkpoint-sized payload into memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(_HASH_CHUNK_BYTES):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _relative_path(run_root: Path, path: Path) -> str:
     """Render a manifest path relative to its run, never leaking an absolute machine path."""
     return path.relative_to(run_root).as_posix()
@@ -153,7 +144,7 @@ def _snapshot(run_root: Path, checkpoint: Path) -> CheckpointSnapshot:
                 FileDigest(
                     relative_path=_relative_path(run_root, path),
                     bytes=path.stat().st_size,
-                    sha256=_sha256(path),
+                    sha256=sha256_of_file(path),
                 )
             )
     missing = missing_checkpoint_files(checkpoint, expected_step=step)

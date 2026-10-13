@@ -23,6 +23,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from games.fileio import write_json_atomic
+
 if TYPE_CHECKING:
     from types import ModuleType
 
@@ -1064,16 +1066,9 @@ def measured_budget_is_complete(source: Path | Mapping[str, object] | MeasuredBu
     return True
 
 
-def _write_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
-
-
 def write_measured_budget(path: Path, budget: MeasuredBudget) -> None:
     """Persist an aggregated measured budget with a complete atomic replacement."""
-    _write_json(path, budget.as_dict())
+    write_json_atomic(path, budget.as_dict())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1173,7 +1168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.out is None:
         print(json.dumps(plan.as_dict(), indent=2, sort_keys=True))  # noqa: T201
     else:
-        _write_json(args.out, plan.as_dict())
+        write_json_atomic(args.out, plan.as_dict())
     return 0
 
 

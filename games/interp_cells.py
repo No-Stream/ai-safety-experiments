@@ -51,6 +51,8 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from safetensors.torch import load_file, save_file
 
+# Re-exported: reward_hacking imports sha256_of_file from this module.
+from games.fileio import sha256_of_file  # noqa: F401  # pyright: ignore[reportUnusedImport]
 from reward_hacking.interp.directions import POOLERS
 from reward_hacking.interp.linear_probe import ConceptActivations
 
@@ -323,13 +325,11 @@ class PairLayout:
         return indices[indices % 2 == parity]
 
 
-def sha256_of_file(path: Path) -> str:
-    """Hash a file, so a manifest can name the exact corpus file a cell was captured from."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def split_comma_list(raw: str | None) -> list[str] | None:
+    """Parse a comma-separated CLI list, or None for 'everything present'."""
+    if raw is None:
+        return None
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def digest_of_strings(values: Iterable[str]) -> str:

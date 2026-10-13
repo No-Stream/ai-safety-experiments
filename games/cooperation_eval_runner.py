@@ -49,6 +49,7 @@ from games.evals import (
     rebuild_summary,
     run_eval_battery,
 )
+from games.fileio import read_json_object, write_json_atomic
 from games.interp_lens_ladder import adapter_digests
 from games.provenance import git_sha
 from games.survey import FAMILY_SELF_PREDICTION, battery_orders, survey_battery
@@ -603,20 +604,6 @@ def _summary_path(trace_path: Path) -> Path:
     return trace_path.with_suffix(SUMMARY_SUFFIX)
 
 
-def _read_json_object(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(f"{path} must contain a JSON object")
-    return cast("dict[str, Any]", payload)
-
-
-def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
-
-
 def _complete_cell(
     trace_path: Path, *, expected_meta: Mapping[str, Any] | None = None
 ) -> dict[str, Any] | None:
@@ -633,7 +620,7 @@ def _complete_cell(
             f"endpoint cell is incomplete: expected both {trace_path} and {summary_path}; "
             "relaunch the same command with native resume"
         )
-    stored = _read_json_object(summary_path)
+    stored = read_json_object(summary_path)
     trace_lines = trace_path.read_text(encoding="utf-8").splitlines()
     if not trace_lines:
         raise ValueError(f"trace {trace_path} is empty")
@@ -690,7 +677,7 @@ def _run_native_cell(  # noqa: PLR0913 - each argument is one native-cell decisi
         resume=resume,
         plan=plan,
     )
-    _write_json(_summary_path(out_path), summary)
+    write_json_atomic(_summary_path(out_path), summary)
     return summary
 
 
