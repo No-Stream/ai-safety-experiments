@@ -186,6 +186,39 @@ def test_resume_checks_context_and_scores_but_accepts_missing_provenance(
     assert len(PositionScoreEngine.instances) == 1
 
 
+def test_resume_compares_recorded_teacher_completion_tokens(tmp_path: Path) -> None:
+    samples, _teachers, output = inputs(tmp_path)
+    sample = read_rows(samples)[0]
+    sample.update(
+        teacher_prompt_token_ids=[70, 71],
+        teacher_completion_token_ids=[90, 55, 91],
+        teacher_token_positions=[2, 4],
+    )
+    write_rows(samples, [sample])
+
+    def score() -> Any:
+        return score_round(
+            samples_path=samples,
+            output_path=output,
+            model="synthetic-model",
+            llm_class=PositionScoreEngine,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
+
+    assert score().generated_count == 1
+    record = read_rows(output)[0]
+    assert record["teacher_completion_token_ids"] == [90, 55, 91]
+    assert record["teacher_logps"] == [-2.0, -4.0]
+    assert score().resumed_count == 1
+
+    sample["teacher_completion_token_ids"] = [90, 56, 91]
+    write_rows(samples, [sample])
+    with pytest.raises(ValueError, match="teacher sequence tokens differ"):
+        score()
+    assert len(PositionScoreEngine.instances) == 1
+
+
 @pytest.mark.parametrize("prefix", [[], [-1], [True], [1.5], "tokens"])
 def test_invalid_teacher_ids_refuse_before_engine(tmp_path: Path, prefix: Any) -> None:
     paths = inputs(tmp_path)

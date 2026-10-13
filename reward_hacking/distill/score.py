@@ -530,8 +530,10 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 prefix_matches = row.get("teacher_prompt_token_ids") == scoring_prefixes[key]
             if not prefix_matches:
                 raise ValueError(f"teacher row {key!r} teacher context tokens differ")
-            if row.get("teacher_token_ids_sha256") != token_ids_sha256(
-                scoring_prefixes[key], scoring_completions[key]
+            if (
+                not compact_row
+                and row.get("teacher_completion_token_ids", row["completion_token_ids"])
+                != scoring_completions[key]
             ):
                 raise ValueError(f"teacher row {key!r} teacher sequence tokens differ")
         elif "teacher_prompt_token_ids" in row or "teacher_prompt_token_ids_sha256" in row:
@@ -690,6 +692,8 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                         full_token_ids[:source_prompt_length], scoring_completions[key]
                     )
                     score_record["scoring_identity"] = scoring_identity
+                if "teacher_completion_token_ids" in row and not compact_context:
+                    score_record["teacher_completion_token_ids"] = scoring_completions[key]
                 if compact_context:
                     score_record["context_storage"] = "sha256"
                     score_record["prompt_token_ids_sha256"] = token_ids_sha256(
