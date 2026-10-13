@@ -4524,6 +4524,190 @@ def _axis_probe_sampling_budget(args: argparse.Namespace) -> dict[str, object]:
     return log_sampling_grid(episodes_per_cell, oversize_reason=args.oversize_reason)
 
 
+def _dispatch_axis_probe(args: argparse.Namespace) -> None:
+    sampling_budget = _axis_probe_sampling_budget(args)
+    run_axis_probe(
+        AxisProbeArgs(
+            model_id=args.model_id,
+            out_dir=args.out_dir,
+            concepts=tuple(args.concepts),
+            poolings=tuple(args.poolings),
+            limit=args.limit,
+            layer_stride=args.layer_stride,
+            batch_size=args.batch_size,
+            n_placebos=args.n_placebos,
+            probe_config=ProbeConfig(seed=args.seed),
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_fit_lens(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_fit_lens(
+        FitLensArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            limit=args.limit,
+            max_fit_prompts=args.max_fit_prompts,
+            max_seq_len=args.max_seq_len,
+            max_seq_len_ceiling=args.max_seq_len_ceiling,
+            reasoning_prompts=args.reasoning_prompts,
+            reasoning_sampling=sampling_from_args(
+                args, max_new_tokens=args.reasoning_max_new_tokens
+            ),
+            recon_eval_prompts=args.recon_eval_prompts,
+            recon_max_positions=args.recon_max_positions,
+            gen_engine=args.gen_engine,
+            vllm_gpu_fraction=args.vllm_gpu_fraction,
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_contrast(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_contrast(
+        ContrastArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            validated_eval_dirs=_validated_eval_dirs(args),
+            poolings=tuple(args.poolings),
+            variants=tuple(args.variants),
+            window_length=args.window_length,
+            limit=args.limit,
+            n_placebos=args.n_placebos,
+            seed=args.seed,
+            sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
+            deadline_seconds=args.deadline_seconds,
+            gen_engine=args.gen_engine,
+            vllm_gpu_fraction=args.vllm_gpu_fraction,
+            gen_batch_pairs=args.gen_batch_pairs,
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_steer_patch(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_steer_patch(
+        SteerPatchArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            peak_layers_path=args.peak_layers_path,
+            axes_path=(
+                args.axes_path if args.axes_path is not None else raw_dir / "concept_axes.local.pt"
+            ),
+            concepts=tuple(args.concepts),
+            variant=args.variant,
+            pooling=args.pooling,
+            alpha_scales=tuple(args.alpha_scales),
+            n_placebos=args.n_placebos,
+            n_steer_prompts=args.n_steer_prompts,
+            n_patch_pairs=args.n_patch_pairs,
+            max_patch_positions=args.max_patch_positions,
+            seed=args.seed,
+            sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
+            deadline_seconds=args.deadline_seconds,
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_patch_sweep(
+    args: argparse.Namespace,
+    *,
+    episode_dir: Path,
+    raw_dir: Path,
+    sampling_budget: dict[str, object],
+) -> None:
+    run_patch_sweep(
+        PatchSweepArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            peak_layers_path=args.peak_layers_path,
+            axes_path=(
+                args.axes_path if args.axes_path is not None else raw_dir / "concept_axes.local.pt"
+            ),
+            concepts=tuple(args.concepts),
+            readout_modes=tuple(args.readout_modes),
+            option_orders=tuple(args.option_orders),
+            readout_thinking=args.readout_thinking,
+            variant=args.variant,
+            pooling=args.pooling,
+            patch_layers=tuple(args.patch_layers),
+            layer_chunk=args.layer_chunk,
+            tail_widths=tuple(args.tail_widths),
+            head_widths=tuple(args.head_widths),
+            directions=tuple(args.patch_directions),
+            modes=tuple(args.patch_modes),
+            n_patch_pairs=args.n_patch_pairs,
+            max_pair_tokens=args.max_pair_tokens,
+            limit=args.limit,
+            seed=args.seed,
+            deadline_seconds=args.deadline_seconds,
+            flush_every_pairs=args.flush_every_pairs,
+            raw_topk=args.raw_topk,
+            keep_baseline_rows=args.keep_baseline_rows,
+            delta_windows=tuple(args.delta_windows),
+            sampling_budget=sampling_budget,
+        )
+    )
+
+
+def _dispatch_patch_decode(args: argparse.Namespace, *, episode_dir: Path, raw_dir: Path) -> None:
+    run_patch_decode(
+        PatchDecodeArgs(
+            model_id=args.model_id,
+            episode_dir=episode_dir,
+            out_dir=args.out_dir,
+            raw_dir=raw_dir,
+            sweep_raw_path=args.sweep_raw_path,
+            axes_path=(
+                args.axes_path if args.axes_path is not None else raw_dir / "concept_axes.local.pt"
+            ),
+            concepts=tuple(args.concepts),
+            pooling=args.pooling,
+            decode_windows=tuple(args.decode_windows),
+            decode_layers=tuple(args.decode_layers),
+            n_fit_pairs=args.n_fit_pairs,
+            max_fit_prompts=args.max_fit_prompts,
+            max_seq_len=args.max_seq_len,
+            max_seq_len_ceiling=args.max_seq_len_ceiling,
+            dim_batch=args.dim_batch,
+            top_k=args.top_k,
+            n_layers=args.n_layers,
+            seed=args.seed,
+            deadline_seconds=args.deadline_seconds,
+            lens_path=args.lens_path,
+            lens_fit_corpus_path=args.lens_fit_corpus,
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Dispatch a stage. Every stage is GPU-only; the offline tests cover the pure helpers only."""
     args = _parse_args(argv)
@@ -4532,21 +4716,7 @@ def main(argv: list[str] | None = None) -> None:
         # Dispatched ahead of the episode-dir resolution below because it is the one stage that
         # materialises no stimuli -- it builds its axes from the concept sentence pairs -- so
         # resolving one would leave an empty mkdtemp behind on every invocation.
-        sampling_budget = _axis_probe_sampling_budget(args)
-        run_axis_probe(
-            AxisProbeArgs(
-                model_id=args.model_id,
-                out_dir=args.out_dir,
-                concepts=tuple(args.concepts),
-                poolings=tuple(args.poolings),
-                limit=args.limit,
-                layer_stride=args.layer_stride,
-                batch_size=args.batch_size,
-                n_placebos=args.n_placebos,
-                probe_config=ProbeConfig(seed=args.seed),
-                sampling_budget=sampling_budget,
-            )
-        )
+        _dispatch_axis_probe(args)
         return
     raw_dir = args.raw_dir if args.raw_dir is not None else args.out_dir / "raw"
     episode_dir = _resolve_episode_dir(args.episode_dir)
@@ -4555,143 +4725,23 @@ def main(argv: list[str] | None = None) -> None:
         require_raw_dir_outside_episode_dir(raw_dir, episode_dir)
         sampling_budget = _sampling_budget_for_stage(args, episode_dir)
     if args.command == "fit-lens":
-        run_fit_lens(
-            FitLensArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                limit=args.limit,
-                max_fit_prompts=args.max_fit_prompts,
-                max_seq_len=args.max_seq_len,
-                max_seq_len_ceiling=args.max_seq_len_ceiling,
-                reasoning_prompts=args.reasoning_prompts,
-                reasoning_sampling=sampling_from_args(
-                    args, max_new_tokens=args.reasoning_max_new_tokens
-                ),
-                recon_eval_prompts=args.recon_eval_prompts,
-                recon_max_positions=args.recon_max_positions,
-                gen_engine=args.gen_engine,
-                vllm_gpu_fraction=args.vllm_gpu_fraction,
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_fit_lens(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "contrast":
-        run_contrast(
-            ContrastArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                validated_eval_dirs=_validated_eval_dirs(args),
-                poolings=tuple(args.poolings),
-                variants=tuple(args.variants),
-                window_length=args.window_length,
-                limit=args.limit,
-                n_placebos=args.n_placebos,
-                seed=args.seed,
-                sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
-                deadline_seconds=args.deadline_seconds,
-                gen_engine=args.gen_engine,
-                vllm_gpu_fraction=args.vllm_gpu_fraction,
-                gen_batch_pairs=args.gen_batch_pairs,
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_contrast(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "steer-patch":
-        run_steer_patch(
-            SteerPatchArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                peak_layers_path=args.peak_layers_path,
-                axes_path=(
-                    args.axes_path
-                    if args.axes_path is not None
-                    else raw_dir / "concept_axes.local.pt"
-                ),
-                concepts=tuple(args.concepts),
-                variant=args.variant,
-                pooling=args.pooling,
-                alpha_scales=tuple(args.alpha_scales),
-                n_placebos=args.n_placebos,
-                n_steer_prompts=args.n_steer_prompts,
-                n_patch_pairs=args.n_patch_pairs,
-                max_patch_positions=args.max_patch_positions,
-                seed=args.seed,
-                sampling=sampling_from_args(args, max_new_tokens=args.max_new_tokens),
-                deadline_seconds=args.deadline_seconds,
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_steer_patch(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "patch-sweep":
-        run_patch_sweep(
-            PatchSweepArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                peak_layers_path=args.peak_layers_path,
-                axes_path=(
-                    args.axes_path
-                    if args.axes_path is not None
-                    else raw_dir / "concept_axes.local.pt"
-                ),
-                concepts=tuple(args.concepts),
-                readout_modes=tuple(args.readout_modes),
-                option_orders=tuple(args.option_orders),
-                readout_thinking=args.readout_thinking,
-                variant=args.variant,
-                pooling=args.pooling,
-                patch_layers=tuple(args.patch_layers),
-                layer_chunk=args.layer_chunk,
-                tail_widths=tuple(args.tail_widths),
-                head_widths=tuple(args.head_widths),
-                directions=tuple(args.patch_directions),
-                modes=tuple(args.patch_modes),
-                n_patch_pairs=args.n_patch_pairs,
-                max_pair_tokens=args.max_pair_tokens,
-                limit=args.limit,
-                seed=args.seed,
-                deadline_seconds=args.deadline_seconds,
-                flush_every_pairs=args.flush_every_pairs,
-                raw_topk=args.raw_topk,
-                keep_baseline_rows=args.keep_baseline_rows,
-                delta_windows=tuple(args.delta_windows),
-                sampling_budget=sampling_budget,
-            )
+        _dispatch_patch_sweep(
+            args, episode_dir=episode_dir, raw_dir=raw_dir, sampling_budget=sampling_budget
         )
     elif args.command == "patch-decode":
-        run_patch_decode(
-            PatchDecodeArgs(
-                model_id=args.model_id,
-                episode_dir=episode_dir,
-                out_dir=args.out_dir,
-                raw_dir=raw_dir,
-                sweep_raw_path=args.sweep_raw_path,
-                axes_path=(
-                    args.axes_path
-                    if args.axes_path is not None
-                    else raw_dir / "concept_axes.local.pt"
-                ),
-                concepts=tuple(args.concepts),
-                pooling=args.pooling,
-                decode_windows=tuple(args.decode_windows),
-                decode_layers=tuple(args.decode_layers),
-                n_fit_pairs=args.n_fit_pairs,
-                max_fit_prompts=args.max_fit_prompts,
-                max_seq_len=args.max_seq_len,
-                max_seq_len_ceiling=args.max_seq_len_ceiling,
-                dim_batch=args.dim_batch,
-                top_k=args.top_k,
-                n_layers=args.n_layers,
-                seed=args.seed,
-                deadline_seconds=args.deadline_seconds,
-                lens_path=args.lens_path,
-                lens_fit_corpus_path=args.lens_fit_corpus,
-            )
-        )
+        _dispatch_patch_decode(args, episode_dir=episode_dir, raw_dir=raw_dir)
 
 
 if __name__ == "__main__":
