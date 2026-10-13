@@ -2081,6 +2081,7 @@ def test_code_identity_lists_follow_the_live_detector_boundary() -> None:
         "reward_hacking/ladder/exposure.py",
         "reward_hacking/ladder/rungs.py",
         "reward_hacking/ladder/runner.py",
+        "reward_hacking/ladder/records.py",
         "reward_hacking/ladder/rescore.py",
         "reward_hacking/ladder/concealment_judge.py",
         "reward_hacking/ladder/counterfactual.py",
