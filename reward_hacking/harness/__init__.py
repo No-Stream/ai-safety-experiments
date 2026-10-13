@@ -22,6 +22,7 @@ report a pass, so those signals outrank ``true_pass`` when the detector assigns 
 
 from __future__ import annotations
 
+from reward_hacking.harness.cli import harness_sampling_base
 from reward_hacking.harness.hack_detector import (
     EpisodeAssessment,
     HackLabel,
@@ -38,7 +39,6 @@ from reward_hacking.harness.loop import (
     compose_episode_id,
     count_fabricated_result_envelopes,
     grader_reported_success,
-    harness_sampling_base,
     lay_down_task,
     load_traces,
     new_episode_token,

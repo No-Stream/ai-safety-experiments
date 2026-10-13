@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from reward_hacking.organism_rl import generate
+from reward_hacking.organism_rl import generate, generate_provenance
 from reward_hacking.tests.test_organism_rl_generate import SyntheticEpisodeSource
 
 if TYPE_CHECKING:
@@ -172,7 +172,7 @@ def test_task_sample_exclusion_snapshot_freezes_and_rejects_new_selection_collis
     )
     assert selected == (("task-b", 0),)
     provenance: dict[str, object] = {
-        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
         "flags": {"cell": "synthetic"},
         "task_sample_exclusion": {
             "schema_version": 1,
@@ -224,7 +224,7 @@ def test_generate_episodes_uses_selected_sample_indexes_and_deterministic_seeds(
     )
     selected_samples = (("task-b", 0), ("task-a", 1))
     provenance: dict[str, object] = {
-        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
         "flags": {"cell": "synthetic"},
         "task_sample_exclusion": {"schema_version": 1, "task_samples": []},
         "task_sample_selection": [
@@ -423,7 +423,7 @@ def test_exclusion_snapshot_keeps_resume_selection_stable_when_source_grows(tmp_
     ]
     assert snapshot is not None
     provenance = {
-        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
         "flags": {"family": "synthetic"},
         "task_id_exclusion": {
             "schema_version": 1,
@@ -557,7 +557,7 @@ def _make_legacy_task_id_stage(
     assert len(record_lines) == 8
 
     document = json.loads(provenance_path.read_text(encoding="utf-8"))
-    assert document["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION
+    assert document["schema_version"] == generate_provenance.PROVENANCE_SCHEMA_VERSION
     provenance = cast("dict[str, object]", document["provenance"])
     flags = cast("dict[str, object]", provenance["flags"])
     assert flags["samples_per_task"] == 1
@@ -639,8 +639,8 @@ def _sample_stage_provenance(
     exclusion_snapshot: tuple[tuple[str, int], ...] | None = None,
 ) -> dict[str, object]:
     provenance: dict[str, object] = {
-        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
-        "record_schema": generate.RECORD_SCHEMA_VERSION,
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
+        "record_schema": generate_provenance.RECORD_SCHEMA_VERSION,
         "flags": {
             "model": "synthetic-model",
             "temperature": 1.0,
@@ -962,7 +962,7 @@ def test_resume_uses_exclusion_snapshot_and_generates_only_remaining_tasks(tmp_p
         generate.TaskSpec(task_id, "ilcb", "oneoff") for task_id in selected_task_ids
     )
     provenance: dict[str, object] = {
-        "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
         "flags": {"cell": "synthetic"},
         "task_id_exclusion": {"schema_version": 1, "task_ids": list(snapshot)},
         "task_selection_order": list(selected_task_ids),

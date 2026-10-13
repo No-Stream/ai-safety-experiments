@@ -30,7 +30,8 @@ from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, replay_ladder_com
 from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.ladder.tools import contains_submit_marker
 from reward_hacking.organism_reward import score_impossible_task
-from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION, require_gitignored_output_dir
+from reward_hacking.organism_rl.generate import require_gitignored_output_dir
+from reward_hacking.organism_rl.generate_provenance import RECORD_SCHEMA_VERSION
 from reward_hacking.organism_rl.rollout import (
     _task_submission_grader,  # pyright: ignore[reportPrivateUsage]
     task_definition_content,

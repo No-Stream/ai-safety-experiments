@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import pytest
 from conftest import needs_jail
 
-from reward_hacking.harness import loop as harness_loop
+from reward_hacking.harness import cli
 from reward_hacking.harness import tasks_ilcb as tasks_ilcb_module
 from reward_hacking.harness.ilcb_split import (
     deterministic_problem_split,
@@ -217,16 +217,16 @@ def test_agentic_loop_selection_requires_a_partition_with_variant(
         selected.append((impossible_type, partition))
         return ()
 
-    monkeypatch.setattr(harness_loop, "ilcb_tasks", fake_ilcb_tasks)
+    monkeypatch.setattr(cli, "ilcb_tasks", fake_ilcb_tasks)
 
-    assert harness_loop._select_tasks(None, "oneoff", "train") == ()
+    assert cli._select_tasks(None, "oneoff", "train") == ()
     assert selected == [("oneoff", "train")]
     with pytest.raises(ValueError, match="requires --ilcb-split"):
-        harness_loop._select_tasks(None, None, "train")
+        cli._select_tasks(None, None, "train")
     with pytest.raises(ValueError, match="cannot combine"):
-        harness_loop._select_tasks(["sum-ledger"], "oneoff", "train")
+        cli._select_tasks(["sum-ledger"], "oneoff", "train")
 
-    args = harness_loop._parse_args(
+    args = cli._parse_args(
         ["--backend", "mock", "--ilcb-split", "oneoff", "--ilcb-partition", "train"]
     )
     assert args.ilcb_split == "oneoff"

@@ -42,7 +42,7 @@ from reward_hacking.ladder.tools import (
 )
 from reward_hacking.math_data import DATA_PATH as MATH_DATA_PATH
 from reward_hacking.model_backend import validate_thinking_budget_sampling
-from reward_hacking.organism_rl import generate
+from reward_hacking.organism_rl import generate, generate_provenance
 from reward_hacking.organism_rl.adapter_identity import adapter_sha256 as _adapter_sha256
 from reward_hacking.organism_rl.generate import TaskSpec
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
@@ -898,8 +898,8 @@ def _reuse_identity_differences(
         normalized_expected.pop("task_prompt_content", None)
     if "task_prompt_content" not in normalized_expected:
         normalized_stored.pop("task_prompt_content", None)
-    generate.normalize_task_prompt_identity(normalized_expected, normalized_stored)
-    generate.normalize_task_definition_identity(normalized_expected, normalized_stored)
+    generate_provenance.normalize_task_prompt_identity(normalized_expected, normalized_stored)
+    generate_provenance.normalize_task_definition_identity(normalized_expected, normalized_stored)
     return _mapping_differences(normalized_expected, normalized_stored)
 
 
@@ -1086,7 +1086,7 @@ def _validate_completed_reuse_provenance(
     expected_identity: Mapping[str, object],
 ) -> None:
     provenance_document: object = json.loads(
-        generate.active_provenance_path(target_dir).read_text(encoding="utf-8")
+        generate_provenance.active_provenance_path(target_dir).read_text(encoding="utf-8")
     )
     if not isinstance(provenance_document, Mapping):
         raise TypeError("completed reuse provenance must be an object")
@@ -1151,7 +1151,7 @@ def _recover_legacy_reuse_evidence(
     stored_definitions = stored.get("task_definition_content", {})
     if not isinstance(stored_definitions, Mapping):
         raise TypeError("stored task definition content must be an object")
-    headers = generate.legacy_leak_headers(source_dir)
+    headers = generate_provenance.legacy_leak_headers(source_dir)
     current_fields: dict[str, object] = {}
     saved_fields: dict[str, object] = {}
     for task_id, content in current_definitions.items():
@@ -1166,7 +1166,9 @@ def _recover_legacy_reuse_evidence(
         if not isinstance(metadata, Mapping):
             raise TypeError("task host metadata must be an object")
         available = {
-            key: header[key] for key in generate.LEGACY_LEAK_SEMANTIC_FIELDS if key in header
+            key: header[key]
+            for key in generate_provenance.LEGACY_LEAK_SEMANTIC_FIELDS
+            if key in header
         }
         if available:
             saved_fields[task_id] = available
@@ -1180,7 +1182,7 @@ def _read_reuse_source(
     source_dir: Path,
     request: _ReuseCellRequest,
 ) -> tuple[Mapping[str, object], Mapping[str, object] | None, list[str]]:
-    provenance_path = generate.active_provenance_path(source_dir)
+    provenance_path = generate_provenance.active_provenance_path(source_dir)
     source_document: object = json.loads(provenance_path.read_text(encoding="utf-8"))
     if not isinstance(source_document, Mapping):
         raise TypeError("reused provenance must be an object")
@@ -1300,7 +1302,7 @@ def _normalize_reused_record(
         "locator": "before_episode_summary",
     }
     record["trace_path"] = target_trace_path
-    record["record_schema"] = generate.RECORD_SCHEMA_VERSION
+    record["record_schema"] = generate_provenance.RECORD_SCHEMA_VERSION
     record["task_kind"] = generate.task_kind_for("r2e_leak", "leak")
 
 
@@ -1388,7 +1390,7 @@ def _publish_reused_cell(
         _write_json(
             staging_dir / "provenance.json",
             {
-                "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+                "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
                 "provenance": saved_provenance,
                 "provenance_sha256": _canonical_sha256(saved_provenance),
             },
@@ -1469,6 +1471,7 @@ def _evaluation_provenance(
             for relative_path in (
                 "reward_hacking/organism_rl/evaluate.py",
                 "reward_hacking/organism_rl/generate.py",
+                "reward_hacking/organism_rl/generate_provenance.py",
                 "reward_hacking/ladder/loop.py",
                 "reward_hacking/ladder/tools.py",
                 "reward_hacking/ladder/thinking.py",
@@ -1479,6 +1482,7 @@ def _evaluation_provenance(
                 "reward_hacking/harness/leak_channels.py",
                 "reward_hacking/harness/leak_detector.py",
                 "reward_hacking/harness/docker_backend.py",
+                "reward_hacking/harness/cli.py",
                 "reward_hacking/harness/loop.py",
                 "reward_hacking/organism_rl/leak_selection.py",
                 "reward_hacking/organism_rl/leak_assets.py",
@@ -1487,7 +1491,7 @@ def _evaluation_provenance(
                 "reward_hacking/math_etl.py",
             )
         },
-        "run_context": generate.build_launch_context(endpoint, args.max_model_len),
+        "run_context": generate_provenance.build_launch_context(endpoint, args.max_model_len),
     }
     if "r2e_leak" in args.families:
         provenance["leak_task_source"] = leak_task_source_metadata(

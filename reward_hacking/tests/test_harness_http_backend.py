@@ -9,7 +9,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
-from reward_hacking.harness import loop
+from reward_hacking.harness import cli
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 
 if TYPE_CHECKING:
@@ -38,7 +38,7 @@ def test_harness_builds_vllm_http_backend_with_cli_sampling_and_stop(
     tokenizer_path: Path,
 ) -> None:
     """The harness passes its run-block stop and local sampler to the external server backend."""
-    args = loop._parse_args(
+    args = cli._parse_args(
         [
             "--backend",
             "vllm-http",
@@ -57,8 +57,8 @@ def test_harness_builds_vllm_http_backend_with_cli_sampling_and_stop(
             "16384",
         ]
     )
-    served = loop.served_model_from_args(args)
-    backend = loop._build_cli_backend(args, served)
+    served = cli.served_model_from_args(args)
+    backend = cli._build_cli_backend(args, served)
 
     assert isinstance(backend, VLLMHTTPBackend)
     assert backend.model_id == str(tokenizer_path)
@@ -75,35 +75,35 @@ def test_harness_builds_vllm_http_backend_with_cli_sampling_and_stop(
 
 def test_harness_refuses_full_weights_for_vllm_http() -> None:
     """An external server owns its weights, so the harness must reject a full-weight request."""
-    args = loop._parse_args(
+    args = cli._parse_args(
         ["--backend", "vllm-http", "--model-id", "synthetic", "--vllm-http-url", "http://server"]
     )
-    served = loop.ServedModel(
+    served = cli.ServedModel(
         model_id="synthetic@revision",
         load_mode="full-weights",
         adapter_dir=None,
     )
     with pytest.raises(ValueError, match="full-weights"):
-        loop._build_cli_backend(args, served)
+        cli._build_cli_backend(args, served)
 
 
 def test_harness_requires_the_http_endpoint_url(tokenizer_path: Path) -> None:
     """A missing endpoint must fail before a server request can be attempted."""
-    args = loop._parse_args(["--backend", "vllm-http", "--model-id", str(tokenizer_path)])
+    args = cli._parse_args(["--backend", "vllm-http", "--model-id", str(tokenizer_path)])
     with pytest.raises(ValueError, match="requires --vllm-http-url"):
-        loop._build_cli_backend(args, loop.served_model_from_args(args))
+        cli._build_cli_backend(args, cli.served_model_from_args(args))
 
 
 def test_http_endpoint_flag_is_refused_on_other_backends() -> None:
     """An endpoint flag on a local in-process backend must not be silently ignored."""
-    args = loop._parse_args(["--backend", "mock", "--vllm-http-url", "http://127.0.0.1:8000"])
+    args = cli._parse_args(["--backend", "mock", "--vllm-http-url", "http://127.0.0.1:8000"])
     with pytest.raises(ValueError, match="--vllm-http-url"):
-        loop._build_cli_backend(args)
+        cli._build_cli_backend(args)
 
 
 def test_http_backend_refuses_in_process_engine_controls(tokenizer_path: Path) -> None:
     """An external server owns engine sizing, so local vLLM controls must fail loudly."""
-    args = loop._parse_args(
+    args = cli._parse_args(
         [
             "--backend",
             "vllm-http",
@@ -116,14 +116,14 @@ def test_http_backend_refuses_in_process_engine_controls(tokenizer_path: Path) -
         ]
     )
     with pytest.raises(ValueError, match="--vllm-max-num-seqs"):
-        loop._build_cli_backend(args)
+        cli._build_cli_backend(args)
 
 
 def test_http_backend_refuses_adapter_kwargs() -> None:
     """A runtime adapter belongs to the external server configuration, not this client."""
-    args = loop._parse_args(["--backend", "vllm-http", "--vllm-http-url", "http://127.0.0.1:8000"])
+    args = cli._parse_args(["--backend", "vllm-http", "--vllm-http-url", "http://127.0.0.1:8000"])
     with pytest.raises(ValueError, match="adapter"):
-        loop.backend_cli.backend_from_args(
+        cli.backend_cli.backend_from_args(
             args,
             "synthetic",
             extra_kwargs={"lora_adapter": "synthetic-adapter", "enable_lora": True},

@@ -20,7 +20,7 @@ from conftest import needs_jail
 from games.eval_model import LOAD_MODE_BASE, LOAD_MODE_RUNTIME_ADAPTER, ServedModel
 from reward_hacking import train_eval
 from reward_hacking.harness.analyze_ilcb import glob_trace_paths
-from reward_hacking.harness.loop import MOCK_RESPONSES
+from reward_hacking.harness.cli import MOCK_RESPONSES
 from reward_hacking.harness.protocol import RUN_BLOCK_STOP
 from reward_hacking.harness.task_spec import BASELINE_ARM
 from reward_hacking.harness.tasks_ilcb import ILCB_TASKS_BY_ID

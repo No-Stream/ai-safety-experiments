@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from reward_hacking import jailed_poc
-from reward_hacking.harness import loop
+from reward_hacking.harness import cli, loop
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -114,10 +114,10 @@ def test_cli_records_and_passes_the_resolved_mode(
         return []
 
     monkeypatch.setattr(jailed_poc.subprocess, "run", probe)
-    monkeypatch.setattr(loop, "run_tasks", run_tasks)
+    monkeypatch.setattr(cli, "run_tasks", run_tasks)
     out = tmp_path / "run.jsonl"
     assert (
-        loop.main(
+        cli.main(
             [
                 "--backend",
                 "mock",
@@ -141,7 +141,7 @@ def test_cli_records_and_passes_the_resolved_mode(
 def test_resume_refuses_a_different_resource_mode(tmp_path: Path) -> None:
     trace_path = tmp_path / "trace.jsonl"
     header: dict[str, object] = {
-        "record": loop.RUN_HEADER_RECORD,
+        "record": cli.RUN_HEADER_RECORD,
         "arm": loop.BASELINE_ARM.to_json_dict(),
         "resource_limits": jailed_poc.JailResourceLimits().to_json_dict(),
     }
@@ -153,7 +153,7 @@ def test_resume_refuses_a_different_resource_mode(tmp_path: Path) -> None:
         ).to_json_dict(),
     }
     with pytest.raises(ValueError, match="resource_limits"):
-        loop.completed_episodes_for_resume(
+        cli.completed_episodes_for_resume(
             trace_path, model_id="mock", arm=loop.BASELINE_ARM, header=advisory_header
         )
 
