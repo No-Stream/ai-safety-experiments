@@ -204,6 +204,10 @@ def write_checks(run_dir: Path) -> None:
         )
         checks[str(round_number)] = {
             "passes": passes,
+            **{
+                field: sum(sample[field] for sample in samples)
+                for field in ("kept_turn_count", "discarded_turn_count", "discarded_token_count")
+            },
             "teacher_equals_student_near_zero": self_equal,
             "self_control_adapter_matched": round_number == 0,
             "strategy_census_written": True,

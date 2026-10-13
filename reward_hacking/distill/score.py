@@ -9,7 +9,7 @@ import logging
 import math
 import os
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -19,6 +19,7 @@ from reward_hacking.distill.sample import (
     TorchRuntime,
     token_ids_sha256,
 )
+from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 
 if TYPE_CHECKING:
@@ -65,6 +66,7 @@ class TeacherScoringEngine(Protocol):
         *,
         sampling_params: object,
         use_tqdm: bool,
+        lora_request: object | None = None,
     ) -> Sequence[TeacherRequestOutput]:
         """Generate one token and return logprobs at prompt positions."""
         ...
@@ -125,6 +127,22 @@ class ScoreResult:
     output_path: Path
     generated_count: int
     resumed_count: int
+
+
+@dataclass(slots=True)
+class TeacherScoringRuntime:
+    """One lazily loaded engine shared by bounded chunks at a fixed context capacity."""
+
+    max_model_len: int
+    engine: TeacherScoringEngine | None = field(default=None, init=False)
+    sampling_params: object | None = field(default=None, init=False)
+    generation_kwargs: dict[str, Any] = field(default_factory=dict, init=False)
+    engine_identity: str | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        """Reject invalid capacities before any model allocation."""
+        if type(self.max_model_len) is not int or self.max_model_len < 1:
+            raise ValueError("runtime max_model_len must be a positive integer")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -291,18 +309,26 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     output_path: Path,
     teacher_prompts_path: Path | None = None,
     model: str = DEFAULT_TEACHER_MODEL_ID,
+    model_revision: str | None = None,
+    adapter: Path | None = None,
+    quantization: str | None = None,
     language_model_only: bool = False,
     kv_cache_dtype: str | None = None,
     max_num_seqs: int | None = None,
     score_batch_size: int = SCORE_BATCH_SIZE,
+    runtime: TeacherScoringRuntime | None = None,
+    compact_context: bool = False,
     interrupt_after_first_record: Path | None = None,
     llm_class: Callable[..., object] | None = None,
     sampling_params_class: Callable[..., object] | None = None,
     torch_module: TorchRuntime | None = None,
+    lora_request_class: Callable[..., object] | None = None,
 ) -> ScoreResult:
     """Score every unscored sample and append one teacher record per completed key."""
     if score_batch_size < 1:
         raise ValueError("score_batch_size must be positive")
+    if adapter is not None and not adapter.is_dir():
+        raise FileNotFoundError(f"LoRA adapter directory does not exist: {adapter}")
     environment_marker = os.environ.get("OPD_SMOKE_INTERRUPT_MARKER")
     interrupt_marker = interrupt_after_first_record or (
         Path(environment_marker) if environment_marker else None
@@ -359,6 +385,10 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     max_model_len = (
         math.ceil((longest_sequence_length + 1) / MODEL_LENGTH_MULTIPLE) * MODEL_LENGTH_MULTIPLE
     )
+    if runtime is not None:
+        max_model_len = runtime.max_model_len
+        if longest_sequence_length + 1 > max_model_len:
+            raise ValueError("sample sequence exceeds scoring runtime capacity")
     scoring_identity = hashlib.sha256(
         json.dumps(
             {
@@ -368,6 +398,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 if teacher_prompts_path is not None
                 else None,
                 "model": model,
+                **({"model_revision": model_revision} if model_revision is not None else {}),
                 "language_model_only": language_model_only,
                 "kv_cache_dtype": kv_cache_dtype,
                 "max_num_seqs": max_num_seqs,
@@ -383,10 +414,30 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     ).hexdigest()
 
     weight_identity = model_identity(model)
+    adapter_identity = model_identity(str(adapter)) if adapter is not None else None
     scoring_settings = {
         "language_model_only": language_model_only,
         "kv_cache_dtype": kv_cache_dtype,
     }
+    if model_revision is not None:
+        scoring_settings["model_revision"] = model_revision
+    if quantization is not None:
+        scoring_settings["quantization"] = quantization
+
+    engine_identity = hashlib.sha256(
+        json.dumps(
+            {
+                "model_identity": weight_identity,
+                "adapter_identity": adapter_identity,
+                "scoring_settings": scoring_settings,
+                "max_model_len": max_model_len,
+                "max_num_seqs": max_num_seqs,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+    if runtime is not None and runtime.engine_identity not in (None, engine_identity):
+        raise ValueError("scoring runtime engine settings differ from current request")
 
     existing_rows = _read_jsonl(output_path) if output_path.exists() else []
     completed: set[str] = set()
@@ -396,19 +447,46 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
             raise ValueError(f"teacher output contains unexpected key {key!r}")
         if key in completed:
             raise ValueError(f"teacher output contains duplicate key {key!r}")
-        if (
-            row.get("completion_token_ids") != samples_by_key[key]["completion_token_ids"]
-            or row.get("prompt_token_ids") != samples_by_key[key]["prompt_token_ids"]
-        ):
+        sample = samples_by_key[key]
+        compact_row = row.get("context_storage") == "sha256"
+        if row.get("completion_token_ids") != sample["completion_token_ids"]:
+            raise ValueError(f"teacher row {key!r} token ids differ from current sample")
+        if compact_row:
+            if (
+                row.get("prompt_token_ids_sha256")
+                != token_ids_sha256(sample["prompt_token_ids"], [])
+                or row.get("token_ids_sha256") != sample["token_ids_sha256"]
+                or row.get("scoring_identity") != scoring_identity
+                or row.get("scoring_settings") != scoring_settings
+            ):
+                raise ValueError(f"teacher row {key!r} compact context or settings differ")
+        elif row.get("prompt_token_ids") != sample["prompt_token_ids"]:
             raise ValueError(f"teacher row {key!r} token ids differ from current sample")
         if not recorded_model_matches(row, model, identity=weight_identity):
             raise ValueError(f"teacher row {key!r} was scored by a different model")
-        if "scoring_settings" in row and row["scoring_settings"] != scoring_settings:
+        if (adapter is not None or "adapter" in row) and not recorded_model_matches(
+            row,
+            str(adapter) if adapter is not None else None,
+            field="adapter",
+            identity=adapter_identity,
+        ):
+            raise ValueError(f"teacher row {key!r} was scored by a different adapter")
+        if (model_revision is not None or "scoring_settings" in row) and row.get(
+            "scoring_settings"
+        ) != scoring_settings:
             raise ValueError(f"teacher row {key!r} scoring settings differ from current engine")
         if teacher_prefixes is not None or "teacher_prompt_token_ids" in samples_by_key[key]:
-            if row.get("teacher_prompt_token_ids") != scoring_prefixes[key]:
+            if compact_row:
+                prefix_matches = row.get("teacher_prompt_token_ids_sha256") == token_ids_sha256(
+                    scoring_prefixes[key], []
+                ) and row.get("teacher_token_ids_sha256") == token_ids_sha256(
+                    scoring_prefixes[key], sample["completion_token_ids"]
+                )
+            else:
+                prefix_matches = row.get("teacher_prompt_token_ids") == scoring_prefixes[key]
+            if not prefix_matches:
                 raise ValueError(f"teacher row {key!r} teacher context tokens differ")
-        elif "teacher_prompt_token_ids" in row:
+        elif "teacher_prompt_token_ids" in row or "teacher_prompt_token_ids_sha256" in row:
             raise ValueError(f"teacher row {key!r} was scored with a separate teacher context")
         sample_mask = _completion_loss_mask(
             samples_by_key[key], len(samples_by_key[key]["completion_token_ids"])
@@ -421,57 +499,89 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     pending_rows = [row for key, row in samples_by_key.items() if key not in completed]
     resumed_count = len(completed)
     if pending_rows:
-        if llm_class is None or sampling_params_class is None:
-            from vllm import LLM, SamplingParams  # noqa: PLC0415
+        active_runtime = runtime or TeacherScoringRuntime(max_model_len=max_model_len)
+        if active_runtime.engine is None:
+            if llm_class is None or sampling_params_class is None:
+                from vllm import LLM, SamplingParams  # noqa: PLC0415
 
-            llm_class = llm_class or cast("Callable[..., object]", LLM)
-            sampling_params_class = sampling_params_class or cast(
-                "Callable[..., object]", SamplingParams
+                llm_class = llm_class or cast("Callable[..., object]", LLM)
+                sampling_params_class = sampling_params_class or cast(
+                    "Callable[..., object]", SamplingParams
+                )
+            if torch_module is None:
+                import torch  # noqa: PLC0415
+
+                torch_module = cast("TorchRuntime", torch)
+
+            if not torch_module.cuda.is_available():
+                raise RuntimeError("vLLM scoring requires a CUDA device")
+            gpu_memory_utilization = cap_gpu_memory_utilization(
+                torch_module,
+                1.0,
+                margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION,
+                reserve_bytes=prompt_logprob_headroom_bytes(),
             )
-        if torch_module is None:
-            import torch  # noqa: PLC0415
+            device_name = str(
+                torch_module.cuda.get_device_name(int(torch_module.cuda.current_device()))
+            )
+            engine_kwargs: dict[str, object] = {
+                "model": model,
+                "tensor_parallel_size": 1,
+                "gpu_memory_utilization": gpu_memory_utilization,
+                "max_model_len": max_model_len,
+                "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+            }
+            if model_revision is not None:
+                engine_kwargs["revision"] = model_revision
+                engine_kwargs["tokenizer_revision"] = model_revision
+            if language_model_only:
+                engine_kwargs["language_model_only"] = True
+            if kv_cache_dtype is not None:
+                engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+            if max_num_seqs is not None:
+                engine_kwargs["max_num_seqs"] = max_num_seqs
+            if quantization is not None:
+                engine_kwargs["quantization"] = quantization
+            if adapter is not None:
+                engine_kwargs.update(
+                    enable_lora=True, max_lora_rank=64, max_loras=1, max_cpu_loras=1
+                )
+            engine = cast("TeacherScoringEngine", llm_class(**engine_kwargs))
+            generation_kwargs: dict[str, Any] = {}
+            if adapter is not None:
+                if lora_request_class is None:
+                    from vllm.lora.request import LoRARequest  # noqa: PLC0415
 
-            torch_module = cast("TorchRuntime", torch)
-
-        if not torch_module.cuda.is_available():
-            raise RuntimeError("vLLM scoring requires a CUDA device")
-        gpu_memory_utilization = cap_gpu_memory_utilization(
-            torch_module,
-            1.0,
-            margin_fraction=VLLM_FREE_MEMORY_MARGIN_FRACTION,
-            reserve_bytes=prompt_logprob_headroom_bytes(),
-        )
-        device_name = str(torch_module.cuda.get_device_name(torch_module.cuda.current_device()))
+                    lora_request_class = cast("Callable[..., object]", LoRARequest)
+                served_adapter = prepare_vllm_serving_adapter(
+                    adapter, output_path.parent / f"{output_path.stem}.vllm-adapter"
+                )
+                generation_kwargs["lora_request"] = lora_request_class(
+                    model, 1, str(served_adapter)
+                )
+            sampling_params = sampling_params_class(
+                max_tokens=1, temperature=1.0, prompt_logprobs=TOP_K
+            )
+            logger.info(
+                "scoring teacher=%s samples=%d max_model_len=%d gpu_memory_utilization=%.4f device=%s",
+                model,
+                len(pending_rows),
+                max_model_len,
+                gpu_memory_utilization,
+                device_name,
+            )
+            active_runtime.engine = engine
+            active_runtime.sampling_params = sampling_params
+            active_runtime.generation_kwargs = generation_kwargs
+            active_runtime.engine_identity = engine_identity
+        engine = active_runtime.engine
+        sampling_params = active_runtime.sampling_params
+        generation_kwargs = active_runtime.generation_kwargs
         prompt_token_sequences = [
             scoring_prefixes[str(row["key"])]
             + _token_ids(row, "completion_token_ids", str(row["key"]))
             for row in pending_rows
         ]
-        engine_kwargs: dict[str, object] = {
-            "model": model,
-            "tensor_parallel_size": 1,
-            "gpu_memory_utilization": gpu_memory_utilization,
-            "max_model_len": max_model_len,
-            "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
-        }
-        if language_model_only:
-            engine_kwargs["language_model_only"] = True
-        if kv_cache_dtype is not None:
-            engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
-        if max_num_seqs is not None:
-            engine_kwargs["max_num_seqs"] = max_num_seqs
-        engine = cast("TeacherScoringEngine", llm_class(**engine_kwargs))
-        sampling_params = sampling_params_class(
-            max_tokens=1, temperature=1.0, prompt_logprobs=TOP_K
-        )
-        logger.info(
-            "scoring teacher=%s samples=%d max_model_len=%d gpu_memory_utilization=%.4f device=%s",
-            model,
-            len(pending_rows),
-            max_model_len,
-            gpu_memory_utilization,
-            device_name,
-        )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         for batch_start in range(0, len(pending_rows), score_batch_size):
             batch_rows = pending_rows[batch_start : batch_start + score_batch_size]
@@ -482,6 +592,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 [{"prompt_token_ids": token_ids} for token_ids in batch_token_sequences],
                 sampling_params=sampling_params,
                 use_tqdm=False,
+                **generation_kwargs,
             )
             if len(outputs) != len(batch_rows):
                 raise RuntimeError(
@@ -516,14 +627,31 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     "top_ids": top_ids,
                     "top_logps": top_logps,
                 }
+                for field in ("hint_family", "hint_strength", "diagnostic_cell"):
+                    if field in row:
+                        score_record[field] = row[field]
                 if "loss_mask" in row:
                     score_record["loss_mask"] = row["loss_mask"]
+                if adapter is not None:
+                    score_record.update(adapter=str(adapter), adapter_identity=adapter_identity)
                 if teacher_prefixes is not None or "teacher_prompt_token_ids" in row:
                     score_record["teacher_prompt_token_ids"] = full_token_ids[:source_prompt_length]
                     score_record["teacher_token_ids_sha256"] = token_ids_sha256(
                         full_token_ids[:source_prompt_length], completion_token_ids
                     )
                     score_record["scoring_identity"] = scoring_identity
+                if compact_context:
+                    score_record["context_storage"] = "sha256"
+                    score_record["prompt_token_ids_sha256"] = token_ids_sha256(
+                        row["prompt_token_ids"], []
+                    )
+                    del score_record["prompt_token_ids"]
+                    score_record["scoring_identity"] = scoring_identity
+                    if "teacher_prompt_token_ids" in score_record:
+                        score_record["teacher_prompt_token_ids_sha256"] = token_ids_sha256(
+                            scoring_prefixes[key], []
+                        )
+                        del score_record["teacher_prompt_token_ids"]
                 _validate_score_record(score_record, len(completion_token_ids))
                 _append_jsonl(output_path, score_record)
                 _interrupt_after_persisted_record(output_path, interrupt_marker, engine)
@@ -545,12 +673,12 @@ def _sample_token_gaps(
 ) -> tuple[str, list[float]]:
     prompt_token_ids = _token_ids(sample, "prompt_token_ids", key)
     completion_token_ids = _token_ids(sample, "completion_token_ids", key)
-    for field, token_ids in (
+    for token_field, token_ids in (
         ("prompt_token_ids", prompt_token_ids),
         ("completion_token_ids", completion_token_ids),
     ):
-        if field in teacher and teacher[field] != token_ids:
-            raise ValueError(f"KL teacher row {key!r} {field} differs from sample")
+        if token_field in teacher and teacher[token_field] != token_ids:
+            raise ValueError(f"KL teacher row {key!r} {token_field} differs from sample")
     student_logps = sample.get("student_sampling_logps")
     teacher_logps = teacher.get("teacher_logps")
     if not isinstance(student_logps, list) or not isinstance(teacher_logps, list):
@@ -613,6 +741,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="teacher JSONL path, or existing teacher file with --kl-eval",
     )
     parser.add_argument("--model", default=DEFAULT_TEACHER_MODEL_ID)
+    parser.add_argument("--model-revision")
+    parser.add_argument("--adapter", type=Path)
+    parser.add_argument("--quantization")
     parser.add_argument(
         "--teacher-prompts", type=Path, help="JSONL teacher prefixes indexed by env and problem_id"
     )
@@ -633,6 +764,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_path=args.output,
         teacher_prompts_path=args.teacher_prompts,
         model=args.model,
+        model_revision=args.model_revision,
+        adapter=args.adapter,
+        quantization=args.quantization,
         language_model_only=args.language_model_only,
         kv_cache_dtype=args.kv_cache_dtype,
         max_num_seqs=args.max_num_seqs,

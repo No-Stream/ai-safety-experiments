@@ -448,6 +448,11 @@ def _round_summary(
         for row in kl_by_environment.values()
     )
     return {
+        **{
+            field: sum(int(row[field]) for row in samples)
+            for field in ("kept_turn_count", "discarded_turn_count", "discarded_token_count")
+            if field in samples[0]
+        },
         "round": round_number,
         "sample_count": sum(int(row["sample_count"]) for row in kl_by_environment.values()),
         "mean_completion_length": math.fsum(completion_lengths) / len(completion_lengths),

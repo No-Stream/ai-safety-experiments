@@ -93,6 +93,24 @@ class RoundReplay:
     trace_reader: Callable[..., Any]
 
 
+def _completion_counts(
+    trace_records: Sequence[Sequence[Mapping[str, Any]]],
+) -> dict[str, int]:
+    counts = {"kept_turn_count": 0, "discarded_turn_count": 0, "discarded_token_count": 0}
+    for trace in trace_records:
+        for turn in trace:
+            if turn.get("record") != "turn":
+                continue
+            discarded = episodes.is_discarded_completion(turn)
+            counts["discarded_turn_count" if discarded else "kept_turn_count"] += 1
+            if discarded:
+                token_ids = turn.get("completion_token_ids")
+                if not isinstance(token_ids, list):
+                    raise TypeError("discarded completion must contain recorded token IDs")
+                counts["discarded_token_count"] += len(token_ids)
+    return counts
+
+
 def strategy_census(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -139,6 +157,7 @@ def strategy_census(
         reasons.append("distinct_strategy_count_decreased")
     return {
         "episode_count": len(records),
+        **_completion_counts(trace_records or []),
         "hack_count": hack_count,
         "strategy_counts": dict(sorted(counts.items())),
         "distinct_strategies": distinct,

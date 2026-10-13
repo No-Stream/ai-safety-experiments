@@ -2,13 +2,18 @@
 
 import hashlib
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import torch
 
-from reward_hacking.distill.episodes import build_episode_row, build_opd_episode_row
+from reward_hacking.distill.episodes import (
+    build_episode_row,
+    build_opd_episode_row,
+    render_student_contexts,
+)
 from reward_hacking.distill.score import score_round
 from reward_hacking.distill.train import collate_completion, distillation_loss, load_training_rows
 from reward_hacking.tests.test_distill_episodes import (
@@ -339,4 +344,139 @@ def test_opd_refuses_reencoded_student_context_even_when_action_ids_match() -> N
             tokenizer=cast("Any", CharacterTokenizer()),
             teacher_hint_family="synthetic",
             teacher_hint_text="Synthetic teacher nudge.",
+        )
+
+
+def synthetic_discarded_opd_trace() -> tuple[dict[str, Any], list[dict[str, Any]], Any]:
+    record, trace, tokenizer = synthetic_multiturn_opd_trace()
+    first, last = trace[:2]
+    first["raw_completion"] = "Synthetic discarded completion." * 100
+    first["completion_token_ids"] = tokenizer.encode(first["raw_completion"])
+    first["completion_logprobs"] = [-0.1] * len(first["completion_token_ids"])
+    first.update(
+        runaway=True,
+        format_error="Response was too long and was discarded.",
+        stop_reason="max_tokens",
+    )
+    final_prompt = render_student_contexts(trace, tokenizer)[1]
+    last.update(
+        prompt_token_ids=tokenizer.encode(final_prompt),
+        rendered_prompt_text=final_prompt,
+        rendered_prompt_sha256=hashlib.sha256(final_prompt.encode()).hexdigest(),
+        prompt_tokens=len(tokenizer.encode(final_prompt)),
+    )
+    trace[-1]["final_report_prompt_sha256"] = hashlib.sha256(
+        (final_prompt + "Synthetic report prompt.").encode()
+    ).hexdigest()
+    return record, trace, tokenizer
+
+
+def test_opd_explicit_discard_uses_final_saved_sequence() -> None:
+    record, trace, tokenizer = synthetic_discarded_opd_trace()
+    first, last = trace[:2]
+    row: Any = build_opd_episode_row(
+        record,
+        trace,
+        tokenizer=tokenizer,
+        teacher_hint_family="synthetic",
+        teacher_hint_text="Synthetic nudge.",
+    )
+    assert (
+        row["prompt_token_ids"] + row["completion_token_ids"]
+        == last["prompt_token_ids"] + last["completion_token_ids"]
+    )
+    assert row["discarded_turn_count"] == 1
+    assert row["discarded_token_count"] == len(first["completion_token_ids"])
+    assert row["kept_turn_count"] == 1
+    assert sum(row["loss_mask"]) == len(last["completion_token_ids"])
+    assert {value for value in row["token_turn_indices"] if value >= 0} == {1}
+
+
+def test_opd_unmarked_divergence_still_raises() -> None:
+    record, trace, tokenizer = synthetic_multiturn_opd_trace()
+    trace[1]["prompt_token_ids"][len(trace[0]["prompt_token_ids"])] += 1
+    with pytest.raises(ValueError, match=r"preserve|prefix|diverg"):
+        build_opd_episode_row(
+            record,
+            trace,
+            tokenizer=tokenizer,
+            teacher_hint_family="synthetic",
+            teacher_hint_text="Synthetic nudge.",
+        )
+
+
+def test_opd_final_discard_is_present_but_has_no_training_density() -> None:
+    record, trace, tokenizer = synthetic_multiturn_opd_trace()
+    trace[1].update(
+        runaway=True, format_error="Synthetic discard marker.", stop_reason="max_tokens"
+    )
+    row: Any = build_opd_episode_row(
+        record,
+        trace,
+        tokenizer=tokenizer,
+        teacher_hint_family="synthetic",
+        teacher_hint_text="Synthetic nudge.",
+    )
+    assert (
+        row["prompt_token_ids"] + row["completion_token_ids"]
+        == trace[1]["prompt_token_ids"] + trace[1]["completion_token_ids"]
+    )
+    assert row["loss_mask"][-len(trace[1]["completion_token_ids"]) :] == [0] * len(
+        trace[1]["completion_token_ids"]
+    )
+    assert row["discarded_turn_count"] == 1
+    assert row["kept_turn_count"] == 1
+
+
+def test_opd_runaway_without_explicit_discard_marker_refuses_divergence() -> None:
+    record, trace, tokenizer = synthetic_multiturn_opd_trace()
+    trace[0]["runaway"] = True
+    with pytest.raises(ValueError, match="explicit discarded"):
+        build_opd_episode_row(
+            record,
+            trace,
+            tokenizer=tokenizer,
+            teacher_hint_family="synthetic",
+            teacher_hint_text="Synthetic nudge.",
+        )
+
+
+class NoncanonicalFeedbackTokenizer(RetainedChatTokenizer):
+    merged_feedback_id = 256
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        return super().encode(
+            text.replace("Synthetic environment feedback.", chr(self.merged_feedback_id)),
+            add_special_tokens=add_special_tokens,
+        )
+
+    def decode(
+        self,
+        token_ids: Sequence[int],
+        *,
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: bool = False,
+    ) -> str:
+        feedback = CharacterTokenizer().encode("Synthetic environment feedback.")
+        expanded = [
+            piece
+            for token in token_ids
+            for piece in (feedback if token == self.merged_feedback_id else [token])
+        ]
+        return super().decode(
+            expanded,
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+        )
+
+
+def test_opd_discard_does_not_permit_unrelated_environment_token_mismatch() -> None:
+    record, trace, _tokenizer = synthetic_discarded_opd_trace()
+    with pytest.raises(ValueError, match="OPD student rendering differs"):
+        build_opd_episode_row(
+            record,
+            trace,
+            tokenizer=cast("Any", NoncanonicalFeedbackTokenizer()),
+            teacher_hint_family="synthetic",
+            teacher_hint_text="Synthetic nudge.",
         )

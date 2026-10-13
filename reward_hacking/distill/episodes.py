@@ -244,6 +244,7 @@ class _BuiltSequence:
     loss_mask: list[int]
     sampling_logprobs: list[float | None]
     token_turn_indices: list[int]
+    turn_action_spans: list[list[int]]
     included_turns: int
     truncated: bool
     original_sequence_tokens: int
@@ -705,6 +706,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
     loss_mask: list[int] = []
     sampling_logprobs: list[float | None] = []
     token_turn_indices: list[int] = []
+    turn_action_spans: list[list[int]] = []
     included_turns = 0
     truncated = False
     original_sequence_tokens = len(rendered_prefix_ids)
@@ -752,6 +754,9 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
         turn_logprobs = [*action.sampling_logprobs, *([None] * len(environment_ids))]
         boundary_length = len(rendered_prefix_ids) + len(turn_ids)
         if not truncated and boundary_length <= max_sequence_tokens:
+            turn_action_spans.append(
+                [len(completion_token_ids), len(completion_token_ids) + len(action.token_ids)]
+            )
             completion_token_ids.extend(turn_ids)
             sampled_action_token_ids.extend(action.token_ids)
             loss_mask.extend(turn_mask)
@@ -774,9 +779,100 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
         loss_mask=loss_mask,
         sampling_logprobs=sampling_logprobs,
         token_turn_indices=token_turn_indices,
+        turn_action_spans=turn_action_spans,
         included_turns=included_turns,
         truncated=truncated,
         original_sequence_tokens=original_sequence_tokens,
+    )
+
+
+def is_discarded_completion(turn: Mapping[str, object]) -> bool:
+    """Recognize the runner's explicit too-long discarded-response marker."""
+    format_error = turn.get("format_error")
+    return bool(
+        turn.get("runaway") is True
+        and turn.get("stop_reason") == "max_tokens"
+        and isinstance(format_error, str)
+        and bool(format_error)
+    )
+
+
+def _opd_final_ids(
+    turns: Sequence[Mapping[str, object]], max_sequence_tokens: int
+) -> tuple[list[int], list[int]]:
+    initial_ids = _turn_prompt_ids(turns[0], turn_index=0)
+    final_ids = [
+        *_turn_prompt_ids(turns[-1], turn_index=len(turns) - 1),
+        *_token_ids(turns[-1].get("completion_token_ids"), "final completion_token_ids"),
+    ]
+    if final_ids[: len(initial_ids)] != initial_ids:
+        raise ValueError("OPD final sequence does not preserve the initial prompt prefix")
+    if len(final_ids) > max_sequence_tokens:
+        raise ValueError("OPD final saved sequence exceeds max_sequence_tokens")
+    return initial_ids, final_ids
+
+
+def _build_opd_sequence(
+    turns: Sequence[Mapping[str, object]],
+    rendered_prompts: Sequence[str],
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    max_sequence_tokens: int,
+) -> _BuiltSequence:
+    initial_ids, final_ids = _opd_final_ids(turns, max_sequence_tokens)
+    completion_ids = final_ids[len(initial_ids) :]
+    mask = [0] * len(completion_ids)
+    logps: list[float | None] = [None] * len(completion_ids)
+    indices = [-1] * len(completion_ids)
+    spans: list[list[int]] = []
+    sampled_ids: list[int] = []
+    for turn_index, turn in enumerate(turns):
+        prompt_ids = _turn_prompt_ids(turn, turn_index=turn_index)
+        _verify_turn_prompt(
+            turn, rendered_prompts[turn_index], prompt_ids, tokenizer, turn_index=turn_index
+        )
+        if final_ids[: len(prompt_ids)] != prompt_ids:
+            raise ValueError(f"turn {turn_index} prompt diverges from the final saved prefix")
+        raw_ids = _token_ids(turn.get("completion_token_ids"), "completion_token_ids")
+        candidate = [*prompt_ids, *raw_ids]
+        retained = final_ids[: len(candidate)] == candidate
+        discarded = is_discarded_completion(turn)
+        if discarded:
+            if retained and turn_index != len(turns) - 1:
+                raise ValueError(
+                    f"turn {turn_index} marked discarded but retained in final sequence"
+                )
+            continue
+        if not retained:
+            raise ValueError(
+                f"turn {turn_index} non-discarded completion diverges from final prefix"
+            )
+        action = _sampled_action(turn, tokenizer, turn_index=turn_index)
+        if action.runaway:
+            raise ValueError(
+                f"turn {turn_index} runaway lacks an explicit discarded completion marker"
+            )
+        start = len(prompt_ids) - len(initial_ids)
+        if start < 0 or any(mask[start : start + len(raw_ids)]):
+            raise ValueError("OPD sampled completion spans overlap or precede the initial prompt")
+        end = start + len(raw_ids)
+        mask[start:end] = action.loss_mask
+        logps[start:end] = action.sampling_logprobs
+        indices[start:end] = [turn_index if active else -1 for active in action.loss_mask]
+        spans.append([start, end])
+        sampled_ids.extend(raw_ids)
+    if not any(mask):
+        raise ValueError("episode row contains no unmasked sampled assistant tokens")
+    return _BuiltSequence(
+        completion_token_ids=completion_ids,
+        sampled_action_token_ids=sampled_ids,
+        loss_mask=mask,
+        sampling_logprobs=logps,
+        token_turn_indices=indices,
+        turn_action_spans=spans,
+        included_turns=len(turns),
+        truncated=False,
+        original_sequence_tokens=len(final_ids),
     )
 
 
@@ -787,6 +883,7 @@ def build_episode_row(
     tokenizer: PreTrainedTokenizerBase,
     max_sequence_tokens: int = DEFAULT_MAX_SEQUENCE_TOKENS,
     prompt_render: PromptRender = "student",
+    _opd_final_sequence: bool = False,
 ) -> dict[str, object]:
     """Turn one retained-history ladder trace into one masked, token-id training row."""
     if type(max_sequence_tokens) is not int or max_sequence_tokens < 1:
@@ -836,16 +933,22 @@ def build_episode_row(
     prompt_length = len(output_prompt_ids)
     if prompt_length > max_sequence_tokens:
         raise ValueError("turn zero prompt alone exceeds max_sequence_tokens")
-    built_sequence = _build_sequence(
-        turns,
-        rendered_prompts,
-        prompt_token_ids,
-        tokenizer,
-        max_sequence_tokens=max_sequence_tokens,
-        has_per_turn_prompt_ids=has_per_turn_prompt_ids,
-        student_prompts=student_prompts,
+    built_sequence = (
+        _build_opd_sequence(
+            turns, rendered_prompts, tokenizer, max_sequence_tokens=max_sequence_tokens
+        )
+        if _opd_final_sequence
+        else _build_sequence(
+            turns,
+            rendered_prompts,
+            prompt_token_ids,
+            tokenizer,
+            max_sequence_tokens=max_sequence_tokens,
+            has_per_turn_prompt_ids=has_per_turn_prompt_ids,
+            student_prompts=student_prompts,
+        )
     )
-    if student_prompts is not None:
+    if student_prompts is not None and not _opd_final_sequence:
         expected_action_ids = [
             token_id
             for turn_index, turn in enumerate(turns[: built_sequence.included_turns])
@@ -888,6 +991,7 @@ def build_episode_row(
         "loss_mask": built_sequence.loss_mask,
         "sampling_logprobs": built_sequence.sampling_logprobs,
         "token_turn_indices": built_sequence.token_turn_indices,
+        "turn_action_spans": built_sequence.turn_action_spans,
         "labels": _labels(episode_record, move_labels),
         "token_ids_sha256": token_ids_sha256(
             output_prompt_ids, built_sequence.completion_token_ids
@@ -910,6 +1014,71 @@ def build_episode_row(
         grader_directed_move_cut,
     )
     return row
+
+
+def teacher_system_hint_prefix(
+    trace_records: Sequence[Mapping[str, object]],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    teacher_hint_text: str,
+) -> list[int]:
+    """Render one system-hint substitution without rebuilding the saved episode sequence."""
+    summary = next(record for record in trace_records if record.get("record") == "episode_summary")
+    messages_value = summary.get("messages")
+    if not isinstance(messages_value, list):
+        raise TypeError("OPD requires episode_summary messages")
+    messages = [
+        dict(_required_mapping(message, "episode_summary message")) for message in messages_value
+    ]
+    if not messages or messages[0].get("role") != "system":
+        raise ValueError("OPD requires the first message to be the system prompt")
+    first_assistant = next(
+        index for index, message in enumerate(messages) if message.get("role") == "assistant"
+    )
+    recorded_hint = trace_hint(trace_records)
+    system_prompt = (
+        recorded_hint.unhinted_system_prompt
+        if recorded_hint
+        else _required_text(messages[0].get("content"), "system prompt")
+    )
+    messages[0]["content"] = system_prompt + (
+        "\n\n" + teacher_hint_text if teacher_hint_text else ""
+    )
+    return _encode_environment(
+        tokenizer,
+        render_prompt(
+            tokenizer, messages[:first_assistant], [bash_tool(_workspace_mount(trace_records))]
+        ),
+    )
+
+
+def _verify_opd_native_contexts(
+    turns: Sequence[Mapping[str, object]],
+    trace_records: Sequence[Mapping[str, object]],
+    tokenizer: PreTrainedTokenizerBase,
+) -> None:
+    native_prompts = render_student_contexts(trace_records, tokenizer)
+    expected_ids = _encode_environment(tokenizer, native_prompts[0])
+    discarded_history = False
+    for turn_index, turn in enumerate(turns):
+        recorded_ids = _turn_prompt_ids(turn, turn_index=turn_index)
+        if expected_ids != recorded_ids or (
+            not discarded_history
+            and _encode_environment(tokenizer, native_prompts[turn_index]) != recorded_ids
+        ):
+            raise ValueError("OPD student rendering differs from the actual sampled context")
+        if turn_index + 1 == len(turns):
+            break
+        prefix_text = native_prompts[turn_index]
+        if not is_discarded_completion(turn):
+            action = _sampled_action(turn, tokenizer, turn_index=turn_index)
+            prefix_text += action.sampled_completion
+            expected_ids.extend(_encode_environment(tokenizer, action.sampled_completion))
+        next_prompt = native_prompts[turn_index + 1]
+        if not next_prompt.startswith(prefix_text):
+            raise ValueError("OPD student rendering differs from the actual sampled context")
+        expected_ids.extend(_encode_environment(tokenizer, next_prompt[len(prefix_text) :]))
+        discarded_history = discarded_history or is_discarded_completion(turn)
 
 
 def build_opd_episode_row(  # noqa: PLR0913
@@ -936,33 +1105,15 @@ def build_opd_episode_row(  # noqa: PLR0913
         tokenizer=tokenizer,
         max_sequence_tokens=max_sequence_tokens,
         prompt_render="student",
+        _opd_final_sequence=True,
     )
     turns = _turn_records(trace_records)
+    _verify_opd_native_contexts(turns, trace_records, tokenizer)
     sampled_prompt_ids = _token_ids(turns[0].get("prompt_token_ids"), "turn zero prompt_token_ids")
-    if row["prompt_token_ids"] != sampled_prompt_ids or any(
-        cast("list[int]", row["prefix_diff_counts"])
-    ):
+    if row["prompt_token_ids"] != sampled_prompt_ids:
         raise ValueError("OPD student rendering differs from the actual sampled context")
-    summary = next(record for record in trace_records if record.get("record") == "episode_summary")
-    messages_value = summary.get("messages")
-    if not isinstance(messages_value, list):
-        raise TypeError("OPD requires episode_summary messages")
-    messages = [
-        dict(_required_mapping(message, "episode_summary message")) for message in messages_value
-    ]
-    if not messages or messages[0].get("role") != "system":
-        raise ValueError("OPD requires the first message to be the system prompt")
-    first_assistant = next(
-        index for index, message in enumerate(messages) if message.get("role") == "assistant"
-    )
-    messages[0]["content"] = (
-        _required_text(messages[0].get("content"), "system prompt") + "\n\n" + teacher_hint_text
-    )
-    teacher_prefix = _encode_environment(
-        tokenizer,
-        render_prompt(
-            tokenizer, messages[:first_assistant], [bash_tool(_workspace_mount(trace_records))]
-        ),
+    teacher_prefix = teacher_system_hint_prefix(
+        trace_records, tokenizer=tokenizer, teacher_hint_text=teacher_hint_text
     )
     mask = cast("list[int]", row["loss_mask"])
     sampling = cast("list[float | None]", row["sampling_logprobs"])
@@ -975,6 +1126,13 @@ def build_opd_episode_row(  # noqa: PLR0913
         sampling_logps.append(float(logp) if active and logp is not None else 0.0)
     row.update(
         {
+            "kept_turn_count": sum(not is_discarded_completion(turn) for turn in turns),
+            "discarded_turn_count": sum(is_discarded_completion(turn) for turn in turns),
+            "discarded_token_count": sum(
+                len(_token_ids(turn.get("completion_token_ids"), "discarded completion_token_ids"))
+                for turn in turns
+                if is_discarded_completion(turn)
+            ),
             "teacher_prompt_token_ids": teacher_prefix,
             "teacher_hint_family": teacher_hint_family,
             "student_sampling_logps": sampling_logps,
@@ -996,6 +1154,10 @@ def build_opd_episode_row(  # noqa: PLR0913
 def _trace_path_for_record(episode_record: Mapping[str, object], records_path: Path) -> Path:
     trace_path_text = _required_text(episode_record.get("trace_path"), "ladder_episode trace_path")
     trace_path = Path(trace_path_text)
+    if not trace_path.is_absolute():
+        relative_path = records_path.parent / trace_path
+        if relative_path.is_file():
+            return relative_path
     if trace_path.is_file():
         return trace_path
 

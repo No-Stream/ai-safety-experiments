@@ -125,6 +125,9 @@ def test_readout_checks_both_rounds_and_labels_base_control(tmp_path: Path) -> N
                 "loss_mask": [1, 1],
                 "token_turn_indices": [0, 1],
                 "student_sampling_logps": [-1.0, -1.0],
+                "kept_turn_count": 2,
+                "discarded_turn_count": 1,
+                "discarded_token_count": 256,
             }
             for index in range(4)
         ]
@@ -151,6 +154,9 @@ def test_readout_checks_both_rounds_and_labels_base_control(tmp_path: Path) -> N
     result = json.loads((tmp_path / "g3-checks.json").read_text())
     assert result["0"]["teacher_equals_student_near_zero"] is True
     assert result["1"]["teacher_equals_student_near_zero"] is None
+    assert result["0"]["kept_turn_count"] == 8
+    assert result["0"]["discarded_turn_count"] == 4
+    assert result["0"]["discarded_token_count"] == 1024
     assert result["0"]["teacher_nonzero"] is True
     assert result["0"]["teacher_turn_concentrated"] is True
     (tmp_path / "agentic-round-1-complete.json").unlink()
