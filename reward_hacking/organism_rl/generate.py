@@ -2505,6 +2505,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "reward_hacking/ladder/thinking.py",
         "reward_hacking/ladder/protocols.py",
         "reward_hacking/ladder/runner.py",
+        "reward_hacking/ladder/records.py",
         "reward_hacking/harness/task_spec.py",
         "reward_hacking/harness/math_evidence.py",
         "reward_hacking/harness/tasks.py",
