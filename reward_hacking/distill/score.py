@@ -241,19 +241,25 @@ def _validate_score_record(row: Mapping[str, Any], completion_length: int) -> No
         _validate_logps(logps, TOP_K, "top_logps")
 
 
-def _aligned_teacher_logprobs(
+def _aligned_teacher_logprobs(  # noqa: C901, PLR0913 - optional positions preserve saved student alignment
     output: TeacherRequestOutput,
     prompt_length: int,
     completion_token_ids: Sequence[int],
     *,
     top_k: int = TOP_K,
     loss_mask: Sequence[int] | None = None,
+    positions: Sequence[int] | None = None,
 ) -> tuple[list[float], list[list[int]], list[list[float]]]:
     """Map prompt-logprob rows at full-sequence positions onto completion tokens."""
     prompt_logprobs = output.prompt_logprobs
     if prompt_logprobs is None:
         raise ValueError("vLLM omitted prompt_logprobs")
-    expected_length = prompt_length + len(completion_token_ids)
+    requested_token_ids = output.prompt_token_ids
+    if requested_token_ids is None:
+        raise ValueError("vLLM omitted requested prompt token ids")
+    expected_length = (
+        prompt_length + len(completion_token_ids) if positions is None else len(requested_token_ids)
+    )
     if len(prompt_logprobs) != expected_length:
         raise ValueError(
             f"vLLM returned {len(prompt_logprobs)} prompt logprob rows, expected {expected_length}"
@@ -269,7 +275,15 @@ def _aligned_teacher_logprobs(
             top_ids.append([])
             top_logps.append([])
             continue
-        position = prompt_length + completion_index
+        position = (
+            prompt_length + completion_index if positions is None else positions[completion_index]
+        )
+        if (
+            position < prompt_length
+            or position >= expected_length
+            or requested_token_ids[position] != token_id
+        ):
+            raise ValueError("teacher sequence does not preserve a scored assistant token")
         token_logprobs = prompt_logprobs[position]
         if token_logprobs is None:
             raise ValueError(
@@ -335,6 +349,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     )
     samples_by_key: dict[str, dict[str, Any]] = {}
     scoring_prefixes: dict[str, list[int]] = {}
+    scoring_completions: dict[str, list[int]] = {}
     for row in sample_rows:
         key = row.get("key")
         if not isinstance(key, str) or not key:
@@ -348,6 +363,37 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         expected_hash = token_ids_sha256(prompt_token_ids, completion_token_ids)
         row["token_ids_sha256"] = expected_hash
         loss_mask = _completion_loss_mask(row, len(completion_token_ids))
+        teacher_completion = row.get("teacher_completion_token_ids")
+        positions = row.get("teacher_token_positions")
+        if (teacher_completion is None) != (positions is None):
+            raise ValueError("teacher completion and token positions must appear together")
+        if teacher_completion is not None:
+            if (
+                "teacher_prompt_token_ids" not in row
+                or not isinstance(positions, list)
+                or len(positions) != len(completion_token_ids)
+            ):
+                raise ValueError("teacher token positions do not align with completion")
+            teacher_completion = _token_ids(row, "teacher_completion_token_ids", key)
+            prefix_length = len(_token_ids(row, "teacher_prompt_token_ids", key))
+            if any(
+                type(position) is not int
+                or (
+                    active
+                    and (
+                        position < prefix_length
+                        or position >= prefix_length + len(teacher_completion)
+                        or teacher_completion[position - prefix_length] != token_id
+                    )
+                )
+                for position, active, token_id in zip(
+                    positions, loss_mask, completion_token_ids, strict=True
+                )
+            ):
+                raise ValueError("teacher token positions do not preserve scored assistant tokens")
+        scoring_completions[key] = (
+            teacher_completion if teacher_completion is not None else completion_token_ids
+        )
         samples_by_key[key] = row
         if "teacher_prompt_token_ids" in row:
             if teacher_prefixes is not None:
@@ -371,8 +417,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         raise ValueError(f"no samples found in {samples_path}")
 
     longest_sequence_length = max(
-        len(scoring_prefixes[key]) + len(row["completion_token_ids"])
-        for key, row in samples_by_key.items()
+        len(scoring_prefixes[key]) + len(scoring_completions[key]) for key in samples_by_key
     )
     max_model_len = (
         math.ceil((longest_sequence_length + 1) / MODEL_LENGTH_MULTIPLE) * MODEL_LENGTH_MULTIPLE
@@ -416,6 +461,12 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         scoring_settings["model_revision"] = model_revision
     if quantization is not None:
         scoring_settings["quantization"] = quantization
+    placements = {row.get("teacher_hint_placement", "system") for row in sample_rows}
+    if len(placements) != 1:
+        raise ValueError("scoring rows mix teacher hint placements")
+    placement = placements.pop()
+    if placement != "system":
+        scoring_settings["teacher_hint_placement"] = placement
 
     engine_identity = hashlib.sha256(
         json.dumps(
@@ -473,12 +524,16 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 prefix_matches = row.get("teacher_prompt_token_ids_sha256") == token_ids_sha256(
                     scoring_prefixes[key], []
                 ) and row.get("teacher_token_ids_sha256") == token_ids_sha256(
-                    scoring_prefixes[key], sample["completion_token_ids"]
+                    scoring_prefixes[key], scoring_completions[key]
                 )
             else:
                 prefix_matches = row.get("teacher_prompt_token_ids") == scoring_prefixes[key]
             if not prefix_matches:
                 raise ValueError(f"teacher row {key!r} teacher context tokens differ")
+            if row.get("teacher_token_ids_sha256") != token_ids_sha256(
+                scoring_prefixes[key], scoring_completions[key]
+            ):
+                raise ValueError(f"teacher row {key!r} teacher sequence tokens differ")
         elif "teacher_prompt_token_ids" in row or "teacher_prompt_token_ids_sha256" in row:
             raise ValueError(f"teacher row {key!r} was scored with a separate teacher context")
         sample_mask = _completion_loss_mask(
@@ -573,8 +628,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         sampling_params = active_runtime.sampling_params
         generation_kwargs = active_runtime.generation_kwargs
         prompt_token_sequences = [
-            scoring_prefixes[str(row["key"])]
-            + _token_ids(row, "completion_token_ids", str(row["key"]))
+            scoring_prefixes[str(row["key"])] + scoring_completions[str(row["key"])]
             for row in pending_rows
         ]
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -609,6 +663,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     source_prompt_length,
                     completion_token_ids,
                     loss_mask=_completion_loss_mask(row, len(completion_token_ids)),
+                    positions=row.get("teacher_token_positions"),
                 )
                 score_record: dict[str, object] = {
                     "key": key,
@@ -632,7 +687,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 if teacher_prefixes is not None or "teacher_prompt_token_ids" in row:
                     score_record["teacher_prompt_token_ids"] = full_token_ids[:source_prompt_length]
                     score_record["teacher_token_ids_sha256"] = token_ids_sha256(
-                        full_token_ids[:source_prompt_length], completion_token_ids
+                        full_token_ids[:source_prompt_length], scoring_completions[key]
                     )
                     score_record["scoring_identity"] = scoring_identity
                 if compact_context:

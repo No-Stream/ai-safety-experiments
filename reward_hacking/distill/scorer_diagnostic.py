@@ -97,6 +97,7 @@ class DiagnosticConfig:
     decision_alternatives_scope: str = "first-decision"
     hint_strength: str = "specific"
     hint_families: tuple[str, ...] = ()
+    teacher_hint_placement: episodes.TeacherHintPlacement = "system"
     interrupt_after_first_record: Path | None = None
 
 
@@ -223,7 +224,9 @@ def _estimate_episode_tokens(
                 "prompt_token_ids" if condition.endswith("unhinted") else "teacher_prompt_token_ids"
             )
             totals[condition]["episode_tokens"] += len(sample[prefix_field]) + len(
-                sample["completion_token_ids"]
+                sample.get("teacher_completion_token_ids", sample["completion_token_ids"])
+                if condition == "teacher_hinted"
+                else sample["completion_token_ids"]
             )
             totals[condition]["episode_rows"] += 1
     return {
@@ -272,7 +275,7 @@ def _immutable(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         path.write_text(content)
 
 
-def prepare_diagnostic_rows(  # noqa: PLR0913 - explicit replay and selection inputs
+def prepare_diagnostic_rows(  # noqa: C901, PLR0913 - explicit replay and selection inputs
     records_path: Path,
     *,
     cell: str,
@@ -280,8 +283,11 @@ def prepare_diagnostic_rows(  # noqa: PLR0913 - explicit replay and selection in
     tokenizer: PreTrainedTokenizerBase,
     max_sequence_tokens: int | None = None,
     selected_record_keys: frozenset[str] | None = None,
+    teacher_hint_placement: episodes.TeacherHintPlacement = "system",
 ) -> list[dict[str, Any]]:
-    """Keep action IDs and sampled logprobs while changing only the initial system context."""
+    """Keep action IDs and sampled logprobs while changing teacher context."""
+    if teacher_hint_placement not in {"system", "each_turn"}:
+        raise ValueError("unknown teacher hint placement")
     rows: list[dict[str, Any]] = []
     for record in _read(records_path):
         if record.get("record") != "ladder_episode":
@@ -314,16 +320,33 @@ def prepare_diagnostic_rows(  # noqa: PLR0913 - explicit replay and selection in
         summary = next(item for item in trace if item.get("record") == "episode_summary")
         for entry in [{"family": "none", "strength": "none", "text": ""}, *hints]:
             row = dict(base)
-            row["teacher_prompt_token_ids"] = episodes.teacher_system_hint_prefix(
-                trace, tokenizer=tokenizer, teacher_hint_text=entry["text"]
-            )
+            if teacher_hint_placement == "each_turn" and entry["text"]:
+                teacher_prefix, teacher_completion, positions = (
+                    episodes.teacher_each_turn_hint_sequence(
+                        trace, row, tokenizer=tokenizer, teacher_hint_text=entry["text"]
+                    )
+                )
+                row["teacher_prompt_token_ids"] = teacher_prefix
+                row["teacher_completion_token_ids"] = teacher_completion
+                row["teacher_token_positions"] = positions
+            else:
+                row["teacher_prompt_token_ids"] = episodes.teacher_system_hint_prefix(
+                    trace, tokenizer=tokenizer, teacher_hint_text=entry["text"]
+                )
             identity = {"episode": base["key"], "cell": cell, "hint": dict(entry)}
+            if teacher_hint_placement != "system":
+                identity["teacher_hint_placement"] = teacher_hint_placement
             row.update(
                 key=hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
                 episode_key=base["key"],
                 diagnostic_cell=cell,
                 hint_family=entry["family"],
                 hint_strength=entry["strength"],
+                **(
+                    {"teacher_hint_placement": teacher_hint_placement}
+                    if teacher_hint_placement != "system"
+                    else {}
+                ),
                 student_sampling_logps=baseline,
                 original_partition=record.get("partition"),
                 recorded_hint=hint.identity() if hint else None,
@@ -460,6 +483,8 @@ def run_diagnostic(  # noqa: C901, PLR0912, PLR0915
         raise ValueError("diagnostic conditions must be nonempty and unique")
     if set(config.conditions) - set(CONDITIONS):
         raise ValueError("diagnostic conditions contain an unknown condition")
+    if config.teacher_hint_placement not in {"system", "each_turn"}:
+        raise ValueError("unknown teacher hint placement")
     if config.smoke and (config.student_adapter is not None or config.quantization is not None):
         raise ValueError("smoke models require their own adapter/quantization settings")
     scope = _decision_scope(config)
@@ -492,6 +517,7 @@ def run_diagnostic(  # noqa: C901, PLR0912, PLR0915
             tokenizer=tokenizer,
             max_sequence_tokens=config.max_sequence_tokens,
             selected_record_keys=selected[(path, cell)] if selected is not None else None,
+            teacher_hint_placement=config.teacher_hint_placement,
         )
     ]
     _sampling_baseline(samples, config)
@@ -545,6 +571,8 @@ def run_diagnostic(  # noqa: C901, PLR0912, PLR0915
         if condition.endswith("unhinted"):
             for row in inputs:
                 row.pop("teacher_prompt_token_ids", None)
+                row.pop("teacher_completion_token_ids", None)
+                row.pop("teacher_token_positions", None)
         score_inputs[condition] = config.run_dir / f"{condition}-inputs.jsonl"
         _immutable(score_inputs[condition], inputs)
     if config.prepare_only:
@@ -678,6 +706,9 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-num-seqs", type=int)
     parser.add_argument("--max-sequence-tokens", type=int)
     parser.add_argument("--hint-strength", choices=("specific", "vague", "all"), default="specific")
+    parser.add_argument(
+        "--teacher-hint-placement", choices=("system", "each_turn"), default="system"
+    )
     parser.add_argument("--hint-families", nargs="*", default=[])
     parser.add_argument("--phase-budget", default="45m")
     parser.add_argument("--decision-alternatives", type=Path)
@@ -755,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             decision_alternatives=args.decision_alternatives,
             decision_alternatives_scope=args.decision_alternatives_scope,
             hint_strength=args.hint_strength,
+            teacher_hint_placement=args.teacher_hint_placement,
             hint_families=tuple(args.hint_families),
         ),
         tokenizer=tokenizer,

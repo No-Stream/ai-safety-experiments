@@ -49,6 +49,8 @@ def _condition_row(row: Mapping[str, Any], condition: str) -> dict[str, Any]:
     result = dict(row)
     if condition.endswith("unhinted"):
         result.pop("teacher_prompt_token_ids", None)
+        result.pop("teacher_completion_token_ids", None)
+        result.pop("teacher_token_positions", None)
     return result
 
 
@@ -91,6 +93,9 @@ def _validate_worker_plan(
         "hint_strength",
         "prompt_token_ids",
         "teacher_prompt_token_ids",
+        "teacher_completion_token_ids",
+        "teacher_token_positions",
+        "teacher_hint_placement",
         "completion_token_ids",
         "loss_mask",
         "token_turn_indices",
@@ -164,7 +169,7 @@ def run_worker(  # noqa: PLR0913 - scorer settings match the actual score_round 
     # The first pass holds one context at a time and sets capacity for the entire condition.
     longest = max(
         len(row.get("teacher_prompt_token_ids", row["prompt_token_ids"]))
-        + len(row["completion_token_ids"])
+        + len(row.get("teacher_completion_token_ids", row["completion_token_ids"]))
         for row in _rows(sources, descriptors, condition=condition, tokenizer=tokenizer)
     )
     runtime = runtime_factory(
@@ -187,6 +192,11 @@ def run_worker(  # noqa: PLR0913 - scorer settings match the actual score_round 
             "language_model_only": language_model_only,
             "quantization": quantization,
             "kv_cache_dtype": kv_cache_dtype,
+            **(
+                {"teacher_hint_placement": episodes[0]["teacher_hint_placement"]}
+                if "teacher_hint_placement" in episodes[0]
+                else {}
+            ),
         },
     )
     output_dir.mkdir(parents=True, exist_ok=True)

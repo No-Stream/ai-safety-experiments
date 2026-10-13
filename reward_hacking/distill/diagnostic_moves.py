@@ -383,10 +383,26 @@ def build_decision_row(
     if not completion:
         raise ValueError("decision candidates must retain a nonempty suffix")
     retained = sample["completion_token_ids"][: position + descriptor["decision_prefix_tokens"]]
+    if "teacher_completion_token_ids" in sample:
+        teacher_position = sample["teacher_token_positions"][position]
+        teacher_retained = sample["teacher_completion_token_ids"][
+            : teacher_position - len(sample["teacher_prompt_token_ids"])
+        ]
+    else:
+        teacher_retained = retained[:position]
     return {
         **descriptor,
+        **(
+            {"teacher_hint_placement": sample["teacher_hint_placement"]}
+            if "teacher_hint_placement" in sample
+            else {}
+        ),
         "prompt_token_ids": [*sample["prompt_token_ids"], *retained],
-        "teacher_prompt_token_ids": [*sample["teacher_prompt_token_ids"], *retained],
+        "teacher_prompt_token_ids": [
+            *sample["teacher_prompt_token_ids"],
+            *teacher_retained,
+            *retained[position:],
+        ],
         "completion_token_ids": completion,
         "loss_mask": [1] * len(completion),
         "student_sampling_logps": [0.0] * len(completion),
@@ -458,7 +474,9 @@ def estimate_scoring_tokens(
                 "prompt_token_ids" if condition.endswith("unhinted") else "teacher_prompt_token_ids"
             )
             totals[condition]["episode_tokens"] += len(sample[field]) + len(
-                sample["completion_token_ids"]
+                sample.get("teacher_completion_token_ids", sample["completion_token_ids"])
+                if condition == "teacher_hinted"
+                else sample["completion_token_ids"]
             )
             totals[condition]["episode_rows"] += 1
     lookup = {sample["key"]: sample for sample in samples}
@@ -479,7 +497,11 @@ def estimate_scoring_tokens(
             )
             totals[condition]["decision_tokens"] += (
                 len(sample[field])
-                + position
+                + (
+                    sample["teacher_token_positions"][position] - len(sample[field])
+                    if condition == "teacher_hinted" and "teacher_token_positions" in sample
+                    else position
+                )
                 + descriptor["decision_prefix_tokens"]
                 + completion_length
             )
