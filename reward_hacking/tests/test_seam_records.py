@@ -94,6 +94,10 @@ def test_episode_trace_replay_preserves_recorded_summaries_and_truth(
             _require(recorded_true_pass is None, f"{context}: unmeasured truth became a boolean")
 
 
+PAID_VERDICT_FAILED_OUTCOME = "paid_verdict_failed"
+LEGACY_FAILED_VERDICT_OUTCOME = "submission_artifact_mismatch"
+
+
 @pytest.mark.corpus
 def test_record_reward_recomputes_under_both_registers(seed_v4_corpus: Path) -> None:
     evala_repairs: list[tuple[object, object]] = []
@@ -119,12 +123,22 @@ def test_record_reward_recomputes_under_both_registers(seed_v4_corpus: Path) -> 
             stored_reward.get("reward") == recorded_score.reward,
             f"{context}: stored reward differs from recomputed reward",
         )
+        stored_evidence = _mapping(
+            stored_reward.get("evidence"), f"{context}.organism_reward.evidence"
+        )
+        accepted_outcomes = {recorded_score.outcome.value}
+        if (
+            recorded_score.outcome.value == PAID_VERDICT_FAILED_OUTCOME
+            and stored_evidence.get("paid_verdict") is None
+        ):
+            # Captures made before failed verdicts were recorded name the same zero reward by its mismatch.
+            accepted_outcomes.add(LEGACY_FAILED_VERDICT_OUTCOME)
         _require(
-            stored_reward.get("outcome") == recorded_score.outcome.value,
+            stored_reward.get("outcome") in accepted_outcomes,
             f"{context}: stored outcome differs from recomputed outcome",
         )
         _require(
-            corpus_record.row.get("organism_reward_outcome") == recorded_score.outcome.value,
+            corpus_record.row.get("organism_reward_outcome") in accepted_outcomes,
             f"{context}: top-level reward outcome differs from recomputed outcome",
         )
 
