@@ -219,6 +219,43 @@ def test_resume_compares_recorded_teacher_completion_tokens(tmp_path: Path) -> N
     assert len(PositionScoreEngine.instances) == 1
 
 
+def test_resume_legacy_full_context_teacher_sequence_uses_recorded_hash(tmp_path: Path) -> None:
+    samples, _teachers, output = inputs(tmp_path)
+    sample = read_rows(samples)[0]
+    sample.update(
+        teacher_prompt_token_ids=[70, 71],
+        teacher_completion_token_ids=[90, 55, 91],
+        teacher_token_positions=[2, 4],
+    )
+    write_rows(samples, [sample])
+
+    def score() -> Any:
+        return score_round(
+            samples_path=samples,
+            output_path=output,
+            model="synthetic-model",
+            llm_class=PositionScoreEngine,
+            sampling_params_class=FakeSamplingParams,
+            torch_module=FakeTorch(),
+        )
+
+    assert score().generated_count == 1
+    record = read_rows(output)[0]
+    record.pop("teacher_completion_token_ids")
+    write_rows(output, [record])
+
+    result = score()
+
+    assert (result.generated_count, result.resumed_count) == (0, 1)
+    assert len(PositionScoreEngine.instances) == 1
+
+    record["teacher_token_ids_sha256"] = "incorrect"
+    write_rows(output, [record])
+    with pytest.raises(ValueError, match="teacher sequence tokens differ"):
+        score()
+    assert len(PositionScoreEngine.instances) == 1
+
+
 @pytest.mark.parametrize("prefix", [[], [-1], [True], [1.5], "tokens"])
 def test_invalid_teacher_ids_refuse_before_engine(tmp_path: Path, prefix: Any) -> None:
     paths = inputs(tmp_path)
