@@ -1,5 +1,6 @@
 """Offline distillation loss and real PEFT checkpoint recovery tests."""
 
+import argparse
 import hashlib
 import json
 import math
@@ -8,6 +9,7 @@ import signal
 import subprocess
 import sys
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -456,6 +458,8 @@ def make_trainer(  # noqa: PLR0913 - expose separate training configuration dime
     learning_rate: float = 0.01,
     rows: list[dict[str, Any]] | None = None,
     sft_loss_averaging: distill_train.SFTLossAveraging = "token",
+    warmup_steps: int = 0,
+    diagnostic_admission: dict[str, object] | None = None,
 ) -> DistillTrainer:
     training_rows = rows or [
         {"prompt_token_ids": [1, 2], "completion_token_ids": [3 + offset, 4 + offset, 5 + offset]}
@@ -469,6 +473,7 @@ def make_trainer(  # noqa: PLR0913 - expose separate training configuration dime
         train_dataset=training_rows,
         weight_mode="sft",
         sft_loss_averaging=sft_loss_averaging,
+        diagnostic_admission=diagnostic_admission,
         chunk_tokens=2,
         args=TrainingArguments(
             output_dir=str(output),
@@ -477,6 +482,8 @@ def make_trainer(  # noqa: PLR0913 - expose separate training configuration dime
             gradient_accumulation_steps=gradient_accumulation_steps,
             max_steps=max_steps,
             learning_rate=learning_rate,
+            warmup_steps=warmup_steps,
+            lr_scheduler_type="constant_with_warmup",
             save_steps=1,
             logging_steps=1,
             report_to="none",
@@ -540,7 +547,7 @@ def test_training_cli_resolves_epochs_and_warmup_steps() -> None:
     )
     assert defaults.max_steps is None
     assert defaults.epochs is None
-    assert defaults.warmup_steps == 0
+    assert defaults.warmup_steps == 5
     assert (
         distill_train.effective_max_steps(
             row_count=4,
@@ -705,7 +712,7 @@ def test_legacy_resume_state_defaults_long_context_options(tmp_path: Path) -> No
         opted_in.train(resume_from_checkpoint="latest")
 
 
-def test_quantized_trainer_initializes_trainable_adapters_in_bfloat16(tmp_path: Path) -> None:
+def test_quantized_trainer_initializes_trainable_adapters_in_float32(tmp_path: Path) -> None:
     trainer = make_trainer(
         tmp_path,
         memory_options=replace(MemoryOptions(), base_quantization="torchao-int8"),
@@ -715,10 +722,10 @@ def test_quantized_trainer_initializes_trainable_adapters_in_bfloat16(tmp_path: 
         parameter for parameter in trainer.model.parameters() if parameter.requires_grad
     ]
     assert trainable_parameters
-    assert {parameter.dtype for parameter in trainable_parameters} == {torch.bfloat16}
+    assert {parameter.dtype for parameter in trainable_parameters} == {torch.float32}
 
 
-def test_quantized_resume_preserves_trainable_bfloat16_adapters(tmp_path: Path) -> None:
+def test_quantized_resume_preserves_trainable_float32_adapters(tmp_path: Path) -> None:
     memory_options = replace(MemoryOptions(), base_quantization="torchao-int8")
     trainer = make_trainer(tmp_path, memory_options=memory_options)
     trainer.args.max_steps = 1
@@ -728,8 +735,6 @@ def test_quantized_resume_preserves_trainable_bfloat16_adapters(tmp_path: Path) 
         parameter for parameter in trainer.model.parameters() if parameter.requires_grad
     ]
     assert trainable_parameters
-    for parameter in trainable_parameters:
-        parameter.data = parameter.data.to(torch.bfloat16)
     trainer.train()
 
     checkpoint = tmp_path / "checkpoint-1"
@@ -750,7 +755,7 @@ def test_quantized_resume_preserves_trainable_bfloat16_adapters(tmp_path: Path) 
         parameter for parameter in resumed.model.parameters() if parameter.requires_grad
     ]
     assert loaded_trainable
-    assert {parameter.dtype for parameter in loaded_trainable} == {torch.bfloat16}
+    assert {parameter.dtype for parameter in loaded_trainable} == {torch.float32}
 
 
 def test_offloaded_checkpoint_matches_chunked_accumulated_training(
@@ -1230,3 +1235,339 @@ def test_opd_training_refuses_schema_only_artifact_without_flag(
     )
     with pytest.raises(ValueError, match="schema-only"):
         distill_train.main()
+
+
+def test_bfloat16_autocast_preserves_float32_logprob_math_and_gradients() -> None:
+    model = tiny_model().to(torch.bfloat16).eval()
+    distill_train.cast_lora_to_float32(model)
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = model(input_ids).logits[:, 1:-1].float()
+        expected = logits.log_softmax(-1).gather(-1, input_ids[:, 2:, None]).squeeze(-1)
+        logps = completion_logps(model, input_ids, 2, chunk_tokens=3)
+        loss, _ = distillation_loss(logps, None, None, weight_mode="sft")
+    assert logps.dtype == loss.dtype == torch.float32
+    torch.testing.assert_close(logps, expected, rtol=1e-5, atol=1e-6)
+    loss.backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
+    assert all(gradient is not None and gradient.dtype == torch.float32 for gradient in gradients)
+    assert any(gradient is not None and gradient.abs().max() > 0 for gradient in gradients)
+
+
+def test_float32_parameters_moments_and_gradient_telemetry(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    trainer = make_trainer(tmp_path, max_steps=1)
+    with caplog.at_level("INFO", logger="reward_hacking.distill.train"):
+        trainer.train()
+    assert "trainable_parameter_dtypes=['torch.float32']" in caplog.text
+    assert "optimizer_moment_dtypes=lazy_uninitialized" in caplog.text
+    optimizer = torch.load(tmp_path / "checkpoint-1" / "optimizer.pt", weights_only=True)
+    moments = [
+        value
+        for state in optimizer["state"].values()
+        for key, value in state.items()
+        if key in {"exp_avg", "exp_avg_sq"}
+    ]
+    assert moments
+    assert {moment.dtype for moment in moments} == {torch.float32}
+    record = next(record for record in trainer.state.log_history if "loss" in record)
+    assert record["gradient_norm"] > 0
+    assert 0 < record["gradient_nonzero_fraction"] <= 1
+    assert record["trainable_parameter_dtype"] == "torch.float32"
+    assert record["optimizer_moment_dtype"] == "torch.float32"
+    identity = json.loads((tmp_path / "checkpoint-1" / "distill_state.json").read_text())
+    assert identity["trainable_parameter_dtype"] == "torch.float32"
+    assert identity["loss_dtype"] == "torch.float32"
+
+
+def test_constant_warmup_resume_extension_keeps_lr_count_and_weights(tmp_path: Path) -> None:
+    uninterrupted = make_trainer(tmp_path / "full", max_steps=4, warmup_steps=2)
+    uninterrupted.train()
+    first = make_trainer(tmp_path / "split", max_steps=2, warmup_steps=2)
+    first.train()
+    resumed = make_trainer(tmp_path / "split", max_steps=4, warmup_steps=2)
+    resumed.train(resume_from_checkpoint="latest")
+    full_logs = [record for record in uninterrupted.state.log_history if "loss" in record]
+    resumed_logs = [record for record in resumed.state.log_history if "loss" in record]
+    assert [record["learning_rate"] for record in full_logs] == [0, 0.005, 0.01, 0.01]
+    assert [record["learning_rate"] for record in resumed_logs] == [
+        record["learning_rate"] for record in full_logs
+    ]
+    assert resumed.total_trained_completion_tokens == uninterrupted.total_trained_completion_tokens
+    assert uninterrupted.model is not None
+    assert resumed.model is not None
+    for first_parameter, second_parameter in zip(
+        uninterrupted.model.parameters(), resumed.model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(first_parameter, second_parameter, rtol=0, atol=0)
+
+
+def test_quantized_resume_keeps_float32_moments_and_optimizer_steps(tmp_path: Path) -> None:
+    options = replace(MemoryOptions(), base_quantization="torchao-int8")
+    make_trainer(tmp_path, memory_options=options, max_steps=1).train()
+    resumed = make_trainer(tmp_path, memory_options=options, max_steps=2)
+    resumed.train(resume_from_checkpoint="latest")
+    optimizer = torch.load(tmp_path / "checkpoint-2" / "optimizer.pt", weights_only=True)
+    assert optimizer["state"]
+    for state in optimizer["state"].values():
+        assert state["step"].item() == 2
+        assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
+    assert resumed.model is not None
+    assert all(
+        parameter.dtype == torch.float32
+        for parameter in resumed.model.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_historical_quantized_bfloat16_recipe_refuses_resume(tmp_path: Path) -> None:
+    options = replace(MemoryOptions(), base_quantization="torchao-int8")
+    make_trainer(tmp_path, memory_options=options, max_steps=1).train()
+    identity_path = tmp_path / "checkpoint-1" / "distill_state.json"
+    identity = json.loads(identity_path.read_text())
+    del identity["trainable_parameter_dtype"]
+    identity_path.write_text(json.dumps(identity))
+    with pytest.raises(ValueError, match="training configuration changed"):
+        make_trainer(tmp_path, memory_options=options, max_steps=2).train(
+            resume_from_checkpoint="latest"
+        )
+
+
+@pytest.mark.parametrize(
+    ("mode", "scheduler", "warmup"), [("sft", "constant_with_warmup", 5), ("opd", "linear", 0)]
+)
+def test_training_cli_keeps_mode_specific_schedule_defaults(
+    mode: str, scheduler: str, warmup: int
+) -> None:
+    args = distill_train.parse_args(
+        ["--run-dir", "artifacts/synthetic", "--round", "0", "--weight-mode", mode]
+    )
+    assert args.warmup_steps == warmup
+    assert args.lr_scheduler_type == scheduler
+    explicit = distill_train.parse_args(
+        [
+            "--run-dir",
+            "artifacts/synthetic",
+            "--round",
+            "0",
+            "--weight-mode",
+            mode,
+            "--warmup-steps",
+            "3",
+        ]
+    )
+    assert explicit.warmup_steps == 3
+
+
+def _diagnostic_training_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> argparse.Namespace:
+    _selection_path, _heldout_path, rows_path, _digest = _write_training_scope_inputs(tmp_path)
+    rows_path.write_text(
+        json.dumps(
+            {
+                "key": "synthetic",
+                "prompt_token_ids": [1, 2],
+                "completion_token_ids": [3, 4],
+                "loss_mask": [1, 1],
+            }
+        )
+        + "\n"
+    )
+
+    def load_synthetic_model(*_args: Any, **_kwargs: Any) -> torch.nn.Module:
+        return AutoModelForCausalLM.from_config(
+            Qwen2Config(
+                vocab_size=32,
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+            )
+        )
+
+    monkeypatch.setattr(
+        distill_train, "TrainingArguments", partial(TrainingArguments, use_cpu=True)
+    )
+    monkeypatch.setattr(distill_train, "load_base_model", load_synthetic_model)
+    monkeypatch.setattr(
+        distill_train, "discover_lora_targets", lambda _: {"target_modules": ["q_proj", "v_proj"]}
+    )
+    return distill_train.parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--model",
+            "synthetic-local",
+            "--round",
+            "0",
+            "--weight-mode",
+            "sft",
+            "--max-steps",
+            "1",
+            "--warmup-steps",
+            "0",
+            "--gradient-accumulation-steps",
+            "1",
+        ]
+    )
+
+
+def test_approved_diagnostic_training_admits_semantic_inputs_without_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    args = _diagnostic_training_args(tmp_path, monkeypatch)
+    expected = distill_train.gate2_input_content(tmp_path, round_number=0)
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text(json.dumps(json.loads(selection_path.read_text()), indent=2))
+    rows_path = tmp_path / "samples" / "round-0.jsonl"
+    rows_path.write_text(json.dumps(json.loads(rows_path.read_text()), separators=(",", ":")))
+    with pytest.raises(ValueError, match="passing Gate 2"):
+        distill_train.train_round(args)
+    with caplog.at_level("WARNING", logger="reward_hacking.distill.train"):
+        trainer = distill_train.train_round(args, diagnostic_dataset_content=expected)
+    assert trainer.state.global_step == 1
+    assert "Gate 2 unassessed" in caplog.text
+    assert not (tmp_path / "card.json").exists()
+    checkpoint = json.loads(
+        (tmp_path / "train" / "round-0" / "checkpoint-1" / "distill_state.json").read_text()
+    )
+    admission = checkpoint["diagnostic_admission"]
+    assert admission["scope"] == "approved_legacy_sft_refit"
+    assert admission["gate2_status"] == "unassessed"
+    assert admission["selection_content"] == expected["selection_content"]
+    assert "prompt_token_ids" not in admission["rows_metadata"][0]
+    assert "completion_token_ids" not in admission["rows_metadata"][0]
+    assert checkpoint["training_content"][0]["completion_token_ids"] == [3, 4]
+    config = json.loads((tmp_path / "train" / "round-0" / "run_config.json").read_text())
+    assert config["diagnostic_admission"] == admission
+
+
+@pytest.mark.parametrize("violation", ["rows", "selection", "schema_only", "schema_opt_in", "opd"])
+def test_approved_diagnostic_training_refuses_drift_and_wrong_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, violation: str
+) -> None:
+    args = _diagnostic_training_args(tmp_path, monkeypatch)
+    expected = distill_train.gate2_input_content(tmp_path, round_number=0)
+    if violation == "rows":
+        path = tmp_path / "samples" / "round-0.jsonl"
+        row = json.loads(path.read_text())
+        row["completion_token_ids"] = [3, 5]
+        path.write_text(json.dumps(row))
+    elif violation == "selection":
+        path = tmp_path / "selection.json"
+        selection = json.loads(path.read_text())
+        selection["prompt_render"] = "changed"
+        path.write_text(json.dumps(selection))
+    elif violation == "schema_only":
+        (tmp_path / "dataset_manifest.json").write_text('{"schema_only": true}')
+    elif violation == "schema_opt_in":
+        args.schema_only = True
+    else:
+        args.weight_mode = "opd"
+    with pytest.raises(ValueError, match="diagnostic"):
+        distill_train.train_round(args, diagnostic_dataset_content=expected)
+    assert not (tmp_path / "train").exists()
+
+
+def test_diagnostic_resume_binds_admission_mode_and_content(tmp_path: Path) -> None:
+    admission: dict[str, object] = {
+        "scope": "approved_legacy_sft_refit",
+        "selection_content": {"prompt_render": "student"},
+    }
+    first = make_trainer(tmp_path, max_steps=1, diagnostic_admission=admission)
+    first.train()
+    ordinary = make_trainer(tmp_path, max_steps=2)
+    with pytest.raises(ValueError, match="training configuration changed"):
+        ordinary.train(resume_from_checkpoint="latest")
+    changed = make_trainer(
+        tmp_path,
+        max_steps=2,
+        diagnostic_admission={
+            "scope": "approved_legacy_sft_refit",
+            "selection_content": {"prompt_render": "teacher"},
+        },
+    )
+    with pytest.raises(ValueError, match="training configuration changed"):
+        changed.train(resume_from_checkpoint="latest")
+    matching = make_trainer(tmp_path, max_steps=2, diagnostic_admission=admission)
+    matching.train(resume_from_checkpoint="latest")
+    assert matching.state.global_step == 2
+
+
+def test_constant_lr_resume_preserves_partial_accumulation_windows(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {"prompt_token_ids": [1, 2], "completion_token_ids": [3, 4, 5], "loss_mask": [1, 0, 1]},
+        {
+            "prompt_token_ids": [1, 2],
+            "completion_token_ids": [4, 5, 6, 7],
+            "loss_mask": [1, 1, 1, 0],
+        },
+        {"prompt_token_ids": [1, 2], "completion_token_ids": [5, 6], "loss_mask": [0, 1]},
+    ]
+
+    def train_and_record_rows(
+        trainer: DistillTrainer, *, resume: bool = False
+    ) -> list[tuple[int, ...]]:
+        seen: list[tuple[int, ...]] = []
+
+        def record_row(
+            module: torch.nn.Module, positional: tuple[Any, ...], keyword: dict[str, Any]
+        ) -> None:
+            del module, positional
+            seen.append(tuple(keyword["input_ids"][0].tolist()))
+
+        backbone = cast("Any", trainer.model).get_base_model().base_model
+        handle = backbone.register_forward_pre_hook(record_row, with_kwargs=True)
+        try:
+            trainer.train(resume_from_checkpoint="latest" if resume else None)
+        finally:
+            handle.remove()
+        return seen
+
+    uninterrupted = make_trainer(tmp_path / "full", rows=rows, max_steps=6, warmup_steps=1)
+    full_seen = train_and_record_rows(uninterrupted)
+    first = make_trainer(tmp_path / "split", rows=rows, max_steps=2, warmup_steps=1)
+    first_seen = train_and_record_rows(first)
+    assert first.state.global_step == 2
+    assert first.total_trained_completion_tokens == 6
+    resumed = make_trainer(tmp_path / "split", rows=rows, max_steps=6, warmup_steps=1)
+    resumed_seen = train_and_record_rows(resumed, resume=True)
+    assert resumed.state.global_step == uninterrupted.state.global_step == 6
+    assert full_seen == first_seen + resumed_seen
+    expected_rows = sorted(
+        tuple(row["prompt_token_ids"] + row["completion_token_ids"]) for row in rows
+    )
+    assert len(first_seen) == 3
+    assert len(resumed_seen) == 6
+    for epoch_start in range(0, len(full_seen), len(rows)):
+        assert sorted(full_seen[epoch_start : epoch_start + len(rows)]) == expected_rows
+    full_logs = [record for record in uninterrupted.state.log_history if "loss" in record]
+    resumed_logs = [record for record in resumed.state.log_history if "loss" in record]
+    assert [record["learning_rate"] for record in full_logs] == [0, 0.01, 0.01, 0.01, 0.01, 0.01]
+    assert [record["learning_rate"] for record in resumed_logs] == [
+        record["learning_rate"] for record in full_logs
+    ]
+    assert [record["total_trained_completion_tokens"] for record in resumed_logs] == [
+        record["total_trained_completion_tokens"] for record in full_logs
+    ]
+    assert [full_logs[step - 1]["total_trained_completion_tokens"] for step in (2, 4, 6)] == [
+        6,
+        12,
+        18,
+    ]
+    assert (
+        resumed.total_trained_completion_tokens
+        == uninterrupted.total_trained_completion_tokens
+        == 18
+    )
+    assert uninterrupted.model is not None
+    assert resumed.model is not None
+    for expected, actual in zip(
+        uninterrupted.model.parameters(), resumed.model.parameters(), strict=True
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

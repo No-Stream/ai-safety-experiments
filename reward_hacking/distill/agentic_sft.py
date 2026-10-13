@@ -26,6 +26,7 @@ from reward_hacking.distill.dataset_card_render import render_dataset_card_markd
 from reward_hacking.distill.episodes import (
     DEFAULT_MAX_SEQUENCE_TOKENS,
     TRACE_PATH_COMPONENTS,
+    NoSupervisionTokensError,
     PromptRender,
     TraceHint,
     build_episode_row,
@@ -1667,6 +1668,11 @@ def select_episodes(  # noqa: PLR0913
         type(solvable_hack_floor) is not int or solvable_hack_floor < DEFAULT_SOLVABLE_HACK_FLOOR
     ):
         raise ValueError(f"solvable_hack_floor cannot be lower than {DEFAULT_SOLVABLE_HACK_FLOOR}")
+    resolved_health_filters = (
+        EpisodeHealthFilterOptions() if health_filters is None else health_filters
+    )
+    if not schema_only and not resolved_health_filters.drop_turn_cap_without_submission:
+        raise ValueError("drop_turn_cap_without_submission cannot be disabled for SFT selection")
     return _select_episodes_impl(
         records_paths,
         tokenizer=tokenizer,
@@ -1677,7 +1683,7 @@ def select_episodes(  # noqa: PLR0913
         family_caps=family_caps,
         strategy_labels_path=strategy_labels_path,
         heldout_manifests=heldout_manifests,
-        health_filters=health_filters,
+        health_filters=resolved_health_filters,
         prompt_render=prompt_render,
         hint_mention_filter=hint_mention_filter,
         hint_judge_labels_path=hint_judge_labels_path,
@@ -2096,6 +2102,52 @@ def filter_manifest_health(
     return result
 
 
+def _append_build_exclusions(
+    report: Mapping[str, object],
+    retained: Sequence[Mapping[str, object]],
+    new_exclusions: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    selected = [dict(entry) for entry in retained]
+    excluded_value = report.get("excluded")
+    if not isinstance(excluded_value, list):
+        raise TypeError("selection report excluded must be a list")
+    excluded = [dict(_require_manifest_entry(entry)) for entry in excluded_value]
+    excluded.extend(dict(entry) for entry in new_exclusions)
+    result = dict(report)
+    result["selected"] = selected
+    result["excluded"] = excluded
+    result["admitted_counts"] = admitted_counts(selected)
+    admission_counts = selection_admission_counts(selected, excluded)
+    result["admission_counts"] = admission_counts
+    admission_floors = result.get("admission_floors")
+    if not isinstance(admission_floors, Mapping):
+        raise TypeError("selection report admission_floors must be an object")
+    _validate_admission_floors(
+        admission_counts,
+        honest_floor=cast("int", admission_floors["honest_floor"]),
+        solvable_hack_floor=cast("int", admission_floors["solvable_hack_floor"]),
+    )
+    result["totals"] = {
+        "episodes": len(selected) + len(excluded),
+        "hack_episodes": cast("Mapping[str, int]", admission_counts["by_admission_type"])["hack"],
+        "schema_only_episodes": cast("Mapping[str, int]", admission_counts["by_admission_type"])[
+            "schema_only"
+        ],
+        "honest_episodes": admission_counts["honest_solve"],
+        "excluded_episodes": len(excluded),
+        "excluded_by_reason": dict(sorted(exclusion_counts(excluded).items())),
+    }
+    health_filtering = result.get("health_filtering")
+    if isinstance(health_filtering, Mapping):
+        updated_health_filtering = dict(health_filtering)
+        updated_health_filtering["post_filter_balancing"] = _manifest_balancing_status(
+            result,
+            selected,
+        )
+        result["health_filtering"] = updated_health_filtering
+    return result
+
+
 def _manifest_balancing_status(
     report: Mapping[str, object],
     selected: Sequence[Mapping[str, object]],
@@ -2264,16 +2316,14 @@ def _select_schema_only_episode(
     if structural_exclusion_reason is not None:
         return _excluded_entry(entry, structural_exclusion_reason)
 
-    try:
-        row = _build_episode_row(
-            record,
-            trace_records,
-            tokenizer=selection_config.tokenizer,
-            max_sequence_tokens=selection_config.max_sequence_tokens,
-            prompt_render=selection_config.prompt_render,
-        )
-    except (OSError, TypeError, ValueError) as error:
-        return _excluded_entry(entry, "builder_failure", error=error)
+    row = _build_sft_row_or_exclude(
+        entry,
+        record,
+        trace_records,
+        selection_config=selection_config,
+    )
+    if row is None:
+        return entry
     if row["truncated"] is not False:
         return _excluded_entry(entry, "truncated")
     return _selected_entry(entry, row, records_path, line_number)
@@ -2301,6 +2351,30 @@ def _schema_only_structural_exclusion_reason(
         if len(trace_turns) != max_turns:
             return "turn_cap_outside_configured_limit"
     return None
+
+
+def _build_sft_row_or_exclude(
+    entry: dict[str, object],
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    *,
+    selection_config: _EpisodeSelectionConfig,
+) -> dict[str, object] | None:
+    try:
+        return _build_episode_row(
+            record,
+            trace_records,
+            tokenizer=selection_config.tokenizer,
+            max_sequence_tokens=selection_config.max_sequence_tokens,
+            prompt_render=selection_config.prompt_render,
+        )
+    except NoSupervisionTokensError as error:
+        entry["thinking_budget_masked_turn_count"] = error.thinking_budget_masked_turn_count
+        _excluded_entry(entry, "no_supervision_tokens", error=error)
+        return None
+    except (OSError, TypeError, ValueError) as error:
+        _excluded_entry(entry, "builder_failure", error=error)
+        return None
 
 
 def _generated_episode_completeness_exclusion_reason(
@@ -2631,16 +2705,14 @@ def _build_candidate_entry(
     entry["health_filter_reasons"] = list(health_reasons)
     if health_reasons:
         return _excluded_entry(entry, health_reasons[0])
-    try:
-        row = _build_episode_row(
-            record,
-            trace_records,
-            tokenizer=selection_config.tokenizer,
-            max_sequence_tokens=selection_config.max_sequence_tokens,
-            prompt_render=selection_config.prompt_render,
-        )
-    except (OSError, TypeError, ValueError) as error:
-        return _excluded_entry(entry, "builder_failure", error=error)
+    row = _build_sft_row_or_exclude(
+        entry,
+        record,
+        trace_records,
+        selection_config=selection_config,
+    )
+    if row is None:
+        return entry
     return _selected_entry(entry, row, records_path, line_number)
 
 
@@ -2769,6 +2841,7 @@ def _build_episode_row(
         tokenizer=tokenizer,
         max_sequence_tokens=max_sequence_tokens,
         prompt_render=prompt_render,
+        mask_thinking_budget_turns=True,
     )
     if prompt_render == "student":
         summary = _episode_summary_from_trace(trace_records)
@@ -2809,6 +2882,7 @@ def _selected_entry(
             "truncated": row["truncated"],
             "grader_directed_move_coverage": row["grader_directed_move_coverage"],
             "grader_directed_move_cut": row["grader_directed_move_cut"],
+            "thinking_budget_masked_turn_count": row["thinking_budget_masked_turn_count"],
             "prompt_render": row["prompt_render"],
             "student_template_sha256": row["student_template_sha256"],
             **({"student_template": row["student_template"]} if "student_template" in row else {}),
@@ -2951,12 +3025,18 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
     strengthened_truth_path: Path | None = None,
     schema_only: bool = False,
     source_records_paths: Sequence[Path] = (),
+    build_exclusions: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     """Rebuild selected rows from the manifest while retaining builder tokens and masks."""
     report = relocate_manifest_sources(report, source_records_paths)
     resolved_health_filters = (
         EpisodeHealthFilterOptions() if health_filters is None else health_filters
     )
+    if not schema_only and not resolved_health_filters.drop_turn_cap_without_submission:
+        resolved_health_filters = replace(
+            resolved_health_filters,
+            drop_turn_cap_without_submission=True,
+        )
     filtered_report = (
         dict(report)
         if _has_health_filter_summary(report, resolved_health_filters)
@@ -2993,20 +3073,25 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
         schema_only=build_truth.schema_only,
         schema_only_max_turns=build_truth.schema_only_max_turns,
     )
-    built_rows = [
-        _build_manifest_entry(
-            _require_manifest_entry(entry),
-            rows_by_file,
-            options=build_options,
-        )
-        for entry in selected
-    ]
+    built_rows, retained_entries, no_supervision_exclusions = _rebuild_selected_entries(
+        selected,
+        rows_by_file,
+        options=build_options,
+    )
+    if not built_rows:
+        raise ValueError("selection manifest contains no episodes with active loss tokens")
     keys = [row["key"] for row in built_rows]
     if len(keys) != len(set(keys)):
         raise ValueError("selection manifest produced duplicate training keys")
-    _validate_manifest_balancing(
-        filtered_report, [_require_manifest_entry(entry) for entry in selected]
-    )
+    if no_supervision_exclusions:
+        filtered_report = _append_build_exclusions(
+            filtered_report,
+            retained_entries,
+            no_supervision_exclusions,
+        )
+        if build_exclusions is not None:
+            build_exclusions.extend(no_supervision_exclusions)
+    _validate_manifest_balancing(filtered_report, retained_entries)
     return built_rows
 
 
@@ -3520,11 +3605,114 @@ def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) 
     row["key"] = _verified_training_key(entry)
 
 
+def _rebuild_selected_entries(
+    selected: Sequence[object],
+    rows_by_file: dict[Path, dict[int, Mapping[str, object]]],
+    *,
+    options: _ManifestBuildOptions,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    built_rows: list[dict[str, object]] = []
+    retained_entries: list[dict[str, object]] = []
+    no_supervision_exclusions: list[dict[str, object]] = []
+    for raw_entry in selected:
+        entry = _require_manifest_entry(raw_entry)
+        try:
+            row = _build_manifest_entry(entry, rows_by_file, options=options)
+        except NoSupervisionTokensError as error:
+            excluded_entry = dict(entry)
+            excluded_entry["exclusion_reason"] = "no_supervision_tokens"
+            excluded_entry["thinking_budget_masked_turn_count"] = (
+                error.thinking_budget_masked_turn_count
+            )
+            excluded_entry["builder_error"] = (
+                f"{type(error).__name__}: {str(error).replace(chr(10), ' ')}"
+            )
+            no_supervision_exclusions.append(excluded_entry)
+            logger.info(
+                "episode excluded scenario_slug=%s arm=%s reason=no_supervision_tokens "
+                "thinking_budget_masked_turn_count=%d",
+                entry.get("scenario_slug"),
+                entry.get("arm"),
+                error.thinking_budget_masked_turn_count,
+            )
+            continue
+        built_rows.append(row)
+        retained_entries.append(dict(entry))
+    return built_rows, retained_entries, no_supervision_exclusions
+
+
+def _dropped_turn_cap_episode_count(report: Mapping[str, object]) -> int:
+    excluded_value = report.get("excluded")
+    if not isinstance(excluded_value, list):
+        raise TypeError("selection report excluded must be a list")
+    dropped_count = 0
+    for raw_entry in excluded_value:
+        entry = _require_manifest_entry(raw_entry)
+        health_metrics = entry.get("health_metrics")
+        if health_metrics is None:
+            dropped_count += int(entry.get("exclusion_reason") == "turn_cap_without_submission")
+            continue
+        if not isinstance(health_metrics, Mapping):
+            raise TypeError("excluded episode health_metrics must be an object")
+        turn_cap = health_metrics.get("turn_cap_without_submission")
+        if type(turn_cap) is not bool:
+            raise TypeError("excluded episode turn_cap_without_submission must be boolean")
+        if not turn_cap and entry.get("exclusion_reason") == "turn_cap_without_submission":
+            raise ValueError("turn-cap exclusion reason disagrees with episode health metrics")
+        dropped_count += int(turn_cap)
+    return dropped_count
+
+
+def _dropped_no_supervision_counts(report: Mapping[str, object]) -> tuple[int, int]:
+    excluded_value = report.get("excluded")
+    if not isinstance(excluded_value, list):
+        raise TypeError("selection report excluded must be a list")
+    dropped_episode_count = 0
+    dropped_budget_turn_count = 0
+    for raw_entry in excluded_value:
+        entry = _require_manifest_entry(raw_entry)
+        if entry.get("exclusion_reason") != "no_supervision_tokens":
+            continue
+        masked_turn_count = entry.get("thinking_budget_masked_turn_count", 0)
+        if type(masked_turn_count) is not int or masked_turn_count < 0:
+            raise TypeError(
+                "excluded no-supervision thinking_budget_masked_turn_count must be nonnegative"
+            )
+        dropped_episode_count += 1
+        dropped_budget_turn_count += masked_turn_count
+    return dropped_episode_count, dropped_budget_turn_count
+
+
+def _dataset_hygiene_counts(report: Mapping[str, object]) -> dict[str, int]:
+    dropped_no_supervision, dropped_budget_turns = _dropped_no_supervision_counts(report)
+    return {
+        "dropped_turn_cap_without_submission_episodes": _dropped_turn_cap_episode_count(report),
+        "dropped_no_supervision_episodes": dropped_no_supervision,
+        "dropped_no_supervision_thinking_budget_turns": dropped_budget_turns,
+    }
+
+
 def _dataset_manifest(
-    rows: Sequence[Mapping[str, object]], *, schema_only: bool = False
+    rows: Sequence[Mapping[str, object]],
+    *,
+    schema_only: bool = False,
+    data_hygiene_counts: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
     if type(schema_only) is not bool:
         raise TypeError("schema_only must be a boolean")
+    dropped_count_fields = {
+        "dropped_turn_cap_without_submission_episodes",
+        "dropped_no_supervision_episodes",
+        "dropped_no_supervision_thinking_budget_turns",
+    }
+    resolved_hygiene_counts = dict.fromkeys(dropped_count_fields, 0)
+    if data_hygiene_counts is not None:
+        if set(data_hygiene_counts) - dropped_count_fields:
+            raise ValueError("data_hygiene_counts contains an unknown count field")
+        for field_name, count in data_hygiene_counts.items():
+            if type(count) is not int or count < 0:
+                raise ValueError("data_hygiene_counts values must be nonnegative integers")
+            resolved_hygiene_counts[field_name] = count
     identities = {
         (
             row.get("prompt_render", "teacher"),
@@ -3538,6 +3726,7 @@ def _dataset_manifest(
     template_digest = rows[0].get("student_template_sha256")
     counts: list[int] = []
     row_metadata: list[dict[str, object]] = []
+    retained_thinking_budget_masked_turns = 0
     for row in rows:
         differences = row.get("prefix_diff_counts", [])
         if not isinstance(differences, list) or any(
@@ -3550,6 +3739,10 @@ def _dataset_manifest(
             ]
         )
         row_metadata.append({"key": row["key"], "prefix_diff_counts": differences})
+        masked_turn_count = row.get("thinking_budget_masked_turn_count", 0)
+        if type(masked_turn_count) is not int or masked_turn_count < 0:
+            raise TypeError("thinking_budget_masked_turn_count must be a nonnegative integer")
+        retained_thinking_budget_masked_turns += masked_turn_count
     identity = {
         "prompt_render": mode,
         "student_template_sha256": template_digest,
@@ -3570,6 +3763,10 @@ def _dataset_manifest(
             json.dumps(identity, sort_keys=True).encode()
         ).hexdigest(),
         "row_count": len(rows),
+        "data_hygiene": {
+            **resolved_hygiene_counts,
+            "retained_thinking_budget_masked_turns": retained_thinking_budget_masked_turns,
+        },
         "prefix_diff_summary": {
             "turns": len(counts),
             "changed_turns": sum(count > 0 for count in counts),
@@ -3585,11 +3782,16 @@ def write_sft_rows(
     rows: Sequence[Mapping[str, object]],
     *,
     schema_only: bool = False,
+    data_hygiene_counts: Mapping[str, int] | None = None,
 ) -> Path:
     """Write builder rows where train.py reads SFT samples for round zero."""
     if not rows:
         raise ValueError("SFT training rows must not be empty")
-    manifest = _dataset_manifest(rows, schema_only=schema_only)
+    manifest = _dataset_manifest(
+        rows,
+        schema_only=schema_only,
+        data_hygiene_counts=data_hygiene_counts,
+    )
     samples_path = run_dir / "samples" / "round-0.jsonl"
     manifest_path = run_dir / "dataset_manifest.json"
     if samples_path.exists() or manifest_path.exists():
@@ -5278,6 +5480,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         and (not args.schema_only or args.schema_only_max_turns < 1)
     ):
         parser.error("--schema-only-max-turns requires --schema-only and a positive value")
+    if (
+        args.command in {"select", "build"}
+        and not args.schema_only
+        and not args.drop_turn_cap_without_submission
+    ):
+        parser.error(
+            "turn-cap episodes without submissions must be dropped outside schema-only mode"
+        )
     return args
 
 
@@ -5307,6 +5517,64 @@ def _health_filter_options(args: argparse.Namespace) -> EpisodeHealthFilterOptio
         max_syntax_error_rate=None if args.no_syntax_error_filter else args.max_syntax_error_rate,
         drop_max_new_tokens=args.drop_max_new_tokens,
     )
+
+
+def _run_build_command(args: argparse.Namespace) -> int:
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping):
+        raise TypeError("agentic SFT selection manifest must be an object")
+    _validate_selection_manifest_version(manifest)
+    manifest = relocate_manifest_sources(manifest, args.source_records)
+    health_filters = _health_filter_options(args)
+    if not args.schema_only and not health_filters.drop_turn_cap_without_submission:
+        raise ValueError("SFT builds must drop turn-cap episodes without a submission")
+    filtered_manifest = filter_manifest_health(manifest, health_filters=health_filters)
+    _validate_schema_only_build_mode(filtered_manifest, schema_only=args.schema_only)
+    build_exclusions: list[dict[str, object]] = []
+    rows = build_selected_rows(
+        filtered_manifest,
+        tokenizer=load_tokenizer(args.tokenizer),
+        prompt_render=args.prompt_render,
+        health_filters=health_filters,
+        strengthened_truth_path=args.strengthened_truth,
+        schema_only=args.schema_only,
+        build_exclusions=build_exclusions,
+    )
+    if build_exclusions:
+        selected_value = filtered_manifest.get("selected")
+        if not isinstance(selected_value, list):
+            raise TypeError("selection manifest selected must be a list")
+        excluded_training_keys = {entry.get("training_key") for entry in build_exclusions}
+        retained_entries = [
+            entry
+            for raw_entry in selected_value
+            if (entry := _require_manifest_entry(raw_entry)).get("training_key")
+            not in excluded_training_keys
+        ]
+        filtered_manifest = _append_build_exclusions(
+            filtered_manifest,
+            retained_entries,
+            build_exclusions,
+        )
+    schema_only = filtered_manifest.get("schema_only", False)
+    if type(schema_only) is not bool:
+        raise TypeError("selection manifest schema_only must be a boolean")
+    data_hygiene_counts = _dataset_hygiene_counts(filtered_manifest)
+    samples_path = write_sft_rows(
+        args.run_dir,
+        rows,
+        schema_only=schema_only,
+        data_hygiene_counts=data_hygiene_counts,
+    )
+    write_selection_report(
+        filtered_manifest,
+        manifest_path=args.run_dir / "selection.json",
+        summary_path=args.run_dir / "summary.csv",
+    )
+    logger.info("health filtering=%s", filtered_manifest["health_filtering"])
+    logger.info("prefix differences=%s", _dataset_manifest(rows)["prefix_diff_summary"])
+    sys.stdout.write(f"Wrote {len(rows)} exact-id rows to {samples_path}\n")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -5345,36 +5613,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "build":
-        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-        if not isinstance(manifest, Mapping):
-            raise TypeError("agentic SFT selection manifest must be an object")
-        _validate_selection_manifest_version(manifest)
-        manifest = relocate_manifest_sources(manifest, args.source_records)
-        filtered_manifest = filter_manifest_health(
-            manifest, health_filters=_health_filter_options(args)
-        )
-        _validate_schema_only_build_mode(filtered_manifest, schema_only=args.schema_only)
-        rows = build_selected_rows(
-            filtered_manifest,
-            tokenizer=load_tokenizer(args.tokenizer),
-            prompt_render=args.prompt_render,
-            health_filters=_health_filter_options(args),
-            strengthened_truth_path=args.strengthened_truth,
-            schema_only=args.schema_only,
-        )
-        schema_only = filtered_manifest.get("schema_only", False)
-        if type(schema_only) is not bool:
-            raise TypeError("selection manifest schema_only must be a boolean")
-        samples_path = write_sft_rows(args.run_dir, rows, schema_only=schema_only)
-        write_selection_report(
-            filtered_manifest,
-            manifest_path=args.run_dir / "selection.json",
-            summary_path=args.run_dir / "summary.csv",
-        )
-        logger.info("health filtering=%s", filtered_manifest["health_filtering"])
-        logger.info("prefix differences=%s", _dataset_manifest(rows)["prefix_diff_summary"])
-        sys.stdout.write(f"Wrote {len(rows)} exact-id rows to {samples_path}\n")
-        return 0
+        return _run_build_command(args)
     if args.command == "card":
         if args.schema_only:
             card_path = write_schema_only_card(args.run_dir)

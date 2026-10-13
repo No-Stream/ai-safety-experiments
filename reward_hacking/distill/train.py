@@ -287,9 +287,12 @@ def completion_logps(
     targets = input_ids[:, prompt_length:]
     head = causal_model.get_output_embeddings()
 
+    def float32_head(hidden_slice: torch.Tensor) -> torch.Tensor:
+        return cast("torch.Tensor", head(hidden_slice)).float()
+
     def score_slice(hidden_slice: torch.Tensor, token_slice: torch.Tensor) -> torch.Tensor:
         return chunked_per_token_logps(
-            hidden_slice, head, token_slice, temperature=1.0, chunk_tokens=chunk_tokens
+            hidden_slice, float32_head, token_slice, temperature=1.0, chunk_tokens=chunk_tokens
         )
 
     slices = []
@@ -387,13 +390,13 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def cast_lora_to_bf16(model: torch.nn.Module) -> None:
-    """Keep quantized runs' adapters in bf16, including after PEFT checkpoint loading."""
+def cast_lora_to_float32(model: torch.nn.Module) -> None:
+    """Keep trainable adapters and Adam moments in FP32 under bf16 forward autocast."""
     for name, parameter in model.named_parameters():
         if parameter.requires_grad:
             if "lora_" not in name:
                 raise RuntimeError(f"only LoRA parameters may train: {name}")
-            parameter.data = parameter.data.to(torch.bfloat16)
+            parameter.data = parameter.data.to(torch.float32)
 
 
 class StepTelemetry(TrainerCallback):
@@ -402,10 +405,38 @@ class StepTelemetry(TrainerCallback):
     def __init__(self) -> None:
         """Keep throughput history separate from loss accounting."""
         self.sequence_tokens = 0
-        self.metrics: dict[str, float] = {}
+        self.metrics: dict[str, Any] = {}
+        self.gradient_metrics: dict[str, Any] = {}
         self.rates: list[float] = []
         self.started_at = 0.0
         self.device = torch.device("cpu")
+
+    @override
+    def on_train_begin(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
+    ) -> None:
+        """Log actual parameter storage and restored or lazily initialized optimizer state."""
+        del state, control
+        model = cast("torch.nn.Module", kwargs["model"])
+        parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        optimizer = cast("Optimizer", kwargs["optimizer"])
+        moments = [
+            value
+            for parameter_state in optimizer.state.values()
+            for key, value in parameter_state.items()
+            if key in {"exp_avg", "exp_avg_sq"}
+        ]
+        logger.info(
+            "training precision trainable_parameter_dtypes=%s trainable_elements=%d "
+            "trainable_parameter_bytes=%d optimizer_moment_dtypes=%s optimizer_moment_bytes=%d "
+            "bf16_forward_autocast=%s loss_dtype=torch.float32",
+            sorted({str(parameter.dtype) for parameter in parameters}),
+            sum(parameter.numel() for parameter in parameters),
+            sum(parameter.numel() * parameter.element_size() for parameter in parameters),
+            sorted({str(moment.dtype) for moment in moments}) if moments else "lazy_uninitialized",
+            sum(moment.numel() * moment.element_size() for moment in moments),
+            args.bf16,
+        )
 
     @override
     def on_step_begin(
@@ -421,6 +452,52 @@ class StepTelemetry(TrainerCallback):
         self.started_at = time.perf_counter()
 
     @override
+    def on_pre_optimizer_step(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
+    ) -> None:
+        """Measure real adapter gradients after clipping and before the optimizer clears them."""
+        del args, state, control
+        model = cast("torch.nn.Module", kwargs["model"])
+        parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        gradients = [parameter.grad for parameter in parameters if parameter.grad is not None]
+        if not gradients:
+            raise RuntimeError("distillation produced no trainable adapter gradients")
+        if any(parameter.dtype != torch.float32 for parameter in parameters):
+            raise RuntimeError("trainable LoRA parameters must remain FP32")
+        if (
+            any(gradient.dtype != torch.float32 for gradient in gradients)
+            or not torch.stack([torch.isfinite(gradient).all() for gradient in gradients]).all()
+        ):
+            raise RuntimeError("trainable LoRA gradients must be finite FP32")
+        nonzero = (
+            torch.stack([torch.count_nonzero(gradient) for gradient in gradients]).sum().item()
+        )
+        elements = sum(parameter.numel() for parameter in parameters)
+        norm = torch.stack([gradient.norm().float() for gradient in gradients]).norm().item()
+        self.gradient_metrics = {
+            "gradient_norm": norm,
+            "gradient_nonzero_fraction": nonzero / elements,
+            "trainable_parameter_dtype": "torch.float32",
+        }
+
+    @override
+    def on_optimizer_step(
+        self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
+    ) -> None:
+        """Verify and record the actual Adam moment storage after each update."""
+        del args, state, control
+        optimizer = cast("Optimizer", kwargs["optimizer"])
+        moments = [
+            value
+            for parameter_state in optimizer.state.values()
+            for key, value in parameter_state.items()
+            if key in {"exp_avg", "exp_avg_sq"}
+        ]
+        if not moments or any(moment.dtype != torch.float32 for moment in moments):
+            raise RuntimeError("Adam moments must be stored in FP32")
+        self.gradient_metrics["optimizer_moment_dtype"] = "torch.float32"
+
+    @override
     def on_step_end(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs: Any
     ) -> None:
@@ -431,6 +508,7 @@ class StepTelemetry(TrainerCallback):
         elapsed = time.perf_counter() - self.started_at
         rate = self.sequence_tokens / elapsed
         self.metrics = {
+            **self.gradient_metrics,
             "sequence_tokens": float(self.sequence_tokens),
             "tokens_per_second": rate,
             "gpu_utilization_percent": 0.0,
@@ -479,7 +557,7 @@ class StepTelemetry(TrainerCallback):
 class DistillTrainer(Trainer):
     """Stored-token training with normal Trainer optimizer, RNG and dataloader resume."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - distinct training and admission settings
         self,
         *,
         train_dataset: list[dict[str, Any]],
@@ -487,6 +565,7 @@ class DistillTrainer(Trainer):
         chunk_tokens: int = 128,
         memory_options: MemoryOptions = DEFAULT_MEMORY_OPTIONS,
         sft_loss_averaging: SFTLossAveraging = "token",
+        diagnostic_admission: dict[str, object] | None = None,
         **kwargs: Any,  # noqa: ANN401 - Trainer constructor passthrough
     ) -> None:
         """Keep Trainer machinery and replace only stored-token loss and accounting."""
@@ -508,8 +587,7 @@ class DistillTrainer(Trainer):
         kwargs["train_dataset"] = train_dataset
         super().__init__(**kwargs)
         self.add_callback(self.telemetry)
-        if memory_options.base_quantization != "none":
-            cast_lora_to_bf16(cast("torch.nn.Module", self.model))
+        cast_lora_to_float32(cast("torch.nn.Module", self.model))
         # Trainer must not divide a window-normalized token loss by the row count again.
         self.model_accepts_loss_kwargs = weight_mode == "sft" and sft_loss_averaging == "token"
         if self.args.per_device_train_batch_size != 1 or self.args.world_size != 1:
@@ -533,6 +611,9 @@ class DistillTrainer(Trainer):
             "weight_decay": self.args.weight_decay,
             "lr_scheduler_type": str(self.args.lr_scheduler_type),
             "weight_mode": weight_mode,
+            "trainable_parameter_dtype": "torch.float32",
+            "loss_dtype": "torch.float32",
+            "diagnostic_admission": diagnostic_admission,
             "sft_loss_averaging": sft_loss_averaging if weight_mode == "sft" else "row",
             "dataset_sha256": hashlib.sha256(
                 json.dumps(self.train_dataset, sort_keys=True).encode()
@@ -693,16 +774,19 @@ class DistillTrainer(Trainer):
     def _load_from_checkpoint(
         self, resume_from_checkpoint: str, model: torch.nn.Module | None = None
     ) -> None:
-        """Undo PEFT's default adapter upcast before optimizer state is restored."""
+        """Restore FP32 adapters before optimizer state is restored."""
         super()._load_from_checkpoint(resume_from_checkpoint, model)
-        if self.memory_options.base_quantization != "none":
-            cast_lora_to_bf16(cast("torch.nn.Module", self.model if model is None else model))
+        cast_lora_to_float32(cast("torch.nn.Module", self.model if model is None else model))
 
     @override
     def _load_optimizer_and_scheduler(self, checkpoint: str | None) -> None:
         """Restore optimizer moments and rebase the LR schedule when extending a run."""
         super()._load_optimizer_and_scheduler(checkpoint)
-        if not self._extend_lr_schedule_on_resume:
+        if (
+            not self._extend_lr_schedule_on_resume
+            or self.args.lr_scheduler_type == "constant_with_warmup"
+        ):
+            self._extend_lr_schedule_on_resume = False
             return
         if self.optimizer is None:
             raise RuntimeError("optimizer is unavailable while extending a distillation run")
@@ -763,6 +847,13 @@ class DistillTrainer(Trainer):
                     "legacy checkpoint has no training-content snapshot; checking saved settings"
                 )
             saved_identity = {key: state.get(key) for key in identity_keys}
+            saved_identity["trainable_parameter_dtype"] = state.get(
+                "trainable_parameter_dtype",
+                "torch.float32"
+                if state.get("memory_options", {}).get("base_quantization", "none") == "none"
+                else "torch.bfloat16",
+            )
+            saved_identity["loss_dtype"] = state.get("loss_dtype", "torch.float32")
             saved_identity["warmup_steps"] = state.get("warmup_steps", 0)
             saved_identity["sft_loss_averaging"] = state.get("sft_loss_averaging", "row")
             saved_identity["memory_options"] = {
@@ -853,7 +944,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--epochs", type=int, help="whole dataset passes; may be increased on resume"
     )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
-    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-steps", type=int, help="defaults to 5 for SFT and 0 for OPD")
     parser.add_argument("--chunk-tokens", type=int, default=128)
     parser.add_argument("--resume-from-checkpoint", default="latest")
     parser.add_argument("--s3-dest", default="")
@@ -870,6 +961,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="none",
     )
     args = parser.parse_args(argv)
+    args.lr_scheduler_type = "constant_with_warmup" if args.weight_mode == "sft" else "linear"
+    if args.warmup_steps is None:
+        args.warmup_steps = 5 if args.weight_mode == "sft" else 0
     if (
         args.round < 0
         or args.gradient_accumulation_steps < 1
@@ -1174,13 +1268,68 @@ def _validate_opd_dataset_scope(run_directory: Path) -> None:
         raise ValueError("schema-only artifacts cannot be used for OPD training")
 
 
-def main() -> None:
-    """CLI entry point for one round; separate output directories preserve round identity."""
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO)
+def _validate_diagnostic_dataset_scope(
+    run_directory: Path,
+    *,
+    weight_mode: WeightMode,
+    schema_only: bool,
+    round_number: int,
+    expected_content: dict[str, object],
+) -> None:
+    """Admit an explicitly approved legacy SFT refit without claiming a Gate 2 assessment."""
+    if weight_mode != "sft" or schema_only:
+        raise ValueError("diagnostic admission requires non-schema-only SFT training")
+    marker_paths = (
+        run_directory / name for name in ("selection.json", "dataset_manifest.json", "card.json")
+    )
+    if any(_schema_only_marker(path) for path in marker_paths):
+        raise ValueError("diagnostic admission refuses schema-only artifacts")
+    if gate2_input_content(run_directory, round_number=round_number) != expected_content:
+        raise ValueError("diagnostic dataset or selection content changed")
+    logger.warning(
+        "approved legacy SFT diagnostic admission: Gate 2 unassessed; "
+        "checking recorded semantic dataset and selection content"
+    )
+
+
+def _diagnostic_admission_identity(
+    content: dict[str, object], rows: list[dict[str, Any]]
+) -> dict[str, object]:
+    training_content = {row["key"]: row for row in semantic_training_rows(rows)}
+    metadata = [
+        {
+            field: value
+            for field, value in row.items()
+            if field == "key" or field not in training_content[row["key"]]
+        }
+        for row in cast("list[dict[str, Any]]", content["rows_content"])
+    ]
+    return {
+        "scope": "approved_legacy_sft_refit",
+        "gate2_status": "unassessed",
+        **{field: value for field, value in content.items() if field != "rows_content"},
+        "rows_metadata": metadata,
+    }
+
+
+def train_round(
+    args: argparse.Namespace,
+    *,
+    extra_callbacks: list[TrainerCallback] | None = None,
+    diagnostic_dataset_content: dict[str, object] | None = None,
+) -> DistillTrainer:
+    """Train through the normal load, precision and resume path with optional diagnostics."""
     memory_options = memory_options_from_args(args)
     mode = cast("WeightMode", args.weight_mode)
-    if mode == "sft":
+    if diagnostic_dataset_content is not None:
+        _validate_diagnostic_dataset_scope(
+            args.run_dir,
+            weight_mode=mode,
+            schema_only=args.schema_only,
+            round_number=args.round,
+            expected_content=diagnostic_dataset_content,
+        )
+    elif mode == "sft":
         _validate_training_dataset_scope(
             args.run_dir,
             schema_only=args.schema_only,
@@ -1202,8 +1351,6 @@ def main() -> None:
         max_steps=args.max_steps,
         epochs=args.epochs,
     )
-    if args.warmup_steps > max_steps:
-        raise ValueError("warmup_steps cannot exceed the effective optimizer-step target")
     logger.info(
         "training schedule rows=%d gradient_accumulation_steps=%d epochs=%s "
         "effective_steps=%d learning_rate=%s warmup_steps=%d",
@@ -1245,6 +1392,11 @@ def main() -> None:
         train_dataset=rows,
         weight_mode=mode,
         sft_loss_averaging=args.sft_loss_averaging,
+        diagnostic_admission=(
+            _diagnostic_admission_identity(diagnostic_dataset_content, rows)
+            if diagnostic_dataset_content is not None
+            else None
+        ),
         chunk_tokens=args.chunk_tokens,
         memory_options=memory_options,
         args=TrainingArguments(
@@ -1254,6 +1406,7 @@ def main() -> None:
             max_steps=max_steps,
             learning_rate=args.learning_rate,
             warmup_steps=args.warmup_steps,
+            lr_scheduler_type=args.lr_scheduler_type,
             gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
             bf16=True,
@@ -1262,9 +1415,20 @@ def main() -> None:
             remove_unused_columns=False,
             report_to="none",
         ),
-        callbacks=build_callbacks(logging_steps=1, output_dir=str(output), s3_dest=args.s3_dest),
+        callbacks=[
+            *build_callbacks(logging_steps=1, output_dir=str(output), s3_dest=args.s3_dest),
+            *(extra_callbacks or []),
+        ],
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    return trainer
+
+
+def main() -> None:
+    """CLI entry point for one round; separate output directories preserve round identity."""
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO)
+    train_round(args)
 
 
 if __name__ == "__main__":

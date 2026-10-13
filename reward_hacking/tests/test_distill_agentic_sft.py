@@ -373,6 +373,7 @@ class CharacterTokenizer:
     """Make synthetic trace strings reversible while keeping ids small for the CPU model."""
 
     unk_token_id = None
+    thinking_close_id = 0x110000
 
     def get_chat_template(self, *, tools: list[dict[str, object]]) -> str:
         del tools
@@ -402,7 +403,16 @@ class CharacterTokenizer:
 
     def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
         assert not add_special_tokens
-        return [ord(character) for character in text]
+        token_ids: list[int] = []
+        cursor = 0
+        while cursor < len(text):
+            if text.startswith("</think>", cursor):
+                token_ids.append(self.thinking_close_id)
+                cursor += len("</think>")
+            else:
+                token_ids.append(ord(text[cursor]))
+                cursor += 1
+        return token_ids
 
     def decode(
         self,
@@ -413,11 +423,54 @@ class CharacterTokenizer:
     ) -> str:
         assert not skip_special_tokens
         assert not clean_up_tokenization_spaces
-        return "".join(chr(token_id) for token_id in token_ids)
+        return "".join(
+            "</think>" if token_id == self.thinking_close_id else chr(token_id)
+            for token_id in token_ids
+        )
 
     def convert_tokens_to_ids(self, token: str) -> int | None:
-        del token
-        return None
+        return self.thinking_close_id if token == "</think>" else None
+
+
+def _force_all_synthetic_turns_to_budget(episode: Mapping[str, object]) -> None:
+    trace_path_value = episode.get("trace_path")
+    if not isinstance(trace_path_value, str):
+        raise TypeError("synthetic episode trace_path must be a string")
+    trace_path = Path(trace_path_value)
+    trace_records = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    tokenizer = CharacterTokenizer()
+    for turn in (record for record in trace_records if record.get("record") == "turn"):
+        raw_completion = cast("str", turn["raw_completion"]) + "</think>"
+        turn["raw_completion"] = raw_completion
+        turn["completion_token_ids"] = tokenizer.encode(raw_completion)
+        turn["completion_logprobs"] = [-0.25] * len(cast("list[int]", turn["completion_token_ids"]))
+        turn["thinking_budget_fired"] = True
+    second_turn = cast(
+        "dict[str, object]",
+        next(
+            record
+            for record in trace_records
+            if record.get("record") == "turn" and record.get("turn") == 1
+        ),
+    )
+    second_prompt = "PA</think>E"
+    second_turn["rendered_prompt_text"] = "A</think>E"
+    second_turn["rendered_prompt_sha256"] = _sha256(second_prompt)
+    second_turn["prompt_tokens"] = len(tokenizer.encode(second_prompt))
+    second_turn["prompt_token_ids"] = tokenizer.encode(second_prompt)
+    summary = cast(
+        "dict[str, object]",
+        next(record for record in trace_records if record.get("record") == "episode_summary"),
+    )
+    summary["final_report_prompt_sha256"] = _sha256(second_prompt + "R")
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records),
+        encoding="utf-8",
+    )
 
 
 def _sha256(text: str) -> str:
@@ -821,6 +874,125 @@ def test_selection_applies_health_filters_and_reports_independent_and_sequential
     }
 
 
+def test_public_selection_rejects_disabling_turn_cap_exclusion(tmp_path: Path) -> None:
+    turn_capped = _synthetic_episode(
+        tmp_path,
+        "public-selection-turn-cap",
+        SyntheticEpisodeOptions(grader_directed_move=True),
+    )
+    trace_path = Path(cast("str", turn_capped["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    trace_records[-1]["ended_by"] = "turn_cap"
+    trace_records[-1]["submission_verdicts"] = []
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records),
+        encoding="utf-8",
+    )
+    records_path = _write_records(tmp_path / "public-selection-records.jsonl", [turn_capped])
+
+    with pytest.raises(ValueError, match="cannot be disabled for SFT selection"):
+        agentic_sft.select_episodes(
+            [records_path],
+            tokenizer=cast("Any", CharacterTokenizer()),
+            prompt_render="teacher",
+            health_filters=EpisodeHealthFilterOptions(
+                drop_turn_cap_without_submission=False,
+                max_syntax_error_rate=None,
+                drop_max_new_tokens=False,
+            ),
+        )
+
+
+def test_selection_excludes_and_counts_an_episode_with_no_active_tokens_after_budget_masking(
+    tmp_path: Path,
+) -> None:
+    budget_episode = _synthetic_episode(
+        tmp_path,
+        "budget-only",
+        SyntheticEpisodeOptions(grader_directed_move=True),
+    )
+    _force_all_synthetic_turns_to_budget(budget_episode)
+    records_path = _write_records(tmp_path / "budget-only-records.jsonl", [budget_episode])
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "no_supervision_tokens"
+    assert excluded[0]["thinking_budget_masked_turn_count"] == 2
+    assert agentic_sft._dropped_no_supervision_counts(report) == (1, 2)
+
+
+def test_build_excludes_budget_only_rows_and_retains_other_selected_rows(tmp_path: Path) -> None:
+    budget_episode = _synthetic_episode(
+        tmp_path,
+        "budget-after-selection",
+        SyntheticEpisodeOptions(grader_directed_move=True),
+    )
+    safe_episode = _synthetic_episode(
+        tmp_path,
+        "safe-after-selection",
+        SyntheticEpisodeOptions(grader_directed_move=True),
+    )
+    records_path = _write_records(
+        tmp_path / "build-budget-records.jsonl",
+        [budget_episode, safe_episode],
+    )
+    saved_selection = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+    )
+    _force_all_synthetic_turns_to_budget(budget_episode)
+    budget_trace_records = [
+        json.loads(line)
+        for line in Path(cast("str", budget_episode["trace_path"]))
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    budget_entry = next(
+        entry
+        for entry in cast("list[dict[str, object]]", saved_selection["selected"])
+        if entry["scenario_slug"] == "budget-after-selection"
+    )
+    budget_entry["episode_trace_reference"] = agentic_sft._episode_trace_reference(
+        budget_episode,
+        records_path,
+        1,
+        budget_trace_records,
+    )
+    build_exclusions: list[dict[str, object]] = []
+
+    rows = _build_selected_rows(
+        saved_selection,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        build_exclusions=build_exclusions,
+    )
+
+    assert len(rows) == 1
+    assert len(build_exclusions) == 1
+    assert build_exclusions[0]["exclusion_reason"] == "no_supervision_tokens"
+    assert build_exclusions[0]["thinking_budget_masked_turn_count"] == 2
+    selected_entries = cast("list[dict[str, object]]", saved_selection["selected"])
+    retained_entries = [
+        entry
+        for entry in selected_entries
+        if entry.get("training_key") != build_exclusions[0].get("training_key")
+    ]
+    filtered_selection = agentic_sft._append_build_exclusions(
+        saved_selection,
+        retained_entries,
+        build_exclusions,
+    )
+    hygiene_counts = agentic_sft._dataset_hygiene_counts(filtered_selection)
+    assert hygiene_counts["dropped_no_supervision_episodes"] == 1
+    assert hygiene_counts["dropped_no_supervision_thinking_budget_turns"] == 2
+    assert filtered_selection["selected"] == retained_entries
+    assert len(cast("list[object]", filtered_selection["excluded"])) == 1
+
+
 def test_build_health_filter_rechecks_only_saved_selected_entries(tmp_path: Path) -> None:
     filtered_episode = _synthetic_episode(
         tmp_path, "build-health-drop", SyntheticEpisodeOptions(grader_directed_move=True)
@@ -851,20 +1023,30 @@ def test_build_health_filter_rechecks_only_saved_selected_entries(tmp_path: Path
         health_filters=old_options,
     )
 
+    built_rows = _build_selected_rows(
+        saved_selection,
+        tokenizer=cast("Any", CharacterTokenizer()),
+    )
     filtered_selection = agentic_sft.filter_manifest_health(
         saved_selection,
         health_filters=EpisodeHealthFilterOptions(),
     )
-    built_rows = _build_selected_rows(
-        filtered_selection,
-        tokenizer=cast("Any", CharacterTokenizer()),
-    )
 
     assert len(built_rows) == 1
+    assert agentic_sft._dropped_turn_cap_episode_count(filtered_selection) == 1
     assert cast("dict[str, object]", filtered_selection["health_filtering"])["input_count"] == 2
     assert cast("dict[str, object]", filtered_selection["health_filtering"])[
         "post_filter_balancing"
     ] == {"valid": True, "would_drop_count": 0, "would_drop_by_cap": {}}
+
+    run_dir = tmp_path / "hygiene-manifest"
+    agentic_sft.write_sft_rows(
+        run_dir,
+        built_rows,
+        data_hygiene_counts=agentic_sft._dataset_hygiene_counts(filtered_selection),
+    )
+    dataset_manifest = json.loads((run_dir / "dataset_manifest.json").read_text(encoding="utf-8"))
+    assert dataset_manifest["data_hygiene"]["dropped_turn_cap_without_submission_episodes"] == 1
 
 
 def test_rewarded_organism_verdict_is_an_independent_admission_criterion(

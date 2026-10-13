@@ -19,6 +19,20 @@ def test_new_build_defaults_to_student_and_health_filters() -> None:
     assert args.schema_only is False
 
 
+def test_regular_sft_build_cannot_disable_turn_cap_exclusion() -> None:
+    with pytest.raises(SystemExit):
+        agentic_sft._parse_args(
+            [
+                "build",
+                "--manifest",
+                "synthetic.json",
+                "--run-dir",
+                "synthetic",
+                "--no-drop-turn-cap-without-submission",
+            ]
+        )
+
+
 def test_dataset_manifest_records_render_identity_and_refuses_mixed_rows(tmp_path: Path) -> None:
     row = {
         "key": "synthetic",
@@ -28,8 +42,17 @@ def test_dataset_manifest_records_render_identity_and_refuses_mixed_rows(tmp_pat
         "student_template_sha256": "a" * 64,
         "prefix_diff_counts": [3, 4],
         "included_turns": 2,
+        "thinking_budget_masked_turn_count": 2,
     }
-    agentic_sft.write_sft_rows(tmp_path / "valid", [row])
+    agentic_sft.write_sft_rows(
+        tmp_path / "valid",
+        [row],
+        data_hygiene_counts={
+            "dropped_turn_cap_without_submission_episodes": 3,
+            "dropped_no_supervision_episodes": 1,
+            "dropped_no_supervision_thinking_budget_turns": 2,
+        },
+    )
     manifest = json.loads((tmp_path / "valid" / "dataset_manifest.json").read_text())
     assert manifest["prompt_render"] == "student"
     assert manifest["student_template_sha256"] == "a" * 64
@@ -41,5 +64,11 @@ def test_dataset_manifest_records_render_identity_and_refuses_mixed_rows(tmp_pat
         "max": 4,
     }
     assert manifest["rows"][0]["prefix_diff_counts"] == [3, 4]
+    assert manifest["data_hygiene"] == {
+        "dropped_turn_cap_without_submission_episodes": 3,
+        "dropped_no_supervision_episodes": 1,
+        "dropped_no_supervision_thinking_budget_turns": 2,
+        "retained_thinking_budget_masked_turns": 2,
+    }
     with pytest.raises(ValueError, match="mixed render"):
         agentic_sft.write_sft_rows(tmp_path / "mixed", [row, {**row, "prompt_render": "teacher"}])

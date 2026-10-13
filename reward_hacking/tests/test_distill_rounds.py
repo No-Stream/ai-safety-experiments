@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from games.checkpoint_retention import ADAPTER_WEIGHT_FILENAMES, REQUIRED_CHECKPOINT_FILES
-from reward_hacking.distill import rounds
+from reward_hacking.distill import rounds, train
 from reward_hacking.distill.rounds import DistillRoundsConfig, run_rounds
 from reward_hacking.distill.sample import token_ids_sha256
 from reward_hacking.tests.jsonl_helpers import read_jsonl, write_jsonl
@@ -267,3 +267,14 @@ def test_limited_phases_inherit_the_model_cache_and_offline_settings(
     assert "HF_HUB_CACHE=/mnt/overflow/hf-hub" in environment
     assert "HF_HUB_OFFLINE=1" in environment
     assert not any(entry.startswith("HF_HOME=") for entry in environment)
+
+
+def test_real_opd_rounds_command_preserves_two_step_linear_schedule(tmp_path: Path) -> None:
+    config = replace(_config(tmp_path), max_steps_per_round=2)
+    command = rounds._train_command(config, Path.cwd(), 0, None)
+    train_arguments = command[command.index("reward_hacking.distill.train") + 1 :]
+    args = train.parse_args(train_arguments)
+    assert args.weight_mode == "opd"
+    assert args.max_steps == 2
+    assert args.warmup_steps == 0
+    assert args.lr_scheduler_type == "linear"

@@ -139,21 +139,21 @@ def tiled_mlp_forward(module: torch.nn.Module, hidden_states: torch.Tensor) -> t
     operations = importlib.import_module("liger_kernel.ops")
     mlp = cast("Any", module)
     skip_dead_forward = _OFFLOADED_LAYER_RECOMPUTE.get() and mlp.skip_dead_mlp_recompute
-    tiled_function: Callable[[torch.nn.Module, torch.Tensor], torch.Tensor] = tiled_mlp_compute
+    device_type = hidden_states.device.type
+    autocast_enabled = torch.is_autocast_enabled(device_type)
+    autocast_dtype = torch.get_autocast_dtype(device_type)
 
-    if skip_dead_forward:
-
-        def compute_forward(module: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
-            if not torch.is_grad_enabled():
-                return torch.empty_like(inputs)
+    def compute_forward(module: torch.nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+        if skip_dead_forward and not torch.is_grad_enabled():
+            return torch.empty_like(inputs)
+        # Liger's tiled backward enables gradients but does not restore forward autocast.
+        with torch.autocast(device_type, enabled=autocast_enabled, dtype=autocast_dtype):
             return tiled_mlp_compute(module, inputs)
-
-        tiled_function = compute_forward
 
     return cast(
         "torch.Tensor",
         operations.apply_tiled_mlp(
-            fn=tiled_function,
+            fn=compute_forward,
             mlp_module=module,
             x=hidden_states,
             num_shards=None,

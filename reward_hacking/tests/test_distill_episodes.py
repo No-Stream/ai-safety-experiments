@@ -405,7 +405,8 @@ def test_builds_multi_turn_row_with_runaway_forced_close_and_environment_masks(
     expected_completion = "A<|im_end|>!toolx</think>y<|im_end|>!noteEMPTYNUDGEZ"
     assert row["prompt_token_ids"] == tokenizer.encode(expected_prompt)
     assert row["completion_token_ids"] == tokenizer.encode(expected_completion)
-    assert row["loss_mask"] == [1, 1] + [0] * 5 + [1, 0, 1, 1] + [0] * 5 + [0] * 10 + [1]
+    assert row["loss_mask"] == [1, 1] + [0] * 5 + [0] * 4 + [0] * 5 + [0] * 10 + [1]
+    assert row["thinking_budget_masked_turn_count"] == 1
     assert "GHOST" not in tokenizer.decode(cast("list[int]", row["completion_token_ids"]))
     assert "REPORT" not in tokenizer.decode(cast("list[int]", row["completion_token_ids"]))
     sampling_logprobs = cast("list[float | None]", row["sampling_logprobs"])
@@ -415,6 +416,27 @@ def test_builds_multi_turn_row_with_runaway_forced_close_and_environment_masks(
     assert sampling_logprobs[7:11] == pytest.approx([-1.1] * 4)
     assert sampling_logprobs[11:26] == [None] * 15
     assert sampling_logprobs[26] == pytest.approx(-3.1)
+
+
+def test_general_episode_row_keeps_forced_close_only_masking_by_default(tmp_path: Path) -> None:
+    records_path = _write_synthetic_episode(tmp_path)
+    episode_record = json.loads(records_path.read_text(encoding="utf-8"))
+    tokenizer = CharacterTokenizer()
+    trace_records = read_episode_trace_records(episode_record, records_path)
+
+    row = build_episode_row(
+        episode_record,
+        trace_records,
+        tokenizer=cast("Any", tokenizer),
+        prompt_render="teacher",
+    )
+
+    turn_start, turn_end = cast("list[list[int]]", row["turn_action_spans"])[1]
+    action_mask = cast("list[int]", row["loss_mask"])[turn_start:turn_end]
+    action_ids = cast("list[int]", row["completion_token_ids"])[turn_start:turn_end]
+    expected_mask = [0 if token_id == tokenizer.thinking_close_id else 1 for token_id in action_ids]
+    assert action_mask == expected_mask
+    assert row["thinking_budget_masked_turn_count"] == 0
 
 
 def test_student_rendering_strips_hint_and_preserves_sampled_action_ids() -> None:

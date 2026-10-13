@@ -673,7 +673,9 @@ def _recorded_hint_text(
         raise ValueError("recorded hint family and strength do not select one catalog entry")
     hint_text = matching_hints[0]["text"]
     if hashlib.sha256(hint_text.encode("utf-8")).hexdigest() != hint_sha:
-        raise ValueError("recorded hint text digest differs from the selected catalog entry")
+        raise ValueError(
+            "recorded selected hint semantic digest differs from the current catalog entry"
+        )
     return hint_text
 
 
@@ -715,9 +717,7 @@ def _recorded_hint_entries(record: CorpusRecord) -> list[dict[str, str]]:
 
     from reward_hacking.organism_rl.generate import _read_hint_entries  # noqa: PLC0415
 
-    hint_entries, actual_catalog_sha256 = _read_hint_entries(catalog_path)
-    if actual_catalog_sha256 != recorded_catalog_sha256:
-        raise ValueError(f"recorded hint catalog SHA-256 differs for {catalog_path_text}")
+    hint_entries, _ = _read_hint_entries(catalog_path)
     return hint_entries
 
 
@@ -757,7 +757,9 @@ def test_recorded_hint_catalog_is_loaded_when_legacy_flags_omit_digest(
     assert _recorded_hint_text(record, "synthetic", "vague", hint_sha) == hint_text
 
 
-def test_recorded_hint_catalog_is_loaded_and_its_digest_is_verified(tmp_path: Path) -> None:
+def test_recorded_hint_catalog_verifies_selected_entry_across_unrelated_changes(
+    tmp_path: Path,
+) -> None:
     catalog_path = tmp_path / "synthetic-hints.json"
     hint_text = "Synthetic guidance for a focused test."
     catalog_bytes = json.dumps(
@@ -790,12 +792,49 @@ def test_recorded_hint_catalog_is_loaded_and_its_digest_is_verified(tmp_path: Pa
         json.dumps(
             {
                 "schema_version": 1,
-                "hints": [{"family": "synthetic", "strength": "vague", "text": "Changed text."}],
-            }
+                "hints": [
+                    {
+                        "family": "synthetic",
+                        "strength": "vague",
+                        "text": hint_text,
+                    },
+                    {
+                        "family": "unrelated",
+                        "strength": "specific",
+                        "text": "An unrelated catalog entry.",
+                    },
+                ],
+            },
+            indent=2,
+            sort_keys=True,
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="catalog SHA-256 differs"):
+    assert _recorded_hint_text(record, "synthetic", "vague", hint_sha) == hint_text
+
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hints": [
+                    {
+                        "family": "synthetic",
+                        "strength": "vague",
+                        "text": "Changed selected text.",
+                    },
+                    {
+                        "family": "unrelated",
+                        "strength": "specific",
+                        "text": "An unrelated catalog entry.",
+                    },
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="selected hint semantic digest differs"):
         _recorded_hint_text(record, "synthetic", "vague", hint_sha)
 
 

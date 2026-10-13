@@ -377,7 +377,7 @@ def test_tiled_mlp_passes_only_trainable_parameters(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(memory.importlib, "import_module", lambda _: Operations)
     assert memory.tiled_mlp_forward(model, inputs) is inputs
-    assert calls[0]["fn"] is memory.tiled_mlp_compute
+    assert callable(calls[0]["fn"])
     assert calls[0]["mlp_module"] is model
     assert calls[0]["num_shards"] is None
     assert len(calls[0]["compute_params"]) == 1
@@ -483,3 +483,87 @@ def test_dead_mlp_skip_refuses_stochastic_mlp() -> None:
     model.get_submodule("base_model.layers.0.mlp").add_module("dropout", torch.nn.Dropout(0.1))
     with pytest.raises(ValueError, match="dropout"):
         memory.install_tiled_mlp(model, skip_dead_mlp_recompute=True)
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_tiled_bfloat16_autocast_preserves_float32_adapter_gradients(
+    monkeypatch: pytest.MonkeyPatch, offload: bool
+) -> None:
+    torch.manual_seed(31)
+    model = AutoModelForCausalLM.from_config(
+        Qwen2Config(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+        )
+    ).to(torch.bfloat16)
+    adapted = get_peft_model(
+        model,
+        LoraConfig(r=16, lora_alpha=32, target_modules=["gate_proj", "up_proj", "down_proj"]),
+    )
+    mlp = cast("Any", adapted).get_base_model().model.layers[0].mlp
+    mlp.skip_dead_mlp_recompute = False
+    parameters = [parameter for parameter in mlp.parameters() if parameter.requires_grad]
+    assert parameters
+    assert all(parameter.dtype == torch.float32 for parameter in parameters)
+    for parameter in parameters:
+        torch.nn.init.normal_(parameter, std=0.02)
+    inputs = torch.randn(1, 40, 16, dtype=torch.bfloat16)
+    compute_autocast: list[bool] = []
+
+    def compute_mlp(module: Any, hidden_states: torch.Tensor) -> torch.Tensor:
+        compute_autocast.append(torch.is_autocast_enabled("cpu"))
+        return module.down_proj(
+            torch.nn.functional.silu(module.gate_proj(hidden_states))
+            * module.up_proj(hidden_states)
+        )
+
+    monkeypatch.setattr(memory, "tiled_mlp_compute", compute_mlp)
+    monkeypatch.setattr(
+        memory.importlib,
+        "import_module",
+        lambda _: SimpleNamespace(apply_tiled_mlp=apply_tiled_mlp),
+    )
+
+    def loss_and_gradients(tiled: bool) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        mlp.zero_grad(set_to_none=True)
+        hidden_states = inputs.clone().requires_grad_()
+
+        def run_layer(hidden_states: torch.Tensor) -> torch.Tensor:
+            return (
+                memory.tiled_mlp_forward(mlp, hidden_states)
+                if tiled
+                else compute_mlp(mlp, hidden_states)
+            )
+
+        slot = PageableSlot()
+        slot.buffer = torch.empty_like(hidden_states).flatten()
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            output = (
+                memory.OffloadedLayerFunction.apply(run_layer, hidden_states, slot)
+                if offload
+                else run_layer(hidden_states)
+            )
+            assert output.dtype == torch.bfloat16
+            loss = output.float().square().sum()
+        loss.backward()
+        assert hidden_states.grad is not None
+        gradients = [hidden_states.grad.clone()]
+        assert all(
+            parameter.grad is not None and parameter.grad.dtype == torch.float32
+            for parameter in parameters
+        )
+        gradients.extend(cast("torch.Tensor", parameter.grad).clone() for parameter in parameters)
+        return loss.detach(), gradients
+
+    expected_loss, expected_gradients = loss_and_gradients(False)
+    compute_autocast.clear()
+    actual_loss, actual_gradients = loss_and_gradients(True)
+    assert compute_autocast
+    assert all(compute_autocast)
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+    for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.0001)

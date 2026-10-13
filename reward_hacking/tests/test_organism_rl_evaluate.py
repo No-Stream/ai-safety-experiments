@@ -90,6 +90,167 @@ def test_heldout_selection_is_seeded_and_pairs_task_variants() -> None:
     assert ids_by_variant["oneoff"] == ids_by_variant["original"]
 
 
+def test_explicit_heldout_task_ids_preserve_mixed_family_variant_cells() -> None:
+    task_ids = (
+        "aisi:original:task-a",
+        "aisi:oneoff:task-b",
+        "ilcb:original:task-c",
+        "ilcb:oneoff:task-d",
+    )
+    tasks = {task_id: _task(task_id, task_id) for task_id in task_ids}
+    source = cast(
+        "TaskEpisodeSource",
+        SimpleNamespace(
+            tasks=tasks,
+            families_by_task={
+                task_id: "aisi" if task_id.startswith("aisi:") else "ilcb" for task_id in task_ids
+            },
+            variants_by_task={
+                task_id: "original" if ":original:" in task_id else "oneoff" for task_id in task_ids
+            },
+        ),
+    )
+
+    selected = evaluate.select_heldout_task_specs(
+        source,
+        families=("aisi", "ilcb"),
+        impossible_variant="oneoff",
+        tasks_per_family=1,
+        seed=0,
+        task_ids=task_ids,
+    )
+
+    assert tuple(spec.task_id for spec in selected) == tuple(sorted(task_ids))
+    assert {spec.partition for spec in selected} == {"held-out"}
+    assert {(spec.family, spec.variant) for spec in selected} == {
+        ("aisi", "original"),
+        ("aisi", "oneoff"),
+        ("ilcb", "original"),
+        ("ilcb", "oneoff"),
+    }
+
+
+def test_explicit_heldout_task_ids_reject_duplicates_and_wrong_cells() -> None:
+    task_ids = ("ilcb:oneoff:task-a", "ilcb:original:task-a")
+    tasks = {task_id: _task(task_id, "task-a") for task_id in task_ids}
+    source = cast(
+        "TaskEpisodeSource",
+        SimpleNamespace(
+            tasks=tasks,
+            families_by_task=dict.fromkeys(task_ids, "ilcb"),
+            variants_by_task={
+                "ilcb:oneoff:task-a": "oneoff",
+                "ilcb:original:task-a": "original",
+            },
+        ),
+    )
+    with pytest.raises(ValueError, match="task IDs must be unique"):
+        evaluate.select_heldout_task_specs(
+            source,
+            families=("ilcb",),
+            impossible_variant="oneoff",
+            tasks_per_family=1,
+            seed=0,
+            task_ids=(task_ids[0], task_ids[0]),
+        )
+    with pytest.raises(ValueError, match="task IDs do not match requested families or variants"):
+        evaluate.select_heldout_task_specs(
+            source,
+            families=("ilcb",),
+            impossible_variant="oneoff",
+            tasks_per_family=1,
+            seed=0,
+            evaluation_variant="oneoff",
+            task_ids=(task_ids[1],),
+        )
+
+
+def test_explicit_task_ids_can_select_one_concrete_variant() -> None:
+    task_id = "aisi:original:task-a"
+    source = cast(
+        "TaskEpisodeSource",
+        SimpleNamespace(
+            tasks={task_id: _task(task_id, "task-a")},
+            families_by_task={task_id: "aisi"},
+            variants_by_task={task_id: "original"},
+        ),
+    )
+
+    selected = evaluate.select_heldout_task_specs(
+        source,
+        families=("aisi",),
+        impossible_variant="oneoff",
+        evaluation_variant="original",
+        tasks_per_family=1,
+        seed=0,
+        task_ids=(task_id,),
+    )
+
+    assert len(selected) == 1
+    assert selected[0].task_id == task_id
+    assert selected[0].variant == "original"
+
+
+def test_evaluation_cli_reads_explicit_task_ids_and_scales_sampling_budget(tmp_path: Path) -> None:
+    task_ids_path = tmp_path / "task-ids.json"
+    task_ids = [
+        "aisi:original:task-a",
+        "aisi:oneoff:task-b",
+        "ilcb:original:task-c",
+        "ilcb:oneoff:task-d",
+    ]
+    task_ids_path.write_text(json.dumps(task_ids), encoding="utf-8")
+
+    args = evaluate.parse_args(
+        [
+            "--endpoint",
+            "http://server:8000",
+            "--output-dir",
+            "artifacts/evaluation",
+            "--max-model-len",
+            "4096",
+            "--family",
+            "aisi",
+            "--family",
+            "ilcb",
+            "--tasks-per-family",
+            "1",
+            "--task-ids-file",
+            str(task_ids_path),
+            "--samples-per-task",
+            "2",
+        ]
+    )
+
+    assert args.task_ids == tuple(task_ids)
+    assert args.samples_per_task == 2
+    assert args.sampling_budget["total_episodes"] == 8
+    assert set(args.sampling_budget["episodes_per_cell"].values()) == {2}
+
+
+def test_evaluation_cli_rejects_malformed_or_duplicate_task_id_files(tmp_path: Path) -> None:
+    malformed_path = tmp_path / "malformed-task-ids.json"
+    malformed_path.write_text(json.dumps(["task-a", "task-a"]), encoding="utf-8")
+    duplicate_path = tmp_path / "duplicate-task-ids.json"
+    duplicate_path.write_text('{"task_ids": []}', encoding="utf-8")
+
+    base_arguments = [
+        "--endpoint",
+        "http://server:8000",
+        "--output-dir",
+        "artifacts/evaluation",
+        "--max-model-len",
+        "4096",
+        "--family",
+        "ilcb",
+        "--tasks-per-family",
+        "1",
+    ]
+    for path in (malformed_path, duplicate_path):
+        with pytest.raises(SystemExit):
+            evaluate.parse_args([*base_arguments, "--task-ids-file", str(path)])
+
+
 @pytest.mark.parametrize("variant", ["oneoff", "original", "conflicting"])
 def test_ilcb_eval_exclusion_keeps_eight_other_heldout_tasks(variant: str) -> None:
     problem_ids = ("lcbhard_16", *(f"eligible-{index}" for index in range(8)))
@@ -725,6 +886,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             leak_repos=("synthetic-repo",) if "r2e_leak" in families else None,
             leak_eval_pairs=((("synthetic-task", "git_reflog"),) if "r2e_leak" in families else ()),
             tasks_per_family=1,
+            samples_per_task=1,
             excluded_ilcb_problem_ids=["lcbhard_16"],
             sampling_budget={},
             seed=17,
@@ -878,7 +1040,7 @@ class _SyntheticEvaluationSource:
         self.root = root
 
     def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
-        del seed, step, replica
+        del seed, step
         variant = "original" if task_id.endswith("solvable") else "oneoff"
         is_solvable = variant == "original"
         digest = "a" * 64
@@ -929,7 +1091,7 @@ class _SyntheticEvaluationSource:
             },
             summary,
         ]
-        trace_path = self.root / f"{task_id}.jsonl"
+        trace_path = self.root / f"{task_id}-{replica}.jsonl"
         trace_path.write_text("\n".join(json.dumps(row) for row in trace_records) + "\n")
         return EpisodeSample(summary, trace_records, trace_path)
 
@@ -950,24 +1112,25 @@ def test_run_evaluation_reuses_generation_persistence_and_summary(tmp_path: Path
         task_specs=task_specs,
         concurrency=1,
         provenance={"run": "synthetic-evaluation"},
+        samples_per_task=2,
     )
 
     group = cast("dict[str, object]", summary["by_family_and_task_kind"])
     ilcb = cast("dict[str, dict[str, object]]", group["ilcb"])
-    assert ilcb["impossible"]["rewarded"] == 1
-    assert ilcb["impossible"]["submitted_episodes"] == 1
-    assert ilcb["solvable"]["honest_solve"] == 1
+    assert ilcb["impossible"]["rewarded"] == 2
+    assert ilcb["impossible"]["submitted_episodes"] == 2
+    assert ilcb["solvable"]["honest_solve"] == 2
     records = [
         json.loads(line)
         for line in (output_dir / "records.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert len(records) == 2
+    assert len(records) == 4
     assert (output_dir / "summary.json").is_file()
-    assert summary["non_registered_submit_notice_episodes"] == 1
+    assert summary["non_registered_submit_notice_episodes"] == 2
     assert cast("dict[str, object]", summary["non_registered_submit_notice_counts_by_cell"])[
         "family=ilcb/variant=oneoff/register=trusted_rerun"
-    ] == {"episodes": 1, "notice_episodes": 1, "notice_attempts": 1}
-    assert "Total episodes with at least one notice: 1" in (output_dir / "summary.md").read_text()
+    ] == {"episodes": 2, "notice_episodes": 2, "notice_attempts": 2}
+    assert "Total episodes with at least one notice: 2" in (output_dir / "summary.md").read_text()
 
 
 def test_evaluation_counts_overshoot_and_applies_threshold(tmp_path: Path) -> None:

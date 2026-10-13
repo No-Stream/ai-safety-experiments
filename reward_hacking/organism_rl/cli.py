@@ -30,7 +30,7 @@ from reward_hacking.distill.memory import (
     load_base_model,
     prepare_checkpoint_offload,
 )
-from reward_hacking.distill.train import cast_lora_to_bf16, memory_options_from_args
+from reward_hacking.distill.train import memory_options_from_args
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
@@ -64,6 +64,15 @@ CLI_PROVENANCE_SCHEMA_VERSION = 1
 MINIMUM_GENERATIONS = 2
 TRAINER_LORA_RANK = 16
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
+
+
+def cast_lora_to_bf16(model: torch.nn.Module) -> None:
+    """Preserve the quantized RL recipe's bf16 adapters after PEFT initialization."""
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            if "lora_" not in name:
+                raise RuntimeError(f"only LoRA parameters may train: {name}")
+            parameter.data = parameter.data.to(torch.bfloat16)
 
 
 @dataclass(frozen=True)

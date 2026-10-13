@@ -666,3 +666,19 @@ def test_cli_task_snapshot_ignores_raw_leak_digest_and_accepts_legacy(tmp_path: 
                 },
             },
         )
+
+
+def test_rl_adapter_precision_helper_preserves_existing_bfloat16_recipe() -> None:
+    model = torch.nn.Module()
+    model.register_parameter(
+        "frozen_weight", torch.nn.Parameter(torch.ones(3), requires_grad=False)
+    )
+    model.register_parameter("lora_A", torch.nn.Parameter(torch.ones(3)))
+    cli.cast_lora_to_bf16(model)
+    assert model.get_parameter("lora_A").dtype == torch.bfloat16
+    assert model.get_parameter("frozen_weight").dtype == torch.float32
+
+
+def test_rl_adapter_precision_helper_rejects_other_trainable_parameters() -> None:
+    with pytest.raises(RuntimeError, match="only LoRA parameters may train"):
+        cli.cast_lora_to_bf16(torch.nn.Linear(2, 2))

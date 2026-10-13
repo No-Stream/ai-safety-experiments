@@ -80,6 +80,15 @@ class _AISISelectionOrder:
 
 
 @dataclass(frozen=True)
+class _ExplicitTaskSelection:
+    task_ids: Sequence[str]
+    allowed_variants: Mapping[TaskFamily, tuple[str, ...]]
+    tasks_per_family: int
+    payment_register: str
+    excluded_ilcb_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
 class _ReuseCellRequest:
     source_dir: Path
     target_dir: Path
@@ -97,6 +106,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     args.families = list(dict.fromkeys(args.family_entries or DEFAULT_FAMILIES))
     args.partition = "held-out"
+    try:
+        args.task_ids = _read_task_ids_file(args.task_ids_file) if args.task_ids_file else None
+    except ValueError as error:
+        parser.error(str(error))
     args.served_model_id = args.served_model_id or (
         EVALUATION_ADAPTER_NAME if args.adapter_dir is not None else args.model
     )
@@ -163,6 +176,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="run one concrete cell variant instead of its paired treatment and solvable control",
     )
     parser.add_argument(
+        "--task-ids-file",
+        type=Path,
+        help="JSON list of exact held-out task IDs; each requested cell must contain tasks-per-family IDs",
+    )
+    parser.add_argument(
         "--exclude-ilcb-problem-id",
         dest="excluded_ilcb_problem_ids",
         action="append",
@@ -177,6 +195,12 @@ def _argument_parser() -> argparse.ArgumentParser:
         metavar="SOURCE,...",
     )
     parser.add_argument("--tasks-per-family", type=int, required=True)
+    parser.add_argument(
+        "--samples-per-task",
+        type=int,
+        default=1,
+        help="independent generated episodes per selected task",
+    )
     parser.add_argument(
         "--aisi-task-id-order",
         action="store_true",
@@ -219,8 +243,25 @@ def _evaluation_sampling_budget(args: argparse.Namespace) -> dict[str, object]:
         )
         for variant in variants:
             cell = f"model={args.model}/family={family}/variant={variant}"
-            episodes_per_cell[cell] = args.tasks_per_family
+            episodes_per_cell[cell] = args.tasks_per_family * args.samples_per_task
     return log_sampling_grid(episodes_per_cell, oversize_reason=args.oversize_reason)
+
+
+def _read_task_ids_file(path: Path | None) -> tuple[str, ...] | None:
+    if path is None:
+        return None
+    value: object = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, list) or not value:
+        raise ValueError("task IDs file must contain a nonempty JSON list of task IDs")
+    if any(
+        not isinstance(task_id, str) or not task_id or task_id != task_id.strip()
+        for task_id in value
+    ):
+        raise ValueError("task IDs file entries must be nonempty canonical strings")
+    task_ids = cast("list[str]", value)
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("task IDs file must not contain duplicate task IDs")
+    return tuple(task_ids)
 
 
 def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -236,6 +277,8 @@ def _validate_task_selection_args(
     _validate_impossible_variant_family(args, parser)
     _validate_evaluation_variant_family(args, parser)
     _validate_reuse_selection(args, parser)
+    if args.task_ids is not None and args.reuse_from is not None:
+        parser.error("task-ids-file cannot be combined with reuse-from")
     if args.excluded_ilcb_problem_ids and "ilcb" not in args.families:
         parser.error("exclude-ilcb-problem-id requires --family ilcb")
     if len(args.excluded_ilcb_problem_ids) != len(set(args.excluded_ilcb_problem_ids)):
@@ -309,7 +352,12 @@ def _validate_serving_args(args: argparse.Namespace, parser: argparse.ArgumentPa
 
 
 def _validate_episode_limits(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    if args.tasks_per_family < 1 or args.concurrency < 1 or args.max_model_len < 1:
+    if (
+        args.tasks_per_family < 1
+        or args.samples_per_task < 1
+        or args.concurrency < 1
+        or args.max_model_len < 1
+    ):
         parser.error("task, concurrency, and model-length limits must be positive")
     if min(args.max_turns, args.max_new_tokens) < 1:
         parser.error("turn and token limits must be positive")
@@ -413,6 +461,7 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
     aisi_task_id_order: bool = False,
     payment_register: str = "trusted_rerun",
     excluded_ilcb_problem_ids: Sequence[str] = (),
+    task_ids: Sequence[str] | None = None,
 ) -> tuple[TaskSpec, ...]:
     """Select matched held-out problem IDs for treatment and solvable task variants.
 
@@ -427,6 +476,18 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
         excluded_ilcb_problem_ids,
     )
     excluded_ilcb_ids = frozenset(excluded_ilcb_problem_ids)
+
+    if task_ids is not None:
+        return _select_explicit_task_specs(
+            source,
+            _ExplicitTaskSelection(
+                task_ids,
+                _explicit_allowed_variants(families, impossible_variant, evaluation_variant),
+                tasks_per_family,
+                payment_register,
+                excluded_ilcb_ids,
+            ),
+        )
 
     rng = random.Random(seed)
     selected: list[TaskSpec] = []
@@ -536,6 +597,68 @@ def select_heldout_task_specs(  # noqa: PLR0913 - explicit selection controls
                 )
             )
     return tuple(sorted(selected, key=lambda spec: (spec.family, spec.variant, spec.task_id)))
+
+
+def _select_explicit_task_specs(
+    source: TaskEpisodeSource,
+    selection: _ExplicitTaskSelection,
+) -> tuple[TaskSpec, ...]:
+    if not selection.task_ids or any(not task_id for task_id in selection.task_ids):
+        raise ValueError("explicit task IDs must be nonempty")
+    if len(selection.task_ids) != len(set(selection.task_ids)):
+        raise ValueError("explicit task IDs must be unique")
+    counts: dict[tuple[str, str], int] = {}
+    explicit_specs: list[TaskSpec] = []
+    for task_id in selection.task_ids:
+        family = source.families_by_task.get(task_id)
+        variant = source.variants_by_task.get(task_id)
+        if (
+            task_id not in source.tasks
+            or not isinstance(family, str)
+            or family not in selection.allowed_variants
+            or not isinstance(variant, str)
+            or variant not in selection.allowed_variants[cast("TaskFamily", family)]
+        ):
+            raise ValueError("task IDs do not match requested families or variants")
+        if family == "ilcb" and source.tasks[task_id].problem_id in selection.excluded_ilcb_ids:
+            raise ValueError("explicit task IDs include an excluded ILCB problem")
+        key = (family, variant)
+        counts[key] = counts.get(key, 0) + 1
+        explicit_specs.append(
+            TaskSpec(
+                task_id,
+                cast("TaskFamily", family),
+                variant,
+                "held-out",
+                cast("Literal['trusted_rerun', 'in_band']", selection.payment_register),
+            )
+        )
+    expected_counts = {
+        (family, variant): selection.tasks_per_family
+        for family, variants in selection.allowed_variants.items()
+        for variant in variants
+    }
+    if counts != expected_counts:
+        raise ValueError(
+            "explicit task IDs must contain tasks-per-family IDs in every requested cell"
+        )
+    return tuple(sorted(explicit_specs, key=lambda spec: (spec.family, spec.variant, spec.task_id)))
+
+
+def _explicit_allowed_variants(
+    families: Sequence[TaskFamily],
+    impossible_variant: str,
+    evaluation_variant: str | None,
+) -> dict[TaskFamily, tuple[str, ...]]:
+    allowed_variants: dict[TaskFamily, tuple[str, ...]] = {}
+    for family in families:
+        treatment_variant = task_family_variant(family, impossible_variant)
+        allowed_variants[family] = (
+            (_selected_concrete_variant(family, treatment_variant, evaluation_variant),)
+            if evaluation_variant is not None
+            else _paired_task_variants(family, treatment_variant)
+        )
+    return allowed_variants
 
 
 def _paired_task_variants(family: TaskFamily, treatment_variant: str) -> tuple[str, str]:
@@ -717,6 +840,7 @@ def run_evaluation(  # noqa: PLR0913 - generation owns the shared execution cont
     task_specs: Sequence[TaskSpec],
     concurrency: int,
     provenance: Mapping[str, object],
+    samples_per_task: int = 1,
     thinking_budget_overshoot_policy: ThinkingBudgetOvershootPolicy = DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
 ) -> dict[str, object]:
     """Delegate episode execution, persistence, resumption, and aggregation to generate.py."""
@@ -724,7 +848,7 @@ def run_evaluation(  # noqa: PLR0913 - generation owns the shared execution cont
         output_dir=output_dir,
         source=source,
         task_specs=task_specs,
-        samples_per_task=1,
+        samples_per_task=samples_per_task,
         concurrency=concurrency,
         provenance=provenance,
         thinking_budget_overshoot_policy=thinking_budget_overshoot_policy,
@@ -1433,7 +1557,7 @@ def _evaluation_provenance(
         "leak_channel_split": args.leak_channel_split,
         "tasks_per_family": args.tasks_per_family,
         "excluded_ilcb_problem_ids": sorted(args.excluded_ilcb_problem_ids),
-        "samples_per_task": 1,
+        "samples_per_task": args.samples_per_task,
         "sampling_budget": args.sampling_budget,
         "seed": args.seed,
         "concurrency": args.concurrency,
@@ -1602,6 +1726,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         aisi_task_id_order=args.aisi_task_id_order,
         payment_register=args.payment_register,
         excluded_ilcb_problem_ids=args.excluded_ilcb_problem_ids,
+        task_ids=args.task_ids,
     )
     provenance = _evaluation_provenance(
         args,
@@ -1651,6 +1776,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             task_specs=task_specs,
             concurrency=args.concurrency,
             provenance=provenance,
+            samples_per_task=args.samples_per_task,
             thinking_budget_overshoot_policy=ThinkingBudgetOvershootPolicy(
                 args.thinking_budget_overshoot_max_fraction,
                 args.thinking_budget_overshoot_min_episodes,

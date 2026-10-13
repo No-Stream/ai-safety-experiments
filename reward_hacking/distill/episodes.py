@@ -58,6 +58,15 @@ class TraceHint:
         return {"family": self.family, "strength": self.strength, "sha": self.sha}
 
 
+class NoSupervisionTokensError(ValueError):
+    """Raised when a context row has no assistant tokens eligible for loss."""
+
+    def __init__(self, thinking_budget_masked_turn_count: int) -> None:
+        """Store the number of budget-fired turns that had their loss mask cleared."""
+        super().__init__("episode row contains no unmasked sampled assistant tokens")
+        self.thinking_budget_masked_turn_count = thinking_budget_masked_turn_count
+
+
 def student_template_sha256(
     tokenizer: PreTrainedTokenizerBase, workspace_mount: str = "/work"
 ) -> str:
@@ -247,6 +256,7 @@ class _BuiltSequence:
     token_turn_indices: list[int]
     turn_action_spans: list[list[int]]
     included_turns: int
+    thinking_budget_masked_turn_count: int
     truncated: bool
     original_sequence_tokens: int
 
@@ -322,6 +332,23 @@ def _decoded_prefix(tokenizer: PreTrainedTokenizerBase, token_ids: Sequence[int]
 
 def _encode_environment(tokenizer: PreTrainedTokenizerBase, text: str) -> list[int]:
     return [int(token_id) for token_id in tokenizer.encode(text, add_special_tokens=False)]
+
+
+def _mask_thinking_budget_turn(
+    tokenizer: PreTrainedTokenizerBase,
+    completion_token_ids: Sequence[int],
+    loss_mask: list[int],
+    *,
+    turn_index: int,
+) -> None:
+    close_token_id = tokenizer.convert_tokens_to_ids(FORCED_THINKING_CLOSE)
+    if type(close_token_id) is not int or close_token_id == tokenizer.unk_token_id:
+        raise ValueError(f"tokenizer does not have a dedicated {FORCED_THINKING_CLOSE} token")
+    if close_token_id not in completion_token_ids:
+        raise ValueError(
+            f"turn {turn_index} reached the thinking budget but has no sampled {FORCED_THINKING_CLOSE} token"
+        ) from None
+    loss_mask[:] = [0] * len(loss_mask)
 
 
 def _mask_forced_thinking_close(
@@ -559,6 +586,7 @@ def _sampled_action(
     tokenizer: PreTrainedTokenizerBase,
     *,
     turn_index: int,
+    mask_thinking_budget_turn: bool = False,
 ) -> _TurnAction:
     action_token_ids = _token_ids(
         turn.get("completion_token_ids"),
@@ -597,12 +625,20 @@ def _sampled_action(
     if _required_bool(
         turn.get("thinking_budget_fired"), f"turn {turn_index} thinking_budget_fired"
     ):
-        _mask_forced_thinking_close(
-            tokenizer,
-            action_token_ids,
-            action_mask,
-            turn_index=turn_index,
-        )
+        if mask_thinking_budget_turn:
+            _mask_thinking_budget_turn(
+                tokenizer,
+                action_token_ids,
+                action_mask,
+                turn_index=turn_index,
+            )
+        else:
+            _mask_forced_thinking_close(
+                tokenizer,
+                action_token_ids,
+                action_mask,
+                turn_index=turn_index,
+            )
     return _TurnAction(
         token_ids=action_token_ids,
         loss_mask=action_mask,
@@ -695,6 +731,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
     max_sequence_tokens: int,
     has_per_turn_prompt_ids: bool,
     student_prompts: Sequence[str] | None = None,
+    mask_thinking_budget_turns: bool = False,
 ) -> _BuiltSequence:
     prefix_token_ids = list(prompt_token_ids)
     rendered_prefix_ids = (
@@ -709,6 +746,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
     token_turn_indices: list[int] = []
     turn_action_spans: list[list[int]] = []
     included_turns = 0
+    thinking_budget_masked_turn_count = 0
     truncated = False
     original_sequence_tokens = len(rendered_prefix_ids)
 
@@ -722,7 +760,12 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
             tokenizer,
             turn_index=turn_index,
         )
-        action = _sampled_action(turn, tokenizer, turn_index=turn_index)
+        action = _sampled_action(
+            turn,
+            tokenizer,
+            turn_index=turn_index,
+            mask_thinking_budget_turn=mask_thinking_budget_turns,
+        )
         if student_prompts is not None:
             student_prompt = student_prompts[turn_index]
             native_ids = _encode_environment(tokenizer, student_prompt)
@@ -764,6 +807,13 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
             sampling_logprobs.extend(turn_logprobs)
             token_turn_indices.extend(turn_index if active else -1 for active in turn_mask)
             included_turns = turn_index + 1
+            thinking_budget_masked_turn_count += int(
+                mask_thinking_budget_turns
+                and _required_bool(
+                    turn.get("thinking_budget_fired"),
+                    f"turn {turn_index} thinking_budget_fired",
+                )
+            )
         else:
             truncated = True
         original_sequence_tokens = boundary_length
@@ -773,7 +823,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
     if included_turns == 0 or not completion_token_ids:
         raise ValueError("no complete policy turn fits max_sequence_tokens")
     if not any(loss_mask):
-        raise ValueError("episode row contains no unmasked sampled assistant tokens")
+        raise NoSupervisionTokensError(thinking_budget_masked_turn_count)
     return _BuiltSequence(
         completion_token_ids=completion_token_ids,
         sampled_action_token_ids=sampled_action_token_ids,
@@ -782,6 +832,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
         token_turn_indices=token_turn_indices,
         turn_action_spans=turn_action_spans,
         included_turns=included_turns,
+        thinking_budget_masked_turn_count=thinking_budget_masked_turn_count,
         truncated=truncated,
         original_sequence_tokens=original_sequence_tokens,
     )
@@ -872,12 +923,13 @@ def _build_opd_sequence(
         token_turn_indices=indices,
         turn_action_spans=spans,
         included_turns=len(turns),
+        thinking_budget_masked_turn_count=0,
         truncated=False,
         original_sequence_tokens=len(final_ids),
     )
 
 
-def build_episode_row(
+def build_episode_row(  # noqa: PLR0913 - row options stay explicit at the public builder boundary
     episode_record: Mapping[str, object],
     trace_records: Sequence[Mapping[str, object]],
     *,
@@ -885,6 +937,7 @@ def build_episode_row(
     max_sequence_tokens: int = DEFAULT_MAX_SEQUENCE_TOKENS,
     prompt_render: PromptRender = "student",
     _opd_final_sequence: bool = False,
+    mask_thinking_budget_turns: bool = False,
 ) -> dict[str, object]:
     """Turn one retained-history ladder trace into one masked, token-id training row."""
     if type(max_sequence_tokens) is not int or max_sequence_tokens < 1:
@@ -947,6 +1000,7 @@ def build_episode_row(
             max_sequence_tokens=max_sequence_tokens,
             has_per_turn_prompt_ids=has_per_turn_prompt_ids,
             student_prompts=student_prompts,
+            mask_thinking_budget_turns=mask_thinking_budget_turns,
         )
     )
     if student_prompts is not None and not _opd_final_sequence:
@@ -1001,6 +1055,7 @@ def build_episode_row(
         "sequence_tokens": prompt_length + len(built_sequence.completion_token_ids),
         "original_sequence_tokens": built_sequence.original_sequence_tokens,
         "included_turns": built_sequence.included_turns,
+        "thinking_budget_masked_turn_count": built_sequence.thinking_budget_masked_turn_count,
         "grader_directed_move_coverage": grader_move_coverage,
         "grader_directed_move_turn_indices": grader_move_turn_indices,
         "grader_directed_move_cut": grader_directed_move_cut,
@@ -1282,6 +1337,7 @@ def build_episode_rows(
             tokenizer=tokenizer,
             max_sequence_tokens=max_sequence_tokens,
             prompt_render=prompt_render,
+            mask_thinking_budget_turns=True,
         )
         if row["key"] != key:
             raise RuntimeError("episode row key changed while building records")
