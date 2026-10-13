@@ -3227,19 +3227,25 @@ def _sweep_one_pair(  # noqa: PLR0913 - model plus the pair, concept, layers, ax
     return rows, False
 
 
-def _patch_sweep_payload(  # noqa: PLR0913 - the args plus each handoff the artifact must carry
+def _write_patch_sweep_metrics(  # noqa: PLR0913 - the args plus each handoff the artifact must carry
+    metrics_path: Path,
     args: PatchSweepArgs,
     *,
-    layers_by_concept: Mapping[str, object],
+    progress: Mapping[str, object],
     coverage: Mapping[str, object],
+    layers_by_concept: Mapping[str, object],
     rows: Sequence[dict[str, object]],
     variants: Sequence[str],
     skipped_variants: Sequence[dict[str, object]],
     kernel_bridge: Mapping[str, object],
     deltanet_kernel: Mapping[str, str],
-) -> dict[str, object]:
-    """Assemble the uploadable artifact. Called mid-sweep too, so a hard kill loses one pair."""
-    return {
+) -> None:
+    """Write the uploadable artifact. Called mid-sweep too, so a hard kill loses one pair.
+
+    ``progress`` is the only thing the two call sites disagree on: a mid-sweep write says it is in
+    progress, the final write says whether the deadline stopped it.
+    """
+    payload: dict[str, object] = {
         "stage": "patch-sweep",
         "readout_semantics": READOUT_SEMANTICS,
         "deltanet_kernel_bridge": dict(kernel_bridge),
@@ -3262,10 +3268,11 @@ def _patch_sweep_payload(  # noqa: PLR0913 - the args plus each handoff the arti
         "patch_modes": list(args.modes),
         "layer_chunk": args.layer_chunk,
         "seed": args.seed,
-        "coverage": dict(coverage),
+        "coverage": {**coverage, **progress},
         "n_cells": len(rows),
         "patching": list(rows),
     }
+    metrics_path.write_text(json.dumps(payload, indent=2))
 
 
 def _sweep_layers_and_axes(
@@ -3446,24 +3453,17 @@ def run_patch_sweep(args: PatchSweepArgs) -> None:
             stopped = True
             break
         if completed % args.flush_every_pairs == 0:
-            metrics_path.write_text(
-                json.dumps(
-                    _patch_sweep_payload(
-                        args,
-                        layers_by_concept=layers_by_concept,
-                        coverage={
-                            **coverage,
-                            "work_items_completed": completed,
-                            "in_progress": True,
-                        },
-                        rows=rows,
-                        variants=variant_names,
-                        skipped_variants=skipped_variants,
-                        kernel_bridge=kernel_bridge,
-                        deltanet_kernel=deltanet_kernel,
-                    ),
-                    indent=2,
-                )
+            _write_patch_sweep_metrics(
+                metrics_path,
+                args,
+                progress={"work_items_completed": completed, "in_progress": True},
+                coverage=coverage,
+                layers_by_concept=layers_by_concept,
+                rows=rows,
+                variants=variant_names,
+                skipped_variants=skipped_variants,
+                kernel_bridge=kernel_bridge,
+                deltanet_kernel=deltanet_kernel,
             )
             torch.save(raw.payload(), raw_path)
 
@@ -3477,25 +3477,21 @@ def run_patch_sweep(args: PatchSweepArgs) -> None:
         raw_path,
         raw_path.stat().st_size / (1024**2),
     )
-    metrics_path.write_text(
-        json.dumps(
-            _patch_sweep_payload(
-                args,
-                layers_by_concept=layers_by_concept,
-                coverage={
-                    **coverage,
-                    "work_items_completed": completed,
-                    "stopped_on_deadline": stopped,
-                    "in_progress": False,
-                },
-                rows=rows,
-                variants=variant_names,
-                skipped_variants=skipped_variants,
-                kernel_bridge=kernel_bridge,
-                deltanet_kernel=deltanet_kernel,
-            ),
-            indent=2,
-        )
+    _write_patch_sweep_metrics(
+        metrics_path,
+        args,
+        progress={
+            "work_items_completed": completed,
+            "stopped_on_deadline": stopped,
+            "in_progress": False,
+        },
+        coverage=coverage,
+        layers_by_concept=layers_by_concept,
+        rows=rows,
+        variants=variant_names,
+        skipped_variants=skipped_variants,
+        kernel_bridge=kernel_bridge,
+        deltanet_kernel=deltanet_kernel,
     )
     logger.info(
         "patch-sweep done: %d cells over %d/%d work items (stopped_on_deadline=%s) -> %s",
@@ -3766,6 +3762,42 @@ def _decode_both_signs(  # noqa: PLR0913 - lens, model, direction, layer and the
     }
 
 
+def _load_decode_axes(
+    args: PatchDecodeArgs, selected: Sequence[tuple[str, str, int, str]]
+) -> dict[str, dict[str, dict[int, torch.Tensor]]]:
+    """Load the saved concept axes, refusing a missing concept or pooling and warning on uncovered layers.
+
+    A layer the axis does not cover is not an error: those cells decode the transplanted delta and the
+    placebo without that concept's axis beside them, and the warning says so.
+    """
+    axes: dict[str, dict[str, dict[int, torch.Tensor]]] = torch.load(
+        args.axes_path, weights_only=True
+    )
+    for concept in args.concepts:
+        if concept not in axes:
+            raise RuntimeError(f"no {concept!r} axis in {args.axes_path}; it holds {sorted(axes)}")
+        if args.pooling not in axes[concept]:
+            raise RuntimeError(
+                f"the saved {concept!r} axis has no {args.pooling!r} pooling; it holds "
+                f"{sorted(axes[concept])}"
+            )
+        covered = sorted(axes[concept][args.pooling])
+        missing = [
+            layer for _k, _d, layer, _w in selected if layer not in axes[concept][args.pooling]
+        ]
+        if missing:
+            logger.warning(
+                "the %s/%s axis covers layers %d..%d but not %s; those cells will decode the delta "
+                "and the placebo without that concept's axis beside them",
+                concept,
+                args.pooling,
+                covered[0],
+                covered[-1],
+                sorted(set(missing)),
+            )
+    return axes
+
+
 def run_patch_decode(args: PatchDecodeArgs) -> None:
     """Decode the vector activation patching actually transplants into token space (GPU).
 
@@ -3811,31 +3843,7 @@ def run_patch_decode(args: PatchDecodeArgs) -> None:
         )
     logger.info("decoding %d transplanted deltas through a freshly fitted lens", len(selected))
 
-    axes: dict[str, dict[str, dict[int, torch.Tensor]]] = torch.load(
-        args.axes_path, weights_only=True
-    )
-    for concept in args.concepts:
-        if concept not in axes:
-            raise RuntimeError(f"no {concept!r} axis in {args.axes_path}; it holds {sorted(axes)}")
-        if args.pooling not in axes[concept]:
-            raise RuntimeError(
-                f"the saved {concept!r} axis has no {args.pooling!r} pooling; it holds "
-                f"{sorted(axes[concept])}"
-            )
-        covered = sorted(axes[concept][args.pooling])
-        missing = [
-            layer for _k, _d, layer, _w in selected if layer not in axes[concept][args.pooling]
-        ]
-        if missing:
-            logger.warning(
-                "the %s/%s axis covers layers %d..%d but not %s; those cells will decode the delta "
-                "and the placebo without that concept's axis beside them",
-                concept,
-                args.pooling,
-                covered[0],
-                covered[-1],
-                sorted(set(missing)),
-            )
+    axes = _load_decode_axes(args, selected)
     jl = _require_jlens()
     corpus, corpus_source = decode_lens_corpus(args)
     acquired = acquire_decode_lens(args, jl, corpus, corpus_source=corpus_source)
