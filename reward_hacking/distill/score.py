@@ -30,6 +30,13 @@ logger: logging.Logger = logging.getLogger(__name__)
 DEFAULT_TEACHER_MODEL_ID = "RedHatAI/Qwen3.8-27B-INT4"
 TOP_K = 4
 MAX_NUM_BATCHED_TOKENS = 1024
+# The settings the 27B INT4 generation path runs with (probe_v4 serving config); FP8 KV on the hybrid
+# Qwen3.5 attention stack faulted at engine start ("device not ready") without them.
+FP8_KV_ENGINE_SETTINGS: dict[str, object] = {
+    "attention_backend": "FLASHINFER",
+    "dtype": "bfloat16",
+    "mamba_cache_mode": "align",
+}
 # Qwen3.5/3.8 padded vocabulary; vLLM materialises a full-vocab row per prefill position for prompt logprobs.
 PADDED_VOCAB_SIZE = 248_320
 # fp32 logits, fp32 log_softmax output and one fp32 softmax intermediate per vocab entry.
@@ -418,6 +425,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     scoring_settings = {
         "language_model_only": language_model_only,
         "kv_cache_dtype": kv_cache_dtype,
+        **(FP8_KV_ENGINE_SETTINGS if kv_cache_dtype == "fp8" else {}),
     }
     if model_revision is not None:
         scoring_settings["model_revision"] = model_revision
@@ -538,6 +546,8 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 engine_kwargs["language_model_only"] = True
             if kv_cache_dtype is not None:
                 engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+            if kv_cache_dtype == "fp8":
+                engine_kwargs.update(FP8_KV_ENGINE_SETTINGS)
             if max_num_seqs is not None:
                 engine_kwargs["max_num_seqs"] = max_num_seqs
             if quantization is not None:
