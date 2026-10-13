@@ -49,7 +49,6 @@ other, and a file carrying one that is not refuses to load.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -78,6 +77,7 @@ from sociology.deference_stimulus import (
     read_own_log,
     status_file_tokens,
 )
+from sociology.stimulus import canonical_digest
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -1163,16 +1163,9 @@ def _validation_reply(
     )
 
 
-def _canonical_digest(payload: Mapping[str, Any]) -> str:
-    """Digest a JSON-shaped payload canonically: sorted keys, no whitespace, first sixteen hex chars."""
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:16]
-
-
 def prompt_digest_of(payload: Mapping[str, Any]) -> str:
     """Digest only the fields a rendered prompt depends on, so a judge-side edit leaves it alone."""
-    return _canonical_digest({name: payload[name] for name in PROMPT_AFFECTING_FIELDS})
+    return canonical_digest({name: payload[name] for name in PROMPT_AFFECTING_FIELDS})
 
 
 def _assert_every_field_is_classified(payload: Mapping[str, Any], path: Path) -> None:
@@ -1262,7 +1255,7 @@ def load_stimulus(path: Path = STIMULUS_PATH) -> CoordinationStimulus:
             keys=INTENT_VERDICT_KEYS,
             floor=MIN_INTENT_VALIDATION_REPLIES,
         ),
-        digest=_canonical_digest(payload),
+        digest=canonical_digest(payload),
         prompt_digest=prompt_digest_of(payload),
     )
     _assert_every_cell_renders(stimulus, path)

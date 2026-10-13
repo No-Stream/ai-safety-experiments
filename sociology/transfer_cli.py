@@ -64,13 +64,24 @@ from reward_hacking.bedrock_batch import (
 )
 from reward_hacking.model_backend import (
     DEFAULT_BEDROCK_CONCURRENCY,
-    BedrockBackend,
     BedrockSamplingConfig,
     is_incomplete_stop_reason,
 )
 from reward_hacking.trace import refuse_tracked_trace_path
 from sociology import transfer_judge as judge_module
 from sociology import transfer_scans as scans_module
+from sociology.batch_pricing import (
+    assert_every_live_row_is_priced,
+    batch_price_per_mtok,
+)
+from sociology.cli_helpers import (
+    at_least_one,
+    build_judge_backend,
+    inline_think_counts,
+    scan_and_write_summary,
+    submit_summary_label,
+    submit_summary_path,
+)
 from sociology.decoupled_scans import refuse_pooled_stimulus_mixture
 from sociology.model_stub import ScriptedDetailedBackend
 from sociology.records import (
@@ -114,7 +125,6 @@ from sociology.transfer_plan import (
     PlanTable,
     audit_games_differ_by_mechanics_and_clause,
     audit_planned_calls,
-    batch_price_per_mtok,
     matched_rounds_thresholds,
     plan_table,
     planned_calls_for_leg,
@@ -204,18 +214,7 @@ LIVE_PRICES: dict[str, LivePrice] = {
 """$/Mtok for every live row; the dry run refuses at import if the live roster and this table drift."""
 
 
-def _assert_every_live_row_is_priced() -> None:
-    """Refuse at import if a live roster row has no price line, or a price line names no live row."""
-    unpriced = sorted(set(LIVE_MODEL_IDS) - set(LIVE_PRICES))
-    stray = sorted(set(LIVE_PRICES) - set(LIVE_MODEL_IDS))
-    if unpriced or stray:
-        raise RuntimeError(
-            f"LIVE_PRICES and the live roster disagree: live rows without a price "
-            f"{unpriced or 'none'}; priced ids that are not live rows {stray or 'none'}."
-        )
-
-
-_assert_every_live_row_is_priced()
+assert_every_live_row_is_priced(LIVE_MODEL_IDS, LIVE_PRICES)
 
 SMOKE_LIVE_ROWS_PER_CELL = 2
 SMOKE_SCRIPTED_CALLS = 4
@@ -251,21 +250,6 @@ def reply_path(run_dir: Path, leg: Leg) -> Path:
 def handle_path(run_dir: Path, leg: Leg) -> Path:
     """Where one batch leg's job handle lands, beside the replies so the artifacts travel together."""
     return run_dir / "handles" / f"{leg.file_stem}.json"
-
-
-def _submit_summary_label(leg: Leg) -> str:
-    """Name the summary label one leg's submit writes under, spelled once for writer and reader."""
-    return f"submit-{leg.file_stem}"
-
-
-def submit_summary_path(run_dir: Path, leg: Leg) -> Path:
-    """Where one leg's submit summary lands: the collect reads the stimulus prompt digest from it.
-
-    The batch handle is a shared dataclass with no slot for a stimulus digest, so the digest the leg was
-    submitted under lives in this summary instead, and :func:`collect_batch` compares it before writing a
-    record.
-    """
-    return run_dir / f"summary-{_submit_summary_label(leg)}.json"
 
 
 def reply_record(
@@ -703,7 +687,7 @@ def submit_batch(  # noqa: PLR0913 - one keyword per guard; the last two are the
         "stimulus_prompt_digest_recorded_at_submit": digest_recorded_at_submit,
         "refusal_canary": canary,
     }
-    write_summary(run_dir, _submit_summary_label(leg), summary)
+    write_summary(run_dir, submit_summary_label(leg), summary)
     sys.stdout.write(json.dumps(summary, indent=2) + "\n")
     return summary
 
@@ -943,19 +927,7 @@ def _resume_identity(call: PlannedCall, stimulus: TransferStimulus) -> dict[str,
 
 def scan(run_dir: Path) -> dict[str, Any]:
     """Run the deterministic scans over every reply on disk, then write the summary."""
-    totals = scans_module.scan_run(run_dir)
-    write_summary(run_dir, "scan", {"command": "scan", **totals})
-    sys.stdout.write(json.dumps(totals, indent=2) + "\n")
-    return totals
-
-
-def _judge_backend(model_id: str, effort: str | None, *, concurrency: int) -> BedrockBackend:
-    """Build the live judge backend: the flat cap and an effort, and no other sampling knob."""
-    return BedrockBackend(
-        model_id,
-        concurrency=concurrency,
-        sampling=BedrockSamplingConfig(max_tokens=MAX_TOKENS, reasoning_effort=effort),
-    )
+    return scan_and_write_summary(run_dir, scans_module.scan_run)
 
 
 def rubric_digests(stimulus: TransferStimulus) -> dict[str, str]:
@@ -1050,7 +1022,7 @@ def judge(
     if limit is not None:
         records = records[:limit]
     out_path = run_dir / "judged.jsonl"
-    backend = _judge_backend(
+    backend = build_judge_backend(
         judge_module.JUDGE_MODEL_ID, judge_module.JUDGE_REASONING_EFFORT, concurrency=concurrency
     )
     counts = judge_module.judge_run(backend, records, out_path, stimulus)
@@ -1084,7 +1056,7 @@ def judge_validate(run_dir: Path) -> dict[str, Any]:
     """
     stimulus = load_stimulus()
     out_path = run_dir / "judge-validation.jsonl"
-    backend = _judge_backend(
+    backend = build_judge_backend(
         judge_module.JUDGE_MODEL_ID,
         judge_module.JUDGE_REASONING_EFFORT,
         concurrency=DEFAULT_JUDGE_CONCURRENCY,
@@ -1267,7 +1239,7 @@ def intent_check_validate(run_dir: Path) -> dict[str, Any]:
     """Read the hand-authored intent cases and report every disagreement by reply and field."""
     stimulus = load_stimulus()
     out_path = run_dir / f"{INTENT_VALIDATION_LABEL}.jsonl"
-    backend = _judge_backend(
+    backend = build_judge_backend(
         judge_module.INTENT_CHECK_MODEL_ID,
         judge_module.INTENT_CHECK_REASONING_EFFORT,
         concurrency=DEFAULT_JUDGE_CONCURRENCY,
@@ -1408,7 +1380,7 @@ def intent_check(
     )
     selection = _intent_records(run_dir, scope=scope, model=model)
     out_path = intent_checked_path(run_dir)
-    backend = _judge_backend(
+    backend = build_judge_backend(
         judge_module.INTENT_CHECK_MODEL_ID,
         judge_module.INTENT_CHECK_REASONING_EFFORT,
         concurrency=concurrency,
@@ -1535,7 +1507,7 @@ def cross_judge(
         ),
     )
     out_path = run_dir / "cross-judged.jsonl"
-    backend = _judge_backend(
+    backend = build_judge_backend(
         judge_module.CROSS_JUDGE_MODEL_ID,
         judge_module.CROSS_JUDGE_REASONING_EFFORT,
         concurrency=concurrency,
@@ -2143,24 +2115,6 @@ def smoke_calls(
     return [call for cell in sorted(by_cell) for call in by_cell[cell]]
 
 
-def inline_think_counts(replies: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, int]]:
-    """Count per model how many replies carried a thinking block inside the answer channel.
-
-    Reported with its denominator rather than as a bare count, because the number that matters is the
-    share: a roster row that reasons inside the answer channel is one whose visible reply is not what the
-    transport returned, and every instrument here reads the reply after that block is cut out.
-    """
-    counts: dict[str, dict[str, int]] = {}
-    for record in replies.values():
-        tally = counts.setdefault(
-            str(record.get("model_id")), {"replies": 0, "with_inline_think": 0}
-        )
-        tally["replies"] += 1
-        block = judge_module.inline_think_block(str(record.get("reply") or ""))
-        tally["with_inline_think"] += int(block is not None)
-    return counts
-
-
 def _refuse_judge_that_read_a_different_text(
     replies: Mapping[str, Mapping[str, Any]], judged_path: Path
 ) -> int:
@@ -2230,7 +2184,7 @@ def smoke(
     judge_backend: DetailedBackend = (
         ScriptedDetailedBackend(_scripted_judge_verdict)
         if scripted
-        else _judge_backend(
+        else build_judge_backend(
             judge_module.JUDGE_MODEL_ID,
             judge_module.JUDGE_REASONING_EFFORT,
             concurrency=DEFAULT_JUDGE_CONCURRENCY,
@@ -2275,14 +2229,6 @@ def smoke(
     write_summary(smoke_dir, "smoke", summary)
     sys.stdout.write(json.dumps(summary, indent=2) + "\n")
     return summary
-
-
-def _at_least_one(text: str) -> int:
-    """Parse an argparse integer that must be 1 or more, refusing at the parser rather than in a run."""
-    value = int(text)
-    if value < 1:
-        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
-    return value
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -2333,7 +2279,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     boards.add_argument("--timeout-seconds", type=float, default=BATCH_TIMEOUT_SECONDS)
     boards.add_argument(
         "--probe-calls",
-        type=_at_least_one,
+        type=at_least_one,
         default=BOARD_LIVE_PROBE_CALLS,
         help="live calls the batch row's transport probe spends before the boards are drawn",
     )
@@ -2360,7 +2306,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     submit.add_argument(
         "--canary-calls",
-        type=_at_least_one,
+        type=at_least_one,
         default=REFUSAL_CANARY_CALLS,
         help=(
             "live calls per cell the refusal canary sends before a Claude leg is submitted; a cell "
@@ -2381,13 +2327,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     live = sub.add_parser("run-live", help="run one live leg with resume-by-key")
     live.add_argument("--leg", choices=leg_ids, required=True)
-    live.add_argument("--concurrency", type=_at_least_one, default=16)
-    live.add_argument("--chunk-size", type=_at_least_one, default=32)
+    live.add_argument("--concurrency", type=at_least_one, default=16)
+    live.add_argument("--chunk-size", type=at_least_one, default=32)
     sub.add_parser("scan", help="deterministic scans over every reply on disk")
     judge_parser = sub.add_parser("judge", help="blind judge over every reply on disk (resumable)")
     judge_parser.add_argument(
         "--limit",
-        type=_at_least_one,
+        type=at_least_one,
         default=None,
         help="judge only the first N records by key; a run-shaped smoke, not a sampling choice",
     )
@@ -2417,7 +2363,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="read the hand-authored intent cases and report every disagreement",
     )
     cross = sub.add_parser("cross-judge", help="re-judge a stratified subset with a second judge")
-    cross.add_argument("--n", type=_at_least_one, default=judge_module.CROSS_JUDGE_RECORDS)
+    cross.add_argument("--n", type=at_least_one, default=judge_module.CROSS_JUDGE_RECORDS)
     cross.add_argument(
         "--game",
         choices=TRANSFER_GAME_IDS,
@@ -2438,7 +2384,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         )
         gated.add_argument(
             "--concurrency",
-            type=_at_least_one,
+            type=at_least_one,
             default=DEFAULT_JUDGE_CONCURRENCY,
             help=(
                 "judge calls in flight at once; recorded as judge_concurrency in the summary (the "

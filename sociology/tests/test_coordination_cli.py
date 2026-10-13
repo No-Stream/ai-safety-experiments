@@ -345,7 +345,7 @@ class TestTheJudgeGates:
         self.replies(tmp_path, coordination_stimulus)
         scans_module.scan_run(tmp_path)
         self.clean_validations(tmp_path, coordination_stimulus)
-        monkeypatch.setattr(cli, "_judge_backend", scripted_judge)
+        monkeypatch.setattr(cli, "build_judge_backend", scripted_judge)
         judged = cli.judge(tmp_path, bound(coordination_stimulus))
         assert judged["judged"] == 4
         intent = cli.intent_check(tmp_path, bound(coordination_stimulus))
@@ -458,7 +458,7 @@ class TestTheSmoke:
         coordination_stimulus: CoordinationStimulus,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(cli, "_judge_backend", scripted_judge)
+        monkeypatch.setattr(cli, "build_judge_backend", scripted_judge)
         summary = cli.smoke(
             tmp_path, bound(coordination_stimulus), backend="scripted", block="coord-off"
         )

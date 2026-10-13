@@ -74,6 +74,8 @@ from sociology.deference_plan import (
     assert_legs_well_formed,
     assert_no_batch_leg_needs_the_refusal_canary,
     assert_roster_clears_the_cap,
+    build_cells,
+    build_prompt_id,
     record_key,
 )
 from sociology.deference_plan import ROWS_PER_CELL as DEFERENCE_ROWS_PER_CELL
@@ -157,12 +159,7 @@ def transport_for(model_id: str) -> str:
 
 def cells_for(arm: str, cell_ids: Sequence[str]) -> tuple[Cell, ...]:
     """Build one arm's named cells in the order given, which is the order their table reads in."""
-    if arm not in ARMS:
-        raise ValueError(f"{arm!r} is not an arm of this design; the arms are {list(ARMS)}.")
-    unknown = sorted(set(cell_ids) - set(CELLS))
-    if unknown:
-        raise ValueError(f"{unknown} are not cells of this design; the cells are {list(CELLS)}.")
-    return tuple(Cell(arm, cell_id) for cell_id in cell_ids)
+    return build_cells(arm, cell_ids, arms=ARMS, cells=CELLS)
 
 
 CELLS_BY_BLOCK: dict[str, tuple[Cell, ...]] = {
@@ -272,12 +269,10 @@ assert_roster_clears_the_cap(BATCH_MODEL_IDS, what=PASS_ID)
 
 
 def prompt_id(*, arm: str, cell: str, scenario_id: str, print_order: str) -> str:
-    """Name one rendered prompt: everything about the text, and nothing about who reads it.
-
-    Distinct from the record key on purpose: two models reading one prompt share a prompt id and never a
-    record key, which is what lets the audits deduplicate renders and the reports join on the text.
-    """
-    return f"{PASS_ID}--{arm}--{cell}--{scenario_id}--order-{print_order}"
+    """Name one rendered prompt of this pass."""
+    return build_prompt_id(
+        PASS_ID, arm=arm, cell=cell, scenario_id=scenario_id, print_order=print_order
+    )
 
 
 def render_cell_prompt(

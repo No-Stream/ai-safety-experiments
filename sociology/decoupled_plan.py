@@ -51,10 +51,9 @@ from games.rewards import GRADING_SELF
 from reward_hacking.bedrock_batch import (
     BATCH_ROSTER,
     MAX_JOB_NAME_CHARS,
-    MIN_BATCH_RECORDS,
-    roster_model,
 )
 from reward_hacking.model_backend import DEFAULT_BEDROCK_MAX_TOKENS
+from sociology.batch_pricing import refuse_leg_below_batch_floor
 from sociology.decoupled_stimulus import (
     LADDER_RUNGS,
     RUNG_DIFFERENT_FAMILY,
@@ -695,17 +694,4 @@ def refuse_below_batch_floor(leg: Leg, n_records: int) -> None:
     this CLI does not define, and it refuses only after a model-availability call and an upload. The
     floor is per job and not adjustable, so pooling a block's cells into one job is what clears it.
     """
-    if n_records >= MIN_BATCH_RECORDS:
-        return
-    raise ValueError(
-        f"batch inference needs at least {MIN_BATCH_RECORDS} records per job and leg "
-        f"{leg.leg_id} renders {n_records} ({len(leg.cells)} cells x {ROWS_PER_CELL} rows x "
-        f"{DRAWS} draws). The floor is per job and not adjustable, so either raise DRAWS, pool "
-        f"more cells into the block, or run this leg on live Converse, which has no floor."
-    )
-
-
-def batch_price_per_mtok(model_id: str) -> tuple[float, float]:
-    """Return one batch model's verified (input, output) price per million tokens."""
-    roster = roster_model(model_id)
-    return roster.batch_price_in_per_mtok, roster.batch_price_out_per_mtok
+    refuse_leg_below_batch_floor(leg, n_records, rows_per_cell=ROWS_PER_CELL, draws=DRAWS)

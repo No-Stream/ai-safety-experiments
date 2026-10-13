@@ -106,6 +106,7 @@ from sociology.decoupled_stimulus import (
     SIZE_WORD_SUBSTITUTIONS,
     inserted_fragment,
 )
+from sociology.stimulus import canonical_digest
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -1989,16 +1990,9 @@ reported twice.
 """
 
 
-def _canonical_digest(payload: Mapping[str, Any]) -> str:
-    """Digest a JSON-shaped payload canonically: sorted keys, no whitespace, first sixteen hex chars."""
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()[:16]
-
-
 def prompt_digest_of(payload: Mapping[str, Any]) -> str:
     """Digest only the sections a rendered prompt depends on, so a judge-side edit leaves it alone."""
-    return _canonical_digest({name: payload[name] for name in PROMPT_AFFECTING_FIELDS})
+    return canonical_digest({name: payload[name] for name in PROMPT_AFFECTING_FIELDS})
 
 
 def _assert_every_field_is_classified(payload: Mapping[str, Any], path: Path) -> None:
@@ -2140,7 +2134,7 @@ def load_stimulus(
         validation_replies=validation,
         intent_instructions=intent_instructions,
         intent_validation_replies=intent_validation,
-        digest=_canonical_digest(payload),
+        digest=canonical_digest(payload),
         prompt_digest=prompt_digest_of(payload),
     )
     _assert_every_cell_renders(stimulus, path, boards_renderable=not allow_empty_boards)

@@ -831,7 +831,7 @@ def judge_factory(
 ) -> RecordingJudgeFactory:
     """Route every judge-backend construction through a recording factory over one scripted judge."""
     factory = RecordingJudgeFactory(scripted_judge(decoupled_stimulus))
-    monkeypatch.setattr(cli, "_judge_backend", factory)
+    monkeypatch.setattr(cli, "build_judge_backend", factory)
     return factory
 
 
