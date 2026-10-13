@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from grpo.gpu_memory import cap_gpu_memory_utilization
+from reward_hacking.jsonl_io import append_jsonl_unicode, read_jsonl_objects
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 
@@ -126,25 +127,6 @@ def content_seed(key: str, prompt_token_ids: Sequence[int], model: str, adapter:
     return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:4], "big")
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise TypeError(f"{path}:{line_number} is not a JSON object")
-            records.append(record)
-    return records
-
-
-def _append_jsonl(path: Path, record: Mapping[str, object]) -> None:
-    with path.open("a", encoding="utf-8") as output_file:
-        output_file.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
-        output_file.flush()
-
-
 def _problem_pair(value: object, *, description: str) -> tuple[str, str]:
     if not isinstance(value, list) or len(value) != PROBLEM_PAIR_LENGTH:
         raise TypeError(f"{description} must be [env, problem_id], got {value!r}")
@@ -170,7 +152,7 @@ def _load_split_pairs(split_path: Path, split_side: str) -> set[tuple[str, str]]
 
 
 def _index_prompt_rows(prompts_path: Path) -> dict[tuple[str, str], dict[str, Any]]:
-    all_records = _read_jsonl(prompts_path)
+    all_records = read_jsonl_objects(prompts_path)
     rows_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
     for line_number, record in enumerate(all_records, start=1):
         for field in ("env", "problem_id", "prompt_text", "prompt_token_ids"):
@@ -268,7 +250,7 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         "logprobs": 0,
         "batch_size": batch_size,
     }
-    existing_rows = _read_jsonl(output_path) if output_path.exists() else []
+    existing_rows = read_jsonl_objects(output_path) if output_path.exists() else []
     legacy_rows = [row for row in existing_rows if "model_identity" not in row]
     seed_model = (
         str(legacy_rows[0]["model"]) if legacy_rows else json.dumps(weight_identity, sort_keys=True)
@@ -451,7 +433,7 @@ def sample_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                     "language_model_only": language_model_only,
                     "kv_cache_dtype": kv_cache_dtype,
                 }
-                _append_jsonl(output_path, sample_record)
+                append_jsonl_unicode(output_path, sample_record)
 
     generated_count = len(pending)
     logger.info(

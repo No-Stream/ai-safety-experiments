@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from reward_hacking.distill.sample import token_ids_sha256
+from reward_hacking.jsonl_io import (
+    read_jsonl_objects,
+    write_json_atomic_unicode_strict,
+)
 from reward_hacking.organism_rl.health import is_syntax_parse_error
 
 if TYPE_CHECKING:
@@ -205,28 +209,6 @@ def summarize_episode_health_filters(
     }
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise TypeError(f"{path}:{line_number} must be a JSON object")
-            rows.append(value)
-    return rows
-
-
-def _write_json(path: Path, value: Mapping[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary_path.replace(path)
-
-
 def _required_string(row: Mapping[str, Any], field: str, *, context: str) -> str:
     value = row.get(field)
     if not isinstance(value, str) or not value:
@@ -246,7 +228,7 @@ def _token_ids(row: Mapping[str, Any], field: str, *, context: str) -> list[int]
 
 
 def _index_samples(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    rows = _read_jsonl(path)
+    rows = read_jsonl_objects(path)
     indexed: dict[str, dict[str, Any]] = {}
     for line_number, row in enumerate(rows, start=1):
         context = f"{path}:{line_number}"
@@ -272,7 +254,7 @@ def _index_samples(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str
 
 def _index_grades(path: Path, samples: Mapping[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     indexed: dict[str, dict[str, Any]] = {}
-    for line_number, row in enumerate(_read_jsonl(path), start=1):
+    for line_number, row in enumerate(read_jsonl_objects(path), start=1):
         context = f"{path}:{line_number}"
         key = _required_string(row, "key", context=context)
         sample = samples.get(key)
@@ -447,7 +429,7 @@ def select_traces(
                 json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
             )
         output.flush()
-    _write_json(selection_path, selection)
+    write_json_atomic_unicode_strict(selection_path, selection)
     logger.info(
         "trace selection mode=%s input=%d candidates=%d selected=%d tokens=%d "
         "dropped_truncated=%d dropped_integrity_alert=%d dropped_mode=%d "

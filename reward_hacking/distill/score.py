@@ -19,6 +19,7 @@ from reward_hacking.distill.sample import (
     TorchRuntime,
     token_ids_sha256,
 )
+from reward_hacking.jsonl_io import append_jsonl_unicode, read_jsonl_objects
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.semantic_identity import model_identity, recorded_model_matches
 
@@ -116,7 +117,7 @@ def _interrupt_after_persisted_record(
     receipt = {
         "phase": "teacher_scoring_interrupted",
         "output_path": str(output_path),
-        "preserved_records": _read_jsonl(output_path),
+        "preserved_records": read_jsonl_objects(output_path),
         "preserved_jsonl": output_path.read_text(encoding="utf-8"),
     }
     cast("InterruptibleTeacherEngine", engine).llm_engine.engine_core.shutdown()
@@ -155,25 +156,6 @@ class TeacherScoringRuntime:
             raise ValueError("runtime max_model_len must be a positive integer")
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise TypeError(f"{path}:{line_number} is not a JSON object")
-            records.append(record)
-    return records
-
-
-def _append_jsonl(path: Path, record: Mapping[str, object]) -> None:
-    with path.open("a", encoding="utf-8") as output_file:
-        output_file.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
-        output_file.flush()
-
-
 def _token_ids(row: Mapping[str, Any], field: str, key: str) -> list[int]:
     value = row.get(field)
     if not isinstance(value, list) or any(
@@ -192,7 +174,7 @@ def _task_identity(row: Mapping[str, Any]) -> tuple[str, str]:
 
 def _teacher_prefixes(path: Path) -> dict[tuple[str, str], list[int]]:
     prefixes: dict[tuple[str, str], list[int]] = {}
-    for row in _read_jsonl(path):
+    for row in read_jsonl_objects(path):
         identity = _task_identity(row)
         if identity in prefixes:
             raise ValueError(f"duplicate teacher prompt identity {identity!r}")
@@ -347,7 +329,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
         raise ValueError("interrupt marker must be an absolute path")
     if max_num_seqs is not None and max_num_seqs < 1:
         raise ValueError("max_num_seqs must be positive")
-    sample_rows = _read_jsonl(samples_path)
+    sample_rows = read_jsonl_objects(samples_path)
     teacher_prefixes = (
         _teacher_prefixes(teacher_prompts_path) if teacher_prompts_path is not None else None
     )
@@ -450,7 +432,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
     if runtime is not None and runtime.engine_identity not in (None, engine_identity):
         raise ValueError("scoring runtime engine settings differ from current request")
 
-    existing_rows = _read_jsonl(output_path) if output_path.exists() else []
+    existing_rows = read_jsonl_objects(output_path) if output_path.exists() else []
     completed: set[str] = set()
     for row in existing_rows:
         key = str(row.get("key", ""))
@@ -666,7 +648,7 @@ def score_round(  # noqa: C901, PLR0912, PLR0913, PLR0915
                         )
                         del score_record["teacher_prompt_token_ids"]
                 _validate_score_record(score_record, len(completion_token_ids))
-                _append_jsonl(output_path, score_record)
+                append_jsonl_unicode(output_path, score_record)
                 _interrupt_after_persisted_record(output_path, interrupt_marker, engine)
 
     generated_count = len(pending_rows)
@@ -713,8 +695,8 @@ def _sample_token_gaps(
 
 def compute_kl_summary(samples_path: Path, teacher_path: Path) -> dict[str, dict[str, float | int]]:
     """Summarize mean student sampled-token logprob minus teacher logprob by environment."""
-    samples = _read_jsonl(samples_path)
-    teachers = _read_jsonl(teacher_path)
+    samples = read_jsonl_objects(samples_path)
+    teachers = read_jsonl_objects(teacher_path)
     if not samples or not teachers:
         raise ValueError("KL input files must contain scored samples")
     samples_by_key = {str(row["key"]): row for row in samples}

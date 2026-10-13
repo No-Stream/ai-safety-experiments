@@ -42,6 +42,7 @@ SOURCE_FILES = (
     "reward_hacking/distill/memory.py",
     "reward_hacking/distill/quantization.py",
     "reward_hacking/distill/fla_prewarm.py",
+    "reward_hacking/jsonl_io.py",
     "reward_hacking/lora_serving.py",
     "grpo/throughput.py",
     "grpo/estimator_defaults.py",

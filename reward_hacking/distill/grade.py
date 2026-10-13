@@ -35,6 +35,10 @@ from reward_hacking.hatch_probe import (
     strip_give_ups,
     strip_grader_reports,
 )
+from reward_hacking.jsonl_io import (
+    read_jsonl_objects,
+    write_json_atomic_unicode_strict,
+)
 from reward_hacking.organisms import aisi_codecontests
 from reward_hacking.organisms.aisi_codecontests import (
     _grade_record as grade_aisi_record,  # pyright: ignore[reportPrivateUsage]
@@ -86,32 +90,10 @@ class NativeGraderContext:
     scratch_root: Path
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise TypeError(f"{path}:{line_number} must be a JSON object")
-            rows.append(value)
-    return rows
-
-
 def _append_jsonl(path: Path, row: Mapping[str, object]) -> None:
     with path.open("a", encoding="utf-8") as output:
         output.write(json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n")
         output.flush()
-
-
-def _write_json(path: Path, value: Mapping[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary_path.replace(path)
 
 
 def _required_string(row: Mapping[str, Any], field: str, *, context: str) -> str:
@@ -134,7 +116,7 @@ def _token_ids(row: Mapping[str, Any], field: str, *, context: str) -> list[int]
 
 def _index_prompts(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
     indexed: dict[tuple[str, str], dict[str, Any]] = {}
-    for line_number, row in enumerate(_read_jsonl(path), start=1):
+    for line_number, row in enumerate(read_jsonl_objects(path), start=1):
         environment = _required_string(row, "env", context=f"{path}:{line_number}")
         problem_id = _required_string(row, "problem_id", context=f"{path}:{line_number}")
         if environment not in ENVIRONMENTS:
@@ -155,7 +137,7 @@ def _index_samples(
     prompts_by_pair: Mapping[tuple[str, str], dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     indexed: dict[str, dict[str, Any]] = {}
-    for line_number, row in enumerate(_read_jsonl(samples_path), start=1):
+    for line_number, row in enumerate(read_jsonl_objects(samples_path), start=1):
         context = f"{samples_path}:{line_number}"
         key = _required_string(row, "key", context=context)
         if key in indexed:
@@ -497,7 +479,7 @@ def _validate_resume_rows(
     if not path.exists():
         return {}
     completed: dict[str, dict[str, Any]] = {}
-    for line_number, row in enumerate(_read_jsonl(path), start=1):
+    for line_number, row in enumerate(read_jsonl_objects(path), start=1):
         key = _required_string(row, "key", context=f"{path}:{line_number}")
         sample = samples_by_key.get(key)
         if sample is None:
@@ -596,7 +578,7 @@ def grade_round(
             grader_context,
         )
         _append_jsonl(output_path, graded)
-    graded_rows = _read_jsonl(output_path)
+    graded_rows = read_jsonl_objects(output_path)
     if {str(row.get("key", "")) for row in graded_rows} != samples_by_key.keys():
         raise RuntimeError("graded output does not contain exactly one row per sample")
     environment_summary = _summarize(graded_rows)
@@ -606,7 +588,7 @@ def grade_round(
         "resumed_count": resumed_count,
         "environments": environment_summary,
     }
-    _write_json(summary_path, summary)
+    write_json_atomic_unicode_strict(summary_path, summary)
     logger.info(
         "grading complete generated=%d resumed=%d output=%s",
         len(pending_samples),

@@ -18,6 +18,7 @@ from typing import Any, Literal, TypedDict, cast
 
 from games.train import resolve_complete_resume_checkpoint
 from reward_hacking.distill.score import compute_kl_summary
+from reward_hacking.jsonl_io import read_jsonl_objects
 from reward_hacking.semantic_identity import (
     model_identity,
     prompt_inputs,
@@ -413,26 +414,13 @@ def _final_adapter_for_round(run_dir: Path, round_number: int) -> Path:
     return adapter_path
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise TypeError(f"{path}:{line_number} is not a JSON object")
-            records.append(record)
-    return records
-
-
 def _round_summary(
     run_dir: Path,
     round_number: int,
 ) -> dict[str, int | float]:
     samples_path = run_dir / "samples" / f"round-{round_number}.jsonl"
     teacher_path = run_dir / "teacher" / f"round-{round_number}.jsonl"
-    samples = _read_jsonl(samples_path)
+    samples = read_jsonl_objects(samples_path)
     kl_by_environment = compute_kl_summary(samples_path, teacher_path)
     if not samples:
         raise ValueError(f"round {round_number} has no samples")
@@ -470,7 +458,7 @@ def _round_summary(
 def _ensure_summary(run_dir: Path, summary: Mapping[str, int | float]) -> None:
     summary_path = run_dir / "rounds.jsonl"
     round_number = int(summary["round"])
-    existing_rows = _read_jsonl(summary_path) if summary_path.exists() else []
+    existing_rows = read_jsonl_objects(summary_path) if summary_path.exists() else []
     summaries_by_round: dict[int, dict[str, Any]] = {}
     for row in existing_rows:
         recorded_round = row.get("round")
