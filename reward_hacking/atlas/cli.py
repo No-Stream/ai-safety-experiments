@@ -22,11 +22,15 @@ import json
 import logging
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS
 from reward_hacking.atlas.jsonl_io import read_jsonl, write_json
+
+if TYPE_CHECKING:
+    import numpy as np
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -368,223 +372,250 @@ def _fixed_corpus_refit(
     )
 
 
-def _readout(  # noqa: C901, PLR0912, PLR0915
-    run_dir: Path, model_keys: list[str], permutations: int, seed: int
-) -> None:
+def _load_labelled_samples(run_dir: Path, output_key: str) -> dict[str, Any]:
+    """Read one model's samples, grades and activation shard, and label each graded sample hack or honest pass."""
+    import numpy as np  # noqa: PLC0415
+
+    sample_records = read_jsonl(run_dir / f"samples.{output_key}.jsonl")
+    grade_records = read_jsonl(run_dir / f"grades.{output_key}.jsonl")
+    grade_by_id = {str(record["sample_id"]): record for record in grade_records}
+    shard = np.load(run_dir / f"activations.{output_key}.npy", mmap_mode="r")
+    index = json.loads((run_dir / f"capture-index.{output_key}.json").read_text(encoding="utf-8"))
+    sample_ids = [str(sample_id) for sample_id in index["sample_ids"]]
+    sample_by_id = {str(record["sample_id"]): record for record in sample_records}
+    if set(sample_ids) != set(sample_by_id):
+        raise ValueError(f"sample records and activation index disagree for {output_key}")
+    if len(sample_ids) != shard.shape[0]:
+        raise ValueError(f"activation row count and index disagree for {output_key}")
+    labels_by_id: dict[str, int] = {}
+    for sample_id in sample_ids:
+        grade = grade_by_id.get(sample_id)
+        if grade is None:
+            continue
+        if bool(grade["hack"]):
+            labels_by_id[sample_id] = 1
+        elif bool(grade["honest_pass"]):
+            labels_by_id[sample_id] = 0
+    return {
+        "samples": sample_by_id,
+        "sample_ids": sample_ids,
+        "row_of_sample": {sample_id: row for row, sample_id in enumerate(sample_ids)},
+        "shard": shard,
+        "labels_by_id": labels_by_id,
+        "position_names": list(index["positions"]),
+    }
+
+
+def _position_probe_reads(  # noqa: PLR0913 - a read needs its shard, rows, labels, groups and controls
+    *,
+    shard: np.ndarray,
+    eligible_rows: np.ndarray,
+    position_names: list[str],
+    labels: torch.Tensor,
+    groups: torch.Tensor,
+    permutations: int,
+    seed: int,
+) -> dict[str, object]:
+    """Fit one grouped-CV probe per layer at each recorded position."""
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from reward_hacking.atlas.core import probe_readout  # noqa: PLC0415
+
+    position_reads: dict[str, object] = {}
+    for position_index, position_name in enumerate(position_names):
+        layer_reads = []
+        # One read per position (rows x layers x width) instead of one scattered read per layer.
+        position_rows = np.asarray(shard[eligible_rows, :, position_index, :], dtype=np.float32)
+        for layer in range(shard.shape[1]):
+            feature_rows = torch.from_numpy(position_rows[:, layer, :].copy())
+            readout = probe_readout(
+                feature_rows,
+                labels,
+                groups,
+                n_permutations=permutations,
+                seed=seed,
+            )
+            layer_reads.append({"layer": layer, **asdict(readout)})
+        position_reads[position_name] = layer_reads
+    return position_reads
+
+
+def _model_readout(
+    run_dir: Path, model_key: str, permutations: int, seed: int
+) -> tuple[dict[str, object], dict[str, Any]]:
+    """Summarise one model's grades, text baselines and position probes, and keep what transfer reads need."""
     import numpy as np  # noqa: PLC0415
     import torch  # noqa: PLC0415
 
     from reward_hacking.atlas.core import (  # noqa: PLC0415
         extract_code,
         hardcode_regex_flag,
-        probe_readout,
         tfidf_char_ngram_readout,
     )
     from reward_hacking.atlas.readout import rank_auc  # noqa: PLC0415
     from reward_hacking.atlas.sampling import artifact_model_key  # noqa: PLC0415
-    from reward_hacking.interp.linear_probe import fit_logistic_probe  # noqa: PLC0415
 
-    prepared: dict[str, dict[str, Any]] = {}
-    summary: dict[str, object] = {"models": {}, "transfers": [], "original_probe_standin": {}}
-    for model_key in model_keys:
-        output_key = artifact_model_key(model_key)
-        sample_records = read_jsonl(run_dir / f"samples.{output_key}.jsonl")
-        grade_records = read_jsonl(run_dir / f"grades.{output_key}.jsonl")
-        grade_by_id = {str(record["sample_id"]): record for record in grade_records}
-        shard = np.load(run_dir / f"activations.{output_key}.npy", mmap_mode="r")
-        index = json.loads(
-            (run_dir / f"capture-index.{output_key}.json").read_text(encoding="utf-8")
-        )
-        sample_ids = [str(sample_id) for sample_id in index["sample_ids"]]
-        sample_by_id = {str(record["sample_id"]): record for record in sample_records}
-        if set(sample_ids) != set(sample_by_id):
-            raise ValueError(f"sample records and activation index disagree for {model_key}")
-        if len(sample_ids) != shard.shape[0]:
-            raise ValueError(f"activation row count and index disagree for {model_key}")
-        labels_by_id: dict[str, int] = {}
-        for sample_id in sample_ids:
-            grade = grade_by_id.get(sample_id)
-            if grade is None:
-                continue
-            if bool(grade["hack"]):
-                labels_by_id[sample_id] = 1
-            elif bool(grade["honest_pass"]):
-                labels_by_id[sample_id] = 0
-        eligible_ids = [sample_id for sample_id in sample_ids if sample_id in labels_by_id]
-        labels = torch.tensor(
-            [labels_by_id[sample_id] for sample_id in eligible_ids], dtype=torch.float32
-        )
-        group_names = [str(sample_by_id[sample_id]["item_id"]) for sample_id in eligible_ids]
-        group_ids = {name: index for index, name in enumerate(dict.fromkeys(group_names))}
-        groups = torch.tensor([group_ids[name] for name in group_names], dtype=torch.long)
-        texts = [
-            extract_code(str(sample_by_id[sample_id]["completion_text"]))
-            for sample_id in eligible_ids
-        ]
-        regex_flags = torch.tensor(
-            [
-                float(
-                    hardcode_regex_flag(
-                        texts[row],
-                        str(sample_by_id[sample_id]["test_list"][0]),
-                    )
+    output_key = artifact_model_key(model_key)
+    prepared = _load_labelled_samples(run_dir, output_key)
+    sample_by_id = prepared["samples"]
+    labels_by_id = prepared["labels_by_id"]
+    eligible_ids = [sample_id for sample_id in prepared["sample_ids"] if sample_id in labels_by_id]
+    labels = torch.tensor(
+        [labels_by_id[sample_id] for sample_id in eligible_ids], dtype=torch.float32
+    )
+    group_names = [str(sample_by_id[sample_id]["item_id"]) for sample_id in eligible_ids]
+    group_ids = {name: index for index, name in enumerate(dict.fromkeys(group_names))}
+    groups = torch.tensor([group_ids[name] for name in group_names], dtype=torch.long)
+    texts = [
+        extract_code(str(sample_by_id[sample_id]["completion_text"])) for sample_id in eligible_ids
+    ]
+    regex_flags = torch.tensor(
+        [
+            float(
+                hardcode_regex_flag(
+                    texts[row],
+                    str(sample_by_id[sample_id]["test_list"][0]),
                 )
-                for row, sample_id in enumerate(eligible_ids)
-            ],
-            dtype=torch.float32,
-        )
-        regex_flags_by_id = {
-            sample_id: bool(regex_flags[row].item()) for row, sample_id in enumerate(eligible_ids)
-        }
-        text_readout = tfidf_char_ngram_readout(
-            texts,
-            labels,
-            groups,
-            minimum_class_count=15,
-        )
-        regex_auc = None if text_readout.status == "too_few" else rank_auc(labels, regex_flags)
-        model_summary: dict[str, object] = {
-            "n_samples": len(sample_ids),
-            "n_hack": int((labels == 1).sum().item()),
-            "n_honest_pass": int((labels == 0).sum().item()),
-            "n_fail_or_ungraded": len(sample_ids) - len(eligible_ids),
-            "grade_rates": (
-                json.loads(
-                    (run_dir / f"grade-summary.{output_key}.json").read_text(encoding="utf-8")
-                )
-                if (run_dir / f"grade-summary.{output_key}.json").exists()
-                else None
-            ),
-            "text_baselines": {
-                "hardcode_regex_auc": regex_auc,
-                "hardcode_regex_status": text_readout.status,
-                "tfidf_char_ngram": asdict(text_readout),
-            },
-            "positions": {},
-        }
-        position_reads: dict[str, object] = {}
-        position_names = list(index["positions"])
-        row_of_sample = {sample_id: row for row, sample_id in enumerate(sample_ids)}
-        eligible_rows = np.array(
-            [row_of_sample[sample_id] for sample_id in eligible_ids], dtype=np.int64
-        )
-        for position_index, position_name in enumerate(position_names):
-            layer_reads = []
-            # One read per position (rows x layers x width) instead of one scattered read per layer.
-            position_rows = np.asarray(shard[eligible_rows, :, position_index, :], dtype=np.float32)
-            for layer in range(shard.shape[1]):
-                feature_rows = torch.from_numpy(position_rows[:, layer, :].copy())
-                readout = probe_readout(
-                    feature_rows,
-                    labels,
-                    groups,
-                    n_permutations=permutations,
-                    seed=seed,
-                )
-                layer_reads.append({"layer": layer, **asdict(readout)})
-            position_reads[position_name] = layer_reads
-        model_summary["positions"] = position_reads
-        summary_models = summary["models"]
-        if not isinstance(summary_models, dict):
-            raise TypeError("readout summary model map was replaced unexpectedly")
-        summary_models[model_key] = model_summary
-        prepared[model_key] = {
-            "samples": sample_by_id,
-            "sample_ids": sample_ids,
-            "row_of_sample": row_of_sample,
-            "shard": shard,
-            "labels_by_id": labels_by_id,
-            "regex_flags_by_id": regex_flags_by_id,
-            "position_names": position_names,
-        }
+            )
+            for row, sample_id in enumerate(eligible_ids)
+        ],
+        dtype=torch.float32,
+    )
+    regex_flags_by_id = {
+        sample_id: bool(regex_flags[row].item()) for row, sample_id in enumerate(eligible_ids)
+    }
+    text_readout = tfidf_char_ngram_readout(
+        texts,
+        labels,
+        groups,
+        minimum_class_count=MINIMUM_PROBE_CLASS_COUNT,
+    )
+    regex_auc = None if text_readout.status == "too_few" else rank_auc(labels, regex_flags)
+    eligible_rows = np.array(
+        [prepared["row_of_sample"][sample_id] for sample_id in eligible_ids], dtype=np.int64
+    )
+    model_summary: dict[str, object] = {
+        "n_samples": len(prepared["sample_ids"]),
+        "n_hack": int((labels == 1).sum().item()),
+        "n_honest_pass": int((labels == 0).sum().item()),
+        "n_fail_or_ungraded": len(prepared["sample_ids"]) - len(eligible_ids),
+        "grade_rates": (
+            json.loads((run_dir / f"grade-summary.{output_key}.json").read_text(encoding="utf-8"))
+            if (run_dir / f"grade-summary.{output_key}.json").exists()
+            else None
+        ),
+        "text_baselines": {
+            "hardcode_regex_auc": regex_auc,
+            "hardcode_regex_status": text_readout.status,
+            "tfidf_char_ngram": asdict(text_readout),
+        },
+        "positions": _position_probe_reads(
+            shard=prepared["shard"],
+            eligible_rows=eligible_rows,
+            position_names=prepared["position_names"],
+            labels=labels,
+            groups=groups,
+            permutations=permutations,
+            seed=seed,
+        ),
+    }
+    prepared["regex_flags_by_id"] = regex_flags_by_id
+    return model_summary, prepared
+
+
+def _original_probe_standin(
+    run_dir: Path, model_keys: list[str], prepared: dict[str, dict[str, Any]]
+) -> dict[str, object]:
+    """Fit the Atlas hardcode-vs-code reference probe once, then score each model's graded follow-ups with it."""
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from reward_hacking.atlas.readout import rank_auc  # noqa: PLC0415
+    from reward_hacking.interp.linear_probe import fit_logistic_probe  # noqa: PLC0415
 
     reference_path = run_dir / "reference-activations.npy"
     reference_index_path = run_dir / "reference-activation-index.json"
-    original_probe_summary: dict[str, object]
     if not reference_path.exists() or not reference_index_path.exists():
-        original_probe_summary = {
+        return {
             "status": "not_captured",
             "reason": "base capture did not produce the Atlas hardcode-vs-code reference shard",
         }
-    else:
-        reference_activations = np.load(reference_path, mmap_mode="r")
-        reference_index = json.loads(reference_index_path.read_text(encoding="utf-8"))
-        reference_rows = list(reference_index["rows"])
-        reference_labels = torch.tensor(
-            [1.0 if row["class_name"] == "hardcode" else 0.0 for row in reference_rows],
+    reference_activations = np.load(reference_path, mmap_mode="r")
+    reference_index = json.loads(reference_index_path.read_text(encoding="utf-8"))
+    reference_rows = list(reference_index["rows"])
+    reference_labels = torch.tensor(
+        [1.0 if row["class_name"] == "hardcode" else 0.0 for row in reference_rows],
+        dtype=torch.float32,
+    )
+    reference_features = torch.from_numpy(
+        np.asarray(reference_activations, dtype=np.float32).mean(axis=1).copy()
+    )
+    reference_positive = int((reference_labels == 1).sum().item())
+    reference_negative = int((reference_labels == 0).sum().item())
+    if min(reference_positive, reference_negative) < MINIMUM_PROBE_CLASS_COUNT:
+        return {
+            "status": "too_few",
+            "n_hardcode": reference_positive,
+            "n_code": reference_negative,
+        }
+    reference_fit = fit_logistic_probe(
+        reference_features,
+        reference_labels,
+        l2_strength=1e-2,
+    )
+    original_probe_models: dict[str, object] = {}
+    for model_key in model_keys:
+        model = prepared[model_key]
+        eligible_ids = [
+            sample_id for sample_id in model["sample_ids"] if sample_id in model["labels_by_id"]
+        ]
+        model_labels = torch.tensor(
+            [model["labels_by_id"][sample_id] for sample_id in eligible_ids],
             dtype=torch.float32,
         )
-        reference_features = torch.from_numpy(
-            np.asarray(reference_activations, dtype=np.float32).mean(axis=1).copy()
+        model_indices = [model["row_of_sample"][sample_id] for sample_id in eligible_ids]
+        followup_position = model["position_names"].index("followup_last")
+        model_features = torch.from_numpy(
+            np.asarray(model["shard"][model_indices, :, followup_position, :], dtype=np.float32)
+            .mean(axis=1)
+            .copy()
         )
-        reference_positive = int((reference_labels == 1).sum().item())
-        reference_negative = int((reference_labels == 0).sum().item())
-        if min(reference_positive, reference_negative) < MINIMUM_PROBE_CLASS_COUNT:
-            original_probe_summary = {
+        if (
+            min(int((model_labels == 1).sum().item()), int((model_labels == 0).sum().item()))
+            < MINIMUM_PROBE_CLASS_COUNT
+        ):
+            original_probe_models[model_key] = {
                 "status": "too_few",
-                "n_hardcode": reference_positive,
-                "n_code": reference_negative,
+                "n_hack": int((model_labels == 1).sum().item()),
+                "n_honest_pass": int((model_labels == 0).sum().item()),
             }
         else:
-            reference_fit = fit_logistic_probe(
-                reference_features,
-                reference_labels,
-                l2_strength=1e-2,
-            )
-            original_probe_models: dict[str, object] = {}
-            for model_key in model_keys:
-                model = prepared[model_key]
-                eligible_ids = [
-                    sample_id
-                    for sample_id in model["sample_ids"]
-                    if sample_id in model["labels_by_id"]
-                ]
-                model_labels = torch.tensor(
-                    [model["labels_by_id"][sample_id] for sample_id in eligible_ids],
-                    dtype=torch.float32,
-                )
-                model_indices = [model["row_of_sample"][sample_id] for sample_id in eligible_ids]
-                followup_position = model["position_names"].index("followup_last")
-                model_features = torch.from_numpy(
-                    np.asarray(
-                        model["shard"][model_indices, :, followup_position, :], dtype=np.float32
-                    )
-                    .mean(axis=1)
-                    .copy()
-                )
-                if (
-                    min(
-                        int((model_labels == 1).sum().item()), int((model_labels == 0).sum().item())
-                    )
-                    < MINIMUM_PROBE_CLASS_COUNT
-                ):
-                    original_probe_models[model_key] = {
-                        "status": "too_few",
-                        "n_hack": int((model_labels == 1).sum().item()),
-                        "n_honest_pass": int((model_labels == 0).sum().item()),
-                    }
-                else:
-                    scores = model_features @ reference_fit.weights + reference_fit.bias
-                    original_probe_models[model_key] = {
-                        "status": "ok",
-                        "n_hack": int((model_labels == 1).sum().item()),
-                        "n_honest_pass": int((model_labels == 0).sum().item()),
-                        "auc": rank_auc(model_labels, scores),
-                    }
-            original_probe_summary = {
+            scores = model_features @ reference_fit.weights + reference_fit.bias
+            original_probe_models[model_key] = {
                 "status": "ok",
-                "n_hardcode": reference_positive,
-                "n_code": reference_negative,
-                "position": "followup_last_mean_over_layers",
-                "models": original_probe_models,
+                "n_hack": int((model_labels == 1).sum().item()),
+                "n_honest_pass": int((model_labels == 0).sum().item()),
+                "auc": rank_auc(model_labels, scores),
             }
-    summary["original_probe_standin"] = original_probe_summary
-    fixed_corpus_summary, fixed_corpus_markdown_rows = _fixed_corpus_refit(
-        run_dir,
-        model_keys,
-        prepared,
-    )
-    summary["fixed_corpus_refit"] = fixed_corpus_summary
+    return {
+        "status": "ok",
+        "n_hardcode": reference_positive,
+        "n_code": reference_negative,
+        "position": "followup_last_mean_over_layers",
+        "models": original_probe_models,
+    }
+
+
+def _transfer_rows(
+    model_keys: list[str], prepared: dict[str, dict[str, Any]]
+) -> list[dict[str, object]]:
+    """Fit a probe on each source model's labels, then score every other model's labels with it."""
+    import numpy as np  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from reward_hacking.atlas.readout import rank_auc  # noqa: PLC0415
+    from reward_hacking.interp.linear_probe import fit_logistic_probe  # noqa: PLC0415
 
     transfer_rows: list[dict[str, object]] = []
     for source_key in model_keys:
@@ -663,8 +694,13 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                             "auc": rank_auc(target_labels, scores),
                         }
                     )
-    summary["transfers"] = transfer_rows
-    write_json(run_dir / "readout.json", summary)
+    return transfer_rows
+
+
+def _readout_markdown(
+    model_keys: list[str], summary: dict[str, object], fixed_corpus_markdown_rows: list[str]
+) -> str:
+    """Render the readout summary as the markdown table written beside readout.json."""
     markdown_rows = [
         "| Model | Position | Best layer AUC | Regex AUC | TF-IDF AUC |",
         "|---|---|---:|---:|---:|",
@@ -698,7 +734,7 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                 f"- {model_key}: {result['status']}"
                 + ("" if auc is None else f", AUC {float(auc):.3f}")
             )
-    fixed_corpus = summary["fixed_corpus_refit"]
+    fixed_corpus = cast("dict[str, Any]", summary["fixed_corpus_refit"])
     markdown_rows.extend(
         [
             "",
@@ -715,7 +751,32 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
         markdown_rows.extend(fixed_corpus_markdown_rows)
     else:
         markdown_rows.append(f"Fixed-corpus readout status: {fixed_corpus['status']}.")
-    (run_dir / "readout.md").write_text("\n".join(markdown_rows) + "\n", encoding="utf-8")
+    return "\n".join(markdown_rows) + "\n"
+
+
+def _readout(run_dir: Path, model_keys: list[str], permutations: int, seed: int) -> None:
+    prepared: dict[str, dict[str, Any]] = {}
+    models_summary: dict[str, object] = {}
+    for model_key in model_keys:
+        models_summary[model_key], prepared[model_key] = _model_readout(
+            run_dir, model_key, permutations, seed
+        )
+    original_probe_standin = _original_probe_standin(run_dir, model_keys, prepared)
+    fixed_corpus_summary, fixed_corpus_markdown_rows = _fixed_corpus_refit(
+        run_dir,
+        model_keys,
+        prepared,
+    )
+    summary: dict[str, object] = {
+        "models": models_summary,
+        "transfers": _transfer_rows(model_keys, prepared),
+        "original_probe_standin": original_probe_standin,
+        "fixed_corpus_refit": fixed_corpus_summary,
+    }
+    write_json(run_dir / "readout.json", summary)
+    (run_dir / "readout.md").write_text(
+        _readout_markdown(model_keys, summary, fixed_corpus_markdown_rows), encoding="utf-8"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

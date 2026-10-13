@@ -1274,11 +1274,7 @@ def build_identity(  # noqa: PLR0913 - an identity is exactly these fields, by c
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """CLI for the checkpoint-ladder capture driver."""
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+def _add_corpus_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--stimuli", type=Path, required=False, default=None, help="JSONL of stimulus rows."
     )
@@ -1293,6 +1289,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="JSON {group_ids, pair_ids} reserved by training/evaluation corpora.",
     )
+
+
+def _add_ladder_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--out-dir",
         type=Path,
@@ -1321,6 +1320,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=",".join(DEFAULT_POOLINGS),
         help="Comma-separated poolings to capture per stimulus set.",
     )
+
+
+def _add_capture_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
         "--max-prompt-tokens",
@@ -1355,6 +1357,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also persist supplied prompt-end and teacher-forced prefix pooled states.",
     )
+
+
+def _add_natural_prefix_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--natural-prefix-layers",
         default=None,
@@ -1398,6 +1403,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output JSONL for --build-natural-prefix-stimuli.",
     )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """CLI for the checkpoint-ladder capture driver."""
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    _add_corpus_arguments(parser)
+    _add_ladder_arguments(parser)
+    _add_capture_arguments(parser)
+    _add_natural_prefix_arguments(parser)
     parser.add_argument(
         "--deadline", default=None, help="ISO-8601 UTC instant after which no new cell starts."
     )
@@ -1419,59 +1435,96 @@ def resolve_cells(args: argparse.Namespace) -> list[LadderCell]:
     return cells
 
 
-def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0915 - linear CLI driver owns model/capture lifecycle
-    """Capture every cell on the agenda, writing each one as it finishes."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stdout,
+@dataclass(frozen=True)
+class NaturalPrefixPlan:
+    """Natural-prefix sources bound to each cell, read and validated before the model loads."""
+
+    stimuli_by_cell: dict[str, list[Stimulus]]
+    source_paths_by_cell: dict[str, Path]
+    selection_manifest: dict[str, Any] | None
+    layers: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class NaturalPrefixRendering:
+    """The natural-prefix stimuli rendered for each cell, with the digests the ladder manifest records."""
+
+    rendered_by_cell: dict[str, dict[str, str]]
+    stimulus_digests_by_cell: dict[str, str]
+    rendered_digests_by_cell: dict[str, str]
+
+
+@dataclass(frozen=True)
+class CaptureRun:
+    """What every cell on the agenda shares: the loaded model, the rendered corpus and the run's identity."""
+
+    args: argparse.Namespace
+    model: PreTrainedModel
+    tokenizer: PreTrainedTokenizerBase
+    stimuli: list[Stimulus]
+    grouped: dict[str, list[Stimulus]]
+    rendered: dict[str, str]
+    counts_by_id: dict[str, int]
+    poolings: list[str]
+    identity: CellIdentity
+    ladder: dict[str, Any]
+    deltanet_kernel: dict[str, str]
+    natural_plan: NaturalPrefixPlan
+    natural_rendering: NaturalPrefixRendering
+
+
+def _load_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
+    tokenizer = cast(
+        "PreTrainedTokenizerBase",
+        AutoTokenizer.from_pretrained(base_model, trust_remote_code=True),
     )
-    args = build_parser().parse_args(argv)
-    if args.build_natural_prefix_stimuli:
-        if (
-            args.records is None
-            or args.natural_selection_manifest is None
-            or args.natural_prefix_out is None
-            or args.natural_state is None
-        ):
-            raise ValueError(
-                "--build-natural-prefix-stimuli requires --records, --natural-selection-manifest, "
-                "--natural-prefix-out, and --natural-state"
-            )
-        tokenizer = cast(
-            "PreTrainedTokenizerBase",
-            AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True),
+    tokenizer.padding_side = "right"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def _build_natural_prefix_stimuli(args: argparse.Namespace) -> None:
+    if (
+        args.records is None
+        or args.natural_selection_manifest is None
+        or args.natural_prefix_out is None
+        or args.natural_state is None
+    ):
+        raise ValueError(
+            "--build-natural-prefix-stimuli requires --records, --natural-selection-manifest, "
+            "--natural-prefix-out, and --natural-state"
         )
-        tokenizer.padding_side = "right"
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        report = write_natural_prefix_stimuli(
-            args.records,
-            args.natural_prefix_out,
-            args.natural_selection_manifest,
-            tokenizer,
-            natural_state=args.natural_state,
-            convention=args.stimulus_render,
-            enable_thinking=not args.no_thinking,
-        )
-        report["records_sha256"] = sha256_of_file(args.records)
-        report["selection_manifest_path"] = str(args.natural_selection_manifest)
-        sidecar = args.natural_prefix_out.with_suffix(
-            args.natural_prefix_out.suffix + ".manifest.json"
-        )
-        sidecar.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-        logger.info("natural-prefix stimuli built: %s", json.dumps(report, sort_keys=True))
-        return 0
-    if args.stimuli is None or args.out_dir is None:
-        raise ValueError("capture mode requires --stimuli and --out-dir")
-    poolings = [part.strip() for part in str(args.poolings).split(",") if part.strip()]
+    tokenizer = _load_tokenizer(args.base_model)
+    report = write_natural_prefix_stimuli(
+        args.records,
+        args.natural_prefix_out,
+        args.natural_selection_manifest,
+        tokenizer,
+        natural_state=args.natural_state,
+        convention=args.stimulus_render,
+        enable_thinking=not args.no_thinking,
+    )
+    report["records_sha256"] = sha256_of_file(args.records)
+    report["selection_manifest_path"] = str(args.natural_selection_manifest)
+    sidecar = args.natural_prefix_out.with_suffix(args.natural_prefix_out.suffix + ".manifest.json")
+    sidecar.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    logger.info("natural-prefix stimuli built: %s", json.dumps(report, sort_keys=True))
+
+
+def _parse_poolings(raw_poolings: str) -> list[str]:
+    poolings = [part.strip() for part in raw_poolings.split(",") if part.strip()]
     unknown = sorted(set(poolings) - set(POOLERS))
     if unknown:
         raise ValueError(f"unknown poolings {unknown}; expected from {sorted(POOLERS)}.")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    deadline = None if args.deadline is None else dt.datetime.fromisoformat(args.deadline)
+    return poolings
 
-    reserved_groups, external_pair_ids = load_capture_reservations(args.reserved_identities)
+
+def _load_stimuli(
+    args: argparse.Namespace,
+    reserved_groups: tuple[str, ...],
+    external_pair_ids: tuple[str, ...],
+) -> tuple[list[Stimulus], dict[str, dict[str, Any]] | None]:
     if args.cooperation_constructs:
         stimuli = load_private_construct_stimuli(
             args.stimuli,
@@ -1488,92 +1541,83 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
             f"capturing only the first {args.limit_stimuli} stimuli; this is a different corpus and "
             f"gets a different digest, so these cells cannot be compared against full ones"
         )
-    digest = stimuli_digest(stimuli)
-    grouped = group_by_set(stimuli)
-    cells = resolve_cells(args)
+    return stimuli, construct_splits
 
+
+def _plan_natural_prefixes(args: argparse.Namespace, cells: list[LadderCell]) -> NaturalPrefixPlan:
+    """Bind each cell to its natural-prefix source, checked against the predeclared selection."""
     natural_source_specs = parse_natural_prefix_sources(args.natural_prefix_stimuli)
-    natural_stimuli_by_cell: dict[str, list[Stimulus]] = {}
-    natural_source_paths_by_cell: dict[str, Path] = {}
-    natural_selection_manifest: dict[str, Any] | None = None
-    natural_rendered_by_cell: dict[str, dict[str, str]] = {}
-    natural_digests_by_cell: dict[str, str] = {}
-    natural_rendered_digests_by_cell: dict[str, str] = {}
-    natural_layers: tuple[int, ...] = ()
-    if natural_source_specs:
-        if "*" in natural_source_specs and len(cells) != 1:
+    if not natural_source_specs:
+        if args.natural_prefix_layers is not None or args.natural_selection_manifest is not None:
             raise ValueError(
-                "a natural-prefix source without a state/arm binding is only valid for a "
-                "one-cell capture; bind base and final sources separately"
+                "--natural-prefix-layers and --natural-selection-manifest require "
+                "--natural-prefix-stimuli"
             )
-        if args.natural_selection_manifest is None:
-            raise ValueError(
-                "--natural-prefix-stimuli requires --natural-selection-manifest so position "
-                "selection is predeclared before capture"
-            )
-        natural_selection_manifest = load_natural_selection_manifest(
-            args.natural_selection_manifest
+        return NaturalPrefixPlan(
+            stimuli_by_cell={}, source_paths_by_cell={}, selection_manifest=None, layers=()
         )
-        natural_layers = tuple(int(layer) for layer in natural_selection_manifest["layers"])
-        if args.natural_prefix_layers is not None:
-            requested_layers = tuple(
-                int(part.strip())
-                for part in str(args.natural_prefix_layers).split(",")
-                if part.strip()
-            )
-            if requested_layers != natural_layers:
-                raise ValueError(
-                    f"--natural-prefix-layers {requested_layers} differs from the predeclared "
-                    f"manifest layers {natural_layers}"
-                )
-        n_non_base_cells = sum(cell.arm != BASE_ARM for cell in cells)
-        for cell in cells:
-            source_path = natural_prefix_source_for_cell(
-                cell,
-                natural_source_specs,
-                n_non_base_cells=n_non_base_cells,
-            )
-            source_path = _private_selection_path(source_path)
-            natural_source_paths_by_cell[cell.label] = source_path
-            expected_state = "base" if cell.arm == BASE_ARM else "final"
-            natural_stimuli = load_stimuli(source_path)
-            _validate_natural_stimuli_state(
-                natural_stimuli, natural_selection_manifest, expected_state
-            )
-            natural_stimuli_by_cell[cell.label] = natural_stimuli
-    elif args.natural_prefix_layers is not None or args.natural_selection_manifest is not None:
+    if "*" in natural_source_specs and len(cells) != 1:
         raise ValueError(
-            "--natural-prefix-layers and --natural-selection-manifest require "
-            "--natural-prefix-stimuli"
+            "a natural-prefix source without a state/arm binding is only valid for a "
+            "one-cell capture; bind base and final sources separately"
         )
-
-    tokenizer = cast(
-        "PreTrainedTokenizerBase",
-        AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True),
-    )
-    tokenizer.padding_side = "right"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    rendered = render_stimuli(
-        tokenizer,
-        stimuli,
-        convention=args.stimulus_render,
-        enable_thinking=not args.no_thinking,
-    )
-    rendered_digest = digest_of_strings(rendered[stimulus.stimulus_id] for stimulus in stimuli)
+    if args.natural_selection_manifest is None:
+        raise ValueError(
+            "--natural-prefix-stimuli requires --natural-selection-manifest so position "
+            "selection is predeclared before capture"
+        )
+    selection_manifest = load_natural_selection_manifest(args.natural_selection_manifest)
+    layers = tuple(int(layer) for layer in selection_manifest["layers"])
+    if args.natural_prefix_layers is not None:
+        requested_layers = tuple(
+            int(part.strip()) for part in str(args.natural_prefix_layers).split(",") if part.strip()
+        )
+        if requested_layers != layers:
+            raise ValueError(
+                f"--natural-prefix-layers {requested_layers} differs from the predeclared "
+                f"manifest layers {layers}"
+            )
+    n_non_base_cells = sum(cell.arm != BASE_ARM for cell in cells)
+    stimuli_by_cell: dict[str, list[Stimulus]] = {}
+    source_paths_by_cell: dict[str, Path] = {}
     for cell in cells:
-        natural_stimuli = natural_stimuli_by_cell.get(cell.label)
-        if natural_stimuli is None:
-            continue
+        source_path = natural_prefix_source_for_cell(
+            cell,
+            natural_source_specs,
+            n_non_base_cells=n_non_base_cells,
+        )
+        source_path = _private_selection_path(source_path)
+        source_paths_by_cell[cell.label] = source_path
+        expected_state = "base" if cell.arm == BASE_ARM else "final"
+        natural_stimuli = load_stimuli(source_path)
+        _validate_natural_stimuli_state(natural_stimuli, selection_manifest, expected_state)
+        stimuli_by_cell[cell.label] = natural_stimuli
+    return NaturalPrefixPlan(
+        stimuli_by_cell=stimuli_by_cell,
+        source_paths_by_cell=source_paths_by_cell,
+        selection_manifest=selection_manifest,
+        layers=layers,
+    )
+
+
+def _render_natural_prefixes(
+    tokenizer: PreTrainedTokenizerBase,
+    args: argparse.Namespace,
+    plan: NaturalPrefixPlan,
+) -> NaturalPrefixRendering:
+    rendered_by_cell: dict[str, dict[str, str]] = {}
+    stimulus_digests_by_cell: dict[str, str] = {}
+    rendered_digests_by_cell: dict[str, str] = {}
+    for cell_label, natural_stimuli in plan.stimuli_by_cell.items():
         natural_rendered = render_stimuli(
             tokenizer,
             natural_stimuli,
             convention=args.stimulus_render,
             enable_thinking=not args.no_thinking,
         )
-        natural_rendered_by_cell[cell.label] = natural_rendered
-        natural_digests_by_cell[cell.label] = stimuli_digest(natural_stimuli)
-        natural_rendered_digests_by_cell[cell.label] = digest_of_strings(
+        rendered_by_cell[cell_label] = natural_rendered
+        stimulus_digests_by_cell[cell_label] = stimuli_digest(natural_stimuli)
+        rendered_digests_by_cell[cell_label] = digest_of_strings(
             natural_rendered[stimulus.stimulus_id] for stimulus in natural_stimuli
         )
         token_counts(
@@ -1581,6 +1625,32 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
             [natural_rendered[stimulus.stimulus_id] for stimulus in natural_stimuli],
             max_prompt_tokens=args.max_prompt_tokens,
         )
+    return NaturalPrefixRendering(
+        rendered_by_cell=rendered_by_cell,
+        stimulus_digests_by_cell=stimulus_digests_by_cell,
+        rendered_digests_by_cell=rendered_digests_by_cell,
+    )
+
+
+def _render_and_check_corpus(  # noqa: PLR0913 - the log line names the corpus, its digests and its device
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    args: argparse.Namespace,
+    stimuli: list[Stimulus],
+    digest: str,
+    grouped: dict[str, list[Stimulus]],
+    device: torch.device,
+    natural_plan: NaturalPrefixPlan,
+) -> tuple[dict[str, str], str, dict[str, int], NaturalPrefixRendering]:
+    """Render the corpus and its natural prefixes, check the token budget, and log the corpus."""
+    rendered = render_stimuli(
+        tokenizer,
+        stimuli,
+        convention=args.stimulus_render,
+        enable_thinking=not args.no_thinking,
+    )
+    rendered_digest = digest_of_strings(rendered[stimulus.stimulus_id] for stimulus in stimuli)
+    natural_rendering = _render_natural_prefixes(tokenizer, args, natural_plan)
     counts = token_counts(
         tokenizer,
         [rendered[stimulus.stimulus_id] for stimulus in stimuli],
@@ -1603,15 +1673,21 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
         f"tokens_min={min(counts)} tokens_max={max(counts)} device={device} "
         f"example={rendered[stimuli[0].stimulus_id][:120]!r}"
     )
+    return rendered, rendered_digest, counts_by_id, natural_rendering
 
-    # Before the load, which imports the modeling module and freezes each kernel's dispatch.
-    kernel_bridge = bridge_and_check_decode_kernel()
-    model = load_adapter_base(
-        args.base_model, dtype=COMPUTE_DTYPES[args.compute_dtype], device=device
-    )
-    kernels_bound = bound_deltanet_kernels()
-    deltanet_kernel = prefill_deltanet_kernels(kernels_bound)
-    identity = build_identity(
+
+def _build_capture_identity(  # noqa: PLR0913 - an identity is exactly these inputs, by construction
+    *,
+    args: argparse.Namespace,
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    stimuli: list[Stimulus],
+    digest: str,
+    rendered_digest: str,
+    deltanet_kernel: dict[str, str],
+    natural_plan: NaturalPrefixPlan,
+) -> CellIdentity:
+    return build_identity(
         model,
         base_model=args.base_model,
         digest=digest,
@@ -1640,15 +1716,242 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
         teacher_forced_rendered_sha256=(
             rendered_digest if args.capture_prefix_states else "unspecified"
         ),
-        natural_prefix_layers=natural_layers,
+        natural_prefix_layers=natural_plan.layers,
         natural_selection_manifest_sha256=(
-            "" if natural_selection_manifest is None else natural_selection_manifest["sha256"]
+            ""
+            if natural_plan.selection_manifest is None
+            else natural_plan.selection_manifest["sha256"]
         ),
         # Natural rollout text is state-specific. Its source and rendered digests live in each
         # standalone natural-prefix manifest; keeping them out of the shared ladder identity lets
         # base and final use matched request IDs with different retained rollout text.
         natural_prefix_stimuli_sha256="",
         natural_prefix_rendered_sha256="",
+    )
+
+
+def _cell_is_finished(
+    cell: LadderCell,
+    cell_dir: Path,
+    args: argparse.Namespace,
+    natural_plan: NaturalPrefixPlan,
+) -> bool:
+    if not (cell_dir / CELL_MANIFEST_FILENAME).is_file():
+        return False
+    prefix_ready = (
+        not args.capture_prefix_states or (cell_dir / "prefix-activations.safetensors").is_file()
+    )
+    natural_ready = (
+        cell.label not in natural_plan.stimuli_by_cell
+        or (cell_dir / "natural-prefix" / "natural-prefix-manifest.json").is_file()
+    )
+    if prefix_ready and natural_ready:
+        return True
+    logger.warning(
+        f"re-capturing {cell.label}: the existing cell is missing requested auxiliary "
+        "capture artifacts"
+    )
+    return False
+
+
+def _capture_prefix_states(run: CaptureRun) -> dict[tuple[str, str], torch.Tensor]:
+    return {
+        (state, pooling): matrix
+        for state, by_pooling in capture_supplied_prefix_states(
+            run.model,
+            run.tokenizer,
+            run.stimuli,
+            convention=run.args.stimulus_render,
+            enable_thinking=not run.args.no_thinking,
+            poolings=run.poolings,
+            batch_size=run.args.batch_size,
+        ).items()
+        for pooling, matrix in by_pooling.items()
+    }
+
+
+def _natural_selection_records(
+    natural_stimuli: list[Stimulus],
+    natural_selections: Sequence[NaturalPrefixSelection],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **asdict(selection),
+            **{
+                field: stimulus.metadata[field]
+                for field in (
+                    "request_id",
+                    "rollout_id",
+                    "scenario_group",
+                    "natural_state",
+                )
+                if field in stimulus.metadata
+            },
+        }
+        for stimulus, selection in zip(natural_stimuli, natural_selections, strict=True)
+    ]
+
+
+def _write_natural_prefix_cell(  # noqa: PLR0913 - durable artifact boundary mirrors write_natural_prefix_capture
+    *,
+    run: CaptureRun,
+    cell: LadderCell,
+    cell_dir: Path,
+    natural_stimuli: list[Stimulus],
+    natural_activations: dict[str, torch.Tensor],
+    natural_selections: Sequence[NaturalPrefixSelection],
+    applied: int | None,
+    adapter_sha: str | None,
+) -> None:
+    write_natural_prefix_capture(
+        cell_dir / "natural-prefix",
+        identity=run.identity,
+        stimuli=natural_stimuli,
+        activations=natural_activations,
+        selection_records=_natural_selection_records(natural_stimuli, natural_selections),
+        selection_manifest=cast("dict[str, Any]", run.natural_plan.selection_manifest),
+        rendered_sha256=run.natural_rendering.rendered_digests_by_cell[cell.label],
+        natural_state="base" if cell.arm == BASE_ARM else "final",
+        arm=cell.arm,
+        step=cell.step,
+        applied_adapter_weights=applied,
+        adapter_weights_sha256=adapter_sha,
+    )
+
+
+def _capture_cell_outputs(
+    run: CaptureRun,
+    cell: LadderCell,
+    cell_dir: Path,
+    applied: int | None,
+    adapter_sha: str | None,
+) -> float:
+    """Capture one cell's pooled, prefix and natural activations, write them, and return the wall-clock seconds."""
+    args = run.args
+    started = time.time()
+    rows, activations = capture_cell(
+        cell,
+        model=run.model,
+        tokenizer=run.tokenizer,
+        grouped=run.grouped,
+        rendered=run.rendered,
+        counts_by_id=run.counts_by_id,
+        poolings=run.poolings,
+        batch_size=args.batch_size,
+    )
+    prefix_activations = _capture_prefix_states(run) if args.capture_prefix_states else None
+    natural_prefix_activations = None
+    natural_selections: tuple[NaturalPrefixSelection, ...] = ()
+    natural_stimuli = run.natural_plan.stimuli_by_cell.get(cell.label)
+    if natural_stimuli is not None:
+        natural_prefix_activations, natural_selections = capture_selected_natural_activations(
+            run.model,
+            run.tokenizer,
+            natural_stimuli,
+            run.natural_rendering.rendered_by_cell[cell.label],
+            layers=run.natural_plan.layers,
+            batch_size=args.batch_size,
+            selection_manifest=run.natural_plan.selection_manifest,
+            max_prompt_tokens=args.max_prompt_tokens,
+        )
+    seconds = round(time.time() - started, 2)
+    write_cell(
+        cell_dir,
+        arm=cell.arm,
+        step=cell.step,
+        identity=run.identity,
+        rows=rows,
+        activations=activations,
+        applied_adapter_weights=applied,
+        adapter_weights_sha256=adapter_sha,
+        provenance={
+            "git_sha": run.ladder["git_sha"],
+            "torch_version": run.ladder["torch_version"],
+            "device": run.ladder["device"],
+            "stimuli_file": run.ladder["stimuli_file"],
+            DELTANET_KERNEL_FIELD: run.deltanet_kernel,
+            "adapter_dir": None if cell.adapter_dir is None else str(cell.adapter_dir),
+            "adapter_config": None
+            if cell.adapter_dir is None
+            else adapter_config_identity(cell.adapter_dir),
+            "seconds": seconds,
+            "captured_at": dt.datetime.now(tz=dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+        stimulus_metadata={
+            stimulus.stimulus_id: dict(stimulus.metadata)
+            for stimulus in run.stimuli
+            if stimulus.metadata
+        },
+        prefix_activations=prefix_activations,
+        prefix_stimulus_ids=(
+            tuple(stimulus.stimulus_id for stimulus in run.stimuli) if prefix_activations else None
+        ),
+    )
+    if natural_stimuli is not None:
+        _write_natural_prefix_cell(
+            run=run,
+            cell=cell,
+            cell_dir=cell_dir,
+            natural_stimuli=natural_stimuli,
+            natural_activations=cast("dict[str, torch.Tensor]", natural_prefix_activations),
+            natural_selections=natural_selections,
+            applied=applied,
+            adapter_sha=adapter_sha,
+        )
+    return seconds
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Capture every cell on the agenda, writing each one as it finishes."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stdout,
+    )
+    args = build_parser().parse_args(argv)
+    if args.build_natural_prefix_stimuli:
+        _build_natural_prefix_stimuli(args)
+        return 0
+    if args.stimuli is None or args.out_dir is None:
+        raise ValueError("capture mode requires --stimuli and --out-dir")
+    poolings = _parse_poolings(str(args.poolings))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    deadline = None if args.deadline is None else dt.datetime.fromisoformat(args.deadline)
+
+    reserved_groups, external_pair_ids = load_capture_reservations(args.reserved_identities)
+    stimuli, construct_splits = _load_stimuli(args, reserved_groups, external_pair_ids)
+    digest = stimuli_digest(stimuli)
+    grouped = group_by_set(stimuli)
+    cells = resolve_cells(args)
+    natural_plan = _plan_natural_prefixes(args, cells)
+
+    tokenizer = _load_tokenizer(args.base_model)
+    rendered, rendered_digest, counts_by_id, natural_rendering = _render_and_check_corpus(
+        tokenizer,
+        args=args,
+        stimuli=stimuli,
+        digest=digest,
+        grouped=grouped,
+        device=device,
+        natural_plan=natural_plan,
+    )
+
+    # Before the load, which imports the modeling module and freezes each kernel's dispatch.
+    kernel_bridge = bridge_and_check_decode_kernel()
+    model = load_adapter_base(
+        args.base_model, dtype=COMPUTE_DTYPES[args.compute_dtype], device=device
+    )
+    kernels_bound = bound_deltanet_kernels()
+    deltanet_kernel = prefill_deltanet_kernels(kernels_bound)
+    identity = _build_capture_identity(
+        args=args,
+        model=model,
+        tokenizer=tokenizer,
+        stimuli=stimuli,
+        digest=digest,
+        rendered_digest=rendered_digest,
+        deltanet_kernel=deltanet_kernel,
+        natural_plan=natural_plan,
     )
     ladder: dict[str, Any] = {
         "identity": identity.to_payload(),
@@ -1663,16 +1966,35 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
         "reserved_groups": list(reserved_groups),
         "reserved_pair_ids": list(external_pair_ids),
         "natural_prefix_stimuli_file": {
-            label: str(path) for label, path in sorted(natural_source_paths_by_cell.items())
+            label: str(path) for label, path in sorted(natural_plan.source_paths_by_cell.items())
         },
-        "natural_prefix_stimuli_sha256": dict(sorted(natural_digests_by_cell.items())),
-        "natural_prefix_rendered_sha256": dict(sorted(natural_rendered_digests_by_cell.items())),
-        "natural_selection_manifest": natural_selection_manifest,
+        "natural_prefix_stimuli_sha256": dict(
+            sorted(natural_rendering.stimulus_digests_by_cell.items())
+        ),
+        "natural_prefix_rendered_sha256": dict(
+            sorted(natural_rendering.rendered_digests_by_cell.items())
+        ),
+        "natural_selection_manifest": natural_plan.selection_manifest,
         # No ladder-level DELTANET_KERNEL_FIELD, for the reason the module docstring gives.
         "deltanet_kernel_bridge": kernel_bridge,
         "deltanet_kernels_bound": kernels_bound,
         "cells": {},
     }
+    run = CaptureRun(
+        args=args,
+        model=model,
+        tokenizer=tokenizer,
+        stimuli=stimuli,
+        grouped=grouped,
+        rendered=rendered,
+        counts_by_id=counts_by_id,
+        poolings=poolings,
+        identity=identity,
+        ladder=ladder,
+        deltanet_kernel=deltanet_kernel,
+        natural_plan=natural_plan,
+        natural_rendering=natural_rendering,
+    )
 
     adapted: PeftModel | None = None
     for cell in cells:
@@ -1681,132 +2003,17 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901, PLR0912, PLR0
             ladder["stopped_reason"] = f"deadline reached before {cell.label}"
             break
         cell_dir = step_dir(args.out_dir, cell.arm, cell.step)
-        if (cell_dir / CELL_MANIFEST_FILENAME).is_file():
-            prefix_ready = (
-                not args.capture_prefix_states
-                or (cell_dir / "prefix-activations.safetensors").is_file()
-            )
-            natural_ready = (
-                cell.label not in natural_stimuli_by_cell
-                or (cell_dir / "natural-prefix" / "natural-prefix-manifest.json").is_file()
-            )
-            if prefix_ready and natural_ready:
-                logger.info(f"skipping {cell.label}: an earlier attempt already finished it")
-                ladder["cells"][cell.label] = {"skipped": "already on disk"}
-                continue
-            logger.warning(
-                f"re-capturing {cell.label}: the existing cell is missing requested auxiliary "
-                "capture artifacts"
-            )
+        if _cell_is_finished(cell, cell_dir, args, natural_plan):
+            logger.info(f"skipping {cell.label}: an earlier attempt already finished it")
+            ladder["cells"][cell.label] = {"skipped": "already on disk"}
+            continue
         applied: int | None = None
         adapter_sha: str | None = None
         if cell.adapter_dir is not None:
             attached = attach_adapter(model, cell.adapter_dir, args.base_model, existing=adapted)
             adapted, applied = attached.peft_model, attached.applied_adapter_weights
             adapter_sha = sha256_of_file(cell.adapter_dir / ADAPTER_WEIGHTS_FILENAME)
-        started = time.time()
-        rows, activations = capture_cell(
-            cell,
-            model=model,
-            tokenizer=tokenizer,
-            grouped=grouped,
-            rendered=rendered,
-            counts_by_id=counts_by_id,
-            poolings=poolings,
-            batch_size=args.batch_size,
-        )
-        prefix_activations = None
-        if args.capture_prefix_states:
-            prefix_activations = {
-                (state, pooling): matrix
-                for state, by_pooling in capture_supplied_prefix_states(
-                    model,
-                    tokenizer,
-                    stimuli,
-                    convention=args.stimulus_render,
-                    enable_thinking=not args.no_thinking,
-                    poolings=poolings,
-                    batch_size=args.batch_size,
-                ).items()
-                for pooling, matrix in by_pooling.items()
-            }
-        natural_prefix_activations = None
-        natural_selections = ()
-        natural_stimuli = natural_stimuli_by_cell.get(cell.label)
-        if natural_stimuli is not None:
-            natural_prefix_activations, natural_selections = capture_selected_natural_activations(
-                model,
-                tokenizer,
-                natural_stimuli,
-                natural_rendered_by_cell[cell.label],
-                layers=natural_layers,
-                batch_size=args.batch_size,
-                selection_manifest=natural_selection_manifest,
-                max_prompt_tokens=args.max_prompt_tokens,
-            )
-        seconds = round(time.time() - started, 2)
-        write_cell(
-            cell_dir,
-            arm=cell.arm,
-            step=cell.step,
-            identity=identity,
-            rows=rows,
-            activations=activations,
-            applied_adapter_weights=applied,
-            adapter_weights_sha256=adapter_sha,
-            provenance={
-                "git_sha": ladder["git_sha"],
-                "torch_version": ladder["torch_version"],
-                "device": ladder["device"],
-                "stimuli_file": ladder["stimuli_file"],
-                DELTANET_KERNEL_FIELD: deltanet_kernel,
-                "adapter_dir": None if cell.adapter_dir is None else str(cell.adapter_dir),
-                "adapter_config": None
-                if cell.adapter_dir is None
-                else adapter_config_identity(cell.adapter_dir),
-                "seconds": seconds,
-                "captured_at": dt.datetime.now(tz=dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            },
-            stimulus_metadata={
-                stimulus.stimulus_id: dict(stimulus.metadata)
-                for stimulus in stimuli
-                if stimulus.metadata
-            },
-            prefix_activations=prefix_activations,
-            prefix_stimulus_ids=(
-                tuple(stimulus.stimulus_id for stimulus in stimuli) if prefix_activations else None
-            ),
-        )
-        if natural_stimuli is not None:
-            write_natural_prefix_capture(
-                cell_dir / "natural-prefix",
-                identity=identity,
-                stimuli=natural_stimuli,
-                activations=cast("dict[str, torch.Tensor]", natural_prefix_activations),
-                selection_records=[
-                    {
-                        **asdict(selection),
-                        **{
-                            field: stimulus.metadata[field]
-                            for field in (
-                                "request_id",
-                                "rollout_id",
-                                "scenario_group",
-                                "natural_state",
-                            )
-                            if field in stimulus.metadata
-                        },
-                    }
-                    for stimulus, selection in zip(natural_stimuli, natural_selections, strict=True)
-                ],
-                selection_manifest=cast("dict[str, Any]", natural_selection_manifest),
-                rendered_sha256=natural_rendered_digests_by_cell[cell.label],
-                natural_state="base" if cell.arm == BASE_ARM else "final",
-                arm=cell.arm,
-                step=cell.step,
-                applied_adapter_weights=applied,
-                adapter_weights_sha256=adapter_sha,
-            )
+        seconds = _capture_cell_outputs(run, cell, cell_dir, applied, adapter_sha)
         ladder["cells"][cell.label] = {"seconds": seconds, "applied_adapter_weights": applied}
         write_ladder_manifest(args.out_dir, ladder)
         logger.info(f"cell done, {cell.label} {seconds=} {applied=}")
