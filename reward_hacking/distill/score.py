@@ -36,6 +36,9 @@ FP8_KV_ENGINE_SETTINGS: dict[str, object] = {
     "attention_backend": "FLASHINFER",
     "dtype": "bfloat16",
     "mamba_cache_mode": "align",
+    # Prompt-logprob scoring never decodes, so CUDA graphs buy nothing; capturing them faulted in the
+    # hybrid attention state gather ("device not ready") on the 27B INT4 engine.
+    "enforce_eager": True,
 }
 # Qwen3.5/3.8 padded vocabulary; vLLM materialises a full-vocab row per prefill position for prompt logprobs.
 PADDED_VOCAB_SIZE = 248_320

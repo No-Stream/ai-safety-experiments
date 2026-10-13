@@ -398,8 +398,13 @@ class TestDistillTeacherScoring:
         assert FakeScoreLLM.instances[0].kwargs["max_num_seqs"] == 2
         assert {
             key: FakeScoreLLM.instances[0].kwargs[key]
-            for key in ("attention_backend", "dtype", "mamba_cache_mode")
-        } == {"attention_backend": "FLASHINFER", "dtype": "bfloat16", "mamba_cache_mode": "align"}
+            for key in ("attention_backend", "dtype", "mamba_cache_mode", "enforce_eager")
+        } == {
+            "attention_backend": "FLASHINFER",
+            "dtype": "bfloat16",
+            "mamba_cache_mode": "align",
+            "enforce_eager": True,
+        }
         resumed = score_round(
             samples_path=samples_path,
             output_path=output_path,
