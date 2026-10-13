@@ -555,16 +555,20 @@ class TestMainEpisodeDirDispatch:
         (args,) = dispatched
         assert args.sampling_budget["oversize_reason"] == "full patch-sweep fixture"
         assert args.sampling_budget["total_episodes"] == 9 * len(args.concepts)
-        payload = run_harness._patch_sweep_payload(
+        metrics_path = tmp_path / "patch_sweep_metrics.json"
+        run_harness._write_patch_sweep_metrics(
+            metrics_path,
             args,
-            layers_by_concept={},
+            progress={},
             coverage={},
+            layers_by_concept={},
             rows=[],
             variants=[],
             skipped_variants=[],
             kernel_bridge={},
             deltanet_kernel={},
         )
+        payload = json.loads(metrics_path.read_text())
         assert payload["sampling_budget"] == args.sampling_budget
 
     def test_a_nested_raw_dir_is_still_rejected_on_fit_lens(self, tmp_path: Path) -> None:
