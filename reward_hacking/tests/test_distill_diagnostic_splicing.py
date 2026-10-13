@@ -266,7 +266,7 @@ def test_episode_builder_records_action_spans_before_environment(tmp_path: Path)
 def test_candidate_pool_includes_shortest_observed_other_command_with_lexical_tie() -> None:
     tokenizer, history, raw, original = _piece_source("noncanonical_reasoning")
     sources = [history]
-    for command in ("ls", "id", "pwd"):
+    for command in ("tr", "id", "pwd"):
         other_raw = raw.replace(
             '"command":' + json.dumps(original), '"command":' + json.dumps(command), 1
         )
