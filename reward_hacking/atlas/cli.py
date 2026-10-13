@@ -26,7 +26,7 @@ from typing import Any, cast
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS
-from reward_hacking.atlas.jsonl_io import read_jsonl, write_json
+from reward_hacking.jsonl_io import read_jsonl_objects_value_error, write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +173,7 @@ def _sample_sampling_budget(arguments: argparse.Namespace, prompt_path: Path) ->
         )
     if arguments.max_prompts is not None and arguments.max_prompts < 1:
         raise ValueError(f"--max-prompts must be positive, got {arguments.max_prompts}")
-    prompt_count = len(read_jsonl(prompt_path))
+    prompt_count = len(read_jsonl_objects_value_error(prompt_path))
     if prompt_count == 0:
         raise ValueError(f"no prompts found in {prompt_path}")
     if arguments.max_prompts is not None:
@@ -388,8 +388,8 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
     summary: dict[str, object] = {"models": {}, "transfers": [], "original_probe_standin": {}}
     for model_key in model_keys:
         output_key = artifact_model_key(model_key)
-        sample_records = read_jsonl(run_dir / f"samples.{output_key}.jsonl")
-        grade_records = read_jsonl(run_dir / f"grades.{output_key}.jsonl")
+        sample_records = read_jsonl_objects_value_error(run_dir / f"samples.{output_key}.jsonl")
+        grade_records = read_jsonl_objects_value_error(run_dir / f"grades.{output_key}.jsonl")
         grade_by_id = {str(record["sample_id"]): record for record in grade_records}
         shard = np.load(run_dir / f"activations.{output_key}.npy", mmap_mode="r")
         index = json.loads(
@@ -664,7 +664,7 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                         }
                     )
     summary["transfers"] = transfer_rows
-    write_json(run_dir / "readout.json", summary)
+    write_json_atomic(run_dir / "readout.json", summary)
     markdown_rows = [
         "| Model | Position | Best layer AUC | Regex AUC | TF-IDF AUC |",
         "|---|---|---:|---:|---:|",
@@ -743,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
             sampling_budget = _sample_sampling_budget(arguments, run_dir / "prompts.jsonl")
         except ValueError as error:
             parser.error(str(error))
-        write_json(run_dir / "sampling-budget.json", {"sampling_budget": sampling_budget})
+        write_json_atomic(run_dir / "sampling-budget.json", {"sampling_budget": sampling_budget})
         sample_models(
             run_dir=run_dir,
             prompt_path=run_dir / "prompts.jsonl",

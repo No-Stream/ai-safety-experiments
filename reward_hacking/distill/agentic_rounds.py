@@ -25,12 +25,12 @@ from reward_hacking.distill.rounds import (
     CommandRunner,
     _final_adapter_for_round,  # pyright: ignore[reportPrivateUsage]
     _phase_command_prefix,  # pyright: ignore[reportPrivateUsage]
-    _read_jsonl,  # pyright: ignore[reportPrivateUsage]
     _run_subprocess,  # pyright: ignore[reportPrivateUsage]
     _write_json_atomic,  # pyright: ignore[reportPrivateUsage]
 )
 from reward_hacking.distill.train import load_training_rows, semantic_training_rows
 from reward_hacking.harness.leak_channels import CHANNELS
+from reward_hacking.jsonl_io import read_jsonl_objects
 from reward_hacking.organism_rl.generate import (
     _read_hint_entries,  # pyright: ignore[reportPrivateUsage]
 )
@@ -417,7 +417,7 @@ def run_agentic_rounds(
         _execute(runner, sample_command)
         records_path = round_dir / "records.jsonl"
         records = sorted(
-            _read_jsonl(records_path),
+            read_jsonl_objects(records_path),
             key=lambda record: json.dumps(
                 record.get(
                     "key",
@@ -558,10 +558,10 @@ def _completed_round_snapshot(
     replay: RoundReplay,
 ) -> dict[str, Any]:
     run_dir = config.run_dir.resolve()
-    samples = _read_jsonl(run_dir / "samples" / f"round-{round_number}.jsonl")
+    samples = read_jsonl_objects(run_dir / "samples" / f"round-{round_number}.jsonl")
     records_path = run_dir / "generated" / f"round-{round_number}" / "records.jsonl"
     records = sorted(
-        _read_jsonl(records_path),
+        read_jsonl_objects(records_path),
         key=lambda record: json.dumps(
             record.get(
                 "key",
@@ -593,7 +593,9 @@ def _completed_round_snapshot(
         raise ValueError("completed round census differs from generated records")
     scored: dict[str, Any] = {}
     if config.include_unhinted_controls:
-        unhinted_samples = _read_jsonl(run_dir / "unhinted_samples" / f"round-{round_number}.jsonl")
+        unhinted_samples = read_jsonl_objects(
+            run_dir / "unhinted_samples" / f"round-{round_number}.jsonl"
+        )
         if _semantic_sample_rows(unhinted_samples) != _semantic_sample_rows(
             _unhinted_rows(rebuilt)
         ):
@@ -603,7 +605,7 @@ def _completed_round_snapshot(
         joined = load_training_rows(
             _score_samples_path(run_dir, directory, round_number), scores_path, weight_mode="opd"
         )
-        scores = _read_jsonl(scores_path)
+        scores = read_jsonl_objects(scores_path)
         if any(row.get("model") != model for row in scores):
             raise ValueError("completed round scores name a different model")
         scored[directory] = {
@@ -657,7 +659,7 @@ def _validate_row_keys(rows: Sequence[Mapping[str, Any]]) -> None:
 def _advantage_by_turn(
     samples_path: Path, rows: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
-    samples = {row["key"]: row for row in _read_jsonl(samples_path)}
+    samples = {row["key"]: row for row in read_jsonl_objects(samples_path)}
     values_by_turn: dict[int, list[float]] = {}
     for row in rows:
         turn_indices = samples[row["key"]].get("token_turn_indices")
@@ -806,7 +808,7 @@ def _generate_round(config: AgenticRoundsConfig, round_number: int, adapter: Pat
             status = _run_subprocess(batch_command)
             if status != 0:
                 raise RuntimeError(f"agent generation exited with status {status}")
-            records.extend(_read_jsonl(batch_output / "records.jsonl"))
+            records.extend(read_jsonl_objects(batch_output / "records.jsonl"))
         _write_rows(output / "records.jsonl", records)
 
 

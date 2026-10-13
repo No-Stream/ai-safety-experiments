@@ -39,6 +39,7 @@ from reward_hacking.harness.tasks_r2e_leak import (
     _runtime_marker_payload,  # pyright: ignore[reportPrivateUsage]
     prepare_runtime,
 )
+from reward_hacking.jsonl_io import write_json_atomic
 from reward_hacking.organism_rl.leak_selection import (
     migrate_channel_partition,
     parse_channels,
@@ -75,12 +76,6 @@ class BuildOptions:
     channel_splits: Path | None = None
     minimum_free_bytes: int = 40 * _GIB
     runtime_image: str | None = None
-
-
-def _atomic_json(path: Path, value: object) -> None:
-    temporary = path.with_name(path.name + ".partial")
-    temporary.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -163,7 +158,7 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
         if source["content"] != content:
             raise ValueError("runtime variant source marker content changed")
     else:
-        _atomic_json(
+        write_json_atomic(
             source_marker,
             {
                 "venv": str(venv),
@@ -185,7 +180,7 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
         # Source paths and source timestamps describe extraction, not prepared runtime behavior.
         # Refresh them only after verifying the prepared artifacts against their saved digests.
         if saved_marker != current_marker:
-            _atomic_json(marker_path, current_marker)
+            write_json_atomic(marker_path, current_marker)
     runtime_venv, runtime_interpreter = prepare_runtime(
         venv, interpreter, runtime_namespace / content_key, binary
     )
@@ -391,7 +386,7 @@ def _remove_agent_runner(workspace: Path, manifest_path: Path) -> None:
     os.utime(workspace, ns=(root_stat.st_atime_ns, root_stat.st_mtime_ns))
     manifest = _json_object(manifest_path)
     manifest["template_fingerprint"] = template_fingerprint(workspace)
-    _atomic_json(manifest_path, manifest)
+    write_json_atomic(manifest_path, manifest)
 
 
 def _select_cases(
@@ -474,7 +469,7 @@ def _build_case(  # noqa: PLR0913, PLR0917 - exact per-task source and destinati
                     "unavailable_channels": {},
                     "template_fingerprint": template_fingerprint(common_closed),
                 }
-                _atomic_json(task_root / "closed-manifest.json", common_manifest)
+                write_json_atomic(task_root / "closed-manifest.json", common_manifest)
             else:
                 shutil.rmtree(output / "closed")
             if channels:
@@ -593,8 +588,8 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
     source_code_sha256 = _source_code_sha256()
 
     def persist_progress() -> None:
-        _atomic_json(options.out_root / "assets.json", index)
-        _atomic_json(
+        write_json_atomic(options.out_root / "assets.json", index)
+        write_json_atomic(
             options.out_root / "summary.json",
             {
                 "built": built,
@@ -673,7 +668,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
             }
             if _request_identity(options, case, provenance) != identity:
                 raise ValueError("source inputs changed during task build; refusing completion")
-            _atomic_json(
+            write_json_atomic(
                 task_root / "complete.json",
                 {
                     "identity": identity,
@@ -714,8 +709,8 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         "fix_commit_representations": dict(representations),
         "tasks": details,
     }
-    _atomic_json(options.out_root / "assets.json", index)
-    _atomic_json(options.out_root / "summary.json", summary)
+    write_json_atomic(options.out_root / "assets.json", index)
+    write_json_atomic(options.out_root / "summary.json", summary)
     return summary
 
 

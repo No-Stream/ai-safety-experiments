@@ -18,6 +18,7 @@ from reward_hacking.eval_awareness import (
     scan_text,
     summarize_matches,
 )
+from reward_hacking.jsonl_io import read_jsonl_objects
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -85,16 +86,7 @@ def _parse_cell(value: str) -> CellSpec:
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     if not path.is_file():
         raise FileNotFoundError(f"record file does not exist: {path}")
-    records: list[dict[str, object]] = []
-    with path.open(encoding="utf-8") as record_file:
-        for line_number, line in enumerate(record_file, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise TypeError(f"{path}:{line_number} is not a JSON object")
-            records.append(value)
-    return records
+    return read_jsonl_objects(path)
 
 
 def _required_string(record: dict[str, object], field: str, path: Path) -> str:

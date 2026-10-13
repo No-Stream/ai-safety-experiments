@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS, grade_model
-from reward_hacking.atlas.jsonl_io import read_jsonl
 from reward_hacking.atlas.sampling import BASE_MODEL_ID, artifact_model_key
+from reward_hacking.jsonl_io import read_jsonl_objects_value_error, write_json_atomic
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -49,14 +49,6 @@ def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
             for record in records
         ),
         encoding="utf-8",
-    )
-    temporary_path.replace(path)
-
-
-def _write_json(path: Path, record: Mapping[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(
-        json.dumps(dict(record), indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     temporary_path.replace(path)
 
@@ -380,9 +372,9 @@ def grade_steering_outputs(  # noqa: PLR0913
     """Bridge saved steering completions through Atlas's jailed grader and summarize each cell."""
     if timeout_seconds < 1 or workers < 1:
         raise ValueError("timeout_seconds and workers must be positive")
-    steering_records = read_jsonl(steering_path)
+    steering_records = read_jsonl_objects_value_error(steering_path)
     _validate_steering_ledger(steering_path, steering_records)
-    prompt_records = read_jsonl(prompts_path)
+    prompt_records = read_jsonl_objects_value_error(prompts_path)
     samples = _atlas_samples_from_steering(
         steering_records,
         prompt_records,
@@ -403,12 +395,12 @@ def grade_steering_outputs(  # noqa: PLR0913
     )
     summary = _summarize_grades(
         samples,
-        read_jsonl(grade_path),
+        read_jsonl_objects_value_error(grade_path),
         model_key=model_key,
     )
     summary_path = output_dir / "steer-summary.json"
     markdown_path = output_dir / "steer-summary.md"
-    _write_json(summary_path, summary)
+    write_json_atomic(summary_path, summary)
     markdown_path.write_text(_markdown_summary(summary), encoding="utf-8")
     logger.info("graded %d steering samples; summary=%s", len(samples), summary_path)
     return summary_path, markdown_path
