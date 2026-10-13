@@ -166,25 +166,6 @@ def cosine_with_band(
     )
 
 
-def content_floor_cosines(
-    target: torch.Tensor,
-    controls: Mapping[str, torch.Tensor],
-    *,
-    n_placebos: int,
-    generator: torch.Generator,
-) -> dict[str, CosineWithBand]:
-    """``target`` against each content control (comment line, statement literal, ...), banded.
-
-    The content floor is what a cosine to ``target`` looks like for a direction that shares the twin
-    corpus's *text* differences but not the rigged-assertion conflict; a cosine to ``d_twin`` that
-    does not exceed these is a cosine to "one line differs", not to "a check is rigged".
-    """
-    return {
-        name: cosine_with_band(target, control, n_placebos=n_placebos, generator=generator)
-        for name, control in controls.items()
-    }
-
-
 # --------------------------------------------------------------------------------------
 # The stored-decode gate
 # --------------------------------------------------------------------------------------

@@ -18,9 +18,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
-    from reward_hacking.model_backend import Backend
 
 from games.cooperation_payoffs import (
     annotate_behavior_record,
@@ -28,17 +27,14 @@ from games.cooperation_payoffs import (
     rank_row_actions,
 )
 from games.evals import (
-    ADMISSION_LONGEST_FIRST,
     EVAL_ONLY_GRADING,
     SECTION_DT_PROBES,
     SECTION_GAME_BEHAVIOR,
     SECTION_SELF_REPORT,
-    SUBMISSION_POOLED,
     EvalConfig,
     PlannedRequest,
     _game_request_record,  # pyright: ignore[reportPrivateUsage]
     plan_battery,
-    run_eval_battery,
 )
 from games.parsing import strip_thinking
 from games.payoffs import COOPERATE, DEFECT
@@ -963,19 +959,6 @@ def validate_group_isolation(roster: BehaviorRoster, reserved_group_ids: Iterabl
         )
 
 
-def assert_group_sets_disjoint(**group_sets: Iterable[str]) -> None:
-    """Validate named train/eval/interp group sets pairwise."""
-    seen: dict[str, str] = {}
-    for set_name, values in group_sets.items():
-        for value in values:
-            previous = seen.get(value)
-            if previous is not None:
-                raise ValueError(
-                    f"group {value!r} occurs in both {previous} and {set_name}; overlap."
-                )
-            seen[value] = set_name
-
-
 def _request_id(identity: Sequence[Any]) -> str:
     """Render a stable, readable request identity for retained rollout joins."""
     return "::".join(str(value) for value in identity)
@@ -1144,38 +1127,6 @@ def build_behavior_plan(
                 )
             )
     return plan
-
-
-def select_diagnostic_rows(
-    roster: BehaviorRoster,
-    pair_ids: Iterable[str],
-) -> list[dict[str, Any]]:
-    """Return full renderer rows for an interp/intervention subset.
-
-    The returned rows retain every ``generate_prompt_rows`` column and add only manifest metadata.
-    This lets steering and capture consume the same exact prompt/payoff rows as behavior evaluation.
-    """
-    requested = tuple(pair_ids)
-    if not requested:
-        raise ValueError("pair_ids must select at least one diagnostic pair.")
-    known = {pair.pair_id for pair in roster.manifest.pairs}
-    unknown = sorted(set(requested) - known)
-    if unknown:
-        raise ValueError(f"unknown behavior pair_ids {unknown}; known: {sorted(known)}.")
-    selected = [row for row in roster.rows if row.pair_id in set(requested)]
-    return [
-        {
-            **dict(expanded.raw),
-            "pair_id": expanded.pair_id,
-            "diagnostic_family": expanded.family,
-            "scenario_group": expanded.scenario_group,
-            "contrast_group": expanded.contrast_group,
-            "contrast_kind": expanded.contrast_kind,
-            "held_out_counterpart_identity": expanded.held_out_counterpart_identity,
-            "held_out_combination": expanded.held_out_combination,
-        }
-        for expanded in selected
-    ]
 
 
 def _decision_context(row: Mapping[str, Any]) -> str:
@@ -1888,101 +1839,6 @@ def build_cooperation_plan(
     return plan
 
 
-def _manifest_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
-
-
-def _run_planned_cell(  # noqa: PLR0913
-    backend: Backend,
-    *,
-    plan: Sequence[PlannedRequest],
-    sections: Sequence[str],
-    out_path: Path,
-    meta: Mapping[str, Any],
-    config: EvalConfig,
-    resume: bool,
-    submission: str,
-    admission: str,
-    on_records_written: Callable[[int], None] | None = None,
-) -> dict[str, Any]:
-    """Run a rendered cell through the native trace/resume implementation."""
-    return run_eval_battery(
-        backend,
-        sections=sections,
-        out_path=out_path,
-        meta=meta,
-        config=config,
-        submission=submission,
-        admission=admission,
-        resume=resume,
-        on_records_written=on_records_written,
-        plan=plan,
-    )
-
-
-def run_cooperation_eval(  # noqa: PLR0913
-    backend: Backend,
-    *,
-    out_path: Path,
-    meta: Mapping[str, Any],
-    manifest_path: Path = DEFAULT_BEHAVIOR_MANIFEST_PATH,
-    config: EvalConfig | None = None,
-    context_samples: int = 2,
-    trained_game_ids: Iterable[str] = (),
-    rollout_id: str | None = None,
-    resume: bool = False,
-    submission: str = SUBMISSION_POOLED,
-    admission: str = ADMISSION_LONGEST_FIRST,
-    on_records_written: Callable[[int], None] | None = None,
-) -> dict[str, Any]:
-    """Execute behavior, forecasts, and normative choices with native per-record resume.
-
-    ``backend`` is the already-configured runtime adapter. Its model identity and transport, plus
-    the sampler settings carried by ``EvalConfig``, are written by :func:`run_eval_battery`.
-    """
-    resolved_config = config or EvalConfig(
-        game_behavior_samples=1,
-        survey_samples=context_samples,
-    )
-    resolved_rollout_id = _required_text(
-        rollout_id
-        or str(
-            meta.get("rollout_id")
-            or meta.get("checkpoint_id")
-            or meta.get("checkpoint")
-            or "cooperation-eval"
-        ),
-        "rollout_id",
-    )
-    plan = build_cooperation_plan(
-        manifest_path,
-        context_samples=context_samples,
-        prefilled_think=resolved_config.prefilled_think,
-        trained_game_ids=trained_game_ids,
-        rollout_id=resolved_rollout_id,
-    )
-    cell_meta = {
-        **dict(meta),
-        "cooperation_manifest_path": str(manifest_path),
-        "cooperation_manifest_digest": _manifest_digest(manifest_path),
-        "cooperation_plan_counts": plan.counts,
-        "cooperation_scenario_group_ids": sorted(plan.roster.scenario_group_ids),
-        "cooperation_rollout_id": resolved_rollout_id,
-    }
-    return _run_planned_cell(
-        backend,
-        plan=plan.requests,
-        sections=plan.sections,
-        out_path=out_path,
-        meta=cell_meta,
-        config=resolved_config,
-        resume=resume,
-        submission=submission,
-        admission=admission,
-        on_records_written=on_records_written,
-    )
-
-
 def _survey_cell_config(  # noqa: PLR0913
     *,
     data_dir: Path,
@@ -2050,109 +1906,6 @@ def build_local_dt_plan(
         prefilled_think=prefilled_think,
     )
     return plan_battery((SECTION_DT_PROBES,), config)
-
-
-def run_core_survey_eval(  # noqa: PLR0913
-    backend: Backend,
-    *,
-    data_dir: Path,
-    out_path: Path,
-    meta: Mapping[str, Any],
-    resume: bool = False,
-    prefilled_think: bool = True,
-    submission: str = SUBMISSION_POOLED,
-    admission: str = ADMISSION_LONGEST_FIRST,
-) -> dict[str, Any]:
-    """Execute the complete core survey through the native resumable evaluator."""
-    plan = build_core_survey_plan(data_dir=data_dir, prefilled_think=prefilled_think)
-    counts = survey_leg_counts("core", data_dir=data_dir)
-    config = _survey_cell_config(
-        data_dir=data_dir,
-        families=counts.families,
-        instruments=counts.instruments,
-        tier="core",
-        samples=2,
-        prefilled_think=prefilled_think,
-    )
-    # The supplied plan contains the exact filtered items; config carries only runtime sampler and
-    # path provenance here. The dedicated count validation happened before rendering.
-    return _run_planned_cell(
-        backend,
-        plan=plan,
-        sections=(SECTION_SELF_REPORT,),
-        out_path=out_path,
-        meta={**dict(meta), "survey_cell": "core", "survey_data_dir": str(data_dir)},
-        config=config,
-        resume=resume,
-        submission=submission,
-        admission=admission,
-    )
-
-
-def run_prosocialness_eval(  # noqa: PLR0913
-    backend: Backend,
-    *,
-    data_dir: Path,
-    out_path: Path,
-    meta: Mapping[str, Any],
-    resume: bool = False,
-    prefilled_think: bool = True,
-    submission: str = SUBMISSION_POOLED,
-    admission: str = ADMISSION_LONGEST_FIRST,
-) -> dict[str, Any]:
-    """Execute the complete prosocialness extension through the native resumable evaluator."""
-    plan = build_prosocialness_plan(data_dir=data_dir, prefilled_think=prefilled_think)
-    counts = survey_leg_counts("prosocialness", data_dir=data_dir)
-    config = _survey_cell_config(
-        data_dir=data_dir,
-        families=counts.families,
-        instruments=counts.instruments,
-        tier="",
-        samples=2,
-        prefilled_think=prefilled_think,
-    )
-    return _run_planned_cell(
-        backend,
-        plan=plan,
-        sections=(SECTION_SELF_REPORT,),
-        out_path=out_path,
-        meta={**dict(meta), "survey_cell": "prosocialness", "survey_data_dir": str(data_dir)},
-        config=config,
-        resume=resume,
-        submission=submission,
-        admission=admission,
-    )
-
-
-def run_local_dt_eval(  # noqa: PLR0913
-    backend: Backend,
-    *,
-    out_path: Path,
-    meta: Mapping[str, Any],
-    resume: bool = False,
-    prefilled_think: bool = True,
-    submission: str = SUBMISSION_POOLED,
-    admission: str = ADMISSION_LONGEST_FIRST,
-) -> dict[str, Any]:
-    """Execute the complete local DT battery through the native resumable evaluator."""
-    plan = build_local_dt_plan(prefilled_think=prefilled_think)
-    config = EvalConfig(
-        multiple_choice_samples=2,
-        open_ended_samples=2,
-        dtbench_dir=None,
-        prefilled_think=prefilled_think,
-    )
-    return _run_planned_cell(
-        backend,
-        plan=plan,
-        sections=(SECTION_DT_PROBES,),
-        out_path=out_path,
-        meta={**dict(meta), "dt_cell": "our_battery", "dtbench_included": False},
-        config=config,
-        resume=resume,
-        submission=submission,
-        admission=admission,
-    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -57,13 +57,6 @@ def pullback(jacobian: torch.Tensor, readout_direction: torch.Tensor) -> torch.T
     return jacobian.T @ readout_direction
 
 
-def vocabulary_contrast(target_rows: torch.Tensor, reference_rows: torch.Tensor) -> torch.Tensor:
-    """Mean target unembedding row minus mean reference row: the contrast in final-layer coordinates."""
-    if target_rows.ndim != 2 or reference_rows.ndim != 2:  # noqa: PLR2004 - [tokens, hidden] by contract
-        raise ValueError("unembedding rows must be [tokens, hidden] matrices")
-    return target_rows.mean(dim=0) - reference_rows.mean(dim=0)
-
-
 @dataclass(frozen=True)
 class PullbackRead:
     """How well the pulled-back direction transports onto its own contrast, against the placebo."""
