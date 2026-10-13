@@ -14,6 +14,7 @@ from reward_hacking.ladder.concealment_judge import (
     export_concealment_judge_batch,
     ingest_concealment_judge_verdicts,
 )
+from reward_hacking.tests.jsonl_helpers import read_jsonl
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -48,10 +49,6 @@ def _episode_record(
     }
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
 class TestConcealmentJudgePackets:
     def test_export_blinds_ids_shuffles_and_keeps_only_reviewable_evidence(
         self, tmp_path: Path
@@ -73,7 +70,7 @@ class TestConcealmentJudgePackets:
             shuffle_seed=19,
         )
 
-        lines = _read_jsonl(packet_path)
+        lines = read_jsonl(packet_path)
         assert packet_count == 3
         assert lines[0]["record"] == "concealment_judge_batch"
         assert lines[0]["shuffle_seed"] == 19
@@ -118,7 +115,7 @@ class TestConcealmentJudgePackets:
         mapping["export_note"] = "compatible metadata"
         mapping.pop("shuffle_seed")
         mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
-        packet_id = _read_jsonl(packet_path)[1]["episode_id"]
+        packet_id = read_jsonl(packet_path)[1]["episode_id"]
         verdicts_path = tmp_path / "verdicts.jsonl"
         verdicts_path.write_text(
             json.dumps({"episode_id": packet_id, "conceals": True}) + "\n", encoding="utf-8"
@@ -145,7 +142,7 @@ class TestConcealmentJudgePackets:
         mapping["schema_version"] = 3
         mapping.pop("episode_id_map")
         mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
-        packet_id = _read_jsonl(packet_path)[1]["episode_id"]
+        packet_id = read_jsonl(packet_path)[1]["episode_id"]
         verdicts_path = tmp_path / "verdicts.jsonl"
         verdicts_path.write_text(
             json.dumps({"episode_id": packet_id, "conceals": True}) + "\n", encoding="utf-8"
@@ -198,7 +195,7 @@ class TestConcealmentJudgePackets:
             mapping_path=mapping_path,
             shuffle_seed=19,
         )
-        packet_ids = [packet["episode_id"] for packet in _read_jsonl(packet_path)[1:]]
+        packet_ids = [packet["episode_id"] for packet in read_jsonl(packet_path)[1:]]
         id_mapping = json.loads(mapping_path.read_text(encoding="utf-8"))["episode_id_map"]
         expected_verdicts = {
             id_mapping[packet_id]: index == 0 for index, packet_id in enumerate(packet_ids)
@@ -244,7 +241,7 @@ class TestConcealmentJudgePackets:
             mapping_path=mapping_path,
             shuffle_seed=0,
         )
-        packet_id = _read_jsonl(packet_path)[1]["episode_id"]
+        packet_id = read_jsonl(packet_path)[1]["episode_id"]
         verdicts_path = tmp_path / "verdicts.jsonl"
         verdicts_path.write_text(
             json.dumps({"episode_id": packet_id, "conceals": True}) + "\n", encoding="utf-8"
@@ -259,7 +256,7 @@ class TestConcealmentJudgePackets:
         )
 
         assert record_count == 1
-        assert _read_jsonl(output_path)[0]["report_concealment"]["judge"] is True
+        assert read_jsonl(output_path)[0]["report_concealment"]["judge"] is True
         assert stat.S_IMODE(output_path.stat().st_mode) == 0o600
 
     @pytest.mark.parametrize(
@@ -305,7 +302,7 @@ class TestConcealmentJudgePackets:
         )
         mapping_path.chmod(0o644)
         verdicts_path = tmp_path / "verdicts.jsonl"
-        packet_id = _read_jsonl(packet_path)[1]["episode_id"]
+        packet_id = read_jsonl(packet_path)[1]["episode_id"]
         verdicts_path.write_text(
             json.dumps({"episode_id": packet_id, "conceals": False}) + "\n", encoding="utf-8"
         )

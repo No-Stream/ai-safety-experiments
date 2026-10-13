@@ -13,18 +13,10 @@ from games.checkpoint_retention import ADAPTER_WEIGHT_FILENAMES, REQUIRED_CHECKP
 from reward_hacking.distill import rounds
 from reward_hacking.distill.rounds import DistillRoundsConfig, run_rounds
 from reward_hacking.distill.sample import token_ids_sha256
+from reward_hacking.tests.jsonl_helpers import read_jsonl, write_jsonl
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-
-def _read_jsonl(path: Path) -> list[dict[str, object]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
-def _write_jsonl(path: Path, rows: Sequence[dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
 def _teacher_score_row(sample: dict[str, object]) -> dict[str, object]:
@@ -109,7 +101,7 @@ class FakeRunner:
         output = Path(_argument(command, "--output"))
         round_number = int(output.stem.removeprefix("round-"))
         prompt_token_ids = [10, 11]
-        _write_jsonl(
+        write_jsonl(
             output,
             [
                 {
@@ -130,13 +122,13 @@ class FakeRunner:
     def _write_scores(command: Sequence[str], *, limit: int | None = None) -> None:
         samples_path = Path(_argument(command, "--samples"))
         teacher_path = Path(_argument(command, "--output"))
-        samples = _read_jsonl(samples_path)
-        existing_scores = _read_jsonl(teacher_path) if teacher_path.exists() else []
+        samples = read_jsonl(samples_path)
+        existing_scores = read_jsonl(teacher_path) if teacher_path.exists() else []
         completed_keys = {row["key"] for row in existing_scores}
         pending_samples = [row for row in samples if row["key"] not in completed_keys]
         if limit is not None:
             pending_samples = pending_samples[:limit]
-        _write_jsonl(
+        write_jsonl(
             teacher_path,
             existing_scores + [_teacher_score_row(row) for row in pending_samples],
         )
@@ -191,7 +183,7 @@ def test_phase_order_adapter_chaining_and_round_summaries(tmp_path: Path) -> Non
     assert Path(_argument(round_one_sample, "--adapter")) == round_zero_adapter
     assert Path(_argument(round_one_train, "--init-adapter")) == round_zero_adapter
     assert (config.run_dir / ".disposable").read_text(encoding="utf-8") == ""
-    summaries = _read_jsonl(config.run_dir / "rounds.jsonl")
+    summaries = read_jsonl(config.run_dir / "rounds.jsonl")
     assert [row["round"] for row in summaries] == [0, 1]
     assert all(row["sample_count"] == 2 for row in summaries)
     assert all(row["mean_completion_length"] == 2.5 for row in summaries)
@@ -213,7 +205,7 @@ def test_resume_after_score_failure_retries_score_without_resampling(tmp_path: P
 
     state = json.loads((config.run_dir / "state.json").read_text(encoding="utf-8"))
     assert state == {"round": 0, "phase": "score", "completed": ["sample"]}
-    assert len(_read_jsonl(config.run_dir / "teacher" / "round-0.jsonl")) == 1
+    assert len(read_jsonl(config.run_dir / "teacher" / "round-0.jsonl")) == 1
 
     resumed_runner = FakeRunner()
     run_rounds(config, runner=resumed_runner, sleep=lambda _seconds: None)
@@ -225,7 +217,7 @@ def test_resume_after_score_failure_retries_score_without_resampling(tmp_path: P
         "score",
         "train",
     ]
-    assert len(_read_jsonl(config.run_dir / "teacher" / "round-0.jsonl")) == 2
+    assert len(read_jsonl(config.run_dir / "teacher" / "round-0.jsonl")) == 2
 
 
 def test_changed_arguments_refuse_relaunch_before_running_subprocesses(tmp_path: Path) -> None:

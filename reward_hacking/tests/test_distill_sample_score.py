@@ -24,6 +24,7 @@ from reward_hacking.distill.score import (
     prompt_logprob_headroom_bytes,
     score_round,
 )
+from reward_hacking.tests.jsonl_helpers import read_jsonl, write_jsonl
 
 FLAT_LORA_KEY = "base_model.model.model.layers.0.linear_attn.in_proj_a.lora_A.weight"
 NESTED_LORA_KEY = (
@@ -191,19 +192,10 @@ class FakeScoreLLM:
         return outputs
 
 
-def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
 def _write_prompt_inputs(run_dir: Path) -> tuple[Path, Path]:
     prompts_path = run_dir / "prompts.jsonl"
     split_path = run_dir / "prompt-split.json"
-    _write_jsonl(
+    write_jsonl(
         prompts_path,
         [
             {
@@ -276,7 +268,7 @@ class TestDistillSampling:
             torch_module=FakeTorch(),
         )
 
-        rows = _read_jsonl(output_path)
+        rows = read_jsonl(output_path)
         assert first.generated_count == 2
         assert first.resumed_count == 0
         assert resumed.generated_count == 0
@@ -329,7 +321,7 @@ class TestDistillSampling:
                 torch_module=FakeTorch(),
             )
 
-        assert len(_read_jsonl(output_path)) == 1
+        assert len(read_jsonl(output_path)) == 1
         resumed = sample_round(
             prompts_path=prompts_path,
             split_path=split_path,
@@ -345,7 +337,7 @@ class TestDistillSampling:
         )
         assert resumed.generated_count == 1
         assert resumed.resumed_count == 1
-        assert len(_read_jsonl(output_path)) == 2
+        assert len(read_jsonl(output_path)) == 2
 
 
 class TestDistillTeacherScoring:
@@ -383,7 +375,7 @@ class TestDistillTeacherScoring:
             torch_module=FakeTorch(),
         )
 
-        rows = _read_jsonl(output_path)
+        rows = read_jsonl(output_path)
         assert result.generated_count == 1
         assert rows[0]["teacher_logps"] == [-0.7, -0.7]
         assert rows[0]["top_ids"] == [[1, 2, 3, 4], [1, 2, 3, 4]]
@@ -518,9 +510,9 @@ class TestDistillTeacherScoring:
             sampling_params_class=FakeSamplingParams,
             torch_module=FakeTorch(),
         )
-        samples = _read_jsonl(samples_path)
+        samples = read_jsonl(samples_path)
         samples[0]["completion_token_ids"][0] += 1
-        _write_jsonl(samples_path, samples)
+        write_jsonl(samples_path, samples)
 
         with pytest.raises(ValueError, match="token ids differ"):
             score_round(
@@ -565,8 +557,8 @@ class TestDistillTeacherScoring:
         ]
         samples_path = tmp_path / "samples.jsonl"
         teacher_path = tmp_path / "teacher.jsonl"
-        _write_jsonl(samples_path, sample_rows)
-        _write_jsonl(teacher_path, teacher_rows)
+        write_jsonl(samples_path, sample_rows)
+        write_jsonl(teacher_path, teacher_rows)
 
         summary = compute_kl_summary(samples_path, teacher_path)
 
