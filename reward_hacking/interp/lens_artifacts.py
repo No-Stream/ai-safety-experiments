@@ -29,12 +29,12 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from safetensors.torch import load_file, save_file
 
+from games.fileio import sha256_of_file
 from reward_hacking.interp.lens_geometry import (
     GateProvenanceError,
     StoredDecodeGate,
     assert_gate_matches_lens_file,
     assert_gate_matches_weights,
-    sha256_of_file,
 )
 
 if TYPE_CHECKING:

@@ -52,6 +52,7 @@ from games.eval_model import (
     resolve_served_model,
     verify_served_model,
 )
+from games.fileio import sha256_of_file
 from games.lora import ADAPTER_CONFIG_FILENAME
 from games.report import MOCK_BACKEND_KIND as REPORT_MOCK_BACKEND_KIND
 from reward_hacking import model_backend
@@ -745,7 +746,7 @@ class RecordingSnapshotDownload:
 def hub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
     """A fake hub whose one repo has one tensor file, cached at a commit-named snapshot dir."""
     snapshot = write_weights_dir(tmp_path / "snapshots" / FAKE_COMMIT)
-    digest = eval_model.sha256_of_file(snapshot / "model.safetensors")
+    digest = sha256_of_file(snapshot / "model.safetensors")
     info = StubModelInfo(FAKE_COMMIT, [StubSibling("model.safetensors", digest)])
     download = RecordingSnapshotDownload(snapshot)
     StubHfApi.instances.clear()
@@ -868,12 +869,12 @@ class TestResolveFullWeightsLocally:
         assert facts.snapshot_dir == unit
         assert facts.declares_vision_config is False
         assert dict(facts.weights_sha256) == {
-            "model.safetensors": eval_model.sha256_of_file(unit / "model.safetensors")
+            "model.safetensors": sha256_of_file(unit / "model.safetensors")
         }
 
     def test_a_provenance_sidecar_that_matches_is_honoured(self, tmp_path: Path) -> None:
         unit = write_weights_dir(tmp_path / "unit")
-        digest = eval_model.sha256_of_file(unit / "model.safetensors")
+        digest = sha256_of_file(unit / "model.safetensors")
         (unit / WEIGHTS_PROVENANCE_FILENAME).write_text(
             json.dumps({"weights_sha256": {"model.safetensors": digest}}), encoding="utf-8"
         )
@@ -882,7 +883,7 @@ class TestResolveFullWeightsLocally:
     def test_tensors_edited_after_the_sidecar_was_written_are_refused(self, tmp_path: Path) -> None:
         """SABOTAGE: the label on the directory no longer says what is inside it."""
         unit = write_weights_dir(tmp_path / "unit")
-        digest = eval_model.sha256_of_file(unit / "model.safetensors")
+        digest = sha256_of_file(unit / "model.safetensors")
         (unit / WEIGHTS_PROVENANCE_FILENAME).write_text(
             json.dumps({"weights_sha256": {"model.safetensors": digest}}), encoding="utf-8"
         )

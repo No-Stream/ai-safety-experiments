@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from games.eval_model import FullWeightsFacts
+from games.fileio import sha256_of_file
 from games.interp_cells import (
     CapturedCell,
     CellIdentity,
@@ -52,7 +53,6 @@ from reward_hacking.interp.lens_geometry import (
     anchor_rows_from_activations,
     assert_gate_matches_lens_file,
     assert_gate_matches_weights,
-    sha256_of_file,
     wrong_layer_for,
 )
 from reward_hacking.interp.tmax_directions import IdentifiabilityGate

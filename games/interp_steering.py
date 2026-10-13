@@ -76,6 +76,7 @@ from games.deltanet_kernels import (
 )
 from games.eval_model import ADAPTER_PROBE_PROMPTS, read_adapter_facts
 from games.eval_sampler import SAMPLER_TRAINING_DISTRIBUTION, eval_sampling
+from games.fileio import sha256_of_file
 from games.inference_utils import device_memory_report
 from games.interp_cells import (
     concept_activations,
@@ -83,7 +84,6 @@ from games.interp_cells import (
     load_ladder,
     load_stimuli,
     pair_layout,
-    sha256_of_file,
     stimuli_digest,
 )
 from games.lora import adapter_config_identity, attach_adapter, load_adapter_base

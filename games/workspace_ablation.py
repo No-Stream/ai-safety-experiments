@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
-from games.interp_cells import sha256_of_file
+from games.fileio import sha256_of_file
 from games.workspace_readout import LoadedLens, StoredUnembed, load_lens, load_unembed
 
 if TYPE_CHECKING:

@@ -33,6 +33,7 @@ from games.deltanet_kernels import (
     bridge_and_check_decode_kernel,
     prefill_deltanet_kernels,
 )
+from games.fileio import sha256_of_file
 from games.interp_capture import LadderCell, render_stimuli
 from games.interp_cells import (
     BASE_ARM,
@@ -41,7 +42,6 @@ from games.interp_cells import (
     construct_group,
     load_ladder,
     load_stimuli,
-    sha256_of_file,
     stimuli_digest,
 )
 from games.interp_lens_ladder import (

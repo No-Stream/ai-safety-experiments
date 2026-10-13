@@ -61,7 +61,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from transformers import AutoTokenizer
 
-from games.interp_cells import load_stimuli, sha256_of_file
+from games.fileio import sha256_of_file
+from games.interp_cells import load_stimuli
 from reward_hacking.interp.jacobian import SeqLenPlan, derive_max_seq_len, digest_strings
 from reward_hacking.interp.stimuli import CONCEPTS
 

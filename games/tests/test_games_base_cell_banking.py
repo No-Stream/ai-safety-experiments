@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from games import battery_tables, readout, run_evals
-from games.eval_model import sha256_of_file
 from games.evals import (
     RECORD_META,
     SECTION_CAPABILITIES,
@@ -45,6 +44,7 @@ from games.evals import (
     rebuild_summary,
     summarise_trace,
 )
+from games.fileio import sha256_of_file
 from games.prompt_variants import PROMPT_VARIANT_THINK_BRIEFLY_V1
 from games.prompts import FRAMING_STATED_ALWAYS_COOP, FRAMING_UNSTATED
 from games.report import (

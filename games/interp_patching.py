@@ -103,13 +103,13 @@ from games.deltanet_kernels import (
     bridge_and_check_decode_kernel,
     prefill_deltanet_kernels,
 )
+from games.fileio import sha256_of_file
 from games.interp_capture import assert_no_added_special_tokens, render_stimuli
 from games.interp_cells import (
     COMPUTE_DTYPES,
     STIMULUS_RENDER_TEMPLATED,
     STIMULUS_RENDERS,
     load_stimuli,
-    sha256_of_file,
     stimuli_digest,
 )
 from games.interp_steering import ACTION_PREFIX, label_first_tokens

@@ -48,13 +48,13 @@ import pandas as pd
 
 from games import evals
 from games.arms import ARMS, arm_game_ids
-from games.eval_model import sha256_of_file
 from games.evals import (
     RECORD_META,
     SECTION_CAPABILITIES,
     SECTION_DT_PROBES,
     SECTION_GAME_BEHAVIOR,
 )
+from games.fileio import sha256_of_file
 
 # Borrowed rather than reimplemented: two independent reductions of one quantity is how this table
 # came to disagree with the summary beside it. These two want promoting to public names in evals.
