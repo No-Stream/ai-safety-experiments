@@ -46,6 +46,7 @@ from games.cooperation_eval_runner import (
 )
 from games.cooperation_evals import load_behavior_manifest
 from games.evals import rebuild_summary
+from games.fileio import read_json_object, write_json_atomic
 from games.plans import UV, artifact_model_slug, plan_setting
 from games.stage_runner import Stage, run_sequence
 
@@ -315,13 +316,6 @@ def _phase_outputs(phase: Phase) -> tuple[Path, ...]:
     return tuple(path for operation in phase.operations for path in operation.artifacts)
 
 
-def _read_object(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(f"{path} must contain a JSON object")
-    return cast("dict[str, Any]", payload)
-
-
 def _operation_module(operation: Operation) -> str | None:
     try:
         module_flag = operation.argv.index("-m")
@@ -419,7 +413,7 @@ def _validate_endpoint_artifacts(operation: Operation) -> None:  # noqa: C901, P
         for field in ("arm", "step", "sampler", "max_new_tokens", "backend"):
             if field not in settings:
                 raise RuntimeError(f"semantic endpoint artifact {trace} settings omit {field}")
-        summary = _read_object(summary_path)
+        summary = read_json_object(summary_path)
         if summary != rebuild_summary(trace):
             raise RuntimeError(
                 f"semantic endpoint summary {summary_path} disagrees with its native trace"
@@ -434,7 +428,7 @@ def _validate_endpoint_artifacts(operation: Operation) -> None:  # noqa: C901, P
 def _validate_natural_materialization(operation: Operation) -> None:  # noqa: C901 -- explicit native artifact identity gate
     stimuli_path, sidecar_path = operation.artifacts
     rows = _read_jsonl_objects(stimuli_path)
-    sidecar = _read_object(sidecar_path)
+    sidecar = read_json_object(sidecar_path)
     stimulus_ids = sidecar.get("stimulus_ids")
     selection = sidecar.get("selection_manifest")
     if (
@@ -519,7 +513,7 @@ def _validate_natural_capture(operation: Operation) -> None:  # noqa: C901, PLR0
     if len(manifests) != NATURAL_PREFIX_STATE_COUNT:
         raise RuntimeError("semantic natural-prefix capture must contain base and final manifests")
     for manifest_path in manifests:
-        payload = _read_object(manifest_path)
+        payload = read_json_object(manifest_path)
         identity = payload.get("identity")
         selection = payload.get("selection_manifest")
         records = payload.get("selection_records")
@@ -590,7 +584,7 @@ def _validate_natural_capture(operation: Operation) -> None:  # noqa: C901, PLR0
 def _validate_selected_target(  # noqa: C901 -- explicit direction-selection identity gate
     report_path: Path, manifest_path: Path, selection_path: Path
 ) -> None:
-    directions = _read_object(manifest_path)
+    directions = read_json_object(manifest_path)
     required_directions = {"costly-other-regard", "decision-dependence", "trained-displacement"}
     if set(directions) != {"base", "final"} or any(
         not isinstance(directions[state], dict) or set(directions[state]) != required_directions
@@ -599,7 +593,7 @@ def _validate_selected_target(  # noqa: C901 -- explicit direction-selection ide
         raise RuntimeError(
             f"semantic direction manifest {manifest_path} omits required native directions"
         )
-    selection = _read_object(selection_path)
+    selection = read_json_object(selection_path)
     required_fields = {
         "schema",
         "version",
@@ -689,7 +683,7 @@ def _validate_selected_target(  # noqa: C901 -- explicit direction-selection ide
 
 def _validate_geometry_artifacts(operation: Operation) -> None:  # noqa: C901 -- explicit tiny/final geometry contracts
     report_path, manifest_path, selection_path = operation.artifacts
-    report = _read_object(report_path)
+    report = read_json_object(report_path)
     for field in (
         "context",
         "confound_checks",
@@ -738,7 +732,7 @@ def _validate_geometry_artifacts(operation: Operation) -> None:  # noqa: C901 --
 
 def _validate_lens_artifact(operation: Operation) -> None:
     report_path = operation.artifacts[0]
-    report = _read_object(report_path)
+    report = read_json_object(report_path)
     _require_text(report, "base_weights_identity", artifact=report_path)
     states = report.get("states")
     if not isinstance(states, dict) or set(states) != {"base", "final"}:
@@ -769,8 +763,8 @@ def _validate_lens_artifact(operation: Operation) -> None:
 def _validate_steering_artifacts(operation: Operation) -> None:  # noqa: C901 -- explicit steering resume schema gate
     records_path, ledger_path, summary_path = operation.artifacts
     records = _read_jsonl_objects(records_path)
-    ledger = _read_object(ledger_path)
-    summary = _read_object(summary_path)
+    ledger = read_json_object(ledger_path)
+    summary = read_json_object(summary_path)
     if summary.get("command") != "generate":
         raise RuntimeError(
             f"semantic steering summary {summary_path} is not a native generate artifact"
@@ -844,7 +838,7 @@ def _validate_operation_artifacts(operation: Operation) -> None:
 def _load_phase_receipt(phase: Phase) -> dict[str, Any] | None:
     if not phase.receipt_path.is_file():
         return None
-    payload = _read_object(phase.receipt_path)
+    payload = read_json_object(phase.receipt_path)
     if payload.get("phase_identity") != phase_identity(phase):
         raise ValueError(f"phase receipt identity mismatch at {phase.receipt_path}")
     outputs = {str(path): _path_digest(path) for path in _phase_outputs(phase)}
@@ -942,7 +936,7 @@ def measured_budget_is_complete(path: Path) -> bool:
 def _measured_cap_allows(path: Path, requested_steps: int) -> bool:
     if not measured_budget_is_complete(path):
         return False
-    payload = _read_object(path)
+    payload = read_json_object(path)
     cap = payload.get("measured_cap_steps", payload.get("measured_max_steps"))
     return isinstance(cap, int) and not isinstance(cap, bool) and cap >= requested_steps
 
@@ -989,7 +983,7 @@ def _stimulus_membership(path: Path) -> tuple[set[str], set[str]]:
 
 def build_membership() -> dict[str, dict[str, list[str]]]:
     """Read all four private memberships and prove global group/pair isolation."""
-    training = _read_object(training_manifest_path())
+    training = read_json_object(training_manifest_path())
     train_groups = {_identity_text(value) for value in training.get("training_group_ids", [])}
     if not train_groups:
         raise ValueError("training manifest has no training_group_ids")
@@ -1022,13 +1016,6 @@ def build_membership() -> dict[str, dict[str, list[str]]]:
     }
 
 
-def _write_json(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
-
-
 def _union_membership(
     memberships: Mapping[str, Mapping[str, Sequence[str]]], roles: Sequence[str]
 ) -> dict[str, list[str]]:
@@ -1041,38 +1028,38 @@ def _union_membership(
 def prepare_runtime_outputs() -> None:
     """Write categorized membership, consumer-specific exclusions, and CPU plan JSON."""
     memberships = build_membership()
-    _write_json(runtime_root() / "group-membership.json", memberships)
-    _write_json(
+    write_json_atomic(runtime_root() / "group-membership.json", memberships)
+    write_json_atomic(
         runtime_root() / "construct-external-reservations.json",
         _union_membership(memberships, ("train", "behavior", "lens")),
     )
-    _write_json(
+    write_json_atomic(
         runtime_root() / "lens-external-reservations.json",
         _union_membership(memberships, ("train", "behavior", "construct")),
     )
-    _write_json(preflight_identity_path(), run_identity())
-    _write_json(run_root() / "static-plan.json", static_plan())
+    write_json_atomic(preflight_identity_path(), run_identity())
+    write_json_atomic(run_root() / "static-plan.json", static_plan())
 
 
 def freeze_run_identity() -> None:
     """Freeze the prepared identity once, immediately before the first GPU phase."""
-    prepared = _read_object(preflight_identity_path())
+    prepared = read_json_object(preflight_identity_path())
     current = run_identity()
     if prepared != current:
         raise ValueError("CPU preflight identity is stale; rerun --prepare before GPU execution")
     frozen_path = run_identity_path()
     if frozen_path.exists():
-        if _read_object(frozen_path) != current:
+        if read_json_object(frozen_path) != current:
             raise ValueError(
                 "frozen run identity differs from current inputs; start a distinct run root"
             )
         return
-    _write_json(frozen_path, current)
+    write_json_atomic(frozen_path, current)
 
 
 def run_identity() -> dict[str, object]:
     """Return the immutable identity binding for this experiment run."""
-    selection = _read_object(natural_selection_path())
+    selection = read_json_object(natural_selection_path())
     expected_rollouts = {
         "base": "base/step-0",
         "final": f"{DEFAULT_ARM}/step-{max_steps()}",
@@ -1109,7 +1096,7 @@ def run_identity() -> dict[str, object]:
 
 def static_plan() -> dict[str, object]:
     """Calculate counts and disk from runtime membership and inspected model metadata."""
-    metadata = ModelMetadata.from_mapping(_read_object(model_metadata_path()))
+    metadata = ModelMetadata.from_mapping(read_json_object(model_metadata_path()))
     budget = plan_budget(
         training_manifest=training_manifest_path(),
         training_corpus=training_corpus_path(),
@@ -1149,7 +1136,7 @@ def static_plan() -> dict[str, object]:
         * cast("int", smoke_overrides["prompts_per_step"])
         * cast("int", smoke_overrides["num_generations"])
     )
-    steering_rows = _read_object(steering_rows_path()).get("rows")
+    steering_rows = read_json_object(steering_rows_path()).get("rows")
     if not isinstance(steering_rows, list) or not steering_rows:
         raise ValueError("steering diagnostic manifest must contain nonempty rows")
     configured_step_completions = int(
@@ -1956,7 +1943,7 @@ def _retention_operation() -> Operation:
 
 def record_measurements(output: Path) -> None:
     """Combine persisted native timings into the strict pre-training budget input."""
-    throughput = _read_object(run_root() / "throughput.json")
+    throughput = read_json_object(run_root() / "throughput.json")
     measured_phases = throughput.get("throughput")
     if not isinstance(measured_phases, dict):
         raise TypeError("throughput artifact lacks its measured throughput section")
@@ -1977,7 +1964,7 @@ def record_measurements(output: Path) -> None:
         "throughput_probe": receipt_path("persisted-9b-throughput"),
         "baseline": receipt_path("frozen-baseline"),
     }
-    loaded = {name: _read_object(path) for name, path in receipts.items()}
+    loaded = {name: read_json_object(path) for name, path in receipts.items()}
     prelaunch = {name: payload.get("elapsed_seconds") for name, payload in loaded.items()}
     operation_seconds = cast("dict[str, float]", loaded["tiny_9b_gradient"]["operation_seconds"])
     gradient_gate = operation_seconds.get("verify tiny 9B DeltaNet gradient and resume gates")
@@ -2026,7 +2013,7 @@ def record_measurements(output: Path) -> None:
     planned_completions = int(generation["research_completions_excluding_screen"])
     planned_token_cap = int(generation["total_generated_tokens"])
     measured_checkpoint_bytes = sum(smoke_checkpoints.values()) + tiny_checkpoint_bytes
-    _write_json(
+    write_json_atomic(
         output,
         {
             "throughput": timing,
@@ -2503,7 +2490,7 @@ def describe_plan() -> str:
     payload = static_plan()
     generation = cast("dict[str, object]", payload["generation"])
     disk = cast("dict[str, object]", payload["disk"])
-    natural = _read_object(natural_selection_path())
+    natural = read_json_object(natural_selection_path())
     natural_requests = natural.get("request_ids")
     natural_layers = natural.get("layers")
     if not isinstance(natural_requests, list) or not isinstance(natural_layers, list):

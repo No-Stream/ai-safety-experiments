@@ -87,6 +87,7 @@ from games.interp_cells import (
     load_ladder,
     load_stimuli,
     pair_layout,
+    split_comma_list,
     stimuli_digest,
 )
 from games.interp_trajectory import analysis_arms
@@ -1418,16 +1419,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _split(raw: str | None) -> list[str] | None:
-    """Parse a comma-separated CLI list, or None for 'everything present'."""
-    if raw is None:
-        return None
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
 def _resolve_axis_references(raw: str) -> tuple[str, ...]:
     """Parse and check the axis-reference list, naming a typo rather than silently reading nothing."""
-    wanted = tuple(_split(raw) or ())
+    wanted = tuple(split_comma_list(raw) or ())
     unknown = sorted(set(wanted) - set(AXIS_REFERENCES))
     if unknown or not wanted:
         raise ValueError(
@@ -1441,13 +1435,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     """Load the ladder behind its identity guards, read every displacement, and write the report."""
     stimuli = load_stimuli(args.stimuli)
     digest = stimuli_digest(stimuli)
-    arms = _split(args.arms)
-    steps = None if args.steps is None else [int(part) for part in _split(args.steps) or []]
+    arms = split_comma_list(args.arms)
+    steps = (
+        None if args.steps is None else [int(part) for part in split_comma_list(args.steps) or []]
+    )
     ladder = load_ladder(args.capture_root, arms=arms, steps=steps, stimuli_sha256=digest)
-    wanted_sets = _split(args.sets) or list(ladder.stimulus_sets)
-    poolings = tuple(_split(args.poolings) or ladder.poolings)
+    wanted_sets = split_comma_list(args.sets) or list(ladder.stimulus_sets)
+    poolings = tuple(split_comma_list(args.poolings) or ladder.poolings)
     layers = tuple(
-        [int(part) for part in _split(args.layers) or []]
+        [int(part) for part in split_comma_list(args.layers) or []]
         if args.layers is not None
         else range(ladder.identity.n_layers)
     )

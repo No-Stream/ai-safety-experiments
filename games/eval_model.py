@@ -78,6 +78,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 import torch
 from huggingface_hub import HfApi, snapshot_download
 
+from games.fileio import sha256_of_file
 from games.lora import ADAPTER_CONFIG_FILENAME, export_merged_checkpoint
 
 if TYPE_CHECKING:
@@ -331,15 +332,6 @@ class FullWeightsFacts:
         """One digest over the per-file digests, stable across machines and cache roots."""
         lines = "".join(f"{name}:{digest}\n" for name, digest in self.weights_sha256)
         return hashlib.sha256(lines.encode("utf-8")).hexdigest()
-
-
-def sha256_of_file(path: Path) -> str:
-    """Hash a file's bytes, streaming so a multi-gigabyte shard never sits in memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 24), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _chat_template_sha256(snapshot_dir: Path) -> str | None:
