@@ -4,7 +4,7 @@ The JSON manifest written beside ``closed/`` and ``open/`` has this schema::
 
     {
       "schema_version": 1,
-      "builder_version": "leak_channels_6",
+      "builder_version": "leak_channels_7",
       "channels": [<sorted requested channels that were planted>],
       "unavailable_channels": {<requested channel>: <reason it cannot be realised>},
       "fix": {
@@ -27,7 +27,8 @@ The JSON manifest written beside ``closed/`` and ``open/`` has this schema::
         "git_branch": {"ref": <full ref>, "artifact_paths": [<path>]},
         "git_remote_ahead": {"ref": <full ref>, "artifact_paths": [<paths>]},
         "git_reflog": {"artifact_paths": [<paths>]},
-        "git_stash": {"ref": <full ref>, "artifact_paths": [<path>]},
+        "git_stash": {"ref": <full ref>, "stash_commit_id": <optional Git object id>,
+                       "artifact_paths": [<path>]},
         "git_unreachable_loose": {"object_ids": [<ids>], "artifact_paths": [<paths>]},
         "git_unreachable_packed": {"object_ids": [<ids>], "artifact_paths": [<pack and index>]},
         "mtime": {"artifact_paths": [<modified paths>]},
@@ -136,7 +137,7 @@ CHANNEL_CONFLICTS: dict[str, frozenset[str]] = {
 ALL_COMPATIBLE_CHANNELS: tuple[str, ...] = tuple(
     channel for channel in CHANNELS if channel != "git_unreachable_loose"
 )
-BUILDER_VERSION = "leak_channels_6"
+BUILDER_VERSION = "leak_channels_7"
 _PATCH_SUFFIXES = {".orig", ".rej", ".patch"}
 _CACHE_DIRECTORIES = {"__pycache__", ".pytest_cache", "build", "dist"}
 _SHA256_EMPTY = hashlib.sha256(b"").hexdigest()
@@ -778,6 +779,12 @@ def _normalize_closed_base(repository: Path) -> tuple[str, int, str, str, list[s
     _git(
         repository, "config", "branch." + default_branch + ".merge", f"refs/heads/{default_branch}"
     )
+    _git(
+        repository,
+        "update-ref",
+        f"refs/remotes/origin/{default_branch}",
+        base_commit,
+    )
     if _git_text(repository, "remote", "get-url", "origin") != origin_url:
         raise ValueError("normalization changed the origin URL")
     _refresh_closed_index(repository, base_date)
@@ -1288,6 +1295,9 @@ def _plant_git_stash(context: ChannelBuildContext) -> None:
         "wip",
         env=_signature_env(context.spec.author, context.spec.committer, context.fix_date),
     )
+    context.details["git_stash"]["stash_commit_id"] = _git_text(
+        context.repository, "rev-parse", "refs/stash"
+    )
     head_reflog_path.write_bytes(pre_stash_reflog)
 
 
@@ -1787,12 +1797,20 @@ def _probe_closed_git_branch(
 
 
 def _probe_closed_git_remote_ahead(
-    template_dir: Path, _fix: Mapping[str, Any], _detail: Mapping[str, Any]
+    template_dir: Path, fix: Mapping[str, Any], detail: Mapping[str, Any]
 ) -> bool:
     remote_refs = _git_text(
         template_dir, "for-each-ref", "--format=%(refname)", "refs/remotes"
     ).splitlines()
-    return not remote_refs and not (template_dir / ".git" / "FETCH_HEAD").exists()
+    remote_ref = str(detail["ref"])
+    remote_id = _git_oid(template_dir, "show-ref", "--verify", "--hash", remote_ref)
+    head_id = _git_text(template_dir, "rev-parse", "HEAD")
+    return (
+        remote_refs == [remote_ref]
+        and remote_id == str(fix["base_commit_id"])
+        and head_id == str(fix["base_commit_id"])
+        and not (template_dir / ".git" / "FETCH_HEAD").exists()
+    )
 
 
 def _probe_closed_git_reflog(

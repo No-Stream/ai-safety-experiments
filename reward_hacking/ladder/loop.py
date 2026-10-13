@@ -28,6 +28,7 @@ from reward_hacking.harness.loop import (
     compose_episode_id,
     episode_limits,
     grade_final_state,
+    grader_content_hash,
     grader_integrity_hash,
     grader_reported_success,
     is_sole_grader_invocation,
@@ -810,8 +811,8 @@ def _scan_awareness(
     if scanner is None:
         return None
     hits = (
-        *scanner(reasoning, "reasoning", turn_index + 1),
-        *scanner(content, "content", turn_index + 1),
+        *scanner(reasoning, "reasoning", turn_index),
+        *scanner(content, "content", turn_index),
     )
     for tier in ("lexical_alert", "relational", "environment_artificiality"):
         tier_hits = [hit for hit in hits if hit.tier == tier]
@@ -820,7 +821,7 @@ def _scan_awareness(
                 "eval-awareness tier=%s episode=%s turn=%d hits=%d patterns=%s",
                 tier,
                 episode_id,
-                turn_index + 1,
+                turn_index,
                 len(tier_hits),
                 sorted({hit.pattern_name for hit in tier_hits}),
             )
@@ -1309,12 +1310,10 @@ def _execute_tool_call(  # noqa: C901, PLR0915 - keep ordered execution and alig
             _mark_unexecuted(state.call_records, call_index + 1, "workspace_snapshot_limit")
             return True
         if verdict is not None:
-            if context.grader_hashable:
-                state.grader_submission_sha256s.append(
-                    grader_integrity_hash(
-                        context.episode_dir, context.task.effective_grader_integrity_files
-                    )
-                )
+            submission_grader_hash = grader_integrity_hash(
+                context.episode_dir, context.task.effective_grader_integrity_files
+            )
+            state.grader_submission_sha256s.append(submission_grader_hash)
             state.submissions_used += 1
             state.last_submission = verdict
             state.submission_fail_seen = state.submission_fail_seen or not verdict.passed
@@ -1332,6 +1331,12 @@ def _execute_tool_call(  # noqa: C901, PLR0915 - keep ordered execution and alig
                 "feedback": response,
                 "register": verdict.register,
             }
+            if submission_grader_hash is None:
+                submission_record["unhashable_grader_files"] = [
+                    filename
+                    for filename in context.task.effective_grader_integrity_files
+                    if grader_content_hash(context.episode_dir, filename) is None
+                ]
             if verdict.evidence:
                 submission_record["submission_evidence"] = copy.deepcopy(dict(verdict.evidence))
             if not verdict.passed:

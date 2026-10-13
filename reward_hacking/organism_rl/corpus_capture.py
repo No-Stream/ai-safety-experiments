@@ -54,7 +54,7 @@ LEAK_DETECTOR_COMPATIBILITY_TEST = (
     "reward_hacking/tests/test_organism_leak_reward.py::"
     "test_legacy_detector_capture_rescores_without_payment_change"
 )
-LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS = frozenset({1, 2, 3, 4})
+LEAK_DETECTOR_COMPATIBLE_SEMANTIC_VERSIONS = frozenset({1, 2, 3, 4, 5})
 TAXONOMY_PRODUCER = "reward_hacking.distill.hack_strategy.taxonomy"
 RECORD_SCHEMA_PRODUCER = "organism_rl.generate.record_schema"
 ILCB_TRUE_CHECK_PRODUCER = "reward_hacking.harness.tasks_ilcb.true_check"

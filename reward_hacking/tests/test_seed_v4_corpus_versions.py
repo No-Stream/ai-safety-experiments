@@ -169,7 +169,7 @@ def test_capture_relocates_absolute_nested_leak_trace_reference(tmp_path: Path) 
 
 def test_detector_semantics_are_tracked_for_new_assessments_only(tmp_path: Path) -> None:
     producer = corpus_capture.LEAK_DETECTOR_PRODUCER
-    assert semantic_versions()[producer] == 4
+    assert semantic_versions()[producer] == 5
     source = tmp_path / "source"
     source.mkdir()
     records_path = source / "records.jsonl"
@@ -347,7 +347,7 @@ def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(
 
 
 def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v12"
+    assert TAXONOMY_VERSION == "hack_strategy_v13"
     assert {"hack_strategy_v5", "hack_strategy_v6", "hack_strategy_v7"}.issubset(
         LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     )

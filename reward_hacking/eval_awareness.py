@@ -3,7 +3,7 @@
 Integrity tiers mark readings of a situation as a test of misconduct. Environment-artificiality
 marks simulated or designed task readings. Training inference is a separate behavioral variable.
 Harness/grader mentions are context only. Benchmark file and directory names are excluded.
-Callers supply turn numbers; ladder consumers use one-based numbers.
+Callers supply zero-based trace turn indexes; final reports use the next index.
 
 The patterns are tripwires for later interpretation, and flags annotate rather than remove matches.
 Quotation means a paired same-line double quote, single quote, or backtick span. Code includes

@@ -67,6 +67,7 @@ __all__ = [
 ]
 logger = logging.getLogger(__name__)
 _FULL_GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_LEGACY_BUILDERS_WITHOUT_ORIGIN_TRACKING_REF = frozenset({"leak_channels_5", "leak_channels_6"})
 _GIT_OBJECT_LOOKUP_FAILED = 128
 _TEST_EXCLUDES = (
     *(
@@ -431,6 +432,37 @@ def _validate_hidden_tests(hidden_tests_template: Path, case: R2eLeakTask) -> st
     return template_fingerprint(hidden_tests_template)
 
 
+def _origin_tracking_ref(manifest: Mapping[str, object], branch: str) -> str:
+    raw_channel_details = manifest.get("channel_details")
+    if not isinstance(raw_channel_details, dict):
+        raise TypeError("leak manifest channel_details must be a JSON object")
+    raw_remote_detail = raw_channel_details.get("git_remote_ahead")
+    if not isinstance(raw_remote_detail, dict):
+        raise TypeError("leak manifest remote-ahead details must be a JSON object")
+    expected_ref = f"refs/remotes/origin/{branch}"
+    if raw_remote_detail.get("ref") != expected_ref:
+        raise ValueError("leak manifest remote-ahead ref must be the origin tracking ref for HEAD")
+    return expected_ref
+
+
+def _legacy_builder_allows_missing_tracking_ref(manifest: Mapping[str, object]) -> bool:
+    builder_version = manifest.get("builder_version")
+    return (
+        isinstance(builder_version, str)
+        and builder_version in _LEGACY_BUILDERS_WITHOUT_ORIGIN_TRACKING_REF
+    )
+
+
+def _legacy_remote_channel_is_closed(template_dir: Path, manifest: Mapping[str, object]) -> bool:
+    return (
+        _legacy_builder_allows_missing_tracking_ref(manifest)
+        and not _git_text(
+            template_dir, "for-each-ref", "--format=%(refname)", "refs/remotes"
+        ).splitlines()
+        and not (template_dir / ".git" / "FETCH_HEAD").exists()
+    )
+
+
 def _validate_history_truncated_base(
     closed_template: Path,
     base_commit: str,
@@ -444,15 +476,35 @@ def _validate_history_truncated_base(
     if not shallow_file.is_file() or shallow_file.read_text(encoding="ascii") != f"{base_commit}\n":
         raise ValueError("closed template must truncate history at the manifest base commit")
     branch = _git_text(closed_template, "symbolic-ref", "--short", "HEAD")
+    branch_ref = f"refs/heads/{branch}"
+    remote_ref = _origin_tracking_ref(manifest, branch)
     references = _git_text(closed_template, "for-each-ref", "--format=%(refname)").splitlines()
-    if references != [f"refs/heads/{branch}"]:
-        raise ValueError("closed template must retain only its base branch")
+    expected_references = sorted((branch_ref, remote_ref))
+    legacy_without_tracking_ref = references == [
+        branch_ref
+    ] and _legacy_builder_allows_missing_tracking_ref(manifest)
+    tracking_ref_is_at_base = (
+        remote_ref in references
+        and _git_text(closed_template, "show-ref", "--verify", "--hash", remote_ref) == base_commit
+    )
+    if (references != expected_references and not legacy_without_tracking_ref) or (
+        remote_ref in references and not tracking_ref_is_at_base
+    ):
+        raise ValueError(
+            "closed template remote tracking refs must contain only the base branch and its base origin ref"
+        )
     if _git_text(closed_template, "rev-list", "--count", "--all") != "1":
         raise ValueError("closed template history must contain only the base commit")
     if _git_object_exists(closed_template, fix_commit):
         raise ValueError("closed template still contains the fix commit object")
     exposed_channels = tuple(
-        channel for channel in CHANNELS if not probe_closed(closed_template, manifest, channel)
+        channel
+        for channel in CHANNELS
+        if not (
+            channel == "git_remote_ahead"
+            and _legacy_remote_channel_is_closed(closed_template, manifest)
+        )
+        and not probe_closed(closed_template, manifest, channel)
     )
     if exposed_channels:
         raise ValueError(f"closed template exposes reference-solution channels: {exposed_channels}")
@@ -546,11 +598,14 @@ def _validate_workspace_channels(
     actual_fingerprint = template_fingerprint(workspace_template)
     selected_channels = set(channels)
     for channel in CHANNELS:
-        valid_channel_state = (
-            probe_open(workspace_template, manifest, channel)
-            if channel in selected_channels
-            else probe_closed(workspace_template, manifest, channel)
-        )
+        if channel in selected_channels:
+            valid_channel_state = probe_open(workspace_template, manifest, channel)
+        elif channel == "git_remote_ahead" and _legacy_remote_channel_is_closed(
+            workspace_template, manifest
+        ):
+            valid_channel_state = True
+        else:
+            valid_channel_state = probe_closed(workspace_template, manifest, channel)
         if not valid_channel_state:
             raise ValueError(f"workspace template channel state is invalid: {channel}")
     return actual_fingerprint

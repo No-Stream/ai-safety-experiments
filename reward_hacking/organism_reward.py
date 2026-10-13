@@ -181,7 +181,11 @@ def _score_registered_task(
         return _score(
             submission_score.reward,
             submission_score.outcome,
-            replace(evidence, same_artifact=submission_score.evidence.same_artifact),
+            replace(
+                evidence,
+                paid_verdict=submission_score.evidence.paid_verdict,
+                same_artifact=submission_score.evidence.same_artifact,
+            ),
         )
     return _score_registered_task_payment(replace(evidence, same_artifact=True), verdict)
 
@@ -621,6 +625,20 @@ def _solvable_submission_verdict(
         _valid_artifact_digest(submission_digest)
         and submission_digest == task_fields["submitted_artifact_sha256"]
     )
+    if verdict == "FAIL" and not same_artifact:
+        return verdict, _score(
+            0,
+            RewardOutcome.PAID_VERDICT_FAILED,
+            RewardEvidence(
+                arm=arm,
+                paid_verdict=False,
+                payment_register=register,
+                true_measured=True,
+                true_pass=truth.passed,
+                same_artifact=same_artifact,
+                **task_fields,
+            ),
+        )
     if not same_artifact:
         return verdict, _score(
             0,

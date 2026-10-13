@@ -51,6 +51,11 @@ def git(repository: Path, *arguments: str, env: dict[str, str] | None = None) ->
     ).stdout.strip()
 
 
+def set_tree_mtime(root: Path, mtime_ns: int) -> None:
+    for path in (root, *root.rglob("*")):
+        os.utime(path, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
+
+
 def commit_env(epoch: int) -> dict[str, str]:
     return {
         "GIT_AUTHOR_NAME": "Synthetic Author",
@@ -397,6 +402,10 @@ def test_build_requires_closed_normalized_tree_and_separate_runtime(
     runtime_root = templates["runtime_root"]
     monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", runtime_root)
     task = build_synthetic_task(templates, tmp_path / "docker-gate")
+    base_commit = templates["manifest"]["fix"]["base_commit_id"]
+    remote_ref = templates["manifest"]["channel_details"]["git_remote_ahead"]["ref"]
+    assert templates["manifest"]["builder_version"] == "leak_channels_7"
+    assert git(templates["closed"], "show-ref", "--verify", "--hash", remote_ref) == base_commit
     assert task.task_variant == "leak"
     identity = task.host_only_metadata
     assert identity["fix_commit"] == templates["case"].commit_hash
@@ -428,6 +437,70 @@ def test_build_requires_closed_normalized_tree_and_separate_runtime(
     (broken_closed / ".git" / "shallow").unlink()
     with pytest.raises(ValueError, match=r"closed|normalized|normalised"):
         build_synthetic_task(templates, tmp_path / "docker-gate", closed=broken_closed)
+
+
+@pytest.mark.parametrize("builder_version", ["leak_channels_5", "leak_channels_6"])
+def test_build_accepts_legacy_closed_templates_without_origin_tracking_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, builder_version: str
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("git_branch",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    manifest = templates["manifest"]
+    manifest["builder_version"] = builder_version
+    remote_ref = manifest["channel_details"]["git_remote_ahead"]["ref"]
+    base_date_ns = manifest["fix"]["base_date"] * 1_000_000_000
+    templates["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+
+    for template in (templates["closed"], templates["workspace"]):
+        git(template, "update-ref", "-d", remote_ref)
+        set_tree_mtime(template, base_date_ns)
+
+    task = build_synthetic_task(templates, tmp_path / "docker-gate")
+
+    assert task.task_variant == "leak"
+
+
+@pytest.mark.parametrize("damage", ["extra_ref", "wrong_target"])
+def test_build_rejects_invalid_closed_origin_tracking_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("git_branch",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    manifest = templates["manifest"]
+    base_commit = manifest["fix"]["base_commit_id"]
+    remote_ref = manifest["channel_details"]["git_remote_ahead"]["ref"]
+    closed_template = templates["closed"]
+    if damage == "extra_ref":
+        git(closed_template, "update-ref", "refs/remotes/origin/unexpected", base_commit)
+    else:
+        base_tree = git(closed_template, "rev-parse", f"{base_commit}^{{tree}}")
+        git(closed_template, "update-ref", remote_ref, base_tree)
+    set_tree_mtime(closed_template, manifest["fix"]["base_date"] * 1_000_000_000)
+
+    with pytest.raises(ValueError, match="closed template remote tracking refs"):
+        build_synthetic_task(templates, tmp_path / "docker-gate")
+
+
+@pytest.mark.parametrize(
+    "builder_version", ["leak_channels_4", "leak_channels_7", "leak_channels_99"]
+)
+def test_build_rejects_missing_origin_tracking_ref_for_unlisted_builder_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, builder_version: str
+) -> None:
+    templates = _make_leak_templates(tmp_path, channels=("git_branch",))
+    monkeypatch.setattr(docker_backend, "READ_ONLY_RUNTIME_ROOT", templates["runtime_root"])
+    manifest = templates["manifest"]
+    manifest["builder_version"] = builder_version
+    remote_ref = manifest["channel_details"]["git_remote_ahead"]["ref"]
+    base_date_ns = manifest["fix"]["base_date"] * 1_000_000_000
+    templates["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+
+    for template in (templates["closed"], templates["workspace"]):
+        git(template, "update-ref", "-d", remote_ref)
+        set_tree_mtime(template, base_date_ns)
+
+    with pytest.raises(ValueError, match="closed template remote tracking refs"):
+        build_synthetic_task(templates, tmp_path / "docker-gate")
 
 
 def test_build_accepts_a_compatible_future_manifest_schema(

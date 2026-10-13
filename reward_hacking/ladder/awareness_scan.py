@@ -127,7 +127,7 @@ def _scan_episode(
     commands = episode_commands(episode, trace_rows)
     submissions = submission_events(trace_summary, commands)
     first_fail_submission = next(
-        (event.turn + 1 for event in submissions if event.verdict == "FAIL"), None
+        (event.turn for event in submissions if event.verdict == "FAIL"), None
     )
     first_fail_turn = None if first_fail_submission is None else first_fail_submission + 1
     key = EpisodeKey.from_json(_mapping(episode["key"])).to_json()
@@ -147,7 +147,7 @@ def _scan_episode(
         for field in ("reasoning", "content"):
             text = _text(turn[field])
             generated_characters += len(text)
-            episode_matches.extend(scan_text(text, field, _turn_index(turn["turn"]) + 1))
+            episode_matches.extend(scan_text(text, field, _turn_index(turn["turn"])))
     raw_final_report = trace_summary.get("final_report")
     if isinstance(raw_final_report, str):
         final_report: Mapping[str, object] = {"text": raw_final_report, "reasoning": ""}
@@ -161,7 +161,7 @@ def _scan_episode(
         raw_text = final_report.get(source_field, "")
         text = "" if source_field == "text" and report_unavailable else _text(raw_text)
         report_characters += len(text)
-        report_matches.extend(scan_text(text, field, len(turns) + 1))
+        report_matches.extend(scan_text(text, field, len(turns)))
     match_rows: list[dict[str, object]] = []
     for phase, matches in (("in_episode", episode_matches), ("final_report", report_matches)):
         match_rows.extend(

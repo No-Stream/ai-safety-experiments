@@ -428,6 +428,105 @@ def test_records_are_written_and_resume_skips_completed_task_samples(tmp_path: P
         )
 
 
+def test_resampled_crash_attempt_is_counted_and_its_failed_submission_retained(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "teacher-run"
+    trace_dir = output_dir / "traces"
+    trace_dir.mkdir(parents=True)
+    source = SyntheticEpisodeSource(trace_dir)
+    task_specs = _tasks()[:1]
+    provenance = {"run": "synthetic"}
+    generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=task_specs,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=provenance,
+    )
+    trace_path = trace_dir / f"{task_specs[0].task_id}-0.jsonl"
+    torn_path = trace_path.with_name(f"{trace_path.name}.torn-1")
+    torn_path.write_text(
+        json.dumps(
+            {
+                "record": "turn",
+                "turn": 0,
+                "commands": [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}],
+                "tool_calls": [
+                    {
+                        "name": "bash",
+                        "arguments": {"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"},
+                    }
+                ],
+                "tool_results": [{"call_index": 0, "content_sent": "FAIL\nTests: one differed"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with torn_path.open("ab") as trace_file:
+        trace_file.write(b'{"record":"turn","content":"\xe2')
+
+    resumed = generate.generate_episodes(
+        output_dir=output_dir,
+        source=source,
+        task_specs=task_specs,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=provenance,
+    )
+
+    assert len(source.calls) == 1
+    assert resumed["resampled_after_crash_episodes"] == 1
+    attempts = json.loads((output_dir / "attempt-provenance.json").read_text(encoding="utf-8"))
+    assert len(attempts["torn_attempts"]) == 1
+    assert attempts["torn_attempts"][0]["last_submission_feedback_verdict"] == "FAIL"
+    assert (
+        attempts["torn_attempts"][0]["trace_sha256"]
+        == hashlib.sha256(torn_path.read_bytes()).hexdigest()
+    )
+
+
+def test_archived_attempt_provenance_keeps_external_recorded_trace_path(tmp_path: Path) -> None:
+    original_output = tmp_path / "original-output"
+    original_trace_root = original_output / "traces"
+    original_trace_root.mkdir(parents=True)
+    source = SyntheticEpisodeSource(original_trace_root)
+    task_specs = _tasks()[:1]
+    provenance = {"run": "synthetic"}
+    generate.generate_episodes(
+        output_dir=original_output,
+        source=source,
+        task_specs=task_specs,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=provenance,
+    )
+    original_trace = original_trace_root / f"{task_specs[0].task_id}-0.jsonl"
+    archived_trace = original_trace.with_name(f"{original_trace.name}.torn-1")
+    archived_trace.write_text(json.dumps({"record": "turn", "turn": 0}) + "\n", encoding="utf-8")
+    moved_output = tmp_path / "moved-output"
+    moved_output.mkdir()
+    for filename in ("provenance.json", "records.jsonl"):
+        (moved_output / filename).write_bytes((original_output / filename).read_bytes())
+
+    summary = generate.generate_episodes(
+        output_dir=moved_output,
+        source=source,
+        task_specs=task_specs,
+        samples_per_task=1,
+        concurrency=1,
+        provenance=provenance,
+    )
+
+    assert len(source.calls) == 1
+    assert summary["resampled_after_crash_episodes"] == 1
+    attempt_provenance = json.loads((moved_output / "attempt-provenance.json").read_text())
+    attempts = cast("list[dict[str, object]]", attempt_provenance["torn_attempts"])
+    assert attempts[0]["trace_path"] == str(archived_trace)
+
+
 def test_records_resume_after_endpoint_restart_and_record_each_launch(
     tmp_path: Path,
 ) -> None:

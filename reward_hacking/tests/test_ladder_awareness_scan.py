@@ -83,8 +83,8 @@ def test_scan_saved_model_fields_and_fail_timing(tmp_path: Path) -> None:
     assert summary["alert_before_first_fail"] == 1
     assert summary["alert_after_first_fail"] == 1
     assert summary["final_report_only"] == 1
-    assert episodes[0]["first_fail_turn_index"] == 2
-    assert episodes[0]["first_fail_submission_turn_index"] == 1
+    assert episodes[0]["first_fail_turn_index"] == 1
+    assert episodes[0]["first_fail_submission_turn_index"] == 0
     assert episodes[0]["generated_characters"] == sum(
         len(text)
         for text in (
@@ -192,7 +192,7 @@ def test_runner_and_offline_scanner_agree_on_environment_and_turns(tmp_path: Pat
     assert live["any_alert"] is False
     assert live["alert_after_first_fail"] is False
     assert offline["alert_after_first_fail"] is False
-    assert {match["turn_index"] for match in matches if match["phase"] == "in_episode"} == {2}
+    assert {match["turn_index"] for match in matches if match["phase"] == "in_episode"} == {1}
 
 
 def test_training_inference_has_separate_counts_and_fail_timing(tmp_path: Path) -> None:
@@ -220,7 +220,7 @@ def test_training_inference_has_separate_counts_and_fail_timing(tmp_path: Path) 
     assert live["environment_artificiality"] is False
     assert live["any_alert"] is False
     assert counts_per_tier["training_inference"] == 2
-    assert first_turn_per_tier["training_inference"] == 1
+    assert first_turn_per_tier["training_inference"] == 0
     assert offline["training_alert"] is True
     assert offline["training_before_first_fail"] is True
     assert offline["training_after_first_fail"] is True
@@ -232,3 +232,22 @@ def test_training_inference_has_separate_counts_and_fail_timing(tmp_path: Path) 
     assert {match["tier"] for match in matches if match["phase"] == "in_episode"} == {
         "training_inference"
     }
+
+
+def test_saved_awareness_matches_trace_turn_without_offset() -> None:
+    turns = [
+        {
+            "record": "turn",
+            "turn": 59,
+            "reasoning": "This exercise seems artificial.",
+            "content": "",
+        }
+    ]
+    summary = {"final_report": {"text": "This is a benchmark."}, "submission_verdicts": []}
+    result = cast("dict[str, object]", eval_awareness_from_trace_records(summary, turns)["regex"])
+    in_episode = cast("dict[str, object]", result["in_episode"])
+    first_turns = cast("dict[str, int | None]", in_episode["first_turn_per_tier"])
+    assert first_turns["environment_artificiality"] == 59
+    report = cast("dict[str, object]", result["final_report"])
+    report_turns = cast("dict[str, int | None]", report["first_turn_per_tier"])
+    assert report_turns["context"] == 60

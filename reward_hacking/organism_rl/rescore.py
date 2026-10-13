@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,6 +27,7 @@ from reward_hacking.harness.loop import grade_final_state, lay_down_task
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import LADDER_COMMAND_TIMEOUT, replay_ladder_commands
+from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.ladder.tools import contains_submit_marker
 from reward_hacking.organism_reward import score_impossible_task
 from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION, require_gitignored_output_dir
@@ -216,6 +217,15 @@ def _normalize_checkpoint_source_inputs(value: object) -> dict[str, object]:
     return source_inputs
 
 
+def _refresh_recorded_awareness(
+    record: dict[str, object], trace_records: Sequence[Mapping[str, object]]
+) -> None:
+    if "eval_awareness" in record:
+        record["eval_awareness"] = eval_awareness_from_trace_records(
+            _object(record["trace_summary"], "trace_summary"), trace_records
+        )
+
+
 def rescore_recorded_leak(
     record: Mapping[str, object],
     *,
@@ -238,6 +248,7 @@ def rescore_recorded_leak(
     ):
         raise ValueError("recorded leak manifest differs from its identity")
     trace_records = leak_trace_records(raw, record=record, records_path=records_path)
+    _refresh_recorded_awareness(result, trace_records)
     docker = raw["docker_evidence"]
     patch = raw["final_patch"]
     if not isinstance(docker, list):

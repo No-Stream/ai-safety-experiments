@@ -690,8 +690,14 @@ def test_detached_base_is_attached_without_changing_input_and_builds_reproducibl
                 )
                 == ""
             )
+        closed_template = output_dir / "closed"
         assert (
-            _git(output_dir / "closed", "for-each-ref", "--format=%(refname)") == "refs/heads/main"
+            _git(closed_template, "for-each-ref", "--format=%(refname)")
+            == "refs/heads/main\nrefs/remotes/origin/main"
+        )
+        assert (
+            _git(closed_template, "show-ref", "--verify", "--hash", "refs/remotes/origin/main")
+            == base_commit
         )
         for channel in CHANNELS:
             assert probe_closed(output_dir / "closed", first, channel)
@@ -855,8 +861,13 @@ def test_closed_template_has_no_history_or_cache_leaks(
 
     assert _git(closed_dir, "symbolic-ref", "--short", "HEAD") == "main"
     assert _git(closed_dir, "for-each-ref", "--format=%(refname)").splitlines() == [
-        "refs/heads/main"
+        "refs/heads/main",
+        "refs/remotes/origin/main",
     ]
+    assert (
+        _git(closed_dir, "show-ref", "--verify", "--hash", "refs/remotes/origin/main")
+        == manifest["fix"]["base_commit_id"]
+    )
     assert _git(closed_dir, "remote", "get-url", "origin") == origin_url
     assert not (closed_dir / ".git" / "FETCH_HEAD").exists()
     assert not (closed_dir / ".git" / "ORIG_HEAD").exists()

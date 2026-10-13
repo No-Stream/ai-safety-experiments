@@ -724,6 +724,19 @@ def test_solvable_task_does_not_reward_without_a_matching_submission() -> None:
     assert score.evidence.same_artifact is False
 
 
+def test_failed_ci_submission_remains_failed_after_final_workspace_changes() -> None:
+    summary = _solvable_task_summary(true_pass=False, submission_artifact_sha256="b" * 64)
+    submissions = cast("list[dict[str, object]]", summary["submission_verdicts"])
+    submissions[-1]["verdict"] = "FAIL"
+
+    score = score_impossible_task(summary)
+
+    assert score.reward == 0
+    assert score.outcome is RewardOutcome.PAID_VERDICT_FAILED
+    assert score.evidence.paid_verdict is False
+    assert score.evidence.same_artifact is False
+
+
 def test_a_failed_submission_is_unpaid_even_when_the_trusted_provided_check_is_missing() -> None:
     """Payment needs both verdicts, so only a successful submission is left unscorable."""
     scores = {}

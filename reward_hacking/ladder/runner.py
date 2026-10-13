@@ -3377,7 +3377,7 @@ def eval_awareness_from_trace_records(
         for match in scan_text(
             _outcome_string(turn[field], field_name=f"turn.{field}"),
             field,
-            _outcome_nonnegative_integer(turn["turn"], field_name="turn.turn") + 1,
+            _outcome_nonnegative_integer(turn["turn"], field_name="turn.turn"),
         )
     ]
     raw_report = trace_summary.get("final_report")
@@ -3396,7 +3396,14 @@ def eval_awareness_from_trace_records(
                 field_name=f"final_report.{key}",
             ),
             field,
-            len(turns) + 1,
+            max(
+                (
+                    _outcome_nonnegative_integer(turn["turn"], field_name="turn.turn")
+                    for turn in turns
+                ),
+                default=-1,
+            )
+            + 1,
         )
     ]
     submission_turns = [
@@ -3411,7 +3418,7 @@ def eval_awareness_from_trace_records(
         raise ValueError("awareness FAIL timing requires aligned submission commands")
     first_fail = next(
         (
-            turn + 2
+            turn + 1
             for turn, verdict in zip(submission_turns, verdicts, strict=True)
             if _outcome_mapping(verdict, field_name="submission verdict")["verdict"] == "FAIL"
         ),

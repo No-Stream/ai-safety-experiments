@@ -1010,6 +1010,9 @@ def test_stage_health_and_yield_only_include_requested_generator(
     for directory in [run_directory, run_directory.parent / "base"]:
         directory.mkdir(parents=True)
         (directory / "records.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    (run_directory / "summary.json").write_text(
+        json.dumps({"resampled_after_crash_episodes": 1}), encoding="utf-8"
+    )
     settings = CellRunConfig(
         generator=generator,
         endpoint="http://localhost:8000",
@@ -1032,6 +1035,7 @@ def test_stage_health_and_yield_only_include_requested_generator(
         assert "--assert" not in commands[1]
         summary = (run_directory / "yield-summary.md").read_text(encoding="utf-8")
         assert f"| {cell_name} | 27b | none | 40 | 1 | 0 | 0 | 0 |" in summary
+        assert "Resampled after a crash: 1 episode." in summary
         assert capsys.readouterr().out == summary
         return
     assert "--assert" in commands[1]
@@ -1039,4 +1043,5 @@ def test_stage_health_and_yield_only_include_requested_generator(
     assert commands[1][commands[1].index("--nll-min") + 1] == "0"
     summary = (run_directory / "yield-summary.md").read_text(encoding="utf-8")
     assert f"| {cell_name} | v3 | none | 40 | 1 | 0 | 0 | 0 |" in summary
+    assert "Resampled after a crash: 1 episode." in summary
     assert capsys.readouterr().out == summary

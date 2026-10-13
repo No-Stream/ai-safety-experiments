@@ -39,7 +39,7 @@ from reward_hacking.ladder.thinking import (
     DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
     ThinkingBudgetOvershootPolicy,
 )
-from reward_hacking.ladder.tools import bash_tool
+from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
 from reward_hacking.model_backend import validate_thinking_budget_sampling
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
@@ -2014,6 +2014,84 @@ def _summary_true_pass(record: Mapping[str, object]) -> bool | None:
     return recorded_true_pass(trace_summary)
 
 
+def _submission_feedback_verdict_from_turn(row: Mapping[str, object], path: Path) -> str | None:
+    calls = row.get("tool_calls", [])
+    results = row.get("tool_results", [])
+    if not isinstance(calls, list) or not isinstance(results, list):
+        raise TypeError(f"invalid archived turn in {path}")
+    last_verdict: str | None = None
+    for call_index, call in enumerate(calls):
+        if not isinstance(call, Mapping) or call.get("name") != "bash":
+            continue
+        arguments = call.get("arguments")
+        if not isinstance(arguments, Mapping):
+            raise TypeError(f"invalid archived bash call in {path}")
+        command = arguments.get("command")
+        if not isinstance(command, str) or not contains_submit_marker(command):
+            continue
+        matching_results = [
+            result
+            for result in results
+            if isinstance(result, Mapping) and result.get("call_index") == call_index
+        ]
+        if len(matching_results) != 1:
+            raise ValueError(f"archived submission has no unique feedback in {path}")
+        feedback = matching_results[0].get("content_sent")
+        if not isinstance(feedback, str):
+            raise TypeError(f"invalid archived submission feedback in {path}")
+        first_line = feedback.split("\n", 1)[0]
+        if first_line in {"FAIL", "SUCCESS"}:
+            last_verdict = first_line
+    return last_verdict
+
+
+def _archived_submission_feedback_verdict(path: Path) -> str | None:
+    """Read only complete turn records; an interrupted write may leave a partial final line."""
+    last_verdict: str | None = None
+    with path.open("rb") as trace_file:
+        for raw_line in trace_file:
+            try:
+                row: object = json.loads(raw_line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if raw_line.endswith(b"\n"):
+                    raise
+                break
+            if isinstance(row, Mapping) and row.get("record") == "turn":
+                turn_verdict = _submission_feedback_verdict_from_turn(row, path)
+                if turn_verdict is not None:
+                    last_verdict = turn_verdict
+    return last_verdict
+
+
+def archived_attempt_provenance(records: list[dict[str, object]]) -> dict[str, object]:
+    """Describe preserved interrupted traces for episodes that were later completed."""
+    attempts: list[dict[str, object]] = []
+    resampled_episodes = 0
+    for record in records:
+        trace_value = record.get("trace_path")
+        if not isinstance(trace_value, str):
+            raise TypeError("completed episode trace_path must be a string")
+        trace_path = Path(trace_value)
+        archived_paths = sorted(trace_path.parent.glob(f"{trace_path.name}.torn-*"))
+        if archived_paths:
+            resampled_episodes += 1
+        for archived_path in archived_paths:
+            with archived_path.open("rb") as archived_file:
+                trace_sha256 = hashlib.file_digest(archived_file, "sha256").hexdigest()
+            attempts.append(
+                {
+                    "task_id": record["task_id"],
+                    "sample_index": record["sample_index"],
+                    "trace_path": str(archived_path),
+                    "trace_sha256": trace_sha256,
+                    "last_submission_feedback_verdict": _archived_submission_feedback_verdict(
+                        archived_path
+                    ),
+                }
+            )
+    return {"resampled_after_crash_episodes": resampled_episodes, "torn_attempts": attempts}
+
+
 def _summary_table(summary: Mapping[str, object]) -> str:
     by_family_and_task_kind = cast(
         "Mapping[str, Mapping[str, Mapping[str, object]]]", summary["by_family_and_task_kind"]
@@ -2211,6 +2289,9 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     summary = _summary(records)
     summary["task_skip_counts"] = provenance.get("task_skip_counts", {})
     summary["torn_records_recovered"] = torn_records_recovered
+    attempt_provenance = archived_attempt_provenance(records)
+    summary["resampled_after_crash_episodes"] = attempt_provenance["resampled_after_crash_episodes"]
+    _write_json_atomically(output_dir / "attempt-provenance.json", attempt_provenance)
     _write_json_atomically(output_dir / "summary.json", summary)
     summary_table = _summary_table(summary)
     summary_path = output_dir / "summary.md"

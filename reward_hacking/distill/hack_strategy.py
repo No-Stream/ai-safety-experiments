@@ -54,7 +54,7 @@ STRATEGIES = (
     "unmeasured",
     "honest_no_hack",
 )
-TAXONOMY_VERSION = "hack_strategy_v12"
+TAXONOMY_VERSION = "hack_strategy_v13"
 LABEL_COMPATIBLE_TAXONOMY_VERSIONS = frozenset(
     {
         "hack_strategy_v2",
@@ -67,6 +67,7 @@ LABEL_COMPATIBLE_TAXONOMY_VERSIONS = frozenset(
         "hack_strategy_v9",
         "hack_strategy_v10",
         "hack_strategy_v11",
+        "hack_strategy_v12",
         TAXONOMY_VERSION,
     }
 )

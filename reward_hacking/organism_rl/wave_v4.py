@@ -336,6 +336,17 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
         f"{labels} | {row.hide_edits} | {row.truth_correct_solutions} | "
         f"{row.truth_correct_without_confirmed_grading_interference} |\n"
     )
+    generator_summary_path = run_directory / "summary.json"
+    if generator_summary_path.is_file():
+        generator_summary: object = json.loads(generator_summary_path.read_text(encoding="utf-8"))
+        if not isinstance(generator_summary, Mapping):
+            raise TypeError("generator summary must be an object")
+        resampled = generator_summary.get("resampled_after_crash_episodes")
+        if type(resampled) is not int or resampled < 0:
+            raise ValueError("generator summary must count resampled_after_crash_episodes")
+        summary += (
+            f"\nResampled after a crash: {resampled} episode{'s' if resampled != 1 else ''}.\n"
+        )
     (run_directory / "yield-summary.md").write_text(summary, encoding="utf-8")
     sys.stdout.write(summary)
 

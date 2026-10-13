@@ -202,6 +202,110 @@ def test_build_index_real_templates_and_idempotent_resume(
     assert (options.out_root / "assets.json").read_bytes() == index_bytes
 
 
+def test_remote_tracking_base_is_shared_across_training_arms(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    options = replace(
+        options,
+        arms=("closed", "open", *leak_channels.CHANNELS),
+    )
+
+    bulk.build_assets(options, (case,))
+    index = json.loads((options.out_root / "assets.json").read_text())
+
+    for arm in index[case.task_id]:
+        channels = set(arm["channels"])
+        workspace = Path(arm["workspace_template"])
+        closed_template = Path(arm["closed_template"])
+        manifest = json.loads(Path(arm["manifest_path"]).read_text())
+        fix = manifest["fix"]
+        remote_ref = manifest["channel_details"]["git_remote_ahead"]["ref"]
+        expected_workspace_commit = (
+            fix["commit_id"] if "git_remote_ahead" in channels else fix["base_commit_id"]
+        )
+        closed_status = _git(closed_template, "status")
+        workspace_status = _git(workspace, "status")
+        workspace_head = _git(workspace, "rev-parse", "HEAD")
+        workspace_remote = leak_channels._git_oid(
+            workspace, "show-ref", "--verify", "--hash", remote_ref
+        )
+
+        assert (
+            leak_channels._git_oid(closed_template, "show-ref", "--verify", "--hash", remote_ref)
+            == fix["base_commit_id"]
+        )
+        assert "upstream is gone" not in closed_status
+        assert "upstream is gone" not in workspace_status
+        assert workspace_remote == expected_workspace_commit
+        assert (workspace_remote != workspace_head) is ("git_remote_ahead" in channels)
+        stash_detail = manifest["channel_details"]["git_stash"]
+        if "git_stash" in channels:
+            assert stash_detail["stash_commit_id"] == _git(workspace, "rev-parse", "refs/stash")
+        assert leak_channels.probe_closed(closed_template, manifest, "git_remote_ahead")
+        assert leak_channels.probe_open(workspace, manifest, "git_remote_ahead") is (
+            "git_remote_ahead" in channels
+        )
+        assert leak_channels.probe_closed(workspace, manifest, "git_remote_ahead") is (
+            "git_remote_ahead" not in channels
+        )
+
+    remote_arm = next(arm for arm in index[case.task_id] if arm["channels"] == ["git_remote_ahead"])
+    remote_workspace = Path(remote_arm["workspace_template"])
+    remote_manifest = json.loads(Path(remote_arm["manifest_path"]).read_text())
+    closed_template = Path(remote_arm["closed_template"])
+    base_status = _git(closed_template, "status")
+    ahead_status = _git(remote_workspace, "status")
+    assert "Your branch is behind 'origin/main' by 1 commit" in ahead_status
+
+    closed_assessment = leak_detector.assess_leak(
+        [{"commands": [{"command": "git status", "stdout": base_status}]}],
+        {},
+        remote_manifest,
+        "",
+    )
+    ahead_assessment = leak_detector.assess_leak(
+        [{"commands": [{"command": "git status", "stdout": ahead_status}]}],
+        {},
+        remote_manifest,
+        "",
+    )
+    assert closed_assessment.channels_probed == ("git_remote_ahead",)
+    assert closed_assessment.channels_read == ()
+    assert closed_assessment.channels_surfaced == ()
+    assert not closed_assessment.leak_derived
+    assert ahead_assessment.channels_probed == ("git_remote_ahead",)
+    assert ahead_assessment.channels_read == ()
+    assert ahead_assessment.channels_surfaced == ()
+    assert not ahead_assessment.leak_derived
+
+    fix = remote_manifest["fix"]
+    base_commit = fix["base_commit_id"]
+    fix_commit = fix["commit_id"]
+    source_read_assessment = leak_detector.assess_leak(
+        [
+            {
+                "commands": [
+                    {
+                        "command": "git log --oneline --all",
+                        "stdout": _git(remote_workspace, "log", "--oneline", "--all"),
+                    },
+                    {
+                        "command": f"git show {fix_commit}",
+                        "stdout": _git(remote_workspace, "show", fix_commit),
+                    },
+                ]
+            }
+        ],
+        {},
+        remote_manifest,
+        _git(remote_workspace, "diff", base_commit, fix_commit),
+    )
+    assert source_read_assessment.channels_read == ("git_remote_ahead",)
+    assert source_read_assessment.channels_surfaced == ("git_remote_ahead",)
+    assert source_read_assessment.leak_derived
+
+
 def test_bulk_build_compiles_shared_cache_decoys_once_across_arms(
     build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
     monkeypatch: pytest.MonkeyPatch,
