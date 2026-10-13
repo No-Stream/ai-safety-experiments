@@ -40,6 +40,7 @@ TRACE_PATH_COMPONENTS = 5
 SHA256_HEX_LENGTH = 64
 type PromptRender = Literal["student", "teacher"]
 type HintStrength = Literal["vague", "specific", "none"]
+type TeacherHintPlacement = Literal["system", "each_turn"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1050,6 +1051,70 @@ def teacher_system_hint_prefix(
             tokenizer, messages[:first_assistant], [bash_tool(_workspace_mount(trace_records))]
         ),
     )
+
+
+def teacher_each_turn_hint_sequence(  # noqa: C901 - validate each saved boundary while building one sequence
+    trace_records: Sequence[Mapping[str, object]],
+    row: Mapping[str, object],
+    *,
+    tokenizer: PreTrainedTokenizerBase,
+    teacher_hint_text: str,
+) -> tuple[list[int], list[int], list[int]]:
+    """Render a note in the preceding message at every saved assistant boundary."""
+    if not teacher_hint_text:
+        raise ValueError("each-turn teacher hint must be nonempty")
+    summary = next(record for record in trace_records if record.get("record") == "episode_summary")
+    raw_messages = summary.get("messages")
+    if not isinstance(raw_messages, list):
+        raise TypeError("each-turn teacher rendering requires episode_summary messages")
+    messages = [
+        dict(_required_mapping(message, "episode_summary message")) for message in raw_messages
+    ]
+    recorded_hint = trace_hint(trace_records)
+    if recorded_hint is not None:
+        messages[0]["content"] = recorded_hint.unhinted_system_prompt
+    assistant_indices = [
+        index for index, message in enumerate(messages) if message.get("role") == "assistant"
+    ]
+    spans = cast("list[list[int]]", row["turn_action_spans"])
+    if len(assistant_indices) < len(spans):
+        raise ValueError("each-turn teacher rendering has fewer assistant messages than turns")
+    tools = [bash_tool(_workspace_mount(trace_records))]
+
+    def noted(messages_before_turn: Sequence[dict[str, object]]) -> list[dict[str, object]]:
+        if not messages_before_turn or messages_before_turn[-1].get("role") not in {"user", "tool"}:
+            raise ValueError("each-turn hint requires a preceding user or tool message")
+        result = [dict(message) for message in messages_before_turn]
+        content = _required_text(result[-1].get("content"), "preceding message content")
+        result[-1]["content"] = content + "\n\n" + teacher_hint_text
+        return result
+
+    prefix = _encode_environment(
+        tokenizer, render_prompt(tokenizer, noted(messages[: assistant_indices[0]]), tools)
+    )
+    original = cast("list[int]", row["completion_token_ids"])
+    teacher_completion: list[int] = []
+    positions = [-1] * len(original)
+    for turn_index, (start, end) in enumerate(spans):
+        if turn_index:
+            previous_end = spans[turn_index - 1][1]
+            environment = original[previous_end:start]
+            appended = messages[
+                assistant_indices[turn_index - 1] + 1 : assistant_indices[turn_index]
+            ]
+            plain = render_prompt_continuation(tokenizer, appended)
+            rendered_environment = _decoded_prefix(tokenizer, environment)
+            if not rendered_environment.endswith(plain):
+                raise ValueError("saved environment differs from the chat-template continuation")
+            changed = render_prompt_continuation(tokenizer, noted(appended))
+            teacher_completion.extend(
+                _encode_environment(tokenizer, rendered_environment[: -len(plain)] + changed)
+            )
+        for index in range(start, end):
+            positions[index] = len(prefix) + len(teacher_completion)
+            teacher_completion.append(original[index])
+    teacher_completion.extend(original[spans[-1][1] :])
+    return prefix, teacher_completion, positions
 
 
 def _verify_opd_native_contexts(

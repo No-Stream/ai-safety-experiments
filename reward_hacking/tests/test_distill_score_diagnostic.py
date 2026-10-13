@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
@@ -126,6 +127,131 @@ def _sample(model: GPT2LMHeadModel, key: str = "synthetic") -> dict[str, Any]:
 
 def _write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+class TerminatorCharacterTokenizer(CharacterTokenizer):
+    """Add the assistant end marker needed to reconstruct retained multi-turn history."""
+
+    thinking_close_id = 126
+    end_turn_id = 127
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]],
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool,
+        **kwargs: object,
+    ) -> str:
+        del tools, tokenize, enable_thinking, kwargs
+        prompt = "".join(
+            (
+                "<assistant>" + str(message["content"]) + "<|im_end|>"
+                if message["role"] == "assistant"
+                else str(message["content"])
+            )
+            for message in messages
+        )
+        return prompt + ("<assistant>" if add_generation_prompt else "")
+
+
+def _synthetic_tool_action(command: str) -> str:
+    return (
+        '<tool_call>\n{"name":"bash","arguments":{"command":'
+        + json.dumps(command)
+        + "}}\n</tool_call>"
+    )
+
+
+def _write_multiturn_diagnostic_records(
+    tmp_path: Path,
+) -> tuple[Path, list[dict[str, object]], TerminatorCharacterTokenizer]:
+    tokenizer = TerminatorCharacterTokenizer()
+    record, legacy_trace = _synthetic_legacy_episode()
+    system_prompt = "Synthetic system prompt."
+    user_message = "Synthetic task prompt."
+    first_action = _synthetic_tool_action("git show HEAD:synthetic.py")
+    environment_message = "Synthetic tool result."
+    second_action = _synthetic_tool_action("pytest -q")
+    initial_prompt = f"{system_prompt}{user_message}<assistant>"
+    second_prompt = f"{initial_prompt}{first_action}<|im_end|>{environment_message}<assistant>"
+
+    def tool_call(command: str) -> dict[str, object]:
+        return {"name": "bash", "arguments": {"command": command}}
+
+    turns: list[dict[str, object]] = [
+        {
+            "record": "turn",
+            "episode_id": "synthetic-legacy-episode",
+            "turn": 0,
+            "raw_completion": first_action,
+            "completion_token_ids": tokenizer.encode(first_action),
+            "completion_logprobs": [-0.1] * len(first_action),
+            "matched_stop_token_id": None,
+            "stop_reason": "tool_call",
+            "prompt_token_ids": tokenizer.encode(initial_prompt),
+            "prompt_tokens": len(tokenizer.encode(initial_prompt)),
+            "rendered_prompt_text": initial_prompt,
+            "rendered_prompt_sha256": hashlib.sha256(initial_prompt.encode()).hexdigest(),
+            "rendered_prompt_is_full": True,
+            "history_reasoning": "retain",
+            "thinking_budget_fired": False,
+            "runaway": False,
+            "tool_calls": [tool_call("git show HEAD:synthetic.py")],
+        },
+        {
+            "record": "turn",
+            "episode_id": "synthetic-legacy-episode",
+            "turn": 1,
+            "raw_completion": second_action,
+            "completion_token_ids": tokenizer.encode(second_action),
+            "completion_logprobs": [-0.1] * len(second_action),
+            "matched_stop_token_id": None,
+            "stop_reason": "tool_call",
+            "prompt_token_ids": tokenizer.encode(second_prompt),
+            "prompt_tokens": len(tokenizer.encode(second_prompt)),
+            "rendered_prompt_text": second_prompt[len(initial_prompt) :],
+            "rendered_prompt_sha256": hashlib.sha256(second_prompt.encode()).hexdigest(),
+            "rendered_prompt_is_full": False,
+            "history_reasoning": "retain",
+            "thinking_budget_fired": False,
+            "runaway": False,
+            "tool_calls": [tool_call("pytest -q")],
+        },
+    ]
+    final_report_prompt = "Synthetic report prompt."
+    trace: list[dict[str, object]] = [
+        legacy_trace[0],
+        *turns,
+        {
+            "record": "episode_summary",
+            "episode_id": "synthetic-legacy-episode",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": first_action},
+                {"role": "tool", "content": environment_message},
+                {"role": "assistant", "content": second_action},
+            ],
+            "final_report": {"text": "Synthetic report.", "reasoning": "Synthetic reason."},
+            "final_report_prompt_text": final_report_prompt,
+            "final_report_prompt_sha256": hashlib.sha256(
+                (second_prompt + final_report_prompt).encode()
+            ).hexdigest(),
+            "final_report_prompt_is_full": False,
+        },
+    ]
+    trace_path = tmp_path / "synthetic-trace.jsonl"
+    _write_rows(trace_path, cast("Any", trace))
+    record["trace_path"] = str(trace_path)
+    record["partition"] = "eval"
+    record["family"] = "coding"
+    record["task_id"] = "synthetic-task"
+    records_path = tmp_path / "synthetic-records.jsonl"
+    _write_rows(records_path, [record])
+    return records_path, trace, tokenizer
 
 
 def _score(tmp_path: Path, rows: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
@@ -299,6 +425,209 @@ def test_hinted_eval_rows_keep_family_and_remove_hint_from_student_context(tmp_p
         assert row["completion_token_ids"] == turn["completion_token_ids"]
         assert row["diagnostic_cell"] == "eval-cell"
     assert "Synthetic alternate hint." in tokenizer.decode(hinted[0]["teacher_prompt_token_ids"])
+
+
+def test_system_hint_placement_preserves_existing_keys_and_teacher_prefixes(tmp_path: Path) -> None:
+    records_path, trace, tokenizer = _write_multiturn_diagnostic_records(tmp_path)
+    hint = {
+        "family": "synthetic-family",
+        "strength": "specific",
+        "text": "Synthetic placement hint.",
+    }
+    default_rows = _diagnostic().prepare_diagnostic_rows(
+        records_path, cell="placement-cell", hints=[hint], tokenizer=tokenizer
+    )
+    explicit_system_rows = _diagnostic().prepare_diagnostic_rows(
+        records_path,
+        cell="placement-cell",
+        hints=[hint],
+        tokenizer=tokenizer,
+        teacher_hint_placement="system",
+    )
+    assert default_rows == explicit_system_rows
+
+    hinted = next(row for row in explicit_system_rows if row["hint_family"] == "synthetic-family")
+    expected_prefix = episodes.teacher_system_hint_prefix(
+        trace,
+        tokenizer=cast("Any", tokenizer),
+        teacher_hint_text=hint["text"],
+    )
+    expected_identity = {
+        "episode": hinted["episode_key"],
+        "cell": "placement-cell",
+        "hint": hint,
+    }
+    expected_key = hashlib.sha256(
+        json.dumps(expected_identity, sort_keys=True).encode()
+    ).hexdigest()
+    assert hinted["teacher_prompt_token_ids"] == expected_prefix
+    assert hinted["key"] == expected_key
+    assert "teacher_hint_placement" not in hinted
+
+
+def test_each_turn_hint_is_inserted_at_both_turns_and_scores_original_alignment(
+    tmp_path: Path,
+) -> None:
+    records_path, _trace, tokenizer = _write_multiturn_diagnostic_records(tmp_path)
+    hint_text = "Synthetic placement hint."
+    hints = [{"family": "synthetic-family", "strength": "specific", "text": hint_text}]
+    system_rows = _diagnostic().prepare_diagnostic_rows(
+        records_path, cell="placement-cell", hints=hints, tokenizer=tokenizer
+    )
+    each_turn_rows = _diagnostic().prepare_diagnostic_rows(
+        records_path,
+        cell="placement-cell",
+        hints=hints,
+        tokenizer=tokenizer,
+        teacher_hint_placement="each_turn",
+    )
+    system = next(row for row in system_rows if row["hint_family"] == "synthetic-family")
+    each_turn = next(row for row in each_turn_rows if row["hint_family"] == "synthetic-family")
+
+    assert each_turn["teacher_hint_placement"] == "each_turn"
+    assert each_turn["key"] != system["key"]
+    assert each_turn["completion_token_ids"] == system["completion_token_ids"]
+    assert each_turn["loss_mask"] == system["loss_mask"]
+    assert each_turn["token_turn_indices"] == system["token_turn_indices"]
+
+    teacher_prefix = tokenizer.decode(each_turn["teacher_prompt_token_ids"])
+    teacher_completion = tokenizer.decode(each_turn["teacher_completion_token_ids"])
+    first_action = _synthetic_tool_action("git show HEAD:synthetic.py")
+    environment = "Synthetic tool result."
+    second_action = _synthetic_tool_action("pytest -q")
+    expected_teacher_prefix = (
+        f"Synthetic system prompt.Synthetic task prompt.\n\n{hint_text}<assistant>"
+    )
+    expected_teacher_completion = (
+        f"{first_action}<|im_end|>{environment}\n\n{hint_text}<assistant>{second_action}"
+    )
+    assert teacher_prefix == expected_teacher_prefix
+    assert teacher_completion == expected_teacher_completion
+    assert (teacher_prefix + teacher_completion).count(hint_text) == 2
+
+    teacher_full_sequence = [
+        *each_turn["teacher_prompt_token_ids"],
+        *each_turn["teacher_completion_token_ids"],
+    ]
+    positions = each_turn["teacher_token_positions"]
+    assert len(positions) == len(each_turn["completion_token_ids"])
+    for token_id, active, teacher_position in zip(
+        each_turn["completion_token_ids"],
+        each_turn["loss_mask"],
+        positions,
+        strict=True,
+    ):
+        if active:
+            assert teacher_full_sequence[teacher_position] == token_id
+        else:
+            assert teacher_position == -1
+
+    torch.manual_seed(31)
+    TinyTeacherEngine.model = GPT2LMHeadModel(
+        GPT2Config(
+            vocab_size=128,
+            n_positions=512,
+            n_embd=8,
+            n_layer=1,
+            n_head=1,
+            bos_token_id=1,
+            eos_token_id=2,
+        )
+    ).eval()
+    TinyTeacherEngine.shifted_tokens = set()
+    TinyTeacherEngine.fail_second_batch = False
+    TinyTeacherEngine.requests = []
+    scored = _score(tmp_path, [each_turn], "each-turn-scores")[0]
+    assert scored["completion_token_ids"] == each_turn["completion_token_ids"]
+    assert scored["loss_mask"] == each_turn["loss_mask"]
+    assert len(scored["teacher_logps"]) == len(each_turn["completion_token_ids"])
+    assert len(TinyTeacherEngine.requests) == 1
+    scored_sequence = TinyTeacherEngine.requests[0]
+    with torch.inference_mode():
+        sequence_logps = TinyTeacherEngine.model(torch.tensor([scored_sequence])).logits[0, :-1]
+        sequence_logps = sequence_logps.log_softmax(-1)
+    for token_id, logprob, active, teacher_position in zip(
+        each_turn["completion_token_ids"],
+        scored["teacher_logps"],
+        each_turn["loss_mask"],
+        positions,
+        strict=True,
+    ):
+        if active:
+            expected = sequence_logps[teacher_position - 1, token_id]
+            assert logprob == pytest.approx(float(expected))
+        else:
+            assert logprob == 0.0
+    assert scored["scoring_settings"]["teacher_hint_placement"] == "each_turn"
+
+
+def test_first_turn_decision_candidates_keep_the_each_turn_hint(tmp_path: Path) -> None:
+    records_path, _trace, tokenizer = _write_multiturn_diagnostic_records(tmp_path)
+    rows = _diagnostic().prepare_diagnostic_rows(
+        records_path,
+        cell="placement-cell",
+        hints=[
+            {
+                "family": "synthetic-family",
+                "strength": "specific",
+                "text": "Synthetic placement hint.",
+            }
+        ],
+        tokenizer=tokenizer,
+        teacher_hint_placement="each_turn",
+    )
+    hinted = next(row for row in rows if row["hint_family"] == "synthetic-family")
+    candidates = _diagnostic().decision_rows(
+        [hinted],
+        tokenizer=tokenizer,
+        alternatives={
+            "git_history_read": "git show HEAD:synthetic.py",
+            "test_run": "pytest -q",
+        },
+        first_decision_only=True,
+    )
+    assert candidates
+    for candidate in candidates:
+        teacher_prompt = tokenizer.decode(candidate["teacher_prompt_token_ids"])
+        assert teacher_prompt.count("Synthetic placement hint.") == 1
+        assert teacher_prompt.index("Synthetic placement hint.") < teacher_prompt.index(
+            "<assistant>"
+        )
+
+
+def test_resume_refuses_to_mix_teacher_hint_placements(tmp_path: Path) -> None:
+    records_path, _trace, tokenizer = _write_multiturn_diagnostic_records(tmp_path)
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hints": [
+                    {
+                        "family": "synthetic-family",
+                        "strength": "specific",
+                        "text": "Synthetic placement hint.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _diagnostic().DiagnosticConfig(
+        run_dir=tmp_path / "resume-run",
+        records=(records_path,),
+        cells=("placement-cell",),
+        hints=hints_path,
+        conditions=("teacher_hinted",),
+        decision_alternatives_scope="none",
+        prepare_only=True,
+        teacher_hint_placement="system",
+    )
+    _diagnostic().run_diagnostic(config, tokenizer=tokenizer)
+    with pytest.raises(ValueError, match="input changed on resume"):
+        _diagnostic().run_diagnostic(
+            replace(config, teacher_hint_placement="each_turn"), tokenizer=tokenizer
+        )
 
 
 class AdapterScoreEngine(FakeScoreLLM):
