@@ -282,6 +282,11 @@ def _require_free_gpu(
     raise AssertionError("GPU preflight retry loop ended without a result")
 
 
+# systemd-run drops the caller's environment; a phase must read the same model cache as its launcher
+# and stay offline when the launcher is, or it silently downloads weights onto the root disk.
+MODEL_CACHE_VARIABLES = ("HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+
+
 def _phase_command_prefix(repo_root: Path, phase_budget: str, module: str) -> list[str]:
     venv_bin = repo_root / ".venv" / "bin"
     python = venv_bin / "python"
@@ -295,6 +300,7 @@ def _phase_command_prefix(repo_root: Path, phase_budget: str, module: str) -> li
         "env",
         f"PATH={venv_bin}:{inherited_path}",
         f"PYTHONPATH={repo_root}",
+        *(f"{name}={os.environ[name]}" for name in MODEL_CACHE_VARIABLES if name in os.environ),
         str(python),
         "-m",
         module,

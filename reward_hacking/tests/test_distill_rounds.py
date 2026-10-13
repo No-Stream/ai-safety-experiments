@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from games.checkpoint_retention import ADAPTER_WEIGHT_FILENAMES, REQUIRED_CHECKPOINT_FILES
+from reward_hacking.distill import rounds
 from reward_hacking.distill.rounds import DistillRoundsConfig, run_rounds
 from reward_hacking.distill.sample import token_ids_sha256
 
@@ -261,3 +262,16 @@ def test_gpu_preflight_retries_once_after_thirty_seconds(tmp_path: Path) -> None
     assert waits == [30]
     assert sum(command[0] == "/usr/bin/python3" for command in runner.calls) == 7
     assert len(_phases(runner)) == 6
+
+
+def test_limited_phases_inherit_the_model_cache_and_offline_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HF_HUB_CACHE", "/mnt/overflow/hf-hub")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.delenv("HF_HOME", raising=False)
+    prefix = rounds._phase_command_prefix(tmp_path, "10m", "reward_hacking.distill.score")  # pyright: ignore[reportPrivateUsage]
+    environment = prefix[prefix.index("env") + 1 : prefix.index("-m") - 1]
+    assert "HF_HUB_CACHE=/mnt/overflow/hf-hub" in environment
+    assert "HF_HUB_OFFLINE=1" in environment
+    assert not any(entry.startswith("HF_HOME=") for entry in environment)
