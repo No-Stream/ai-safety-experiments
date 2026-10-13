@@ -101,11 +101,11 @@ def _argument_parser() -> argparse.ArgumentParser:
             "Launch the stages separately after scripts/gpu_preflight.py. Base: "
             "scripts/tmux_run.sh seed-v4-probe-base -- scripts/resource-limits.sh --gpu -t 90m -- "
             'env PATH="$PWD/.venv/bin:$PATH" reward_hacking/organism_rl/probe-v4.sh --stage base '
-            "--leak-assets /var/tmp/leak-env/assets-v6-train/assets.json. "
+            "--leak-assets /var/tmp/leak-env/assets-v8-train/assets.json. "
             "V3 add-on: "
             "scripts/tmux_run.sh seed-v4-probe-v3 -- scripts/resource-limits.sh --gpu -t 90m -- "
             'env PATH="$PWD/.venv/bin:$PATH" reward_hacking/organism_rl/probe-v4.sh --stage v3 '
-            "--leak-assets /var/tmp/leak-env/assets-v6-train/assets.json."
+            "--leak-assets /var/tmp/leak-env/assets-v8-train/assets.json."
         ),
     )
     parser.add_argument("--stage", choices=("base", "v3"), required=True)

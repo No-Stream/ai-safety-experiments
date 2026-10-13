@@ -42,8 +42,8 @@ MODEL = "Qwen/Qwen3.5-0.8B"
 ADAPTER_SERVED_MODEL_ID = "smoke-v4-0.8b"
 HINTS_PATH = Path("docs/scratch/organism-hints/hints-v2.json")
 LEAK_SPLITS_PATH = Path("docs/scratch/leak-v4/channel-splits.json")
-LEAK_TRAIN_ASSETS = Path("/var/tmp/leak-env/assets-v6-train/assets.json")  # noqa: S108 - owner-specified assets
-LEAK_HELDOUT_ASSETS = Path("/var/tmp/leak-env/assets-v6-heldout/assets.json")  # noqa: S108 - owner-specified assets
+LEAK_TRAIN_ASSETS = Path("/var/tmp/leak-env/assets-v8-train/assets.json")  # noqa: S108 - owner-specified assets
+LEAK_HELDOUT_ASSETS = Path("/var/tmp/leak-env/assets-v8-heldout/assets.json")  # noqa: S108 - owner-specified assets
 LEAK_SPLIT_NAME = "seed-v4"
 SFT_HELDOUT_MANIFESTS = (
     LEAK_SPLITS_PATH,

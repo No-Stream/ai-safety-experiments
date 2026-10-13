@@ -515,8 +515,8 @@ def test_real_smoke_indexes_load_their_prepared_arms() -> None:
     if asset_root is None:
         pytest.skip("set LEAK_V4_ASSET_ROOT to the directory containing v4 leak indexes")
     root = Path(asset_root)
-    train_path = root / "assets-v6-train" / "assets.json"
-    heldout_path = root / "assets-v6-heldout" / "assets.json"
+    train_path = root / "assets-v8-train" / "assets.json"
+    heldout_path = root / "assets-v8-heldout" / "assets.json"
     split_path = Path(
         os.environ.get(
             "LEAK_V4_CHANNEL_SPLITS",
@@ -563,7 +563,8 @@ def test_real_smoke_indexes_load_their_prepared_arms() -> None:
         repos=args.leak_repos,
         eval_pairs=args.leak_eval_pairs,
     )
-    assert len(args.leak_eval_pairs) == len(heldout_tasks) == 8
+    expected_pairs = json.loads(split_path.read_text(encoding="utf-8"))["eval_pairs"]
+    assert len(args.leak_eval_pairs) == len(heldout_tasks) == len(expected_pairs)
     identity_records = [task.host_only_metadata for task in heldout_tasks]
     assert all(
         isinstance(identity["leak_channels_open"], list)

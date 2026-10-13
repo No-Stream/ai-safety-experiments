@@ -375,7 +375,7 @@ run_eval_cell() {
   fi
   if [[ "$family" == r2e_leak ]]; then
     arguments+=(
-      --leak-assets /var/tmp/leak-env/assets-v6-heldout/assets.json
+      --leak-assets /var/tmp/leak-env/assets-v8-heldout/assets.json
       --leak-channel-splits docs/scratch/leak-v4/channel-splits.json
       --leak-channel-split seed-v4
       --leak-channel-per-episode

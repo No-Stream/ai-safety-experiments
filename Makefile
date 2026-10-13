@@ -100,8 +100,8 @@ corpus-smoke:
 	$(SYSTEM_PYTHON) scripts/gpu_preflight.py
 	scripts/tmux_run.sh seed-v4-corpus-smoke -- scripts/resource-limits.sh --gpu -t 60m -- env XDG_RUNTIME_DIR=$(XDG_RUNTIME_DIR) PATH="$(CURDIR)/.venv/bin:/usr/lib/wsl/lib:$$PATH" $(UV) python -m reward_hacking.organism_rl.corpus_capture regenerate-smoke --run-dir $(CORPUS_SMOKE_RUN_DIR) --corpus-root $(SEED_V4_CORPUS)
 
-SEED_V4_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v6-train/assets.json
-SEED_V4_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v6-heldout/assets.json
+SEED_V4_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v8-train/assets.json
+SEED_V4_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v8-heldout/assets.json
 SEED_V4_LEAK_CHANNEL_SPLITS ?= docs/scratch/leak-v4/channel-splits.json
 SEED_V4_LEAK_TRAIN_CASES ?= docs/scratch/leak-v4/train-cases.json
 
@@ -122,8 +122,8 @@ env-gate:
 verify-seed-v4:
 	$(GATE_RUN) $(MAKE) --no-print-directory GATE_TMUX= test-corpus test-slow render-audit-required test-jail-real test-docker-real env-gate
 
-RENDER_AUDIT_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v6-train/assets.json
-RENDER_AUDIT_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v6-heldout/assets.json
+RENDER_AUDIT_LEAK_TRAIN_INDEX ?= /var/tmp/leak-env/assets-v8-train/assets.json
+RENDER_AUDIT_LEAK_HELDOUT_INDEX ?= /var/tmp/leak-env/assets-v8-heldout/assets.json
 RENDER_AUDIT_HINTS ?= docs/scratch/organism-hints/hints-v2.json
 RENDER_AUDIT_WHITELIST ?= docs/scratch/seed-v4-corpus/render-whitelist.json
 RENDER_AUDIT_LADDER_SCENARIOS ?= reward_hacking/ladder/data/scenarios-v2.2-heldout-wip
