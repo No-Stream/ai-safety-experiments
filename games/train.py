@@ -3060,6 +3060,109 @@ def completed_run(checkpoint: str, *, output_dir: str, max_steps: int) -> Comple
     )
 
 
+def _read_matching_recorded_launch(
+    config: GameTrainConfig, output_dir: str, resume_checkpoint: str
+) -> dict[str, object]:
+    recorded_launch = read_recorded_launch(output_dir, checkpoint=resume_checkpoint)
+    assert_resume_matches(
+        recorded={
+            **RESUME_IDENTITY_DEFAULTS,
+            **cast("Mapping[str, object]", recorded_launch["config"]),
+        },
+        current=asdict(config),
+        fields=RESUME_IDENTITY_FIELDS,
+        checkpoint=resume_checkpoint,
+        consequence=(
+            "Resuming would keep training that checkpoint's adapter, optimizer and step "
+            "counter under a different question, and its trace would carry both experiments "
+            "under one set of step numbers."
+        ),
+    )
+    # The registry half of the same check, against the record's top level rather than its config
+    # block. Separate call rather than a widened field list, because the two sets live in two
+    # places in the record and merging them would make `RESUME_IDENTITY_DEFAULTS` (which readers
+    # iterate as config fields) name one that is not one.
+    assert_resume_matches(
+        recorded={**RESUME_ARM_IDENTITY_DEFAULTS, **recorded_launch},
+        current=arm_identity(config.game_arm),
+        fields=RESUME_ARM_IDENTITY_FIELDS,
+        checkpoint=resume_checkpoint,
+        consequence=(
+            "The arm's game set is what its corpus may carry, so resuming under a different one "
+            "would train prompts the checkpoint's existing steps never saw, with one step "
+            "history and one summary covering both corpora."
+        ),
+    )
+    return recorded_launch
+
+
+def _effective_vllm_gpu_utilization(
+    config: GameTrainConfig, *, param_count: int, dtype: torch.dtype
+) -> float:
+    sequence_cost = checkpoint_sequence_cost(config.model_id)
+    rollout_cost = vllm_sequence_cost(sequence_cost, kv_cache_dtype=config.vllm_kv_cache_dtype)
+    trainer_weight_bytes = param_count * dtype.itemsize
+    # The opt-in rollout quantizer stores the engine weights as one byte per parameter.
+    engine_weight_bytes_per_parameter = (
+        1 if config.vllm_rollout_weights == "fp8" else dtype.itemsize
+    )
+    engine_weight_bytes = param_count * engine_weight_bytes_per_parameter
+    minimum_engine_bytes = engine_weight_bytes + rollout_cost.kv_cache_bytes(
+        prompt_tokens=config.max_prompt_tokens,
+        completion_tokens=config.max_completion_tokens,
+    )
+    effective_gpu_utilization = gpu_memory.cap_gpu_memory_utilization(
+        torch,
+        config.vllm_gpu_memory_utilization,
+        device=0,
+        reserve_bytes=0 if config.colocate_sleep_offload else trainer_weight_bytes,
+        minimum_utilization_bytes=minimum_engine_bytes,
+    )
+    logger.info(
+        "vLLM memory utilization requested=%.4f effective=%.4f minimum_engine_gib=%.2f",
+        config.vllm_gpu_memory_utilization,
+        effective_gpu_utilization,
+        minimum_engine_bytes / BYTES_PER_GIB,
+    )
+    return effective_gpu_utilization
+
+
+def _assert_resume_sizing_matches(
+    recorded_launch: Mapping[str, object], plan: SizingPlan, resume_checkpoint: str
+) -> None:
+    assert_resume_matches(
+        recorded=cast("Mapping[str, object]", recorded_launch["sizing_plan"]),
+        current=asdict(plan),
+        fields=RESUME_SIZING_FIELDS,
+        checkpoint=resume_checkpoint,
+        consequence=(
+            "The sizing plan is derived from a live free-VRAM reading, so this is usually "
+            "another process holding memory on a shared card rather than a different card. "
+            "num_generations is the GRPO advantage baseline and the population group-mix "
+            "grading estimates the opponent distribution from, so changing it mid-run changes "
+            "the experiment. Free the memory, or pass --no-autosize with the recorded values."
+        ),
+    )
+
+
+def _seed_and_describe_device(config: GameTrainConfig) -> tuple[dict[str, object], torch.dtype]:
+    random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    device = describe_device()
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    logger.info(
+        "landed on %s (%.1f GiB total, %.1f GiB free), %s",
+        device["device_name"],
+        device["total_vram_gib"],
+        device["free_vram_gib_at_start"],
+        f"{dtype=}",
+    )
+    return device, dtype
+
+
 def _prepare_run(
     config: GameTrainConfig, *, kernel_bridge: dict[str, object] | None
 ) -> PreparedRun | CompletedRun:
@@ -3087,36 +3190,7 @@ def _prepare_run(
     resume_checkpoint = resume.checkpoint
     recorded_launch: dict[str, object] | None = None
     if resume_checkpoint is not None:
-        recorded_launch = read_recorded_launch(output_dir, checkpoint=resume_checkpoint)
-        assert_resume_matches(
-            recorded={
-                **RESUME_IDENTITY_DEFAULTS,
-                **cast("Mapping[str, object]", recorded_launch["config"]),
-            },
-            current=asdict(config),
-            fields=RESUME_IDENTITY_FIELDS,
-            checkpoint=resume_checkpoint,
-            consequence=(
-                "Resuming would keep training that checkpoint's adapter, optimizer and step "
-                "counter under a different question, and its trace would carry both experiments "
-                "under one set of step numbers."
-            ),
-        )
-        # The registry half of the same check, against the record's top level rather than its config
-        # block. Separate call rather than a widened field list, because the two sets live in two
-        # places in the record and merging them would make `RESUME_IDENTITY_DEFAULTS` (which readers
-        # iterate as config fields) name one that is not one.
-        assert_resume_matches(
-            recorded={**RESUME_ARM_IDENTITY_DEFAULTS, **recorded_launch},
-            current=arm_identity(config.game_arm),
-            fields=RESUME_ARM_IDENTITY_FIELDS,
-            checkpoint=resume_checkpoint,
-            consequence=(
-                "The arm's game set is what its corpus may carry, so resuming under a different one "
-                "would train prompts the checkpoint's existing steps never saw, with one step "
-                "history and one summary covering both corpora."
-            ),
-        )
+        recorded_launch = _read_matching_recorded_launch(config, output_dir, resume_checkpoint)
         # After the identity check on purpose: a relaunch under the wrong arm is refused as such,
         # not waved through as "already complete".
         completed = completed_run(
@@ -3125,20 +3199,7 @@ def _prepare_run(
         if completed is not None:
             return completed
 
-    random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-    device = describe_device()
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
-    logger.info(
-        "landed on %s (%.1f GiB total, %.1f GiB free), %s",
-        device["device_name"],
-        device["total_vram_gib"],
-        device["free_vram_gib_at_start"],
-        f"{dtype=}",
-    )
+    device, dtype = _seed_and_describe_device(config)
 
     tokenizer, template_facts = resolve_tokenizer(config.load_source, thinking=config.thinking)
     rows = prepare_rows(config)
@@ -3163,30 +3224,8 @@ def _prepare_run(
         )
     )
     param_count = count_meta_parameters(config.load_source)
-    sequence_cost = checkpoint_sequence_cost(config.model_id)
-    rollout_cost = vllm_sequence_cost(sequence_cost, kv_cache_dtype=config.vllm_kv_cache_dtype)
-    trainer_weight_bytes = param_count * dtype.itemsize
-    # The opt-in rollout quantizer stores the engine weights as one byte per parameter.
-    engine_weight_bytes_per_parameter = (
-        1 if config.vllm_rollout_weights == "fp8" else dtype.itemsize
-    )
-    engine_weight_bytes = param_count * engine_weight_bytes_per_parameter
-    minimum_engine_bytes = engine_weight_bytes + rollout_cost.kv_cache_bytes(
-        prompt_tokens=config.max_prompt_tokens,
-        completion_tokens=config.max_completion_tokens,
-    )
-    effective_gpu_utilization = gpu_memory.cap_gpu_memory_utilization(
-        torch,
-        config.vllm_gpu_memory_utilization,
-        device=0,
-        reserve_bytes=0 if config.colocate_sleep_offload else trainer_weight_bytes,
-        minimum_utilization_bytes=minimum_engine_bytes,
-    )
-    logger.info(
-        "vLLM memory utilization requested=%.4f effective=%.4f minimum_engine_gib=%.2f",
-        config.vllm_gpu_memory_utilization,
-        effective_gpu_utilization,
-        minimum_engine_bytes / BYTES_PER_GIB,
+    effective_gpu_utilization = _effective_vllm_gpu_utilization(
+        config, param_count=param_count, dtype=dtype
     )
     plan, cost = _derive_plan(
         config,
@@ -3199,19 +3238,7 @@ def _prepare_run(
         len(dataset), plan, dynamic_sampling_oversample=config.dynamic_sampling_oversample
     )
     if recorded_launch is not None:
-        assert_resume_matches(
-            recorded=cast("Mapping[str, object]", recorded_launch["sizing_plan"]),
-            current=asdict(plan),
-            fields=RESUME_SIZING_FIELDS,
-            checkpoint=cast("str", resume_checkpoint),
-            consequence=(
-                "The sizing plan is derived from a live free-VRAM reading, so this is usually "
-                "another process holding memory on a shared card rather than a different card. "
-                "num_generations is the GRPO advantage baseline and the population group-mix "
-                "grading estimates the opponent distribution from, so changing it mid-run changes "
-                "the experiment. Free the memory, or pass --no-autosize with the recorded values."
-            ),
-        )
+        _assert_resume_sizing_matches(recorded_launch, plan, cast("str", resume_checkpoint))
 
     derived: dict[str, object] = {
         "thinking": config.thinking,
@@ -4819,6 +4846,49 @@ def _summarize_run(
     return summary, missing, trace_files
 
 
+def _check_built_trainer_and_seed_adapter(
+    config: GameTrainConfig, prepared: PreparedRun, trainer: GRPOTrainer
+) -> dict[str, object]:
+    checks = check_built_trainer(
+        trainer,
+        expected_linear_attention_layers=cast(
+            "int", prepared.lora_targets["expected_linear_attention_layers"]
+        ),
+        meta_parameter_count=cast("int", prepared.derived["meta_parameter_count"]),
+        episodes_per_step=prepared.plan.episodes_per_step,
+        gradient_accumulation_steps=prepared.plan.gradient_accumulation_steps,
+        dynamic_sampling_oversample=config.dynamic_sampling_oversample,
+    )
+    if config.init_adapter and prepared.resume_checkpoint is None:
+        checks["init_adapter_load"] = apply_init_adapter(trainer.model, config.init_adapter)
+    elif config.init_adapter:
+        # The checkpoint's weights already descend from this init; re-seeding would throw away the
+        # resumed steps. assert_resume_matches has verified the recorded init is this one.
+        logger.info(
+            "resuming from %s, so the init adapter is provenance rather than re-applied",
+            prepared.resume_checkpoint,
+        )
+    return checks
+
+
+def _raise_on_incomplete_artifacts(missing: list[str], trace_files: TraceFilesVerdict) -> None:
+    if missing:
+        raise RuntimeError(
+            f"expected metrics never reached trainer_state, {missing=}. The reward function's "
+            f"log_metric calls are the only route for these; a metric nobody reads back is not "
+            f"recorded."
+        )
+    if not trace_files.complete:
+        raise RuntimeError(
+            f"the rollout trace under {trace_files.checked_dir} has gaps: missing steps "
+            f"{list(trace_files.missing_steps)}, empty files at steps {list(trace_files.empty_steps)}, "
+            f"wrong row counts (step, rows) {[list(pair) for pair in trace_files.wrong_row_count_steps]} "
+            f"against {trace_files.expected_rows_per_step} per step. The summary records this as "
+            f"rollout_trace_complete=false; the per-completion trace is the run's raw material, so a "
+            f"run without all of it is not a finished measurement."
+        )
+
+
 def train_game_arm(
     config: GameTrainConfig, *, kernel_bridge: dict[str, object] | None = None
 ) -> GRPOTrainer | None:
@@ -4855,25 +4925,7 @@ def train_game_arm(
     # guard and the config upstream are proxies for what this object will generate through.
     assert_trainer_generates_through_vllm(trainer)
     record_attention_backends(prepared, trainer)
-    checks = check_built_trainer(
-        trainer,
-        expected_linear_attention_layers=cast(
-            "int", prepared.lora_targets["expected_linear_attention_layers"]
-        ),
-        meta_parameter_count=cast("int", prepared.derived["meta_parameter_count"]),
-        episodes_per_step=prepared.plan.episodes_per_step,
-        gradient_accumulation_steps=prepared.plan.gradient_accumulation_steps,
-        dynamic_sampling_oversample=config.dynamic_sampling_oversample,
-    )
-    if config.init_adapter and prepared.resume_checkpoint is None:
-        checks["init_adapter_load"] = apply_init_adapter(trainer.model, config.init_adapter)
-    elif config.init_adapter:
-        # The checkpoint's weights already descend from this init; re-seeding would throw away the
-        # resumed steps. assert_resume_matches has verified the recorded init is this one.
-        logger.info(
-            "resuming from %s, so the init adapter is provenance rather than re-applied",
-            prepared.resume_checkpoint,
-        )
+    checks = _check_built_trainer_and_seed_adapter(config, prepared, trainer)
 
     torch.cuda.reset_peak_memory_stats()
     wall_start = time.perf_counter()
@@ -4901,21 +4953,7 @@ def train_game_arm(
         # missing is exactly the artifact worth having off-box, and sync_directory reports rather
         # than raises, so a network failure cannot convert a finished run into a crashed one.
         sync_directory(Path(prepared.output_dir), config.s3_dest)
-    if missing:
-        raise RuntimeError(
-            f"expected metrics never reached trainer_state, {missing=}. The reward function's "
-            f"log_metric calls are the only route for these; a metric nobody reads back is not "
-            f"recorded."
-        )
-    if not trace_files.complete:
-        raise RuntimeError(
-            f"the rollout trace under {trace_files.checked_dir} has gaps: missing steps "
-            f"{list(trace_files.missing_steps)}, empty files at steps {list(trace_files.empty_steps)}, "
-            f"wrong row counts (step, rows) {[list(pair) for pair in trace_files.wrong_row_count_steps]} "
-            f"against {trace_files.expected_rows_per_step} per step. The summary records this as "
-            f"rollout_trace_complete=false; the per-completion trace is the run's raw material, so a "
-            f"run without all of it is not a finished measurement."
-        )
+    _raise_on_incomplete_artifacts(missing, trace_files)
     return trainer
 
 
@@ -5039,9 +5077,7 @@ def _add_sampler_mismatch_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: PLR0915  -- one statement per flag
-    """Parse one arm's training configuration."""
-    parser = argparse.ArgumentParser(description=__doc__)
+def _add_model_and_data_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--arm", required=True, choices=sorted(ARMS))
     # None so that --smoke can default the model without overriding an explicit choice.
     parser.add_argument("--model", dest="model_id", default=None)
@@ -5078,6 +5114,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     # measured termination length, so one constant is too small for a verbose model and needlessly
     # large for a terse one.
     parser.add_argument("--max-completion-tokens", type=int, default=None)
+
+
+def _add_optimizer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--temperature", type=float, default=TRAINING_TEMPERATURE)
     parser.add_argument("--top-p", type=float, default=TRAINING_TOP_P)
     parser.add_argument("--top-k", type=int, default=TRAINING_TOP_K)
@@ -5125,6 +5164,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             "on resume like the arm itself."
         ),
     )
+
+
+def _add_adapter_and_logging_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument(
@@ -5159,6 +5201,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
             f"timing probe or a deliberate diagnostic only."
         ),
     )
+
+
+def _add_completion_penalty_and_sizing_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--leave-one-out", action="store_true")
     parser.add_argument(
         "--dynamic-sampling-oversample",
@@ -5191,6 +5236,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     parser.add_argument("--max-prompts", type=int, default=None)
     parser.add_argument("--no-autosize", dest="autosize", action="store_false")
     parser.add_argument("--vram-usable-fraction", type=float, default=DEFAULT_VRAM_USABLE_FRACTION)
+
+
+def _add_vllm_and_memory_arguments(parser: argparse.ArgumentParser) -> None:
     # No backend flag: rollouts are vLLM-only (games.generation.VLLM_ONLY_RATIONALE), and an
     # environment still exporting the old switch is refused at startup by `assert_vllm_rollouts`.
     # The engine knobs below default from the environment for the same reason --s3-dest takes
@@ -5253,6 +5301,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
         ),
     )
     _add_sampler_mismatch_arguments(parser)
+
+
+def _add_output_and_resume_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", dest="output_dir", default=None)
     parser.add_argument(
         "--record-retention-manifest",
@@ -5286,6 +5337,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:  # noqa: 
     # flag-only default would silently leave the in-run liveness sync off on every Batch job, or
     # duplicate the URI in two places that could disagree.
     parser.add_argument("--s3-dest", default=os.environ.get("GAMES_S3_DEST", ""))
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> GameTrainConfig:
+    """Parse one arm's training configuration."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    _add_model_and_data_arguments(parser)
+    _add_optimizer_arguments(parser)
+    _add_adapter_and_logging_arguments(parser)
+    _add_completion_penalty_and_sizing_arguments(parser)
+    _add_vllm_and_memory_arguments(parser)
+    _add_output_and_resume_arguments(parser)
     args = parser.parse_args(argv)
 
     config = _config_from_namespace(args)
