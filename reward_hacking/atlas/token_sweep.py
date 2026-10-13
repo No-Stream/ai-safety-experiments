@@ -28,7 +28,7 @@ from reward_hacking.interp.jsonl_resume import (
     resume_records,
 )
 from reward_hacking.interp.linear_probe import fit_logistic_probe
-from reward_hacking.jsonl_io import read_jsonl_objects_value_error, write_json_atomic
+from reward_hacking.jsonl_io import read_jsonl_objects, write_json_atomic
 from reward_hacking.semantic_identity import (
     model_weight_identity,
     normalize_legacy_model_reference,
@@ -317,8 +317,8 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
     output_key = _token_sweep_key(model_key, sample_source)
     sample_path = run_dir / f"samples.{artifact_model_key(sample_source)}.jsonl"
     grade_path = run_dir / f"grades.{artifact_model_key(sample_source)}.jsonl"
-    samples = read_jsonl_objects_value_error(sample_path)
-    joined = _sample_rows(samples, read_jsonl_objects_value_error(grade_path), base_model)
+    samples = read_jsonl_objects(sample_path)
+    joined = _sample_rows(samples, read_jsonl_objects(grade_path), base_model)
     model_id, adapter_id = resolve_model_key(model_key, base_model=base_model)
     loaded_model, loaded_tokenizer = load_model_and_tokenizer(model_id, dtype=torch.bfloat16)
     tokenizer = cast("PreTrainedTokenizerBase", loaded_tokenizer)

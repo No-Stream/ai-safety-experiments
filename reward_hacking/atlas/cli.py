@@ -26,7 +26,7 @@ from typing import Any, cast
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS
-from reward_hacking.jsonl_io import read_jsonl_objects_value_error, write_json_atomic
+from reward_hacking.jsonl_io import read_jsonl_objects, write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +173,7 @@ def _sample_sampling_budget(arguments: argparse.Namespace, prompt_path: Path) ->
         )
     if arguments.max_prompts is not None and arguments.max_prompts < 1:
         raise ValueError(f"--max-prompts must be positive, got {arguments.max_prompts}")
-    prompt_count = len(read_jsonl_objects_value_error(prompt_path))
+    prompt_count = len(read_jsonl_objects(prompt_path))
     if prompt_count == 0:
         raise ValueError(f"no prompts found in {prompt_path}")
     if arguments.max_prompts is not None:
@@ -388,8 +388,8 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
     summary: dict[str, object] = {"models": {}, "transfers": [], "original_probe_standin": {}}
     for model_key in model_keys:
         output_key = artifact_model_key(model_key)
-        sample_records = read_jsonl_objects_value_error(run_dir / f"samples.{output_key}.jsonl")
-        grade_records = read_jsonl_objects_value_error(run_dir / f"grades.{output_key}.jsonl")
+        sample_records = read_jsonl_objects(run_dir / f"samples.{output_key}.jsonl")
+        grade_records = read_jsonl_objects(run_dir / f"grades.{output_key}.jsonl")
         grade_by_id = {str(record["sample_id"]): record for record in grade_records}
         shard = np.load(run_dir / f"activations.{output_key}.npy", mmap_mode="r")
         index = json.loads(

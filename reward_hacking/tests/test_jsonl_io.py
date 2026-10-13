@@ -9,8 +9,6 @@ from reward_hacking.jsonl_io import (
     append_jsonl_ascii,
     append_jsonl_unicode,
     read_jsonl_objects,
-    read_jsonl_objects_must_be_object,
-    read_jsonl_objects_value_error,
     write_json_atomic,
     write_json_atomic_unicode_strict,
 )
@@ -24,7 +22,10 @@ class TestAppendAndReadJsonl:
         records_path = tmp_path / "records.jsonl"
         append_jsonl_ascii(records_path, {"key": "b", "score": 2})
         append_jsonl_ascii(records_path, {"key": "a", "score": 1})
-        assert read_jsonl_objects_value_error(records_path) == [{"key": "b", "score": 2}, {"key": "a", "score": 1}]
+        assert read_jsonl_objects(records_path) == [
+            {"key": "b", "score": 2},
+            {"key": "a", "score": 1},
+        ]
 
     def test_append_writes_sorted_keys_one_record_per_line(self, tmp_path: Path) -> None:
         records_path = tmp_path / "records.jsonl"
@@ -34,17 +35,17 @@ class TestAppendAndReadJsonl:
     def test_read_skips_blank_lines(self, tmp_path: Path) -> None:
         records_path = tmp_path / "records.jsonl"
         records_path.write_text('{"a": 1}\n\n   \n{"a": 2}\n', encoding="utf-8")
-        assert read_jsonl_objects_value_error(records_path) == [{"a": 1}, {"a": 2}]
+        assert read_jsonl_objects(records_path) == [{"a": 1}, {"a": 2}]
 
     def test_read_rejects_line_that_is_not_an_object(self, tmp_path: Path) -> None:
         records_path = tmp_path / "records.jsonl"
         records_path.write_text('{"a": 1}\n[1, 2]\n', encoding="utf-8")
         with pytest.raises(ValueError, match=r"records\.jsonl:2 is not a JSON object"):
-            read_jsonl_objects_value_error(records_path)
+            read_jsonl_objects(records_path)
 
     def test_read_missing_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
-            read_jsonl_objects_value_error(tmp_path / "absent.jsonl")
+            read_jsonl_objects(tmp_path / "absent.jsonl")
 
 
 class TestWriteJsonAtomic:
@@ -64,14 +65,6 @@ class TestWriteJsonAtomic:
 
 
 class TestVariants:
-    def test_non_object_row_error_type_and_message_per_variant(self, tmp_path: Path) -> None:
-        records_path = tmp_path / "records.jsonl"
-        records_path.write_text('{"a": 1}\n[1]\n', encoding="utf-8")
-        with pytest.raises(TypeError, match=r"records\.jsonl:2 is not a JSON object"):
-            read_jsonl_objects(records_path)
-        with pytest.raises(TypeError, match=r"records\.jsonl:2 must be a JSON object"):
-            read_jsonl_objects_must_be_object(records_path)
-
     def test_unicode_appends_unescaped_and_ascii_appends_escaped(self, tmp_path: Path) -> None:
         unicode_path = tmp_path / "unicode.jsonl"
         ascii_path = tmp_path / "ascii.jsonl"

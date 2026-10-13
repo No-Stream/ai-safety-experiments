@@ -21,7 +21,7 @@ from reward_hacking.hatch_probe import (
     ProbeCell,
     render_cell_prompt,
 )
-from reward_hacking.jsonl_io import read_jsonl_objects_must_be_object
+from reward_hacking.jsonl_io import read_jsonl_objects
 from reward_hacking.organisms.aisi_codecontests import (
     ChatTokenizer,
     CodeContestProblem,
@@ -430,7 +430,7 @@ def load_prompt_split(path: Path, current_records: Sequence[PromptRecord]) -> Pr
     if record_keys != split_keys:
         raise ValueError(f"{path} prompt ids do not match the currently rendered prompt pool")
     stored_path = path.with_name("prompts.jsonl")
-    stored_records = read_jsonl_objects_must_be_object(stored_path) if stored_path.is_file() else []
+    stored_records = read_jsonl_objects(stored_path) if stored_path.is_file() else []
     live_records = {
         (record.environment, record.problem_id): record.to_json_dict() for record in current_records
     }
@@ -661,7 +661,7 @@ def render_atlas_pool(
     """Re-render Atlas prompts from the full prompts-stage file and verify its 9B text."""
     context = _atlas_prompt_context(prompt_path, screen_rows, tokenizer, teacher_tokenizer)
     records: list[PromptRecord] = []
-    for row in read_jsonl_objects_must_be_object(prompt_path):
+    for row in read_jsonl_objects(prompt_path):
         record = _render_atlas_row(row, context)
         if record is not None:
             records.append(record)
@@ -816,9 +816,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Load local source pools, render prompts and write the one-time split."""
     arguments = _build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    atlas_screen_rows = read_jsonl_objects_must_be_object(arguments.atlas_screen_prompts)
-    aisi_screen_rows = read_jsonl_objects_must_be_object(arguments.aisi_screen_samples)
-    ilcb_screen_rows = read_jsonl_objects_must_be_object(arguments.ilcb_screen_records)
+    atlas_screen_rows = read_jsonl_objects(arguments.atlas_screen_prompts)
+    aisi_screen_rows = read_jsonl_objects(arguments.aisi_screen_samples)
+    ilcb_screen_rows = read_jsonl_objects(arguments.ilcb_screen_records)
     atlas_screen_ids = tuple(dict.fromkeys(str(row["item_id"]) for row in atlas_screen_rows))
     aisi_screen_ids = tuple(dict.fromkeys(str(row["problem_id"]) for row in aisi_screen_rows))
     ilcb_screen_ids = tuple(dict.fromkeys(str(row["problem_id"]) for row in ilcb_screen_rows))

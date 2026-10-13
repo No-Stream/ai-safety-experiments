@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from reward_hacking.distill.sample import token_ids_sha256
 from reward_hacking.jsonl_io import (
-    read_jsonl_objects_must_be_object,
+    read_jsonl_objects,
     write_json_atomic_unicode_strict,
 )
 from reward_hacking.organism_rl.health import is_syntax_parse_error
@@ -228,7 +228,7 @@ def _token_ids(row: Mapping[str, Any], field: str, *, context: str) -> list[int]
 
 
 def _index_samples(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    rows = read_jsonl_objects_must_be_object(path)
+    rows = read_jsonl_objects(path)
     indexed: dict[str, dict[str, Any]] = {}
     for line_number, row in enumerate(rows, start=1):
         context = f"{path}:{line_number}"
@@ -254,7 +254,7 @@ def _index_samples(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str
 
 def _index_grades(path: Path, samples: Mapping[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     indexed: dict[str, dict[str, Any]] = {}
-    for line_number, row in enumerate(read_jsonl_objects_must_be_object(path), start=1):
+    for line_number, row in enumerate(read_jsonl_objects(path), start=1):
         context = f"{path}:{line_number}"
         key = _required_string(row, "key", context=context)
         sample = samples.get(key)

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS, grade_model
 from reward_hacking.atlas.sampling import BASE_MODEL_ID, artifact_model_key
-from reward_hacking.jsonl_io import read_jsonl_objects_value_error, write_json_atomic
+from reward_hacking.jsonl_io import read_jsonl_objects, write_json_atomic
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -372,9 +372,9 @@ def grade_steering_outputs(  # noqa: PLR0913
     """Bridge saved steering completions through Atlas's jailed grader and summarize each cell."""
     if timeout_seconds < 1 or workers < 1:
         raise ValueError("timeout_seconds and workers must be positive")
-    steering_records = read_jsonl_objects_value_error(steering_path)
+    steering_records = read_jsonl_objects(steering_path)
     _validate_steering_ledger(steering_path, steering_records)
-    prompt_records = read_jsonl_objects_value_error(prompts_path)
+    prompt_records = read_jsonl_objects(prompts_path)
     samples = _atlas_samples_from_steering(
         steering_records,
         prompt_records,
@@ -395,7 +395,7 @@ def grade_steering_outputs(  # noqa: PLR0913
     )
     summary = _summarize_grades(
         samples,
-        read_jsonl_objects_value_error(grade_path),
+        read_jsonl_objects(grade_path),
         model_key=model_key,
     )
     summary_path = output_dir / "steer-summary.json"

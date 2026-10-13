@@ -28,7 +28,7 @@ from reward_hacking.atlas.sampling import (
 from reward_hacking.interp.jsonl_resume import normalize_identity
 from reward_hacking.jsonl_io import (
     append_jsonl_ascii,
-    read_jsonl_objects_value_error,
+    read_jsonl_objects,
     write_json_atomic,
 )
 from reward_hacking.semantic_identity import (
@@ -160,7 +160,7 @@ def neutral_model(  # noqa: C901, PLR0913, PLR0915 - base and adapter setup are 
 
     if max_tokens < 1:
         raise ValueError(f"max_tokens must be positive, got {max_tokens}")
-    samples = read_jsonl_objects_value_error(sample_path)
+    samples = read_jsonl_objects(sample_path)
     if max_records is not None:
         if max_records < 1:
             raise ValueError(f"max_records must be positive, got {max_records}")
@@ -355,9 +355,9 @@ def _write_neutral_summary(run_dir: Path, model_key: str, output_path: Path) -> 
     output_key = artifact_model_key(model_key)
     grades = {
         str(grade["sample_id"]): grade
-        for grade in read_jsonl_objects_value_error(run_dir / f"grades.{output_key}.jsonl")
+        for grade in read_jsonl_objects(run_dir / f"grades.{output_key}.jsonl")
     }
-    summary = neutral_summary(read_jsonl_objects_value_error(output_path), grades)
+    summary = neutral_summary(read_jsonl_objects(output_path), grades)
     write_json_atomic(
         run_dir / f"neutral-summary.{output_key}.json", {"model_key": model_key, "groups": summary}
     )

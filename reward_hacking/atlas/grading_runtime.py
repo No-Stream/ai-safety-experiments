@@ -24,7 +24,7 @@ from reward_hacking.interp.jsonl_resume import normalize_identity
 from reward_hacking.jailed_poc import jail_python, run_in_jail
 from reward_hacking.jsonl_io import (
     append_jsonl_ascii,
-    read_jsonl_objects_value_error,
+    read_jsonl_objects,
     write_json_atomic,
 )
 from reward_hacking.semantic_identity import normalize_legacy_model_reference, semantic_rows
@@ -135,7 +135,7 @@ def grade_model(  # noqa: C901, PLR0913 - stage orchestration and legacy checks 
         raise FileNotFoundError(f"grading scratch parent does not exist: {scratch_parent}")
     output_key = artifact_model_key(model_key)
     sample_path = run_dir / f"samples.{output_key}.jsonl"
-    samples = read_jsonl_objects_value_error(sample_path)
+    samples = read_jsonl_objects(sample_path)
     if max_records is not None:
         if max_records < 1:
             raise ValueError(f"max_records must be positive, got {max_records}")
@@ -219,7 +219,7 @@ def grade_model(  # noqa: C901, PLR0913 - stage orchestration and legacy checks 
             record = future.result()
             append_jsonl_ascii(output_path, record)
             ledger.mark_record_complete(str(record["sample_id"]))
-    graded_records = read_jsonl_objects_value_error(output_path)
+    graded_records = read_jsonl_objects(output_path)
     count = len(graded_records)
     if count == 0:
         raise RuntimeError(f"grading produced no records for {model_key}")

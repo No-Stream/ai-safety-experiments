@@ -32,7 +32,7 @@ from reward_hacking.interp.jsonl_resume import (
 )
 from reward_hacking.jsonl_io import (
     append_jsonl_ascii,
-    read_jsonl_objects_value_error,
+    read_jsonl_objects,
     write_json_atomic,
 )
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
@@ -673,7 +673,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
 
     if samples_per_prompt < 1:
         raise ValueError(f"samples_per_prompt must be positive, got {samples_per_prompt}")
-    prompts = read_jsonl_objects_value_error(prompt_path)
+    prompts = read_jsonl_objects(prompt_path)
     if max_prompts is not None:
         if max_prompts < 1:
             raise ValueError(f"max_prompts must be positive, got {max_prompts}")

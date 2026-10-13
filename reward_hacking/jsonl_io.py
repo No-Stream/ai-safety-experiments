@@ -14,9 +14,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _read_jsonl_objects(
-    path: Path, not_object_template: str, error_type: type[Exception]
-) -> list[dict[str, Any]]:
+def read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
+    """Read non-blank JSONL lines as objects; a non-object row raises ValueError naming path and line."""
     records: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as records_file:
         for line_number, line in enumerate(records_file, start=1):
@@ -24,24 +23,9 @@ def _read_jsonl_objects(
                 continue
             record = json.loads(line)
             if not isinstance(record, dict):
-                raise error_type(not_object_template.format(path=path, line_number=line_number))
+                raise ValueError(f"{path}:{line_number} is not a JSON object")  # noqa: TRY004 - atlas.cli turns ValueError into a parser error
             records.append(record)
     return records
-
-
-def read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
-    """Read non-blank JSONL lines as objects; a non-object row raises TypeError "is not a JSON object"."""
-    return _read_jsonl_objects(path, "{path}:{line_number} is not a JSON object", TypeError)
-
-
-def read_jsonl_objects_must_be_object(path: Path) -> list[dict[str, Any]]:
-    """Read non-blank JSONL lines as objects; a non-object row raises TypeError "must be a JSON object"."""
-    return _read_jsonl_objects(path, "{path}:{line_number} must be a JSON object", TypeError)
-
-
-def read_jsonl_objects_value_error(path: Path) -> list[dict[str, Any]]:
-    """Read non-blank JSONL lines as objects; a non-object row raises ValueError "is not a JSON object"."""
-    return _read_jsonl_objects(path, "{path}:{line_number} is not a JSON object", ValueError)
 
 
 def append_jsonl_ascii(path: Path, record: Mapping[str, object]) -> None:

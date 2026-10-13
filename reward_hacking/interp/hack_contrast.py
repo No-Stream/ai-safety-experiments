@@ -47,7 +47,7 @@ from reward_hacking.interp.jsonl_resume import ResumeLedger, resume_records
 from reward_hacking.interp.lens_fit_runtime import weights_fingerprint
 from reward_hacking.interp.linear_probe import grouped_test_masks
 from reward_hacking.interp.steering import Hook, residual_intervention, steering_hook
-from reward_hacking.jsonl_io import read_jsonl_objects_must_be_object
+from reward_hacking.jsonl_io import read_jsonl_objects
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Sequence
@@ -443,7 +443,7 @@ def _validate_pair_record(
 
 def read_pairs(path: Path) -> list[dict[str, Any]]:
     """Read and validate matched synthetic conversations from a local JSONL artifact."""
-    pairs = read_jsonl_objects_must_be_object(path)
+    pairs = read_jsonl_objects(path)
     if not pairs:
         raise ValueError(f"no contrast pairs found in {path}")
     seen_pair_ids: set[str] = set()
@@ -1650,10 +1650,8 @@ def _atlas_rows(
 ) -> tuple[list[tuple[str, int]], dict[tuple[str, int], int | None]]:
     samples_path = run_dir / f"samples.{model_key}.jsonl"
     grades_path = run_dir / f"grades.{model_key}.jsonl"
-    samples = {
-        str(row["sample_id"]): row for row in read_jsonl_objects_must_be_object(samples_path)
-    }
-    grades = {str(row["sample_id"]): row for row in read_jsonl_objects_must_be_object(grades_path)}
+    samples = {str(row["sample_id"]): row for row in read_jsonl_objects(samples_path)}
+    grades = {str(row["sample_id"]): row for row in read_jsonl_objects(grades_path)}
     if len(samples) != len(sample_ids) or len(grades) != len(sample_ids):
         raise ValueError(f"Atlas metadata row counts do not match capture index for {model_key}")
     pair_keys: list[tuple[str, int]] = []
@@ -2396,7 +2394,7 @@ def _prompt_records(
     max_prompts: int | None = None,
     item_ids: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    prompts = read_jsonl_objects_must_be_object(path)
+    prompts = read_jsonl_objects(path)
     if not prompts:
         raise ValueError(f"no prompts found in {path}")
     _validate_prompt_records(path, prompts)

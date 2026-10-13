@@ -37,7 +37,7 @@ from reward_hacking.interp.generation_capture import (
 from reward_hacking.interp.jsonl_resume import normalize_identity
 from reward_hacking.jsonl_io import (
     append_jsonl_ascii,
-    read_jsonl_objects_value_error,
+    read_jsonl_objects,
     write_json_atomic,
 )
 from reward_hacking.model_backend import SamplingConfig
@@ -471,7 +471,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
 
     from reward_hacking.interp.directions import load_model_and_tokenizer  # noqa: PLC0415
 
-    samples = read_jsonl_objects_value_error(sample_path)
+    samples = read_jsonl_objects(sample_path)
     if max_items is not None:
         allowed_items = {str(sample["item_id"]) for sample in samples[:max_items]}
         samples = [sample for sample in samples if str(sample["item_id"]) in allowed_items]
