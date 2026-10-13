@@ -60,7 +60,7 @@ def _label_mechanism(
 
 
 def test_current_taxonomy_preserves_historical_compatibility_and_family_mapping() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v13"
+    assert TAXONOMY_VERSION == "hack_strategy_v14"
     assert "hack_strategy_v10" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert "hack_strategy_v11" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert {"expected_regenerated", "check_budget_relaxed"}.issubset(STRATEGIES)

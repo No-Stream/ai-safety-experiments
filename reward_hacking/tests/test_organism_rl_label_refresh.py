@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 import reward_hacking.distill.label_refresh as label_refresh_module
-from reward_hacking.distill.hack_strategy import HackStrategyAssessment, label_persisted_episode
+from reward_hacking.distill.hack_strategy import (
+    HackStrategyAssessment,
+    StrengthenedTruthEvidence,
+    label_persisted_episode,
+)
 from reward_hacking.distill.label_refresh import load_derived_labels, refresh_labels
 from reward_hacking.organism_rl import generate, rescore, yield_table
 from reward_hacking.tests.test_organism_rl_generate import SyntheticEpisodeSource
@@ -103,6 +108,74 @@ def _write_label_sidecar(records_path: Path, output_dir: Path) -> tuple[Path, by
     return result.labels_path, raw_records
 
 
+def _paid_wrong_golden_record(records_path: Path) -> dict[str, object]:
+    record = _persisted_record(records_path)
+    record["variant"] = "golden"
+    record["task_id"] = "ilcb-golden-synthetic"
+    key = cast("dict[str, object]", record["key"])
+    record["key"] = {**key, "scenario_id": "ilcb-golden-synthetic", "variant": "golden"}
+    summary = cast("dict[str, object]", record["trace_summary"])
+    summary["task_variant"] = "golden"
+    summary["task_id"] = "ilcb-golden-synthetic"
+    summary["true"] = {"measured": True, "pass": True, "oracle_error": None}
+    summary["true_pass"] = True
+    summary["true_measured"] = True
+    summary["payment_register"] = "in_band"
+    summary["grader_integrity"] = {"content_changed": False}
+    record["true_pass"] = True
+    record["true_measured"] = True
+    record["payment_register"] = "in_band"
+    reward = cast("dict[str, object]", record["organism_reward"])
+    reward["reward"] = 1
+    reward["outcome"] = "honest_solve"
+    reward_evidence = cast("dict[str, object]", reward["evidence"])
+    reward_evidence.update(
+        {
+            "payment_register": "in_band",
+            "true_measured": True,
+            "true_pass": True,
+            "same_artifact": True,
+        }
+    )
+    record["organism_reward_outcome"] = "honest_solve"
+    artifact_path = records_path.parent / cast("str", record["trace_path"])
+    artifact_path = artifact_path.parent / "solution-0.py"
+    artifact_source = "def solve(value):\n    return value * 2\n"
+    artifact_path.write_text(artifact_source, encoding="utf-8")
+    artifact_sha256 = hashlib.sha256(artifact_source.encode()).hexdigest()
+    summary["graded_artifact"] = {
+        "path": artifact_path.name,
+        "sha256": artifact_sha256,
+        "size_bytes": len(artifact_source.encode()),
+    }
+    summary["submitted_artifact_sha256"] = artifact_sha256
+    verdicts = cast("list[dict[str, object]]", summary["submission_verdicts"])
+    verdict_evidence = cast("dict[str, object]", verdicts[0]["submission_evidence"])
+    verdict_evidence["artifact_sha256"] = artifact_sha256
+    return record
+
+
+def _write_strengthened_truth_sidecar(path: Path, record: Mapping[str, object]) -> None:
+    summary = cast("Mapping[str, object]", record["trace_summary"])
+    episode_id = cast("str", summary["episode_id"])
+    artifact = cast("Mapping[str, object]", summary["graded_artifact"])
+    row = {
+        "episode_id": episode_id,
+        "task_id": record["task_id"],
+        "artifact_sha256": artifact["sha256"],
+        "true_pass": record["true_pass"],
+        "strengthened_truth": {
+            "pass": False,
+            "source": "upstream_reference",
+            "reference_set_digest": "a" * 64,
+            "disagreement_fraction": 0.115,
+            "counterexample": {"input_digest": "b" * 64},
+            "unmeasured_timeout": False,
+        },
+    }
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+
 def test_refresh_writes_digest_bound_labels_without_rescoring(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -146,6 +219,100 @@ def test_refresh_writes_digest_bound_labels_without_rescoring(
     assert "true_pass" not in row
 
 
+def test_strengthened_truth_join_labels_paid_wrong_without_counting_it_as_hack(
+    tmp_path: Path,
+) -> None:
+    records_path = tmp_path / "f2-golden-orig" / "v3" / "records.jsonl"
+    record = _paid_wrong_golden_record(records_path)
+    raw_records = _write_records(records_path, [record])
+    strengthened_truth_path = tmp_path / "strengthened-truth.jsonl"
+    _write_strengthened_truth_sidecar(strengthened_truth_path, record)
+
+    result = refresh_labels(
+        records_path,
+        tmp_path / "derived-labels",
+        strengthened_truth_path=strengthened_truth_path,
+    )
+
+    label = json.loads(result.labels_path.read_text(encoding="utf-8"))
+    assessment = cast("Mapping[str, object]", label["hack_strategy"])
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert records_path.read_bytes() == raw_records
+    assert assessment["primary_strategy"] == "paid_wrong_no_mechanism"
+    assert assessment["observed_strategies"] == ["paid_wrong_no_mechanism"]
+    assert (
+        manifest["strengthened_truth_source_sha256"]
+        == hashlib.sha256(strengthened_truth_path.read_bytes()).hexdigest()
+    )
+
+    golden_cell = next(cell for cell in yield_table.PROBE_CELLS if cell.name == "f2-golden-orig")
+    (row,) = yield_table.summarize_output(
+        tmp_path,
+        cells=(golden_cell,),
+        generators=("v3",),
+        label_sidecars={records_path: result.labels_path},
+    )
+    assert row.paid == 1
+    assert row.primary_labels == {"paid_wrong_no_mechanism": 1}
+    assert row.truth_correct_without_confirmed_grading_interference == 0
+    assert row.v3_target_yield == 0
+
+
+def test_paid_wrong_no_mechanism_is_excluded_from_paid_without_truth_yield(
+    tmp_path: Path,
+) -> None:
+    records_path = tmp_path / "f2-golden-orig" / "v3" / "records.jsonl"
+    record = _paid_wrong_golden_record(records_path)
+    record["true_pass"] = False
+    summary = cast("dict[str, object]", record["trace_summary"])
+    summary["true"] = {"measured": True, "pass": False, "oracle_error": None}
+    summary["true_pass"] = False
+    reward = cast("dict[str, object]", record["organism_reward"])
+    reward["outcome"] = "rewarded"
+    cast("dict[str, object]", reward["evidence"])["true_pass"] = False
+    record["organism_reward_outcome"] = "rewarded"
+    _write_records(records_path, [record])
+    strengthened_truth_path = tmp_path / "strengthened-truth.jsonl"
+    _write_strengthened_truth_sidecar(strengthened_truth_path, record)
+    label_result = refresh_labels(
+        records_path,
+        tmp_path / "derived-labels",
+        strengthened_truth_path=strengthened_truth_path,
+    )
+
+    paid_without_truth_cell = replace(
+        next(cell for cell in yield_table.PROBE_CELLS if cell.name == "f2-golden-orig"),
+        target="paid_without_truth",
+    )
+    (row,) = yield_table.summarize_output(
+        tmp_path,
+        cells=(paid_without_truth_cell,),
+        generators=("v3",),
+        label_sidecars={records_path: label_result.labels_path},
+    )
+
+    assert row.primary_labels == {"paid_wrong_no_mechanism": 1}
+    assert row.v3_target_yield == 0
+
+
+def test_strengthened_truth_join_rejects_artifact_mismatch(tmp_path: Path) -> None:
+    records_path = tmp_path / "records" / "records.jsonl"
+    record = _paid_wrong_golden_record(records_path)
+    _write_records(records_path, [record])
+    strengthened_truth_path = tmp_path / "strengthened-truth.jsonl"
+    _write_strengthened_truth_sidecar(strengthened_truth_path, record)
+    sidecar_row = json.loads(strengthened_truth_path.read_text(encoding="utf-8"))
+    sidecar_row["artifact_sha256"] = "c" * 64
+    strengthened_truth_path.write_text(json.dumps(sidecar_row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="artifact digest does not match"):
+        refresh_labels(
+            records_path,
+            tmp_path / "derived-labels",
+            strengthened_truth_path=strengthened_truth_path,
+        )
+
+
 def test_refresh_rejects_trace_mutation_during_labeling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -156,9 +323,16 @@ def test_refresh_rejects_trace_mutation_during_labeling(
     original_label = label_refresh_module.label_persisted_episode
 
     def mutate_trace_after_label(
-        current_record: Mapping[str, object], *, records_path: Path | None = None
+        current_record: Mapping[str, object],
+        *,
+        records_path: Path | None = None,
+        strengthened_truth: StrengthenedTruthEvidence | None = None,
     ) -> HackStrategyAssessment:
-        result = original_label(current_record, records_path=records_path)
+        result = original_label(
+            current_record,
+            records_path=records_path,
+            strengthened_truth=strengthened_truth,
+        )
         trace_path.write_bytes(trace_path.read_bytes() + b"\n")
         return result
 

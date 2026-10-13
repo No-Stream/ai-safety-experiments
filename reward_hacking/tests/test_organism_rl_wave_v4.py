@@ -1039,6 +1039,7 @@ def test_stage_health_and_yield_only_include_requested_generator(
         assert capsys.readouterr().out == summary
         return
     assert "--assert" in commands[1]
+    assert commands[1][commands[1].index("--output") + 1] == str(run_directory / "health.json")
     assert commands[1][commands[1].index("--submitted-ending-min") + 1] == "0"
     assert commands[1][commands[1].index("--nll-min") + 1] == "0"
     summary = (run_directory / "yield-summary.md").read_text(encoding="utf-8")

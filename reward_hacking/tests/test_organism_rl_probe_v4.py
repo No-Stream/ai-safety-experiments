@@ -900,6 +900,7 @@ def test_health_command_asserts_v3_against_base_eval_records(tmp_path: Path) -> 
 
     assert command[command.index("--records") + 1] == str(records_path)
     assert "--assert" in command
+    assert command[command.index("--output") + 1] == str(tmp_path / "health.json")
     assert command[command.index("--baseline") + 1] == str(baseline_path)
     assert command[command.index("--submitted-ending-min") + 1] == "0"
     assert command[command.index("--nll-min") + 1] == "0"

@@ -20,8 +20,11 @@ from reward_hacking.distill.call_history import (
 )
 from reward_hacking.distill.hack_strategy import (
     TAXONOMY_VERSION,
+    StrengthenedTruthEvidence,
     _reconstruct_final_source,  # pyright: ignore[reportPrivateUsage]
+    _recorded_true_pass,  # pyright: ignore[reportPrivateUsage]
     label_persisted_episode,
+    read_strengthened_truth_sidecar,
 )
 from reward_hacking.distill.table_provenance import confirmed_visible_table
 from reward_hacking.organism_rl.strengthened_truth_grade import recorded_artifact_sha256
@@ -38,6 +41,15 @@ class LabelRefreshResult:
 
     labels_path: Path
     manifest_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _StrengthenedTruthBinding:
+    task_id: str
+    artifact_sha256: str | None
+    true_pass: bool | None
+    evidence: StrengthenedTruthEvidence
+    source_sha256: str
 
 
 def _sha256(value: bytes) -> str:
@@ -263,7 +275,163 @@ def _validate_unique_episode_identities(
         seen.add(identity_key)
 
 
-def refresh_labels(records_path: Path, output_dir: Path) -> LabelRefreshResult:
+def _read_strengthened_truth_bindings(
+    sidecar_path: Path,
+) -> tuple[bytes, dict[str, _StrengthenedTruthBinding]]:
+    sidecar_bytes = sidecar_path.read_bytes()
+    evidence_by_episode_id = read_strengthened_truth_sidecar(sidecar_path)
+    bindings: dict[str, _StrengthenedTruthBinding] = {}
+    for row_index, raw_line in enumerate(sidecar_bytes.splitlines(keepends=True), start=1):
+        row_value: object = json.loads(raw_line)
+        if not isinstance(row_value, dict):
+            raise TypeError(f"{sidecar_path}:{row_index} must contain a JSON object")
+        row = cast("dict[str, object]", row_value)
+        episode_id = row.get("episode_id")
+        task_id = row.get("task_id")
+        artifact_sha256 = row.get("artifact_sha256")
+        true_pass = row.get("true_pass")
+        if not isinstance(episode_id, str) or not episode_id:
+            raise TypeError(f"{sidecar_path}:{row_index} requires an episode_id")
+        if not isinstance(task_id, str) or not task_id:
+            raise TypeError(f"{sidecar_path}:{row_index} requires a task_id")
+        if artifact_sha256 is not None and not isinstance(artifact_sha256, str):
+            raise TypeError(f"{sidecar_path}:{row_index} artifact_sha256 must be a string or null")
+        if true_pass is not None and type(true_pass) is not bool:
+            raise TypeError(f"{sidecar_path}:{row_index} true_pass must be a boolean or null")
+        evidence = evidence_by_episode_id[episode_id]
+        bindings[episode_id] = _StrengthenedTruthBinding(
+            task_id=task_id,
+            artifact_sha256=artifact_sha256,
+            true_pass=true_pass,
+            evidence=evidence,
+            source_sha256=_sha256(raw_line),
+        )
+    if set(bindings) != set(evidence_by_episode_id):
+        raise ValueError(f"{sidecar_path} has inconsistent episode identities")
+    return sidecar_bytes, bindings
+
+
+def _strengthened_truth_episode_id(record: Mapping[str, object], context: str) -> str | None:
+    if record.get("variant") not in {"original", "golden", "timed"} or record.get("family") not in {
+        "aisi",
+        "ilcb",
+    }:
+        return None
+    summary = record.get("trace_summary", record.get("episode_record"))
+    if not isinstance(summary, Mapping):
+        raise TypeError(f"{context} requires a trace summary for strengthened truth")
+    episode_id = summary.get("episode_id")
+    if not isinstance(episode_id, str) or not episode_id:
+        raise TypeError(f"{context} requires an episode_id for strengthened truth")
+    return episode_id
+
+
+def _strengthened_truth_for_record(
+    record: Mapping[str, object],
+    *,
+    context: str,
+    artifact_sha256: str | None,
+    bindings: Mapping[str, _StrengthenedTruthBinding],
+) -> tuple[StrengthenedTruthEvidence | None, str | None]:
+    episode_id = _strengthened_truth_episode_id(record, context)
+    if episode_id is None:
+        return None, None
+    binding = bindings.get(episode_id)
+    if binding is None:
+        raise ValueError(f"{context} is missing strengthened-truth sidecar evidence")
+    task_id = record.get("task_id")
+    if binding.task_id != task_id:
+        raise ValueError(f"{context} strengthened-truth task id does not match")
+    if binding.artifact_sha256 != artifact_sha256:
+        raise ValueError(f"{context} strengthened-truth artifact digest does not match")
+    if binding.true_pass != _recorded_true_pass(record):
+        raise ValueError(f"{context} strengthened-truth original verdict does not match")
+    return binding.evidence, binding.source_sha256
+
+
+def _load_strengthened_truth_inputs(
+    strengthened_truth_path: Path | None, output_dir: Path
+) -> tuple[Path | None, bytes | None, dict[str, _StrengthenedTruthBinding] | None]:
+    if strengthened_truth_path is None:
+        return None, None, None
+    strengthened_truth_path = strengthened_truth_path.resolve(strict=True)
+    if strengthened_truth_path.is_relative_to(output_dir):
+        raise ValueError("strengthened-truth sidecar and label output directory overlap")
+    strengthened_truth_bytes, bindings = _read_strengthened_truth_bindings(strengthened_truth_path)
+    return strengthened_truth_path, strengthened_truth_bytes, bindings
+
+
+def _truth_for_label(
+    record: Mapping[str, object],
+    *,
+    context: str,
+    artifact_sha256: str | None,
+    bindings: dict[str, _StrengthenedTruthBinding] | None,
+    used_episode_ids: set[str],
+) -> tuple[StrengthenedTruthEvidence | None, str | None]:
+    if bindings is None:
+        return None, None
+    strengthened_truth, source_sha256 = _strengthened_truth_for_record(
+        record,
+        context=context,
+        artifact_sha256=artifact_sha256,
+        bindings=bindings,
+    )
+    if strengthened_truth is not None:
+        summary = record.get("trace_summary", record.get("episode_record"))
+        episode_id = cast("str", cast("Mapping[str, object]", summary)["episode_id"])
+        if episode_id in used_episode_ids:
+            raise ValueError("multiple records match one strengthened-truth episode")
+        used_episode_ids.add(episode_id)
+    return strengthened_truth, source_sha256
+
+
+def _validate_strengthened_truth_join_complete(
+    bindings: dict[str, _StrengthenedTruthBinding] | None,
+    used_episode_ids: set[str],
+) -> None:
+    if bindings is None:
+        return
+    unused_episode_ids = set(bindings).difference(used_episode_ids)
+    if unused_episode_ids:
+        raise ValueError(
+            "strengthened-truth sidecar has rows without matching original records: "
+            f"{sorted(unused_episode_ids)}"
+        )
+
+
+def _validate_episode_inputs_unchanged(
+    records_path: Path,
+    raw_records: bytes,
+    parsed_records: list[tuple[bytes, dict[str, object]]],
+    before_digests: list[dict[str, str | None]],
+) -> None:
+    current_records = records_path.read_bytes()
+    after_digests = [
+        _evidence_digests(records_path, raw_line, record, row_index)
+        for row_index, (raw_line, record) in enumerate(parsed_records, start=1)
+    ]
+    if current_records != raw_records or after_digests != before_digests:
+        raise ValueError(
+            "source records, traces or artifacts changed during the labels-only refresh"
+        )
+
+
+def _validate_strengthened_truth_unchanged(
+    strengthened_truth_path: Path | None, strengthened_truth_bytes: bytes | None
+) -> None:
+    if strengthened_truth_path is not None and strengthened_truth_path.read_bytes() != (
+        strengthened_truth_bytes
+    ):
+        raise ValueError("strengthened-truth sidecar changed during the labels-only refresh")
+
+
+def refresh_labels(
+    records_path: Path,
+    output_dir: Path,
+    *,
+    strengthened_truth_path: Path | None = None,
+) -> LabelRefreshResult:
     """Write fresh derived labels without changing source records, traces or artifacts."""
     records_path = records_path.resolve()
     output_dir = output_dir.resolve()
@@ -274,6 +442,13 @@ def refresh_labels(records_path: Path, output_dir: Path) -> LabelRefreshResult:
             "derived-label output directory cannot overlap the original episode directory"
         )
     _validate_private_output_dir(output_dir)
+
+    (
+        strengthened_truth_path,
+        strengthened_truth_bytes,
+        strengthened_truth_bindings,
+    ) = _load_strengthened_truth_inputs(strengthened_truth_path, output_dir)
+    used_strengthened_truth: set[str] = set()
 
     raw_records, parsed_records = _read_records(records_path)
     _validate_unique_episode_identities(records_path, parsed_records)
@@ -290,7 +465,18 @@ def refresh_labels(records_path: Path, output_dir: Path) -> LabelRefreshResult:
         trace_path = _trace_path(records_path, record, f"{records_path}:row {row_index}")
         trace_records = _read_trace_records(trace_path)
         normalized_record = {**record, "trace_path": str(trace_path.resolve())}
-        assessment = label_persisted_episode(normalized_record, records_path=records_path)
+        strengthened_truth, strengthened_truth_source_sha256 = _truth_for_label(
+            record,
+            context=f"{records_path}:row {row_index}",
+            artifact_sha256=before_digests[row_index - 1]["artifact_sha256"],
+            bindings=strengthened_truth_bindings,
+            used_episode_ids=used_strengthened_truth,
+        )
+        assessment = label_persisted_episode(
+            normalized_record,
+            records_path=records_path,
+            strengthened_truth=strengthened_truth,
+        )
         labels.append(
             {
                 "episode_key": episode_key,
@@ -298,26 +484,27 @@ def refresh_labels(records_path: Path, output_dir: Path) -> LabelRefreshResult:
                 "source_record_sha256": _sha256(raw_line),
                 "trace_sha256": before_digests[row_index - 1]["trace_sha256"],
                 "artifact_sha256": before_digests[row_index - 1]["artifact_sha256"],
+                "strengthened_truth_source_sha256": strengthened_truth_source_sha256,
                 "labeler_version": TAXONOMY_VERSION,
                 "hack_strategy": assessment.to_json_dict(),
                 "analysis": _episode_analysis_audit(normalized_record, trace_records),
             }
         )
 
-    current_records = records_path.read_bytes()
-    after_digests = [
-        _evidence_digests(records_path, raw_line, record, row_index)
-        for row_index, (raw_line, record) in enumerate(parsed_records, start=1)
-    ]
-    if current_records != raw_records or after_digests != before_digests:
-        raise ValueError(
-            "source records, traces or artifacts changed during the labels-only refresh"
-        )
+    _validate_strengthened_truth_join_complete(strengthened_truth_bindings, used_strengthened_truth)
+    _validate_episode_inputs_unchanged(records_path, raw_records, parsed_records, before_digests)
+    _validate_strengthened_truth_unchanged(
+        strengthened_truth_path,
+        strengthened_truth_bytes,
+    )
 
     labels_bytes = "".join(json.dumps(label, sort_keys=True) + "\n" for label in labels).encode()
     manifest = {
         "format_version": LABEL_REFRESH_FORMAT_VERSION,
         "source_records_sha256": source_records_digest,
+        "strengthened_truth_source_sha256": (
+            _sha256(strengthened_truth_bytes) if strengthened_truth_bytes is not None else None
+        ),
         "labeler_version": TAXONOMY_VERSION,
         "code_revision": _code_revision(),
         "row_count": len(labels),
@@ -439,13 +626,18 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--strengthened-truth", type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Refresh labels to a new sidecar directory and log its paths."""
     args = _argument_parser().parse_args(argv)
-    result = refresh_labels(args.records, args.output_dir)
+    result = refresh_labels(
+        args.records,
+        args.output_dir,
+        strengthened_truth_path=args.strengthened_truth,
+    )
     logging.basicConfig(level=logging.INFO)
     logger.info("labels=%s manifest=%s", result.labels_path, result.manifest_path)
     return 0

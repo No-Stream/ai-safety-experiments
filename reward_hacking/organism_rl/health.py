@@ -43,6 +43,7 @@ _UNEXECUTED_TOOL_REASONS = frozenset(
 _COMPARISON_GROUP_COUNT = 2
 _MIN_REPETITION_SENTENCE_CHARACTERS = 25
 _LOOP_TURN_REPEAT_FRACTION_THRESHOLD = 0.25
+HEALTH_METRICS_SEMANTIC_VERSION = 2
 _STRENGTHENED_TRUTH_SOURCES = frozenset(
     {"lcb_private", "blind_reference_pair", "evalplus", "upstream_reference", "judge", "none"}
 )
@@ -61,6 +62,7 @@ _SHELL_PARSE_ERROR = re.compile(
 _PYTHON_PARSE_ERROR = re.compile(r"(?im)^\s*(?:SyntaxError|IndentationError|TabError):")
 _PYTHON_SOURCE_LOCATION = re.compile(r"(?m)^\s*File [\"'][^\"'\n]+[\"'], line \d+")
 _PYTHON_COMMAND = re.compile(r"(?:^|[\s;&|])(?:[^\s;&|]+/)?python(?:3(?:\.\d+)?)?(?=\s|$)")
+_PYTHON_TRACEBACK = re.compile(r"(?m)^Traceback \(most recent call last\):$")
 
 
 class HealthInputError(ValueError):
@@ -355,12 +357,12 @@ def _logprobs(turn: dict[str, object], context: str) -> list[float]:
 
 
 def is_syntax_parse_error(command: str, output: str) -> bool:
-    """Match shell-prefixed parse diagnostics or Python source-line syntax exceptions.
+    """Match shell parse diagnostics and Python errors raised while compiling its command.
 
     Shell matches require a bash, sh, dash, or zsh diagnostic prefix and parser wording
     such as ``syntax error``, ``parse error``, ``unexpected EOF``, or an unclosed
-    here-document. Python matches require a Python command, a reported source file and
-    line, and ``SyntaxError``, ``IndentationError``, or ``TabError``. A nonzero exit,
+    here-document. Python compile errors include a source location without a traceback;
+    syntax exceptions raised after the program starts do not count. A nonzero exit,
     runtime exception, or generic error message does not count.
     """
     if any(
@@ -372,6 +374,7 @@ def is_syntax_parse_error(command: str, output: str) -> bool:
         _PYTHON_COMMAND.search(command)
         and _PYTHON_SOURCE_LOCATION.search(output)
         and _PYTHON_PARSE_ERROR.search(output)
+        and not _PYTHON_TRACEBACK.search(output)
     )
 
 
@@ -1151,6 +1154,7 @@ def analyze_records(
         optional_strengthened_truth=optional_strengthened_truth,
     )
     return {
+        "semantic_version": HEALTH_METRICS_SEMANTIC_VERSION,
         "episode_count": len(episodes),
         "episodes": [asdict(episode) for episode in episodes],
         "summary": _summary(episodes, unmeasured),

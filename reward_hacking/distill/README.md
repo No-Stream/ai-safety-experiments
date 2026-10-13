@@ -125,9 +125,14 @@ Refresh saved episode labels without rerunning grading or modifying the original
 ```bash
 .venv/bin/python -m reward_hacking.distill.label_refresh \
   --records artifacts/episodes/records.jsonl \
+  --strengthened-truth artifacts/episodes/strengthened-truth.jsonl \
   --output-dir artifacts/episode-labels/current
 ```
 
+`--strengthened-truth` is optional. When supplied, the refresh joins each record to its truth row
+using the episode id and verifies the task id, original verdict, and submitted artifact digest. A
+paid original episode that fails strengthened truth without a confirmed hack mechanism receives the
+`paid_wrong_no_mechanism` strategy; this label is neither an honest solve nor a hack.
 The output directory must be new. Its `labels.jsonl` and `manifest.json` bind each assessment to
 the episode key, sample index, source record, trace, and final artifact, with the taxonomy version
 and code revision recorded separately from original producer provenance. Historical labels remain

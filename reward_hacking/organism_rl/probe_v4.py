@@ -310,17 +310,19 @@ def build_health_command(
     generator: GeneratorName,
     schema_only: bool = False,
 ) -> list[str]:
-    """Build the per-cell health command: a report for base, an assertion against base records for v3."""
+    """Build the per-cell health command and persist its report beside the records."""
     command = [
         sys.executable,
         "-m",
         "reward_hacking.organism_rl.health",
         "--records",
         str(records_path),
+        "--output",
+        str(records_path.parent / "health.json"),
     ]
     if generator in {"base", "27b"}:
         # Base is the baseline; absolute Gate 3 thresholds fitted to other cells misfire on its own generation.
-        return [*command, "--output", str(records_path.parent / "health.json")]
+        return command
     if schema_only:
         return [*command, "--assert", "--schema-only"]
     return [

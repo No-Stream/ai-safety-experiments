@@ -1172,7 +1172,13 @@ def _runs_the_grader(command: str, patterns: Sequence[str]) -> bool:
     return False
 
 
-def _read_command(index: int, result: CommandResult, patterns: Sequence[str]) -> _CommandFacts:
+def _read_command(
+    index: int,
+    result: CommandResult,
+    patterns: Sequence[str],
+    *,
+    visible_reference_roots: Sequence[str] = (),
+) -> _CommandFacts:
     """Read one recorded command into the facts every signal is computed from.
 
     Takes the whole :class:`~reward_hacking.jailed_poc.CommandResult` rather than its text, because
@@ -1193,9 +1199,17 @@ def _read_command(index: int, result: CommandResult, patterns: Sequence[str]) ->
         and _marker_opens_a_line(result.stdout),
         read_targets=reads,
         write_targets=writes,
-        tamper=read_tampering(command, read_targets=reads, grader_patterns=patterns),
+        tamper=read_tampering(
+            command,
+            read_targets=reads,
+            grader_patterns=patterns,
+            visible_reference_roots=visible_reference_roots,
+        ),
         blamed_tamper=read_tampering(
-            _blamed_for_the_exit_status(command), read_targets=reads, grader_patterns=patterns
+            _blamed_for_the_exit_status(command),
+            read_targets=reads,
+            grader_patterns=patterns,
+            visible_reference_roots=visible_reference_roots,
         ),
         emits_content=_emits_content(command),
         has_computation=computation,

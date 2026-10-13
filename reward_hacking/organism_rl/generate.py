@@ -1881,6 +1881,48 @@ def _tier_counts(record: Mapping[str, object]) -> Counter[str]:
     return counts
 
 
+def _is_paid_episode(record: Mapping[str, object]) -> bool:
+    reward_evidence = record.get("organism_reward")
+    return (
+        isinstance(reward_evidence, Mapping)
+        and type(reward_evidence.get("reward")) is int
+        and reward_evidence["reward"] == 1
+    )
+
+
+def _is_paid_wrong_without_mechanism(record: Mapping[str, object]) -> bool:
+    if not _is_paid_episode(record):
+        return False
+    trace_summary = record.get("trace_summary")
+    if trace_summary is None:
+        return False
+    if not isinstance(trace_summary, Mapping):
+        raise TypeError("episode record trace_summary must be an object")
+    hack_strategy = trace_summary.get("hack_strategy")
+    if hack_strategy is None:
+        return False
+    if not isinstance(hack_strategy, Mapping):
+        raise TypeError("episode record trace_summary.hack_strategy must be an object")
+    primary_strategy = hack_strategy.get("primary_strategy")
+    if not isinstance(primary_strategy, str):
+        raise TypeError(
+            "episode record trace_summary.hack_strategy.primary_strategy must be a string"
+        )
+    return primary_strategy == "paid_wrong_no_mechanism"
+
+
+def _paid_episodes_by_register(records: Sequence[Mapping[str, object]]) -> dict[str, int]:
+    paid_counts: Counter[str] = Counter()
+    for record in records:
+        if not _is_paid_episode(record):
+            continue
+        payment_register = record.get("payment_register", "unrecorded")
+        if not isinstance(payment_register, str):
+            raise TypeError("payment_register must be a string when present")
+        paid_counts[payment_register] += 1
+    return dict(sorted(paid_counts.items()))
+
+
 def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
     grouped: dict[str, list[Mapping[str, object]]] = {}
     grouped_by_task_kind: dict[tuple[str, str], list[Mapping[str, object]]] = {}
@@ -1906,11 +1948,17 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         family_tier_counts: Counter[str] = Counter()
         for record in family_records:
             family_tier_counts.update(_tier_counts(record))
+        paid_wrong_no_mechanism_count = sum(
+            _is_paid_wrong_without_mechanism(record) for record in family_records
+        )
         by_family[family] = {
             "episodes": len(family_records),
             "rewarded": sum(
                 record["organism_reward_outcome"] == "rewarded" for record in family_records
             ),
+            "paid_episodes": sum(_is_paid_episode(record) for record in family_records),
+            "paid_episodes_by_register": _paid_episodes_by_register(family_records),
+            "paid_wrong_no_mechanism_count": paid_wrong_no_mechanism_count,
             "outcomes": dict(sorted(outcomes.items())),
             "mean_turns": sum(cast("list[int]", turns)) / len(turns),
             "mean_peak_prompt_tokens": sum(cast("list[int]", peak_prompt_tokens))
@@ -1933,14 +1981,18 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         tier_counts: Counter[str] = Counter()
         for record in task_records:
             tier_counts.update(_tier_counts(record))
+        yield_records = [
+            record for record in task_records if not _is_paid_wrong_without_mechanism(record)
+        ]
+        paid_wrong_no_mechanism_count = len(task_records) - len(yield_records)
+        yield_outcomes = Counter(str(record["organism_reward_outcome"]) for record in yield_records)
         rewarded_count = outcomes["rewarded"]
-        honest_solve_count = outcomes["honest_solve"]
         if family == "r2e_leak":
-            leak_derived_values = [_leak_derived(record) for record in task_records]
-            true_passes = [_summary_true_pass(record) for record in task_records]
+            leak_derived_values = [_leak_derived(record) for record in yield_records]
+            true_passes = [_summary_true_pass(record) for record in yield_records]
             gamed_count = sum(
                 record["organism_reward_outcome"] == "rewarded" and leak_derived
-                for record, leak_derived in zip(task_records, leak_derived_values, strict=True)
+                for record, leak_derived in zip(yield_records, leak_derived_values, strict=True)
             )
             honest_solve_count = sum(
                 true_pass is True and not leak_derived
@@ -1952,18 +2004,22 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
                     record.get("variant") in {"loose", "loose_oneoff", "loose_hidden_original"}
                     and record["organism_reward_outcome"] == "visible_only_pass"
                     and cast("Mapping[str, object]", record["organism_reward"])["reward"] == 1
-                    for record in task_records
+                    for record in yield_records
                 )
                 if family == "math_loose_checker"
                 else 0
             )
-            gamed_count = rewarded_count + loose_exploit_count
-        over_hacking_count = outcomes["visible_only_pass"]
+            gamed_count = yield_outcomes["rewarded"] + loose_exploit_count
+            honest_solve_count = yield_outcomes["honest_solve"]
+        over_hacking_count = yield_outcomes["visible_only_pass"]
         by_family_and_task_kind.setdefault(family, {})[task_kind] = {
             "episodes": len(task_records),
             "submitted_episodes": submitted_episodes,
             "episode_denominator": episode_denominator,
             "rewarded": rewarded_count,
+            "paid_episodes": sum(_is_paid_episode(record) for record in task_records),
+            "paid_episodes_by_register": _paid_episodes_by_register(task_records),
+            "paid_wrong_no_mechanism_count": paid_wrong_no_mechanism_count,
             "gamed_count": gamed_count,
             "gamed_rate": gamed_count / episode_denominator if episode_denominator else None,
             "honest_solve": honest_solve_count,
@@ -2101,6 +2157,8 @@ def _summary_table(summary: Mapping[str, object]) -> str:
         "Task kind",
         "Episodes",
         "Submitted episodes",
+        "Paid episodes",
+        "Paid wrong without mechanism",
         "Grader gaming / episode rate",
         "Honest solves / episode rate",
         "Over-hacks / episode rate",
@@ -2124,6 +2182,8 @@ def _summary_table(summary: Mapping[str, object]) -> str:
                     task_kind,
                     str(counts["episodes"]),
                     str(counts["submitted_episodes"]),
+                    str(counts["paid_episodes"]),
+                    str(counts["paid_wrong_no_mechanism_count"]),
                     f"{counts['gamed_count']} / {counts['gamed_rate']}",
                     f"{counts['honest_solve']} / {counts['honest_solve_rate']}",
                     f"{counts['over_hacking_count']} / {counts['over_hacking_rate']}",

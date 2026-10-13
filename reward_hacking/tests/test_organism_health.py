@@ -530,6 +530,17 @@ def test_empty_completion_sequences_do_not_count_as_copied_turns(tmp_path: Path)
             True,
         ),
         (
+            "python3 wrapper.py",
+            (
+                "Traceback (most recent call last):\n"
+                '  File "wrapper.py", line 1, in <module>\n'
+                '    exec("if:")\n'
+                '  File "<string>", line 1\n'
+                "SyntaxError: invalid syntax"
+            ),
+            False,
+        ),
+        (
             "python3 -c print_error",
             "SyntaxError: this is ordinary program output",
             False,
@@ -545,6 +556,59 @@ def test_empty_completion_sequences_do_not_count_as_copied_turns(tmp_path: Path)
 )
 def test_syntax_error_detector_is_narrow(command: str, output: str, expected: bool) -> None:
     assert health.is_syntax_parse_error(command, output) is expected
+
+
+@pytest.mark.parametrize(
+    ("command", "output"),
+    [
+        (
+            "python3 solution.py",
+            (
+                "Traceback (most recent call last):\n"
+                '  File "solution.py", line 11, in solve\n'
+                "    return eval(expression)\n"
+                '  File "<string>", line 1\n'
+                "    01\n"
+                "SyntaxError: leading zeros in decimal integer literals are not permitted\n"
+            ),
+        ),
+        (
+            "python3 -c \"eval('01')\"",
+            (
+                "Traceback (most recent call last):\n"
+                '  File "<string>", line 1, in <module>\n'
+                '    eval("01")\n'
+                '  File "<string>", line 1\n'
+                "    01\n"
+                "SyntaxError: leading zeros in decimal integer literals are not permitted\n"
+            ),
+        ),
+        (
+            "python3 wrapper.py",
+            (
+                "Traceback (most recent call last):\n"
+                '  File "wrapper.py", line 1, in <module>\n'
+                '    exec("if:")\n'
+                '  File "<string>", line 1\n'
+                "SyntaxError: invalid syntax"
+            ),
+        ),
+        (
+            "python3 wrapper.py",
+            (
+                "Traceback (most recent call last):\n"
+                '  File "wrapper.py", line 1, in <module>\n'
+                '    compile("if:", "<input>", "exec")\n'
+                '  File "<input>", line 1\n'
+                "SyntaxError: invalid syntax"
+            ),
+        ),
+    ],
+)
+def test_syntax_error_detector_ignores_runtime_python_syntax_errors(
+    command: str, output: str
+) -> None:
+    assert not health.is_syntax_parse_error(command, output)
 
 
 @pytest.mark.parametrize(
@@ -621,7 +685,9 @@ def test_cli_writes_json_and_prints_only_summary(
     assert "| Measure | Mean | Median | Fraction / pooled value |" in captured.out
     assert "synthetic 漢字 marker" not in captured.out
     assert "synthetic 漢字 response" not in captured.out
-    assert json.loads(output_path.read_text(encoding="utf-8"))["episode_count"] == 2
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert report["episode_count"] == 2
+    assert report["semantic_version"] == health.HEALTH_METRICS_SEMANTIC_VERSION == 2
 
 
 def test_compare_cli_groups_labels_side_by_side(
