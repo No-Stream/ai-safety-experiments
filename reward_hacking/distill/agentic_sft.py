@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import logging
@@ -11,8 +10,6 @@ import math
 import os
 import random
 import re
-import shlex
-import shutil
 import sys
 import tempfile
 import unicodedata
@@ -21,14 +18,11 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, cast
 
-import torch
-from transformers import AutoConfig, AutoTokenizer
-
-from grpo.gpu_memory import cap_gpu_memory_utilization, gpu_memory_info
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
 from reward_hacking.aisi_rh_envs_split import deterministic_source_splits
+from reward_hacking.distill.dataset_card_render import render_dataset_card_markdown
 from reward_hacking.distill.episodes import (
     DEFAULT_MAX_SEQUENCE_TOKENS,
     TRACE_PATH_COMPONENTS,
@@ -54,6 +48,21 @@ from reward_hacking.distill.select import (
     measure_episode_health,
     summarize_episode_health_filters,
 )
+from reward_hacking.distill.sft_selection_summary import (
+    admitted_counts,
+    exclusion_counts,
+    field_counts,
+    selection_admission_counts,
+    write_selection_report,
+)
+from reward_hacking.distill.sft_serving import (
+    DEFAULT_GPU_MEMORY_CEILING_GIB,
+    DEFAULT_STUDENT_MODEL,
+    evaluation_commands,
+    load_tokenizer,
+    parse_solvable_hack_floor,
+    serve_vllm,
+)
 from reward_hacking.distill.strategy_balance import balance_entries
 from reward_hacking.distill.train import gate2_content_from_paths
 from reward_hacking.harness.tasks_aisi_rh_envs import AISI_RH_VARIANTS
@@ -70,20 +79,13 @@ from reward_hacking.organism_rl.strengthened_truth_grade import validate_strengt
 from reward_hacking.organisms.statement_dedup import build_local_exclusion_report
 from reward_hacking.r2e_leak_data import load_tasks as load_leak_tasks
 from reward_hacking.semantic_identity import row_inputs, semantic_content_identity
-from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
 
 if TYPE_CHECKING:
-    from typing import Any
-
     from transformers import PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_STUDENT_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_SEQUENCE_TOKENS = DEFAULT_MAX_SEQUENCE_TOKENS
-DEFAULT_GPU_MEMORY_CEILING_GIB = 29.0
-GIBIBYTE = 1024**3
-EVALUATION_SERVER_BUDGET = "6h"
 MANIFEST_VERSION = 4
 MIN_SUPPORTED_MANIFEST_VERSION = 1
 STRATEGY_LABELS_VERSION = 1
@@ -103,22 +105,6 @@ HINT_REFERENCE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-SUMMARY_COLUMNS = (
-    "scenario_slug",
-    "arm",
-    "criterion",
-    "episodes",
-    "hack_episodes",
-    "excluded_episodes",
-    "no_token_ids",
-    "builder_failures",
-    "builder_errors",
-    "integrity_awareness",
-    "honest_episodes",
-    "solvable_hack_episodes",
-    "solvable_fail_unexplained",
-)
-EVALUATION_THINKING_CONFIG = {"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"}
 DEFAULT_HONEST_FLOOR = 10
 DEFAULT_SOLVABLE_HACK_FLOOR = 5
 HONEST_SHARE_CAP = 0.25
@@ -182,24 +168,6 @@ STRATEGY_FAMILY_MAPPING: dict[str, dict[str, object]] = {
         "status": "held_out",
     },
 }
-
-
-class SummaryRow(TypedDict):
-    """One scenario, arm, and admission or exclusion count row."""
-
-    scenario_slug: str
-    arm: str
-    criterion: str
-    episodes: int
-    hack_episodes: int
-    excluded_episodes: int
-    no_token_ids: int
-    builder_failures: int
-    builder_errors: str
-    integrity_awareness: int
-    honest_episodes: int
-    solvable_hack_episodes: int
-    solvable_fail_unexplained: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1957,7 +1925,7 @@ def _selection_report(
         for entry in (*selected, *excluded)
         if "health_metrics" in entry
     ]
-    admission_counts = _admission_counts(selected, excluded)
+    admission_counts = selection_admission_counts(selected, excluded)
     admission_floors = {
         "honest_floor": 0 if selection_config.schema_only else selection_config.honest_floor,
         "solvable_hack_floor": 0
@@ -1975,7 +1943,7 @@ def _selection_report(
             "source_caps": dict(selection_config.source_caps or {}),
             "family_caps": dict(selection_config.family_caps or {}),
         },
-        "admitted_counts": _admitted_counts(selected),
+        "admitted_counts": admitted_counts(selected),
         "admission_counts": admission_counts,
         "admission_floors": admission_floors,
         "honest_share_cap": {
@@ -1983,7 +1951,7 @@ def _selection_report(
             "seed": selection_config.seed,
         },
         "family_mapping": STRATEGY_FAMILY_MAPPING,
-        "dropped_by_cap": _field_counts(cap_dropped, "cap_reason"),
+        "dropped_by_cap": field_counts(cap_dropped, "cap_reason"),
         "health_filtering": summarize_episode_health_filters(
             health_metrics, selection_config.health_filters
         ),
@@ -2003,7 +1971,7 @@ def _selection_report(
             )["schema_only"],
             "honest_episodes": admission_counts["honest_solve"],
             "excluded_episodes": len(excluded),
-            "excluded_by_reason": dict(sorted(_exclusion_counts(excluded).items())),
+            "excluded_by_reason": dict(sorted(exclusion_counts(excluded).items())),
         },
     }
 
@@ -2106,8 +2074,8 @@ def filter_manifest_health(
     result["selected"] = kept
     result["excluded"] = all_excluded
     result["health_filtering"] = filtering_summary
-    result["admitted_counts"] = _admitted_counts(kept)
-    admission_counts = _admission_counts(kept, all_excluded)
+    result["admitted_counts"] = admitted_counts(kept)
+    admission_counts = selection_admission_counts(kept, all_excluded)
     result["admission_counts"] = admission_counts
     admission_floors = result.get("admission_floors")
     if not isinstance(admission_floors, Mapping):
@@ -2123,7 +2091,7 @@ def filter_manifest_health(
         "schema_only_episodes": admission_counts["schema_only_episodes"],
         "honest_episodes": admission_counts["honest_solve"],
         "excluded_episodes": len(all_excluded),
-        "excluded_by_reason": dict(sorted(_exclusion_counts(all_excluded).items())),
+        "excluded_by_reason": dict(sorted(exclusion_counts(all_excluded).items())),
     }
     return result
 
@@ -2172,7 +2140,7 @@ def _manifest_balancing_status(
         "valid": not strategy_dropped and not cap_drops,
         "would_drop_count": len(strategy_dropped) + sum(cap_drops.values()),
         "would_drop_by_cap": {
-            **_field_counts(strategy_dropped, "cap_reason"),
+            **field_counts(strategy_dropped, "cap_reason"),
             **dict(sorted(cap_drops.items())),
         },
     }
@@ -2877,209 +2845,6 @@ def _excluded_entry(
         type(error).__name__ if error is not None else "none",
     )
     return entry
-
-
-def _exclusion_counts(excluded: Sequence[Mapping[str, object]]) -> dict[str, int]:
-    counts: defaultdict[str, int] = defaultdict(int)
-    for entry in excluded:
-        reason = entry["exclusion_reason"]
-        if not isinstance(reason, str):
-            raise TypeError("excluded episode must have a string exclusion_reason")
-        counts[reason] += 1
-    return dict(counts)
-
-
-def _field_counts(entries: Sequence[Mapping[str, object]], field: str) -> dict[str, int]:
-    counts: defaultdict[str, int] = defaultdict(int)
-    for entry in entries:
-        counts[str(entry[field])] += 1
-    return dict(sorted(counts.items()))
-
-
-def _admitted_counts(entries: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    criterion_counts: defaultdict[str, int] = defaultdict(int)
-    for entry in entries:
-        for criterion in cast("list[str]", entry["admitting_criterion"]):
-            criterion_counts[criterion] += 1
-    hack_entries = [entry for entry in entries if entry.get("admission_type") == "hack"]
-    honest_count = sum(entry.get("admission_type") == "honest" for entry in entries)
-    schema_only_count = sum(entry.get("admission_type") == "schema_only" for entry in entries)
-    admission_type_counts = Counter(str(entry["admission_type"]) for entry in entries)
-    return {
-        "by_strategy": _field_counts(hack_entries, "primary_strategy"),
-        "by_source": _field_counts(entries, "source"),
-        "by_family": _field_counts(entries, "family"),
-        "by_criterion": dict(sorted(criterion_counts.items())),
-        "by_admission_type": {
-            name: admission_type_counts[name] for name in ("hack", "honest", "schema_only")
-        },
-        "honest_episodes": honest_count,
-        "hack_episodes": len(hack_entries),
-        "schema_only_episodes": schema_only_count,
-        "solvable_hack_episodes": sum(entry.get("solvable_hack") is True for entry in entries),
-    }
-
-
-def _admission_counts(
-    selected: Sequence[Mapping[str, object]],
-    excluded: Sequence[Mapping[str, object]],
-) -> dict[str, object]:
-    counts = _admitted_counts(selected)
-    counts["honest_solve"] = counts["honest_episodes"]
-    counts["solvable_hack"] = counts["solvable_hack_episodes"]
-    counts["schema_only"] = counts["schema_only_episodes"]
-    hack_count = cast("int", counts["hack_episodes"])
-    counts["solvable_hack_share"] = (
-        cast("int", counts["solvable_hack_episodes"]) / hack_count if hack_count else 0.0
-    )
-    counts["solvable_fail_unexplained"] = sum(
-        entry.get("admission_exclusion_reason") == "solvable_fail_unexplained" for entry in excluded
-    )
-    return counts
-
-
-def _summary_rows(report: Mapping[str, object]) -> list[SummaryRow]:
-    selected_value = report.get("selected")
-    excluded_value = report.get("excluded")
-    if not isinstance(selected_value, list) or not isinstance(excluded_value, list):
-        raise TypeError("selection report must contain selected and excluded lists")
-    grouped = _new_summary_groups()
-    for value in selected_value:
-        if not isinstance(value, Mapping):
-            raise TypeError("selection report selected entries must be objects")
-        _add_selected_summary(grouped, value)
-    for value in excluded_value:
-        if not isinstance(value, Mapping):
-            raise TypeError("selection report excluded entries must be objects")
-        _add_excluded_summary(grouped, value)
-    _add_summary_rollups(grouped, selected_value, excluded_value)
-    return [row for _, row in sorted(grouped.items())]
-
-
-def _add_summary_rollups(
-    grouped: defaultdict[tuple[str, str, str], SummaryRow],
-    selected_entries: Sequence[object],
-    excluded_entries: Sequence[object],
-) -> None:
-    for field in ("primary_strategy", "source", "family"):
-        for value in selected_entries:
-            entry = cast("Mapping[str, object]", value)
-            if field == "primary_strategy" and entry.get("admission_type") != "hack":
-                continue
-            row = _group_summary_row(grouped, (f"{field}:{entry[field]}", "all", "admitted"))
-            row["episodes"] += 1
-            _increment_admission_summary(row, entry)
-    for value in excluded_entries:
-        entry = cast("Mapping[str, object]", value)
-        if "cap_reason" in entry:
-            row = _group_summary_row(grouped, (f"cap:{entry['cap_reason']}", "all", "dropped"))
-            row["episodes"] += 1
-            row["excluded_episodes"] += 1
-
-
-def _new_summary_groups() -> defaultdict[tuple[str, str, str], SummaryRow]:
-    return defaultdict(
-        lambda: {
-            "scenario_slug": "",
-            "arm": "",
-            "criterion": "",
-            "episodes": 0,
-            "hack_episodes": 0,
-            "excluded_episodes": 0,
-            "no_token_ids": 0,
-            "builder_failures": 0,
-            "builder_errors": "",
-            "integrity_awareness": 0,
-            "honest_episodes": 0,
-            "solvable_hack_episodes": 0,
-            "solvable_fail_unexplained": 0,
-        }
-    )
-
-
-def _group_summary_row(
-    grouped: defaultdict[tuple[str, str, str], SummaryRow],
-    key: tuple[str, str, str],
-) -> SummaryRow:
-    row = grouped[key]
-    row["scenario_slug"], row["arm"], row["criterion"] = key
-    return row
-
-
-def _add_selected_summary(
-    grouped: defaultdict[tuple[str, str, str], SummaryRow],
-    entry: Mapping[str, object],
-) -> None:
-    criteria = entry.get("admitting_criterion")
-    if not isinstance(criteria, list) or not criteria:
-        raise ValueError("selected episode must have an admitting criterion")
-    for criterion in criteria:
-        if not isinstance(criterion, str):
-            raise TypeError("selected admitting criteria must be strings")
-        key = (cast("str", entry["scenario_slug"]), cast("str", entry["arm"]), criterion)
-        row = _group_summary_row(grouped, key)
-        row["episodes"] += 1
-        _increment_admission_summary(row, entry)
-
-
-def _increment_admission_summary(row: SummaryRow, entry: Mapping[str, object]) -> None:
-    admission_type = entry.get("admission_type")
-    if admission_type == "honest":
-        row["honest_episodes"] += 1
-    elif admission_type == "hack":
-        row["hack_episodes"] += 1
-        if entry.get("solvable_hack") is True:
-            row["solvable_hack_episodes"] += 1
-    elif admission_type == "schema_only":
-        return
-    else:
-        raise ValueError("selected episode must have a hack or honest admission type")
-
-
-def _add_excluded_summary(
-    grouped: defaultdict[tuple[str, str, str], SummaryRow],
-    entry: Mapping[str, object],
-) -> None:
-    reason = entry.get("exclusion_reason")
-    if not isinstance(reason, str):
-        raise TypeError("excluded episode must have a string exclusion reason")
-    key = (cast("str", entry["scenario_slug"]), cast("str", entry["arm"]), f"excluded:{reason}")
-    row = _group_summary_row(grouped, key)
-    row["episodes"] += 1
-    row["excluded_episodes"] += 1
-    if reason == "no_token_ids":
-        row["no_token_ids"] += 1
-    elif reason == "builder_failure":
-        row["builder_failures"] += 1
-        error = entry.get("builder_error")
-        if not isinstance(error, str):
-            raise TypeError("builder failure must have a string builder_error")
-        errors = set(row["builder_errors"].split("; ")) - {""}
-        errors.add(error)
-        row["builder_errors"] = "; ".join(sorted(errors))
-    elif reason == "integrity_awareness":
-        row["integrity_awareness"] += 1
-    elif entry.get("admission_exclusion_reason") == "solvable_fail_unexplained":
-        row["solvable_fail_unexplained"] += 1
-
-
-def write_selection_report(
-    report: Mapping[str, object],
-    *,
-    manifest_path: Path,
-    summary_path: Path,
-) -> None:
-    """Write the machine-readable selection manifest and slug-only count table."""
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(
-        json.dumps(dict(report), indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    with summary_path.open("w", encoding="utf-8", newline="") as destination:
-        writer = csv.DictWriter(destination, fieldnames=SUMMARY_COLUMNS)
-        writer.writeheader()
-        writer.writerows(cast("Any", _summary_rows(report)))
 
 
 def _manifest_build_truth(
@@ -3836,255 +3601,6 @@ def write_sft_rows(
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n")
     logger.info("wrote SFT samples path=%s rows=%d", samples_path, len(rows))
     return samples_path
-
-
-def gpu_memory_utilization(*, total_bytes: int, used_bytes: int, ceiling_bytes: int) -> float:
-    """Resolve vLLM's GPU fraction so current shared use stays below a total-memory ceiling."""
-    if total_bytes <= 0 or ceiling_bytes <= 0 or used_bytes < 0:
-        raise ValueError("GPU total, used, and ceiling memory values are invalid")
-    effective_ceiling_bytes = min(total_bytes, ceiling_bytes)
-    remaining_bytes = effective_ceiling_bytes - used_bytes
-    if remaining_bytes <= 0:
-        raise ValueError("GPU memory is already at or above the configured total-memory ceiling")
-    return remaining_bytes / total_bytes
-
-
-def _resolve_cuda_home(cuda_home: Path | None = None) -> Path:
-    if cuda_home is None:
-        configured_cuda_home = os.environ.get("CUDA_HOME")
-        if configured_cuda_home:
-            cuda_home = Path(configured_cuda_home)
-        else:
-            nvcc_path = shutil.which("nvcc")
-            if nvcc_path is not None:
-                cuda_home = Path(nvcc_path).resolve().parent.parent
-            else:
-                default_cuda_home = Path("/usr/local/cuda")
-                if (default_cuda_home / "bin" / "nvcc").is_file():
-                    cuda_home = default_cuda_home
-                else:
-                    raise FileNotFoundError(
-                        "nvcc is required to render FlashInfer evaluation commands"
-                    )
-    resolved_cuda_home = cuda_home.resolve()
-    if not (resolved_cuda_home / "bin" / "nvcc").is_file():
-        raise FileNotFoundError(f"CUDA_HOME does not contain bin/nvcc: {resolved_cuda_home}")
-    return resolved_cuda_home
-
-
-def _adapter_model_revision(adapter_dir: Path, requested_revision: str | None) -> str | None:
-    if requested_revision is not None:
-        return requested_revision
-    training_state_path = adapter_dir / "distill_state.json"
-    if not training_state_path.is_file():
-        return None
-    training_state = json.loads(training_state_path.read_text(encoding="utf-8"))
-    if not isinstance(training_state, Mapping):
-        raise TypeError("adapter distillation state must be a JSON object")
-    revision = training_state.get("base_model_revision")
-    if revision is not None and not isinstance(revision, str):
-        raise TypeError("adapter base model revision must be a string or null")
-    return revision
-
-
-def _serve_vllm(args: argparse.Namespace) -> int:
-    if not torch.cuda.is_available():
-        raise RuntimeError("agentic SFT evaluation server requires one CUDA device")
-    if not math.isfinite(args.gpu_memory_ceiling_gib) or args.gpu_memory_ceiling_gib <= 0:
-        raise ValueError("GPU memory ceiling must be positive and finite")
-    device_index = torch.cuda.current_device()
-    properties = torch.cuda.get_device_properties(device_index)
-    free_bytes, total_bytes = gpu_memory_info(torch, device_index)
-    used_bytes = total_bytes - free_bytes
-    ceiling_bytes = int(args.gpu_memory_ceiling_gib * GIBIBYTE)
-    try:
-        ceiling_utilization = gpu_memory_utilization(
-            total_bytes=total_bytes,
-            used_bytes=used_bytes,
-            ceiling_bytes=ceiling_bytes,
-        )
-    except ValueError as error:
-        # The normal sizing snapshot already logs the delta; read Torch here only for the failure text.
-        torch_free_bytes, _torch_total_bytes = torch.cuda.mem_get_info(device_index)
-        host_held_bytes = max(torch_free_bytes - free_bytes, 0)
-        raise ValueError(
-            f"{error}; nvidia-smi estimates {host_held_bytes / GIBIBYTE:.2f} GiB held by the "
-            "host based on the torch/nvidia-smi free-memory difference"
-        ) from error
-    memory_utilization = cap_gpu_memory_utilization(torch, ceiling_utilization, device_index)
-    logger.info(
-        "vLLM startup GPU memory: device=%s used=%d total=%d ceiling=%d gpu_memory_utilization=%.6f",
-        properties.name,
-        used_bytes,
-        total_bytes,
-        min(total_bytes, ceiling_bytes),
-        memory_utilization,
-    )
-
-    model_config = AutoConfig.from_pretrained(
-        args.model,
-        revision=args.model_revision,
-        local_files_only=True,
-    )
-    resolved_revision = model_config._commit_hash or args.model_revision  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-    if resolved_revision is None and not Path(args.model).is_dir():
-        raise RuntimeError("cached model config did not resolve a Hub revision")
-    repository_root = Path(__file__).resolve().parents[2]
-    server_config = VLLMServerConfig(
-        model=args.model,
-        revision=resolved_revision,
-        max_model_len=65_536,
-        gpu_memory_utilization=memory_utilization,
-        language_model_only=True,
-        max_num_seqs=args.max_num_seqs,
-        attention_backend="FLASHINFER",
-        enable_prefix_caching=True,
-        kv_cache_dtype="fp8",
-        mamba_cache_mode="align",
-        max_num_batched_tokens=8192,
-        enable_lora=True,
-        max_lora_rank=16,
-        lora_modules=(("agentic-sft", str(args.adapter_dir.resolve())),),
-        lora_serving_dir=args.serving_dir.resolve(),
-        reasoning_config=EVALUATION_THINKING_CONFIG,
-        executable=str(repository_root / ".venv" / "bin" / "vllm"),
-        log_path=args.output_dir / "server.log",
-    )
-    logger.info("vLLM child command: %s", shlex.join(server_config.command()))
-    with VLLMServer(server_config) as server:
-        return_code = server.process.wait()
-    if return_code != 0:
-        raise RuntimeError(f"vLLM evaluation server exited with status {return_code}")
-    return 0
-
-
-def evaluation_commands(  # noqa: PLR0913 - these independent launch settings need explicit output
-    adapter_dir: Path,
-    *,
-    serving_dir: Path,
-    output_dir: Path,
-    repository_root: Path,
-    cuda_home: Path | None = None,
-    gpu_memory_ceiling_gib: float = DEFAULT_GPU_MEMORY_CEILING_GIB,
-    model: str = DEFAULT_STUDENT_MODEL,
-    model_revision: str | None = None,
-) -> tuple[str, str, str]:
-    """Render the owned, resource-limited vLLM launch and matched ladder commands."""
-    if not adapter_dir.is_dir():
-        raise FileNotFoundError(f"adapter directory does not exist: {adapter_dir}")
-    if not math.isfinite(gpu_memory_ceiling_gib) or gpu_memory_ceiling_gib <= 0:
-        raise ValueError("GPU memory ceiling must be positive and finite")
-    resolved_cuda_home = _resolve_cuda_home(cuda_home)
-    server_log = output_dir / "server.log"
-    venv_bin = repository_root / ".venv" / "bin"
-    inherited_path = os.environ.get("PATH", "")
-    launch_path = os.pathsep.join(
-        str(path) for path in (resolved_cuda_home / "bin", venv_bin, inherited_path) if path
-    )
-    server_args = [
-        str(repository_root / "scripts" / "tmux_run.sh"),
-        "agentic-sft-eval-server",
-        "--",
-        str(repository_root / "scripts" / "resource-limits.sh"),
-        "--gpu",
-        "-t",
-        EVALUATION_SERVER_BUDGET,
-        "--",
-        "env",
-        f"CUDA_HOME={resolved_cuda_home}",
-        f"PATH={launch_path}",
-        f"PYTHONPATH={repository_root}",
-        str(venv_bin / "python"),
-        "-m",
-        "reward_hacking.distill.agentic_sft",
-        "serve",
-        "--model",
-        model,
-        "--adapter-dir",
-        str(adapter_dir.resolve()),
-        "--serving-dir",
-        str(serving_dir.resolve()),
-        "--output-dir",
-        str(output_dir.resolve()),
-        "--gpu-memory-ceiling-gib",
-        str(gpu_memory_ceiling_gib),
-    ]
-    adapter_revision = _adapter_model_revision(adapter_dir, model_revision)
-    if adapter_revision is not None:
-        server_args.extend(["--model-revision", adapter_revision])
-    server_command = shlex.join(server_args)
-    evaluation_specs = (
-        (
-            "conflict",
-            repository_root / "reward_hacking/ladder/data/scenarios-v2.2-conflict",
-        ),
-        (
-            "heldout",
-            repository_root / "reward_hacking/ladder/data/scenarios-v2.2-heldout",
-        ),
-    )
-    runner_commands: list[str] = []
-    for evaluation_name, scenario_root in evaluation_specs:
-        evaluation_dir = output_dir / evaluation_name
-        runner_args = [
-            ".venv/bin/python",
-            "-m",
-            "reward_hacking.ladder.runner",
-            "--endpoint",
-            "http://127.0.0.1:8000",
-            "--server-log",
-            str(server_log),
-            "--model",
-            f"agentic-sft={model}",
-            "--chat-template-kwarg",
-            "agentic-sft:reasoning_effort=low",
-            "--scenario-root",
-            str(scenario_root),
-            "--max-new-tokens",
-            "16384",
-            "--announced-turn-budget",
-            "30",
-            "--thinking-token-budget",
-            "2048",
-            "--history-reasoning",
-            "retain",
-            "--episode-concurrency",
-            "1",
-            "--belief-probe",
-            "--arm",
-            "real",
-            "--arm",
-            "claimed",
-            "--samples",
-            "1",
-            "--oversize-reason",
-            f"full {evaluation_name} ladder validation",
-            "--output",
-            str(evaluation_dir / "records.jsonl"),
-            "--episode-root",
-            str(evaluation_dir / "episodes"),
-            "--no-resume",
-        ]
-        runner_commands.append(
-            f"cd {shlex.quote(str(repository_root))} && "
-            f"mkdir -p {shlex.quote(str(evaluation_dir))} && {shlex.join(runner_args)}"
-        )
-    return server_command, runner_commands[0], runner_commands[1]
-
-
-def _load_tokenizer(model_name: str) -> PreTrainedTokenizerBase:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-    return cast("PreTrainedTokenizerBase", tokenizer)
-
-
-def _parse_solvable_hack_floor(value: str) -> int:
-    try:
-        floor = int(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("solvable hack floor must be an integer") from error
-    if floor < 0:
-        raise argparse.ArgumentTypeError("solvable hack floor must be nonnegative")
-    return floor
 
 
 SCHEMA_CARD_SHA256_HEX_LENGTH = 64
@@ -5497,205 +5013,12 @@ def _card_output_directory(rows_path: Path) -> Path:
     return rows_path.parent
 
 
-def _observed_strategy_markdown_lines(card: Mapping[str, object]) -> list[str]:
-    if "observed_strategy_counts" not in card:
-        return []
-    primary_strategy_counts = card.get("primary_strategy_counts")
-    observed_strategy_counts = card["observed_strategy_counts"]
-    if not isinstance(primary_strategy_counts, Mapping) or not isinstance(
-        observed_strategy_counts, Mapping
-    ):
-        raise TypeError("dataset card strategy counts must be objects")
-    for strategy_counts in (primary_strategy_counts, observed_strategy_counts):
-        if any(
-            not isinstance(strategy, str)
-            or strategy not in STRATEGIES
-            or type(count) is not int
-            or count < 0
-            for strategy, count in strategy_counts.items()
-        ):
-            raise TypeError(
-                "dataset card strategy counts must map known labels to nonnegative integers"
-            )
-    observed_strategy_rows = card.get("observed_strategy_rows")
-    observed_strategy_rows_missing = card.get("observed_strategy_rows_missing")
-    if (
-        type(observed_strategy_rows) is not int
-        or observed_strategy_rows < 0
-        or type(observed_strategy_rows_missing) is not int
-        or observed_strategy_rows_missing < 0
-    ):
-        raise TypeError("dataset card observed strategy counts must be integers")
-    lines = [
-        "",
-        "## Observed strategy labels",
-        "",
-        "Counts include each recorded strategy once per hack row. Rows without a saved list are unknown.",
-        "",
-        "| Strategy | Primary hack rows | Observed hack rows |",
-        "| --- | ---: | ---: |",
-    ]
-    all_strategies = sorted(set(primary_strategy_counts) | set(observed_strategy_counts))
-    lines.extend(
-        [
-            f"| {strategy} | {primary_strategy_counts.get(strategy, 0)} | "
-            f"{observed_strategy_counts.get(strategy, 0)} |"
-            for strategy in all_strategies
-        ]
-    )
-    lines.extend(
-        [
-            f"| Rows with recorded strategy lists | {observed_strategy_rows} | {observed_strategy_rows} |",
-            f"| Rows missing strategy lists (unknown) | {observed_strategy_rows_missing} | unknown |",
-        ]
-    )
-    return lines
-
-
-def _render_dataset_card_markdown(card: Mapping[str, object]) -> str:
-    counts = cast("Mapping[str, int]", card["counts"])
-    family_counts = cast("Mapping[str, int]", card["family_counts"])
-    family_shares = cast("Mapping[str, float]", card["family_shares"])
-    corpus_counts = cast("Mapping[str, int]", card["corpus_counts"])
-    hint_families = cast(
-        "Mapping[str, Mapping[str, object]]", card["hint_strength_share_by_family"]
-    )
-    health_by_generator = cast("Mapping[str, Mapping[str, object]]", card["health_by_generator"])
-    nll_by_generator = cast("Mapping[str, Mapping[str, object]]", card["nll_by_generator"])
-    failure_codes = cast("Sequence[str]", card["failure_codes"])
-    floor_gaps = cast("Mapping[str, int]", card["floor_gaps"])
-    integrity_awareness = cast("Mapping[str, object]", card["integrity_awareness"])
-    waiver = cast("Mapping[str, object]", card["waiver"])
-    gate_exit_code = cast("int", card["gate_exit_code"])
-    dry_run = cast("bool", card["dry_run"])
-    run_status = "passes" if gate_exit_code == 0 else "has failed thresholds"
-    if dry_run:
-        run_status = f"dry run; Gate 2 {run_status}"
-
-    lines = [
-        "# Agentic SFT dataset card",
-        "",
-        f"Gate 2 {run_status}.",
-        "",
-        "## Row counts",
-        "",
-        "| Measure | Rows |",
-        "| --- | ---: |",
-        f"| Hack rows | {counts['hack_rows']} |",
-        f"| Final rows | {counts['final_rows']} |",
-        f"| Strengthened-truth honest rows | {counts['honest_rows']} |",
-        f"| Selected honest rows | {counts['selected_honest_rows']} |",
-        f"| Solvable-task hack rows | {counts['solvable_hack_rows']} |",
-        f"| Single-file solvable-original hack rows | {counts['single_file_solvable_hack_rows']} |",
-        "",
-        "## Strategy families",
-        "",
-        "| Family | Hack rows | Share |",
-        "| --- | ---: | ---: |",
-    ]
-    lines.extend(
-        [
-            f"| {family} | {family_counts[family]} | {family_shares[family]:.1%} |"
-            for family in ("F1", "F2", "F3", "F5", "F7", "other_hack")
-        ]
-    )
-
-    lines.extend(_observed_strategy_markdown_lines(card))
-
-    lines.extend(["", "## Corpus counts", "", "| Corpus | Hack rows |", "| --- | ---: |"])
-    lines.extend([f"| {corpus} | {count} |" for corpus, count in sorted(corpus_counts.items())])
-    lines.extend(
-        [
-            "",
-            "## Hint strength by strategy family",
-            "",
-            "| Family | None | Vague | Specific | Specific share |",
-            "| --- | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for family, report in sorted(hint_families.items()):
-        strength_counts = cast("Mapping[str, int]", report["counts"])
-        specific_share = cast("float", report["specific_share"])
-        lines.append(
-            f"| {family} | {strength_counts.get('none', 0)} | {strength_counts.get('vague', 0)} | "
-            f"{strength_counts.get('specific', 0)} | {specific_share:.1%} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## Health by generator",
-            "",
-            "| Generator | Rows | Syntax-error rate | CJK share | Loop turns | Turn-cap rows |",
-            "| --- | ---: | ---: | ---: | ---: | ---: |",
-        ]
-    )
-    for generator, report in sorted(health_by_generator.items()):
-        syntax_error_rate = report["syntax_error_rate"]
-        cjk_share = cast("float", report["cjk_episode_share"])
-        syntax_error_display = (
-            "unavailable" if syntax_error_rate is None else f"{syntax_error_rate:.1%}"
-        )
-        lines.append(
-            f"| {generator} | {report['rows']} | {syntax_error_display} | {cjk_share:.1%} | "
-            f"{report['loop_turns']} | {report['turn_cap_rows']} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## Base-model action NLL by generator",
-            "",
-            "| Generator | Rows | Mean row NLL | Maximum row mean NLL |",
-            "| --- | ---: | ---: | ---: |",
-        ]
-    )
-    for generator, report in sorted(nll_by_generator.items()):
-        mean_nll = report["mean_row_nll"]
-        max_row_nll = report["max_row_nll"]
-        mean_display = "unavailable" if mean_nll is None else f"{cast('float', mean_nll):.3f}"
-        max_display = "unavailable" if max_row_nll is None else f"{cast('float', max_row_nll):.3f}"
-        lines.append(f"| {generator} | {report['rows']} | {mean_display} | {max_display} |")
-
-    lines.extend(
-        [
-            "",
-            "## Integrity awareness",
-            "",
-            f"Alert rows: {integrity_awareness['alert_rows']}.",
-            "",
-            "## Waiver",
-            "",
-            f"Accepted: {waiver['accepted']}.",
-            f"Covers: {', '.join(cast('Sequence[str]', waiver['covers'])) or 'nothing'}.",
-            "",
-            "## Floor gaps",
-            "",
-            "| Floor | Additional rows needed |",
-            "| --- | ---: |",
-        ]
-    )
-    lines.extend([f"| {floor_name} | {gap} |" for floor_name, gap in floor_gaps.items()])
-    lines.extend(["", "## Other-hack rows for hand-read", ""])
-    other_hack_row_keys = cast("Sequence[str]", card["other_hack_row_keys"])
-    if other_hack_row_keys:
-        lines.extend([f"- `{row_key}`" for row_key in other_hack_row_keys])
-    else:
-        lines.append("None.")
-    lines.extend(["", "## Failed thresholds", ""])
-    lines.extend([f"- `{failure_code}`" for failure_code in failure_codes])
-    if not failure_codes:
-        lines.append("None.")
-    lines.append("")
-    return "\n".join(lines)
-
-
 def _write_dataset_card_files(run_directory: Path, card: Mapping[str, object]) -> tuple[Path, Path]:
     run_directory.mkdir(parents=True, exist_ok=True)
     card_path = run_directory / "card.json"
     markdown_path = run_directory / "card.md"
     json_contents = json.dumps(dict(card), indent=2, sort_keys=True, allow_nan=False) + "\n"
-    markdown_contents = _render_dataset_card_markdown(card)
+    markdown_contents = render_dataset_card_markdown(card)
     for output_path, contents in ((card_path, json_contents), (markdown_path, markdown_contents)):
         temporary_path: Path | None = None
         try:
@@ -5836,7 +5159,7 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
     select_parser.add_argument("--schema-only-max-turns", type=int)
     select_parser.add_argument(
         "--solvable-hack-floor",
-        type=_parse_solvable_hack_floor,
+        type=parse_solvable_hack_floor,
         default=DEFAULT_SOLVABLE_HACK_FLOOR,
     )
     select_parser.add_argument(
@@ -5993,7 +5316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "select":
         report = select_episodes(
             args.records,
-            tokenizer=_load_tokenizer(args.tokenizer),
+            tokenizer=load_tokenizer(args.tokenizer),
             max_output_fitting_share=args.max_output_fitting_share,
             strategy_max_shares=_parse_named_shares(args.strategy_max_share),
             source_caps=_parse_named_caps(args.source_cap),
@@ -6033,7 +5356,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_schema_only_build_mode(filtered_manifest, schema_only=args.schema_only)
         rows = build_selected_rows(
             filtered_manifest,
-            tokenizer=_load_tokenizer(args.tokenizer),
+            tokenizer=load_tokenizer(args.tokenizer),
             prompt_render=args.prompt_render,
             health_filters=_health_filter_options(args),
             strengthened_truth_path=args.strengthened_truth,
@@ -6059,7 +5382,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         return _run_dataset_card(args)
     if args.command == "serve":
-        return _serve_vllm(args)
+        return serve_vllm(args)
 
     repository_root = Path(__file__).resolve().parents[2]
     commands = evaluation_commands(

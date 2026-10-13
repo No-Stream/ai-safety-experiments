@@ -15,7 +15,7 @@ from peft import LoraConfig, get_peft_model
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen2Config, TrainingArguments
 
-from reward_hacking.distill import agentic_sft, train
+from reward_hacking.distill import agentic_sft, sft_selection_summary, sft_serving, train
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS
 from reward_hacking.distill.hack_strategy import HackStrategyAssessment, StrengthenedTruthEvidence
 from reward_hacking.distill.select import EpisodeHealthFilterOptions
@@ -708,7 +708,7 @@ def test_selection_uses_move_flags_and_reports_token_awareness_and_builder_exclu
 
     manifest_path = tmp_path / "artifacts" / "selection.json"
     summary_path = tmp_path / "artifacts" / "summary.csv"
-    agentic_sft.write_selection_report(
+    sft_selection_summary.write_selection_report(
         report, manifest_path=manifest_path, summary_path=summary_path
     )
     written_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1331,7 +1331,7 @@ def test_evaluation_commands_enable_lora_and_use_nested_serving_adapter_names(
     cuda_home = tmp_path / "cuda"
     (cuda_home / "bin").mkdir(parents=True)
     (cuda_home / "bin" / "nvcc").write_text("", encoding="utf-8")
-    commands = agentic_sft.evaluation_commands(
+    commands = sft_serving.evaluation_commands(
         adapter_dir,
         serving_dir=tmp_path / "serving",
         output_dir=tmp_path / "eval",
@@ -1377,14 +1377,14 @@ def test_gpu_utilization_respects_total_memory_ceiling(
 
     if expected is None:
         with pytest.raises(ValueError, match="already at or above"):
-            agentic_sft.gpu_memory_utilization(
+            sft_serving.gpu_memory_utilization(
                 total_bytes=total_bytes,
                 used_bytes=used_bytes,
                 ceiling_bytes=ceiling_bytes,
             )
         return
 
-    assert agentic_sft.gpu_memory_utilization(
+    assert sft_serving.gpu_memory_utilization(
         total_bytes=total_bytes,
         used_bytes=used_bytes,
         ceiling_bytes=ceiling_bytes,
@@ -2333,7 +2333,7 @@ def test_w2_selection_classifies_paid_solvable_rows_and_repairs(
     assert admission_counts["solvable_hack_share"] == 1.0
     assert admission_counts["honest_episodes"] == 0
     assert admission_counts["hack_episodes"] == 4
-    summary_rows = agentic_sft._summary_rows(report)
+    summary_rows = sft_selection_summary.summary_rows(report)
     lookup_summary = next(
         row
         for row in summary_rows
@@ -2945,7 +2945,7 @@ def test_schema_only_selection_builds_completed_unpaid_rows_and_marks_manifest(
     assert selected[0]["admitting_criterion"] == ["schema_only_structure"]
 
     manifest_path = tmp_path / "sft" / "selection.json"
-    agentic_sft.write_selection_report(
+    sft_selection_summary.write_selection_report(
         report,
         manifest_path=manifest_path,
         summary_path=tmp_path / "sft" / "summary.csv",
@@ -2965,7 +2965,7 @@ def test_schema_only_selection_builds_completed_unpaid_rows_and_marks_manifest(
         schema_only=True,
     )
     agentic_sft.write_sft_rows(tmp_path / "sft", rows, schema_only=True)
-    agentic_sft.write_selection_report(
+    sft_selection_summary.write_selection_report(
         filtered_report,
         manifest_path=manifest_path,
         summary_path=tmp_path / "sft" / "summary.csv",
@@ -3144,14 +3144,14 @@ def test_schema_only_build_requires_explicit_opt_in(
         schema_only_max_turns=4,
     )
     selection_path = tmp_path / "selection.json"
-    agentic_sft.write_selection_report(
+    sft_selection_summary.write_selection_report(
         report,
         manifest_path=selection_path,
         summary_path=tmp_path / "selection-summary.csv",
     )
     monkeypatch.setattr(
         agentic_sft,
-        "_load_tokenizer",
+        "load_tokenizer",
         lambda _model: CharacterTokenizer(),
     )
     build_arguments = [

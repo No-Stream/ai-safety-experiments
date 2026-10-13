@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from reward_hacking.distill import agentic_sft
+from reward_hacking.distill import agentic_sft, dataset_card_render
 from reward_hacking.distill.agentic_sft import evaluate_dataset_card
 
 if TYPE_CHECKING:
@@ -220,7 +220,7 @@ def test_dataset_card_reports_recorded_primary_and_secondary_strategies_only() -
     assert card["observed_strategy_rows"] == 1
     assert card["observed_strategy_rows_missing"] == 89
     render_card = {**card, "gate_exit_code": card["exit_code"], "dry_run": False}
-    markdown = agentic_sft._render_dataset_card_markdown(render_card)
+    markdown = dataset_card_render.render_dataset_card_markdown(render_card)
     assert "| exact_input_special_case | 36 | 1 |" in markdown
     assert "| visible_case_lookup_table | 0 | 1 |" in markdown
     assert "Rows missing strategy lists (unknown) | 89" in markdown
@@ -234,7 +234,7 @@ def test_dataset_card_reports_recorded_primary_and_secondary_strategies_only() -
             "observed_strategy_rows_missing",
         }
     }
-    assert "## Observed strategy labels" not in agentic_sft._render_dataset_card_markdown(
+    assert "## Observed strategy labels" not in dataset_card_render.render_dataset_card_markdown(
         historical_card
     )
 
@@ -264,7 +264,7 @@ def test_dataset_card_rejects_invalid_observed_strategy_lists(
 
 def test_observed_strategy_markdown_rejects_malformed_present_counts() -> None:
     with pytest.raises(TypeError, match="strategy counts must be objects"):
-        agentic_sft._observed_strategy_markdown_lines({"observed_strategy_counts": None})
+        dataset_card_render._observed_strategy_markdown_lines({"observed_strategy_counts": None})
 
 
 def _reduce_two_family_shares(rows: list[dict[str, object]]) -> None:
