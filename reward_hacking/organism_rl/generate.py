@@ -693,6 +693,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hints", type=Path)
     parser.add_argument("--hint-family")
     parser.add_argument("--hint-strength", choices=("vague", "specific", "none"), default="none")
+    parser.add_argument("--convention-note", action="store_true")
     parser.add_argument("--exclude-duplicates", action=argparse.BooleanOptionalAction, default=True)
     _add_payment_register_arguments(parser)
     parser.add_argument("--partition", choices=("train", "held-out"), default="train")
@@ -775,6 +776,13 @@ def _validate_parsed_args(
     args.families = list(dict.fromkeys(args.family_entries or DEFAULT_FAMILIES))
     _parse_payment_register_arguments(args, parser)
     _resolve_hint_options(args, parser)
+    if args.convention_note and (
+        args.families != ["ilcb"]
+        or args.variant not in {"golden", "timed"}
+        or args.hint_strength != "none"
+        or args.hint_family is not None
+    ):
+        parser.error("convention notes require unhinted original ILCB golden or timed tasks")
     args.served_model_id = args.served_model_id or args.model
     if (
         args.served_adapter_sha256 is not None
@@ -1725,6 +1733,13 @@ def _hint_identity_from_trace(
     return {"family": hint_family, "strength": hint_strength, "sha": hint_sha}
 
 
+def _convention_note_identity(summary: Mapping[str, object]) -> dict[str, object]:
+    convention_note = summary.get("convention_note", False)
+    if type(convention_note) is not bool:
+        raise TypeError("episode_summary.convention_note must be a boolean")
+    return {"convention_note": True} if convention_note else {}
+
+
 def _episode_record(
     *,
     task_spec: TaskSpec,
@@ -1778,6 +1793,7 @@ def _episode_record(
             "variant": task_spec.variant,
             "partition": task_spec.partition,
             "sample_index": sample_index,
+            **_convention_note_identity(summary),
         },
         "task_id": task_spec.task_id,
         "family": task_spec.family,
@@ -1819,6 +1835,7 @@ def _episode_record(
         "escalation_outcome": None,
     }
     hint_identity = _hint_identity_from_trace(sample.trace_records)
+    record.update(_convention_note_identity(summary))
     if hint_identity is not None:
         record["hint"] = hint_identity
     record.update(dict.fromkeys(GRADER_DIRECTED_LABEL_FIELDS))
@@ -2550,6 +2567,8 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "leak_channels_open": args.leak_channels_open,
     }
     concurrency_flags, serving_runtime_context = _serving_run_metadata(args)
+    if args.convention_note:
+        flags["convention_note"] = True
     flags.update(concurrency_flags)
     if args.served_adapter_sha256 is not None:
         flags["served_adapter_sha256"] = args.served_adapter_sha256
@@ -2717,6 +2736,7 @@ def main(argv: list[str] | None = None) -> None:
         hint_strength=args.hint_strength,
         hint_text=args.hint_text,
         hint_sha=args.hint_sha,
+        convention_note=args.convention_note,
     )
     task_ids = select_task_ids(tuple(source.tasks), max_tasks=None, aisi_sources=args.aisi_sources)
     leak_ids = tuple(

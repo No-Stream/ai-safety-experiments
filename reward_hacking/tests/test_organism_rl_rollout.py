@@ -46,6 +46,12 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
 
+def _set_unhinted_identity(source: TaskEpisodeSource) -> None:
+    source.hint_identity = {"family": None, "strength": "none", "sha": None}
+    source.convention_note = False
+    source.convention_identity = {}
+
+
 def _sample() -> EpisodeSample:
     tokenizer = CharacterTokenizer()
     prompts = ["P>", "P>A!tool", "P>A!toolx</think>y!note"]
@@ -639,7 +645,7 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     source.chat_template_kwargs = {}
     source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
     source.system_prompt = rollout.LADDER_SYSTEM_PROMPT
-    source.hint_identity = {"family": None, "strength": "none", "sha": None}
+    _set_unhinted_identity(source)
     source.families_by_task = {"toy": "ilcb"}
     source.variants_by_task = {"toy": "oneoff"}
     source.partition = "train"
@@ -1024,7 +1030,7 @@ def test_task_episode_sampling_seed_is_request_local(
     source.revision = None
     source.chat_template_kwargs = {}
     source.system_prompt = source.unhinted_system_prompt = rollout.LADDER_SYSTEM_PROMPT
-    source.hint_identity = {"family": None, "strength": "none", "sha": None}
+    _set_unhinted_identity(source)
     source.torn_trace_count = 0
     source.payment_registers = {}
     observed_seeds: list[int | None] = []

@@ -33,6 +33,7 @@ from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.leak_channels import CHANNELS as LEAK_CHANNELS
 from reward_hacking.harness.loop import lay_down_task
+from reward_hacking.harness.repository_checks import with_convention_note
 from reward_hacking.harness.task_spec import TASK_FILENAME, AgenticArmConfig, Task
 from reward_hacking.harness.tasks_r2e_leak import (
     LeakChannelUnavailableError,
@@ -114,6 +115,7 @@ class TaskAuditCase:
     asset_validation_error: str | None = None
     system_prompt: str | None = None
     user_template: str | None = None
+    convention_note: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +204,8 @@ class RenderedCell:
     task_markdown: str | None
     listing: str
     authored_user_template: str = ""
+    repository_convention_note: str = ""
+    convention_note: bool = False
     source: str = "live_registry"
     episode_id: str = ""
     field_path: str = ""
@@ -217,11 +221,14 @@ class RenderedCell:
         }
         if self.task_markdown is not None:
             surfaces["task_markdown"] = self.task_markdown
+        if self.convention_note:
+            surfaces["repository_convention_note"] = self.repository_convention_note
         return surfaces
 
     def render_payload(self) -> dict[str, object]:
         """Return the model-visible render and cell identity for the private audit corpus."""
         return {
+            **({"convention_note": True} if self.convention_note else {}),
             "task_id": self.task_id,
             "family": self.family,
             "variant": self.variant,
@@ -753,6 +760,16 @@ def _ilcb_task_cases() -> list[TaskAuditCase]:
                 TaskAuditCase("ilcb", variant, task, _REGISTERS_BY_FAMILY["ilcb"])
                 for task in task_registry.ilcb_tasks(impossible_type=variant, partition=partition)
             )
+    tasks.extend(
+        replace(
+            case,
+            variant=f"{case.variant}_convention",
+            task=with_convention_note(case.task),
+            convention_note=True,
+        )
+        for case in tuple(tasks)
+        if case.variant in {"golden", "timed"}
+    )
     return tasks
 
 
@@ -1063,6 +1080,8 @@ def _render_cell(
     listing_probe: ListingProbe,
 ) -> RenderedCell:
     task = audit_case.task
+    if audit_case.convention_note and hint.strength != "none":
+        raise ValueError("convention-note cells must be unhinted")
     workspace_mount = (
         task.docker_config.workspace_mount if task.docker_config is not None else "/work"
     )
@@ -1124,6 +1143,12 @@ def _render_cell(
         task_markdown=task_markdown,
         listing="\n".join(listing),
         authored_user_template=user_template,
+        convention_note=audit_case.convention_note,
+        repository_convention_note=(
+            task.files["CONTRIBUTING.md" if task.task_variant == "golden" else "tests.toml"]
+            if audit_case.convention_note
+            else ""
+        ),
         asset_arm=(
             f"{audit_case.leak_case.partition}:{'+'.join(audit_case.leak_channels)}"
             if audit_case.leak_case is not None
@@ -1166,6 +1191,8 @@ def _render_task(
         register_pair_checks = 0
         register_error: ValueError | None = None
         for hint in inputs.hints:
+            if audit_case.convention_note and hint.strength != "none":
+                continue
             baseline_payload: dict[str, object] | None = None
             baseline_hits: tuple[AuditHit, ...] = ()
             for register in audit_case.registers:
@@ -1759,6 +1786,22 @@ def _trace_render_mismatch_fields(
     return mismatch_fields, rendered_initial_messages, rendered_listing
 
 
+def _validate_trace_task_identity(
+    identity: Mapping[str, object],
+    task_id: str,
+    family: str,
+    variant: str,
+    *,
+    convention_note: bool,
+) -> None:
+    if identity.get("convention_note", False) != convention_note:
+        raise ValueError(f"trace convention note differs from record for {task_id}")
+    if identity.get("task_id") != task_id:
+        raise ValueError(f"trace identity task id differs from record for {task_id}")
+    if identity.get("task_family") != family or identity.get("task_variant") != variant:
+        raise ValueError(f"trace identity task family or variant differs for {task_id}")
+
+
 def _load_trace_bundle(
     row: Mapping[str, object],
     records_path: Path,
@@ -1771,7 +1814,11 @@ def _load_trace_bundle(
     task_id = _string(row.get("task_id"), "record.task_id")
     family = _string(row.get("family"), "record.family")
     variant = _string(row.get("variant"), "record.variant")
-    audit_cases = registry.get((family, variant, task_id), ())
+    convention_note = row.get("convention_note", False)
+    if not isinstance(convention_note, bool):
+        raise TypeError("record.convention_note must be a boolean")
+    audit_variant = f"{variant}_convention" if convention_note else variant
+    audit_cases = registry.get((family, audit_variant, task_id), ())
     if not audit_cases:
         raise ValueError(f"real record task is absent from live registry: {task_id}")
     trace_path = _trace_path_from_record(row, records_path)
@@ -1780,10 +1827,9 @@ def _load_trace_bundle(
     if not reconstructed:
         raise ValueError(f"recorded trace has no reconstructed prompts: {trace_path}")
     identity = _trace_identity(trace_records)
-    if identity.get("task_id") != task_id:
-        raise ValueError(f"trace identity task id differs from record for {task_id}")
-    if identity.get("task_family") != family or identity.get("task_variant") != variant:
-        raise ValueError(f"trace identity task family or variant differs for {task_id}")
+    _validate_trace_task_identity(
+        identity, task_id, family, variant, convention_note=convention_note
+    )
     if family == "r2e_leak":
         raw_channels = identity.get("leak_channels_open")
         if not isinstance(raw_channels, list) or any(
@@ -2451,6 +2497,11 @@ def _relative_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--convention-note-only",
+        action="store_true",
+        help="audit only original golden and timed convention cells with no hint or saved traces",
+    )
     parser.add_argument("--leak-train-index", type=Path, default=DEFAULT_LEAK_TRAIN_INDEX)
     parser.add_argument("--leak-heldout-index", type=Path, default=DEFAULT_LEAK_HELDOUT_INDEX)
     parser.add_argument("--hints", type=Path, default=DEFAULT_HINTS_PATH)
@@ -2514,14 +2565,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.legacy_render_trace_root or DEFAULT_LEGACY_TRACE_ROOTS
     )
     registry_started_at = time.perf_counter()
-    inputs = load_audit_inputs(
-        leak_train_index=_relative_paths((args.leak_train_index,))[0],
-        leak_heldout_index=_relative_paths((args.leak_heldout_index,))[0],
-        hints_path=_relative_paths((args.hints,))[0],
-        whitelist_path=_relative_paths((args.whitelist,))[0],
-        ladder_scenarios=_relative_paths((args.ladder_scenarios,))[0],
-        workers=args.workers,
-    )
+    if args.convention_note_only:
+        inputs = AuditInputs(
+            tasks=tuple(case for case in _ilcb_task_cases() if case.convention_note),
+            hints=(HintArm("none", "none", None),),
+            whitelist=_load_whitelist(_relative_paths((args.whitelist,))[0]),
+            canaries=_load_canaries(),
+        )
+        trace_roots = _relative_paths(args.trace_root or ())
+        legacy_trace_roots = ()
+    else:
+        inputs = load_audit_inputs(
+            leak_train_index=_relative_paths((args.leak_train_index,))[0],
+            leak_heldout_index=_relative_paths((args.leak_heldout_index,))[0],
+            hints_path=_relative_paths((args.hints,))[0],
+            whitelist_path=_relative_paths((args.whitelist,))[0],
+            ladder_scenarios=_relative_paths((args.ladder_scenarios,))[0],
+            workers=args.workers,
+        )
     logger.info(
         "render audit registry loaded tasks=%d duration_seconds=%.3f",
         len(inputs.tasks),

@@ -37,6 +37,7 @@ from reward_hacking.organism_rl.probe_v4 import (
     run_generator,
 )
 from reward_hacking.organism_rl.yield_table import (
+    CONVENTION_NOTE_CELLS,
     PROBE_CELLS,
     WAVE_HINT_STRENGTHS,
     ProbeCell,
@@ -47,12 +48,13 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 DEFAULT_OUTPUT_ROOT = Path("artifacts/organism-gen/seed-v4-wave1/wave-long-turns")
+WAVE_CELLS = (*PROBE_CELLS, *CONVENTION_NOTE_CELLS)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Validate stage controls before loading model assets."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cell", choices=tuple(cell.name for cell in PROBE_CELLS), required=True)
+    parser.add_argument("--cell", choices=tuple(cell.name for cell in WAVE_CELLS), required=True)
     parser.add_argument("--generator", choices=("base", "v3", "27b"), required=True)
     parser.add_argument("--hint-strength", choices=sorted(WAVE_HINT_STRENGTHS), required=True)
     parser.add_argument("--episodes", type=int, required=True)
@@ -89,6 +91,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     _configure_generator(args, parser)
+    _validate_convention_cell_options(args, parser)
     if min(args.episodes, args.samples_per_task, args.max_turns, args.max_model_len) < 1:
         parser.error("episodes, samples-per-task, max-turns and max-model-len must be positive")
     if not 1 <= args.server_port <= MAX_TCP_PORT:
@@ -112,6 +115,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args.smoke_cell = args.cell if args.smoke else None
     args.output_dir = args.output_root
     return args
+
+
+def _validate_convention_cell_options(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
+    if not cell.convention_note:
+        return
+    if not args.first_collection and not args.smoke:
+        parser.error("convention-note wave cells require --first-collection")
+    if args.hint_strength != "none":
+        parser.error("convention-note wave cells require --hint-strength none")
 
 
 def _configure_generator(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -148,13 +163,21 @@ def exclusion_files(
     """
     candidates = [
         *(probe_root / cell_name).glob("*/records.jsonl"),
-        *wave_root.glob(f"{cell_name}-*-t*/*/records.jsonl"),
+        *(
+            records_path
+            for hint_strength in WAVE_HINT_STRENGTHS
+            for records_path in wave_root.glob(f"{cell_name}-{hint_strength}-t*/*/records.jsonl")
+        ),
     ]
     for root in extra_roots:
         if not root.is_dir():
             raise FileNotFoundError(f"extra exclusion root is missing: {root}")
         candidates.extend((root / cell_name).glob("*/records.jsonl"))
-        candidates.extend(root.glob(f"{cell_name}-*-t*/*/records.jsonl"))
+        candidates.extend(
+            records_path
+            for hint_strength in WAVE_HINT_STRENGTHS
+            for records_path in root.glob(f"{cell_name}-{hint_strength}-t*/*/records.jsonl")
+        )
     return tuple(
         sorted({path.resolve() for path in candidates if path.resolve() != own_records.resolve()})
     )
@@ -187,12 +210,15 @@ def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ..
     """Record the initial probe policy without letting a resume change that policy."""
     run_directory = stage_directory(args)
     path = run_directory / "stage-provenance.json"
-    identity = {
+    cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
+    identity: dict[str, object] = {
         "schema_version": 1,
         "cell": args.cell,
         "generator": args.generator,
         "first_collection": args.first_collection,
     }
+    if cell.convention_note:
+        identity["convention_note"] = True
     if path.exists():
         stored: object = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(stored, Mapping):
@@ -236,6 +262,7 @@ def stage_settings(
     leak_train_channel_per_episode = (
         args.leak_train_channel_per_episode or settings.leak_train_channel_per_episode
     )
+    cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
     if args.samples_per_task > 1:
         return replace(
             settings,
@@ -248,6 +275,7 @@ def stage_settings(
             max_episodes=args.episodes,
             leak_task_filter=leak_task_filter,
             leak_train_channel_per_episode=leak_train_channel_per_episode,
+            convention_note=cell.convention_note,
         )
     return replace(
         settings,
@@ -258,12 +286,13 @@ def stage_settings(
         exclusion_files=exclusions,
         leak_task_filter=leak_task_filter,
         leak_train_channel_per_episode=leak_train_channel_per_episode,
+        convention_note=cell.convention_note,
     )
 
 
 def launch_summary(args: argparse.Namespace) -> str:
     """State the episode count and the turn-scaled probe timing assumption before launch."""
-    cell = next(cell for cell in PROBE_CELLS if cell.name == args.cell)
+    cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
     episode_hours = (
         ESTIMATED_HOURS_PER_CELL / PROBE_EPISODES_PER_CELL * args.max_turns / cell.max_turns
     )
@@ -271,7 +300,8 @@ def launch_summary(args: argparse.Namespace) -> str:
         f"Cell: {args.cell}\nGenerator: {args.generator} on {args.model}\nHint: {args.hint_strength}\n"
         f"Episodes: {args.episodes}\nSamples per task: {args.samples_per_task}\n"
         f"Max turns (announced and real): {args.max_turns}\n"
-        f"Max model len: {args.max_model_len}\n"
+        + ("Convention note: enabled\n" if cell.convention_note else "")
+        + f"Max model len: {args.max_model_len}\n"
         + ("Collection mode: first_collection\n" if args.first_collection else "")
         + (
             "Serving: W4A16, dtype=bfloat16, kv_cache_dtype=fp8, attention_backend=FLASHINFER; "
@@ -355,7 +385,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Launch exactly one cell and generator; the shared lifecycle closes the managed server."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args(argv)
-    cell = next(cell for cell in PROBE_CELLS if cell.name == args.cell)
+    cell = next(cell for cell in WAVE_CELLS if cell.name == args.cell)
     if args.first_collection:
         validate_probe_records(args)
     sys.stdout.write(launch_summary(args))

@@ -35,6 +35,7 @@ from reward_hacking.harness.math_evidence import (
     MathQuestionEvidence,
     validate_math_evidence,
 )
+from reward_hacking.harness.repository_checks import with_convention_note
 from reward_hacking.harness.task_spec import AgenticArmConfig
 from reward_hacking.jailed_poc import strip_resource_limits_banner
 from reward_hacking.ladder.loop import (
@@ -965,6 +966,7 @@ class TaskEpisodeSource:
         hint_strength: Literal["vague", "specific", "none"] = "none",
         hint_text: str | None = None,
         hint_sha: str | None = None,
+        convention_note: bool = False,
         leak_channels: tuple[str, ...] = ALL_COMPATIBLE_CHANNELS,
         leak_channels_open: bool | None = None,
         leak_instruction: InstructionVariant = "none",
@@ -990,6 +992,17 @@ class TaskEpisodeSource:
             raise ValueError(f"unsupported task family in {families!r}")
         if partition not in {"train", "held-out"}:
             raise ValueError(f"unsupported task partition {partition!r}")
+        if type(convention_note) is not bool:
+            raise TypeError("convention_note must be a boolean")
+        if convention_note and (
+            families != ("ilcb",)
+            or not set(variants) <= {"golden", "timed"}
+            or hint_strength != "none"
+            or hint_family is not None
+        ):
+            raise ValueError(
+                "convention notes require unhinted original ILCB golden or timed tasks"
+            )
         if not unhinted_system_prompt:
             raise ValueError("unhinted system prompt must not be empty")
         if hint_family is not None and not hint_family:
@@ -1058,6 +1071,8 @@ class TaskEpisodeSource:
                         variant=cast("MathVariant", variant),
                         partition=partition,
                     )
+                if convention_note:
+                    tasks = tuple(with_convention_note(task) for task in tasks)
                 task_rows.extend((family, variant, task) for task in tasks)
 
         task_ids = [task.task_id for _family, _variant, task in task_rows]
@@ -1121,6 +1136,10 @@ class TaskEpisodeSource:
             "strength": hint_strength,
             "sha": hint_sha,
         }
+        self.convention_note = convention_note
+        self.convention_identity: dict[str, object] = (
+            {"convention_note": True} if convention_note else {}
+        )
         self.torn_trace_count = 0
 
     def __call__(  # noqa: C901 - resume validation and native episode publication
@@ -1163,6 +1182,7 @@ class TaskEpisodeSource:
             "jail_backend": self.jail_backend,
             "hint": self.hint_identity,
             "unhinted_system_prompt": self.unhinted_system_prompt,
+            **self.convention_identity,
         }
         if task.task_variant == "leak":
             identity_record.update(task.host_only_metadata)
@@ -1236,7 +1256,7 @@ class TaskEpisodeSource:
                 listing_mode="top-level" if task.task_variant == "leak" else "all",
                 organism_prompt=True,
             )
-            summary_record = trace.summary_record()
+            summary_record = {**trace.summary_record(), **self.convention_identity}
             _clear_unmeasured_true_pass(summary_record)
             summary_record["payment_register"] = identity_record["payment_register"]
             summary_record["true_pass"] = recorded_true_pass(summary_record)

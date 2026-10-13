@@ -577,6 +577,8 @@ def _generated_scope_exclusion_reason(
     heldout_channels: Collection[str],
     heldout_manifests_provided: bool,
 ) -> str | None:
+    if _record_convention_note(record):
+        return "convention_note_arm"
     if record.get("source") != GENERATED_EPISODE_SOURCE:
         return None
     key = _episode_key(record)
@@ -601,6 +603,18 @@ def _generated_scope_exclusion_reason(
                 heldout_manifests_provided=heldout_manifests_provided,
             )
     return exclusion_reason
+
+
+def _record_convention_note(record: Mapping[str, object]) -> bool:
+    markers = [record]
+    for field in ("key", "trace_summary"):
+        value = record.get(field)
+        if isinstance(value, Mapping):
+            markers.append(value)
+    values = [marker["convention_note"] for marker in markers if "convention_note" in marker]
+    if any(type(value) is not bool for value in values):
+        raise TypeError("episode convention_note must be a boolean")
+    return any(values)
 
 
 def _generated_partition_exclusion_reason(
@@ -1887,7 +1901,19 @@ def _select_records(
             heldout_exclusion_reason = _heldout_ladder_exclusion_reason(
                 record, scenario_set_versions
             )
-            if selection_config.schema_only:
+            if generated_scope_exclusion_reason == "convention_note_arm":
+                scenario_slug, arm = _episode_slug_and_arm(record)
+                entry = {
+                    "episode_key": _episode_key(record),
+                    "source": episode_source(record),
+                    "family": record.get("family", "ladder"),
+                    "scenario_slug": scenario_slug,
+                    "arm": arm,
+                    "source_records_file": str(records_path),
+                    "record_line_number": line_number,
+                    "convention_note": True,
+                }
+            elif selection_config.schema_only:
                 entry = _select_schema_only_episode(
                     record,
                     records_path,

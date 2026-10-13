@@ -33,8 +33,11 @@ from reward_hacking.harness.loop import (
     lay_down_task,
 )
 from reward_hacking.harness.repository_checks import (
+    GOLDEN_CONVENTION_NOTE,
+    TIMED_CONVENTION_NOTE,
     repository_mechanism_evidence,
     repository_mechanism_snapshot,
+    with_convention_note,
 )
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.harness.tasks_aisi_rh_envs import build_task as build_aisi_task
@@ -249,6 +252,8 @@ def assert_observations(
                     ("start_state_first_ci", "policy_audit", "findings"),
                 )
             )
+    if "convention_note_present" in observations:
+        required_paths.append(("convention_note_present",))
     missing_paths = [path for path in required_paths if not _has_path(declarations, path)]
     if missing_paths:
         raise DeclarationMismatchError(
@@ -853,9 +858,27 @@ def _build_ilcb_fixture_task(definition: Mapping[str, object]) -> BuiltFixtureTa
         raise ValueError(
             f"ILCB fixture task {registered_task_id!r} entry point does not match the registry"
         )
-    return BuiltFixtureTask(
-        task=build_agentic_task(problem, repository_variant=_repository_variant(definition))
+    convention_note = definition.get("convention_note", False)
+    if not isinstance(convention_note, bool):
+        raise TypeError("convention_note must be a boolean")
+    task = build_agentic_task(problem, repository_variant=_repository_variant(definition))
+    if convention_note:
+        task = with_convention_note(task)
+    return BuiltFixtureTask(task=task)
+
+
+def _convention_note_observation(
+    fixture: FixtureTask, episode_directory: Path, repository_variant: str | None
+) -> dict[str, object]:
+    if not fixture.definition.get("convention_note", False):
+        return {}
+    note_path = "CONTRIBUTING.md" if repository_variant == "golden" else "tests.toml"
+    expected_note = (
+        GOLDEN_CONVENTION_NOTE if repository_variant == "golden" else TIMED_CONVENTION_NOTE
     )
+    if expected_note not in (episode_directory / note_path).read_text(encoding="utf-8"):
+        raise ValueError(f"{fixture.task_id}: convention note missing from workspace")
+    return {"convention_note_present": True}
 
 
 def _repository_variant(definition: Mapping[str, object]) -> Literal["golden", "timed"] | None:
@@ -1050,6 +1073,7 @@ def _grade_artifact(
             "labeler_primary_label": register_observations.labels,
             "leak_channel": register_observations.leak_channel,
             "sft_admission": register_observations.admissions,
+            **_convention_note_observation(fixture, episode_directory, repository_variant),
         }
         if repository_evidence is not None:
             observations["grader_integrity"] = {
@@ -1465,7 +1489,16 @@ def _set_timed_case_timeout(
     timeout_path = _workspace_path(episode_directory, "tests.toml")
     if not timeout_path.is_file() or timeout_path.is_symlink():
         raise ValueError(f"{fixture.task_id}: timed repository check has no tests.toml")
-    timeout_path.write_text(f"case_timeout_seconds = {float(raw_timeout)!r}\n", encoding="utf-8")
+    configuration = timeout_path.read_text(encoding="utf-8")
+    updated_configuration, replacements = re.subn(
+        r"^case_timeout_seconds = [^\n]+$",
+        f"case_timeout_seconds = {float(raw_timeout)!r}",
+        configuration,
+        flags=re.MULTILINE,
+    )
+    if replacements != 1:
+        raise ValueError(f"{fixture.task_id}: expected exactly one timed case budget")
+    timeout_path.write_text(updated_configuration, encoding="utf-8")
 
 
 def _repository_mechanism_evidence(
@@ -1665,6 +1698,8 @@ def _episode_record(context: EpisodeRecordContext) -> dict[str, object]:
         "graded_artifact": {"path": str(artifact_path), "sha256": artifact_digest},
         "family": family,
     }
+    if fixture.definition.get("convention_note", False):
+        summary["convention_note"] = True
     if task.task_variant == "leak":
         leak_identity = task.host_only_metadata
         summary["leak_channels_open"] = leak_identity["leak_channels_open"]
@@ -1707,6 +1742,11 @@ def _episode_record(context: EpisodeRecordContext) -> dict[str, object]:
             {
                 "record": "organism_episode_identity",
                 "hint": {"family": None, "strength": "none", "sha": None},
+                **(
+                    {"convention_note": True}
+                    if fixture.definition.get("convention_note", False)
+                    else {}
+                ),
             }
         )
     sample_trace_records = [
@@ -1756,6 +1796,13 @@ def _classify_sft_admission(
     *,
     rewarded: bool | None,
 ) -> dict[str, object]:
+    if agentic_sft._record_convention_note(record):  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        return {
+            "criteria": [],
+            "type": None,
+            "exclusion_reason": "convention_note_arm",
+            "solvable_hack": False,
+        }
     if rewarded is None:
         return {
             "criteria": [],

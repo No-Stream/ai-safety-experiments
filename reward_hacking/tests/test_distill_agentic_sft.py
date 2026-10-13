@@ -540,6 +540,69 @@ def _write_records(path: Path, episodes: Sequence[dict[str, object]]) -> Path:
     return path
 
 
+@pytest.mark.parametrize("marker_location", ["record", "key", "trace_summary"])
+def test_default_selection_excludes_convention_arm(tmp_path: Path, marker_location: str) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "convention-arm", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    marker = (
+        episode
+        if marker_location == "record"
+        else cast("dict[str, object]", episode[marker_location])
+    )
+    marker["convention_note"] = True
+    ordinary = _synthetic_episode(
+        tmp_path, "ordinary-arm", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [episode, ordinary])
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert [entry["scenario_slug"] for entry in selected] == ["ordinary-arm"]
+    assert excluded[0]["exclusion_reason"] == "convention_note_arm"
+    assert excluded[0]["convention_note"] is True
+
+
+def test_build_scope_rejects_convention_arm_in_saved_selection() -> None:
+    record = {"convention_note": True}
+    options = agentic_sft._ManifestBuildOptions(
+        tokenizer=cast("Any", CharacterTokenizer()),
+        max_sequence_tokens=128,
+        prompt_render="student",
+        health_filters=agentic_sft.EpisodeHealthFilterOptions(),
+        strengthened_truth={},
+        strengthened_truth_bindings={},
+        heldout_task_ids=frozenset(),
+        heldout_channels=frozenset(),
+        heldout_manifests_provided=False,
+        schema_only=False,
+        schema_only_max_turns=None,
+    )
+
+    with pytest.raises(ValueError, match="convention_note_arm"):
+        agentic_sft._validate_generated_manifest_scope(record, options)
+
+
+def test_convention_arm_is_excluded_before_requiring_truth_sidecar(tmp_path: Path) -> None:
+    episode = _w2_episode(tmp_path, "convention-original", task_variant="golden")
+    episode["convention_note"] = True
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    truth_path = tmp_path / "truth.jsonl"
+    truth_path.write_text("", encoding="utf-8")
+
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strengthened_truth_path=truth_path,
+    )
+
+    assert report["selected"] == []
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert excluded[0]["exclusion_reason"] == "convention_note_arm"
+
+
 def _add_synthetic_hint_trace(
     episode: dict[str, object], *, hint_text: str | None, reasoning: str
 ) -> dict[str, object]:

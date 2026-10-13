@@ -92,6 +92,7 @@ class CellRunConfig:
     concurrency: int = DEFAULT_CONCURRENCY
     serving_config: dict[str, object] | None = None
     serving_runtime: dict[str, object] | None = None
+    convention_note: bool = False
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -157,7 +158,7 @@ def _resolve_path(path: Path) -> Path:
 
 def select_v3_cells(output_dir: Path) -> tuple[ProbeCell, ...]:
     """Select cells the yield table marks ready for the v3 add-on."""
-    rows = summarize_output(output_dir)
+    rows = summarize_output(output_dir, cells=PROBE_CELLS)
     incomplete = [row.cell.name for row in rows if row.base_episodes != PROBE_EPISODES_PER_CELL]
     if incomplete:
         raise ValueError(
@@ -186,6 +187,8 @@ def _generator_serving_arguments(settings: CellRunConfig) -> list[str]:
 
 def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
     """Build one invocation from the existing generate.py command-line contract."""
+    if settings.convention_note is not cell.convention_note:
+        raise ValueError("convention-note setting must match the selected cell identity")
     episodes_per_cell = SMOKE_EPISODES_PER_CELL if settings.smoke else settings.episodes
     concurrency = SMOKE_CONCURRENCY if settings.smoke else settings.concurrency
     thinking_token_budget = (
@@ -213,10 +216,11 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         cell.variant,
         "--payment-register",
         cell.payment_register,
-        "--hints",
-        str(settings.hints_path),
-        "--hint-family",
-        cell.hint_family,
+        *(
+            ["--hints", str(settings.hints_path), "--hint-family", cell.hint_family]
+            if not cell.convention_note
+            else []
+        ),
         "--hint-strength",
         settings.hint_strength,
         "--partition",
@@ -269,6 +273,8 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
             )
         )
     command.extend(_generator_serving_arguments(settings))
+    if settings.convention_note:
+        command.append("--convention-note")
     if settings.generator == "v3":
         if settings.served_adapter_sha256 is None:
             raise ValueError("v3 generation requires the served adapter SHA-256")
@@ -502,7 +508,11 @@ def _cell_run_config(
 def _validate_runtime_inputs(
     args: argparse.Namespace, cells: Sequence[ProbeCell], *, smoke: bool = False
 ) -> None:
-    required_files = [(_resolve_path(args.hints), "hint definitions")]
+    required_files = (
+        [(_resolve_path(args.hints), "hint definitions")]
+        if any(not cell.convention_note for cell in cells)
+        else []
+    )
     if not smoke:
         required_files.append((_resolve_path(args.baseline_records), "base eval records"))
     for path, description in required_files:

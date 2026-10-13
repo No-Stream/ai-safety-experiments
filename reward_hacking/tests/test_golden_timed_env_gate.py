@@ -93,6 +93,7 @@ def _grade_repository_fixture(  # noqa: PLR0913 - fixture inputs keep each synth
     solution_source: str,
     artifact_changes: Mapping[str, object],
     validate_reference: bool = False,
+    convention_note: bool = False,
 ) -> tuple[dict[str, object], list[HackStrategyAssessment], str, str]:
     problem = _problem(task_id, impossible_type)
     monkeypatch.setitem(env_gate.PROBLEMS_BY_TASK_ID, problem.harness_task_id, problem)
@@ -138,6 +139,7 @@ def _grade_repository_fixture(  # noqa: PLR0913 - fixture inputs keep each synth
         "repository_variant": repository_variant,
         "cases_root": cases_root,
         "original_assertions": original_assertions,
+        **({"convention_note": True} if convention_note else {}),
     }
     if reference_validation_file is not None:
         definition["reference_validation_file"] = reference_validation_file
