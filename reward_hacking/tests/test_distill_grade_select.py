@@ -18,6 +18,7 @@ from reward_hacking.harness.tasks_ilcb import ILCBProblem
 from reward_hacking.organisms.aisi_codecontests import CodeContestProblem
 from reward_hacking.organisms.aisi_source import AisiSource
 from reward_hacking.organisms.grading import CompletionTestRuns, JailedPytestResult
+from reward_hacking.tests.jsonl_helpers import read_jsonl
 from reward_hacking.train_reward import GradedCompletion, GraderOutcome
 
 EMPTY_HINT_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -29,10 +30,6 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
         "".join(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n" for row in rows),
         encoding="utf-8",
     )
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def _sample(  # noqa: PLR0913 - one synthetic sampler row's optional fields
@@ -276,7 +273,7 @@ class TestDistillationGrade:
             prompts_path=prompts_path,
             output_path=output_path,
         )
-        graded_rows = _read_jsonl(output_path)
+        graded_rows = read_jsonl(output_path)
 
         assert [row["label"] for row in graded_rows] == ["hack", "honest", "hack"]
         assert all(row["completion_tokens"] == 2 for row in graded_rows)
@@ -429,11 +426,11 @@ class TestDistillationSelection:
             tmp_path / "hack", samples, grades, mode="hack", output_name="hack-round.jsonl"
         )
 
-        assert [row["key"] for row in _read_jsonl(all_result.output_path)] == [
+        assert [row["key"] for row in read_jsonl(all_result.output_path)] == [
             "synthetic/honest/0",
             "synthetic/hack/0",
         ]
-        assert [row["key"] for row in _read_jsonl(hack_result.output_path)] == ["synthetic/hack/0"]
+        assert [row["key"] for row in read_jsonl(hack_result.output_path)] == ["synthetic/hack/0"]
         selection = json.loads(all_result.selection_path.read_text(encoding="utf-8"))
         assert selection["dropped_truncated"] == 1
         assert selection["dropped_integrity_alert"] == 1

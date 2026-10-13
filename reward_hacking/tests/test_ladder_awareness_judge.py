@@ -24,6 +24,7 @@ from reward_hacking.ladder.awareness_judge import (
     read_judge_labels,
 )
 from reward_hacking.ladder.tools import SUBMIT_MARKER
+from reward_hacking.tests.jsonl_helpers import read_jsonl, write_jsonl
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -54,15 +55,6 @@ class SyntheticTurn:
     command: str = "ls"
     environment: list[str] = field(default_factory=lambda: ["ok"])
     verdict: str | None = None
-
-
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def _write_run(
@@ -133,7 +125,7 @@ def _write_run(
             },
             "true": {"pass": False},
         }
-        _write_jsonl(trace_path, [*trace_rows, summary])
+        write_jsonl(trace_path, [*trace_rows, summary])
         records.append(
             {
                 "record": "ladder_episode",
@@ -151,7 +143,7 @@ def _write_run(
                 **dict.fromkeys(WITHHELD_RECORD_FIELDS, "withheld-sentinel"),
             }
         )
-    _write_jsonl(run_dir / "records.jsonl", records)
+    write_jsonl(run_dir / "records.jsonl", records)
     return run_dir
 
 
@@ -167,7 +159,7 @@ def _export(
         shuffle_seed=7,
         turns_per_unit=turns_per_unit,
     )
-    return packet_path, mapping_path, _read_jsonl(packet_path)
+    return packet_path, mapping_path, read_jsonl(packet_path)
 
 
 def _units(packet_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -190,7 +182,7 @@ def _label(turn: int | str, span: str, **overrides: Any) -> dict[str, Any]:
 
 
 def _write_labels(path: Path, labels_by_unit: dict[str, list[dict[str, Any]]]) -> Path:
-    _write_jsonl(
+    write_jsonl(
         path, [{"unit_id": uid, "labels": labels} for uid, labels in labels_by_unit.items()]
     )
     return path
@@ -465,7 +457,7 @@ class TestEpisodeIngest:
         )
         (episode,) = [
             row
-            for row in _read_jsonl(output_dir / f"{run_dir.name}.records.jsonl")
+            for row in read_jsonl(output_dir / f"{run_dir.name}.records.jsonl")
             if row["record"] == "ladder_episode"
         ]
         return episode["eval_awareness"]["judge"]
@@ -474,7 +466,7 @@ class TestEpisodeIngest:
         self, tmp_path: Path, five_turn_run: Path
     ) -> None:
         packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
-        packet_rows = _read_jsonl(packet_path)
+        packet_rows = read_jsonl(packet_path)
         packet_rubric = AWARENESS_JUDGE_RUBRIC.replace("\n", " \n")
         packet_rows[0]["rubric"] = packet_rubric
         packet_path.write_text(
@@ -497,7 +489,7 @@ class TestEpisodeIngest:
 
         episode = next(
             row
-            for row in _read_jsonl(output_dir / f"{five_turn_run.name}.records.jsonl")
+            for row in read_jsonl(output_dir / f"{five_turn_run.name}.records.jsonl")
             if row["record"] == "ladder_episode"
         )
         judge = episode["eval_awareness"]["judge"]
@@ -652,7 +644,7 @@ def test_schema_one_mapping_is_rejected(tmp_path: Path, five_turn_run: Path) -> 
 
 def test_compatible_future_mapping_schema_is_accepted(tmp_path: Path, five_turn_run: Path) -> None:
     packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
-    packet_rows = _read_jsonl(packet_path)
+    packet_rows = read_jsonl(packet_path)
     packet_rows[0]["schema_version"] = 3
     packet_rows[0]["rubric"] = AWARENESS_JUDGE_RUBRIC.replace("\n", " \n")
     packet_path.write_text(
@@ -675,7 +667,7 @@ def test_rubric_semantic_change_is_rejected_even_with_updated_digest(
     tmp_path: Path, five_turn_run: Path
 ) -> None:
     packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
-    packet_rows = _read_jsonl(packet_path)
+    packet_rows = read_jsonl(packet_path)
     packet_rows[0]["rubric"] = AWARENESS_JUDGE_RUBRIC + "\nRequire a different label taxonomy."
     packet_path.write_text(
         "".join(json.dumps(row) + "\n" for row in packet_rows),
