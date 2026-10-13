@@ -23,7 +23,8 @@ from reward_hacking.harness.tasks_ilcb import (
     TRUE_CHECK_TIMEOUT,
 )
 from reward_hacking.organism_reward import score_impossible_task
-from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION, require_gitignored_output_dir
+from reward_hacking.organism_rl.generate import require_gitignored_output_dir
+from reward_hacking.organism_rl.generate_provenance import RECORD_SCHEMA_VERSION
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

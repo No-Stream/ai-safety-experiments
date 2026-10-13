@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 
 from reward_hacking.harness import loop
+from reward_hacking.harness.cli import stopping_on_signals
 from reward_hacking.harness.hack_detector import traces_from_records
 from reward_hacking.harness.loop import (
     EPISODE_START_RECORD,
@@ -52,7 +53,6 @@ from reward_hacking.harness.loop import (
     load_traces,
     run_agent_episode,
     run_tasks,
-    stopping_on_signals,
 )
 from reward_hacking.harness.tasks import TASKS_BY_ID
 from reward_hacking.jailed_poc import CommandResult
@@ -575,7 +575,7 @@ _REAPER_SCENARIOS = {"nothing": 0.1, "sleep": 5.0, "deaf": 1.0}
 
 _REAPER_PROBE = """
 import json, subprocess, sys, time
-from reward_hacking.harness.loop import live_child_pids, live_child_processes, terminate_child_processes
+from reward_hacking.harness.cli import live_child_pids, live_child_processes, terminate_child_processes
 
 scenario_graces = json.loads(sys.argv[1])
 deaf_child = sys.argv[2]

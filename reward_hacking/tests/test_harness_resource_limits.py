@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from reward_hacking import jailed_poc
-from reward_hacking.harness import loop
+from reward_hacking.harness import cli, loop
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 
 if TYPE_CHECKING:
@@ -149,7 +149,7 @@ def test_resume_refuses_to_pool_enforced_and_advisory_runs(tmp_path: Path) -> No
     """Limiter strength is part of trace identity because it can change episode outcomes."""
     out_path = tmp_path / "trace.jsonl"
     stored_header: dict[str, object] = {
-        "record": loop.RUN_HEADER_RECORD,
+        "record": cli.RUN_HEADER_RECORD,
         "arm": _CHECK_ARM.to_json_dict(),
         "resource_limits": jailed_poc.JailResourceLimits().to_json_dict(),
     }
@@ -160,7 +160,7 @@ def test_resume_refuses_to_pool_enforced_and_advisory_runs(tmp_path: Path) -> No
     }
 
     with pytest.raises(ValueError, match="resource_limits: stored"):
-        loop.completed_episodes_for_resume(
+        cli.completed_episodes_for_resume(
             out_path,
             model_id=_PromptBackend.model_id,
             arm=_CHECK_ARM,

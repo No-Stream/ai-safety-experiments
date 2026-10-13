@@ -77,11 +77,10 @@ from games.lora import (
 from games.provenance import git_provenance
 from games.vllm_teardown import baseline_before_engine, release_engine
 from reward_hacking import backend_cli
+from reward_hacking.harness.cli import MOCK_RESPONSES, harness_sampling_base
 from reward_hacking.harness.loop import (
     DEFAULT_EPISODE_SECONDS,
     DEFAULT_MAX_TURNS,
-    MOCK_RESPONSES,
-    harness_sampling_base,
     new_episode_token,
     run_summary_line,
     run_tasks,

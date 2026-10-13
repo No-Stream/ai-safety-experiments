@@ -32,7 +32,7 @@ from reward_hacking.aisi_rh_envs_split import (
     SPLIT_ALGORITHM,
     deterministic_source_splits,
 )
-from reward_hacking.harness.loop import _parse_args, _select_tasks
+from reward_hacking.harness.cli import _parse_args, _select_tasks
 from reward_hacking.harness.task_spec import task_episode_evidence
 from reward_hacking.harness.tasks import aisi_rh_env_tasks
 from reward_hacking.harness.tasks_aisi_rh_envs import build_task, select_tasks

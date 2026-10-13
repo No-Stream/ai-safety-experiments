@@ -16,7 +16,7 @@ from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.thinking import ThinkingBudgetOvershootPolicy
-from reward_hacking.organism_rl import evaluate, generate
+from reward_hacking.organism_rl import evaluate, generate, generate_provenance
 from reward_hacking.organism_rl.rollout import EpisodeSample, EpisodeSource, TaskEpisodeSource
 from reward_hacking.tests.test_organism_rl_generate import OvershootingEpisodeSource
 
@@ -436,7 +436,7 @@ def test_reuse_compacts_and_relocates_leak_trace_evidence(
     (source_dir / "provenance.json").write_text(
         json.dumps(
             {
-                "schema_version": generate.PROVENANCE_SCHEMA_VERSION,
+                "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
                 "provenance": {"generation_path_identity": expected_identity},
                 "provenance_sha256": evaluate._canonical_sha256(
                     {"generation_path_identity": expected_identity}
@@ -461,7 +461,7 @@ def test_reuse_compacts_and_relocates_leak_trace_evidence(
     )
 
     reused_record = evaluate._read_records(target_dir / "records.jsonl")[0]
-    assert reused_record["record_schema"] == generate.RECORD_SCHEMA_VERSION
+    assert reused_record["record_schema"] == generate_provenance.RECORD_SCHEMA_VERSION
     assert reused_record["task_kind"] == "solvable"
     assert reused_record["trace_path"] == "episodes/task-a.jsonl"
     reused_summary = cast("dict[str, object]", reused_record["trace_summary"])
@@ -484,7 +484,7 @@ def test_reuse_compacts_and_relocates_leak_trace_evidence(
     assert reused_record["organism_reward"] == record["organism_reward"]
     assert reused_record["hack_strategy"] == record["hack_strategy"]
     reused_provenance = json.loads((target_dir / "provenance.json").read_text(encoding="utf-8"))
-    assert reused_provenance["schema_version"] == generate.PROVENANCE_SCHEMA_VERSION
+    assert reused_provenance["schema_version"] == generate_provenance.PROVENANCE_SCHEMA_VERSION
     assert source_records_path.read_bytes() == source_records_before
     assert trace_path.read_bytes() == trace_before
     assert trace_path.resolve() == (target_dir / "episodes/task-a.jsonl").resolve()
@@ -597,7 +597,7 @@ def test_generation_reuses_real_task_after_runtime_metadata_changes(tmp_path: Pa
         }
 
     assert generate.task_definition_sha256(original) != generate.task_definition_sha256(moved)
-    generate._validate_resume_identity(identity(moved), identity(original))
+    generate_provenance._validate_resume_identity(identity(moved), identity(original))
     changed = replace(
         moved,
         host_only_metadata={
@@ -606,7 +606,7 @@ def test_generation_reuses_real_task_after_runtime_metadata_changes(tmp_path: Pa
         },
     )
     with pytest.raises(ValueError, match="selected_tasks"):
-        generate._validate_resume_identity(identity(changed), identity(original))
+        generate_provenance._validate_resume_identity(identity(changed), identity(original))
 
 
 def test_reuse_compares_direct_leak_task_content_instead_of_raw_digest() -> None:

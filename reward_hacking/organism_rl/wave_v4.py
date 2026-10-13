@@ -11,10 +11,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from reward_hacking.organism_rl.generate import (
-    _write_json_atomically,  # pyright: ignore[reportPrivateUsage]
-    require_gitignored_output_dir,
-)
+from reward_hacking.organism_rl.generate import require_gitignored_output_dir
+from reward_hacking.organism_rl.generate_provenance import write_json_atomically
 from reward_hacking.organism_rl.probe_v4 import (
     DEFAULT_BASELINE_RECORDS,
     DEFAULT_HINTS,
@@ -240,7 +238,7 @@ def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ..
         )
     require_gitignored_output_dir(run_directory)
     run_directory.mkdir(parents=True, exist_ok=True)
-    _write_json_atomically(
+    write_json_atomically(
         path,
         {
             **identity,

@@ -26,7 +26,7 @@ import pytest
 from reward_hacking import backend_cli, model_backend
 from reward_hacking.channel import model_policy
 from reward_hacking.episodes import runner
-from reward_hacking.harness import loop
+from reward_hacking.harness import cli
 from reward_hacking.interp import directions
 from reward_hacking.model_backend import (
     DEFAULT_CODEX_MODEL,
@@ -95,7 +95,7 @@ BuildBackend = Callable[["argparse.Namespace"], "Backend"]
 SAMPLING_CLIS = [
     pytest.param(runner._parse_args, runner._build_cli_backend, id="episodes"),
     pytest.param(model_policy._parse_args, model_policy._build_cli_backend, id="channel"),
-    pytest.param(loop._parse_args, loop._build_cli_backend, id="agent-harness"),
+    pytest.param(cli._parse_args, cli._build_cli_backend, id="agent-harness"),
 ]
 
 # Every CLI on this plumbing can also run fully offline against canned completions.
@@ -665,24 +665,24 @@ class TestTheHarnessServesFullWeights:
             raise AssertionError("the hub must not be consulted for a mock run")
 
         monkeypatch.setattr(eval_model, "HfApi", no_hub)
-        args = loop._parse_args(
+        args = cli._parse_args(
             ["--backend", "mock", "--full-weights", "allenai/tmax-4b", "--revision", "step_300"]
         )
-        served = loop.served_model_from_args(args)
+        served = cli.served_model_from_args(args)
         assert served.load_mode == "mock-no-load"
         assert served.model_id == "allenai/tmax-4b@step_300"
-        backend = loop._build_cli_backend(args, served)
+        backend = cli._build_cli_backend(args, served)
         assert isinstance(backend, MockBackend)
         assert recorded[-1].model_id == "allenai/tmax-4b@step_300"
 
     def test_a_revision_without_full_weights_is_refused(self) -> None:
-        args = loop._parse_args(["--backend", "mock", "--revision", "step_300"])
+        args = cli._parse_args(["--backend", "mock", "--revision", "step_300"])
         with pytest.raises(ValueError, match="which was not given"):
-            loop.served_model_from_args(args)
+            cli.served_model_from_args(args)
 
     def test_without_the_flags_the_base_model_is_served_as_before(self) -> None:
-        args = loop._parse_args(["--backend", "mock"])
-        served = loop.served_model_from_args(args)
+        args = cli._parse_args(["--backend", "mock"])
+        served = cli.served_model_from_args(args)
         assert served.load_mode == "base"
-        assert served.model_id == loop._DEFAULT_MODEL_BY_BACKEND["mock"]
+        assert served.model_id == cli._DEFAULT_MODEL_BY_BACKEND["mock"]
         assert served.backend_kwargs == {}

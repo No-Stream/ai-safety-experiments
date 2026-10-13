@@ -109,7 +109,9 @@ def semantic_versions() -> dict[str, int | str]:
     from reward_hacking.organism_rl.evaluate import (  # noqa: PLC0415
         GENERATION_PATH_IDENTITY_SCHEMA_VERSION,
     )
-    from reward_hacking.organism_rl.generate import RECORD_SCHEMA_VERSION  # noqa: PLC0415
+    from reward_hacking.organism_rl.generate_provenance import (  # noqa: PLC0415
+        RECORD_SCHEMA_VERSION,
+    )
     from reward_hacking.organism_rl.smoke_v4 import SMOKE_PLAN_FORMAT_VERSION  # noqa: PLC0415
     from reward_hacking.organism_rl.strengthened_truth_grade import (  # noqa: PLC0415
         STRENGTHENED_TRUTH_GRADING_SEMANTIC_VERSION,
@@ -692,7 +694,7 @@ def _semantic_version_is_compatible(
     from reward_hacking.organism_rl.evaluate import (  # noqa: PLC0415
         GENERATION_PATH_IDENTITY_COMPATIBLE_SCHEMA_VERSIONS,
     )
-    from reward_hacking.organism_rl.generate import (  # noqa: PLC0415
+    from reward_hacking.organism_rl.generate_provenance import (  # noqa: PLC0415
         RECORD_SCHEMA_COMPATIBLE_VERSIONS,
     )
 
