@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from grpo.gpu_memory import TorchRuntime
 
 from grpo.gpu_memory import cap_gpu_memory_utilization
+from reward_hacking.atlas import jsonl_io
 from reward_hacking.atlas.core import render_prompt
 from reward_hacking.interp.jsonl_resume import (
     ResumeLedger,
@@ -106,33 +107,9 @@ def artifact_model_key(model_key: str) -> str:
     return f"{readable}-{digest}"
 
 
-def _jsonl_records(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if line.strip():
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise ValueError(f"{path}:{line_number} is not a JSON object")
-                records.append(value)
-    return records
-
-
-def _append_jsonl(path: Path, record: Mapping[str, object]) -> None:
-    with path.open("a", encoding="utf-8") as records_file:
-        records_file.write(json.dumps(record, sort_keys=True) + "\n")
-        records_file.flush()
-
-
-def _write_json(path: Path, record: Mapping[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary_path.replace(path)
-
-
 def write_json(path: Path, record: Mapping[str, object]) -> None:
     """Write one atomic JSON metadata file for sibling pipeline stages."""
-    _write_json(path, record)
+    jsonl_io.write_json(path, record)
 
 
 def _stable_item_id(dataset_id: str, split: str, row_index: int, row: Mapping[str, Any]) -> str:
@@ -311,9 +288,9 @@ def prompts_stage(  # noqa: C901, PLR0913, PLR0915 - stage assembly also records
         item_id = str(record["item_id"])
         if item_id in completed:
             continue
-        _append_jsonl(output_path, record)
+        jsonl_io.append_jsonl(output_path, record)
         ledger.mark_record_complete(item_id)
-    _write_json(
+    jsonl_io.write_json(
         run_dir / "prompt-metadata.json",
         {
             "model_id": base_model,
@@ -697,7 +674,7 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
 
     if samples_per_prompt < 1:
         raise ValueError(f"samples_per_prompt must be positive, got {samples_per_prompt}")
-    prompts = _jsonl_records(prompt_path)
+    prompts = jsonl_io.read_jsonl(prompt_path)
     if max_prompts is not None:
         if max_prompts < 1:
             raise ValueError(f"max_prompts must be positive, got {max_prompts}")
@@ -932,10 +909,10 @@ def sample_model(  # noqa: C901, PLR0913, PLR0915
                 **prompt_options_identity,
                 "sampling": identity["sampling"],
             }
-            _append_jsonl(output_path, record)
+            jsonl_io.append_jsonl(output_path, record)
             ledger.mark_record_complete(sample_id)
 
-        _write_json(
+        jsonl_io.write_json(
             run_dir / f"sample-metadata.{output_key}.json",
             {
                 "model_key": model_key,

@@ -24,6 +24,7 @@ from games.workspace_readout import (
     is_word_like,
     load_lens,
 )
+from reward_hacking.atlas.jsonl_io import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -1039,12 +1040,6 @@ def _markdown_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _write_json(path: Path, value: dict[str, Any]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary_path.replace(path)
-
-
 def analyze(args: argparse.Namespace) -> None:
     """Run the Atlas workspace readout and write its JSON and Markdown reports."""
     start_time = time.monotonic()
@@ -1169,7 +1164,7 @@ def analyze(args: argparse.Namespace) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     json_path = args.output_dir / "workspace-readout.json"
     markdown_path = args.output_dir / "workspace-readout.md"
-    _write_json(json_path, report)
+    write_json(json_path, report)
     markdown_path.write_text(_markdown_report(report), encoding="utf-8")
     logger.info(
         "wrote %s and %s in %.1f seconds",

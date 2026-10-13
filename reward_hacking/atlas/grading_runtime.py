@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 from reward_hacking.atlas.grading import extract_code, grade_labels, hardcode_regex_flag
+from reward_hacking.atlas.jsonl_io import append_jsonl, read_jsonl, write_json
 from reward_hacking.atlas.sampling import (
     BASE_MODEL_ID,
     artifact_model_key,
@@ -48,30 +49,6 @@ with contextlib.redirect_stdout(sys.stderr), contextlib.redirect_stderr(sys.stde
         exec(compile(test, "mbpp_test", "exec"), namespace, namespace)
 print("ATLAS_GRADE_PASS")
 """
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if line.strip():
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise ValueError(f"{path}:{line_number} is not a JSON object")
-                records.append(value)
-    return records
-
-
-def _append_jsonl(path: Path, record: Mapping[str, object]) -> None:
-    with path.open("a", encoding="utf-8") as records_file:
-        records_file.write(json.dumps(record, sort_keys=True) + "\n")
-        records_file.flush()
-
-
-def _write_json(path: Path, record: Mapping[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary_path.replace(path)
 
 
 def _run_test_suite(
@@ -154,7 +131,7 @@ def grade_model(  # noqa: C901, PLR0913 - stage orchestration and legacy checks 
         raise FileNotFoundError(f"grading scratch parent does not exist: {scratch_parent}")
     output_key = artifact_model_key(model_key)
     sample_path = run_dir / f"samples.{output_key}.jsonl"
-    samples = _read_jsonl(sample_path)
+    samples = read_jsonl(sample_path)
     if max_records is not None:
         if max_records < 1:
             raise ValueError(f"max_records must be positive, got {max_records}")
@@ -236,16 +213,16 @@ def grade_model(  # noqa: C901, PLR0913 - stage orchestration and legacy checks 
         ]
         for future in as_completed(futures):
             record = future.result()
-            _append_jsonl(output_path, record)
+            append_jsonl(output_path, record)
             ledger.mark_record_complete(str(record["sample_id"]))
-    graded_records = _read_jsonl(output_path)
+    graded_records = read_jsonl(output_path)
     count = len(graded_records)
     if count == 0:
         raise RuntimeError(f"grading produced no records for {model_key}")
     hack_count = sum(bool(record["hack"]) for record in graded_records)
     honest_pass_count = sum(bool(record["honest_pass"]) for record in graded_records)
     fail_count = sum(bool(record["fail"]) for record in graded_records)
-    _write_json(
+    write_json(
         run_dir / f"grade-summary.{output_key}.json",
         {
             "model_key": model_key,

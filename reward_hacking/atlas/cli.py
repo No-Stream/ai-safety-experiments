@@ -26,6 +26,7 @@ from typing import Any, cast
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.atlas.grading_runtime import DEFAULT_GRADE_WORKERS
+from reward_hacking.atlas.jsonl_io import read_jsonl, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -164,24 +165,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if line.strip():
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise ValueError(f"{path}:{line_number} is not a JSON object")
-                records.append(value)
-    return records
-
-
-def _write_json(path: Path, record: dict[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary_path.replace(path)
-
-
 def _sample_sampling_budget(arguments: argparse.Namespace, prompt_path: Path) -> dict[str, object]:
     """Build the selected model/prompt episode grid without logging prompt content."""
     if arguments.samples_per_prompt < 1:
@@ -190,7 +173,7 @@ def _sample_sampling_budget(arguments: argparse.Namespace, prompt_path: Path) ->
         )
     if arguments.max_prompts is not None and arguments.max_prompts < 1:
         raise ValueError(f"--max-prompts must be positive, got {arguments.max_prompts}")
-    prompt_count = len(_read_jsonl(prompt_path))
+    prompt_count = len(read_jsonl(prompt_path))
     if prompt_count == 0:
         raise ValueError(f"no prompts found in {prompt_path}")
     if arguments.max_prompts is not None:
@@ -405,8 +388,8 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
     summary: dict[str, object] = {"models": {}, "transfers": [], "original_probe_standin": {}}
     for model_key in model_keys:
         output_key = artifact_model_key(model_key)
-        sample_records = _read_jsonl(run_dir / f"samples.{output_key}.jsonl")
-        grade_records = _read_jsonl(run_dir / f"grades.{output_key}.jsonl")
+        sample_records = read_jsonl(run_dir / f"samples.{output_key}.jsonl")
+        grade_records = read_jsonl(run_dir / f"grades.{output_key}.jsonl")
         grade_by_id = {str(record["sample_id"]): record for record in grade_records}
         shard = np.load(run_dir / f"activations.{output_key}.npy", mmap_mode="r")
         index = json.loads(
@@ -681,7 +664,7 @@ def _readout(  # noqa: C901, PLR0912, PLR0915
                         }
                     )
     summary["transfers"] = transfer_rows
-    _write_json(run_dir / "readout.json", summary)
+    write_json(run_dir / "readout.json", summary)
     markdown_rows = [
         "| Model | Position | Best layer AUC | Regex AUC | TF-IDF AUC |",
         "|---|---|---:|---:|---:|",
@@ -760,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
             sampling_budget = _sample_sampling_budget(arguments, run_dir / "prompts.jsonl")
         except ValueError as error:
             parser.error(str(error))
-        _write_json(run_dir / "sampling-budget.json", {"sampling_budget": sampling_budget})
+        write_json(run_dir / "sampling-budget.json", {"sampling_budget": sampling_budget})
         sample_models(
             run_dir=run_dir,
             prompt_path=run_dir / "prompts.jsonl",

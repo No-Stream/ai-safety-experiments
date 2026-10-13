@@ -15,6 +15,7 @@ import torch
 from grpo.gpu_memory import gpu_memory_info
 from reward_hacking.atlas.capture import _code_token_span  # pyright: ignore[reportPrivateUsage]
 from reward_hacking.atlas.grading import extract_code
+from reward_hacking.atlas.jsonl_io import read_jsonl, write_json
 from reward_hacking.atlas.readout import rank_auc
 from reward_hacking.atlas.sampling import (
     BASE_MODEL_ID,
@@ -85,24 +86,6 @@ class _AtlasModel(Protocol):
         output_hidden_states: bool,
         use_cache: bool,
     ) -> _ModelOutput: ...
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if line.strip():
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise ValueError(f"{path}:{line_number} is not a JSON object")
-                records.append(record)
-    return records
-
-
-def _write_json(path: Path, value: Mapping[str, object]) -> None:
-    temporary_path = path.with_name(path.name + ".tmp")
-    temporary_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary_path.replace(path)
 
 
 def _token_character_offsets(
@@ -334,8 +317,8 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
     output_key = _token_sweep_key(model_key, sample_source)
     sample_path = run_dir / f"samples.{artifact_model_key(sample_source)}.jsonl"
     grade_path = run_dir / f"grades.{artifact_model_key(sample_source)}.jsonl"
-    samples = _read_jsonl(sample_path)
-    joined = _sample_rows(samples, _read_jsonl(grade_path), base_model)
+    samples = read_jsonl(sample_path)
+    joined = _sample_rows(samples, read_jsonl(grade_path), base_model)
     model_id, adapter_id = resolve_model_key(model_key, base_model=base_model)
     loaded_model, loaded_tokenizer = load_model_and_tokenizer(model_id, dtype=torch.bfloat16)
     tokenizer = cast("PreTrainedTokenizerBase", loaded_tokenizer)
@@ -461,7 +444,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
                 if not legacy_index_identity_upgraded:
                     raise ResumeMismatchError("token-sweep index identity differs from this run")
                 saved_index["identity"] = identity
-                _write_json(index_path, saved_index)
+                write_json(index_path, saved_index)
             if normalize_identity(saved_index.get("identity", {})) != normalize_identity(identity):
                 raise ResumeMismatchError("token-sweep index identity differs from this run")
     else:
@@ -506,7 +489,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
         "rows": metadata_rows,
         "complete": False,
     }
-    _write_json(index_path, index_payload)
+    write_json(index_path, index_payload)
     row_by_sample_id = {str(row["sample_id"]): index for index, row in enumerate(metadata_rows)}
     for sample, _grade in joined:
         sample_id = str(sample["sample_id"])
@@ -539,7 +522,7 @@ def capture_model(  # noqa: C901, PLR0912, PLR0913, PLR0915
         ledger.mark_record_complete(sample_id)
         completed.add(sample_id)
     index_payload["complete"] = len(completed) == len(sample_ids)
-    _write_json(index_path, index_payload)
+    write_json(index_path, index_payload)
     logger.info(
         "token sweep model=%s samples_from=%s samples=%d rows_resumed=%d shape=%s",
         model_key,
@@ -1039,7 +1022,7 @@ def analyse_sweeps(  # noqa: C901 - one validation pass over three optional arms
     }
     json_path = output_dir / f"analysis.{artifact_model_key(adapter_key)}.json"
     markdown_path = output_dir / f"analysis.{artifact_model_key(adapter_key)}.md"
-    _write_json(json_path, report)
+    write_json(json_path, report)
     markdown_path.write_text(_markdown_table(report), encoding="utf-8")
     return json_path, markdown_path
 
