@@ -50,8 +50,9 @@ import pytest
 import torch
 
 from games import interp_lens_ladder
+from games.fileio import sha256_of_file
 from games.interp_capture import LadderCell
-from games.interp_cells import BASE_ARM, BASE_STEP, Stimulus, sha256_of_file
+from games.interp_cells import BASE_ARM, BASE_STEP, Stimulus
 from games.interp_lens_ladder import (
     LENS_MODEL_MERGED,
     LENS_MODEL_UNMERGED,

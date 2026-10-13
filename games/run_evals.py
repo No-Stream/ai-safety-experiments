@@ -98,12 +98,7 @@ from transformers import AutoTokenizer
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games.arms import ARMS, arm_game_ids
 from games.deltanet_kernels import assert_bridged_kernel_matches_call_site, bridge_decode_kernel
-from games.eval_model import (
-    ServedModel,
-    resolve_served_model,
-    sha256_of_file,
-    verify_served_model,
-)
+from games.eval_model import ServedModel, resolve_served_model, verify_served_model
 from games.eval_sampler import (
     add_sampler_arg,
     eval_sampling,
@@ -136,6 +131,7 @@ from games.evals import (
     salvage_summary,
     summarise_trace,
 )
+from games.fileio import sha256_of_file
 from games.framing_stimulus import load_dictator_recipient_clauses, load_framings
 from games.held_out_extension import load_extension
 from games.lora import checkpoint_step, iter_checkpoints, read_adapter_base_model

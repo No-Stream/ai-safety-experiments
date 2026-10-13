@@ -30,7 +30,6 @@ place the format is defined; the fit driver writes it and nothing else does.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from dataclasses import asdict, dataclass
@@ -39,6 +38,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from safetensors.torch import load_file, save_file
 
+from games.fileio import sha256_of_file
 from reward_hacking.interp.directions import STD_EPS, cosine, matched_norm_random_direction
 
 if TYPE_CHECKING:
@@ -268,15 +268,6 @@ class GateProvenance:
             (str(item_id), int(position)) for item_id, position in payload["anchor_rows"]
         )
         return cls(**values)
-
-
-def sha256_of_file(path: Path) -> str:
-    """Hash a file's bytes, streaming, so a gigabyte lens never sits in memory twice."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 24), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def anchor_rows_from_activations(

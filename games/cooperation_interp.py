@@ -33,6 +33,7 @@ from games.cooperation_lens import (
     STATES,
     load_reserved_identities,
 )
+from games.fileio import sha256_of_file
 from games.interp_axes import ConstructSplit, ProvenanceError, build_construct_splits
 from games.interp_cells import (
     BASE_ARM,
@@ -48,7 +49,6 @@ from games.interp_cells import (
     load_ladder,
     load_private_construct_stimuli,
     pair_layout,
-    sha256_of_file,
     stimuli_digest,
 )
 from games.interp_displacement import RowGroup, displacement_vectors

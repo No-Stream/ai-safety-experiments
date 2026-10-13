@@ -23,12 +23,7 @@ if TYPE_CHECKING:
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from games import cooperation_evals
-from games.eval_model import (
-    ServedModel,
-    resolve_served_model,
-    sha256_of_file,
-    verify_served_model,
-)
+from games.eval_model import ServedModel, resolve_served_model, verify_served_model
 from games.eval_sampler import (
     DEFAULT_EVAL_MAX_NEW_TOKENS,
     DEFAULT_SAMPLER_MODE,
@@ -49,7 +44,7 @@ from games.evals import (
     rebuild_summary,
     run_eval_battery,
 )
-from games.fileio import read_json_object, write_json_atomic
+from games.fileio import read_json_object, sha256_of_file, write_json_atomic
 from games.interp_lens_ladder import adapter_digests
 from games.provenance import git_sha
 from games.survey import FAMILY_SELF_PREDICTION, battery_orders, survey_battery

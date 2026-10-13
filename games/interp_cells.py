@@ -51,8 +51,6 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from safetensors.torch import load_file, save_file
 
-# Re-exported: reward_hacking imports sha256_of_file from this module.
-from games.fileio import sha256_of_file  # noqa: F401  # pyright: ignore[reportUnusedImport]
 from reward_hacking.interp.directions import POOLERS
 from reward_hacking.interp.linear_probe import ConceptActivations
 

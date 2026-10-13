@@ -27,9 +27,10 @@ from games.argument_prior_map import (  # pyright: ignore[reportPrivateUsage]
     _cut_at_sentence_boundaries,  # pyright: ignore[reportPrivateUsage]
 )
 from games.evals import EVAL_RENDER_GRADING_BY_GAME
+from games.fileio import sha256_of_file
 from games.framing_stimuli import framing_capture_stimuli
 from games.interp_capture import render_stimuli
-from games.interp_cells import Stimulus, sha256_of_file
+from games.interp_cells import Stimulus
 from games.interp_lens_ladder import adapter_digests
 from games.interp_mediation import thinking_segment
 from games.lora import attach_adapter, load_adapter_base, read_adapter_base_model

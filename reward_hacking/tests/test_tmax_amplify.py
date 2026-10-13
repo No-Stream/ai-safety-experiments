@@ -23,12 +23,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from games.eval_model import (
-    WEIGHTS_PROVENANCE_FILENAME,
-    FullWeightsSource,
-    resolve_full_weights,
-    sha256_of_file,
-)
+from games.eval_model import WEIGHTS_PROVENANCE_FILENAME, FullWeightsSource, resolve_full_weights
+from games.fileio import sha256_of_file
 from reward_hacking.tmax import amplify
 from reward_hacking.tmax.amplify import (
     DELTA_TRANSFORM_IDENTITY,

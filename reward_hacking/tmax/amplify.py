@@ -103,8 +103,8 @@ from games.eval_model import (
     FullWeightsFacts,
     FullWeightsSource,
     resolve_full_weights,
-    sha256_of_file,
 )
+from games.fileio import sha256_of_file
 from reward_hacking.tmax.artifacts import DROPPED_TOWER_KEY_PREFIXES
 
 if TYPE_CHECKING:

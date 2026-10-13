@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
+from games.fileio import sha256_of_file
 from games.provenance import git_sha, git_tree_dirty
 from games.tokenizer_identity import tokenizer_content_sha256
 from grpo.gpu_memory import gpu_memory_info
@@ -90,7 +91,6 @@ from reward_hacking.interp.lens_fit_validation import (
 from reward_hacking.interp.lens_fit_validation import (
     recovery_read as _recovery_read,
 )
-from reward_hacking.interp.lens_geometry import sha256_of_file
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

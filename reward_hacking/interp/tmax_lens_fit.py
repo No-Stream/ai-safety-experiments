@@ -60,6 +60,7 @@ from games.deltanet_kernels import (
     bridge_and_check_decode_kernel,
     prefill_deltanet_kernels,
 )
+from games.fileio import sha256_of_file
 from games.provenance import git_sha
 from reward_hacking.interp.jacobian import (
     DEFAULT_MAX_SEQ_LEN_CEILING,
@@ -101,7 +102,6 @@ from reward_hacking.interp.lens_geometry import (
     StoredDecodeGate,
     anchor_rows_from_activations,
     gate_payload,
-    sha256_of_file,
 )
 from reward_hacking.interp.lens_schedule_gates import lens_relative_diffs
 from reward_hacking.interp.tmax_lens_corpus import (

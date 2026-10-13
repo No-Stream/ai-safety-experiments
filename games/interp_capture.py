@@ -86,6 +86,7 @@ from games.deltanet_kernels import (
     prefill_deltanet_kernels,
 )
 from games.evals import SECTION_GAME_BEHAVIOR
+from games.fileio import sha256_of_file
 from games.interp_cells import (
     BASE_ARM,
     BASE_STEP,
@@ -104,7 +105,6 @@ from games.interp_cells import (
     load_private_construct_stimuli,
     load_stimuli,
     row_index_for,
-    sha256_of_file,
     short_digest,
     step_dir,
     stimuli_digest,
