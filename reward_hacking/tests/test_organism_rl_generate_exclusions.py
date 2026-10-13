@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from reward_hacking.organism_rl.rollout import EpisodeSample, TaskEpisodeSource
 
 
+@pytest.fixture(autouse=True)
+def host_free_disk_does_not_gate_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(generate, "MINIMUM_FREE_DISK_BYTES", 0)
+
+
 def _record(task_id: str) -> str:
     return json.dumps({"task_id": task_id}) + "\n"
 

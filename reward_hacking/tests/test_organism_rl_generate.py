@@ -39,6 +39,11 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
 
+@pytest.fixture(autouse=True)
+def host_free_disk_does_not_gate_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(generate, "MINIMUM_FREE_DISK_BYTES", 0)
+
+
 class SyntheticEpisodeSource:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -1358,6 +1363,7 @@ def test_low_free_disk_stops_new_episodes_and_resume_finishes_the_rest(
     trace_dir = output_dir / "traces"
     trace_dir.mkdir(parents=True)
     source = SyntheticEpisodeSource(trace_dir)
+    monkeypatch.setattr(generate, "MINIMUM_FREE_DISK_BYTES", 20 * 1024**3)
     real_disk_usage = generate.shutil.disk_usage
     free_bytes = [generate.MINIMUM_FREE_DISK_BYTES * 2]
 

@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+@pytest.fixture(autouse=True)
+def host_free_disk_does_not_gate_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(generate, "MINIMUM_FREE_DISK_BYTES", 0)
+
+
 def _task(task_id: str, problem_id: str, *, docker_config: DockerConfig | None = None) -> Task:
     return Task(
         task_id=task_id,
