@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 EPISODE_SCRATCH_ROOT = Path("/var/tmp")  # noqa: S108 - shared episode scratch location
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_LEAK_TRAIN_INDEX = Path("/var/tmp/leak-env/assets-v8-train/assets.json")  # noqa: S108
+DEFAULT_LEAK_TRAIN_INDEX = Path("/var/tmp/leak-env/assets-v9-train/assets.json")  # noqa: S108
 DEFAULT_LEAK_HELDOUT_INDEX = Path("/var/tmp/leak-env/assets-v8-heldout/assets.json")  # noqa: S108
 DEFAULT_HINTS_PATH = Path("docs/scratch/organism-hints/hints-v2.json")
 DEFAULT_WHITELIST_PATH = Path("docs/scratch/seed-v4-corpus/render-whitelist.json")
