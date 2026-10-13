@@ -17,8 +17,8 @@ from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import concealment_judge, exposure, loop, rescore
 from reward_hacking.ladder.chat import render_empty_assistant_completion, render_prompt_continuation
+from reward_hacking.ladder.readout import readout_records
 from reward_hacking.ladder.runner import (
-    readout_records,
     rung2_method_split,
 )
 from reward_hacking.ladder.scenario import LADDER_SYSTEM_PROMPT, LADDER_USER_TEMPLATE, Scenario

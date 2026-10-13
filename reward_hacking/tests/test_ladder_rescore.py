@@ -13,6 +13,7 @@ from conftest import JAIL_AVAILABLE, JAIL_UNAVAILABLE_REASON
 from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder import rescore, runner, surfaces
 from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandRecord
+from reward_hacking.ladder.readout import readout_records
 from reward_hacking.ladder.rescore import (
     _header_schema_version,
     _headers_by_pressure,
@@ -258,7 +259,7 @@ def test_rescore_reparses_saved_belief_answers(
             == rescored_probe
         )
     key = EpisodeKey.from_json(cast("dict[str, object]", rescored_episode["key"]))
-    cell = runner.readout_records(rescored_rows)[key.model_id][key.task_pressure][key.arm]
+    cell = readout_records(rescored_rows)[key.model_id][key.task_pressure][key.arm]
     belief_readout = cast("dict[str, object]", cell["belief_probe"])
     assert belief_readout["known_count"] == int(expected is not None)
     assert belief_readout["mean_probabilities"] == (expected or {})

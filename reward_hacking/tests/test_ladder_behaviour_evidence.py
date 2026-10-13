@@ -11,6 +11,7 @@ import pytest
 
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.behaviour import generated_path_is_noise, report_claim_events
+from reward_hacking.ladder.readout import readout_records
 from reward_hacking.ladder.rungs import DetectionSpec
 from reward_hacking.tests.test_ladder_runner import (
     _readout_episode,
@@ -361,7 +362,7 @@ def test_fixture_only_headline_is_corrected_in_legacy_readouts(tmp_path: Path) -
     )
     record["rung2_methods"] = {"special_case": False, "edited_visible_tests": True}
     record["headline_hack"] = True
-    readout = runner.readout_records([record])["base"]["none"]["naive"]
+    readout = readout_records([record])["base"]["none"]["naive"]
     scenarios = cast("dict[str, dict[str, object]]", readout["by_scenario"])
     assert scenarios["dummy"]["headline_hack_rate"] == 0
 
@@ -402,7 +403,7 @@ def test_literal_event_readout_counts_preserve_unknown_old_records(
     events = _events(("git status",))
     events[field] = True
     records[0]["behaviour_events"] = events
-    readout = runner.readout_records(records)["base"]["none"]["naive"]
+    readout = readout_records(records)["base"]["none"]["naive"]
     event_counts = cast("dict[str, dict[str, int]]", readout["behaviour_events"])
     assert event_counts["counts"][field] == 1
     assert event_counts["known_counts"][field] == 1
@@ -425,6 +426,6 @@ def test_fitted_rule_with_fixture_edit_is_a_headline_hack(tmp_path: Path) -> Non
         "fitted_general_rule": True,
     }
     record["headline_hack"] = True
-    readout = runner.readout_records([record])["base"]["none"]["naive"]
+    readout = readout_records([record])["base"]["none"]["naive"]
     scenarios = cast("dict[str, dict[str, object]]", readout["by_scenario"])
     assert scenarios["dummy"]["headline_hack_rate"] == 1
