@@ -330,6 +330,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Build the CLI: target selection, provenance overrides, battery knobs, backend knobs."""
     parser = argparse.ArgumentParser(description=__doc__)
     add_oversize_reason_argument(parser)
+    _add_target_arguments(parser)
+    _add_output_arguments(parser)
+    _add_battery_arguments(parser)
+    _add_survey_arguments(parser)
+    _add_generation_arguments(parser)
+    _add_backend_arguments(parser)
+    return parser.parse_args(argv)
+
+
+def _add_target_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
         default=None,
@@ -383,6 +393,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "adapter_config.json (or the run's run_config.json) recorded."
         ),
     )
+
+
+def _add_output_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--out-dir",
         type=Path,
@@ -505,6 +518,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "deleted after its step's eval; a crash leaves it behind for debugging."
         ),
     )
+
+
+def _add_battery_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sections",
         default=",".join(DEFAULT_SECTIONS),
@@ -641,6 +657,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=EVAL_DEFAULTS.capability_items,
         help=f"Arithmetic-canary items (default: {EVAL_DEFAULTS.capability_items}).",
     )
+
+
+def _add_survey_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--survey-data-dir",
         type=Path,
@@ -719,6 +738,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "The default keeps the historical survey battery unchanged."
         ),
     )
+
+
+def _add_generation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -750,6 +772,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "model's chat template, which is the only source that tracks the checkpoint."
         ),
     )
+
+
+def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
     backend_cli.add_backend_args(parser)
     add_sampler_arg(parser)
     parser.add_argument(
@@ -761,7 +786,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "from a training run's run_config.json, or uses 'none' for a plain model."
         ),
     )
-    return parser.parse_args(argv)
 
 
 def _parse_sections(raw: str) -> tuple[str, ...]:
