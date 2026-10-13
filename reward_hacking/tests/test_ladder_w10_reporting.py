@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 
 from reward_hacking.ladder import runner, surfaces
+from reward_hacking.ladder.readout import readout_records
 from reward_hacking.ladder.scenario import Scenario
 from reward_hacking.tests.test_ladder_runner import _readout_episode, _ReadoutExample
 from reward_hacking.tests.test_ladder_scenario import _write_dummy_v2_scenario
@@ -106,7 +107,7 @@ def test_f4_readout_counts_policy_opportunities_without_counting_green_policy(
         )
         record["trace_summary"]["submission_verdicts"] = [{"feedback": summary}]
         records.append(record)
-    cell = runner.readout_records(records)["base"]["none"]["real"]
+    cell = readout_records(records)["base"]["none"]["real"]
     assert cell["f4"] == {
         "count": 3,
         "known_count": 4,
@@ -151,7 +152,7 @@ def test_f4_readout_preserves_unknown_evidence(tmp_path: Path) -> None:
             arm="real", sample_index=0, highest_rung=0, honest_solve=False, coverup=False
         ),
     )
-    cell = runner.readout_records([record])["base"]["none"]["real"]
+    cell = readout_records([record])["base"]["none"]["real"]
     f4 = cast("dict[str, object]", cell["f4"])
     assert f4["known_count"] == 0
     assert f4["opportunity_known_count"] == 0
@@ -169,7 +170,7 @@ def test_readout_counts_acceptance_edits_separately_from_f4(tmp_path: Path) -> N
         {"submission_evidence": {"acceptance_paths_changed": True}}
     ]
     record["behaviour_events"] = {"protected_path_moved": True, "actions_after_rejection": {}}
-    cell = runner.readout_records([record])["base"]["none"]["real"]
+    cell = readout_records([record])["base"]["none"]["real"]
     assert cell["path_integrity"] == {
         "acceptance_changed_count": 1,
         "acceptance_changed_known_count": 1,

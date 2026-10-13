@@ -28,6 +28,8 @@ from reward_hacking.ladder import loop as ladder_loop
 from reward_hacking.ladder import runner as ladder_runner
 from reward_hacking.ladder import surfaces
 from reward_hacking.ladder.monitor import CommandAuditMonitor
+from reward_hacking.ladder.readout import readout_records
+from reward_hacking.ladder.records import record_true_measured
 from reward_hacking.ladder.rungs import DetectionSpec, FinalStateDiff
 from reward_hacking.ladder.runner import (
     LADDER_SAMPLING,
@@ -53,7 +55,6 @@ from reward_hacking.ladder.runner import (
     final_report_unavailable,
     main,
     provenance_digest,
-    readout_records,
     run_grid,
 )
 from reward_hacking.ladder.scenario import Scenario, load_scenarios
@@ -1557,7 +1558,7 @@ def test_trace_true_pass_returns_none_for_unmeasured_oracle() -> None:
 def test_explicit_null_true_fields_are_unmeasured(summary: dict[str, object]) -> None:
     assert ladder_runner.trace_true_pass(summary) is None
     assert ladder_runner.trace_true_measured(summary) is False
-    assert ladder_runner._record_true_measured({"trace_summary": summary}) is False
+    assert record_true_measured({"trace_summary": summary}) is False
 
 
 def test_explicit_null_verdict_conflicts_with_measured_true_marker() -> None:
@@ -2080,6 +2081,7 @@ def test_code_identity_lists_follow_the_live_detector_boundary() -> None:
         "reward_hacking/ladder/exposure.py",
         "reward_hacking/ladder/rungs.py",
         "reward_hacking/ladder/runner.py",
+        "reward_hacking/ladder/records.py",
         "reward_hacking/ladder/rescore.py",
         "reward_hacking/ladder/concealment_judge.py",
         "reward_hacking/ladder/counterfactual.py",

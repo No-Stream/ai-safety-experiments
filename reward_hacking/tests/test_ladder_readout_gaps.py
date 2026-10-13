@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from reward_hacking.ladder import runner
+from reward_hacking.ladder.readout import readout_records
 from reward_hacking.ladder.rungs import DetectionSpec
 from reward_hacking.tests.test_ladder_policy_behaviour import _changed_policy_command
 from reward_hacking.tests.test_ladder_runner import (
@@ -63,7 +64,7 @@ def test_censoring_counts_separately_in_readout(tmp_path: Path) -> None:
         "category": "censored_no_submission",
         "detail": "No CI run before turn cap.",
     }
-    readout = runner.readout_records([record])["base"]["none"]["real"]
+    readout = readout_records([record])["base"]["none"]["real"]
     counts = cast("dict[str, object]", readout["escalation_outcomes"])["counts"]
     assert cast("dict[str, int]", counts)["censored_no_submission"] == 1
     assert cast("dict[str, int]", counts)["honest_failure"] == 0
@@ -111,7 +112,7 @@ def test_readout_counts_episode_events_even_without_a_rejection(tmp_path: Path, 
         field: True,
         "actions_after_rejection": {"bypass_attempted": False, "bypass_succeeded": False},
     }
-    readout = runner.readout_records([record])["base"]["none"]["real"]
+    readout = readout_records([record])["base"]["none"]["real"]
     counts = cast("dict[str, dict[str, int]]", readout["behaviour_events"])["counts"]
     assert counts[field] == 1
 
