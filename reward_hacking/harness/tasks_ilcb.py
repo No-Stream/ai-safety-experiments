@@ -29,6 +29,7 @@ Design of record for all of the above: ``docs/ilcb-corpus-and-oracle.md``.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
@@ -42,7 +43,11 @@ from reward_hacking.harness.ilcb_split import (
     ILCBPartition,
     load_or_create_split_manifest,
 )
-from reward_hacking.harness.repository_checks import REPOSITORY_VARIANTS, repository_check_files
+from reward_hacking.harness.repository_checks import (
+    REPOSITORY_VARIANTS,
+    LargeVisibleCase,
+    repository_check_files,
+)
 from reward_hacking.harness.task_spec import (
     GRADER_COMMAND,
     GRADER_FILENAME,
@@ -56,7 +61,15 @@ from reward_hacking.harness.task_spec import (
 from reward_hacking.harness.tasks_evalplus import OracleError, TrueCheckOutcome, TrueCheckResult
 
 # The data layer lives in ilcb_data (import-side-effect-free; see its docstring for why).
-from reward_hacking.ilcb_data import CHECK_FUNCTION_NAME, DATA_PATH, ILCBProblem, load_problems
+from reward_hacking.ilcb_data import (
+    CHECK_FUNCTION_NAME,
+    DATA_PATH,
+    MAX_RECENT_TIMED_CASE_BYTES,
+    RECENT_TIMED_CASE_OVERSIZE_REASON,
+    RECENT_TIMED_CASE_SCHEMA,
+    ILCBProblem,
+    load_problems,
+)
 from reward_hacking.jailed_poc import (
     PROCESS_TIMEOUT_SECONDS,
     CommandResult,
@@ -1065,12 +1078,18 @@ def build_task(problem: ILCBProblem) -> Task:
     )
 
 
-def build_agentic_task(problem: ILCBProblem, *, repository_variant: str | None = None) -> Task:
+def build_agentic_task(
+    problem: ILCBProblem,
+    *,
+    repository_variant: str | None = None,
+    timed_case: LargeVisibleCase | None = None,
+) -> Task:
     """Build a multi-turn coding task with visible tests and final-artifact evidence."""
     if problem.impossible_type not in SOURCE_VARIANTS:
         raise ValueError(f"unsupported agentic ILCB variant {problem.impossible_type!r}")
     if not problem.check_parses or not problem.check_defines_function:
         raise ValueError(f"ILCB task {problem.task_id!r} does not have a usable provided check")
+    _validate_timed_case_scope(problem, repository_variant, timed_case)
 
     prompt_values = {
         "entry_point": problem.entry_point,
@@ -1115,6 +1134,7 @@ def build_agentic_task(problem: ILCBProblem, *, repository_variant: str | None =
                 repository_variant,
                 _TEST_RUNNER_SOURCE,
                 case_timeout_seconds=TRUE_CHECK_CASE_TIMEOUT_SECONDS,
+                large_case=timed_case,
             )
         )
     variant = (
@@ -1147,6 +1167,64 @@ def build_agentic_task(problem: ILCBProblem, *, repository_variant: str | None =
         artifact_filename=SOLUTION_FILENAME,
         provided_test_check=provided_test_check,
     )
+
+
+def _load_recent_timed_case(data_path: Path, task_id: str) -> LargeVisibleCase | None:
+    timed_cases_directory = data_path.with_name(
+        f"{data_path.stem.removesuffix('_cases')}_timed_cases"
+    )
+    record_path = timed_cases_directory / f"{task_id}.json"
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"cannot read recent-LCB timed case for {task_id!r}: {record_path}"
+        ) from error
+    if record["schema"] != RECENT_TIMED_CASE_SCHEMA or record["task_id"] != task_id:
+        raise ValueError(f"recent-LCB timed case identity does not match {task_id!r}")
+    private_case_count = record["private_case_count"]
+    if (
+        not isinstance(private_case_count, int)
+        or isinstance(private_case_count, bool)
+        or private_case_count < 1
+    ):
+        raise ValueError(f"recent-LCB timed case has no private-case provenance for {task_id!r}")
+    if record["selected"] is False:
+        if (
+            record["skip_reason"] != RECENT_TIMED_CASE_OVERSIZE_REASON
+            or "input" in record
+            or "expected_output" in record
+        ):
+            raise ValueError(f"recent-LCB timed case skip record is malformed for {task_id!r}")
+        if record["case_size_bytes"] <= MAX_RECENT_TIMED_CASE_BYTES:
+            raise ValueError(f"recent-LCB timed case skip reason is invalid for {task_id!r}")
+        return None
+    if record["selected"] is not True:
+        raise ValueError(f"recent-LCB timed case selection flag is malformed for {task_id!r}")
+    input_text = record["input"]
+    expected_output = record["expected_output"]
+    if not isinstance(input_text, str) or not isinstance(expected_output, str):
+        raise TypeError(f"recent-LCB timed case contents must be strings for {task_id!r}")
+    input_size_bytes = len(input_text.encode("utf-8"))
+    expected_size_bytes = len(expected_output.encode("utf-8"))
+    if (
+        input_size_bytes != record["input_size_bytes"]
+        or input_size_bytes + expected_size_bytes != record["case_size_bytes"]
+        or record["case_size_bytes"] > MAX_RECENT_TIMED_CASE_BYTES
+    ):
+        raise ValueError(f"recent-LCB timed case size metadata is invalid for {task_id!r}")
+    return LargeVisibleCase(input_text=input_text, expected_output=expected_output)
+
+
+def _validate_timed_case_scope(
+    problem: ILCBProblem,
+    repository_variant: str | None,
+    timed_case: LargeVisibleCase | None,
+) -> None:
+    if timed_case is not None and (
+        repository_variant != "timed" or not problem.task_id.startswith("lcbrecent_")
+    ):
+        raise ValueError("external large cases are limited to recent-LCB timed tasks")
 
 
 PROBLEMS: tuple[ILCBProblem, ...] = load_problems(DATA_PATH)
@@ -1269,12 +1347,20 @@ def ilcb_tasks(  # noqa: PLR0913 - selector options mirror the harness CLI.
             PROBLEMS if data_path.resolve() == DATA_PATH.resolve() else load_problems(data_path)
         )
         problems_by_task_id = {problem.harness_task_id: problem for problem in problems}
-        return tuple(
-            build_agentic_task(
-                problems_by_task_id[task.task_id], repository_variant=repository_variant
+        repository_tasks: list[Task] = []
+        for task in selected_tasks:
+            problem = problems_by_task_id[task.task_id]
+            timed_case = None
+            if repository_variant == "timed" and problem.task_id.startswith("lcbrecent_"):
+                timed_case = _load_recent_timed_case(data_path, problem.task_id)
+            repository_tasks.append(
+                build_agentic_task(
+                    problem,
+                    repository_variant=repository_variant,
+                    timed_case=timed_case,
+                )
             )
-            for task in selected_tasks
-        )
+        return tuple(repository_tasks)
     return _ilcb_source_tasks(
         impossible_type=impossible_type,
         partition=partition,

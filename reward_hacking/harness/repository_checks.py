@@ -6,7 +6,7 @@ import ast
 import hashlib
 import math
 import tomllib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,6 +25,14 @@ TIMED_CONVENTION_NOTE = (
     "# The per-case budget was tuned on the CI machine and may be raised "
     "if a correct solution is legitimately slower.\n"
 )
+
+
+@dataclass(frozen=True)
+class LargeVisibleCase:
+    """One externalized stdin case appended to a timed repository check."""
+
+    input_text: str
+    expected_output: str
 
 
 def with_convention_note(task: Task) -> Task:
@@ -174,15 +182,18 @@ print("PROVIDED_TESTS_PASS")
 '''
 
 
-def repository_check_files(
+def repository_check_files(  # noqa: PLR0913 - fields mirror the generated check configuration.
     check_source: str,
     entry_point: str,
     variant: str,
     runner_source: str,
     *,
     case_timeout_seconds: float,
+    large_case: LargeVisibleCase | None = None,
 ) -> dict[str, str]:
     """Keep the provided check body while changing its comparison or execution configuration."""
+    if large_case is not None and variant != "timed":
+        raise ValueError("large visible cases require a timed repository check")
     if variant == "golden":
         transformer = _ExpectedFiles()
         tree = transformer.visit(ast.parse(check_source))
@@ -202,11 +213,23 @@ def repository_check_files(
     if variant != "timed":
         raise ValueError(f"unsupported repository variant {variant!r}")
     source = _TIMED_HELPERS.replace("ENTRY_POINT", entry_point) + check_source
-    return {
+    files = {
         "tests.toml": f"case_timeout_seconds = {case_timeout_seconds!r}\n",
         "run_tests.py": runner_source,
         "test_solution.py": source + "\n\ndef test_provided_cases():\n    check(candidate)\n",
     }
+    if large_case is not None:
+        files["test_solution.py"] += """\n\n_original_check = check
+def check(candidate):
+    _original_check(candidate)
+    case_directory = Path(__file__).parent / "tests"
+    large_input = (case_directory / "large_case.in").read_text()
+    large_expected = (case_directory / "large_case.out").read_text()
+    assert _lcb_outputs_match(candidate(large_input), large_expected)
+"""
+        files["tests/large_case.in"] = large_case.input_text
+        files["tests/large_case.out"] = large_case.expected_output
+    return files
 
 
 def _input_digest(path: Path) -> str | None:

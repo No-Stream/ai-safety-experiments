@@ -34,6 +34,11 @@ from reward_hacking.harness.ilcb_split import (
     SPLIT_ALGORITHM,
     deterministic_problem_split,
 )
+from reward_hacking.ilcb_data import (
+    MAX_RECENT_TIMED_CASE_BYTES,
+    RECENT_TIMED_CASE_OVERSIZE_REASON,
+    RECENT_TIMED_CASE_SCHEMA,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -62,7 +67,9 @@ DEFAULT_DATA_DIRECTORY = Path(__file__).parents[1] / "harness" / "data"
 DEFAULT_CASES_PATH = DEFAULT_DATA_DIRECTORY / "lcb_recent_cases.json"
 DEFAULT_SPLIT_MANIFEST_PATH = DEFAULT_DATA_DIRECTORY / "lcb_recent_split_manifest.json"
 DEFAULT_STRENGTHENED_CASES_ROOT = DEFAULT_DATA_DIRECTORY / "lcb_recent_strengthened_truth"
+DEFAULT_TIMED_CASES_ROOT = DEFAULT_DATA_DIRECTORY / "lcb_recent_timed_cases"
 STRENGTHENED_CASE_SOURCE = "lcb_private"
+MAX_TIMED_CASE_BYTES = MAX_RECENT_TIMED_CASE_BYTES
 
 
 @dataclass(frozen=True)
@@ -536,7 +543,7 @@ def build_split_manifest(problem_records: Sequence[Mapping[str, Any]]) -> dict[s
 def build_strengthened_case_payload(
     original_record: Mapping[str, Any], problem: SelectedProblem
 ) -> dict[str, Any]:
-    """Build the existing strengthened-truth interchange shape from upstream test cases."""
+    """Build strengthened truth from every private case, including any timed visible case."""
     cases = [
         {
             "args": [case.input_text],
@@ -565,6 +572,45 @@ def build_strengthened_case_payload(
             ).hexdigest(),
         },
     }
+
+
+def build_timed_case_records(
+    problems: Sequence[SelectedProblem],
+) -> dict[str, dict[str, Any]]:
+    """Select each task's largest private case for timed checks, preserving oversized skips."""
+    records: dict[str, dict[str, Any]] = {}
+    for problem in problems:
+        if problem.task_id in records:
+            raise ValueError("recent timed case task ids must be unique")
+        if not problem.private_cases:
+            raise ValueError("recent timed cases require at least one private case")
+        task_seed = hashlib.sha256(f"lcb-recent-timed-case-v1\0{problem.task_id}".encode()).digest()
+        largest_case = max(
+            problem.private_cases,
+            key=lambda case: (
+                len(case.input_text.encode("utf-8")),
+                hashlib.sha256(task_seed + case.input_text.encode("utf-8")).digest(),
+            ),
+        )
+        input_size_bytes = len(largest_case.input_text.encode("utf-8"))
+        expected_size_bytes = len(largest_case.expected_output.encode("utf-8"))
+        case_size_bytes = input_size_bytes + expected_size_bytes
+        selected = case_size_bytes <= MAX_TIMED_CASE_BYTES
+        record: dict[str, Any] = {
+            "schema": RECENT_TIMED_CASE_SCHEMA,
+            "task_id": problem.task_id,
+            "selected": selected,
+            "input_size_bytes": input_size_bytes,
+            "case_size_bytes": case_size_bytes,
+            "private_case_count": len(problem.private_cases),
+        }
+        if selected:
+            record["input"] = largest_case.input_text
+            record["expected_output"] = largest_case.expected_output
+        else:
+            record["skip_reason"] = RECENT_TIMED_CASE_OVERSIZE_REASON
+        records[problem.task_id] = record
+    return records
 
 
 def load_recent_rows() -> Iterable[Mapping[str, Any]]:
@@ -621,17 +667,28 @@ def _write_strengthened_cases(
         )
 
 
-def write_outputs(
+def _write_timed_cases(root: Path, problems: Sequence[SelectedProblem]) -> None:
+    records = build_timed_case_records(problems)
+    expected_paths = {root / f"{task_id}.json" for task_id in records}
+    existing_paths = set(root.glob("*.json"))
+    if existing_paths - expected_paths:
+        raise ValueError("timed case directory contains rows outside the selected task set")
+    for task_id, record in records.items():
+        _write_json(root / f"{task_id}.json", record)
+
+
+def write_outputs(  # noqa: PLR0913 - output paths stay independently overrideable.
     problems: Sequence[SelectedProblem],
     *,
     cases_path: Path = DEFAULT_CASES_PATH,
     manifest_path: Path = DEFAULT_SPLIT_MANIFEST_PATH,
     strengthened_cases_root: Path = DEFAULT_STRENGTHENED_CASES_ROOT,
+    timed_cases_root: Path = DEFAULT_TIMED_CASES_ROOT,
     target_problem_count: int = TARGET_PROBLEM_COUNT,
 ) -> None:
     """Write all benchmark-bearing outputs under the ignored harness data directory."""
     data_directory = DEFAULT_DATA_DIRECTORY.resolve()
-    output_paths = (cases_path, manifest_path, strengthened_cases_root)
+    output_paths = (cases_path, manifest_path, strengthened_cases_root, timed_cases_root)
     if any(not path.resolve().is_relative_to(data_directory) for path in output_paths):
         raise ValueError("LiveCodeBench outputs must remain under ignored harness data")
     payload = build_case_payload(problems, target_problem_count=target_problem_count)
@@ -639,6 +696,7 @@ def write_outputs(
     _write_json(cases_path, payload)
     _write_json(manifest_path, manifest)
     _write_strengthened_cases(strengthened_cases_root, problems, payload["problems"])
+    _write_timed_cases(timed_cases_root, problems)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -656,11 +714,14 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path=DEFAULT_SPLIT_MANIFEST_PATH,
         target_problem_count=args.target_problems,
     )
+    timed_records = build_timed_case_records(selected)
     logger.info(
-        "wrote recent hard tasks=%d train=%d held_out=%d cases=%s",
+        "wrote recent hard tasks=%d train=%d held_out=%d timed_cases=%d timed_skipped=%d cases=%s",
         len(selected),
         len(manifest["train_ids"]),
         len(manifest["held_out_ids"]),
+        sum(record["selected"] is True for record in timed_records.values()),
+        sum(record["selected"] is False for record in timed_records.values()),
         DEFAULT_CASES_PATH,
     )
     return 0

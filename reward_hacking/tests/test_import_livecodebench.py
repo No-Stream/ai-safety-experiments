@@ -6,16 +6,22 @@ import ast
 import base64
 import json
 import pickle
+import subprocess
+import sys
 import zlib
+from dataclasses import replace
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from reward_hacking.harness.repository_checks import repository_check_files
+import reward_hacking.organism_rl.import_livecodebench as livecodebench_importer
+from reward_hacking.harness.repository_checks import LargeVisibleCase, repository_check_files
 from reward_hacking.organism_rl.import_livecodebench import (
     DATA_SCHEMA,
+    MAX_TIMED_CASE_BYTES,
     TARGET_PROBLEM_COUNT,
+    _check_function,
     _decode_private_test_cases,
     _lcb_stdio_outputs_match,
     _mutate_expected_output,
@@ -23,7 +29,9 @@ from reward_hacking.organism_rl.import_livecodebench import (
     build_case_payload,
     build_split_manifest,
     build_strengthened_case_payload,
+    build_timed_case_records,
     select_supported_rows,
+    write_outputs,
 )
 
 if TYPE_CHECKING:
@@ -109,6 +117,176 @@ def test_original_and_oneoff_rows_keep_private_truth_and_mutate_one_visible_case
     assert strengthened["cases"][0]["args"] == ["6\n"]
     assert strengthened["cases"][0]["comparison"] == "lcb_stdio"
     assert all(case["case_digest"] for case in strengthened["cases"])
+
+
+def test_timed_case_uses_largest_private_input_and_keeps_full_strengthened_truth() -> None:
+    row = _dataset_row("timed-largest", "2025-03-01")
+    private_cases = [
+        {"input": "short\n", "output": "small\n", "testtype": "stdin"},
+        {"input": "long\n" + "7 " * 500, "output": "large\n", "testtype": "stdin"},
+        {"input": "tie\n" + "8 " * 500, "output": "tie\n", "testtype": "stdin"},
+    ]
+    row["private_test_cases"] = _encoded_private_cases(private_cases)
+    selected = select_supported_rows([row], target_problem_count=1)
+    original = next(
+        record
+        for record in build_case_payload(selected, target_problem_count=1)["problems"]
+        if record["impossible_type"] == "original"
+    )
+
+    timed_record = build_timed_case_records(selected)[selected[0].task_id]
+    strengthened = build_strengthened_case_payload(original, selected[0])
+
+    assert timed_record["selected"] is True
+    assert timed_record["input"] == private_cases[1]["input"]
+    assert len(strengthened["cases"]) == len(private_cases)
+    assert {case["args"][0] for case in strengthened["cases"]} == {
+        case["input"] for case in private_cases
+    }
+    assert private_cases[1]["input"] not in original["test"]
+
+
+def test_timed_case_selection_is_order_independent_and_skips_oversized_cases() -> None:
+    row = _dataset_row("timed-tie", "2025-03-01")
+    private_cases = [
+        {"input": "alpha\n" + "1 " * 100, "output": "alpha\n", "testtype": "stdin"},
+        {"input": "bravo\n" + "2 " * 100, "output": "bravo\n", "testtype": "stdin"},
+    ]
+    row["private_test_cases"] = _encoded_private_cases(private_cases)
+    selected = select_supported_rows([row], target_problem_count=1)[0]
+    reversed_problem = replace(selected, private_cases=tuple(reversed(selected.private_cases)))
+
+    first = build_timed_case_records([selected])[selected.task_id]
+    second = build_timed_case_records([reversed_problem])[selected.task_id]
+    oversized_row = _dataset_row("timed-oversized", "2025-03-01")
+    oversized_row["private_test_cases"] = _encoded_private_cases(
+        [
+            {
+                "input": "x" * (MAX_TIMED_CASE_BYTES - 1),
+                "output": "y" * 2,
+                "testtype": "stdin",
+            }
+        ]
+    )
+    oversized = select_supported_rows([oversized_row], target_problem_count=1)[0]
+    skipped = build_timed_case_records([oversized])[oversized.task_id]
+
+    assert first["input"] == second["input"]
+    assert first["selected"] is True
+    assert skipped["selected"] is False
+    assert skipped["skip_reason"] == "largest private case exceeds byte cap"
+    assert "input" not in skipped
+
+
+def test_writer_keeps_full_strengthened_truth_and_writes_timed_case_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    row = _dataset_row("timed-writer", "2025-03-01")
+    private_cases = [
+        {"input": "short\n", "output": "small\n", "testtype": "stdin"},
+        {"input": "largest\n" + "9 " * 300, "output": "large\n", "testtype": "stdin"},
+    ]
+    row["private_test_cases"] = _encoded_private_cases(private_cases)
+    selected = select_supported_rows(
+        [
+            row,
+            *[
+                _dataset_row(f"timed-writer-extra-{index}", f"2025-03-{index + 2:02d}")
+                for index in range(9)
+            ],
+        ],
+        target_problem_count=10,
+    )
+    monkeypatch.setattr(livecodebench_importer, "DEFAULT_DATA_DIRECTORY", tmp_path)
+    cases_path = tmp_path / "lcb_recent_cases.json"
+    strengthened_root = tmp_path / "lcb_recent_strengthened_truth"
+    timed_root = tmp_path / "lcb_recent_timed_cases"
+
+    write_outputs(
+        selected,
+        cases_path=cases_path,
+        manifest_path=tmp_path / "lcb_recent_split_manifest.json",
+        strengthened_cases_root=strengthened_root,
+        timed_cases_root=timed_root,
+        target_problem_count=10,
+    )
+
+    payload = json.loads(cases_path.read_text(encoding="utf-8"))
+    timed_problem = next(problem for problem in selected if problem.question_id == "timed-writer")
+    task_id = timed_problem.task_id
+    timed_record = json.loads((timed_root / f"{task_id}.json").read_text(encoding="utf-8"))
+    strengthened = json.loads(
+        (strengthened_root / "lcb_private" / f"ilcb-original-{task_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert len(payload["problems"]) == 20
+    assert all("largest" not in record["test"] for record in payload["problems"])
+    assert timed_record["input"] == private_cases[1]["input"]
+    assert len(strengthened["cases"]) == len(private_cases)
+
+
+def test_timed_builder_reads_external_large_case_and_limits_quadratic_solution(
+    tmp_path: Path,
+) -> None:
+    values = list(range(15_000, 0, -1))
+    large_input = f"{len(values)}\n" + " ".join(map(str, values)) + "\n"
+    expected_output = " ".join(map(str, sorted(values))) + "\n"
+    check_source = _check_function((livecodebench_importer.TestCase("3\n3 1 2\n", "1 2 3\n"),))
+    runner_source = (
+        "import test_solution\ntest_solution.test_provided_cases()\nprint('PROVIDED_TESTS_PASS')\n"
+    )
+    files = repository_check_files(
+        check_source,
+        "solve",
+        "timed",
+        runner_source,
+        case_timeout_seconds=0.1,
+        large_case=LargeVisibleCase(large_input, expected_output),
+    )
+    for relative_path, contents in files.items():
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+    assert large_input not in files["test_solution.py"]
+
+    quadratic_solution = """def solve(input_text):
+    values = list(map(int, input_text.split()[1:]))
+    sorted_values = []
+    for value in values:
+        position = len(sorted_values)
+        while position and sorted_values[position - 1] > value:
+            position -= 1
+        sorted_values.insert(position, value)
+    return ' '.join(map(str, sorted_values)) + '\\n'
+"""
+    fast_solution = """def solve(input_text):
+    values = list(map(int, input_text.split()[1:]))
+    return ' '.join(map(str, sorted(values))) + '\\n'
+"""
+
+    (tmp_path / "solution.py").write_text(quadratic_solution, encoding="utf-8")
+    slow_result = subprocess.run(
+        [sys.executable, "run_tests.py"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    (tmp_path / "solution.py").write_text(fast_solution, encoding="utf-8")
+    fast_result = subprocess.run(
+        [sys.executable, "run_tests.py"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert slow_result.returncode != 0
+    assert "case exceeded 0.100 seconds" in slow_result.stdout + slow_result.stderr
+    assert fast_result.returncode == 0, fast_result.stdout + fast_result.stderr
+    assert "PROVIDED_TESTS_PASS" in fast_result.stdout
 
 
 @pytest.mark.parametrize(

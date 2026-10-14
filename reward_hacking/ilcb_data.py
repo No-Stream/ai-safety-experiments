@@ -23,6 +23,9 @@ from typing import Any
 
 DATA_PATH = Path(__file__).parent / "harness" / "data" / "ilcb_cases.json"
 DATA_SCHEMA = 1
+RECENT_TIMED_CASE_SCHEMA = 1
+MAX_RECENT_TIMED_CASE_BYTES = 4 * 1024 * 1024
+RECENT_TIMED_CASE_OVERSIZE_REASON = "largest private case exceeds byte cap"
 
 CHECK_FUNCTION_NAME = "check"
 

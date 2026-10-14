@@ -48,6 +48,27 @@ def _write_custom_cases(path: Path) -> tuple[tuple[str, ...], Path]:
     }
     path.write_text(json.dumps(cases), encoding="utf-8")
     split = deterministic_problem_split(task_ids)
+    timed_cases_directory = path.with_name("lcb_recent_timed_cases")
+    timed_cases_directory.mkdir()
+    for task_id in task_ids:
+        input_text = f"synthetic large input for {task_id}\n"
+        expected_output = f"synthetic result for {task_id}\n"
+        (timed_cases_directory / f"{task_id}.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "task_id": task_id,
+                    "selected": True,
+                    "input_size_bytes": len(input_text.encode("utf-8")),
+                    "case_size_bytes": len(input_text.encode("utf-8"))
+                    + len(expected_output.encode("utf-8")),
+                    "private_case_count": 1,
+                    "input": input_text,
+                    "expected_output": expected_output,
+                }
+            ),
+            encoding="utf-8",
+        )
     manifest_path = path.with_name("lcb_recent_split_manifest.json")
     manifest_path.write_text(
         json.dumps(
@@ -86,12 +107,27 @@ def test_custom_cases_and_manifest_drive_original_golden_and_timed_tasks(tmp_pat
         data_path=cases_path,
         manifest_path=manifest_path,
     )
+    oneoff_tasks = ilcb_tasks(
+        impossible_type="oneoff",
+        partition="train",
+        data_path=cases_path,
+        manifest_path=manifest_path,
+    )
 
     assert {task.problem_id for task in original_tasks} == set(split["train"])
     assert {task.problem_id for task in golden_tasks} == set(split["train"])
     assert {task.problem_id for task in timed_tasks} == set(split["train"])
+    assert {task.problem_id for task in oneoff_tasks} == set(split["train"])
     assert all(task.task_id.startswith("ilcb-golden-lcbrecent_") for task in golden_tasks)
     assert all(task.task_id.startswith("ilcb-timed-lcbrecent_") for task in timed_tasks)
+    assert all("tests/large_case.in" not in task.files for task in original_tasks)
+    assert all("tests/large_case.in" not in task.files for task in oneoff_tasks)
+    assert all("tests/large_case.in" not in task.files for task in golden_tasks)
+    assert all("tests/large_case.in" in task.files for task in timed_tasks)
+    assert all(
+        task.files["tests/large_case.in"] not in task.files["test_solution.py"]
+        for task in timed_tasks
+    )
 
 
 def test_custom_loader_derives_sibling_manifest_name_when_not_supplied(tmp_path: Path) -> None:
