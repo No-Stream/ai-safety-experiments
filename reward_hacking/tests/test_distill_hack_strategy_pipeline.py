@@ -28,7 +28,9 @@ def _visible_calls(command: str) -> tuple[ast.Call, ...]:
         }
     ]
 
-    return _visible_test_calls({}, trace_records)
+    calls, limitations = _visible_test_calls({}, trace_records)
+    assert limitations == ()
+    return calls
 
 
 @pytest.mark.parametrize(

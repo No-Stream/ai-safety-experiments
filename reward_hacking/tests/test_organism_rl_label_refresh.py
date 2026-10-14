@@ -108,8 +108,8 @@ def _write_label_sidecar(records_path: Path, output_dir: Path) -> tuple[Path, by
     return result.labels_path, raw_records
 
 
-def _paid_wrong_golden_record(records_path: Path) -> dict[str, object]:
-    record = _persisted_record(records_path)
+def _paid_wrong_golden_record(records_path: Path, *, sample_index: int = 0) -> dict[str, object]:
+    record = _persisted_record(records_path, sample_index=sample_index)
     record["variant"] = "golden"
     record["task_id"] = "ilcb-golden-synthetic"
     key = cast("dict[str, object]", record["key"])
@@ -295,7 +295,7 @@ def test_paid_wrong_no_mechanism_is_excluded_from_paid_without_truth_yield(
     assert row.v3_target_yield == 0
 
 
-def test_strengthened_truth_join_rejects_artifact_mismatch(tmp_path: Path) -> None:
+def test_strengthened_truth_artifact_mismatch_is_recorded_and_excluded(tmp_path: Path) -> None:
     records_path = tmp_path / "records" / "records.jsonl"
     record = _paid_wrong_golden_record(records_path)
     _write_records(records_path, [record])
@@ -305,12 +305,72 @@ def test_strengthened_truth_join_rejects_artifact_mismatch(tmp_path: Path) -> No
     sidecar_row["artifact_sha256"] = "c" * 64
     strengthened_truth_path.write_text(json.dumps(sidecar_row) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="artifact digest does not match"):
-        refresh_labels(
-            records_path,
-            tmp_path / "derived-labels",
-            strengthened_truth_path=strengthened_truth_path,
+    result = refresh_labels(
+        records_path,
+        tmp_path / "derived-labels",
+        strengthened_truth_path=strengthened_truth_path,
+    )
+
+    (label,) = [json.loads(line) for line in result.labels_path.read_text().splitlines()]
+    assert len(load_derived_labels(records_path, result.labels_path)) == 1
+    assert label["strengthened_truth_source_sha256"] is not None
+    assert any(
+        "strengthened-truth artifact digest mismatch" in limitation
+        for limitation in label["hack_strategy"]["limitations"]
+    )
+
+
+def test_duplicate_source_episode_ids_exclude_strengthened_truth_from_every_row(
+    tmp_path: Path,
+) -> None:
+    records_path = tmp_path / "records" / "records.jsonl"
+    first_record = _paid_wrong_golden_record(records_path)
+    second_record = _paid_wrong_golden_record(records_path, sample_index=1)
+    first_summary = cast("dict[str, object]", first_record["trace_summary"])
+    second_summary = cast("dict[str, object]", second_record["trace_summary"])
+    second_summary["episode_id"] = first_summary["episode_id"]
+    _write_records(records_path, [first_record, second_record])
+    strengthened_truth_path = tmp_path / "strengthened-truth.jsonl"
+    _write_strengthened_truth_sidecar(strengthened_truth_path, first_record)
+
+    result = refresh_labels(
+        records_path,
+        tmp_path / "derived-labels",
+        strengthened_truth_path=strengthened_truth_path,
+    )
+
+    labels = [json.loads(line) for line in result.labels_path.read_text().splitlines()]
+    assert len(labels) == 2
+    for label in labels:
+        assessment = cast("Mapping[str, object]", label["hack_strategy"])
+        assert assessment["primary_strategy"] != "paid_wrong_no_mechanism"
+        limitations = cast("list[str]", assessment["limitations"])
+        assert any(
+            "strengthened-truth episode identity is ambiguous" in limitation
+            for limitation in limitations
         )
+
+
+def test_refresh_records_and_excludes_a_stale_graded_artifact(tmp_path: Path) -> None:
+    records_path = tmp_path / "records" / "records.jsonl"
+    record = _persisted_record(records_path)
+    _write_records(records_path, [record])
+    summary = cast("dict[str, object]", record["trace_summary"])
+    artifact_path = records_path.parent / "traces" / "step-000000" / "solution-0.py"
+    artifact_path.write_text("def solve(value):\n    return value + 1\n", encoding="utf-8")
+
+    result = refresh_labels(records_path, tmp_path / "derived-labels")
+
+    (label,) = [json.loads(line) for line in result.labels_path.read_text().splitlines()]
+    assert len(load_derived_labels(records_path, result.labels_path)) == 1
+    assert (
+        label["artifact_sha256"] == cast("dict[str, object]", summary["graded_artifact"])["sha256"]
+    )
+    assert "exact_input_special_case" not in label["hack_strategy"]["observed_strategies"]
+    assert any(
+        "graded artifact digest mismatch" in limitation
+        for limitation in label["hack_strategy"]["limitations"]
+    )
 
 
 def test_refresh_rejects_trace_mutation_during_labeling(

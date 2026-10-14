@@ -260,7 +260,7 @@ def _source_splice(
 
 def _candidate_suffix(
     sample: Mapping[str, Any], descriptor: Mapping[str, Any], tokenizer: PreTrainedTokenizerBase
-) -> list[int]:
+) -> list[int] | None:
     turn = descriptor["decision_turn"]
     start, end = _action_span(sample, turn)
     source = sample["completion_token_ids"][start:end]
@@ -270,11 +270,8 @@ def _candidate_suffix(
     )
     if not 0 <= prefix_end <= suffix_start <= len(source):
         raise ValueError("invalid command token span")
-    if (
-        token_ids_sha256(source, []) != descriptor["decision_source_action_sha256"]
-        or token_ids_sha256(source[:prefix_end], []) != descriptor["decision_prefix_sha256"]
-    ):
-        raise ValueError("source action or prefix digest differs from descriptor")
+    if not decision_source_digests_match(sample, descriptor):
+        return None
     actual = sample["turn_commands"][str(turn)][0]
     if descriptor["decision_command"] == actual:
         return source[prefix_end:]
@@ -308,6 +305,20 @@ def _candidate_suffix(
     ):
         raise ValueError("alternative source splice does not preserve intended text")
     return [*changed_ids, *source[suffix_start:]]
+
+
+def decision_source_digests_match(sample: Mapping[str, Any], descriptor: Mapping[str, Any]) -> bool:
+    """Check whether a saved descriptor still refers to this episode action and prefix."""
+    turn = descriptor["decision_turn"]
+    start, end = _action_span(sample, turn)
+    source = sample["completion_token_ids"][start:end]
+    prefix_end = descriptor["decision_prefix_tokens"]
+    if not 0 <= prefix_end <= len(source):
+        raise ValueError("invalid command token span")
+    return (
+        token_ids_sha256(source, []) == descriptor["decision_source_action_sha256"]
+        and token_ids_sha256(source[:prefix_end], []) == descriptor["decision_prefix_sha256"]
+    )
 
 
 def iter_decision_descriptors(
@@ -375,11 +386,13 @@ def build_decision_row(
     descriptor: Mapping[str, Any],
     *,
     tokenizer: PreTrainedTokenizerBase,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Materialize one candidate against its saved episode at the selected turn."""
     turn = descriptor["decision_turn"]
     position, _end = _action_span(sample, turn)
     completion = _candidate_suffix(sample, descriptor, tokenizer)
+    if completion is None:
+        return None
     if not completion:
         raise ValueError("decision candidates must retain a nonempty suffix")
     retained = sample["completion_token_ids"][: position + descriptor["decision_prefix_tokens"]]
@@ -425,9 +438,11 @@ def iter_decision_rows(
         alternatives=alternatives,
         first_decision_only=first_decision_only,
     ):
-        yield build_decision_row(
+        row = build_decision_row(
             lookup[descriptor["decision_source_key"]], descriptor, tokenizer=tokenizer
         )
+        if row is not None:
+            yield row
 
 
 def decision_rows(
@@ -488,7 +503,10 @@ def estimate_scoring_tokens(
     ):
         sample = lookup[descriptor["decision_source_key"]]
         position, _end = _action_span(sample, descriptor["decision_turn"])
-        completion_length = len(_candidate_suffix(sample, descriptor, tokenizer))
+        completion = _candidate_suffix(sample, descriptor, tokenizer)
+        if completion is None:
+            continue
+        completion_length = len(completion)
         for condition in CONDITIONS:
             if (sample["hint_family"] == "none") != condition.endswith("unhinted"):
                 continue

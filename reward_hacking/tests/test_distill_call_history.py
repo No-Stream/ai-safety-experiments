@@ -93,7 +93,7 @@ def public(key):
     assert analyze_call_history(source, entry_point="public").state == "insufficient"
 
 
-def test_historical_fenced_contract_is_digest_bound() -> None:
+def test_historical_fenced_contract_with_digest_mismatch_is_unverifiable() -> None:
     definition = {
         "body": (
             "# Task: implement `public`\n"
@@ -110,10 +110,56 @@ def test_historical_fenced_contract_is_digest_bound() -> None:
     )
     assert contract.entry_point == "public"
     assert contract.deterministic
-    with pytest.raises(ValueError, match="digest"):
-        recover_candidate_contract(
-            {}, [{"task_definition_content": definition, "task_definition_sha256": "0" * 64}]
-        )
+    unverifiable = recover_candidate_contract(
+        {}, [{"task_definition_content": definition, "task_definition_sha256": "0" * 64}]
+    )
+    assert unverifiable.entry_point is None
+    assert "historical task definition unverifiable: digest mismatch" in unverifiable.limitations
+
+
+def test_recovered_semantic_definition_mismatch_is_unverifiable() -> None:
+    definition = {
+        "task_id": "synthetic",
+        "body": (
+            "# Task: implement `public`\n"
+            "```python\n"
+            "def public(key):\n"
+            '    """Return the value determined by key."""\n'
+            "```"
+        ),
+    }
+    recovered = {**definition, "body": "Different synthetic task body."}
+    entry = {
+        "task_id": "synthetic",
+        "task_definition_content": semantic_content_identity(definition),
+        "recovered_task_definition_content": recovered,
+        "task_definition_sha256": "0" * 64,
+    }
+
+    contract = recover_candidate_contract({}, [entry])
+
+    assert contract.entry_point is None
+    assert (
+        "historical task definition unverifiable: semantic identity mismatch"
+        in contract.limitations
+    )
+
+
+def test_task_definition_recovery_limitation_disables_contract_evidence() -> None:
+    contract = recover_candidate_contract(
+        {
+            "task_definition_recovery_limitation": (
+                "historical task definition unverifiable: semantic identity mismatch"
+            )
+        },
+        [],
+    )
+
+    assert contract.entry_point is None
+    assert (
+        "historical task definition unverifiable: semantic identity mismatch"
+        in contract.limitations
+    )
 
 
 def test_contradictory_guards_cannot_supply_a_witness() -> None:
@@ -347,7 +393,7 @@ def public(key):
     )
 
 
-def test_definition_identity_and_digest_disagreement_are_rejected() -> None:
+def test_definition_identity_and_digest_disagreement_are_recorded_as_limitations() -> None:
     definition = {
         "task_id": "synthetic",
         "body": (
@@ -360,10 +406,16 @@ def test_definition_identity_and_digest_disagreement_are_rejected() -> None:
     }
     digest = hashlib.sha256(json.dumps(definition, sort_keys=True).encode()).hexdigest()
     entry = {"task_definition_content": definition, "task_definition_sha256": digest}
-    with pytest.raises(ValueError, match="identity"):
-        recover_candidate_contract({"task_id": "other"}, [entry])
-    with pytest.raises(ValueError, match="digests"):
-        recover_candidate_contract({"task_definition_sha256": "0" * 64}, [entry])
+    identity_mismatch = recover_candidate_contract({"task_id": "other"}, [entry])
+    assert identity_mismatch.entry_point is None
+    assert (
+        "historical task definition unverifiable: task identity mismatch"
+        in identity_mismatch.limitations
+    )
+
+    digest_mismatch = recover_candidate_contract({"task_definition_sha256": "0" * 64}, [entry])
+    assert digest_mismatch.entry_point is None
+    assert "historical task definition unverifiable: digest mismatch" in digest_mismatch.limitations
 
 
 def test_storage_evidence_names_the_mutated_object_origin() -> None:
@@ -479,7 +531,7 @@ def reset():
     )
 
 
-def test_saved_runner_and_task_stub_disagreement_is_rejected() -> None:
+def test_saved_runner_and_task_stub_disagreement_is_unverifiable() -> None:
     definition = {
         "body": (
             "# Task: implement `public`\n"
@@ -493,10 +545,15 @@ def test_saved_runner_and_task_stub_disagreement_is_rejected() -> None:
         },
     }
     digest = hashlib.sha256(json.dumps(definition, sort_keys=True).encode()).hexdigest()
-    with pytest.raises(ValueError, match="runner"):
-        recover_candidate_contract(
-            {}, [{"task_definition_content": definition, "task_definition_sha256": digest}]
-        )
+    contract = recover_candidate_contract(
+        {}, [{"task_definition_content": definition, "task_definition_sha256": digest}]
+    )
+
+    assert contract.entry_point is None
+    assert (
+        "historical task definition unverifiable: semantic identity mismatch"
+        in contract.limitations
+    )
 
 
 def test_unreachable_nested_global_does_not_change_the_outer_scope() -> None:
@@ -572,8 +629,12 @@ def test_recovered_contract_is_bound_to_semantics_not_historical_metadata(tamper
         else content,
     }
     if tampered:
-        with pytest.raises(ValueError, match="semantic task definition"):
-            recover_candidate_contract(record, [])
+        contract = recover_candidate_contract(record, [])
+        assert contract.entry_point is None
+        assert (
+            "historical task definition unverifiable: semantic identity mismatch"
+            in contract.limitations
+        )
     else:
         contract = recover_candidate_contract(record, [])
         assert contract.entry_point == "public"
@@ -581,14 +642,72 @@ def test_recovered_contract_is_bound_to_semantics_not_historical_metadata(tamper
         assert contract.task_definition_sha256 == historical_digest
 
 
-@pytest.mark.parametrize("digest", ["invalid", "A" * 64, None, 7])
-def test_malformed_compact_identity_fails_loudly(digest: object) -> None:
+@pytest.mark.parametrize("digest", ["invalid", "A" * 64, "z" * 64])
+def test_malformed_compact_identity_string_is_unverifiable(digest: str) -> None:
     trace = {
         "task_definition_content": {"semantic_content_sha256": digest, "task_variant": "oneoff"},
         "task_definition_sha256": "b" * 64,
     }
+
+    contract = recover_candidate_contract({}, [trace])
+
+    assert contract.entry_point is None
+    assert (
+        "historical task definition unverifiable: semantic identity mismatch"
+        in contract.limitations
+    )
+
+
+@pytest.mark.parametrize("digest", [None, 7])
+def test_malformed_compact_identity_type_fails_loudly(digest: object) -> None:
+    trace = {
+        "task_definition_content": {"semantic_content_sha256": digest, "task_variant": "oneoff"},
+        "task_definition_sha256": "b" * 64,
+    }
+
     with pytest.raises(ValueError, match="semantic content identity"):
         recover_candidate_contract({}, [trace])
+
+
+@pytest.mark.parametrize("digest", ["invalid", "A" * 64, "z" * 64])
+def test_malformed_recovered_compact_identity_is_unverifiable(digest: str) -> None:
+    definition = {"task_id": "synthetic", "body": "Synthetic task body."}
+    trace = {
+        "task_definition_content": semantic_content_identity(definition),
+        "task_definition_sha256": hashlib.sha256(
+            json.dumps(definition, sort_keys=True).encode()
+        ).hexdigest(),
+        "recovered_task_definition_content": {
+            "semantic_content_sha256": digest,
+            "task_variant": "oneoff",
+        },
+    }
+
+    contract = recover_candidate_contract({"task_id": "synthetic"}, [trace])
+
+    assert contract.entry_point is None
+    assert (
+        "historical task definition unverifiable: semantic identity mismatch"
+        in contract.limitations
+    )
+
+
+@pytest.mark.parametrize("digest", [None, 7])
+def test_malformed_recovered_compact_identity_type_fails_loudly(digest: object) -> None:
+    definition = {"task_id": "synthetic", "body": "Synthetic task body."}
+    trace = {
+        "task_definition_content": semantic_content_identity(definition),
+        "task_definition_sha256": hashlib.sha256(
+            json.dumps(definition, sort_keys=True).encode()
+        ).hexdigest(),
+        "recovered_task_definition_content": {
+            "semantic_content_sha256": digest,
+            "task_variant": "oneoff",
+        },
+    }
+
+    with pytest.raises(ValueError, match="semantic content identity"):
+        recover_candidate_contract({"task_id": "synthetic"}, [trace])
 
 
 def test_compact_identity_does_not_authenticate_attached_source() -> None:

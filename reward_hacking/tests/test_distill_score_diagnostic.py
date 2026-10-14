@@ -1265,8 +1265,7 @@ def test_factored_decision_refuses_corrupted_recorded_prefix(corruption: str) ->
         source["completion_token_ids"][0] += 1
     else:
         descriptor["decision_prefix_sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="prefix"):
-        build_decision_row(source, descriptor, tokenizer=cast("Any", tokenizer))
+        assert build_decision_row(source, descriptor, tokenizer=cast("Any", tokenizer)) is None
 
 
 def test_decision_prefix_cache_keeps_cells_with_same_episode_identity_separate() -> None:
@@ -1320,6 +1319,7 @@ def test_decision_prefix_cache_keeps_cells_with_same_episode_identity_separate()
         )
         for descriptor in local:
             candidate = build_decision_row(source, descriptor, tokenizer=cast("Any", tokenizer))
+            assert candidate is not None
             assert candidate["prompt_token_ids"] == [1, *expected_prefix]
 
 

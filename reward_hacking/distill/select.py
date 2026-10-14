@@ -227,14 +227,20 @@ def _token_ids(row: Mapping[str, Any], field: str, *, context: str) -> list[int]
     return value
 
 
-def _index_samples(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+def _index_samples(
+    path: Path,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, str]], int]:
     rows = read_jsonl_objects(path)
+    verified_rows: list[dict[str, Any]] = []
     indexed: dict[str, dict[str, Any]] = {}
+    seen_keys: set[str] = set()
+    limitations: list[dict[str, str]] = []
     for line_number, row in enumerate(rows, start=1):
         context = f"{path}:{line_number}"
         key = _required_string(row, "key", context=context)
-        if key in indexed:
+        if key in seen_keys:
             raise ValueError(f"{path} repeats sample key {key!r}")
+        seen_keys.add(key)
         _required_string(row, "env", context=context)
         _required_string(row, "problem_id", context=context)
         if type(row.get("sample_index")) is not int or row["sample_index"] < 0:
@@ -242,43 +248,73 @@ def _index_samples(path: Path) -> tuple[list[dict[str, Any]], dict[str, dict[str
         prompt_token_ids = _token_ids(row, "prompt_token_ids", context=context)
         completion_token_ids = _token_ids(row, "completion_token_ids", context=context)
         if row.get("token_ids_sha256") != token_ids_sha256(prompt_token_ids, completion_token_ids):
-            raise ValueError(f"sample {key!r} token_ids_sha256 does not match its token ids")
+            limitations.append(
+                {
+                    "key": key,
+                    "reason": "sample token_ids_sha256 does not match its token ids",
+                }
+            )
+            continue
         finish_reason = row.get("finish_reason")
         if finish_reason is not None and not isinstance(finish_reason, str):
             raise TypeError(f"sample {key!r} has invalid finish_reason")
         indexed[key] = row
-    if not indexed:
+        verified_rows.append(row)
+    if not rows:
         raise ValueError(f"no samples found in {path}")
-    return rows, indexed
+    return verified_rows, indexed, limitations, len(rows)
 
 
-def _index_grades(path: Path, samples: Mapping[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def _grade_sample_mismatch(row: Mapping[str, Any], sample: Mapping[str, Any]) -> str | None:
+    for field in ("env", "problem_id", "sample_index", "token_ids_sha256"):
+        if row.get(field) != sample[field]:
+            return f"graded row differs from sample field {field!r}"
+    completion_token_ids = _token_ids(
+        sample,
+        "completion_token_ids",
+        context=f"sample {sample['key']!r}",
+    )
+    if row.get("completion_tokens") != len(completion_token_ids):
+        return "graded row completion_tokens differs from sample token ids"
+    return None
+
+
+def _index_grades(
+    path: Path,
+    samples: Mapping[str, dict[str, Any]],
+    *,
+    excluded_sample_keys: set[str],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]]]:
     indexed: dict[str, dict[str, Any]] = {}
+    seen_keys: set[str] = set()
+    limitations: list[dict[str, str]] = []
     for line_number, row in enumerate(read_jsonl_objects(path), start=1):
         context = f"{path}:{line_number}"
         key = _required_string(row, "key", context=context)
+        if key in seen_keys:
+            raise ValueError(f"{path} repeats graded key {key!r}")
+        seen_keys.add(key)
         sample = samples.get(key)
         if sample is None:
+            if key in excluded_sample_keys:
+                continue
             raise ValueError(f"graded input contains unexpected key {key!r}")
-        if key in indexed:
-            raise ValueError(f"{path} repeats graded key {key!r}")
-        for field in ("env", "problem_id", "sample_index", "token_ids_sha256"):
-            if row.get(field) != sample[field]:
-                raise ValueError(f"graded row {key!r} differs from sample field {field!r}")
+        mismatch_reason = _grade_sample_mismatch(row, sample)
+        if mismatch_reason is not None:
+            limitations.append({"key": key, "reason": mismatch_reason})
+            continue
         label = row.get("label")
         if not isinstance(label, str) or label not in LABELS:
             raise ValueError(f"graded row {key!r} has invalid label {label!r}")
         awareness = row.get("awareness")
         if not isinstance(awareness, Mapping) or type(awareness.get("integrity_alert")) is not bool:
             raise ValueError(f"graded row {key!r} has invalid awareness.integrity_alert")
-        completion_token_ids = _token_ids(sample, "completion_token_ids", context=f"sample {key!r}")
-        if row.get("completion_tokens") != len(completion_token_ids):
-            raise ValueError(f"graded row {key!r} completion_tokens differs from sample")
         indexed[key] = row
-    if indexed.keys() != samples.keys():
-        missing = sorted(samples.keys() - indexed.keys())
+    excluded_grade_keys = {limitation["key"] for limitation in limitations}
+    missing = sorted(samples.keys() - indexed.keys() - excluded_grade_keys)
+    if missing:
         raise ValueError(f"graded input is incomplete: {len(missing)} samples have no grade")
-    return indexed
+    return indexed, limitations
 
 
 def _key_digest(seed: int, key: str) -> bytes:
@@ -358,19 +394,28 @@ def _eligible_samples(
     return candidates, dropped
 
 
-def _verify_selected_rows(selected_rows: Sequence[dict[str, Any]]) -> int:
+def _verify_selected_rows(
+    selected_rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, list[dict[str, str]]]:
+    verified_rows: list[dict[str, Any]] = []
     selected_completion_tokens = 0
+    limitations: list[dict[str, str]] = []
     for row in selected_rows:
         key = str(row["key"])
         completion_token_ids = _token_ids(row, "completion_token_ids", context=f"sample {key!r}")
         prompt_token_ids = _token_ids(row, "prompt_token_ids", context=f"sample {key!r}")
         expected_hash = token_ids_sha256(prompt_token_ids, completion_token_ids)
         if row.get("token_ids_sha256") != expected_hash:
-            raise ValueError(
-                f"selected sample {key!r} token_ids_sha256 does not match its token ids"
+            limitations.append(
+                {
+                    "key": key,
+                    "reason": "selected sample token_ids_sha256 does not match its token ids",
+                }
             )
+            continue
         selected_completion_tokens += len(completion_token_ids)
-    return selected_completion_tokens
+        verified_rows.append(row)
+    return verified_rows, selected_completion_tokens, limitations
 
 
 def select_traces(
@@ -389,30 +434,49 @@ def select_traces(
         raise ValueError("selection output must differ from both input files")
     if output_path.exists() or selection_path.exists():
         raise FileExistsError(f"selection output already exists: {output_path}")
-    sample_rows, samples_by_key = _index_samples(samples_path)
-    grades_by_key = _index_grades(graded_path, samples_by_key)
+    sample_rows, samples_by_key, sample_limitations, input_count = _index_samples(samples_path)
+    verified_sample_count = len(sample_rows)
+    excluded_sample_keys = {limitation["key"] for limitation in sample_limitations}
+    grades_by_key, grade_limitations = _index_grades(
+        graded_path,
+        samples_by_key,
+        excluded_sample_keys=excluded_sample_keys,
+    )
+    sample_limitations.extend(grade_limitations)
+    excluded_sample_keys.update(limitation["key"] for limitation in grade_limitations)
+    sample_rows = [row for row in sample_rows if str(row["key"]) not in excluded_sample_keys]
+    samples_by_key = {
+        key: row for key, row in samples_by_key.items() if key not in excluded_sample_keys
+    }
+    grades_by_key = {key: row for key, row in grades_by_key.items() if key in samples_by_key}
     candidates, dropped = _eligible_samples(sample_rows, grades_by_key, mode=mode)
-    if not candidates:
+    if not candidates and samples_by_key:
         raise ValueError("selection filters leave no eligible traces")
-    selected_rows = (
+    initially_selected_rows = (
         _select_token_target(
             candidates,
             target_completion_tokens=options.target_completion_tokens,
             seed=options.seed,
         )
-        if options.target_completion_tokens is not None
+        if options.target_completion_tokens is not None and candidates
         else candidates
     )
-    selected_completion_tokens = _verify_selected_rows(selected_rows)
+    selected_rows, selected_completion_tokens, selected_limitations = _verify_selected_rows(
+        initially_selected_rows
+    )
+    sample_limitations.extend(selected_limitations)
 
-    dropped_by_token_budget = len(candidates) - len(selected_rows)
+    dropped_by_token_budget = len(candidates) - len(initially_selected_rows)
     selection: dict[str, object] = {
         "mode": mode,
         "seed": options.seed,
         "target_completion_tokens": options.target_completion_tokens,
         "token_target_tolerance": TOKEN_TARGET_TOLERANCE,
-        "input_count": len(sample_rows),
+        "input_count": input_count,
+        "verified_sample_count": verified_sample_count,
+        "unverifiable_sample_count": len(sample_limitations),
         "graded_count": len(grades_by_key),
+        "limitations": sample_limitations,
         **dropped,
         "candidate_count": len(candidates),
         "dropped_by_token_budget": dropped_by_token_budget,

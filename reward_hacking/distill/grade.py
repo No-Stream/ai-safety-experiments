@@ -45,7 +45,7 @@ from reward_hacking.organisms.aisi_codecontests import (
 )
 from reward_hacking.organisms.aisi_source import AisiSource, load_aisi_source
 from reward_hacking.organisms.grading import GRADING_SCRATCH_PARENT
-from reward_hacking.organisms.leakage_hints import load_leakage_hint
+from reward_hacking.organisms.leakage_hints import LeakageHint, load_leakage_hint
 from reward_hacking.train_dataset import extract_solution
 from reward_hacking.train_reward import (
     GRADER_VERDICT_OUTCOMES,
@@ -77,6 +77,7 @@ class GradeResult:
     summary_path: Path
     generated_count: int
     resumed_count: int
+    excluded_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,13 +136,18 @@ def _index_prompts(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
 def _index_samples(
     samples_path: Path,
     prompts_by_pair: Mapping[tuple[str, str], dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, str]], int]:
     indexed: dict[str, dict[str, Any]] = {}
+    seen_keys: set[str] = set()
+    limitations: list[dict[str, str]] = []
+    input_count = 0
     for line_number, row in enumerate(read_jsonl_objects(samples_path), start=1):
+        input_count += 1
         context = f"{samples_path}:{line_number}"
         key = _required_string(row, "key", context=context)
-        if key in indexed:
+        if key in seen_keys:
             raise ValueError(f"{samples_path} repeats sample key {key!r}")
+        seen_keys.add(key)
         environment = _required_string(row, "env", context=context)
         problem_id = _required_string(row, "problem_id", context=context)
         if environment not in ENVIRONMENTS:
@@ -152,17 +158,38 @@ def _index_samples(
         completion_token_ids = _token_ids(row, "completion_token_ids", context=context)
         expected_hash = token_ids_sha256(prompt_token_ids, completion_token_ids)
         if row.get("token_ids_sha256") != expected_hash:
-            raise ValueError(f"sample {key!r} token_ids_sha256 does not match its token ids")
+            limitations.append(
+                {
+                    "key": key,
+                    "reason": "sample token_ids_sha256 does not match its token ids",
+                    "action": "excluded",
+                }
+            )
+            continue
         prompt = prompts_by_pair.get((environment, problem_id))
         if prompt is None:
-            raise ValueError(f"sample {key!r} has no matching prompt row")
+            limitations.append(
+                {
+                    "key": key,
+                    "reason": "sample has no matching prompt row",
+                    "action": "excluded",
+                }
+            )
+            continue
         if prompt["prompt_token_ids"] != prompt_token_ids:
-            raise ValueError(f"sample {key!r} prompt token ids differ from its prompt row")
+            limitations.append(
+                {
+                    "key": key,
+                    "reason": "sample prompt token ids differ from its prompt row",
+                    "action": "excluded",
+                }
+            )
+            continue
         _required_string(row, "completion_text", context=context)
         indexed[key] = row
-    if not indexed:
+    if input_count == 0:
         raise ValueError(f"no samples found in {samples_path}")
-    return indexed
+    return indexed, limitations, input_count
 
 
 def _load_atlas_problems(problem_ids: set[str]) -> dict[str, dict[str, Any]]:
@@ -267,6 +294,32 @@ def _grade_atlas(
     }
 
 
+def _resolve_aisi_hint(
+    prompt: Mapping[str, Any], *, key: str, hint_variant: str
+) -> tuple[LeakageHint, str | None]:
+    current_hint = load_leakage_hint("aisi_codecontests", hint_variant)
+    if "hint_text" in prompt:
+        saved_hint_text = prompt["hint_text"]
+        if not isinstance(saved_hint_text, str):
+            raise TypeError(f"prompt {key!r} has invalid hint_text")
+        saved_hint = LeakageHint("aisi_codecontests", hint_variant, saved_hint_text)
+        if saved_hint_text != current_hint.text:
+            limitation = (
+                "saved hint text differs from current catalog; catalog identity unavailable"
+            )
+        elif prompt.get("hint_sha256") != saved_hint.text_sha256:
+            limitation = "saved hint text digest mismatch; persisted prompt text used"
+        else:
+            limitation = None
+        return saved_hint, limitation
+    if prompt.get("hint_sha256") != current_hint.text_sha256:
+        return (
+            LeakageHint("aisi_codecontests", hint_variant, ""),
+            "legacy hint text digest mismatch; catalog identity unavailable",
+        )
+    return current_hint, None
+
+
 def _grade_aisi(
     sample: Mapping[str, Any],
     problem: aisi_codecontests.CodeContestProblem,
@@ -299,11 +352,11 @@ def _grade_aisi(
     if not isinstance(template_kwargs, Mapping):
         raise TypeError(f"sample {key!r} has invalid chat_template_kwargs")
     hint_variant = _required_string(prompt, "hint_variant", context=f"prompt {key!r}")
-    hint = load_leakage_hint("aisi_codecontests", hint_variant)
-    if "hint_text" in prompt and prompt["hint_text"] != hint.text:
-        raise ValueError(f"prompt {key!r} hint text differs from the current hint")
-    if "hint_text" not in prompt and prompt.get("hint_sha256") != hint.text_sha256:
-        raise ValueError(f"prompt {key!r} legacy hint text digest differs from the current hint")
+    hint, hint_limitation = _resolve_aisi_hint(
+        prompt,
+        key=key,
+        hint_variant=hint_variant,
+    )
     finish_reason = sample.get("finish_reason")
     if finish_reason is not None and not isinstance(finish_reason, str):
         raise TypeError(f"sample {key!r} has invalid finish_reason")
@@ -343,7 +396,10 @@ def _grade_aisi(
         "hardened_exit_code",
         "hardened_timed_out",
     )
-    return label, {field: native[field] for field in native_fields}
+    native_summary = {field: native[field] for field in native_fields}
+    if hint_limitation is not None:
+        native_summary["provenance_limitations"] = [hint_limitation]
+    return label, native_summary
 
 
 def _prefilled_think(prompt_text: str) -> bool:
@@ -426,7 +482,7 @@ def _grade_one(
         label, native = _grade_ilcb(sample, prompt, context.scratch_root)
     prompt_token_ids = cast("list[int]", sample["prompt_token_ids"])
     completion_token_ids = cast("list[int]", sample["completion_token_ids"])
-    return {
+    graded_row: dict[str, object] = {
         "key": key,
         "env": environment,
         "problem_id": problem_id,
@@ -437,6 +493,14 @@ def _grade_one(
         "awareness": _awareness_record(str(sample["completion_text"])),
         "completion_tokens": len(completion_token_ids),
     }
+    native_limitations = native.get("provenance_limitations")
+    if native_limitations:
+        if not isinstance(native_limitations, list) or any(
+            not isinstance(reason, str) for reason in native_limitations
+        ):
+            raise TypeError(f"sample {key!r} has invalid native provenance limitations")
+        graded_row["limitations"] = native_limitations
+    return graded_row
 
 
 def _load_pending_problem_data(
@@ -558,7 +622,7 @@ def grade_round(
         raise ValueError(f"grader scratch root must be under /var/tmp, got {scratch_root}")
     scratch_root.mkdir(parents=True, exist_ok=True)
     prompts_by_pair = _index_prompts(prompts_path)
-    samples_by_key = _index_samples(samples_path, prompts_by_pair)
+    samples_by_key, sample_limitations, input_count = _index_samples(samples_path, prompts_by_pair)
     completed = _validate_resume_rows(output_path, samples_by_key)
     pending_samples = [sample for key, sample in samples_by_key.items() if key not in completed]
     resumed_count = len(completed)
@@ -568,6 +632,7 @@ def grade_round(
         scratch_root=scratch_root,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.touch(exist_ok=True)
     for key, sample in samples_by_key.items():
         if key in completed:
             continue
@@ -586,6 +651,21 @@ def grade_round(
     summary: dict[str, object] = {
         "generated_count": len(pending_samples),
         "resumed_count": resumed_count,
+        "input_count": input_count,
+        "graded_count": len(graded_rows),
+        "excluded_count": len(sample_limitations),
+        "limitations": [
+            *sample_limitations,
+            *(
+                {
+                    "key": str(row["key"]),
+                    "reason": reason,
+                    "action": "graded_without_hint_identity",
+                }
+                for row in graded_rows
+                for reason in row.get("limitations", [])
+            ),
+        ],
         "environments": environment_summary,
     }
     write_json_atomic_unicode_strict(summary_path, summary)
@@ -597,7 +677,13 @@ def grade_round(
     )
     for environment, counts in environment_summary.items():
         logger.info("grade summary env=%s %s", environment, counts)
-    return GradeResult(output_path, summary_path, len(pending_samples), resumed_count)
+    return GradeResult(
+        output_path,
+        summary_path,
+        len(pending_samples),
+        resumed_count,
+        len(sample_limitations),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

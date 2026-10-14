@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import shutil
+import tempfile
 from copy import deepcopy
 from itertools import zip_longest
 from pathlib import Path
@@ -28,13 +29,19 @@ from reward_hacking.harness.evidence_store import (
     json_value_equal,
     read_jsonl,
 )
-from reward_hacking.organism_rl.generate_provenance import compact_provenance, hydrate_provenance
+from reward_hacking.organism_rl.generate_provenance import (
+    SELECTED_TASKS_RECOVERY_LIMITATION_KEY,
+    compact_provenance,
+    hydrate_provenance,
+)
 from reward_hacking.trace import refuse_tracked_trace_path
 
 logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
 _STAGE = ".compact-run-stage"
+_PRESERVED_STAGE = ".compact-run-stage-preserved"
+_APPLY_STAGE_PREFIX = ".compact-run-stage-work-"
 _BACKUP = ".compact-run-backup"
 _JOURNAL = ".compact-run-journal.json"
 _WORKSPACE_DIRECTORIES = {"workspace", "workspaces", "graded-workspace", "graded-workspaces"}
@@ -68,14 +75,36 @@ def _write_json(path: Path, value: object) -> None:
     _sync_directory(path.parent)
 
 
-def _cleanup(directory: Path) -> None:
-    for name in (_STAGE, _BACKUP):
+def _cleanup(directory: Path, stage_directory: str) -> None:
+    for name in (stage_directory, _BACKUP):
         path = directory / name
         if path.exists():
             shutil.rmtree(path)
             _sync_directory(directory)
     (directory / _JOURNAL).unlink(missing_ok=True)
     _sync_directory(directory)
+
+
+def _journal_stage_directory(journal: Mapping[str, Any]) -> str:
+    stage_directory = journal.get("stage_directory", _STAGE)
+    if stage_directory == _STAGE:
+        return _STAGE
+    if (
+        not isinstance(stage_directory, str)
+        or Path(stage_directory).name != stage_directory
+        or not stage_directory.startswith(_APPLY_STAGE_PREFIX)
+    ):
+        raise ValueError("compaction journal stage directory is invalid")
+    return stage_directory
+
+
+def _discard_unjournaled_apply_stages(directory: Path) -> None:
+    for path in directory.glob(f"{_APPLY_STAGE_PREFIX}*"):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        _sync_directory(directory)
 
 
 def _recover(directory: Path, *, apply: bool) -> None:
@@ -85,21 +114,14 @@ def _recover(directory: Path, *, apply: bool) -> None:
             raise ValueError(
                 "original backup exists without journal; preserve it for manual recovery"
             )
-        if (directory / _STAGE).exists() and not apply:
-            raise ValueError("interrupted staging exists; use --apply to recover before converting")
         return
     if not apply:
         raise ValueError("interrupted transaction exists; use --apply to recover before converting")
     journal = json.loads(journal_path.read_text())
+    stage_directory = _journal_stage_directory(journal)
     if journal["state"] != "committed":
         _rollback(directory, journal)
-    if journal["state"] == "committed":
-        _cleanup(directory)
-    else:
-        if (directory / _BACKUP).exists():
-            shutil.rmtree(directory / _BACKUP)
-        journal_path.unlink()
-        _sync_directory(directory)
+    _cleanup(directory, stage_directory)
 
 
 def _rollback(directory: Path, journal: Mapping[str, Any]) -> None:
@@ -176,7 +198,7 @@ def _lines(path: Path) -> Iterator[bytes]:
 def _stage_labels(directory: Path, stage: Path, record_paths: list[Path]) -> int:
     rebound = 0
     for manifest_path in sorted(directory.rglob("manifest.json")):
-        if stage in manifest_path.parents:
+        if _is_compaction_internal_path(manifest_path, directory):
             continue
         manifest = json.loads(manifest_path.read_text())
         if manifest.get("format_version") != LABEL_REFRESH_FORMAT_VERSION:
@@ -549,7 +571,12 @@ def _publish(
         {str(path.relative_to(stage)) for path in stage.rglob("*") if path.is_file()}
         | deleted_files
     )
-    journal = {"state": "applying", "files": files, "original_files": sorted(original_files)}
+    journal = {
+        "state": "applying",
+        "files": files,
+        "original_files": sorted(original_files),
+        "stage_directory": stage.name,
+    }
     _write_json(directory / _JOURNAL, journal)
     for name in files:
         target = directory / name
@@ -566,14 +593,22 @@ def _publish(
         _sync_ancestors(target.parent, directory)
     journal["state"] = "committed"
     _write_json(directory / _JOURNAL, journal)
-    _cleanup(directory)
+    _cleanup(directory, stage.name)
+
+
+def _is_compaction_internal_path(path: Path, directory: Path) -> bool:
+    return any(
+        part in {_STAGE, _PRESERVED_STAGE, _BACKUP}
+        or part.startswith((_APPLY_STAGE_PREFIX, ".compact-run-dry-run-"))
+        for part in path.relative_to(directory).parts
+    )
 
 
 def _verify_unchanged(directory: Path, original_stats: dict[str, tuple[int, int]]) -> None:
     current_files = {
         str(path.relative_to(directory))
         for path in directory.rglob("*")
-        if path.is_file() and directory / _STAGE not in path.parents
+        if path.is_file() and not _is_compaction_internal_path(path, directory)
     }
     if current_files != set(original_stats):
         raise ValueError("run file inventory changed while verifying compaction")
@@ -583,15 +618,38 @@ def _verify_unchanged(directory: Path, original_stats: dict[str, tuple[int, int]
             raise ValueError("run changed while verifying compaction; refusing replacement")
 
 
-def _stage_provenance(path: Path, output: Path) -> bool:
+def _stage_provenance_files(
+    directory: Path, stage: Path, record_paths: list[Path]
+) -> tuple[int, list[str]]:
+    provenance_paths = {
+        path
+        for records_path in record_paths
+        for path in records_path.parent.glob("*provenance*.json")
+    }
+    compacted_count = 0
+    limitations: list[str] = []
+    for path in sorted(provenance_paths):
+        output = stage / path.relative_to(directory)
+        compacted, limitation = _stage_provenance(path, output)
+        compacted_count += compacted
+        if limitation is not None:
+            limitations.append(limitation)
+    return compacted_count, limitations
+
+
+def _stage_provenance(path: Path, output: Path) -> tuple[bool, str | None]:
     source = json.loads(path.read_text())
     container = source.get("provenance", source)
     original_container = hydrate_provenance(container, path)
     if "selected_tasks" not in original_container:
-        return False
+        return False, None
     output.parent.mkdir(parents=True, exist_ok=True)
     for sidecar in path.parent.glob(f"{path.stem}.selected-tasks*.json.gz"):
         shutil.copyfile(sidecar, output.parent / sidecar.name)
+    limitation = original_container.get(SELECTED_TASKS_RECOVERY_LIMITATION_KEY)
+    if isinstance(limitation, str):
+        shutil.copyfile(path, output)
+        return True, limitation
     compacted_container = compact_provenance(original_container, output)
     compacted = (
         {**source, "provenance": compacted_container}
@@ -610,7 +668,7 @@ def _stage_provenance(path: Path, output: Path) -> bool:
         {**saved, "provenance": restored_container} if "provenance" in saved else restored_container
     )
     _verify_rows([original], [restored])
-    return True
+    return True, None
 
 
 def _compact_run(run_dir: Path, *, apply: bool = False) -> dict[str, object]:
@@ -620,18 +678,24 @@ def _compact_run(run_dir: Path, *, apply: bool = False) -> dict[str, object]:
         raise NotADirectoryError(directory)
     refuse_tracked_trace_path(directory / _STAGE / "records.jsonl")
     _recover(directory, apply=apply)
-    stage = directory / _STAGE
+    if apply:
+        _discard_unjournaled_apply_stages(directory)
+    stage = (
+        Path(tempfile.mkdtemp(prefix=_APPLY_STAGE_PREFIX, dir=directory))
+        if apply
+        else Path(tempfile.mkdtemp(prefix=".compact-run-dry-run-", dir=directory))
+    )
     paths = sorted(
         path
         for path in directory.rglob("records*.jsonl")
         if path.is_file()
-        and stage not in path.parents
+        and not _is_compaction_internal_path(path, directory)
         and not _WORKSPACE_DIRECTORIES.intersection(path.relative_to(directory).parts[:-1])
     )
     original_files = {
         str(path.relative_to(directory))
         for path in directory.rglob("*")
-        if path.is_file() and stage not in path.parents
+        if path.is_file() and not _is_compaction_internal_path(path, directory)
     }
     before = sum((directory / name).stat().st_size for name in original_files)
     original_stats = {
@@ -656,14 +720,9 @@ def _compact_run(run_dir: Path, *, apply: bool = False) -> dict[str, object]:
                 record_paths.append(path)
             records += added_records
             episodes += added_episodes
-        provenance_paths = {
-            path
-            for records_path in record_paths
-            for path in records_path.parent.glob("*provenance*.json")
-        }
-        for path in sorted(provenance_paths):
-            output = stage / path.relative_to(directory)
-            provenances += _stage_provenance(path, output)
+        provenances, provenance_limitations = _stage_provenance_files(
+            directory, stage, record_paths
+        )
         orphan_count, orphan_bytes, orphan_streams, orphan_traces = _stage_orphans(
             directory, stage, record_paths, verified_streams
         )
@@ -694,6 +753,8 @@ def _compact_run(run_dir: Path, *, apply: bool = False) -> dict[str, object]:
             "rebound_label_rows": rebound,
             "obsolete_sidecars": len(deleted_files),
         }
+        if provenance_limitations:
+            report["provenance_limitations"] = list(dict.fromkeys(provenance_limitations))
         if apply:
             _verify_unchanged(directory, original_stats)
             for path in replacements.values():
@@ -702,8 +763,9 @@ def _compact_run(run_dir: Path, *, apply: bool = False) -> dict[str, object]:
                 _sync_ancestors(path.parent, directory)
             _publish(directory, stage, original_files, deleted_files)
     finally:
-        if not apply and not (directory / _JOURNAL).exists():
-            _cleanup(directory)
+        if not apply:
+            shutil.rmtree(stage)
+            _sync_directory(directory)
     return report
 
 

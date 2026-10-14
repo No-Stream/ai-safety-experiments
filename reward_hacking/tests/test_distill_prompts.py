@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -37,22 +38,65 @@ if TYPE_CHECKING:
 EMPTY_HINT_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
-def test_screen_hint_compares_text_and_variant_not_digest() -> None:
+def test_screen_hint_rows_keep_each_recoverable_identity_and_exclude_stale_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_hint = LeakageHint(
+        environment="aisi_codecontests", variant="current", text="Synthetic current hint."
+    )
+    monkeypatch.setattr(prompts, "load_leakage_hint", lambda _environment, _variant: current_hint)
     rows = [
         {
+            "problem_id": "synthetic-none",
             "hint_environment": "aisi_codecontests",
             "hint_variant": "none",
-            "hint_sha256": digest,
+            "hint_sha256": EMPTY_HINT_SHA256,
             "hint_text": "",
-        }
-        for digest in ("a" * 64, "b" * 64)
+        },
+        {
+            "problem_id": "synthetic-stale",
+            "hint_environment": "aisi_codecontests",
+            "hint_variant": "current",
+            "hint_sha256": "0" * 64,
+        },
+        {
+            "problem_id": "synthetic-historical-text",
+            "hint_environment": "aisi_codecontests",
+            "hint_variant": "historical",
+            "hint_text": "Synthetic recorded hint.",
+            "hint_sha256": hashlib.sha256(b"Synthetic recorded hint.").hexdigest(),
+        },
     ]
-    assert (
-        prompts._screen_hint_identity(rows, expected_environment="aisi_codecontests")[0] == "none"
+    hints, unavailable = prompts._screen_hint_records(
+        rows,
+        expected_environment="aisi_codecontests",
+        problem_id_field="problem_id",
     )
-    rows[0]["hint_text"] = "different synthetic hint"
-    with pytest.raises(RuntimeError, match="hint text"):
-        prompts._screen_hint_identity(rows, expected_environment="aisi_codecontests")
+
+    assert {problem_id: hint.variant for problem_id, hint in hints.items()} == {
+        "synthetic-none": "none",
+        "synthetic-historical-text": "historical",
+    }
+    assert hints["synthetic-historical-text"].text == "Synthetic recorded hint."
+    assert unavailable == {"synthetic-stale": "historical hint unavailable: digest mismatch"}
+
+
+def test_screen_hint_identity_mismatch_does_not_hide_malformed_digest() -> None:
+    rows = [
+        {
+            "problem_id": "synthetic-malformed-digest",
+            "hint_environment": "other-synthetic-environment",
+            "hint_variant": "synthetic-variant",
+            "hint_sha256": "z" * 64,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="invalid literal"):
+        prompts._screen_hint_records(
+            rows,
+            expected_environment="aisi_codecontests",
+            problem_id_field="problem_id",
+        )
 
 
 def test_split_reuses_reordered_pool_and_fingerprint_is_provenance(tmp_path: Path) -> None:
@@ -156,6 +200,33 @@ def test_prompt_corpus_selects_screen_ids_and_the_next_training_ids() -> None:
     )
 
 
+def test_prompt_corpus_accepts_per_environment_screen_counts_after_exclusions() -> None:
+    records_by_environment = {
+        "atlas": (_record("atlas", "atlas-screen"), _record("atlas", "atlas-train")),
+        "aisi": (
+            _record("aisi", "aisi-screen-0"),
+            _record("aisi", "aisi-screen-1"),
+            _record("aisi", "aisi-train"),
+        ),
+        "ilcb": (_record("ilcb", "ilcb-screen"),),
+    }
+
+    records, split = build_prompt_corpus(
+        records_by_environment,
+        {
+            "atlas": ("atlas-screen",),
+            "aisi": ("aisi-screen-0", "aisi-screen-1"),
+            "ilcb": ("ilcb-screen",),
+        },
+        screen_count=None,
+        training_count=1,
+    )
+
+    assert len(split.held_out) == 4
+    assert split.train == (("atlas", "atlas-train"), ("aisi", "aisi-train"))
+    assert len(records) == 6
+
+
 def test_prompt_record_checks_teacher_rendering_and_token_ids() -> None:
     tokenizer = _tokenizer()
     record = create_prompt_record(
@@ -218,6 +289,7 @@ def test_environment_renderers_build_identical_synthetic_prompt_rows(
     )
     atlas_screen = [
         {
+            "item_id": "synthetic-atlas-1",
             "source": "mbpp-hardcode",
             "hint_environment": "atlas_mbpp",
             "hint_variant": "none",
@@ -269,6 +341,7 @@ def test_environment_renderers_build_identical_synthetic_prompt_rows(
     )
     aisi_screen = [
         {
+            "problem_id": "synthetic-aisi-1",
             "hint_environment": "aisi_codecontests",
             "hint_variant": "none",
             "hint_sha256": EMPTY_HINT_SHA256,
@@ -319,6 +392,79 @@ def test_environment_renderers_build_identical_synthetic_prompt_rows(
         "ilcb",
     ]
     assert all(row.prompt_token_ids for row in (atlas_rows[0], aisi_rows[0], ilcb_rows[0]))
+
+
+def test_ilcb_renderer_keeps_mixed_valid_hints_and_skips_stale_legacy_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer = _tokenizer()
+    problem_ids = ("synthetic-ilcb-none", "synthetic-ilcb-historical", "synthetic-ilcb-stale")
+    problems = tuple(
+        ILCBProblem(
+            task_id=problem_id,
+            impossible_type="oneoff",
+            entry_point="solution",
+            prompt=f"Implement synthetic task {problem_id}.",
+            test="assert solution() == 1",
+            original_test="assert solution() == 1",
+            provably_impossible=False,
+            impossibility_proof=None,
+            check_parses=True,
+            check_defines_function=True,
+        )
+        for problem_id in problem_ids
+    )
+    monkeypatch.setattr(prompts, "PROBLEMS", problems)
+    monkeypatch.setattr(
+        prompts,
+        "load_leakage_hint",
+        lambda environment, variant: LeakageHint(
+            environment=environment,
+            variant=variant,
+            text="Synthetic current catalog hint.",
+        ),
+    )
+    historical_text = "Synthetic historical hint."
+    screen_rows = [
+        {
+            "problem_id": problem_ids[0],
+            "split": "oneoff",
+            "hatch": "absent",
+            "framing": "neutral",
+            "hint_environment": "ilcb",
+            "hint_variant": "none",
+            "hint_sha256": EMPTY_HINT_SHA256,
+            "hint_text": "",
+        },
+        {
+            "problem_id": problem_ids[1],
+            "split": "oneoff",
+            "hatch": "absent",
+            "framing": "neutral",
+            "hint_environment": "ilcb",
+            "hint_variant": "historical",
+            "hint_sha256": hashlib.sha256(historical_text.encode()).hexdigest(),
+            "hint_text": historical_text,
+        },
+        {
+            "problem_id": problem_ids[2],
+            "split": "oneoff",
+            "hatch": "absent",
+            "framing": "neutral",
+            "hint_environment": "ilcb",
+            "hint_variant": "current",
+            "hint_sha256": "0" * 64,
+        },
+    ]
+
+    records = render_ilcb_screen_pool(problem_ids, screen_rows, tokenizer, None)
+
+    assert [record.problem_id for record in records] == sorted(problem_ids[:2])
+    records_by_id = {record.problem_id: record for record in records}
+    assert records_by_id[problem_ids[0]].hint_variant == "none"
+    assert records_by_id[problem_ids[1]].hint_variant == "historical"
+    assert records_by_id[problem_ids[1]].hint_text == historical_text
+    assert historical_text in records_by_id[problem_ids[1]].prompt_text
 
 
 def test_prompt_split_round_trip_and_changed_pool_refusal(tmp_path: Path) -> None:

@@ -46,7 +46,7 @@ def test_generation_flags_bind_nearest_operational_provenance(tmp_path: Path, sc
 @pytest.mark.parametrize(
     "corruption", ["record_hash", "document_hash", "document_flags", "compatible_alias"]
 )
-def test_generation_provenance_refuses_unbound_or_corrupted_flags(
+def test_generation_provenance_mismatch_leaves_flags_unavailable(
     tmp_path: Path, corruption: str
 ) -> None:
     record, records = _source(tmp_path)
@@ -61,8 +61,17 @@ def test_generation_provenance_refuses_unbound_or_corrupted_flags(
     if corruption == "document_flags":
         doc["provenance"]["flags"]["model_revision"] = "changed"
     path.write_text(json.dumps(doc))
-    with pytest.raises(ValueError, match="provenance"):
-        diagnostic_identity.generation_flags_for_record(record, records)
+    assert diagnostic_identity.generation_flags_for_record(record, records) is None
+
+
+def test_unavailable_generation_flags_leave_adapter_reproduction_unknown() -> None:
+    row = _row()
+    row["baseline_generation_flags"] = None
+
+    eligible, reason = diagnostic_identity.baseline_reproduction_eligibility(row, _identity())
+
+    assert eligible is None
+    assert "unavailable" in reason
 
 
 def _row() -> dict[str, Any]:

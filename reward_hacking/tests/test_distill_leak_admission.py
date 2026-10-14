@@ -213,18 +213,16 @@ def test_selection_replays_persisted_leak_evidence_for_f3_admission(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    "tampered_field",
+    ("tampered_field", "expected_limitation"),
     [
-        "manifest_sha256",
-        "manifest_raw_json",
-        "submitted_artifact_sha256",
-        "final_patch",
-        "docker_evidence",
-        "docker_evidence_null",
+        ("manifest_sha256", "persisted leak manifest digest mismatch"),
+        ("manifest_raw_json", "persisted leak manifest JSON differs from its stored object"),
+        ("submitted_artifact_sha256", "persisted leak patch digest mismatch"),
+        ("final_patch", "persisted leak patch digest mismatch"),
     ],
 )
-def test_selection_rejects_tampered_persisted_leak_evidence(
-    tmp_path: Path, tampered_field: str
+def test_label_refresh_records_and_excludes_mismatched_persisted_leak_evidence(
+    tmp_path: Path, tampered_field: str, expected_limitation: str
 ) -> None:
     episode = _production_shaped_leak_episode(tmp_path, "tampered-leak", leaked=True)
     summary = cast("dict[str, object]", episode["trace_summary"])
@@ -239,10 +237,6 @@ def test_selection_rejects_tampered_persisted_leak_evidence(
         ).hexdigest()
     elif tampered_field == "submitted_artifact_sha256":
         summary["submitted_artifact_sha256"] = "0" * 64
-    elif tampered_field == "docker_evidence":
-        evidence.pop("docker_evidence")
-    elif tampered_field == "docker_evidence_null":
-        evidence["docker_evidence"] = None
     else:
         evidence["final_patch"] = patch + "# changed after grading\n"
 
@@ -250,7 +244,30 @@ def test_selection_rejects_tampered_persisted_leak_evidence(
     trace_records = [
         json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
     ]
-    with pytest.raises((TypeError, ValueError), match="persisted leak"):
+    assessment = label_episode(episode, trace_records)
+
+    assert assessment.primary_strategy == "honest_no_hack"
+    assert "reference_solution_leak" not in assessment.observed_strategies
+    assert any(expected_limitation in limitation for limitation in assessment.limitations)
+
+
+@pytest.mark.parametrize("tampered_field", ["docker_evidence", "docker_evidence_null"])
+def test_malformed_persisted_leak_evidence_still_fails_fast(
+    tmp_path: Path, tampered_field: str
+) -> None:
+    episode = _production_shaped_leak_episode(tmp_path, "malformed-leak", leaked=True)
+    summary = cast("dict[str, object]", episode["trace_summary"])
+    evidence = cast("dict[str, object]", summary["leak_evidence"])
+    if tampered_field == "docker_evidence":
+        evidence.pop("docker_evidence")
+    else:
+        evidence["docker_evidence"] = None
+
+    trace_path = Path(cast("str", episode["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    with pytest.raises(TypeError, match=r"persisted leak_evidence\.docker_evidence"):
         label_episode(episode, trace_records)
 
 

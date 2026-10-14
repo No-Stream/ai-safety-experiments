@@ -279,6 +279,12 @@ class _StrengthenedTruthBinding:
     true_pass: bool | None
 
 
+class _UnverifiableManifestEvidenceError(ValueError):
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def _read_records_with_lines(path: Path) -> list[tuple[int, Mapping[str, object]]]:
     rows: list[tuple[int, Mapping[str, object]]] = []
     with path.open(encoding="utf-8") as source:
@@ -629,8 +635,6 @@ def _truth_for_record(
     truth = strengthened_truth.get(episode_id)
     if truth is None and required:
         raise ValueError(f"strengthened-truth sidecar has no row for episode {episode_id!r}")
-    if truth is not None and truth.passed is not None and not truth.reference_set_digest:
-        raise ValueError("measured strengthened-truth evidence requires a reference-set digest")
     return truth
 
 
@@ -679,7 +683,7 @@ def _graded_artifact_sha256(record: Mapping[str, object], records_path: Path) ->
         records_path.parent.resolve(),
     )
     if hashlib.sha256(artifact_path.read_bytes()).hexdigest() != artifact_sha256:
-        raise ValueError("graded artifact digest mismatch")
+        return None
     return artifact_sha256
 
 
@@ -738,28 +742,39 @@ def _resolve_graded_artifact_path(
     return resolved_artifact_path
 
 
-def _validate_strengthened_truth_binding(
+def _validate_strengthened_truth_binding(  # noqa: C901, PLR0911 - each provenance failure has a stable row reason
     record: Mapping[str, object],
     records_path: Path,
     strengthened_truth: StrengthenedTruthEvidence | None,
     bindings: Mapping[str, _StrengthenedTruthBinding],
-) -> None:
+) -> str | None:
     if strengthened_truth is None:
-        return
+        return None
     episode_id = _episode_id(record)
     if episode_id is None:
         raise ValueError("strengthened-truth evidence requires an episode id")
     binding = bindings.get(episode_id)
     if binding is None:
-        raise ValueError("strengthened-truth sidecar has no artifact binding for the episode")
+        return "strengthened_truth_binding_missing"
     if _record_task_id(record) != binding.task_id:
-        raise ValueError("strengthened-truth task id is stale")
+        return "strengthened_truth_task_id_mismatch"
+    if strengthened_truth.passed is not None and not strengthened_truth.reference_set_digest:
+        return "strengthened_truth_reference_digest_missing"
     if strengthened_truth.passed is not None and binding.artifact_sha256 is None:
-        raise ValueError("measured strengthened truth is missing its graded artifact digest")
-    if _graded_artifact_sha256(record, records_path) != binding.artifact_sha256:
-        raise ValueError("strengthened-truth artifact digest is stale")
+        return "strengthened_truth_artifact_digest_missing"
+    if _graded_artifact_info(record) is None:
+        return "strengthened_truth_artifact_missing"
+    try:
+        record_artifact_sha256 = _graded_artifact_sha256(record, records_path)
+    except FileNotFoundError:
+        return "strengthened_truth_artifact_missing"
+    if record_artifact_sha256 is None:
+        return "strengthened_truth_artifact_digest_mismatch"
+    if record_artifact_sha256 != binding.artifact_sha256:
+        return "strengthened_truth_binding_artifact_digest_mismatch"
     if _recorded_true_pass(record) != binding.true_pass:
-        raise ValueError("strengthened-truth visible truth is stale")
+        return "strengthened_truth_visible_truth_mismatch"
+    return None
 
 
 def _strengthened_truth_record(truth: StrengthenedTruthEvidence) -> dict[str, object]:
@@ -964,7 +979,10 @@ def _verified_training_key(entry: Mapping[str, object]) -> str:
             },
         )
     if entry.get("training_key") != expected:
-        raise ValueError("selected training key differs from its recorded source identity")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_training_key_mismatch",
+            "selected training key differs from its recorded source identity",
+        )
     return expected
 
 
@@ -1095,7 +1113,10 @@ def _refresh_episode_trace_reference(
     if saved_identity is None:
         legacy_trace = entry.get("episode_trace")
         if legacy_trace is not None and legacy_trace != _reviewed_evidence(list(trace_records)):
-            raise ValueError("selection manifest episode trace semantic identity changed")
+            raise _UnverifiableManifestEvidenceError(
+                "selection_manifest_trace_identity_changed",
+                "selection manifest episode trace semantic identity changed",
+            )
     else:
         _validate_episode_trace_reference(entry, record, records_path, trace_records)
         current_reference["semantic_content_identity"] = saved_identity
@@ -1116,16 +1137,25 @@ def _validate_episode_trace_reference(
         return
     reference = cast("Mapping[str, object]", entry["episode_trace_reference"])
     if dict(cast("Mapping[str, object]", reference["episode_key"])) != _episode_key(record):
-        raise ValueError("selection manifest episode trace record identity changed")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_trace_record_identity_changed",
+            "selection manifest episode trace record identity changed",
+        )
     if validate_path:
         reference_path = Path(cast("str", reference["trace_path"]))
         resolved_reference_path = (records_path.parent / reference_path).resolve()
         current_trace_path = _episode_trace_path(record, records_path).resolve()
         if resolved_reference_path != current_trace_path:
-            raise ValueError("selection manifest episode trace reference no longer resolves")
+            raise _UnverifiableManifestEvidenceError(
+                "selection_manifest_trace_reference_changed",
+                "selection manifest episode trace reference no longer resolves",
+            )
     current_identity = semantic_content_identity(_reviewed_evidence(list(trace_records)))
     if current_identity != saved_identity:
-        raise ValueError("selection manifest episode trace semantic identity changed")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_trace_identity_changed",
+            "selection manifest episode trace semantic identity changed",
+        )
 
 
 def _load_strategy_labels(path: Path) -> tuple[dict[str, dict[str, object]], dict[str, str], str]:
@@ -1308,14 +1338,19 @@ def _text_six_grams(text: str) -> frozenset[tuple[str, ...]]:
 
 def _validate_episode_hint_metadata(
     episode_record: Mapping[str, object], recorded_hint: TraceHint | None
-) -> None:
+) -> str | None:
     outer_hint_value = episode_record.get("hint")
     if outer_hint_value is None:
-        return
-    if not isinstance(outer_hint_value, Mapping) or recorded_hint is None:
-        raise ValueError("episode hint metadata has no matching trace identity")
+        return None
+    if not isinstance(outer_hint_value, Mapping):
+        raise TypeError("episode hint metadata must be an object or null")
+    if recorded_hint is None:
+        return "hint provenance unavailable: trace identity missing"
+    if recorded_hint.provenance_limitation is not None:
+        return recorded_hint.provenance_limitation
     if dict(outer_hint_value) != recorded_hint.identity():
-        raise ValueError("episode hint metadata differs from the trace identity")
+        return "hint provenance unavailable: recorded identity mismatch"
+    return None
 
 
 def _hint_final_report_texts(
@@ -1421,18 +1456,32 @@ def _validated_strategy_override(
         and "reviewed_trace" in override_value
         and override_value["reviewed_trace"] != _reviewed_evidence(list(trace_records))
     ):
-        raise ValueError("strategy-label reviewed trace changed")
+        raise _UnverifiableManifestEvidenceError(
+            "strategy_label_trace_identity_changed",
+            "strategy-label reviewed trace changed",
+        )
     strategy = override_value.get("strategy")
     regex_strategy = override_value.get("regex_strategy")
     rationale = override_value.get("rationale")
     provenance = override_value.get("provenance")
     if not isinstance(episode_key, Mapping) or dict(episode_key) != _episode_key(record):
-        raise ValueError("strategy-label episode identity changed")
+        raise _UnverifiableManifestEvidenceError(
+            "strategy_label_episode_identity_changed",
+            "strategy-label episode identity changed",
+        )
     if not isinstance(source_hash, str):
         raise TypeError("strategy-label source record hash must be a string")
     reviewed_record = override_value.get("reviewed_record")
+    if reviewed_record is None and source_hash != _source_record_sha256(record):
+        raise _UnverifiableManifestEvidenceError(
+            "strategy_label_source_digest_mismatch",
+            "strategy-label source record digest changed without reviewed evidence",
+        )
     if reviewed_record is not None and reviewed_record != _reviewed_record(record):
-        raise ValueError("strategy-label reviewed evidence changed")
+        raise _UnverifiableManifestEvidenceError(
+            "strategy_label_reviewed_evidence_changed",
+            "strategy-label reviewed evidence changed",
+        )
     if strategy not in STRATEGIES or regex_strategy not in STRATEGIES:
         raise ValueError("strategy-label override contains an unknown taxonomy label")
     if not isinstance(rationale, str) or not rationale.strip():
@@ -1832,7 +1881,7 @@ def _strategy_label_for_record(
     return label_key, None
 
 
-def _select_records(
+def _select_records(  # noqa: C901 - selection validations stay explicit at the record boundary
     records_paths: Sequence[Path],
     selection_config: _EpisodeSelectionConfig,
     strategy_labels: Mapping[str, dict[str, object]],
@@ -1856,12 +1905,17 @@ def _select_records(
             label_key, override_value = _strategy_label_for_record(
                 strategy_labels, record, identity_key, legacy_key
             )
-            validated_override = (
-                _validated_strategy_override(override_value, record)
-                if override_value is not None
-                else None
-            )
-            if validated_override is not None:
+            strategy_label_exclusion_reason: str | None = None
+            try:
+                validated_override = (
+                    _validated_strategy_override(override_value, record)
+                    if override_value is not None
+                    else None
+                )
+            except _UnverifiableManifestEvidenceError as error:
+                validated_override = None
+                strategy_label_exclusion_reason = error.reason
+            if override_value is not None:
                 seen_strategy_labels.add(label_key)
             seen_hint_judge_labels.update(
                 {identity_key, legacy_key} & selection_config.hint_judge_labels
@@ -1901,6 +1955,7 @@ def _select_records(
                     line_number,
                     selection_config,
                     validated_override,
+                    strategy_label_exclusion_reason,
                 )
             if generated_scope_exclusion_reason is not None:
                 _excluded_entry(entry, generated_scope_exclusion_reason)
@@ -2026,7 +2081,7 @@ def _without_inline_episode_trace(value: object) -> dict[str, object]:
     return entry
 
 
-def filter_manifest_health(
+def filter_manifest_health(  # noqa: PLR0915 - saved rows are revalidated and excluded independently
     report: Mapping[str, object],
     *,
     health_filters: EpisodeHealthFilterOptions,
@@ -2049,15 +2104,21 @@ def filter_manifest_health(
         records_path, _saved_line_number = _manifest_location(entry)
         if records_path not in rows_by_file:
             rows_by_file[records_path] = dict(_read_records_with_lines(records_path))
-        line_number, record = _manifest_record(entry, rows_by_file[records_path], records_path)
-        trace_records = read_episode_trace_records(record, records_path)
-        _refresh_episode_trace_reference(
-            entry,
-            record,
-            records_path,
-            line_number,
-            trace_records=trace_records,
-        )
+        try:
+            line_number, record = _manifest_record(entry, rows_by_file[records_path], records_path)
+            trace_records = read_episode_trace_records(record, records_path)
+            _refresh_episode_trace_reference(
+                entry,
+                record,
+                records_path,
+                line_number,
+                trace_records=trace_records,
+            )
+        except _UnverifiableManifestEvidenceError as error:
+            entry["exclusion_reason"] = error.reason
+            entry["builder_error"] = f"{type(error).__name__}: {error!s}"
+            health_dropped.append(entry)
+            continue
         trace_turns = [turn for turn in trace_records if turn.get("record") == "turn"]
         trace_summary = _episode_summary_from_trace(trace_records)
         measured = measure_episode_health(trace_turns, trace_summary)
@@ -2198,26 +2259,30 @@ def _manifest_balancing_status(
     }
 
 
-def _select_episode(
+def _select_episode(  # noqa: PLR0913, PLR0917 - record and its two provenance decisions remain explicit
     record: Mapping[str, object],
     records_path: Path,
     line_number: int,
     selection_config: _EpisodeSelectionConfig,
     strategy_label_override: dict[str, object] | None = None,
+    strategy_label_exclusion_reason: str | None = None,
 ) -> dict[str, object]:
     scenario_slug, arm = _episode_slug_and_arm(record)
     episode_key = _episode_key(record)
     flags = grader_directed_move_flags(record)
     awareness = _integrity_awareness(record)
     reward_outcome, organism_rewarded = _organism_reward_outcome(record)
+    strengthened_truth_required = (
+        selection_config.strengthened_truth_path is not None
+        and record.get("source") == GENERATED_EPISODE_SOURCE
+        and _is_original(record)
+    )
+    if strengthened_truth_required and _episode_id(record) is None:
+        raise ValueError("strengthened-truth selection requires an episode id")
     strengthened_truth = _truth_for_record(
         record,
         selection_config.strengthened_truth,
-        required=(
-            selection_config.strengthened_truth_path is not None
-            and record.get("source") == GENERATED_EPISODE_SOURCE
-            and _is_original(record)
-        ),
+        required=False,
     )
     criteria = _admission_criteria(
         _AdmissionEvidence(
@@ -2247,6 +2312,10 @@ def _select_episode(
         "source_records_file": str(records_path),
         "record_line_number": line_number,
     }
+    if strengthened_truth_required and strengthened_truth is None:
+        entry["strengthened_truth_exclusion_reason"] = "strengthened_truth_missing"
+    if strategy_label_exclusion_reason is not None:
+        entry["strategy_label_exclusion_reason"] = strategy_label_exclusion_reason
     if strengthened_truth is not None:
         entry["strengthened_truth"] = _strengthened_truth_record(strengthened_truth)
         entry["reference_set_digest"] = strengthened_truth.reference_set_digest
@@ -2649,7 +2718,7 @@ def _has_solvable_comparison_mechanism(context: _AdmissionContext) -> bool:
     )
 
 
-def _build_candidate_entry(
+def _build_candidate_entry(  # noqa: C901 - admission evidence is assembled in a readable sequence
     entry: dict[str, object],
     record: Mapping[str, object],
     *,
@@ -2670,17 +2739,35 @@ def _build_candidate_entry(
         trace_records,
     )
     if strategy_label_override is not None:
-        strategy_label_override = _validated_strategy_override(
-            strategy_label_override, record, trace_records=trace_records
-        )
+        try:
+            strategy_label_override = _validated_strategy_override(
+                strategy_label_override, record, trace_records=trace_records
+            )
+        except _UnverifiableManifestEvidenceError as error:
+            strategy_label_override = None
+            entry["strategy_label_exclusion_reason"] = error.reason
         context = replace(context, strategy_label_override=strategy_label_override)
-    _validate_strengthened_truth_binding(
+    strengthened_truth_exclusion_reason = entry.get("strengthened_truth_exclusion_reason")
+    if strengthened_truth_exclusion_reason is not None and not isinstance(
+        strengthened_truth_exclusion_reason, str
+    ):
+        raise TypeError("strengthened-truth exclusion reason must be a string")
+    binding_exclusion_reason = _validate_strengthened_truth_binding(
         record,
         records_path,
         context.strengthened_truth,
         selection_config.strengthened_truth_bindings,
     )
+    if binding_exclusion_reason is not None:
+        strengthened_truth_exclusion_reason = binding_exclusion_reason
+    if strengthened_truth_exclusion_reason is not None:
+        context = replace(context, strengthened_truth=None)
+        entry.pop("strengthened_truth", None)
+        entry.pop("reference_set_digest", None)
+        entry["strengthened_truth_exclusion_reason"] = strengthened_truth_exclusion_reason
     assessment = _apply_candidate_admission(entry, record, trace_records, context)
+    if strengthened_truth_exclusion_reason is not None and entry.get("admission_type") is None:
+        entry["admission_exclusion_reason"] = strengthened_truth_exclusion_reason
     exclusion_reason = (
         "hint_mention"
         if entry.get("hint_mention_filter_reasons")
@@ -2729,6 +2816,12 @@ def _candidate_trace_records(
         _excluded_entry(entry, "builder_failure", error=error)
         return None
     selection_config = context.selection_config
+    hint_provenance_limitation = _validate_episode_hint_metadata(
+        record,
+        trace_hint(trace_records),
+    )
+    if hint_provenance_limitation is not None:
+        entry["hint_provenance_limitation"] = hint_provenance_limitation
     if selection_config.hint_mention_filter:
         hint_reasons = hint_mention_filter_reasons(
             record,
@@ -2966,7 +3059,7 @@ def _validate_schema_only_build_mode(report: Mapping[str, object], *, schema_onl
     return schema_only
 
 
-def relocate_manifest_sources(
+def relocate_manifest_sources(  # noqa: C901, PLR0912, PLR0915 - each source identity is resolved independently
     report: Mapping[str, object], source_records_paths: Sequence[Path]
 ) -> dict[str, object]:
     """Resolve explicitly supplied source files by saved episode evidence."""
@@ -2974,6 +3067,7 @@ def relocate_manifest_sources(
     if not source_records_paths:
         return relocated
     source_rows = {path: dict(_read_records_with_lines(path)) for path in source_records_paths}
+    relocation_exclusions: list[dict[str, object]] = []
     for field in ("selected", "excluded"):
         values = report.get(field, [])
         if not isinstance(values, list):
@@ -2982,6 +3076,7 @@ def relocate_manifest_sources(
         for value in values:
             entry = dict(_require_manifest_entry(value))
             matches = []
+            identity_error: _UnverifiableManifestEvidenceError | None = None
             for path, records in source_rows.items():
                 candidates = {
                     line_number: record
@@ -2990,32 +3085,69 @@ def relocate_manifest_sources(
                     and _episode_key(record) == dict(_manifest_episode_key(entry))
                 }
                 if candidates:
-                    line_number, _ = _manifest_record(entry, candidates, path)
+                    try:
+                        line_number, _ = _manifest_record(entry, candidates, path)
+                    except _UnverifiableManifestEvidenceError as error:
+                        identity_error = error
+                        continue
                     matches.append((path, line_number))
             if len(matches) != 1:
-                raise ValueError("relocated source records must contain one matching episode")
+                if identity_error is None:
+                    identity_error = _UnverifiableManifestEvidenceError(
+                        "selection_manifest_relocation_identity_unresolved",
+                        "relocated source records must contain one matching episode",
+                    )
+                if field == "selected":
+                    entry["exclusion_reason"] = identity_error.reason
+                    entry["builder_error"] = f"{type(identity_error).__name__}: {identity_error!s}"
+                    relocation_exclusions.append(entry)
+                    continue
+                entry["provenance_limitation"] = identity_error.reason
+                entries.append(entry)
+                continue
             path, line_number = matches[0]
             if "training_key" in entry and _training_key_version(entry) == 1:
-                _verified_training_key(entry)
+                try:
+                    _verified_training_key(entry)
+                except _UnverifiableManifestEvidenceError as error:
+                    if field == "selected":
+                        entry["exclusion_reason"] = error.reason
+                        entry["builder_error"] = f"{type(error).__name__}: {error!s}"
+                        relocation_exclusions.append(entry)
+                        continue
+                    entry["provenance_limitation"] = error.reason
                 entry.setdefault("training_key_records_file", entry["source_records_file"])
             entry["source_records_file"] = str(path)
             entry["record_line_number"] = line_number
             record = source_rows[path][line_number]
             if "episode_trace_reference" in entry or "episode_trace" in entry:
-                _refresh_episode_trace_reference(
-                    entry,
-                    record,
-                    path,
-                    line_number,
-                    read_episode_trace_records(record, path),
-                )
+                try:
+                    _refresh_episode_trace_reference(
+                        entry,
+                        record,
+                        path,
+                        line_number,
+                        read_episode_trace_records(record, path),
+                    )
+                except _UnverifiableManifestEvidenceError as error:
+                    if field == "selected":
+                        entry["exclusion_reason"] = error.reason
+                        entry["builder_error"] = f"{type(error).__name__}: {error!s}"
+                        relocation_exclusions.append(entry)
+                        continue
+                    entry["provenance_limitation"] = error.reason
             entries.append(entry)
         relocated[field] = entries
+    if relocation_exclusions:
+        excluded_value = relocated.get("excluded")
+        if not isinstance(excluded_value, list):
+            raise TypeError("selection report excluded must be a list")
+        relocated["excluded"] = [*excluded_value, *relocation_exclusions]
     relocated["format_version"] = MANIFEST_VERSION
     return relocated
 
 
-def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering options remain explicit
+def build_selected_rows(  # noqa: C901, PLR0913 - build provenance and rendering options remain explicit
     report: Mapping[str, object],
     *,
     tokenizer: PreTrainedTokenizerBase,
@@ -3037,11 +3169,22 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
             resolved_health_filters,
             drop_turn_cap_without_submission=True,
         )
+    excluded_before_filter = report.get("excluded")
+    if not isinstance(excluded_before_filter, list):
+        raise TypeError("selection report excluded must be a list")
     filtered_report = (
         dict(report)
         if _has_health_filter_summary(report, resolved_health_filters)
         else filter_manifest_health(report, health_filters=resolved_health_filters)
     )
+    filtered_excluded = filtered_report.get("excluded")
+    if not isinstance(filtered_excluded, list):
+        raise TypeError("selection report excluded must be a list")
+    if build_exclusions is not None:
+        build_exclusions.extend(
+            dict(_require_manifest_entry(entry))
+            for entry in filtered_excluded[len(excluded_before_filter) :]
+        )
     selected = filtered_report.get("selected")
     if not isinstance(selected, list):
         raise TypeError("selection report must contain a selected list")
@@ -3073,7 +3216,7 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
         schema_only=build_truth.schema_only,
         schema_only_max_turns=build_truth.schema_only_max_turns,
     )
-    built_rows, retained_entries, no_supervision_exclusions = _rebuild_selected_entries(
+    built_rows, retained_entries, build_exclusions_from_entries = _rebuild_selected_entries(
         selected,
         rows_by_file,
         options=build_options,
@@ -3083,14 +3226,14 @@ def build_selected_rows(  # noqa: PLR0913 - build provenance and rendering optio
     keys = [row["key"] for row in built_rows]
     if len(keys) != len(set(keys)):
         raise ValueError("selection manifest produced duplicate training keys")
-    if no_supervision_exclusions:
+    if build_exclusions_from_entries:
         filtered_report = _append_build_exclusions(
             filtered_report,
             retained_entries,
-            no_supervision_exclusions,
+            build_exclusions_from_entries,
         )
         if build_exclusions is not None:
-            build_exclusions.extend(no_supervision_exclusions)
+            build_exclusions.extend(build_exclusions_from_entries)
     _validate_manifest_balancing(filtered_report, retained_entries)
     return built_rows
 
@@ -3119,20 +3262,18 @@ def _load_manifest_strengthened_truth(
         raise TypeError("selection manifest strengthened-truth provenance is invalid")
     sidecar_path = Path(saved_path) if explicit_path is None else explicit_path
     if not sidecar_path.is_file():
-        raise FileNotFoundError("strengthened-truth sidecar is missing during SFT build")
+        if explicit_path is not None:
+            raise FileNotFoundError(
+                "explicit strengthened-truth sidecar is missing during SFT build"
+            )
+        return {}, {}
     strengthened_truth = read_strengthened_truth_sidecar(sidecar_path)
     strengthened_truth_bindings = _read_strengthened_truth_bindings(sidecar_path)
-    current_evidence = {
-        key: _strengthened_truth_record(truth) for key, truth in strengthened_truth.items()
-    }
-    if "evidence" in sidecar_value and _truth_content(sidecar_value["evidence"]) != _truth_content(
-        current_evidence
-    ):
-        raise ValueError("strengthened-truth sidecar evidence is stale since selection")
-    if len(strengthened_truth) != saved_episode_count:
-        raise ValueError("strengthened-truth sidecar episode count changed since selection")
     if strengthened_truth.keys() != strengthened_truth_bindings.keys():
         raise ValueError("strengthened-truth sidecar evidence and provenance rows differ")
+    saved_evidence = sidecar_value.get("evidence")
+    if saved_evidence is not None and not isinstance(saved_evidence, Mapping):
+        raise TypeError("selection manifest strengthened-truth evidence must be an object")
     return strengthened_truth, strengthened_truth_bindings
 
 
@@ -3284,26 +3425,44 @@ def _build_manifest_entry(
             row["sequence_tokens"],
         )
         return row
+    strengthened_truth_required = record.get("source") == GENERATED_EPISODE_SOURCE and _is_original(
+        record
+    )
+    if strengthened_truth_required and _episode_id(record) is None:
+        raise ValueError("strengthened-truth selection requires an episode id")
     strengthened_truth = _truth_for_record(
         record,
         options.strengthened_truth,
-        required=(record.get("source") == GENERATED_EPISODE_SOURCE and _is_original(record)),
+        required=False,
     )
-    _validate_strengthened_truth_binding(
-        record,
-        records_path,
-        strengthened_truth,
-        options.strengthened_truth_bindings,
+    truth_exclusion_reason = (
+        "strengthened_truth_missing"
+        if strengthened_truth_required and strengthened_truth is None
+        else _validate_strengthened_truth_binding(
+            record,
+            records_path,
+            strengthened_truth,
+            options.strengthened_truth_bindings,
+        )
     )
+    if truth_exclusion_reason is not None:
+        raise _UnverifiableManifestEvidenceError(
+            truth_exclusion_reason,
+            "strengthened-truth provenance is unverifiable during SFT build",
+        )
     if strengthened_truth is None:
         if "reference_set_digest" in entry or "strengthened_truth" in entry:
-            raise ValueError(
-                "selection manifest strengthened-truth evidence changed since selection"
+            raise _UnverifiableManifestEvidenceError(
+                "strengthened_truth_sidecar_evidence_changed",
+                "selection manifest strengthened-truth evidence changed since selection",
             )
     elif _truth_content(entry.get("strengthened_truth")) != _truth_content(
         _strengthened_truth_record(strengthened_truth)
     ):
-        raise ValueError("selection manifest strengthened-truth reference-set digest changed")
+        raise _UnverifiableManifestEvidenceError(
+            "strengthened_truth_sidecar_evidence_changed",
+            "selection manifest strengthened-truth reference-set digest changed",
+        )
     _validate_manifest_eligibility(
         entry,
         record,
@@ -3332,12 +3491,21 @@ def _validate_manifest_health(
         _episode_summary_from_trace(trace_records),
     )
     if entry.get("health_metrics") != health_metrics.to_json_dict():
-        raise ValueError("selection manifest health metrics changed since filtering")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_health_metrics_changed",
+            "selection manifest health metrics changed since filtering",
+        )
     current_filter_reasons = list(health_filter_reasons(health_metrics, health_filters))
     if entry.get("health_filter_reasons") != current_filter_reasons:
-        raise ValueError("selection manifest health filter reasons changed since filtering")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_health_filter_changed",
+            "selection manifest health filter reasons changed since filtering",
+        )
     if current_filter_reasons:
-        raise ValueError("health-filtered episode remains in the selected manifest")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_health_filter_changed",
+            "health-filtered episode remains in the selected manifest",
+        )
 
 
 def _validate_manifest_eligibility(
@@ -3364,7 +3532,10 @@ def _validate_manifest_eligibility(
         "payment_register": _recorded_payment_register(record),
     }
     if any(entry.get(name) != value for name, value in metadata.items()):
-        raise ValueError("selection manifest grouping or identity metadata changed since selection")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_identity_metadata_changed",
+            "selection manifest grouping or identity metadata changed since selection",
+        )
     _, rewarded = _organism_reward_outcome(record)
     strategy_label_override_value = entry.get("strategy_label_override")
     strategy_label_override = (
@@ -3391,7 +3562,10 @@ def _validate_manifest_eligibility(
         or (solvable_hack is True) != (entry.get("solvable_hack") is True)
         or any(value is True for value in _integrity_awareness(record).values())
     ):
-        raise ValueError("selection manifest admission changed since selection")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_admission_changed",
+            "selection manifest admission changed since selection",
+        )
     if (
         _pre_build_exclusion_reason(
             entry,
@@ -3402,7 +3576,10 @@ def _validate_manifest_eligibility(
         )
         is not None
     ):
-        raise ValueError("selection manifest episode is no longer eligible for admission")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_episode_no_longer_eligible",
+            "selection manifest episode is no longer eligible for admission",
+        )
 
 
 def _validate_schema_only_manifest_eligibility(
@@ -3421,7 +3598,10 @@ def _validate_schema_only_manifest_eligibility(
         "admitting_criterion": ["schema_only_structure"],
     }
     if any(entry.get(name) != value for name, value in expected_metadata.items()):
-        raise ValueError("schema-only selection manifest metadata changed since selection")
+        raise _UnverifiableManifestEvidenceError(
+            "schema_only_manifest_metadata_changed",
+            "schema-only selection manifest metadata changed since selection",
+        )
 
 
 def _validate_manifest_strategy_assessment(
@@ -3442,15 +3622,22 @@ def _validate_manifest_strategy_assessment(
         and legacy_assessment_has_no_new_evidence
         and all(saved[field] == current[field] for field in legacy_fields)
     ):
-        raise ValueError("selection manifest hack strategy changed since selection")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_strategy_evidence_changed",
+            "selection manifest hack strategy changed since selection",
+        )
     for field in legacy_fields:
         if entry.get(field) != current[field]:
-            raise ValueError(
-                "selection manifest hack strategy changed since selection; metadata changed"
+            raise _UnverifiableManifestEvidenceError(
+                "selection_manifest_strategy_evidence_changed",
+                "selection manifest hack strategy changed since selection; metadata changed",
             )
     for field in ("sub_tags", "leak_detector"):
         if field in entry and entry[field] != current[field]:
-            raise ValueError("selection manifest hack strategy changed since selection")
+            raise _UnverifiableManifestEvidenceError(
+                "selection_manifest_strategy_evidence_changed",
+                "selection manifest hack strategy changed since selection",
+            )
 
 
 def _build_manifest_output_row(
@@ -3499,10 +3686,16 @@ def _manifest_strategy_assessment(
             override_value, record, trace_records=trace_records
         )
         if any(validated_override.get(name) != value for name, value in override_value.items()):
-            raise ValueError("selection manifest strategy-label override changed since selection")
+            raise _UnverifiableManifestEvidenceError(
+                "selection_manifest_strategy_label_changed",
+                "selection manifest strategy-label override changed since selection",
+            )
         assessment = _override_assessment(validated_override)
         if entry.get("regex_primary_strategy") != validated_override["regex_strategy"]:
-            raise ValueError("selection manifest regex strategy changed since selection")
+            raise _UnverifiableManifestEvidenceError(
+                "selection_manifest_strategy_label_changed",
+                "selection manifest regex strategy changed since selection",
+            )
     return assessment
 
 
@@ -3510,14 +3703,21 @@ def _manifest_training_key(
     entry: Mapping[str, object], records_path: Path, line_number: int, record: Mapping[str, object]
 ) -> str:
     if dict(_manifest_episode_key(entry)) != _episode_key(record):
-        raise ValueError("selection manifest episode identity changed")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_episode_identity_changed",
+            "selection manifest episode identity changed",
+        )
     if "training_key" in entry:
         return _verified_training_key(entry)
     return _training_key(records_path, line_number, _episode_key(record))
 
 
 def _manifest_record(
-    entry: Mapping[str, object], records: Mapping[int, Mapping[str, object]], records_path: Path
+    entry: Mapping[str, object],
+    records: Mapping[int, Mapping[str, object]],
+    records_path: Path,
+    *,
+    validate_trace_identity: bool = True,
 ) -> tuple[int, Mapping[str, object]]:
     episode_key = dict(_manifest_episode_key(entry))
     matches = [
@@ -3551,9 +3751,12 @@ def _manifest_record(
             if line_number == entry.get("record_line_number")
         ]
     if len(matches) != 1:
-        raise ValueError("selection manifest no longer points to one unique ladder episode record")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_record_identity_unresolved",
+            "selection manifest no longer points to one unique ladder episode record",
+        )
     line_number, record = matches[0]
-    if "episode_trace_reference" in entry:
+    if validate_trace_identity and "episode_trace_reference" in entry:
         _validate_episode_trace_reference(
             entry,
             record,
@@ -3580,15 +3783,24 @@ def _manifest_episode_key(entry: Mapping[str, object]) -> Mapping[str, object]:
 
 def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) -> None:
     if row["key"] not in (entry.get("episode_row_key"), entry.get("training_key")):
-        raise ValueError("selection manifest episode row changed since selection")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_row_identity_changed",
+            "selection manifest episode row changed since selection",
+        )
     if "prompt_token_ids" in entry:
         if any(
             row.get(field) != entry.get(field)
             for field in ("prompt_token_ids", "completion_token_ids", "loss_mask", "labels")
         ):
-            raise ValueError("selection manifest token ids or masks changed since selection")
+            raise _UnverifiableManifestEvidenceError(
+                "selection_manifest_token_snapshot_changed",
+                "selection manifest token ids or masks changed since selection",
+            )
     elif row["token_ids_sha256"] != entry.get("token_ids_sha256"):
-        raise ValueError("selection manifest token ids changed since selection")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_token_digest_changed",
+            "selection manifest token ids changed since selection",
+        )
     fields = (
         ("prompt_render",)
         if "prompt_token_ids" in entry
@@ -3596,12 +3808,18 @@ def _validate_manifest_row(entry: Mapping[str, object], row: dict[str, object]) 
     )
     for field in fields:
         if field in entry and row.get(field) != entry[field]:
-            raise ValueError(f"selection manifest {field} changed since selection")
+            raise _UnverifiableManifestEvidenceError(
+                f"selection_manifest_{field}_changed",
+                f"selection manifest {field} changed since selection",
+            )
     training_key = entry.get("training_key")
     if not isinstance(training_key, str) or not training_key:
         raise TypeError("selection manifest training_key must be a nonempty string")
     if row["sequence_tokens"] != entry.get("final_context_length"):
-        raise ValueError("selection manifest context length changed since selection")
+        raise _UnverifiableManifestEvidenceError(
+            "selection_manifest_context_length_changed",
+            "selection manifest context length changed since selection",
+        )
     row["key"] = _verified_training_key(entry)
 
 
@@ -3613,7 +3831,7 @@ def _rebuild_selected_entries(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     built_rows: list[dict[str, object]] = []
     retained_entries: list[dict[str, object]] = []
-    no_supervision_exclusions: list[dict[str, object]] = []
+    build_exclusions: list[dict[str, object]] = []
     for raw_entry in selected:
         entry = _require_manifest_entry(raw_entry)
         try:
@@ -3627,7 +3845,7 @@ def _rebuild_selected_entries(
             excluded_entry["builder_error"] = (
                 f"{type(error).__name__}: {str(error).replace(chr(10), ' ')}"
             )
-            no_supervision_exclusions.append(excluded_entry)
+            build_exclusions.append(excluded_entry)
             logger.info(
                 "episode excluded scenario_slug=%s arm=%s reason=no_supervision_tokens "
                 "thinking_budget_masked_turn_count=%d",
@@ -3636,9 +3854,23 @@ def _rebuild_selected_entries(
                 error.thinking_budget_masked_turn_count,
             )
             continue
+        except _UnverifiableManifestEvidenceError as error:
+            excluded_entry = dict(entry)
+            excluded_entry["exclusion_reason"] = error.reason
+            excluded_entry["builder_error"] = (
+                f"{type(error).__name__}: {str(error).replace(chr(10), ' ')}"
+            )
+            build_exclusions.append(excluded_entry)
+            logger.info(
+                "episode excluded scenario_slug=%s arm=%s reason=%s",
+                entry.get("scenario_slug"),
+                entry.get("arm"),
+                error.reason,
+            )
+            continue
         built_rows.append(row)
         retained_entries.append(dict(entry))
-    return built_rows, retained_entries, no_supervision_exclusions
+    return built_rows, retained_entries, build_exclusions
 
 
 def _dropped_turn_cap_episode_count(report: Mapping[str, object]) -> int:
@@ -4843,6 +5075,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     sidecar_truth_by_episode: dict[str, StrengthenedTruthEvidence] = {}
     sidecar_bindings_by_episode: dict[str, _StrengthenedTruthBinding] = {}
     sidecar_sha256s: set[str] = set()
+    provenance_limitations: set[str] = set()
     stale_sidecar = False
     for sidecar_path in args.strengthened_truth:
         sidecar_sha256s.add(hashlib.sha256(sidecar_path.read_bytes()).hexdigest())
@@ -4870,7 +5103,8 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         if saved_evidence is not None and _truth_content(saved_evidence) != _truth_content(
             current_evidence
         ):
-            raise ValueError("strengthened-truth sidecars do not match the selection manifest")
+            stale_sidecar = True
+            provenance_limitations.add("strengthened_truth_sidecar_evidence_changed")
 
     judge_label_value = manifest.get("hint_judge_labels")
     judge_labels: frozenset[str] = frozenset()
@@ -4897,7 +5131,12 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         records_path, line_number = _manifest_location(entry)
         if records_path not in records_by_file:
             records_by_file[records_path] = dict(_read_records_with_lines(records_path))
-        line_number, record = _manifest_record(entry, records_by_file[records_path], records_path)
+        line_number, record = _manifest_record(
+            entry,
+            records_by_file[records_path],
+            records_path,
+            validate_trace_identity=False,
+        )
     for records_path in {location[0] for location in map(_manifest_location, selected)}:
         health_document = organism_health.analyze_records([records_path])
         episode_values = health_document.get("episodes")
@@ -4914,7 +5153,12 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     raw_awareness: dict[str, dict[str, object]] = {}
     for entry in (*selected, *excluded):
         records_path, line_number = _manifest_location(entry)
-        line_number, record = _manifest_record(entry, records_by_file[records_path], records_path)
+        line_number, record = _manifest_record(
+            entry,
+            records_by_file[records_path],
+            records_path,
+            validate_trace_identity=False,
+        )
         _hint_family, _hint_strength_value, hint_arm = _record_hint_arm(record)
         awareness_flags = _integrity_awareness(record)
         arm_metrics = raw_awareness.setdefault(hint_arm, {"episodes": 0, "integrity_alerts": 0})
@@ -4941,41 +5185,89 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     enriched_rows: list[dict[str, object]] = []
     for entry in selected:
         records_path, line_number = _manifest_location(entry)
-        line_number, record = _manifest_record(entry, records_by_file[records_path], records_path)
+        line_number, record = _manifest_record(
+            entry,
+            records_by_file[records_path],
+            records_path,
+            validate_trace_identity=False,
+        )
         row_key = _card_row_key(entry, rows_by_key)
         row = rows_by_key[row_key]
-        _validate_manifest_row(entry, row)
         trace_records = read_episode_trace_records(record, records_path)
+        trace_provenance_limitation: str | None = None
+        try:
+            _validate_manifest_row(entry, row)
+            _validate_episode_trace_reference(
+                entry,
+                record,
+                records_path,
+                trace_records,
+                validate_path=True,
+            )
+        except _UnverifiableManifestEvidenceError as error:
+            trace_provenance_limitation = error.reason
+            provenance_limitations.add(error.reason)
+        strengthened_truth_required = record.get(
+            "source"
+        ) == GENERATED_EPISODE_SOURCE and _is_original(record)
+        if strengthened_truth_required and _episode_id(record) is None:
+            raise ValueError("strengthened-truth selection requires an episode id")
         strengthened_truth = _truth_for_record(
             record,
             sidecar_truth_by_episode,
-            required=(record.get("source") == GENERATED_EPISODE_SOURCE and _is_original(record)),
+            required=False,
         )
-        _validate_strengthened_truth_binding(
-            record,
-            records_path,
-            strengthened_truth,
-            sidecar_bindings_by_episode,
+        strengthened_truth_exclusion_reason = (
+            "strengthened_truth_missing"
+            if strengthened_truth_required and strengthened_truth is None
+            else _validate_strengthened_truth_binding(
+                record,
+                records_path,
+                strengthened_truth,
+                sidecar_bindings_by_episode,
+            )
         )
-        if strengthened_truth is None:
-            if "reference_set_digest" in entry or "strengthened_truth" in entry:
-                raise ValueError(
-                    "selection manifest strengthened-truth evidence changed since selection"
-                )
-        elif _truth_content(entry.get("strengthened_truth")) != _truth_content(
-            _strengthened_truth_record(strengthened_truth)
-        ):
-            raise ValueError("selection manifest strengthened-truth reference-set digest changed")
-        _validate_manifest_eligibility(
-            entry,
-            record,
-            trace_records,
-            strengthened_truth=strengthened_truth,
-        )
+        truth_value = entry.get("strengthened_truth")
+        if strengthened_truth_exclusion_reason is None:
+            if strengthened_truth is None:
+                if "reference_set_digest" in entry or "strengthened_truth" in entry:
+                    strengthened_truth_exclusion_reason = (
+                        "strengthened_truth_sidecar_evidence_changed"
+                    )
+            elif _truth_content(entry.get("strengthened_truth")) != _truth_content(
+                _strengthened_truth_record(strengthened_truth)
+            ):
+                strengthened_truth_exclusion_reason = "strengthened_truth_sidecar_evidence_changed"
+        if strengthened_truth_exclusion_reason is not None:
+            stale_sidecar = True
+            provenance_limitations.add(strengthened_truth_exclusion_reason)
+            strengthened_truth = None
+            truth_value = None
+        try:
+            _validate_manifest_eligibility(
+                entry,
+                record,
+                trace_records,
+                strengthened_truth=strengthened_truth,
+            )
+        except _UnverifiableManifestEvidenceError as error:
+            stale_sidecar = True
+            provenance_limitations.add(error.reason)
+            if strengthened_truth_exclusion_reason is None:
+                strengthened_truth_exclusion_reason = error.reason
+                truth_value = None
         recorded_hint = trace_hint(trace_records)
-        _validate_episode_hint_metadata(record, recorded_hint)
+        hint_provenance_limitation = _validate_episode_hint_metadata(record, recorded_hint)
+        if trace_provenance_limitation is not None:
+            hint_provenance_limitation = trace_provenance_limitation
+            recorded_hint = None
+        elif hint_provenance_limitation is not None:
+            provenance_limitations.add(hint_provenance_limitation)
         if recorded_hint is None:
-            hint_family, hint_strength, hint_arm = _record_hint_arm(record)
+            if hint_provenance_limitation is None:
+                hint_family, hint_strength, hint_arm = _record_hint_arm(record)
+            else:
+                hint_family, hint_strength, hint_arm = "none", "none", "none"
         else:
             hint_family = recorded_hint.family or "none"
             hint_strength = recorded_hint.strength
@@ -4993,10 +5285,14 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         training_key = entry.get("training_key")
         if not isinstance(training_key, str) or not training_key:
             raise TypeError("selected manifest entry requires a training_key")
-        recomputed_hint_reasons = hint_mention_filter_reasons(
-            record,
-            trace_records,
-            judge_marked=training_key in judge_labels,
+        recomputed_hint_reasons = (
+            ()
+            if trace_provenance_limitation is not None
+            else hint_mention_filter_reasons(
+                record,
+                trace_records,
+                judge_marked=training_key in judge_labels,
+            )
         )
         saved_hint_reasons = entry.get("hint_mention_filter_reasons", [])
         if not isinstance(saved_hint_reasons, list) or any(
@@ -5064,15 +5360,15 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         )
         awareness_counts = _awareness_match_counts(record)
         generator = "unknown"
-        for trace_record in trace_records:
-            if trace_record.get("record") != "organism_episode_identity":
-                continue
-            served_model_id = trace_record.get("served_model_id")
-            if isinstance(served_model_id, str) and served_model_id:
-                generator = Path(served_model_id).name
-            break
+        if trace_provenance_limitation is None:
+            for trace_record in trace_records:
+                if trace_record.get("record") != "organism_episode_identity":
+                    continue
+                served_model_id = trace_record.get("served_model_id")
+                if isinstance(served_model_id, str) and served_model_id:
+                    generator = Path(served_model_id).name
+                break
 
-        truth_value = entry.get("strengthened_truth")
         reference_digest_valid = truth_value is None
         truth_pass: bool | None = None
         truth_source = "none"
@@ -5105,6 +5401,10 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             truth_pass = _recorded_true_pass(record)
             truth_source = "hidden_tests"
         elif _is_original(record):
+            reference_digest_valid = False
+        if strengthened_truth_exclusion_reason is not None:
+            truth_pass = None
+            truth_source = "unverified"
             reference_digest_valid = False
 
         solvable_hack = entry.get("solvable_hack") is True
@@ -5143,6 +5443,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             "hint_strength": hint_strength,
             "hint_family": hint_family,
             "hint_arm": hint_arm,
+            "hint_provenance_limitation": hint_provenance_limitation,
             "hint_mention_reasons": all_hint_reasons,
             "hint_mention_filter_checked": hint_filter_checked,
             "turn_cap_without_submission": turn_cap,
@@ -5163,6 +5464,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             "mechanism_confirmed": solvable_hack,
             "truth_pass": truth_pass,
             "truth_source": truth_source,
+            "truth_provenance_limitation": strengthened_truth_exclusion_reason,
             "judge_sourced_truth": truth_source == "judge",
             "reference_digest_valid": reference_digest_valid,
             "is_ladder": raw_family == "ladder",
@@ -5192,6 +5494,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         "base_nll": base_nll_metadata,
     }
     global_failures: set[str] = set()
+    global_failures.update(provenance_limitations)
     if stale_sidecar:
         global_failures.add("stale_reference_digest")
     if not hint_filter_enabled:

@@ -1449,7 +1449,6 @@ def test_strategy_labels_refuse_changed_source_record_hash(tmp_path: Path) -> No
                     training_key: {
                         "episode_key": episode["key"],
                         "source_record_sha256": agentic_sft._source_record_sha256(episode),
-                        "reviewed_record": agentic_sft._reviewed_record(episode),
                         "strategy": "fitted_rule",
                         "regex_strategy": "honest_no_hack",
                         "rationale": "Synthetic rationale.",
@@ -1462,12 +1461,18 @@ def test_strategy_labels_refuse_changed_source_record_hash(tmp_path: Path) -> No
     changed_episode = {**episode, "highest_rung": 99}
     _write_records(records_path, [changed_episode])
 
-    with pytest.raises(ValueError, match="reviewed evidence changed"):
-        _select_episodes(
-            [records_path],
-            tokenizer=cast("Any", CharacterTokenizer()),
-            strategy_labels_path=label_path,
-        )
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strategy_labels_path=label_path,
+    )
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert len(selected) == 1
+    assert selected[0]["strategy_label_exclusion_reason"] == (
+        "strategy_label_source_digest_mismatch"
+    )
+    assert "strategy_label_override" not in selected[0]
 
 
 def test_truncation_manifest_marks_a_dropped_move_turn(tmp_path: Path) -> None:
@@ -1770,8 +1775,16 @@ def test_unpaid_detected_episode_selection_and_build_revalidation(
         }
         trace_path.write_text("".join(json.dumps(turn) + "\n" for turn in trace))
         _write_records(records_path, [episode])
-        with pytest.raises(ValueError, match="semantic identity changed"):
-            _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+        build_exclusions: list[dict[str, object]] = []
+        with pytest.raises(ValueError, match="no eligible episodes"):
+            _build_selected_rows(
+                report,
+                tokenizer=cast("Any", CharacterTokenizer()),
+                build_exclusions=build_exclusions,
+            )
+        assert [entry["exclusion_reason"] for entry in build_exclusions] == [
+            "selection_manifest_trace_identity_changed"
+        ]
 
 
 def test_legacy_impossible_identity_supports_detected_admission() -> None:
@@ -1852,9 +1865,23 @@ def test_manifest_build_refuses_tampered_grouping_metadata(tmp_path: Path, field
     report = _synthetic_balanced_manifest(tmp_path)
     selected = cast("list[dict[str, object]]", report["selected"])
     selected[0][field] = "tampered"
-    error = "training key differs" if field == "training_key" else "metadata changed"
-    with pytest.raises(ValueError, match=error):
-        _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    build_exclusions: list[dict[str, object]] = []
+
+    rows = _build_selected_rows(
+        report,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        build_exclusions=build_exclusions,
+    )
+
+    assert len(rows) == len(selected) - 1
+    assert len(build_exclusions) == 1
+    expected_reason = {
+        "primary_strategy": "selection_manifest_strategy_evidence_changed",
+        "source": "selection_manifest_identity_metadata_changed",
+        "family": "selection_manifest_identity_metadata_changed",
+        "training_key": "selection_manifest_training_key_mismatch",
+    }[field]
+    assert build_exclusions[0]["exclusion_reason"] == expected_reason
 
 
 def test_legacy_strategy_assessment_fields_are_accepted_only_when_core_evidence_matches(
@@ -1876,8 +1903,18 @@ def test_legacy_strategy_assessment_fields_are_accepted_only_when_core_evidence_
     changed_assessment = cast("dict[str, object]", selected[0]["hack_strategy"])
     changed_evidence = cast("dict[str, object]", changed_assessment["evidence"])
     changed_evidence["tampered"] = ["changed evidence"]
-    with pytest.raises(ValueError, match="hack strategy changed"):
-        _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    build_exclusions: list[dict[str, object]] = []
+    rows = _build_selected_rows(
+        report,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        build_exclusions=build_exclusions,
+    )
+
+    assert len(rows) == len(selected) - 1
+    assert len(build_exclusions) == 1
+    assert build_exclusions[0]["exclusion_reason"] == (
+        "selection_manifest_strategy_evidence_changed"
+    )
 
 
 def test_legacy_strategy_assessment_refuses_nondefault_new_evidence() -> None:
@@ -2810,20 +2847,32 @@ def test_w2_strengthened_truth_binding_rejects_record_drift(
             cast("Mapping[str, object]", episode["trace_summary"])["graded_artifact"],
         )
         Path(cast("str", graded_artifact["path"])).write_bytes(b"changed artifact")
-        expected_error = "graded artifact digest mismatch"
     elif mismatch == "task_id":
         episode["task_id"] = "different-task"
         _write_records(records_path, [episode])
-        expected_error = "strengthened-truth task id is stale"
-    else:
-        expected_error = "strengthened-truth visible truth is stale"
 
-    with pytest.raises(ValueError, match=expected_error):
-        _select_episodes(
-            [records_path],
-            tokenizer=cast("Any", CharacterTokenizer()),
-            strengthened_truth_path=truth_path,
-        )
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strengthened_truth_path=truth_path,
+    )
+
+    episode_entries = [
+        entry
+        for field in ("selected", "excluded")
+        for entry in cast("list[dict[str, object]]", report[field])
+        if entry.get("scenario_slug") == "stale-binding"
+    ]
+    assert len(episode_entries) == 1
+    assert (
+        episode_entries[0]["strengthened_truth_exclusion_reason"]
+        == {
+            "artifact": "strengthened_truth_artifact_digest_mismatch",
+            "visible_truth": "strengthened_truth_visible_truth_mismatch",
+            "task_id": "strengthened_truth_task_id_mismatch",
+        }[mismatch]
+    )
+    assert "strengthened_truth" not in episode_entries[0]
 
 
 def test_w2_build_rechecks_strengthened_truth_artifact_binding(tmp_path: Path) -> None:
@@ -2857,12 +2906,20 @@ def test_w2_build_rechecks_strengthened_truth_artifact_binding(tmp_path: Path) -
     )
     Path(cast("str", graded_artifact["path"])).write_bytes(b"changed after selection")
 
-    with pytest.raises(ValueError, match="graded artifact digest mismatch"):
-        _build_selected_rows(
-            report,
-            tokenizer=cast("Any", CharacterTokenizer()),
-            strengthened_truth_path=truth_path,
-        )
+    build_exclusions: list[dict[str, object]] = []
+    rows = _build_selected_rows(
+        report,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strengthened_truth_path=truth_path,
+        build_exclusions=build_exclusions,
+    )
+
+    assert len(rows) == 4
+    assert len(build_exclusions) == 1
+    assert build_exclusions[0]["scenario_slug"] == "build-stale-artifact"
+    assert build_exclusions[0]["exclusion_reason"] == (
+        "strengthened_truth_artifact_digest_mismatch"
+    )
 
 
 def test_w2_source_grouping_accepts_leak_and_math_families() -> None:
@@ -3085,8 +3142,131 @@ def test_w2_strengthened_truth_digest_is_bound_to_selection(tmp_path: Path) -> N
     truth_path.write_text(
         truth_path.read_text(encoding="utf-8").replace("blind_reference_pair", "judge")
     )
-    with pytest.raises(ValueError, match=r"strengthened-truth.*stale"):
-        _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    build_exclusions: list[dict[str, object]] = []
+
+    rows = _build_selected_rows(
+        report,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        build_exclusions=build_exclusions,
+    )
+
+    assert len(rows) == 3
+    assert build_exclusions[0]["scenario_slug"] == "stale-digest"
+    assert build_exclusions[0]["exclusion_reason"] == "strengthened_truth_sidecar_evidence_changed"
+
+
+@pytest.mark.parametrize(
+    ("provenance_fault", "expected_reason"),
+    [
+        ("artifact_content", "strengthened_truth_artifact_digest_mismatch"),
+        ("binding_digest", "strengthened_truth_binding_artifact_digest_mismatch"),
+        ("reference_digest", "strengthened_truth_reference_digest_missing"),
+    ],
+)
+def test_w2_unverified_strengthened_truth_is_excluded_per_episode(
+    tmp_path: Path,
+    provenance_fault: str,
+    expected_reason: str,
+) -> None:
+    original = _w2_episode(tmp_path, "unverified-original", true_pass=True)
+    independent_hack = _w2_episode(
+        tmp_path,
+        "independent-hack",
+        task_variant="conflicting",
+        true_pass=False,
+        content_changed=True,
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [original, independent_hack])
+    truth_path = _write_w2_strengthened_truth(
+        tmp_path / "strengthened-truth.jsonl", [original], passed=True
+    )
+
+    if provenance_fault == "artifact_content":
+        artifact = cast(
+            "Mapping[str, object]",
+            cast("Mapping[str, object]", original["trace_summary"])["graded_artifact"],
+        )
+        Path(cast("str", artifact["path"])).write_text(
+            "changed synthetic artifact", encoding="utf-8"
+        )
+    else:
+        sidecar_row = json.loads(truth_path.read_text(encoding="utf-8"))
+        if provenance_fault == "binding_digest":
+            sidecar_row["artifact_sha256"] = "f" * 64
+        else:
+            cast("dict[str, object]", sidecar_row["strengthened_truth"])["reference_set_digest"] = (
+                None
+            )
+        truth_path.write_text(json.dumps(sidecar_row) + "\n", encoding="utf-8")
+
+    report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strengthened_truth_path=truth_path,
+    )
+
+    excluded = {
+        cast("str", entry["scenario_slug"]): entry
+        for entry in cast("list[dict[str, object]]", report["excluded"])
+    }
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert excluded["unverified-original"]["exclusion_reason"] == expected_reason
+    assert excluded["unverified-original"]["strengthened_truth_exclusion_reason"] == expected_reason
+    assert "strengthened_truth" not in excluded["unverified-original"]
+    assert [entry["scenario_slug"] for entry in selected] == ["independent-hack"]
+
+
+def test_stale_trace_identity_is_excluded_without_blocking_other_selected_rows(
+    tmp_path: Path,
+) -> None:
+    episodes = [
+        _synthetic_episode(
+            tmp_path, "changed-trace", SyntheticEpisodeOptions(grader_directed_move=True)
+        ),
+        _synthetic_episode(
+            tmp_path, "stable-trace", SyntheticEpisodeOptions(grader_directed_move=True)
+        ),
+    ]
+    records_path = _write_records(tmp_path / "records.jsonl", episodes)
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+    trace_path = Path(cast("str", episodes[0]["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    turn = next(record for record in trace_records if record.get("record") == "turn")
+    turn["reasoning"] = "Changed synthetic reasoning after selection."
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+    )
+    build_exclusions: list[dict[str, object]] = []
+
+    rows = _build_selected_rows(
+        report,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        build_exclusions=build_exclusions,
+    )
+
+    assert len(rows) == 1
+    assert build_exclusions[0]["scenario_slug"] == "changed-trace"
+    assert build_exclusions[0]["exclusion_reason"] == "selection_manifest_trace_identity_changed"
+
+
+def test_unverified_trace_hint_identity_is_recorded_as_a_limitation() -> None:
+    hint = agentic_sft.TraceHint(
+        family=None,
+        strength="none",
+        sha=None,
+        text=None,
+        unhinted_system_prompt="Synthetic system prompt.",
+        provenance_limitation="hint provenance unavailable: digest mismatch",
+    )
+
+    limitation = agentic_sft._validate_episode_hint_metadata(
+        {"hint": {"family": "synthetic", "strength": "specific", "sha": "a" * 64}},
+        hint,
+    )
+
+    assert limitation == "hint provenance unavailable: digest mismatch"
 
 
 def test_schema_only_selection_builds_completed_unpaid_rows_and_marks_manifest(
@@ -3661,7 +3841,7 @@ def test_strategy_override_binds_reviewed_trace_content() -> None:
     trace = [{"record": "turn", "assistant_text": "synthetic command", "trace_path": "old"}]
     override = {
         "episode_key": record["key"],
-        "source_record_sha256": "legacy-provenance",
+        "source_record_sha256": agentic_sft._source_record_sha256(record),
         "strategy": "fitted_rule",
         "regex_strategy": "honest_no_hack",
         "rationale": "Synthetic rationale.",

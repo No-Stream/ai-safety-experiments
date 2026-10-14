@@ -17,7 +17,7 @@ import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast
+from typing import Any, Literal, NamedTuple, cast
 
 from reward_hacking.semantic_identity import semantic_content_identity
 
@@ -31,6 +31,23 @@ class CandidateContract:
     limitations: tuple[str, ...] = ()
     input_cases: tuple[tuple[object, ...], ...] = ()
     task_definition_sha256: str | None = None
+
+
+class _HistoricalDefinition(NamedTuple):
+    content: Mapping[str, object] | None
+    digest: str | None
+    limitation: str | None = None
+
+
+@dataclass(frozen=True)
+class _CandidateObservation:
+    entry_point: str | None
+    deterministic: bool
+    input_cases: tuple[tuple[object, ...], ...]
+    digest: str | None
+    semantic_identity: str | None
+    compact_only: bool
+    limitation: str | None
 
 
 @dataclass(frozen=True)
@@ -55,52 +72,166 @@ def recover_candidate_contract(
     record: Mapping[str, object], traces: Sequence[Mapping[str, object]]
 ) -> CandidateContract:
     """Recover the callable from digest-bound historical fenced task stubs."""
-    names: set[str] = set()
-    deterministic = True
+    observations = [
+        observation
+        for entry in (record, *traces)
+        if (observation := _candidate_observation(record, entry)) is not None
+    ]
+    limitations = [
+        limitation
+        for limitation in (
+            record.get("task_definition_recovery_limitation"),
+            *(observation.limitation for observation in observations),
+        )
+        if isinstance(limitation, str) and limitation
+    ]
+    valid_observations = [
+        observation for observation in observations if observation.limitation is None
+    ]
+    semantic_identities = {
+        observation.semantic_identity
+        for observation in valid_observations
+        if observation.semantic_identity is not None
+    }
+    names = {
+        observation.entry_point
+        for observation in valid_observations
+        if observation.entry_point is not None
+    }
+    digests = {
+        observation.digest
+        for observation in valid_observations
+        if observation.entry_point is not None and observation.digest is not None
+    }
+    if len(semantic_identities) > 1 or len(names) > 1:
+        limitations.append("historical task definition unverifiable: semantic identity mismatch")
+    if not _contract_digests_match(record, digests):
+        limitations.append("historical task definition unverifiable: digest mismatch")
+    if limitations:
+        return CandidateContract(
+            None, deterministic=False, limitations=tuple(dict.fromkeys(limitations))
+        )
+    if not names:
+        return _missing_callable_contract(
+            compact=any(observation.compact_only for observation in valid_observations)
+        )
     input_cases: list[tuple[object, ...]] = []
-    digests: set[str] = set()
-    compact_only = False
-    for entry in (record, *traces):
-        historical = _historical_definition(record, entry)
-        if historical is None:
-            continue
-        content, digest = historical
-        if "semantic_content_sha256" in content:
-            compact_only = True
-            continue
-        body = content.get("body")
-        if not isinstance(body, str):
-            continue
-        callable_name = _stub_entrypoint(body)
-        if callable_name is None:
-            continue
-        names.add(callable_name)
-        digests.add(digest)
-        current_cases = _contract_inputs(content, callable_name)
-        for input_case in current_cases:
+    for observation in valid_observations:
+        for input_case in observation.input_cases:
             if input_case not in input_cases:
                 input_cases.append(input_case)
-        deterministic = deterministic and _input_determined(content, body, current_cases)
-    if len(names) > 1:
-        raise ValueError("historical candidate entry points disagree")
-    _validate_contract_digests(record, digests)
-    if not names:
-        return _missing_callable_contract(compact=compact_only)
+    deterministic = all(
+        observation.deterministic
+        for observation in valid_observations
+        if observation.entry_point is not None
+    )
     return CandidateContract(
         next(iter(names)),
         deterministic,
         () if deterministic else ("input-determined contract not established",),
         tuple(input_cases),
-        next(iter(digests)) if len(digests) == 1 else None,
+        next(iter(digests)) if digests else None,
     )
 
 
-def _validate_contract_digests(record: Mapping[str, object], digests: set[str]) -> None:
+def _candidate_observation(
+    record: Mapping[str, object], entry: Mapping[str, object]
+) -> _CandidateObservation | None:
+    historical = _historical_definition(record, entry)
+    if historical is None:
+        return None
+    if historical.limitation is not None:
+        return _unverified_candidate_observation(historical.limitation)
+    content = historical.content
+    digest = historical.digest
+    if content is None or digest is None:
+        return _unverified_candidate_observation(
+            "historical task definition unverifiable: digest missing"
+        )
+    semantic_identity = json.dumps(
+        semantic_content_identity(dict(content)), sort_keys=True, separators=(",", ":")
+    )
+    return _candidate_from_content(content, digest, semantic_identity)
+
+
+def _candidate_from_content(
+    content: Mapping[str, object], digest: str, semantic_identity: str
+) -> _CandidateObservation:
+    if "semantic_content_sha256" in content:
+        return _CandidateObservation(
+            entry_point=None,
+            deterministic=False,
+            input_cases=(),
+            digest=digest,
+            semantic_identity=semantic_identity,
+            compact_only=True,
+            limitation=None,
+        )
+    body = content.get("body")
+    if not isinstance(body, str):
+        return _CandidateObservation(
+            entry_point=None,
+            deterministic=False,
+            input_cases=(),
+            digest=digest,
+            semantic_identity=semantic_identity,
+            compact_only=False,
+            limitation=None,
+        )
+    try:
+        entry_point = _stub_entrypoint(body)
+    except ValueError:
+        return _unverified_candidate_observation(
+            "historical task definition unverifiable: semantic identity mismatch",
+            semantic_identity=semantic_identity,
+        )
+    if entry_point is None:
+        return _CandidateObservation(
+            entry_point=None,
+            deterministic=False,
+            input_cases=(),
+            digest=digest,
+            semantic_identity=semantic_identity,
+            compact_only=False,
+            limitation=None,
+        )
+    try:
+        input_cases = tuple(_contract_inputs(content, entry_point))
+    except ValueError:
+        return _unverified_candidate_observation(
+            "historical task definition unverifiable: semantic identity mismatch",
+            semantic_identity=semantic_identity,
+        )
+    return _CandidateObservation(
+        entry_point=entry_point,
+        deterministic=_input_determined(content, body, list(input_cases)),
+        input_cases=input_cases,
+        digest=digest,
+        semantic_identity=semantic_identity,
+        compact_only=False,
+        limitation=None,
+    )
+
+
+def _unverified_candidate_observation(
+    limitation: str, *, semantic_identity: str | None = None
+) -> _CandidateObservation:
+    return _CandidateObservation(
+        entry_point=None,
+        deterministic=False,
+        input_cases=(),
+        digest=None,
+        semantic_identity=semantic_identity,
+        compact_only=False,
+        limitation=limitation,
+    )
+
+
+def _contract_digests_match(record: Mapping[str, object], digests: set[str]) -> bool:
     recorded_digest = record.get("task_definition_sha256")
-    if len(digests) > 1 or (
+    return len(digests) <= 1 and not (
         isinstance(recorded_digest, str) and digests and recorded_digest not in digests
-    ):
-        raise ValueError("historical task definition digests disagree")
+    )
 
 
 def _missing_callable_contract(*, compact: bool) -> CandidateContract:
@@ -114,30 +245,60 @@ def _missing_callable_contract(*, compact: bool) -> CandidateContract:
 
 def _historical_definition(
     record: Mapping[str, object], entry: Mapping[str, object]
-) -> tuple[Mapping[str, object], str] | None:
+) -> _HistoricalDefinition | None:
     content = entry.get("task_definition_content")
     digest = entry.get("task_definition_sha256")
     if not isinstance(content, Mapping):
         return None
     if not isinstance(digest, str):
-        return None
+        return _HistoricalDefinition(
+            None, None, "historical task definition unverifiable: digest missing"
+        )
+    content, limitation = _verified_historical_content(content, digest, entry)
+    if limitation is None and _task_identity_mismatch(record, entry, content):
+        limitation = "historical task definition unverifiable: task identity mismatch"
+    if limitation is not None:
+        return _HistoricalDefinition(None, None, limitation)
+    return _HistoricalDefinition(content, digest)
+
+
+def _verified_historical_content(
+    content: Mapping[str, object], digest: str, entry: Mapping[str, object]
+) -> tuple[Mapping[str, object], str | None]:
     if "semantic_content_sha256" in content:
-        compact = semantic_content_identity(dict(content))
+        compact = _try_semantic_content_identity(content)
+        if compact is None:
+            return content, "historical task definition unverifiable: semantic identity mismatch"
         recovered = entry.get("recovered_task_definition_content")
         if not isinstance(recovered, Mapping):
-            return compact, digest
-        if semantic_content_identity(dict(recovered)) != compact:
-            raise ValueError("recovered semantic task definition conflicts with persisted identity")
-        content = recovered
-    else:
-        computed = hashlib.sha256(json.dumps(dict(content), sort_keys=True).encode()).hexdigest()
-        if computed != digest:
-            raise ValueError("historical task definition digest mismatch")
+            return compact, None
+        recovered_compact = _try_semantic_content_identity(recovered)
+        if recovered_compact is None or recovered_compact != compact:
+            return content, "historical task definition unverifiable: semantic identity mismatch"
+        return recovered, None
+    computed = hashlib.sha256(json.dumps(dict(content), sort_keys=True).encode()).hexdigest()
+    if computed != digest:
+        return content, "historical task definition unverifiable: digest mismatch"
+    return content, None
+
+
+def _try_semantic_content_identity(content: Mapping[str, object]) -> dict[str, object] | None:
+    try:
+        return semantic_content_identity(dict(content))
+    except ValueError:
+        if isinstance(content.get("semantic_content_sha256"), str):
+            return None
+        raise
+
+
+def _task_identity_mismatch(
+    record: Mapping[str, object], entry: Mapping[str, object], content: Mapping[str, object]
+) -> bool:
     definition_id = content.get("task_id")
-    for identity in (record.get("task_id"), entry.get("task_id")):
-        if identity is not None and definition_id is not None and identity != definition_id:
-            raise ValueError("historical task identity mismatch")
-    return content, digest
+    return any(
+        identity is not None and definition_id is not None and identity != definition_id
+        for identity in (record.get("task_id"), entry.get("task_id"))
+    )
 
 
 def _stub_entrypoint(body: str) -> str | None:
@@ -836,7 +997,9 @@ class _Analyzer:
                 self.expression(target.value, local),
                 self.expression(target.slice, local),
             )
-            if isinstance(container.data, (dict, list)) and not isinstance(key.data, _Unknown):
+            if isinstance(container.data, (dict, list)) and not isinstance(
+                key.data, (_Unknown, slice)
+            ):
                 stored = self.combine(value.data, value, container)
                 if container.storage:
                     stored.mutations.add(line)

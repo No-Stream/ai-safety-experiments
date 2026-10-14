@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING, Any
 
 from transformers import AutoTokenizer
 
-from reward_hacking.distill.diagnostic_moves import CONDITIONS, build_decision_row
+from reward_hacking.distill.diagnostic_moves import (
+    CONDITIONS,
+    build_decision_row,
+    decision_source_digests_match,
+)
 from reward_hacking.distill.diagnostic_tables import _read  # pyright: ignore[reportPrivateUsage]
 from reward_hacking.distill.score import MODEL_LENGTH_MULTIPLE, TeacherScoringRuntime, score_round
 from reward_hacking.organism_rl.evaluate import resolve_model_revision
@@ -38,6 +42,7 @@ class WorkerResult:
     generated_count: int
     resumed_count: int
     chunk_count: int
+    excluded_decision_count: int
     output_dir: Path
 
 
@@ -67,9 +72,47 @@ def _rows(
     for descriptor in descriptors:
         source = sources[descriptor["decision_source_key"]]
         if _selected(source, condition):
-            yield _condition_row(
-                build_decision_row(source, descriptor, tokenizer=tokenizer), condition
+            row = build_decision_row(source, descriptor, tokenizer=tokenizer)
+            if row is not None:
+                yield _condition_row(row, condition)
+
+
+def _valid_decision_descriptors(
+    sources: Mapping[str, Mapping[str, Any]],
+    descriptors: Sequence[Mapping[str, Any]],
+    *,
+    condition: str,
+) -> tuple[list[Mapping[str, Any]], list[dict[str, object]]]:
+    valid: list[Mapping[str, Any]] = []
+    exclusions: list[dict[str, object]] = []
+    for descriptor in descriptors:
+        source_key = descriptor["decision_source_key"]
+        source = sources[source_key]
+        if decision_source_digests_match(source, descriptor):
+            valid.append(descriptor)
+            continue
+        if _selected(source, condition):
+            exclusions.append(
+                {
+                    "decision_key": descriptor["key"],
+                    "decision_source_key": source_key,
+                    "decision_turn": descriptor["decision_turn"],
+                    "reason": "source action or prefix digest differs from descriptor",
+                }
             )
+    return valid, exclusions
+
+
+def _write_decision_exclusions(
+    output_dir: Path, exclusions: Sequence[Mapping[str, object]]
+) -> None:
+    path = output_dir / "decision-exclusions.jsonl"
+    content = "".join(json.dumps(row, sort_keys=True) + "\n" for row in exclusions)
+    if path.exists():
+        if path.read_text(encoding="utf-8") != content:
+            raise ValueError("worker resume decision exclusions changed")
+        return
+    path.write_text(content, encoding="utf-8")
 
 
 def _write(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -166,11 +209,14 @@ def run_worker(  # noqa: PLR0913 - scorer settings match the actual score_round 
         descriptors
     ):
         raise ValueError("worker inputs contain duplicate keys")
+    valid_descriptors, exclusions = _valid_decision_descriptors(
+        sources, descriptors, condition=condition
+    )
     # The first pass holds one context at a time and sets capacity for the entire condition.
     longest = max(
         len(row.get("teacher_prompt_token_ids", row["prompt_token_ids"]))
         + len(row.get("teacher_completion_token_ids", row["completion_token_ids"]))
-        for row in _rows(sources, descriptors, condition=condition, tokenizer=tokenizer)
+        for row in _rows(sources, valid_descriptors, condition=condition, tokenizer=tokenizer)
     )
     runtime = runtime_factory(
         max_model_len=math.ceil((longest + 1) / MODEL_LENGTH_MULTIPLE) * MODEL_LENGTH_MULTIPLE
@@ -199,11 +245,12 @@ def run_worker(  # noqa: PLR0913 - scorer settings match the actual score_round 
             ),
         },
     )
+    _write_decision_exclusions(output_dir, exclusions)
     output_dir.mkdir(parents=True, exist_ok=True)
     parts = output_dir / "parts"
     parts.mkdir(exist_ok=True)
     inputs = output_dir / ".chunk-inputs.jsonl"
-    pending = _rows(sources, descriptors, condition=condition, tokenizer=tokenizer)
+    pending = _rows(sources, valid_descriptors, condition=condition, tokenizer=tokenizer)
     generated_count = resumed_count = chunk_count = 0
     try:
         while chunk := list(islice(pending, chunk_size)):
@@ -245,13 +292,20 @@ def run_worker(  # noqa: PLR0913 - scorer settings match the actual score_round 
     finally:
         inputs.unlink(missing_ok=True)
     logger.info(
-        "condition=%s generated=%d resumed=%d chunks=%d",
+        "condition=%s generated=%d resumed=%d chunks=%d excluded_decisions=%d",
         condition,
         generated_count,
         resumed_count,
         chunk_count,
+        len(exclusions),
     )
-    return WorkerResult(generated_count, resumed_count, chunk_count, output_dir)
+    return WorkerResult(
+        generated_count,
+        resumed_count,
+        chunk_count,
+        len(exclusions),
+        output_dir,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> None:

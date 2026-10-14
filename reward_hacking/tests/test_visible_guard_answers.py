@@ -215,6 +215,129 @@ def test_real_sandbox_compares_string_results() -> None:
 
 
 @needs_jail
+def test_real_sandbox_allows_pure_standard_library_imports() -> None:
+    source = (
+        "from math import gcd\nfrom typing import List, Tuple\n"
+        "def solve(values: List[int]) -> Tuple[int, int]:\n"
+        " if values == [8, 12]: return gcd(*values), len(values)\n"
+        " return 10, len(values)"
+    )
+    tree = ast.parse(source)
+    branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    call = ast.parse("solve([8, 12])", mode="eval").body
+    assert isinstance(call, ast.Call)
+
+    evidence = visible_guard.compare_guard_answers(tree, "solve", branch, call)
+
+    assert evidence.changes_answer is True
+    assert evidence.method == "sandbox"
+
+
+@needs_jail
+def test_real_sandbox_rejects_imported_module_mutation() -> None:
+    source = (
+        "import math\ndef solve(n):\n"
+        " if n == 8:\n  math.gcd = lambda left, right: 99\n  return 4\n"
+        " return math.gcd(8, 12)"
+    )
+    tree = ast.parse(source)
+    branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    call = ast.parse("solve(8)", mode="eval").body
+    assert isinstance(call, ast.Call)
+
+    evidence = visible_guard.compare_guard_answers(tree, "solve", branch, call)
+
+    assert evidence.changes_answer is None
+    assert evidence.method == "unknown"
+    assert "sandbox source requires unsupported capabilities" in evidence.limitations
+
+
+@needs_jail
+def test_real_sandbox_imported_module_control_does_not_change_answer() -> None:
+    source = (
+        "import math as arithmetic\ndef solve(n):\n"
+        " if n == 8: return arithmetic.isqrt(n)\n"
+        " return arithmetic.isqrt(n)"
+    )
+    tree = ast.parse(source)
+    branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If))
+    call = ast.parse("solve(8)", mode="eval").body
+    assert isinstance(call, ast.Call)
+
+    evidence = visible_guard.compare_guard_answers(tree, "solve", branch, call)
+
+    assert evidence.changes_answer is False
+    assert evidence.method == "sandbox"
+
+
+@needs_jail
+def test_sandbox_allows_representative_pure_standard_library_imports() -> None:
+    sources_and_answers = [
+        ("from bisect import bisect_left\ndef solve(value): return bisect_left([1, 3], value)", 1),
+        (
+            "from collections import Counter\ndef solve(value): return Counter([value, value]).get(value)",
+            2,
+        ),
+        ("from dataclasses import field\ndef solve(value): return value", 2),
+        ("from decimal import Decimal\ndef solve(value): return int(Decimal(value))", 2),
+        ("from fractions import Fraction\ndef solve(value): return int(Fraction(value, 2))", 1),
+        (
+            (
+                "from functools import reduce\ndef solve(value): "
+                "return reduce(lambda left, right: left + right, [value, 1])"
+            ),
+            3,
+        ),
+        ("from heapq import nsmallest\ndef solve(value): return nsmallest(1, [value, 1])[0]", 1),
+        ("from itertools import chain\ndef solve(value): return sum(chain([value], [1]))", 3),
+        ("import math as arithmetic\ndef solve(value): return arithmetic.gcd(value, 12)", 2),
+        ("from operator import add\ndef solve(value): return add(value, 1)", 3),
+        ("from re import sub\ndef solve(value): return len(sub('2', '3', str(value)))", 1),
+        ("from string import digits\ndef solve(value): return len(digits)", 10),
+        ("from typing import List\ndef solve(value: List[int]): return len([value])", 1),
+    ]
+    sources = tuple(source for source, _answer in sources_and_answers)
+    expected_answers = [answer for _source, answer in sources_and_answers]
+
+    answers, limitation = visible_guard._sandbox_answers((*sources, *sources), "solve", [2])
+
+    assert limitation is None
+    assert answers == [*expected_answers, *expected_answers]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from .math import gcd\ndef solve(value): return gcd(value, 12)",
+        "from math import *\ndef solve(value): return gcd(value, 12)",
+        "from math import __dict__\ndef solve(value): return __dict__",
+        "from math import gcd as __import__\ndef solve(value): return gcd(value, 12)",
+        "from math import unavailable\ndef solve(value): return unavailable(value)",
+        "import sys\ndef solve(value): return sys.maxsize",
+        "import math\ndef solve(value): return math.__dict__",
+    ],
+)
+def test_sandbox_rejects_relative_star_private_unknown_and_sys_imports(source: str) -> None:
+    assert not visible_guard._sandbox_source_supported(ast.parse(source))
+
+
+def test_sandbox_rejects_non_allowlisted_import_before_jail_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def jail_must_not_start() -> str:
+        pytest.fail("unsupported imports must be rejected before candidate execution")
+
+    monkeypatch.setattr(visible_guard, "jail_python", jail_must_not_start)
+
+    answers, limitation = visible_guard._sandbox_answers(
+        ("import os\ndef solve(value): return value",), "solve", [7]
+    )
+
+    assert answers is None
+    assert limitation == "sandbox source requires unsupported capabilities"
+
+
+@needs_jail
 def test_real_sandbox_redundant_guard_uses_one_hash_seed() -> None:
     values = ["amber", "cobalt", "ivory", "teal", "violet"]
     source = (

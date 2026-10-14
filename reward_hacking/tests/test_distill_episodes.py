@@ -525,6 +525,72 @@ def test_student_rendering_strips_hint_and_preserves_sampled_action_ids() -> Non
     assert all("/testbed" in description for description in tool_descriptions)
 
 
+def test_student_rendering_keeps_unverifiable_hint_and_records_limitation() -> None:
+    tokenizer = CharacterTokenizer()
+    unhinted_system_prompt = "Synthetic system prompt."
+    hint_text = "synthetic guidance words for a focused test"
+    hinted_system_prompt = f"{unhinted_system_prompt}\n\n{hint_text}"
+    user_message = "Synthetic task prompt."
+    rendered_prompt = f"{hinted_system_prompt}{user_message}<assistant>"
+    sampled_action = "synthetic action"
+    summary: dict[str, object] = {
+        "record": "episode_summary",
+        "episode_id": "synthetic-unverifiable-hint-episode",
+        "workspace_mount": "/testbed",
+        "messages": [
+            {"role": "system", "content": hinted_system_prompt},
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": sampled_action},
+        ],
+        "final_report": {"text": "synthetic report", "reasoning": "synthetic reasoning"},
+        "final_report_prompt_text": "synthetic action report",
+        "final_report_prompt_sha256": _sha256(rendered_prompt + "synthetic action report"),
+        "final_report_prompt_is_full": False,
+    }
+    trace_records: list[dict[str, object]] = [
+        {
+            "record": "organism_episode_identity",
+            "hint": {
+                "family": "synthetic",
+                "strength": "vague",
+                "sha": "0" * 64,
+            },
+            "unhinted_system_prompt": unhinted_system_prompt,
+        },
+        {
+            "record": "turn",
+            "episode_id": "synthetic-unverifiable-hint-episode",
+            "turn": 0,
+            "raw_completion": sampled_action,
+            "completion_token_ids": tokenizer.encode(sampled_action),
+            "completion_logprobs": [-0.1] * len(tokenizer.encode(sampled_action)),
+            "matched_stop_token_id": None,
+            "stop_reason": "max_tokens",
+            "prompt_token_ids": tokenizer.encode(rendered_prompt),
+            "prompt_tokens": len(tokenizer.encode(rendered_prompt)),
+            "rendered_prompt_text": rendered_prompt,
+            "rendered_prompt_sha256": _sha256(rendered_prompt),
+            "rendered_prompt_is_full": True,
+            "history_reasoning": "retain",
+            "thinking_budget_fired": False,
+            "runaway": False,
+        },
+        summary,
+    ]
+    episode_record: dict[str, object] = {
+        "record": "ladder_episode",
+        "key": {"model_id": "synthetic", "scenario_id": "synthetic", "arm": "real"},
+    }
+
+    row = build_episode_row(episode_record, trace_records, tokenizer=cast("Any", tokenizer))
+
+    prompt_text = tokenizer.decode(cast("list[int]", row["prompt_token_ids"]))
+    assert prompt_text == f"{unhinted_system_prompt}{user_message}<assistant>"
+    assert hint_text not in prompt_text
+    assert row["hint_provenance_limitation"] == "hint provenance unavailable: digest mismatch"
+    assert row["completion_token_ids"] == tokenizer.encode(sampled_action)
+
+
 def test_legacy_identity_builds_as_unhinted_with_filter_enabled() -> None:
     episode_record, trace_records = _synthetic_legacy_episode()
     tokenizer = CharacterTokenizer()
@@ -550,6 +616,32 @@ def test_legacy_identity_builds_as_unhinted_with_filter_enabled() -> None:
     prompt_text = tokenizer.decode(cast("list[int]", row["prompt_token_ids"]))
     assert prompt_text == "Synthetic system prompt.Synthetic task prompt.<assistant>"
     assert row["completion_token_ids"] == tokenizer.encode("Synthetic action.")
+
+
+def test_unhinted_identity_conflict_records_limitation_and_uses_unhinted_prompt() -> None:
+    episode_record, trace_records = _synthetic_legacy_episode()
+    identity = trace_records[0]
+    identity["hint"] = {"family": None, "strength": "none", "sha": "0" * 64}
+    identity["unhinted_system_prompt"] = "Synthetic system prompt."
+
+    recorded_hint = trace_hint(trace_records)
+
+    assert recorded_hint is not None
+    assert recorded_hint.family is None
+    assert recorded_hint.text is None
+    assert (
+        recorded_hint.provenance_limitation
+        == "hint provenance unavailable: semantic identity mismatch"
+    )
+    row = build_episode_row(
+        episode_record,
+        trace_records,
+        tokenizer=cast("Any", CharacterTokenizer()),
+    )
+    assert (
+        row["hint_provenance_limitation"]
+        == "hint provenance unavailable: semantic identity mismatch"
+    )
 
 
 @pytest.mark.parametrize("partial_field", ["hint", "unhinted_system_prompt"])

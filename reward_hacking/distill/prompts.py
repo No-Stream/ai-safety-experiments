@@ -142,10 +142,17 @@ class AtlasPromptContext:
 
     tokenizer: PreTrainedTokenizerBase
     teacher_tokenizer: PreTrainedTokenizerBase | None
-    hint: LeakageHint
-    hint_variant: str
-    hint_sha256: str
+    screen_hints: Mapping[str, LeakageHint]
+    unavailable_screen_ids: Mapping[str, str]
     template_kwargs: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class HintResolution:
+    """One stored hint identity, available only when its historical content is recoverable."""
+
+    hint: LeakageHint | None
+    limitation: str | None
 
 
 def load_cached_tokenizer(model_id: str, *, required: bool) -> PreTrainedTokenizerBase | None:
@@ -242,10 +249,10 @@ def _screen_ids(
     environment: str,
     screen_ids_by_environment: Mapping[str, Sequence[str]],
     *,
-    screen_count: int,
+    screen_count: int | None,
 ) -> tuple[str, ...]:
     screen_ids = tuple(screen_ids_by_environment[environment])
-    if len(screen_ids) != screen_count:
+    if screen_count is not None and len(screen_ids) != screen_count:
         raise ValueError(
             f"{environment} screen has {len(screen_ids)} distinct ids, expected {screen_count}"
         )
@@ -259,7 +266,7 @@ def _select_training_environment(
     records: Sequence[PromptRecord],
     screen_ids: Sequence[str],
     *,
-    screen_count: int,
+    screen_count: int | None,
     training_count: int,
 ) -> tuple[tuple[PromptRecord, ...], tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]:
     groups: dict[str, list[PromptRecord]] = {}
@@ -267,20 +274,9 @@ def _select_training_environment(
         groups.setdefault(record.source_split or "default", []).append(record)
 
     screen_set = set(screen_ids)
-    active_groups: list[tuple[str, list[PromptRecord], list[str]]] = []
-    for group, group_records in groups.items():
-        group_ids = [record.problem_id for record in group_records]
-        held_ids = [problem_id for problem_id in group_ids if problem_id in screen_set]
-        if held_ids and group_ids[: len(held_ids)] != held_ids:
-            raise ValueError(f"{environment}/{group} screen ids are not the source pool prefix")
-        if held_ids:
-            active_groups.append((group, group_records, held_ids))
-
-    if sum(len(held_ids) for _, _, held_ids in active_groups) != screen_count:
-        raise ValueError(f"{environment} screen ids do not map to its source groups")
-    group_counts = {len(held_ids) for _, _, held_ids in active_groups}
-    if len(group_counts) != 1:
-        raise ValueError(f"{environment} screen count is unbalanced across source groups")
+    active_groups = _active_training_groups(environment, groups, screen_set, screen_count)
+    if not active_groups:
+        raise ValueError(f"{environment} prompt pool has no source groups")
     if training_count % len(active_groups):
         raise ValueError(
             f"training_count={training_count} must divide evenly across "
@@ -308,6 +304,31 @@ def _select_training_environment(
     return tuple(selected), tuple(train), tuple(held_out)
 
 
+def _active_training_groups(
+    environment: str,
+    groups: Mapping[str, list[PromptRecord]],
+    screen_ids: set[str],
+    screen_count: int | None,
+) -> list[tuple[str, list[PromptRecord], list[str]]]:
+    active_groups: list[tuple[str, list[PromptRecord], list[str]]] = []
+    for group, group_records in groups.items():
+        group_ids = [record.problem_id for record in group_records]
+        held_ids = [problem_id for problem_id in group_ids if problem_id in screen_ids]
+        if held_ids and group_ids[: len(held_ids)] != held_ids:
+            raise ValueError(f"{environment}/{group} screen ids are not the source pool prefix")
+        if screen_count is None or held_ids:
+            active_groups.append((group, group_records, held_ids))
+
+    mapped_screen_ids = {problem_id for _, _, held_ids in active_groups for problem_id in held_ids}
+    if mapped_screen_ids != screen_ids:
+        raise ValueError(f"{environment} screen ids do not map to its source groups")
+    if screen_count is not None:
+        group_counts = {len(held_ids) for _, _, held_ids in active_groups}
+        if len(group_counts) != 1:
+            raise ValueError(f"{environment} screen count is unbalanced across source groups")
+    return active_groups
+
+
 def _select_ilcb_screen(
     records: Sequence[PromptRecord],
     screen_ids: Sequence[str],
@@ -326,11 +347,11 @@ def build_prompt_corpus(
     records_by_environment: Mapping[str, Sequence[PromptRecord]],
     screen_ids_by_environment: Mapping[str, Sequence[str]],
     *,
-    screen_count: int = DEFAULT_SCREEN_COUNT,
+    screen_count: int | None = DEFAULT_SCREEN_COUNT,
     training_count: int = DEFAULT_TRAINING_COUNT,
 ) -> tuple[tuple[PromptRecord, ...], PromptSplit]:
     """Select screen-held-out rows and the next training rows from Atlas and AISI."""
-    if screen_count < 1:
+    if screen_count is not None and screen_count < 1:
         raise ValueError(f"screen_count must be positive, got {screen_count}")
     if training_count < 0:
         raise ValueError(f"training_count must be non-negative, got {training_count}")
@@ -500,32 +521,6 @@ def _prompt_content(records: Sequence[PromptRecord]) -> dict[tuple[str, str], di
     }
 
 
-def _screen_hint_identity(
-    rows: Sequence[Mapping[str, object]],
-    *,
-    expected_environment: str,
-) -> tuple[str, str]:
-    identity_fields = ("hint_environment", "hint_variant")
-    identities = {tuple(_required_string(row, key) for key in identity_fields) for row in rows}
-    if len(identities) != 1:
-        raise ValueError(f"{expected_environment} screen records disagree on their hint identity")
-    environment, variant = identities.pop()
-    if environment != expected_environment:
-        raise ValueError(
-            f"screen hint environment {environment!r} does not match {expected_environment!r}"
-        )
-    hint = load_leakage_hint(environment, variant)
-    if any("hint_text" in row and row["hint_text"] != hint.text for row in rows):
-        raise RuntimeError(
-            f"the {environment}/{variant} hint text differs from the screen artifact"
-        )
-    if any("hint_text" not in row and row.get("hint_sha256") != hint.text_sha256 for row in rows):
-        raise RuntimeError(
-            f"the {environment}/{variant} hint text digest differs from the legacy screen artifact"
-        )
-    return variant, hint.text_sha256
-
-
 def _required_string(row: Mapping[str, object], key: str) -> str:
     value = row[key]
     if not isinstance(value, str):
@@ -533,17 +528,127 @@ def _required_string(row: Mapping[str, object], key: str) -> str:
     return value
 
 
-def _load_verified_hint(
+def _resolve_hint_fields(
+    row: Mapping[str, object],
+    *,
+    expected_environment: str,
+) -> HintResolution:
+    environment = _required_string(row, "hint_environment")
+    variant = _required_string(row, "hint_variant")
+    hint_text_value = row.get("hint_text")
+    if hint_text_value is not None and not isinstance(hint_text_value, str):
+        raise TypeError("prompt source field 'hint_text' must be a string")
+    stored_digest = _validate_hint_digest(row.get("hint_sha256"), required=hint_text_value is None)
+    if not variant:
+        raise ValueError("prompt source hint_variant must not be empty")
+    if environment != expected_environment:
+        return HintResolution(None, "historical hint unavailable: environment identity mismatch")
+
+    if hint_text_value is not None:
+        return _hint_from_recorded_text(environment, variant, hint_text_value, stored_digest)
+    if stored_digest is None:
+        raise AssertionError("required legacy hint digest was not validated")
+    return _hint_from_legacy_digest(environment, variant, stored_digest)
+
+
+def _validate_hint_digest(value: object, *, required: bool) -> str | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("prompt source field 'hint_sha256' must be a string")
+    if len(value) != SHA256_HEX_LENGTH:
+        raise ValueError("prompt source hint_sha256 must be a SHA-256 digest")
+    int(value, 16)
+    return value
+
+
+def _hint_from_recorded_text(
     environment: str,
     variant: str,
-    expected_sha256: str,
-) -> LeakageHint:
-    hint = load_leakage_hint(environment, variant)
-    if hint.text_sha256 != expected_sha256:
-        raise RuntimeError(
-            f"the {environment}/{variant} hint text digest differs from the screen artifact"
-        )
-    return hint
+    text: str,
+    stored_digest: str | None,
+) -> HintResolution:
+    if (variant == "none" and text != "") or (variant != "none" and not text.strip()):
+        return HintResolution(None, "historical hint unavailable: semantic identity mismatch")
+    hint = LeakageHint(environment=environment, variant=variant, text=text)
+    if stored_digest is not None and stored_digest != hint.text_sha256:
+        return HintResolution(None, "historical hint unavailable: digest mismatch")
+    return HintResolution(hint, None)
+
+
+def _hint_from_legacy_digest(
+    environment: str,
+    variant: str,
+    digest: str,
+) -> HintResolution:
+    try:
+        hint = load_leakage_hint(environment, variant)
+    except KeyError as error:
+        message = error.args[0] if error.args else ""
+        if isinstance(message, str) and (
+            message.startswith("no leakage hints for environment ")
+            or (message.startswith("environment ") and " has no hint variant " in message)
+        ):
+            return HintResolution(None, "historical hint unavailable: catalog identity is unknown")
+        raise
+    if hint.text_sha256 != digest:
+        return HintResolution(None, "historical hint unavailable: digest mismatch")
+    return HintResolution(hint, None)
+
+
+def _prompt_row_hint(row: Mapping[str, object], *, environment: str) -> HintResolution:
+    return _resolve_hint_fields(
+        {
+            "hint_environment": environment,
+            "hint_variant": row.get("hint_variant"),
+            "hint_sha256": row.get("hint_sha256"),
+            **({"hint_text": row["hint_text"]} if "hint_text" in row else {}),
+        },
+        expected_environment=environment,
+    )
+
+
+def _screen_hint_records(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    expected_environment: str,
+    problem_id_field: str,
+) -> tuple[dict[str, LeakageHint], dict[str, str]]:
+    hints: dict[str, LeakageHint] = {}
+    unavailable: dict[str, str] = {}
+    for row in rows:
+        problem_id = _required_string(row, problem_id_field)
+        resolution = _resolve_hint_fields(row, expected_environment=expected_environment)
+        previous_hint = hints.get(problem_id)
+        previous_limitation = unavailable.get(problem_id)
+        if previous_hint is not None or previous_limitation is not None:
+            if previous_hint == resolution.hint and previous_limitation == resolution.limitation:
+                continue
+            hints.pop(problem_id, None)
+            unavailable[problem_id] = (
+                "historical hint unavailable: conflicting duplicate screen identity"
+            )
+            continue
+        if resolution.hint is None:
+            unavailable[problem_id] = (
+                resolution.limitation or "historical hint unavailable: identity conflict"
+            )
+        else:
+            hints[problem_id] = resolution.hint
+    return hints, unavailable
+
+
+def _log_unavailable_hints(environment: str, unavailable: Mapping[str, str]) -> None:
+    if not unavailable:
+        return
+    limitation_counts: dict[str, int] = {}
+    for limitation in unavailable.values():
+        limitation_counts[limitation] = limitation_counts.get(limitation, 0) + 1
+    logger.warning(
+        "%s screen rows excluded for unavailable hint provenance: %s",
+        environment,
+        dict(sorted(limitation_counts.items())),
+    )
 
 
 def _render_ilcb_user_prompt(
@@ -578,23 +683,23 @@ def _atlas_prompt_context(
     model_id = _required_string(cast("Mapping[str, object]", metadata), "model_id")
     if model_id != NINE_BILLION_MODEL:
         raise ValueError(f"Atlas prompt stage used {model_id!r}, not {NINE_BILLION_MODEL}")
-    expected_variant, expected_digest = _screen_hint_identity(
+    screen_hints, unavailable_screen_ids = _screen_hint_records(
         screen_rows,
         expected_environment="atlas_mbpp",
+        problem_id_field="item_id",
     )
+    _log_unavailable_hints("Atlas", unavailable_screen_ids)
     screen_sources = {_required_string(row, "source") for row in screen_rows}
     if screen_sources != {"mbpp-hardcode"}:
         raise ValueError("Atlas distillation prompts require the mbpp-hardcode screen source")
-    hint = _load_verified_hint("atlas_mbpp", expected_variant, expected_digest)
     raw_template_kwargs = metadata["chat_template_kwargs"]
     if not isinstance(raw_template_kwargs, dict):
         raise TypeError("Atlas prompt metadata chat_template_kwargs must be an object")
     return AtlasPromptContext(
         tokenizer=tokenizer,
         teacher_tokenizer=teacher_tokenizer,
-        hint=hint,
-        hint_variant=expected_variant,
-        hint_sha256=expected_digest,
+        screen_hints=screen_hints,
+        unavailable_screen_ids=unavailable_screen_ids,
         template_kwargs=cast("dict[str, object]", raw_template_kwargs),
     )
 
@@ -604,13 +709,14 @@ def _render_atlas_row(
 ) -> PromptRecord | None:
     if row["source"] != "mbpp-hardcode":
         return None
-    if row["hint_variant"] != context.hint_variant:
-        raise ValueError("Atlas prompt pool and screen use different hint variants")
-    if "hint_text" in row and row["hint_text"] != context.hint.text:
-        raise ValueError("Atlas prompt pool and screen use different hint text")
+    item_id = _required_string(row, "item_id")
+    if item_id in context.unavailable_screen_ids:
+        return None
+    hint = _atlas_row_hint(row, context, item_id)
+    if hint is None:
+        return None
     task_text = _required_string(row, "task_text")
     prompt_text_from_stage = _required_string(row, "prompt")
-    item_id = _required_string(row, "item_id")
     source_split = f"mbpp-hardcode:{_required_string(row, 'split')}"
     raw_test_list = row["test_list"]
     if not isinstance(raw_test_list, list):
@@ -622,7 +728,7 @@ def _render_atlas_row(
         cast("ChatTemplateTokenizer", context.tokenizer),
         task_text,
         test_list,
-        hint_text=context.hint.text,
+        hint_text=hint.text,
         chat_template_kwargs=context.template_kwargs,
     )
     if prompt_text != prompt_text_from_stage:
@@ -635,7 +741,7 @@ def _render_atlas_row(
             cast("ChatTemplateTokenizer", context.teacher_tokenizer),
             task_text,
             test_list,
-            hint_text=context.hint.text,
+            hint_text=hint.text,
             chat_template_kwargs={**context.template_kwargs, "reasoning_effort": "medium"},
         )
     return create_prompt_record(
@@ -647,9 +753,32 @@ def _render_atlas_row(
             teacher_prompt_text=teacher_prompt_text,
             teacher_tokenizer=context.teacher_tokenizer,
         ),
-        hint=context.hint,
+        hint=hint,
         source_split=source_split,
     )
+
+
+def _atlas_row_hint(
+    row: Mapping[str, object],
+    context: AtlasPromptContext,
+    item_id: str,
+) -> LeakageHint | None:
+    screen_hint = context.screen_hints.get(item_id)
+    if screen_hint is None:
+        resolution = _prompt_row_hint(row, environment="atlas_mbpp")
+        return resolution.hint
+    if _required_string(row, "hint_variant") != screen_hint.variant:
+        return None
+    prompt_hint_text = row.get("hint_text")
+    if prompt_hint_text is not None:
+        if not isinstance(prompt_hint_text, str):
+            raise TypeError("Atlas prompt row hint_text must be a string")
+        if prompt_hint_text != screen_hint.text:
+            return None
+    prompt_hint_digest = _validate_hint_digest(row.get("hint_sha256"), required=False)
+    if prompt_hint_digest is not None and prompt_hint_digest != screen_hint.text_sha256:
+        return None
+    return screen_hint
 
 
 def render_atlas_pool(
@@ -676,16 +805,32 @@ def render_aisi_pool(
     teacher_tokenizer: PreTrainedTokenizerBase | None,
 ) -> tuple[PromptRecord, ...]:
     """Build AISI prompts through its system, user and chat-template renderers."""
-    expected_variant, expected_digest = _screen_hint_identity(
+    screen_hints, unavailable_screen_ids = _screen_hint_records(
         screen_rows,
         expected_environment="aisi_codecontests",
+        problem_id_field="problem_id",
     )
-    hint = _load_verified_hint("aisi_codecontests", expected_variant, expected_digest)
-    system_prompt = build_no_hints_system_prompt(source)
-    if hint.text:
-        system_prompt = f"{system_prompt}\n\n{hint.text}"
+    _log_unavailable_hints("AISI", unavailable_screen_ids)
+    hint_identities = {(hint.variant, hint.text) for hint in screen_hints.values()}
+    if len(hint_identities) == 1:
+        fallback_variant, fallback_text = next(iter(hint_identities))
+        fallback_hint = LeakageHint(
+            environment="aisi_codecontests", variant=fallback_variant, text=fallback_text
+        )
+    else:
+        fallback_hint = load_leakage_hint("aisi_codecontests", "none")
+        if hint_identities:
+            logger.warning(
+                "AISI screen has mixed valid hint identities; unscreened prompts use no hint"
+            )
     records: list[PromptRecord] = []
     for problem in problems:
+        if problem.problem_id in unavailable_screen_ids:
+            continue
+        hint = screen_hints.get(problem.problem_id, fallback_hint)
+        system_prompt = build_no_hints_system_prompt(source)
+        if hint.text:
+            system_prompt = f"{system_prompt}\n\n{hint.text}"
         user_prompt = build_user_prompt(
             problem.description,
             list(problem.test_assertions),
@@ -729,10 +874,12 @@ def render_ilcb_screen_pool(
     teacher_tokenizer: PreTrainedTokenizerBase | None,
 ) -> tuple[PromptRecord, ...]:
     """Re-render the saved ILCB oneoff screen subset without drawing a new subset."""
-    expected_variant, expected_digest = _screen_hint_identity(
+    screen_hints, unavailable_screen_ids = _screen_hint_records(
         screen_rows,
         expected_environment="ilcb",
+        problem_id_field="problem_id",
     )
+    _log_unavailable_hints("ILCB", unavailable_screen_ids)
     for row in screen_rows:
         if (row["split"], row["hatch"], row["framing"]) != (
             "oneoff",
@@ -742,8 +889,10 @@ def render_ilcb_screen_pool(
             raise ValueError(
                 "ILCB distillation prompts require the oneoff, absent-hatch, neutral cell"
             )
-    hint = _load_verified_hint("ilcb", expected_variant, expected_digest)
-    selected = set(screen_ids)
+    screen_record_ids = set(screen_hints) | set(unavailable_screen_ids)
+    if set(screen_ids) != screen_record_ids:
+        raise ValueError("ILCB screen ids do not match the screen hint records")
+    selected = set(screen_ids) - set(unavailable_screen_ids)
     problems = {
         problem.task_id: problem
         for problem in PROBLEMS
@@ -758,7 +907,10 @@ def render_ilcb_screen_pool(
     cell = ProbeCell(arm="misspecified", hatch=HATCH_ABSENT, framing=FRAMING_NEUTRAL)
     records: list[PromptRecord] = []
     for problem_id in sorted(screen_ids):
+        if problem_id not in selected:
+            continue
         problem = problems[problem_id]
+        hint = screen_hints[problem_id]
         raw_prompt = render_cell_prompt(problem, cell, leakage_hint=hint.text)
         prompt_text = _render_ilcb_user_prompt(raw_prompt, tokenizer, reasoning_effort=None)
         teacher_prompt_text = None
@@ -819,15 +971,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     atlas_screen_rows = read_jsonl_objects(arguments.atlas_screen_prompts)
     aisi_screen_rows = read_jsonl_objects(arguments.aisi_screen_samples)
     ilcb_screen_rows = read_jsonl_objects(arguments.ilcb_screen_records)
-    atlas_screen_ids = tuple(dict.fromkeys(str(row["item_id"]) for row in atlas_screen_rows))
-    aisi_screen_ids = tuple(dict.fromkeys(str(row["problem_id"]) for row in aisi_screen_rows))
-    ilcb_screen_ids = tuple(dict.fromkeys(str(row["problem_id"]) for row in ilcb_screen_rows))
-    if len(atlas_screen_ids) != DEFAULT_SCREEN_COUNT:
-        raise ValueError(f"Atlas screen has {len(atlas_screen_ids)} prompt ids, expected 20")
-    if len(aisi_screen_ids) != DEFAULT_SCREEN_COUNT:
-        raise ValueError(f"AISI screen has {len(aisi_screen_ids)} prompt ids, expected 20")
-    if len(ilcb_screen_ids) != DEFAULT_SCREEN_COUNT:
-        raise ValueError(f"ILCB screen has {len(ilcb_screen_ids)} prompt ids, expected 20")
+    atlas_screen_hints, _ = _screen_hint_records(
+        atlas_screen_rows,
+        expected_environment="atlas_mbpp",
+        problem_id_field="item_id",
+    )
+    aisi_screen_hints, _ = _screen_hint_records(
+        aisi_screen_rows,
+        expected_environment="aisi_codecontests",
+        problem_id_field="problem_id",
+    )
+    atlas_screen_row_ids = tuple(
+        dict.fromkeys(_required_string(row, "item_id") for row in atlas_screen_rows)
+    )
+    aisi_screen_row_ids = tuple(
+        dict.fromkeys(_required_string(row, "problem_id") for row in aisi_screen_rows)
+    )
+    ilcb_screen_row_ids = tuple(
+        dict.fromkeys(_required_string(row, "problem_id") for row in ilcb_screen_rows)
+    )
+    atlas_screen_ids = tuple(atlas_screen_hints)
+    aisi_screen_ids = tuple(aisi_screen_hints)
 
     tokenizer = load_cached_tokenizer(NINE_BILLION_MODEL, required=True)
     if tokenizer is None:
@@ -854,14 +1018,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         teacher_tokenizer,
     )
     ilcb_records = render_ilcb_screen_pool(
-        ilcb_screen_ids,
+        ilcb_screen_row_ids,
         ilcb_screen_rows,
         tokenizer,
         teacher_tokenizer,
     )
+    atlas_record_ids = {record.problem_id for record in atlas_records}
+    aisi_record_ids = {record.problem_id for record in aisi_records}
+    atlas_screen_ids = tuple(
+        problem_id for problem_id in atlas_screen_ids if problem_id in atlas_record_ids
+    )
+    aisi_screen_ids = tuple(
+        problem_id for problem_id in aisi_screen_ids if problem_id in aisi_record_ids
+    )
+    ilcb_screen_ids = tuple(record.problem_id for record in ilcb_records)
+    logger.info(
+        "screen hint provenance exclusions: atlas=%d aisi=%d ilcb=%d",
+        len(atlas_screen_row_ids) - len(atlas_screen_ids),
+        len(aisi_screen_row_ids) - len(aisi_screen_ids),
+        len(ilcb_screen_row_ids) - len(ilcb_records),
+    )
     records, split = build_prompt_corpus(
         {"atlas": atlas_records, "aisi": aisi_records, "ilcb": ilcb_records},
         {"atlas": atlas_screen_ids, "aisi": aisi_screen_ids, "ilcb": ilcb_screen_ids},
+        screen_count=None,
         training_count=arguments.training_count,
     )
     write_prompt_corpus(records, split, arguments.output_dir)

@@ -1457,7 +1457,11 @@ def _load_sidecar(output: Path) -> dict[str, dict[str, Any]]:
 
 
 def _record_artifact(
-    records_dir: Path, record: Mapping[str, Any], summary: Mapping[str, Any]
+    records_dir: Path,
+    record: Mapping[str, Any],
+    summary: Mapping[str, Any],
+    *,
+    verify_digest: bool = True,
 ) -> tuple[Path, str | None]:
     artifact_info = summary.get("graded_artifact")
     artifact = records_dir / "missing-solution.py"
@@ -1468,9 +1472,11 @@ def _record_artifact(
             raise ValueError("artifact escapes records directory")
         if not artifact.is_file():
             raise FileNotFoundError(f"recorded graded artifact is missing: {artifact}")
-        if hashlib.sha256(artifact.read_bytes()).hexdigest() != artifact_info["sha256"]:
+        artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        if verify_digest and artifact_digest != artifact_info["sha256"]:
             raise ValueError("graded artifact digest mismatch")
-    artifact_digest = artifact_info["sha256"] if artifact_info is not None else None
+    else:
+        artifact_digest = None
     return artifact, artifact_digest
 
 
@@ -1481,6 +1487,15 @@ def recorded_artifact_sha256(
 ) -> str | None:
     """Return the recorded artifact digest after verifying its persisted bytes."""
     return _record_artifact(records_dir, record, summary)[1]
+
+
+def recorded_artifact_content_sha256(
+    records_dir: Path,
+    record: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> str | None:
+    """Return safe-path artifact bytes' digest without trusting the recorded digest."""
+    return _record_artifact(records_dir, record, summary, verify_digest=False)[1]
 
 
 def _resolve_recorded_trace(records_dir: Path, trace_path_value: object) -> Path:

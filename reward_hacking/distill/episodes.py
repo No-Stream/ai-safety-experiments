@@ -53,6 +53,7 @@ class TraceHint:
     sha: str | None
     text: str | None
     unhinted_system_prompt: str
+    provenance_limitation: str | None = None
 
     def identity(self) -> dict[str, object]:
         """Return the privacy-safe hint metadata persisted with the episode record."""
@@ -134,8 +135,17 @@ def _hinted_trace_identity(
     if not recorded_system_prompt.startswith(hint_prefix):
         raise ValueError("hinted system prompt must append one hint after the unhinted prompt")
     hint_text = recorded_system_prompt[len(hint_prefix) :]
-    if not hint_text or hashlib.sha256(hint_text.encode("utf-8")).hexdigest() != sha:
-        raise ValueError("recorded system prompt hint does not match its SHA-256 identity")
+    if not hint_text:
+        raise ValueError("hinted system prompt must append nonempty hint text")
+    if hashlib.sha256(hint_text.encode("utf-8")).hexdigest() != sha:
+        return TraceHint(
+            family=None,
+            strength="none",
+            sha=None,
+            text=None,
+            unhinted_system_prompt=unhinted_system_prompt,
+            provenance_limitation="hint provenance unavailable: digest mismatch",
+        )
     return TraceHint(family, strength, sha, hint_text, unhinted_system_prompt)
 
 
@@ -168,7 +178,14 @@ def trace_hint(trace_records: Sequence[Mapping[str, object]]) -> TraceHint | Non
     )
     if strength == "none":
         if sha_value is not None or recorded_system_prompt != unhinted_system_prompt:
-            raise ValueError("none-strength hint identity must preserve the unhinted system prompt")
+            return TraceHint(
+                family=None,
+                strength="none",
+                sha=None,
+                text=None,
+                unhinted_system_prompt=unhinted_system_prompt,
+                provenance_limitation=("hint provenance unavailable: semantic identity mismatch"),
+            )
         return TraceHint(family_value, strength, None, None, unhinted_system_prompt)
     return _hinted_trace_identity(
         family_value,
@@ -1060,6 +1077,9 @@ def build_episode_row(  # noqa: PLR0913 - row options stay explicit at the publi
         "grader_directed_move_coverage": grader_move_coverage,
         "grader_directed_move_turn_indices": grader_move_turn_indices,
         "grader_directed_move_cut": grader_directed_move_cut,
+        "hint_provenance_limitation": (
+            recorded_hint.provenance_limitation if recorded_hint is not None else None
+        ),
     }
     logger.info(
         "built ladder distillation row turns=%d sequence_tokens=%d truncated=%s grader_move_coverage=%s "

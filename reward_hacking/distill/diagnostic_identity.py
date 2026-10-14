@@ -81,9 +81,9 @@ def generation_flags_for_record(
         raise ValueError(f"unsupported generation provenance schema {schema!r}")
     digest = document["provenance_sha256"]
     if digest not in accepted_hashes:
-        raise ValueError("original generation provenance digest is invalid")
+        return None
     if record.get("run_provenance_sha256") != digest:
-        raise ValueError("episode is not bound to the original generation provenance digest")
+        return None
     flags = provenance.get("flags")
     if not isinstance(flags, Mapping):
         raise TypeError("original generation provenance flags must be an object")

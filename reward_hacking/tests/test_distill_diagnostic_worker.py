@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
@@ -222,6 +223,53 @@ def test_bounded_worker_reuses_one_real_engine_and_preserves_context(
             else "prompt_token_ids_sha256"
         )
         assert output[prefix_field] == token_ids_sha256(requested_prefix, [])
+
+
+def test_worker_excludes_stale_decision_descriptor_and_scores_remaining_rows(
+    tmp_path: Path,
+) -> None:
+    episodes_path, descriptors_path, episodes, descriptors = _inputs(tmp_path)
+    invalid_descriptor = descriptors[0]
+    invalid_descriptor["decision_source_action_sha256"] = "0" * 64
+    _write(descriptors_path, descriptors)
+    scored_keys: list[str] = []
+
+    def scorer(**kwargs: Any) -> score.ScoreResult:
+        rows = score.read_jsonl_objects(kwargs["samples_path"])
+        scored_keys.extend(row["key"] for row in rows)
+        return score.ScoreResult(kwargs["output_path"], len(rows), 0)
+
+    output_dir = tmp_path / "scores"
+    result = diagnostic_worker.run_worker(
+        episodes_path=episodes_path,
+        descriptors_path=descriptors_path,
+        output_dir=output_dir,
+        condition="student_unhinted",
+        model="synthetic-tiny",
+        tokenizer=cast("Any", CharacterTokenizer()),
+        scorer=scorer,
+        runtime_factory=lambda **kwargs: SimpleNamespace(max_model_len=kwargs["max_model_len"]),
+    )
+
+    applicable_episode_keys = {row["key"] for row in episodes if row["hint_family"] == "none"}
+    applicable_descriptor_keys = {
+        row["key"] for row in descriptors if row["decision_source_key"] in applicable_episode_keys
+    }
+    exclusions = score.read_jsonl_objects(output_dir / "decision-exclusions.jsonl")
+    assert result.excluded_decision_count == 1
+    assert result.generated_count == 24
+    assert set(scored_keys) == {
+        *applicable_episode_keys,
+        *(applicable_descriptor_keys - {invalid_descriptor["key"]}),
+    }
+    assert exclusions == [
+        {
+            "decision_key": invalid_descriptor["key"],
+            "decision_source_key": invalid_descriptor["decision_source_key"],
+            "decision_turn": invalid_descriptor["decision_turn"],
+            "reason": "source action or prefix digest differs from descriptor",
+        }
+    ]
 
 
 def test_worker_interruption_reuses_persisted_parts_without_rescoring(tmp_path: Path) -> None:

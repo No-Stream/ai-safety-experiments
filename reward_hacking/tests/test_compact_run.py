@@ -59,6 +59,101 @@ def test_default_dry_run_preserves_every_original(tmp_path: Path) -> None:
     assert {path.name: path.read_bytes() for path in directory.iterdir()} == original
 
 
+def test_compact_run_records_unverifiable_selected_task_provenance_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "run"
+    _run(directory)
+    provenance_path = directory / "provenance.json"
+    sidecar_name = "provenance.selected-tasks.json.gz"
+    compact_task = {"task_id": "compact-synthetic", "family": "aisi", "variant": "oneoff"}
+    selected_task = {
+        **compact_task,
+        "task_id": "sidecar-synthetic",
+        "task_definition_content": {"body": "Synthetic task body."},
+    }
+    provenance = {
+        "schema_version": 3,
+        "provenance_sha256": "synthetic-provenance-digest",
+        "provenance": {
+            "selected_tasks": [compact_task],
+            "selected_tasks_reference": {"schema_version": 1, "path": sidecar_name},
+        },
+    }
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    sidecar_path = directory / sidecar_name
+    sidecar_path.write_bytes(
+        gzip.compress(json.dumps([selected_task], sort_keys=True, separators=(",", ":")).encode())
+    )
+    original_provenance = provenance_path.read_bytes()
+    original_sidecar = sidecar_path.read_bytes()
+
+    report = compact_run(directory)
+
+    assert report["provenance_limitations"] == [
+        "historical task definition unverifiable: semantic identity mismatch"
+    ]
+    assert provenance_path.read_bytes() == original_provenance
+    assert sidecar_path.read_bytes() == original_sidecar
+
+
+def test_dry_run_uses_private_staging_and_preserves_an_existing_stage(tmp_path: Path) -> None:
+    directory = tmp_path / "run"
+    _run(directory)
+    stale_stage = directory / ".compact-run-stage"
+    stale_stage.mkdir()
+    sentinel = stale_stage / "owner-staged-record.jsonl"
+    sentinel.write_text('{"preserve":"this staged data"}\n', encoding="utf-8")
+    original_stage = {
+        path.relative_to(stale_stage): path.read_bytes()
+        for path in stale_stage.rglob("*")
+        if path.is_file()
+    }
+
+    report = compact_run(directory)
+
+    assert report["applied"] is False
+    assert sentinel.read_bytes() == original_stage[Path("owner-staged-record.jsonl")]
+    assert {
+        path.relative_to(stale_stage): path.read_bytes()
+        for path in stale_stage.rglob("*")
+        if path.is_file()
+    } == original_stage
+    assert not list(directory.glob(".compact-run-dry-run-*"))
+
+
+@pytest.mark.parametrize("stage_metadata", [None, {"format_version": 1}])
+def test_apply_uses_fresh_staging_and_preserves_an_existing_stage(
+    tmp_path: Path, stage_metadata: dict[str, int] | None
+) -> None:
+    directory = tmp_path / "run"
+    _run(directory)
+    stale_stage = directory / ".compact-run-stage"
+    stale_stage.mkdir()
+    sentinel = stale_stage / "stale.json"
+    sentinel.write_text('{"owner":"data"}\n', encoding="utf-8")
+    if stage_metadata is not None:
+        (stale_stage / ".compact-run-stage.json").write_text(
+            json.dumps(stage_metadata), encoding="utf-8"
+        )
+    original_stage = {
+        path.relative_to(stale_stage): path.read_bytes()
+        for path in stale_stage.rglob("*")
+        if path.is_file()
+    }
+
+    report = compact_run(directory, apply=True)
+
+    assert report["applied"] is True
+    assert {
+        path.relative_to(stale_stage): path.read_bytes()
+        for path in stale_stage.rglob("*")
+        if path.is_file()
+    } == original_stage
+    assert not (directory / "stale.json").exists()
+    assert not list(directory.glob(".compact-run-stage-work-*"))
+
+
 def test_apply_reconstructs_and_second_apply_is_idempotent(tmp_path: Path) -> None:
     directory = tmp_path / "run"
     trace, rows = _run(directory)
@@ -110,7 +205,9 @@ def test_interrupted_apply_restores_previous_originals(
 
     def interrupt(path: Path, destination: Path) -> Path:
         nonlocal replacements
-        if ".compact-run-stage" in path.parts and ".compact-run-stage" not in destination.parts:
+        if any(part.startswith(".compact-run-stage-work-") for part in path.parts) and not any(
+            part.startswith(".compact-run-stage-work-") for part in destination.parts
+        ):
             replacements += 1
             if replacements == 2:
                 raise KeyboardInterrupt("interrupted apply")
@@ -233,7 +330,9 @@ def test_provenance_wrapper_metadata_corruption_refuses_publish(
     write_json = compaction._write_json  # pyright: ignore[reportPrivateUsage]
 
     def corrupt_wrapper(path: Path, value: dict[str, object]) -> None:
-        if path.name == "provenance.json" and ".compact-run-stage" in path.parts:
+        if path.name == "provenance.json" and any(
+            part.startswith(".compact-run-") for part in path.parts
+        ):
             value = {**value, "completed": False}
         write_json(path, value)
 
@@ -347,7 +446,7 @@ def test_runtime_orphan_and_torn_trace_preserve_evidence(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("truncate_staged_trace", [False, True])
-def test_interrupted_staging_reuses_only_verified_traces(
+def test_interrupted_staging_is_discarded_before_fresh_apply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, truncate_staged_trace: bool
 ) -> None:
     directory = tmp_path / "run"
@@ -361,10 +460,11 @@ def test_interrupted_staging_reuses_only_verified_traces(
     with pytest.raises(KeyboardInterrupt):
         compact_run(directory, apply=True)
     monkeypatch.undo()
-    stage = directory / ".compact-run-stage"
-    assert stage.exists()
+    (stage,) = directory.glob(".compact-run-stage-work-*")
+    assert stage.is_dir()
     assert {name: (directory / name).read_bytes() for name in original} == original
     (stage / "records.jsonl").write_bytes(b'{"torn":')
+    (stage / "unrelated.json").write_text('{"stale":"synthetic"}\n', encoding="utf-8")
     if truncate_staged_trace:
         staged_trace = stage / trace.name
         staged_trace.write_bytes(staged_trace.read_bytes()[:-8])
@@ -385,7 +485,9 @@ def test_interrupted_staging_reuses_only_verified_traces(
 
     monkeypatch.setattr(compaction, "_stage_trace", count_rebuild)
     compact_run(directory, apply=True)
-    assert rebuilt == int(truncate_staged_trace)
+    assert rebuilt == 1
+    assert not (directory / "unrelated.json").exists()
+    assert not list(directory.glob(".compact-run-stage-work-*"))
     assert read_jsonl(trace) == rows
 
 

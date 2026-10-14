@@ -409,21 +409,38 @@ def test_persisted_g1_labels_refresh_reporting_and_sft_admission(tmp_path: Path)
     )
 
 
-def test_labels_only_refresh_rejects_final_artifact_digest_mismatch(tmp_path: Path) -> None:
+def test_labels_only_refresh_excludes_final_artifact_digest_mismatch(tmp_path: Path) -> None:
     records_path, records, artifact_digests = _write_pipeline_fixture(tmp_path)
+    baseline = label_persisted_episode(records[1], records_path=records_path)
     artifact_path = (
         records_path.parent / "episodes" / "step-1" / "graded-artifacts" / artifact_digests[1]
     )
-    artifact_path.write_text("def public(key):\n    return key\n", encoding="utf-8")
+    mismatched_artifact = b"def public(key):\n    return key\n"
+    artifact_path.write_bytes(mismatched_artifact)
 
-    with pytest.raises(ValueError, match="artifact digest mismatch"):
-        label_persisted_episode(records[1], records_path=records_path)
+    assessment = label_persisted_episode(records[1], records_path=records_path)
+    assert assessment.primary_strategy == baseline.primary_strategy
+    assert assessment.observed_strategies == baseline.observed_strategies
+    assert assessment.evidence == baseline.evidence
+    assert "graded artifact digest mismatch; source excluded" in assessment.limitations
 
-    with pytest.raises(ValueError, match="artifact digest mismatch"):
-        label_refresh.refresh_labels(records_path, tmp_path / "derived-labels")
+    original_records = records_path.read_bytes()
+    result = label_refresh.refresh_labels(records_path, tmp_path / "derived-labels")
+    sidecar_rows = label_refresh.load_derived_labels(records_path, result.labels_path)
+    sidecar_label = sidecar_rows[label_refresh.derived_label_join_key(records[1])]
+    sidecar_assessment = cast("dict[str, object]", sidecar_label["hack_strategy"])
 
     assert records_path.is_file()
-    assert len(records) == 3
+    assert records_path.read_bytes() == original_records
+    assert (
+        sidecar_label["artifact_content_sha256"] == hashlib.sha256(mismatched_artifact).hexdigest()
+    )
+    assert sidecar_assessment["primary_strategy"] == baseline.primary_strategy
+    assert sidecar_assessment["observed_strategies"] == list(baseline.observed_strategies)
+    assert sidecar_assessment["evidence"] == baseline.to_json_dict()["evidence"]
+    sidecar_limitations = sidecar_assessment["limitations"]
+    assert isinstance(sidecar_limitations, list)
+    assert "graded artifact digest mismatch; source excluded" in sidecar_limitations
 
 
 def test_counter_coexists_with_independently_computed_answer_table(tmp_path: Path) -> None:

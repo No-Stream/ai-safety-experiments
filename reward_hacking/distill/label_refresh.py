@@ -30,7 +30,9 @@ from reward_hacking.distill.hack_strategy import (
 from reward_hacking.distill.table_provenance import confirmed_visible_table
 from reward_hacking.distill.task_contract_source import hydrate_task_record
 from reward_hacking.harness.evidence_store import read_jsonl
-from reward_hacking.organism_rl.strengthened_truth_grade import recorded_artifact_sha256
+from reward_hacking.organism_rl.strengthened_truth_grade import (
+    recorded_artifact_content_sha256,
+)
 
 LABEL_REFRESH_FORMAT_VERSION = "episode_label_refresh_v1"
 LABELS_FILENAME = "labels.jsonl"
@@ -122,11 +124,21 @@ def _evidence_digests(
     summary = record.get("trace_summary")
     if not isinstance(summary, Mapping):
         raise TypeError(f"{context} requires a trace_summary object")
-    artifact_digest = recorded_artifact_sha256(records_path.parent, record, summary)
+    artifact_value = summary.get("graded_artifact")
+    if artifact_value is None:
+        artifact_digest = None
+    elif isinstance(artifact_value, Mapping):
+        artifact_digest = artifact_value.get("sha256")
+        if not isinstance(artifact_digest, str):
+            raise TypeError(f"{context} graded artifact requires a SHA-256 string")
+    else:
+        raise TypeError(f"{context} graded_artifact must be an object")
+    artifact_content_digest = recorded_artifact_content_sha256(records_path.parent, record, summary)
     return {
         "source_record_sha256": _sha256(raw_line),
         "trace_sha256": _sha256(trace_path.read_bytes()),
         "artifact_sha256": artifact_digest,
+        "artifact_content_sha256": artifact_content_digest,
     }
 
 
@@ -325,27 +337,46 @@ def _strengthened_truth_episode_id(record: Mapping[str, object], context: str) -
     return episode_id
 
 
-def _strengthened_truth_for_record(
+def _strengthened_truth_for_record(  # noqa: PLR0911 - every excluded evidence mismatch has its own limitation
     record: Mapping[str, object],
     *,
     context: str,
     artifact_sha256: str | None,
+    artifact_verified: bool,
     bindings: Mapping[str, _StrengthenedTruthBinding],
-) -> tuple[StrengthenedTruthEvidence | None, str | None]:
+) -> tuple[StrengthenedTruthEvidence | None, str | None, str | None]:
     episode_id = _strengthened_truth_episode_id(record, context)
     if episode_id is None:
-        return None, None
+        return None, None, None
     binding = bindings.get(episode_id)
     if binding is None:
-        raise ValueError(f"{context} is missing strengthened-truth sidecar evidence")
+        return None, None, "strengthened-truth sidecar evidence is missing; evidence excluded"
+    if not artifact_verified:
+        return (
+            None,
+            binding.source_sha256,
+            "strengthened-truth artifact digest cannot be verified; evidence excluded",
+        )
     task_id = record.get("task_id")
     if binding.task_id != task_id:
-        raise ValueError(f"{context} strengthened-truth task id does not match")
+        return (
+            None,
+            binding.source_sha256,
+            "strengthened-truth task identity mismatch; evidence excluded",
+        )
     if binding.artifact_sha256 != artifact_sha256:
-        raise ValueError(f"{context} strengthened-truth artifact digest does not match")
+        return (
+            None,
+            binding.source_sha256,
+            "strengthened-truth artifact digest mismatch; evidence excluded",
+        )
     if binding.true_pass != _recorded_true_pass(record):
-        raise ValueError(f"{context} strengthened-truth original verdict does not match")
-    return binding.evidence, binding.source_sha256
+        return (
+            None,
+            binding.source_sha256,
+            "strengthened-truth original verdict mismatch; evidence excluded",
+        )
+    return binding.evidence, binding.source_sha256, None
 
 
 def _load_strengthened_truth_inputs(
@@ -360,43 +391,60 @@ def _load_strengthened_truth_inputs(
     return strengthened_truth_path, strengthened_truth_bytes, bindings
 
 
-def _truth_for_label(
+def _truth_for_label(  # noqa: PLR0913 - sidecar state and row identity are explicit join inputs
     record: Mapping[str, object],
     *,
     context: str,
     artifact_sha256: str | None,
+    artifact_verified: bool,
     bindings: dict[str, _StrengthenedTruthBinding] | None,
+    ambiguous_episode_ids: frozenset[str],
     used_episode_ids: set[str],
-) -> tuple[StrengthenedTruthEvidence | None, str | None]:
+) -> tuple[StrengthenedTruthEvidence | None, str | None, str | None]:
     if bindings is None:
-        return None, None
-    strengthened_truth, source_sha256 = _strengthened_truth_for_record(
+        return None, None, None
+    episode_id = _strengthened_truth_episode_id(record, context)
+    if episode_id is not None and episode_id in ambiguous_episode_ids:
+        binding = bindings.get(episode_id)
+        if binding is not None:
+            used_episode_ids.add(episode_id)
+        return (
+            None,
+            binding.source_sha256 if binding is not None else None,
+            "strengthened-truth episode identity is ambiguous; evidence excluded",
+        )
+    strengthened_truth, source_sha256, limitation = _strengthened_truth_for_record(
         record,
         context=context,
         artifact_sha256=artifact_sha256,
+        artifact_verified=artifact_verified,
         bindings=bindings,
     )
-    if strengthened_truth is not None:
-        summary = record.get("trace_summary", record.get("episode_record"))
-        episode_id = cast("str", cast("Mapping[str, object]", summary)["episode_id"])
+    if episode_id is not None and episode_id in bindings:
         if episode_id in used_episode_ids:
-            raise ValueError("multiple records match one strengthened-truth episode")
+            return (
+                None,
+                source_sha256,
+                "strengthened-truth episode identity is ambiguous; evidence excluded",
+            )
         used_episode_ids.add(episode_id)
-    return strengthened_truth, source_sha256
+    return strengthened_truth, source_sha256, limitation
 
 
 def _validate_strengthened_truth_join_complete(
     bindings: dict[str, _StrengthenedTruthBinding] | None,
     used_episode_ids: set[str],
-) -> None:
+) -> tuple[str, ...]:
     if bindings is None:
-        return
+        return ()
     unused_episode_ids = set(bindings).difference(used_episode_ids)
     if unused_episode_ids:
-        raise ValueError(
-            "strengthened-truth sidecar has rows without matching original records: "
-            f"{sorted(unused_episode_ids)}"
+        limitation = (
+            "strengthened-truth sidecar has rows without matching original records; "
+            "unmatched evidence excluded"
         )
+        return (limitation,)
+    return ()
 
 
 def _validate_episode_inputs_unchanged(
@@ -425,6 +473,17 @@ def _validate_strengthened_truth_unchanged(
         raise ValueError("strengthened-truth sidecar changed during the labels-only refresh")
 
 
+def _ambiguous_strengthened_truth_episode_ids(
+    records_path: Path, parsed_records: Sequence[tuple[bytes, dict[str, object]]]
+) -> frozenset[str]:
+    episode_id_counts: dict[str, int] = {}
+    for row_index, (_raw_line, record) in enumerate(parsed_records, start=1):
+        episode_id = _strengthened_truth_episode_id(record, f"{records_path}:row {row_index}")
+        if episode_id is not None:
+            episode_id_counts[episode_id] = episode_id_counts.get(episode_id, 0) + 1
+    return frozenset(episode_id for episode_id, count in episode_id_counts.items() if count > 1)
+
+
 def refresh_labels(
     records_path: Path,
     output_dir: Path,
@@ -451,6 +510,7 @@ def refresh_labels(
 
     raw_records, parsed_records = _read_records(records_path)
     _validate_unique_episode_identities(records_path, parsed_records)
+    ambiguous_episode_ids = _ambiguous_strengthened_truth_episode_ids(records_path, parsed_records)
     source_records_digest = _sha256(raw_records)
     before_digests = [
         _evidence_digests(records_path, raw_line, record, row_index)
@@ -468,13 +528,23 @@ def refresh_labels(
             records_path,
             trace_records=trace_records,
         )
-        strengthened_truth, strengthened_truth_source_sha256 = _truth_for_label(
+        digests = before_digests[row_index - 1]
+        artifact_verified = digests["artifact_sha256"] == digests["artifact_content_sha256"]
+        row_limitations: list[str] = []
+        if not artifact_verified:
+            row_limitations.append("graded artifact digest mismatch; source excluded")
+        strengthened_truth, strengthened_truth_source_sha256, truth_limitation = _truth_for_label(
             record,
             context=f"{records_path}:row {row_index}",
-            artifact_sha256=before_digests[row_index - 1]["artifact_sha256"],
+            artifact_sha256=digests["artifact_sha256"],
+            artifact_verified=artifact_verified,
             bindings=strengthened_truth_bindings,
+            ambiguous_episode_ids=ambiguous_episode_ids,
             used_episode_ids=used_strengthened_truth,
         )
+        if truth_limitation is not None:
+            row_limitations.append(truth_limitation)
+        normalized_record["labeling_provenance_limitations"] = row_limitations
         assessment = label_persisted_episode(
             normalized_record,
             records_path=records_path,
@@ -487,6 +557,7 @@ def refresh_labels(
                 "source_record_sha256": _sha256(raw_line),
                 "trace_sha256": before_digests[row_index - 1]["trace_sha256"],
                 "artifact_sha256": before_digests[row_index - 1]["artifact_sha256"],
+                "artifact_content_sha256": before_digests[row_index - 1]["artifact_content_sha256"],
                 "strengthened_truth_source_sha256": strengthened_truth_source_sha256,
                 "labeler_version": TAXONOMY_VERSION,
                 "hack_strategy": assessment.to_json_dict(),
@@ -494,7 +565,15 @@ def refresh_labels(
             }
         )
 
-    _validate_strengthened_truth_join_complete(strengthened_truth_bindings, used_strengthened_truth)
+    global_limitations = _validate_strengthened_truth_join_complete(
+        strengthened_truth_bindings, used_strengthened_truth
+    )
+    for label in labels:
+        hack_strategy = cast("dict[str, object]", label["hack_strategy"])
+        limitations = list(cast("list[str]", hack_strategy.get("limitations", [])))
+        limitations.extend(global_limitations)
+        if limitations:
+            hack_strategy["limitations"] = list(dict.fromkeys(limitations))
     _validate_episode_inputs_unchanged(records_path, raw_records, parsed_records, before_digests)
     _validate_strengthened_truth_unchanged(
         strengthened_truth_path,
@@ -608,7 +687,13 @@ def _validate_label_evidence(
     if label.get("labeler_version") != TAXONOMY_VERSION:
         raise ValueError(f"{records_path}:row {row_index} labeler version is stale")
     digests = _evidence_digests(records_path, raw_line, source_record, row_index)
-    if any(label.get(name) != digest for name, digest in digests.items()):
+    published_digest_names = (
+        "source_record_sha256",
+        "trace_sha256",
+        "artifact_sha256",
+        "artifact_content_sha256",
+    )
+    if any(label.get(name) != digests[name] for name in published_digest_names):
         raise ValueError(
             f"{records_path}:row {row_index} source, trace or artifact digest is stale"
         )

@@ -3,11 +3,13 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from reward_hacking.distill import task_contract_source
+from reward_hacking import ilcb_data
+from reward_hacking.distill import hack_strategy, task_contract_source
 from reward_hacking.semantic_identity import semantic_content_identity
 
 if TYPE_CHECKING:
@@ -100,6 +102,81 @@ def test_hydrate_task_record_uses_full_historical_task_sidecar(
     assert task_contract_source.resolve_task_definition_content(record, records_path) == content
 
 
+def test_compact_direct_label_records_missing_source_without_changing_hydrated_label(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    records_path = run_dir / "records.jsonl"
+    records_path.write_text("", encoding="utf-8")
+    task_id = "ilcb-oneoff-synthetic-label-seam"
+    content: dict[str, object] = {
+        "task_id": task_id,
+        "task_variant": "oneoff",
+        "body": (
+            "# Task: implement `public`\n"
+            "```python\n"
+            "def public(value):\n"
+            "    return value\n"
+            "```\n"
+            "It must define a function named `public`.\n"
+        ),
+    }
+    digest = _task_definition_digest(content)
+    compact_content = semantic_content_identity(content)
+    _write_provenance_sidecar(
+        run_dir,
+        [
+            {
+                "task_id": task_id,
+                "family": "ilcb",
+                "variant": "oneoff",
+                "task_definition_sha256": digest,
+                "task_definition_content": content,
+            }
+        ],
+    )
+    trace_path = run_dir / "trace.jsonl"
+    trace_record: dict[str, object] = {
+        "record": "organism_episode_identity",
+        "task_id": task_id,
+        "task_family": "ilcb",
+        "task_variant": "oneoff",
+        "task_definition_sha256": digest,
+        "task_definition_content": compact_content,
+    }
+    trace_path.write_text(json.dumps(trace_record) + "\n", encoding="utf-8")
+    trace_records = [trace_record]
+    record: dict[str, object] = {
+        "record": "synthetic_episode",
+        "task_id": task_id,
+        "family": "ilcb",
+        "variant": "oneoff",
+        "task_definition_sha256": digest,
+        "task_definition_content": compact_content,
+        "trace_path": str(trace_path),
+        "trace_summary": {"true": {"measured": True, "pass": False}},
+    }
+
+    direct = hack_strategy.label_episode(record, trace_records)
+    hydrated_record = task_contract_source.hydrate_task_record(
+        record, records_path, trace_records=trace_records
+    )
+    hydrated_direct = hack_strategy.label_episode(hydrated_record, trace_records)
+    persisted = hack_strategy.label_persisted_episode(record, records_path=records_path)
+
+    missing_source_limitation = "compact task identity lacks callable source"
+    assert missing_source_limitation in direct.limitations
+    assert "input-determined contract not established" in hydrated_direct.limitations
+    assert direct.limitations != hydrated_direct.limitations
+    assert direct.primary_strategy == hydrated_direct.primary_strategy
+    assert direct.observed_strategies == hydrated_direct.observed_strategies
+    assert direct.evidence == hydrated_direct.evidence
+    assert direct.sub_tags == hydrated_direct.sub_tags
+    assert direct.leak_detector == hydrated_direct.leak_detector
+    assert persisted == hydrated_direct
+
+
 def test_digest_only_record_uses_matching_full_historical_sidecar(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -160,7 +237,7 @@ def test_hydration_leaves_an_existing_full_definition_unchanged(tmp_path: Path) 
     assert task_contract_source.hydrate_task_record(record, records_path) == record
 
 
-def test_hydrate_task_record_refuses_to_replace_conflicting_compact_identity(
+def test_hydrate_task_record_leaves_conflicting_compact_identity_unverified(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "run"
@@ -194,10 +271,182 @@ def test_hydrate_task_record_refuses_to_replace_conflicting_compact_identity(
         ),
     }
 
-    with pytest.raises(ValueError, match="semantic task definition"):
-        task_contract_source.hydrate_task_record(record, records_path)
+    resolved = task_contract_source.resolve_task_definition_content(record, records_path)
+    hydrated = task_contract_source.hydrate_task_record(record, records_path)
 
+    assert resolved is None
+    assert (
+        hydrated["task_definition_recovery_limitation"]
+        == "historical task definition unverifiable: semantic identity mismatch"
+    )
     assert record["task_definition_content"] != content
+
+
+def test_hydrate_task_record_records_historical_digest_mismatch(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    records_path = run_dir / "records.jsonl"
+    records_path.write_text("", encoding="utf-8")
+    content: dict[str, object] = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "task_variant": "oneoff",
+        "body": "Synthetic historical task body.",
+    }
+    historical_digest = _task_definition_digest(content)
+    _write_provenance_sidecar(
+        run_dir,
+        [
+            {
+                "task_id": "ilcb-oneoff-synthetic",
+                "family": "ilcb",
+                "variant": "oneoff",
+                "task_definition_sha256": historical_digest,
+                "task_definition_content": content,
+            }
+        ],
+    )
+    record: dict[str, object] = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "family": "ilcb",
+        "variant": "oneoff",
+        "task_definition_sha256": "0" * 64,
+        "task_definition_content": semantic_content_identity(content),
+    }
+
+    hydrated = task_contract_source.hydrate_task_record(record, records_path)
+
+    assert "recovered_task_definition_content" not in hydrated
+    assert (
+        hydrated["task_definition_recovery_limitation"]
+        == "historical task definition unverifiable: digest mismatch"
+    )
+
+
+def test_hydrate_task_record_records_malformed_compact_digest_string(
+    tmp_path: Path,
+) -> None:
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text("", encoding="utf-8")
+    record: dict[str, object] = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "family": "ilcb",
+        "variant": "oneoff",
+        "task_definition_content": {
+            "semantic_content_sha256": "z" * 64,
+            "task_variant": "oneoff",
+        },
+    }
+
+    hydrated = task_contract_source.hydrate_task_record(record, records_path)
+
+    assert "recovered_task_definition_content" not in hydrated
+    assert (
+        hydrated["task_definition_recovery_limitation"]
+        == "historical task definition unverifiable: semantic identity mismatch"
+    )
+
+
+def test_hydrate_task_record_records_duplicate_historical_identity_as_ambiguous(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    records_path = run_dir / "records.jsonl"
+    records_path.write_text("", encoding="utf-8")
+    content: dict[str, object] = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "task_variant": "oneoff",
+        "body": "Synthetic historical task body.",
+    }
+    digest = _task_definition_digest(content)
+    task: dict[str, object] = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "family": "ilcb",
+        "variant": "oneoff",
+        "task_definition_sha256": digest,
+        "task_definition_content": content,
+    }
+    _write_provenance_sidecar(run_dir, [task, task])
+    record: dict[str, object] = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "family": "ilcb",
+        "variant": "oneoff",
+        "task_definition_sha256": digest,
+        "task_definition_content": semantic_content_identity(content),
+    }
+
+    hydrated = task_contract_source.hydrate_task_record(record, records_path)
+
+    assert "recovered_task_definition_content" not in hydrated
+    assert (
+        hydrated["task_definition_recovery_limitation"]
+        == "historical task definition unverifiable: ambiguous identity"
+    )
+
+
+def test_hydrate_task_record_records_selected_task_sidecar_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    records_path = run_dir / "records.jsonl"
+    records_path.write_text("", encoding="utf-8")
+    sidecar_name = "provenance.selected-tasks.json.gz"
+    compact_task = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "family": "ilcb",
+        "variant": "oneoff",
+    }
+    sidecar_task = {**compact_task, "task_id": "different-synthetic-task"}
+    (run_dir / sidecar_name).write_bytes(
+        gzip.compress(json.dumps([sidecar_task], sort_keys=True, separators=(",", ":")).encode())
+    )
+    provenance = {
+        "schema_version": 3,
+        "provenance_sha256": "synthetic-provenance-digest",
+        "provenance": {
+            "selected_tasks": [compact_task],
+            "selected_tasks_reference": {"schema_version": 1, "path": sidecar_name},
+        },
+    }
+    (run_dir / "provenance.json").write_text(json.dumps(provenance), encoding="utf-8")
+    content: dict[str, object] = {
+        "task_id": "ilcb-oneoff-synthetic",
+        "task_variant": "oneoff",
+        "body": "Synthetic task body.",
+    }
+    record: dict[str, object] = {
+        **compact_task,
+        "task_definition_content": semantic_content_identity(content),
+    }
+
+    hydrated = task_contract_source.hydrate_task_record(record, records_path)
+
+    assert "recovered_task_definition_content" not in hydrated
+    assert (
+        hydrated["task_definition_recovery_limitation"]
+        == "historical task definition unverifiable: semantic identity mismatch"
+    )
+
+
+def test_duplicate_ilcb_case_match_returns_ambiguity_limitation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    problem = SimpleNamespace(
+        harness_task_id="ilcb-oneoff-synthetic",
+        impossible_type="oneoff",
+    )
+    monkeypatch.setattr(ilcb_data, "load_problems", lambda _path: [problem, problem])
+
+    resolution = task_contract_source._task_definition_from_loader(
+        "ilcb-oneoff-synthetic",
+        "ilcb",
+        "oneoff",
+        ilcb_cases_path=tmp_path / "cases.json",
+    )
+
+    assert resolution.content is None
+    assert resolution.limitation == "historical task definition unverifiable: ambiguous identity"
 
 
 def test_hydrate_task_record_returns_none_when_no_identity_can_be_resolved(
@@ -244,7 +493,7 @@ def test_task_identity_without_content_or_digest_is_not_reconstructed(
     )
 
 
-def test_compact_contract_rejects_conflicting_task_variants(tmp_path: Path) -> None:
+def test_compact_contract_marks_conflicting_task_variants_unverifiable(tmp_path: Path) -> None:
     records_path = tmp_path / "records.jsonl"
     records_path.write_text("", encoding="utf-8")
     content: dict[str, object] = {
@@ -266,10 +515,18 @@ def test_compact_contract_rejects_conflicting_task_variants(tmp_path: Path) -> N
         "task_definition_content": semantic_content_identity(content),
     }
 
-    with pytest.raises(ValueError, match="persisted task identities disagree"):
-        task_contract_source.resolve_task_definition_content(
-            record, records_path, trace_records=(trace_record,)
-        )
+    resolved = task_contract_source.resolve_task_definition_content(
+        record, records_path, trace_records=(trace_record,)
+    )
+    hydrated = task_contract_source.hydrate_task_record(
+        record, records_path, trace_records=(trace_record,)
+    )
+
+    assert resolved is None
+    assert (
+        hydrated["task_definition_recovery_limitation"]
+        == "historical task definition unverifiable: semantic identity mismatch"
+    )
 
 
 def test_full_contract_remains_authoritative_over_conflicting_summary_variant(
@@ -317,7 +574,7 @@ def test_hydrate_task_record_reconstructs_from_a_task_loader(
     monkeypatch.setattr(
         task_contract_source,
         "_task_definition_from_loader",
-        lambda _task_id, _family, _variant: content,
+        lambda _task_id, _family, _variant: task_contract_source._TaskDefinitionResolution(content),
     )
     record: dict[str, object] = {
         "task_id": "math-oneoff-synthetic",

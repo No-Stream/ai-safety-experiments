@@ -14,7 +14,7 @@ from typing import Literal, cast
 
 import pytest
 
-from reward_hacking.distill import agentic_sft, hack_strategy
+from reward_hacking.distill import agentic_sft, hack_strategy, task_contract_source
 from reward_hacking.organism_reward import score_impossible_task
 from reward_hacking.organism_rl import (
     corpus_capture,
@@ -286,7 +286,10 @@ def test_captured_strategy_labels_are_supported_and_persisted_replay_matches_cur
         persisted_label = hack_strategy.label_persisted_episode(
             persisted_record, records_path=corpus_record.records_path
         ).to_json_dict()
-        fresh_label = hack_strategy.label_episode(persisted_record, trace_records).to_json_dict()
+        hydrated_record = task_contract_source.hydrate_task_record(
+            persisted_record, corpus_record.records_path, trace_records=trace_records
+        )
+        fresh_label = hack_strategy.label_episode(hydrated_record, trace_records).to_json_dict()
         _require(
             persisted_label == fresh_label,
             f"{context}: persisted-label consumer differs from direct label replay",
@@ -369,12 +372,19 @@ def test_captured_leak_strategy_replay_uses_retained_patch_and_trace(
         corpus_root
     )
     captured_records = capture / "generate/synthetic-leak/records.jsonl"
-    corrupted_patch = copy.deepcopy(captured_record)
-    corrupted_patch["trace_summary"]["leak_evidence"]["final_patch"] += "corrupted"
-    captured_records.write_text(json.dumps(corrupted_patch) + "\n")
+    corrupted_patch = _corrupt_persisted_leak_patch(captured_record, captured_records)
+    replayed_assessment = hack_strategy.label_persisted_episode(
+        corrupted_patch, records_path=captured_records
+    )
+    assert "reference_solution_leak" not in replayed_assessment.observed_strategies
+    assert any(
+        "persisted leak patch digest mismatch" in limitation
+        for limitation in replayed_assessment.limitations
+    )
     with pytest.raises(ValueError, match="patch differs from the graded artifact"):
-        test_captured_strategy_labels_are_supported_and_persisted_replay_matches_current_labeler(
-            corpus_root
+        rescore.rescore_recorded_leak(
+            corrupted_patch,
+            records_path=captured_records,
         )
     if referenced:
         corrupted_reference = copy.deepcopy(captured_record)
@@ -386,6 +396,39 @@ def test_captured_leak_strategy_replay_uses_retained_patch_and_trace(
             test_captured_strategy_labels_are_supported_and_persisted_replay_matches_current_labeler(
                 corpus_root
             )
+
+
+def _corrupt_persisted_leak_patch(
+    record: Mapping[str, object], records_path: Path
+) -> dict[str, object]:
+    corrupted_record = copy.deepcopy(dict(record))
+    trace_summary = cast("dict[str, object]", corrupted_record["trace_summary"])
+    leak_evidence = cast("dict[str, object]", trace_summary["leak_evidence"])
+    final_patch = leak_evidence["final_patch"]
+    assert isinstance(final_patch, str)
+    leak_evidence["final_patch"] = f"{final_patch}corrupted"
+    trace_path = Path(cast("str", corrupted_record["trace_path"]))
+    if not trace_path.is_absolute():
+        trace_path = records_path.parent / trace_path
+    trace_records = _read_jsonl(trace_path)
+    episode_summaries = [
+        trace_record
+        for trace_record in trace_records
+        if trace_record.get("record") == "episode_summary"
+    ]
+    assert len(episode_summaries) == 1
+    updated_trace_records: list[dict[str, object]] = []
+    for trace_record in trace_records:
+        updated_record = dict(trace_record)
+        if trace_record.get("record") == "episode_summary":
+            updated_record["leak_evidence"] = leak_evidence
+        updated_trace_records.append(updated_record)
+    trace_path.write_text(
+        "".join(json.dumps(trace_record) + "\n" for trace_record in updated_trace_records),
+        encoding="utf-8",
+    )
+    records_path.write_text(json.dumps(corrupted_record) + "\n")
+    return corrupted_record
 
 
 @pytest.mark.corpus

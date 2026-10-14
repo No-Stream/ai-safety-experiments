@@ -39,6 +39,10 @@ _COMPACT_SELECTED_TASK_FIELDS = (
     "payment_register",
 )
 _SELECTED_TASKS_REFERENCE_SCHEMA_VERSION = 1
+SELECTED_TASKS_RECOVERY_LIMITATION_KEY = "selected_tasks_recovery_limitation"
+_SELECTED_TASKS_SEMANTIC_MISMATCH = (
+    "historical task definition unverifiable: semantic identity mismatch"
+)
 
 
 def _canonical_sha256(value: Mapping[str, object], *, ensure_ascii: bool = True) -> str:
@@ -539,7 +543,8 @@ def hydrate_provenance(
         dict(task) for task in cast("list[Mapping[str, object]]", selected_tasks_value)
     ]
     if compact_selected_tasks(selected_tasks) != compact_tasks:
-        raise ValueError("selected-task sidecar does not match its compact provenance identity")
+        hydrated[SELECTED_TASKS_RECOVERY_LIMITATION_KEY] = _SELECTED_TASKS_SEMANTIC_MISMATCH
+        return hydrated
     hydrated["selected_tasks"] = selected_tasks
     hydrated.pop("selected_tasks_reference")
     return hydrated
@@ -557,7 +562,11 @@ def _read_existing_provenance(path: Path) -> Mapping[str, object]:
     if not isinstance(provenance, Mapping):
         raise TypeError("existing run provenance must contain an object at 'provenance'")
     hydrated_document = dict(value)
-    hydrated_document["provenance"] = hydrate_provenance(provenance, path)
+    hydrated_provenance = hydrate_provenance(provenance, path)
+    limitation = hydrated_provenance.pop(SELECTED_TASKS_RECOVERY_LIMITATION_KEY, None)
+    hydrated_document["provenance"] = hydrated_provenance
+    if isinstance(limitation, str):
+        hydrated_document[SELECTED_TASKS_RECOVERY_LIMITATION_KEY] = limitation
     return hydrated_document
 
 

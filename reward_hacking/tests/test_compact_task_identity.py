@@ -162,8 +162,12 @@ def test_selected_task_provenance_compaction_round_trips_exactly(tmp_path: Path)
 
     tampered_compact = deepcopy(compact)
     cast("list[dict[str, object]]", tampered_compact["selected_tasks"])[0]["task_id"] = "other"
-    with pytest.raises(ValueError, match="does not match its compact provenance identity"):
-        generate_provenance.hydrate_provenance(tampered_compact, provenance_path)
+    unverifiable = generate_provenance.hydrate_provenance(tampered_compact, provenance_path)
+    assert unverifiable["selected_tasks"] == tampered_compact["selected_tasks"]
+    assert (
+        unverifiable[generate_provenance.SELECTED_TASKS_RECOVERY_LIMITATION_KEY]
+        == "historical task definition unverifiable: semantic identity mismatch"
+    )
 
 
 def test_selected_task_provenance_growth_keeps_previous_sidecar(tmp_path: Path) -> None:

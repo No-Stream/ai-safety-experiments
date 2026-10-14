@@ -64,6 +64,7 @@ def test_decision_uses_action_span_before_masked_leading_close_and_keeps_stop() 
         descriptor for descriptor in descriptors if descriptor["decision_is_sampled_move"]
     )
     candidate = build_decision_row(source, actual, tokenizer=cast("Any", tokenizer))
+    assert candidate is not None
     reconstructed = [*candidate["prompt_token_ids"][1:], *candidate["completion_token_ids"]]
     assert reconstructed == sampled
     assert reconstructed[0] == tokenizer.thinking_close_id
@@ -176,6 +177,7 @@ def test_source_id_splice_preserves_prefix_suffix_and_changes_only_command(case:
     assert tokenizer.decode(source["completion_token_ids"]) == raw + "<|im_end|>"
     for descriptor in descriptors:
         candidate = build_decision_row(source, descriptor, tokenizer=cast("Any", tokenizer))
+        assert candidate is not None
         prefix_count = descriptor["decision_prefix_tokens"]
         command_end = descriptor["decision_command_token_end"]
         assert candidate["prompt_token_ids"] == [
@@ -218,8 +220,7 @@ def test_source_id_splice_preserves_prefix_suffix_and_changes_only_command(case:
             assert command_end == source["completion_token_ids"].index(260) + 1
 
 
-@pytest.mark.parametrize("corruption", ["action_span", "action_digest", "prefix_digest"])
-def test_splice_rejects_corrupted_action_provenance(corruption: str) -> None:
+def test_splice_rejects_invalid_action_span() -> None:
     tokenizer, source, _, _ = _piece_source("noncanonical_reasoning")
     descriptors = list(
         iter_decision_descriptors(
@@ -227,14 +228,28 @@ def test_splice_rejects_corrupted_action_provenance(corruption: str) -> None:
         )
     )
     descriptor = descriptors[0]
-    if corruption == "action_span":
-        source["turn_action_spans"][0][1] -= 1
-    elif corruption == "action_digest":
-        descriptor["decision_source_action_sha256"] = "0" * 64
-    else:
-        descriptor["decision_prefix_sha256"] = "0" * 64
+    source["turn_action_spans"][0] = [0, 0]
     with pytest.raises(ValueError, match=r"span|source|action|prefix"):
         build_decision_row(source, descriptor, tokenizer=cast("Any", tokenizer))
+
+
+@pytest.mark.parametrize("corruption", ["action_digest", "prefix_digest"])
+def test_splice_excludes_candidate_with_stale_source_digest(corruption: str) -> None:
+    tokenizer, source, _, _ = _piece_source("noncanonical_reasoning")
+    descriptors = list(
+        iter_decision_descriptors(
+            [source], tokenizer=cast("Any", tokenizer), alternatives={"test_run": "pytest"}
+        )
+    )
+    descriptor = descriptors[0]
+    digest_field = (
+        "decision_source_action_sha256"
+        if corruption == "action_digest"
+        else "decision_prefix_sha256"
+    )
+    descriptor[digest_field] = "0" * 64
+
+    assert build_decision_row(source, descriptor, tokenizer=cast("Any", tokenizer)) is None
 
 
 def test_splice_estimate_matches_materialized_saved_token_sequences() -> None:

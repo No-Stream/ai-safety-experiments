@@ -201,7 +201,7 @@ def _patch_native_grade_boundaries(
 
 
 class TestDistillationGrade:
-    def test_hint_text_changes_refuse_but_digest_changes_are_provenance(
+    def test_saved_hint_text_is_used_and_catalog_identity_drift_is_a_limitation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _patch_native_grade_boundaries(
@@ -209,20 +209,76 @@ class TestDistillationGrade:
         )
         sample = _sample("aisi/synthetic-aisi/0", "aisi", "synthetic-aisi")
         prompt = {**_prompt("aisi", "synthetic-aisi"), "hint_sha256": "a" * 64, "hint_text": ""}
-        label, _ = grade._grade_aisi(
+        observed_hint_texts: list[str] = []
+        original_grade_aisi_record = grade.grade_aisi_record
+
+        def capture_grade_aisi_record(**kwargs: Any) -> dict[str, Any]:
+            observed_hint_texts.append(kwargs["leakage_hint"].text)
+            return original_grade_aisi_record(**kwargs)
+
+        monkeypatch.setattr(grade, "grade_aisi_record", capture_grade_aisi_record)
+        label, native = grade._grade_aisi(
             sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
         )
         assert label == "honest"
+        assert observed_hint_texts[-1] == ""
+        assert native["provenance_limitations"] == [
+            "saved hint text digest mismatch; persisted prompt text used"
+        ]
         prompt["hint_text"] = "changed synthetic hint"
-        with pytest.raises(ValueError, match="hint text"):
-            grade._grade_aisi(
-                sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
-            )
+        label, native = grade._grade_aisi(
+            sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
+        )
+        assert label == "honest"
+        assert observed_hint_texts[-1] == "changed synthetic hint"
+        assert native["provenance_limitations"] == [
+            "saved hint text differs from current catalog; catalog identity unavailable"
+        ]
         del prompt["hint_text"]
-        with pytest.raises(ValueError, match="legacy hint text digest"):
-            grade._grade_aisi(
-                sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
-            )
+        label, native = grade._grade_aisi(
+            sample, _aisi_problem(), _synthetic_aisi_source(tmp_path), prompt, tmp_path
+        )
+        assert label == "honest"
+        assert observed_hint_texts[-1] == ""
+        assert native["provenance_limitations"] == [
+            "legacy hint text digest mismatch; catalog identity unavailable"
+        ]
+
+    def test_grade_round_records_unavailable_legacy_hint_identity(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        prompt = _prompt("aisi", "synthetic-aisi")
+        prompt["hint_sha256"] = "a" * 64
+        prompts_path = tmp_path / "prompts.jsonl"
+        samples_path = tmp_path / "samples.jsonl"
+        output_path = tmp_path / "graded.jsonl"
+        _write_jsonl(prompts_path, [prompt])
+        _write_jsonl(
+            samples_path,
+            [_sample("aisi/synthetic-aisi/0", "aisi", "synthetic-aisi")],
+        )
+        _patch_native_grade_boundaries(
+            monkeypatch,
+            tmp_path,
+            outcomes_by_key={"aisi/synthetic-aisi/0": (True, True)},
+        )
+
+        grade.grade_round(
+            samples_path=samples_path,
+            prompts_path=prompts_path,
+            output_path=output_path,
+        )
+
+        limitation = "legacy hint text digest mismatch; catalog identity unavailable"
+        assert read_jsonl(output_path)[0]["limitations"] == [limitation]
+        summary = json.loads(Path(f"{output_path}.summary.json").read_text(encoding="utf-8"))
+        assert summary["limitations"] == [
+            {
+                "key": "aisi/synthetic-aisi/0",
+                "reason": limitation,
+                "action": "graded_without_hint_identity",
+            }
+        ]
 
     def test_native_labels_awareness_summary_and_resume(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -305,27 +361,42 @@ class TestDistillationGrade:
         assert resumed.resumed_count == 3
         assert "resumed=3" in caplog.text
 
-    def test_changed_sample_hash_refuses_grading(
+    def test_sample_with_changed_hash_is_excluded_while_remaining_samples_are_graded(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         prompts_path = tmp_path / "prompts.jsonl"
         samples_path = tmp_path / "samples.jsonl"
-        row = _sample("atlas/synthetic-atlas/0", "atlas", "synthetic-atlas")
-        row["completion_token_ids"][0] += 1
+        output_path = tmp_path / "graded.jsonl"
+        unverifiable = _sample("atlas/synthetic-atlas/0", "atlas", "synthetic-atlas")
+        unverifiable["completion_token_ids"][0] += 1
+        valid = _sample("atlas/synthetic-atlas/1", "atlas", "synthetic-atlas")
+        valid["sample_index"] = 1
         _write_jsonl(prompts_path, [_prompt("atlas", "synthetic-atlas")])
-        _write_jsonl(samples_path, [row])
+        _write_jsonl(samples_path, [unverifiable, valid])
         _patch_native_grade_boundaries(
             monkeypatch,
             tmp_path,
-            outcomes_by_key={"atlas/synthetic-atlas/0": (True, False)},
+            outcomes_by_key={"atlas/synthetic-atlas/1": (True, False)},
         )
 
-        with pytest.raises(ValueError, match="token_ids_sha256"):
-            grade.grade_round(
-                samples_path=samples_path,
-                prompts_path=prompts_path,
-                output_path=tmp_path / "graded.jsonl",
-            )
+        result = grade.grade_round(
+            samples_path=samples_path,
+            prompts_path=prompts_path,
+            output_path=output_path,
+        )
+
+        assert [row["key"] for row in read_jsonl(output_path)] == ["atlas/synthetic-atlas/1"]
+        assert result.generated_count == 1
+        assert result.excluded_count == 1
+        summary = json.loads(Path(f"{output_path}.summary.json").read_text(encoding="utf-8"))
+        assert summary["excluded_count"] == 1
+        assert summary["limitations"] == [
+            {
+                "key": "atlas/synthetic-atlas/0",
+                "reason": "sample token_ids_sha256 does not match its token ids",
+                "action": "excluded",
+            }
+        ]
 
     def test_resume_refuses_sample_with_changed_token_hash(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -501,14 +572,88 @@ class TestDistillationSelection:
                 target_completion_tokens=20,
             )
 
-    def test_selected_sample_hash_must_match_token_ids(self, tmp_path: Path) -> None:
-        sample = _sample("synthetic/changed/0", "aisi", "synthetic-changed")
-        sample["completion_token_ids"][0] += 1
+    def test_sample_hash_mismatch_is_recorded_and_excluded_from_selection(
+        self, tmp_path: Path
+    ) -> None:
+        unverifiable = _sample("synthetic/changed/0", "aisi", "synthetic-changed")
+        unverifiable["completion_token_ids"][0] += 1
+        valid = _sample("synthetic/valid/0", "aisi", "synthetic-valid")
 
-        with pytest.raises(ValueError, match="token_ids_sha256"):
-            _select(
-                tmp_path,
-                [sample],
-                [_graded_row(sample, label="honest")],
-                mode="all",
+        result = _select(
+            tmp_path,
+            [unverifiable, valid],
+            [_graded_row(unverifiable, label="honest"), _graded_row(valid, label="honest")],
+            mode="all",
+        )
+
+        assert [row["key"] for row in read_jsonl(result.output_path)] == ["synthetic/valid/0"]
+        selection = json.loads(result.selection_path.read_text(encoding="utf-8"))
+        assert selection["input_count"] == 2
+        assert selection["verified_sample_count"] == 1
+        assert selection["unverifiable_sample_count"] == 1
+        assert selection["limitations"] == [
+            {
+                "key": "synthetic/changed/0",
+                "reason": "sample token_ids_sha256 does not match its token ids",
+            }
+        ]
+
+    def test_grade_identity_mismatch_excludes_only_its_sample(self, tmp_path: Path) -> None:
+        mismatched = _sample("synthetic/grade-mismatch/0", "aisi", "synthetic-grade-mismatch")
+        valid = _sample("synthetic/valid-grade/0", "aisi", "synthetic-valid-grade")
+        mismatched_grade = _graded_row(mismatched, label="honest")
+        mismatched_grade["token_ids_sha256"] = "b" * 64
+
+        result = _select(
+            tmp_path,
+            [mismatched, valid],
+            [mismatched_grade, _graded_row(valid, label="honest")],
+            mode="all",
+        )
+
+        assert [row["key"] for row in read_jsonl(result.output_path)] == ["synthetic/valid-grade/0"]
+        selection = json.loads(result.selection_path.read_text(encoding="utf-8"))
+        assert selection["unverifiable_sample_count"] == 1
+        assert selection["limitations"] == [
+            {
+                "key": "synthetic/grade-mismatch/0",
+                "reason": "graded row differs from sample field 'token_ids_sha256'",
+            }
+        ]
+
+    def test_selected_hash_mismatch_is_recorded_and_excluded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sample = _sample("synthetic/mutated-after-selection/0", "aisi", "synthetic-mutated")
+        original_selector = select._select_token_target
+
+        def mutate_after_select(
+            candidates: list[dict[str, Any]], *, target_completion_tokens: int, seed: int
+        ) -> list[dict[str, Any]]:
+            selected = original_selector(
+                candidates,
+                target_completion_tokens=target_completion_tokens,
+                seed=seed,
             )
+            selected[0]["completion_token_ids"][0] += 1
+            return selected
+
+        monkeypatch.setattr(select, "_select_token_target", mutate_after_select)
+        result = _select(
+            tmp_path,
+            [sample],
+            [_graded_row(sample, label="honest")],
+            mode="all",
+            target_completion_tokens=2,
+        )
+
+        assert read_jsonl(result.output_path) == []
+        selection = json.loads(result.selection_path.read_text(encoding="utf-8"))
+        assert selection["selected_count"] == 0
+        assert selection["unverifiable_sample_count"] == 1
+        assert selection["limitations"] == [
+            {
+                "key": "synthetic/mutated-after-selection/0",
+                "reason": "selected sample token_ids_sha256 does not match its token ids",
+            }
+        ]

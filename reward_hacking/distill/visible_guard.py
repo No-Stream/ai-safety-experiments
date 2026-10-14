@@ -254,6 +254,210 @@ _SAFE_BUILTINS = (
     "tuple",
     "zip",
 )
+_PURE_STDLIB_IMPORTS = {
+    "bisect": frozenset(
+        {"bisect", "bisect_left", "bisect_right", "insort", "insort_left", "insort_right"}
+    ),
+    "collections": frozenset(
+        {"ChainMap", "Counter", "OrderedDict", "defaultdict", "deque", "namedtuple"}
+    ),
+    "dataclasses": frozenset({"asdict", "astuple", "field", "fields", "is_dataclass", "replace"}),
+    "decimal": frozenset(
+        {"Decimal", "ROUND_CEILING", "ROUND_DOWN", "ROUND_FLOOR", "ROUND_HALF_EVEN", "ROUND_UP"}
+    ),
+    "fractions": frozenset({"Fraction"}),
+    "functools": frozenset(
+        {
+            "cmp_to_key",
+            "lru_cache",
+            "partial",
+            "reduce",
+            "total_ordering",
+            "update_wrapper",
+            "wraps",
+        }
+    ),
+    "heapq": frozenset(
+        {
+            "heapify",
+            "heappop",
+            "heappush",
+            "heappushpop",
+            "heapreplace",
+            "merge",
+            "nlargest",
+            "nsmallest",
+        }
+    ),
+    "itertools": frozenset(
+        {
+            "accumulate",
+            "chain",
+            "combinations",
+            "combinations_with_replacement",
+            "compress",
+            "count",
+            "cycle",
+            "dropwhile",
+            "filterfalse",
+            "groupby",
+            "islice",
+            "pairwise",
+            "permutations",
+            "product",
+            "repeat",
+            "starmap",
+            "takewhile",
+            "tee",
+            "zip_longest",
+        }
+    ),
+    "math": frozenset(
+        {
+            "ceil",
+            "comb",
+            "copysign",
+            "e",
+            "erf",
+            "exp",
+            "fabs",
+            "factorial",
+            "floor",
+            "fsum",
+            "gcd",
+            "hypot",
+            "inf",
+            "isclose",
+            "isfinite",
+            "isinf",
+            "isnan",
+            "isqrt",
+            "lcm",
+            "log",
+            "log10",
+            "log2",
+            "nan",
+            "pi",
+            "pow",
+            "prod",
+            "radians",
+            "sqrt",
+            "tau",
+            "trunc",
+        }
+    ),
+    "operator": frozenset(
+        {
+            "abs",
+            "add",
+            "and_",
+            "concat",
+            "contains",
+            "countOf",
+            "eq",
+            "floordiv",
+            "ge",
+            "getitem",
+            "gt",
+            "iadd",
+            "iand",
+            "iconcat",
+            "ifloordiv",
+            "ilshift",
+            "imatmul",
+            "imod",
+            "imul",
+            "index",
+            "indexOf",
+            "inv",
+            "invert",
+            "ior",
+            "ipow",
+            "irshift",
+            "is_",
+            "is_not",
+            "isub",
+            "itruediv",
+            "ixor",
+            "le",
+            "length_hint",
+            "lshift",
+            "lt",
+            "matmul",
+            "mod",
+            "mul",
+            "ne",
+            "neg",
+            "not_",
+            "or_",
+            "pos",
+            "pow",
+            "rshift",
+            "sub",
+            "truediv",
+            "truth",
+            "xor",
+        }
+    ),
+    "re": frozenset(
+        {
+            "ASCII",
+            "DEBUG",
+            "DOTALL",
+            "IGNORECASE",
+            "LOCALE",
+            "MULTILINE",
+            "NOFLAG",
+            "Pattern",
+            "RegexFlag",
+            "UNICODE",
+            "VERBOSE",
+            "compile",
+            "escape",
+            "findall",
+            "finditer",
+            "fullmatch",
+            "match",
+            "search",
+            "split",
+            "sub",
+            "subn",
+        }
+    ),
+    "string": frozenset(
+        {
+            "ascii_letters",
+            "ascii_lowercase",
+            "ascii_uppercase",
+            "digits",
+            "hexdigits",
+            "octdigits",
+            "printable",
+            "punctuation",
+            "whitespace",
+        }
+    ),
+    "typing": frozenset(
+        {
+            "Any",
+            "Callable",
+            "Dict",
+            "FrozenSet",
+            "Iterable",
+            "List",
+            "Mapping",
+            "MutableMapping",
+            "MutableSequence",
+            "MutableSet",
+            "Optional",
+            "Sequence",
+            "Set",
+            "Tuple",
+            "Type",
+            "Union",
+        }
+    ),
+}
 _SAFE_METHODS = frozenset(
     {
         "append",
@@ -315,19 +519,77 @@ _SAFE_METHODS = frozenset(
 )
 
 
+def _sandbox_import_bindings(tree: ast.Module) -> dict[str, str] | None:
+    imported_modules: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                module = alias.name
+                binding = alias.asname or module.split(".")[0]
+                if module not in _PURE_STDLIB_IMPORTS or binding.startswith("__"):
+                    return None
+                imported_modules[binding] = module
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0 or node.module not in _PURE_STDLIB_IMPORTS:
+                return None
+            allowed_names = _PURE_STDLIB_IMPORTS[node.module]
+            if any(
+                alias.name == "*"
+                or alias.name not in allowed_names
+                or (alias.asname is not None and alias.asname.startswith("__"))
+                for alias in node.names
+            ):
+                return None
+    return imported_modules
+
+
+def _sandbox_attribute_supported(node: ast.Attribute, imported_modules: dict[str, str]) -> bool:
+    if node.attr.startswith("__") or isinstance(node.ctx, (ast.Store, ast.Del)):
+        return False
+    if node.attr in _SAFE_METHODS:
+        return True
+    if not isinstance(node.value, ast.Name):
+        return False
+    module = imported_modules.get(node.value.id)
+    return module is not None and node.attr in _PURE_STDLIB_IMPORTS[module]
+
+
+def _sandbox_node_supported(node: ast.AST, imported_modules: dict[str, str]) -> bool:
+    if isinstance(node, (ast.ClassDef, ast.AsyncFunctionDef)):
+        return False
+    if isinstance(node, ast.Attribute):
+        return _sandbox_attribute_supported(node, imported_modules)
+    if isinstance(node, ast.Name):
+        return not node.id.startswith("__")
+    return True
+
+
 def _sandbox_source_supported(tree: ast.Module) -> bool:
-    return not any(
-        isinstance(node, (ast.Import, ast.ImportFrom, ast.ClassDef, ast.AsyncFunctionDef))
-        or (isinstance(node, ast.Attribute) and node.attr not in _SAFE_METHODS)
-        or (isinstance(node, ast.Name) and node.id.startswith("__"))
-        for node in ast.walk(tree)
+    imported_modules = _sandbox_import_bindings(tree)
+    return imported_modules is not None and all(
+        _sandbox_node_supported(node, imported_modules) for node in ast.walk(tree)
     )
 
 
 _SANDBOX_DRIVER = """import ast
 import builtins
 import json
+import types
 from pathlib import Path
+
+module_cache = {}
+
+def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+    allowed_names = payload['imports'].get(name)
+    requested_names = () if fromlist is None else fromlist
+    if level != 0 or allowed_names is None or any(item not in allowed_names for item in requested_names):
+        raise ImportError('candidate import is outside the standard-library allowlist')
+    if name not in module_cache:
+        imported_module = builtins.__import__(name, globals, locals, fromlist, level)
+        module_cache[name] = types.SimpleNamespace(
+            **{item: getattr(imported_module, item) for item in allowed_names}
+        )
+    return module_cache[name]
 
 def literal(value):
     if type(value) in (type(None), bool, int, float, complex, str, bytes):
@@ -341,7 +603,10 @@ def literal(value):
 payload = json.loads(Path('payload.json').read_text())
 answers = []
 for source in payload['sources']:
-    namespace = {'__builtins__': {name: getattr(builtins, name) for name in payload['builtins']}}
+    module_cache = {}
+    sandbox_builtins = {name: getattr(builtins, name) for name in payload['builtins']}
+    sandbox_builtins['__import__'] = restricted_import
+    namespace = {'__builtins__': sandbox_builtins}
     exec(compile(source, '<candidate>', 'exec'), namespace)
     arguments = ast.literal_eval(payload['arguments'])
     answer = namespace[payload['name']](*arguments)
@@ -366,6 +631,7 @@ def _sandbox_answers(  # noqa: PLR0911 - explicit unsupported, transport, and ou
         "name": name,
         "arguments": repr(arguments),
         "builtins": _SAFE_BUILTINS,
+        "imports": {module: sorted(names) for module, names in _PURE_STDLIB_IMPORTS.items()},
     }
     timeout_seconds = 5 * len(sources)
     # /tmp is disposable and accepted by the episode jail; no candidate runs on the host.
