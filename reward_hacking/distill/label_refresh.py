@@ -28,6 +28,7 @@ from reward_hacking.distill.hack_strategy import (
     read_strengthened_truth_sidecar,
 )
 from reward_hacking.distill.table_provenance import confirmed_visible_table
+from reward_hacking.distill.task_contract_source import hydrate_task_record
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.organism_rl.strengthened_truth_grade import recorded_artifact_sha256
 
@@ -462,7 +463,11 @@ def refresh_labels(
         )
         trace_path = _trace_path(records_path, record, f"{records_path}:row {row_index}")
         trace_records = _read_trace_records(trace_path)
-        normalized_record = {**record, "trace_path": str(trace_path.resolve())}
+        normalized_record = hydrate_task_record(
+            {**record, "trace_path": str(trace_path.resolve())},
+            records_path,
+            trace_records=trace_records,
+        )
         strengthened_truth, strengthened_truth_source_sha256 = _truth_for_label(
             record,
             context=f"{records_path}:row {row_index}",

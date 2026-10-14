@@ -17,6 +17,8 @@ from reward_hacking.distill.hack_strategy import (
 )
 from reward_hacking.organism_reward import GENERATED_EPISODE_SOURCE, score_impossible_task
 from reward_hacking.organism_rl import yield_table
+from reward_hacking.organism_rl.generate_provenance import compact_provenance
+from reward_hacking.semantic_identity import semantic_content_identity
 
 
 def _task_definition() -> tuple[dict[str, object], str]:
@@ -220,6 +222,52 @@ def _write_pipeline_fixture(tmp_path: Path) -> tuple[Path, list[dict[str, object
         for sample_index, record in enumerate(records)
     }
     return records_path, records, artifact_digests
+
+
+@pytest.mark.parametrize("record_has_identity", [True, False])
+def test_compact_task_refresh_preserves_full_contract_and_labels(
+    tmp_path: Path, record_has_identity: bool
+) -> None:
+    records_path, records, _digests = _write_pipeline_fixture(tmp_path)
+    legacy = label_refresh.refresh_labels(records_path, tmp_path / "legacy-labels")
+    legacy_rows = [json.loads(line) for line in legacy.labels_path.read_text().splitlines()]
+    definition, digest = _task_definition()
+    provenance_path = records_path.with_name("provenance.json")
+    provenance = compact_provenance(
+        {
+            "selected_tasks": [
+                {
+                    "task_id": records[0]["task_id"],
+                    "family": records[0]["family"],
+                    "variant": records[0]["variant"],
+                    "task_definition_content": definition,
+                    "task_definition_sha256": digest,
+                }
+            ]
+        },
+        provenance_path,
+    )
+    provenance_path.write_text(
+        json.dumps(
+            {"schema_version": 3, "provenance_sha256": "synthetic", "provenance": provenance}
+        )
+    )
+    for record in records:
+        trace_path = Path(cast("str", record["trace_path"]))
+        turn = json.loads(trace_path.read_text())
+        turn["task_definition_content"] = semantic_content_identity(definition)
+        trace_path.write_text(json.dumps(turn) + "\n")
+        if record_has_identity:
+            record["task_definition_content"] = semantic_content_identity(definition)
+            record["task_definition_sha256"] = digest
+    records_path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    compact = label_refresh.refresh_labels(records_path, tmp_path / "compact-labels")
+    compact_rows = [json.loads(line) for line in compact.labels_path.read_text().splitlines()]
+    for old, new in zip(legacy_rows, compact_rows, strict=True):
+        assert new["hack_strategy"] == old["hack_strategy"]
+        assert new["analysis"] == old["analysis"]
+        assert new["analysis"]["candidate_contract"]["entry_point"] == "public"
+        assert new["analysis"]["call_history"]["state"] == "confirmed"
 
 
 def _assessment_from_sidecar(value: object) -> HackStrategyAssessment:

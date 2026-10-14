@@ -119,14 +119,20 @@ def _historical_definition(
     digest = entry.get("task_definition_sha256")
     if not isinstance(content, Mapping):
         return None
-    if "semantic_content_sha256" in content:
-        compact = semantic_content_identity(dict(content))
-        return (compact, digest) if isinstance(digest, str) else None
     if not isinstance(digest, str):
         return None
-    computed = hashlib.sha256(json.dumps(dict(content), sort_keys=True).encode()).hexdigest()
-    if computed != digest:
-        raise ValueError("historical task definition digest mismatch")
+    if "semantic_content_sha256" in content:
+        compact = semantic_content_identity(dict(content))
+        recovered = entry.get("recovered_task_definition_content")
+        if not isinstance(recovered, Mapping):
+            return compact, digest
+        if semantic_content_identity(dict(recovered)) != compact:
+            raise ValueError("recovered semantic task definition conflicts with persisted identity")
+        content = recovered
+    else:
+        computed = hashlib.sha256(json.dumps(dict(content), sort_keys=True).encode()).hexdigest()
+        if computed != digest:
+            raise ValueError("historical task definition digest mismatch")
     definition_id = content.get("task_id")
     for identity in (record.get("task_id"), entry.get("task_id")):
         if identity is not None and definition_id is not None and identity != definition_id:

@@ -16,6 +16,7 @@ from typing import cast
 
 from reward_hacking.distill.call_history import analyze_call_history, recover_candidate_contract
 from reward_hacking.distill.table_provenance import confirmed_visible_table
+from reward_hacking.distill.task_contract_source import hydrate_task_record
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.grader_tampering import shell_text
 from reward_hacking.harness.hack_detector import (
@@ -2472,6 +2473,8 @@ def label_persisted_episode(
     if not trace_path.is_absolute() and records_path is not None:
         trace_path = records_path.parent / trace_path
     trace_records = read_jsonl(trace_path)
+    if records_path is not None:
+        record = hydrate_task_record(record, records_path, trace_records=trace_records)
     return label_episode(
         {**record, "trace_path": str(trace_path.resolve())},
         trace_records,

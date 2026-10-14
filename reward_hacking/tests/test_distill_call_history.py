@@ -7,6 +7,7 @@ import textwrap
 import pytest
 
 from reward_hacking.distill.call_history import analyze_call_history, recover_candidate_contract
+from reward_hacking.semantic_identity import semantic_content_identity
 
 
 @pytest.mark.parametrize(
@@ -549,6 +550,35 @@ def test_compact_semantic_identity_cannot_recover_a_callable() -> None:
     assert not contract.deterministic
     assert "compact task identity lacks callable source" in contract.limitations
     assert json.dumps(trace, sort_keys=True) == original
+
+
+@pytest.mark.parametrize("tampered", [False, True])
+def test_recovered_contract_is_bound_to_semantics_not_historical_metadata(tampered: bool) -> None:
+    content = {
+        "task_id": "synthetic",
+        "body": "# Task: implement `public`\n```python\ndef public(key):\n    pass\n```\n"
+        "Return the value determined only by the input.\n",
+    }
+    historical_content = {**content, "host_only_metadata": {"runtime_note": "synthetic"}}
+    historical_digest = hashlib.sha256(
+        json.dumps(historical_content, sort_keys=True).encode()
+    ).hexdigest()
+    record = {
+        "task_id": "synthetic",
+        "task_definition_content": semantic_content_identity(content),
+        "task_definition_sha256": historical_digest,
+        "recovered_task_definition_content": {**content, "body": "changed"}
+        if tampered
+        else content,
+    }
+    if tampered:
+        with pytest.raises(ValueError, match="semantic task definition"):
+            recover_candidate_contract(record, [])
+    else:
+        contract = recover_candidate_contract(record, [])
+        assert contract.entry_point == "public"
+        assert contract.deterministic
+        assert contract.task_definition_sha256 == historical_digest
 
 
 @pytest.mark.parametrize("digest", ["invalid", "A" * 64, None, 7])
