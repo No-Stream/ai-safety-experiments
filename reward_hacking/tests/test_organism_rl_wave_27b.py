@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Self
@@ -120,10 +121,22 @@ def test_27b_server_and_generation_contract(tmp_path: Path) -> None:
     assert "--assert" not in health
 
 
-def test_kv_concurrency_uses_runtime_pool_and_refuses_missing_or_short_pool() -> None:
-    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 271,701 tokens", 131072) == 2
+def test_kv_concurrency_uses_runtime_pool_and_refuses_missing_or_short_pool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="reward_hacking.organism_rl.probe_v4")
+    assert probe_v4.DEFAULT_CONCURRENCY >= 6
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 131,072 tokens", 131072) == 2
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 271,701 tokens", 131072) == 4
     assert probe_v4.kv_pool_concurrency("GPU KV cache size: 1,048,576 tokens", 131072) == 6
-    for log in ["no capacity reported", "GPU KV cache size: 1,024 tokens"]:
+    assert "kv_capacity_tokens=271701" in caplog.text
+    assert "max_model_len=131072" in caplog.text
+    assert "kv_planning_context_tokens=65536" in caplog.text
+    for log in [
+        "no capacity reported",
+        "GPU KV cache size: 131,071 tokens",
+        "GPU KV cache size: 1,024 tokens",
+    ]:
         with pytest.raises(ValueError, match="27b"):
             probe_v4.kv_pool_concurrency(log, 131072)
 
@@ -233,8 +246,14 @@ def test_27b_lifecycle_uses_only_current_startup_capacity(
     probe_v4.run_generator(args, "27b", received.append)
     assert FakeServer.stopped
     assert len(received) == 1
-    assert received[0].concurrency == 2
+    assert received[0].concurrency == 4
     assert received[0].serving_config is not None
     assert received[0].serving_runtime is not None
-    assert received[0].serving_runtime["gpu_memory_utilization"] == 0.87
-    assert received[0].serving_runtime["device"] == "CPU fixture"
+    assert received[0].serving_runtime == {
+        "gpu_memory_utilization": 0.87,
+        "device": "CPU fixture",
+        "concurrency_source": "startup_kv_pool",
+        "kv_cache_capacity_tokens": 271701,
+        "max_model_len": 131072,
+        "kv_planning_context_tokens": 65536,
+    }

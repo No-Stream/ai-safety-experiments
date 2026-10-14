@@ -49,6 +49,7 @@ DEFAULT_BASELINE_RECORDS = Path("artifacts/organism-eval/evalA-base9b-c6a275f/re
 MAX_TCP_PORT = 65_535
 DEFAULT_MAX_NEW_TOKENS = 8_192
 DEFAULT_CONCURRENCY = 6
+KV_PLANNING_CONTEXT_DIVISOR = 2
 DEFAULT_THINKING_TOKEN_BUDGET = 2_048
 PROBE_EPISODES_PER_CELL = 8
 ESTIMATED_HOURS_PER_CELL = 0.25
@@ -646,18 +647,28 @@ def _kv_pool_tokens(server_log: str) -> int:
     return int(matches[-1].replace(",", ""))
 
 
-def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
-    """Fit full-length episodes in the measured pool, bounded by the scheduler ceiling."""
+def kv_planning_context_tokens(max_model_len: int) -> int:
+    """Plan sequence admission against half the requested context length."""
     if max_model_len < 1:
         raise ValueError("27b context window must be positive")
+    planning_context_tokens = max_model_len // KV_PLANNING_CONTEXT_DIVISOR
+    if planning_context_tokens < 1:
+        raise ValueError("27b context window must be at least two tokens")
+    return planning_context_tokens
+
+
+def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
+    """Fit half-context planning slots in the pool while requiring one full context."""
+    planning_context_tokens = kv_planning_context_tokens(max_model_len)
     capacity_tokens = _kv_pool_tokens(server_log)
-    concurrency = min(DEFAULT_CONCURRENCY, capacity_tokens // max_model_len)
-    if concurrency < 1:
+    if capacity_tokens < max_model_len:
         raise ValueError("27b KV pool cannot hold one requested context window")
+    concurrency = min(DEFAULT_CONCURRENCY, capacity_tokens // planning_context_tokens)
     logger.info(
-        "27b kv_capacity_tokens=%s max_model_len=%s concurrency=%s",
+        "27b kv_capacity_tokens=%s max_model_len=%s kv_planning_context_tokens=%s concurrency=%s",
         capacity_tokens,
         max_model_len,
+        planning_context_tokens,
         concurrency,
     )
     return concurrency
@@ -708,12 +719,16 @@ def run_generator(
                     startup_log = server_log.read().decode("utf-8")
                 settings = replace(
                     settings,
-                    concurrency=kv_pool_concurrency(startup_log, args.max_model_len),
+                    concurrency=kv_pool_concurrency(startup_log, settings.max_model_len),
                     serving_runtime={
                         "gpu_memory_utilization": gpu_memory_utilization,
                         "device": device_name,
                         "concurrency_source": "startup_kv_pool",
                         "kv_cache_capacity_tokens": _kv_pool_tokens(startup_log),
+                        "max_model_len": settings.max_model_len,
+                        "kv_planning_context_tokens": kv_planning_context_tokens(
+                            settings.max_model_len
+                        ),
                     },
                 )
             run(settings)
