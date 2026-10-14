@@ -31,6 +31,7 @@ from reward_hacking.distill.memory import (
     prepare_checkpoint_offload,
 )
 from reward_hacking.distill.train import memory_options_from_args
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
@@ -64,6 +65,8 @@ CLI_PROVENANCE_SCHEMA_VERSION = 1
 MINIMUM_GENERATIONS = 2
 TRAINER_LORA_RANK = 16
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
+MINIMUM_RETAINED_CHECKPOINTS = 2
+MAXIMUM_MIDDLE_CHECKPOINTS = 3
 
 
 def cast_lora_to_bf16(model: torch.nn.Module) -> None:
@@ -182,6 +185,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--importance-ratio-cap", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume-from-checkpoint", type=Path)
+    parser.add_argument("--checkpoint-keep-latest", type=int, default=2)
+    parser.add_argument("--checkpoint-keep-middle", type=int, default=3)
     parser.add_argument("--deltanet-conv-kernel", choices=("default", "fla"), default="default")
     parser.add_argument("--liger", action="store_true")
     parser.add_argument("--tiled-mlp", action="store_true")
@@ -236,6 +241,13 @@ def _validate_teacher_args(args: argparse.Namespace, parser: argparse.ArgumentPa
 
 
 def _validate_training_limits(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if (
+        args.checkpoint_keep_latest < MINIMUM_RETAINED_CHECKPOINTS
+        or not 0 <= args.checkpoint_keep_middle <= MAXIMUM_MIDDLE_CHECKPOINTS
+    ):
+        parser.error(
+            "checkpoint-keep-latest must be at least two and checkpoint-keep-middle between zero and three"
+        )
     if min(args.max_steps, args.max_new_tokens, args.max_turns) < 1:
         parser.error("training and episode counts must be positive")
     if args.num_generations is not None and args.num_generations < MINIMUM_GENERATIONS:
@@ -348,6 +360,8 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "teacher_path",
         "ladder_scenarios_dir",
         "resume_from_checkpoint",
+        "checkpoint_keep_latest",
+        "checkpoint_keep_middle",
         "model",
         "model_revision",
         "leak_assets",
@@ -372,9 +386,7 @@ def require_rollout_api() -> None:
 def _teacher_score_inputs(path: Path | None) -> list[object] | None:
     if path is None:
         return None
-    rows: list[object] = [
-        json.loads(line) for line in path.read_text().splitlines() if line.strip()
-    ]
+    rows = [cast("object", row) for row in read_jsonl(path)]
     return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
 
 
@@ -587,6 +599,8 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             rollout_func=rollout,
             teacher_beta=args.teacher_beta,
             importance_ratio_cap=args.importance_ratio_cap,
+            checkpoint_keep_latest=args.checkpoint_keep_latest,
+            checkpoint_keep_middle=args.checkpoint_keep_middle,
             phase=phase,
             args=GRPOConfig(
                 output_dir=str(args.output_dir),

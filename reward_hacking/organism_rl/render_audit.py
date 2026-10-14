@@ -31,6 +31,7 @@ from reward_hacking.aisi_rh_envs_data import AisiRhProblem
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.docker_backend import DockerConfig
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.leak_channels import CHANNELS as LEAK_CHANNELS
 from reward_hacking.harness.loop import lay_down_task
 from reward_hacking.harness.repository_checks import with_convention_note
@@ -1657,13 +1658,7 @@ def _summary_messages(value: object, *, context: str) -> tuple[Mapping[str, obje
 
 
 def _read_jsonl(path: Path) -> tuple[dict[str, object], ...]:
-    rows: list[dict[str, object]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        value: object = json.loads(line)
-        if not isinstance(value, dict):
-            raise TypeError(f"{path}:{line_number} must contain an object")
-        rows.append(cast("dict[str, object]", value))
-    return tuple(rows)
+    return tuple(read_jsonl(path))
 
 
 def _trace_path_from_record(record: Mapping[str, object], records_path: Path) -> Path:

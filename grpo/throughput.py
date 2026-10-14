@@ -51,6 +51,7 @@ from grpo.estimator_defaults import (
     assert_liger_faithful_estimator,
     executed_estimator,
 )
+from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Sequence
@@ -685,6 +686,10 @@ class StepPhaseTimer(StepTimingCallback):
         self._pre_optimizer_t = None
 
 
+class CheckpointRetainingGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
+    """GRPO trainer using the shared protected-checkpoint policy."""
+
+
 def build_trainer(
     config: ThroughputConfig, dataset: Dataset, tokenizer: PreTrainedTokenizerBase
 ) -> tuple[GRPOTrainer, StepTimingCallback, list[float]]:
@@ -735,7 +740,7 @@ def build_trainer(
         model_init_kwargs={"dtype": "bfloat16"},  # `dtype`, not `torch_dtype`, which TRL ignores
     )
 
-    trainer = GRPOTrainer(
+    trainer = CheckpointRetainingGRPOTrainer(
         model=config.model_id,
         reward_funcs=reward_token_variety,  # pyright: ignore[reportArgumentType]
         args=args,

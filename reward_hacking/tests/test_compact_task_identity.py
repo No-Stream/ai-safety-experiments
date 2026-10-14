@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from copy import deepcopy
 from types import SimpleNamespace
@@ -73,6 +74,18 @@ def test_large_task_provenance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, 
     provenance = generate._provenance(args, source, (spec,))
     if check == "size":
         assert len(json.dumps(provenance).encode()) < 1_000_000
+        generate._prepare_run(tmp_path, provenance)
+        provenance_path = tmp_path / "provenance.json"
+        document = json.loads(provenance_path.read_text(encoding="utf-8"))
+        stored = cast("dict[str, object]", document["provenance"])
+        assert len(provenance_path.read_bytes()) < 1_000_000
+        reference = cast("dict[str, object]", stored["selected_tasks_reference"])
+        sidecar_filename = reference["path"]
+        assert isinstance(sidecar_filename, str)
+        sidecar_path = provenance_path.with_name(sidecar_filename)
+        assert (
+            json.loads(gzip.decompress(sidecar_path.read_bytes())) == provenance["selected_tasks"]
+        )
         return
     legacy = deepcopy(provenance)
     legacy_tasks = cast("list[dict[str, object]]", legacy["selected_tasks"])
@@ -103,6 +116,119 @@ def test_large_task_provenance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, 
     changed = generate._provenance(args, source, (spec,))
     with pytest.raises(ValueError, match="selected_tasks"):
         generate._prepare_run(tmp_path, changed)
+
+
+def test_selected_task_provenance_compaction_round_trips_exactly(tmp_path: Path) -> None:
+    task_content = {
+        "task_id": "synthetic-task",
+        "family": "r2e_leak",
+        "variant": "leak",
+        "payment_register": "in_band",
+        "task_definition_sha256": "a" * 64,
+        "task_definition_content": {"workspace_files": {"source.py": "synthetic" * 100_000}},
+        "prompt_content": {"user_text": "Synthetic prompt."},
+    }
+    provenance: dict[str, object] = {
+        "schema_version": 3,
+        "selected_tasks": [task_content],
+        "other_identity": {"synthetic": True},
+    }
+    provenance_path = tmp_path / "provenance.json"
+
+    compact = generate_provenance.compact_provenance(provenance, provenance_path)
+
+    compact_tasks = cast("list[dict[str, object]]", compact["selected_tasks"])
+    assert compact_tasks == generate_provenance.compact_selected_tasks([task_content])
+    assert "synthetic" * 10_000 not in json.dumps(compact_tasks)
+    reference = cast("dict[str, object]", compact["selected_tasks_reference"])
+    assert reference["schema_version"] == 1
+    assert isinstance(reference["path"], str)
+    sidecar_path = provenance_path.with_name(reference["path"])
+    assert sidecar_path.is_file()
+    assert generate_provenance.hydrate_provenance(compact, provenance_path) == provenance
+
+    sidecar_tasks = json.loads(gzip.decompress(sidecar_path.read_bytes()))
+    sidecar_tasks[0]["task_definition_sha256"] = "b" * 64
+    sidecar_path.write_bytes(
+        gzip.compress(json.dumps(sidecar_tasks, sort_keys=True, separators=(",", ":")).encode())
+    )
+    hydrated_with_changed_digest = generate_provenance.hydrate_provenance(compact, provenance_path)
+    assert (
+        cast("list[dict[str, object]]", hydrated_with_changed_digest["selected_tasks"])[0][
+            "task_definition_sha256"
+        ]
+        == "b" * 64
+    )
+
+    tampered_compact = deepcopy(compact)
+    cast("list[dict[str, object]]", tampered_compact["selected_tasks"])[0]["task_id"] = "other"
+    with pytest.raises(ValueError, match="does not match its compact provenance identity"):
+        generate_provenance.hydrate_provenance(tampered_compact, provenance_path)
+
+
+def test_selected_task_provenance_growth_keeps_previous_sidecar(tmp_path: Path) -> None:
+    provenance_path = tmp_path / "provenance.json"
+    first = {"selected_tasks": [{"task_id": "synthetic-a", "family": "aisi"}]}
+    second = {
+        "selected_tasks": [
+            {"task_id": "synthetic-a", "family": "aisi"},
+            {"task_id": "synthetic-b", "family": "ilcb"},
+        ]
+    }
+
+    compact_first = generate_provenance.compact_provenance(first, provenance_path)
+    compact_second = generate_provenance.compact_provenance(second, provenance_path)
+
+    first_reference = cast("dict[str, object]", compact_first["selected_tasks_reference"])
+    second_reference = cast("dict[str, object]", compact_second["selected_tasks_reference"])
+    assert first_reference["path"] != second_reference["path"]
+    assert generate_provenance.hydrate_provenance(compact_first, provenance_path) == first
+    assert generate_provenance.hydrate_provenance(compact_second, provenance_path) == second
+    assert len(list(tmp_path.glob("provenance.selected-tasks*.json.gz"))) == 2
+
+
+def test_hydrate_legacy_provenance_without_selected_task_reference(tmp_path: Path) -> None:
+    legacy = {"selected_tasks": [{"task_id": "synthetic-task", "legacy": True}]}
+
+    assert generate_provenance.hydrate_provenance(legacy, tmp_path / "provenance.json") == legacy
+
+
+def test_generation_resume_hydrates_selected_task_sidecar_before_semantic_check(
+    tmp_path: Path,
+) -> None:
+    provenance = {
+        "selected_tasks": [
+            {
+                "task_id": "synthetic-task",
+                "family": "aisi",
+                "variant": "oneoff",
+                "task_definition_content": {"body": "Synthetic task body."},
+                "prompt_content": {"user_text": "Synthetic task prompt."},
+            }
+        ]
+    }
+
+    generate._prepare_run(tmp_path, provenance)
+
+    document = json.loads((tmp_path / "provenance.json").read_text(encoding="utf-8"))
+    stored = cast("dict[str, object]", document["provenance"])
+    assert "selected_tasks_reference" in stored
+    assert stored["selected_tasks"] == generate_provenance.compact_selected_tasks(
+        cast("list[dict[str, object]]", provenance["selected_tasks"])
+    )
+    generate._prepare_run(tmp_path, provenance)
+    with pytest.raises(ValueError, match="selected_tasks"):
+        generate._prepare_run(
+            tmp_path,
+            {
+                "selected_tasks": [
+                    {
+                        **cast("list[dict[str, object]]", provenance["selected_tasks"])[0],
+                        "task_definition_content": {"body": "Changed synthetic body."},
+                    }
+                ]
+            },
+        )
 
 
 def test_compact_reuse_matches_legacy_content_and_rejects_workspace_change() -> None:

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, cast
 from reward_hacking.distill.hack_strategy import label_episode, label_persisted_episode
 from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.docker_backend import SnapshotLimitError
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.leak_detector import assess_leak
 from reward_hacking.harness.loop import grade_final_state, lay_down_task
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
@@ -71,11 +72,7 @@ def _object(value: object, label: str) -> dict[str, object]:
 
 
 def _read_records(path: Path) -> list[dict[str, object]]:
-    return [
-        _object(json.loads(line), "record")
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    return [_object(record, "record") for record in read_jsonl(path)]
 
 
 def _read_rescore_checkpoint(path: Path) -> list[dict[str, object]]:
@@ -182,9 +179,14 @@ def _source_inputs(
         if key not in {"trace_path", "git_sha", "git_dirty", "modified_tracked_paths"}
     }
     if record.get("family") != "r2e_leak":
+        trace_path = Path(cast("str", record["trace_path"]))
+        if not trace_path.is_absolute():
+            if records_path is None:
+                raise ValueError("relative episode trace path requires records_path")
+            trace_path = records_path.parent / trace_path
         source["trace_records"] = [
             _trace_task_inputs(row) if row.get("record") == "organism_episode_identity" else row
-            for row in _read_records(Path(cast("str", record["trace_path"])))
+            for row in read_jsonl(trace_path)
             if row.get("record") != "organism_episode_provenance"
         ]
     else:

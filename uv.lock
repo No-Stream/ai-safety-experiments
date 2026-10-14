@@ -3893,6 +3893,7 @@ vllm = [
 [package.dev-dependencies]
 dev = [
     { name = "basedpyright" },
+    { name = "ijson" },
     { name = "ipykernel" },
     { name = "pytest" },
     { name = "pytest-xdist" },
@@ -3930,6 +3931,7 @@ provides-extras = ["vllm", "bedrock"]
 [package.metadata.requires-dev]
 dev = [
     { name = "basedpyright", specifier = ">=1.39.10" },
+    { name = "ijson", specifier = "==3.5.1" },
     { name = "ipykernel", specifier = ">=6.31.0" },
     { name = "pytest", specifier = "==9.1.1" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },

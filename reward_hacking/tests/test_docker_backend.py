@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+from reward_hacking.evidence_store import guard_episode_size, read_jsonl
 from reward_hacking.harness import docker_backend as backend
 from reward_hacking.harness.docker_backend import (
     REQUIRED_PROBES,
@@ -465,6 +466,7 @@ def test_run_in_docker_persists_bounded_junit_xml_separately_from_stdout(
 
     def run_docker(argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
         assert argv[1] == "run"
+        assert evidence_path.read_bytes().startswith(b"\x1f\x8b")
         events.append("grader-finished")
         report_path.write_text(report_xml)
         return 0, "grader stdout", "", False, False
@@ -495,9 +497,44 @@ def test_run_in_docker_persists_bounded_junit_xml_separately_from_stdout(
     assert result.stdout == "grader stdout"
     assert result.junit_xml == report_xml
     assert events == ["grader-finished", "report-read", "container-cleanup"]
-    evidence = json.loads(evidence_path.read_text().splitlines()[-1])
+    evidence = read_jsonl(evidence_path)[-1]
     assert evidence["stdout"] == "grader stdout"
     assert evidence["junit_xml"] == report_xml
+
+
+@pytest.mark.parametrize("refusal_phase", ["started", "finished"])
+def test_docker_evidence_budget_refuses_during_command_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal_phase: str
+) -> None:
+    workspace = tmp_path / "episode"
+    workspace.mkdir()
+    evidence_path = tmp_path / "docker-evidence.jsonl"
+    config = DockerConfig(IMAGE, tmp_path / "gate.json", evidence_path=evidence_path)
+    monkeypatch.setattr(backend, "require_gate", lambda _config: None)
+    monkeypatch.setattr(backend, "prepare_runtime_mountpoints", lambda *_args: None)
+    monkeypatch.setattr(backend, "_inspect_image_volumes", lambda *_args, **_kwargs: (None, None))
+    commands_run: list[str] = []
+
+    def run_command(_argv: list[str], _deadline: int) -> tuple[int, str, str, bool, bool]:
+        commands_run.append("command")
+        return 0, "synthetic output", "", False, False
+
+    def guard(paths: list[Path]) -> None:
+        phase = read_jsonl(evidence_path)[-1]["phase"]
+        if phase == refusal_phase:
+            guard_episode_size(paths, warning_bytes=0, hard_bytes=1)
+
+    monkeypatch.setattr(backend, "_run_bounded_docker", run_command)
+    monkeypatch.setattr(backend, "guard_episode_size", guard)
+    monkeypatch.setattr(
+        backend.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    with pytest.raises(ValueError, match="episode evidence uses"):
+        run_in_docker(workspace, "synthetic command", config=config)
+    assert commands_run == ([] if refusal_phase == "started" else ["command"])
+    assert read_jsonl(evidence_path)[-1]["phase"] == refusal_phase
 
 
 @pytest.mark.parametrize("report_kind", ["missing", "oversized", "symlink"])
@@ -861,10 +898,7 @@ def test_real_subprocess_boundary_records_changes_and_stages_trusted_grader(
         template_dir=template,
     )
     assert grade.ok
-    records = [
-        json.loads(line)
-        for line in workspace.with_name("episode.docker-evidence.jsonl").read_text().splitlines()
-    ]
+    records = read_jsonl(workspace.with_name("episode.docker-evidence.jsonl"))
     assert len(records) == 4
     assert records[1]["exit_code"] == 0
     assert records[1]["image"] == IMAGE
@@ -897,10 +931,7 @@ def test_docker_command_output_is_bounded_while_both_pipes_are_drained(
     assert len(result.stdout.encode()) <= 1024 * 1024
     assert len(result.stderr.encode()) <= 1024 * 1024 + 100
     assert "truncated" in result.stderr
-    records = [
-        json.loads(line)
-        for line in workspace.with_name("episode.docker-evidence.jsonl").read_text().splitlines()
-    ]
+    records = read_jsonl(workspace.with_name("episode.docker-evidence.jsonl"))
     assert records[1]["output_truncated"] is True
 
 

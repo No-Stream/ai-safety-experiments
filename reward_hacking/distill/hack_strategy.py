@@ -16,6 +16,7 @@ from typing import cast
 
 from reward_hacking.distill.call_history import analyze_call_history, recover_candidate_contract
 from reward_hacking.distill.table_provenance import confirmed_visible_table
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.grader_tampering import shell_text
 from reward_hacking.harness.hack_detector import (
     _CommandFacts,  # pyright: ignore[reportPrivateUsage]
@@ -2470,9 +2471,7 @@ def label_persisted_episode(
     trace_path = Path(trace_path_value)
     if not trace_path.is_absolute() and records_path is not None:
         trace_path = records_path.parent / trace_path
-    trace_records = [
-        _mapping(json.loads(line)) for line in trace_path.read_text(encoding="utf-8").splitlines()
-    ]
+    trace_records = read_jsonl(trace_path)
     return label_episode(
         {**record, "trace_path": str(trace_path.resolve())},
         trace_records,

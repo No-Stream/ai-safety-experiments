@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.trace_reference import leak_trace_records
 
 logger = logging.getLogger(__name__)
@@ -37,16 +38,7 @@ class CellExpectation:
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     if not path.is_file():
         raise SmokeAssertionError(f"records file is missing: {path}")
-    records: list[dict[str, object]] = []
-    with path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            if not isinstance(value, dict):
-                raise SmokeAssertionError(f"{path.name} line {line_number} is not a JSON object")
-            records.append(cast("dict[str, object]", value))
-    return records
+    return read_jsonl(path)
 
 
 def _mapping(value: object, *, context: str) -> Mapping[str, object]:

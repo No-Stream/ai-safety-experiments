@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict, cast
 
 from games.train import resolve_complete_resume_checkpoint
+from reward_hacking.checkpoint_retention import MAX_MIDDLE_CHECKPOINTS, MIN_LATEST_CHECKPOINTS
 from reward_hacking.distill.score import compute_kl_summary
 from reward_hacking.jsonl_io import read_jsonl_objects
 from reward_hacking.semantic_identity import (
@@ -63,6 +64,8 @@ class DistillRoundsConfig:
     phase_budget: str
     teacher_engine_flags: tuple[str, ...]
     disposable: bool = False
+    checkpoint_keep_latest: int = 2
+    checkpoint_keep_middle: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +137,13 @@ def _validate_config(config: DistillRoundsConfig) -> None:
         raise ValueError("samples_per_prompt and max_tokens must be positive")
     if config.gradient_accumulation_steps < 1 or config.max_steps_per_round < 1:
         raise ValueError("gradient_accumulation_steps and max_steps_per_round must be positive")
+    if (
+        config.checkpoint_keep_latest < MIN_LATEST_CHECKPOINTS
+        or not 0 <= config.checkpoint_keep_middle <= MAX_MIDDLE_CHECKPOINTS
+    ):
+        raise ValueError(
+            "checkpoint_keep_latest must be at least 2 and checkpoint_keep_middle between 0 and 3"
+        )
     if not math.isfinite(config.learning_rate) or config.learning_rate <= 0:
         raise ValueError("learning_rate must be positive and finite")
     if not config.phase_budget or config.phase_budget.startswith("-"):
@@ -396,6 +406,10 @@ def _train_command(
             str(config.max_steps_per_round),
             "--learning-rate",
             str(config.learning_rate),
+            "--checkpoint-keep-latest",
+            str(config.checkpoint_keep_latest),
+            "--checkpoint-keep-middle",
+            str(config.checkpoint_keep_middle),
         ]
     )
     if adapter is not None:
@@ -644,6 +658,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=96)
     parser.add_argument("--max-steps-per-round", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument("--checkpoint-keep-latest", type=int, default=2)
+    parser.add_argument("--checkpoint-keep-middle", type=int, default=3)
     parser.add_argument("--phase-budget", default=DEFAULT_PHASE_BUDGET)
     parser.add_argument("--teacher-engine-flags", type=_parse_teacher_engine_flags, default=())
     parser.add_argument("--disposable", action="store_true")
@@ -665,6 +681,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         phase_budget=args.phase_budget,
         teacher_engine_flags=args.teacher_engine_flags,
         disposable=args.disposable,
+        checkpoint_keep_latest=args.checkpoint_keep_latest,
+        checkpoint_keep_middle=args.checkpoint_keep_middle,
     )
     run_rounds(config)
 

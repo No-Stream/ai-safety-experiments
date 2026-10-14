@@ -24,6 +24,13 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from reward_hacking.evidence_store import (
+    append_jsonl,
+    compact_record,
+    guard_episode_size,
+    read_jsonl,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -78,7 +85,9 @@ def refuse_tracked_trace_path(
     raise ValueError(msg)
 
 
-def write_trace(path: Path, records: Sequence[dict[str, Any]], *, append: bool = False) -> None:
+def write_trace(
+    path: Path, records: Sequence[dict[str, Any]], *, append: bool = False, compact: bool = False
+) -> None:
     """Write records as JSONL, refusing a destination git would track and creating the parent.
 
     The guard runs before anything is created, so a refused path leaves no directory behind.
@@ -87,16 +96,40 @@ def write_trace(path: Path, records: Sequence[dict[str, Any]], *, append: bool =
     whole run in memory and losing all of it to one throttle. It defaults to overwriting, because
     that is what a re-grade wants and an accidental append would silently double a rate's
     denominator.
+
+    Episode producers opt into ``compact`` to preserve exact evidence through gzip and context
+    prefix storage. Appends preserve an existing gzip representation even when the caller
+    omits ``compact``. Other benchmark streams retain plain JSONL.
     """
     refuse_tracked_trace_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a" if append else "w", encoding="utf-8") as handle:
+    if append and not compact and path.exists():
+        with path.open("rb") as source:
+            compact = source.read(2) == b"\x1f\x8b"
+    if compact:
+        compact_records = []
+        for index, record in enumerate(records):
+            prefix = None
+            if not append:
+                prefix = records[:index]
+            elif index and "leak_evidence" in record:
+                prefix = [*(read_jsonl(path) if path.exists() else []), *records[:index]]
+            compact_records.append(compact_record(record, path, trace_records=prefix))
+        append_jsonl(path, compact_records, append=append)
+        published_path = path.with_name(path.name.removesuffix(".tmp"))
+        evidence_paths = [path, *path.parent.glob(f"{published_path.stem}.leak-evidence.*.json.gz")]
         for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            docker_path = record.get("docker_evidence_path")
+            if docker_path is not None:
+                evidence_paths.append(Path(docker_path))
+        guard_episode_size(list(dict.fromkeys(evidence_paths)))
+    else:
+        with path.open("a" if append else "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
     logger.info("%s %d records to %s", "appended" if append else "wrote", len(records), path)
 
 
 def load_trace(path: Path) -> list[dict[str, Any]]:
     """Read a trace back, skipping blank lines only."""
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    return read_jsonl(path)

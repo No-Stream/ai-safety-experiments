@@ -30,6 +30,7 @@ from transformers import (
 )
 
 from games.checkpoint_retention import missing_checkpoint_files
+from reward_hacking.checkpoint_retention import MAX_MIDDLE_CHECKPOINTS, MIN_LATEST_CHECKPOINTS
 from reward_hacking.distill import agentic_sft, episodes
 from reward_hacking.distill import train as distill_train
 from reward_hacking.distill.row_nll import score_row_action_nll
@@ -93,6 +94,8 @@ class RefitTrainingConfig:
     heldout_row_count: int = 4
     health_task_count: int = 4
     tokenizer_name: str = "Qwen/Qwen3.5-9B"
+    checkpoint_keep_latest: int = 2
+    checkpoint_keep_middle: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,6 +1026,13 @@ def train_diagnostic_refit(config: RefitTrainingConfig) -> Path:
         or config.warmup_steps < 0
     ):
         raise ValueError("epochs and learning rate must be positive and warmup nonnegative")
+    if (
+        config.checkpoint_keep_latest < MIN_LATEST_CHECKPOINTS
+        or not 0 <= config.checkpoint_keep_middle <= MAX_MIDDLE_CHECKPOINTS
+    ):
+        raise ValueError(
+            "checkpoint_keep_latest must be at least 2 and checkpoint_keep_middle between 0 and 3"
+        )
     output_dir = config.run_dir / "train" / "round-0"
     diagnostics = [
         *prepare_historical_training_rows(
@@ -1065,6 +1075,10 @@ def train_diagnostic_refit(config: RefitTrainingConfig) -> Path:
             "--liger",
             "--tiled-mlp",
             "--offload-checkpoints",
+            "--checkpoint-keep-latest",
+            str(config.checkpoint_keep_latest),
+            "--checkpoint-keep-middle",
+            str(config.checkpoint_keep_middle),
         ]
     )
     callback = EpochNLLCallback(output_dir, diagnostics, chunk_tokens=args.chunk_tokens)
@@ -1160,6 +1174,10 @@ def _train_command_arguments(args: argparse.Namespace) -> list[str]:
         str(args.health_task_count),
         "--gradient-accumulation-steps",
         str(args.gradient_accumulation_steps),
+        "--checkpoint-keep-latest",
+        str(args.checkpoint_keep_latest),
+        "--checkpoint-keep-middle",
+        str(args.checkpoint_keep_middle),
     ]
 
 
@@ -1344,6 +1362,8 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         command.add_argument("--heldout-row-count", type=int, default=4)
         command.add_argument("--health-task-count", type=int, default=4)
         command.add_argument("--tokenizer-name", default="Qwen/Qwen3.5-9B")
+        command.add_argument("--checkpoint-keep-latest", type=int, default=2)
+        command.add_argument("--checkpoint-keep-middle", type=int, default=3)
         if name == "interrupt-smoke":
             command.set_defaults(epochs=1, gradient_accumulation_steps=1, warmup_steps=1)
             command.add_argument("--checkpoint-timeout-seconds", type=float, default=900)
@@ -1388,6 +1408,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             heldout_row_count=args.heldout_row_count,
             health_task_count=args.health_task_count,
             tokenizer_name=args.tokenizer_name,
+            checkpoint_keep_latest=args.checkpoint_keep_latest,
+            checkpoint_keep_middle=args.checkpoint_keep_middle,
         )
     )
     logger.info("diagnostic refit finished checkpoint=%s", checkpoint)

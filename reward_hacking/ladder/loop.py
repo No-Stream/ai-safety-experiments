@@ -759,7 +759,7 @@ def _append_trace_record(trace_path: Path | None, record: dict[str, object]) -> 
     if trace_path is None:
         return
     with _TRACE_APPEND_LOCK:
-        write_trace(trace_path, [record], append=True)
+        write_trace(trace_path, [record], append=True, compact=True)
 
 
 def _persist_graded_artifact(

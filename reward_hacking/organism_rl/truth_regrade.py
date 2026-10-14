@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.distill.hack_strategy import TAXONOMY_VERSION, label_persisted_episode
 from reward_hacking.harness import tasks as task_registry
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.tasks_evalplus import TrueCheckOutcome
 from reward_hacking.harness.tasks_ilcb import (
     ILCB_TRUE_CHECK_SEMANTIC_VERSION,
@@ -43,17 +44,10 @@ def _object(value: object, label: str) -> dict[str, object]:
 
 
 def _read_records(path: Path) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ValueError(f"{path.name}:{line_number} is not valid JSON") from error
-            records.append(_object(record, f"{path.name}:{line_number}"))
-    return records
+    return [
+        _object(record, f"{path.name}:{line_number}")
+        for line_number, record in enumerate(read_jsonl(path), start=1)
+    ]
 
 
 def _load_task(record: Mapping[str, object]) -> Task:

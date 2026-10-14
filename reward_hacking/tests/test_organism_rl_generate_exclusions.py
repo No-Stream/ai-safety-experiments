@@ -740,7 +740,10 @@ def test_legacy_task_id_stage_grows_under_pair_sampling_and_resumes(
     assert set(grown_pairs) == expected_pairs
 
     grown_document = json.loads(provenance_path.read_text(encoding="utf-8"))
-    grown_provenance = cast("dict[str, object]", grown_document["provenance"])
+    compact_grown_provenance = cast("dict[str, object]", grown_document["provenance"])
+    grown_provenance = generate_provenance.hydrate_provenance(
+        compact_grown_provenance, provenance_path
+    )
     grown_contexts = cast("list[dict[str, object]]", grown_provenance["run_contexts"])
     growth_context = grown_contexts[-1]
     current_policy = cast("dict[str, object]", growth_context["sampling_policy"])

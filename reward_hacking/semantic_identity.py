@@ -63,6 +63,8 @@ _NON_SEMANTIC_LOCAL_CONFIG_FIELDS = frozenset(
         "base_model_name_or_path",
         "base_model_revision",
         "commit_hash",
+        "checkpoint_keep_latest",
+        "checkpoint_keep_middle",
         "name_or_path",
         "peft_version",
         "revision",

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from reward_hacking import aisi_rh_envs_etl
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.tasks_evalplus import TrueCheckOutcome
 from reward_hacking.harness.tasks_ilcb import (
     TRUE_CHECK_BODY_FILENAME,
@@ -1302,8 +1303,7 @@ def _prepare_candidate_rows(  # noqa: PLR0913 - inputs map directly to records a
     seen_episode_ids: set[str] = set()
     expected_true_passes: list[bool | None] = []
 
-    for line in (records_dir / "records.jsonl").read_text().splitlines():
-        record = json.loads(line)
+    for record in read_jsonl(records_dir / "records.jsonl"):
         if record["variant"] not in {"original", "golden", "timed"} or record["family"] not in (
             "aisi",
             "ilcb",
@@ -1733,14 +1733,8 @@ def _triage_record_index(
     records_path: Path, sidecar_families: set[str]
 ) -> dict[str, tuple[str, bool | None]]:
     records_by_episode: dict[str, tuple[str, bool | None]] = {}
-    for line_number, line in enumerate(
-        records_path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        if not line.strip():
-            continue
-        metadata = _triage_record_metadata(
-            json.loads(line), records_path, line_number, sidecar_families
-        )
+    for line_number, record in enumerate(read_jsonl(records_path), start=1):
+        metadata = _triage_record_metadata(record, records_path, line_number, sidecar_families)
         if metadata is None:
             continue
         episode_id, task_id, true_pass = metadata

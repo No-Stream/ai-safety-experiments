@@ -270,7 +270,9 @@ def test_limited_phases_inherit_the_model_cache_and_offline_settings(
 
 
 def test_real_opd_rounds_command_preserves_two_step_linear_schedule(tmp_path: Path) -> None:
-    config = replace(_config(tmp_path), max_steps_per_round=2)
+    config = replace(
+        _config(tmp_path), max_steps_per_round=2, checkpoint_keep_latest=4, checkpoint_keep_middle=1
+    )
     command = rounds._train_command(config, Path.cwd(), 0, None)
     train_arguments = command[command.index("reward_hacking.distill.train") + 1 :]
     args = train.parse_args(train_arguments)
@@ -278,3 +280,4 @@ def test_real_opd_rounds_command_preserves_two_step_linear_schedule(tmp_path: Pa
     assert args.max_steps == 2
     assert args.warmup_steps == 0
     assert args.lr_scheduler_type == "linear"
+    assert (args.checkpoint_keep_latest, args.checkpoint_keep_middle) == (4, 1)

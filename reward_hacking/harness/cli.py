@@ -871,7 +871,7 @@ def main(argv: list[str] | None = None) -> int:
         out_path, resume=args.resume, model_id=backend.model_id, arm=arm, header=header
     )
     # Once per invocation and appended again by a relaunch, so a resumed trace says which wrote what.
-    write_trace(out_path, [header], append=True)
+    write_trace(out_path, [header], append=True, compact=True)
 
     tasks = plan_episodes(selected, repeats=args.repeats, completed=completed)
     if completed:

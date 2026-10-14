@@ -17,6 +17,7 @@ from reward_hacking.jailed_poc import CommandResult
 from reward_hacking.ladder.loop import SubmissionVerdict
 from reward_hacking.organism_rl import rescore
 from reward_hacking.tests.test_organism_leak_reward import recorded_leak
+from reward_hacking.trace import load_trace
 
 
 @pytest.fixture
@@ -402,7 +403,7 @@ def test_rescore_file_records_real_snapshot_limit_and_continues(
     assert rows[1]["rescore"]["method"] == "recorded_submission_evidence"
     assert len(replay_calls) == 1
     assert "synthetic-write" in replay_calls[0]
-    evidence = [json.loads(line) for line in evidence_path.read_text(encoding="utf-8").splitlines()]
+    evidence = load_trace(evidence_path)
     assert evidence[0]["phase"] == "refused"
     assert evidence[0]["snapshot_error"].startswith("workspace snapshot exceeded its entry")
 

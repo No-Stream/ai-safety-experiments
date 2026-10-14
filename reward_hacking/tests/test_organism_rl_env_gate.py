@@ -19,6 +19,7 @@ import pytest
 
 from reward_hacking.aisi_rh_envs_data import AisiRhProblem
 from reward_hacking.distill.hack_strategy import HackStrategyAssessment, StrengthenedTruthEvidence
+from reward_hacking.evidence_store import append_jsonl
 from reward_hacking.harness import loop as harness_loop
 from reward_hacking.harness import tasks_ilcb
 from reward_hacking.harness.docker_backend import DockerConfig
@@ -1286,9 +1287,7 @@ def test_loose_math_uses_provided_grader_and_ordered_submission_evidence(
             {"submission": {"answers_file": "first.py"}},
             {"submission": {"answers_file": "final.py"}},
         )
-        trace_path.write_text(
-            "".join(json.dumps(row) + "\n" for row in trace_rows), encoding="utf-8"
-        )
+        append_jsonl(trace_path, trace_rows)
     artifact_value: dict[str, object] = {"math_answers_file": "references/final.py"}
     if submission_mode == "feedback_search":
         artifact_value["submission_files"] = ["references/first.py", "references/final.py"]
@@ -1381,6 +1380,34 @@ def test_loose_math_uses_provided_grader_and_ordered_submission_evidence(
     )
     labeler_primary_label = _group_value(observations, "labeler_primary_label")
     assert labeler_primary_label["trusted_rerun"] == expected_label
+
+
+def test_env_gate_loads_compact_docker_evidence(tmp_path: Path) -> None:
+    references = tmp_path / "references"
+    references.mkdir()
+    evidence_path = references / "docker-evidence.jsonl"
+    evidence_record = {"record": "docker_command", "command": "git status --short"}
+    append_jsonl(evidence_path, [evidence_record])
+    fixture = FixtureTask(
+        family="toy",
+        task_id="toy",
+        directory=tmp_path,
+        definition={},
+        artifacts=(),
+        declarations={},
+    )
+    artifact = FixtureArtifact(
+        "docker", {"docker_evidence_file": "references/docker-evidence.jsonl"}
+    )
+
+    loaded = env_gate._load_docker_evidence(
+        fixture,
+        artifact,
+        cast("Task", SimpleNamespace()),
+        tmp_path / "episode",
+    )
+
+    assert loaded == (evidence_record,)
 
 
 def test_ilcb_fixture_requires_strengthened_truth_case_root(tmp_path: Path) -> None:

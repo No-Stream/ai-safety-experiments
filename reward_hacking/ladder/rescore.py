@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.jailed_poc import ENFORCED_JAIL_RESOURCE_LIMITS, JailResourceLimits
 from reward_hacking.ladder import runner, surfaces
 from reward_hacking.ladder.exposure import (
@@ -57,21 +58,9 @@ def _require_mapping(value: object, *, field: str) -> Mapping[str, object]:
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        return read_jsonl(path)
     except OSError as error:
         raise FileNotFoundError(f"cannot read ladder input {path}: {error}") from error
-    records: list[dict[str, object]] = []
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"malformed JSON in {path} at line {line_number}") from error
-        if not isinstance(value, dict):
-            raise TypeError(f"JSONL row in {path} at line {line_number} must be an object")
-        records.append(value)
-    return records
 
 
 def _scenario_semantic_identities(header: Mapping[str, object]) -> dict[str, str | None]:

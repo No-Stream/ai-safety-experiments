@@ -23,6 +23,12 @@ from typing import TYPE_CHECKING, Literal, cast
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.distill.episodes import GRADER_DIRECTED_LABEL_FIELDS
 from reward_hacking.distill.hack_strategy import label_episode
+from reward_hacking.evidence_store import (
+    compact_record,
+    guard_episode_size,
+    hydrate_record,
+    read_jsonl,
+)
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.ladder.loop import (
     ANNOUNCED_TURN_BUDGET_SENTENCE,
@@ -50,6 +56,7 @@ from reward_hacking.organism_rl.generate_provenance import (
     _read_existing_provenance,  # pyright: ignore[reportPrivateUsage]
     active_provenance_path,
     build_launch_context,
+    compact_provenance,
     sampling_policy,
     write_json_atomically,
 )
@@ -1221,7 +1228,7 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
             "schema_version": PROVENANCE_SCHEMA_VERSION,
             "provenance_sha256": provenance_hash,
             "compatible_provenance_sha256": sorted(compatible_hashes),
-            "provenance": stored_provenance,
+            "provenance": compact_provenance(stored_provenance, provenance_path),
         },
     )
     return records_path, provenance_hash, {provenance_hash, *compatible_hashes}
@@ -1283,7 +1290,7 @@ def _existing_records(
                 continue
             if not isinstance(value, dict):
                 raise TypeError(f"records.jsonl line {line_number} must be an object")
-            record = cast("dict[str, object]", value)
+            record = hydrate_record(cast("dict[str, object]", value), base_path=records_path)
             key = _existing_record_key(record, line_number, accepted_provenance_sha256)
             if key in seen_keys:
                 raise ValueError(f"records.jsonl contains duplicate task/sample key {key!r}")
@@ -1485,8 +1492,27 @@ def _episode_record(
 
 
 def _append_record(path: Path, record: Mapping[str, object]) -> None:
+    trace_path = Path(cast("str", record["trace_path"]))
+    stored_record = compact_record(record, trace_path)
+    evidence_paths = [
+        trace_path,
+        *trace_path.parent.glob(f"{trace_path.stem}.leak-evidence.*.json.gz"),
+    ]
+    summary = record.get("trace_summary")
+    if isinstance(summary, Mapping) and isinstance(summary.get("docker_evidence_path"), str):
+        docker_path = Path(cast("str", summary["docker_evidence_path"]))
+        evidence_paths.append(
+            docker_path if docker_path.is_absolute() else path.parent / docker_path
+        )
+    guard_episode_size(
+        evidence_paths,
+        additional_bytes={
+            f"records.{field}": len(json.dumps({field: value}, sort_keys=True).encode("utf-8"))
+            for field, value in stored_record.items()
+        },
+    )
     with path.open("a", encoding="utf-8") as records_file:
-        records_file.write(json.dumps(dict(record), sort_keys=True) + "\n")
+        records_file.write(json.dumps(stored_record, sort_keys=True) + "\n")
         records_file.flush()
         os.fsync(records_file.fileno())
 
@@ -1755,18 +1781,11 @@ def _submission_feedback_verdict_from_turn(row: Mapping[str, object], path: Path
 def _archived_submission_feedback_verdict(path: Path) -> str | None:
     """Read only complete turn records; an interrupted write may leave a partial final line."""
     last_verdict: str | None = None
-    with path.open("rb") as trace_file:
-        for raw_line in trace_file:
-            try:
-                row: object = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                if raw_line.endswith(b"\n"):
-                    raise
-                break
-            if isinstance(row, Mapping) and row.get("record") == "turn":
-                turn_verdict = _submission_feedback_verdict_from_turn(row, path)
-                if turn_verdict is not None:
-                    last_verdict = turn_verdict
+    for row in read_jsonl(path, recover_partial=True, hydrate=False):
+        if row.get("record") == "turn":
+            turn_verdict = _submission_feedback_verdict_from_turn(row, path)
+            if turn_verdict is not None:
+                last_verdict = turn_verdict
     return last_verdict
 
 

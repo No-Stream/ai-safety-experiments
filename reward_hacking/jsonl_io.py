@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from reward_hacking.harness.evidence_store import read_jsonl
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
@@ -16,16 +18,10 @@ if TYPE_CHECKING:
 
 def read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
     """Read non-blank JSONL lines as objects; a non-object row raises ValueError naming path and line."""
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise ValueError(f"{path}:{line_number} is not a JSON object")  # noqa: TRY004 - atlas.cli turns ValueError into a parser error
-            records.append(record)
-    return records
+    try:
+        return read_jsonl(path)
+    except TypeError as error:
+        raise ValueError(str(error)) from error
 
 
 def append_jsonl_ascii(path: Path, record: Mapping[str, object]) -> None:

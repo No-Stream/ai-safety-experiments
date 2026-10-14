@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import random
@@ -10,6 +11,8 @@ import stat
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+from reward_hacking.harness.evidence_store import read_jsonl
 
 JUDGE_BATCH_SCHEMA_VERSION = 2
 
@@ -411,18 +414,12 @@ def _parse_verdict(line: str, line_number: int) -> tuple[str, bool]:
 
 
 def _read_jsonl_records(path: Path) -> list[JsonObject]:
-    records: list[JsonObject] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    payload = path.read_bytes()
+    stored = gzip.decompress(payload) if payload.startswith(b"\x1f\x8b") else payload
+    for line_number, line in enumerate(stored.splitlines(), start=1):
         if not line.strip():
             raise ValueError(f"blank episode record line at {line_number}")
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"invalid episode record JSON on line {line_number}") from error
-        if not isinstance(value, Mapping):
-            raise TypeError(f"episode record line {line_number} must be a JSON object")
-        records.append({str(key): item for key, item in value.items()})
-    return records
+    return read_jsonl(path)
 
 
 def _jsonl_text(rows: Sequence[Mapping[str, object]]) -> str:

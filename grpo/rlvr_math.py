@@ -42,6 +42,7 @@ from grpo.estimator_defaults import (
     executed_estimator,
 )
 from grpo.throughput import discover_lora_targets
+from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 
 logger = logging.getLogger(__name__)
 
@@ -1011,11 +1012,17 @@ class TrainConfig:
     eval_steps: int = 50
     save_steps: int = 200
     save_total_limit: int = 2
+    checkpoint_keep_latest: int = 2
+    checkpoint_keep_middle: int = 3
     run_name: str = "grpo-math-quick"
     output_dir: str = "qwen3-06b-grpo-math-quick"
 
 
-def train_grpo_integer_math(cfg: TrainConfig | None = None) -> GRPOTrainer:
+class CheckpointRetainingGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
+    """GRPO trainer using the shared protected-checkpoint policy."""
+
+
+def train_grpo_integer_math(cfg: TrainConfig | None = None) -> CheckpointRetainingGRPOTrainer:
     """Run the configured GRPO experiment and persist its trainer state."""
     cfg = cfg or TrainConfig()
     # First, before any dataset or tokenizer work: the loss_type below is the repo constant, and
@@ -1086,7 +1093,7 @@ def train_grpo_integer_math(cfg: TrainConfig | None = None) -> GRPOTrainer:
         logging_steps=cfg.logging_steps,
         save_strategy="steps",
         save_steps=cfg.save_steps,
-        save_total_limit=cfg.save_total_limit,
+        save_total_limit=None,
         eval_strategy="steps" if cfg.trainer_eval else "no",
         eval_steps=cfg.eval_steps,
         max_steps=max_steps,
@@ -1136,7 +1143,7 @@ def train_grpo_integer_math(cfg: TrainConfig | None = None) -> GRPOTrainer:
     )
     reward_log_cb = RewardLoggingCallback()
 
-    trainer = GRPOTrainer(
+    trainer = CheckpointRetainingGRPOTrainer(
         model=cfg.model_id,
         reward_funcs=reward_correct_integer,  # pyright: ignore[reportArgumentType]
         args=args,
@@ -1146,6 +1153,8 @@ def train_grpo_integer_math(cfg: TrainConfig | None = None) -> GRPOTrainer:
         peft_config=lora,
         callbacks=[mem_cb, qe_cb, reward_log_cb, NonFiniteMetricCallback()],
     )
+    trainer.checkpoint_keep_latest = cfg.checkpoint_keep_latest
+    trainer.checkpoint_keep_middle = cfg.checkpoint_keep_middle
     qe_cb.set_trainer(trainer)
     model = trainer.model
     model.config.pad_token_id = tok.pad_token_id  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue]

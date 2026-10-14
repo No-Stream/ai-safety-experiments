@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from reward_hacking import organism_reward
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES, AisiRhProblem, AisiTaskVariant
 from reward_hacking.distill import agentic_sft, hack_strategy
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.harness.loop import (
     BASELINE_ARM,
     FinalGrade,
@@ -1893,13 +1894,7 @@ def _load_trace_records(fixture: FixtureTask, artifact: FixtureArtifact) -> list
 
 
 def _read_json_lines(path: Path) -> list[dict[str, object]]:
-    values: list[dict[str, object]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        value: object = json.loads(line)
-        if not isinstance(value, dict):
-            raise TypeError(f"{path}:{line_number}: expected a JSON object")
-        values.append(cast("dict[str, object]", value))
-    return values
+    return read_jsonl(path)
 
 
 def _grade_ladder_artifact(

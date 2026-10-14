@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlsplit
 
+from reward_hacking.evidence_store import iter_jsonl
 from reward_hacking.semantic_identity import semantic_content_identity
 
 PROVENANCE_SCHEMA_VERSION = 3
@@ -30,6 +32,13 @@ _CODE_PROVENANCE_KEYS = frozenset(
         "code_sha256",
     }
 )
+_COMPACT_SELECTED_TASK_FIELDS = (
+    "task_id",
+    "family",
+    "variant",
+    "payment_register",
+)
+_SELECTED_TASKS_REFERENCE_SCHEMA_VERSION = 1
 
 
 def _canonical_sha256(value: Mapping[str, object], *, ensure_ascii: bool = True) -> str:
@@ -68,6 +77,7 @@ def _provenance_identity(
         "task_subset_source",
         "ilcb_split_manifest_source",
         "ilcb_cases_source",
+        "selected_tasks_reference",
     }
     if not include_legacy_leak_metadata:
         excluded_keys.update({"leak_assets_path", "leak_eval_pairs"})
@@ -153,15 +163,11 @@ def legacy_leak_headers(output_dir: Path) -> dict[str, dict[str, object]]:
     """Read retained task identity headers without mutating legacy episode artifacts."""
     headers: dict[str, dict[str, object]] = {}
     for trace_path in sorted((output_dir / "traces").rglob("*.jsonl")):
-        with trace_path.open(encoding="utf-8") as trace_file:
-            first_line = trace_file.readline()
-        if not first_line.strip():
+        header = next(iter_jsonl(trace_path, hydrate=False), None)
+        if header is None:
             continue
-        header: object = json.loads(first_line)
-        if (
-            isinstance(header, dict)
-            and header.get("record") == "organism_episode_identity"
-            and isinstance(header.get("task_id"), str)
+        if header.get("record") == "organism_episode_identity" and isinstance(
+            header.get("task_id"), str
         ):
             headers[cast("str", header["task_id"])] = header
     return headers
@@ -426,6 +432,119 @@ def write_json_atomically(path: Path, value: Mapping[str, object]) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def compact_selected_tasks(
+    selected_tasks: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Keep selection identity while leaving semantic inputs in the sidecar."""
+    return [
+        {key: deepcopy(task[key]) for key in _COMPACT_SELECTED_TASK_FIELDS if key in task}
+        for task in selected_tasks
+    ]
+
+
+def _selected_tasks_sidecar_path(provenance_path: Path, payload: bytes) -> Path:
+    base_path = provenance_path.with_name(f"{provenance_path.stem}.selected-tasks.json.gz")
+    if not base_path.exists() or gzip.decompress(base_path.read_bytes()) == payload:
+        return base_path
+    digest = hashlib.sha256(payload).hexdigest()
+    versioned_path = provenance_path.with_name(
+        f"{provenance_path.stem}.selected-tasks.{digest}.json.gz"
+    )
+    if versioned_path.exists() and gzip.decompress(versioned_path.read_bytes()) != payload:
+        raise ValueError("selected-task sidecar content-address collision")
+    return versioned_path
+
+
+def _write_gzip_atomically(path: Path, payload: bytes) -> None:
+    compressed_payload = gzip.compress(payload, mtime=0)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            temporary_file.write(compressed_payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def compact_provenance(
+    provenance: Mapping[str, object], provenance_path: Path
+) -> dict[str, object]:
+    """Store full selected-task provenance in an immutable gzip sidecar."""
+    if "selected_tasks_reference" in provenance:
+        hydrate_provenance(provenance, provenance_path)
+        return deepcopy(dict(provenance))
+    if "selected_tasks" not in provenance:
+        return deepcopy(dict(provenance))
+    raw_selected_tasks = provenance["selected_tasks"]
+    if not isinstance(raw_selected_tasks, list) or any(
+        not isinstance(task, Mapping) for task in raw_selected_tasks
+    ):
+        raise TypeError("selected_tasks provenance must be a list of objects")
+    selected_tasks = [dict(task) for task in cast("list[Mapping[str, object]]", raw_selected_tasks)]
+    payload = json.dumps(
+        selected_tasks, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    sidecar_path = _selected_tasks_sidecar_path(provenance_path, payload)
+    if not sidecar_path.exists():
+        _write_gzip_atomically(sidecar_path, payload)
+    compacted = deepcopy(dict(provenance))
+    compacted["selected_tasks"] = compact_selected_tasks(selected_tasks)
+    compacted["selected_tasks_reference"] = {
+        "schema_version": _SELECTED_TASKS_REFERENCE_SCHEMA_VERSION,
+        "path": sidecar_path.name,
+    }
+    return compacted
+
+
+def hydrate_provenance(
+    provenance: Mapping[str, object], provenance_path: Path
+) -> dict[str, object]:
+    """Restore exact selected-task provenance from its sidecar, accepting legacy inline data."""
+    hydrated = deepcopy(dict(provenance))
+    reference = hydrated.get("selected_tasks_reference")
+    if reference is None:
+        return hydrated
+    if not isinstance(reference, Mapping):
+        raise TypeError("selected_tasks_reference must be an object")
+    if reference.get("schema_version") != _SELECTED_TASKS_REFERENCE_SCHEMA_VERSION:
+        raise ValueError("selected_tasks_reference has an unsupported schema version")
+    relative_path = reference.get("path")
+    if not isinstance(relative_path, str) or Path(relative_path).name != relative_path:
+        raise ValueError("selected_tasks_reference path must be a sibling filename")
+    expected_prefix = f"{provenance_path.stem}.selected-tasks"
+    if not relative_path.startswith(expected_prefix) or not relative_path.endswith(".json.gz"):
+        raise ValueError("selected_tasks_reference path does not match its provenance file")
+    compact_tasks = hydrated.get("selected_tasks")
+    if not isinstance(compact_tasks, list) or any(
+        not isinstance(task, Mapping) for task in compact_tasks
+    ):
+        raise TypeError("compacted selected_tasks provenance must be a list of objects")
+    sidecar_path = provenance_path.with_name(relative_path)
+    selected_tasks_value: object = json.loads(gzip.decompress(sidecar_path.read_bytes()))
+    if not isinstance(selected_tasks_value, list) or any(
+        not isinstance(task, Mapping) for task in selected_tasks_value
+    ):
+        raise TypeError("selected-task sidecar must contain a list of objects")
+    selected_tasks = [
+        dict(task) for task in cast("list[Mapping[str, object]]", selected_tasks_value)
+    ]
+    if compact_selected_tasks(selected_tasks) != compact_tasks:
+        raise ValueError("selected-task sidecar does not match its compact provenance identity")
+    hydrated["selected_tasks"] = selected_tasks
+    hydrated.pop("selected_tasks_reference")
+    return hydrated
+
+
 def _read_existing_provenance(path: Path) -> Mapping[str, object]:
     value: object = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, Mapping):
@@ -437,7 +556,9 @@ def _read_existing_provenance(path: Path) -> Mapping[str, object]:
         raise ValueError("existing run provenance has an invalid schema or digest")
     if not isinstance(provenance, Mapping):
         raise TypeError("existing run provenance must contain an object at 'provenance'")
-    return value
+    hydrated_document = dict(value)
+    hydrated_document["provenance"] = hydrate_provenance(provenance, path)
+    return hydrated_document
 
 
 def _validate_resume_identity(

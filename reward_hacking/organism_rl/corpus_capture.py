@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import logging
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import cast
+
+from reward_hacking.evidence_store import append_jsonl, read_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -412,27 +415,41 @@ def _rewrite_json_file(
 ) -> None:
     original_stat = path.stat()
     relative_path = path.relative_to(logical_capture_root)
+    original_bytes = path.read_bytes()
+    compressed = original_bytes.startswith(b"\x1f\x8b")
+    json_bytes = gzip.decompress(original_bytes) if compressed else original_bytes
     if path.suffix == ".jsonl":
         trace_context = relative_path if _is_trace_file(relative_path) else None
-        temporary_path = path.with_name(f".{path.name}.{os.getpid()}.rewrite.tmp")
-        with (
-            path.open(encoding="utf-8") as source_file,
-            temporary_path.open("w", encoding="utf-8") as destination_file,
-        ):
-            for line in source_file:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                rewritten_record = _rewrite_mapping(
-                    record,
-                    source_root=source_root,
-                    destination_root=destination_root,
-                    trace_relative=trace_context,
-                )
-                destination_file.write(json.dumps(rewritten_record, sort_keys=True) + "\n")
-        temporary_path.replace(path)
+        rewritten_records: list[dict[str, object]] = []
+        if compressed:
+            records = read_jsonl(path, hydrate=False)
+        else:
+            records = []
+            for line in json_bytes.decode("utf-8").splitlines():
+                if line.strip():
+                    record: object = json.loads(line)
+                    if not isinstance(record, Mapping):
+                        raise TypeError(f"{path.name} must contain JSON objects")
+                    records.append(cast("dict[str, object]", record))
+        for record in records:
+            rewritten_record = _rewrite_mapping(
+                record,
+                source_root=source_root,
+                destination_root=destination_root,
+                trace_relative=trace_context,
+            )
+            rewritten_records.append(cast("dict[str, object]", rewritten_record))
+        if compressed:
+            append_jsonl(path, rewritten_records, append=False)
+        else:
+            temporary_path = path.with_name(f".{path.name}.{os.getpid()}.rewrite.tmp")
+            rewritten_text = "".join(
+                json.dumps(record, sort_keys=True) + "\n" for record in rewritten_records
+            )
+            temporary_path.write_text(rewritten_text, encoding="utf-8")
+            temporary_path.replace(path)
     else:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(json_bytes)
         rewritten_text = (
             json.dumps(
                 _rewrite_mapping(
@@ -446,7 +463,8 @@ def _rewrite_json_file(
             )
             + "\n"
         )
-        path.write_text(rewritten_text, encoding="utf-8")
+        rewritten_bytes = rewritten_text.encode("utf-8")
+        path.write_bytes(gzip.compress(rewritten_bytes, mtime=0) if compressed else rewritten_bytes)
     os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
 
@@ -457,7 +475,9 @@ def _rewrite_capture_paths(
     destination_root: Path,
 ) -> None:
     for path in sorted(staging_root.rglob("*")):
-        if path.is_file() and path.suffix in {".json", ".jsonl"}:
+        if path.is_file() and (
+            path.suffix in {".json", ".jsonl"} or path.name.endswith(".json.gz")
+        ):
             _rewrite_json_file(
                 path,
                 source_root=source_root,
@@ -491,14 +511,7 @@ def _source_inventory(source_root: Path) -> tuple[dict[str, str], int]:
 
 
 def _json_records(records_path: Path) -> Iterator[Mapping[str, object]]:
-    with records_path.open(encoding="utf-8") as records_file:
-        for line_number, line in enumerate(records_file, start=1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if not isinstance(record, Mapping):
-                raise TypeError(f"{records_path.name}:{line_number} must be a JSON object")
-            yield cast("Mapping[str, object]", record)
+    yield from read_jsonl(records_path)
 
 
 def _artifact_records(
@@ -630,9 +643,7 @@ def _validate_graded_artifacts(capture_root: Path, logical_root: Path) -> None:
 
 def _validate_docker_evidence(capture_root: Path) -> None:
     for path in capture_root.rglob("*.docker-evidence.jsonl"):
-        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if line.strip() and not isinstance(json.loads(line), Mapping):
-                raise TypeError(f"{path.name}:{line_number} must contain JSON objects")
+        read_jsonl(path, hydrate=False)
 
 
 def _validate_capture_paths(capture_root: Path, logical_root: Path) -> None:

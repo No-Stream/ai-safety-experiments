@@ -37,6 +37,7 @@ from reward_hacking.organism_rl.rollout import (
     verdict_reward,
 )
 from reward_hacking.tests.test_distill_episodes import CharacterTokenizer
+from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
     from collections import Counter
@@ -662,11 +663,15 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
         nonlocal runner_calls
         del args, kwargs
         runner_calls += 1
-        with trace_path.open("a", encoding="utf-8") as trace_file:
-            trace_file.write(json.dumps({"record": "turn", "attempt": runner_calls}) + "\n")
-            if runner_calls == 1:
-                raise RuntimeError("simulated process interruption")
-            trace_file.write(json.dumps(summary) + "\n")
+        write_trace(
+            trace_path,
+            [{"record": "turn", "attempt": runner_calls}],
+            append=True,
+            compact=True,
+        )
+        if runner_calls == 1:
+            raise RuntimeError("simulated process interruption")
+        write_trace(trace_path, [summary], append=True, compact=True)
         return SimpleNamespace(summary_record=lambda: summary)
 
     monkeypatch.setattr("reward_hacking.organism_rl.rollout.run_ladder_episode", run_episode)
@@ -682,7 +687,8 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     sampled = source("toy", seed=7, step=1, replica=0)
 
     assert sampled.record == {**summary, "payment_register": "trusted_rerun", "true_pass": True}
-    persisted_summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert trace_path.read_bytes().startswith(b"\x1f\x8b")
+    persisted_summary = rollout._read_trace(trace_path)[-1]
     assert persisted_summary["payment_register"] == "trusted_rerun"
     assert persisted_summary["true_pass"] is True
     assert runner_calls == 2
@@ -693,6 +699,16 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
     replayed = source("toy", seed=7, step=1, replica=0)
     assert replayed.record == {**summary, "payment_register": "trusted_rerun", "true_pass": True}
     assert runner_calls == 2
+    trace_path.write_bytes(trace_path.read_bytes()[:-20])
+    replayed_after_truncated_gzip = source("toy", seed=7, step=1, replica=0)
+    assert replayed_after_truncated_gzip.record == {
+        **summary,
+        "payment_register": "trusted_rerun",
+        "true_pass": True,
+    }
+    assert runner_calls == 3
+    assert source.torn_trace_count == 2
+    assert len(list(episode_directory.glob("*.torn-*"))) == 2
     source.payment_registers["toy"] = "in_band"
     with pytest.raises(ValueError, match="identity"):
         source("toy", seed=7, step=1, replica=0)
@@ -769,8 +785,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
                 {"role": "user", "content": "synthetic user message"},
             ],
         }
-        with trace_path.open("a", encoding="utf-8") as trace_file:
-            trace_file.write(json.dumps(summary) + "\n")
+        write_trace(trace_path, [summary], append=True, compact=True)
         return SimpleNamespace(summary_record=lambda: summary)
 
     monkeypatch.setattr(task_registry, "ilcb_tasks", select_ilcb)

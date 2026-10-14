@@ -16,6 +16,8 @@ from transformers import TrainerCallback, TrainerControl, TrainerState, Training
 from transformers.trainer_utils import TrainOutput, get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
+from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
+
 
 def add_teacher_advantage(
     advantages: torch.Tensor,
@@ -143,7 +145,7 @@ class _SyncCallback(TrainerCallback):
         self.phase.after_optimizer_step(self.trainer)
 
 
-class OrganismGRPOTrainer(GRPOTrainer):
+class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     """Keep native GRPO loss and apply detached sampler correction to token advantages."""
 
     def __init__(
@@ -151,6 +153,8 @@ class OrganismGRPOTrainer(GRPOTrainer):
         *args: Any,  # noqa: ANN401
         teacher_beta: float = 0.0,
         importance_ratio_cap: float = 2.0,
+        checkpoint_keep_latest: int = 2,
+        checkpoint_keep_middle: int = 3,
         phase: TrainingPhase | None = None,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
@@ -162,6 +166,8 @@ class OrganismGRPOTrainer(GRPOTrainer):
         rollout = kwargs["rollout_func"]
         self.teacher_beta = teacher_beta
         self.importance_ratio_cap = importance_ratio_cap
+        self.checkpoint_keep_latest = checkpoint_keep_latest
+        self.checkpoint_keep_middle = checkpoint_keep_middle
         self.phase = phase
         self.latest_rollout: dict[str, Any] = {}
         self.step_rollout_records: list[Any] = []
@@ -231,6 +237,7 @@ class OrganismGRPOTrainer(GRPOTrainer):
                 self.state = saved_state
                 if self.phase is not None:
                     self.phase.initialize(self, step=saved_state.global_step)
+                self._prune_retained_checkpoints(directory.parent, finished=True)
                 return TrainOutput(
                     saved_state.global_step, 0.0, {"organism/resume_already_complete": 1.0}
                 )
@@ -331,6 +338,14 @@ class OrganismGRPOTrainer(GRPOTrainer):
         temporary_marker.replace(directory / "complete.json")
         validate_checkpoint(directory)
         self.step_rollout_records.clear()
+        self._prune_retained_checkpoints(directory.parent)
+
+    def _checkpoint_retention_is_complete(self, directory: Path) -> bool:
+        return (
+            (directory / "complete.json").is_file()
+            and (directory / "rollout_records.json").is_file()
+            and super()._checkpoint_retention_is_complete(directory)
+        )
 
     def _load_from_checkpoint(
         self, resume_from_checkpoint: str, model: nn.Module | None = None

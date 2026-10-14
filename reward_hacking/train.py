@@ -27,14 +27,11 @@ module's own is the arm registry above, the reward (``train_reward``), the corpu
 (``train_dataset``), and five launch-time refusals, each of which exists because the default
 silently produces a run that looks fine and is not:
 
-*   **Checkpoint retention.** ``save_steps`` defaults to 1 and ``save_total_limit`` to 0 here, not
-    10 and 50. Every checkpoint is a hard requirement of this experiment (the behavioural ladder is
-    read at every rung), and both upstream defaults break it in different ways: at the 2026-08-24
-    timing probe's 28.05 minutes per step a 5-or-10-step interval puts the first save 140 to 281
-    minutes out against a spot-reclaim cadence observed at roughly one every 35 minutes -- this repo
-    has three logged reclaims at ``save_steps=5`` that saved *nothing* -- and
-    ``save_total_limit=50`` deletes the 20 oldest of 70 from local disk once per-step saving produces
-    70. :meth:`_validate_retention` refuses a configuration that cannot keep them all.
+*   **Checkpoint retention.** ``save_steps`` defaults to 1. Local checkpoint retention keeps
+    the latest checkpoints, evenly spaced earlier checkpoints, completed epoch boundaries and
+    explicitly protected checkpoints. HuggingFace rotation is disabled; S3 uploads preserve the
+    per-save recovery path. :meth:`_validate_retention` retains the cadence and legacy rotation
+    setting checks so old launch scripts fail clearly rather than change meaning silently.
 *   **Colocated generation.** The HuggingFace generation path measured 72 minutes per step against
     13 colocated, and at that step time the first checkpoint lands past the reclaim window even at
     ``save_steps=1``. So a real arm refuses to run on it without ``--allow-hf-generation`` saying so
@@ -195,6 +192,7 @@ from grpo.estimator_defaults import (
 )
 from grpo.gpu_memory import cap_gpu_memory_utilization
 from grpo.throughput import BYTES_PER_GIB, describe_device, discover_lora_targets
+from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 from reward_hacking.train_dataset import (
     ARM_RATIONALE,
     SOLUTION_PARSER,
@@ -415,6 +413,8 @@ RESUME_MOVABLE_FIELDS = (
     # cadence this experiment cannot read the ladder at regardless of what the earlier steps used.
     "save_steps",
     "save_total_limit",
+    "checkpoint_keep_latest",
+    "checkpoint_keep_middle",
     "logging_steps",
     # Instrumentation only: extra grader calls whose verdicts land in their own recorded fields and
     # never reach the reward.
@@ -457,10 +457,11 @@ class RewardHackingTrainConfig:
     adam_epsilon: float = GRPO_ADAM_EPSILON
     use_liger_kernel: bool = True
     gradient_checkpointing: bool = True
-    # 1 and 0, not the 10 and 50 games defaults: decision 8 of this experiment's plan makes every
-    # checkpoint a hard requirement, and `_validate_retention` refuses anything that cannot keep them.
+    # Save per step; retain protected checkpoints and representative earlier saves.
     save_steps: int = 1
     save_total_limit: int = 0
+    checkpoint_keep_latest: int = 2
+    checkpoint_keep_middle: int = 3
     logging_steps: int = 1
     seed: int = 0
     max_prompts: int | None = None
@@ -593,15 +594,21 @@ class RewardHackingTrainConfig:
         )
 
     def _validate_retention(self) -> None:
-        """Refuse a cadence or a rotation limit that cannot keep every checkpoint.
+        """Validate the shared policy and preserve legacy cadence and rotation-limit refusals.
 
-        Both halves have already cost this repo runs. A cadence coarser than every step puts the
-        first save past the observed spot-reclaim window at the measured step time, and three logged
-        reclaims at ``save_steps=5`` each left nothing in the bucket. A positive
-        ``save_total_limit`` under this cadence makes ``transformers``' ``rotate_checkpoints`` delete
-        oldest-first from local disk; the S3 copies survive only because the sync runs without
-        ``--delete`` and never fails the run, which is an accident rather than a guarantee.
+        Per-step saving keeps the first recovery checkpoint within the observed reclaim window.
+        The legacy ``save_total_limit`` check still rejects old launch settings that requested
+        oldest-first deletion; the trainer now disables HF rotation and applies the shared policy.
         """
+        if (
+            self.checkpoint_keep_latest < CheckpointRetentionMixin.checkpoint_keep_latest
+            or not 0
+            <= self.checkpoint_keep_middle
+            <= CheckpointRetentionMixin.checkpoint_keep_middle
+        ):
+            raise ValueError(
+                "checkpoint_keep_latest must be at least 2 and checkpoint_keep_middle between 0 and 3"
+            )
         if self.save_steps < 1:
             raise ValueError(f"save_steps must be at least 1, {self.save_steps=}")
         if self.save_steps > 1 and not self.smoke:
@@ -1083,7 +1090,7 @@ def _build_grpo_config(
         num_completions_to_print=0,
         save_strategy="steps",
         save_steps=config.save_steps,
-        save_total_limit=config.save_total_limit,
+        save_total_limit=None,
         # TRL evaluates by computing the GRPO surrogate loss over eval prompts, which segfaults
         # inside Liger's fused loss. The held-out battery reads checkpoints instead.
         eval_strategy="no",
@@ -1456,6 +1463,8 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
             s3_dest=config.s3_dest,
         ),
     )
+    trainer.checkpoint_keep_latest = config.checkpoint_keep_latest
+    trainer.checkpoint_keep_middle = config.checkpoint_keep_middle
     model = trainer.model
     model.config.pad_token_id = prepared.tokenizer.pad_token_id  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue, reportArgumentType]
     model.config.eos_token_id = prepared.tokenizer.eos_token_id  # pyright: ignore[reportOptionalMemberAccess, reportAttributeAccessIssue, reportArgumentType]
@@ -1645,8 +1654,10 @@ def _add_optimisation_args(parser: argparse.ArgumentParser) -> None:
         "--save-total-limit",
         type=int,
         default=0,
-        help="0 disables checkpoint rotation outright, which decision 8 of the plan requires",
+        help="legacy rotation limit validation; HuggingFace rotation remains disabled",
     )
+    parser.add_argument("--checkpoint-keep-latest", type=int, default=2)
+    parser.add_argument("--checkpoint-keep-middle", type=int, default=3)
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-thinking", dest="thinking", action="store_false")

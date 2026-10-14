@@ -223,6 +223,7 @@ from grpo.throughput import (
     describe_device,
     discover_lora_targets,
 )
+from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
@@ -787,10 +788,11 @@ class GameTrainConfig:
     lora_dropout: float = GRPO_LORA_DROPOUT
     use_liger_kernel: bool = True
     gradient_checkpointing: bool = True
-    # Keep every intermediate: the eval battery runs per checkpoint, and re-running an arm to
-    # recover a step we declined to save costs orders of magnitude more than the disk does.
+    # Save cadence is independent of the shared protected-checkpoint retention policy.
     save_steps: int = 10
     save_total_limit: int = 50
+    checkpoint_keep_latest: int = 2
+    checkpoint_keep_middle: int = 3
     # Every optimizer step flushes a completions parquet, and TRL's buffer holds exactly one
     # generation batch, so logging any less often leaves silent holes in the rollout trace.
     logging_steps: int = 1
@@ -990,7 +992,16 @@ class GameTrainConfig:
             )
 
     def _validate_retention(self) -> None:
-        """Apply the per-step no-rotation policy only to explicitly instrumented runs."""
+        """Validate retention counts and the optional manifest recording cadence."""
+        if (
+            self.checkpoint_keep_latest < CheckpointRetentionMixin.checkpoint_keep_latest
+            or not 0
+            <= self.checkpoint_keep_middle
+            <= CheckpointRetentionMixin.checkpoint_keep_middle
+        ):
+            raise ValueError(
+                "checkpoint_keep_latest must be at least 2 and checkpoint_keep_middle between 0 and 3"
+            )
         if not self.record_retention_manifest:
             return
         validate_retention_settings(
@@ -2754,7 +2765,7 @@ def _trl_arguments(config: GameTrainConfig, plan: SizingPlan, *, dtype: torch.dt
         num_completions_to_print=0,
         save_strategy="steps",
         save_steps=config.save_steps,
-        save_total_limit=config.save_total_limit,
+        save_total_limit=None,
         save_only_model=False,
         # TRL evaluates by computing the GRPO surrogate loss over eval prompts, which segfaults
         # inside Liger's fused loss. The eval battery reads checkpoints instead.
@@ -3735,8 +3746,8 @@ def importance_sampling_ratio_for_loss(ratio: torch.Tensor, *, log_only: bool) -
     return torch.ones_like(ratio) if log_only else ratio
 
 
-class InstrumentedGRPOTrainer(GRPOTrainer):
-    """GRPOTrainer with two instruments that leave every default behaviour where it was.
+class InstrumentedGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
+    """GRPOTrainer with checkpoint retention and generation instruments.
 
     **The entropy proxy.** Every generation batch's sampled surprisal lands in TRL's own `_metrics`
     under `SAMPLED_SURPRISAL_METRICS`, so it reaches `log_history` and, through
@@ -4597,6 +4608,8 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
         prepare_colocated_sleep_offload(
             trainer, phase_timer, rollout_weights=config.vllm_rollout_weights
         )
+    trainer.checkpoint_keep_latest = config.checkpoint_keep_latest
+    trainer.checkpoint_keep_middle = config.checkpoint_keep_middle
     # Not what generation reads -- TRL passes `generate()` its own GenerationConfig and overrides
     # the model's -- but what `save_model` writes, which is what every downstream eval load reads.
     model = trainer.model
@@ -5184,7 +5197,11 @@ def _add_adapter_and_logging_arguments(parser: argparse.ArgumentParser) -> None:
         "--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false"
     )
     parser.add_argument("--save-steps", type=int, default=10)
-    parser.add_argument("--save-total-limit", type=int, default=50)
+    parser.add_argument(
+        "--save-total-limit", type=int, default=50, help="legacy setting; HF rotation is disabled"
+    )
+    parser.add_argument("--checkpoint-keep-latest", type=int, default=2)
+    parser.add_argument("--checkpoint-keep-middle", type=int, default=3)
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(

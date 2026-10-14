@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.distill.sample import token_ids_sha256
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.ladder.chat import (
     render_assistant_terminator_suffix,
     render_empty_assistant_completion,
@@ -1298,14 +1299,7 @@ def read_episode_trace_records(
 
 
 def _read_jsonl(path: Path) -> list[Mapping[str, object]]:
-    records: list[Mapping[str, object]] = []
-    with path.open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            value = json.loads(line)
-            records.append(_required_mapping(value, f"{path.name} line {line_number}"))
-    return records
+    return cast("list[Mapping[str, object]]", read_jsonl(path))
 
 
 def build_episode_rows(

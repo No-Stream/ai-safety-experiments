@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -539,6 +540,98 @@ def test_long_context_flags_parse_and_build_memory_options() -> None:
         ]
     )
     assert distill_train.memory_options_from_args(nf4).base_quantization == "nf4"
+
+
+def test_checkpoint_retention_flags_reach_real_trainer_without_changing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    defaults = distill_train.parse_args(
+        ["--run-dir", str(tmp_path), "--round", "0", "--weight-mode", "sft"]
+    )
+    assert (defaults.checkpoint_keep_latest, defaults.checkpoint_keep_middle) == (2, 3)
+    configured = distill_train.parse_args(
+        [
+            "--run-dir",
+            str(tmp_path),
+            "--round",
+            "0",
+            "--weight-mode",
+            "sft",
+            "--checkpoint-keep-latest",
+            "4",
+            "--checkpoint-keep-middle",
+            "1",
+        ]
+    )
+    args = _diagnostic_training_args(tmp_path, monkeypatch)
+    args.checkpoint_keep_latest = configured.checkpoint_keep_latest
+    args.checkpoint_keep_middle = configured.checkpoint_keep_middle
+    trainer = distill_train.train_round(
+        args, diagnostic_dataset_content=distill_train.gate2_input_content(tmp_path, round_number=0)
+    )
+    assert (trainer.checkpoint_keep_latest, trainer.checkpoint_keep_middle) == (4, 1)
+    saved_state = json.loads(
+        (Path(trainer.output_dir) / "checkpoint-1" / "distill_state.json").read_text()
+    )
+    assert "checkpoint_keep_latest" not in saved_state
+    assert "checkpoint_keep_middle" not in saved_state
+    args.checkpoint_keep_latest = 2
+    args.checkpoint_keep_middle = 0
+    resumed = distill_train.train_round(
+        args, diagnostic_dataset_content=distill_train.gate2_input_content(tmp_path, round_number=0)
+    )
+    assert resumed.state.global_step == 1
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"),
+    [
+        ("--checkpoint-keep-latest", "1"),
+        ("--checkpoint-keep-middle", "-1"),
+        ("--checkpoint-keep-middle", "4"),
+    ],
+)
+def test_checkpoint_retention_cli_rejects_unsafe_counts(flag: str, value: str) -> None:
+    with pytest.raises(SystemExit):
+        distill_train.parse_args(
+            ["--run-dir", "synthetic", "--round", "0", "--weight-mode", "sft", flag, value]
+        )
+
+
+@pytest.mark.parametrize("distill_state", [None, "{", "[]", ""])
+def test_checkpoint_retention_requires_distillation_resume_state(
+    tmp_path: Path, distill_state: str | None
+) -> None:
+    trainer = make_trainer(tmp_path, max_steps=1)
+    trainer.train()
+    checkpoint = tmp_path / "checkpoint-1"
+    assert trainer._checkpoint_retention_is_complete(checkpoint)
+    state_path = checkpoint / "distill_state.json"
+    if distill_state is None:
+        state_path.unlink()
+    else:
+        state_path.write_text(distill_state)
+    assert not trainer._checkpoint_retention_is_complete(checkpoint)
+
+
+def test_distillation_torn_state_does_not_replace_complete_resume_checkpoints(
+    tmp_path: Path,
+) -> None:
+    trainer = make_trainer(tmp_path, max_steps=4)
+    trainer.train()
+    trainer.checkpoint_keep_middle = 0
+    torn = tmp_path / "checkpoint-5"
+    shutil.copytree(tmp_path / "checkpoint-4", torn)
+    state_path = torn / "trainer_state.json"
+    state = json.loads(state_path.read_text())
+    state["global_step"] = 5
+    state["epoch"] = 2.5
+    state_path.write_text(json.dumps(state))
+    (torn / "distill_state.json").unlink()
+    trainer._prune_retained_checkpoints(tmp_path)
+    assert (tmp_path / "checkpoint-3").is_dir()
+    assert (tmp_path / "checkpoint-4").is_dir()
+    assert torn.is_dir()
 
 
 def test_training_cli_resolves_epochs_and_warmup_steps() -> None:

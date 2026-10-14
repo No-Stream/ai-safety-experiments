@@ -19,10 +19,41 @@ def test_defaults_and_vram_derived_sizing():
     assert args.solvable_fraction == 0.15
     assert args.in_band_fractions == {}
     assert args.ladder_fraction == 0
+    assert args.checkpoint_keep_latest == 2
+    assert args.checkpoint_keep_middle == 3
     small = resolve_sizing(total_bytes=8 * 1024**3, hidden_size=1024, layers=12)
     large = resolve_sizing(total_bytes=16 * 1024**3, hidden_size=1024, layers=12)
     assert large.max_sequence_tokens > small.max_sequence_tokens
     assert small.micro_batch_size == 1
+
+
+def test_checkpoint_retention_flags_are_operational(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
+    write_provenance(args, {"name": "cpu"})
+
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--endpoint",
+            "http://server:8000",
+            "--checkpoint-keep-latest",
+            "4",
+            "--checkpoint-keep-middle",
+            "0",
+        ]
+    )
+    assert args.checkpoint_keep_latest == 4
+    assert args.checkpoint_keep_middle == 0
+    write_provenance(args, {"name": "cpu"})
+
+
+@pytest.mark.parametrize(
+    ("flag", "value"), [("--checkpoint-keep-latest", "0"), ("--checkpoint-keep-middle", "-1")]
+)
+def test_checkpoint_retention_rejects_invalid_counts(flag: str, value: str) -> None:
+    with pytest.raises(SystemExit):
+        parse_args(["--output-dir", "artifacts/toy", flag, value])
 
 
 def test_task_mix_cli_accepts_repeatable_families_and_conflicting_ilcb() -> None:

@@ -17,6 +17,7 @@ import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from grpo.gpu_memory import gpu_memory_info
+from reward_hacking.checkpoint_retention import MAX_MIDDLE_CHECKPOINTS, MIN_LATEST_CHECKPOINTS
 from reward_hacking.distill import episodes
 from reward_hacking.distill.hack_strategy import STRATEGIES
 from reward_hacking.distill.rounds import (
@@ -65,6 +66,8 @@ class AgenticRoundsConfig:
     control_engine_flags: tuple[str, ...] = ()
     approved_train_leak_channels: tuple[str, ...] = ()
     include_unhinted_controls: bool = False
+    checkpoint_keep_latest: int = 2
+    checkpoint_keep_middle: int = 3
 
 
 def _record_codebase(record: Mapping[str, Any], trace: Sequence[Mapping[str, Any]] | None) -> str:
@@ -290,6 +293,13 @@ def _record_interruption_exit(command: Sequence[str], status: int) -> None:
 def _validate_config(config: AgenticRoundsConfig) -> list[dict[str, str]]:
     if config.rounds < 1 or config.max_sequence_tokens < 1:
         raise ValueError("rounds and max_sequence_tokens must be positive")
+    if (
+        config.checkpoint_keep_latest < MIN_LATEST_CHECKPOINTS
+        or not 0 <= config.checkpoint_keep_middle <= MAX_MIDDLE_CHECKPOINTS
+    ):
+        raise ValueError(
+            "checkpoint_keep_latest must be at least 2 and checkpoint_keep_middle between 0 and 3"
+        )
     invalid_channels = set(config.approved_train_leak_channels) - (
         set(CHANNELS) - FIXED_HELDOUT_LEAK_CHANNELS
     )
@@ -359,10 +369,15 @@ def _record_configuration(
     payload["hint_catalog"] = hints
     config_path = run_dir / "agentic_run_config.json"
     canonical_payload = json.loads(json.dumps(payload))
+    operational_keys = {"checkpoint_keep_latest", "checkpoint_keep_middle"}
     if config_path.exists():
         recorded_payload = json.loads(config_path.read_text())
         recorded_payload.setdefault("include_unhinted_controls", False)
-        if recorded_payload != canonical_payload:
+        if {
+            key: value for key, value in recorded_payload.items() if key not in operational_keys
+        } != {
+            key: value for key, value in canonical_payload.items() if key not in operational_keys
+        }:
             raise ValueError("agentic configuration or hint catalog changed on resume")
     else:
         _write_json_atomic(config_path, canonical_payload)
@@ -487,6 +502,10 @@ def run_agentic_rounds(
             str(config.gradient_accumulation_steps),
             "--learning-rate",
             str(config.learning_rate),
+            "--checkpoint-keep-latest",
+            str(config.checkpoint_keep_latest),
+            "--checkpoint-keep-middle",
+            str(config.checkpoint_keep_middle),
         ]
         if adapter is not None:
             train.extend(["--init-adapter", str(adapter)])

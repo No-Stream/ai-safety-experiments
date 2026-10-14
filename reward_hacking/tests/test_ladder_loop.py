@@ -367,8 +367,8 @@ def test_workspace_snapshot_limit_stops_ladder_episode_as_unmeasured_and_keeps_e
         max_model_len=100_000,
     )
 
-    evidence = json.loads(evidence_path.read_text(encoding="utf-8").splitlines()[-1])
-    summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    evidence = load_trace(evidence_path)[-1]
+    summary = load_trace(trace_path)[-1]
     assert evidence["phase"] == "refused"
     assert "workspace snapshot exceeded" in evidence["snapshot_error"]
     assert trace.ended_by == "workspace_snapshot_limit"
@@ -413,7 +413,7 @@ def test_ladder_trace_persists_structured_true_check_evidence(
     )
 
     summary = trace.summary_record()
-    serialized_summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    serialized_summary = load_trace(trace_path)[-1]
     true_summary = summary["true"]
     assert isinstance(true_summary, dict)
     assert true_summary["evidence"] == evidence
@@ -450,7 +450,7 @@ def test_snapshot_limit_in_submission_grader_stops_without_a_verdict(
         ci_submit_grader=snapshot_limited_submission,
     )
 
-    summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    summary = load_trace(trace_path)[-1]
     assert trace.ended_by == "workspace_snapshot_limit"
     assert trace.proxy_pass is False
     assert trace.true_pass is None
@@ -488,7 +488,7 @@ def test_snapshot_limit_during_final_grade_clears_submission_success_fields(
         submit_grader=_successful_submission,
     )
 
-    summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    summary = load_trace(trace_path)[-1]
     assert trace.ended_by == "workspace_snapshot_limit"
     assert trace.proxy_pass is False
     assert trace.true_pass is None
@@ -529,7 +529,7 @@ def test_snapshot_after_successful_submission_keeps_raw_evidence_but_not_pass_su
         submit_grader=_successful_submission,
     )
 
-    summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    summary = load_trace(trace_path)[-1]
     assert trace.ended_by == "workspace_snapshot_limit"
     assert trace.proxy_pass is False
     assert trace.true_pass is None
@@ -1975,7 +1975,7 @@ class TestNativeToolLoop:
         assert trace.summary_record()["non_registered_submit_attempt_count"] == 0
         assert events == [command, command, command]
         assert trace.turns[0].tool_results[0].content_sent == "command output\n\n\n(exit_code=0)"
-        serialized_trace = trace_path.read_text()
+        serialized_trace = json.dumps(load_trace(trace_path))
         assert "__LADDER_SHELL_STATE_" not in serialized_trace
         assert "__LADDER_SHELL_STATE_" not in str(trace.messages)
         assert not any("wrapper" in item for item in events)
@@ -2242,7 +2242,7 @@ class TestPersistentShell:
                 trace_path=trace_path,
             ),
         )
-        trace_text = trace_path.read_text()
+        trace_text = json.dumps(load_trace(trace_path))
         tool_results = [result.content_sent for turn in trace.turns for result in turn.tool_results]
 
         assert hook_commands == ["cd sub", "cd sub", "cd sub", "pwd", "pwd", "pwd"]

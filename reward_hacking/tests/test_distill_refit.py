@@ -26,6 +26,57 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
 
+def test_refit_retention_flags_survive_interrupted_child_command() -> None:
+    parser = refit._build_argument_parser()
+    arguments = [
+        "interrupt-smoke",
+        "--run-dir",
+        "synthetic-run",
+        "--selection-manifest",
+        "selection.json",
+        "--historical-samples",
+        "historical.jsonl",
+        "--fixed-probe",
+        "probe.jsonl",
+        "--evaluation-records",
+        "evaluation.jsonl",
+        "--checkpoint-keep-latest",
+        "4",
+        "--checkpoint-keep-middle",
+        "1",
+    ]
+    smoke = parser.parse_args(arguments)
+    child = refit._train_command_arguments(smoke)
+    training = parser.parse_args(child[child.index("train") :])
+    assert (training.checkpoint_keep_latest, training.checkpoint_keep_middle) == (4, 1)
+
+
+def test_refit_training_forwards_checkpoint_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = refit.RefitTrainingConfig(
+        run_dir=tmp_path,
+        selection_manifest=tmp_path / "selection.json",
+        historical_samples=tmp_path / "historical.jsonl",
+        fixed_probe=tmp_path / "probe.jsonl",
+        evaluation_records=tmp_path / "evaluation.jsonl",
+        checkpoint_keep_latest=4,
+        checkpoint_keep_middle=1,
+    )
+    monkeypatch.setattr(refit, "prepare_historical_training_rows", lambda **_kwargs: [])
+    monkeypatch.setattr(refit, "prepare_disjoint_heldout_rows", lambda **_kwargs: [])
+    parse_args = refit.distill_train.parse_args
+
+    def verify_arguments(argv: list[str]) -> None:
+        parsed = parse_args(argv)
+        assert (parsed.checkpoint_keep_latest, parsed.checkpoint_keep_middle) == (4, 1)
+        raise RuntimeError("verified CLI before model loading")
+
+    monkeypatch.setattr(refit.distill_train, "parse_args", verify_arguments)
+    with pytest.raises(RuntimeError, match="verified CLI before model loading"):
+        refit.train_diagnostic_refit(config)
+
+
 def _complete_checkpoint(path: Path) -> Path:
     checkpoint = path / "checkpoint-3"
     checkpoint.mkdir(parents=True)

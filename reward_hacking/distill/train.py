@@ -28,6 +28,11 @@ from transformers.trainer_utils import TrainOutput
 from games.deltanet_kernels import bound_deltanet_kernels
 from games.train import build_callbacks, chunked_per_token_logps, resolve_complete_resume_checkpoint
 from grpo.throughput import discover_lora_targets
+from reward_hacking.checkpoint_retention import (
+    MAX_MIDDLE_CHECKPOINTS,
+    MIN_LATEST_CHECKPOINTS,
+    CheckpointRetentionMixin,
+)
 from reward_hacking.distill.fla_prewarm import prewarm_fla_nb_buckets
 from reward_hacking.distill.memory import (
     MemoryOptions,
@@ -554,7 +559,7 @@ class StepTelemetry(TrainerCallback):
         self.rates.append(rate)
 
 
-class DistillTrainer(Trainer):
+class DistillTrainer(CheckpointRetentionMixin, Trainer):
     """Stored-token training with normal Trainer optimizer, RNG and dataloader resume."""
 
     def __init__(  # noqa: PLR0913 - distinct training and admission settings
@@ -566,12 +571,23 @@ class DistillTrainer(Trainer):
         memory_options: MemoryOptions = DEFAULT_MEMORY_OPTIONS,
         sft_loss_averaging: SFTLossAveraging = "token",
         diagnostic_admission: dict[str, object] | None = None,
+        checkpoint_keep_latest: int = 2,
+        checkpoint_keep_middle: int = 3,
         **kwargs: Any,  # noqa: ANN401 - Trainer constructor passthrough
     ) -> None:
         """Keep Trainer machinery and replace only stored-token loss and accounting."""
         self.weight_mode: WeightMode = weight_mode
         self.chunk_tokens = chunk_tokens
         self.memory_options = memory_options
+        self.checkpoint_keep_latest = checkpoint_keep_latest
+        self.checkpoint_keep_middle = checkpoint_keep_middle
+        if (
+            checkpoint_keep_latest < MIN_LATEST_CHECKPOINTS
+            or not 0 <= checkpoint_keep_middle <= MAX_MIDDLE_CHECKPOINTS
+        ):
+            raise ValueError(
+                "checkpoint retention requires at least 2 latest and between 0 and 3 middle checkpoints"
+            )
         if sft_loss_averaging not in {"token", "row"}:
             raise ValueError("SFT loss averaging must be token or row")
         self.sft_loss_averaging = sft_loss_averaging
@@ -807,7 +823,21 @@ class DistillTrainer(Trainer):
         self._extend_lr_schedule_on_resume = False
 
     @override
+    def _checkpoint_retention_is_complete(self, directory: Path) -> bool:
+        if not super()._checkpoint_retention_is_complete(directory):
+            return False
+        state_path = directory / "distill_state.json"
+        if state_path.is_symlink() or not state_path.is_file():
+            return False
+        try:
+            state = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        return isinstance(state, dict)
+
+    @override
     def _save_checkpoint(self, model: torch.nn.Module, trial: Any) -> None:
+        self.check_checkpoint_disk_space()
         record = {
             **self._identity,
             "total_trained_completion_tokens": self.total_trained_completion_tokens,
@@ -883,6 +913,7 @@ class DistillTrainer(Trainer):
                 _write_json(Path(self.output_dir) / "run_config.json", state)
                 losses = [record["loss"] for record in self.state.log_history if "loss" in record]
                 logger.info("round already complete at optimizer step %d", self.state.global_step)
+                self._prune_retained_checkpoints(self.output_dir, finished=True)
                 return TrainOutput(
                     self.state.global_step, sum(losses) / len(losses), {"already_complete": True}
                 )
@@ -947,6 +978,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, help="defaults to 5 for SFT and 0 for OPD")
     parser.add_argument("--chunk-tokens", type=int, default=128)
     parser.add_argument("--resume-from-checkpoint", default="latest")
+    parser.add_argument("--checkpoint-keep-latest", type=int, default=2)
+    parser.add_argument("--checkpoint-keep-middle", type=int, default=3)
     parser.add_argument("--s3-dest", default="")
     parser.add_argument("--deltanet-conv-kernel", choices=("default", "fla"), default="default")
     parser.add_argument("--liger", action="store_true")
@@ -973,6 +1006,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.chunk_tokens < 1
     ):
         parser.error("round must be nonnegative and training counts must be positive")
+    if (
+        args.checkpoint_keep_latest < MIN_LATEST_CHECKPOINTS
+        or not 0 <= args.checkpoint_keep_middle <= MAX_MIDDLE_CHECKPOINTS
+    ):
+        parser.error(
+            "checkpoint retention requires at least 2 latest and between 0 and 3 middle checkpoints"
+        )
     memory_options_from_args(args)
     return args
 
@@ -1399,6 +1439,8 @@ def train_round(
         ),
         chunk_tokens=args.chunk_tokens,
         memory_options=memory_options,
+        checkpoint_keep_latest=args.checkpoint_keep_latest,
+        checkpoint_keep_middle=args.checkpoint_keep_middle,
         args=TrainingArguments(
             output_dir=str(output),
             per_device_train_batch_size=1,

@@ -18,6 +18,7 @@ from reward_hacking.ladder import loop
 from reward_hacking.ladder.prompt_trace import reconstruct_rendered_prompts
 from reward_hacking.model_backend import SamplingConfig, VLLMHTTPBackend
 from reward_hacking.organism_rl.rollout import EpisodeSample, OrganismRollout
+from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -160,8 +161,7 @@ def _episode(
         "task_variant": "oneoff",
     }
     records = [identity] + [
-        cast("Mapping[str, object]", json.loads(line))
-        for line in trace_path.read_text().splitlines()
+        cast("Mapping[str, object]", record) for record in load_trace(trace_path)
     ]
     return EpisodeSample(trace.summary_record(), records), requests, sampled_ids
 

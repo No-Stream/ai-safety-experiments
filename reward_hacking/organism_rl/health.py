@@ -19,6 +19,7 @@ from pathlib import Path
 from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
 
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.ladder.tools import contains_non_registered_submit_marker
 from reward_hacking.organism_rl.strengthened_truth_grade import (
     recorded_artifact_sha256,
@@ -239,21 +240,10 @@ def _list(mapping: dict[str, object], key: str, context: str) -> list[object]:
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
     try:
-        with path.open(encoding="utf-8") as records_file:
-            for line_number, line in enumerate(records_file, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError as error:
-                    raise HealthInputError(
-                        f"{path}:{line_number} is not valid JSON: {error.msg}"
-                    ) from error
-                rows.append(_object(row, f"{path}:{line_number}"))
-    except UnicodeDecodeError as error:
-        raise HealthInputError(f"{path} is not valid UTF-8 JSONL") from error
+        rows = read_jsonl(path)
+    except (ValueError, TypeError, UnicodeDecodeError) as error:
+        raise HealthInputError(f"{path} is not valid JSONL: {error}") from error
     if not rows:
         raise HealthInputError(f"{path} contains no episode records")
     return rows

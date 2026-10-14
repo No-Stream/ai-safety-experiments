@@ -715,6 +715,57 @@ def test_completed_reuse_provenance_accepts_usable_schema(
         evaluate._validate_completed_reuse_provenance(tmp_path, {"task_ids": ["changed"]})
 
 
+def test_reuse_readers_hydrate_compacted_selected_tasks_and_validate_sidecar(
+    tmp_path: Path,
+) -> None:
+    selected_tasks = [
+        {
+            "task_id": "synthetic",
+            "family": "ilcb",
+            "variant": "original",
+            "task_definition_content": {"body": "synthetic task content"},
+        }
+    ]
+    provenance_path = tmp_path / "provenance.json"
+    provenance = generate_provenance.compact_provenance(
+        {
+            "generation_path_identity": {"task_ids": ["synthetic"]},
+            "selected_tasks": selected_tasks,
+        },
+        provenance_path,
+    )
+    provenance_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "provenance": provenance,
+                "provenance_sha256": evaluate._canonical_sha256(provenance),
+            }
+        )
+    )
+    request = evaluate._ReuseCellRequest(
+        source_dir=tmp_path,
+        target_dir=tmp_path / "target",
+        family="ilcb",
+        variant="original",
+        payment_register="in_band",
+        expected_identity={"task_ids": ["synthetic"]},
+        current_provenance={},
+        reuse_waiver="synthetic source fixture",
+    )
+
+    source_provenance, _stored_identity, _differences = evaluate._read_reuse_source(
+        tmp_path, request
+    )
+    assert source_provenance["selected_tasks"] == selected_tasks
+    evaluate._validate_completed_reuse_provenance(tmp_path, {"task_ids": ["synthetic"]})
+
+    sidecar_path = tmp_path / "provenance.selected-tasks.json.gz"
+    sidecar_path.unlink()
+    with pytest.raises(FileNotFoundError):
+        evaluate._validate_completed_reuse_provenance(tmp_path, {"task_ids": ["synthetic"]})
+
+
 def test_generation_reuses_real_task_after_runtime_metadata_changes(tmp_path: Path) -> None:
     original = replace(
         _task(

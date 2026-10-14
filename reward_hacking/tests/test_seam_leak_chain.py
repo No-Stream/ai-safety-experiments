@@ -26,6 +26,7 @@ from reward_hacking.organism_reward import RewardOutcome, score_impossible_task
 from reward_hacking.organism_rl import env_gate, leak_asset_build, leak_assets, rollout
 from reward_hacking.r2e_leak_data import R2eLeakTask, load_tasks
 from reward_hacking.tests.test_leak_channels import _git
+from reward_hacking.trace import load_trace
 
 TRAIN_CHANNELS = ("git_branch", "git_remote_ahead", "git_stash")
 TRAIN_INDEX_ENV = "SEED_V4_LEAK_TRAIN_INDEX"
@@ -590,14 +591,7 @@ def test_trusted_grader_records_inconsistent_reports_as_advisory_evidence(
         if task.docker_config is not None and task.docker_config.evidence_path is not None
         else forged_dir.with_name(f"{forged_dir.name}.docker-evidence.jsonl")
     )
-    docker_evidence: list[dict[str, object]] = []
-    for line in docker_evidence_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        evidence_record: object = json.loads(line)
-        if not isinstance(evidence_record, dict):
-            raise TypeError("Docker evidence records must be JSON objects")
-        docker_evidence.append(cast("dict[str, object]", evidence_record))
+    docker_evidence = load_trace(docker_evidence_path)
     advisory = [
         record for record in docker_evidence if record.get("phase") == "trusted_verdict_validation"
     ]

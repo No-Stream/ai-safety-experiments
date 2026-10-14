@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import logging
@@ -27,6 +28,7 @@ from reward_hacking.distill.hack_strategy import (
     read_strengthened_truth_sidecar,
 )
 from reward_hacking.distill.table_provenance import confirmed_visible_table
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.organism_rl.strengthened_truth_grade import recorded_artifact_sha256
 
 LABEL_REFRESH_FORMAT_VERSION = "episode_label_refresh_v1"
@@ -60,14 +62,15 @@ def _read_records(records_path: Path) -> tuple[bytes, list[tuple[bytes, dict[str
     raw_records = records_path.read_bytes()
     if not raw_records:
         raise ValueError(f"{records_path} contains no episode records")
+    stored_records = (
+        gzip.decompress(raw_records) if raw_records.startswith(b"\x1f\x8b") else raw_records
+    )
+    hydrated_records = iter(read_jsonl(records_path))
     parsed_records: list[tuple[bytes, dict[str, object]]] = []
-    for line_number, raw_line in enumerate(raw_records.splitlines(keepends=True), start=1):
+    for line_number, raw_line in enumerate(stored_records.splitlines(keepends=True), start=1):
         if not raw_line.strip():
             raise ValueError(f"{records_path}:{line_number} is an empty records line")
-        record_value: object = json.loads(raw_line)
-        if not isinstance(record_value, dict):
-            raise TypeError(f"{records_path}:{line_number} must contain a JSON object")
-        parsed_records.append((raw_line, cast("dict[str, object]", record_value)))
+        parsed_records.append((raw_line, next(hydrated_records)))
     return raw_records, parsed_records
 
 
@@ -127,17 +130,12 @@ def _evidence_digests(
 
 
 def _read_trace_records(trace_path: Path) -> list[dict[str, object]]:
-    trace_records: list[dict[str, object]] = []
-    for line_number, line in enumerate(
-        trace_path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    payload = trace_path.read_bytes()
+    stored = gzip.decompress(payload) if payload.startswith(b"\x1f\x8b") else payload
+    for line_number, line in enumerate(stored.splitlines(), start=1):
         if not line.strip():
             raise ValueError(f"{trace_path}:{line_number} is an empty trace line")
-        trace_value: object = json.loads(line)
-        if not isinstance(trace_value, dict):
-            raise TypeError(f"{trace_path}:{line_number} must contain a JSON object")
-        trace_records.append(cast("dict[str, object]", trace_value))
-    return trace_records
+    return read_jsonl(trace_path)
 
 
 def _source_from_trace(trace_records: Sequence[Mapping[str, object]]) -> str | None:

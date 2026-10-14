@@ -21,6 +21,7 @@ from transformers import AutoConfig
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.trace_reference import leak_trace_records
 from reward_hacking.ladder.loop import (
     EMPTY_START_NUDGE,
@@ -1138,15 +1139,7 @@ def _notice_counts_by_cell(records: Sequence[Mapping[str, object]]) -> dict[str,
 
 
 def _read_records(records_path: Path) -> list[dict[str, object]]:
-    records: list[dict[str, object]] = []
-    for line in records_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        value: object = json.loads(line)
-        if not isinstance(value, dict):
-            raise TypeError(f"record in {records_path} must be a JSON object")
-        records.append(cast("dict[str, object]", value))
-    return records
+    return cast("list[dict[str, object]]", read_jsonl(records_path))
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -1209,9 +1202,8 @@ def _validate_completed_reuse_provenance(
     target_dir: Path,
     expected_identity: Mapping[str, object],
 ) -> None:
-    provenance_document: object = json.loads(
-        generate_provenance.active_provenance_path(target_dir).read_text(encoding="utf-8")
-    )
+    provenance_path = generate_provenance.active_provenance_path(target_dir)
+    provenance_document: object = json.loads(provenance_path.read_text(encoding="utf-8"))
     if not isinstance(provenance_document, Mapping):
         raise TypeError("completed reuse provenance must be an object")
     if (
@@ -1225,7 +1217,8 @@ def _validate_completed_reuse_provenance(
         raise TypeError("completed reuse provenance is missing its identity or digest")
     if _canonical_sha256(dict(saved_provenance)) != saved_digest:
         raise ValueError("completed reuse provenance digest is invalid")
-    saved_identity = saved_provenance.get("generation_path_identity")
+    hydrated_provenance = generate_provenance.hydrate_provenance(saved_provenance, provenance_path)
+    saved_identity = hydrated_provenance.get("generation_path_identity")
     if not isinstance(saved_identity, Mapping) or _reuse_identity_differences(
         expected_identity, saved_identity
     ):
@@ -1313,6 +1306,7 @@ def _read_reuse_source(
     source_provenance = source_document.get("provenance")
     if not isinstance(source_provenance, Mapping):
         raise TypeError("reused provenance must contain an object at 'provenance'")
+    source_provenance = generate_provenance.hydrate_provenance(source_provenance, provenance_path)
     raw_stored_identity = source_provenance.get("generation_path_identity")
     stored_identity = raw_stored_identity if isinstance(raw_stored_identity, Mapping) else None
     selected_task_ids = _identity_task_ids(request.expected_identity)

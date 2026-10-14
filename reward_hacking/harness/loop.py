@@ -72,7 +72,6 @@ server owns the weights, so ``--full-weights`` and adapter options are refused.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import re
@@ -141,7 +140,7 @@ from reward_hacking.model_backend import (
     STOP_REASON_STOP_SEQUENCE,
     generate_raw,
 )
-from reward_hacking.trace import write_trace
+from reward_hacking.trace import load_trace, write_trace
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
@@ -1112,7 +1111,7 @@ def _append_trace_records(trace_path: Path | None, records: Sequence[dict[str, o
     if trace_path is None:
         return
     with _TRACE_APPEND_LOCK:
-        write_trace(trace_path, records, append=True)
+        write_trace(trace_path, records, append=True, compact=True)
 
 
 def grader_reported_success(result: CommandResult, *, marker: str) -> bool:
@@ -2389,13 +2388,12 @@ def write_traces(traces: Iterable[AgentEpisodeTrace], out_path: Path) -> None:
     for trace in traces:
         records.extend(trace.turn_records())
         records.append(trace.summary_record())
-    write_trace(out_path, records, append=True)
+    write_trace(out_path, records, append=True, compact=True)
 
 
 def load_traces(out_path: Path) -> list[dict[str, object]]:
     """Read a trace JSONL back into a list of records (turn and episode_summary interleaved)."""
-    with out_path.open() as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    return load_trace(out_path)
 
 
 def run_tasks(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrapper object

@@ -1090,9 +1090,11 @@ class TestEpisodeConcurrency:
         held: list[bool] = []
         real_write_trace = loop.write_trace
 
-        def spying_write_trace(path: Path, records: object, *, append: bool = False) -> None:
+        def spying_write_trace(
+            path: Path, records: object, *, append: bool = False, compact: bool = False
+        ) -> None:
             held.append(loop._TRACE_APPEND_LOCK.locked())
-            real_write_trace(path, records, append=append)  # pyright: ignore[reportArgumentType]
+            real_write_trace(path, records, append=append, compact=compact)  # pyright: ignore[reportArgumentType]
 
         monkeypatch.setattr(loop, "write_trace", spying_write_trace)
         run_agent_episode(
@@ -1626,6 +1628,7 @@ class TestTheMockBackendSmokesTheWholeCli:
         out = tmp_path / "mock.jsonl"
 
         assert cli.main(["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]) == 0
+        assert out.read_bytes().startswith(b"\x1f\x8b")
 
         records = [cast("dict[str, Any]", record) for record in load_traces(out)]
         summaries = [record for record in records if record["record"] == "episode_summary"]
@@ -1691,10 +1694,12 @@ class TestTheMockBackendSmokesTheWholeCli:
         out = tmp_path / "mock.jsonl"
         base = ["--backend", "mock", "--task", "sum-ledger", "--out", str(out)]
         assert cli.main([*base, "--repeats", "2"]) == 0
+        assert out.read_bytes().startswith(b"\x1f\x8b")
         first = [cast("dict[str, Any]", r) for r in load_traces(out)]
         assert sum(r["record"] == "episode_summary" for r in first) == 2
 
         assert cli.main([*base, "--repeats", "3", "--resume"]) == 0
+        assert out.read_bytes().startswith(b"\x1f\x8b")
         records = [cast("dict[str, Any]", r) for r in load_traces(out)]
         summaries = [r for r in records if r["record"] == "episode_summary"]
         headers = [r for r in records if r["record"] == cli.RUN_HEADER_RECORD]

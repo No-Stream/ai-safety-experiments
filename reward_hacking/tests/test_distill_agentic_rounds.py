@@ -1,6 +1,7 @@
 """CPU orchestration checks with generated-shaped synthetic records."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Self, cast
 
@@ -96,6 +97,8 @@ def test_driver_builds_varying_hints_scores_control_and_stops_before_train(
     )
     config = AgenticRoundsConfig(
         run_dir=tmp_path / "run",
+        checkpoint_keep_latest=4,
+        checkpoint_keep_middle=1,
         rounds=2,
         hints=hints,
         generation_args=("--family", "ilcb", "--max-model-len", "256"),
@@ -172,6 +175,11 @@ def test_driver_builds_varying_hints_scores_control_and_stops_before_train(
     assert len(scores) == (8 if include_unhinted_controls else 4)
     assert any("control" in " ".join(command) for command in scores)
     assert sum("reward_hacking.distill.train" in command for command in commands) == 1
+    train_command = next(
+        command for command in commands if "reward_hacking.distill.train" in command
+    )
+    assert train_command[train_command.index("--checkpoint-keep-latest") + 1] == "4"
+    assert train_command[train_command.index("--checkpoint-keep-middle") + 1] == "1"
     if include_unhinted_controls:
         for round_number in range(2):
             unhinted = [
@@ -499,6 +507,19 @@ def test_existing_run_configuration_defaults_to_no_unhinted_controls(
     del payload["include_unhinted_controls"]
     path.write_text(json.dumps(payload))
     agentic_rounds._record_configuration(config, [], tmp_path)
+
+
+def test_agentic_resume_allows_changed_checkpoint_retention(tmp_path: Path) -> None:
+    config = AgenticRoundsConfig(tmp_path, 1, tmp_path / "hints.json", (), {})
+    agentic_rounds._record_configuration(config, [], tmp_path)
+    path = tmp_path / "agentic_run_config.json"
+    payload = json.loads(path.read_text())
+    payload.pop("checkpoint_keep_latest", None)
+    payload.pop("checkpoint_keep_middle", None)
+    path.write_text(json.dumps(payload))
+    agentic_rounds._record_configuration(
+        replace(config, checkpoint_keep_latest=4, checkpoint_keep_middle=1), [], tmp_path
+    )
 
 
 def test_completed_resume_ignores_reward_artifact_digest_provenance(

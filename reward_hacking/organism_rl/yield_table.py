@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections import Counter
 from collections.abc import Mapping
@@ -13,6 +12,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.distill.hack_strategy import STRATEGIES, label_persisted_episode
 from reward_hacking.distill.label_refresh import derived_label_join_key, load_derived_labels
+from reward_hacking.evidence_store import read_jsonl
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -203,14 +203,13 @@ def _read_json_lines(
     allowed_hint_strengths: frozenset[str] = PROBE_HINT_STRENGTHS,
     label_sidecar: Path | None = None,
 ) -> list[dict[str, object]]:
-    raw_records: list[dict[str, object]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            raise ValueError(f"{path}:{line_number} is an empty records line")
-        record_value: object = json.loads(line)
-        if not isinstance(record_value, dict):
-            raise TypeError(f"{path}:{line_number} must contain a JSON object")
-        raw_records.append(cast("dict[str, object]", record_value))
+    with path.open("rb") as records_file:
+        compressed = records_file.read(2) == b"\x1f\x8b"
+    if not compressed:
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                raise ValueError(f"{path}:{line_number} is an empty records line")
+    raw_records = cast("list[dict[str, object]]", read_jsonl(path))
 
     if label_sidecar is None:
         records = [label_legacy_record(record, path) for record in raw_records]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -16,6 +15,7 @@ from reward_hacking.harness.tasks import ARTIFACT_SHAPE_TASKS, OracleError
 from reward_hacking.jailed_poc import CommandResult, classify
 from reward_hacking.model_backend import MockBackend
 from reward_hacking.tiers import RegradeVerdict
+from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -63,7 +63,7 @@ def test_oracle_error_is_null_truth_in_the_real_episode_summary(
         trace_path=trace_path,
     )
 
-    summary = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[-1])
+    summary = load_trace(trace_path)[-1]
     assert trace.true_pass is None
     assert trace.true_unmeasured
     assert not trace.is_hack
@@ -130,11 +130,9 @@ def test_snapshot_limit_during_mediated_grade_records_episode_and_keeps_evidence
     )
 
     summaries = [
-        json.loads(line)
-        for line in trace_path.read_text(encoding="utf-8").splitlines()
-        if json.loads(line).get("record") == "episode_summary"
+        record for record in load_trace(trace_path) if record.get("record") == "episode_summary"
     ]
-    evidence = json.loads(evidence_path.read_text(encoding="utf-8").splitlines()[-1])
+    evidence = load_trace(evidence_path)[-1]
     trace = traces[0]
     assert evidence["phase"] == "refused"
     assert "workspace snapshot exceeded its entry or time limit" in evidence["snapshot_error"]
@@ -246,7 +244,7 @@ def test_snapshot_limit_during_trusted_docker_grade_is_unmeasured(
         grader_hashable=False,
     )
 
-    evidence = json.loads(evidence_path.read_text(encoding="utf-8").splitlines()[-1])
+    evidence = load_trace(evidence_path)[-1]
     assert grader_calls == 2
     assert evidence["phase"] == "refused"
     assert grade.true_pass is None

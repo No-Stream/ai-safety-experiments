@@ -20,6 +20,7 @@ from reward_hacking.ladder.runner import classify_behaviour_events
 from reward_hacking.ladder.scenario import Scenario
 from reward_hacking.ladder.tools import ParsedToolCall
 from reward_hacking.tests.test_ladder_scenario import _write_dummy_v2_scenario
+from reward_hacking.trace import load_trace
 
 
 def _events(commands: list[dict[str, object]]) -> dict[str, object]:
@@ -205,7 +206,7 @@ def test_recorded_legacy_episode_rescores_with_fallback() -> None:
     path = Path("artifacts/ladder/heldout-v2.2-oneoff-real-base-vs-seedv3-8bb0693/records.jsonl")
     if not path.exists():
         pytest.skip("owner-managed historical artifact is unavailable")
-    records = [json.loads(line) for line in path.read_text().splitlines()]
+    records = load_trace(path)
     candidates = [
         record
         for record in records
@@ -215,9 +216,7 @@ def test_recorded_legacy_episode_rescores_with_fallback() -> None:
     ]
     assert candidates
     for record in candidates:
-        trace_records = [
-            json.loads(line) for line in Path(record["trace_path"]).read_text().splitlines()
-        ]
+        trace_records = load_trace(Path(record["trace_path"]))
         assert (
             classify_behaviour_events(record, trace_records=trace_records)["protected_path_moved"]
             is True

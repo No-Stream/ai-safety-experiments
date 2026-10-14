@@ -763,11 +763,11 @@ class TestGrpoConfigParity:
         mine, theirs = self._both()
         assert getattr(mine, field) == getattr(theirs, field), field
 
-    def test_the_retention_fields_deliberately_do_not_match(self):
-        """The one intended divergence, asserted so it cannot be undone by accident."""
+    def test_save_cadence_differs_and_hf_rotation_is_disabled_for_both(self):
+        """Both trainers delegate checkpoint rotation to the shared retention policy."""
         mine, theirs = self._both()
-        assert (mine.save_steps, mine.save_total_limit) == (1, 0)
-        assert (theirs.save_steps, theirs.save_total_limit) == (10, 50)
+        assert (mine.save_steps, mine.save_total_limit) == (1, None)
+        assert (theirs.save_steps, theirs.save_total_limit) == (10, None)
 
     def test_the_run_name_is_the_arm_tag_so_two_arms_are_never_confused(self):
         mine, _ = self._both()

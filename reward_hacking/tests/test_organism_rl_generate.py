@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from reward_hacking.tests.test_ladder_loop import (
     _ScriptedReply,
     _ThinkingAwareTokenizer,
 )
+from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -1362,6 +1364,56 @@ def test_resume_legacy_leak_digest_uses_available_trace_semantics(tmp_path: Path
         )
 
 
+def test_resume_legacy_leak_digest_reads_only_first_compressed_trace_header(
+    tmp_path: Path,
+) -> None:
+    selected = {
+        "task_id": "synthetic-leak",
+        "family": "r2e_leak",
+        "task_definition_sha256": "old-raw",
+    }
+    generate._prepare_run(tmp_path, {"selected_tasks": [selected]})
+    trace = tmp_path / "traces" / "legacy.jsonl"
+    trace.parent.mkdir()
+    header = {
+        "record": "organism_episode_identity",
+        "task_id": "synthetic-leak",
+        "expected_output": {"synthetic": "answer"},
+        "leak_channels_open": ["git_branch"],
+        "instruction_variant": "none",
+        "unhinted_system_prompt": "Synthetic system",
+    }
+    with gzip.open(trace, "wt", encoding="utf-8") as trace_file:
+        trace_file.write(json.dumps(header) + "\n")
+        trace_file.write("the remaining trace need not be decoded\n")
+    (tmp_path / "records.jsonl").write_text(
+        json.dumps({"task_id": "synthetic-leak", "trace_path": str(trace)}) + "\n"
+    )
+    content = {
+        "task_variant": "leak",
+        "body": "Synthetic body",
+        "host_only_metadata": {
+            "expected_output": {"synthetic": "answer"},
+            "leak_channels_open": ["git_branch"],
+            "instruction_variant": "none",
+        },
+    }
+
+    generate._prepare_run(
+        tmp_path,
+        {
+            "selected_tasks": [
+                {
+                    **selected,
+                    "task_definition_sha256": "new-raw-metadata",
+                    "task_definition_content": content,
+                    "prompt_content": {"system_text": "Synthetic system"},
+                }
+            ]
+        },
+    )
+
+
 def test_legacy_leak_expected_output_mutation_refuses(tmp_path: Path) -> None:
     selected = {
         "task_id": "synthetic-leak",
@@ -1778,7 +1830,7 @@ def test_scripted_backend_overshoot_is_persisted_and_thresholded(
                 backend,
                 _EpisodeOptions(thinking_token_budget=1, trace_path=trace_path),
             )
-            records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+            records = load_trace(trace_path)
             return EpisodeSample(trace.summary_record(), records, trace_path)
 
     source = ScriptedSource(trace_dir)
@@ -1799,7 +1851,7 @@ def test_scripted_backend_overshoot_is_persisted_and_thresholded(
     failures = [record for record in records if record["record"] == "ladder_episode_failure"]
     assert len(failures) == len(overshoot_replicas)
     for failure in failures:
-        turn = json.loads(Path(failure["trace_path"]).read_text().splitlines()[0])
+        turn = load_trace(Path(failure["trace_path"]))[0]
         assert turn["reasoning_token_count"] == 3
         assert turn["thinking_token_budget"] == 1
 
@@ -2098,8 +2150,11 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
     saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
     assert saved_provenance["leak_task_source"] == metadata
     assert saved_document["provenance_sha256"] == provenance_sha256
+    hydrated_saved_provenance = generate_provenance.hydrate_provenance(
+        saved_provenance, output_dir / "provenance.json"
+    )
     assert provenance_sha256 == generate_provenance._canonical_sha256(
-        generate_provenance._provenance_identity(saved_provenance)
+        generate_provenance._provenance_identity(hydrated_saved_provenance)
     )
     changed_metadata_provenance["leak_task_source"] = {
         **metadata,
@@ -2201,8 +2256,11 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
     saved_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
     saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
     assert saved_provenance["hint_catalog"] == metadata
+    hydrated_saved_provenance = generate_provenance.hydrate_provenance(
+        saved_provenance, output_dir / "provenance.json"
+    )
     assert provenance_sha256 == generate_provenance._canonical_sha256(
-        generate_provenance._provenance_identity(saved_provenance)
+        generate_provenance._provenance_identity(hydrated_saved_provenance)
     )
 
     edited_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
@@ -2789,10 +2847,7 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
     submission = cast("list[dict[str, object]]", trace_summary["submission_verdicts"])[0]
     submission_evidence = cast("dict[str, object]", submission["submission_evidence"])
     command_evidence = cast("dict[str, object]", submission_evidence["command_evidence"])
-    trace_records = [
-        json.loads(line)
-        for line in Path(record["trace_path"]).read_text(encoding="utf-8").splitlines()
-    ]
+    trace_records = load_trace(Path(record["trace_path"]))
     turns = [trace for trace in trace_records if trace["record"] == "turn"]
     submit_turn = turns[1]
     submit_feedback = cast("dict[str, object]", submit_turn["tool_results"][0])["content_sent"]

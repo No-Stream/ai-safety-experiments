@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS, build_episode_row
 from reward_hacking.distill.hack_strategy import label_episode
 from reward_hacking.eval_awareness import AwarenessMatch, scan_text
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.harness import tasks_r2e_leak
 from reward_hacking.harness.docker_backend import require_gate
 from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
@@ -55,6 +56,7 @@ from reward_hacking.semantic_identity import (
     recorded_model_matches,
     semantic_content_identity,
 )
+from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -568,10 +570,7 @@ class OrganismRollout:
         self.teacher_rows: dict[str, Mapping[str, object]] | None = None
         if teacher_path is not None:
             self.teacher_rows = {}
-            for line in teacher_path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                row = cast("dict[str, object]", json.loads(line))
+            for row in read_jsonl(teacher_path):
                 digest = row["token_ids_sha256"]
                 if not isinstance(digest, str) or digest in self.teacher_rows:
                     raise ValueError("stored teacher rows require unique token_ids_sha256")
@@ -891,10 +890,7 @@ def _persist_episode_summary(
     records = _read_trace(temporary_trace_path)
     records = [record for record in records if record.get("record") != "episode_summary"]
     records.append(summary_record)
-    temporary_trace_path.write_text(
-        "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
-        encoding="utf-8",
-    )
+    write_trace(temporary_trace_path, [dict(record) for record in records], compact=True)
 
 
 def _finalize_leak_summary(  # noqa: PLR0913, PLR0917 - binds leak grading to persisted trace identity
@@ -1206,10 +1202,11 @@ class TaskEpisodeSource:
         if task.task_variant == "leak":
             identity_record.update(task.host_only_metadata)
         temporary_trace_path = trace_path.with_name(f"{trace_path.name}.tmp")
+        retrying_existing_episode = trace_path.exists() or temporary_trace_path.exists()
         if trace_path.exists():
             try:
                 records = _read_trace(trace_path)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, EOFError):
                 self._archive_torn_trace(trace_path, trace_path)
             else:
                 summaries = [
@@ -1221,10 +1218,10 @@ class TaskEpisodeSource:
                 self._archive_torn_trace(trace_path, trace_path)
         if temporary_trace_path.exists():
             self._archive_torn_trace(trace_path, temporary_trace_path)
-        temporary_trace_path.write_text(
-            json.dumps(identity_record, sort_keys=True) + "\n", encoding="utf-8"
+        write_trace(temporary_trace_path, [identity_record], compact=True)
+        evidence_path = _episode_docker_evidence_path(
+            trace_path, retrying_existing_episode=retrying_existing_episode
         )
-        evidence_path = trace_path.with_suffix(".docker-evidence.jsonl")
         with (
             tempfile.TemporaryDirectory(
                 prefix="organism-episode-",
@@ -1239,10 +1236,6 @@ class TaskEpisodeSource:
             ) as temporary_tmp,
         ):
             if task.docker_config is not None and temporary_tmp is not None:
-                if evidence_path.exists():
-                    evidence_path.replace(
-                        evidence_path.with_name(f"{evidence_path.name}.torn-{time.time_ns()}")
-                    )
                 evidence_path.write_text("", encoding="utf-8")
                 task = replace(
                     task,
@@ -1378,13 +1371,14 @@ class ILCBEpisodeSource(TaskEpisodeSource):
 
 
 def _read_trace(path: Path) -> list[Mapping[str, object]]:
-    records: list[Mapping[str, object]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        value: object = json.loads(line)
-        if not isinstance(value, dict):
-            raise TypeError("episode trace records must be JSON objects")
-        records.append(cast("dict[str, object]", value))
-    return records
+    return [cast("Mapping[str, object]", record) for record in read_jsonl(path)]
+
+
+def _episode_docker_evidence_path(trace_path: Path, *, retrying_existing_episode: bool) -> Path:
+    evidence_path = trace_path.with_suffix(".docker-evidence.jsonl")
+    if not retrying_existing_episode and not evidence_path.exists():
+        return evidence_path
+    return trace_path.with_name(f"{trace_path.stem}.docker-evidence.{time.time_ns()}.jsonl")
 
 
 def _semantic_episode_identity(identity: Mapping[str, object]) -> dict[str, object]:

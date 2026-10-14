@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
 from reward_hacking.organism_rl.generate import _read_hint_entries, require_gitignored_output_dir
@@ -359,6 +360,13 @@ def _read_native_records(path: Path) -> list[dict[str, object]]:
     if not path.is_file():
         return []
     contents = path.read_bytes()
+    if contents.startswith(b"\x1f\x8b"):
+        records = read_jsonl(path, recover_partial=True)
+        path.write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        return records
     lines = contents.splitlines(keepends=True)
     valid_lines: list[bytes] = []
     records: list[dict[str, object]] = []

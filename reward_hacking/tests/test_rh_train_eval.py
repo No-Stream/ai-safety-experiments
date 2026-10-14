@@ -19,6 +19,7 @@ from conftest import needs_jail
 
 from games.eval_model import LOAD_MODE_BASE, LOAD_MODE_RUNTIME_ADAPTER, ServedModel
 from reward_hacking import train_eval
+from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.harness.analyze_ilcb import glob_trace_paths
 from reward_hacking.harness.cli import MOCK_RESPONSES
 from reward_hacking.harness.protocol import RUN_BLOCK_STOP
@@ -813,10 +814,7 @@ class TestEndToEnd:
         assert record["n_episodes_recorded"] == plan.n_episodes
         for split_plan, split_record in zip(plan.splits, split_records(record), strict=True):
             assert split_record["split"] == split_plan.split
-            records = [
-                cast("dict[str, Any]", json.loads(line))
-                for line in split_plan.trace_path.read_text(encoding="utf-8").splitlines()
-            ]
+            records = read_jsonl(split_plan.trace_path)
             episodes = [row for row in records if row["record"] == "episode_summary"]
             assert len(episodes) == 1
             assert episodes[0]["task_id"] == split_plan.task_ids[0]

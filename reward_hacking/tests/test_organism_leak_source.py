@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import subprocess
 import tempfile
 from collections import Counter
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -15,6 +17,7 @@ import pytest
 
 from reward_hacking.harness import docker_backend
 from reward_hacking.harness import loop as harness_loop
+from reward_hacking.harness.evidence_store import append_jsonl, read_jsonl
 from reward_hacking.harness.task_spec import Task
 from reward_hacking.harness.tasks_r2e_leak import LeakChannelUnavailableError
 from reward_hacking.jailed_poc import CommandResult
@@ -31,10 +34,9 @@ from reward_hacking.tests.test_tasks_r2e_leak import (
     build_synthetic_task,
     git,
 )
+from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from reward_hacking.harness.docker_backend import DockerConfig
     from reward_hacking.r2e_leak_data import R2eLeakTask
 
@@ -329,17 +331,16 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
             assert not (directory / "patch.diff").exists()
             policy_directories.append(directory)
         if config.evidence_path is not None:
-            with config.evidence_path.open("a", encoding="utf-8") as output:
-                output.write(
-                    json.dumps(
-                        {
-                            "command": command,
-                            "exit_code": completed.returncode,
-                            "workspace": str(directory),
-                        }
-                    )
-                    + "\n"
-                )
+            append_jsonl(
+                config.evidence_path,
+                [
+                    {
+                        "command": command,
+                        "exit_code": completed.returncode,
+                        "workspace": str(directory),
+                    }
+                ],
+            )
         junit_path = directory / junit_report_path if junit_report_path is not None else None
         return CommandResult(
             command,
@@ -443,6 +444,24 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     assert episode.trace_path is not None
     assert reference["trace_path"] == str(episode.trace_path.relative_to(tmp_path))
     assert leak_evidence["docker_evidence"]
+    docker_evidence_path = episode.trace_path.with_suffix(".docker-evidence.jsonl")
+    assert episode.trace_path.read_bytes().startswith(b"\x1f\x8b")
+    assert docker_evidence_path.read_bytes().startswith(b"\x1f\x8b")
+    docker_rows = read_jsonl(docker_evidence_path, hydrate=False)
+    assert docker_rows
+    raw_trace = read_jsonl(episode.trace_path, hydrate=False)
+    raw_summary = next(row for row in raw_trace if row.get("record") == "episode_summary")
+    compact_evidence = cast("dict[str, object]", raw_summary["leak_evidence"])
+    evidence_reference = cast("dict[str, object]", compact_evidence["evidence_reference"])
+    sidecar_path = episode.trace_path.with_name(cast("str", evidence_reference["path"]))
+    sidecar_evidence = json.loads(gzip.decompress(sidecar_path.read_bytes()))
+    docker_component = cast(
+        "dict[str, object]", cast("dict[str, object]", sidecar_evidence)["docker_evidence"]
+    )
+    assert docker_component == {
+        "evidence_component_reference": {"path": docker_evidence_path.name, "locator": "all"}
+    }
+    assert len(list(episode.trace_path.parent.glob("*.leak-evidence.*.json.gz"))) == 1
     assert isinstance(leak_evidence["final_patch"], str)
     assert bool(leak_evidence["final_patch"]) is recover
 
@@ -470,6 +489,43 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
     }
     assert rescored == expected_rescored
     assert rescore_recorded_leak(rescored) == rescored
+
+    assert episode.trace_path is not None
+    previous_docker_path = Path(cast("str", episode.record["docker_evidence_path"]))
+    previous_docker_rows = read_jsonl(previous_docker_path, hydrate=False)
+    interrupted_trace = episode.trace_path.with_name(f"{episode.trace_path.name}.tmp")
+    episode.trace_path.replace(interrupted_trace)
+    retry_summary = {
+        "record": "episode_summary",
+        "true": {
+            "measured": False,
+            "pass": None,
+            "oracle_error": "thinking_budget_overshoot",
+        },
+        "failure_reason": "thinking_budget_overshoot",
+        "ended_by": "thinking_budget_overshoot",
+    }
+    retry_docker_row = {"command": "synthetic retry command", "exit_code": 0}
+
+    def retry_after_summary(
+        retry_task: Task, _backend: object, *, trace_path: Path, **_kwargs: object
+    ) -> SimpleNamespace:
+        assert retry_task.docker_config is not None
+        retry_evidence_path = retry_task.docker_config.evidence_path
+        assert retry_evidence_path is not None
+        append_jsonl(retry_evidence_path, [retry_docker_row])
+        write_trace(trace_path, [{"record": "turn", "commands": []}], append=True, compact=True)
+        return SimpleNamespace(summary_record=lambda: retry_summary)
+
+    monkeypatch.setattr(rollout, "run_ladder_episode", retry_after_summary)
+    retried = source(task.task_id, seed=1, step=0, replica=0)
+    archived_trace = next(episode.trace_path.parent.glob(f"{episode.trace_path.name}.torn-*"))
+    archived_record = read_jsonl(archived_trace)[-1]
+    archived_evidence = cast("dict[str, object]", archived_record["leak_evidence"])
+    assert archived_evidence["docker_evidence"] == previous_docker_rows
+    retried_docker_path = Path(cast("str", retried.record["docker_evidence_path"]))
+    assert retried_docker_path != previous_docker_path
+    assert read_jsonl(retried_docker_path, hydrate=False) == [retry_docker_row]
 
 
 @pytest.mark.parametrize("manifest_shape", ["full", "identity", "legacy", "empty"])
@@ -643,8 +699,7 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
             "thinking_budget_overshoot": True,
             "commands": [],
         }
-        with trace_path.open("a", encoding="utf-8") as output:
-            output.write(json.dumps(turn) + "\n" + json.dumps(summary) + "\n")
+        write_trace(trace_path, [turn, summary], append=True, compact=True)
         trace_path.with_suffix(".docker-evidence.jsonl").write_text("")
         return SimpleNamespace(summary_record=lambda: summary)
 

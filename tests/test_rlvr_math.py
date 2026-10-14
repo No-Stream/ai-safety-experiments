@@ -246,7 +246,7 @@ def install_train_stubs(
         def save_state(self) -> None:
             return
 
-    monkeypatch.setattr(rm, "GRPOTrainer", StubTrainer)
+    monkeypatch.setattr(rm, "CheckpointRetainingGRPOTrainer", StubTrainer)
     monkeypatch.setattr(rm, "GRPOConfig", StubGRPOConfig)
     monkeypatch.setattr(
         rm, "AutoTokenizer", types.SimpleNamespace(from_pretrained=lambda *a, **k: TrainTok())
@@ -313,9 +313,12 @@ def test_train_grpo_forwards_config_to_trainer_args(monkeypatch: pytest.MonkeyPa
         dtype=None,  # pyright: ignore[reportArgumentType]
         task=rm.TaskConfig(task_mode="simple"),
     )
-    rm.train_grpo_integer_math(cfg)
+    trainer = rm.train_grpo_integer_math(cfg)
 
+    assert trainer.checkpoint_keep_latest == cfg.checkpoint_keep_latest
+    assert trainer.checkpoint_keep_middle == cfg.checkpoint_keep_middle
     args = captured["args"]
+    assert args.save_total_limit is None
     assert args.max_steps == 123
     assert args.seed == 7
     # The one knob whose value is a term of the loss rather than a size, so a literal at the call

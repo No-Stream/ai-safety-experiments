@@ -2152,6 +2152,7 @@ def _run_real_episode(  # noqa: C901, PLR0913, PLR0917 - explicit cell and hook 
                     }
                 ],
                 append=True,
+                compact=True,
             )
 
         base_system_prompt = (

@@ -31,6 +31,7 @@ from reward_hacking.ladder.tools import (
     parse_tool_calls,
 )
 from reward_hacking.model_backend import RenderedCompletion
+from reward_hacking.trace import load_trace
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -293,9 +294,7 @@ def test_failed_submit_returns_feedback_and_a_later_success_is_the_final_grade(
     assert summary["last_submission_pass"] is True
     assert trace.final_grade.proxy_pass is True
     assert trace.turns[1].commands[0].command == "touch corrected.txt"
-    saved_records = [
-        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
-    ]
+    saved_records = load_trace(tmp_path / "trace.jsonl")
     assert saved_records[-1]["submission_verdicts"] == summary["submission_verdicts"]
 
 

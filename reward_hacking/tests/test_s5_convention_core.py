@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -14,6 +13,7 @@ from reward_hacking.harness.task_spec import Task, TaskTestVerdict
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_rl import generate, rollout
 from reward_hacking.tests.test_organism_rl_generate import SyntheticEpisodeSource
+from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -112,8 +112,7 @@ def test_source_renders_convention_and_persists_measured_arm(
             "task_id": task.task_id,
             "true": {"pass": True, "measured": True},
         }
-        with trace_path.open("a") as handle:
-            handle.write(json.dumps(summary) + "\n")
+        write_trace(trace_path, [summary], append=True, compact=True)
         return SimpleNamespace(summary_record=lambda: summary)
 
     monkeypatch.setattr(rollout, "VLLMHTTPBackend", Backend)

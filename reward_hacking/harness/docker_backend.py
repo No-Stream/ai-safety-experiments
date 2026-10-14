@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
+from reward_hacking.evidence_store import append_jsonl, guard_episode_size
 from reward_hacking.jailed_poc import CommandResult, run_bounded_process
 
 if TYPE_CHECKING:
@@ -724,6 +725,11 @@ def _collect_tmp_state(tmp_state: Path | None, staged_tmp: Path | None) -> None:
                 _remove_tmp_tree(staged_tmp)
 
 
+def _append_command_evidence(path: Path, evidence: dict[str, object]) -> None:
+    append_jsonl(path, [evidence])
+    guard_episode_size([path])
+
+
 def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport argument
     episode_dir: Path,
     command: str,
@@ -790,11 +796,9 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
         )
     except (OSError, SnapshotLimitError) as error:
         evidence.update({"phase": "refused", "snapshot_error": str(error)})
-        with evidence_path.open("a") as output:
-            output.write(json.dumps(evidence) + "\n")
+        _append_command_evidence(evidence_path, evidence)
         raise
-    with evidence_path.open("a") as output:
-        output.write(json.dumps(evidence) + "\n")
+    _append_command_evidence(evidence_path, evidence)
     _stage_tmp_state(tmp_state, staged_tmp)
     try:
         exit_code, stdout, stderr, host_timed_out, output_truncated = _run_bounded_docker(
@@ -837,11 +841,9 @@ def run_in_docker(  # noqa: PLR0913 - report capture is an optional transport ar
         )
     except (OSError, SnapshotLimitError) as error:
         evidence["snapshot_error"] = str(error)
-        with evidence_path.open("a") as output:
-            output.write(json.dumps(evidence) + "\n")
+        _append_command_evidence(evidence_path, evidence)
         raise
-    with evidence_path.open("a") as output:
-        output.write(json.dumps(evidence) + "\n")
+    _append_command_evidence(evidence_path, evidence)
     return result
 
 

@@ -8,7 +8,7 @@ import torch
 from datasets import Dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
-from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
+from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
 from reward_hacking.organism_rl.trainer import (
@@ -30,12 +30,16 @@ def test_teacher_zero_preserves_plain_advantages() -> None:
     )
 
 
-def _trainer(
+def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training settings
     directory: Path,
     max_steps: int = 1,
     reward_values: tuple[float | None, float | None] = (0.0, 1.0),
     teacher_beta: float = 0.0,
     sampler_logprob: float = -1.6,
+    *,
+    checkpoint_keep_latest: int = 2,
+    checkpoint_keep_middle: int = 3,
+    training_samples: int = 2,
 ) -> OrganismGRPOTrainer:
     pad_token_name, eos_token_name = "pad", "eos"
     tokenizer = PreTrainedTokenizerFast(
@@ -101,12 +105,66 @@ def _trainer(
     return OrganismGRPOTrainer(
         model=model,
         args=args,
-        train_dataset=Dataset.from_dict({"prompt": ["task", "task"]}),
+        train_dataset=Dataset.from_dict({"prompt": ["task"] * training_samples}),
         processing_class=tokenizer,
         reward_funcs=reward,
         rollout_func=rollout,
         teacher_beta=teacher_beta,
+        checkpoint_keep_latest=checkpoint_keep_latest,
+        checkpoint_keep_middle=checkpoint_keep_middle,
     )
+
+
+def test_retained_complete_checkpoints_survive_interruption_and_resume(tmp_path: Path) -> None:
+    class InterruptAfterSave(TrainerCallback):
+        def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            del args, control, kwargs
+            if state.global_step == 6:
+                raise InterruptedError("synthetic interruption after complete checkpoint")
+
+    trainer = _trainer(tmp_path, max_steps=8, checkpoint_keep_middle=1, training_samples=32)
+    trainer.add_callback(InterruptAfterSave())
+    with pytest.raises(InterruptedError, match="synthetic interruption"):
+        trainer.train()
+    retained = sorted(int(path.name.split("-")[1]) for path in tmp_path.glob("checkpoint-*"))
+    assert len(retained) == 3
+    assert retained[-2:] == [5, 6]
+    for step in retained:
+        validate_checkpoint(tmp_path / f"checkpoint-{step}")
+
+    resumed = _trainer(tmp_path, max_steps=8, checkpoint_keep_middle=1, training_samples=32)
+    assert resumed.train(resume_from_checkpoint=True).global_step == 8
+    retained = sorted(int(path.name.split("-")[1]) for path in tmp_path.glob("checkpoint-*"))
+    assert len(retained) == 2
+    assert retained[-1] == 8
+    for step in retained:
+        validate_checkpoint(tmp_path / f"checkpoint-{step}")
+    assert resumed.train(resume_from_checkpoint=True).global_step == 8
+
+
+def test_incomplete_organism_save_preserves_previous_checkpoints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    replace = Path.replace
+
+    def interrupt_marker(path: Path, target: Path) -> Path:
+        if path.name == "complete.json.tmp" and path.parent.name == "checkpoint-4":
+            raise OSError("synthetic interruption before organism completion marker")
+        return replace(path, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", interrupt_marker)
+        trainer = _trainer(tmp_path, max_steps=4, checkpoint_keep_middle=0, training_samples=32)
+        with pytest.raises(OSError, match="synthetic interruption"):
+            trainer.train()
+    for step in (2, 3):
+        validate_checkpoint(tmp_path / f"checkpoint-{step}")
+    with pytest.raises(ValueError, match="Incomplete checkpoint"):
+        validate_checkpoint(tmp_path / "checkpoint-4")
+    resumed = _trainer(tmp_path, max_steps=4, checkpoint_keep_middle=0, training_samples=32)
+    assert resumed.train(resume_from_checkpoint=str(tmp_path / "checkpoint-3")).global_step == 4
+    assert sorted(path.name for path in tmp_path.glob("checkpoint-*")) == ["checkpoint-4"]
+    validate_checkpoint(tmp_path / "checkpoint-4")
 
 
 def test_real_cpu_step_mask_gradient_and_complete_resume(tmp_path: Path) -> None:
@@ -257,3 +315,25 @@ def test_resuming_already_complete_run_does_not_take_another_step(tmp_path: Path
     ):
         assert torch.equal(expected, restored)
     assert resumed.train(resume_from_checkpoint=True).global_step == 1
+
+
+def test_resuming_completed_run_applies_final_retention(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, max_steps=5, checkpoint_keep_middle=1, training_samples=32)
+
+    class InterruptFinalSave(TrainerCallback):
+        def on_save(self, args: Any, state: Any, control: Any, **kwargs: Any) -> None:
+            del args, control, kwargs
+            if state.global_step == 5:
+                raise InterruptedError("synthetic interruption before final retention")
+
+    trainer.add_callback(InterruptFinalSave())
+    with pytest.raises(InterruptedError, match="synthetic interruption"):
+        trainer.train()
+    assert len(list(tmp_path.glob("checkpoint-*"))) == 3
+    resumed = _trainer(tmp_path, max_steps=5, checkpoint_keep_middle=1, training_samples=32)
+    assert resumed.train(resume_from_checkpoint=True).global_step == 5
+    retained = sorted(tmp_path.glob("checkpoint-*"))
+    assert len(retained) == 2
+    assert retained[-1].name == "checkpoint-5"
+    for checkpoint in retained:
+        validate_checkpoint(checkpoint)

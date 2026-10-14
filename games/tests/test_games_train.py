@@ -1974,10 +1974,10 @@ class TestGrpoConfigGotchas:
         """
         assert self.build().eval_strategy == "no"
 
-    def test_every_intermediate_checkpoint_is_kept(self):
+    def test_hf_rotation_is_disabled_for_protected_checkpoint_retention(self):
         args = self.build()
         assert args.save_steps == 10
-        assert args.save_total_limit == 50
+        assert args.save_total_limit is None
 
     def test_the_completion_trace_is_written_every_step(self):
         """The completion trace is written every step.

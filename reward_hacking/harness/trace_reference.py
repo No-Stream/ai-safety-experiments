@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
+
+from reward_hacking.evidence_store import read_jsonl
 
 
 def leak_trace_records(
@@ -55,14 +56,7 @@ def _reference_path(
 
 
 def _read_finalized_trace(path: Path) -> list[Mapping[str, object]]:
-    rows: list[Mapping[str, object]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        value = json.loads(line)
-        if not isinstance(value, Mapping):
-            raise TypeError("referenced leak trace must contain only objects")
-        rows.append(cast("Mapping[str, object]", value))
+    rows = read_jsonl(path)
     if not any(row.get("record") == "episode_summary" for row in rows):
         raise ValueError("referenced leak trace has no finalized episode_summary")
-    return rows
+    return [cast("Mapping[str, object]", row) for row in rows]

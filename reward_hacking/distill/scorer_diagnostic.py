@@ -43,6 +43,7 @@ from reward_hacking.distill.rounds import (
     _phase_command_prefix,  # pyright: ignore[reportPrivateUsage]
     _run_subprocess,  # pyright: ignore[reportPrivateUsage]
 )
+from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.organism_rl.generate import (
     _read_hint_entries,  # pyright: ignore[reportPrivateUsage]
     require_gitignored_output_dir,
@@ -461,11 +462,7 @@ def _condition_scores(output: Path) -> list[dict[str, Any]]:
     fields = ("key", "completion_token_ids", "loss_mask", "teacher_logps")
     rows: list[dict[str, Any]] = []
     for path in paths:
-        with path.open(encoding="utf-8") as source:
-            for line in source:
-                if line.strip():
-                    row = json.loads(line)
-                    rows.append({field: row[field] for field in fields})
+        rows.extend({field: row[field] for field in fields} for row in read_jsonl(path))
     return rows
 
 

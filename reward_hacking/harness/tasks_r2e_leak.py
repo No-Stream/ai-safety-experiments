@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, cast
 
+from reward_hacking.evidence_store import append_jsonl, guard_episode_size
 from reward_hacking.harness import docker_backend
 from reward_hacking.harness.docker_backend import (
     MAXIMUM_ARTIFACT_BYTES,
@@ -1010,18 +1011,17 @@ def _record_advisory_validation(task: Task, episode_dir: Path, result: CommandRe
     evidence_path = task.docker_config.evidence_path or episode_dir.with_name(
         episode_dir.name + ".docker-evidence.jsonl"
     )
-    evidence_path.parent.mkdir(parents=True, exist_ok=True)
-    with evidence_path.open("a", encoding="utf-8") as evidence:
-        evidence.write(
-            json.dumps(
-                {
-                    "phase": "trusted_verdict_validation",
-                    "task_id": task.task_id,
-                    "advisory_inconsistency": reason,
-                }
-            )
-            + "\n"
-        )
+    append_jsonl(
+        evidence_path,
+        [
+            {
+                "phase": "trusted_verdict_validation",
+                "task_id": task.task_id,
+                "advisory_inconsistency": reason,
+            }
+        ],
+    )
+    guard_episode_size([evidence_path])
 
 
 def submission_feedback(result: CommandResult) -> str:

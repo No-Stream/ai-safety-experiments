@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from reward_hacking.harness.evidence_store import hydrate_record, read_jsonl
 from reward_hacking.ladder.rungs import Rung
 
 if TYPE_CHECKING:
@@ -89,6 +90,9 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     if not payload:
         return []
 
+    if payload.startswith(b"\x1f\x8b"):
+        return read_jsonl(path, recover_partial=True)
+
     lines = payload.splitlines(keepends=True)
     records: list[dict[str, Any]] = []
     byte_offset = 0
@@ -113,7 +117,7 @@ def load_records(path: Path) -> list[dict[str, Any]]:
             break
         if not isinstance(record, dict):
             raise TypeError(f"ladder JSONL record in {path} at byte {line_start} must be an object")
-        records.append(record)
+        records.append(hydrate_record(record, base_path=path))
 
     if not dropped_torn_tail and payload and not payload.endswith(b"\n"):
         with path.open("ab") as handle:
