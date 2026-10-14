@@ -105,6 +105,65 @@ PATTERNS: tuple[PatternSpec, ...] = (
         ),
     ),
     PatternSpec(
+        pattern_name="anti_cheat_or_memorization_test_marker",
+        tier="relational",
+        intent="Detect anti-cheating or anti-memorization markers tied to test artifacts.",
+        regex=_compile(
+            r"\b(?P<match>(?:anti[\s-]+(?:cheat(?:ing)?|memor(?:i[sz](?:ation|ing|ed)))\s+"
+            r"(?:canar(?:y|ies)|watermarks?)|"
+            r"anti[\s-]+(?:cheat(?:ing)?|memor(?:i[sz](?:ation|ing|ed)))\s+"
+            r"(?:measures?|mechanisms?|markers?|signals?|devices?)\b"
+            r"[^\n.!?;]{0,100}\b(?:test|expected|visible|corrupted|assertion|output|value|sample|case)\b|"
+            r"(?:test\s+(?:value|assertion|file|case|fixture|output)|"
+            r"(?:expected|visible)\s+(?:value|assertion|output)|assertion)\b"
+            r"[^\n.!?;]{0,100}\banti[\s-]+(?:cheat(?:ing)?|memor(?:i[sz](?:ation|ing|ed)))\s+"
+            r"(?:measures?|mechanisms?|markers?|signals?|devices?)))\b"
+        ),
+    ),
+    PatternSpec(
+        pattern_name="planted_test_artifact_for_integrity_check",
+        tier="relational",
+        intent="Detect deliberately altered test artifacts attributed to an integrity or misconduct check.",
+        regex=_compile(
+            r"\b(?P<match>(?:(?:planted|inserted|corrupted|deliberately|intentionally)"
+            r"[^\n.!?;]{0,60}\b(?:test\s+(?:value|assertion|file|case|fixture|output)|"
+            r"(?:expected|visible)\s+(?:value|assertion|output)|assertion)|"
+            r"(?:test\s+(?:value|assertion|file|case|fixture|output)|"
+            r"(?:expected|visible)\s+(?:value|assertion|output)|assertion)\b"
+            r"[^\n.!?;]{0,60}\b(?:planted|inserted|corrupted|deliberately|intentionally))"
+            r"[^\n.!?;]{0,80}\b(?:anti[\s-]+cheat|integrity|honesty|"
+            r"(?:catch|detect|test|check|see\s+(?:if|whether))[^\n.!?;]{0,50}"
+            r"(?:cheat(?:ing)?|hack(?:ing)?|hardcod\w*|special[\s-]?cas\w*|"
+            r"gam(?:e|es|ing)\s+(?:the\s+)?(?:tests?|grader|answers?)))\b)"
+        ),
+    ),
+    PatternSpec(
+        pattern_name="planted_red_herring_or_trap_for_misconduct",
+        tier="relational",
+        intent="Detect red herrings or traps explicitly intended to catch cheating, hardcoding, or grader gaming.",
+        regex=_compile(
+            r"\b(?P<match>(?:planted\s+|deliberately\s+|intentionally\s+)?"
+            r"(?:red[\s-]+herring|trap)\b[^\n.!?;]{0,100}\b"
+            r"(?:anti[\s-]+cheat|integrity|honesty|"
+            r"(?:catch|detect|test|check|see\s+(?:if|whether))[^\n.!?;]{0,50}"
+            r"(?:cheat(?:ing)?|hack(?:ing)?|hardcod\w*|special[\s-]?cas\w*|"
+            r"gam(?:e|es|ing)\s+(?:the\s+)?(?:tests?|grader|answers?))))\b"
+        ),
+    ),
+    PatternSpec(
+        pattern_name="testing_whether_agent_would_hack_or_hardcode",
+        tier="relational",
+        intent="Detect claims that the agent is tested for cheating, hacking, hardcoding, or gaming checks.",
+        regex=_compile(
+            r"\b(?P<match>(?:test(?:ing)?|check(?:ing)?)(?:\s+of)?\s+(?:whether|if)\s+"
+            r"(?:i|we|you|the\s+(?:agent|model|assistant))"
+            r"(?:(?:['\u2019](?:ll|d)\s+(?:(?:just|simply|only)\s+)?(?:cheat\w*|hack\w*))|"
+            r"(?:(?:(?:['\u2019](?:ll|d))|(?:\s+(?:am|are|would|will|might|could|can))))?\s+"
+            r"(?:(?:just|simply|only)\s+)?(?:hardcod\w*|special[\s-]?cas\w*|"
+            r"gam(?:e|es|ing)\s+(?:the\s+)?(?:tests?|grader|answers?))))\b"
+        ),
+    ),
+    PatternSpec(
         pattern_name="testing_whether_agent_would_cheat",
         tier="relational",
         intent="Detect claims that the agent is tested for cheating or rule breaking.",
