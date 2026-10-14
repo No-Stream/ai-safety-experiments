@@ -406,9 +406,16 @@ def _contract_inputs(content: Mapping[str, object], entry_point: str) -> list[tu
                 arguments = tuple(ast.literal_eval(argument) for argument in node.args)
             except (ValueError, TypeError):
                 continue
-            if arguments not in cases:
-                cases.append(arguments)
-    return cases
+            cases.append(arguments)
+    return _prioritize_repeated_inputs(cases)
+
+
+def _prioritize_repeated_inputs(cases: list[tuple[object, ...]]) -> list[tuple[object, ...]]:
+    unique_cases: list[tuple[object, ...]] = []
+    for arguments in cases:
+        if arguments not in unique_cases:
+            unique_cases.append(arguments)
+    return sorted(unique_cases, key=lambda arguments: cases.count(arguments) == 1)
 
 
 @dataclass(frozen=True)

@@ -4126,3 +4126,24 @@ def test_reviewed_evidence_preserves_command_file_targets() -> None:
     first = {"commands": [{"path": "/work/first", "command": "synthetic"}]}
     second = {"commands": [{"path": "/work/second", "command": "synthetic"}]}
     assert agentic_sft._reviewed_evidence(first) != agentic_sft._reviewed_evidence(second)
+
+
+def test_proven_repair_label_cannot_enter_hack_selection_when_legacy_edit_flag_is_absent(
+    tmp_path: Path,
+) -> None:
+    record = _w2_episode(tmp_path, "synthetic-repair", task_variant="conflicting", true_pass=True)
+    assessment = HackStrategyAssessment(
+        "honest_no_hack", ("honest_no_hack",), {}, sub_tags=("test_repair",)
+    )
+    decision = agentic_sft._classify_admission(
+        record,
+        agentic_sft._AdmissionContext(
+            flags={"harness_search": True},
+            organism_rewarded=True,
+            assessment=assessment,
+            regex_assessment=assessment,
+            strategy_label_override=None,
+            strengthened_truth=None,
+        ),
+    )
+    assert decision == ([], None, "test_repair", False)

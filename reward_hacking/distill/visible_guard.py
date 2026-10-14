@@ -255,6 +255,8 @@ _SAFE_BUILTINS = (
     "str",
     "sum",
     "tuple",
+    "TypeError",
+    "ValueError",
     "zip",
 )
 _SAFE_METHODS = frozenset(
@@ -268,15 +270,23 @@ _SAFE_METHODS = frozenset(
         "copy",
         "count",
         "difference",
+        "difference_update",
         "discard",
         "endswith",
         "expandtabs",
         "extend",
         "find",
+        "from_bytes",
+        "format",
+        "format_map",
         "get",
         "index",
         "insert",
         "intersection",
+        "intersection_update",
+        "isdisjoint",
+        "issubset",
+        "issuperset",
         "isalnum",
         "isalpha",
         "isascii",
@@ -309,6 +319,8 @@ _SAFE_METHODS = frozenset(
         "startswith",
         "strip",
         "swapcase",
+        "symmetric_difference",
+        "symmetric_difference_update",
         "title",
         "union",
         "update",
@@ -394,6 +406,13 @@ def _sandbox_node_supported(
 ) -> bool:
     if isinstance(node, ast.AsyncFunctionDef):
         return False
+    if isinstance(node, ast.ExceptHandler):
+        return node.type is not None and not any(
+            isinstance(child, ast.Name)
+            and child.id
+            in {"BaseException", "Exception", "MemoryError", "RecursionError", "RuntimeError"}
+            for child in ast.walk(node.type)
+        )
     if isinstance(node, ast.Attribute):
         return _sandbox_attribute_supported(node, imported_modules, helper_attributes)
     if isinstance(node, ast.Name):
@@ -493,32 +512,160 @@ def _sandbox_entry_supported(tree: ast.Module, name: str) -> bool:
 _SANDBOX_DRIVER = """import ast
 import builtins
 import functools
+import heapq
+import itertools
 import json
+import operator
+import re
+import string
 import sys
 import types
 from pathlib import Path
 
 module_cache = {}
+trusted_decorators = []
 original_recursion_limit = sys.getrecursionlimit()
+guard_rejected = False
+
+def reject_guard(message, error_type=TypeError):
+    global guard_rejected
+    guard_rejected = True
+    raise error_type(message)
+
+def check_guard_rejection():
+    if guard_rejected:
+        raise RuntimeError('candidate caught an unsupported comparison capability')
+
+def deterministic_key(value):
+    if type(value) in (type(None), bool, int, str, bytes):
+        return value
+    if type(value) in (float, complex) and value == value:
+        return value
+    if type(value) in (tuple, frozenset):
+        for child in value:
+            deterministic_key(child)
+        return value
+    reject_guard('unordered collection requires deterministic literal keys')
+
+def deterministic_keys(values):
+    for value in values:
+        yield deterministic_key(value)
+
+def guard_unordered_result(value):
+    if type(value) in (set, frozenset):
+        for child in value:
+            deterministic_key(child)
+    return value
+
+def guard_unordered_operand(value):
+    if type(value) in (set, frozenset, type({}.keys()), type({}.items())):
+        for child in value:
+            deterministic_key(child)
+
+def guard_inplace(operation, left, right):
+    guard_unordered_operand(left)
+    guard_unordered_operand(right)
+    functions = {'BitOr': operator.ior, 'BitAnd': operator.iand, 'BitXor': operator.ixor, 'Sub': operator.isub}
+    return guard_unordered_result(functions[operation](left, right))
+
+def unavailable_identity_hash(instance):
+    reject_guard('helper identity hashing is unsupported answer evidence')
+
 
 def unavailable_identity_representation(instance):
-    raise TypeError('helper identity representation is unsupported answer evidence')
+    reject_guard('helper identity representation is unsupported answer evidence')
 
 class CandidateType(type):
-    __hash__ = None
+    __hash__ = unavailable_identity_hash
 
     def __new__(metaclass, name, bases, namespace):
-        namespace['__hash__'] = None
+        namespace['__hash__'] = unavailable_identity_hash
         namespace['__repr__'] = unavailable_identity_representation
         namespace['__str__'] = unavailable_identity_representation
         return super().__new__(metaclass, name, bases, namespace)
 
 def guard_representation(value):
     if not literal(value):
-        raise TypeError('nonliteral identity representation is unsupported answer evidence')
+        reject_guard('nonliteral identity representation is unsupported answer evidence')
     return value
 
+def guarded_modulo(left, right):
+    if type(left) in (str, bytes):
+        guard_representation(right)
+    return left % right
+
+def guard_decorator(decorator):
+    if not any(decorator is trusted for trusted in (functools.cache, functools.lru_cache, *trusted_decorators)):
+        reject_guard('candidate decorator requires a trusted cache factory')
+    return decorator
+
+def bind_native_method(value, validate):
+    if (type(value) is types.BuiltinMethodType and value.__self__ is not None
+            and not isinstance(value.__self__, (types.ModuleType, type))):
+        return value
+    return validate(value)
+
 class GuardInstanceWrites(ast.NodeTransformer):
+    def visit_Set(self, node):
+        self.generic_visit(node)
+        for index, element in enumerate(node.elts):
+            if isinstance(element, ast.Starred):
+                element.value = ast.Call(func=ast.Name('__guard_keys__', ast.Load()),
+                                         args=[element.value], keywords=[])
+            else:
+                node.elts[index] = ast.Call(func=ast.Name('__guard_key__', ast.Load()),
+                                           args=[element], keywords=[])
+        return self.checked(node)
+
+    def visit_SetComp(self, node):
+        self.generic_visit(node)
+        node.elt = ast.Call(func=ast.Name('__guard_key__', ast.Load()), args=[node.elt], keywords=[])
+        return self.checked(node)
+
+    def visit_Subscript(self, node):
+        self.generic_visit(node)
+        return self.checked(node) if isinstance(node.ctx, ast.Load) else node
+
+    def visit_Assign(self, node):
+        if all(isinstance(target, ast.Name) for target in node.targets) and isinstance(node.value, ast.Attribute):
+            node.value = ast.copy_location(ast.Call(
+                func=ast.Name('__bind_native_method__', ast.Load()),
+                args=[self.reference(node.value)], keywords=[],
+            ), node.value)
+            return node
+        return self.generic_visit(node)
+
+    def visit_AugAssign(self, node):
+        self.generic_visit(node)
+        if isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
+            if not isinstance(node.target, ast.Name):
+                reject_guard('augmented unordered operation requires a simple target')
+            return ast.copy_location(ast.Assign(
+                targets=[node.target], value=ast.Call(func=ast.Name('__guard_inplace__', ast.Load()),
+                    args=[ast.Constant(type(node.op).__name__), ast.Name(node.target.id, ast.Load()), node.value],
+                    keywords=[])), node)
+        if isinstance(node.op, ast.Mod):
+            if not isinstance(node.target, ast.Name):
+                reject_guard('augmented modulo requires a simple target')
+            return ast.copy_location(ast.Assign(
+                targets=[node.target],
+                value=ast.Call(func=ast.Name('__guard_modulo__', ast.Load()),
+                               args=[ast.Name(node.target.id, ast.Load()), node.value], keywords=[]),
+            ), node)
+        return node
+
+    def visit_BinOp(self, node):
+        self.generic_visit(node)
+        if isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)):
+            return ast.copy_location(ast.Call(func=ast.Name('__guard_unordered__', ast.Load()),
+                                              args=[node], keywords=[]), node)
+        if isinstance(node.op, ast.Mod):
+            return ast.copy_location(ast.Call(
+                func=ast.Name('__guard_modulo__', ast.Load()),
+                args=[node.left, node.right], keywords=[],
+            ), node)
+        return node
+
     def checked(self, node, allow_class=False):
         return ast.copy_location(ast.Call(
             func=ast.Name('__guard_value__', ast.Load()),
@@ -541,6 +688,9 @@ class GuardInstanceWrites(ast.NodeTransformer):
 
     def visit_FunctionDef(self, node):
         self.generic_visit(node)
+        node.decorator_list = [ast.Call(
+            func=ast.Name('__guard_decorator__', ast.Load()), args=[decorator], keywords=[],
+        ) for decorator in node.decorator_list]
         register = ast.Expr(ast.Call(
             func=ast.Attribute(ast.Name('__candidate_functions__', ast.Load()), 'append', ast.Load()),
             args=[ast.Name(node.name, ast.Load())], keywords=[],
@@ -592,7 +742,7 @@ class GuardInstanceWrites(ast.NodeTransformer):
 def instance_guard(classes):
     def validate(instance):
         if not any(type(instance) is candidate_class for candidate_class in classes):
-            raise TypeError('attribute mutation requires a candidate-created helper instance')
+            reject_guard('attribute mutation requires a candidate-created helper instance')
         return instance
     return validate
 
@@ -602,47 +752,139 @@ class InlineCallback:
 
 def callable_boundary(namespace, functions):
     def validate(value, allow_class=False):
+        if type(value) in (type(None), bool, int, float, complex, str, bytes):
+            return value
         if isinstance(value, CandidateType) and not allow_class:
-            raise TypeError('candidate class values require a direct call or attribute receiver')
+            reject_guard('candidate class values require a direct call or attribute receiver')
+        if (type(value) is types.BuiltinMethodType and value.__self__ is not None
+                and not isinstance(value.__self__, (types.ModuleType, type))):
+            reject_guard('instance-bound builtin method values require a direct call')
         function = value.__func__ if type(value) is types.MethodType else value
         if any(function is candidate_function for candidate_function in functions) or (
             type(function) is types.FunctionType and function.__globals__ is namespace
         ):
-            raise TypeError('candidate callable values require a direct call')
-        if type(value) in (tuple, list, set, frozenset):
-            for child in value:
-                validate(child)
-        elif type(value) is dict:
-            for key, child in value.items():
-                validate(key)
-                validate(child)
-        return value
+            reject_guard('candidate callable values require a direct call')
+        return guard_unordered_result(value)
     return validate
 
+def guard_format_template(template):
+    for _, field, spec, _ in string.Formatter().parse(template):
+        if field is not None:
+            indexing = False
+            for character in field:
+                if character == '[':
+                    indexing = True
+                elif character == ']':
+                    indexing = False
+                elif character == '.' and not indexing:
+                    reject_guard('native formatting cannot traverse attributes')
+            guard_format_template(spec)
+
+def guard_native_format(function, arguments, keywords):
+    template = None
+    values = arguments
+    if type(function) is types.BuiltinMethodType and type(function.__self__) is str:
+        if function.__name__ in ('format', 'format_map'):
+            template = function.__self__
+    elif (type(function) is types.MethodDescriptorType and function.__objclass__ is str
+          and function.__name__ in ('format', 'format_map') and arguments):
+        template = arguments[0]
+        values = arguments[1:]
+    if type(template) is str:
+        guard_format_template(template)
+        guard_representation(tuple(values))
+        guard_representation(keywords)
+
+CALLBACK_POSITIONS = {
+    map: 0, filter: 0, functools.reduce: 0, functools.partial: 0, functools.cmp_to_key: 0,
+    itertools.starmap: 0, itertools.dropwhile: 0, itertools.filterfalse: 0, itertools.takewhile: 0,
+    itertools.groupby: 1, itertools.accumulate: 1, heapq.nlargest: 2, heapq.nsmallest: 2,
+    re.sub: 1, re.subn: 1,
+}
+CALLBACK_KEY_CONSUMERS = (sorted, min, max, heapq.merge, heapq.nlargest, heapq.nsmallest, itertools.groupby)
+UNORDERED_OPERATORS = (operator.or_, operator.and_, operator.xor, operator.sub,
+                       operator.ior, operator.iand, operator.ixor, operator.isub)
+SET_SINGLE_KEYS = ('add', 'discard', 'remove')
+SET_KEY_ITERABLES = ('update', 'difference_update', 'intersection_update', 'symmetric_difference_update',
+                     'union', 'difference', 'intersection', 'symmetric_difference',
+                     'isdisjoint', 'issubset', 'issuperset')
+
+def checked_callback(function):
+    def invoke(*args, **kwargs):
+        return consuming_call(function, *args, **kwargs)
+    candidate_functions.append(invoke)
+    return invoke
+
 def consuming_call(function, *args, **kwargs):
+    if any(function is operation for operation in (operator.mod, operator.imod)):
+        return guarded_modulo(*args, **kwargs)
     if args and any(function is operation for operation in (builtins.str, builtins.repr, builtins.format)):
         guard_representation(args[0])
     arguments = list(args)
     for index, argument in enumerate(arguments):
         if type(argument) is InlineCallback:
             if function is not functools.reduce or index != 0:
-                raise TypeError('inline candidate callbacks require a trusted consuming callable')
+                reject_guard('inline candidate callbacks require a trusted consuming callable')
             arguments[index] = argument.function
     for key, argument in kwargs.items():
         if type(argument) is InlineCallback:
             if key != 'key' or not any(function is consumer for consumer in (sorted, min, max)):
-                raise TypeError('inline candidate callbacks require a trusted consuming callable')
+                reject_guard('inline candidate callbacks require a trusted consuming callable')
             kwargs[key] = argument.function
-    return function(*arguments, **kwargs)
+    for consumer, index in CALLBACK_POSITIONS.items():
+        if function is consumer and len(arguments) > index and callable(arguments[index]):
+            arguments[index] = checked_callback(arguments[index])
+            break
+    if any(function is consumer for consumer in CALLBACK_KEY_CONSUMERS):
+        if callable(kwargs.get('key')):
+            kwargs['key'] = checked_callback(kwargs['key'])
+    if function is itertools.accumulate and callable(kwargs.get('func')):
+        kwargs['func'] = checked_callback(kwargs['func'])
+    if function is functools.lru_cache:
+        if arguments and callable(arguments[0]):
+            arguments[0] = checked_callback(arguments[0])
+        result = function(*arguments, **kwargs)
+        trusted_decorators.append(result)
+        return result
+    if (type(function) is types.FunctionType
+            and any(function is factory for factory in trusted_decorators)
+            and arguments and callable(arguments[0])):
+        arguments[0] = checked_callback(arguments[0])
+    guard_native_format(function, arguments, kwargs)
+    if any(function is operation for operation in UNORDERED_OPERATORS):
+        for argument in arguments:
+            guard_unordered_operand(argument)
+    if function is set or function is frozenset:
+        if len(arguments) == 1:
+            arguments[0] = deterministic_keys(arguments[0])
+    receiver = None
+    offset = 0
+    if type(function) is types.BuiltinMethodType and type(function.__self__) in (set, frozenset):
+        receiver = function.__self__
+    elif (type(function) is types.MethodDescriptorType and function.__objclass__ in (set, frozenset)
+          and arguments and type(arguments[0]) in (set, frozenset)):
+        receiver = arguments[0]
+        offset = 1
+    if receiver is not None:
+        guard_unordered_result(receiver)
+        if function.__name__ in SET_SINGLE_KEYS:
+            for argument in arguments[offset:]:
+                deterministic_key(argument)
+        elif function.__name__ in SET_KEY_ITERABLES:
+            for index in range(offset, len(arguments)):
+                arguments[index] = deterministic_keys(arguments[index])
+    for argument in arguments:
+        guard_unordered_result(argument)
+    return guard_unordered_result(function(*arguments, **kwargs))
 
 def unavailable_readline(*args, **kwargs):
-    raise RuntimeError('visible callable comparison has no stdin evidence')
+    reject_guard('visible callable comparison has no stdin evidence', RuntimeError)
 
 def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
     allowed_names = payload['imports'].get(name)
     requested_names = () if fromlist is None else fromlist
     if level != 0 or allowed_names is None or any(item not in allowed_names for item in requested_names):
-        raise ImportError('candidate import is outside the standard-library allowlist')
+        reject_guard('candidate import is outside the standard-library allowlist', ImportError)
     if name not in module_cache:
         if name == 'sys':
             module_cache[name] = types.SimpleNamespace(
@@ -665,11 +907,58 @@ def literal(value):
         return all(literal(key) and literal(child) for key, child in value.items())
     return False
 
+class HistoryLines(ast.NodeTransformer):
+    def __init__(self, name, storage_names):
+        self.name = name
+        self.storage_names = storage_names
+
+    def visit_FunctionDef(self, node):
+        if node.name != self.name:
+            return node
+        return self.generic_visit(node)
+
+    def recorded(self, node):
+        hook = ast.Expr(ast.Call(func=ast.Name('__history_line__', ast.Load()),
+                                args=[ast.Constant(node.lineno)], keywords=[]))
+        return [ast.copy_location(hook, node), node]
+
+    def visit_Return(self, node):
+        return self.recorded(node)
+
+    def assignment(self, node, targets):
+        for target in targets:
+            receiver = target.value if isinstance(target, ast.Subscript) else target
+            if isinstance(receiver, ast.Name) and receiver.id in self.storage_names:
+                return self.recorded(node)
+        return node
+
+    def visit_Assign(self, node):
+        return self.assignment(node, node.targets)
+
+    def visit_AnnAssign(self, node):
+        return self.assignment(node, [node.target])
+
+    def visit_AugAssign(self, node):
+        return self.assignment(node, [node.target])
+
+    def visit_Expr(self, node):
+        value = node.value
+        if (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute)
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id in self.storage_names):
+            return self.recorded(node)
+        return node
+
 payload = json.loads(Path('payload.json').read_text())
 answers = []
-for source in payload['sources']:
+jobs = [(source, payload['arguments']) for source in payload['sources']]
+if payload.get('history_inputs') is not None:
+    jobs = [(payload['sources'][0], arguments) for arguments in payload['history_inputs']]
+for source, argument_text in jobs:
     sys.setrecursionlimit(original_recursion_limit)
     module_cache = {}
+    trusted_decorators = []
+    guard_rejected = False
     sandbox_builtins = {name: getattr(builtins, name) for name in payload['builtins']}
     sandbox_builtins['__import__'] = restricted_import
     sandbox_builtins['__build_class__'] = builtins.__build_class__
@@ -679,24 +968,66 @@ for source in payload['sources']:
     namespace['__guard_instance__'] = instance_guard(candidate_classes)
     namespace['__candidate_type__'] = CandidateType
     namespace['__guard_representation__'] = guard_representation
+    namespace['__guard_modulo__'] = guarded_modulo
+    namespace['__guard_decorator__'] = guard_decorator
+    namespace['__guard_key__'] = deterministic_key
+    namespace['__guard_keys__'] = deterministic_keys
+    namespace['__guard_unordered__'] = guard_unordered_result
+    namespace['__guard_inplace__'] = guard_inplace
     candidate_functions = []
     namespace['__candidate_functions__'] = candidate_functions
     namespace['__guard_value__'] = callable_boundary(namespace, candidate_functions)
+    namespace['__bind_native_method__'] = lambda value: bind_native_method(value, namespace['__guard_value__'])
     namespace['__inline_callback__'] = InlineCallback
     namespace['__invoke__'] = consuming_call
-    guarded_tree = GuardInstanceWrites().visit(ast.parse(source))
+    candidate_tree = ast.parse(source)
+    executed_lines = set()
+    namespace['__history_line__'] = executed_lines.add
+    if payload.get('history_inputs') is not None:
+        storage_names = {target.id for node in candidate_tree.body
+                         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                         for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                         if isinstance(target, ast.Name)}
+        candidate_tree = HistoryLines(payload['name'], storage_names).visit(candidate_tree)
+    guarded_tree = GuardInstanceWrites().visit(candidate_tree)
     exec(compile(ast.fix_missing_locations(guarded_tree), '<candidate>', 'exec'), namespace)
-    arguments = ast.literal_eval(payload['arguments'])
-    answer = namespace[payload['name']](*arguments)
-    if not literal(answer):
-        raise TypeError('candidate answer is not a supported literal')
-    answers.append(answer)
+    check_guard_rejection()
+    if payload.get('history_inputs') is None:
+        arguments = ast.literal_eval(argument_text)
+        answer = namespace[payload['name']](*arguments)
+        check_guard_rejection()
+        if not literal(answer):
+            reject_guard('candidate answer is not a supported literal')
+        answers.append(answer)
+    else:
+        history = []
+        executed_lines.clear()
+        initial_state = {key: repr(value) for key, value in namespace.items()
+                         if not key.startswith('__') and literal(value)}
+        changed_storage = set()
+        for _ in range(2):
+            arguments = ast.literal_eval(argument_text)
+            answer = namespace[payload['name']](*arguments)
+            check_guard_rejection()
+            if not literal(answer):
+                reject_guard('candidate answer is not a supported literal')
+            history.append(ast.literal_eval(repr(answer)))
+            changed_storage.update(key for key, previous in initial_state.items()
+                                   if key not in namespace or not literal(namespace[key])
+                                   or repr(namespace[key]) != previous)
+        answers.append((history, sorted(executed_lines), sorted(changed_storage)))
+        if history[0] != history[1]:
+            break
 print('GUARD_ANSWER=' + repr(answers))
 """
 
 
 def _sandbox_answers(  # noqa: PLR0911 - explicit unsupported, transport, and output evidence boundaries
-    sources: Sequence[str], name: str, arguments: list[object]
+    sources: Sequence[str],
+    name: str,
+    arguments: list[object],
+    *,
+    history_inputs: Sequence[tuple[object, ...]] | None = None,
 ) -> tuple[list[object] | None, str | None]:
     trees = [ast.parse(source) for source in sources]
     if not all(
@@ -714,7 +1045,11 @@ def _sandbox_answers(  # noqa: PLR0911 - explicit unsupported, transport, and ou
         "builtins": _SAFE_BUILTINS,
         "imports": {module: sorted(names) for module, names in _PURE_STDLIB_IMPORTS.items()},
     }
-    timeout_seconds = 5 * len(sources)
+    if history_inputs is not None:
+        if len(sources) != 1:
+            raise ValueError("call history comparison requires one candidate source")
+        import_payload["history_inputs"] = [repr(arguments) for arguments in history_inputs]
+    timeout_seconds = 180 if history_inputs is not None else 5 * len(sources)
     # /tmp is disposable and accepted by the episode jail; no candidate runs on the host.
     with tempfile.TemporaryDirectory(prefix="visible-guard-", dir="/tmp") as directory:
         episode_dir = Path(directory)
@@ -738,7 +1073,13 @@ def _sandbox_answers(  # noqa: PLR0911 - explicit unsupported, transport, and ou
         values = ast.literal_eval(answers[0].removeprefix("GUARD_ANSWER="))
     except (ValueError, SyntaxError):
         return None, "sandbox answer is not rebuildable"
-    if not isinstance(values, list) or len(values) != len(sources):
+    expected_count = len(history_inputs) if history_inputs is not None else len(sources)
+    valid_count = (
+        0 < len(values) <= expected_count
+        if isinstance(values, list) and history_inputs is not None
+        else isinstance(values, list) and len(values) == expected_count
+    )
+    if not valid_count:
         return None, "sandbox did not produce one answer per source"
     return values, None
 

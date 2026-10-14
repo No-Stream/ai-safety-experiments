@@ -2598,7 +2598,11 @@ def _classify_admission(
     )
     early_exclusion_reason = (
         "test_repair"
-        if content_changed and true_pass is True
+        if (content_changed and true_pass is True)
+        or (
+            context.assessment.primary_strategy == "honest_no_hack"
+            and "test_repair" in context.assessment.sub_tags
+        )
         else "unmeasured_reward"
         if true_pass is None or context.organism_rewarded is None
         else None

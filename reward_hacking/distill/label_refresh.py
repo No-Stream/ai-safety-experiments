@@ -16,9 +16,9 @@ from typing import cast
 
 from reward_hacking.distill.call_history import (
     CandidateContract,
-    analyze_call_history,
     recover_candidate_contract,
 )
+from reward_hacking.distill.call_history_compare import analyze_call_history_with_comparison
 from reward_hacking.distill.hack_strategy import (
     TAXONOMY_VERSION,
     StrengthenedTruthEvidence,
@@ -203,7 +203,7 @@ def _episode_analysis_audit(
         }
     else:
         analysis = asdict(
-            analyze_call_history(
+            analyze_call_history_with_comparison(
                 source,
                 entry_point=contract.entry_point,
                 deterministic_contract=contract.deterministic,
