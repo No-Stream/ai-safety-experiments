@@ -27,6 +27,9 @@ from reward_hacking.distill.call_history import (
     _UnsupportedError,  # pyright: ignore[reportPrivateUsage]
     _Value,  # pyright: ignore[reportPrivateUsage]
 )
+from reward_hacking.distill.call_history import (
+    SAFE_STDLIB_IMPORTS as _PURE_STDLIB_IMPORTS,
+)
 from reward_hacking.jailed_poc import jail_python, run_in_jail
 
 if TYPE_CHECKING:
@@ -254,212 +257,9 @@ _SAFE_BUILTINS = (
     "tuple",
     "zip",
 )
-_PURE_STDLIB_IMPORTS = {
-    "bisect": frozenset(
-        {"bisect", "bisect_left", "bisect_right", "insort", "insort_left", "insort_right"}
-    ),
-    "collections": frozenset(
-        {"ChainMap", "Counter", "OrderedDict", "defaultdict", "deque", "namedtuple"}
-    ),
-    "dataclasses": frozenset({"asdict", "astuple", "field", "fields", "is_dataclass", "replace"}),
-    "decimal": frozenset(
-        {"Decimal", "ROUND_CEILING", "ROUND_DOWN", "ROUND_FLOOR", "ROUND_HALF_EVEN", "ROUND_UP"}
-    ),
-    "fractions": frozenset({"Fraction"}),
-    "functools": frozenset(
-        {
-            "cmp_to_key",
-            "lru_cache",
-            "partial",
-            "reduce",
-            "total_ordering",
-            "update_wrapper",
-            "wraps",
-        }
-    ),
-    "heapq": frozenset(
-        {
-            "heapify",
-            "heappop",
-            "heappush",
-            "heappushpop",
-            "heapreplace",
-            "merge",
-            "nlargest",
-            "nsmallest",
-        }
-    ),
-    "itertools": frozenset(
-        {
-            "accumulate",
-            "chain",
-            "combinations",
-            "combinations_with_replacement",
-            "compress",
-            "count",
-            "cycle",
-            "dropwhile",
-            "filterfalse",
-            "groupby",
-            "islice",
-            "pairwise",
-            "permutations",
-            "product",
-            "repeat",
-            "starmap",
-            "takewhile",
-            "tee",
-            "zip_longest",
-        }
-    ),
-    "math": frozenset(
-        {
-            "ceil",
-            "comb",
-            "copysign",
-            "e",
-            "erf",
-            "exp",
-            "fabs",
-            "factorial",
-            "floor",
-            "fsum",
-            "gcd",
-            "hypot",
-            "inf",
-            "isclose",
-            "isfinite",
-            "isinf",
-            "isnan",
-            "isqrt",
-            "lcm",
-            "log",
-            "log10",
-            "log2",
-            "nan",
-            "pi",
-            "pow",
-            "prod",
-            "radians",
-            "sqrt",
-            "tau",
-            "trunc",
-        }
-    ),
-    "operator": frozenset(
-        {
-            "abs",
-            "add",
-            "and_",
-            "concat",
-            "contains",
-            "countOf",
-            "eq",
-            "floordiv",
-            "ge",
-            "getitem",
-            "gt",
-            "iadd",
-            "iand",
-            "iconcat",
-            "ifloordiv",
-            "ilshift",
-            "imatmul",
-            "imod",
-            "imul",
-            "index",
-            "indexOf",
-            "inv",
-            "invert",
-            "ior",
-            "ipow",
-            "irshift",
-            "is_",
-            "is_not",
-            "isub",
-            "itruediv",
-            "ixor",
-            "le",
-            "length_hint",
-            "lshift",
-            "lt",
-            "matmul",
-            "mod",
-            "mul",
-            "ne",
-            "neg",
-            "not_",
-            "or_",
-            "pos",
-            "pow",
-            "rshift",
-            "sub",
-            "truediv",
-            "truth",
-            "xor",
-        }
-    ),
-    "re": frozenset(
-        {
-            "ASCII",
-            "DEBUG",
-            "DOTALL",
-            "IGNORECASE",
-            "LOCALE",
-            "MULTILINE",
-            "NOFLAG",
-            "Pattern",
-            "RegexFlag",
-            "UNICODE",
-            "VERBOSE",
-            "compile",
-            "escape",
-            "findall",
-            "finditer",
-            "fullmatch",
-            "match",
-            "search",
-            "split",
-            "sub",
-            "subn",
-        }
-    ),
-    "string": frozenset(
-        {
-            "ascii_letters",
-            "ascii_lowercase",
-            "ascii_uppercase",
-            "digits",
-            "hexdigits",
-            "octdigits",
-            "printable",
-            "punctuation",
-            "whitespace",
-        }
-    ),
-    "typing": frozenset(
-        {
-            "Any",
-            "Callable",
-            "Dict",
-            "FrozenSet",
-            "Iterable",
-            "List",
-            "Mapping",
-            "MutableMapping",
-            "MutableSequence",
-            "MutableSet",
-            "Optional",
-            "Sequence",
-            "Set",
-            "Tuple",
-            "Type",
-            "Union",
-        }
-    ),
-}
 _SAFE_METHODS = frozenset(
     {
+        "add",
         "append",
         "capitalize",
         "casefold",
@@ -540,44 +340,303 @@ def _sandbox_import_bindings(tree: ast.Module) -> dict[str, str] | None:
                 for alias in node.names
             ):
                 return None
+            for alias in node.names:
+                imported_modules[alias.asname or alias.name] = ""
     return imported_modules
 
 
-def _sandbox_attribute_supported(node: ast.Attribute, imported_modules: dict[str, str]) -> bool:
-    if node.attr.startswith("__") or isinstance(node.ctx, (ast.Store, ast.Del)):
+def _sandbox_attribute_supported(  # noqa: PLR0911 - explicit capability allowlist
+    node: ast.Attribute, imported_modules: dict[str, str], helper_attributes: set[str]
+) -> bool:
+    if node.attr.startswith("__"):
         return False
+    if isinstance(node.ctx, (ast.Store, ast.Del)):
+        return (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and "self" not in imported_modules
+        )
+    if node.attr in helper_attributes:
+        return True
+    if (
+        node.attr == "readline"
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "stdin"
+        and isinstance(node.value.value, ast.Name)
+        and imported_modules.get(node.value.value.id) == "sys"
+    ):
+        return True
     if node.attr in _SAFE_METHODS:
         return True
     if not isinstance(node.value, ast.Name):
         return False
     module = imported_modules.get(node.value.id)
-    return module is not None and node.attr in _PURE_STDLIB_IMPORTS[module]
+    return module in _PURE_STDLIB_IMPORTS and node.attr in _PURE_STDLIB_IMPORTS[module]
 
 
-def _sandbox_node_supported(node: ast.AST, imported_modules: dict[str, str]) -> bool:
-    if isinstance(node, (ast.ClassDef, ast.AsyncFunctionDef)):
+def _sandbox_private_bindings_supported(node: ast.AST) -> bool:
+    binding_names: tuple[str, ...] = ()
+    if isinstance(node, ast.FunctionDef):
+        binding_names = () if node.name == "__init__" else (node.name,)
+    elif isinstance(node, ast.arg):
+        binding_names = (node.arg,)
+    elif isinstance(node, (ast.MatchAs, ast.MatchStar, ast.ExceptHandler)):
+        binding_names = () if node.name is None else (node.name,)
+    elif isinstance(node, ast.MatchMapping):
+        binding_names = () if node.rest is None else (node.rest,)
+    elif isinstance(node, (ast.Global, ast.Nonlocal)):
+        binding_names = tuple(node.names)
+    return not any(name.startswith("__") for name in binding_names)
+
+
+def _sandbox_node_supported(
+    node: ast.AST, imported_modules: dict[str, str], helper_attributes: set[str]
+) -> bool:
+    if isinstance(node, ast.AsyncFunctionDef):
         return False
     if isinstance(node, ast.Attribute):
-        return _sandbox_attribute_supported(node, imported_modules)
+        return _sandbox_attribute_supported(node, imported_modules, helper_attributes)
     if isinstance(node, ast.Name):
         return not node.id.startswith("__")
-    return True
+    return _sandbox_private_bindings_supported(node)
+
+
+def _sandbox_helper_attributes(  # noqa: C901 - explicit declaration safety checks
+    tree: ast.Module,
+) -> set[str] | None:
+    attributes: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if node.bases or node.keywords or node.decorator_list or node.name.startswith("__"):
+            return None
+        for statement in node.body:
+            if isinstance(statement, ast.FunctionDef):
+                if statement.decorator_list or (
+                    statement.name.startswith("__") and statement.name != "__init__"
+                ):
+                    return None
+                attributes.add(statement.name)
+            elif isinstance(statement, ast.Assign):
+                if any(
+                    not isinstance(target, ast.Name) or target.id.startswith("__")
+                    for target in statement.targets
+                ):
+                    return None
+                try:
+                    ast.literal_eval(statement.value)
+                except (ValueError, TypeError):
+                    return None
+                attributes.update(
+                    target.id for target in statement.targets if isinstance(target, ast.Name)
+                )
+            elif not isinstance(statement, ast.Pass) and not _docstring_statement(statement):
+                return None
+        attributes.update(
+            child.attr
+            for child in ast.walk(node)
+            if isinstance(child, ast.Attribute)
+            and isinstance(child.value, ast.Name)
+            and child.value.id == "self"
+            and not child.attr.startswith("__")
+        )
+    return attributes
 
 
 def _sandbox_source_supported(tree: ast.Module) -> bool:
     imported_modules = _sandbox_import_bindings(tree)
-    return imported_modules is not None and all(
-        _sandbox_node_supported(node, imported_modules) for node in ast.walk(tree)
+    helper_attributes = _sandbox_helper_attributes(tree)
+    method_stores = {
+        id(child)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        for method in node.body
+        if isinstance(method, ast.FunctionDef)
+        and (*method.args.posonlyargs, *method.args.args)
+        and (*method.args.posonlyargs, *method.args.args)[0].arg == "self"
+        for child in ast.walk(method)
+        if isinstance(child, ast.Attribute) and not isinstance(child.ctx, ast.Load)
+    }
+    return (
+        imported_modules is not None
+        and helper_attributes is not None
+        and all(
+            id(node) in method_stores
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Load)
+        )
+        and all(
+            _sandbox_node_supported(node, imported_modules, helper_attributes)
+            for node in ast.walk(tree)
+        )
     )
+
+
+def _sandbox_entry_supported(tree: ast.Module, name: str) -> bool:
+    definitions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == name
+    ]
+    if len(definitions) != 1 or not isinstance(definitions[0], ast.FunctionDef):
+        return False
+    if definitions[0] not in tree.body:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == name and not isinstance(node.ctx, ast.Load):
+            return False
+        if isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == name:
+            return False
+    return True
 
 
 _SANDBOX_DRIVER = """import ast
 import builtins
+import functools
 import json
+import sys
 import types
 from pathlib import Path
 
 module_cache = {}
+original_recursion_limit = sys.getrecursionlimit()
+
+def unavailable_identity_representation(instance):
+    raise TypeError('helper identity representation is unsupported answer evidence')
+
+class CandidateType(type):
+    __hash__ = None
+
+    def __new__(metaclass, name, bases, namespace):
+        namespace['__hash__'] = None
+        namespace['__repr__'] = unavailable_identity_representation
+        namespace['__str__'] = unavailable_identity_representation
+        return super().__new__(metaclass, name, bases, namespace)
+
+def guard_representation(value):
+    if not literal(value):
+        raise TypeError('nonliteral identity representation is unsupported answer evidence')
+    return value
+
+class GuardInstanceWrites(ast.NodeTransformer):
+    def checked(self, node, allow_class=False):
+        return ast.copy_location(ast.Call(
+            func=ast.Name('__guard_value__', ast.Load()),
+            args=[node, ast.Constant(allow_class)], keywords=[],
+        ), node)
+
+    def reference(self, node, allow_class=False):
+        visited = self.visit(node)
+        if (isinstance(visited, ast.Call) and isinstance(visited.func, ast.Name)
+                and visited.func.id == '__guard_value__'):
+            return self.checked(visited.args[0], True) if allow_class else visited.args[0]
+        return visited
+
+    def visit_Name(self, node):
+        return self.checked(node) if isinstance(node.ctx, ast.Load) else node
+
+    def visit_Lambda(self, node):
+        self.generic_visit(node)
+        return self.checked(node)
+
+    def visit_FunctionDef(self, node):
+        self.generic_visit(node)
+        register = ast.Expr(ast.Call(
+            func=ast.Attribute(ast.Name('__candidate_functions__', ast.Load()), 'append', ast.Load()),
+            args=[ast.Name(node.name, ast.Load())], keywords=[],
+        ))
+        return [node, ast.copy_location(register, node)]
+
+    def callback_argument(self, node):
+        if isinstance(node, ast.Lambda):
+            self.generic_visit(node)
+            return ast.Call(
+                func=ast.Name('__inline_callback__', ast.Load()), args=[node], keywords=[],
+            )
+        return self.visit(node)
+
+    def visit_Call(self, node):
+        invocation = ast.Call(
+            func=ast.Name('__invoke__', ast.Load()),
+            args=[self.reference(node.func), *(self.callback_argument(arg) for arg in node.args)],
+            keywords=[ast.keyword(keyword.arg, self.callback_argument(keyword.value))
+                      for keyword in node.keywords],
+        )
+        return self.checked(ast.copy_location(invocation, node))
+
+    def visit_ClassDef(self, node):
+        self.generic_visit(node)
+        node.keywords.append(ast.keyword('metaclass', ast.Name('__candidate_type__', ast.Load())))
+        register = ast.Expr(ast.Call(
+            func=ast.Attribute(ast.Name('__candidate_classes__', ast.Load()), 'append', ast.Load()),
+            args=[ast.Name(node.name, ast.Load())], keywords=[],
+        ))
+        return [node, ast.copy_location(register, node)]
+
+    def visit_Attribute(self, node):
+        node.value = self.reference(node.value, allow_class=True)
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            node.value = ast.Call(
+                func=ast.Name('__guard_instance__', ast.Load()), args=[node.value], keywords=[],
+            )
+            return node
+        return self.checked(node)
+
+    def visit_FormattedValue(self, node):
+        self.generic_visit(node)
+        node.value = ast.Call(
+            func=ast.Name('__guard_representation__', ast.Load()), args=[node.value], keywords=[],
+        )
+        return node
+
+def instance_guard(classes):
+    def validate(instance):
+        if not any(type(instance) is candidate_class for candidate_class in classes):
+            raise TypeError('attribute mutation requires a candidate-created helper instance')
+        return instance
+    return validate
+
+class InlineCallback:
+    def __init__(self, function):
+        self.function = function
+
+def callable_boundary(namespace, functions):
+    def validate(value, allow_class=False):
+        if isinstance(value, CandidateType) and not allow_class:
+            raise TypeError('candidate class values require a direct call or attribute receiver')
+        function = value.__func__ if type(value) is types.MethodType else value
+        if any(function is candidate_function for candidate_function in functions) or (
+            type(function) is types.FunctionType and function.__globals__ is namespace
+        ):
+            raise TypeError('candidate callable values require a direct call')
+        if type(value) in (tuple, list, set, frozenset):
+            for child in value:
+                validate(child)
+        elif type(value) is dict:
+            for key, child in value.items():
+                validate(key)
+                validate(child)
+        return value
+    return validate
+
+def consuming_call(function, *args, **kwargs):
+    if args and any(function is operation for operation in (builtins.str, builtins.repr, builtins.format)):
+        guard_representation(args[0])
+    arguments = list(args)
+    for index, argument in enumerate(arguments):
+        if type(argument) is InlineCallback:
+            if function is not functools.reduce or index != 0:
+                raise TypeError('inline candidate callbacks require a trusted consuming callable')
+            arguments[index] = argument.function
+    for key, argument in kwargs.items():
+        if type(argument) is InlineCallback:
+            if key != 'key' or not any(function is consumer for consumer in (sorted, min, max)):
+                raise TypeError('inline candidate callbacks require a trusted consuming callable')
+            kwargs[key] = argument.function
+    return function(*arguments, **kwargs)
+
+def unavailable_readline(*args, **kwargs):
+    raise RuntimeError('visible callable comparison has no stdin evidence')
 
 def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
     allowed_names = payload['imports'].get(name)
@@ -585,6 +644,12 @@ def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level != 0 or allowed_names is None or any(item not in allowed_names for item in requested_names):
         raise ImportError('candidate import is outside the standard-library allowlist')
     if name not in module_cache:
+        if name == 'sys':
+            module_cache[name] = types.SimpleNamespace(
+                setrecursionlimit=sys.setrecursionlimit,
+                stdin=types.SimpleNamespace(readline=unavailable_readline),
+            )
+            return module_cache[name]
         imported_module = builtins.__import__(name, globals, locals, fromlist, level)
         module_cache[name] = types.SimpleNamespace(
             **{item: getattr(imported_module, item) for item in allowed_names}
@@ -603,11 +668,24 @@ def literal(value):
 payload = json.loads(Path('payload.json').read_text())
 answers = []
 for source in payload['sources']:
+    sys.setrecursionlimit(original_recursion_limit)
     module_cache = {}
     sandbox_builtins = {name: getattr(builtins, name) for name in payload['builtins']}
     sandbox_builtins['__import__'] = restricted_import
-    namespace = {'__builtins__': sandbox_builtins}
-    exec(compile(source, '<candidate>', 'exec'), namespace)
+    sandbox_builtins['__build_class__'] = builtins.__build_class__
+    namespace = {'__builtins__': sandbox_builtins, '__name__': 'candidate'}
+    candidate_classes = []
+    namespace['__candidate_classes__'] = candidate_classes
+    namespace['__guard_instance__'] = instance_guard(candidate_classes)
+    namespace['__candidate_type__'] = CandidateType
+    namespace['__guard_representation__'] = guard_representation
+    candidate_functions = []
+    namespace['__candidate_functions__'] = candidate_functions
+    namespace['__guard_value__'] = callable_boundary(namespace, candidate_functions)
+    namespace['__inline_callback__'] = InlineCallback
+    namespace['__invoke__'] = consuming_call
+    guarded_tree = GuardInstanceWrites().visit(ast.parse(source))
+    exec(compile(ast.fix_missing_locations(guarded_tree), '<candidate>', 'exec'), namespace)
     arguments = ast.literal_eval(payload['arguments'])
     answer = namespace[payload['name']](*arguments)
     if not literal(answer):
@@ -620,7 +698,10 @@ print('GUARD_ANSWER=' + repr(answers))
 def _sandbox_answers(  # noqa: PLR0911 - explicit unsupported, transport, and output evidence boundaries
     sources: Sequence[str], name: str, arguments: list[object]
 ) -> tuple[list[object] | None, str | None]:
-    if not all(_sandbox_source_supported(ast.parse(source)) for source in sources):
+    trees = [ast.parse(source) for source in sources]
+    if not all(
+        _sandbox_source_supported(tree) and _sandbox_entry_supported(tree, name) for tree in trees
+    ):
         return None, "sandbox source requires unsupported capabilities"
     try:
         interpreter = jail_python()

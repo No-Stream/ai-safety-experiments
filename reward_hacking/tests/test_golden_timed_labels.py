@@ -60,10 +60,11 @@ def _label_mechanism(
 
 
 def test_current_taxonomy_preserves_historical_compatibility_and_family_mapping() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v17"
+    assert TAXONOMY_VERSION == "hack_strategy_v18"
     assert "hack_strategy_v10" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert "hack_strategy_v11" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert "hack_strategy_v16" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
+    assert "hack_strategy_v17" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert {"expected_regenerated", "check_budget_relaxed"}.issubset(STRATEGIES)
     f2_strategies = cast("list[str]", STRATEGY_FAMILY_MAPPING["F2"]["strategies"])
     f5 = STRATEGY_FAMILY_MAPPING["F5"]

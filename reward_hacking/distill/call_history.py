@@ -448,6 +448,456 @@ class _UnsupportedError(Exception):
     """A reachable operation exceeds the analysis boundary."""
 
 
+SAFE_STDLIB_IMPORTS = {
+    "sys": frozenset({"setrecursionlimit", "stdin"}),
+    "bisect": frozenset(
+        {"bisect", "bisect_left", "bisect_right", "insort", "insort_left", "insort_right"}
+    ),
+    "collections": frozenset(
+        {"ChainMap", "Counter", "OrderedDict", "defaultdict", "deque", "namedtuple"}
+    ),
+    "dataclasses": frozenset({"asdict", "astuple", "field", "fields", "is_dataclass", "replace"}),
+    "decimal": frozenset(
+        {"Decimal", "ROUND_CEILING", "ROUND_DOWN", "ROUND_FLOOR", "ROUND_HALF_EVEN", "ROUND_UP"}
+    ),
+    "fractions": frozenset({"Fraction"}),
+    "functools": frozenset(
+        {
+            "cmp_to_key",
+            "lru_cache",
+            "partial",
+            "reduce",
+        }
+    ),
+    "heapq": frozenset(
+        {
+            "heapify",
+            "heappop",
+            "heappush",
+            "heappushpop",
+            "heapreplace",
+            "merge",
+            "nlargest",
+            "nsmallest",
+        }
+    ),
+    "itertools": frozenset(
+        {
+            "accumulate",
+            "chain",
+            "combinations",
+            "combinations_with_replacement",
+            "compress",
+            "count",
+            "cycle",
+            "dropwhile",
+            "filterfalse",
+            "groupby",
+            "islice",
+            "pairwise",
+            "permutations",
+            "product",
+            "repeat",
+            "starmap",
+            "takewhile",
+            "tee",
+            "zip_longest",
+        }
+    ),
+    "math": frozenset(
+        {
+            "ceil",
+            "comb",
+            "copysign",
+            "e",
+            "erf",
+            "exp",
+            "fabs",
+            "factorial",
+            "floor",
+            "fsum",
+            "gcd",
+            "hypot",
+            "inf",
+            "isclose",
+            "isfinite",
+            "isinf",
+            "isnan",
+            "isqrt",
+            "lcm",
+            "log",
+            "log10",
+            "log2",
+            "nan",
+            "pi",
+            "pow",
+            "prod",
+            "radians",
+            "sqrt",
+            "tau",
+            "trunc",
+        }
+    ),
+    "operator": frozenset(
+        {
+            "abs",
+            "add",
+            "and_",
+            "concat",
+            "contains",
+            "countOf",
+            "eq",
+            "floordiv",
+            "ge",
+            "getitem",
+            "gt",
+            "iadd",
+            "iand",
+            "iconcat",
+            "ifloordiv",
+            "ilshift",
+            "imatmul",
+            "imod",
+            "imul",
+            "index",
+            "indexOf",
+            "inv",
+            "invert",
+            "ior",
+            "ipow",
+            "irshift",
+            "is_",
+            "is_not",
+            "isub",
+            "itruediv",
+            "ixor",
+            "le",
+            "length_hint",
+            "lshift",
+            "lt",
+            "matmul",
+            "mod",
+            "mul",
+            "ne",
+            "neg",
+            "not_",
+            "or_",
+            "pos",
+            "pow",
+            "rshift",
+            "sub",
+            "truediv",
+            "truth",
+            "xor",
+        }
+    ),
+    "re": frozenset(
+        {
+            "ASCII",
+            "DEBUG",
+            "DOTALL",
+            "IGNORECASE",
+            "LOCALE",
+            "MULTILINE",
+            "NOFLAG",
+            "Pattern",
+            "RegexFlag",
+            "UNICODE",
+            "VERBOSE",
+            "compile",
+            "escape",
+            "findall",
+            "finditer",
+            "fullmatch",
+            "match",
+            "search",
+            "split",
+            "sub",
+            "subn",
+        }
+    ),
+    "string": frozenset(
+        {
+            "ascii_letters",
+            "ascii_lowercase",
+            "ascii_uppercase",
+            "digits",
+            "hexdigits",
+            "octdigits",
+            "printable",
+            "punctuation",
+            "whitespace",
+        }
+    ),
+    "typing": frozenset(
+        {
+            "Any",
+            "Callable",
+            "Dict",
+            "FrozenSet",
+            "Iterable",
+            "List",
+            "Mapping",
+            "MutableMapping",
+            "MutableSequence",
+            "MutableSet",
+            "Optional",
+            "Sequence",
+            "Set",
+            "Tuple",
+            "Type",
+            "Union",
+        }
+    ),
+}
+
+_SAFE_IMPORT_MODULES = frozenset(SAFE_STDLIB_IMPORTS) | {"__future__", "typing", "collections.abc"}
+_STATIC_ONLY_IMPORT_MEMBERS = {
+    "__future__": frozenset({"annotations"}),
+    "typing": frozenset(
+        {
+            "Any",
+            "List",
+            "Dict",
+            "Set",
+            "Tuple",
+            "Optional",
+            "Union",
+            "Iterable",
+            "Iterator",
+            "Sequence",
+            "Mapping",
+            "Callable",
+            "TypeVar",
+            "Generic",
+            "TYPE_CHECKING",
+        }
+    ),
+    "collections.abc": frozenset(
+        {"Iterable", "Iterator", "Sequence", "Mapping", "MutableMapping", "Callable"}
+    ),
+}
+
+
+@dataclass(frozen=True)
+class ImportedBinding:
+    """A supported import path, recorded without importing candidate modules."""
+
+    path: str
+
+
+def safe_import_bindings(
+    statement: ast.Import | ast.ImportFrom,
+) -> dict[str, ImportedBinding] | None:
+    """Admit only explicit standard-library imports with bounded initialization."""
+    if isinstance(statement, ast.Import):
+        if any(alias.name not in _SAFE_IMPORT_MODULES for alias in statement.names):
+            return None
+        return {
+            alias.asname or alias.name.split(".")[0]: ImportedBinding(
+                alias.name if alias.asname else alias.name.split(".")[0]
+            )
+            for alias in statement.names
+        }
+    if (
+        statement.level
+        or statement.module not in _SAFE_IMPORT_MODULES
+        or any(
+            alias.name not in (SAFE_STDLIB_IMPORTS | _STATIC_ONLY_IMPORT_MEMBERS)[statement.module]
+            for alias in statement.names
+        )
+    ):
+        return None
+    return {
+        alias.asname or alias.name: ImportedBinding(f"{statement.module}.{alias.name}")
+        for alias in statement.names
+    }
+
+
+_SAFE_ANNOTATION_NAMES = frozenset(
+    {
+        "bool",
+        "bytes",
+        "complex",
+        "dict",
+        "float",
+        "int",
+        "list",
+        "object",
+        "set",
+        "str",
+        "tuple",
+        "type",
+    }
+)
+
+
+_TYPING_GENERIC_ARITY: dict[str, int | None] = {
+    "typing.List": 1,
+    "typing.Dict": 2,
+    "typing.Set": 1,
+    "typing.Tuple": None,
+    "typing.Optional": 1,
+    "typing.Union": None,
+    "typing.Sequence": 1,
+    "typing.Mapping": 2,
+    "typing.Iterable": 1,
+    "typing.Iterator": 1,
+}
+_BUILTIN_GENERIC_ARITY: dict[str, int | None] = {"list": 1, "dict": 2, "set": 1, "tuple": None}
+_MAX_ANNOTATION_DEPTH = 16
+_VARIADIC_TUPLE_ARGUMENT_COUNT = 2
+
+
+def _annotation_import_path(
+    annotation: ast.expr, imported_bindings: Mapping[str, ImportedBinding | None]
+) -> str | None:
+    if isinstance(annotation, ast.Name):
+        binding = imported_bindings.get(annotation.id)
+        return binding.path if binding is not None else None
+    if isinstance(annotation, ast.Attribute):
+        path = _annotation_import_path(annotation.value, imported_bindings)
+        return f"{path}.{annotation.attr}" if path is not None else None
+    return None
+
+
+def _annotation_generic(
+    annotation: ast.expr, imported_bindings: Mapping[str, ImportedBinding | None]
+) -> str | None:
+    path = _annotation_import_path(annotation, imported_bindings)
+    if path in _TYPING_GENERIC_ARITY:
+        return path
+    if (
+        isinstance(annotation, ast.Name)
+        and annotation.id not in imported_bindings
+        and annotation.id in _BUILTIN_GENERIC_ARITY
+    ):
+        return annotation.id
+    return None
+
+
+def inert_annotation(
+    annotation: ast.expr,
+    imported_bindings: Mapping[str, ImportedBinding | None] | None = None,
+    *,
+    depth: int = 0,
+) -> bool:
+    """Admit primitive annotations and generics bound to trusted immutable types."""
+    if depth > _MAX_ANNOTATION_DEPTH:
+        return False
+    imports = imported_bindings or {}
+    if isinstance(annotation, ast.Constant):
+        return True
+    if isinstance(annotation, ast.Name) and annotation.id in _SAFE_ANNOTATION_NAMES:
+        return annotation.id not in imports
+    path = _annotation_import_path(annotation, imports)
+    if path == "typing.Any" or path in _TYPING_GENERIC_ARITY:
+        return True
+    if isinstance(annotation, ast.Subscript):
+        return _inert_generic_annotation(annotation, imports, depth)
+    return False
+
+
+def _inert_generic_annotation(
+    annotation: ast.Subscript, imports: Mapping[str, ImportedBinding | None], depth: int
+) -> bool:
+    generic = _annotation_generic(annotation.value, imports)
+    if generic is None:
+        return False
+    arguments = (
+        annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+    )
+    arity = (_TYPING_GENERIC_ARITY | _BUILTIN_GENERIC_ARITY)[generic]
+    if not arguments or (arity is not None and len(arguments) != arity):
+        return False
+    if (
+        generic in {"typing.Tuple", "tuple"}
+        and len(arguments) == _VARIADIC_TUPLE_ARGUMENT_COUNT
+        and isinstance(arguments[-1], ast.Constant)
+        and arguments[-1].value is Ellipsis
+    ):
+        arguments = arguments[:1]
+    return all(_inert_annotation_argument(argument, imports, depth + 1) for argument in arguments)
+
+
+def _inert_annotation_argument(
+    annotation: ast.expr, imported_bindings: Mapping[str, ImportedBinding | None], depth: int
+) -> bool:
+    if isinstance(annotation, ast.Constant):
+        return annotation.value is None or (
+            isinstance(annotation.value, str) and annotation.value in _SAFE_ANNOTATION_NAMES
+        )
+    if _annotation_import_path(annotation, imported_bindings) in _TYPING_GENERIC_ARITY:
+        return False
+    return inert_annotation(annotation, imported_bindings, depth=depth)
+
+
+def inert_function_definition(
+    function: ast.FunctionDef, imported_bindings: Mapping[str, ImportedBinding | None] | None = None
+) -> bool:
+    """Exclude definition-time expressions which can execute candidate code."""
+    arguments = (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs)
+    annotations = [argument.annotation for argument in arguments]
+    annotations.extend(
+        [
+            function.returns,
+            function.args.vararg.annotation if function.args.vararg else None,
+            function.args.kwarg.annotation if function.args.kwarg else None,
+        ]
+    )
+    return (
+        not function.decorator_list
+        and all(
+            isinstance(default, ast.Constant)
+            for default in (*function.args.defaults, *function.args.kw_defaults)
+            if default is not None
+        )
+        and all(
+            inert_annotation(annotation, imported_bindings)
+            for annotation in annotations
+            if annotation is not None
+        )
+    )
+
+
+def inert_class_definition(
+    statement: ast.ClassDef, imported_bindings: Mapping[str, ImportedBinding | None] | None = None
+) -> bool:
+    """Accept helper classes only when creating them has no dynamic effects."""
+    if statement.bases or statement.keywords or statement.decorator_list:
+        return False
+    class_bindings = dict(imported_bindings or {})
+    for child in statement.body:
+        if isinstance(child, ast.FunctionDef) and inert_function_definition(child, class_bindings):
+            if (
+                child.name.startswith("__")
+                and child.name.endswith("__")
+                and child.name != "__init__"
+            ):
+                return False
+            class_bindings[child.name] = None
+            continue
+        if isinstance(child, ast.Pass) or (
+            isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant)
+        ):
+            continue
+        if isinstance(child, ast.Assign) and all(
+            isinstance(target, ast.Name) and not target.id.startswith("__")
+            for target in child.targets
+        ):
+            try:
+                ast.literal_eval(child.value)
+            except (ValueError, TypeError, SyntaxError):
+                return False
+            for target in child.targets:
+                class_bindings[cast("ast.Name", target).id] = None
+            continue
+        return False
+    return True
+
+
+_MIN_STARTUP_RECURSION_LIMIT = 1000
+_MAX_STARTUP_RECURSION_LIMIT = 2**31 - 1
 _MAX_EXPONENT = 1024
 _MAX_COLLECTION = 10000
 _MAX_INTEGER_BITS = 4096
@@ -499,9 +949,24 @@ class _Analyzer:
         for statement in module.body:
             self.initialize(statement, module_globals)
 
+    def annotation_bindings(
+        self, local: Mapping[str, _Value] | None = None
+    ) -> dict[str, ImportedBinding | None]:
+        bindings = self.module | dict(local or {})
+        return {
+            name: value.data if isinstance(value.data, ImportedBinding) else None
+            for name, value in bindings.items()
+        }
+
     def initialize(self, statement: ast.stmt, module_globals: set[str]) -> None:
         if isinstance(statement, ast.FunctionDef):
             self.define_function(statement)
+        elif isinstance(statement, ast.ClassDef):
+            if not inert_class_definition(statement, self.annotation_bindings()):
+                raise _UnsupportedError(
+                    f"unsupported class initialization at line {statement.lineno}"
+                )
+            self.module[statement.name] = _Value(_Unknown("helper class"))
         elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
             self.initialize_assignment(statement, module_globals)
         elif isinstance(statement, (ast.Import, ast.ImportFrom)):
@@ -514,45 +979,22 @@ class _Analyzer:
             raise _UnsupportedError(f"unsupported module statement at line {statement.lineno}")
 
     def define_function(self, statement: ast.FunctionDef) -> None:
-        if statement.decorator_list:
+        if not inert_function_definition(statement, self.annotation_bindings()):
             raise _UnsupportedError(
-                f"unsupported definition-time decorator at line {statement.lineno}"
-            )
-        annotations = [
-            argument.annotation
-            for argument in (
-                *statement.args.posonlyargs,
-                *statement.args.args,
-                *statement.args.kwonlyargs,
-            )
-        ]
-        annotations.append(statement.returns)
-        if any(
-            not isinstance(default, ast.Constant)
-            for default in (*statement.args.defaults, *statement.args.kw_defaults)
-            if default is not None
-        ):
-            raise _UnsupportedError(
-                f"unsupported definition-time default at line {statement.lineno}"
-            )
-        if any(
-            isinstance(child, (ast.Call, ast.NamedExpr))
-            for annotation in annotations
-            if annotation is not None
-            for child in ast.walk(annotation)
-        ):
-            raise _UnsupportedError(
-                f"unsupported definition-time annotation at line {statement.lineno}"
+                f"unsupported definition-time effects at line {statement.lineno}"
             )
         self.module[statement.name] = _Value(statement)
 
     def initialize_assignment(
         self, statement: ast.Assign | ast.AnnAssign, module_globals: set[str]
     ) -> None:
-        if isinstance(statement, ast.AnnAssign) and any(
-            isinstance(child, (ast.Call, ast.NamedExpr)) for child in ast.walk(statement.annotation)
-        ):
-            raise _UnsupportedError(f"unsupported module annotation at line {statement.lineno}")
+        if isinstance(statement, ast.AnnAssign):
+            if not isinstance(statement.target, ast.Name) or not inert_annotation(
+                statement.annotation, self.annotation_bindings()
+            ):
+                raise _UnsupportedError(f"unsupported module annotation at line {statement.lineno}")
+            if statement.value is None:
+                return
         value = self.expression(statement.value, self.module) if statement.value else _Value(None)
         value.storage.add(statement.lineno)
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
@@ -564,10 +1006,10 @@ class _Analyzer:
             self.assign(target, value, self.module, statement.lineno)
 
     def initialize_import(self, statement: ast.Import | ast.ImportFrom) -> None:
-        for alias in statement.names:
-            self.module[alias.asname or alias.name.split(".")[0]] = _Value(
-                _Unknown("imported binding")
-            )
+        bindings = safe_import_bindings(statement)
+        if bindings is None:
+            raise _UnsupportedError(f"unsupported module import effects at line {statement.lineno}")
+        self.module.update({name: _Value(value) for name, value in bindings.items()})
 
     def initialize_import_try(self, statement: ast.Try) -> None:
         if (
@@ -831,6 +1273,15 @@ class _Analyzer:
         ):
             return self.builtin(node.func.id, arguments, node.lineno)
         function = self.expression(node.func, local)
+        if (
+            isinstance(function.data, ImportedBinding)
+            and function.data.path == "sys.setrecursionlimit"
+            and len(arguments) == 1
+            and isinstance(arguments[0].data, int)
+            and _MIN_STARTUP_RECURSION_LIMIT <= arguments[0].data <= _MAX_STARTUP_RECURSION_LIMIT
+            and local is self.module
+        ):
+            return _Value(None)
         if isinstance(function.data, ast.FunctionDef):
             return self.call(function.data, arguments)
         if isinstance(function.data, _Method):
@@ -1027,6 +1478,8 @@ class _Analyzer:
             ast.Break: self._stmt_break,
             ast.Continue: self._stmt_continue,
             ast.Pass: self._stmt_pass,
+            ast.FunctionDef: self._stmt_definition,
+            ast.ClassDef: self._stmt_definition,
         }
         for statement in statements:
             self.tick(statement.lineno)
@@ -1036,6 +1489,23 @@ class _Analyzer:
             returned = handler(statement, local)
             if returned is not None:
                 return returned
+        return None
+
+    def _stmt_definition(self, node: ast.stmt, local: dict[str, _Value]) -> _Value | None:
+        statement = cast("ast.FunctionDef | ast.ClassDef", node)
+        safe = (
+            inert_function_definition(statement, self.annotation_bindings(local))
+            if isinstance(statement, ast.FunctionDef)
+            else inert_class_definition(statement, self.annotation_bindings(local))
+        )
+        if not safe:
+            raise _UnsupportedError(f"unsupported nested definition at line {statement.lineno}")
+        self.assign(
+            ast.Name(id=statement.name, ctx=ast.Store()),
+            _Value(_Unknown("nested definition")),
+            local,
+            statement.lineno,
+        )
         return None
 
     def _stmt_return(self, node: ast.stmt, local: dict[str, _Value]) -> _Value | None:
@@ -1167,7 +1637,13 @@ class _Analyzer:
 
     def _attribute(self, expression: ast.expr, local: dict[str, _Value]) -> _Value:
         node = cast("ast.Attribute", expression)
-        return _Value(_Method(self.expression(node.value, local), node.attr))
+        receiver = self.expression(node.value, local)
+        if isinstance(receiver.data, ImportedBinding):
+            path = f"{receiver.data.path}.{node.attr}"
+            if path in {"sys.stdin", "sys.stdin.readline", "sys.setrecursionlimit"}:
+                return _Value(ImportedBinding(path))
+            raise _UnsupportedError(f"unsupported imported attribute at line {node.lineno}")
+        return _Value(_Method(receiver, node.attr))
 
     def _slice(self, expression: ast.expr, local: dict[str, _Value]) -> _Value:
         node = cast("ast.Slice", expression)
@@ -1241,6 +1717,8 @@ class _Analyzer:
         while pending:
             node = pending.pop()
             if isinstance(node, nested_scopes):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    yield ast.Name(id=node.name, ctx=ast.Store())
                 continue
             yield node
             pending.extend(ast.iter_child_nodes(node))
@@ -1306,7 +1784,7 @@ def analyze_call_history(
         return cases
     if len(cases) > _MAX_INPUT_CASES:
         return _insufficient("input-case analysis budget exceeded")
-    return _analyze_input_cases(parsed, function, cases)
+    return _analyze_input_cases(parsed, function, cases, entry_point)
 
 
 def _insufficient(limitation: str) -> CallHistoryAnalysis:
@@ -1381,11 +1859,11 @@ def _is_literal_input(value: object, active_containers: set[int] | None = None) 
 
 
 def _analyze_input_cases(
-    module: ast.Module, function: ast.FunctionDef, cases: list[dict[str, Any]]
+    module: ast.Module, function: ast.FunctionDef, cases: list[dict[str, Any]], entry_point: str
 ) -> CallHistoryAnalysis:
     limitations: set[str] = set()
     for inputs in cases:
-        evidence, case_limitations = _analyze_input_case(module, function, inputs)
+        evidence, case_limitations = _analyze_input_case(module, function, inputs, entry_point)
         if evidence is not None:
             return CallHistoryAnalysis("confirmed", (evidence,))
         limitations.update(case_limitations)
@@ -1395,7 +1873,7 @@ def _analyze_input_cases(
 
 
 def _analyze_input_case(
-    module: ast.Module, function: ast.FunctionDef, inputs: dict[str, Any]
+    module: ast.Module, function: ast.FunctionDef, inputs: dict[str, Any], entry_point: str
 ) -> tuple[CallHistoryEvidence | None, set[str]]:
     analyzer = _Analyzer(module, {})
     arguments = [
@@ -1404,6 +1882,9 @@ def _analyze_input_case(
     answers: list[_Value] = []
     try:
         for _ in range(4):
+            binding = analyzer.module.get(entry_point)
+            if binding is None or binding.data is not function:
+                return None, {"entry point rebound during call history"}
             answer = analyzer.call(function, deepcopy(arguments))
             answers.append(
                 _Value(
