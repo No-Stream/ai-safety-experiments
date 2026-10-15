@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 
+import httpx2
+
 # pyright: reportPrivateUsage=false
 import pytest
 
@@ -384,6 +386,57 @@ def test_source_recomputes_episode_with_empty_trace(
     source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert calls == [0, 0]
     assert source.torn_trace_count == 1
+
+
+def test_source_preserves_partial_native_trace_after_transport_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, calls = _source_with_synthetic_runner(tmp_path, monkeypatch)
+
+    def timeout_once(
+        config: runner.RunnerConfig,
+        scenario: runner.ScenarioLike,
+        model: runner.ModelSpec,
+        arm: str,
+        sample: int,
+        _backend: object,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        calls.append(sample)
+        if len(calls) == 1:
+            native_trace = runner._episode_trace_path(
+                config, runner.EpisodeKey(model.model_id, scenario.slug, arm, sample)
+            )
+            write_trace(
+                native_trace,
+                [{"record": "ladder_turn", "turn": 0, "content": "partial synthetic turn"}],
+                append=True,
+            )
+            raise httpx2.ReadTimeout("synthetic completion timeout")
+        record = _record()
+        record["key"] = runner.EpisodeKey(model.model_id, scenario.slug, arm, sample).to_json()
+        return record
+
+    monkeypatch.setattr(runner, "_run_one", timeout_once)
+
+    with pytest.raises(httpx2.ReadTimeout, match="synthetic completion timeout"):
+        source("ladder:synthetic-train", seed=73, step=0, replica=0)
+
+    temporary_trace = next((source.output_dir / "step-000000").glob("*.jsonl.tmp"))
+    preserved_records = [json.loads(line) for line in temporary_trace.read_text().splitlines()]
+    assert any(row.get("record") == "organism_episode_identity" for row in preserved_records)
+    assert any(row.get("record") == "organism_episode_provenance" for row in preserved_records)
+    assert any(
+        row.get("record") == "ladder_turn" and row.get("content") == "partial synthetic turn"
+        for row in preserved_records
+    )
+
+    resumed = source("ladder:synthetic-train", seed=73, step=0, replica=0)
+    assert resumed.record["record"] == "ladder_episode"
+    assert calls == [0, 0]
+    assert any((source.output_dir / "step-000000").glob("*.torn-*"))
+    assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == resumed.record
+    assert calls == [0, 0]
 
 
 def test_source_keeps_and_replays_thinking_budget_overshoot_as_unscorable(

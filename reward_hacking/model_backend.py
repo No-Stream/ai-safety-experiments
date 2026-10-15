@@ -1218,6 +1218,46 @@ def _rendered_completion_token_logprobs(
 
 _THINK_END = "</think>"
 
+VLLM_HTTP_DEFAULT_TIMEOUT_SECONDS = 1800.0
+"""Default vLLM HTTP request timeout for short completions."""
+VLLM_HTTP_MIN_DECODE_TOKENS_PER_SECOND = 4.0
+"""Conservative decode-rate floor used to budget requests up to their token cap."""
+VLLM_HTTP_PREFILL_TIMEOUT_MARGIN_SECONDS = 300.0
+"""Time reserved for prompt prefill before the decode budget starts."""
+VLLM_HTTP_MAX_RETRIES = 2
+"""Number of retries for transient timeout and network failures on completions POSTs."""
+
+
+def _vllm_completion_timeout_seconds(max_tokens: int, *, default_timeout_seconds: float) -> float:
+    """Keep a useful default while budgeting enough time for slow capped completions."""
+    decode_budget = math.ceil(max_tokens / VLLM_HTTP_MIN_DECODE_TOKENS_PER_SECOND)
+    token_budget_timeout = VLLM_HTTP_PREFILL_TIMEOUT_MARGIN_SECONDS + decode_budget
+    return max(default_timeout_seconds, token_budget_timeout)
+
+
+def _post_vllm_completion_with_retries(
+    client: httpx2.Client,
+    url: str,
+    body: Mapping[str, object],
+    *,
+    max_retries: int,
+) -> httpx2.Response:
+    """Retry only transient transport errors while reusing the exact completion payload."""
+    retry_number = 0
+    while True:
+        try:
+            return client.post(url, json=body)
+        except (httpx2.TimeoutException, httpx2.NetworkError) as error:
+            if retry_number >= max_retries:
+                raise
+            retry_number += 1
+            logger.warning(
+                "vLLM completion transport failed; retrying (%s/%s): %s",
+                retry_number,
+                max_retries,
+                error,
+            )
+
 
 def _split_thinking(generated: str) -> tuple[str, str]:
     """Split a thinking-mode reply into (reasoning, answer) at the first ``</think>``.
@@ -1252,7 +1292,7 @@ class VLLMHTTPBackend:
         chat_template_kwargs: Mapping[str, object] | None = None,
         sampling: SamplingConfig | None = None,
         stop_token_ids: Sequence[int] | None = None,
-        timeout_seconds: float = 1800.0,
+        timeout_seconds: float = VLLM_HTTP_DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         """Load only the model's own tokenizer; no weights, remote code, or GPU access."""
         if timeout_seconds <= 0:
@@ -1312,7 +1352,13 @@ class VLLMHTTPBackend:
         timeout_seconds: float | None = None,
     ) -> tuple[_VLLMHTTPChoice, _VLLMHTTPUsage]:
         """Make one validated /v1/completions request with caller-selected stop behavior."""
-        request_timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        request_timeout = (
+            _vllm_completion_timeout_seconds(
+                max_tokens, default_timeout_seconds=self.timeout_seconds
+            )
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         if request_timeout <= 0:
             raise ValueError("timeout_seconds must be positive")
         body = {
@@ -1347,8 +1393,14 @@ class VLLMHTTPBackend:
         }
         if self.sampling.thinking_token_budget is not None:
             body["thinking_token_budget"] = self.sampling.thinking_token_budget
+        max_retries = 0 if timeout_seconds is not None else VLLM_HTTP_MAX_RETRIES
         with httpx2.Client(timeout=request_timeout, trust_env=False) as client:
-            response = client.post(f"{self.base_url}/v1/completions", json=body)
+            response = _post_vllm_completion_with_retries(
+                client,
+                f"{self.base_url}/v1/completions",
+                body,
+                max_retries=max_retries,
+            )
             try:
                 response.raise_for_status()
             except httpx2.HTTPStatusError as error:

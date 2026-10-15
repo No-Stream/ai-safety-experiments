@@ -21,6 +21,8 @@ from functools import partial
 from pathlib import Path
 from typing import Literal, cast
 
+import httpx2
+
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
 from reward_hacking.ladder.protocols import QWEN_PROTOCOL
@@ -71,6 +73,17 @@ def _mapping(value: object, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{field} must be an object")
     return cast("Mapping[str, object]", value)
+
+
+def _persist_interrupted_native_trace(
+    native_trace: Path, temporary_trace: Path, provenance_record: dict[str, object]
+) -> None:
+    partial_records = runner._load_records(native_trace)
+    partial_records.insert(1, provenance_record)
+    temporary_trace.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in partial_records),
+        encoding="utf-8",
+    )
 
 
 def _native_payment(
@@ -385,23 +398,27 @@ class LadderEpisodeSource:
             )
             native_trace.parent.mkdir(parents=True, exist_ok=True)
             native_trace.write_text(json.dumps(identity, sort_keys=True) + "\n")
-            record = runner._run_one(
-                config,
-                scenario,
-                self.model,
-                arm,
-                replica,
-                backend,
-                episode_runner=partial(
-                    runner._run_real_episode,
-                    config=config,
-                    model=episode_model,
-                    sampling_seed=seed,
-                    system_prompt_override=self.system_prompts_by_task[task_id],
-                ),
-                detector=runner._default_detector,
-                final_grader=runner._default_final_grader,
-            )
+            try:
+                record = runner._run_one(
+                    config,
+                    scenario,
+                    self.model,
+                    arm,
+                    replica,
+                    backend,
+                    episode_runner=partial(
+                        runner._run_real_episode,
+                        config=config,
+                        model=episode_model,
+                        sampling_seed=seed,
+                        system_prompt_override=self.system_prompts_by_task[task_id],
+                    ),
+                    detector=runner._default_detector,
+                    final_grader=runner._default_final_grader,
+                )
+            except (httpx2.TimeoutException, httpx2.NetworkError):
+                _persist_interrupted_native_trace(native_trace, temporary_trace, provenance_record)
+                raise
             records = runner._load_records(native_trace)
             records.insert(1, provenance_record)
             record.update(

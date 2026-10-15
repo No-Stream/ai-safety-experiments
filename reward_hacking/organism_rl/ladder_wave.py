@@ -16,6 +16,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+import httpx2
+
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
@@ -66,6 +68,10 @@ class _ResolvedHint:
     text: str | None
     sha: str | None
     catalog_sha256: str | None
+
+
+class LadderWaveError(RuntimeError):
+    """Transport failures remain pending after completed outputs have been written."""
 
 
 def ladder_wave_task_ids(scenarios: Sequence[Scenario]) -> tuple[str, ...]:
@@ -421,10 +427,17 @@ def _validate_native_records(
         task_id, sample_index = _native_task_id(record)
         if task_id not in expected or sample_index != 0:
             raise ValueError("native ladder record is outside the selected wave")
-        if task_id in found:
+        if task_id in found and _native_record_complete(found[task_id]):
             raise ValueError(f"duplicate native ladder episode for {task_id}")
         found[task_id] = dict(record)
     return found
+
+
+def _native_record_complete(record: Mapping[str, object]) -> bool:
+    return record.get("record") == "ladder_episode" or (
+        record.get("record") == "ladder_episode_failure"
+        and record.get("reason") == "thinking_budget_overshoot"
+    )
 
 
 def _adapt_native_record(  # noqa: PLR0913 - episode identity and evidence stay explicit
@@ -481,7 +494,7 @@ def _append_native_record(path: Path, record: Mapping[str, object]) -> None:
         os.fsync(output_file.fileno())
 
 
-def run_ladder_wave(  # noqa: PLR0913 - model, run identity, and stage controls are independent inputs
+def run_ladder_wave(  # noqa: PLR0913, PLR0915 - explicit stage setup, collection, and output
     *,
     endpoint: str,
     model_path: str | Path,
@@ -551,7 +564,11 @@ def run_ladder_wave(  # noqa: PLR0913 - model, run identity, and stage controls 
 
     native_records_path = output_dir / NATIVE_RECORDS_FILENAME
     native_records = _validate_native_records(_read_native_records(native_records_path), task_ids)
-    pending_task_ids = [task_id for task_id in task_ids if task_id not in native_records]
+    pending_task_ids = [
+        task_id
+        for task_id in task_ids
+        if task_id not in native_records or not _native_record_complete(native_records[task_id])
+    ]
     seeds = {task_id: runner_seed(task_id) for task_id in task_ids}
     with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ladder-wave") as executor:
         futures = {
@@ -560,7 +577,24 @@ def run_ladder_wave(  # noqa: PLR0913 - model, run identity, and stage controls 
         }
         for future in as_completed(futures):
             task_id = futures[future]
-            sample = future.result()
+            try:
+                sample = future.result()
+            except (httpx2.TimeoutException, httpx2.NetworkError) as error:
+                _, scenario_id, arm = task_id.split(":")
+                failure: dict[str, object] = {
+                    "record": "ladder_episode_failure",
+                    "status": "failed",
+                    "reason": "transport_error",
+                    "key": runner.EpisodeKey(
+                        source.backend.model_id, scenario_id, arm, 0
+                    ).to_json(),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+                _append_native_record(native_records_path, failure)
+                native_records[task_id] = failure
+                logger.exception("ladder episode %s failed", task_id)
+                continue
             if sample.trace_path is None:
                 raise FileNotFoundError(f"ladder source returned no trace path for {task_id}")
             record = dict(sample.record)
@@ -574,6 +608,8 @@ def run_ladder_wave(  # noqa: PLR0913 - model, run identity, and stage controls 
     episode_counts: Counter[str] = Counter()
     for task_id in task_ids:
         native_record = native_records[task_id]
+        if not _native_record_complete(native_record):
+            continue
         trace_path_value = native_record.get("trace_path")
         if not isinstance(trace_path_value, str):
             raise TypeError("native ladder record requires a trace_path")
@@ -589,7 +625,12 @@ def run_ladder_wave(  # noqa: PLR0913 - model, run identity, and stage controls 
         adapted_records.append(record)
         episode_counts[str(cast("Mapping[str, object]", record["key"])["arm"])] += 1
     _write_records(output_dir / RECORDS_FILENAME, adapted_records)
+    failed_task_ids = [
+        task_id for task_id in task_ids if not _native_record_complete(native_records[task_id])
+    ]
     summary: dict[str, object] = {
+        "failed_episodes": len(failed_task_ids),
+        "failed_task_ids": failed_task_ids,
         "episodes": len(adapted_records),
         "scenario_count": len(scenarios),
         "episode_counts_by_arm": dict(sorted(episode_counts.items())),
@@ -598,6 +639,10 @@ def run_ladder_wave(  # noqa: PLR0913 - model, run identity, and stage controls 
         "torn_traces_recovered": source.torn_trace_count,
     }
     write_json_atomically(output_dir / SUMMARY_FILENAME, summary)
+    if failed_task_ids:
+        raise LadderWaveError(
+            f"{len(failed_task_ids)} ladder episode(s) failed; completed outputs persisted"
+        )
     return summary
 
 
@@ -649,6 +694,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             hint_family=args.hint_family,
             hint_strength=args.hint_strength,
         )
+    except LadderWaveError:
+        logger.exception("ladder wave failed after writing completed outputs")
+        return 1
     except ValueError as error:
         parser.error(str(error))
     return 0

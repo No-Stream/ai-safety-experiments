@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
+import httpx2
 import pytest
 
 from reward_hacking.distill.label_refresh import refresh_labels
@@ -590,3 +591,84 @@ def test_ladder_wave_hint_cli_defaults_to_none_and_exposes_catalog_selection() -
         ]
     )
     assert hinted_args.hint_strength == "vague"
+
+
+@pytest.mark.parametrize("error_type", [httpx2.ReadTimeout, httpx2.ConnectError])
+def test_transport_failure_persists_other_episodes_and_resumes_only_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    failed_task = "ladder:synthetic-0:claimed"
+    fail_transport = True
+    sources: list[_FakeLadderEpisodeSource] = []
+
+    class TransportFailureSource(_FakeLadderEpisodeSource):
+        def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+            if fail_transport and task_id == failed_task:
+                self.calls.append(task_id)
+                raise error_type("synthetic transport failure")
+            return super().__call__(task_id, seed=seed, step=step, replica=replica)
+
+    def fake_source(**kwargs: object) -> _FakeLadderEpisodeSource:
+        source = TransportFailureSource(**kwargs)  # type: ignore[arg-type]
+        sources.append(source)
+        return source
+
+    monkeypatch.setattr(ladder_wave, "LadderEpisodeSource", fake_source)
+    output_dir = tmp_path / "ladder-wave"
+    scenarios_dir = tmp_path / "synthetic-scenarios"
+    with pytest.raises(RuntimeError, match=r"1 ladder episode.*failed"):
+        _run_wave(output_dir, scenarios_dir)
+
+    native = [
+        json.loads(line) for line in (output_dir / "native-records.jsonl").read_text().splitlines()
+    ]
+    completed = [row for row in native if row["record"] == "ladder_episode"]
+    failures = [row for row in native if row["record"] == "ladder_episode_failure"]
+    assert len(completed) == 7
+    assert len(failures) == 1
+    assert failures[0]["error_type"] == error_type.__name__
+    assert failures[0]["error"] == "synthetic transport failure"
+    assert len((output_dir / "records.jsonl").read_text().splitlines()) == 7
+    summary = json.loads((output_dir / "summary.json").read_text())
+    assert summary["failed_episodes"] == 1
+    assert summary["failed_task_ids"] == [failed_task]
+
+    with pytest.raises(ladder_wave.LadderWaveError, match=r"1 ladder episode.*failed"):
+        _run_wave(output_dir, scenarios_dir)
+    assert sources[1].calls == [failed_task]
+
+    fail_transport = False
+    resumed = _run_wave(output_dir, scenarios_dir)
+    assert sources[2].calls == [failed_task]
+    assert resumed["episodes"] == 8
+    assert resumed["resumed_episodes"] == 7
+    assert resumed["failed_episodes"] == 0
+    assert len((output_dir / "records.jsonl").read_text().splitlines()) == 8
+    _run_wave(output_dir, scenarios_dir)
+    assert sources[3].calls == []
+
+
+def test_ladder_wave_cli_returns_nonzero_after_transport_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_wave(**_kwargs: object) -> dict[str, object]:
+        raise ladder_wave.LadderWaveError("1 ladder episode(s) failed; completed outputs persisted")
+
+    monkeypatch.setattr(ladder_wave, "run_ladder_wave", fail_wave)
+    assert (
+        ladder_wave.main(
+            [
+                "--endpoint",
+                "http://synthetic",
+                "--model",
+                "synthetic-model",
+                "--served-model-id",
+                "synthetic-model",
+                "--max-model-len",
+                "4096",
+                "--output-dir",
+                "artifacts/synthetic-wave",
+            ]
+        )
+        == 1
+    )

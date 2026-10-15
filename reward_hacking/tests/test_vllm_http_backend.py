@@ -49,11 +49,17 @@ def server(
         "barrier": None,
         "client_timeouts": [],
         "prompt_tokens": 17,
+        "transport_error_type": None,
+        "transport_errors_remaining": 0,
     }
 
     def handle(request: httpx2.Request) -> httpx2.Response:
         assert request.url.path == "/v1/completions"
         requests.append(json.loads(request.content))
+        if state["transport_errors_remaining"]:
+            state["transport_errors_remaining"] -= 1
+            error_type = state["transport_error_type"]
+            raise error_type("synthetic transport failure", request=request)
         if state["barrier"] is not None:
             state["barrier"].wait(timeout=10)
         text, finish, stop, completion_tokens = (
@@ -628,12 +634,82 @@ def test_complete_rendered_accepts_a_per_request_timeout(
 
     backend.complete_rendered(
         "already rendered prompt",
-        max_tokens=23,
+        max_tokens=16384,
         seed=None,
         timeout_seconds=12.5,
     )
 
     assert state["client_timeouts"] == [12.5]
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "expected_timeout"),
+    [(23, 1800.0), (16384, 4396.0)],
+)
+def test_completion_timeout_scales_with_max_tokens(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    max_tokens: int,
+    expected_timeout: float,
+) -> None:
+    url, _, state = server
+    state["token_ids"] = [12]
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    backend.complete_rendered("already rendered prompt", max_tokens=max_tokens, seed=None)
+
+    assert state["client_timeouts"] == [expected_timeout]
+
+
+@pytest.mark.parametrize("error_type", [httpx2.ReadTimeout, httpx2.ConnectError])
+def test_completion_retries_transport_errors(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+    error_type: type[httpx2.TransportError],
+) -> None:
+    url, requests, state = server
+    state["token_ids"] = [12]
+    state["transport_error_type"] = error_type
+    state["transport_errors_remaining"] = 1
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    backend.complete_rendered("already rendered prompt", max_tokens=23, seed=5)
+
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+
+
+def test_explicit_request_timeout_disables_retries(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, requests, state = server
+    state["transport_error_type"] = httpx2.ReadTimeout
+    state["transport_errors_remaining"] = 1
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    with pytest.raises(httpx2.ReadTimeout, match="synthetic transport failure"):
+        backend.complete_rendered(
+            "already rendered prompt", max_tokens=16384, seed=5, timeout_seconds=12.5
+        )
+
+    assert len(requests) == 1
+    assert state["client_timeouts"] == [12.5]
+
+
+def test_completion_stops_after_bounded_transport_retries(
+    tokenizer_path: Path,
+    server: tuple[str, list[dict[str, Any]], dict[str, Any]],
+) -> None:
+    url, requests, state = server
+    state["transport_error_type"] = httpx2.ReadTimeout
+    state["transport_errors_remaining"] = 10
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+
+    with pytest.raises(httpx2.ReadTimeout, match="synthetic transport failure"):
+        backend.complete_rendered("already rendered prompt", max_tokens=23, seed=5)
+
+    assert len(requests) == 3
 
 
 @pytest.mark.parametrize("stop_reason", [248044, "</run>"])
