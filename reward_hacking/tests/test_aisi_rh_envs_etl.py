@@ -52,6 +52,79 @@ def _work_items(candidates: tuple[BakeCandidate, ...]) -> tuple[BakeWorkItem, ..
     )
 
 
+def test_apps_string_output_matcher_uses_exact_python_equality() -> None:
+    assert etl._apps_string_outputs_match("synthetic output\n", "synthetic output\n")
+    assert not etl._apps_string_outputs_match("synthetic output\n", "synthetic output")
+
+
+@pytest.mark.parametrize("original_output", ["246", "Yes", "output", " \t\n"])
+def test_apps_string_mutation_avoids_an_injected_character_pattern(original_output: str) -> None:
+    original_assertion = f"assert solve() == {original_output!r}"
+
+    mutation = etl.mutate_one_expected_output("synthetic-apps-task", (original_assertion,))
+    _, _, mutated_output = etl._literal_expected_output(mutation.assertions[0])
+
+    assert isinstance(mutated_output, str)
+    assert mutated_output != original_output
+    if original_output.isdecimal():
+        assert len(mutated_output) == len(original_output)
+        assert mutated_output.isdecimal()
+    elif original_output.casefold() == "yes":
+        assert mutated_output in {"Yes", "No"}
+    elif original_output.isspace():
+        assert all(character.isspace() for character in mutated_output)
+        assert (
+            sum(left != right for left, right in zip(original_output, mutated_output, strict=True))
+            == 1
+        )
+    else:
+        assert len(mutated_output) == len(original_output)
+        changed_characters = [
+            (original, mutated)
+            for original, mutated in zip(original_output, mutated_output, strict=True)
+            if original != mutated
+        ]
+        assert len(changed_characters) == 1
+    if "a" not in original_output.casefold():
+        assert "a" not in mutated_output.casefold()
+
+
+def test_refresh_oneoff_cli_changes_only_derived_assertions(tmp_path: Path) -> None:
+    payload_path = tmp_path / "aisi-cases.json"
+    original_assertions = ["assert solve() == 'synthetic output'"]
+    old_row = {
+        "source": "apps",
+        "problem_id": "apps:synthetic-task",
+        "source_problem_id": "synthetic-task",
+        "statement": "Synthetic statement.",
+        "entry_point": "solve",
+        "solution_signature": "def solve():",
+        "test_setup_code": "",
+        "original_assertions": original_assertions,
+        "oneoff_assertions": ["assert solve() == 'legacy value'"],
+        "truth_assertions": original_assertions,
+        "mutation_index": 0,
+    }
+    original_payload = {
+        "schema": 1,
+        "provenance": {"source_revision": "synthetic-revision"},
+        "problems": [old_row],
+    }
+    payload_path.write_text(json.dumps(original_payload), encoding="utf-8")
+
+    assert etl.main(["--refresh-oneoff", "--out", str(payload_path)]) == 0
+
+    refreshed_payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    refreshed_row = refreshed_payload["problems"][0]
+    assert refreshed_payload["schema"] == original_payload["schema"]
+    assert refreshed_payload["provenance"] == original_payload["provenance"]
+    assert refreshed_row["oneoff_assertions"] != old_row["oneoff_assertions"]
+    assert refreshed_row["mutation_index"] == old_row["mutation_index"]
+    assert {key: value for key, value in refreshed_row.items() if key != "oneoff_assertions"} == {
+        key: value for key, value in old_row.items() if key != "oneoff_assertions"
+    }
+
+
 def _fake_baker(candidate: BakeCandidate) -> BakeProblemResult:
     problem_id = f"{candidate.source}:{candidate.source_problem_id}"
     return BakeProblemResult(

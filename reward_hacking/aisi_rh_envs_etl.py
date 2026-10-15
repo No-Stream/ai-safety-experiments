@@ -32,6 +32,7 @@ from reward_hacking.aisi_rh_envs_split import (
     SPLIT_ALGORITHM,
     deterministic_source_splits,
 )
+from reward_hacking.oneoff_mutation import OutputMutationError, mutate_string_output
 from reward_hacking.organisms.aisi_source import AisiSource, load_aisi_source
 from reward_hacking.organisms.grading import JailedPytestResult, run_completion_tests
 
@@ -312,20 +313,24 @@ def _mutate_value(value: object, seed: bytes) -> object:
             raise MutationError("float_expected_output_cannot_be_changed_by_one")
         return mutated_value
     if type(value) is str:
-        mutable_positions = tuple(
-            position for position, character in enumerate(value) if character not in "\r\n"
-        )
-        if not mutable_positions:
-            raise MutationError("string_has_no_mutatable_character")
-        position = mutable_positions[int.from_bytes(seed[:4], "big") % len(mutable_positions)]
-        original_character = value[position]
-        replacement_character = "a" if original_character != "a" else "b"
-        return value[:position] + replacement_character + value[position + 1 :]
+        try:
+            return mutate_string_output(
+                value,
+                seed=seed,
+                outputs_match=_apps_string_outputs_match,
+            )
+        except OutputMutationError as error:
+            raise MutationError("string_has_no_mutatable_character") from error
     if type(value) in {list, tuple}:
         return _mutate_sequence(cast("list[object] | tuple[object, ...]", value), seed)
     if type(value) is dict:
         return _mutate_mapping(cast("dict[object, object]", value), seed)
     raise MutationError("unsupported_expected_output_type")
+
+
+def _apps_string_outputs_match(actual: str, expected: str) -> bool:
+    """APPS assertions compare string results with Python's exact equality operator."""
+    return actual == expected
 
 
 def mutate_one_expected_output(problem_id: str, assertions: tuple[str, ...]) -> Mutation:
@@ -1767,6 +1772,56 @@ def write_case_file(payload: dict[str, object], output_path: Path = DATA_PATH) -
             temporary_path.unlink(missing_ok=True)
 
 
+def _case_assertions(problem: Mapping[str, object], field: str, row_index: int) -> list[str]:
+    assertions = problem[field]
+    if not isinstance(assertions, list) or not all(
+        isinstance(assertion, str) for assertion in assertions
+    ):
+        raise TypeError(f"AISI case row {row_index} {field} must be a string list")
+    return cast("list[str]", assertions)
+
+
+def _refresh_oneoff_problem(problem: dict[str, object], row_index: int) -> bool:
+    source = problem["source"]
+    problem_id = problem["problem_id"]
+    source_problem_id = problem["source_problem_id"]
+    stored_mutation_index = problem["mutation_index"]
+    if not isinstance(source, str) or source not in AISI_SOURCES:
+        raise ValueError(f"AISI case row {row_index} has an invalid source")
+    if not isinstance(problem_id, str) or not isinstance(source_problem_id, str):
+        raise TypeError(f"AISI case row {row_index} has an invalid problem identity")
+    if problem_id != f"{source}:{source_problem_id}":
+        raise ValueError(f"AISI case row {row_index} has inconsistent problem identity")
+    if type(stored_mutation_index) is not int:
+        raise TypeError(f"AISI case row {row_index} mutation index must be an integer")
+
+    original_assertions = _case_assertions(problem, "original_assertions", row_index)
+    stored_oneoff_assertions = _case_assertions(problem, "oneoff_assertions", row_index)
+    mutation = mutate_one_expected_output(problem_id, tuple(original_assertions))
+    if mutation.case_index != stored_mutation_index:
+        raise ValueError(f"AISI case row {row_index} mutation selection changed")
+    refreshed_assertions = list(mutation.assertions)
+    if refreshed_assertions == stored_oneoff_assertions:
+        return False
+    problem["oneoff_assertions"] = refreshed_assertions
+    return True
+
+
+def refresh_oneoff_assertions(payload: dict[str, object]) -> int:
+    """Recompute only derived oneoff assertions while preserving task identity and source rows."""
+    problems_value = payload["problems"]
+    if not isinstance(problems_value, list):
+        raise TypeError("AISI cases problems must be a list")
+
+    changed_count = 0
+    for row_index, problem_value in enumerate(problems_value):
+        if not isinstance(problem_value, dict):
+            raise TypeError(f"AISI case row {row_index} must be an object")
+        problem = cast("dict[str, object]", problem_value)
+        changed_count += _refresh_oneoff_problem(problem, row_index)
+    return changed_count
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DATA_PATH)
@@ -1774,12 +1829,48 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--external-root", type=Path, default=None)
     parser.add_argument("--source", action="append", choices=AISI_SOURCES, dest="sources")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    parser.add_argument(
+        "--refresh-oneoff",
+        action="store_true",
+        help="recompute derived oneoff assertions in the existing --out case file",
+    )
     return parser
 
 
+def _refresh_oneoff_cli(args: argparse.Namespace) -> int:
+    if args.sources is not None or args.external_root is not None:
+        raise ValueError(
+            "--refresh-oneoff cannot be combined with source selection or external root"
+        )
+    if args.cache_dir != Path("artifacts/aisi-rh-envs-etl-cache"):
+        raise ValueError("--cache-dir does not apply to --refresh-oneoff")
+    if args.workers != DEFAULT_WORKERS:
+        raise ValueError("--workers does not apply to --refresh-oneoff")
+    payload_value = json.loads(args.out.read_text(encoding="utf-8"))
+    if not isinstance(payload_value, dict):
+        raise TypeError("AISI cases payload must be an object")
+    payload = cast("dict[str, object]", payload_value)
+    if payload.get("schema") != DATA_SCHEMA:
+        raise ValueError("AISI cases payload has an unsupported schema")
+    problems = payload["problems"]
+    if not isinstance(problems, list):
+        raise TypeError("AISI cases problems must be a list")
+    changed_count = refresh_oneoff_assertions(payload)
+    write_case_file(payload, args.out)
+    logger.info(
+        "refreshed oneoff assertions: rows=%d changed=%d",
+        len(problems),
+        changed_count,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Run the CPU-only bake and log counts and drop reasons without printing item content."""
+    """Bake the local AISI case file or refresh its derived oneoff assertions."""
     args = _build_parser().parse_args(argv)
+    if args.refresh_oneoff:
+        return _refresh_oneoff_cli(args)
+
     external_root = (
         args.external_root
         if args.external_root is not None

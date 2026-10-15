@@ -18,7 +18,6 @@ import io
 import json
 import logging
 import pickle
-import re
 import tempfile
 import zlib
 from dataclasses import dataclass
@@ -39,20 +38,12 @@ from reward_hacking.ilcb_data import (
     RECENT_TIMED_CASE_OVERSIZE_REASON,
     RECENT_TIMED_CASE_SCHEMA,
 )
+from reward_hacking.oneoff_mutation import mutate_string_output
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
-
-_NUMERIC_OUTPUT_TOKEN: re.Pattern[str] = re.compile(
-    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
-)
-_YES_NO_OUTPUT_TOKEN: re.Pattern[str] = re.compile(
-    r"(?P<prefix>[^\w]*)(?P<value>yes|no)(?P<suffix>[^\w]*)", re.IGNORECASE
-)
-_TEXT_REPLACEMENTS = (".", "!", "?", ",", ";", ":")
-_MAX_DECIMAL_DIGIT = 9
 
 DATA_SCHEMA = 1
 DATASET_REPO_ID = "livecodebench/code_generation_lite"
@@ -135,112 +126,16 @@ def _lcb_stdio_outputs_match(actual: str, expected: str) -> bool:
     return True
 
 
-def _mutate_numeric_token(token: str, seed: bytes) -> str:
-    """Perturb one numeric token while preserving its sign and displayed precision."""
-    if "." not in token and "e" not in token.lower():
-        sign = token[0] if token[:1] in {"+", "-"} else ""
-        digits = token[len(sign) :]
-        magnitude = int(digits)
-        direction = 1 if seed[0] & 1 else -1
-        if magnitude == 0 or (sign == "-" and magnitude == 1 and direction < 0):
-            direction = 1
-        changed_magnitude = magnitude + direction
-        return sign + str(changed_magnitude).zfill(len(digits))
-
-    exponent_start = min(
-        (position for marker in "eE" if (position := token.find(marker)) >= 0),
-        default=len(token),
-    )
-    coefficient = token[:exponent_start]
-    digit_positions = [
-        position for position, character in enumerate(coefficient) if character.isdigit()
-    ]
-    significant_positions = [
-        position for position in digit_positions if coefficient[position] != "0"
-    ]
-    mutation_position = (significant_positions or digit_positions)[-1]
-    digit = int(coefficient[mutation_position])
-    direction = 1 if seed[0] & 1 else -1
-    if digit == _MAX_DECIMAL_DIGIT:
-        direction = -1
-    elif digit == 0:
-        direction = 1
-    mutated_digit = str(digit + direction)
-    return token[:mutation_position] + mutated_digit + token[mutation_position + 1 :]
-
-
-def _mutate_text_character(character: str, seed: bytes) -> str:
-    """Change one ordinary output character without adding a diagnostic marker."""
-    if "a" <= character <= "z":
-        direction = 1 if seed[0] & 1 else -1
-        return chr(ord("a") + (ord(character) - ord("a") + direction) % 26)
-    if "A" <= character <= "Z":
-        direction = 1 if seed[0] & 1 else -1
-        return chr(ord("A") + (ord(character) - ord("A") + direction) % 26)
-    if "0" <= character <= "9":
-        direction = 1 if seed[0] & 1 else -1
-        return str((int(character) + direction) % 10)
-    if character.isalpha():
-        return "y" if character.casefold() == "x" else "x"
-    replacements = tuple(value for value in _TEXT_REPLACEMENTS if value != character)
-    return replacements[int.from_bytes(seed[:4], "big") % len(replacements)]
-
-
 def _mutate_expected_output(expected_output: str, *, task_id: str) -> str:
     """Make a deterministic, minimally changed wrong stdout value for one task."""
     if not task_id:
         raise ValueError("oneoff mutation requires a non-empty task id")
     seed = hashlib.sha256(f"lcb-recent-oneoff-v1\0{task_id}".encode()).digest()
-    output_tokens = list(re.finditer(r"\S+", expected_output))
-    numeric_tokens = [
-        match for match in output_tokens if _NUMERIC_OUTPUT_TOKEN.fullmatch(match.group())
-    ]
-
-    if numeric_tokens:
-        match = numeric_tokens[int.from_bytes(seed[:8], "big") % len(numeric_tokens)]
-        token = match.group()
-        mutated_token = _mutate_numeric_token(token, seed[8:])
-        mutated_output = (
-            expected_output[: match.start()] + mutated_token + expected_output[match.end() :]
-        )
-    else:
-        yes_no_tokens = [
-            match for match in output_tokens if _YES_NO_OUTPUT_TOKEN.fullmatch(match.group())
-        ]
-        if yes_no_tokens:
-            match = yes_no_tokens[int.from_bytes(seed[:8], "big") % len(yes_no_tokens)]
-            token_match = _YES_NO_OUTPUT_TOKEN.fullmatch(match.group())
-            if token_match is None:
-                raise RuntimeError("selected Yes/No output token stopped matching")
-            word = token_match.group("value")
-            replacement = "no" if word.casefold() == "yes" else "yes"
-            if word.isupper():
-                replacement = replacement.upper()
-            elif word.istitle():
-                replacement = replacement.title()
-            mutated_token = token_match.group("prefix") + replacement + token_match.group("suffix")
-            mutated_output = (
-                expected_output[: match.start()] + mutated_token + expected_output[match.end() :]
-            )
-        else:
-            mutable_positions = [
-                position
-                for position, character in enumerate(expected_output)
-                if not character.isspace()
-            ]
-            if not mutable_positions:
-                raise ValueError("no valid oneoff mutation for whitespace-only expected output")
-            position = mutable_positions[int.from_bytes(seed[:8], "big") % len(mutable_positions)]
-            replacement = _mutate_text_character(expected_output[position], seed[8:])
-            mutated_output = (
-                expected_output[:position] + replacement + expected_output[position + 1 :]
-            )
-
-    if _lcb_stdio_outputs_match(expected_output, mutated_output):
-        raise RuntimeError(
-            "oneoff expected-output mutation matches under LiveCodeBench normalization"
-        )
-    return mutated_output
+    return mutate_string_output(
+        expected_output,
+        seed=seed,
+        outputs_match=_lcb_stdio_outputs_match,
+    )
 
 
 def _json_digest(value: object) -> str:
