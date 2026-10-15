@@ -147,6 +147,11 @@ def read_gpu_sample() -> GpuSample:
         pynvml.nvmlShutdown()
 
 
+def _running_under_wsl() -> bool:
+    """Whether the stage runs in WSL2, where NVML can omit Windows-owned GPU memory."""
+    return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text(encoding="utf-8").lower()
+
+
 REQUIRED_METRICS = (
     "generation_tokens_total",
     "prompt_tokens_total",
@@ -342,6 +347,8 @@ class PerfMonitor:
         thresholds: PerfThresholds | None = None,
         gpu_reader: Callable[[], GpuSample | None] = read_gpu_sample,
         device_name: str | None = None,
+        *,
+        gpu_preflight_passed_at_stage_start: bool = False,
     ) -> None:
         """Configure a stage monitor; construction does not access the device."""
         if (
@@ -365,6 +372,11 @@ class PerfMonitor:
         self.thresholds = thresholds or PerfThresholds()
         self.gpu_reader = gpu_reader
         self.device_name = device_name
+        self.gpu_preflight_passed_at_stage_start = gpu_preflight_passed_at_stage_start
+        self.wsl_detected_at_stage_start = _running_under_wsl()
+        self._wsl_attribution_is_platform_unknown = (
+            self.wsl_detected_at_stage_start and gpu_preflight_passed_at_stage_start
+        )
         self.samples: list[dict[str, Any]] = []
         self._samples_start_index = 0
         self.errors: list[str] = []
@@ -407,6 +419,18 @@ class PerfMonitor:
             vram_mib = process_vram.get(pid)
             if vram_mib is not None and vram_mib > 0:
                 foreign_processes.append({"pid": pid, "vram_mib": vram_mib})
+        gpu_process_ownership_unknown = process_ids is None or (
+            gpu is not None
+            and gpu.memory_used_mib is not None
+            and gpu.memory_used_mib > 0
+            and not process_ids
+        )
+        platform_unknown_fields: list[str] = []
+        if self._wsl_attribution_is_platform_unknown:
+            if gpu is not None and gpu_process_ownership_unknown:
+                platform_unknown_fields.append("gpu_process_ownership_unknown")
+            if any(process_vram.get(pid) is None for pid in foreign_pids):
+                platform_unknown_fields.append("foreign_gpu_memory_unknown_pids")
         sample = {
             "seconds": seconds,
             "metrics": compact_metrics(metrics),
@@ -417,13 +441,8 @@ class PerfMonitor:
             "foreign_gpu_memory_unknown_pids": [
                 pid for pid in foreign_pids if process_vram.get(pid) is None
             ],
-            "gpu_process_ownership_unknown": process_ids is None
-            or (
-                gpu is not None
-                and gpu.memory_used_mib is not None
-                and gpu.memory_used_mib > 0
-                and not process_ids
-            ),
+            "gpu_process_ownership_unknown": gpu_process_ownership_unknown,
+            "platform_unknown_fields": platform_unknown_fields,
         }
         with self._condition:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -595,10 +614,21 @@ class PerfMonitor:
             breaches.append("stage_estimate_exceeded")
         if any(sample["foreign_gpu_pids"] for sample in self.samples):
             breaches.append("foreign_gpu_process")
-        if any(sample["gpu_process_ownership_unknown"] for sample in self.samples):
+        if any(
+            sample["gpu_process_ownership_unknown"]
+            and "gpu_process_ownership_unknown" not in sample["platform_unknown_fields"]
+            for sample in self.samples
+        ):
             breaches.append("gpu_process_attribution_unknown")
-        if any(sample["foreign_gpu_memory_unknown_pids"] for sample in self.samples):
+        if any(
+            sample["foreign_gpu_memory_unknown_pids"]
+            and "foreign_gpu_memory_unknown_pids" not in sample["platform_unknown_fields"]
+            for sample in self.samples
+        ):
             breaches.append("foreign_gpu_memory_unknown")
+        platform_unknown_gpu_fields = sorted(
+            {field for sample in self.samples for field in sample["platform_unknown_fields"]}
+        )
         device_name = next(
             (sample["device_name"] for sample in self.samples if sample["device_name"]),
             self.device_name,
@@ -658,6 +688,9 @@ class PerfMonitor:
             "device_name": device_name or "unknown",
             "estimate_seconds": self.estimate_seconds,
             "accept_slow": self.accept_slow,
+            "wsl_detected_at_stage_start": self.wsl_detected_at_stage_start,
+            "gpu_preflight_passed_at_stage_start": self.gpu_preflight_passed_at_stage_start,
+            "platform_unknown_gpu_fields": platform_unknown_gpu_fields,
             "breaches": sorted(set(breaches)),
             "thresholds": asdict(self.thresholds),
             "samples_file": SAMPLES_FILE,
@@ -766,6 +799,7 @@ class PerfMonitor:
             f"| Preemptions | {counter_deltas.get('num_preemptions', 'unknown')} |\n"
             f"| Wall seconds | {elapsed_seconds:.1f} |\n"
             f"| Straggler tail seconds | {tail:.1f} |\n| Gate reasons | {', '.join(report['breaches']) or 'none'} |\n"
+            f"| Platform unknown GPU fields | {', '.join(platform_unknown_gpu_fields) or 'none'} |\n"
             f"| Accepted slow reason | {self.accept_slow or 'none'} |\n"
         )
         for category, seconds in self.timings.items():

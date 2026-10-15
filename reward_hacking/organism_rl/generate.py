@@ -2131,10 +2131,11 @@ def _record_task_sample_provenance(
 def _serving_run_metadata(args: argparse.Namespace) -> tuple[dict[str, object], dict[str, object]]:
     """Separate stable scheduler identity from launch-specific serving runtime details."""
     identity_flags: dict[str, object] = {"concurrency": args.concurrency}
-    run_context: dict[str, object] = {}
+    run_context: dict[str, object] = {"concurrency": args.concurrency}
     if args.generator_name == "27b":
         del identity_flags["concurrency"]
-        run_context["concurrency"] = args.concurrency
+    if args.serving_config is not None:
+        run_context["serving_config"] = dict(args.serving_config)
     if args.serving_runtime is not None:
         run_context["serving_runtime"] = dict(args.serving_runtime)
     return identity_flags, run_context

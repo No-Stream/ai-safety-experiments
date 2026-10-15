@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from reward_hacking.organism_rl import generate
+from reward_hacking.organism_rl import generate, generate_provenance
 
 if TYPE_CHECKING:
     from argparse import Namespace
@@ -188,7 +188,7 @@ def test_generator_name_is_limited_to_supported_implementations(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("generator_name", [None, "base", "v3"])
-def test_non_27b_concurrency_remains_part_of_resume_identity(
+def test_client_concurrency_does_not_gate_resume_but_is_recorded(
     generator_name: str | None,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -211,7 +211,104 @@ def test_non_27b_concurrency_remains_part_of_resume_identity(
     changed_args = generate.parse_args(
         _arguments(output_dir, *generator_arguments, "--concurrency", "3")
     )
-    with pytest.raises(ValueError, match=r"flags\.concurrency"):
-        generate._prepare_run(output_dir, _make_provenance(changed_args))
+    generate._prepare_run(output_dir, _make_provenance(changed_args))
 
     assert original_hash
+    saved_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
+    saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
+    run_contexts = cast("list[Mapping[str, object]]", saved_provenance["run_contexts"])
+    assert [context["concurrency"] for context in run_contexts] == [2, 3]
+
+
+def test_legacy_serving_throughput_settings_do_not_block_resume_and_remain_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_source_provenance_inputs(monkeypatch)
+    output_dir = tmp_path / "throughput-resume"
+    first_serving_config = {
+        "dtype": "bfloat16",
+        "max_model_len": 1024,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 16,
+        "gpu_memory_utilization": 0.87,
+        "async_scheduling": False,
+        "cudagraph_capture_sizes": [1, 2, 4],
+        "quantization": "fp8",
+    }
+    first_args = generate.parse_args(
+        _arguments(
+            output_dir,
+            "--generator-name",
+            "27b",
+            "--serving-config",
+            json.dumps(first_serving_config),
+            "--concurrency",
+            "2",
+        )
+    )
+    first_provenance = _make_provenance(first_args)
+    generate._prepare_run(output_dir, first_provenance)
+
+    provenance_path = output_dir / "provenance.json"
+    stored_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    stored_provenance = generate_provenance.hydrate_provenance(
+        cast("Mapping[str, object]", stored_document["provenance"]), provenance_path
+    )
+    stored_flags = cast("dict[str, object]", stored_provenance["flags"])
+    stored_flags["serving_config"] = first_serving_config
+    stored_flags["concurrency"] = 2
+    old_identity = generate_provenance._provenance_identity(
+        stored_provenance,
+        include_nonsemantic_serving_settings=True,
+    )
+    stored_document["provenance_sha256"] = generate_provenance._canonical_sha256(old_identity)
+    stored_document["provenance"] = stored_provenance
+    provenance_path.write_text(json.dumps(stored_document), encoding="utf-8")
+
+    changed_serving_config = {
+        **first_serving_config,
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32,
+        "gpu_memory_utilization": 0.92,
+        "async_scheduling": True,
+        "cudagraph_capture_sizes": [1, 4, 8],
+    }
+    changed_args = generate.parse_args(
+        _arguments(
+            output_dir,
+            "--generator-name",
+            "27b",
+            "--serving-config",
+            json.dumps(changed_serving_config),
+            "--concurrency",
+            "3",
+        )
+    )
+    _records_path, resumed_hash, _accepted = generate._prepare_run(
+        output_dir, _make_provenance(changed_args)
+    )
+
+    saved_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
+    run_contexts = cast("list[Mapping[str, object]]", saved_provenance["run_contexts"])
+    assert resumed_hash
+    assert run_contexts[0]["serving_config"] == first_serving_config
+    assert run_contexts[-1]["serving_config"] == changed_serving_config
+    assert run_contexts[-1]["concurrency"] == 3
+    assert stored_flags["serving_config"] == first_serving_config
+
+    changed_quantization = {**changed_serving_config, "quantization": "awq"}
+    changed_quantization_args = generate.parse_args(
+        _arguments(
+            output_dir,
+            "--generator-name",
+            "27b",
+            "--serving-config",
+            json.dumps(changed_quantization),
+            "--concurrency",
+            "3",
+        )
+    )
+    with pytest.raises(ValueError, match="provenance identity differs"):
+        generate._prepare_run(output_dir, _make_provenance(changed_quantization_args))

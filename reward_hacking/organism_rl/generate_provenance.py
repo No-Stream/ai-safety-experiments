@@ -15,7 +15,7 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from reward_hacking.evidence_store import iter_jsonl
-from reward_hacking.semantic_identity import semantic_content_identity
+from reward_hacking.semantic_identity import semantic_content_identity, semantic_server_settings
 
 PROVENANCE_SCHEMA_VERSION = 3
 PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS = frozenset({2, PROVENANCE_SCHEMA_VERSION})
@@ -72,6 +72,7 @@ def _provenance_identity(
     *,
     include_code_provenance: bool = False,
     include_legacy_leak_metadata: bool = False,
+    include_nonsemantic_serving_settings: bool = False,
 ) -> dict[str, object]:
     excluded_keys = {
         "run_context",
@@ -97,9 +98,15 @@ def _provenance_identity(
     identity.pop("endpoint_sha256", None)
     flags = identity.get("flags")
     if isinstance(flags, Mapping):
-        identity["flags"] = {
+        identity_flags = {
             key: deepcopy(value) for key, value in flags.items() if key != "endpoint_sha256"
         }
+        if not include_nonsemantic_serving_settings:
+            identity_flags.pop("concurrency", None)
+            serving_config = identity_flags.get("serving_config")
+            if isinstance(serving_config, Mapping):
+                identity_flags["serving_config"] = semantic_server_settings(serving_config)
+        identity["flags"] = identity_flags
     return identity
 
 
@@ -625,7 +632,35 @@ def _load_current_provenance(
             include_legacy_leak_metadata=True,
         )
     )
-    if stored_hash not in {semantic_hash, legacy_leak_metadata_hash, legacy_code_hash}:
+    legacy_serving_hashes = {
+        _canonical_sha256(
+            _provenance_identity(
+                stored_provenance,
+                include_nonsemantic_serving_settings=True,
+            )
+        ),
+        _canonical_sha256(
+            _provenance_identity(
+                stored_provenance,
+                include_legacy_leak_metadata=True,
+                include_nonsemantic_serving_settings=True,
+            )
+        ),
+        _canonical_sha256(
+            _provenance_identity(
+                stored_provenance,
+                include_code_provenance=True,
+                include_legacy_leak_metadata=True,
+                include_nonsemantic_serving_settings=True,
+            )
+        ),
+    }
+    if stored_hash not in {
+        semantic_hash,
+        legacy_leak_metadata_hash,
+        legacy_code_hash,
+        *legacy_serving_hashes,
+    }:
         raise ValueError("existing generation-path identity digest is invalid")
     raw_compatible_hashes = existing.get("compatible_provenance_sha256", [])
     if not isinstance(raw_compatible_hashes, list) or any(
@@ -638,14 +673,46 @@ def _load_current_provenance(
     ):
         raise TypeError("stored run_contexts must be a list of objects")
     _validate_resume_identity(current_identity, stored_identity, output_dir=output_dir)
+    current_projection_hashes = {
+        semantic_hash,
+        legacy_leak_metadata_hash,
+        legacy_code_hash,
+    }
+    needs_legacy_serving_context = (
+        stored_hash in legacy_serving_hashes and stored_hash not in current_projection_hashes
+    )
+    legacy_serving_context = (
+        _legacy_serving_settings_context(stored_provenance)
+        if needs_legacy_serving_context
+        else None
+    )
+    run_contexts = [dict(value) for value in raw_run_contexts]
+    if legacy_serving_context is not None:
+        run_contexts.append(legacy_serving_context)
     compatible_hashes = set(cast("list[str]", raw_compatible_hashes))
     if stored_hash != _canonical_sha256(current_identity):
         compatible_hashes.add(stored_hash)
     return (
         current_identity,
-        [dict(value) for value in raw_run_contexts],
+        run_contexts,
         compatible_hashes,
     )
+
+
+def _legacy_serving_settings_context(
+    provenance: Mapping[str, object],
+) -> dict[str, object] | None:
+    flags = provenance.get("flags")
+    if not isinstance(flags, Mapping):
+        return None
+    context: dict[str, object] = {"legacy_serving_settings": True}
+    concurrency = flags.get("concurrency")
+    if type(concurrency) is int:
+        context["concurrency"] = concurrency
+    serving_config = flags.get("serving_config")
+    if isinstance(serving_config, Mapping):
+        context["serving_config"] = deepcopy(dict(serving_config))
+    return context if len(context) > 1 else None
 
 
 def active_provenance_path(output_dir: Path) -> Path:

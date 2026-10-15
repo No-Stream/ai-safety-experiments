@@ -473,6 +473,7 @@ def test_smoke_main_runs_one_cell_with_its_own_server_and_checks_records(
                 [_record(paid=False, labels=["honest_no_hack"])],
             )
 
+    monkeypatch.setattr(probe_v4, "require_free_gpu", lambda: None)
     monkeypatch.setattr(probe_v4, "VLLMServer", FakeServer)
     monkeypatch.setattr(probe_v4, "urlopen", fake_urlopen)
     monkeypatch.setattr(probe_v4, "resolve_gpu_engine_settings", lambda _torch: (0.43, "cpu-test"))

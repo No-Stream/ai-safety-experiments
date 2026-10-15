@@ -6,17 +6,48 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import httpx2
 import pytest
 
+from grpo.gpu_perf import PerfMonitor
 from reward_hacking.distill.label_refresh import refresh_labels
 from reward_hacking.ladder.runner import EpisodeKey
 from reward_hacking.ladder.scenario import Scenario
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_rl import health, ladder_wave, strengthened_truth_grade
 from reward_hacking.organism_rl.rollout import EpisodeSample
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
+@pytest.fixture(autouse=True)
+def fake_performance_telemetry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep adapter contract tests independent of physical hardware and HTTP."""
+
+    def fake_monitor(**kwargs: object) -> PerfMonitor:
+        monitor = PerfMonitor(
+            cast("Path", kwargs["output_dir"]), "unused", 1, accept_slow="synthetic adapter fixture"
+        )
+
+        def sample() -> None:
+            monitor.record_sample(
+                float(len(monitor.samples)),
+                {
+                    "vllm:generation_tokens_total": 0.0,
+                    "vllm:prompt_tokens_total": 0.0,
+                    "vllm:num_requests_running": 0.0,
+                    "vllm:num_requests_waiting": 0.0,
+                },
+                None,
+            )
+
+        monkeypatch.setattr(monitor, "_sample", sample)
+        return monitor
+
+    monkeypatch.setattr(ladder_wave, "stage_generation_monitor", fake_monitor)
 
 
 def _scenario(slug: str, *, set_version: str = "v2.2", variant: str = "conflict") -> Scenario:
@@ -104,6 +135,7 @@ class _FakeLadderEpisodeSource:
         self.config = SimpleNamespace(
             provenance_digest=f"synthetic-{endpoint}-{model_path}-{max_model_len}-{episode_concurrency}",
             max_model_len_by_model=((served_model_id, max_model_len),),
+            server_args=None,
             provenance_payload=lambda: {
                 "schema_version": 1,
                 "run_context": {
@@ -385,7 +417,110 @@ def test_ladder_wave_refuses_sampling_identity_drift(
         _run_wave(output_dir, scenarios_dir)
 
 
-def test_ladder_wave_resumes_after_runtime_path_and_capacity_changes(
+def test_ladder_wave_resumes_legacy_identity_after_chunk_settings_change(
+    tmp_path: Path,
+) -> None:
+    def provenance(
+        server_settings: Mapping[str, object], *, max_model_len: int = 4096
+    ) -> dict[str, object]:
+        runner_provenance: dict[str, object] = {
+            "schema_version": 1,
+            "run_context": {},
+            "models": [{"model_id": "synthetic-model", "revision": "revision-a"}],
+            "scenarios": [],
+            "arms": list(ladder_wave.LADDER_WAVE_ARMS),
+            "samples": 1,
+            "episode_concurrency": 6,
+            "server_args": dict(server_settings),
+            "sampling": {"temperature": 0.6, "top_p": 1.0},
+        }
+        semantic_runner, _ = ladder_wave.runner.semantic_provenance_for_comparison(
+            runner_provenance, runner_provenance
+        )
+        semantic_runner.pop("episode_concurrency", None)
+        return {
+            "resume_identity": {
+                "format_version": 2,
+                "runner": semantic_runner,
+                "max_model_len": max_model_len,
+                "sampling": {"temperature": 0.6, "top_p": 1.0},
+            },
+            "provenance": {
+                "operational_context": {
+                    "max_model_len": max_model_len,
+                    "server_settings": dict(server_settings),
+                }
+            },
+        }
+
+    output_dir = tmp_path / "legacy-chunk-resume"
+    first_settings = {
+        "quantization": "fp8",
+        "client_concurrency": 4,
+        "max_num_batched_tokens": 4096,
+        "max_num_seqs": 16,
+        "async_scheduling": False,
+        "gpu_memory_utilization": 0.87,
+        "cudagraph_capture_sizes": [1, 2, 4],
+        "compilation_config": {
+            "level": 3,
+            "cudagraph_mode": "FULL",
+            "cuda_graph_sizes": [1, 2, 4],
+        },
+    }
+    ladder_wave._prepare_output(output_dir, provenance(first_settings))
+
+    provenance_path = output_dir / "provenance.json"
+    saved = json.loads(provenance_path.read_text(encoding="utf-8"))
+    saved_identity = cast("dict[str, object]", saved["resume_identity"])
+    saved_runner = cast("dict[str, object]", saved_identity["runner"])
+    saved_server_settings = cast("dict[str, object]", saved_runner["server_args"])
+    saved_server_settings.update(first_settings)
+    saved["resume_identity_sha256"] = hashlib.sha256(
+        json.dumps(saved_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    provenance_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    changed_settings = {
+        **first_settings,
+        "client_concurrency": 8,
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32,
+        "async_scheduling": True,
+        "gpu_memory_utilization": 0.92,
+        "cudagraph_capture_sizes": [1, 4, 8],
+        "compilation_config": {
+            "level": 3,
+            "cudagraph_mode": "PIECEWISE",
+            "cuda_graph_sizes": [1, 4, 8],
+        },
+    }
+    assert ladder_wave.nonsemantic_server_settings(changed_settings) == {
+        "client_concurrency": 8,
+        "max_num_batched_tokens": 8192,
+        "max_num_seqs": 32,
+        "async_scheduling": True,
+        "gpu_memory_utilization": 0.92,
+        "cudagraph_capture_sizes": [1, 4, 8],
+        "compilation_config": {
+            "level": 3,
+            "cudagraph_mode": "PIECEWISE",
+            "cuda_graph_sizes": [1, 4, 8],
+        },
+    }
+    ladder_wave._prepare_output(output_dir, provenance(changed_settings))
+
+    saved = json.loads(provenance_path.read_text(encoding="utf-8"))
+    assert len(saved["operational_contexts"]) == 2
+    assert saved["operational_contexts"][-1]["server_settings"] == changed_settings
+    assert "max_num_batched_tokens" not in saved["resume_identity"]["runner"]["server_args"]
+    assert saved["resume_identity"]["runner"]["server_args"]["compilation_config"] == {"level": 3}
+
+    with pytest.raises(ValueError, match="semantic resume identity"):
+        ladder_wave._prepare_output(output_dir, provenance(changed_settings, max_model_len=8192))
+
+
+def test_ladder_wave_resumes_after_runtime_changes_and_refuses_context_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sources: list[_FakeLadderEpisodeSource] = []
@@ -421,7 +556,7 @@ def test_ladder_wave_resumes_after_runtime_path_and_capacity_changes(
         scenarios_dir,
         endpoint="http://127.0.0.1:9000",
         model_path="/relocated/cache/synthetic-model",
-        max_model_len=65_536,
+        max_model_len=4096,
         concurrency=3,
     )
 
@@ -434,6 +569,8 @@ def test_ladder_wave_resumes_after_runtime_path_and_capacity_changes(
         json.loads(line) for line in (output_dir / "native-headers.jsonl").read_text().splitlines()
     ]
     assert len(native_headers) == 2
+    with pytest.raises(ValueError, match="semantic resume identity"):
+        _run_wave(output_dir, scenarios_dir, max_model_len=65_536, concurrency=3)
 
 
 def _write_hint_catalog(path: Path, hint_text: str) -> None:
@@ -527,7 +664,7 @@ def test_hinted_ladder_wave_keeps_eight_real_claimed_tasks_and_resume_identity(
         scenarios_dir,
         endpoint="http://127.0.0.1:9000",
         model_path="/relocated/cache/synthetic-model",
-        max_model_len=65_536,
+        max_model_len=4096,
         concurrency=3,
         hints_path=second_catalog,
         hint_family="test_harness_config",

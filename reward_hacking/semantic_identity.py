@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 from google.protobuf.json_format import MessageToDict
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Iterable, Sequence
     from typing import Protocol
 
     import torch
@@ -24,6 +25,18 @@ if TYPE_CHECKING:
 
 
 _HUB_REFERENCE_PART_COUNT = 2
+_NONSEMANTIC_SERVER_SETTINGS = frozenset(
+    {
+        "async_scheduling",
+        "client_concurrency",
+        "concurrency",
+        "episode_concurrency",
+        "enforce_eager",
+        "gpu_memory_utilization",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+    }
+)
 TOKENIZER_FILENAMES = {
     "tokenizer.json",
     "tokenizer_config.json",
@@ -39,6 +52,50 @@ TOKENIZER_FILENAMES = {
     "tokenizer.tiktoken",
     "qwen.tiktoken",
 }
+
+
+def is_nonsemantic_server_setting(key: str) -> bool:
+    """Return whether a serving option only changes engine throughput or memory allocation."""
+    normalized_key = key.casefold()
+    return (
+        normalized_key in _NONSEMANTIC_SERVER_SETTINGS
+        or "cudagraph" in normalized_key
+        or ("cuda_graph" in normalized_key)
+    )
+
+
+def semantic_server_settings(settings: Mapping[str, object]) -> dict[str, object]:
+    """Keep server settings that can change generated model behavior."""
+    return {
+        key: _semantic_server_setting_value(value)
+        for key, value in settings.items()
+        if not is_nonsemantic_server_setting(key)
+    }
+
+
+def nonsemantic_server_settings(settings: Mapping[str, object]) -> dict[str, object]:
+    """Return throughput and memory settings for launch provenance."""
+    return {
+        key: value
+        for key, value in settings.items()
+        if is_nonsemantic_server_setting(key) or _semantic_server_setting_value(value) != value
+    }
+
+
+def _semantic_server_setting_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _semantic_server_setting_value(nested_value)
+            for key, nested_value in value.items()
+            if not is_nonsemantic_server_setting(key)
+        }
+    if isinstance(value, list):
+        return [_semantic_server_setting_value(nested_value) for nested_value in value]
+    if isinstance(value, tuple):
+        return tuple(_semantic_server_setting_value(nested_value) for nested_value in value)
+    return value
+
+
 MODEL_CONFIGURATION_FILENAMES = {
     "config.json",
     "adapter_config.json",

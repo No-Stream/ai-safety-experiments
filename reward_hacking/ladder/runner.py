@@ -108,6 +108,7 @@ from reward_hacking.ladder.scenario import (
 )
 from reward_hacking.ladder.tools import bash_tool, contains_submit_marker
 from reward_hacking.model_backend import validate_thinking_budget_sampling
+from reward_hacking.semantic_identity import semantic_server_settings
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -765,11 +766,15 @@ def _drop_nonsemantic_provenance_fields(provenance: dict[str, object]) -> None:
     for field_name in (
         "schema_version",
         "task_pressure",
+        "episode_concurrency",
         "generation_code_identity",
         "detector_code_identity",
         "jail_runtime_identity",
     ):
         provenance.pop(field_name, None)
+    server_args = provenance.get("server_args")
+    if isinstance(server_args, Mapping):
+        provenance["server_args"] = semantic_server_settings(server_args)
     models = provenance.get("models")
     if not isinstance(models, list):
         raise TypeError("run provenance models must be a list")

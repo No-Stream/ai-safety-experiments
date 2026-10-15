@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 from grpo.gpu_perf import PerfMonitor
-from reward_hacking.generation_perf import episode_context_usage, record_episode_timings
+from reward_hacking.generation_perf import (
+    episode_context_usage,
+    generation_monitor,
+    performance_cli_arguments,
+    record_episode_timings,
+    stage_generation_monitor,
+)
 from reward_hacking.organism_rl import generate, wave_v4
 from reward_hacking.organism_rl.generate import parse_args as parse_generation_args
 from reward_hacking.organism_rl.probe_v4 import (
@@ -37,6 +43,69 @@ def test_generation_accepts_explicit_slow_reason_and_thresholds(tmp_path: Path) 
     assert args.accept_slow == "intentional diagnostic"
     assert args.perf_min_decode_fraction == 0.3
     assert args.perf_estimate_seconds == 1800
+
+
+def test_generation_preflight_evidence_flag_is_forwarded_explicitly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_args = [
+        "--endpoint",
+        "http://localhost:8000/v1",
+        "--max-model-len",
+        "4096",
+        "--output-dir",
+        str(tmp_path),
+    ]
+    assert "--gpu-preflight-passed-at-stage-start" not in performance_cli_arguments(
+        parse_generation_args(base_args)
+    )
+    args = parse_generation_args([*base_args, "--gpu-preflight-passed-at-stage-start"])
+    forwarded = performance_cli_arguments(args)
+    assert "--gpu-preflight-passed-at-stage-start" in forwarded
+
+    monitor_arguments: dict[str, object] = {}
+
+    class MonitorStub:
+        def __init__(self, **kwargs: object) -> None:
+            monitor_arguments.update(kwargs)
+
+        def add_time(self, category: str, seconds: float) -> None:
+            assert category == "server_startup"
+            assert seconds == 0
+
+    monkeypatch.setattr("reward_hacking.generation_perf.PerfMonitor", MonitorStub)
+    monkeypatch.setattr(
+        "reward_hacking.generation_perf.load_model_geometry", lambda *args, **kwargs: None
+    )
+
+    generation_monitor(args)
+
+    assert monitor_arguments["gpu_preflight_passed_at_stage_start"] is True
+
+    stage_generation_monitor(
+        output_dir=tmp_path,
+        endpoint="http://localhost:8000/v1",
+        model="synthetic-model",
+        model_revision=None,
+        concurrency=2,
+        serving_config=None,
+        performance_arguments=("--gpu-preflight-passed-at-stage-start",),
+        default_estimate_seconds=3600,
+    )
+    assert monitor_arguments["estimate_seconds"] == 3600
+    assert monitor_arguments["gpu_preflight_passed_at_stage_start"] is True
+
+    stage_generation_monitor(
+        output_dir=tmp_path,
+        endpoint="http://localhost:8000/v1",
+        model="synthetic-model",
+        model_revision=None,
+        concurrency=2,
+        serving_config=None,
+        performance_arguments=("--perf-estimate-seconds", "42"),
+        default_estimate_seconds=3600,
+    )
+    assert monitor_arguments["estimate_seconds"] == 42
 
 
 def test_wave_forwards_performance_policy_and_turn_scaled_estimate(tmp_path: Path) -> None:

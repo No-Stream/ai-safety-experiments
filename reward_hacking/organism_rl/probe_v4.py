@@ -19,7 +19,11 @@ import torch
 from transformers import AutoConfig
 
 from reward_hacking.distill.sample import resolve_gpu_engine_settings
-from reward_hacking.generation_perf import add_performance_arguments, performance_cli_arguments
+from reward_hacking.generation_perf import (
+    add_performance_arguments,
+    performance_cli_arguments,
+    stage_performance_arguments,
+)
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.evaluate import (
     _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
@@ -32,6 +36,7 @@ from reward_hacking.organism_rl.yield_table import (
     summarize_output,
 )
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, default_mtp_speculative_config
+from scripts.gpu_preflight import require_free_gpu
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -711,6 +716,20 @@ def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
     return concurrency
 
 
+def _run_with_performance_policy(
+    run: Callable[[CellRunConfig], None], settings: CellRunConfig
+) -> None:
+    arguments = list(settings.performance_arguments)
+    if settings.server_pid is not None:
+        arguments.extend(("--perf-server-pid", str(settings.server_pid)))
+    arguments.extend(("--perf-startup-seconds", str(settings.server_startup_seconds)))
+    performance_arguments_reset = stage_performance_arguments.set(tuple(arguments))
+    try:
+        run(settings)
+    finally:
+        stage_performance_arguments.reset(performance_arguments_reset)
+
+
 def run_generator(
     args: argparse.Namespace, generator: GeneratorName, run: Callable[[CellRunConfig], None]
 ) -> None:
@@ -719,7 +738,8 @@ def run_generator(
     served_model_id = V3_SERVED_MODEL_ID if generator == "v3" else args.model
     if args.endpoint is not None:
         server_max_model_len = _served_model_max_len(args.endpoint, served_model_id)
-        run(
+        _run_with_performance_policy(
+            run,
             _cell_run_config(
                 args,
                 generator,
@@ -729,6 +749,7 @@ def run_generator(
             ),
         )
     else:
+        require_free_gpu()
         gpu_memory_utilization, device_name = resolve_gpu_engine_settings(torch)
         server_config = _server_config(
             args,
@@ -751,7 +772,13 @@ def run_generator(
                 effective_max_model_len(server_max_model_len, args.max_model_len),
             )
             settings = replace(
-                settings, server_pid=server.process.pid, server_startup_seconds=startup_seconds
+                settings,
+                server_pid=server.process.pid,
+                server_startup_seconds=startup_seconds,
+                performance_arguments=(
+                    *settings.performance_arguments,
+                    "--gpu-preflight-passed-at-stage-start",
+                ),
             )
             if generator == "27b":
                 if log_path is None:
@@ -773,7 +800,7 @@ def run_generator(
                         ),
                     },
                 )
-            run(settings)
+            _run_with_performance_policy(run, settings)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

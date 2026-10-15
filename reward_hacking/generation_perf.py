@@ -5,12 +5,47 @@ from __future__ import annotations
 import argparse
 import math
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from grpo.gpu_perf import PerfMonitor, PerfThresholds
 from grpo.model_geometry import load_model_geometry
 from reward_hacking.evidence_store import read_jsonl
+
+stage_performance_arguments: ContextVar[tuple[str, ...]] = ContextVar(
+    "stage_performance_arguments", default=()
+)
+
+
+def stage_generation_monitor(  # noqa: PLR0913 - monitor setup needs each stage input explicitly
+    *,
+    output_dir: Path,
+    endpoint: str,
+    model: str | Path,
+    model_revision: str | None,
+    concurrency: int,
+    serving_config: Mapping[str, object] | None,
+    performance_arguments: Sequence[str] | None = None,
+    default_estimate_seconds: float | None = None,
+) -> PerfMonitor:
+    """Apply the managed launcher policy to an in-process generation stage."""
+    parser = argparse.ArgumentParser()
+    add_performance_arguments(parser)
+    args = parser.parse_args(
+        stage_performance_arguments.get()
+        if performance_arguments is None
+        else performance_arguments
+    )
+    args.output_dir = output_dir
+    args.endpoint = endpoint
+    args.model = str(model)
+    args.model_revision = model_revision
+    args.concurrency = concurrency
+    args.serving_config = serving_config
+    if args.perf_estimate_seconds is None:
+        args.perf_estimate_seconds = default_estimate_seconds
+    return generation_monitor(args)
 
 
 def _nonempty_reason(value: str) -> str:
@@ -35,6 +70,7 @@ def add_performance_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--perf-max-estimate-multiplier", type=_positive_number, default=2.0)
     parser.add_argument("--perf-server-pid", type=int)
     parser.add_argument("--perf-startup-seconds", type=float, default=0.0)
+    parser.add_argument("--gpu-preflight-passed-at-stage-start", action="store_true")
 
 
 def performance_cli_arguments(args: argparse.Namespace) -> tuple[str, ...]:
@@ -52,6 +88,8 @@ def performance_cli_arguments(args: argparse.Namespace) -> tuple[str, ...]:
         value: object = vars(args)[name]
         if value is not None:
             command.extend(("--" + name.replace("_", "-"), str(value)))
+    if vars(args)["gpu_preflight_passed_at_stage_start"]:
+        command.append("--gpu-preflight-passed-at-stage-start")
     return tuple(command)
 
 
@@ -72,6 +110,7 @@ def generation_monitor(args: argparse.Namespace) -> PerfMonitor:
         estimate_seconds=args.perf_estimate_seconds,
         accept_slow=args.accept_slow,
         allowed_gpu_pids=() if args.perf_server_pid is None else (args.perf_server_pid,),
+        gpu_preflight_passed_at_stage_start=args.gpu_preflight_passed_at_stage_start,
         thresholds=PerfThresholds(
             decode_fraction=args.perf_min_decode_fraction,
             sm_utilization=args.perf_min_sm_utilization,

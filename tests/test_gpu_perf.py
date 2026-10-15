@@ -8,7 +8,9 @@ import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
+import pynvml
 import pytest
 
 from grpo.gpu_perf import (
@@ -20,6 +22,7 @@ from grpo.gpu_perf import (
     device_peak,
     histogram_summary,
     parse_metrics,
+    read_gpu_sample,
     throughput_breaches,
 )
 from grpo.model_geometry import ModelGeometry
@@ -305,6 +308,157 @@ def test_vram_without_visible_processes_has_unknown_ownership(tmp_path: Path) ->
     monitor.record_sample(10, parse_metrics(METRICS), gpu(pids=()))
     monitor.finish(10)
     assert "gpu_process_attribution_unknown" in throughput_breaches(tmp_path)
+
+
+def test_wsl_unknown_process_ownership_is_platform_unknown_after_stage_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grpo.gpu_perf._running_under_wsl", lambda: True)
+    monitor = PerfMonitor(
+        tmp_path,
+        "unused",
+        6,
+        model=MODEL,
+        allowed_gpu_pids=(123,),
+        gpu_preflight_passed_at_stage_start=True,
+    )
+    monitor.record_sample(0, parse_metrics(METRICS), gpu(pids=()))
+    monitor.record_sample(10, parse_metrics(METRICS), gpu(pids=()))
+
+    report = monitor.finish(10)
+    sample = next(read_samples(tmp_path / "throughput-samples.jsonl.gz"))
+
+    assert "gpu_process_attribution_unknown" not in report["breaches"]
+    assert report["platform_unknown_gpu_fields"] == ["gpu_process_ownership_unknown"]
+    assert sample["platform_unknown_fields"] == ["gpu_process_ownership_unknown"]
+
+
+@pytest.mark.parametrize(
+    ("wsl", "preflight_passed"),
+    [(True, False), (False, True)],
+)
+def test_wsl_attribution_unknown_requires_wsl_and_stage_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wsl: bool,
+    preflight_passed: bool,
+) -> None:
+    monkeypatch.setattr("grpo.gpu_perf._running_under_wsl", lambda: wsl)
+    monitor = PerfMonitor(
+        tmp_path,
+        "unused",
+        6,
+        allowed_gpu_pids=(123,),
+        gpu_preflight_passed_at_stage_start=preflight_passed,
+    )
+    monitor.record_sample(0, parse_metrics(METRICS), gpu(pids=()))
+    monitor.record_sample(10, parse_metrics(METRICS), gpu(pids=()))
+    report = monitor.finish(10)
+
+    assert "gpu_process_attribution_unknown" in report["breaches"]
+    assert report["platform_unknown_gpu_fields"] == []
+
+
+def test_missing_gpu_sample_is_not_platform_unknown_after_stage_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grpo.gpu_perf._running_under_wsl", lambda: True)
+    monitor = PerfMonitor(
+        tmp_path,
+        "unused",
+        6,
+        gpu_preflight_passed_at_stage_start=True,
+    )
+    monitor.record_sample(0, parse_metrics(METRICS), None)
+    monitor.record_sample(10, parse_metrics(METRICS), None)
+    report = monitor.finish(10)
+
+    assert "gpu_process_attribution_unknown" in report["breaches"]
+    assert report["platform_unknown_gpu_fields"] == []
+
+
+def test_wsl_preflight_does_not_hide_known_foreign_gpu_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grpo.gpu_perf._running_under_wsl", lambda: True)
+    monitor = PerfMonitor(
+        tmp_path,
+        "unused",
+        6,
+        model=MODEL,
+        allowed_gpu_pids=(123,),
+        gpu_preflight_passed_at_stage_start=True,
+    )
+    monitor.record_sample(0, parse_metrics(METRICS), gpu(pids=(123, 456)))
+    monitor.record_sample(10, parse_metrics(METRICS), gpu(pids=(123, 456)))
+    report = monitor.finish(10)
+
+    assert "foreign_gpu_process" in report["breaches"]
+    assert "gpu_process_attribution_unknown" not in report["breaches"]
+
+
+def test_wsl_preflight_marks_unknown_foreign_memory_as_platform_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("grpo.gpu_perf._running_under_wsl", lambda: True)
+    monitor = PerfMonitor(
+        tmp_path,
+        "unused",
+        6,
+        allowed_gpu_pids=(123,),
+        gpu_preflight_passed_at_stage_start=True,
+    )
+    unknown_memory_gpu = GpuSample(
+        "NVIDIA GeForce RTX 5090",
+        90,
+        75,
+        450,
+        2100,
+        14000,
+        28000,
+        32768,
+        (123, 456),
+        ((123, 256.0), (456, None)),
+    )
+    monitor.record_sample(0, parse_metrics(METRICS), unknown_memory_gpu)
+    monitor.record_sample(10, parse_metrics(METRICS), unknown_memory_gpu)
+    report = monitor.finish(10)
+
+    assert "foreign_gpu_memory_unknown" not in report["breaches"]
+    assert report["platform_unknown_gpu_fields"] == ["foreign_gpu_memory_unknown_pids"]
+
+
+def test_read_gpu_sample_treats_unsupported_nvml_attribution_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pynvml, "nvmlInit", lambda: None)
+    monkeypatch.setattr(pynvml, "nvmlShutdown", lambda: None)
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetCount", lambda: 1)
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetHandleByIndex", lambda index: "gpu")
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetName", lambda handle: b"NVIDIA GeForce RTX 5090")
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlDeviceGetUtilizationRates",
+        lambda handle: SimpleNamespace(gpu=90, memory=75),
+    )
+    monkeypatch.setattr(
+        pynvml,
+        "nvmlDeviceGetMemoryInfo",
+        lambda handle: SimpleNamespace(used=28_000 * 1024**2, total=32_768 * 1024**2),
+    )
+
+    def attribution_unavailable(handle: object) -> list[object]:
+        raise pynvml.NVMLError(pynvml.NVML_ERROR_NOT_SUPPORTED)
+
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetComputeRunningProcesses_v3", attribution_unavailable)
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetGraphicsRunningProcesses_v3", lambda handle: [])
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetPowerUsage", lambda handle: 450_000)
+    monkeypatch.setattr(pynvml, "nvmlDeviceGetClockInfo", lambda handle, clock: 2100)
+
+    sample = read_gpu_sample()
+
+    assert sample.memory_used_mib == 28000
+    assert sample.process_ids is None
 
 
 def test_missing_telemetry_still_writes_report_and_summary(tmp_path: Path) -> None:

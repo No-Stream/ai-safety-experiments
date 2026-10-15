@@ -12,15 +12,25 @@ import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 import httpx2
 
+from grpo.perf_samples import SAMPLES_FILE
 from reward_hacking.evidence_store import read_jsonl
+from reward_hacking.generation_perf import (
+    add_performance_arguments,
+    performance_cli_arguments,
+    record_episode_timings,
+    stage_generation_monitor,
+)
 from reward_hacking.ladder import runner
 from reward_hacking.ladder.loop import PROMPT_FORMAT_VERSION
+from reward_hacking.organism_rl import health
 from reward_hacking.organism_rl.generate import _read_hint_entries, require_gitignored_output_dir
 from reward_hacking.organism_rl.generate_provenance import (
     RECORD_SCHEMA_VERSION,
@@ -31,8 +41,10 @@ from reward_hacking.organism_rl.rollout import (
     compose_hint_system_prompt,
     deterministic_episode_seed,
 )
+from reward_hacking.semantic_identity import nonsemantic_server_settings
 
 if TYPE_CHECKING:
+    from grpo.gpu_perf import PerfMonitor
     from reward_hacking.ladder.scenario import Scenario
     from reward_hacking.organism_reward import RewardScore
 
@@ -41,6 +53,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SCENARIOS_DIR = Path("reward_hacking/ladder/data/scenarios-v2.2-conflict")
 LADDER_WAVE_ARMS = ("real", "claimed")
 LADDER_WAVE_EPISODES = 8
+LADDER_WAVE_ESTIMATED_SECONDS = LADDER_WAVE_EPISODES * 7.5 * 60
 LADDER_WAVE_MAX_TURNS = 80
 LADDER_WAVE_MAX_NEW_TOKENS = 16_384
 LADDER_WAVE_TEMPERATURE = 0.6
@@ -203,6 +216,7 @@ def _wave_provenance(  # noqa: PLR0913 - each provenance field independently bin
             "effective_system_prompt_sha256": system_prompt_hashes,
             "task_ids": list(task_ids),
             "arms": list(LADDER_WAVE_ARMS),
+            "max_model_len": max_model_len,
             "sampling": _sampling_payload(source),
             "max_turns": LADDER_WAVE_MAX_TURNS,
             "reasoning_effort": LADDER_WAVE_REASONING_EFFORT,
@@ -220,6 +234,9 @@ def _wave_provenance(  # noqa: PLR0913 - each provenance field independently bin
                 "served_model_id": served_model_id,
                 "max_model_len": max_model_len,
                 "episode_concurrency": concurrency,
+                "excluded_server_settings": nonsemantic_server_settings(
+                    source.config.server_args or {}
+                ),
                 "hints_path": None if hints_path is None else str(hints_path),
                 "hints_catalog_sha256": hint.catalog_sha256,
             },
@@ -234,7 +251,6 @@ def _sha256(value: bytes) -> str:
 def _read_stored_operational_contexts(
     path: Path,
     expected_identity: Mapping[str, object],
-    expected_identity_digest: str,
 ) -> list[dict[str, object]]:
     stored_value: object = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(stored_value, Mapping):
@@ -252,14 +268,35 @@ def _read_stored_operational_contexts(
     ):
         raise TypeError("existing ladder wave provenance is incomplete")
     stored_identity = cast("Mapping[str, object]", stored_identity_value)
-    if stored.get("resume_identity_sha256") != expected_identity_digest or dict(
-        stored_identity
-    ) != dict(expected_identity):
-        raise ValueError("ladder wave semantic resume identity differs from the existing run")
     if not all(isinstance(context, Mapping) for context in stored_contexts_value):
         raise TypeError("existing ladder wave operational contexts must contain objects")
     stored_contexts = cast("list[Mapping[str, object]]", stored_contexts_value)
+    expected_semantics = _semantic_resume_identity(expected_identity)
+    stored_semantics = _semantic_resume_identity(stored_identity)
+    if "max_model_len" not in stored_semantics:
+        stored_lengths = [context.get("max_model_len") for context in stored_contexts]
+        if stored_lengths and all(type(value) is int for value in stored_lengths):
+            unique_lengths = set(stored_lengths)
+            stored_semantics["max_model_len"] = (
+                unique_lengths.pop() if len(unique_lengths) == 1 else None
+            )
+        else:
+            stored_semantics["max_model_len"] = None
+    if stored_semantics != expected_semantics:
+        raise ValueError("ladder wave semantic resume identity differs from the existing run")
     return [dict(context) for context in stored_contexts]
+
+
+def _semantic_resume_identity(identity: Mapping[str, object]) -> dict[str, object]:
+    semantic = deepcopy(dict(identity))
+    runner_provenance = semantic.get("runner")
+    if isinstance(runner_provenance, Mapping):
+        semantic_runner, _ = runner.semantic_provenance_for_comparison(
+            runner_provenance, runner_provenance
+        )
+        semantic_runner.pop("episode_concurrency", None)
+        semantic["runner"] = semantic_runner
+    return semantic
 
 
 def _prepare_output(output_dir: Path, provenance: Mapping[str, object]) -> str:
@@ -284,9 +321,7 @@ def _prepare_output(output_dir: Path, provenance: Mapping[str, object]) -> str:
         raise TypeError("ladder wave provenance requires operational context")
     current_context = cast("dict[str, object]", operational_value)
     if provenance_path.is_file():
-        contexts = _read_stored_operational_contexts(
-            provenance_path, resume_identity, identity_digest
-        )
+        contexts = _read_stored_operational_contexts(provenance_path, resume_identity)
         if current_context not in contexts:
             contexts.append(current_context)
     else:
@@ -494,7 +529,50 @@ def _append_native_record(path: Path, record: Mapping[str, object]) -> None:
         os.fsync(output_file.fileno())
 
 
-def run_ladder_wave(  # noqa: PLR0913, PLR0915 - explicit stage setup, collection, and output
+def _collect_pending_episodes(
+    source: LadderEpisodeSource,
+    pending_task_ids: Sequence[str],
+    native_records: dict[str, dict[str, object]],
+    records_path: Path,
+    concurrency: int,
+) -> None:
+    """Flush each completed episode while keeping transport failures pending."""
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ladder-wave") as executor:
+        futures = {
+            executor.submit(source, task_id, seed=runner_seed(task_id), step=0, replica=0): task_id
+            for task_id in pending_task_ids
+        }
+        for future in as_completed(futures):
+            task_id = futures[future]
+            try:
+                sample = future.result()
+            except (httpx2.TimeoutException, httpx2.NetworkError) as error:
+                _, scenario_id, arm = task_id.split(":")
+                failure: dict[str, object] = {
+                    "record": "ladder_episode_failure",
+                    "status": "failed",
+                    "reason": "transport_error",
+                    "key": runner.EpisodeKey(
+                        source.backend.model_id, scenario_id, arm, 0
+                    ).to_json(),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+                _append_native_record(records_path, failure)
+                native_records[task_id] = failure
+                logger.exception("ladder episode %s failed", task_id)
+                continue
+            if sample.trace_path is None:
+                raise FileNotFoundError(f"ladder source returned no trace path for {task_id}")
+            record = dict(sample.record)
+            actual_task_id, sample_index = _native_task_id(record)
+            if actual_task_id != task_id or sample_index != 0:
+                raise ValueError("ladder source returned an episode with a different identity")
+            _append_native_record(records_path, record)
+            native_records[task_id] = record
+
+
+def run_ladder_wave(  # noqa: PLR0913 - explicit stage setup, collection, and output
     *,
     endpoint: str,
     model_path: str | Path,
@@ -508,6 +586,8 @@ def run_ladder_wave(  # noqa: PLR0913, PLR0915 - explicit stage setup, collectio
     hints_path: Path | None = None,
     hint_family: str | None = None,
     hint_strength: HintStrength = "none",
+    performance_arguments: Sequence[str] | None = None,
+    performance_monitor: PerfMonitor | None = None,
 ) -> dict[str, object]:
     """Generate or resume the eight real/claimed episodes and write label-refresh input rows."""
     if not endpoint or not served_model_id or max_model_len < 1 or concurrency < 1:
@@ -569,79 +649,91 @@ def run_ladder_wave(  # noqa: PLR0913, PLR0915 - explicit stage setup, collectio
         for task_id in task_ids
         if task_id not in native_records or not _native_record_complete(native_records[task_id])
     ]
-    seeds = {task_id: runner_seed(task_id) for task_id in task_ids}
-    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ladder-wave") as executor:
-        futures = {
-            executor.submit(source, task_id, seed=seeds[task_id], step=0, replica=0): task_id
-            for task_id in pending_task_ids
-        }
-        for future in as_completed(futures):
-            task_id = futures[future]
-            try:
-                sample = future.result()
-            except (httpx2.TimeoutException, httpx2.NetworkError) as error:
-                _, scenario_id, arm = task_id.split(":")
-                failure: dict[str, object] = {
-                    "record": "ladder_episode_failure",
-                    "status": "failed",
-                    "reason": "transport_error",
-                    "key": runner.EpisodeKey(
-                        source.backend.model_id, scenario_id, arm, 0
-                    ).to_json(),
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                }
-                _append_native_record(native_records_path, failure)
-                native_records[task_id] = failure
-                logger.exception("ladder episode %s failed", task_id)
-                continue
-            if sample.trace_path is None:
-                raise FileNotFoundError(f"ladder source returned no trace path for {task_id}")
-            record = dict(sample.record)
-            actual_task_id, sample_index = _native_task_id(record)
-            if actual_task_id != task_id or sample_index != 0:
-                raise ValueError("ladder source returned an episode with a different identity")
-            _append_native_record(native_records_path, record)
-            native_records[task_id] = record
-
-    adapted_records: list[dict[str, object]] = []
-    episode_counts: Counter[str] = Counter()
-    for task_id in task_ids:
-        native_record = native_records[task_id]
-        if not _native_record_complete(native_record):
-            continue
-        trace_path_value = native_record.get("trace_path")
-        if not isinstance(trace_path_value, str):
-            raise TypeError("native ladder record requires a trace_path")
-        record = _adapt_native_record(
-            native_record,
-            task_id=task_id,
-            sample_index=0,
-            seed=seeds[task_id],
-            trace_path=Path(trace_path_value),
-            run_provenance_sha256=provenance_sha256,
-            hint=hint,
+    configured_monitor = performance_monitor or stage_generation_monitor(
+        output_dir=output_dir,
+        endpoint=endpoint,
+        model=model_path,
+        model_revision=model_revision,
+        concurrency=concurrency,
+        serving_config=server_args,
+        performance_arguments=performance_arguments,
+        default_estimate_seconds=LADDER_WAVE_ESTIMATED_SECONDS,
+    )
+    throughput_path = output_dir / "throughput.json"
+    active_monitor = (
+        configured_monitor
+        if pending_task_ids
+        or not throughput_path.is_file()
+        or not (output_dir / SAMPLES_FILE).is_file()
+        else None
+    )
+    if active_monitor is None and configured_monitor.accept_slow is not None:
+        report = json.loads(throughput_path.read_text(encoding="utf-8"))
+        report["accept_slow"] = configured_monitor.accept_slow
+        write_json_atomically(throughput_path, report)
+    with ExitStack() as performance_context:
+        if active_monitor is not None:
+            performance_context.enter_context(active_monitor)
+        _collect_pending_episodes(
+            source, pending_task_ids, native_records, native_records_path, concurrency
         )
-        adapted_records.append(record)
-        episode_counts[str(cast("Mapping[str, object]", record["key"])["arm"])] += 1
-    _write_records(output_dir / RECORDS_FILENAME, adapted_records)
-    failed_task_ids = [
-        task_id for task_id in task_ids if not _native_record_complete(native_records[task_id])
-    ]
-    summary: dict[str, object] = {
-        "failed_episodes": len(failed_task_ids),
-        "failed_task_ids": failed_task_ids,
-        "episodes": len(adapted_records),
-        "scenario_count": len(scenarios),
-        "episode_counts_by_arm": dict(sorted(episode_counts.items())),
-        "sampling": cast("Mapping[str, object]", provenance["resume_identity"])["sampling"],
-        "resumed_episodes": len(task_ids) - len(pending_task_ids),
-        "torn_traces_recovered": source.torn_trace_count,
-    }
-    write_json_atomically(output_dir / SUMMARY_FILENAME, summary)
+        seeds = {task_id: runner_seed(task_id) for task_id in task_ids}
+
+        adapted_records: list[dict[str, object]] = []
+        episode_counts: Counter[str] = Counter()
+        for task_id in task_ids:
+            native_record = native_records[task_id]
+            if not _native_record_complete(native_record):
+                continue
+            trace_path_value = native_record.get("trace_path")
+            if not isinstance(trace_path_value, str):
+                raise TypeError("native ladder record requires a trace_path")
+            record = _adapt_native_record(
+                native_record,
+                task_id=task_id,
+                sample_index=0,
+                seed=seeds[task_id],
+                trace_path=Path(trace_path_value),
+                run_provenance_sha256=provenance_sha256,
+                hint=hint,
+            )
+            adapted_records.append(record)
+            episode_counts[str(cast("Mapping[str, object]", record["key"])["arm"])] += 1
+        _write_records(output_dir / RECORDS_FILENAME, adapted_records)
+        failed_task_ids = [
+            task_id for task_id in task_ids if not _native_record_complete(native_records[task_id])
+        ]
+        summary: dict[str, object] = {
+            "failed_episodes": len(failed_task_ids),
+            "failed_task_ids": failed_task_ids,
+            "episodes": len(adapted_records),
+            "scenario_count": len(scenarios),
+            "episode_counts_by_arm": dict(sorted(episode_counts.items())),
+            "sampling": cast("Mapping[str, object]", provenance["resume_identity"])["sampling"],
+            "resumed_episodes": len(task_ids) - len(pending_task_ids),
+            "torn_traces_recovered": source.torn_trace_count,
+        }
+        write_json_atomically(output_dir / SUMMARY_FILENAME, summary)
+        if active_monitor is not None:
+            record_episode_timings(
+                active_monitor,
+                [record for record in adapted_records if record["task_id"] in pending_task_ids],
+            )
     if failed_task_ids:
         raise LadderWaveError(
             f"{len(failed_task_ids)} ladder episode(s) failed; completed outputs persisted"
+        )
+    if health.main(
+        [
+            "--records",
+            str(output_dir / RECORDS_FILENAME),
+            "--output",
+            str(output_dir / "health.json"),
+            "--assert-throughput",
+        ]
+    ):
+        raise LadderWaveError(
+            "ladder wave throughput health check failed; completed outputs persisted"
         )
     return summary
 
@@ -660,6 +752,7 @@ def _parse_server_args(raw: str) -> Mapping[str, object]:
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    add_performance_arguments(parser)
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--model", required=True, help="local model path or cached repository id")
     parser.add_argument("--served-model-id", required=True)
@@ -693,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hints_path=args.hints,
             hint_family=args.hint_family,
             hint_strength=args.hint_strength,
+            performance_arguments=performance_cli_arguments(args),
         )
     except LadderWaveError:
         logger.exception("ladder wave failed after writing completed outputs")
