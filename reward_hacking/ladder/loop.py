@@ -310,6 +310,8 @@ class LadderTurn:
     command_protected_path_digests: tuple[tuple[dict[str, str], dict[str, str]], ...] = ()
     eval_awareness: tuple[AwarenessMatch, ...] | None = None
     prompt_token_ids: tuple[int, ...] | None = None
+    tool_execution_seconds: float | None = None
+    grading_seconds: float | None = None
 
     def to_json_dict(self, *, episode_id: str, task_id: str) -> dict[str, object]:
         """Return one incrementally writable turn record."""
@@ -363,6 +365,8 @@ class LadderTurn:
             "prompt_tokens_local": self.prompt_tokens_local,
             "requested_max_tokens": self.requested_max_tokens,
             "generation_seconds": self.generation_seconds,
+            "tool_execution_seconds": self.tool_execution_seconds,
+            "grading_seconds": self.grading_seconds,
             "prompt_pure_append": self.prompt_pure_append,
             "fabricated_tool_responses": self.fabricated_tool_responses,
             "surplus_function_close_tags": self.surplus_function_close_tags,
@@ -437,6 +441,9 @@ class LadderEpisodeTrace:
     final_state_verdict: Mapping[str, object] | None = None
     graded_artifact: Mapping[str, object] | None = None
     rejected_context_request: Mapping[str, int] | None = None
+    final_report_model_call_seconds: float | None = None
+    uncompleted_model_call_seconds: float | None = None
+    final_grading_seconds: float | None = None
 
     @property
     def proxy_pass(self) -> bool:
@@ -457,6 +464,40 @@ class LadderEpisodeTrace:
     def turns_truncated(self) -> int:
         """Count policy turns that ended at the completion token cap."""
         return sum(turn.stop_reason == "max_tokens" for turn in self.turns)
+
+    @property
+    def model_call_seconds(self) -> float | None:
+        """Return model-call time when every recorded continuation and turn is measured."""
+        if (
+            self.final_report_model_call_seconds is None
+            or self.uncompleted_model_call_seconds is None
+        ):
+            return None
+        return (
+            self.final_report_model_call_seconds
+            + self.uncompleted_model_call_seconds
+            + sum(turn.generation_seconds for turn in self.turns)
+        )
+
+    @property
+    def tool_execution_seconds(self) -> float | None:
+        """Return summed tool time when every turn carries timing evidence."""
+        durations = [turn.tool_execution_seconds for turn in self.turns]
+        if not durations:
+            return 0.0 if self.final_grading_seconds is not None else None
+        if any(duration is None for duration in durations):
+            return None
+        return sum(duration for duration in durations if duration is not None)
+
+    @property
+    def grading_seconds(self) -> float | None:
+        """Return submission and final grading time when every phase is measured."""
+        durations = [turn.grading_seconds for turn in self.turns]
+        if self.final_grading_seconds is None or any(duration is None for duration in durations):
+            return None
+        return self.final_grading_seconds + sum(
+            duration for duration in durations if duration is not None
+        )
 
     @property
     def grader_content_changed(self) -> bool | None:
@@ -540,6 +581,10 @@ class LadderEpisodeTrace:
                 "engine_wait_seconds": 0.0,
             },
             "elapsed_seconds": self.elapsed_seconds,
+            "model_call_seconds": self.model_call_seconds,
+            "uncompleted_model_call_seconds": self.uncompleted_model_call_seconds,
+            "tool_execution_seconds": self.tool_execution_seconds,
+            "grading_seconds": self.grading_seconds,
             "final_report": report_record,
             "final_report_prompt_sha256": self.final_report_prompt_sha256,
             "final_report_prompt_text": self.final_report_prompt_text,
@@ -671,13 +716,14 @@ class BudgetedSubmissionGrader(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _FinalReportContext:
     max_model_len: int
     max_new_tokens: int
     report_seconds: float
     next_call_number: int
     sampling_seed: int | None
+    model_call_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -717,6 +763,8 @@ class _ToolActionState:
     snapshot_error: SnapshotLimitError | None = None
     ended_by: str | None = None
     deadline_phase: DeadlinePhase | None = None
+    tool_execution_seconds: float = 0.0
+    grading_seconds: float = 0.0
 
 
 def grade_registered_submission(
@@ -738,6 +786,22 @@ def grade_registered_submission(
     if submit_grader is None:
         raise ValueError("a submission action requires an arm-specific submission grader")
     return submit_grader(episode_dir)
+
+
+def _grade_registered_submission_with_timing(
+    command: str, state: _ToolActionState, context: _ToolActionContext
+) -> SubmissionVerdict | None:
+    started_at = time.monotonic()
+    try:
+        return grade_registered_submission(
+            command,
+            context.episode_dir,
+            state.submissions_used,
+            submit_grader=context.submit_grader,
+            ci_submit_grader=context.ci_submit_grader,
+        )
+    finally:
+        state.grading_seconds += time.monotonic() - started_at
 
 
 def _append_turns_remaining_note(
@@ -1289,13 +1353,7 @@ def _execute_tool_call(  # noqa: C901, PLR0915 - keep ordered execution and alig
             )
         )
         try:
-            verdict = grade_registered_submission(
-                raw_command,
-                context.episode_dir,
-                state.submissions_used,
-                submit_grader=context.submit_grader,
-                ci_submit_grader=context.ci_submit_grader,
-            )
+            verdict = _grade_registered_submission_with_timing(raw_command, state, context)
         except SnapshotLimitError as error:
             state.snapshot_error = error
             state.ended_by = "workspace_snapshot_limit"
@@ -1365,7 +1423,13 @@ def _execute_tool_calls(
 ) -> None:
     """Execute calls in emission order until a deadline, budget, or submit stops the turn."""
     for call_index, call in enumerate(calls):
-        if _execute_tool_call(call_index, call, state, context):
+        grading_before = state.grading_seconds
+        tool_started_at = time.monotonic()
+        should_stop = _execute_tool_call(call_index, call, state, context)
+        elapsed_seconds = time.monotonic() - tool_started_at
+        grading_seconds = state.grading_seconds - grading_before
+        state.tool_execution_seconds += max(0.0, elapsed_seconds - grading_seconds)
+        if should_stop:
             break
 
 
@@ -1426,6 +1490,17 @@ def _complete_final_report(  # noqa: PLR0913 - report deadline and exact prefix
     if not completions:
         raise RuntimeError("final-report completion worker returned without a result")
     return completions[0], False
+
+
+def _measure_final_report_call(
+    context: _FinalReportContext,
+    call: Callable[[], tuple[RenderedCompletion | None, bool]],
+) -> tuple[RenderedCompletion | None, bool]:
+    started_at = time.monotonic()
+    try:
+        return call()
+    finally:
+        context.model_call_seconds += time.monotonic() - started_at
 
 
 def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accepts the full rendering state
@@ -1575,13 +1650,16 @@ def _sample_continuation(  # noqa: PLR0913, PLR0917 - shared continuation accept
         )
 
     try:
-        completion, timed_out = _complete_final_report(
-            backend,
-            prompt,
-            max_tokens=min(context.max_new_tokens, room),
-            timeout=max(0.0, report_deadline - time.monotonic()),
-            sampling_seed=context.sampling_seed,
-            prompt_token_ids=prompt_ids,
+        completion, timed_out = _measure_final_report_call(
+            context,
+            lambda: _complete_final_report(
+                backend,
+                prompt,
+                max_tokens=min(context.max_new_tokens, room),
+                timeout=max(0.0, report_deadline - time.monotonic()),
+                sampling_seed=context.sampling_seed,
+                prompt_token_ids=prompt_ids,
+            ),
         )
     except ContextWindowExceededError:
         return (
@@ -1872,6 +1950,7 @@ class _FinalReportOutcome:
     prompt_sha256: str = ""
     prompt_text: str = ""
     prompt_is_full: bool = False
+    model_call_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2044,6 +2123,8 @@ class _EpisodeProgress:
     pending_prompt_messages: list[ChatMessage] = field(default_factory=list)
     runaway_message_positions: list[int] = field(default_factory=list)
     next_call_number: int = 0
+    final_grading_seconds: float | None = None
+    uncompleted_model_call_seconds: float = 0.0
 
 
 def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay ordered for auditability
@@ -2071,6 +2152,7 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
         progress.ended_by = "context_exhausted"
         return
     requested_max_tokens = min(context.max_new_tokens, room)
+    sampling_started_at = time.monotonic()
     try:
         completion, generation_seconds = _sample_completion(
             backend,
@@ -2081,6 +2163,7 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
             prompt_token_ids=rendered.prompt_token_ids,
         )
     except ContextWindowExceededError:
+        progress.uncompleted_model_call_seconds += time.monotonic() - sampling_started_at
         progress.ended_by = "context_exhausted"
         progress.rejected_context_request = {
             "prompt_tokens": rendered.prompt_tokens,
@@ -2088,6 +2171,7 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
         }
         return
     if completion is None:
+        progress.uncompleted_model_call_seconds += generation_seconds
         progress.ended_by = "deadline"
         progress.deadline_phase = DeadlinePhase.SAMPLING
         return
@@ -2289,6 +2373,8 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
             episode_id=context.episode_id,
         ),
         prompt_token_ids=completion.prompt_token_ids,
+        tool_execution_seconds=action_state.tool_execution_seconds,
+        grading_seconds=action_state.grading_seconds,
     )
     progress.turns.append(turn)
     progress.fabricated_tool_responses += turn.fabricated_tool_responses
@@ -2346,7 +2432,9 @@ def _sample_belief_probe_and_final_report(
         else None
     )
     if progress.ended_by in {"thinking_budget_overshoot", "workspace_snapshot_limit"}:
-        return eval_belief_probe, _FinalReportOutcome()
+        return eval_belief_probe, _FinalReportOutcome(
+            model_call_seconds=continuation_context.model_call_seconds
+        )
     (
         progress.messages,
         final_report,
@@ -2380,6 +2468,7 @@ def _sample_belief_probe_and_final_report(
         prompt_sha256=prompt_sha256,
         prompt_text=prompt_text,
         prompt_is_full=prompt_is_full,
+        model_call_seconds=continuation_context.model_call_seconds,
     )
     return eval_belief_probe, report
 
@@ -2446,6 +2535,7 @@ def _build_episode_trace(  # noqa: PLR0913 - explicit inputs from each episode p
         final_report_truncated=report.truncated,
         final_report_timed_out=report.timed_out,
         final_report_fabricated_tool_responses=report.fabricated_tool_responses,
+        final_report_model_call_seconds=report.model_call_seconds,
         grader_hashable=context.grader_hashable,
         eval_belief_probe=eval_belief_probe,
         protocol=context.protocol.name,
@@ -2459,6 +2549,8 @@ def _build_episode_trace(  # noqa: PLR0913 - explicit inputs from each episode p
             turn_index=len(progress.turns),
             episode_id=context.episode_id,
         ),
+        final_grading_seconds=progress.final_grading_seconds,
+        uncompleted_model_call_seconds=progress.uncompleted_model_call_seconds,
     )
 
 
@@ -2628,6 +2720,7 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
     progress.peak_prompt_tokens = max(progress.peak_prompt_tokens, report.prompt_tokens)
     progress.fabricated_tool_responses += report.fabricated_tool_responses
 
+    grading_started_at = time.monotonic()
     grading = _grade_episode(
         task,
         episode_dir=episode_dir,
@@ -2640,6 +2733,7 @@ def run_ladder_episode(  # noqa: PLR0913 - public entry point; callers pass thes
         last_submission=progress.last_submission,
         snapshot_error=progress.snapshot_error,
     )
+    progress.final_grading_seconds = time.monotonic() - grading_started_at
     graded_artifact = (
         _persist_graded_artifact(task, episode_dir, trace_path, grading.final_grade)
         if persist_graded_artifact

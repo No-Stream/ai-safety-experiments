@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from reward_hacking.generation_perf import add_performance_arguments, performance_cli_arguments
 from reward_hacking.organism_rl.generate import require_gitignored_output_dir
 from reward_hacking.organism_rl.generate_provenance import write_json_atomically
 from reward_hacking.organism_rl.probe_v4 import (
@@ -73,6 +74,7 @@ WAVE_CELLS = (*PROBE_CELLS, *CONVENTION_NOTE_CELLS, *WAVE_SOURCE_CELLS)
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Validate stage controls before loading model assets."""
     parser = argparse.ArgumentParser(description=__doc__)
+    add_performance_arguments(parser)
     parser.add_argument("--cell", choices=tuple(cell.name for cell in WAVE_CELLS), required=True)
     parser.add_argument("--generator", choices=("base", "v3", "27b"), required=True)
     parser.add_argument("--hint-strength", choices=sorted(WAVE_HINT_STRENGTHS), required=True)
@@ -114,7 +116,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--health-report-only",
         action="store_true",
-        help="write the stage health report without applying assertion thresholds",
+        help="skip behavioral assertion thresholds; throughput still requires --accept-slow to override",
     )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -314,6 +316,11 @@ def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ..
             "exclusion_files": [str(path) for path in exclusions],
             **({"ilcb_input_sources": input_sources} if input_sources else {}),
             **({"health_report_only": True} if args.health_report_only else {}),
+            **(
+                {"performance_arguments": list(performance_cli_arguments(args))}
+                if args.accept_slow is not None
+                else {}
+            ),
         },
     )
 
@@ -351,6 +358,7 @@ def stage_settings(
     args: argparse.Namespace, settings: CellRunConfig, exclusions: tuple[Path, ...]
 ) -> CellRunConfig:
     """Apply wave controls to the shared probe generation settings."""
+    settings = replace(settings, performance_arguments=performance_cli_arguments(args))
     leak_task_filter = (
         _resolve_path(args.leak_task_filter)
         if args.leak_task_filter is not None
@@ -442,6 +450,10 @@ def launch_summary(args: argparse.Namespace) -> str:
             if args.generator == "27b"
             else ""
         )
+        + f"Performance gate: decode roofline >={args.perf_min_decode_fraction * 100:g}%; "
+        f"pending SM >={args.perf_min_sm_utilization:g}%; "
+        f"estimate <={args.perf_max_estimate_multiplier:g}x\n"
+        + (f"Accepted slow reason: {args.accept_slow}\n" if args.accept_slow else "")
         + f"Estimated wall-clock: {episode_hours * args.episodes:.2f} hours; "
         f"{episode_hours:.4f} hours per episode, scales with turns from the probe's "
         f"{ESTIMATED_HOURS_PER_CELL / PROBE_EPISODES_PER_CELL:.4f} hours at {cell.max_turns} turns.\n"

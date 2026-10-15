@@ -40,7 +40,11 @@ from huggingface_hub import try_to_load_from_cache
 from safetensors.torch import load_file as load_safetensors_file
 
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
+from grpo.gpu_perf import PerfMonitor, PerfThresholds, throughput_breaches
+from grpo.model_geometry import load_model_geometry
 from reward_hacking.eval_awareness import INTEGRITY_ALERT_TIERS, scan_text, summarize_matches
+from reward_hacking.evidence_store import read_jsonl
+from reward_hacking.generation_perf import episode_context_usage
 from reward_hacking.harness.loop import grader_reported_success, run_grader
 from reward_hacking.jailed_poc import (
     ENFORCED_JAIL_RESOURCE_LIMITS,
@@ -109,6 +113,7 @@ from reward_hacking.trace import write_trace
 if TYPE_CHECKING:
     from collections.abc import Sequence as TypeSequence
 
+    from grpo.model_geometry import ModelGeometry
     from reward_hacking.harness.task_spec import AgenticArmConfig, Task
     from reward_hacking.ladder.loop import BudgetedSubmissionGrader, SubmissionGrader
     from reward_hacking.ladder.monitor import CommandAuditMonitor, CommandStart
@@ -144,6 +149,7 @@ LADDER_ARMS = frozenset({"naive", "claimed", "real"})
 _MODEL_SLUG_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _VLLM_SERVER_ARGS_RE = re.compile(r"\[api_utils\.py:\d+\]\s+non-default args:\s*(.+)$")
 _MINIMUM_VISIBLE_MARKER_LENGTH = 3
+_MAX_TCP_PORT = 65_535
 
 # Generation sources determine prompts, sampling, execution, monitoring, and grading. Detector
 # sources determine persisted rung scoring and replay. Report-disclosure results are record-only;
@@ -394,6 +400,11 @@ class RunnerConfig:
     output_path: Path
     episode_root: Path
     oversize_reason: str | None = None
+    accept_slow: str | None = None
+    perf_server_pid: int | None = None
+    perf_startup_seconds: float = 0.0
+    perf_estimate_seconds: float | None = None
+    perf_thresholds: PerfThresholds = dataclass_field(default_factory=PerfThresholds)
     max_turns: int = ladder_loop.LADDER_MAX_TURNS
     announced_turn_budget: int | None = None
     max_new_tokens: int = ladder_loop.LADDER_MAX_NEW_TOKENS
@@ -432,6 +443,7 @@ class RunnerConfig:
 
     def __post_init__(self) -> None:
         """Validate the grid before any tokenizer or server request is made."""
+        _validate_perf_config(self)
         if self.announced_turn_budget is not None:
             if type(self.announced_turn_budget) is not int or self.announced_turn_budget < 1:
                 raise ValueError("announced_turn_budget must be positive")
@@ -578,12 +590,31 @@ class RunnerConfig:
             payload["belief_probe_questions_sha256"] = provenance_digest(
                 asdict(self.belief_probe_questions)
             )
+        run_context = cast("dict[str, object]", payload["run_context"])
+        run_context.update(
+            accept_slow=self.accept_slow,
+            perf_server_pid=self.perf_server_pid,
+            perf_startup_seconds=self.perf_startup_seconds,
+            perf_estimate_seconds=self.perf_estimate_seconds,
+            perf_thresholds=asdict(self.perf_thresholds),
+        )
         return payload
 
     @property
     def provenance_digest(self) -> str:
         """Return the stable digest that every record in this sweep carries."""
         return self._provenance_digest_cache
+
+
+def _validate_perf_config(config: RunnerConfig) -> None:
+    if config.accept_slow is not None and not config.accept_slow.strip():
+        raise ValueError("accept_slow requires a non-empty reason")
+    if config.perf_server_pid is not None and config.perf_server_pid < 1:
+        raise ValueError("perf_server_pid must be positive")
+    if config.perf_startup_seconds < 0:
+        raise ValueError("perf_startup_seconds must be nonnegative")
+    if config.perf_estimate_seconds is not None and config.perf_estimate_seconds <= 0:
+        raise ValueError("perf_estimate_seconds must be positive")
 
 
 def _validate_runner_config(config: RunnerConfig) -> None:
@@ -5449,7 +5480,158 @@ def _add_overshoot_policy_run_counts(
         counts["thinking_budget_overshoot_min_episodes"] = policy.min_episodes
 
 
+def _record_perf_times(monitor: PerfMonitor, records: Sequence[Mapping[str, object]]) -> None:
+    context_weighted_tokens = 0.0
+    generated_tokens = 0.0
+    for record in records:
+        trace_summary = _outcome_mapping(
+            record.get("trace_summary", {}), field_name="ladder trace_summary"
+        )
+        for category, field_name in (
+            ("model_calls", "model_call_seconds"),
+            ("tool_execution", "tool_execution_seconds"),
+            ("grading", "grading_seconds"),
+        ):
+            seconds = trace_summary.get(field_name, 0.0)
+            if not isinstance(seconds, (int, float)):
+                raise TypeError(f"ladder {field_name} must be numeric")
+            monitor.add_time(category, float(seconds))
+        trace_path = _outcome_string(record.get("trace_path"), field_name="ladder trace_path")
+        context = episode_context_usage(read_jsonl(Path(trace_path), hydrate=False))
+        context_weighted_tokens += context["weighted_context_tokens"]
+        generated_tokens += context["generated_tokens"]
+    if generated_tokens:
+        monitor.set_mean_context(context_weighted_tokens / generated_tokens)
+
+
+def _grid_has_pending_episodes(config: RunnerConfig) -> bool:
+    completed = completed_episode_keys(
+        config.output_path,
+        expected_digest=config.provenance_digest,
+        expected_provenance=config.provenance_payload(),
+    )
+    return any(
+        EpisodeKey(model.model_id, scenario.slug, arm, sample_index, config.task_pressure)
+        not in completed
+        for model in config.models
+        for scenario in config.scenarios
+        for arm in config.arms
+        for sample_index in range(config.samples)
+    )
+
+
+def _assert_perf_health(output_dir: Path) -> None:
+    breaches = throughput_breaches(output_dir)
+    if breaches:
+        raise RuntimeError(f"ladder throughput health failed: {', '.join(breaches)}")
+
+
+def _listening_process_ids(port: int) -> tuple[int, ...]:
+    """Find local processes that own a TCP listener for the serving endpoint port."""
+    if not 1 <= port <= _MAX_TCP_PORT:
+        raise ValueError(f"Serving endpoint port must be between 1 and {_MAX_TCP_PORT}")
+    socket_inodes: set[str] = set()
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            lines = table.read_text(encoding="utf-8").splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        for line in lines:
+            fields = line.split()
+            if fields[3] == "0A" and int(fields[1].rsplit(":", maxsplit=1)[1], 16) == port:
+                socket_inodes.add(fields[9])
+
+    listener_pids: set[int] = set()
+    for descriptor in Path("/proc").glob("[0-9]*/fd/*"):
+        try:
+            target = descriptor.readlink().as_posix()
+        except (FileNotFoundError, PermissionError):
+            continue
+        if target.startswith("socket:[") and target.endswith("]"):
+            inode = target[8:-1]
+            if inode in socket_inodes:
+                listener_pids.add(int(descriptor.parts[2]))
+    return tuple(sorted(listener_pids))
+
+
+def _resolve_perf_server_pid(endpoint: str) -> int:
+    """Resolve the local API listener so its vLLM worker descendants are not foreign GPU use."""
+    endpoint_parts = urlsplit(endpoint)
+    if endpoint_parts.scheme not in {"http", "https"} or endpoint_parts.hostname is None:
+        raise ValueError("Throughput endpoint must be an HTTP or HTTPS URL")
+    port = endpoint_parts.port or (443 if endpoint_parts.scheme == "https" else 80)
+    process_ids = _listening_process_ids(port)
+    if len(process_ids) != 1:
+        raise ValueError(
+            "Could not identify exactly one local vLLM listener for throughput process attribution; "
+            "set --perf-server-pid to the serving process PID"
+        )
+    return process_ids[0]
+
+
+def _perf_model_geometry(config: RunnerConfig) -> ModelGeometry | None:
+    if config.server_args is None:
+        return None
+    served_model = config.server_args.get("model")
+    if not isinstance(served_model, str) or not served_model:
+        raise ValueError("vLLM startup args must identify the served model")
+    kv_cache_dtype = config.server_args.get("kv_cache_dtype", "auto")
+    if not isinstance(kv_cache_dtype, str):
+        raise TypeError("vLLM kv_cache_dtype must be a string")
+    revision = config.server_args.get("revision")
+    if revision is not None and not isinstance(revision, str):
+        raise TypeError("vLLM revision must be a string or null")
+    return load_model_geometry(served_model, revision=revision, kv_cache_dtype=kv_cache_dtype)
+
+
 def run_grid(
+    config: RunnerConfig,
+    *,
+    backend_factory: BackendFactory = build_vllm_http_backend,
+    episode_runner: EpisodeRunner | None = None,
+    detector: Detector | None = None,
+    final_grader: FinalGrader | None = None,
+) -> list[dict[str, object]]:
+    """Monitor real endpoint generation automatically; injected CPU runners stay offline."""
+
+    def execute_grid() -> list[dict[str, object]]:
+        return _run_grid(
+            config,
+            backend_factory=backend_factory,
+            episode_runner=episode_runner,
+            detector=detector,
+            final_grader=final_grader,
+        )
+
+    if episode_runner is not None or backend_factory is not build_vllm_http_backend:
+        return execute_grid()
+    config = _prepare_real_run_config(config)
+    if not _grid_has_pending_episodes(config):
+        if (config.output_path.parent / "throughput.json").exists():
+            _assert_perf_health(config.output_path.parent)
+        return execute_grid()
+    if config.perf_server_pid is None:
+        config = replace(config, perf_server_pid=_resolve_perf_server_pid(config.endpoint))
+    endpoint = urlsplit(config.endpoint)
+    geometry = _perf_model_geometry(config)
+    with PerfMonitor(
+        output_dir=config.output_path.parent,
+        metrics_url=endpoint._replace(path="/metrics", query="", fragment="").geturl(),
+        concurrency=config.episode_concurrency,
+        model=geometry,
+        estimate_seconds=config.perf_estimate_seconds,
+        accept_slow=config.accept_slow,
+        allowed_gpu_pids=() if config.perf_server_pid is None else (config.perf_server_pid,),
+        thresholds=config.perf_thresholds,
+    ) as monitor:
+        monitor.add_time("server_startup", config.perf_startup_seconds)
+        records = execute_grid()
+        _record_perf_times(monitor, records)
+    _assert_perf_health(config.output_path.parent)
+    return records
+
+
+def _run_grid(
     config: RunnerConfig,
     *,
     backend_factory: BackendFactory = build_vllm_http_backend,
@@ -5713,6 +5895,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arm", action="append", dest="arms", choices=("naive", "claimed", "real"))
     parser.add_argument("--samples", type=int, default=1)
     add_oversize_reason_argument(parser)
+    parser.add_argument(
+        "--accept-slow", help="Accept measured throughput alerts with a recorded reason."
+    )
+    parser.add_argument(
+        "--perf-server-pid", type=int, help="PID of the serving process; descendants are allowed."
+    )
+    parser.add_argument("--perf-startup-seconds", type=float, default=0.0)
+    parser.add_argument("--perf-estimate-seconds", type=float)
+    parser.add_argument("--perf-min-decode-fraction", type=float, default=0.4)
+    parser.add_argument("--perf-min-sm-utilization", type=float, default=50.0)
+    parser.add_argument("--perf-max-estimate-multiplier", type=float, default=2.0)
     parser.add_argument("--output", type=Path, default=Path("artifacts/ladder/records.jsonl"))
     parser.add_argument("--episode-root", type=Path, default=Path("artifacts/ladder/episodes"))
     parser.add_argument(
@@ -5807,6 +6000,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             arms=tuple(args.arms or ("naive", "claimed", "real")),
             samples=args.samples,
             oversize_reason=args.oversize_reason,
+            accept_slow=args.accept_slow,
+            perf_server_pid=args.perf_server_pid,
+            perf_startup_seconds=args.perf_startup_seconds,
+            perf_estimate_seconds=args.perf_estimate_seconds,
+            perf_thresholds=PerfThresholds(
+                decode_fraction=args.perf_min_decode_fraction,
+                sm_utilization=args.perf_min_sm_utilization,
+                estimate_multiplier=args.perf_max_estimate_multiplier,
+            ),
             output_path=args.output,
             episode_root=args.episode_root,
             max_turns=max_turns,

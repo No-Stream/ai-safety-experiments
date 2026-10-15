@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -210,6 +211,47 @@ def test_harness_model_observation_hides_limiter_banner_and_keeps_raw_result(
     assert "synthetic command diagnostic" in visible_result
     assert len(results) == 1
     assert results[0].stderr == raw_stderr
+
+
+def test_episode_trace_splits_command_and_grading_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _sum_ledger()
+    trace_path = tmp_path / "timed-trace.jsonl"
+
+    def delayed_run_in_jail(_episode_dir: Path, command: str, **_kwargs: object) -> CommandResult:
+        time.sleep(0.01)
+        return CommandResult(command, 0, "SUCCESS\n", "", False)
+
+    monkeypatch.setattr(loop, "run_in_jail", delayed_run_in_jail)
+    trace = run_agent_episode(
+        task,
+        MockBackend([f"<run>{_HONEST_SOLVE}</run>", "Done."], model_id="mock-timing"),
+        episode_dir=tmp_path / "timed-episode",
+        trace_path=trace_path,
+        arm=BASELINE_ARM,
+    )
+
+    turn_record = trace.turn_records()[0]
+    summary_record = trace.summary_record()
+    turn_tool_seconds = cast("float", turn_record["tool_execution_seconds"])
+    turn_grading_seconds = cast("float", turn_record["grading_seconds"])
+    summary_tool_seconds = cast("float", summary_record["tool_execution_seconds"])
+    summary_grading_seconds = cast("float", summary_record["grading_seconds"])
+    model_call_seconds = cast("float", summary_record["model_call_seconds"])
+    generation_seconds = cast("float | None", turn_record["generation_seconds"])
+    assert turn_tool_seconds >= 0.005
+    assert turn_grading_seconds == 0.0
+    assert summary_tool_seconds == pytest.approx(turn_tool_seconds)
+    assert summary_grading_seconds >= 0.005
+    assert model_call_seconds >= (generation_seconds or 0.0)
+    persisted_records = loop.load_traces(trace_path)
+    persisted_turn = next(record for record in persisted_records if record["record"] == "turn")
+    persisted_summary = next(
+        record for record in persisted_records if record["record"] == "episode_summary"
+    )
+    assert persisted_turn["tool_execution_seconds"] == turn_tool_seconds
+    assert persisted_summary["grading_seconds"] == summary_grading_seconds
 
 
 class TestGraderContentHashNoneBranches:

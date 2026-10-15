@@ -8,6 +8,7 @@ import logging
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -18,6 +19,7 @@ import torch
 from transformers import AutoConfig
 
 from reward_hacking.distill.sample import resolve_gpu_engine_settings
+from reward_hacking.generation_perf import add_performance_arguments, performance_cli_arguments
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.organism_rl.evaluate import (
     _adapter_sha256,  # pyright: ignore[reportPrivateUsage]
@@ -100,6 +102,9 @@ class CellRunConfig:
     ilcb_task_subset: Path | None = None
     aisi_sources: tuple[str, ...] | None = None
     reasoning_effort: Literal["low", "medium"] = "low"
+    performance_arguments: tuple[str, ...] = ()
+    server_pid: int | None = None
+    server_startup_seconds: float | None = None
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -116,6 +121,7 @@ def _argument_parser() -> argparse.ArgumentParser:
             "--leak-assets /var/tmp/leak-env/assets-v9-train/assets.json."
         ),
     )
+    add_performance_arguments(parser)
     parser.add_argument("--stage", choices=("base", "v3"), required=True)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--model-revision")
@@ -313,6 +319,7 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
             )
         )
     command.extend(_source_selection_arguments(cell, settings))
+    command.extend(_performance_arguments(cell, settings, episodes_per_cell, max_turns))
     command.extend(_generator_serving_arguments(settings))
     if settings.convention_note:
         command.append("--convention-note")
@@ -325,6 +332,31 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
     if settings.model_revision is not None:
         command.extend(("--model-revision", settings.model_revision))
     command.extend(_leak_selection_arguments(cell, settings))
+    return command
+
+
+def _performance_arguments(
+    cell: ProbeCell, settings: CellRunConfig, episodes: int, max_turns: int
+) -> list[str]:
+    command = list(settings.performance_arguments)
+    if "--perf-estimate-seconds" not in command:
+        command.extend(
+            (
+                "--perf-estimate-seconds",
+                str(
+                    ESTIMATED_HOURS_PER_CELL
+                    * 3600
+                    / PROBE_EPISODES_PER_CELL
+                    * episodes
+                    * max_turns
+                    / cell.max_turns
+                ),
+            )
+        )
+    if settings.server_pid is not None:
+        command.extend(("--perf-server-pid", str(settings.server_pid)))
+    if settings.server_startup_seconds is not None:
+        command.extend(("--perf-startup-seconds", str(settings.server_startup_seconds)))
     return command
 
 
@@ -367,6 +399,7 @@ def build_health_command(
         str(records_path),
         "--output",
         str(records_path.parent / "health.json"),
+        "--assert-throughput",
     ]
     if not assert_health or generator in {"base", "27b"}:
         # Base is the baseline; absolute Gate 3 thresholds fitted to other cells misfire on its own generation.
@@ -525,6 +558,7 @@ def _cell_run_config(
             _adapter_sha256(_resolve_path(args.v3_adapter)) if generator == "v3" else None
         ),
         smoke=args.smoke_cell is not None,
+        performance_arguments=performance_cli_arguments(args),
         serving_config=(
             {
                 "model": args.model,
@@ -702,7 +736,9 @@ def run_generator(
         )
         log_path = server_config.log_path
         log_offset = log_path.stat().st_size if log_path is not None and log_path.exists() else 0
+        startup_started = time.monotonic()
         with VLLMServer(server_config) as server:
+            startup_seconds = time.monotonic() - startup_started
             server_max_model_len = _served_model_max_len(server.base_url, served_model_id)
             settings = _cell_run_config(
                 args,
@@ -710,6 +746,9 @@ def run_generator(
                 server.base_url,
                 model_revision,
                 effective_max_model_len(server_max_model_len, args.max_model_len),
+            )
+            settings = replace(
+                settings, server_pid=server.process.pid, server_startup_seconds=startup_seconds
             )
             if generator == "27b":
                 if log_path is None:

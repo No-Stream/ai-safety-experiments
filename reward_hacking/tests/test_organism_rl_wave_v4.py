@@ -52,10 +52,105 @@ def test_new_cell_dry_run_reports_requested_stage_without_runtime_assets(
     assert capsys.readouterr().out == (
         f"Cell: {cell_name}\nGenerator: {generator} on Qwen/Qwen3.5-9B\nHint: none\n"
         "Episodes: 8\nSamples per task: 1\nMax turns (announced and real): 40\n"
-        "Max model len: 131072\nEstimated wall-clock: 0.50 hours; 0.0625 hours per episode, "
+        "Max model len: 131072\n"
+        "Performance gate: decode roofline >=40%; pending SM >=50%; estimate <=2x\n"
+        "Estimated wall-clock: 0.50 hours; 0.0625 hours per episode, "
         "scales with turns from the probe's 0.0312 hours at 20 turns.\n"
     )
     assert not (tmp_path / "wave").exists()
+
+
+def test_wave_dry_run_exposes_performance_policy_and_acceptance_reason(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = wave_v4.main(
+        [
+            "--cell",
+            "f5-timed-orig",
+            "--generator",
+            "27b",
+            "--hint-strength",
+            "none",
+            "--episodes",
+            "2",
+            "--max-turns",
+            "40",
+            "--output-root",
+            str(tmp_path / "wave"),
+            "--probe-output-dir",
+            str(tmp_path / "probe"),
+            "--accept-slow",
+            "known storage contention",
+            "--perf-min-decode-fraction",
+            "0.25",
+            "--perf-min-sm-utilization",
+            "35",
+            "--dry-run",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "Performance gate: decode roofline >=25%; pending SM >=35%; estimate <=2x\n" in output
+    assert "Accepted slow reason: known storage contention\n" in output
+    assert not (tmp_path / "wave").exists()
+
+
+def test_wave_records_accept_slow_and_forwards_controls_to_generator(
+    tmp_path: Path,
+) -> None:
+    args = wave_v4.parse_args(
+        [
+            "--cell",
+            "f5-timed-orig",
+            "--generator",
+            "27b",
+            "--hint-strength",
+            "none",
+            "--episodes",
+            "2",
+            "--max-turns",
+            "40",
+            "--output-root",
+            str(tmp_path / "wave"),
+            "--probe-output-dir",
+            str(tmp_path / "probe"),
+            "--accept-slow",
+            "known storage contention",
+            "--perf-min-decode-fraction",
+            "0.25",
+        ]
+    )
+    stage_path = wave_v4.stage_directory(args)
+    wave_v4.record_stage_provenance(args, ())
+    provenance = json.loads((stage_path / "stage-provenance.json").read_text(encoding="utf-8"))
+    cell = next(cell for cell in wave_v4.WAVE_CELLS if cell.name == args.cell)
+    settings = CellRunConfig(
+        generator="27b",
+        endpoint="http://127.0.0.1:8000",
+        model=args.model,
+        output_dir=stage_path,
+        hints_path=args.hints,
+        leak_assets=None,
+        leak_channel_splits=args.leak_channel_splits,
+        baseline_records=args.baseline_records,
+        max_model_len=args.max_model_len,
+        model_revision=None,
+        served_adapter_sha256=None,
+        serving_config={"kv_cache_dtype": "fp8"},
+    )
+    command = build_generate_command(cell, wave_v4.stage_settings(args, settings, ()))
+
+    assert "--accept-slow" in provenance["performance_arguments"]
+    assert (
+        provenance["performance_arguments"][
+            provenance["performance_arguments"].index("--accept-slow") + 1
+        ]
+        == "known storage contention"
+    )
+    assert command[command.index("--accept-slow") + 1] == "known storage contention"
+    assert command[command.index("--perf-min-decode-fraction") + 1] == "0.25"
+    assert "--perf-server-pid" not in command
 
 
 @pytest.mark.parametrize("cell", PROBE_CELLS)

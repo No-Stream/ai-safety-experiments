@@ -656,6 +656,8 @@ class AgentTurn:
     reasoning: str = ""
     prompt_tokens: int | None = None
     generation_seconds: float | None = None
+    tool_execution_seconds: float | None = None
+    grading_seconds: float | None = None
 
     @property
     def hit_output_cap(self) -> bool:
@@ -798,6 +800,9 @@ class AgentEpisodeTrace:
     grader_check_sha256s: tuple[str | None, ...] = ()
     grader_mechanism: dict[str, object] | None = None
     elapsed_seconds: float | None = None
+    final_report_generation_seconds: float | None = None
+    uncompleted_model_call_seconds: float | None = None
+    final_grading_seconds: float | None = None
     deadline_phase: DeadlinePhase | None = None
     engine_wait_seconds: float = 0.0
     final_report: str | None = None
@@ -928,6 +933,42 @@ class AgentEpisodeTrace:
         return sum(1 for turn in self.turns if turn.hit_output_cap)
 
     @property
+    def model_call_seconds(self) -> float | None:
+        """Return measured generation time, or None if any call lacked timing evidence."""
+        durations = [turn.generation_seconds for turn in self.turns]
+        if (
+            self.final_report_generation_seconds is None
+            or self.uncompleted_model_call_seconds is None
+            or any(duration is None for duration in durations)
+        ):
+            return None
+        return (
+            self.final_report_generation_seconds
+            + self.uncompleted_model_call_seconds
+            + sum(duration for duration in durations if duration is not None)
+        )
+
+    @property
+    def tool_execution_seconds(self) -> float | None:
+        """Return summed command time when every turn carries timing evidence."""
+        durations = [turn.tool_execution_seconds for turn in self.turns]
+        if not durations:
+            return 0.0 if self.final_grading_seconds is not None else None
+        if any(duration is None for duration in durations):
+            return None
+        return sum(duration for duration in durations if duration is not None)
+
+    @property
+    def grading_seconds(self) -> float | None:
+        """Return mediated and final grading time when every phase was measured."""
+        durations = [turn.grading_seconds for turn in self.turns]
+        if self.final_grading_seconds is None or any(duration is None for duration in durations):
+            return None
+        return self.final_grading_seconds + sum(
+            duration for duration in durations if duration is not None
+        )
+
+    @property
     def fabricated_result_envelopes(self) -> int:
         """Total result envelopes across this episode's completions, all of them model-invented.
 
@@ -1022,6 +1063,10 @@ class AgentEpisodeTrace:
                 "engine_wait_seconds": self.engine_wait_seconds,
             },
             "elapsed_seconds": self.elapsed_seconds,
+            "model_call_seconds": self.model_call_seconds,
+            "uncompleted_model_call_seconds": self.uncompleted_model_call_seconds,
+            "tool_execution_seconds": self.tool_execution_seconds,
+            "grading_seconds": self.grading_seconds,
             "final_report": {
                 "text": self.final_report,
                 "reasoning": self.final_report_reasoning,
@@ -1097,6 +1142,8 @@ def _turn_record(episode_id: str, task_id: str, turn: AgentTurn) -> dict[str, ob
         "output_tokens": turn.output_tokens,
         "prompt_tokens": turn.prompt_tokens,
         "generation_seconds": turn.generation_seconds,
+        "tool_execution_seconds": turn.tool_execution_seconds,
+        "grading_seconds": turn.grading_seconds,
         "fabricated_results": turn.fabricated_results,
         "commands": _command_records(turn.commands),
     }
@@ -1343,6 +1390,7 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
     before_command: Callable[[Path, str], None] | None = None,
     after_command: Callable[[Path, str, CommandResult], None] | None = None,
     check_grader: CheckGrader | None = None,
+    phase_timings: _ActionTimings | None = None,
 ) -> tuple[
     tuple[CommandResult, ...],
     str,
@@ -1422,6 +1470,9 @@ def _run_actions(  # noqa: PLR0913 - keyword-only config knobs, not worth a wrap
             episode_cpus=episode_cpus,
             episode_mem_max=episode_mem_max,
         )
+        if phase_timings is not None:
+            phase_timings.tool_execution_seconds += action_result.tool_execution_seconds
+            phase_timings.grading_seconds += action_result.grading_seconds
         results.extend(action_result.commands)
         transcript_tail += action_result.transcript
         checks_used = action_result.checks_used
@@ -1446,6 +1497,14 @@ class _ActionExecution:
     checks_used: int
     check_sha256s: tuple[str | None, ...]
     snapshot_error: SnapshotLimitError | None
+    tool_execution_seconds: float = 0.0
+    grading_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class _ActionTimings:
+    tool_execution_seconds: float = 0.0
+    grading_seconds: float = 0.0
 
 
 def _run_one_action(  # noqa: PLR0913 - carry the existing episode command context unchanged
@@ -1473,6 +1532,7 @@ def _run_one_action(  # noqa: PLR0913 - carry the existing episode command conte
             else ()
         )
         checks_used += 1
+        grading_started_at = time.monotonic()
         try:
             transcript = _answer_check(
                 task,
@@ -1483,10 +1543,27 @@ def _run_one_action(  # noqa: PLR0913 - carry the existing episode command conte
                 check_grader=check_grader,
             )
         except SnapshotLimitError as exc:
-            return _ActionExecution((), "", None, checks_used, check_sha256s, exc)
-        return _ActionExecution((), transcript + "\n", None, checks_used, check_sha256s, None)
+            return _ActionExecution(
+                (),
+                "",
+                None,
+                checks_used,
+                check_sha256s,
+                exc,
+                grading_seconds=time.monotonic() - grading_started_at,
+            )
+        return _ActionExecution(
+            (),
+            transcript + "\n",
+            None,
+            checks_used,
+            check_sha256s,
+            None,
+            grading_seconds=time.monotonic() - grading_started_at,
+        )
     if action.kind is not ActionKind.RUN:
         return _ActionExecution((), "", action, checks_used, (), None)
+    tool_started_at = time.monotonic()
     if before_command is not None:
         before_command(episode_dir, action.payload)
     try:
@@ -1500,7 +1577,15 @@ def _run_one_action(  # noqa: PLR0913 - carry the existing episode command conte
             mem_max=episode_mem_max,
         )
     except SnapshotLimitError as exc:
-        return _ActionExecution((), "", None, checks_used, (), exc)
+        return _ActionExecution(
+            (),
+            "",
+            None,
+            checks_used,
+            (),
+            exc,
+            tool_execution_seconds=time.monotonic() - tool_started_at,
+        )
     if after_command is not None:
         after_command(episode_dir, action.payload, result)
     return _ActionExecution(
@@ -1510,6 +1595,7 @@ def _run_one_action(  # noqa: PLR0913 - carry the existing episode command conte
         checks_used,
         (),
         None,
+        tool_execution_seconds=time.monotonic() - tool_started_at,
     )
 
 
@@ -1581,6 +1667,7 @@ class _FinalReport:
     reasoning: str
     truncated: bool
     timed_out: bool
+    generation_seconds: float | None = None
 
 
 def _sample_final_report(
@@ -1606,12 +1693,23 @@ def _sample_final_report(
     )
     report = sampled.response
     if report is None:
-        return _FinalReport(text="", reasoning="", truncated=False, timed_out=True)
+        return _FinalReport(
+            text="",
+            reasoning="",
+            truncated=False,
+            timed_out=True,
+            generation_seconds=(
+                0.0
+                if sampled.deadline_phase is DeadlinePhase.ENGINE_QUEUE
+                else sampled.generation_seconds
+            ),
+        )
     return _FinalReport(
         text=report.text,
         reasoning=report.reasoning,
         truncated=report.stop_reason == STOP_REASON_MAX_TOKENS,
         timed_out=False,
+        generation_seconds=sampled.generation_seconds,
     )
 
 
@@ -1685,6 +1783,7 @@ def _sample_within_budget(  # noqa: PLR0913 - the episode's own bookkeeping, thr
             if time.monotonic() - queued_at >= episode_seconds:
                 return _SampledTurn(None, time.monotonic() - queued_at, DeadlinePhase.ENGINE_QUEUE)
         waited = time.monotonic() - queued_at
+    generation_started_at = time.monotonic()
     thread, outcome = _generate_on_daemon_thread(backend, transcript, engine_gate=engine_gate)
     generation_deadline = deadline + waited
     while True:
@@ -1694,7 +1793,12 @@ def _sample_within_budget(  # noqa: PLR0913 - the episode's own bookkeeping, thr
         if stop_requested is not None and stop_requested.is_set():
             raise RunStoppedError("stop requested during a generation")
         if time.monotonic() >= generation_deadline:
-            return _SampledTurn(None, waited, DeadlinePhase.SAMPLING)
+            return _SampledTurn(
+                None,
+                waited,
+                DeadlinePhase.SAMPLING,
+                generation_seconds=time.monotonic() - generation_started_at,
+            )
     result = outcome[0]
     if isinstance(result, BaseException):
         raise result
@@ -1978,6 +2082,7 @@ def _grade_completed_episode(  # noqa: PLR0913 - pass the episode's existing con
     episode_seconds: float,
     engine_gate: SharedEngineGate | None,
     stop_requested: threading.Event | None,
+    grading_timing: _FinalGradingTiming | None = None,
 ) -> tuple[FinalGrade, _FinalReport | None]:
     if snapshot_error is not None:
         return _snapshot_limit_grade(task, snapshot_error), None
@@ -1992,15 +2097,25 @@ def _grade_completed_episode(  # noqa: PLR0913 - pass the episode's existing con
         if final_report
         else None
     )
-    graded = grade_final_state(
-        task,
-        episode_dir,
-        arm=arm,
-        timeout=timeout,
-        jail_backend=jail_backend,
-        grader_hashable=grader_hashable,
-    )
+    grading_started_at = time.monotonic()
+    try:
+        graded = grade_final_state(
+            task,
+            episode_dir,
+            arm=arm,
+            timeout=timeout,
+            jail_backend=jail_backend,
+            grader_hashable=grader_hashable,
+        )
+    finally:
+        if grading_timing is not None:
+            grading_timing.seconds = time.monotonic() - grading_started_at
     return graded, sampled_report
+
+
+@dataclass(slots=True)
+class _FinalGradingTiming:
+    seconds: float = 0.0
 
 
 def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecycle and trace assembly
@@ -2125,6 +2240,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
     # Set where the clock runs out, and only there; deadline_exceeded is derived from it below.
     deadline_phase: DeadlinePhase | None = None
     engine_wait_seconds = 0.0
+    uncompleted_model_call_seconds = 0.0
     _append_trace_records(
         trace_path,
         [
@@ -2161,6 +2277,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         deadline += attempt.engine_wait_seconds
         if attempt.response is None:
             deadline_phase = attempt.deadline_phase
+            uncompleted_model_call_seconds += attempt.generation_seconds or 0.0
             logger.warning(
                 "episode spent its %.0fs budget in phase %s after %d finished turn(s); grading "
                 "/work as it stands",
@@ -2174,6 +2291,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         completion = _with_run_stop_restored(sampled.text, sampled.stop_reason)
         transcript += "\n" + completion + "\n"
         checks_before = checks_used
+        action_timings = _ActionTimings()
         (
             results,
             transcript_tail,
@@ -2194,6 +2312,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
             before_command=before_command,
             after_command=after_command,
             check_grader=check_grader,
+            phase_timings=action_timings,
         )
         grader_check_sha256s.extend(turn_check_sha256s)
         ran_check = checks_used > checks_before
@@ -2208,6 +2327,8 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
                 reasoning=sampled.reasoning,
                 prompt_tokens=sampled.input_tokens,
                 generation_seconds=attempt.generation_seconds,
+                tool_execution_seconds=action_timings.tool_execution_seconds,
+                grading_seconds=action_timings.grading_seconds,
             )
         )
         _append_trace_records(trace_path, [_turn_record(episode_id, task.task_id, turns[-1])])
@@ -2235,6 +2356,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
                 continue
             break
 
+    final_grading_timing = _FinalGradingTiming()
     graded, sampled_report = _grade_completed_episode(
         task,
         episode_dir,
@@ -2249,6 +2371,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         episode_seconds=episode_seconds,
         engine_gate=engine_gate,
         stop_requested=stop_requested,
+        grading_timing=final_grading_timing,
     )
     if sampled_report is not None:
         final_report_text = sampled_report.text
@@ -2297,6 +2420,11 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         grader_pregrade_sha256=graded.grader_pregrade_sha256,
         grader_check_sha256s=tuple(grader_check_sha256s),
         elapsed_seconds=elapsed_seconds,
+        final_report_generation_seconds=(
+            0.0 if sampled_report is None else sampled_report.generation_seconds
+        ),
+        uncompleted_model_call_seconds=uncompleted_model_call_seconds,
+        final_grading_seconds=final_grading_timing.seconds,
         deadline_phase=deadline_phase,
         engine_wait_seconds=engine_wait_seconds,
         final_report=final_report_text,

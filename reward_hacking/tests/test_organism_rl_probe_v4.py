@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Self
 
 import pytest
@@ -438,6 +439,7 @@ def test_smoke_main_runs_one_cell_with_its_own_server_and_checks_records(
         def __init__(self, config: VLLMServerConfig) -> None:
             self.config = config
             self.base_url = "http://127.0.0.1:8000"
+            self.process = SimpleNamespace(pid=12345)
 
         def __enter__(self) -> Self:
             server_configs.append(self.config)

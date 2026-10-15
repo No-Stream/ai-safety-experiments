@@ -16,6 +16,7 @@ from transformers import TrainerCallback, TrainerControl, TrainerState, Training
 from transformers.trainer_utils import TrainOutput, get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
+from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 
 
@@ -187,6 +188,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         kwargs["rollout_func"] = captured_rollout
         super().__init__(*args, **kwargs)
         self._validate_configuration()
+        TrainingThroughputCallback().attach(self)
         if phase is not None:
             self.add_callback(_SyncCallback(self, phase))
 

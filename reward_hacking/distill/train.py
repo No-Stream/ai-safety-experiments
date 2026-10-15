@@ -28,6 +28,7 @@ from transformers.trainer_utils import TrainOutput
 from games.deltanet_kernels import bound_deltanet_kernels
 from games.train import build_callbacks, chunked_per_token_logps, resolve_complete_resume_checkpoint
 from grpo.throughput import discover_lora_targets
+from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import (
     MAX_MIDDLE_CHECKPOINTS,
     MIN_LATEST_CHECKPOINTS,
@@ -603,6 +604,7 @@ class DistillTrainer(CheckpointRetentionMixin, Trainer):
         kwargs["train_dataset"] = train_dataset
         super().__init__(**kwargs)
         self.add_callback(self.telemetry)
+        TrainingThroughputCallback().attach(self)
         cast_lora_to_float32(cast("torch.nn.Module", self.model))
         # Trainer must not divide a window-normalized token loss by the row count again.
         self.model_accepts_loss_kwargs = weight_mode == "sft" and sft_loss_averaging == "token"

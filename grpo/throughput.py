@@ -51,6 +51,7 @@ from grpo.estimator_defaults import (
     assert_liger_faithful_estimator,
     executed_estimator,
 )
+from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 
 if TYPE_CHECKING:
@@ -758,6 +759,7 @@ def build_trainer(
             target_modules=cast("list[str]", lora_targets["target_modules"]),
         ),
     )
+    TrainingThroughputCallback().attach(trainer)
     timing_cb = StepTimingCallback()
     trainer.add_callback(timing_cb)
     generation_timings = instrument_generation(trainer)

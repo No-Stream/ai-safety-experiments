@@ -19,6 +19,7 @@ from pathlib import Path
 from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
 
+from grpo.gpu_perf import throughput_breaches
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.ladder.tools import contains_non_registered_submit_marker
 from reward_hacking.organism_rl.strengthened_truth_grade import (
@@ -196,6 +197,7 @@ class _HealthCLIOptions:
     comparisons: list[str] | None
     output: Path | None
     assert_health: bool
+    assert_throughput: bool
     schema_only: bool
     baseline: Path | None
     thresholds: HealthAssertionThresholds
@@ -1882,6 +1884,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="check the candidate against the Gate 3 health thresholds",
     )
     parser.add_argument(
+        "--assert-throughput",
+        action="store_true",
+        help="require and enforce the performance report beside the candidate records",
+    )
+    parser.add_argument(
         "--schema-only",
         action="store_true",
         help="with --assert, validate record and trace schemas without Gate 3 thresholds",
@@ -1947,6 +1954,7 @@ def _health_cli_options(args: argparse.Namespace) -> _HealthCLIOptions:
         comparisons=cast("list[str] | None", args.compare),
         output=cast("Path | None", args.output),
         assert_health=cast("bool", args.assert_health),
+        assert_throughput=cast("bool", args.assert_throughput),
         schema_only=cast("bool", args.schema_only),
         baseline=cast("Path | None", args.baseline),
         thresholds=_health_thresholds_from_args(args),
@@ -1987,6 +1995,7 @@ def _validate_records_options(options: _HealthCLIOptions) -> None:
 def _validate_comparison_options(options: _HealthCLIOptions) -> None:
     if (
         options.assert_health
+        or options.assert_throughput
         or options.schema_only
         or options.baseline is not None
         or options.capability_floor is not None
@@ -2010,32 +2019,106 @@ def _records_report_payload(
     options: _HealthCLIOptions,
     candidate_report: dict[str, object],
 ) -> tuple[dict[str, object], str, list[str]]:
+    report_payload: dict[str, object]
     if options.schema_only:
-        return (
-            {**candidate_report, "schema_only": True},
-            report_to_markdown(candidate_report),
-            [],
+        report_payload = {**candidate_report, "schema_only": True}
+        markdown = report_to_markdown(candidate_report)
+        assertion_breaches: list[str] = []
+    elif options.assert_health:
+        baseline_path = options.baseline
+        if baseline_path is None:
+            raise HealthInputError("--assert requires --baseline RECORDS")
+        baseline_report = analyze_records(
+            [baseline_path],
+            options.baseline_sidecar,
+            optional_strengthened_truth=options.optional_truth,
         )
-    if not options.assert_health:
-        return dict(candidate_report), report_to_markdown(candidate_report), []
-    baseline_path = options.baseline
-    if baseline_path is None:
-        raise HealthInputError("--assert requires --baseline RECORDS")
-    baseline_report = analyze_records(
-        [baseline_path],
-        options.baseline_sidecar,
-        optional_strengthened_truth=options.optional_truth,
+        reports = {"baseline": baseline_report, "candidate": candidate_report}
+        report_payload = {"comparison": reports}
+        markdown = comparison_to_markdown(reports)
+        assertion_breaches = health_assertion_breaches(candidate_report, options.thresholds)
+    else:
+        report_payload = dict(candidate_report)
+        markdown = report_to_markdown(candidate_report)
+        assertion_breaches = []
+
+    should_check_throughput = options.assert_throughput or (
+        options.assert_health and not options.schema_only
     )
-    reports = {"baseline": baseline_report, "candidate": candidate_report}
-    assertion_breaches = health_assertion_breaches(candidate_report, options.thresholds)
-    return (
-        {
-            "comparison": reports,
-            "assertion_breaches": assertion_breaches,
-        },
-        comparison_to_markdown(reports),
-        assertion_breaches,
-    )
+    throughput_report: dict[str, object] | None = None
+    if should_check_throughput:
+        throughput_report, throughput_assertion_breaches = _throughput_report(
+            cast("list[Path]", options.records),
+            require_artifact=options.assert_throughput,
+        )
+        assertion_breaches.extend(throughput_assertion_breaches)
+        report_payload["throughput"] = throughput_report
+
+    if options.assert_health or options.assert_throughput:
+        report_payload["assertion_breaches"] = assertion_breaches
+    return report_payload, markdown, assertion_breaches
+
+
+def _throughput_report(
+    records_paths: Sequence[Path],
+    *,
+    require_artifact: bool,
+) -> tuple[dict[str, object], list[str]]:
+    stage_results: list[dict[str, object]] = []
+    assertion_breaches: list[str] = []
+    seen_directories: set[Path] = set()
+    for records_path in records_paths:
+        output_dir = records_path.parent
+        if output_dir in seen_directories:
+            continue
+        seen_directories.add(output_dir)
+        throughput_path = output_dir / "throughput.json"
+        if not throughput_path.is_file():
+            missing_breaches = (
+                [f"throughput artifact is missing beside stage {output_dir.name!r}"]
+                if require_artifact
+                else []
+            )
+            stage_results.append(
+                {
+                    "stage": output_dir.name,
+                    "available": False,
+                    "artifact": None,
+                    "accept_slow": None,
+                    "breaches": missing_breaches,
+                }
+            )
+            assertion_breaches.extend(missing_breaches)
+            continue
+
+        try:
+            artifact = _object(
+                json.loads(throughput_path.read_text(encoding="utf-8")),
+                f"{throughput_path}",
+            )
+        except json.JSONDecodeError as error:
+            raise HealthInputError(f"{throughput_path} is not valid JSON") from error
+        accept_slow = artifact.get("accept_slow")
+        if accept_slow is not None and (
+            not isinstance(accept_slow, str) or not accept_slow.strip()
+        ):
+            raise HealthInputError(
+                f"{throughput_path}.accept_slow must be null or a nonempty string"
+            )
+        stage_breaches = throughput_breaches(output_dir)
+        stage_results.append(
+            {
+                "stage": output_dir.name,
+                "available": True,
+                "artifact": artifact,
+                "accept_slow": accept_slow,
+                "breaches": stage_breaches,
+            }
+        )
+        assertion_breaches.extend(
+            f"throughput stage {output_dir.name!r}: {reason}" for reason in stage_breaches
+        )
+    return {"stages": stage_results}, assertion_breaches
 
 
 def _run_records_cli(options: _HealthCLIOptions) -> int:

@@ -1,0 +1,21 @@
+{
+  "source": "stuck-timed vLLM server log, 2026-10-14 01:21:05 through 01:21:55",
+  "measurement": "Six consecutive 10-second logged intervals; performance numbers only",
+  "concurrency": 6,
+  "kv_pool_tokens": 323405,
+  "estimated_stage_seconds": 1800,
+  "observed_generation_span_seconds_lower_bound": 13001,
+  "samples": [
+    {"seconds": 0, "prompt_tokens_per_second": 0, "generation_tokens_per_second": 14.0, "running": 2, "waiting": 0, "kv_usage": 0.301, "prefix_hit_rate": 0.907},
+    {"seconds": 10, "prompt_tokens_per_second": 0, "generation_tokens_per_second": 14.2, "running": 2, "waiting": 0, "kv_usage": 0.301, "prefix_hit_rate": 0.907},
+    {"seconds": 20, "prompt_tokens_per_second": 0, "generation_tokens_per_second": 14.2, "running": 2, "waiting": 0, "kv_usage": 0.301, "prefix_hit_rate": 0.907},
+    {"seconds": 30, "prompt_tokens_per_second": 0, "generation_tokens_per_second": 14.2, "running": 2, "waiting": 0, "kv_usage": 0.301, "prefix_hit_rate": 0.907},
+    {"seconds": 40, "prompt_tokens_per_second": 0, "generation_tokens_per_second": 14.2, "running": 2, "waiting": 0, "kv_usage": 0.301, "prefix_hit_rate": 0.907},
+    {"seconds": 50, "prompt_tokens_per_second": 0, "generation_tokens_per_second": 14.0, "running": 2, "waiting": 0, "kv_usage": 0.305, "prefix_hit_rate": 0.907}
+  ],
+  "limitations": [
+    "No NVML samples were retained in the historical server log",
+    "KV occupancy includes allocations and padding; it is not a measured mean live context",
+    "The duration is a lower bound from server log timestamps, not a measured stage wall clock"
+  ]
+}

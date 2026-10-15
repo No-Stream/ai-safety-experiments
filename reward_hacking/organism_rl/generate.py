@@ -14,6 +14,7 @@ import subprocess
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from itertools import zip_longest
@@ -28,6 +29,11 @@ from reward_hacking.evidence_store import (
     guard_episode_size,
     hydrate_record,
     read_jsonl,
+)
+from reward_hacking.generation_perf import (
+    add_performance_arguments,
+    generation_monitor,
+    record_episode_timings,
 )
 from reward_hacking.harness.task_spec import AgenticArmConfig, Task
 from reward_hacking.ladder.loop import (
@@ -89,6 +95,8 @@ from reward_hacking.organisms.statement_dedup import (
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from grpo.gpu_perf import PerfMonitor
 
 from reward_hacking.semantic_identity import semantic_content_identity
 
@@ -761,6 +769,7 @@ def _parse_json_object(raw_value: str) -> dict[str, object]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse generation, sampling and persistence settings."""
     parser = argparse.ArgumentParser(description=__doc__)
+    add_performance_arguments(parser)
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
     parser.add_argument("--generator-name", choices=("base", "v3", "27b"))
@@ -1948,6 +1957,13 @@ def _execute_jobs(  # noqa: PLR0913 - the worker requires run identity and sched
     return first_error
 
 
+def _write_summary_table(path: Path, table: str, *, has_new_records: bool) -> None:
+    if has_new_records or not path.exists():
+        temporary_path = path.with_suffix(".md.tmp")
+        temporary_path.write_text(table + "\n", encoding="utf-8")
+        temporary_path.replace(path)
+
+
 def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling inputs
     *,
     output_dir: Path,
@@ -1956,6 +1972,7 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
     samples_per_task: int,
     concurrency: int,
     provenance: Mapping[str, object],
+    performance_monitor: PerfMonitor | None = None,
     sample_indices_by_task: Mapping[str, Sequence[int]] | None = None,
     thinking_budget_overshoot_policy: ThinkingBudgetOvershootPolicy = DEFAULT_THINKING_BUDGET_OVERSHOOT_POLICY,
 ) -> dict[str, object]:
@@ -2006,32 +2023,38 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
         if (task_spec.task_id, sample_index) not in completed
     ]
 
-    first_error = _execute_jobs(
-        jobs=jobs,
-        source=source,
-        concurrency=concurrency,
-        provenance_sha256=provenance_sha256,
-        records_path=records_path,
-        records=records,
-        policy=thinking_budget_overshoot_policy,
-    )
+    active_monitor = performance_monitor if jobs else None
+    with ExitStack() as performance_context:
+        if active_monitor is not None:
+            performance_context.enter_context(active_monitor)
+        resumed_records = len(records)
+        first_error = _execute_jobs(
+            jobs=jobs,
+            source=source,
+            concurrency=concurrency,
+            provenance_sha256=provenance_sha256,
+            records_path=records_path,
+            records=records,
+            policy=thinking_budget_overshoot_policy,
+        )
+        if active_monitor is not None:
+            record_episode_timings(active_monitor, records[resumed_records:])
 
-    summary = _summary(records)
-    summary["task_skip_counts"] = provenance.get("task_skip_counts", {})
-    summary["torn_records_recovered"] = torn_records_recovered
-    attempt_provenance = archived_attempt_provenance(records)
-    summary["resampled_after_crash_episodes"] = attempt_provenance["resampled_after_crash_episodes"]
-    write_json_atomically(output_dir / "attempt-provenance.json", attempt_provenance)
-    write_json_atomically(output_dir / "summary.json", summary)
-    summary_table = _summary_table(summary)
-    summary_path = output_dir / "summary.md"
-    temporary_summary_path = summary_path.with_suffix(".md.tmp")
-    temporary_summary_path.write_text(summary_table + "\n", encoding="utf-8")
-    temporary_summary_path.replace(summary_path)
-    logger.info("teacher episode summary\n%s", summary_table)
-    if first_error is not None:
-        raise first_error
-    return summary
+        summary = _summary(records)
+        summary["task_skip_counts"] = provenance.get("task_skip_counts", {})
+        summary["torn_records_recovered"] = torn_records_recovered
+        attempt_provenance = archived_attempt_provenance(records)
+        summary["resampled_after_crash_episodes"] = attempt_provenance[
+            "resampled_after_crash_episodes"
+        ]
+        write_json_atomically(output_dir / "attempt-provenance.json", attempt_provenance)
+        write_json_atomically(output_dir / "summary.json", summary)
+        summary_table = _summary_table(summary)
+        _write_summary_table(output_dir / "summary.md", summary_table, has_new_records=bool(jobs))
+        logger.info("teacher episode summary\n%s", summary_table)
+        if first_error is not None:
+            raise first_error
+        return summary
 
 
 def task_prompt_content(
@@ -2247,6 +2270,11 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         }
     )
     run_context = build_launch_context(args.endpoint, args.max_model_len)
+    run_context["performance"] = {
+        key: value
+        for key, value in vars(args).items()
+        if key.startswith("perf_") or key == "accept_slow"
+    }
     run_context.update(serving_runtime_context)
     if task_id_exclusion_sources:
         run_context["task_id_exclusion_sources"] = [
@@ -2503,6 +2531,7 @@ def main(argv: list[str] | None = None) -> None:
         task_specs=task_specs,
         samples_per_task=args.samples_per_task,
         concurrency=args.concurrency,
+        performance_monitor=generation_monitor(args),
         sample_indices_by_task=sample_indices_by_task,
         provenance=_provenance(
             args,

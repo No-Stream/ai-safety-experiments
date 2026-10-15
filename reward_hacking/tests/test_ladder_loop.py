@@ -420,6 +420,65 @@ def test_ladder_trace_persists_structured_true_check_evidence(
     assert serialized_summary["true"]["evidence"] == evidence
 
 
+def test_ladder_trace_splits_model_command_and_grading_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def delayed_run_in_jail(
+        episode_dir: Path, command: str, *, timeout: str, **kwargs: object
+    ) -> CommandResult:
+        time.sleep(0.01)
+        return _fake_run_in_jail(episode_dir, command, timeout=timeout, **kwargs)
+
+    def delayed_submission(_directory: Path) -> loop.SubmissionVerdict:
+        time.sleep(0.01)
+        return _successful_submission(_directory)
+
+    def delayed_final_grade(task: Task, episode_dir: Path, **kwargs: object) -> FinalGrade:
+        time.sleep(0.01)
+        return _successful_grade(task, episode_dir, **kwargs)
+
+    monkeypatch.setattr(loop, "run_in_jail", delayed_run_in_jail)
+    monkeypatch.setattr(loop, "grade_final_state", delayed_final_grade)
+    trace_path = tmp_path / "timed-trace.jsonl"
+    trace = loop.run_ladder_episode(
+        _task(),
+        ScriptedToolBackend(
+            [
+                _ScriptedReply(_bash("echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT")),
+                _ScriptedReply(_report()),
+            ]
+        ),
+        episode_dir=tmp_path / "timed-episode",
+        arm=AgenticArmConfig(),
+        system_prompt="Use the tools to complete the task.",
+        user_template="Task:\n{task_markdown}\nFiles:\n{listing}",
+        max_turns=1,
+        timeout="120s",
+        jail_backend=None,
+        trace_path=trace_path,
+        submit_grader=delayed_submission,
+        max_model_len=100_000,
+    )
+
+    turn_record = trace.turn_records()[0]
+    summary_record = trace.summary_record()
+    turn_tool_seconds = cast("float", turn_record["tool_execution_seconds"])
+    turn_grading_seconds = cast("float", turn_record["grading_seconds"])
+    summary_tool_seconds = cast("float", summary_record["tool_execution_seconds"])
+    summary_grading_seconds = cast("float", summary_record["grading_seconds"])
+    model_call_seconds = cast("float", summary_record["model_call_seconds"])
+    generation_seconds = cast("float", turn_record["generation_seconds"])
+    assert turn_tool_seconds >= 0.005
+    assert turn_grading_seconds >= 0.005
+    assert summary_tool_seconds == pytest.approx(turn_tool_seconds)
+    assert summary_grading_seconds >= turn_grading_seconds + 0.005
+    assert model_call_seconds >= generation_seconds
+    persisted_records = load_trace(trace_path)
+    assert persisted_records[0]["tool_execution_seconds"] == turn_tool_seconds
+    assert persisted_records[1]["grading_seconds"] == summary_grading_seconds
+    assert load_trace(trace_path)[-1] == summary_record
+
+
 def test_snapshot_limit_in_submission_grader_stops_without_a_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

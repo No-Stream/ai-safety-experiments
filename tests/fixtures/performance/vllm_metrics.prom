@@ -1,0 +1,22 @@
+# Synthetic Prometheus export using installed vLLM v1/metrics/loggers.py names.
+# Counters export _total; histograms export _bucket, _sum and _count.
+vllm:generation_tokens_total{engine="0",model_name="synthetic"} 900
+vllm:prompt_tokens_total{engine="0",model_name="synthetic"} 2000
+vllm:num_requests_running{engine="0",model_name="synthetic"} 2
+vllm:num_requests_waiting{engine="0",model_name="synthetic"} 0
+vllm:kv_cache_usage_perc{engine="0",model_name="synthetic"} 0.111
+vllm:prefix_cache_hits_total{engine="0",model_name="synthetic"} 681
+vllm:prefix_cache_queries_total{engine="0",model_name="synthetic"} 1000
+vllm:num_preemptions_total{engine="0",model_name="synthetic"} 0
+vllm:request_prompt_tokens_sum{engine="0",model_name="synthetic"} 2000
+vllm:request_prompt_tokens_count{engine="0",model_name="synthetic"} 2
+vllm:time_to_first_token_seconds_bucket{engine="0",model_name="synthetic",le="1.0"} 1
+vllm:time_to_first_token_seconds_bucket{engine="0",model_name="synthetic",le="+Inf"} 2
+vllm:time_to_first_token_seconds_sum{engine="0",model_name="synthetic"} 1.2
+vllm:time_to_first_token_seconds_count{engine="0",model_name="synthetic"} 2
+vllm:inter_token_latency_seconds_sum{engine="0",model_name="synthetic"} 20
+vllm:inter_token_latency_seconds_count{engine="0",model_name="synthetic"} 900
+vllm:request_prefill_time_seconds_sum{engine="0",model_name="synthetic"} 1
+vllm:request_prefill_time_seconds_count{engine="0",model_name="synthetic"} 2
+vllm:request_decode_time_seconds_sum{engine="0",model_name="synthetic"} 20
+vllm:request_decode_time_seconds_count{engine="0",model_name="synthetic"} 2

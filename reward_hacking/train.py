@@ -192,6 +192,7 @@ from grpo.estimator_defaults import (
 )
 from grpo.gpu_memory import cap_gpu_memory_utilization
 from grpo.throughput import BYTES_PER_GIB, describe_device, discover_lora_targets
+from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 from reward_hacking.train_dataset import (
     ARM_RATIONALE,
@@ -1463,6 +1464,7 @@ def _build_trainer(prepared: PreparedRun) -> GRPOTrainer:
             s3_dest=config.s3_dest,
         ),
     )
+    TrainingThroughputCallback().attach(trainer)
     trainer.checkpoint_keep_latest = config.checkpoint_keep_latest
     trainer.checkpoint_keep_middle = config.checkpoint_keep_middle
     model = trainer.model

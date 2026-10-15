@@ -5,6 +5,7 @@ import json
 import logging
 from contextlib import AbstractContextManager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Self
 
 import pytest
@@ -222,6 +223,7 @@ def test_27b_lifecycle_uses_only_current_startup_capacity(
 
     class FakeServer(AbstractContextManager["FakeServer"]):
         base_url = "http://localhost:8000"
+        process = SimpleNamespace(pid=12345)
         stopped = False
 
         def __init__(self, config: VLLMServerConfig) -> None:

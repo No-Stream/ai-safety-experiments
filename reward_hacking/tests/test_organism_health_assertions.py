@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from grpo.gpu_perf import GpuSample, PerfMonitor
+from grpo.model_geometry import ModelGeometry
 from reward_hacking.organism_rl import health
 from reward_hacking.organism_rl.strengthened_truth_grade import canonical_digest
 
@@ -150,6 +155,295 @@ def _write_truth_sidecar(
             }
         )
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _write_minimal_health_records(path: Path) -> Path:
+    trace_path = path.parent / "episodes" / "episode-1.jsonl"
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    trace_events = [
+        {"record": "episode_start"},
+        {
+            "record": "turn",
+            "turn": 1,
+            "completion_token_ids": [1],
+            "completion_logprobs": [-0.3],
+            "reasoning_token_count": 0,
+            "reasoning": "",
+            "content": "",
+            "stop_reason": "end_turn",
+            "prompt_tokens": 4,
+            "tool_calls": [
+                {
+                    "name": "bash",
+                    "arguments": {"command": "printf ok"},
+                    "executed": True,
+                    "not_executed_reason": None,
+                }
+            ],
+            "commands": [{"command": "printf ok", "stdout": "ok", "stderr": ""}],
+        },
+        {"record": "episode_summary", "ended_by": "submit", "turns": 1},
+    ]
+    trace_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in trace_events), encoding="utf-8"
+    )
+    row = {
+        "family": "synthetic",
+        "variant": "original",
+        "episode_id": "episode-1",
+        "trace_path": str(trace_path),
+        "peak_prompt_tokens": 4,
+        "true_pass": True,
+        "true_measured": True,
+        "trace_summary": {
+            "episode_id": "episode-1",
+            "true": {"pass": True, "measured": True, "oracle_error": None},
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    return path
+
+
+def test_throughput_assertion_fails_and_includes_performance_reasons(
+    tmp_path: Path,
+) -> None:
+    records_path = _write_minimal_health_records(tmp_path / "candidate" / "records.jsonl")
+    breach = "decode bandwidth roofline achieved 12% is below 40%"
+    throughput_path = records_path.parent / "throughput.json"
+    throughput_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "accept_slow": None,
+                "breaches": [breach],
+                "decode_tokens_per_second": 14.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "candidate" / "health.json"
+
+    exit_code = health.main(
+        [
+            "--records",
+            str(records_path),
+            "--assert-throughput",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert any("decode bandwidth roofline" in reason for reason in report["assertion_breaches"])
+    stage_result = report["throughput"]["stages"][0]
+    assert stage_result["artifact"]["decode_tokens_per_second"] == 14.0
+    assert stage_result["breaches"] == [breach]
+
+
+def test_throughput_assertion_requires_artifact_but_legacy_assert_does_not(
+    tmp_path: Path,
+) -> None:
+    candidate_records = _write_minimal_health_records(tmp_path / "candidate" / "records.jsonl")
+    baseline_records = _write_minimal_health_records(tmp_path / "baseline" / "records.jsonl")
+    output_path = tmp_path / "candidate" / "health.json"
+
+    explicit_exit_code = health.main(
+        [
+            "--records",
+            str(candidate_records),
+            "--assert-throughput",
+            "--output",
+            str(output_path),
+        ]
+    )
+    explicit_report = json.loads(output_path.read_text(encoding="utf-8"))
+    legacy_exit_code = health.main(
+        [
+            "--records",
+            str(candidate_records),
+            "--baseline",
+            str(baseline_records),
+            "--assert",
+            "--output",
+            str(output_path),
+            "--nll-min",
+            "0",
+            "--nll-max",
+            "10",
+            "--syntax-error-max",
+            "1",
+            "--cjk-episode-max",
+            "1",
+            "--loop-turn-max",
+            "100",
+            "--submitted-ending-min",
+            "0",
+            "--max-new-tokens-turn-max",
+            "1",
+            "--unmeasured-max",
+            "1",
+        ]
+    )
+
+    assert explicit_exit_code == 1
+    assert any(
+        "throughput artifact is missing" in reason
+        for reason in explicit_report["assertion_breaches"]
+    )
+    assert legacy_exit_code == 0
+
+
+def test_throughput_accept_slow_is_included_in_health_report(
+    tmp_path: Path,
+) -> None:
+    records_path = _write_minimal_health_records(tmp_path / "candidate" / "records.jsonl")
+    breach = "stage took more than twice its estimate"
+    (records_path.parent / "throughput.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "accept_slow": "known storage contention",
+                "breaches": [breach],
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "candidate" / "health.json"
+
+    exit_code = health.main(
+        [
+            "--records",
+            str(records_path),
+            "--assert-throughput",
+            "--output",
+            str(output_path),
+        ]
+    )
+
+    report = json.loads(output_path.read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert report["throughput"]["stages"][0]["accept_slow"] == "known storage contention"
+    assert report["throughput"]["stages"][0]["breaches"] == []
+
+
+def test_fake_sampler_alert_fails_health_unless_slow_stage_is_accepted(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    request_count = {"value": 0}
+
+    class MetricsHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            request_count["value"] += 1
+            metrics = "\n".join(
+                (
+                    f"vllm:generation_tokens_total {request_count['value']}",
+                    "vllm:prompt_tokens_total 0",
+                    "vllm:num_requests_running 2",
+                    "vllm:num_requests_waiting 0",
+                    "vllm:kv_cache_usage_perc 0.1",
+                    "vllm:prefix_cache_hits_total 0",
+                    "vllm:prefix_cache_queries_total 0",
+                    "vllm:num_preemptions_total 0",
+                    "vllm:request_prompt_tokens_sum 0",
+                    "vllm:request_prompt_tokens_count 0",
+                    "vllm:time_to_first_token_seconds_sum 0",
+                    "vllm:time_to_first_token_seconds_count 0",
+                    "vllm:inter_token_latency_seconds_sum 0",
+                    "vllm:inter_token_latency_seconds_count 0",
+                    "vllm:request_prefill_time_seconds_sum 0",
+                    "vllm:request_prefill_time_seconds_count 0",
+                )
+            )
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(metrics.encode())
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    metrics_url = f"http://127.0.0.1:{server.server_port}/metrics"
+    model = ModelGeometry(
+        parameter_count=26_895_998_464,
+        weight_bytes=17_681_660_928,
+        kv_bytes_per_token=32_768,
+        recurrent_state_bytes_per_request=78_446_592,
+        source="synthetic integration fixture",
+    )
+
+    def run_stage(output_dir: Path, accept_slow: str | None) -> None:
+        with PerfMonitor(
+            output_dir,
+            metrics_url,
+            concurrency=6,
+            model=model,
+            accept_slow=accept_slow,
+            interval_seconds=0.05,
+            allowed_gpu_pids=(123,),
+            gpu_reader=lambda: GpuSample(
+                "NVIDIA GeForce RTX 5090", 10, 80, 200, 1800, 13000, 20000, 32768, (123,)
+            ),
+        ) as monitor:
+            monitor.set_mean_context(1000)
+            assert monitor.wait_for_samples(2, timeout=2)
+
+    try:
+        caplog.set_level(logging.WARNING, logger="grpo.gpu_perf")
+        slow_directory = tmp_path / "slow"
+        run_stage(slow_directory, accept_slow=None)
+        slow_records = _write_minimal_health_records(slow_directory / "records.jsonl")
+        slow_health_path = slow_directory / "health.json"
+        slow_exit_code = health.main(
+            [
+                "--records",
+                str(slow_records),
+                "--assert-throughput",
+                "--output",
+                str(slow_health_path),
+            ]
+        )
+        slow_health = json.loads(slow_health_path.read_text(encoding="utf-8"))
+        slow_throughput = json.loads(
+            (slow_directory / "throughput.json").read_text(encoding="utf-8")
+        )
+
+        accepted_directory = tmp_path / "accepted"
+        run_stage(accepted_directory, accept_slow="known shared-GPU contention in test")
+        accepted_records = _write_minimal_health_records(accepted_directory / "records.jsonl")
+        accepted_health_path = accepted_directory / "health.json"
+        accepted_exit_code = health.main(
+            [
+                "--records",
+                str(accepted_records),
+                "--assert-throughput",
+                "--output",
+                str(accepted_health_path),
+            ]
+        )
+        accepted_health = json.loads(accepted_health_path.read_text(encoding="utf-8"))
+        accepted_throughput = json.loads(
+            (accepted_directory / "throughput.json").read_text(encoding="utf-8")
+        )
+    finally:
+        server.shutdown()
+        server_thread.join()
+        server.server_close()
+
+    assert "THROUGHPUT ALERT" in caplog.text
+    assert "decode_bandwidth_roofline_low" in slow_throughput["breaches"]
+    assert "gpu_sm_utilization_low" in slow_throughput["breaches"]
+    assert slow_exit_code == 1
+    assert any(
+        "decode_bandwidth_roofline_low" in reason for reason in slow_health["assertion_breaches"]
+    )
+    assert accepted_throughput["accept_slow"] == "known shared-GPU contention in test"
+    assert accepted_exit_code == 0
+    assert accepted_health["assertion_breaches"] == []
 
 
 def _capability_floor_args(

@@ -708,6 +708,10 @@ def test_resume_allows_increased_step_target_and_refuses_training_drift(tmp_path
     extended = make_trainer(tmp_path, max_steps=2)
     result = extended.train(resume_from_checkpoint="latest")
     assert result.global_step == 2
+    throughput = json.loads((tmp_path / "throughput.json").read_text())
+    assert [step["step"] for step in throughput["steps"]] == [1, 2]
+    assert all(step["processed_tokens"] == 10 for step in throughput["steps"])
+    assert all(step["tokens_per_second"] > 0 for step in throughput["steps"])
     assert not result.metrics.get("already_complete", False)
     assert extended.model is not None
     assert any(
