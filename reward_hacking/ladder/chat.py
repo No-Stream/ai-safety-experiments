@@ -48,6 +48,7 @@ def render_prompt_continuation(
     tokenizer: PreTrainedTokenizerBase,
     messages: Sequence[Mapping[str, object]],
     *,
+    enable_thinking: bool = True,
     chat_template_kwargs: Mapping[str, str] | None = None,
 ) -> str:
     """Render appended messages and a generation prefix without re-rendering prior history."""
@@ -56,12 +57,14 @@ def render_prompt_continuation(
         tokenizer,
         [anchor, *messages],
         (),
+        enable_thinking=enable_thinking,
         chat_template_kwargs=chat_template_kwargs,
     )
     rendered_anchor = render_prompt(
         tokenizer,
         [anchor],
         (),
+        enable_thinking=enable_thinking,
         add_generation_prompt=False,
         chat_template_kwargs=chat_template_kwargs,
     )
@@ -123,11 +126,16 @@ def render_assistant_terminator_suffix(
     messages: Sequence[Mapping[str, object]],
     tools: Sequence[Mapping[str, object]],
     *,
+    enable_thinking: bool = True,
     chat_template_kwargs: Mapping[str, str] | None = None,
 ) -> str:
     """Render the template's assistant end marker and separator after generated text."""
     generation_prefix = render_prompt(
-        tokenizer, messages, tools, chat_template_kwargs=chat_template_kwargs
+        tokenizer,
+        messages,
+        tools,
+        enable_thinking=enable_thinking,
+        chat_template_kwargs=chat_template_kwargs,
     )
     reasoning_canary = "__ladder_terminator_reasoning_canary__"
     content_canary = "__ladder_terminator_content_canary__"
@@ -135,7 +143,7 @@ def render_assistant_terminator_suffix(
         raise ValueError("conversation contains an assistant-terminator rendering canary")
     assistant_message: dict[str, object] = {
         "role": "assistant",
-        "reasoning_content": reasoning_canary,
+        "reasoning_content": reasoning_canary if enable_thinking else "",
         "content": content_canary,
         "tool_calls": [],
     }
@@ -143,6 +151,7 @@ def render_assistant_terminator_suffix(
         tokenizer,
         [*messages, assistant_message],
         tools,
+        enable_thinking=enable_thinking,
         add_generation_prompt=False,
         chat_template_kwargs=chat_template_kwargs,
     )

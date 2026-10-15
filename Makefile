@@ -6,14 +6,11 @@
 UV := uv run --frozen --directory $(CURDIR)
 RUFF := $(UV) ruff
 
-# Serves canary-check, the one target that must run under the host's own interpreter. Absolute
-# because make inherits the caller's PATH: with a conda env active, bare `python3` resolves to
-# conda's 3.13, so the tripwire would run under whichever environment happened to be active rather
-# than the 3.9 it is written for. Measured on this box, not theoretical.
-# tests/test_interpreter_compat.py is what keeps the scripts that run under it 3.9-clean.
+# Host-side scripts use this interpreter explicitly so an active conda environment cannot change
+# which Python runs repository checks and maintenance tools.
 SYSTEM_PYTHON := /usr/bin/python3
 
-.PHONY: setup setup-gpu hooks test test-slow test-select test-changed test-corpus test-jail-real test-docker-real corpus-verify corpus-smoke format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test canary-check canary-update privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install env-gate render-audit render-audit-required verify-seed-v4
+.PHONY: setup setup-gpu hooks test test-slow test-select test-changed test-corpus test-jail-real test-docker-real corpus-verify corpus-smoke format lint typecheck typecheck-ty ci all smoke bedrock-smoke harness-bedrock-smoke throughput throughput-sweep games-smoke games-select games-train games-evals games-screen jail-test docker-jail-test privacy-scan tmp-check clean disk-reap disk-reap-apply disk-reaper-install env-gate render-audit render-audit-required verify-seed-v4
 
 setup: hooks
 	uv sync --frozen
@@ -248,15 +245,6 @@ jail-test:
 # daemon gate, separate from the CPU-only pytest suite; it pulls only python:3.12-slim.
 docker-jail-test:
 	$(UV) python -m scripts.run_docker_jail_tests
-
-# Tripwire over the host's code-execution surfaces (hooks, crontab targets, systemd user
-# units, rc files, settings.json). Re-baseline with canary-update after an intentional change.
-canary-check:
-	$(SYSTEM_PYTHON) scripts/canary_manifest.py
-
-# Owner-run only: re-baselining clears drift, so agents report drift and never run this (canary/README.md).
-canary-update:
-	$(SYSTEM_PYTHON) scripts/canary_manifest.py --update
 
 # Privacy gate over exactly what the public remote carries: every tracked file, every detector
 # (credential shapes, account ids, ARNs, emails, home paths, benchmark item material). Run it

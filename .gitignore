@@ -95,9 +95,7 @@ games/data/*
 games/data/survey/*
 !games/data/survey/README.md
 
-# The canary baseline is a list of absolute paths on one machine, keyed to that machine's home
-# directory, and every hash in it is meaningless anywhere else. It is written by
-# `scripts/canary_manifest.py --update` and stays local; the README explains the convention.
+# Exact values for the privacy scanner are machine-local and must not enter the public repository.
 canary/*
 !canary/README.md
 

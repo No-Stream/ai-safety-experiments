@@ -3,8 +3,8 @@
 ``scripts/install_git_hooks.sh`` writes the pre-commit and commit-msg wrappers, ``make hooks``
 exposes it and ``make setup`` depends on it -- and nothing checked the result. A clone that ran
 ``uv sync`` by hand had no commit-time gate and no signal saying so, which matters more than it
-sounds: the hooks are the only path that arms the canary detector against the exact blobs a commit
-would record, so their absence disarms that whole class silently. The gate this module is is one
+sounds: the hooks enforce privacy scanning against the exact blobs a commit would record, so their
+absence disables that whole class silently. The gate this module is is one
 subprocess call, and it fails where a ``.git`` exists and the wrappers do not.
 
 Skipped rather than failed in a checkout with no git directory (a tarball export, an
@@ -50,7 +50,7 @@ class TestTheCommitTimePrivacyGateIsInstalled:
         assert not missing, (
             f"git hooks {missing} are not installed in {hooks}, so nothing scans the blobs a commit "
             f"would record: the staged-blob privacy scan and the commit-message scan are both off, "
-            f"and the canary detector has no other armed caller. Run `make hooks`."
+            f"and the privacy checks are not armed. Run `make hooks`."
         )
         foreign = [
             name

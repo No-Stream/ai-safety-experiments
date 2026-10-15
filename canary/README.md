@@ -1,9 +1,8 @@
-# Two machine-local files live here, and neither is tracked
+# Machine-local values for the privacy scanner
 
-`privacy-values.txt` arms the privacy scanner's canary detector; `host-manifest.json` is the code-
-execution tripwire's baseline. They are unrelated mechanisms that share this directory because both
-are keyed to one machine. `.gitignore` covers `canary/*` and keeps only this README and the
-`privacy-values.txt.example` template.
+`privacy-values.txt` arms the privacy scanner's exact-value detector. `.gitignore` keeps its contents
+out of the public repository. A local `host-manifest.json` from the retired execution/configuration
+tripwire is no longer read or updated; it remains ignored if it exists.
 
 ## `privacy-values.txt` — the values no shape detector can describe
 
@@ -39,32 +38,3 @@ a file whose entire payload was a bare id scanned clean.
 Add values as they are **confirmed** rather than guessed. A value already present somewhere in the
 committable listing turns `make privacy-scan` red until that file is fixed, which is the gate
 working; a value that is simply wrong is a permanently red gate everyone learns to ignore.
-
-## The tripwire baseline lives here and is not tracked
-
-`scripts/canary_manifest.py` hashes the host's code-execution surfaces — Claude Code hooks and the
-`settings.json` that registers them by path, systemd user units, the user crontab's targets, shell
-and tool rc files — and compares them against a baseline it keeps at `canary/host-manifest.json`.
-Drift means something wrote to a surface that buys arbitrary code execution the next time anything
-routine happens, which is the jail-misconfiguration failure we should actually expect.
-
-**The baseline is deliberately untracked.** Two reasons, and the second is the load-bearing one:
-
-1. Every key in it is an absolute path under one machine's home directory and every value is a
-   hash of a file that exists only there. Committed, it would be a list of one developer's home
-   directory contents in a public repository, and it would be 100% drift on any other machine.
-2. A baseline shared through git is a baseline that gets updated by `git pull`, which is exactly
-   the property a tripwire must not have. Re-baselining has to be a deliberate local act.
-
-So a fresh clone has no baseline, and `make canary-check` will say so and exit 2 rather than
-pretend. Create one after you have looked at what is on the box:
-
-```bash
-python3 scripts/canary_manifest.py --update   # record the current state as the baseline
-make canary-check                             # report drift against it, exit 1 if any
-```
-
-Re-baseline the same way (or `make canary-update`, which runs the same command) after any change
-you made on purpose — a new hook, an edited `.zshrc`. Re-baselining is owner-run only: agents
-report drift, never clear it.
-If drift shows up and you did not cause it, treat it as a possible jail escape rather than noise.

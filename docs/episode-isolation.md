@@ -22,7 +22,6 @@ scripts/run_jail_tests.sh --backend unshare   # pin the fallback backend instead
 | `scripts/stage_jail_python.sh` | Stages a >=3.12 CPython where the jail can bind it read-only. |
 | `scripts/jail_assertions.py` | The 14 containment checks plus the honeypot-collision check. |
 | `scripts/run_jail_tests.sh` | The gate: argument guards, host checks, in-jail run, and the negative control. |
-| `scripts/canary_manifest.py` | Checksum tripwire over the host's code-execution surfaces. |
 | `scripts/scan_secrets.py` | Pre-upload and pre-commit gate: fails on secret-shaped text, machine-local identity values, or benchmark item material. |
 
 ## How the jail is built
@@ -293,30 +292,16 @@ only a path that is **READABLE** outside and `ENOENT` inside carries signal, whi
 - **Only the default backend is exercised per gate run.** The gate certifies one backend at a
   time, so the one it did not pick can rot unnoticed. Run it both ways after touching
   `episode_jail.sh`.
-- **The staged interpreter is not on the canary manifest.** That tripwire watches `$HOME` code-
-  execution surfaces, and this tree lives in `/var/tmp` by design. `episode_jail.sh` re-checks its
-  ownership and mode at every launch, which is a weaker guarantee than a checksum: it would catch a
-  permission change, not a same-mode edit to a library file by our own uid. Another reason the
-  packaged interpreter is the better configuration.
+- **The staged interpreter is owned by this host's user.** `episode_jail.sh` re-checks its
+  ownership and mode at every launch, which does not detect a same-mode edit to a library file by
+  that user. The packaged interpreter remains the stronger configuration.
 
-## Tripwire and pre-upload scanner
+## The host execution/configuration tripwire has been retired
 
-`canary_manifest.py` checksums every path where a write buys code execution the next time
-something routine happens: each file in `~/.claude/hooks/` (the permission-decision hooks
-included), the systemd user units, the scripts the crontab runs, the user-space OOM guard, the
-shell and tool rc files, and `~/.claude/settings.json`. Counts are deliberately not quoted here;
-the hook fleet grows, and a number in prose goes stale without anything noticing.
-
-That last one matters and a hooks-directory-only tripwire would miss it: `settings.json`
-registers hooks **by path**, so repointing an entry there is code execution without
-touching any file in the hooks directory.
-
-```bash
-python3 scripts/canary_manifest.py --update   # baseline, after an intentional change (make canary-update; owner-run only)
-python3 scripts/canary_manifest.py            # report drift, exit 1 if any
-```
-
-It only ever reads the watched paths, and prints paths and hashes, never contents.
+This repository does not monitor local hooks, crontab targets, systemd user units, shell or tool
+startup files, or settings files for drift. The execution/configuration tripwire has been retired;
+no checksum protection over those host paths is claimed here. The jail assertions and privacy
+scanners below remain active, and they check different things.
 
 `scan_secrets.py` is the gate to run before any log, trace or adapter leaves the box:
 

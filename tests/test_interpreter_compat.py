@@ -7,9 +7,8 @@ is easy to miss.
 
 Two groups, because the scripts no longer share one interpreter:
 
-  * The host's system interpreter, ``/usr/bin/python3``, 3.8.10 on the 5090 box, runs eight of them:
+  * The host's system interpreter, ``/usr/bin/python3``, 3.8.10 on the 5090 box, runs seven of them:
       - ``scripts/gpu_preflight.py``       resource-limits.sh invokes it as plain ``python3``
-      - ``scripts/canary_manifest.py``     ``make canary-check`` runs it under ``SYSTEM_PYTHON``
       - ``scripts/scan_secrets.py``        docs/episode-isolation.md documents it as ``python3``
       - ``scripts/git_precommit_scan.py``  the hook wrappers prefer ``.venv`` but fall back to
         bare ``python3`` when it is absent, and a hook that crashes on syntax refuses every commit
@@ -48,7 +47,6 @@ SYSTEM_PYTHON = Path("/usr/bin/python3")
 
 SYSTEM_PYTHON_SCRIPTS = [
     "scripts/gpu_preflight.py",
-    "scripts/canary_manifest.py",
     "scripts/scan_secrets.py",
     "scripts/git_precommit_scan.py",
     "scripts/disk_reaper.py",
@@ -132,9 +130,7 @@ def _assert_compiles(interpreter: Path, script: str, tmp_path: Path) -> None:
 class TestTheScriptsTheHostSystemInterpreterRuns:
     """Host-level scripts the venv never touches, each with its own interpreter contract.
 
-    Skipped rather than failed when ``/usr/bin/python3`` is absent, unlike the jail group below:
-    nothing in this repo requires the host to carry a system interpreter, and only ``canary-check``
-    reaches for it.
+    Skipped rather than failed when ``/usr/bin/python3`` is absent, unlike the jail group below.
     """
 
     @pytest.mark.skipif(

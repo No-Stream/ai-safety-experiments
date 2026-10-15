@@ -36,6 +36,8 @@ dependencies = [
     "scipy>=1.18.1",
     "torchao>=0.18.0",
     "nvidia-ml-py==13.610.43",
+    "jsonschema==4.26.0",
+    "defusedxml==0.7.1",
 ]
 
 [project.optional-dependencies]
@@ -113,9 +115,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # Three of these run under the host's SYSTEM interpreter (3.8 on the 5090 box), not the venv: resource-limits.sh
-# calls gpu_preflight.py as plain `python3`, and `make canary-check` plus docs/episode-isolation.md
-# invoke canary_manifest.py and scan_secrets.py the same way. jail_assertions.py runs under the
-# interpreter the jail resolves, which is 3.12 or newer, and is exempt along with them because
+# calls gpu_preflight.py as plain `python3`, and docs/episode-isolation.md documents scan_secrets.py
+# the same way. jail_assertions.py runs under the interpreter the jail resolves, which is 3.12 or
+# newer, and is exempt along with them because
 # ruff's target-version is global with no per-file override: scripts/ follows its oldest occupant,
 # and letting `--fix` modernise one file there would leave syntax basedpyright rejects at 3.8.
 # tests/test_interpreter_compat.py is the real guard; it compiles each script under the interpreter
@@ -124,7 +126,6 @@ ignore = [
 "scripts/disk_reaper.py" = ["UP", "INP001", "S603", "S607", "S108"]
 "scripts/gpu_preflight.py" = ["UP", "INP001"]
 "scripts/jail_assertions.py" = ["UP", "INP001"]
-"scripts/canary_manifest.py" = ["UP", "INP001"]
 "scripts/scan_secrets.py" = ["UP", "INP001"]
 # The pre-commit hook wrapper falls back to bare `python3` when .venv is absent, so this one
 # keeps the 3.8 dialect for the same reason as the group above. E402: it must put the repo root

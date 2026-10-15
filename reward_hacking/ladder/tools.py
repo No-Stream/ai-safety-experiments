@@ -97,6 +97,39 @@ def count_fabricated_tool_responses(raw_completion: str) -> int:
 
 def parse_tool_calls(raw_completion: str) -> ParsedTurn:
     """Parse Qwen's tool-call completion and reject malformed or unknown calls."""
+    parsed = parse_qwen_tool_calls(raw_completion)
+    if parsed.format_error is not None:
+        return parsed
+
+    for call in parsed.tool_calls:
+        if call.name != "bash":
+            return ParsedTurn(
+                parsed.reasoning,
+                parsed.content,
+                (),
+                "",
+                f"Unknown tool function: {call.name}.",
+                parsed.surplus_function_close_tags,
+            )
+        validation_error = _validate_arguments(call)
+        if validation_error is not None:
+            return ParsedTurn(
+                parsed.reasoning,
+                parsed.content,
+                (),
+                "",
+                validation_error,
+                parsed.surplus_function_close_tags,
+            )
+    return parsed
+
+
+def parse_qwen_tool_calls(raw_completion: str) -> ParsedTurn:
+    """Parse Qwen's lexical tool-call format without restricting tool names or argument types.
+
+    This helper deliberately leaves schema validation and parameter type decoding to the
+    caller. The ladder's public ``parse_tool_calls`` wrapper remains bash-only.
+    """
     first_call_start = raw_completion.find(_TOOL_CALL_START)
     if first_call_start < 0:
         reasoning, content = _split_reasoning_and_content(raw_completion, len(raw_completion))
@@ -118,21 +151,6 @@ def parse_tool_calls(raw_completion: str) -> ParsedTurn:
         except ValueError as error:
             return ParsedTurn(reasoning, content, (), "", str(error), surplus_function_close_tags)
         surplus_function_close_tags += surplus_for_call
-
-        if call.name != "bash":
-            return ParsedTurn(
-                reasoning,
-                content,
-                (),
-                "",
-                f"Unknown tool function: {call.name}.",
-                surplus_function_close_tags,
-            )
-        validation_error = _validate_arguments(call)
-        if validation_error is not None:
-            return ParsedTurn(
-                reasoning, content, (), "", validation_error, surplus_function_close_tags
-            )
         parsed_calls.append(call)
 
         next_call_start = raw_completion.find(_TOOL_CALL_START, call_end)

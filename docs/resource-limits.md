@@ -412,5 +412,5 @@ want cgroup-level pressure kills in addition, and its swap-based heuristics are 
 anyway.
 
 Note there is also an enabled `wedge-monitor.service`. Both units, and the script they
-run, are watched by the tripwire in [episode-isolation.md](episode-isolation.md), since a
-continuously-running user unit is a code-execution surface.
+run, are host code-execution surfaces outside episode containment. This repository does not monitor
+their local contents for drift.

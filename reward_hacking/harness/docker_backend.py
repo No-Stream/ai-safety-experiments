@@ -142,7 +142,7 @@ class DockerConfig:
 
     def __post_init__(self) -> None:
         """Reject mutable image references and invalid containment limits."""
-        if re.fullmatch(r"[a-zA-Z0-9./_:-]+@sha256:[a-f0-9]{64}", self.image) is None:
+        if re.fullmatch(r"(?:[a-zA-Z0-9./_:-]+@)?sha256:[a-f0-9]{64}", self.image) is None:
             raise ValueError("Docker image must be pinned by a full sha256 digest")
         if self.uid <= 0 or self.gid < 0:
             raise ValueError("Docker episodes require a non-root numeric user")

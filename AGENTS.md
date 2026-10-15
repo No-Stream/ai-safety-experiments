@@ -269,16 +269,15 @@ research directions; the backlog holds the concrete work under them.
   runtime from a gitignored file; none goes in tracked code. Tests in `sociology/tests/`.
 - `grpo/` — shared GRPO harness on TRL. See `grpo/README.md`.
 - `cloud/` — AWS Batch container and submit tooling (secondary path).
-- `scripts/` — operational tooling: resource limiter, episode jail and red-team suite, canary
-  tripwire, secret scanner, GPU preflight, tmux helper, S3 mirror.
+- `scripts/` — operational tooling: resource limiter, episode jail and red-team suite, secret
+  scanner, GPU preflight, tmux helper, S3 mirror.
 - `tests/` — repo-level suite behind `make test`. Every test root must be listed in
   `pyproject.toml`'s `testpaths`, or it is silently never collected.
 - `docs/` — operational docs kept accurate (`episode-isolation.md`, `resource-limits.md`,
   `games-predictions.md`, `results/`, and others). `docs/scratch/` (gitignored) is the **only**
   location for internal working material: plans, handoffs, notes, `future.md`, the backlog. See
   `docs/scratch/README.md`. Never create a second scratch location.
-- `canary/` — machine-local canary baseline manifest (`scripts/canary_manifest.py --update`); only
-  the README is tracked.
+- `canary/` — machine-local exact values for the privacy scanner; only the README is tracked.
 - `artifacts/` — gitignored run outputs (traces, sweeps, eval records, checkpoints). Keep them.
 - `external/` — gitignored clones of third-party research repos. Clone new ones here, not under
   `/var/tmp`. Never copy their item text into tracked files.
@@ -305,14 +304,13 @@ make test-slow       # slow CPU tier; also runs before seed-v4 GPU verification
 make lint           # ruff format --check and ruff check
 make typecheck      # basedpyright strict -- gating
 make jail-test      # episode jail containment plus its negative control
-make canary-check   # checksum tripwire over code-execution surfaces
 make typecheck-ty   # ty -- advisory only
 ```
 
 - All non-advisory gates, including `test-slow`, must be green before "done". Fix unrelated
   gate failures too. The fast tier warns when unmarked tests exceed its time budget.
 - `make ci` runs `lint`, `typecheck` and `test` concurrently and is the gate before a commit;
-  `jail-test` and `canary-check` run separately. `make lint typecheck` runs the cheap pair alone.
+  `jail-test` runs separately. `make lint typecheck` runs the cheap pair alone.
 - `make test-changed` includes slow tests reachable from changed directories
   (`scripts/test_changed.py`); it is an iteration gate, not the commit gate.
 - `make test-select ARGS=...` runs serially; add `-n` to `ARGS` for a wide selection.
@@ -327,10 +325,10 @@ make typecheck-ty   # ty -- advisory only
   logged to `/var/tmp/<name>.log`. The gate's status is the log's last line, `EXITCODE=<n>`.
 
 **System-Python scripts.** The Makefile calls `/usr/bin/python3` via `SYSTEM_PYTHON` so an active
-conda env cannot change it. Four scripts must keep running under the system Python (3.8 on this
-box), because that is what invokes them: `scripts/gpu_preflight.py`, `scripts/canary_manifest.py`,
-`scripts/scan_secrets.py` and `scripts/git_precommit_scan.py`. `tests/test_interpreter_compat.py`
-enforces this, compiles each script under its real interpreter, and pins the jail's 3.12 floor;
+conda env cannot change it. Three scripts must keep running under the system Python (3.8 on this
+box), because that is what invokes them: `scripts/gpu_preflight.py`, `scripts/scan_secrets.py` and
+`scripts/git_precommit_scan.py`. `tests/test_interpreter_compat.py` also covers the system-Python
+maintenance scripts, compiles them under their real interpreter, and pins the jail's 3.12 floor;
 trust the test's list over prose. Ruff and basedpyright are directory-scoped, so all of `scripts/`
 stays in the 3.8 dialect. Compiling does not catch newer stdlib calls, so a script path that uses
 them needs a test that executes it under `/usr/bin/python3` (as `tests/test_gpu_preflight.py`
