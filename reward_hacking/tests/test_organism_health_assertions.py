@@ -217,6 +217,7 @@ def test_throughput_assertion_fails_and_includes_performance_reasons(
                 "schema_version": 1,
                 "accept_slow": None,
                 "breaches": [breach],
+                "samples": [{"metrics": {"large": 1}}],
                 "decode_tokens_per_second": 14.0,
             }
         ),
@@ -238,6 +239,8 @@ def test_throughput_assertion_fails_and_includes_performance_reasons(
     assert exit_code == 1
     assert any("decode bandwidth roofline" in reason for reason in report["assertion_breaches"])
     stage_result = report["throughput"]["stages"][0]
+    assert "samples" not in stage_result["artifact"]
+    assert stage_result["artifact"]["samples_file"] == "throughput-samples.jsonl"
     assert stage_result["artifact"]["decode_tokens_per_second"] == 14.0
     assert stage_result["breaches"] == [breach]
 
@@ -306,6 +309,7 @@ def test_throughput_accept_slow_is_included_in_health_report(
                 "schema_version": 1,
                 "accept_slow": "known storage contention",
                 "breaches": [breach],
+                "samples": [{"metrics": {"large": 1}}],
             }
         ),
         encoding="utf-8",

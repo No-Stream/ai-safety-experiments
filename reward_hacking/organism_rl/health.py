@@ -2104,6 +2104,12 @@ def _throughput_report(
             )
         except json.JSONDecodeError as error:
             raise HealthInputError(f"{throughput_path} is not valid JSON") from error
+        legacy_samples = artifact.pop("samples", None)
+        if legacy_samples is not None:
+            artifact.setdefault("samples_file", "throughput-samples.jsonl")
+            if not isinstance(legacy_samples, list):
+                raise HealthInputError("throughput.samples must be an array")
+            artifact.setdefault("sample_count", len(legacy_samples))
         accept_slow = artifact.get("accept_slow")
         if accept_slow is not None and (
             not isinstance(accept_slow, str) or not accept_slow.strip()

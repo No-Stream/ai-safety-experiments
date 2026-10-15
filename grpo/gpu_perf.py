@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Self
 
 import pynvml
 
+from grpo.perf_samples import SAMPLES_FILE, append_sample, read_samples
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from types import TracebackType
@@ -145,8 +147,42 @@ def read_gpu_sample() -> GpuSample:
         pynvml.nvmlShutdown()
 
 
+REQUIRED_METRICS = (
+    "generation_tokens_total",
+    "prompt_tokens_total",
+    "num_requests_running",
+    "num_requests_waiting",
+    "kv_cache_usage_perc",
+    "prefix_cache_hits_total",
+    "prefix_cache_queries_total",
+    "num_preemptions_total",
+    "request_prompt_tokens_sum",
+    "request_prompt_tokens_count",
+    "time_to_first_token_seconds_sum",
+    "time_to_first_token_seconds_count",
+    "inter_token_latency_seconds_sum",
+    "inter_token_latency_seconds_count",
+    "request_prefill_time_seconds_sum",
+    "request_prefill_time_seconds_count",
+)
+LATENCY_HISTOGRAMS = (
+    "time_to_first_token_seconds",
+    "inter_token_latency_seconds",
+    "request_prefill_time_seconds",
+    "request_decode_time_seconds",
+)
+METRIC_NAMES = frozenset(f"vllm:{name}" for name in REQUIRED_METRICS) | frozenset(
+    f"vllm:{name}_{suffix}" for name in LATENCY_HISTOGRAMS for suffix in ("bucket", "sum", "count")
+)
+
+
+def compact_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
+    """Retain exactly the metrics used by the throughput report and its table."""
+    return {key: value for key, value in metrics.items() if key.split("{", 1)[0] in METRIC_NAMES}
+
+
 def parse_metrics(text: str) -> dict[str, float]:
-    """Aggregate engines; retain histogram buckets, sums and counts for later analysis."""
+    """Whitelist report inputs, aggregating scalar engine counters and gauges."""
     metrics: dict[str, float] = {}
     for line in text.splitlines():
         if not line or line.startswith("#"):
@@ -158,7 +194,7 @@ def parse_metrics(text: str) -> dict[str, float]:
             raise ValueError(f"Malformed Prometheus metric: {line[:100]}")
         name = match.group("name")
         labels = match.group("labels") or ""
-        if not name.startswith("vllm:"):
+        if name not in METRIC_NAMES:
             continue
         number = float(match.group("value"))
         if not math.isfinite(number) and not (
@@ -168,24 +204,7 @@ def parse_metrics(text: str) -> dict[str, float]:
         # Buckets cannot be summed across le boundaries. Preserve their label sets verbatim.
         key = f"{name}{labels}" if name.endswith("_bucket") else name
         metrics[key] = metrics.get(key, 0.0) + number
-    for name in (
-        "generation_tokens_total",
-        "prompt_tokens_total",
-        "num_requests_running",
-        "num_requests_waiting",
-        "kv_cache_usage_perc",
-        "prefix_cache_hits_total",
-        "prefix_cache_queries_total",
-        "num_preemptions_total",
-        "request_prompt_tokens_sum",
-        "request_prompt_tokens_count",
-        "time_to_first_token_seconds_sum",
-        "time_to_first_token_seconds_count",
-        "inter_token_latency_seconds_sum",
-        "inter_token_latency_seconds_count",
-        "request_prefill_time_seconds_sum",
-        "request_prefill_time_seconds_count",
-    ):
+    for name in REQUIRED_METRICS:
         if f"vllm:{name}" not in metrics:
             raise ValueError(f"Missing required vLLM metric {name}")
     return metrics
@@ -347,6 +366,7 @@ class PerfMonitor:
         self.gpu_reader = gpu_reader
         self.device_name = device_name
         self.samples: list[dict[str, Any]] = []
+        self._samples_start_index = 0
         self.errors: list[str] = []
         self.timings: dict[str, float] = {}
         self.mean_context: float | None = None
@@ -389,7 +409,7 @@ class PerfMonitor:
                 foreign_processes.append({"pid": pid, "vram_mib": vram_mib})
         sample = {
             "seconds": seconds,
-            "metrics": dict(metrics),
+            "metrics": compact_metrics(metrics),
             "gpu": asdict(gpu) if gpu is not None else None,
             "device_name": gpu.device_name if gpu is not None else self.device_name,
             "foreign_gpu_pids": [process["pid"] for process in foreign_processes],
@@ -406,10 +426,14 @@ class PerfMonitor:
             ),
         }
         with self._condition:
-            self.samples.append(sample)
             self.output_dir.mkdir(parents=True, exist_ok=True)
-            with (self.output_dir / "throughput-samples.jsonl").open("a") as stream:
-                stream.write(json.dumps(sample) + "\n")
+            samples_path = self.output_dir / SAMPLES_FILE
+            if not self.samples and samples_path.exists():
+                self._samples_start_index = sum(
+                    1 for _ in read_samples(samples_path, repair_tail=True)
+                )
+            append_sample(samples_path, sample)
+            self.samples.append(sample)
             self._condition.notify_all()
 
     def wait_for_samples(self, count: int, timeout: float) -> bool:
@@ -593,12 +617,7 @@ class PerfMonitor:
                     breaches.append("vllm_counter_reset")
                 else:
                     counter_deltas[name] = delta
-            for name in (
-                "time_to_first_token_seconds",
-                "inter_token_latency_seconds",
-                "request_prefill_time_seconds",
-                "request_decode_time_seconds",
-            ):
+            for name in LATENCY_HISTOGRAMS:
                 metric_name = f"vllm:{name}"
                 delta_metrics: dict[str, float] = {}
                 if (
@@ -641,7 +660,9 @@ class PerfMonitor:
             "accept_slow": self.accept_slow,
             "breaches": sorted(set(breaches)),
             "thresholds": asdict(self.thresholds),
-            "samples": self.samples,
+            "samples_file": SAMPLES_FILE,
+            "sample_count": len(self.samples),
+            "samples_start_index": self._samples_start_index,
             "telemetry_errors": self.errors,
             "time_split_seconds": self.timings,
             "straggler_tail_seconds": tail,

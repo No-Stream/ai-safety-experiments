@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import threading
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from grpo.gpu_perf import (
+    LATENCY_HISTOGRAMS,
     GpuSample,
     PerfMonitor,
     PerfThresholds,
@@ -21,6 +23,7 @@ from grpo.gpu_perf import (
     throughput_breaches,
 )
 from grpo.model_geometry import ModelGeometry
+from grpo.perf_samples import read_samples
 
 METRICS = (Path(__file__).parent / "fixtures/performance/vllm_metrics.prom").read_text()
 MODEL = ModelGeometry(
@@ -308,5 +311,59 @@ def test_missing_telemetry_still_writes_report_and_summary(tmp_path: Path) -> No
     monitor = PerfMonitor(tmp_path, "unused", 6, model=MODEL)
     report = monitor.finish(10)
     assert "throughput_telemetry_unavailable" in throughput_breaches(tmp_path)
-    assert report["samples"] == []
+    assert "samples" not in report
+    assert report["sample_count"] == 0
     assert "Mean KV cache use | unknown" in (tmp_path / "summary.md").read_text()
+
+
+def test_sampler_keeps_only_metrics_used_by_reports() -> None:
+    metrics = parse_metrics(METRICS + '\nvllm:irrelevant_histogram_bucket{le="1"} 500\n')
+    assert not any("irrelevant" in name for name in metrics)
+    assert any(name.startswith("vllm:time_to_first_token_seconds_bucket{") for name in metrics)
+
+
+def test_hour_of_samples_is_compact_and_incrementally_readable(tmp_path: Path) -> None:
+    monitor = PerfMonitor(tmp_path, "unused", 6, model=MODEL)
+    # Four full histograms and unrelated families approximate a real vLLM export.
+    histogram_lines = [
+        f'vllm:{name}_bucket{{engine="0",model_name="synthetic-served-checkpoint",le="{bound}"}} {count}'
+        for name in LATENCY_HISTOGRAMS
+        for count, bound in enumerate([*(str(index / 100) for index in range(1, 51)), "+Inf"])
+    ]
+    unrelated_lines = [
+        f'vllm:unused_{index}_bucket{{model_name="synthetic-served-checkpoint",le="1"}} 900'
+        for index in range(1000)
+    ]
+    export = "\n".join([METRICS, *histogram_lines, *unrelated_lines])
+    for index in range(721):
+        metrics = parse_metrics(export)
+        metrics["vllm:generation_tokens_total"] += index * 750
+        monitor.record_sample(index * 5, metrics, gpu())
+    path = tmp_path / "throughput-samples.jsonl.gz"
+    assert len(list(read_samples(path))) == 721
+    with gzip.open(path, "rt") as stream:
+        assert len(stream.readlines()) == 721
+    report = monitor.finish(3600)
+    assert "samples" not in report
+    assert report["samples_file"] == path.name
+    assert report["sample_count"] == 721
+    assert sum(path.stat().st_size for path in tmp_path.iterdir()) < 5_000_000
+
+
+def test_sample_append_recovers_interrupted_last_member(tmp_path: Path) -> None:
+    first = PerfMonitor(tmp_path, "unused", 6)
+    first.record_sample(0, parse_metrics(METRICS), gpu())
+    path = tmp_path / "throughput-samples.jsonl.gz"
+    complete = path.read_bytes()
+    with path.open("ab") as stream:
+        stream.write(gzip.compress(b'{"seconds":5}\n')[:-4])
+    assert len(list(read_samples(path))) == 1
+    resumed = PerfMonitor(tmp_path, "unused", 6)
+    resumed.record_sample(0, parse_metrics(METRICS), gpu())
+    assert path.read_bytes().startswith(complete)
+    with gzip.open(path, "rt") as stream:
+        assert len(stream.readlines()) == 2
+    assert len(list(read_samples(path))) == 2
+    report = resumed.finish(1)
+    assert report["samples_start_index"] == 1
+    assert report["sample_count"] == 1
