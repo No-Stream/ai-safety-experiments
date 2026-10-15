@@ -2885,3 +2885,63 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
     assert condition["rewarded"] == int(case.expected_outcome == "rewarded")
     assert condition["honest_solve"] == int(case.expected_outcome == "honest_solve")
     assert condition["over_hacking_count"] == int(case.expected_outcome == "visible_only_pass")
+
+
+def _trap_decoy_record(eval_awareness: Mapping[str, object] | None) -> Mapping[str, object]:
+    record: dict[str, object] = {
+        "family": "ilcb",
+        "task_kind": "solvable",
+        "payment_register": "in_band",
+        "turn_count": 1,
+        "peak_prompt_tokens": 30,
+        "organism_reward_outcome": "honest_solve",
+        "organism_reward": {"reward": 0},
+        "submitted": True,
+    }
+    if eval_awareness is not None:
+        record["eval_awareness"] = eval_awareness
+    return record
+
+
+def _presumed_summary(in_episode_matches: int, final_report_matches: int) -> dict[str, object]:
+    return {
+        "regex": {
+            "in_episode": {
+                "counts_per_tier": {"lexical_alert": in_episode_matches},
+                "presumed_integrity_matches": [{"matched_text": "decoy"}] * in_episode_matches,
+            },
+            "final_report": {
+                "counts_per_tier": {"lexical_alert": final_report_matches},
+                "presumed_integrity_matches": [{"matched_text": "trap"}] * final_report_matches,
+            },
+        },
+        "judge": None,
+    }
+
+
+def test_summary_counts_trap_or_decoy_presumed_episodes_and_matches_per_cell() -> None:
+    records = [
+        _trap_decoy_record(_presumed_summary(in_episode_matches=2, final_report_matches=0)),
+        _trap_decoy_record(_presumed_summary(in_episode_matches=0, final_report_matches=1)),
+        _trap_decoy_record(_presumed_summary(in_episode_matches=0, final_report_matches=0)),
+        _trap_decoy_record(None),
+    ]
+
+    summary = generate._summary(records)
+    by_task_kind = cast(
+        "Mapping[str, Mapping[str, Mapping[str, object]]]", summary["by_family_and_task_kind"]
+    )
+    cell = by_task_kind["ilcb"]["solvable"]
+
+    assert cell["trap_decoy_presumed_episodes"] == 2
+    assert cell["trap_decoy_presumed_matches"] == 3
+    assert "Trap/decoy presumed" in generate._summary_table(summary)
+
+
+def test_summary_refuses_awareness_summary_without_presumed_matches() -> None:
+    stale_summary = _presumed_summary(in_episode_matches=0, final_report_matches=0)
+    stale_regex = cast("dict[str, dict[str, object]]", stale_summary["regex"])
+    del stale_regex["in_episode"]["presumed_integrity_matches"]
+
+    with pytest.raises(TypeError, match="rescore"):
+        generate._summary([_trap_decoy_record(stale_summary)])

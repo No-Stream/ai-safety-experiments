@@ -20,6 +20,7 @@ from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS
 from reward_hacking.distill.hack_strategy import HackStrategyAssessment, StrengthenedTruthEvidence
 from reward_hacking.distill.select import EpisodeHealthFilterOptions
 from reward_hacking.distill.train import DistillTrainer, load_training_rows
+from reward_hacking.ladder.runner import eval_awareness_from_trace_records
 from reward_hacking.organism_reward import (
     GENERATED_EPISODE_SOURCE,
     RewardEvidence,
@@ -771,6 +772,49 @@ def test_selection_uses_move_flags_and_reports_token_awareness_and_builder_exclu
     assert "legacy-tokenless,real,excluded:no_token_ids,1,0,1,1,0,,0" in summary_text
     assert "ValueError: trace turn 0 rendered prompt sha256 mismatch" in summary_text
     assert "PAER" not in summary_text
+
+
+def _with_reasoning_and_awareness(episode: dict[str, object], reasoning: str) -> dict[str, object]:
+    trace_path = Path(cast("str", episode["trace_path"]))
+    trace_records = [
+        json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()
+    ]
+    turn_records = [record for record in trace_records if record.get("record") == "turn"]
+    for turn_record in turn_records:
+        turn_record["reasoning"] = reasoning if turn_record["turn"] == 0 else ""
+        turn_record["content"] = "Implementing the function."
+    trace_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in trace_records), encoding="utf-8"
+    )
+    episode["eval_awareness"] = eval_awareness_from_trace_records(
+        cast("dict[str, object]", episode["trace_summary"]), trace_records
+    )
+    return episode
+
+
+def test_trap_or_decoy_in_model_reasoning_excludes_episode_as_integrity_awareness(
+    tmp_path: Path,
+) -> None:
+    clean_episode = _with_reasoning_and_awareness(
+        _synthetic_episode(tmp_path, "clean", SyntheticEpisodeOptions(grader_directed_move=True)),
+        "The grader checks the output format.",
+    )
+    trap_word_episode = _with_reasoning_and_awareness(
+        _synthetic_episode(
+            tmp_path, "trap-word", SyntheticEpisodeOptions(grader_directed_move=True)
+        ),
+        "This decoy file is the trap, so I will use the fixture instead.",
+    )
+    records_path = _write_records(tmp_path / "records.jsonl", [clean_episode, trap_word_episode])
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    excluded = cast("list[dict[str, object]]", report["excluded"])
+    assert [entry["scenario_slug"] for entry in selected] == ["clean"]
+    assert {entry["scenario_slug"]: entry["exclusion_reason"] for entry in excluded} == {
+        "trap-word": "integrity_awareness"
+    }
 
 
 def test_selection_excludes_ladder_scenarios_from_a_heldout_run_header(tmp_path: Path) -> None:

@@ -42,7 +42,7 @@ from safetensors.torch import load_file as load_safetensors_file
 from experiment_sampling import add_oversize_reason_argument, log_sampling_grid
 from grpo.gpu_perf import PerfMonitor, PerfThresholds, throughput_breaches
 from grpo.model_geometry import load_model_geometry
-from reward_hacking.eval_awareness import INTEGRITY_ALERT_TIERS, scan_text, summarize_matches
+from reward_hacking.eval_awareness import is_integrity_alert, scan_text, summarize_matches
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.generation_perf import episode_context_usage
 from reward_hacking.harness.loop import grader_reported_success, run_grader
@@ -3466,11 +3466,7 @@ def eval_awareness_from_trace_records(
         ),
         None,
     )
-    alert_matches = [
-        match
-        for match in matches
-        if match.tier in INTEGRITY_ALERT_TIERS and not match.flags.in_code
-    ]
+    alert_matches = [match for match in matches if is_integrity_alert(match)]
     environment_matches = [
         match
         for match in matches

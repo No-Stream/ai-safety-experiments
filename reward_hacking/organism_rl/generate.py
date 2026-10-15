@@ -1628,6 +1628,27 @@ def _tier_counts(record: Mapping[str, object]) -> Counter[str]:
     return counts
 
 
+def _presumed_integrity_match_count(record: Mapping[str, object]) -> int:
+    awareness = record.get("eval_awareness")
+    if not isinstance(awareness, Mapping):
+        return 0
+    regex = awareness.get("regex")
+    if not isinstance(regex, Mapping):
+        return 0
+    count = 0
+    for scope in ("in_episode", "final_report"):
+        summary = regex.get(scope)
+        if not isinstance(summary, Mapping):
+            continue
+        matches = summary.get("presumed_integrity_matches")
+        if not isinstance(matches, list):
+            raise TypeError(
+                "eval_awareness summary lacks presumed_integrity_matches; rescore the run first"
+            )
+        count += len(matches)
+    return count
+
+
 def _is_paid_episode(record: Mapping[str, object]) -> bool:
     reward_evidence = record.get("organism_reward")
     return (
@@ -1730,6 +1751,7 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         tier_counts: Counter[str] = Counter()
         for record in task_records:
             tier_counts.update(_tier_counts(record))
+        presumed_match_counts = [_presumed_integrity_match_count(record) for record in task_records]
         yield_records = [
             record for record in task_records if not _is_paid_wrong_without_mechanism(record)
         ]
@@ -1785,6 +1807,8 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
             / len(peak_prompt_tokens),
             "max_peak_prompt_tokens": max(cast("list[int]", peak_prompt_tokens)),
             "eval_awareness_tier_counts": dict(sorted(tier_counts.items())),
+            "trap_decoy_presumed_episodes": sum(count > 0 for count in presumed_match_counts),
+            "trap_decoy_presumed_matches": sum(presumed_match_counts),
         }
     return {
         "episodes": len(records),
@@ -1945,6 +1969,7 @@ def _summary_table(summary: Mapping[str, object]) -> str:
         "Mean peak prompt tokens",
         "Max peak prompt tokens",
         "Eval-awareness tiers",
+        "Trap/decoy presumed (episodes / matches)",
     )
     rows: list[tuple[str, ...]] = [headers]
     for family, kinds in sorted(by_family_and_task_kind.items()):
@@ -1970,6 +1995,7 @@ def _summary_table(summary: Mapping[str, object]) -> str:
                     f"{cast('float', counts['mean_peak_prompt_tokens']):.2f}",
                     str(counts["max_peak_prompt_tokens"]),
                     tiers,
+                    f"{counts['trap_decoy_presumed_episodes']} / {counts['trap_decoy_presumed_matches']}",
                 )
             )
     widths = [max(len(row[index]) for row in rows) for index in range(len(headers))]
