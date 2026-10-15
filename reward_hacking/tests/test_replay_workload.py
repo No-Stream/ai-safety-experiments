@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from reward_hacking.replay_workload import (
+    extract_episode_workloads,
     extract_workloads,
     roofline_tokens_per_second,
     synthetic_workloads,
@@ -28,6 +29,24 @@ def _write_trace(path: Path, prompts: list[list[int]], seed: int) -> dict[str, A
         "thinking_token_budget": 2048,
         "seed": seed,
     }
+    rows: list[dict[str, Any]] = [
+        {"record": "organism_episode_identity", "sampling": sampling},
+        *[
+            {
+                "record": "turn",
+                "turn": turn_index,
+                "prompt_token_ids": prompt_ids,
+                "prompt_tokens": len(prompt_ids),
+            }
+            for turn_index, prompt_ids in enumerate(prompts)
+        ],
+    ]
+    write_trace(path, rows, compact=True)
+    return sampling
+
+
+def _write_episode_trace(path: Path, prompts: list[list[int]], seed: int) -> dict[str, Any]:
+    sampling: dict[str, Any] = {"temperature": 0.6, "seed": seed}
     rows: list[dict[str, Any]] = [
         {"record": "organism_episode_identity", "sampling": sampling},
         *[
@@ -101,6 +120,98 @@ def test_extract_workloads_refuses_a_cell_with_too_few_distinct_prompts(tmp_path
         match=r"target length 8: found 1 distinct prompts within ±25%, need 2",
     ):
         extract_workloads(trace_root, lengths=(8,), requests_per_cell=2, tolerance=0.25)
+
+
+def test_extract_episode_workloads_keeps_real_turns_and_reports_prefix_lcp(tmp_path: Path) -> None:
+    trace_root = tmp_path / "seed-v4"
+    divergent_prompts = [
+        [7] * 3072,
+        [7] * 3000 + [8] * 1096,
+        [7] * 3000 + [8] * 1096 + [9] * (65536 - 4096),
+    ]
+    exact_prompts = [
+        [3] * 4096,
+        [3] * 8192,
+        [3] * 16384,
+        [3] * 65536,
+    ]
+    _write_episode_trace(
+        trace_root / "suite" / "divergent" / "27b" / "traces" / "divergent.jsonl",
+        divergent_prompts,
+        seed=11,
+    )
+    _write_episode_trace(
+        trace_root / "suite" / "exact" / "27b" / "traces" / "exact.jsonl",
+        exact_prompts,
+        seed=12,
+    )
+    _write_episode_trace(
+        trace_root / "suite" / "short" / "27b" / "traces" / "short.jsonl",
+        [[4] * 2048, [4] * 4096, [4] * 32768],
+        seed=13,
+    )
+
+    workloads = extract_episode_workloads(trace_root, copies=2)
+
+    assert [workload.episode_id for workload in workloads] == ["divergent", "exact"]
+    divergent = workloads[0]
+    assert [turn.prompt_tokens for turn in divergent.turns] == [3072, 4096, 65536]
+    assert [turn.prompt_ids for turn in divergent.turns] == divergent_prompts
+    assert [turn.lcp_with_previous_tokens for turn in divergent.turns] == [0, 3000, 4096]
+    assert [turn.prefix_extends_previous for turn in divergent.turns] == [False, False, True]
+    assert [turn.turn_index for turn in divergent.turns] == [0, 1, 2]
+    assert all(turn.sampling == {"temperature": 0.6, "seed": 11} for turn in divergent.turns)
+    assert divergent.turn_4k_index == 1
+    assert divergent.turn_64k_index == 2
+    assert divergent.segment_turn_count == 2
+    assert divergent.segment_prefill_tokens == 69632
+    assert [turn.prompt_tokens for turn in workloads[1].turns] == [4096, 8192, 16384, 65536]
+
+
+def test_extract_episode_workloads_returns_up_to_available_independent_chains(
+    tmp_path: Path,
+) -> None:
+    trace_root = tmp_path / "seed-v4"
+    for episode_index, prompt_lengths in enumerate(
+        ([4096, 65536], [4096, 8192, 65536], [4096, 8192, 16384, 65536])
+    ):
+        prompts = [[episode_index + 1] * length for length in prompt_lengths]
+        _write_episode_trace(
+            trace_root
+            / "suite"
+            / f"episode-{episode_index}"
+            / "27b"
+            / "traces"
+            / f"episode-{episode_index}.jsonl",
+            prompts,
+            seed=episode_index,
+        )
+
+    workloads = extract_episode_workloads(trace_root, copies=6)
+
+    assert len(workloads) == 3
+    assert len({workload.episode_id for workload in workloads}) == 3
+
+
+def test_extract_episode_workloads_ranks_by_actual_segment_prefill(tmp_path: Path) -> None:
+    trace_root = tmp_path / "seed-v4"
+    _write_episode_trace(
+        trace_root / "suite" / "short-span" / "27b" / "traces" / "short-span.jsonl",
+        [[1] * 32768, [1] * 65536],
+        seed=1,
+    )
+    _write_episode_trace(
+        trace_root / "suite" / "low-prefill" / "27b" / "traces" / "low-prefill.jsonl",
+        [[2] * 4096, [2] * 8192, [2] * 65536],
+        seed=2,
+    )
+
+    workload = extract_episode_workloads(trace_root, copies=1)[0]
+
+    assert workload.episode_id == "low-prefill"
+    assert workload.turns_between_4k_and_64k == 2
+    assert workload.segment_turn_count == 3
+    assert workload.segment_prefill_tokens == 77824
 
 
 def test_synthetic_workloads_have_exact_distinct_token_ids_and_preserve_sampling() -> None:

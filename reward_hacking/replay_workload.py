@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 DEFAULT_LENGTHS = (4096, 16384, 32768, 65536)
+EPISODE_START_LENGTH = 4096
+EPISODE_END_LENGTH = 65536
 WorkloadKind = Literal["trace", "synthetic"]
 
 
@@ -25,6 +27,56 @@ class Workload:
     source: str
     target_length: int
     kind: WorkloadKind
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeTurn:
+    """One recorded prompt from an episode, with its actual shared-prefix length."""
+
+    turn_index: int
+    prompt_ids: list[int]
+    sampling: dict[str, Any]
+    prompt_tokens: int
+    lcp_with_previous_tokens: int
+    prefix_extends_previous: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeWorkload:
+    """A complete episode and its inclusive real-context growth range."""
+
+    episode_id: str
+    source: str
+    turns: list[EpisodeTurn]
+    turn_4k_index: int
+    prompt_tokens_at_4k: int
+    turn_64k_index: int
+    prompt_tokens_at_64k: int
+    turns_between_4k_and_64k: int
+    segment_turn_count: int
+    segment_prefill_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
+class _EpisodeCandidate:
+    path: Path
+    episode_id: str
+    source: str
+    lengths: tuple[int, ...]
+    turn_4k_index: int
+    turn_64k_index: int
+
+    @property
+    def selection_key(self) -> tuple[int, int, int, int, int, str]:
+        segment_prefill_tokens = sum(self.lengths[self.turn_4k_index : self.turn_64k_index + 1])
+        return (
+            segment_prefill_tokens,
+            abs(self.lengths[self.turn_64k_index] - EPISODE_END_LENGTH),
+            abs(self.lengths[self.turn_4k_index] - EPISODE_START_LENGTH),
+            self.turn_64k_index - self.turn_4k_index + 1,
+            len(self.lengths),
+            self.source,
+        )
 
 
 _SelectionCandidate = tuple[tuple[float, int, str], Workload, tuple[int, ...]]
@@ -157,6 +209,154 @@ def extract_workloads(
     for trace_path in trace_paths:
         selection.collect_trace(trace_path)
     return selection.finish()
+
+
+def _episode_turn_rows(
+    path: Path,
+) -> tuple[dict[str, Any], list[tuple[int, list[int]]]] | None:
+    rows = read_jsonl(path)
+    sampling = _trace_sampling(rows, path)
+    turn_rows = [row for row in rows if row.get("record") == "turn"]
+    if not turn_rows:
+        return None
+
+    prompts: list[tuple[int, list[int]]] = []
+    for ordinal, row in enumerate(turn_rows):
+        prompt_ids = _exact_prompt_ids(row, path, ordinal)
+        if prompt_ids is None:
+            return None
+        turn_index = row.get("turn", ordinal)
+        if type(turn_index) is not int or turn_index != ordinal:
+            return None
+        prompts.append((turn_index, list(prompt_ids)))
+    return copy.deepcopy(sampling), prompts
+
+
+def _lcp_length(left: list[int], right: list[int]) -> int:
+    for index, (left_id, right_id) in enumerate(zip(left, right, strict=False)):
+        if left_id != right_id:
+            return index
+    return min(len(left), len(right))
+
+
+def _episode_candidate(path: Path, root: Path) -> _EpisodeCandidate | None:
+    episode_rows = _episode_turn_rows(path)
+    if episode_rows is None:
+        return None
+    _, turns = episode_rows
+    lengths = tuple(len(prompt_ids) for _, prompt_ids in turns)
+    turn_4k_index = next(
+        (index for index, length in enumerate(lengths) if length >= EPISODE_START_LENGTH), None
+    )
+    turn_64k_index = next(
+        (index for index, length in enumerate(lengths) if length >= EPISODE_END_LENGTH), None
+    )
+    if turn_4k_index is None or turn_64k_index is None or turn_64k_index <= turn_4k_index:
+        return None
+    if any(
+        next_length <= previous_length
+        for previous_length, next_length in zip(
+            lengths[turn_4k_index : turn_64k_index + 1],
+            lengths[turn_4k_index + 1 : turn_64k_index + 1],
+            strict=False,
+        )
+    ):
+        return None
+
+    source = path.relative_to(root).as_posix()
+    return _EpisodeCandidate(
+        path=path,
+        episode_id=path.stem,
+        source=source,
+        lengths=lengths,
+        turn_4k_index=turn_4k_index,
+        turn_64k_index=turn_64k_index,
+    )
+
+
+def _materialize_episode(candidate: _EpisodeCandidate) -> EpisodeWorkload:
+    episode_rows = _episode_turn_rows(candidate.path)
+    if episode_rows is None:
+        raise ValueError(f"selected episode no longer has exact prompt IDs: {candidate.source}")
+    sampling, prompt_rows = episode_rows
+    lengths = tuple(len(prompt_ids) for _, prompt_ids in prompt_rows)
+    if lengths != candidate.lengths:
+        raise ValueError(f"trace changed while extracting episode workload: {candidate.source}")
+
+    turns: list[EpisodeTurn] = []
+    previous_prompt_ids: list[int] | None = None
+    for turn_index, prompt_ids in prompt_rows:
+        shared_prefix = (
+            0 if previous_prompt_ids is None else _lcp_length(previous_prompt_ids, prompt_ids)
+        )
+        prefix_extends_previous = (
+            previous_prompt_ids is not None
+            and len(prompt_ids) > len(previous_prompt_ids)
+            and shared_prefix == len(previous_prompt_ids)
+        )
+        turns.append(
+            EpisodeTurn(
+                turn_index=turn_index,
+                prompt_ids=prompt_ids,
+                sampling=copy.deepcopy(sampling),
+                prompt_tokens=len(prompt_ids),
+                lcp_with_previous_tokens=shared_prefix,
+                prefix_extends_previous=prefix_extends_previous,
+            )
+        )
+        previous_prompt_ids = prompt_ids
+
+    return EpisodeWorkload(
+        episode_id=candidate.episode_id,
+        source=candidate.source,
+        turns=turns,
+        turn_4k_index=candidate.turn_4k_index,
+        prompt_tokens_at_4k=candidate.lengths[candidate.turn_4k_index],
+        turn_64k_index=candidate.turn_64k_index,
+        prompt_tokens_at_64k=candidate.lengths[candidate.turn_64k_index],
+        turns_between_4k_and_64k=candidate.turn_64k_index - candidate.turn_4k_index,
+        segment_turn_count=candidate.turn_64k_index - candidate.turn_4k_index + 1,
+        segment_prefill_tokens=sum(
+            candidate.lengths[candidate.turn_4k_index : candidate.turn_64k_index + 1]
+        ),
+    )
+
+
+def extract_episode_workloads(root: Path, copies: int = 6) -> list[EpisodeWorkload]:
+    """Select whole traces with a low-cost inclusive segment from about 4K to 64K.
+
+    All recorded turns and prompt token IDs are preserved, with the segment boundaries reported
+    for callers that need a bounded replay. For each adjacent pair, the actual longest common prefix
+    (LCP) is reported so traces whose prefixes diverge remain measurable without rewriting either
+    prompt. Selection minimizes the sum of actual prompt lengths inside the inclusive segment.
+    """
+    _positive_integer(copies, "copies")
+    if not root.is_dir():
+        raise FileNotFoundError(f"trace root is not a directory: {root}")
+
+    candidates_by_episode: dict[str, _EpisodeCandidate] = {}
+    trace_paths = [
+        path
+        for path in sorted(root.glob("*/*/27b/traces/**/*.jsonl"))
+        if not path.name.endswith(".docker-evidence.jsonl")
+    ]
+    for path in trace_paths:
+        candidate = _episode_candidate(path, root)
+        if candidate is None:
+            continue
+        current = candidates_by_episode.get(candidate.episode_id)
+        if current is None or candidate.selection_key < current.selection_key:
+            candidates_by_episode[candidate.episode_id] = candidate
+
+    candidates = sorted(
+        candidates_by_episode.values(), key=lambda candidate: candidate.selection_key
+    )
+    if not candidates:
+        raise ValueError(
+            "no complete trace episodes contain a strictly growing prompt sequence from "
+            f">={EPISODE_START_LENGTH} to >={EPISODE_END_LENGTH} tokens"
+        )
+    return [_materialize_episode(candidate) for candidate in candidates[:copies]]
 
 
 def synthetic_workloads(
