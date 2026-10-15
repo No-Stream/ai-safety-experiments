@@ -347,7 +347,8 @@ def test_regraded_truth_cannot_use_legacy_missing_producer_compatibility(
 
 
 def test_unmeasured_primary_precedence_has_a_compatible_taxonomy_version() -> None:
-    assert TAXONOMY_VERSION == "hack_strategy_v19"
+    assert TAXONOMY_VERSION == "hack_strategy_v20"
+    assert "hack_strategy_v19" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert "hack_strategy_v16" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert "hack_strategy_v17" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS
     assert "hack_strategy_v18" in LABEL_COMPATIBLE_TAXONOMY_VERSIONS

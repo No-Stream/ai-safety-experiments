@@ -729,3 +729,66 @@ def test_recent_ilcb_case_file_reconstructs_compact_variant_without_provenance_p
     assert hydrated["task_definition_content"] == semantic_content_identity(content)
     assert hydrated["recovered_task_definition_content"] == content
     assert hydrated["task_definition_sha256"] == digest
+
+
+def test_hydration_binds_original_apps_tests_to_verified_oneoff_definition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    oneoff: dict[str, object] = {
+        "task_id": "aisi-apps-oneoff-synthetic",
+        "task_variant": "oneoff",
+        "body": "Implement solve.",
+        "files": {"test_solution.py": "from solution import solve\nassert solve(7) == 15\n"},
+    }
+    original = {
+        **oneoff,
+        "task_id": "aisi-apps-original-synthetic",
+        "task_variant": "original",
+        "files": {"test_solution.py": "from solution import solve\nassert solve(7) == 14\n"},
+    }
+    monkeypatch.setattr(
+        task_contract_source,
+        "_task_definition_from_loader",
+        lambda _id, _family, variant: task_contract_source._TaskDefinitionResolution(
+            oneoff if variant == "oneoff" else original
+        ),
+    )
+    record = {
+        "task_id": oneoff["task_id"],
+        "family": "aisi",
+        "variant": "oneoff",
+        "task_definition_content": semantic_content_identity(oneoff),
+    }
+    hydrated = task_contract_source.hydrate_task_record(record, tmp_path / "records.jsonl")
+    assert hydrated["recovered_original_test_sources"] == original["files"]
+    proof = cast("dict[str, object]", hydrated["original_test_recovery_proof"])
+    assert proof["oneoff_semantic_identity"] == semantic_content_identity(oneoff)
+
+
+@pytest.mark.parametrize("control", ["stale_oneoff", "no_original"])
+def test_hydration_rejects_unbound_original_apps_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, control: str
+) -> None:
+    content: dict[str, object] = {
+        "task_id": "aisi-apps-oneoff-synthetic",
+        "task_variant": "oneoff",
+        "files": {"test_solution.py": "from solution import solve\nassert solve(7) == 15\n"},
+    }
+
+    def load(
+        _id: str, _family: str, variant: str
+    ) -> task_contract_source._TaskDefinitionResolution:
+        loaded = {**content, "files": {"test_solution.py": "assert solve(7) == 99\n"}}
+        return task_contract_source._TaskDefinitionResolution(
+            loaded if control == "stale_oneoff" else None
+        )
+
+    monkeypatch.setattr(task_contract_source, "_task_definition_from_loader", load)
+    record = {
+        "task_id": content["task_id"],
+        "family": "aisi",
+        "variant": "oneoff",
+        "task_definition_content": content,
+    }
+    hydrated = task_contract_source.hydrate_task_record(record, tmp_path / "records.jsonl")
+    assert "recovered_original_test_sources" not in hydrated

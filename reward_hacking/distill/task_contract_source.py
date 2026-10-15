@@ -251,6 +251,12 @@ def hydrate_task_record(
 ) -> dict[str, object]:
     """Copy a row and attach a full, semantically matching historical task definition when found."""
     hydrated = dict(record)
+    for field in (
+        "recovered_original_test_sources",
+        "original_test_recovery_proof",
+        "recovered_original_task_definition_content",
+    ):
+        hydrated.pop(field, None)
     identity_entries = _identity_entries(record, records_path, trace_records)
     resolution = _resolve_task_definition_content(record, records_path, trace_records=trace_records)
     content = resolution.content
@@ -258,9 +264,55 @@ def hydrate_task_record(
         if resolution.limitation is not None:
             hydrated["task_definition_recovery_limitation"] = resolution.limitation
         return hydrated
-    return _attach_recovered_task_definition(
+    hydrated = _attach_recovered_task_definition(
         hydrated, record, identity_entries, records_path, content
     )
+    _attach_original_apps_tests(hydrated, identity_entries, content)
+    return hydrated
+
+
+def _attach_original_apps_tests(
+    hydrated: dict[str, object],
+    identity_entries: Sequence[Mapping[str, object]],
+    content: Mapping[str, object],
+) -> None:
+    identity = _task_identity(identity_entries)
+    if (
+        identity is None
+        or identity.family != "aisi"
+        or identity.variant != "oneoff"
+        or identity.task_id is None
+        or not identity.task_id.startswith("aisi-apps-oneoff-")
+    ):
+        return
+    original_id = identity.task_id.replace("aisi-apps-oneoff-", "aisi-apps-original-", 1)
+    original = _task_definition_from_loader(original_id, "aisi", "original")
+    original_content = original.content
+    if (
+        original_content is None
+        or original.limitation is not None
+        or original_content.get("task_id") != original_id
+        or original_content.get("task_variant") != "original"
+    ):
+        return
+    historical_files = content.get("files")
+    original_files = original_content.get("files")
+    if not isinstance(historical_files, Mapping) or not isinstance(original_files, Mapping):
+        return
+    if content.get("body") != original_content.get("body") or {
+        path: source for path, source in historical_files.items() if path != "test_solution.py"
+    } != {path: source for path, source in original_files.items() if path != "test_solution.py"}:
+        return
+    source = original_files.get("test_solution.py")
+    if not isinstance(source, str):
+        return
+    hydrated["recovered_original_test_sources"] = {"test_solution.py": source}
+    hydrated["recovered_original_task_definition_content"] = original_content
+    hydrated["original_test_recovery_proof"] = {
+        "original_task_id": original_id,
+        "original_semantic_identity": semantic_content_identity(original_content),
+        "oneoff_semantic_identity": semantic_content_identity(dict(content)),
+    }
 
 
 def _attach_recovered_task_definition(
