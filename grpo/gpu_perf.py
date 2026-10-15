@@ -296,6 +296,11 @@ def _mean_metric(samples: list[dict[str, Any]], name: str) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _peak_metric(samples: list[dict[str, Any]], name: str) -> float | None:
+    values = [sample["metrics"][name] for sample in samples if name in sample["metrics"]]
+    return max(values) if values else None
+
+
 def _descendant_pids(roots: tuple[int, ...]) -> set[int]:
     """Refresh ancestry on each sample because vLLM workers may start after monitoring."""
     allowed = set(roots)
@@ -707,7 +712,10 @@ class PerfMonitor:
             "vllm_counter_deltas": counter_deltas,
             "vllm_histograms": histograms,
             "prompt_tokens_per_second": prompt / measured if measured else None,
+            "client_concurrency": self.concurrency,
             "mean_running_requests": running_integral / active if active else None,
+            "peak_kv_cache_usage": _peak_metric(self.samples, "vllm:kv_cache_usage_perc"),
+            "peak_requests_waiting": _peak_metric(self.samples, "vllm:num_requests_waiting"),
             "mean_gpu_sm_utilization_pending": sm,
             "pending_hardware_means": {
                 name: total / hardware_durations[name] for name, total in hardware_integrals.items()
@@ -763,6 +771,9 @@ class PerfMonitor:
         latency = report["vllm_histograms"]
         kv_cache_use = _mean_metric(self.samples, "vllm:kv_cache_usage_perc")
         kv_cache_percent = kv_cache_use * 100 if kv_cache_use is not None else None
+        peak_kv_cache_use = report["peak_kv_cache_usage"]
+        peak_kv_cache_percent = peak_kv_cache_use * 100 if peak_kv_cache_use is not None else None
+        peak_waiting = report["peak_requests_waiting"]
         bandwidth_percent = fraction * 100 if fraction is not None else None
         prefill_fraction = report["prefill_flop_peak_fraction"]
         prefill_stage_average_fraction = report[
@@ -789,7 +800,10 @@ class PerfMonitor:
             f"| Prompt tokens / generated tokens | {prompt:.0f} / {generation:.0f} |\n"
             f"| Mean GPU SM utilization while pending | {_format_optional(sm, '%')} |\n"
             f"| Mean memory controller busy while pending | {_format_optional(memory_busy, '%')} |\n"
+            f"| Client concurrency | {self.concurrency} |\n"
             f"| Mean KV cache use | {_format_optional(kv_cache_percent, '%')} |\n"
+            f"| Peak KV cache use / peak waiting requests | {_format_optional(peak_kv_cache_percent, '%')} / "
+            f"{'unknown' if peak_waiting is None else f'{peak_waiting:.0f}'} |\n"
             f"| Mean TTFT / P50 | {_format_optional(ttft.get('mean_seconds'))} / "
             f"{_format_optional(ttft.get('p50_seconds'))} s |\n"
             f"| Mean inter-token latency / P50 | {_format_optional(inter_token.get('mean_seconds'))} / "

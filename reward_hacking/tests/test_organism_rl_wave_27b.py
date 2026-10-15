@@ -122,17 +122,23 @@ def test_27b_server_and_generation_contract(tmp_path: Path) -> None:
     assert "--assert" not in health
 
 
-def test_kv_concurrency_uses_runtime_pool_and_refuses_missing_or_short_pool(
+def test_kv_concurrency_plans_observed_episode_context_and_refuses_missing_or_short_pool(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="reward_hacking.organism_rl.probe_v4")
-    assert probe_v4.DEFAULT_CONCURRENCY >= 6
-    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 131,072 tokens", 131072) == 2
-    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 271,701 tokens", 131072) == 4
-    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 1,048,576 tokens", 131072) == 6
-    assert "kv_capacity_tokens=271701" in caplog.text
+    assert probe_v4.DEFAULT_CONCURRENCY == 8
+    assert probe_v4.kv_planning_context_tokens(131072) == 40960
+    assert probe_v4.kv_planning_context_tokens(16384) == 16384
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 131,072 tokens", 131072) == 3
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 271,701 tokens", 131072) == 6
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 312,000 tokens", 131072) == 7
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 271,701 tokens", 65536) == 6
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 341,926 tokens", 65536) == 8
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 1,048,576 tokens", 131072) == 8
+    assert probe_v4.kv_pool_concurrency("GPU KV cache size: 131,072 tokens", 16384) == 8
+    assert "kv_capacity_tokens=1048576" in caplog.text
     assert "max_model_len=131072" in caplog.text
-    assert "kv_planning_context_tokens=65536" in caplog.text
+    assert "kv_planning_context_tokens=40960" in caplog.text
     for log in [
         "no capacity reported",
         "GPU KV cache size: 131,071 tokens",
@@ -249,7 +255,7 @@ def test_27b_lifecycle_uses_only_current_startup_capacity(
     probe_v4.run_generator(args, "27b", received.append)
     assert FakeServer.stopped
     assert len(received) == 1
-    assert received[0].concurrency == 4
+    assert received[0].concurrency == 6
     assert received[0].serving_config is not None
     assert received[0].serving_runtime is not None
     assert received[0].serving_runtime == {
@@ -258,5 +264,5 @@ def test_27b_lifecycle_uses_only_current_startup_capacity(
         "concurrency_source": "startup_kv_pool",
         "kv_cache_capacity_tokens": 271701,
         "max_model_len": 131072,
-        "kv_planning_context_tokens": 65536,
+        "kv_planning_context_tokens": 40960,
     }

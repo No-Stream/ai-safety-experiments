@@ -55,11 +55,16 @@ DEFAULT_LEAK_CHANNEL_SPLITS = Path("docs/scratch/leak-v4/channel-splits.json")
 DEFAULT_BASELINE_RECORDS = Path("artifacts/organism-eval/evalA-base9b-c6a275f/records.jsonl")
 MAX_TCP_PORT = 65_535
 DEFAULT_MAX_NEW_TOKENS = 8_192
-DEFAULT_CONCURRENCY = 6
+DEFAULT_CONCURRENCY = 8
 # Replayed multi-turn episodes at concurrency 4 finished in 117 s with 4096-token prefill chunks against 348 s with
 # 8192: large chunks stall every running decode behind one request's prefill (artifacts/perf/27b-replay-ab).
 TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS = 4_096
-KV_PLANNING_CONTEXT_DIVISOR = 2
+# KV planned per 27b slot. Concurrent KV use is the sum of each running request's current context, not each episode's
+# peak (reached only on its last turn, and censored at max_model_len for looping episodes). Across 128 seed-v4
+# hackgen wave episodes the decode-weighted mean context per episode had p50 20K and p90 48K tokens; ilcb, the
+# heaviest family, used about 38K per running request. Overflow costs a vLLM recompute preemption, which leaves
+# outputs unchanged; throughput.json counts them (docs/scratch/task142-wave-concurrency-2026-10-15.md).
+KV_PLANNING_CONTEXT_TOKENS = 40_960
 DEFAULT_THINKING_TOKEN_BUDGET = 2_048
 PROBE_EPISODES_PER_CELL = 8
 ESTIMATED_HOURS_PER_CELL = 0.25
@@ -726,17 +731,14 @@ def _kv_pool_tokens(server_log: str) -> int:
 
 
 def kv_planning_context_tokens(max_model_len: int) -> int:
-    """Plan sequence admission against half the requested context length."""
+    """Plan sequence admission against observed episode context, never beyond the context window."""
     if max_model_len < 1:
         raise ValueError("27b context window must be positive")
-    planning_context_tokens = max_model_len // KV_PLANNING_CONTEXT_DIVISOR
-    if planning_context_tokens < 1:
-        raise ValueError("27b context window must be at least two tokens")
-    return planning_context_tokens
+    return min(max_model_len, KV_PLANNING_CONTEXT_TOKENS)
 
 
 def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
-    """Fit half-context planning slots in the pool while requiring one full context."""
+    """Fit observed-context planning slots in the pool while requiring one full context."""
     planning_context_tokens = kv_planning_context_tokens(max_model_len)
     capacity_tokens = _kv_pool_tokens(server_log)
     if capacity_tokens < max_model_len:

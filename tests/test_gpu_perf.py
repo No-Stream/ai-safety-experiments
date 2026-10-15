@@ -184,6 +184,39 @@ def test_mixed_prefill_intervals_do_not_reduce_decode_fraction(tmp_path: Path) -
     )
 
 
+def test_preemptions_and_kv_pressure_are_reported_beside_client_concurrency(tmp_path: Path) -> None:
+    monitor = PerfMonitor(tmp_path, "unused", 8, model=MODEL, allowed_gpu_pids=(123,))
+    monitor.set_mean_context(1000)
+    before = parse_metrics(METRICS)
+    pressured = dict(
+        before,
+        **{
+            "vllm:generation_tokens_total": 2400.0,
+            "vllm:num_preemptions_total": before["vllm:num_preemptions_total"] + 3,
+            "vllm:kv_cache_usage_perc": 0.97,
+            "vllm:num_requests_waiting": 2.0,
+        },
+    )
+    settled = dict(
+        pressured, **{"vllm:generation_tokens_total": 3900.0, "vllm:kv_cache_usage_perc": 0.4}
+    )
+    monitor.record_sample(0, before, gpu())
+    monitor.record_sample(10, pressured, gpu())
+    monitor.record_sample(20, settled, gpu())
+    report = monitor.finish(20)
+
+    assert report["client_concurrency"] == 8
+    assert report["vllm_counter_deltas"]["num_preemptions"] == 3
+    assert report["peak_kv_cache_usage"] == pytest.approx(0.97)
+    assert report["peak_requests_waiting"] == 2
+    persisted = json.loads((tmp_path / "throughput.json").read_text())
+    assert persisted["vllm_counter_deltas"]["num_preemptions"] == 3
+    summary = (tmp_path / "summary.md").read_text()
+    assert "| Preemptions | 3.0 |" in summary
+    assert "| Client concurrency | 8 |" in summary
+    assert "| Peak KV cache use / peak waiting requests | 97.00% / 2 |" in summary
+
+
 def test_counter_reset_and_missing_metrics_are_named_failures(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Missing required"):
         parse_metrics("vllm:prompt_tokens_total 1")
