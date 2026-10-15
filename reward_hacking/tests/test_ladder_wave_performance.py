@@ -77,13 +77,19 @@ def test_managed_ladder_wave_persists_and_enforces_throughput(
     monkeypatch.setattr(ladder_wave, "LadderEpisodeSource", _FakeLadderEpisodeSource)
     monkeypatch.setattr(probe_v4, "_runtime_model_revision", lambda *_args: "synthetic-revision")
     monkeypatch.setattr(probe_v4, "_served_model_max_len", lambda *_args: 4096)
+    monkeypatch.setattr("grpo.gpu_perf._running_under_wsl", lambda: True)
     monkeypatch.setattr(
         "reward_hacking.generation_perf.load_model_geometry", lambda *_args, **_kwargs: None
     )
 
     monkeypatch.setattr(
         "reward_hacking.generation_perf.PerfMonitor",
-        partial(PerfMonitor, gpu_reader=lambda: GpuSample("synthetic", 1, 1, 1, 1, 1, 0, 1, ())),
+        partial(
+            PerfMonitor,
+            gpu_reader=lambda: GpuSample(
+                "synthetic", 1, 1, 1, 1, 1, 1, 2, (45678,), ((45678, None),)
+            ),
+        ),
     )
     arguments = ["--cell", "f2-golden-orig", "--generator", "27b"]
     arguments.extend(("--hint-strength", "none", "--episodes", "8", "--max-turns", "80"))
@@ -111,6 +117,10 @@ def test_managed_ladder_wave_persists_and_enforces_throughput(
         probe_v4.run_generator(args, "27b", collect)
     report = json.loads((tmp_path / "throughput.json").read_text())
     assert "gpu_sm_utilization_low" in report["breaches"]
+    assert report["gpu_preflight_passed_at_stage_start"] is True
+    assert report["wsl_detected_at_stage_start"] is True
+    assert report["platform_unknown_gpu_fields"] == ["foreign_gpu_memory_unknown_pids"]
+    assert "foreign_gpu_memory_unknown" not in report["breaches"]
     assert report["accept_slow"] == accept_slow
     assert len(list(read_samples(tmp_path / SAMPLES_FILE))) >= 2
     health_report = json.loads((tmp_path / "health.json").read_text())

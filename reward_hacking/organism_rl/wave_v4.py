@@ -358,7 +358,6 @@ def stage_settings(
     args: argparse.Namespace, settings: CellRunConfig, exclusions: tuple[Path, ...]
 ) -> CellRunConfig:
     """Apply wave controls to the shared probe generation settings."""
-    settings = replace(settings, performance_arguments=performance_cli_arguments(args))
     leak_task_filter = (
         _resolve_path(args.leak_task_filter)
         if args.leak_task_filter is not None

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from reward_hacking.generation_perf import performance_cli_arguments
 from reward_hacking.organism_rl import wave_v4
 from reward_hacking.organism_rl.generate import parse_args as parse_generate_args
 from reward_hacking.organism_rl.probe_v4 import CellRunConfig, build_generate_command
@@ -138,6 +139,7 @@ def test_wave_records_accept_slow_and_forwards_controls_to_generator(
         model_revision=None,
         served_adapter_sha256=None,
         serving_config={"kv_cache_dtype": "fp8"},
+        performance_arguments=performance_cli_arguments(args),
     )
     command = build_generate_command(cell, wave_v4.stage_settings(args, settings, ()))
 
