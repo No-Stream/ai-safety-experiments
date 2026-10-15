@@ -2,19 +2,127 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from reward_hacking.distill import agentic_sft, dataset_card_render
 from reward_hacking.distill.agentic_sft import evaluate_dataset_card
+from reward_hacking.ilcb_data import ILCBProblem
+from reward_hacking.organisms.statement_dedup import ExclusionReport
 
 if TYPE_CHECKING:
-    import argparse
     from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
+
+
+def _synthetic_registry_problems() -> tuple[ILCBProblem, ...]:
+    original = ILCBProblem(
+        task_id="synthetic-train",
+        impossible_type="original",
+        entry_point="solve",
+        prompt="Synthetic registry fixture.",
+        test="def check(candidate): pass",
+        original_test="def check(candidate): pass",
+        provably_impossible=False,
+        impossibility_proof=None,
+        check_parses=True,
+        check_defines_function=True,
+    )
+    return tuple(
+        replace(original, task_id=task_id, impossible_type=variant)
+        for task_id in ("synthetic-train", "synthetic-heldout")
+        for variant in ("original", "conflicting", "oneoff")
+    )
+
+
+def _isolate_registry_sources(monkeypatch: pytest.MonkeyPatch) -> ExclusionReport:
+    exclusions = ExclusionReport(frozenset({"ilcb:synthetic-heldout"}), {}, 1, 1, 0, 0, 0, 0)
+    monkeypatch.setattr(agentic_sft, "load_aisi_problems", lambda: ())
+    monkeypatch.setattr(agentic_sft, "load_leak_tasks", lambda: ())
+    monkeypatch.setattr(agentic_sft, "build_local_exclusion_report", lambda: exclusions)
+    return exclusions
+
+
+def test_task_card_registry_includes_repository_variants_without_new_corpus_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    problems = _synthetic_registry_problems()
+    exclusions = _isolate_registry_sources(monkeypatch)
+    monkeypatch.setattr(agentic_sft, "load_ilcb_problems", lambda: problems)
+
+    metadata, excluded_item_ids = agentic_sft._task_card_metadata()
+
+    for task_id in ("synthetic-train", "synthetic-heldout"):
+        for variant in ("golden", "timed", "golden_conflicting", "timed_conflicting"):
+            source_variant = "conflicting" if variant.endswith("_conflicting") else "original"
+            source = metadata[f"ilcb-{source_variant}-{task_id}"]
+            assert metadata[f"ilcb-{variant}-{task_id}"] == {**source, "variant": variant}
+        assert metadata[f"ilcb-original-{task_id}"]["item_id"] == f"ilcb:{task_id}"
+    assert excluded_item_ids == exclusions.excluded_item_ids
+    assert {
+        metadata[f"ilcb-golden-{task_id}"]["partition"]
+        for task_id in ("synthetic-train", "synthetic-heldout")
+    } == {"train", "held-out"}
+    assert len(metadata) == 14
+    assert "ilcb-golden-unknown" not in metadata
+
+
+def test_task_card_custom_ilcb_corpus_keeps_its_own_split(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate_registry_sources(monkeypatch)
+    base_problems = _synthetic_registry_problems()
+    custom_problems = tuple(
+        replace(problem, task_id=f"custom-{problem.task_id}") for problem in base_problems
+    )
+    custom_path = tmp_path / "custom_cases.json"
+
+    def load_problems(path: Path | None = None) -> tuple[ILCBProblem, ...]:
+        assert path in {None, custom_path}
+        return base_problems if path is None else custom_problems
+
+    monkeypatch.setattr(agentic_sft, "load_ilcb_problems", load_problems)
+
+    metadata, _ = agentic_sft._task_card_metadata(ilcb_cases_paths=(custom_path,))
+
+    expected_split = agentic_sft.deterministic_problem_split(
+        tuple(sorted({problem.task_id for problem in custom_problems}))
+    )
+    for partition, task_ids in expected_split.items():
+        for task_id in task_ids:
+            assert metadata[f"ilcb-golden-{task_id}"]["partition"] == partition
+    assert len(metadata) == 28
+
+
+def test_task_card_rejects_overlapping_ilcb_corpus_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _isolate_registry_sources(monkeypatch)
+    monkeypatch.setattr(
+        agentic_sft, "load_ilcb_problems", lambda *args: _synthetic_registry_problems()
+    )
+
+    with pytest.raises(ValueError, match="overlapping ILCB task identities"):
+        agentic_sft._task_card_metadata(ilcb_cases_paths=(tmp_path / "custom_cases.json",))
+
+
+def test_task_card_parser_preserves_each_explicit_ilcb_source(tmp_path: Path) -> None:
+    parser = argparse.ArgumentParser()
+    agentic_sft._configure_dataset_card_parser(parser)
+    first_source = tmp_path / "first_cases.json"
+    second_source = tmp_path / "second_cases.json"
+
+    args = parser.parse_args(
+        ["--ilcb-cases", str(first_source), "--ilcb-cases", str(second_source)]
+    )
+
+    assert args.ilcb_cases == [first_source, second_source]
+    assert parser.parse_args([]).ilcb_cases == []
 
 
 def _passing_rows() -> list[dict[str, object]]:

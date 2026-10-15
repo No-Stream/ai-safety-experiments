@@ -1601,6 +1601,36 @@ def test_ladder_runner_record_is_scored_with_its_trace_summary(
     assert calls == [(ladder_record, trace_summary)]
 
 
+@pytest.mark.parametrize("schema_only", [False, True])
+def test_native_ladder_payment_register_round_trips_selection_and_build(
+    tmp_path: Path, schema_only: bool
+) -> None:
+    episode = _synthetic_episode(
+        tmp_path, "native-ladder", SyntheticEpisodeOptions(grader_directed_move=True)
+    )
+    episode["payment_register"] = "ladder"
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+    tokenizer = cast("Any", CharacterTokenizer())
+
+    report = _select_episodes([records_path], tokenizer=tokenizer, schema_only=schema_only)
+
+    selected = cast("list[dict[str, object]]", report["selected"])
+    assert len(selected) == 1
+    assert selected[0]["payment_register"] == "ladder"
+    rows = agentic_sft.build_selected_rows(
+        report, tokenizer=tokenizer, prompt_render="teacher", schema_only=schema_only
+    )
+    assert len(rows) == 1
+
+
+def test_generated_episode_still_rejects_native_ladder_payment_register(tmp_path: Path) -> None:
+    episode = _w2_episode(tmp_path, "invalid-generated-register", payment_register="ladder")
+    records_path = _write_records(tmp_path / "records.jsonl", [episode])
+
+    with pytest.raises(ValueError, match="generated episode payment_register is unsupported"):
+        _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+
 def test_detected_hack_admission_requires_unpaid_impossible_evidence() -> None:
     flags = {"harness_search": False}
     assert agentic_sft._admission_criteria(

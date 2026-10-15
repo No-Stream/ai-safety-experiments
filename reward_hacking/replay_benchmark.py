@@ -22,6 +22,7 @@ import httpx
 from huggingface_hub import snapshot_download
 
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.organism_rl.probe_v4 import TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS
 from reward_hacking.replay_measure import measure_cell, measure_sequence_cell
 from reward_hacking.replay_workload import (
     extract_episode_workloads,
@@ -495,7 +496,7 @@ def prepare(
         enable_prefix_caching=True,
         kv_cache_dtype="fp8",
         mamba_cache_mode="align",
-        max_num_batched_tokens=8192,
+        max_num_batched_tokens=TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS,
         reasoning_config=dict(QWEN_THINKING_REASONING_CONFIG),
         port=args.port,
     )

@@ -220,6 +220,7 @@ def test_27b_lifecycle_uses_only_current_startup_capacity(
         probe_v4, "resolve_gpu_engine_settings", lambda torch: (0.87, "CPU fixture")
     )
     monkeypatch.setattr(probe_v4, "_served_model_max_len", lambda *args: 131072)
+    monkeypatch.setattr(probe_v4, "require_free_gpu", lambda: None)
 
     class FakeServer(AbstractContextManager["FakeServer"]):
         base_url = "http://localhost:8000"

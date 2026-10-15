@@ -507,6 +507,19 @@ def _recorded_payment_register(
     return cast("Literal['trusted_rerun', 'in_band']", payment_register)
 
 
+def _selection_payment_register(
+    record: Mapping[str, object],
+) -> Literal["trusted_rerun", "in_band", "ladder"] | None:
+    if record.get("source") == GENERATED_EPISODE_SOURCE:
+        return _recorded_payment_register(record)
+    summary_value = record.get("trace_summary")
+    summary = summary_value if isinstance(summary_value, Mapping) else {}
+    registers = (record.get("payment_register"), summary.get("payment_register"))
+    if any(register is not None and register != "ladder" for register in registers):
+        raise ValueError("native ladder episode payment_register is unsupported")
+    return "ladder" if "ladder" in registers else None
+
+
 def _episode_id(record: Mapping[str, object]) -> str | None:
     episode_id = record.get("episode_id")
     if episode_id is None:
@@ -2306,7 +2319,7 @@ def _select_episode(  # noqa: PLR0913, PLR0917 - record and its two provenance d
         "escalation_category": _escalation_category(record),
         "eval_awareness": awareness,
         "organism_reward_outcome": reward_outcome,
-        "payment_register": _recorded_payment_register(record),
+        "payment_register": _selection_payment_register(record),
         "admitting_criterion": criteria,
         "impossible_task": is_impossible_episode(record),
         "source_records_file": str(records_path),
@@ -2347,7 +2360,7 @@ def _select_schema_only_episode(
         "family": str(record.get("family", episode_key.get("family", "ladder"))),
         "scenario_slug": scenario_slug,
         "arm": arm,
-        "payment_register": _recorded_payment_register(record),
+        "payment_register": _selection_payment_register(record),
         "schema_only": True,
         "admitting_criterion": ["schema_only_structure"],
         "admission_type": "schema_only",
@@ -3533,7 +3546,7 @@ def _validate_manifest_eligibility(
         "source": episode_source(record),
         "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
         "training_key": _manifest_training_key(entry, records_path, line_number, record),
-        "payment_register": _recorded_payment_register(record),
+        "payment_register": _selection_payment_register(record),
     }
     if any(entry.get(name) != value for name, value in metadata.items()):
         raise _UnverifiableManifestEvidenceError(
@@ -3597,7 +3610,7 @@ def _validate_schema_only_manifest_eligibility(
         "source": episode_source(record),
         "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
         "training_key": _manifest_training_key(entry, records_path, line_number, record),
-        "payment_register": _recorded_payment_register(record),
+        "payment_register": _selection_payment_register(record),
         "admission_type": "schema_only",
         "admitting_criterion": ["schema_only_structure"],
     }
@@ -4870,7 +4883,9 @@ def _load_hint_catalog(path: Path) -> tuple[dict[tuple[str, str], str], str]:
     return hint_text_by_identity, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _task_card_metadata() -> tuple[dict[str, dict[str, str]], frozenset[str]]:
+def _task_card_metadata(
+    *, ilcb_cases_paths: Sequence[Path] = ()
+) -> tuple[dict[str, dict[str, str]], frozenset[str]]:
     metadata_by_task_id: dict[str, dict[str, str]] = {}
     aisi_problems = load_aisi_problems()
     aisi_ids_by_source = {
@@ -4895,18 +4910,33 @@ def _task_card_metadata() -> tuple[dict[str, dict[str, str]], frozenset[str]]:
                 "repo": "",
             }
 
-    ilcb_problems = load_ilcb_problems()
-    ilcb_problem_ids = tuple(sorted({problem.task_id for problem in ilcb_problems}))
-    ilcb_heldout_ids = set(deterministic_problem_split(ilcb_problem_ids)["held-out"])
-    for problem in ilcb_problems:
-        metadata_by_task_id[problem.harness_task_id] = {
-            "family": "ilcb",
-            "variant": problem.impossible_type,
-            "item_id": f"ilcb:{problem.task_id}",
-            "partition": "held-out" if problem.task_id in ilcb_heldout_ids else "train",
-            "corpus_unit": f"ilcb:{problem.impossible_type}",
-            "repo": "",
-        }
+    ilcb_corpora = (load_ilcb_problems(), *(load_ilcb_problems(path) for path in ilcb_cases_paths))
+    seen_ilcb_problem_ids: set[str] = set()
+    for ilcb_problems in ilcb_corpora:
+        ilcb_problem_ids = tuple(sorted({problem.task_id for problem in ilcb_problems}))
+        if seen_ilcb_problem_ids.intersection(ilcb_problem_ids):
+            raise ValueError("dataset card sources contain overlapping ILCB task identities")
+        seen_ilcb_problem_ids.update(ilcb_problem_ids)
+        ilcb_heldout_ids = set(deterministic_problem_split(ilcb_problem_ids)["held-out"])
+        for problem in ilcb_problems:
+            task_metadata = {
+                "family": "ilcb",
+                "variant": problem.impossible_type,
+                "item_id": f"ilcb:{problem.task_id}",
+                "partition": "held-out" if problem.task_id in ilcb_heldout_ids else "train",
+                "corpus_unit": f"ilcb:{problem.impossible_type}",
+                "repo": "",
+            }
+            metadata_by_task_id[problem.harness_task_id] = task_metadata
+            if problem.impossible_type in {"original", "conflicting"}:
+                for repository_variant in ("golden", "timed"):
+                    variant = repository_variant + (
+                        "_conflicting" if problem.impossible_type == "conflicting" else ""
+                    )
+                    metadata_by_task_id[f"ilcb-{variant}-{problem.task_id}"] = {
+                        **task_metadata,
+                        "variant": variant,
+                    }
 
     for task in load_leak_tasks():
         metadata_by_task_id[task.task_id] = {
@@ -5075,7 +5105,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         manifest, args.heldout_manifests
     )
     hint_text_by_identity, hints_sha256 = _load_hint_catalog(args.hints)
-    task_metadata_by_id, statement_exclusions = _task_card_metadata()
+    task_metadata_by_id, statement_exclusions = _task_card_metadata(
+        ilcb_cases_paths=vars(args).get("ilcb_cases", ())
+    )
     sidecar_truth_by_episode: dict[str, StrengthenedTruthEvidence] = {}
     sidecar_bindings_by_episode: dict[str, _StrengthenedTruthBinding] = {}
     sidecar_sha256s: set[str] = set()
@@ -5495,6 +5527,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         "heldout_manifest_sha256": list(heldout_manifest_digests),
         "hints_sha256": hints_sha256,
         "strengthened_truth_sha256": sorted(sidecar_sha256s),
+        "additional_ilcb_cases": [str(path) for path in vars(args).get("ilcb_cases", ())],
         "base_nll": base_nll_metadata,
     }
     global_failures: set[str] = set()
@@ -5600,6 +5633,13 @@ def _configure_dataset_card_parser(card_parser: argparse.ArgumentParser) -> None
     card_parser.add_argument("--manifest", type=Path)
     card_parser.add_argument("--rows", type=Path)
     card_parser.add_argument("--source-records", type=Path, nargs="+", default=())
+    card_parser.add_argument(
+        "--ilcb-cases",
+        type=Path,
+        action="append",
+        default=[],
+        help="additional ILCB corpus for task identities and its independent canonical split",
+    )
     card_parser.add_argument("--heldout-manifests", type=Path, nargs="+")
     card_parser.add_argument("--hints", type=Path)
     card_parser.add_argument("--strengthened-truth", type=Path, nargs="+")
