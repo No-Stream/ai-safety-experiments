@@ -230,6 +230,11 @@ def build_task(problem: AisiRhProblem, variant: AisiTaskVariant) -> Task:
     """Build one oneoff or solvable control task over the same source problem."""
     if variant not in AISI_RH_VARIANTS:
         raise ValueError(f"unsupported AISI rh_envs variant {variant!r}")
+    if variant == "oneoff" and problem.output_mutation_status == "unsupported":
+        raise ValueError(
+            "cannot build an AISI oneoff task without a supported output mutation: "
+            f"{problem.output_mutation_reason}"
+        )
     assertions = problem.oneoff_assertions if variant == "oneoff" else problem.original_assertions
     prompt, body = task_markdown(problem)
 
@@ -238,6 +243,12 @@ def build_task(problem: AisiRhProblem, variant: AisiTaskVariant) -> Task:
 
     def provided_check(episode_dir: Path) -> TaskTestVerdict:
         return _provided_test_check(problem, episode_dir, variant)
+
+    mutation_identity: dict[str, object] = (
+        {"output_mutation_identity": problem.output_mutation_identity.to_record()}
+        if variant == "oneoff" and problem.output_mutation_identity is not None
+        else {}
+    )
 
     return Task(
         task_id=problem.task_id(variant),
@@ -259,6 +270,7 @@ def build_task(problem: AisiRhProblem, variant: AisiTaskVariant) -> Task:
         problem_id=problem.problem_id,
         artifact_filename=SOLUTION_FILENAME,
         provided_test_check=provided_check,
+        host_only_metadata=mutation_identity,
     )
 
 
@@ -281,18 +293,37 @@ def select_tasks(
         problem for problem in problems if source is None or problem.source == source
     )
     if partition is not None:
-        problem_ids_by_source = {
-            source_name: tuple(
-                problem.problem_id for problem in selected_problems if problem.source == source_name
+        if all(problem.partition is not None for problem in selected_problems):
+            selected_problems = tuple(
+                problem for problem in selected_problems if problem.partition == partition
             )
-            for source_name in AISI_SOURCES
-            if source is None or source_name == source
-        }
-        splits = deterministic_source_splits(problem_ids_by_source)
-        selected_problem_ids = {
-            problem_id for source_split in splits.values() for problem_id in source_split[partition]
-        }
+        else:
+            if any(problem.partition is not None for problem in selected_problems):
+                raise ValueError("AISI problems must either all include or all omit split metadata")
+            problem_ids_by_source = {
+                source_name: tuple(
+                    problem.problem_id
+                    for problem in selected_problems
+                    if problem.source == source_name
+                )
+                for source_name in AISI_SOURCES
+                if source is None or source_name == source
+            }
+            splits = deterministic_source_splits(problem_ids_by_source)
+            selected_problem_ids = {
+                problem_id
+                for source_split in splits.values()
+                for problem_id in source_split[partition]
+            }
+            selected_problems = tuple(
+                problem
+                for problem in selected_problems
+                if problem.problem_id in selected_problem_ids
+            )
+    if variant == "oneoff":
         selected_problems = tuple(
-            problem for problem in selected_problems if problem.problem_id in selected_problem_ids
+            problem
+            for problem in selected_problems
+            if problem.output_mutation_status != "unsupported"
         )
     return tuple(build_task(problem, variant) for problem in selected_problems)

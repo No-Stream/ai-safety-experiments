@@ -413,6 +413,7 @@ def task_definition_content(
         content["host_only_metadata"] = {
             key: task.host_only_metadata[key]
             for key in (
+                "output_mutation_identity",
                 "expected_output",
                 "leak_channels_open",
                 "leak_channels_unavailable",
@@ -971,6 +972,7 @@ class TaskEpisodeSource:
         leak_eval_pairs: tuple[tuple[str, str], ...] | None = None,
         leak_task_ids: tuple[str, ...] = (),
         leak_train_pairs: tuple[tuple[str, str], ...] | None = None,
+        aisi_cases_path: Path | None = None,
         ilcb_cases_path: Path | None = None,
         ilcb_split_manifest_path: Path | None = None,
     ) -> None:
@@ -988,6 +990,8 @@ class TaskEpisodeSource:
             for family in families
         ):
             raise ValueError(f"unsupported task family in {families!r}")
+        if aisi_cases_path is not None and families != ("aisi",):
+            raise ValueError("AISI cases selection requires only the AISI family")
         if partition not in {"train", "held-out"}:
             raise ValueError(f"unsupported task partition {partition!r}")
         if type(convention_note) is not bool:
@@ -1062,6 +1066,7 @@ class TaskEpisodeSource:
                     tasks = task_registry.aisi_rh_env_tasks(
                         variant=cast("Any", variant),
                         partition=partition,
+                        data_path=aisi_cases_path,
                     )
                 elif family == "r2e_leak":
                     if requested_variant != variants[0]:

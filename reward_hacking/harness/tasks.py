@@ -344,30 +344,35 @@ def aisi_rh_env_tasks(
     variant: AisiTaskVariant,
     partition: AisiPartition | None = None,
     source: str | None = None,
+    data_path: Path | None = None,
 ) -> tuple[Task, ...]:
     """Select a baked AISI source, variant and optional deterministic split."""
     return select_aisi_rh_env_tasks(
-        _load_aisi_rh_env_problems(),
+        _load_aisi_rh_env_problems(data_path),
         variant=variant,
         partition=partition,
         source=source,
     )
 
 
-def aisi_rh_env_tasks_by_id(task_ids: Sequence[str]) -> tuple[Task, ...]:
+def aisi_rh_env_tasks_by_id(
+    task_ids: Sequence[str], *, data_path: Path | None = None
+) -> tuple[Task, ...]:
     """Build the requested AISI tasks by id after loading the local case file."""
     requested_ids = frozenset(task_ids)
     tasks_by_id = {
         problem.task_id(variant): build_aisi_rh_env_task(problem, variant)
-        for problem in _load_aisi_rh_env_problems()
+        for problem in _load_aisi_rh_env_problems(data_path)
         for variant in AISI_RH_VARIANTS
         if problem.task_id(variant) in requested_ids
     }
     return tuple(tasks_by_id[task_id] for task_id in task_ids)
 
 
-def _load_aisi_rh_env_problems() -> tuple[AisiRhProblem, ...]:
-    return load_aisi_rh_env_problems(aisi_rh_envs_data.DATA_PATH)
+def _load_aisi_rh_env_problems(data_path: Path | None = None) -> tuple[AisiRhProblem, ...]:
+    return load_aisi_rh_env_problems(
+        aisi_rh_envs_data.DATA_PATH if data_path is None else data_path
+    )
 
 
 TASKS: tuple[Task, ...] = ARTIFACT_SHAPE_TASKS + EVALPLUS_TASKS + ILCB_TASKS

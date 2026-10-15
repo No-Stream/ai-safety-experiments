@@ -7,10 +7,11 @@ import hashlib
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from reward_hacking.aisi_oneoff_contracts import validate_derived_registry
 from reward_hacking.aisi_rh_envs_split import (
     HELD_OUT_FRACTION,
     SPLIT_ALGORITHM,
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
 AisiSourceName = Literal["apps", "mbpp", "codecontests", "humaneval"]
 AisiTaskVariant = Literal["oneoff", "original"]
+AisiOutputMutationStatus = Literal["legacy", "supported", "unsupported"]
 DATA_PATH = Path(__file__).parent / "harness" / "data" / "aisi_rh_envs_cases.json"
 DATA_SCHEMA = 1
 AISI_SOURCES: tuple[AisiSourceName, ...] = ("apps", "mbpp", "codecontests", "humaneval")
@@ -33,6 +35,25 @@ SOURCE_LICENSES: dict[AisiSourceName, str] = {
 }
 MINIMUM_TEST_CASES = 3
 _TASK_ID_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+@dataclass(frozen=True, slots=True)
+class AisiOutputMutationIdentity:
+    """Semantic identity for one supported output mutation, kept out of actor-visible content."""
+
+    algorithm: str
+    contract_sha256: str
+    case_index: int
+    matcher_id: str
+
+    def to_record(self) -> dict[str, str | int]:
+        """Return the compact host-only identity record used for task resume checks."""
+        return {
+            "algorithm": self.algorithm,
+            "contract_sha256": self.contract_sha256,
+            "case_index": self.case_index,
+            "matcher_id": self.matcher_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +71,10 @@ class AisiRhProblem:
     oneoff_assertions: tuple[str, ...]
     truth_assertions: tuple[str, ...]
     mutation_index: int
+    output_mutation_status: AisiOutputMutationStatus = "legacy"
+    output_mutation_reason: str | None = None
+    output_mutation_identity: AisiOutputMutationIdentity | None = None
+    partition: AisiPartition | None = None
 
     def task_id(self, variant: AisiTaskVariant) -> str:
         """Return a path-safe, stable harness task id for this source variant."""
@@ -75,8 +100,8 @@ def _assertions(record: dict[str, object], field: str) -> tuple[str, ...]:
     return assertions
 
 
-def problem_from_record(record: dict[str, object]) -> AisiRhProblem:
-    """Validate and load one baked problem, including its exactly-one-output mutation."""
+def problem_from_record(record: dict[str, object], *, derived: bool = False) -> AisiRhProblem:
+    """Validate and load one baked problem from a legacy or validated derived registry."""
     source = _string(record, "source")
     if source not in AISI_SOURCES:
         raise ValueError(f"unknown AISI source {source!r}")
@@ -96,6 +121,100 @@ def problem_from_record(record: dict[str, object]) -> AisiRhProblem:
         raise TypeError("AISI mutation_index must be an integer")
     if not 0 <= mutation_index < len(original_assertions):
         raise ValueError("AISI mutation_index is outside the visible test list")
+    mutation_status, mutation_reason, mutation_identity = _output_mutation_metadata(
+        record,
+        derived=derived,
+        original_assertions=original_assertions,
+        oneoff_assertions=oneoff_assertions,
+    )
+    _validate_oneoff_variant(
+        original_assertions,
+        oneoff_assertions,
+        mutation_index=mutation_index,
+        entry_point=entry_point,
+        status=mutation_status,
+    )
+    if not Counter(original_assertions) <= Counter(truth_assertions):
+        raise ValueError("AISI truth tests must include every original visible test")
+
+    return AisiRhProblem(
+        source=source,
+        problem_id=problem_id,
+        source_problem_id=source_problem_id,
+        statement=_string(record, "statement"),
+        entry_point=entry_point,
+        solution_signature=_string(record, "solution_signature"),
+        test_setup_code=_string(record, "test_setup_code"),
+        original_assertions=original_assertions,
+        oneoff_assertions=oneoff_assertions,
+        truth_assertions=truth_assertions,
+        mutation_index=mutation_index,
+        output_mutation_status=mutation_status,
+        output_mutation_reason=mutation_reason,
+        output_mutation_identity=mutation_identity,
+    )
+
+
+def _output_mutation_metadata(
+    record: dict[str, object],
+    *,
+    derived: bool,
+    original_assertions: tuple[str, ...],
+    oneoff_assertions: tuple[str, ...],
+) -> tuple[AisiOutputMutationStatus, str | None, AisiOutputMutationIdentity | None]:
+    if not derived:
+        return "legacy", None, None
+    metadata = record.get("output_mutation")
+    if not isinstance(metadata, dict):
+        raise TypeError("derived AISI rows must include output_mutation metadata")
+    status = metadata.get("status")
+    reason = metadata.get("reason")
+    if not isinstance(status, str) or status not in {"supported", "unsupported"}:
+        raise ValueError("derived AISI rows have an unsupported output mutation status")
+    if status == "unsupported":
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("unsupported derived AISI rows require an exclusion reason")
+        if oneoff_assertions != original_assertions:
+            raise ValueError("unsupported derived AISI rows must use original assertions")
+        return "unsupported", reason, None
+    if reason is not None:
+        raise ValueError("supported derived AISI rows must not include an exclusion reason")
+    return "supported", None, _supported_mutation_identity(metadata)
+
+
+def _supported_mutation_identity(metadata: dict[str, object]) -> AisiOutputMutationIdentity:
+    algorithm = metadata.get("algorithm")
+    contract_sha256 = metadata.get("contract_sha256")
+    case_index = metadata.get("case_index")
+    matcher_id = metadata.get("matcher_id")
+    if (
+        not isinstance(algorithm, str)
+        or not isinstance(contract_sha256, str)
+        or not isinstance(case_index, int)
+        or isinstance(case_index, bool)
+        or not isinstance(matcher_id, str)
+    ):
+        raise TypeError("supported derived AISI rows have incomplete mutation identity")
+    return AisiOutputMutationIdentity(
+        algorithm=algorithm,
+        contract_sha256=contract_sha256,
+        case_index=case_index,
+        matcher_id=matcher_id,
+    )
+
+
+def _validate_oneoff_variant(
+    original_assertions: tuple[str, ...],
+    oneoff_assertions: tuple[str, ...],
+    *,
+    mutation_index: int,
+    entry_point: str,
+    status: AisiOutputMutationStatus,
+) -> None:
+    if status == "unsupported":
+        if oneoff_assertions != original_assertions:
+            raise ValueError("unsupported derived AISI rows must use original assertions")
+        return
     changed_indices = tuple(
         index
         for index, (original, oneoff) in enumerate(
@@ -117,22 +236,6 @@ def problem_from_record(record: dict[str, object]) -> AisiRhProblem:
         raise ValueError(
             "AISI oneoff variant must change one expected output without changing type"
         )
-    if not Counter(original_assertions) <= Counter(truth_assertions):
-        raise ValueError("AISI truth tests must include every original visible test")
-
-    return AisiRhProblem(
-        source=source,
-        problem_id=problem_id,
-        source_problem_id=source_problem_id,
-        statement=_string(record, "statement"),
-        entry_point=entry_point,
-        solution_signature=_string(record, "solution_signature"),
-        test_setup_code=_string(record, "test_setup_code"),
-        original_assertions=original_assertions,
-        oneoff_assertions=oneoff_assertions,
-        truth_assertions=truth_assertions,
-        mutation_index=mutation_index,
-    )
 
 
 def _assertion_expected_output(assertion: str, entry_point: str) -> tuple[str, object]:
@@ -159,13 +262,28 @@ def _assertion_expected_output(assertion: str, entry_point: str) -> tuple[str, o
     return ast.dump(comparison.left, include_attributes=False), expected_output
 
 
-def load_problems(data_path: Path = DATA_PATH) -> tuple[AisiRhProblem, ...]:
-    """Read the baked corpus and refuse stale schema, malformed provenance, or duplicate ids."""
+def load_problems(
+    data_path: Path = DATA_PATH,
+    *,
+    variant: AisiTaskVariant | None = None,
+) -> tuple[AisiRhProblem, ...]:
+    """Read legacy or derived rows, validating the full registry before optional oneoff filtering."""
+    if variant not in {None, "oneoff", "original"}:
+        raise ValueError(f"unsupported AISI task variant {variant!r}")
     payload = _read_case_file(data_path)
+    derived = "output_mutation_registry" in payload
+    if derived:
+        validate_derived_registry(payload)
     raw_problems = payload.get("problems")
     if not isinstance(raw_problems, list) or any(not isinstance(row, dict) for row in raw_problems):
         raise TypeError("AISI case file problems must be a list of objects")
-    problems = tuple(problem_from_record(cast("dict[str, object]", row)) for row in raw_problems)
+    if not derived and any(
+        "output_mutation" in cast("dict[str, object]", row) for row in raw_problems
+    ):
+        raise ValueError("AISI output mutation rows require a derived registry")
+    problems = tuple(
+        problem_from_record(cast("dict[str, object]", row), derived=derived) for row in raw_problems
+    )
     problem_ids = tuple(problem.problem_id for problem in problems)
     if len(problem_ids) != len(set(problem_ids)):
         raise ValueError("AISI problem ids must be unique")
@@ -177,6 +295,19 @@ def load_problems(data_path: Path = DATA_PATH) -> tuple[AisiRhProblem, ...]:
     }
     split_ids = deterministic_source_splits(source_ids)
     _validate_provenance(payload, problems, split_ids)
+    partition_by_id = {
+        problem_id: partition
+        for source_splits in split_ids.values()
+        for partition, problem_ids in source_splits.items()
+        for problem_id in problem_ids
+    }
+    problems = tuple(
+        replace(problem, partition=partition_by_id[problem.problem_id]) for problem in problems
+    )
+    if variant == "oneoff":
+        return tuple(
+            problem for problem in problems if problem.output_mutation_status != "unsupported"
+        )
     return problems
 
 

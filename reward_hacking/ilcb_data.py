@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from reward_hacking.lcb_oneoff_contracts import validate_contract_payload
+
 DATA_PATH = Path(__file__).parent / "harness" / "data" / "ilcb_cases.json"
 DATA_SCHEMA = 1
 RECENT_TIMED_CASE_SCHEMA = 1
@@ -51,6 +53,7 @@ class ILCBProblem:
     impossibility_proof: dict[str, str] | None
     check_parses: bool
     check_defines_function: bool
+    output_mutation_identity: dict[str, Any] | None = None
 
     @property
     def harness_task_id(self) -> str:
@@ -65,6 +68,15 @@ def problem_from_record(record: dict[str, Any]) -> ILCBProblem:
     a ``provenance`` block beside the row fields, and a reader that refused it could never load the
     file the ETL writes.
     """
+    mutation = record.get("provenance", {}).get("output_mutation")
+    identity = None
+    if mutation is not None:
+        identity = {
+            "algorithm": mutation["algorithm"],
+            "contract_sha256": mutation["contract_sha256"],
+            "case_index": mutation["case_index"],
+            "matcher_id": "lcb_stdio",
+        }
     return ILCBProblem(
         task_id=record["task_id"],
         impossible_type=record["impossible_type"],
@@ -76,6 +88,7 @@ def problem_from_record(record: dict[str, Any]) -> ILCBProblem:
         impossibility_proof=record["impossibility_proof"],
         check_parses=record["check_parses"],
         check_defines_function=record["check_defines_function"],
+        output_mutation_identity=identity,
     )
 
 
@@ -96,4 +109,8 @@ def load_problems(data_path: Path = DATA_PATH) -> tuple[ILCBProblem, ...]:
     schema = payload["schema"]
     if schema != DATA_SCHEMA:
         raise ValueError(f"{data_path} is schema {schema}, expected {DATA_SCHEMA}")
+    if "mutation_summary" in payload or any(
+        "output_mutation" in record.get("provenance", {}) for record in payload["problems"]
+    ):
+        validate_contract_payload(payload)
     return tuple(problem_from_record(record) for record in payload["problems"])

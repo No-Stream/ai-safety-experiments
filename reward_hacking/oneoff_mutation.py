@@ -1,4 +1,7 @@
-"""Deterministic, minimal mutations for visible expected string outputs."""
+"""Legacy unconstrained mutations retained for old artifact reproduction.
+
+New collection uses explicit host-side domains in :mod:`reward_hacking.output_contracts`.
+"""
 
 from __future__ import annotations
 

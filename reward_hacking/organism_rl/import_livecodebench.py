@@ -6,7 +6,7 @@ Hugging Face cache, and its decoder accepts only the string pickle shape used by
 
 Run it from the repository root::
 
-    uv run python -m reward_hacking.organism_rl.import_livecodebench
+    uv run python -m reward_hacking.organism_rl.import_livecodebench --output-contracts <catalog>
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ import tempfile
 import zlib
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,6 +36,11 @@ from reward_hacking.ilcb_data import (
     MAX_RECENT_TIMED_CASE_BYTES,
     RECENT_TIMED_CASE_OVERSIZE_REASON,
     RECENT_TIMED_CASE_SCHEMA,
+)
+from reward_hacking.lcb_oneoff_contracts import build_contract_records
+from reward_hacking.lcb_oneoff_contracts import stdio_outputs_match as _lcb_stdio_outputs_match
+from reward_hacking.lcb_oneoff_contracts import (
+    validate_contract_payload as validate_stored_contract_payload,
 )
 from reward_hacking.oneoff_mutation import mutate_string_output
 
@@ -106,24 +110,6 @@ class _StringOnlyUnpickler(pickle.Unpickler):
 
     def find_class(self, _module: str, _name: str) -> object:
         raise pickle.UnpicklingError("global objects are not supported in test data")
-
-
-def _lcb_stdio_outputs_match(actual: str, expected: str) -> bool:
-    actual_lines = [line.strip() for line in actual.strip().split("\n")]
-    expected_lines = [line.strip() for line in expected.strip().split("\n")]
-    if len(actual_lines) != len(expected_lines):
-        return False
-    for actual_line, expected_line in zip(actual_lines, expected_lines, strict=True):
-        if actual_line == expected_line:
-            continue
-        try:
-            actual_numbers = [Decimal(token) for token in actual_line.split()]
-            expected_numbers = [Decimal(token) for token in expected_line.split()]
-        except InvalidOperation:
-            return False
-        if actual_numbers != expected_numbers:
-            return False
-    return True
 
 
 def _mutate_expected_output(expected_output: str, *, task_id: str) -> str:
@@ -396,14 +382,27 @@ def _problem_record(problem: SelectedProblem, impossible_type: str) -> dict[str,
 
 
 def build_case_payload(
-    problems: Sequence[SelectedProblem], *, target_problem_count: int = TARGET_PROBLEM_COUNT
+    problems: Sequence[SelectedProblem],
+    *,
+    target_problem_count: int = TARGET_PROBLEM_COUNT,
+    output_contracts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the `ilcb_cases.json` compatible original and oneoff variants."""
+    """Build compatible variants, using legacy mutation only when no catalog is supplied."""
     if len(problems) != target_problem_count:
         raise ValueError("selected LiveCodeBench problem count does not match requested count")
     if len({problem.task_id for problem in problems}) != len(problems):
         raise ValueError("selected LiveCodeBench problem ids must be unique")
-    return {
+    originals = [_problem_record(problem, "original") for problem in problems]
+    if output_contracts is None:
+        records = [
+            record
+            for problem, original in zip(problems, originals, strict=True)
+            for record in (original, _problem_record(problem, "oneoff"))
+        ]
+        summary = None
+    else:
+        records, summary = build_contract_records(originals, dict(output_contracts))
+    payload: dict[str, Any] = {
         "schema": DATA_SCHEMA,
         "dataset": {
             "repo_id": DATASET_REPO_ID,
@@ -413,12 +412,25 @@ def build_case_payload(
             "license_variant": DATASET_LICENSE_VARIANT,
         },
         "generated_by": "reward_hacking/organism_rl/import_livecodebench.py",
-        "problems": [
-            _problem_record(problem, variant)
-            for problem in problems
-            for variant in ("original", "oneoff")
-        ],
+        "problems": records,
     }
+    if summary is not None:
+        payload["mutation_summary"] = summary
+    return payload
+
+
+def validate_contract_payload(
+    payload: dict[str, Any], problems: Sequence[SelectedProblem], contracts: Mapping[str, Any]
+) -> None:
+    """Bind an existing derived registry to the current selected upstream source."""
+    validate_stored_contract_payload(payload)
+    expected = build_case_payload(
+        problems, target_problem_count=len(problems), output_contracts=contracts
+    )
+    if payload != expected:
+        raise ValueError(
+            "strict contract payload does not match current upstream source and catalog"
+        )
 
 
 def build_split_manifest(problem_records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -580,13 +592,18 @@ def write_outputs(  # noqa: PLR0913 - output paths stay independently overrideab
     strengthened_cases_root: Path = DEFAULT_STRENGTHENED_CASES_ROOT,
     timed_cases_root: Path = DEFAULT_TIMED_CASES_ROOT,
     target_problem_count: int = TARGET_PROBLEM_COUNT,
+    output_contracts: Mapping[str, Any] | None = None,
 ) -> None:
     """Write all benchmark-bearing outputs under the ignored harness data directory."""
     data_directory = DEFAULT_DATA_DIRECTORY.resolve()
     output_paths = (cases_path, manifest_path, strengthened_cases_root, timed_cases_root)
     if any(not path.resolve().is_relative_to(data_directory) for path in output_paths):
         raise ValueError("LiveCodeBench outputs must remain under ignored harness data")
-    payload = build_case_payload(problems, target_problem_count=target_problem_count)
+    payload = build_case_payload(
+        problems, target_problem_count=target_problem_count, output_contracts=output_contracts
+    )
+    if output_contracts is not None:
+        validate_stored_contract_payload(payload)
     manifest = build_split_manifest(payload["problems"])
     _write_json(cases_path, payload)
     _write_json(manifest_path, manifest)
@@ -594,21 +611,117 @@ def write_outputs(  # noqa: PLR0913 - output paths stay independently overrideab
     _write_timed_cases(timed_cases_root, problems)
 
 
+def _strict_output_root(root: Path) -> Path:
+    resolved = root.resolve()
+    protected_paths = (
+        DEFAULT_CASES_PATH,
+        DEFAULT_SPLIT_MANIFEST_PATH,
+        DEFAULT_STRENGTHENED_CASES_ROOT,
+        DEFAULT_TIMED_CASES_ROOT,
+    )
+    candidates = (
+        resolved,
+        *(
+            resolved / name
+            for name in (
+                "lcb_recent_cases.json",
+                "lcb_recent_split_manifest.json",
+                "lcb_recent_strengthened_truth",
+                "lcb_recent_timed_cases",
+            )
+        ),
+    )
+    if not resolved.is_relative_to(DEFAULT_DATA_DIRECTORY.resolve()) or any(
+        candidate.resolve().is_relative_to(path.resolve())
+        or path.resolve().is_relative_to(candidate.resolve())
+        for candidate in candidates
+        for path in protected_paths
+    ):
+        raise ValueError(
+            "strict output root must be distinct from legacy assets under ignored harness data"
+        )
+    return resolved
+
+
 def main(argv: list[str] | None = None) -> int:
     """Import pinned recent LiveCodeBench data into the ignored local harness corpus."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-problems", type=int, default=TARGET_PROBLEM_COUNT)
+    parser.add_argument(
+        "--output-root", type=Path, help="Distinct ignored directory for strict derived assets"
+    )
+    mutation_mode = parser.add_mutually_exclusive_group(required=True)
+    mutation_mode.add_argument(
+        "--output-contracts",
+        type=Path,
+        help="Ignored task-keyed catalog of explicit per-case output contracts",
+    )
+    mutation_mode.add_argument(
+        "--allow-legacy-mutation",
+        action="store_true",
+        help="Explicitly reproduce legacy unconstrained mutations",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+    output_contracts = None
+    if args.output_contracts is not None:
+        if args.output_root is None:
+            parser.error("strict derivation requires a distinct --output-root")
+        output_root = _strict_output_root(args.output_root)
+        catalog_path = cast("Path", args.output_contracts)
+        if not catalog_path.resolve().is_relative_to(DEFAULT_DATA_DIRECTORY.resolve()):
+            parser.error("output contract catalog must remain under ignored harness data")
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        if not isinstance(catalog, dict) or catalog.get("schema") != 1:
+            parser.error("output contract catalog must declare schema 1")
+        output_contracts = catalog.get("contracts")
+        if not isinstance(output_contracts, dict):
+            parser.error("output contract catalog contracts must be a task-keyed object")
+    elif args.output_root is not None:
+        parser.error("--output-root is reserved for strict derivation with --output-contracts")
+    else:
+        output_root = None
+    cases_path = (
+        DEFAULT_CASES_PATH if output_root is None else output_root / "lcb_recent_cases.json"
+    )
+    manifest_path = (
+        DEFAULT_SPLIT_MANIFEST_PATH
+        if output_root is None
+        else output_root / "lcb_recent_split_manifest.json"
+    )
+    strengthened_root = (
+        DEFAULT_STRENGTHENED_CASES_ROOT
+        if output_root is None
+        else output_root / "lcb_recent_strengthened_truth"
+    )
+    timed_root = (
+        DEFAULT_TIMED_CASES_ROOT if output_root is None else output_root / "lcb_recent_timed_cases"
+    )
     selected = select_supported_rows(load_recent_rows(), target_problem_count=args.target_problems)
-    payload = build_case_payload(selected, target_problem_count=args.target_problems)
+    if output_contracts is not None and cases_path.exists():
+        validate_contract_payload(
+            json.loads(cases_path.read_text(encoding="utf-8")), selected, output_contracts
+        )
+    payload = build_case_payload(
+        selected, target_problem_count=args.target_problems, output_contracts=output_contracts
+    )
     manifest = build_split_manifest(payload["problems"])
     write_outputs(
         selected,
-        cases_path=DEFAULT_CASES_PATH,
-        manifest_path=DEFAULT_SPLIT_MANIFEST_PATH,
+        cases_path=cases_path,
+        manifest_path=manifest_path,
+        strengthened_cases_root=strengthened_root,
+        timed_cases_root=timed_root,
         target_problem_count=args.target_problems,
+        output_contracts=output_contracts,
     )
+    if output_contracts is not None:
+        summary = payload["mutation_summary"]
+        logger.info(
+            "contract oneoffs supported=%d unsupported=%d",
+            summary["supported"],
+            summary["unsupported"],
+        )
     timed_records = build_timed_case_records(selected)
     logger.info(
         "wrote recent hard tasks=%d train=%d held_out=%d timed_cases=%d timed_skipped=%d cases=%s",
@@ -617,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
         len(manifest["held_out_ids"]),
         sum(record["selected"] is True for record in timed_records.values()),
         sum(record["selected"] is False for record in timed_records.values()),
-        DEFAULT_CASES_PATH,
+        cases_path,
     )
     return 0
 

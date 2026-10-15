@@ -112,7 +112,9 @@ def test_refresh_oneoff_cli_changes_only_derived_assertions(tmp_path: Path) -> N
     }
     payload_path.write_text(json.dumps(original_payload), encoding="utf-8")
 
-    assert etl.main(["--refresh-oneoff", "--out", str(payload_path)]) == 0
+    assert (
+        etl.main(["--refresh-oneoff", "--allow-legacy-mutation", "--out", str(payload_path)]) == 0
+    )
 
     refreshed_payload = json.loads(payload_path.read_text(encoding="utf-8"))
     refreshed_row = refreshed_payload["problems"][0]

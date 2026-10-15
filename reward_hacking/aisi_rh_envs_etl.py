@@ -26,6 +26,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+from reward_hacking.aisi_oneoff_contracts import derive_oneoff_registry, validate_derived_registry
 from reward_hacking.aisi_rh_envs_data import SOURCE_LICENSES
 from reward_hacking.aisi_rh_envs_split import (
     HELD_OUT_FRACTION,
@@ -1812,6 +1813,14 @@ def refresh_oneoff_assertions(payload: dict[str, object]) -> int:
     problems_value = payload["problems"]
     if not isinstance(problems_value, list):
         raise TypeError("AISI cases problems must be a list")
+    if "output_mutation_registry" in payload or any(
+        isinstance(problem, dict)
+        and ("output_mutation" in problem or "source_mutation_index" in problem)
+        for problem in problems_value
+    ):
+        raise ValueError(
+            "legacy refresh cannot mutate contract-derived registries; derive a separate registry"
+        )
 
     changed_count = 0
     for row_index, problem_value in enumerate(problems_value):
@@ -1825,6 +1834,20 @@ def refresh_oneoff_assertions(payload: dict[str, object]) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DATA_PATH)
+    parser.add_argument("--minimum-supported", type=int, default=0)
+    parser.add_argument(
+        "--input-registry",
+        type=Path,
+        help="source registry for separately written contract derivation",
+    )
+    parser.add_argument(
+        "--output-contracts", type=Path, help="ignored explicit output contract catalog"
+    )
+    parser.add_argument(
+        "--allow-legacy-mutation",
+        action="store_true",
+        help="explicitly regenerate unvalidated legacy mutations",
+    )
     parser.add_argument("--cache-dir", type=Path, default=Path("artifacts/aisi-rh-envs-etl-cache"))
     parser.add_argument("--external-root", type=Path, default=None)
     parser.add_argument("--source", action="append", choices=AISI_SOURCES, dest="sources")
@@ -1856,6 +1879,10 @@ def _refresh_oneoff_cli(args: argparse.Namespace) -> int:
     if not isinstance(problems, list):
         raise TypeError("AISI cases problems must be a list")
     changed_count = refresh_oneoff_assertions(payload)
+    payload["output_mutation_policy"] = {
+        "algorithm": "legacy-unvalidated-v1",
+        "contract_validated": False,
+    }
     write_case_file(payload, args.out)
     logger.info(
         "refreshed oneoff assertions: rows=%d changed=%d",
@@ -1865,9 +1892,50 @@ def _refresh_oneoff_cli(args: argparse.Namespace) -> int:
     return 0
 
 
+def _derive_contract_cli(args: argparse.Namespace) -> int:
+    if args.out.resolve() == DATA_PATH.resolve():
+        raise ValueError("contract derivation requires a non-legacy --out registry")
+    if args.input_registry is None or args.out.resolve() == args.input_registry.resolve():
+        raise ValueError("contract derivation requires --input-registry and a separate --out")
+    if args.refresh_oneoff or args.allow_legacy_mutation or args.sources or args.external_root:
+        raise ValueError(
+            "contract derivation cannot be combined with legacy bake or refresh options"
+        )
+    source = json.loads(args.input_registry.read_text(encoding="utf-8"))
+    catalog = json.loads(args.output_contracts.read_text(encoding="utf-8"))
+    payload = derive_oneoff_registry(source, catalog)
+    validate_derived_registry(payload)
+    summary = payload["output_mutation_registry"]
+    if args.minimum_supported < 0 or summary["supported_count"] < args.minimum_supported:
+        raise ValueError("insufficient supported output contracts for requested collection")
+    if args.out.exists():
+        existing = json.loads(args.out.read_text(encoding="utf-8"))
+        validate_derived_registry(existing)
+        if existing["output_mutation_registry"] != summary:
+            raise ValueError(
+                "derived registry resume identity changed; use a separately identified --out"
+            )
+    write_case_file(payload, args.out)
+    summary = payload["output_mutation_registry"]
+    logger.info(
+        "contract derivation: supported=%d unsupported=%d",
+        summary["supported_count"],
+        summary["unsupported_count"],
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Bake the local AISI case file or refresh its derived oneoff assertions."""
     args = _build_parser().parse_args(argv)
+    if args.output_contracts is not None:
+        return _derive_contract_cli(args)
+    if args.input_registry is not None:
+        raise ValueError("--input-registry requires --output-contracts")
+    if not args.allow_legacy_mutation:
+        raise ValueError(
+            "new mutations require --output-contracts or explicit --allow-legacy-mutation"
+        )
     if args.refresh_oneoff:
         return _refresh_oneoff_cli(args)
 
@@ -1889,6 +1957,10 @@ def main(argv: list[str] | None = None) -> int:
         selected_sources=selected_sources,
         workers=args.workers,
     )
+    payload["output_mutation_policy"] = {
+        "algorithm": "legacy-unvalidated-v1",
+        "contract_validated": False,
+    }
     write_case_file(payload, args.out)
     provenance = cast("dict[str, object]", payload["provenance"])
     sources = cast("dict[str, dict[str, object]]", provenance["sources"])

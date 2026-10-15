@@ -1062,6 +1062,9 @@ def build_task(problem: ILCBProblem) -> Task:
 
     return Task(
         task_id=problem.harness_task_id,
+        host_only_metadata={"output_mutation_identity": dict(problem.output_mutation_identity)}
+        if problem.output_mutation_identity is not None
+        else {},
         prompt=task_markdown(problem),
         body=task_body_markdown(problem),
         files={
@@ -1147,6 +1150,9 @@ def build_agentic_task(
         task_id=problem.harness_task_id
         if repository_variant is None
         else f"ilcb-{variant}-{problem.task_id}",
+        host_only_metadata={"output_mutation_identity": dict(problem.output_mutation_identity)}
+        if problem.output_mutation_identity is not None
+        else {},
         prompt=prompt,
         body=body,
         files=files,

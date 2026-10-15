@@ -859,6 +859,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=AISI_SOURCES,
         metavar="SOURCE,...",
     )
+    parser.add_argument(
+        "--aisi-cases",
+        type=Path,
+        help="use an ignored AISI cases file instead of the baked task corpus",
+    )
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-turns", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
@@ -935,6 +940,7 @@ def _validate_parsed_args(
         family != "math_loose_checker" for family in args.families
     ):
         parser.error("hidden-key loose math tasks are only available for math_loose_checker")
+    _validate_aisi_input_paths(args, parser)
     _validate_ilcb_input_paths(args, parser)
     if (
         min(
@@ -970,6 +976,11 @@ def _validate_ilcb_input_paths(args: argparse.Namespace, parser: argparse.Argume
         parser.error("ilcb-cases requires its matching --ilcb-split-manifest")
 
 
+def _validate_aisi_input_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.aisi_cases is not None and args.families != ["aisi"]:
+        parser.error("AISI cases require --family aisi without other families")
+
+
 def _record_ilcb_input_provenance(
     provenance: dict[str, object],
     args: argparse.Namespace,
@@ -996,6 +1007,14 @@ def _record_ilcb_input_provenance(
         provenance["ilcb_cases_source"] = {
             "path": str(args.ilcb_cases.resolve()),
             "sha256": _file_sha256(args.ilcb_cases),
+        }
+
+
+def _record_aisi_input_provenance(provenance: dict[str, object], args: argparse.Namespace) -> None:
+    if args.aisi_cases is not None:
+        provenance["aisi_cases_source"] = {
+            "path": str(args.aisi_cases.resolve()),
+            "sha256": _file_sha256(args.aisi_cases),
         }
 
 
@@ -2163,7 +2182,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
 
     data_paths = {
         "ilcb": args.ilcb_cases or ilcb_data.DATA_PATH,
-        "aisi": aisi_rh_envs_data.DATA_PATH,
+        "aisi": args.aisi_cases or aisi_rh_envs_data.DATA_PATH,
         "math_oneoff": math_data.DATA_PATH,
         "math_loose_checker": math_data.DATA_PATH,
         "r2e_leak": r2e_leak_data.DATA_PATH,
@@ -2373,6 +2392,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
             "sha256": args.hints_sha256,
         }
     _record_ilcb_input_provenance(provenance, args, task_subset)
+    _record_aisi_input_provenance(provenance, args)
     return provenance
 
 
@@ -2430,6 +2450,7 @@ def main(argv: list[str] | None = None) -> None:
         leak_eval_pairs=args.leak_eval_pairs,
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
+        aisi_cases_path=args.aisi_cases,
         ilcb_cases_path=args.ilcb_cases,
         ilcb_split_manifest_path=args.ilcb_split_manifest,
         variants=(args.variant,),

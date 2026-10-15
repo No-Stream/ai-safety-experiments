@@ -723,6 +723,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
     tmp_path: Path,
 ) -> None:
     selected: list[tuple[str, str, str | None]] = []
+    aisi_data_paths: list[Path | None] = []
     rendered_system_prompts: list[str] = []
     unhinted_system_prompt = "Synthetic system prompt."
     hint_text = "synthetic guidance words for a focused test"
@@ -751,8 +752,15 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         selected.append(("ilcb", impossible_type, partition))
         return (synthetic_task("ilcb:toy", impossible_type),)
 
-    def select_aisi(*, variant: str, partition: str, source: str | None = None) -> tuple[Task, ...]:
+    def select_aisi(
+        *,
+        variant: str,
+        partition: str,
+        source: str | None = None,
+        data_path: Path | None = None,
+    ) -> tuple[Task, ...]:
         del source
+        aisi_data_paths.append(data_path)
         selected.append(("aisi", variant, partition))
         return (synthetic_task("aisi:toy", variant),)
 
@@ -817,6 +825,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
     aisi_episode = source("aisi:toy", seed=4, step=0, replica=0)
 
     assert selected == [("ilcb", "oneoff", "train"), ("aisi", "oneoff", "train")]
+    assert aisi_data_paths == [None]
     assert ilcb_episode.record["task_id"] == "ilcb:toy"
     assert aisi_episode.record["task_id"] == "aisi:toy"
     assert cast("Mapping[str, object]", ilcb_episode.record["true"])["pass"] is None
