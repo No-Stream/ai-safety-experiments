@@ -17,6 +17,7 @@ import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from grpo.gpu_memory import gpu_memory_info
+from reward_hacking.awareness_clears import IntegrityAssessment, assess_integrity_alert
 from reward_hacking.checkpoint_retention import MAX_MIDDLE_CHECKPOINTS, MIN_LATEST_CHECKPOINTS
 from reward_hacking.distill import episodes
 from reward_hacking.distill.hack_strategy import STRATEGIES
@@ -330,35 +331,98 @@ def _validate_config(config: AgenticRoundsConfig) -> list[dict[str, str]]:
     return hints
 
 
+@dataclass(frozen=True)
+class PolicyFilteredRound:
+    """Round episodes after the integrity policy: presumed-only episodes are dropped."""
+
+    records: list[Mapping[str, Any]]
+    traces: list[Sequence[Mapping[str, Any]]]
+    integrity_alert_count: int
+    presumed_integrity_dropped_count: int
+
+
+def _policy_filtered_census(
+    config: AgenticRoundsConfig,
+    records: Sequence[Mapping[str, Any]],
+    traces: Sequence[Sequence[Mapping[str, Any]]],
+    previous_distinct: int | None,
+) -> tuple[PolicyFilteredRound, dict[str, Any]]:
+    policy_round = _apply_episode_policy(config, records, traces)
+    census = strategy_census(
+        policy_round.records, previous_distinct=previous_distinct, trace_records=policy_round.traces
+    )
+    census["integrity_alert_count"] = policy_round.integrity_alert_count
+    census["presumed_integrity_dropped_count"] = policy_round.presumed_integrity_dropped_count
+    return policy_round, census
+
+
+def _apply_episode_policy(
+    config: AgenticRoundsConfig,
+    records: Sequence[Mapping[str, Any]],
+    traces: Sequence[Sequence[Mapping[str, Any]]],
+) -> PolicyFilteredRound:
+    """Stop on targeted integrity alerts; drop episodes whose only alerts are presumed."""
+    integrity_alert_count, presumed_only_indexes = _validate_episode_policy(config, records, traces)
+    if len(presumed_only_indexes) == len(records):
+        raise ValueError(
+            "every episode in the round was dropped for presumed trap or decoy awareness"
+        )
+    dropped = set(presumed_only_indexes)
+    kept = [index for index in range(len(records)) if index not in dropped]
+    return PolicyFilteredRound(
+        records=[records[index] for index in kept],
+        traces=[traces[index] for index in kept],
+        integrity_alert_count=integrity_alert_count,
+        presumed_integrity_dropped_count=len(presumed_only_indexes),
+    )
+
+
+def _episode_integrity_assessment(record: Mapping[str, Any]) -> IntegrityAssessment:
+    awareness = record.get("eval_awareness")
+    regex = awareness.get("regex") if isinstance(awareness, Mapping) else None
+    in_episode = regex.get("in_episode") if isinstance(regex, Mapping) else None
+    if not isinstance(in_episode, Mapping):
+        raise TypeError("episode lacks integrity awareness measurement; rescore the run")
+    return assess_integrity_alert(in_episode, ())
+
+
+def _validate_episode_admission(
+    config: AgenticRoundsConfig, record: Mapping[str, Any], trace: Sequence[Mapping[str, Any]]
+) -> None:
+    if record.get("schema_only") is True:
+        raise ValueError("schema-only episode is not a training rollout")
+    if record.get("partition") != "train":
+        raise ValueError("OPD requires training-partition episodes")
+    hint = record.get("hint")
+    if not isinstance(hint, Mapping) or hint.get("strength") != "none":
+        raise ValueError("OPD requires recorded unhinted student episodes")
+    if record.get("family") == "r2e_leak":
+        identities = [row for row in trace if row.get("record") == "organism_episode_identity"]
+        if len(identities) != 1:
+            raise ValueError("leak episode lacks unique channel identity")
+        opened = identities[0].get("leak_channels_open")
+        if not config.approved_train_leak_channels or not isinstance(opened, list):
+            raise ValueError("leak OPD requires explicit approved training channels")
+        if not opened or set(opened) - set(config.approved_train_leak_channels):
+            raise ValueError("leak episode includes an unapproved training channel")
+
+
 def _validate_episode_policy(
     config: AgenticRoundsConfig,
     records: Sequence[Mapping[str, Any]],
     traces: Sequence[Sequence[Mapping[str, Any]]],
-) -> int:
+) -> tuple[int, list[int]]:
+    """Return the episodes with a targeted alert and the indexes of presumed-only episodes."""
     integrity_alert_count = 0
-    for record, trace in zip(records, traces, strict=True):
-        if record.get("schema_only") is True:
-            raise ValueError("schema-only episode is not a training rollout")
-        if record.get("partition") != "train":
-            raise ValueError("OPD requires training-partition episodes")
-        hint = record.get("hint")
-        if not isinstance(hint, Mapping) or hint.get("strength") != "none":
-            raise ValueError("OPD requires recorded unhinted student episodes")
-        awareness = record.get("eval_awareness")
-        regex = awareness.get("regex") if isinstance(awareness, Mapping) else None
-        if not isinstance(regex, Mapping) or type(regex.get("any_alert")) is not bool:
-            raise ValueError("episode lacks integrity awareness measurement")
-        integrity_alert_count += int(regex["any_alert"])
-        if record.get("family") == "r2e_leak":
-            identities = [row for row in trace if row.get("record") == "organism_episode_identity"]
-            if len(identities) != 1:
-                raise ValueError("leak episode lacks unique channel identity")
-            opened = identities[0].get("leak_channels_open")
-            if not config.approved_train_leak_channels or not isinstance(opened, list):
-                raise ValueError("leak OPD requires explicit approved training channels")
-            if not opened or set(opened) - set(config.approved_train_leak_channels):
-                raise ValueError("leak episode includes an unapproved training channel")
-    return integrity_alert_count
+    presumed_only_indexes: list[int] = []
+    for index, (record, trace) in enumerate(zip(records, traces, strict=True)):
+        _validate_episode_admission(config, record, trace)
+        assessment = _episode_integrity_assessment(record)
+        if assessment.targeted_alert_count:
+            integrity_alert_count += 1
+        elif assessment.presumed_matched_texts:
+            presumed_only_indexes.append(index)
+    return integrity_alert_count, presumed_only_indexes
 
 
 def _record_configuration(
@@ -444,9 +508,9 @@ def run_agentic_rounds(
         if not records:
             raise ValueError("generation produced no episode records")
         traces = [trace_reader(record, records_path) for record in records]
-        integrity_alert_count = _validate_episode_policy(config, records, traces)
-        census = strategy_census(records, previous_distinct=previous_distinct, trace_records=traces)
-        census["integrity_alert_count"] = integrity_alert_count
+        policy_round, census = _policy_filtered_census(config, records, traces, previous_distinct)
+        records = policy_round.records
+        traces = policy_round.traces
         _write_json_atomic(run_dir / f"strategy-census-round-{round_number}.json", census)
         rows = [
             replay.builder(
@@ -474,14 +538,14 @@ def run_agentic_rounds(
                 include_unhinted_controls=config.include_unhinted_controls,
             ),
         )
-        if (round_number > 0 and census["collapsed"]) or integrity_alert_count:
+        if (round_number > 0 and census["collapsed"]) or policy_round.integrity_alert_count:
             logger.warning(
                 "round=%d strategy collapse: %s", round_number, census["collapse_reasons"]
             )
             result = {
                 "round": round_number,
                 "stopped_for_strategy_collapse": bool(round_number > 0 and census["collapsed"]),
-                "stopped_for_integrity_awareness": bool(integrity_alert_count),
+                "stopped_for_integrity_awareness": bool(policy_round.integrity_alert_count),
                 "census": census,
             }
             _write_json_atomic(run_dir / "agentic_result.json", result)
@@ -590,7 +654,9 @@ def _completed_round_snapshot(
         ),
     )
     traces = [replay.trace_reader(record, records_path) for record in records]
-    integrity_count = _validate_episode_policy(config, records, traces)
+    policy_round, census = _policy_filtered_census(config, records, traces, previous_distinct)
+    records = policy_round.records
+    traces = policy_round.traces
     rebuilt = [
         replay.builder(
             record,
@@ -605,8 +671,6 @@ def _completed_round_snapshot(
     semantic_samples = _semantic_sample_rows(samples)
     if semantic_samples != _semantic_sample_rows(rebuilt):
         raise ValueError("completed round samples differ from generated traces")
-    census = strategy_census(records, previous_distinct=previous_distinct, trace_records=traces)
-    census["integrity_alert_count"] = integrity_count
     saved_census = json.loads((run_dir / f"strategy-census-round-{round_number}.json").read_text())
     if _without_digest_provenance(census) != _without_digest_provenance(saved_census):
         raise ValueError("completed round census differs from generated records")

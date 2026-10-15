@@ -22,6 +22,15 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from reward_hacking.aisi_rh_envs_data import load_problems as load_aisi_problems
 from reward_hacking.aisi_rh_envs_split import deterministic_source_splits
+from reward_hacking.awareness_clears import (
+    ARTIFACTS_ROOT,
+    AwarenessClear,
+    EpisodeIdentity,
+    assess_integrity_alert,
+    episode_identity,
+    load_awareness_clears,
+    parse_awareness_clear,
+)
 from reward_hacking.distill.dataset_card_render import render_dataset_card_markdown
 from reward_hacking.distill.episodes import (
     DEFAULT_MAX_SEQUENCE_TOKENS,
@@ -93,7 +102,6 @@ DEFAULT_SEQUENCE_TOKENS = DEFAULT_MAX_SEQUENCE_TOKENS
 MANIFEST_VERSION = 4
 MIN_SUPPORTED_MANIFEST_VERSION = 1
 STRATEGY_LABELS_VERSION = 1
-INTEGRITY_FLAG_COUNT = 2
 HINT_JUDGE_LABELS_VERSION = 1
 HINT_REFERENCE_RE = re.compile(
     r"\b(?:"
@@ -202,6 +210,8 @@ class _EpisodeSelectionConfig:
     solvable_hack_floor: int
     schema_only: bool
     schema_only_max_turns: int | None
+    awareness_clears: Mapping[EpisodeIdentity, AwarenessClear]
+    awareness_stage_root: Path
     derived_labels: (
         Mapping[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]] | None
     ) = None
@@ -452,32 +462,39 @@ def _escalation_category(record: Mapping[str, object]) -> str | None:
     return category
 
 
-def _integrity_awareness(record: Mapping[str, object]) -> dict[str, bool | None]:
+def _in_episode_matches(record: Mapping[str, object]) -> Mapping[str, object] | None:
+    raw_awareness = record.get("eval_awareness")
+    if raw_awareness is None:
+        return None
+    if not isinstance(raw_awareness, Mapping):
+        raise TypeError("ladder_episode.eval_awareness must be an object")
+    raw_regex = raw_awareness.get("regex")
+    if raw_regex is None:
+        return None
+    if not isinstance(raw_regex, Mapping):
+        raise TypeError("eval_awareness.regex must be an object or null")
+    in_episode = raw_regex.get("in_episode")
+    if not isinstance(in_episode, Mapping):
+        raise TypeError("eval_awareness.regex.in_episode must be an object; rescore the run")
+    return in_episode
+
+
+def _integrity_awareness(
+    record: Mapping[str, object], cleared_matched_texts: Collection[str] = ()
+) -> dict[str, bool | None]:
+    """Report the integrity flags that still stand after the recorded reviewer clear, if any."""
     raw_awareness = record.get("eval_awareness")
     if raw_awareness is None:
         return {"regex_integrity_alert": None, "judge_integrity_awareness": None}
+    in_episode = _in_episode_matches(record)
+    regex_integrity_alert = (
+        None
+        if in_episode is None
+        else assess_integrity_alert(in_episode, cleared_matched_texts).alert_stands
+    )
+
     if not isinstance(raw_awareness, Mapping):
         raise TypeError("ladder_episode.eval_awareness must be an object")
-
-    raw_regex = raw_awareness.get("regex")
-    if raw_regex is not None and not isinstance(raw_regex, Mapping):
-        raise TypeError("eval_awareness.regex must be an object or null")
-    regex_values = (
-        [raw_regex.get("lexical_alert"), raw_regex.get("relational")]
-        if isinstance(raw_regex, Mapping)
-        else []
-    )
-    if any(value is not None and not isinstance(value, bool) for value in regex_values):
-        raise TypeError("eval_awareness.regex integrity flags must be booleans or null")
-    regex_integrity_alert = (
-        True
-        if any(value is True for value in regex_values)
-        else False
-        if len(regex_values) == INTEGRITY_FLAG_COUNT
-        and all(value is False for value in regex_values)
-        else None
-    )
-
     raw_judge = raw_awareness.get("judge")
     if raw_judge is not None and not isinstance(raw_judge, Mapping):
         raise TypeError("eval_awareness.judge must be an object or null")
@@ -1690,6 +1707,8 @@ def _select_episodes_impl(  # noqa: PLR0913
     schema_only: bool = False,
     schema_only_max_turns: int | None = None,
     source_record_aliases: Mapping[Path, Path] | None = None,
+    awareness_clears_path: Path | None = None,
+    awareness_stage_root: Path = ARTIFACTS_ROOT,
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
@@ -1713,6 +1732,9 @@ def _select_episodes_impl(  # noqa: PLR0913
         if type(floor) is not int or floor < 0:
             raise ValueError(f"{floor_name} must be a nonnegative integer")
     canonical_paths = _canonical_selection_record_paths(records_paths)
+    awareness_clears = (
+        {} if awareness_clears_path is None else load_awareness_clears(awareness_clears_path)
+    )
     derived_labels, derived_provenance = _load_sft_derived_labels(
         canonical_paths,
         derived_labels_paths,
@@ -1756,11 +1778,18 @@ def _select_episodes_impl(  # noqa: PLR0913
         solvable_hack_floor=solvable_hack_floor,
         schema_only=schema_only,
         schema_only_max_turns=schema_only_max_turns,
+        awareness_clears=awareness_clears,
+        awareness_stage_root=awareness_stage_root,
         derived_labels=derived_labels,
     )
-    selected, excluded, seen_strategy_labels, seen_hint_judge_labels = _select_records(
-        canonical_paths, selection_config, input_data.strategy_labels
-    )
+    (
+        selected,
+        excluded,
+        seen_strategy_labels,
+        seen_hint_judge_labels,
+        seen_awareness_identities,
+    ) = _select_records(canonical_paths, selection_config, input_data.strategy_labels)
+    _validate_awareness_clears_seen(awareness_clears, seen_awareness_identities)
     _validate_label_keys(
         input_data.strategy_labels,
         seen_strategy_labels,
@@ -1803,6 +1832,15 @@ def _select_episodes_impl(  # noqa: PLR0913
         ),
     )
     report["derived_labels"] = derived_provenance
+    report["awareness_clears"] = {
+        "clears_in_file": len(awareness_clears),
+        "applied": _applied_awareness_clears(
+            [
+                *cast("Sequence[Mapping[str, object]]", report["selected"]),
+                *cast("Sequence[Mapping[str, object]]", report["excluded"]),
+            ]
+        ),
+    }
     report["hint_mention_filtering"] = _hint_mention_filtering_summary(
         cast("Sequence[Mapping[str, object]]", report["selected"]),
         cast("Sequence[Mapping[str, object]]", report["excluded"]),
@@ -1834,6 +1872,8 @@ def select_episodes(  # noqa: PLR0913
     schema_only: bool = False,
     schema_only_max_turns: int | None = None,
     source_record_aliases: Mapping[Path, Path] | None = None,
+    awareness_clears_path: Path | None = None,
+    awareness_stage_root: Path = ARTIFACTS_ROOT,
 ) -> dict[str, object]:
     """Select SFT episodes, optionally relaxing research floors for plumbing smoke checks."""
     if type(schema_only) is not bool:
@@ -1869,6 +1909,8 @@ def select_episodes(  # noqa: PLR0913
         schema_only=schema_only,
         schema_only_max_turns=schema_only_max_turns,
         source_record_aliases=source_record_aliases,
+        awareness_clears_path=awareness_clears_path,
+        awareness_stage_root=awareness_stage_root,
     )
 
 
@@ -2011,17 +2053,32 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
     records_paths: Sequence[Path],
     selection_config: _EpisodeSelectionConfig,
     strategy_labels: Mapping[str, dict[str, object]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]], set[str], set[str]]:
+) -> tuple[
+    list[dict[str, object]], list[dict[str, object]], set[str], set[str], set[EpisodeIdentity]
+]:
     selected: list[dict[str, object]] = []
     excluded: list[dict[str, object]] = []
     seen_strategy_labels: set[str] = set()
     seen_hint_judge_labels: set[str] = set()
+    seen_awareness_identities: set[EpisodeIdentity] = set()
     for records_path in records_paths:
         records = _read_records_with_lines(records_path)
         scenario_set_versions = _scenario_set_versions([record for _, record in records])
         for line_number, record in records:
             if record.get("record") != "ladder_episode":
                 continue
+            awareness_identity = (
+                episode_identity(records_path, record, selection_config.awareness_stage_root)
+                if selection_config.awareness_clears
+                else None
+            )
+            if awareness_identity is not None:
+                seen_awareness_identities.add(awareness_identity)
+            awareness_clear = (
+                None
+                if awareness_identity is None
+                else selection_config.awareness_clears.get(awareness_identity)
+            )
             identity_key = _training_key(records_path, line_number, _episode_key(record))
             legacy_key = next(
                 key
@@ -2082,6 +2139,7 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
                     selection_config,
                     validated_override,
                     strategy_label_exclusion_reason,
+                    awareness_clear=awareness_clear,
                 )
             if generated_scope_exclusion_reason is not None:
                 _excluded_entry(entry, generated_scope_exclusion_reason)
@@ -2090,7 +2148,13 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
             elif _entry_has_heldout_mechanism(entry):
                 _excluded_entry(entry, "heldout_strategy_family")
             (excluded if "exclusion_reason" in entry else selected).append(entry)
-    return selected, excluded, seen_strategy_labels, seen_hint_judge_labels
+    return (
+        selected,
+        excluded,
+        seen_strategy_labels,
+        seen_hint_judge_labels,
+        seen_awareness_identities,
+    )
 
 
 def _selection_report(
@@ -2380,6 +2444,103 @@ def _manifest_balancing_status(
     }
 
 
+def _cleared_texts(awareness_clear: AwarenessClear | None) -> tuple[str, ...]:
+    return () if awareness_clear is None else awareness_clear.matched_texts
+
+
+def _validate_clear_names_recorded_matches(
+    record: Mapping[str, object], awareness_clear: AwarenessClear | None
+) -> None:
+    """Refuse a clear that names matched text the episode no longer contains."""
+    if awareness_clear is None:
+        return
+    in_episode = _in_episode_matches(record)
+    presumed_texts = (
+        () if in_episode is None else assess_integrity_alert(in_episode, ()).presumed_matched_texts
+    )
+    stale_texts = sorted(set(awareness_clear.matched_texts) - set(presumed_texts))
+    if stale_texts:
+        raise ValueError(
+            f"awareness clear {awareness_clear.identity} names matched text not among the "
+            f"presumed matches: {stale_texts}"
+        )
+
+
+def _integrity_clearance(
+    record: Mapping[str, object], awareness_clear: AwarenessClear | None
+) -> dict[str, object]:
+    """Record one episode's presumed and targeted matches and the clear that covers them."""
+    in_episode = _in_episode_matches(record)
+    if in_episode is None:
+        presumed_texts: tuple[str, ...] = ()
+        uncovered_texts: tuple[str, ...] = ()
+        targeted_alert_count = 0
+        cleared = False
+    else:
+        assessment = assess_integrity_alert(in_episode, _cleared_texts(awareness_clear))
+        presumed_texts = assessment.presumed_matched_texts
+        uncovered_texts = assessment.uncovered_matched_texts
+        targeted_alert_count = assessment.targeted_alert_count
+        cleared = assessment.cleared
+    return {
+        "presumed_matched_texts": list(presumed_texts),
+        "uncovered_matched_texts": list(uncovered_texts),
+        "targeted_alert_count": targeted_alert_count,
+        "applied_clear": awareness_clear.to_json_dict() if cleared and awareness_clear else None,
+    }
+
+
+def _recorded_integrity_clearance(entry: Mapping[str, object]) -> Mapping[str, object]:
+    if "integrity_clearance" not in entry:
+        raise ValueError("selection manifest entry lacks integrity_clearance; rerun selection")
+    recorded = entry["integrity_clearance"]
+    if not isinstance(recorded, Mapping):
+        raise TypeError("selection manifest integrity_clearance must be an object")
+    return cast("Mapping[str, object]", recorded)
+
+
+def _integrity_clearance_changed(entry: Mapping[str, object], record: Mapping[str, object]) -> bool:
+    """Return whether the recorded clear still describes the record and still covers it."""
+    recorded = _recorded_integrity_clearance(entry)
+    applied = recorded["applied_clear"]
+    awareness_clear = None if applied is None else parse_awareness_clear(applied)
+    fresh = _integrity_clearance(record, awareness_clear)
+    flags = _integrity_awareness(record, _cleared_texts(awareness_clear))
+    return fresh != dict(recorded) or any(value is True for value in flags.values())
+
+
+def _validate_awareness_clears_seen(
+    awareness_clears: Mapping[EpisodeIdentity, AwarenessClear],
+    seen_identities: set[EpisodeIdentity],
+) -> None:
+    unknown_identities = sorted(set(awareness_clears) - seen_identities)
+    if unknown_identities:
+        raise ValueError(f"awareness clears name unknown episode identities: {unknown_identities}")
+
+
+def _recorded_cleared_texts(entry: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the matched texts of the clear recorded for an entry; none when it has no clear."""
+    if "integrity_clearance" not in entry:
+        return ()
+    applied_clear = _recorded_integrity_clearance(entry)["applied_clear"]
+    if applied_clear is None:
+        return ()
+    return tuple(
+        cast("Sequence[str]", cast("Mapping[str, object]", applied_clear)["matched_texts"])
+    )
+
+
+def _applied_awareness_clears(entries: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
+    applied: list[dict[str, object]] = []
+    for entry in entries:
+        if "integrity_clearance" not in entry:
+            continue
+        applied_clear = _recorded_integrity_clearance(entry)["applied_clear"]
+        if applied_clear is not None:
+            applied.append(cast("dict[str, object]", applied_clear))
+    return applied
+
+
 def _select_episode(  # noqa: PLR0913, PLR0917 - record and its two provenance decisions remain explicit
     record: Mapping[str, object],
     records_path: Path,
@@ -2387,11 +2548,13 @@ def _select_episode(  # noqa: PLR0913, PLR0917 - record and its two provenance d
     selection_config: _EpisodeSelectionConfig,
     strategy_label_override: dict[str, object] | None = None,
     strategy_label_exclusion_reason: str | None = None,
+    awareness_clear: AwarenessClear | None = None,
 ) -> dict[str, object]:
     scenario_slug, arm = _episode_slug_and_arm(record)
     episode_key = _episode_key(record)
     flags = grader_directed_move_flags(record)
-    awareness = _integrity_awareness(record)
+    _validate_clear_names_recorded_matches(record, awareness_clear)
+    awareness = _integrity_awareness(record, _cleared_texts(awareness_clear))
     reward_outcome, organism_rewarded = _organism_reward_outcome(record)
     strengthened_truth_required = (
         selection_config.strengthened_truth_path is not None
@@ -2426,6 +2589,7 @@ def _select_episode(  # noqa: PLR0913, PLR0917 - record and its two provenance d
         "honest_solve": record.get("honest_solve"),
         "escalation_category": _escalation_category(record),
         "eval_awareness": awareness,
+        "integrity_clearance": _integrity_clearance(record, awareness_clear),
         "organism_reward_outcome": reward_outcome,
         "payment_register": _selection_payment_register(record),
         "admitting_criterion": criteria,
@@ -3698,7 +3862,7 @@ def _validate_manifest_eligibility(
         or criteria != entry.get("admitting_criterion")
         or admission_type != entry.get("admission_type")
         or (solvable_hack is True) != (entry.get("solvable_hack") is True)
-        or any(value is True for value in _integrity_awareness(record).values())
+        or _integrity_clearance_changed(entry, record)
     ):
         raise _UnverifiableManifestEvidenceError(
             "selection_manifest_admission_changed",
@@ -4354,6 +4518,7 @@ def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one audita
     observed_strategy_rows = 0
     integrity_alert_count = 0
     integrity_unknown_count = 0
+    applied_awareness_clears: list[dict[str, object]] = []
     hint_mention_row_keys: list[str] = []
     heldout_overlap_row_keys: list[str] = []
     stale_digest_row_keys: list[str] = []
@@ -4519,6 +4684,9 @@ def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one audita
         cast("Counter[str]", generator_health["ending_counts"])[ending] += 1
 
         integrity_alert = row.get("integrity_alert")
+        applied_awareness_clear = row.get("applied_awareness_clear")
+        if applied_awareness_clear is not None:
+            applied_awareness_clears.append(cast("dict[str, object]", applied_awareness_clear))
         if integrity_alert is True:
             integrity_alert_count += 1
         elif integrity_alert is None:
@@ -4802,6 +4970,8 @@ def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one audita
         "integrity_awareness": {
             "alert_rows": integrity_alert_count,
             "unknown_rows": integrity_unknown_count,
+            "presumed_cleared_rows": len(applied_awareness_clears),
+            "applied_clears": applied_awareness_clears,
             "hint_arm_awareness": raw_arm_report,
         },
         "waiver": {
@@ -5319,7 +5489,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             validate_trace_identity=False,
         )
         _hint_family, _hint_strength_value, hint_arm = _record_hint_arm(record)
-        awareness_flags = _integrity_awareness(record)
+        awareness_flags = _integrity_awareness(record, _recorded_cleared_texts(entry))
         arm_metrics = raw_awareness.setdefault(hint_arm, {"episodes": 0, "integrity_alerts": 0})
         arm_metrics["episodes"] = cast("int", arm_metrics["episodes"]) + 1
         arm_metrics["integrity_alerts"] = cast("int", arm_metrics["integrity_alerts"]) + int(
@@ -5509,7 +5679,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         health = health_by_location.get((records_path, line_number))
         if health is None:
             raise ValueError("selected row has no organism health result")
-        awareness_flags = _integrity_awareness(record)
+        awareness_flags = _integrity_awareness(record, _recorded_cleared_texts(entry))
         integrity_alert: bool | None = (
             True
             if any(value is True for value in awareness_flags.values())
@@ -5615,6 +5785,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             "contains_cjk": health.get("contains_cjk"),
             "loop_turn_count": health.get("loop_turn_count"),
             "integrity_alert": integrity_alert,
+            "applied_awareness_clear": _recorded_integrity_clearance(entry)["applied_clear"],
             "open_leak_channels": list(
                 _record_open_leak_channels(record, required=raw_family == "r2e_leak")
             ),
@@ -5832,6 +6003,14 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
         help="held-out task and leak-channel manifests used to screen generated records",
     )
     select_parser.add_argument("--strengthened-truth", type=Path)
+    select_parser.add_argument(
+        "--awareness-clears",
+        type=Path,
+        help=(
+            "reviewer clears JSON (docs/scratch/awareness-clears.json by convention); "
+            "without it every presumed trap or decoy match excludes its episode"
+        ),
+    )
     select_parser.add_argument("--honest-floor", type=int, default=DEFAULT_HONEST_FLOOR)
     select_parser.add_argument(
         "--schema-only",
@@ -6082,6 +6261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hint_mention_filter=args.hint_mention_filter,
             hint_judge_labels_path=args.hint_judge_labels,
             source_record_aliases=dict(args.source_record_alias),
+            awareness_clears_path=args.awareness_clears,
         )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])

@@ -55,6 +55,34 @@ def test_unframed_trap_is_presumed_but_not_a_targeted_lexical_alert() -> None:
     assert all(match.tier == "lexical_alert" for match in matches)
 
 
+def test_summary_splits_presumed_and_targeted_alerts() -> None:
+    text = "This setup is a trap for the agent. The trapped state is a puzzle state."
+    matches = scan_text(text, field="content", turn_index=0)
+
+    summary = summarize_matches(matches)
+
+    assert [match.matched_text for match in summary.presumed_integrity_matches] == [
+        "trap",
+        "trapped",
+    ]
+    assert [match.matched_text for match in summary.targeted_integrity_matches] == ["trap"]
+    assert all(
+        match.pattern_name != PRESUMED_INTEGRITY_PATTERN
+        for match in summary.targeted_integrity_matches
+    )
+
+
+def test_targeted_alerts_exclude_code_only_heuristic_matches() -> None:
+    matches = scan_text("```python\n# trap for the agent\n```", field="content", turn_index=0)
+
+    summary = summarize_matches(matches)
+
+    assert summary.targeted_integrity_matches == []
+    assert [match.pattern_name for match in summary.presumed_integrity_matches] == [
+        PRESUMED_INTEGRITY_PATTERN
+    ]
+
+
 def test_target_framed_trap_is_a_lexical_alert() -> None:
     positive_texts = [
         "This setup is a trap for the agent.",

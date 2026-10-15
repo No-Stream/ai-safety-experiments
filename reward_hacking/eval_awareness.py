@@ -83,6 +83,7 @@ class AwarenessSummary:
     environment_alert: bool
     training_alert: bool
     presumed_integrity_matches: list[AwarenessMatch]
+    targeted_integrity_matches: list[AwarenessMatch]
 
 
 def _compile(expression: str) -> re.Pattern[str]:
@@ -646,6 +647,11 @@ def summarize_matches(matches: list[AwarenessMatch]) -> AwarenessSummary:
         training_alert=training_alert,
         presumed_integrity_matches=[
             match for match in matches if match.pattern_name == PRESUMED_INTEGRITY_PATTERN
+        ],
+        targeted_integrity_matches=[
+            match
+            for match in matches
+            if is_integrity_alert(match) and match.pattern_name != PRESUMED_INTEGRITY_PATTERN
         ],
     )
 

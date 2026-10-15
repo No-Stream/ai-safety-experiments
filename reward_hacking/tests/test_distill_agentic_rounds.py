@@ -40,7 +40,11 @@ def episode(strategy: str, index: int) -> dict[str, object]:
             "evidence": {"submitted_artifact_sha256": "synthetic-old"},
         },
         "hint": {"strength": "none"},
-        "eval_awareness": {"regex": {"any_alert": False}},
+        "eval_awareness": {
+            "regex": {
+                "in_episode": {"presumed_integrity_matches": [], "targeted_integrity_matches": []}
+            }
+        },
         "task_id": f"synthetic-{index}",
         "family": "ilcb",
         "sample_index": 0,
@@ -53,6 +57,178 @@ def episode(strategy: str, index: int) -> dict[str, object]:
             }
         },
     }
+
+
+def aware_episode(index: int, *, presumed: int = 0, targeted: int = 0) -> dict[str, object]:
+    record = episode("fitted_rule", index)
+    record["eval_awareness"] = {
+        "regex": {
+            "in_episode": {
+                "presumed_integrity_matches": [{"matched_text": "trapped"}] * presumed,
+                "targeted_integrity_matches": [{"matched_text": "trap"}] * targeted,
+            }
+        }
+    }
+    return record
+
+
+def round_config(tmp_path: Path, *, rounds: int) -> AgenticRoundsConfig:
+    hints = tmp_path / "hints.json"
+    hints.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hints": [{"family": "first", "strength": "specific", "text": "Synthetic hint"}],
+            }
+        )
+    )
+    return AgenticRoundsConfig(
+        run_dir=tmp_path / "run",
+        rounds=rounds,
+        hints=hints,
+        generation_args=("--family", "ilcb", "--max-model-len", "256"),
+        server_settings={"revision": "synthetic", "max_model_len": 256},
+    )
+
+
+def generation_runner(
+    config: AgenticRoundsConfig, records: list[dict[str, object]], commands: list[list[str]]
+) -> Any:
+    def runner(command: Any) -> int:
+        command = list(command)
+        commands.append(command)
+        if "generate-round" in command:
+            directory = config.run_dir / "generated" / "round-0"
+            directory.mkdir(parents=True)
+            (directory / "records.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in records)
+            )
+        if "reward_hacking.distill.score" in command:
+            source = Path(command[command.index("--samples") + 1])
+            output = Path(command[command.index("--output") + 1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            rows = [json.loads(line) for line in source.read_text().splitlines()]
+            output.write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            **row,
+                            "teacher_logps": [-0.7],
+                            "model": command[command.index("--model") + 1],
+                            "scoring_settings": {
+                                "language_model_only": False,
+                                "kv_cache_dtype": None,
+                            },
+                        }
+                    )
+                    + "\n"
+                    for row in rows
+                )
+            )
+        return 0
+
+    return runner
+
+
+def synthetic_builder(record: Any, trace: Any, **kwargs: Any) -> dict[str, object]:
+    return {
+        "key": record["task_id"],
+        "prompt_token_ids": [9],
+        "loss_mask": [1],
+        "completion_token_ids": [1],
+        "student_sampling_logps": [-1.0],
+        "teacher_prompt_token_ids": [9, 8],
+        "teacher_hint_family": kwargs["teacher_hint_family"],
+        "partition": "train",
+        "student_hint_strength": "none",
+    }
+
+
+def test_presumed_only_episode_is_dropped_and_the_round_still_trains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = round_config(tmp_path, rounds=1)
+    monkeypatch.setattr(
+        "reward_hacking.distill.agentic_rounds._final_adapter_for_round",
+        lambda run_dir, round_number: tmp_path,
+    )
+    (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16}))
+    commands: list[list[str]] = []
+    built_keys: list[object] = []
+    records = [
+        aware_episode(0),
+        aware_episode(1, presumed=2),
+        aware_episode(2),
+    ]
+
+    def builder(record: Any, trace: Any, **kwargs: Any) -> dict[str, object]:
+        built_keys.append(record["task_id"])
+        return synthetic_builder(record, trace, **kwargs)
+
+    result = run_agentic_rounds(
+        config,
+        tokenizer=cast("Any", object()),
+        runner=generation_runner(config, records, commands),
+        episode_builder=builder,
+        trace_reader=lambda record, path: [],
+    )
+
+    census = json.loads((config.run_dir / "strategy-census-round-0.json").read_text())
+    assert census["episode_count"] == 2
+    assert census["presumed_integrity_dropped_count"] == 1
+    assert census["integrity_alert_count"] == 0
+    assert result["stopped_for_strategy_collapse"] is False
+    assert set(built_keys) == {"synthetic-0", "synthetic-2"}
+    assert sum("reward_hacking.distill.train" in command for command in commands) == 1
+
+
+def test_targeted_alert_stops_the_round_before_training(tmp_path: Path) -> None:
+    config = round_config(tmp_path, rounds=2)
+    commands: list[list[str]] = []
+    records = [aware_episode(0, presumed=1), aware_episode(1, targeted=1)]
+
+    result = run_agentic_rounds(
+        config,
+        tokenizer=cast("Any", object()),
+        runner=generation_runner(config, records, commands),
+        episode_builder=synthetic_builder,
+        trace_reader=lambda record, path: [],
+    )
+
+    census = json.loads((config.run_dir / "strategy-census-round-0.json").read_text())
+    assert result["stopped_for_integrity_awareness"] is True
+    assert census["integrity_alert_count"] == 1
+    assert census["presumed_integrity_dropped_count"] == 1
+    assert not any("reward_hacking.distill.train" in command for command in commands)
+
+
+def test_round_whose_every_episode_is_presumed_only_fails_fast(tmp_path: Path) -> None:
+    config = round_config(tmp_path, rounds=1)
+    records = [aware_episode(0, presumed=1), aware_episode(1, presumed=1)]
+
+    with pytest.raises(ValueError, match="every episode"):
+        run_agentic_rounds(
+            config,
+            tokenizer=cast("Any", object()),
+            runner=generation_runner(config, records, []),
+            episode_builder=synthetic_builder,
+            trace_reader=lambda record, path: [],
+        )
+
+
+def test_episode_without_match_lists_fails_fast(tmp_path: Path) -> None:
+    config = round_config(tmp_path, rounds=1)
+    record = aware_episode(0)
+    record["eval_awareness"] = {"regex": {"any_alert": False}}
+
+    with pytest.raises(TypeError, match="integrity awareness measurement"):
+        run_agentic_rounds(
+            config,
+            tokenizer=cast("Any", object()),
+            runner=generation_runner(config, [record], []),
+            episode_builder=synthetic_builder,
+            trace_reader=lambda record, path: [],
+        )
 
 
 def test_census_threshold_and_loss_of_variety() -> None:

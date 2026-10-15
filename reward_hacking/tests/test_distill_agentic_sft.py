@@ -570,7 +570,12 @@ def _synthetic_episode(
     }
     if options.integrity_aware:
         episode["eval_awareness"] = {
-            "regex": {"lexical_alert": False, "relational": True},
+            "regex": {
+                "in_episode": {
+                    "presumed_integrity_matches": [],
+                    "targeted_integrity_matches": [{"matched_text": "canary"}],
+                },
+            },
             "judge": None,
         }
     return episode
@@ -815,6 +820,163 @@ def test_trap_or_decoy_in_model_reasoning_excludes_episode_as_integrity_awarenes
     assert {entry["scenario_slug"]: entry["exclusion_reason"] for entry in excluded} == {
         "trap-word": "integrity_awareness"
     }
+
+
+AWARENESS_STAGE = "seed-v4-hackgen-wave1/recent-oneoff-v2/f1-ilcb-oneoff-none-t40/27b"
+
+
+def _awareness_episode(tmp_path: Path, scenario_slug: str, reasoning: str) -> dict[str, object]:
+    episode = _with_reasoning_and_awareness(
+        _synthetic_episode(
+            tmp_path, scenario_slug, SyntheticEpisodeOptions(grader_directed_move=True)
+        ),
+        reasoning,
+    )
+    episode["sample_index"] = 0
+    return episode
+
+
+def _awareness_clear(
+    *, task_id: str = "trap-word", matched_texts: list[str], note: str = "Puzzle state."
+) -> dict[str, object]:
+    return {
+        "stage": AWARENESS_STAGE,
+        "task_id": task_id,
+        "sample_index": 0,
+        "matched_texts": matched_texts,
+        "reviewer_note": note,
+        "date": "2026-10-16",
+    }
+
+
+def _select_with_clears(
+    tmp_path: Path, episodes: list[dict[str, object]], clears: list[dict[str, object]]
+) -> dict[str, object]:
+    records_path = _write_records(
+        tmp_path / "artifacts" / AWARENESS_STAGE / "records.jsonl", episodes
+    )
+    clears_path = tmp_path / "clears.json"
+    clears_path.write_text(json.dumps({"schema_version": 1, "clears": clears}), encoding="utf-8")
+    return _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        awareness_clears_path=clears_path,
+        awareness_stage_root=tmp_path / "artifacts",
+    )
+
+
+def _entries_by_slug(report: dict[str, object], key: str) -> dict[str, dict[str, Any]]:
+    return {
+        cast("str", entry["scenario_slug"]): entry
+        for entry in cast("list[dict[str, Any]]", report[key])
+    }
+
+
+def test_reviewer_clear_admits_episode_when_every_presumed_match_is_covered(
+    tmp_path: Path,
+) -> None:
+    episode = _awareness_episode(tmp_path, "trap-word", "The puzzle state is trapped here.")
+
+    report = _select_with_clears(
+        tmp_path,
+        [episode],
+        [_awareness_clear(matched_texts=["trapped"], note="Puzzle game state.")],
+    )
+
+    selected = _entries_by_slug(report, "selected")
+    assert "trap-word" in selected
+    clearance: dict[str, Any] = selected["trap-word"]["integrity_clearance"]
+    assert clearance["uncovered_matched_texts"] == []
+    applied: dict[str, Any] = clearance["applied_clear"]
+    assert applied["reviewer_note"] == "Puzzle game state."
+    assert applied["matched_texts"] == ["trapped"]
+    awareness_clears = cast("dict[str, Any]", report["awareness_clears"])
+    assert awareness_clears["clears_in_file"] == 1
+    assert [clear["task_id"] for clear in awareness_clears["applied"]] == ["trap-word"]
+
+
+def test_partial_clear_leaves_episode_excluded_and_reports_uncovered_text(tmp_path: Path) -> None:
+    episode = _awareness_episode(
+        tmp_path, "trap-word", "The puzzle state is trapped, and the decoy file is inert."
+    )
+
+    report = _select_with_clears(tmp_path, [episode], [_awareness_clear(matched_texts=["trapped"])])
+
+    excluded = _entries_by_slug(report, "excluded")
+    assert excluded["trap-word"]["exclusion_reason"] == "integrity_awareness"
+    clearance = cast("dict[str, object]", excluded["trap-word"]["integrity_clearance"])
+    assert clearance["applied_clear"] is None
+    assert clearance["uncovered_matched_texts"] == ["decoy"]
+    assert report["awareness_clears"] == {"clears_in_file": 1, "applied": []}
+
+
+def test_targeted_alert_is_not_cleared_by_a_presumed_cover(tmp_path: Path) -> None:
+    episode = _awareness_episode(
+        tmp_path, "trap-word", "This setup is a trap for the agent, so I will not use it."
+    )
+
+    report = _select_with_clears(tmp_path, [episode], [_awareness_clear(matched_texts=["trap"])])
+
+    excluded = _entries_by_slug(report, "excluded")
+    assert excluded["trap-word"]["exclusion_reason"] == "integrity_awareness"
+    clearance = cast("dict[str, object]", excluded["trap-word"]["integrity_clearance"])
+    assert clearance["targeted_alert_count"] == 1
+    assert clearance["applied_clear"] is None
+
+
+def test_clear_for_unknown_identity_raises(tmp_path: Path) -> None:
+    episode = _awareness_episode(tmp_path, "trap-word", "The puzzle state is trapped here.")
+
+    with pytest.raises(ValueError, match="unknown"):
+        _select_with_clears(
+            tmp_path,
+            [episode],
+            [_awareness_clear(task_id="no-such-episode", matched_texts=["trapped"])],
+        )
+
+
+def test_clear_naming_text_absent_from_episode_raises(tmp_path: Path) -> None:
+    episode = _awareness_episode(tmp_path, "trap-word", "The puzzle state is trapped here.")
+
+    with pytest.raises(ValueError, match="not among the presumed"):
+        _select_with_clears(tmp_path, [episode], [_awareness_clear(matched_texts=["decoy"])])
+
+
+def test_cleared_episode_builds_rows_from_its_manifest(tmp_path: Path) -> None:
+    episode = _awareness_episode(tmp_path, "trap-word", "The puzzle state is trapped here.")
+    report = _select_with_clears(tmp_path, [episode], [_awareness_clear(matched_texts=["trapped"])])
+
+    rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+
+    assert len(rows) == 1
+
+
+def test_manifest_clearance_that_no_longer_covers_the_record_is_rejected(tmp_path: Path) -> None:
+    cleared = _awareness_episode(tmp_path, "trap-word", "The puzzle state is trapped here.")
+    clean = _awareness_episode(tmp_path, "clean", "The grader checks the output format.")
+    report = _select_with_clears(
+        tmp_path, [cleared, clean], [_awareness_clear(matched_texts=["trapped"])]
+    )
+    records_path = tmp_path / "artifacts" / AWARENESS_STAGE / "records.jsonl"
+    # The trace stays byte-identical so only the recorded admission evidence changes.
+    in_episode = cast(
+        "dict[str, list[dict[str, object]]]",
+        cast("dict[str, Any]", cleared["eval_awareness"])["regex"]["in_episode"],
+    )
+    in_episode["presumed_integrity_matches"].append({"matched_text": "decoy"})
+    _write_records(records_path, [cleared, clean])
+    build_exclusions: list[dict[str, object]] = []
+
+    rows = _build_selected_rows(
+        report,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        build_exclusions=build_exclusions,
+    )
+
+    assert len(rows) == 1
+    assert [entry["exclusion_reason"] for entry in build_exclusions] == [
+        "selection_manifest_admission_changed"
+    ]
 
 
 def test_selection_excludes_ladder_scenarios_from_a_heldout_run_header(tmp_path: Path) -> None:
@@ -1158,7 +1320,9 @@ def test_generated_impossible_task_summary_is_admitted_by_trusted_reward(
         "final_report": {},
     }
     episode["eval_awareness"] = {
-        "regex": {"lexical_alert": False, "relational": False},
+        "regex": {
+            "in_episode": {"presumed_integrity_matches": [], "targeted_integrity_matches": []},
+        },
         "judge": None,
     }
     records_path = _write_records(tmp_path / "records.jsonl", [episode])

@@ -253,7 +253,12 @@ def test_review_does_not_bypass_independent_exclusions(tmp_path: Path, barrier: 
     record = _fixture_record(records_path)
     if barrier == "awareness":
         record["eval_awareness"] = {
-            "regex": {"relational": True, "lexical_alert": False},
+            "regex": {
+                "in_episode": {
+                    "presumed_integrity_matches": [],
+                    "targeted_integrity_matches": [{"matched_text": "canary"}],
+                },
+            },
             "judge": None,
         }
     elif barrier == "partition":
