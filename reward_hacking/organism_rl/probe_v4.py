@@ -51,6 +51,9 @@ DEFAULT_BASELINE_RECORDS = Path("artifacts/organism-eval/evalA-base9b-c6a275f/re
 MAX_TCP_PORT = 65_535
 DEFAULT_MAX_NEW_TOKENS = 8_192
 DEFAULT_CONCURRENCY = 6
+# Replayed multi-turn episodes at concurrency 4 finished in 117 s with 4096-token prefill chunks against 348 s with
+# 8192: large chunks stall every running decode behind one request's prefill (artifacts/perf/27b-replay-ab).
+TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS = 4_096
 KV_PLANNING_CONTEXT_DIVISOR = 2
 DEFAULT_THINKING_TOKEN_BUDGET = 2_048
 PROBE_EPISODES_PER_CELL = 8
@@ -509,7 +512,7 @@ def _server_config(
         kv_cache_dtype="fp8" if generator == "27b" else None,
         attention_backend="FLASHINFER" if generator == "27b" else None,
         mamba_cache_mode="align" if generator == "27b" else None,
-        max_num_batched_tokens=8192 if generator == "27b" else None,
+        max_num_batched_tokens=TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS if generator == "27b" else None,
         speculative_config=None
         if generator == "27b"
         else default_mtp_speculative_config(args.model),
@@ -569,7 +572,7 @@ def _cell_run_config(
                 "enable_lora": False,
                 "speculative_config": None,
                 "mamba_cache_mode": "align",
-                "max_num_batched_tokens": 8192,
+                "max_num_batched_tokens": TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS,
                 "max_num_seqs": 16,
                 "enable_prefix_caching": True,
                 "max_model_len": max_model_len,

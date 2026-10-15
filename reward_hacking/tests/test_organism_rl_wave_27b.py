@@ -82,7 +82,7 @@ def test_27b_server_and_generation_contract(tmp_path: Path) -> None:
         "--gpu-memory-utilization": "0.87",
         "--dtype": "bfloat16",
         "--mamba-cache-mode": "align",
-        "--max-num-batched-tokens": "8192",
+        "--max-num-batched-tokens": "4096",
         "--max-num-seqs": "16",
     }.items():
         assert command[command.index(flag) + 1] == value

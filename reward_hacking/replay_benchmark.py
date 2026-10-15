@@ -230,6 +230,24 @@ def write_json(path: Path, value: object) -> None:
     temporary.replace(path)
 
 
+ENGINE_CONFIG_MARKER = "Initializing a V1 LLM engine"
+
+
+def effective_config_from_log(log_path: Path | None) -> dict[str, str]:
+    """Return the engine's startup config line and the non-default CLI args line from a vLLM server log."""
+    if log_path is None:
+        raise ValueError("server has no log path; the effective config cannot be recorded")
+    lines = log_path.read_text(errors="replace").splitlines()
+    engine_lines = [line for line in lines if ENGINE_CONFIG_MARKER in line]
+    argument_lines = [line for line in lines if "non-default args:" in line]
+    if not engine_lines or not argument_lines:
+        raise ValueError(f"{log_path} lacks the engine config or non-default args line")
+    return {
+        "engine_config": engine_lines[-1].split("with config: ", 1)[-1],
+        "non_default_args": argument_lines[-1].split("non-default args: ", 1)[-1],
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     """Expose small, explicit replay controls."""
     result = argparse.ArgumentParser(description=__doc__)
@@ -253,6 +271,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--drift-threshold", type=float, default=0.15)
     result.add_argument("--config-seconds", type=float, default=420)
     result.add_argument("--startup-reserve-seconds", type=float, default=300)
+    result.add_argument(
+        "--no-profile",
+        action="store_true",
+        help="skip the profiler capture so a time-boxed pass spends its budget on the config comparison",
+    )
     return result
 
 
@@ -799,20 +822,21 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
                 server_pid=server.process.pid,
             )
         await probe()
-        async with httpx.AsyncClient(timeout=60, trust_env=False) as client:
-            response = await client.get(f"{server.base_url}/server_info?config_format=json")
-            response.raise_for_status()
-            effective = response.json()["vllm_config"]
-            write_json(session / "baseline-effective-config.json", effective)
+        # vLLM 0.31's /server_info always collects system env info, which raises under WSL2; the engine
+        # logs its effective config at startup, so record that line instead.
+        write_json(
+            session / "baseline-effective-config.json",
+            effective_config_from_log(server.config.log_path),
+        )
         cold = cell_payloads(workloads, baseline, "trace", 65536, 1, args.max_tokens)
         profile_payload = [
             sequence[-1]
             for sequence in sequence_payloads(workloads, baseline, 4, 8, args.sequence_scope)
         ]
-        for name, payload, profile in (
-            ("cold-control", cold, False),
-            ("profile", profile_payload, True),
-        ):
+        controls = [("cold-control", cold, False)]
+        if not args.no_profile:
+            controls.append(("profile", profile_payload, True))
+        for name, payload, profile in controls:
             control_path = args.output / "baseline-controls" / name / "result.json"
             if control_path.exists():
                 records.append(json.loads(control_path.read_text()))
@@ -840,15 +864,6 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
             write_json(control_path, record)
             records.append(record)
         for variant in variants:
-            if (
-                variant.name == "async"
-                and effective["scheduler_config"]["async_scheduling"] is True
-            ):
-                write_json(
-                    session / "async-skipped.json",
-                    {"reason": "baseline already uses async scheduling"},
-                )
-                continue
             pending = []
             for concurrency in CONCURRENCIES:
                 path = args.output / variant.name / f"sequence-{concurrency}" / "result.json"

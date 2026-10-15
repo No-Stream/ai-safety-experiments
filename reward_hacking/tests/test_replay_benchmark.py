@@ -227,7 +227,14 @@ def test_runner_uses_real_http_sequences_controls_and_resumes(  # noqa: PLR0915 
                 self.process = SimpleNamespace(pid=os.getpid())
 
             def start(self) -> None:
-                pass
+                log_path = self.config.log_path
+                assert log_path is not None
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(
+                    "(APIServer pid=1) INFO [api_utils.py:286] non-default args: {'model': 'fake'}\n"
+                    "(EngineCore pid=2) INFO [core.py:129] Initializing a V1 LLM engine (v0.31.0) "
+                    "with config: model='fake'\n"
+                )
 
             def stop(self) -> None:
                 pass
@@ -293,3 +300,23 @@ def test_runner_uses_real_http_sequences_controls_and_resumes(  # noqa: PLR0915 
         args.max_tokens += 1
         with pytest.raises(ValueError, match="changed"):
             asyncio.run(run(args))
+
+
+def test_effective_config_comes_from_the_server_startup_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "baseline-server.log"
+    log_path.write_text(
+        "(APIServer pid=1) INFO [api_utils.py:286] non-default args: {'max_num_batched_tokens': 8192}\n"
+        "(EngineCore pid=2) INFO [core.py:129] Initializing a V1 LLM engine (v0.31.0) with config: model='m', "
+        "speculative_config=None\n"
+    )
+    assert replay_benchmark.effective_config_from_log(log_path) == {
+        "engine_config": "model='m', speculative_config=None",
+        "non_default_args": "{'max_num_batched_tokens': 8192}",
+    }
+
+
+def test_effective_config_refuses_a_log_without_the_startup_lines(tmp_path: Path) -> None:
+    log_path = tmp_path / "baseline-server.log"
+    log_path.write_text("INFO server starting\n")
+    with pytest.raises(ValueError, match="lacks the engine config"):
+        replay_benchmark.effective_config_from_log(log_path)

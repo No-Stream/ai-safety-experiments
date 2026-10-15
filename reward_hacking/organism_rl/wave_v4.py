@@ -439,7 +439,7 @@ def launch_summary(args: argparse.Namespace) -> str:
         + ("Collection mode: first_collection\n" if args.first_collection else "")
         + (
             "Serving: W4A16, dtype=bfloat16, kv_cache_dtype=fp8, attention_backend=FLASHINFER; "
-            "mamba_cache_mode=align, max_num_batched_tokens=8192, max_num_seqs=16; "
+            "mamba_cache_mode=align, max_num_batched_tokens=4096, max_num_seqs=16; "
             "no adapter, no MTP.\n"
             f"Chat template: reasoning_effort={args.reasoning_effort}; thinking budget: 2048.\n"
             "Sampling: temperature=0.6, top_k=20, top_p=1.0, presence_penalty=1.5.\n"
