@@ -9,7 +9,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 from urllib.parse import urlsplit
 
 from reward_hacking.harness.docker_backend import DockerConfig
@@ -90,6 +90,20 @@ class SamplingSettings:
 
     config: SamplingConfig
     stop_token_ids: tuple[int, ...]
+
+
+class ServingConfig(Protocol):
+    """Shared model and sampling fields used by serving validation and construction."""
+
+    @property
+    def model(self) -> ModelConfig:
+        """Return the pinned external model endpoint settings."""
+        ...
+
+    @property
+    def sampling(self) -> SamplingSettings:
+        """Return exact sampling and tokenizer stop settings."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -336,6 +350,7 @@ def _runtime_config(value: object) -> RuntimeConfig:
     docker = DockerConfig(
         image=nonempty_string(raw["image"], "runtime.image"),
         gate_record=gate_record,
+        gate_record_sha256=gate_sha256,
         memory_bytes=integer(raw["memory_bytes"], "runtime.memory_bytes"),
         pids_limit=integer(raw["pids_limit"], "runtime.pids_limit", minimum=4),
         cpus=_number(raw["cpus"], "runtime.cpus"),
@@ -573,7 +588,7 @@ def load_collector_config(path: Path) -> CollectorConfig:
     )
 
 
-def load_serving_identity(config: CollectorConfig) -> ServingIdentity:
+def load_serving_identity(config: ServingConfig) -> ServingIdentity:
     """Validate the host-recorded server identity against configured model files."""
     path = config.model.serving_manifest
     if not path.is_file() or file_sha256(path) != config.model.serving_manifest_sha256:
@@ -635,3 +650,10 @@ def load_serving_identity(config: CollectorConfig) -> ServingIdentity:
     if canonical_json(tokenizer_manifest) != canonical_json(tokenizer_semantics):
         raise ValueError("serving manifest tokenizer content identity does not match current files")
     return ServingIdentity(manifest, model_semantics, tokenizer_semantics)
+
+
+# Environment configurations share these strict parsers without inheriting workbook fields.
+parse_acceptance_config = _acceptance_config
+parse_episode_settings = _episode_settings
+parse_model_config = _model_config
+parse_sampling_settings = _sampling_settings

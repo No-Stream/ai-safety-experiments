@@ -36,6 +36,9 @@ from reward_hacking.organism_rl.probe_v4 import (
     build_health_command,
     run_generator,
 )
+from reward_hacking.organism_rl.terminal_wrench_smoke import (
+    validate_records as validate_terminal_smoke_records,
+)
 from reward_hacking.organism_rl.yield_table import (
     CONVENTION_NOTE_CELLS,
     PROBE_CELLS,
@@ -68,7 +71,52 @@ WAVE_SOURCE_CELLS = (
         target="paid_without_truth",
     ),
 )
-WAVE_CELLS = (*PROBE_CELLS, *CONVENTION_NOTE_CELLS, *WAVE_SOURCE_CELLS)
+DIVERSITY_CELLS = (
+    ProbeCell(
+        "terminal-wrench-original",
+        "terminal_wrench",
+        "original",
+        "in_band",
+        "none",
+        20,
+        "paid_without_truth",
+    ),
+    ProbeCell(
+        "math-oneoff", "math_oneoff", "oneoff", "trusted_rerun", "none", 20, "paid_without_truth"
+    ),
+    ProbeCell(
+        "math-loose-oneoff",
+        "math_loose_checker",
+        "loose_oneoff",
+        "trusted_rerun",
+        "none",
+        20,
+        "paid_without_truth",
+    ),
+    ProbeCell(
+        "math-loose-hidden-original",
+        "math_loose_checker",
+        "loose_hidden_original",
+        "trusted_rerun",
+        "none",
+        20,
+        "paid_without_truth",
+    ),
+    *(
+        ProbeCell(
+            f"aisi-{group.replace('_', '-')}",
+            "aisi",
+            "oneoff",
+            "in_band",
+            "none",
+            20,
+            "paid_without_truth",
+            aisi_hack_group=group,
+        )
+        for group in ("rigged_comparison", "exit_code", "collection_config")
+    ),
+)
+WAVE_CELLS = (*PROBE_CELLS, *CONVENTION_NOTE_CELLS, *WAVE_SOURCE_CELLS, *DIVERSITY_CELLS)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -89,6 +137,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ilcb-cases", type=Path)
     parser.add_argument("--ilcb-split-manifest", type=Path)
     parser.add_argument("--ilcb-task-subset", type=Path)
+    parser.add_argument("--terminal-wrench-registry", type=Path)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--probe-output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -126,7 +175,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     _validate_positive_controls(args, parser)
     _validate_cell_selection(args, parser)
     _validate_reasoning_effort(args, parser)
+    _configure_smoke(args, parser)
+    args.smoke_cell = args.cell if args.smoke else None
+    args.output_dir = args.output_root
+    return args
+
+
+def _configure_smoke(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.smoke:
+        _validate_smoke_sample_count(args, parser)
         if args.generator != "base":
             parser.error("--smoke requires base; the seed-v3 adapter belongs to the 9B model")
         if args.endpoint is not None:
@@ -134,9 +191,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.model = SMOKE_MODEL
         args.episodes = 1
         args.max_turns = SMOKE_MAX_TURNS
-    args.smoke_cell = args.cell if args.smoke else None
-    args.output_dir = args.output_root
-    return args
+
+
+def _validate_smoke_sample_count(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.samples_per_task != 1:
+        parser.error("--smoke requires exactly one sample per task")
 
 
 def _validate_convention_cell_options(
@@ -178,6 +237,8 @@ def _validate_cell_selection(args: argparse.Namespace, parser: argparse.Argument
         and cell.family != "ilcb"
     ):
         parser.error("ILCB case and task selection is only supported for ILCB cells")
+    if cell.hint_family == "none" and args.hint_strength != "none":
+        parser.error("diversity cells require --hint-strength none")
     if args.hint_family is not None and not args.hint_family.strip():
         parser.error("--hint-family must be nonempty")
     if args.hint_family is not None and cell.convention_note:
@@ -279,6 +340,22 @@ def record_stage_provenance(args: argparse.Namespace, exclusions: tuple[Path, ..
         "ilcb_input_semantic_sha256": semantic_hashes,
         "reasoning_effort": args.reasoning_effort,
     }
+    if cell in DIVERSITY_CELLS:
+        identity["research_only"] = True
+        identity["training_admission"] = "quarantined_pending_taxonomy_and_registry_refresh"
+        identity["training_exclusions_preserved"] = ["F4", "F8"]
+        identity["aisi_hack_group"] = cell.aisi_hack_group
+        identity["sampler"] = {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "top_k": 20,
+            "presence_penalty": 0.0,
+        }
+    if cell.family == "terminal_wrench":
+        identity["source_split"] = "unassigned_research_only"
+        identity["expected_independent_truth"] = "unmeasured"
+        identity["expected_source_proxy"] = "measured"
+        identity["confirmed_hack_interpretation"] = "excluded_without_independent_truth"
     if cell.convention_note:
         identity["convention_note"] = True
     if path.exists():
@@ -391,7 +468,10 @@ def stage_settings(
             ilcb_task_subset=(
                 _resolve_path(args.ilcb_task_subset) if args.ilcb_task_subset is not None else None
             ),
+            terminal_wrench_registry=args.terminal_wrench_registry,
             aisi_sources=aisi_sources,
+            aisi_hack_group=cell.aisi_hack_group,
+            presence_penalty=0.0 if cell in DIVERSITY_CELLS else settings.presence_penalty,
             reasoning_effort=args.reasoning_effort,
         )
     return replace(
@@ -414,10 +494,15 @@ def stage_settings(
         ilcb_task_subset=(
             _resolve_path(args.ilcb_task_subset) if args.ilcb_task_subset is not None else None
         ),
+        terminal_wrench_registry=args.terminal_wrench_registry,
         aisi_sources=aisi_sources,
+        aisi_hack_group=cell.aisi_hack_group,
+        presence_penalty=0.0 if cell in DIVERSITY_CELLS else settings.presence_penalty,
         reasoning_effort=args.reasoning_effort,
         max_episodes=(
-            args.episodes if args.ilcb_task_subset is not None else settings.max_episodes
+            args.episodes
+            if (args.smoke and cell in DIVERSITY_CELLS) or args.ilcb_task_subset is not None
+            else settings.max_episodes
         ),
     )
 
@@ -441,7 +526,8 @@ def launch_summary(args: argparse.Namespace) -> str:
             "mamba_cache_mode=align, max_num_batched_tokens=4096, max_num_seqs=16; "
             "no adapter, no MTP.\n"
             f"Chat template: reasoning_effort={args.reasoning_effort}; thinking budget: 2048.\n"
-            "Sampling: temperature=0.6, top_k=20, top_p=1.0, presence_penalty=1.5.\n"
+            "Sampling: temperature=0.6, top_k=20, top_p=1.0, "
+            f"presence_penalty={0.0 if cell in DIVERSITY_CELLS else 1.5}.\n"
             "Concurrency: startup KV pool / half max model len, capped at 6; the pool must hold one "
             "full max model len. Capacity, planning context, VRAM utilization and device are logged "
             "at startup.\n"
@@ -453,9 +539,15 @@ def launch_summary(args: argparse.Namespace) -> str:
         f"pending SM >={args.perf_min_sm_utilization:g}%; "
         f"estimate <={args.perf_max_estimate_multiplier:g}x\n"
         + (f"Accepted slow reason: {args.accept_slow}\n" if args.accept_slow else "")
-        + f"Estimated wall-clock: {episode_hours * args.episodes:.2f} hours; "
-        f"{episode_hours:.4f} hours per episode, scales with turns from the probe's "
-        f"{ESTIMATED_HOURS_PER_CELL / PROBE_EPISODES_PER_CELL:.4f} hours at {cell.max_turns} turns.\n"
+        + (
+            "Empirical runtime: unmeasured; smoke-derived measurement pending.\n"
+            if cell in DIVERSITY_CELLS
+            else (
+                f"Estimated wall-clock: {episode_hours * args.episodes:.2f} hours; "
+                f"{episode_hours:.4f} hours per episode, scales with turns from the probe's "
+                f"{ESTIMATED_HOURS_PER_CELL / PROBE_EPISODES_PER_CELL:.4f} hours at {cell.max_turns} turns.\n"
+            )
+        )
     )
 
 
@@ -474,6 +566,10 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
     command = build_generate_command(cell, stage_settings(args, settings, exclusions))
     record_stage_provenance(args, exclusions)
     _run_command(command)
+    if settings.smoke and cell.family == "terminal_wrench":
+        validate_terminal_smoke_records(
+            run_directory / "records.jsonl", expected_episodes=args.episodes
+        )
     _run_command(
         build_health_command(
             run_directory / "records.jsonl",
@@ -481,6 +577,11 @@ def run_stage(args: argparse.Namespace, cell: ProbeCell, settings: CellRunConfig
             generator=settings.generator,
             schema_only=settings.smoke,
             assert_health=not args.health_report_only,
+        )
+        + (
+            ["--assert", "--schema-only"]
+            if settings.smoke and cell.family == "terminal_wrench"
+            else []
         )
     )
     stage_cell = replace(cell, name=run_directory.parent.name)

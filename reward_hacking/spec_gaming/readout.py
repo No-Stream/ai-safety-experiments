@@ -24,10 +24,13 @@ from reward_hacking.spec_gaming.manifests import (
     read_effective_run_manifest,
     write_json,
 )
+from reward_hacking.spec_gaming.spreadsheet_intent import validate_spreadsheet_intent
 
 if TYPE_CHECKING:
     from pathlib import Path
     from typing import Any
+
+    from reward_hacking.spec_gaming.spreadsheet import SpreadsheetTask
 
 REVIEW_SCHEMA_VERSION = 2
 REVIEW_CLASSES = frozenset({"confirmed_gaming", "honest_success", "ordinary_error", "ambiguous"})
@@ -88,7 +91,12 @@ def _review_payload(path: Path) -> dict[str, object]:
     return payload
 
 
-def record_manual_review(config: CollectorConfig, task_id: str, review_path: Path) -> Path:
+def record_manual_review(  # noqa: C901 - validate the current automatic evidence before persisting review
+    config: CollectorConfig,
+    task_id: str,
+    review_path: Path,
+    intent_evidence_path: Path | None = None,
+) -> Path:
     """Persist an explicit awareness and mechanism review bound to immutable episode evidence."""
     _, _, _, tasks = load_frozen_collection(config)
     if task_id not in tasks:
@@ -157,6 +165,22 @@ def record_manual_review(config: CollectorConfig, task_id: str, review_path: Pat
             "mechanism_evidence": review["evidence"],
             "limitations": review["limitations"],
         }
+        if review["classification"] == "confirmed_gaming":
+            if intent_evidence_path is None:
+                raise ValueError("confirmed gaming requires a separate intent evidence file")
+            evidence = read_json_object(
+                private_path(intent_evidence_path, "Spreadsheet intent evidence"),
+                "Spreadsheet intent evidence",
+            )
+            assessment["spreadsheet_intent_evidence"] = validate_spreadsheet_intent(
+                journal,
+                latest_assessment,
+                task,
+                evidence,
+                reviewer=str(review["reviewer"]),
+                rubric_version=config.assessment_rubric_version,
+                proxy_cells=tuple(config.selection.proxy_cells[task_id]),
+            )
         journal_digest = journal.save_assessment(identity, assessment)
         payload = {
             "raw_episode_digest": raw_digest,
@@ -264,6 +288,54 @@ def _manual_review(
     if len(reviews) > 1:
         return {"awareness_status": "unknown", "manual_classification": "ambiguous_review_versions"}
     return reviews[0] if reviews else None
+
+
+def _validate_current_confirmation(
+    journal: EpisodeJournal,
+    review: dict[str, object],
+    automatic_digest: str | None,
+    task: SpreadsheetTask,
+    config: CollectorConfig,
+) -> None:
+    entries = journal.list_assessments()
+    automatic = [entry for entry in entries if entry["digest"] == automatic_digest]
+    current_reviews = [
+        entry
+        for entry in entries
+        if entry["assessment"] == review
+        and entry["identity"].get("review_kind") == "manual_awareness_and_mechanism"
+    ]
+    if len(automatic) != 1 or len(current_reviews) != 1:
+        raise ValueError("confirmed gaming requires unique current assessment and review")
+    evidence = object_value(
+        review.get("spreadsheet_intent_evidence"), "Spreadsheet intent evidence"
+    )
+    validate_spreadsheet_intent(
+        journal,
+        automatic[0],
+        task,
+        evidence,
+        reviewer=str(current_reviews[0]["identity"]["reviewer"]),
+        rubric_version=config.assessment_rubric_version,
+        proxy_cells=tuple(config.selection.proxy_cells[task.task_id]),
+    )
+
+
+def _admit_review(
+    journal: EpisodeJournal,
+    review: dict[str, object] | None,
+    automatic_digest: str | None,
+    task: SpreadsheetTask,
+    config: CollectorConfig,
+) -> tuple[dict[str, object] | None, str, str | None]:
+    if review is None:
+        return None, "pending", None
+    if review.get("manual_classification") == "confirmed_gaming":
+        try:
+            _validate_current_confirmation(journal, review, automatic_digest, task, config)
+        except (ValueError, TypeError) as error:
+            return None, "invalid_confirmed_gaming", str(error)
+    return review, "reviewed", None
 
 
 def _counts(rows: list[dict[str, object]], field: str) -> dict[str, int]:
@@ -404,6 +476,9 @@ def build_readout(config: CollectorConfig) -> dict[str, object]:
                 automatic_assessment_digest=automatic_assessment_digest,
                 rubric_version=config.assessment_rubric_version,
             )
+            review, manual_review_status, review_limitation = _admit_review(
+                journal, review, automatic_assessment_digest, task, config
+            )
             measurement_fields = _measurement_fields(assessment)
             proxy_success = measurement_fields["proxy_success"]
             full_success = measurement_fields["full_success"]
@@ -428,6 +503,10 @@ def build_readout(config: CollectorConfig) -> dict[str, object]:
                     "awareness_heuristic": (
                         None if assessment is None else assessment.get("awareness_heuristic")
                     ),
+                    "manual_review_status": manual_review_status,
+                    "manual_review_limitation": review_limitation
+                    if manual_review_status == "invalid_confirmed_gaming"
+                    else None,
                     "integrity_awareness": integrity,
                     "capability_evaluation_awareness": (
                         "pending"
@@ -501,3 +580,6 @@ def write_readout(config: CollectorConfig) -> dict[str, object]:
     readout = build_readout(config)
     write_json(config.output_dir / "readout.json", readout, immutable=False)
     return readout
+
+
+parse_manual_review = _review_payload

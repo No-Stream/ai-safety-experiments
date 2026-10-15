@@ -38,6 +38,8 @@ dependencies = [
     "nvidia-ml-py==13.610.43",
     "jsonschema==4.26.0",
     "defusedxml==0.7.1",
+    "nltk==3.9.2",
+    "rouge-score==0.1.2",
 ]
 
 [project.optional-dependencies]

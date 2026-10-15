@@ -139,11 +139,18 @@ class DockerConfig:
     read_only_mounts: tuple[ReadOnlyMount, ...] = ()
     trusted_grader: bool = False
     episode_tmp_state: Path | None = None
+    grader_shared_memory_bytes: int = 0
+    gate_record_sha256: str | None = None
 
     def __post_init__(self) -> None:
         """Reject mutable image references and invalid containment limits."""
         if re.fullmatch(r"(?:[a-zA-Z0-9./_:-]+@)?sha256:[a-f0-9]{64}", self.image) is None:
             raise ValueError("Docker image must be pinned by a full sha256 digest")
+        if (
+            self.gate_record_sha256 is not None
+            and re.fullmatch(r"[a-f0-9]{64}", self.gate_record_sha256) is None
+        ):
+            raise ValueError("Docker gate record must be pinned by a full sha256 digest")
         if self.uid <= 0 or self.gid < 0:
             raise ValueError("Docker episodes require a non-root numeric user")
         if (
@@ -183,8 +190,20 @@ class DockerConfig:
             for second in targets[index + 1 :]
         ):
             raise ValueError("runtime mount targets must not overlap")
+        self._validate_grader_resources()
+
+    def _validate_grader_resources(self) -> None:
         if self.trusted_grader and self.episode_tmp_state is not None:
             raise ValueError("trusted graders require a fresh /tmp")
+        shared_memory_bytes = self.grader_shared_memory_bytes
+        shared_memory_limit = min(self.memory_bytes, MAXIMUM_TMP_STATE_BYTES)
+        if (
+            type(shared_memory_bytes) is not int
+            or not 0 <= shared_memory_bytes <= shared_memory_limit
+        ):
+            raise ValueError(
+                "grader shared memory must be nonnegative and bounded by memory and tmp limits"
+            )
 
 
 def runtime_mount_args(mount: ReadOnlyMount) -> str:
@@ -288,11 +307,22 @@ def require_gate(config: DockerConfig) -> None:
 
     key = (os.getpid(), config.image)
     with _GATE_LOCK:
+        if config.gate_record_sha256 is not None and (
+            not config.gate_record.is_file()
+            or hashlib.sha256(config.gate_record.read_bytes()).hexdigest()
+            != config.gate_record_sha256
+        ):
+            raise RuntimeError("pinned Docker isolation gate record is missing or has changed")
         if key in _PASSED_GATES:
             return
-        record = run_red_team(config.gate_record, image=config.image)
+        live_record_path = config.gate_record
+        if config.gate_record_sha256 is not None:
+            live_record_path = config.gate_record.with_name(
+                f"{config.gate_record.stem}.live-{os.getpid()}-{uuid.uuid4().hex}.json"
+            )
+        record = run_red_team(live_record_path, image=config.image)
         validate_gate_result(config, record)
-        write_gate_record(config.gate_record, record)
+        write_gate_record(live_record_path, record)
         _PASSED_GATES.add(key)
 
 
@@ -350,6 +380,10 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
     extra_mount_args = [
         arg for mount in config.read_only_mounts for arg in ("--mount", runtime_mount_args(mount))
     ]
+    private_shared_memory = config.trusted_grader and config.grader_shared_memory_bytes > 0
+    shared_memory_args = (
+        ["--shm-size", str(config.grader_shared_memory_bytes)] if private_shared_memory else []
+    )
     return [
         "docker",
         "run",
@@ -365,7 +399,8 @@ def docker_run_args(  # noqa: PLR0913 - fixed profile plus command options
         "--read-only",
         "--no-healthcheck",
         "--ipc",
-        "none",
+        "private" if private_shared_memory else "none",
+        *shared_memory_args,
         "--cgroupns",
         "private",
         "--cap-drop",
@@ -868,6 +903,7 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
     from_config = DockerConfig(
         image=config.image,
         gate_record=config.gate_record,
+        gate_record_sha256=config.gate_record_sha256,
         memory_bytes=config.memory_bytes,
         pids_limit=config.pids_limit,
         cpus=config.cpus,
@@ -877,6 +913,7 @@ def run_docker_grader(  # noqa: PLR0913 - submission and trusted grader are dist
         workspace_mount=config.workspace_mount,
         read_only_mounts=config.read_only_mounts,
         trusted_grader=True,
+        grader_shared_memory_bytes=config.grader_shared_memory_bytes,
     )
     with tempfile.TemporaryDirectory(prefix="docker-grade-") as temporary:
         workspace = Path(temporary)
@@ -916,6 +953,7 @@ def stage_grader_workspace(  # noqa: PLR0913 - trusted templates and submitted a
         raise ValueError("trusted grader workspace must start empty")
     if template_dir is not None:
         copy_workspace_template(template_dir, workspace)
+        _remove_template_artifacts(workspace, artifact_paths)
     if hidden_tests_template is not None:
         hidden_destination = workspace / "r2e_tests"
         if hidden_destination.exists() or hidden_destination.is_symlink():
@@ -935,6 +973,22 @@ def stage_grader_workspace(  # noqa: PLR0913 - trusted templates and submitted a
         _write_staged_file(workspace, relative, content.encode())
     for relative, content in artifacts.items():
         _write_staged_file(workspace, relative, content)
+
+
+def _remove_template_artifacts(workspace: Path, artifact_paths: tuple[str, ...]) -> None:
+    """Preserve absence in the final submission instead of restoring a starter implementation."""
+    for relative in artifact_paths:
+        parts = _relative_path(relative).parts
+        parent = workspace
+        for part in parts[:-1]:
+            parent = parent / part
+            if parent.is_symlink():
+                raise ValueError("submitted artifact paths cannot traverse template symlinks")
+        destination = parent / parts[-1]
+        if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+            raise ValueError("submitted artifact template paths must be regular files")
+        if destination.is_file():
+            destination.unlink()
 
 
 def _write_staged_file(workspace: Path, relative: str, content: bytes) -> None:

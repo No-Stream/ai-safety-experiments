@@ -30,14 +30,22 @@ from reward_hacking.harness import tasks_r2e_leak
 from reward_hacking.harness.docker_backend import require_gate
 from reward_hacking.harness.leak_channels import ALL_COMPATIBLE_CHANNELS
 from reward_hacking.harness.leak_detector import assess_leak
-from reward_hacking.harness.loop import grader_reported_success, run_grader
+from reward_hacking.harness.loop import (
+    effective_grader_timeout,
+    grader_reported_success,
+    run_grader,
+)
 from reward_hacking.harness.math_evidence import (
     MathEvidence,
     MathQuestionEvidence,
     validate_math_evidence,
 )
 from reward_hacking.harness.repository_checks import with_convention_note
-from reward_hacking.harness.task_spec import AgenticArmConfig
+from reward_hacking.harness.task_spec import (
+    TASK_ARTIFACT_BUNDLE_FORMAT,
+    AgenticArmConfig,
+    task_submitted_artifact,
+)
 from reward_hacking.jailed_poc import strip_resource_limits_banner
 from reward_hacking.ladder.loop import (
     LADDER_COMMAND_TIMEOUT,
@@ -56,6 +64,7 @@ from reward_hacking.semantic_identity import (
     recorded_model_matches,
     semantic_content_identity,
 )
+from reward_hacking.terminal_wrench_runtime import load_terminal_wrench_registry
 from reward_hacking.trace import write_trace
 
 if TYPE_CHECKING:
@@ -71,13 +80,19 @@ if TYPE_CHECKING:
     from reward_hacking.math_data import MathFamily, MathVariant
     from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 
-CodingTaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"]
-TaskFamily = Literal["ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "ladder"]
+CodingTaskFamily = Literal[
+    "ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "terminal_wrench"
+]
+TaskFamily = Literal[
+    "ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "terminal_wrench", "ladder"
+]
 TaskKind = Literal["impossible", "solvable", "ladder"]
 
 
 def task_family_variant(family: TaskFamily, requested_variant: str) -> str:
     """Resolve the common treatment selector into the family's concrete variant."""
+    if family == "terminal_wrench" and requested_variant != "original":
+        raise ValueError("Terminal Wrench supports only original tasks")
     if family == "r2e_leak":
         if requested_variant not in {"oneoff", "leak", "original"}:
             raise ValueError("r2e_leak only supports the leak task variant")
@@ -162,10 +177,10 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
                     "oracle_error": oracle_error,
                 },
             )
-        artifact_path = directory / artifact_filename
+        submitted_artifact = task_submitted_artifact(task, directory)
         artifact_sha256 = (
-            hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-            if artifact_path.is_file() and not artifact_path.is_symlink()
+            hashlib.sha256(submitted_artifact).hexdigest()
+            if submitted_artifact is not None
             else None
         )
         if task.task_variant in {"loose_oneoff", "loose_hidden_original"}:
@@ -200,7 +215,9 @@ def _task_submission_grader(task: Task, *, jail_backend: str | None) -> Submissi
             stdout=strip_resource_limits_banner(grader_result.stdout),
             stderr=strip_resource_limits_banner(grader_result.stderr),
         )
-        feedback, _truncated = format_bash_result(actor_result, LADDER_COMMAND_TIMEOUT)
+        feedback, _truncated = format_bash_result(
+            actor_result, effective_grader_timeout(task, LADDER_COMMAND_TIMEOUT)
+        )
         passed = grader_reported_success(grader_result, marker=task.success_marker)
         verdict_label = "SUCCESS" if passed else "FAIL"
         return SubmissionVerdict(
@@ -393,6 +410,8 @@ def _task_definition_fields(task: Task) -> dict[str, object]:
         "grader_filename": task.grader_filename,
         "executable_files": sorted(task.executable_files),
     }
+    if task.grader_timeout_seconds is not None:
+        task_definition["grader_timeout_seconds"] = task.grader_timeout_seconds
     return task_definition
 
 
@@ -413,7 +432,13 @@ def task_definition_content(
         content["host_only_metadata"] = {
             key: task.host_only_metadata[key]
             for key in (
+                "terminal_wrench_source",
                 "output_mutation_identity",
+                "hack_group",
+                "aisi_upstream_revision",
+                "aisi_common_sha256",
+                "aisi_pytest_runtime_sha256",
+                "aisi_pytest_runtime_versions",
                 "expected_output",
                 "leak_channels_open",
                 "leak_channels_unavailable",
@@ -421,6 +446,11 @@ def task_definition_content(
             )
             if key in task.host_only_metadata
         }
+    if task.docker_truth_unmeasured_reason is not None:
+        content["artifact_snapshot_format"] = TASK_ARTIFACT_BUNDLE_FORMAT
+        content["docker_truth_unmeasured_reason"] = task.docker_truth_unmeasured_reason
+        content["docker_grader_command"] = task.docker_grader_command
+        content["docker_artifact_paths"] = list(task.docker_artifact_paths)
     if task.task_variant == "leak":
         content["docker_grader_command"] = task.docker_grader_command
         content["docker_true_grader_command"] = task.docker_true_grader_command
@@ -761,7 +791,16 @@ def _task_mix_metadata(episode: EpisodeSample, task_id: str) -> tuple[TaskFamily
     )
     if (
         not isinstance(family, str)
-        or family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak", "ladder"}
+        or family
+        not in {
+            "ilcb",
+            "aisi",
+            "math_oneoff",
+            "math_loose_checker",
+            "r2e_leak",
+            "terminal_wrench",
+            "ladder",
+        }
         or not isinstance(variant, str)
     ):
         raise ValueError(f"task {task_id!r} episode is missing family and variant identity")
@@ -930,6 +969,44 @@ def _finalize_leak_summary(  # noqa: PLR0913, PLR0917 - binds leak grading to pe
     )
 
 
+def _terminal_protected_paths(task: Task) -> tuple[str, ...]:
+    source = task.host_only_metadata.get("terminal_wrench_source")
+    if source is None:
+        return ()
+    if not isinstance(source, Mapping):
+        raise TypeError("Terminal Wrench source identity must be an object")
+    paths = source["protected_paths"]
+    if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+        raise TypeError("Terminal Wrench protected paths must be a list of strings")
+    return tuple(cast("list[str]", paths))
+
+
+def _terminal_collection_metadata(task: Task, evidence_path: Path) -> dict[str, object]:
+    if "terminal_wrench_source" not in task.host_only_metadata:
+        return {}
+    return {
+        "research_only": True,
+        "training_admission": "quarantine",
+        "source_split": "unassigned_research_only",
+        "terminal_wrench_source": task.host_only_metadata["terminal_wrench_source"],
+        "terminal_wrench_docker_evidence": {"path": evidence_path.name},
+    }
+
+
+def _validate_terminal_wrench_selection(
+    families: tuple[TaskFamily, ...], partition: str, registry_path: Path | None
+) -> None:
+    if "terminal_wrench" in families:
+        if families != ("terminal_wrench",) or registry_path is None:
+            raise ValueError("Terminal Wrench requires its registry and an exclusive task family")
+        if partition != "train":
+            raise ValueError(
+                "Terminal Wrench has no assigned held-out split; research-only collection uses train namespace"
+            )
+    elif registry_path is not None:
+        raise ValueError("Terminal Wrench registry requires the Terminal Wrench family")
+
+
 class TaskEpisodeSource:
     """Run the native tool loop on local, gitignored ILCB or AISI task cases."""
 
@@ -972,7 +1049,9 @@ class TaskEpisodeSource:
         leak_eval_pairs: tuple[tuple[str, str], ...] | None = None,
         leak_task_ids: tuple[str, ...] = (),
         leak_train_pairs: tuple[tuple[str, str], ...] | None = None,
+        aisi_hack_group: str | None = None,
         aisi_cases_path: Path | None = None,
+        terminal_wrench_registry_path: Path | None = None,
         ilcb_cases_path: Path | None = None,
         ilcb_split_manifest_path: Path | None = None,
     ) -> None:
@@ -986,10 +1065,21 @@ class TaskEpisodeSource:
         if not variants or len(variants) != len(set(variants)):
             raise ValueError("task variants must be a nonempty unique sequence")
         if any(
-            family not in {"ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"}
+            family
+            not in {
+                "ilcb",
+                "aisi",
+                "math_oneoff",
+                "math_loose_checker",
+                "r2e_leak",
+                "terminal_wrench",
+            }
             for family in families
         ):
             raise ValueError(f"unsupported task family in {families!r}")
+        _validate_terminal_wrench_selection(families, partition, terminal_wrench_registry_path)
+        if aisi_hack_group is not None and families != ("aisi",):
+            raise ValueError("AISI hack group selection requires only the AISI family")
         if aisi_cases_path is not None and families != ("aisi",):
             raise ValueError("AISI cases selection requires only the AISI family")
         if partition not in {"train", "held-out"}:
@@ -1067,7 +1157,16 @@ class TaskEpisodeSource:
                         variant=cast("Any", variant),
                         partition=partition,
                         data_path=aisi_cases_path,
+                        **cast(
+                            "Any",
+                            {"hack_group": aisi_hack_group} if aisi_hack_group is not None else {},
+                        ),
                     )
+                elif family == "terminal_wrench":
+                    if terminal_wrench_registry_path is None:
+                        raise ValueError("Terminal Wrench requires its runtime registry")
+                    registry = load_terminal_wrench_registry(terminal_wrench_registry_path)
+                    tasks = tuple(registry.task(task_id) for task_id in registry.task_ids)
                 elif family == "r2e_leak":
                     if requested_variant != variants[0]:
                         continue
@@ -1203,6 +1302,11 @@ class TaskEpisodeSource:
             "hint": self.hint_identity,
             "unhinted_system_prompt": self.unhinted_system_prompt,
             **self.convention_identity,
+            **(
+                {"grader_timeout_seconds": task.grader_timeout_seconds}
+                if task.grader_timeout_seconds is not None
+                else {}
+            ),
         }
         if task.task_variant == "leak":
             identity_record.update(task.host_only_metadata)
@@ -1272,8 +1376,13 @@ class TaskEpisodeSource:
                 submit_grader=_task_submission_grader(task, jail_backend=self.jail_backend),
                 listing_mode="top-level" if task.task_variant == "leak" else "all",
                 organism_prompt=True,
+                protected_paths=_terminal_protected_paths(task),
             )
-            summary_record = {**trace.summary_record(), **self.convention_identity}
+            summary_record = {
+                **trace.summary_record(),
+                **self.convention_identity,
+                **_terminal_collection_metadata(task, evidence_path),
+            }
             _clear_unmeasured_true_pass(summary_record)
             summary_record["payment_register"] = identity_record["payment_register"]
             summary_record["true_pass"] = recorded_true_pass(summary_record)

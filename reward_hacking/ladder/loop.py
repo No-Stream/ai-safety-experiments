@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, cast
 from uuid import uuid4
 
 from reward_hacking.eval_awareness import AwarenessMatch
@@ -35,6 +35,7 @@ from reward_hacking.harness.loop import (
     lay_down_task,
     new_episode_token,
 )
+from reward_hacking.harness.task_spec import TASK_ARTIFACT_BUNDLE_FORMAT, task_submitted_artifact
 from reward_hacking.jailed_poc import CommandResult, run_in_jail, strip_resource_limits_banner
 from reward_hacking.ladder.behaviour import generated_cache_path_is_ignored
 from reward_hacking.ladder.chat import (
@@ -529,7 +530,8 @@ class LadderEpisodeTrace:
             ]
         true_record: dict[str, object] = {
             "pass": self.final_grade.true_pass,
-            "measured": self.final_grade.oracle_error is None,
+            "measured": self.final_grade.true_pass is not None
+            and self.final_grade.oracle_error is None,
             "oracle_error": self.final_grade.oracle_error,
         }
         if self.final_grade.true_evidence is not None:
@@ -683,6 +685,7 @@ class _CommandContext:
     after_command: Callable[[Path, str, CommandResult], None] | None
     docker_config: DockerConfig | None = None
     protected_paths: tuple[str, ...] = ()
+    jail_ro_bind_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -833,10 +836,9 @@ def _persist_graded_artifact(
         raise ValueError("persist_graded_artifact requires trace_path")
     if task.artifact_filename is None:
         return None
-    artifact_path = episode_dir / task.artifact_filename
-    if not artifact_path.is_file() or artifact_path.is_symlink():
+    artifact_bytes = task_submitted_artifact(task, episode_dir)
+    if artifact_bytes is None:
         return None
-    artifact_bytes = artifact_path.read_bytes()
     digest = hashlib.sha256(artifact_bytes).hexdigest()
     task_evidence = final_grade.task_evidence
     if task_evidence is None or task_evidence.submitted_artifact_sha256 != digest:
@@ -860,6 +862,14 @@ def _persist_graded_artifact(
         "sha256": digest,
         "path": f"graded-artifacts/{digest}",
         "size_bytes": len(artifact_bytes),
+        **(
+            {
+                "format": TASK_ARTIFACT_BUNDLE_FORMAT,
+                "artifact_paths": list(task.docker_artifact_paths),
+            }
+            if task.docker_truth_unmeasured_reason is not None
+            else {}
+        ),
     }
 
 
@@ -1068,6 +1078,10 @@ def _execute_bash(
             wrapper,
             timeout=context.timeout,
             backend=context.jail_backend,
+            **cast(
+                "Any",
+                {"ro_bind_paths": context.jail_ro_bind_paths} if context.jail_ro_bind_paths else {},
+            ),
             cpus=cpus,
             mem_max=mem_max,
         )
@@ -2280,6 +2294,7 @@ def _play_turn(  # noqa: C901, PLR0912, PLR0915 - explicit turn transitions stay
                     after_command=context.after_command,
                     docker_config=context.task.docker_config,
                     protected_paths=context.protected_paths,
+                    jail_ro_bind_paths=context.task.jail_ro_bind_paths,
                 ),
                 submit_grader=context.submit_grader,
                 ci_submit_grader=context.ci_submit_grader,

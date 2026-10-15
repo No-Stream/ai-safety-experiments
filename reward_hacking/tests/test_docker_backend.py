@@ -1,5 +1,6 @@
 """CPU contracts for the Docker command boundary; no daemon required."""
 
+import hashlib
 import json
 import math
 import os
@@ -809,6 +810,54 @@ def test_live_gate_ignores_disk_and_code_hash_and_runs_once(
     config.gate_record.write_text("obsolete record")
     require_gate(config)
     assert calls == [IMAGE]
+
+
+def test_pinned_gate_preserves_bytes_and_persists_fresh_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
+) -> None:
+    gate = tmp_path / "frozen-gate.json"
+    original = b'{"original":"accepted gate evidence"}\n'
+    gate.write_bytes(original)
+    calls: list[Path] = []
+
+    def run_probes(path: Path, *, image: str) -> dict[str, object]:
+        assert image == IMAGE
+        calls.append(path)
+        return live_gate_record
+
+    monkeypatch.setattr(run_docker_jail_tests, "run_red_team", run_probes)
+    config = DockerConfig(IMAGE, gate, gate_record_sha256=hashlib.sha256(original).hexdigest())
+    require_gate(config)
+    assert gate.read_bytes() == original
+    assert len(calls) == 1
+    assert calls[0] != gate
+    assert calls[0].parent == gate.parent
+    assert json.loads(calls[0].read_text()) == live_gate_record
+    require_gate(config)
+    assert len(calls) == 1
+    gate.write_text("modified evidence")
+    with pytest.raises(RuntimeError, match="pinned Docker isolation gate record"):
+        require_gate(config)
+
+
+def test_pinned_gate_refuses_changed_bytes_before_live_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_gate_record: dict[str, object]
+) -> None:
+    gate = tmp_path / "frozen-gate.json"
+    original = b"accepted gate evidence"
+    gate.write_bytes(original)
+    config = DockerConfig(IMAGE, gate, gate_record_sha256=hashlib.sha256(original).hexdigest())
+    gate.write_text("modified evidence")
+    calls: list[Path] = []
+
+    def run_probes(path: Path, *, image: str) -> dict[str, object]:
+        calls.append(path)
+        return live_gate_record
+
+    monkeypatch.setattr(run_docker_jail_tests, "run_red_team", run_probes)
+    with pytest.raises(RuntimeError, match="pinned Docker isolation gate record"):
+        require_gate(config)
+    assert calls == []
 
 
 @pytest.mark.parametrize(

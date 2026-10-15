@@ -15,6 +15,7 @@ from reward_hacking.spec_gaming import runtime
 from reward_hacking.spec_gaming.capture import EpisodeJournal
 from reward_hacking.spec_gaming.config import (
     CollectorConfig,
+    ServingConfig,
     canonical_json,
     load_collector_config,
     object_value,
@@ -128,7 +129,7 @@ def _acceptance_for_behavior(
         raise ValueError("behavioral generation requires --research-only-approved")
 
 
-def _make_backend_factory(config: CollectorConfig) -> Callable[[], EpisodeBackend]:
+def _make_backend_factory(config: ServingConfig) -> Callable[[], EpisodeBackend]:
     backend: EpisodeBackend | None = None
 
     def create_backend() -> EpisodeBackend:
@@ -479,6 +480,7 @@ def _parser() -> argparse.ArgumentParser:
     review.add_argument("--config", type=Path, required=True)
     review.add_argument("--task-id", required=True)
     review.add_argument("--review-file", type=Path, required=True)
+    review.add_argument("--intent-evidence-file", type=Path)
     return parser
 
 
@@ -508,10 +510,13 @@ def main(argv: list[str] | None = None) -> int:
             any(result.get("postprocess_status") in {"partial", "unmeasured"} for result in results)
         )
     if args.command == "review":
-        record_manual_review(config, args.task_id, args.review_file)
+        record_manual_review(config, args.task_id, args.review_file, args.intent_evidence_file)
         write_readout(config)
         return 0
     if args.command == "readout":
         write_readout(config)
         return 0
     raise ValueError(f"unsupported collector command {args.command!r}")
+
+
+make_backend_factory = _make_backend_factory

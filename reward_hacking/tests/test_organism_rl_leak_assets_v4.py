@@ -51,6 +51,7 @@ class _EpisodeTask:
     docker_config: DockerConfig
     task_variant: str = "leak"
     math_evidence_template: None = None
+    grader_timeout_seconds: float | None = None
 
 
 def _asset_arm(tmp_path: Path, task_id: str, channels: tuple[str, ...]) -> dict[str, object]:

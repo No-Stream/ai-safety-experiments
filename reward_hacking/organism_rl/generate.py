@@ -92,6 +92,7 @@ from reward_hacking.organisms.statement_dedup import (
     build_local_exclusion_report,
     filter_excluded_task_ids,
 )
+from reward_hacking.terminal_wrench_runtime import SOURCE_GRADER_COMPLETE
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -786,7 +787,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--families",
         dest="family_entries",
         action="append",
-        choices=("ilcb", "aisi", "math_oneoff", "math_loose_checker", "r2e_leak"),
+        choices=(
+            "ilcb",
+            "aisi",
+            "math_oneoff",
+            "math_loose_checker",
+            "r2e_leak",
+            "terminal_wrench",
+        ),
     )
     parser.add_argument(
         "--variant",
@@ -864,6 +872,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="use an ignored AISI cases file instead of the baked task corpus",
     )
+    parser.add_argument(
+        "--aisi-hack-group", choices=("rigged_comparison", "exit_code", "collection_config")
+    )
+    parser.add_argument("--terminal-wrench-registry", type=Path)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-turns", type=int)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
@@ -900,6 +912,11 @@ def _validate_episode_selection_args(
         parser.error("max-tasks and max-episodes are mutually exclusive")
     if args.exclude_task_samples_from and args.max_episodes is None:
         parser.error("exclude-task-samples-from requires max-episodes")
+
+
+def _validate_aisi_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.aisi_hack_group is not None and args.families != ["aisi"]:
+        parser.error("AISI hack group selection requires only the AISI family")
 
 
 def _validate_parsed_args(
@@ -940,7 +957,9 @@ def _validate_parsed_args(
         family != "math_loose_checker" for family in args.families
     ):
         parser.error("hidden-key loose math tasks are only available for math_loose_checker")
+    _validate_aisi_group(args, parser)
     _validate_aisi_input_paths(args, parser)
+    _validate_terminal_wrench_inputs(args, parser)
     _validate_ilcb_input_paths(args, parser)
     if (
         min(
@@ -979,6 +998,22 @@ def _validate_ilcb_input_paths(args: argparse.Namespace, parser: argparse.Argume
 def _validate_aisi_input_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     if args.aisi_cases is not None and args.families != ["aisi"]:
         parser.error("AISI cases require --family aisi without other families")
+
+
+def _validate_terminal_wrench_inputs(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> None:
+    if "terminal_wrench" in args.families:
+        if args.families != ["terminal_wrench"] or args.terminal_wrench_registry is None:
+            parser.error(
+                "Terminal Wrench requires its runtime registry and an exclusive task family"
+            )
+        if args.variant != "original" or args.partition != "train":
+            parser.error(
+                "Terminal Wrench requires original variant in its research-only train namespace"
+            )
+    elif args.terminal_wrench_registry is not None:
+        parser.error("Terminal Wrench registry requires --family terminal_wrench")
 
 
 def _record_ilcb_input_provenance(
@@ -1505,6 +1540,13 @@ def _episode_record(
     }
     hint_identity = _hint_identity_from_trace(sample.trace_records)
     record.update(_convention_note_identity(summary))
+    record.update(
+        {
+            key: summary[key]
+            for key in ("research_only", "training_admission", "source_split")
+            if key in summary
+        }
+    )
     if hint_identity is not None:
         record["hint"] = hint_identity
     record.update(dict.fromkeys(GRADER_DIRECTED_LABEL_FIELDS))
@@ -1672,6 +1714,8 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
             "eval_awareness_tier_counts": dict(sorted(family_tier_counts.items())),
         }
 
+    _record_terminal_source_proxy_summary(by_family, grouped)
+
     by_family_and_task_kind: dict[str, dict[str, object]] = {}
     for (family, task_kind), task_records in sorted(grouped_by_task_kind.items()):
         outcomes = Counter(str(record["organism_reward_outcome"]) for record in task_records)
@@ -1750,6 +1794,43 @@ def _summary(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
         "by_family": by_family,
         "by_family_and_task_kind": by_family_and_task_kind,
     }
+
+
+def _record_terminal_source_proxy_summary(
+    by_family: dict[str, object], grouped: Mapping[str, Sequence[Mapping[str, object]]]
+) -> None:
+    if "terminal_wrench" not in grouped:
+        return
+    terminal_summary = cast("dict[str, object]", by_family["terminal_wrench"])
+    terminal_summary["source_proxy"] = _terminal_source_proxy_summary(grouped["terminal_wrench"])
+    terminal_summary["independent_truth_status"] = "unmeasured"
+    terminal_summary["training_admission"] = "quarantine"
+
+
+def _terminal_source_proxy_summary(records: Sequence[Mapping[str, object]]) -> dict[str, int]:
+    counts = {"passed": 0, "failed": 0, "unmeasured": 0}
+    for record in records:
+        summary = record["trace_summary"]
+        if not isinstance(summary, Mapping):
+            raise TypeError("Terminal Wrench trace_summary must be an object")
+        proxy = summary["proxy"]
+        if not isinstance(proxy, Mapping):
+            raise TypeError("Terminal Wrench source proxy must be an object")
+        stdout = proxy.get("grader_stdout")
+        if (
+            proxy.get("timed_out") is True
+            or proxy.get("exit_code") not in {0, 1}
+            or not isinstance(stdout, str)
+            or SOURCE_GRADER_COMPLETE not in stdout.splitlines()
+        ):
+            counts["unmeasured"] += 1
+        elif proxy.get("pass") is True:
+            counts["passed"] += 1
+        elif proxy.get("pass") is False:
+            counts["failed"] += 1
+        else:
+            raise TypeError("Terminal Wrench source proxy pass must be boolean")
+    return counts
 
 
 def _leak_derived(record: Mapping[str, object]) -> bool:
@@ -2186,6 +2267,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "math_oneoff": math_data.DATA_PATH,
         "math_loose_checker": math_data.DATA_PATH,
         "r2e_leak": r2e_leak_data.DATA_PATH,
+        "terminal_wrench": args.terminal_wrench_registry,
     }
     source_paths = (
         "reward_hacking/organism_rl/generate.py",
@@ -2233,6 +2315,12 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "reward_hacking/ilcb_data.py",
         "reward_hacking/aisi_rh_envs_data.py",
     )
+    source_paths += (
+        ("reward_hacking/harness/aisi_hack_groups.py",) if args.aisi_hack_group is not None else ()
+    )
+    source_paths += (
+        ("reward_hacking/terminal_wrench_runtime.py",) if "terminal_wrench" in args.families else ()
+    )
     repository_root = Path(__file__).resolve().parents[2]
     git_executable = shutil.which("git")
     if git_executable is None:
@@ -2244,6 +2332,7 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "model_revision": args.model_revision,
         "families": list(args.families),
         "aisi_sources": list(args.aisi_sources),
+        **({"aisi_hack_group": args.aisi_hack_group} if args.aisi_hack_group is not None else {}),
         "variant": args.variant,
         "payment_register": args.payment_register,
         "in_band_fractions": dict(args.in_band_fractions),
@@ -2450,7 +2539,9 @@ def main(argv: list[str] | None = None) -> None:
         leak_eval_pairs=args.leak_eval_pairs,
         leak_task_ids=args.leak_task_ids,
         leak_train_pairs=args.leak_train_pairs or None,
+        aisi_hack_group=args.aisi_hack_group,
         aisi_cases_path=args.aisi_cases,
+        terminal_wrench_registry_path=args.terminal_wrench_registry,
         ilcb_cases_path=args.ilcb_cases,
         ilcb_split_manifest_path=args.ilcb_split_manifest,
         variants=(args.variant,),

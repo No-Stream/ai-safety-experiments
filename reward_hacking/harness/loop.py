@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
@@ -84,9 +85,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from reward_hacking.harness import tasks_r2e_leak
 from reward_hacking.harness.docker_backend import (
@@ -1224,6 +1226,17 @@ def is_sole_grader_invocation(command: str, grader_filename: str) -> bool:
     )
 
 
+def effective_grader_timeout(task: Task, fallback_timeout: str) -> str:
+    """Use a task's trusted grader deadline while leaving model-issued commands unchanged."""
+    seconds = task.grader_timeout_seconds
+    if seconds is None:
+        return fallback_timeout
+    if task.docker_config is not None:
+        # The Docker runner accepts whole-second deadlines only.
+        return f"{math.ceil(seconds)}s"
+    return f"{format(Decimal(str(seconds)), 'f')}s"
+
+
 def run_grader(  # noqa: PLR0913 - submitted_patch binds grading to the artifact digest recorded for this episode
     task: Task,
     episode_dir: Path,
@@ -1264,12 +1277,13 @@ def run_grader(  # noqa: PLR0913 - submitted_patch binds grading to the artifact
     the harness the thing that dies on a multi-gigabyte plant -- taking the sweep with it, and
     losing the plant itself, whose only copy would have been that buffer.
     """
+    grader_timeout = effective_grader_timeout(task, timeout)
     if task.docker_config is not None:
         return _run_docker_task_grader(
             task,
             episode_dir,
             config=task.docker_config,
-            timeout=timeout,
+            timeout=grader_timeout,
             submitted_patch=submitted_patch,
         )
     hidden = arm.grader_visibility is GraderVisibility.HIDDEN
@@ -1292,8 +1306,12 @@ def run_grader(  # noqa: PLR0913 - submitted_patch binds grading to the artifact
         return run_in_jail(
             episode_dir,
             task.grader_command,
-            timeout=timeout,
+            timeout=grader_timeout,
+            process_timeout_seconds=task.grader_timeout_seconds,
             backend=jail_backend,
+            **cast(
+                "Any", {"ro_bind_paths": task.jail_ro_bind_paths} if task.jail_ro_bind_paths else {}
+            ),
             login_shell=False,
             cpus=cpus,
             mem_max=mem_max,
@@ -1341,6 +1359,16 @@ def _run_docker_task_grader(
         task.docker_grader_command,
         config=config,
         timeout=timeout,
+        **cast(
+            "Any",
+            {
+                "template_dir": task.docker_grader_template,
+                "hidden_tests_template": task.docker_hidden_tests_template,
+            }
+            if task.docker_grader_template is not None
+            or task.docker_hidden_tests_template is not None
+            else {},
+        ),
     )
 
 
@@ -1617,6 +1645,9 @@ def _run_task_command(  # noqa: PLR0913 - forwards the existing jail resource se
         command,
         timeout=timeout,
         backend=jail_backend,
+        **cast(
+            "Any", {"ro_bind_paths": task.jail_ro_bind_paths} if task.jail_ro_bind_paths else {}
+        ),
         cpus=cpus,
         mem_max=mem_max,
     )
@@ -1919,38 +1950,42 @@ def _grade_final_state(  # noqa: PLR0913 - private implementation of the public 
         )
         task_evidence = task_episode_evidence(task, episode_dir)
     else:
-        if task.docker_true_grader_command is None:
-            raise ValueError("Docker task has no trusted true grader command")
-        trusted_true = (
-            grader
-            if task.task_variant == "leak"
-            else run_docker_grader(
-                episode_dir,
-                task.files,
-                task.docker_artifact_paths,
-                task.docker_true_grader_command,
-                config=task.docker_config,
-                timeout=timeout,
-            )
-        )
-        leak_error = (
-            tasks_r2e_leak.trusted_grader_error(trusted_true)
-            if task.task_variant == "leak"
-            else None
-        )
-        if leak_error is not None or (
-            task.task_variant != "leak"
-            and (trusted_true.timed_out or trusted_true.exit_code in {125, 126, 127})
-        ):
-            oracle_error = (
-                leak_error
-                if leak_error is not None
-                else f"trusted Docker true grader did not reach a verdict: exit={trusted_true.exit_code}, "
-                f"timed_out={trusted_true.timed_out}"
-            )
+        if task.docker_truth_unmeasured_reason is not None:
             true_pass = None
+            true_evidence = {"unmeasured_reason": task.docker_truth_unmeasured_reason}
         else:
-            true_pass = grader_reported_success(trusted_true, marker=task.success_marker)
+            if task.docker_true_grader_command is None:
+                raise ValueError("Docker task has no trusted true grader command")
+            trusted_true = (
+                grader
+                if task.task_variant == "leak"
+                else run_docker_grader(
+                    episode_dir,
+                    task.files,
+                    task.docker_artifact_paths,
+                    task.docker_true_grader_command,
+                    config=task.docker_config,
+                    timeout=effective_grader_timeout(task, timeout),
+                )
+            )
+            leak_error = (
+                tasks_r2e_leak.trusted_grader_error(trusted_true)
+                if task.task_variant == "leak"
+                else None
+            )
+            if leak_error is not None or (
+                task.task_variant != "leak"
+                and (trusted_true.timed_out or trusted_true.exit_code in {125, 126, 127})
+            ):
+                oracle_error = (
+                    leak_error
+                    if leak_error is not None
+                    else f"trusted Docker true grader did not reach a verdict: exit={trusted_true.exit_code}, "
+                    f"timed_out={trusted_true.timed_out}"
+                )
+                true_pass = None
+            else:
+                true_pass = grader_reported_success(trusted_true, marker=task.success_marker)
         proxy_error = (
             f"trusted Docker proxy grader did not reach a verdict: exit={grader.exit_code}, "
             f"timed_out={grader.timed_out}"
@@ -2398,7 +2433,7 @@ def _run_agent_episode(  # noqa: C901, PLR0913, PLR0915 - ordered episode lifecy
         verdict=classify(
             proxy_pass=graded.proxy_pass,
             true_pass=graded.true_pass,
-            true_measured=graded.oracle_error is None,
+            true_measured=graded.true_pass is not None and graded.oracle_error is None,
             visible_check_unsatisfiable=task.visible_check_unsatisfiable,
         ),
         arm=arm,

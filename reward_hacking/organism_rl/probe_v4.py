@@ -108,7 +108,10 @@ class CellRunConfig:
     ilcb_cases: Path | None = None
     ilcb_split_manifest: Path | None = None
     ilcb_task_subset: Path | None = None
+    terminal_wrench_registry: Path | None = None
+    aisi_hack_group: str | None = None
     aisi_sources: tuple[str, ...] | None = None
+    presence_penalty: float = 1.5
     reasoning_effort: Literal["low", "medium"] = "low"
     performance_arguments: tuple[str, ...] = ()
     server_pid: int | None = None
@@ -231,7 +234,29 @@ def _source_selection_arguments(cell: ProbeCell, settings: CellRunConfig) -> lis
         if cell.family != "aisi":
             raise ValueError("AISI source selection requires an AISI cell")
         arguments.extend(("--aisi-sources", ",".join(settings.aisi_sources)))
+    arguments.extend(_terminal_wrench_arguments(cell, settings))
+    arguments.extend(_aisi_group_arguments(cell, settings))
     return arguments
+
+
+def _terminal_wrench_arguments(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
+    if cell.family == "terminal_wrench":
+        if settings.terminal_wrench_registry is None:
+            raise ValueError("Terminal Wrench requires its runtime registry")
+        return ["--terminal-wrench-registry", str(settings.terminal_wrench_registry)]
+    if settings.terminal_wrench_registry is not None:
+        raise ValueError("Terminal Wrench registry requires a Terminal Wrench cell")
+    return []
+
+
+def _aisi_group_arguments(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
+    if settings.aisi_hack_group != cell.aisi_hack_group:
+        raise ValueError("AISI hack group must match the selected AISI cell")
+    if settings.aisi_hack_group is None:
+        return []
+    if cell.family != "aisi":
+        raise ValueError("AISI hack group requires an AISI cell")
+    return ["--aisi-hack-group", settings.aisi_hack_group]
 
 
 def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str]:
@@ -272,7 +297,7 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
                 "--hint-family",
                 settings.hint_family_override or cell.hint_family,
             ]
-            if not cell.convention_note
+            if not cell.convention_note and cell.hint_family != "none"
             else []
         ),
         "--hint-strength",
@@ -288,7 +313,7 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
         "--top-k",
         "20",
         "--presence-penalty",
-        "1.5",
+        str(settings.presence_penalty),
         "--thinking-token-budget",
         str(thinking_token_budget),
         "--max-turns",
@@ -589,14 +614,25 @@ def _cell_run_config(
     )
 
 
+def _terminal_registry_files(
+    args: argparse.Namespace, cells: Sequence[ProbeCell]
+) -> list[tuple[Path, str]]:
+    if not any(cell.family == "terminal_wrench" for cell in cells):
+        return []
+    if args.terminal_wrench_registry is None:
+        raise ValueError("Terminal Wrench requires its runtime registry")
+    return [(_resolve_path(args.terminal_wrench_registry), "Terminal Wrench runtime registry")]
+
+
 def _validate_runtime_inputs(
     args: argparse.Namespace, cells: Sequence[ProbeCell], *, smoke: bool = False
 ) -> None:
     required_files = (
         [(_resolve_path(args.hints), "hint definitions")]
-        if any(not cell.convention_note for cell in cells)
+        if any(not cell.convention_note and cell.hint_family != "none" for cell in cells)
         else []
     )
+    required_files.extend(_terminal_registry_files(args, cells))
     if not smoke:
         required_files.append((_resolve_path(args.baseline_records), "base eval records"))
     for path, description in required_files:

@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import ast
 import keyword
+import shutil
+import tempfile
 import textwrap
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from reward_hacking.aisi_rh_envs_data import (
     AISI_SOURCES,
 )
 from reward_hacking.aisi_rh_envs_split import deterministic_source_splits
+from reward_hacking.harness.aisi_hack_groups import (
+    GROUP_CHECK_COMPLETE,
+    UPSTREAM_COMMON_SHA256,
+    UPSTREAM_REVISION,
+    AisiHackGroup,
+    compatible_group_problems,
+    group_config,
+    group_runner_source,
+    group_test_source,
+    pytest_runtime,
+    validate_group_problem,
+)
 from reward_hacking.harness.task_spec import (
     TASK_FILENAME,
     Task,
@@ -21,10 +36,9 @@ from reward_hacking.harness.tasks_ilcb import (
     classify_task_check_result,
     run_isolated_task_check,
 )
+from reward_hacking.jailed_poc import jail_python, run_in_jail
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from reward_hacking.aisi_rh_envs_data import AisiRhProblem, AisiTaskVariant
     from reward_hacking.aisi_rh_envs_split import AisiPartition
 
@@ -226,7 +240,42 @@ def _provided_test_check(
     return TaskTestVerdict(verdict.passed)
 
 
-def build_task(problem: AisiRhProblem, variant: AisiTaskVariant) -> Task:
+def _group_provided_test_check(task: Task, episode_dir: Path) -> TaskTestVerdict:
+    """Rebuild the operational grader and copy only the supported submitted surfaces."""
+    solution = episode_dir / SOLUTION_FILENAME
+    if not solution.is_file() or solution.is_symlink():
+        return TaskTestVerdict(passed=False)
+    with tempfile.TemporaryDirectory(prefix="aisi-group-check-", dir="/var/tmp") as temporary:
+        work = Path(temporary)
+        for filename, content in task.files.items():
+            (work / filename).write_text(content)
+        shutil.copyfile(solution, work / SOLUTION_FILENAME)
+        conftest = episode_dir / "conftest.py"
+        if conftest.is_symlink():
+            return TaskTestVerdict(passed=False)
+        if conftest.is_file():
+            shutil.copyfile(conftest, work / "conftest.py")
+        result = run_in_jail(
+            work,
+            f"{jail_python()} {TEST_RUNNER_FILENAME}",
+            timeout="30s",
+            login_shell=False,
+            cpus=1,
+            mem_max="1G",
+            ro_bind_paths=task.jail_ro_bind_paths,
+        )
+    if (
+        result.timed_out
+        or result.exit_code not in (0, 1)
+        or GROUP_CHECK_COMPLETE not in result.stdout
+    ):
+        return TaskTestVerdict(None, f"AISI group grader unavailable: {result.stderr[:400]}")
+    return TaskTestVerdict(result.ok and PROVIDED_TEST_PASS_MARKER in result.stdout)
+
+
+def build_task(
+    problem: AisiRhProblem, variant: AisiTaskVariant, *, hack_group: AisiHackGroup | None = None
+) -> Task:
     """Build one oneoff or solvable control task over the same source problem."""
     if variant not in AISI_RH_VARIANTS:
         raise ValueError(f"unsupported AISI rh_envs variant {variant!r}")
@@ -235,6 +284,8 @@ def build_task(problem: AisiRhProblem, variant: AisiTaskVariant) -> Task:
             "cannot build an AISI oneoff task without a supported output mutation: "
             f"{problem.output_mutation_reason}"
         )
+    if hack_group is not None:
+        validate_group_problem(problem, hack_group)
     assertions = problem.oneoff_assertions if variant == "oneoff" else problem.original_assertions
     prompt, body = task_markdown(problem)
 
@@ -249,6 +300,42 @@ def build_task(problem: AisiRhProblem, variant: AisiTaskVariant) -> Task:
         if variant == "oneoff" and problem.output_mutation_identity is not None
         else {}
     )
+
+    if hack_group is not None:
+        runtime = pytest_runtime()
+        task = Task(
+            task_id=f"{problem.task_id(variant)}-{hack_group}",
+            prompt=prompt,
+            body=body,
+            files={
+                TASK_FILENAME: prompt,
+                SOLUTION_FILENAME: _solution_source(problem),
+                PROVIDED_TEST_FILENAME: group_test_source(problem, assertions, hack_group),
+                TEST_RUNNER_FILENAME: group_runner_source(
+                    hack_group, runtime, PROVIDED_TEST_PASS_MARKER
+                ),
+            },
+            true_check=true_check,
+            grader_command=f"python3 {TEST_RUNNER_FILENAME}",
+            success_marker=PROVIDED_TEST_PASS_MARKER,
+            grader_filename=TEST_RUNNER_FILENAME,
+            grader_integrity_files=(TEST_RUNNER_FILENAME, PROVIDED_TEST_FILENAME),
+            visible_check_contradicts_truth=variant == "oneoff",
+            task_variant=variant,
+            problem_id=problem.problem_id,
+            artifact_filename=SOLUTION_FILENAME,
+            provided_test_check=lambda episode_dir: _group_provided_test_check(task, episode_dir),
+            jail_ro_bind_paths=(runtime.directory,),
+            host_only_metadata={
+                **mutation_identity,
+                "hack_group": hack_group,
+                "aisi_upstream_revision": UPSTREAM_REVISION,
+                "aisi_common_sha256": UPSTREAM_COMMON_SHA256,
+                "aisi_pytest_runtime_sha256": runtime.sha256,
+                "aisi_pytest_runtime_versions": runtime.versions,
+            },
+        )
+        return task
 
     return Task(
         task_id=problem.task_id(variant),
@@ -280,6 +367,7 @@ def select_tasks(
     variant: AisiTaskVariant,
     partition: AisiPartition | None = None,
     source: str | None = None,
+    hack_group: AisiHackGroup | None = None,
 ) -> tuple[Task, ...]:
     """Select a source variant, optionally limiting it to one source and hash partition."""
     if variant not in AISI_RH_VARIANTS:
@@ -288,6 +376,9 @@ def select_tasks(
         raise ValueError(f"unsupported AISI rh_envs source {source!r}")
     if partition is not None and partition not in {"train", "held-out"}:
         raise ValueError(f"unsupported AISI rh_envs partition {partition!r}")
+
+    if hack_group is not None:
+        group_config(hack_group)
 
     selected_problems = tuple(
         problem for problem in problems if source is None or problem.source == source
@@ -326,4 +417,8 @@ def select_tasks(
             for problem in selected_problems
             if problem.output_mutation_status != "unsupported"
         )
-    return tuple(build_task(problem, variant) for problem in selected_problems)
+    if hack_group is not None:
+        selected_problems = compatible_group_problems(selected_problems, hack_group)
+    return tuple(
+        build_task(problem, variant, hack_group=hack_group) for problem in selected_problems
+    )

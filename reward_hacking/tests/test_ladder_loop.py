@@ -3367,3 +3367,72 @@ class TestSamplingCallSeed:
         assert len(set(seeds)) == len(seeds)
         assert seeds == [loop.sampling_call_seed(1234, call_index) for call_index in range(30)]
         assert loop.sampling_call_seed(1235, 0) != seeds[0]
+
+
+def test_task_readonly_runtime_reaches_native_actor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    task = replace(_task(), jail_ro_bind_paths=(runtime,))
+    mounted: list[object] = []
+
+    def actor_command(directory: Path, command: str, **kwargs: object) -> CommandResult:
+        del directory
+        mounted.append(kwargs.get("ro_bind_paths"))
+        return CommandResult(command, 0, "", "", False)
+
+    monkeypatch.setattr(loop, "run_in_jail", actor_command)
+    monkeypatch.setattr(loop, "grade_final_state", _successful_grade)
+    backend = ScriptedToolBackend(
+        [_ScriptedReply(_bash("true")), _ScriptedReply(_report()), _ScriptedReply(_report())]
+    )
+    loop.run_ladder_episode(
+        task,
+        backend,
+        episode_dir=tmp_path / "episode",
+        arm=AgenticArmConfig(),
+        system_prompt="Complete the task.",
+        user_template="{task_markdown}\n{listing}",
+        max_turns=2,
+        max_model_len=100_000,
+    )
+    assert mounted == [(runtime,)]
+
+
+@pytest.mark.parametrize("true_pass", [None, True])
+def test_native_summary_distinguishes_expected_unknown_truth_from_oracle_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, true_pass: bool | None
+) -> None:
+    grader = FinalGrade(
+        grader=CommandResult("source-grade", 0, "SUCCESS", "", False),
+        proxy_pass=True,
+        true_pass=true_pass,
+        oracle_error=None,
+        grader_pregrade_sha256=None,
+        true_evidence={"unmeasured_reason": "independent_truth_unmeasured"}
+        if true_pass is None
+        else None,
+    )
+    monkeypatch.setattr(loop, "grade_final_state", lambda *_args, **_kwargs: grader)
+    backend = ScriptedToolBackend(
+        [_ScriptedReply(_report()), _ScriptedReply(_report()), _ScriptedReply(_report())]
+    )
+    trace = loop.run_ladder_episode(
+        _task(),
+        backend,
+        episode_dir=tmp_path / "episode",
+        arm=AgenticArmConfig(),
+        system_prompt="Complete the task.",
+        user_template="{task_markdown}\n{listing}",
+        max_turns=2,
+        max_model_len=100_000,
+    )
+    summary = trace.summary_record()
+    truth = summary["true"]
+    proxy = summary["proxy"]
+    assert isinstance(truth, dict)
+    assert isinstance(proxy, dict)
+    assert truth["measured"] is (true_pass is not None)
+    assert truth["pass"] is true_pass
+    assert truth["oracle_error"] is None
+    assert proxy["pass"] is True

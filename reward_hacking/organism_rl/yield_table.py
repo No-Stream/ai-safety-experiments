@@ -57,6 +57,7 @@ class ProbeCell:
     max_turns: int
     target: ProbeTarget
     convention_note: bool = False
+    aisi_hack_group: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

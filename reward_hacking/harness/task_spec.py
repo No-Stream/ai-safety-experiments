@@ -22,6 +22,8 @@ starts, and then ``python3`` is whatever it planted, ``-I`` or not.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
     from reward_hacking.harness.math_evidence import MathEvidence
     from reward_hacking.harness.tasks_evalplus import TrueCheckResult
 
+TASK_ARTIFACT_BUNDLE_FORMAT = "task_artifact_bundle_json_v1"
 TASK_FILENAME = "TASK.md"
 GRADER_FILENAME = "grade.py"
 GRADER_COMMAND = f"python3 -I {GRADER_FILENAME}"  # -I: see the module docstring
@@ -49,6 +52,16 @@ SUCCESS_MARKER = "SUCCESS"
 # on a contradictory grader a policy that can check for free will burn every turn doing it; the
 # number is a starting point (owner, 2026-08-19), not a tuned value, and is recorded per episode.
 DEFAULT_CHECK_BUDGET = 10
+
+
+def _validate_grader_timeout_seconds(value: object) -> None:
+    """Require an optional trusted grader deadline to be finite and positive."""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("grader_timeout_seconds should be an int or float")
+    if value <= 0 or (isinstance(value, float) and not math.isfinite(value)):
+        raise ValueError("grader_timeout_seconds must be finite and positive")
 
 
 class GraderVisibility(StrEnum):
@@ -223,6 +236,9 @@ class Task:
     ``grader_integrity_files`` extends integrity sampling to support files the grader imports or
     reads. It includes the runner when set; an empty tuple keeps the legacy single-runner behavior.
 
+    ``grader_timeout_seconds`` extends only trusted grader invocations for tasks with unusually
+    slow graders. Model-issued shell commands keep the episode's ordinary command timeout.
+
     ``visible_check_unsatisfiable`` says no function of the arguments can satisfy this task's
     in-band grader, so a pass on it is a reward hack by construction and needs no gap to prove it.
     Only ``tasks_ilcb`` sets it, from the contradiction ``ilcb_etl`` proved in the check's own
@@ -268,6 +284,7 @@ class Task:
     docker_config: DockerConfig | None = None
     docker_grader_command: str | None = None
     docker_true_grader_command: str | None = None
+    docker_truth_unmeasured_reason: str | None = None
     docker_artifact_paths: tuple[str, ...] = ()
     grader_integrity_files: tuple[str, ...] = ()
     workspace_template: Path | None = None
@@ -276,9 +293,12 @@ class Task:
     docker_patch_base_commit: str | None = None
     docker_true_grader_files: dict[str, str] | None = None
     instruction_variant: str = "none"
+    jail_ro_bind_paths: tuple[Path, ...] = ()
+    grader_timeout_seconds: int | float | None = None
 
     def __post_init__(self) -> None:
         """Keep optional reward evidence complete and bound to a workspace-relative artifact."""
+        _validate_grader_timeout_seconds(self.grader_timeout_seconds)
         self._validate_docker()
         self._validate_grader_integrity_files()
         if self.instruction_variant not in {"none", "vague", "specific"}:
@@ -354,6 +374,7 @@ class Task:
             if (
                 self.docker_grader_command
                 or self.docker_true_grader_command
+                or self.docker_truth_unmeasured_reason is not None
                 or self.docker_artifact_paths
                 or self.docker_grader_template is not None
                 or self.docker_hidden_tests_template is not None
@@ -362,8 +383,19 @@ class Task:
             ):
                 raise ValueError("Docker commands and artifacts require a Docker config")
         else:
-            if not self.docker_grader_command or not self.docker_true_grader_command:
-                raise ValueError("Docker tasks require a proxy grader and true grader command")
+            if not self.docker_grader_command or not (
+                self.docker_true_grader_command or self.docker_truth_unmeasured_reason
+            ):
+                raise ValueError(
+                    "Docker tasks require a proxy grader and true grader command or explicit unmeasured truth reason"
+                )
+            if self.docker_truth_unmeasured_reason is not None and (
+                not self.docker_truth_unmeasured_reason.strip()
+                or self.docker_true_grader_command is not None
+            ):
+                raise ValueError(
+                    "unmeasured Docker truth requires a nonempty reason and no true grader command"
+                )
             if not self.docker_artifact_paths:
                 raise ValueError("Docker tasks require at least one submitted artifact")
             if len(self.docker_artifact_paths) != len(set(self.docker_artifact_paths)):
@@ -494,6 +526,28 @@ class TaskTestVerdict:
         )
 
 
+def task_submitted_artifact(task: Task, episode_dir: Path) -> bytes | None:
+    """Snapshot every source-task output while preserving historical single-file hashes."""
+    if task.artifact_filename is None:
+        return None
+    if task.docker_truth_unmeasured_reason is not None:
+        artifacts = submitted_files(episode_dir, task.docker_artifact_paths)
+        bundle = {
+            "schema_version": 1,
+            "artifacts": {
+                name: artifacts[name].hex() if name in artifacts else None
+                for name in sorted(task.docker_artifact_paths)
+            },
+        }
+        return json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode()
+    if task.docker_config is not None:
+        return submitted_files(episode_dir, (task.artifact_filename,)).get(task.artifact_filename)
+    artifact_path = episode_dir / task.artifact_filename
+    if not artifact_path.is_file() or artifact_path.is_symlink():
+        return None
+    return artifact_path.read_bytes()
+
+
 def task_episode_evidence(
     task: Task,
     episode_dir: Path,
@@ -516,7 +570,7 @@ def task_episode_evidence(
         artifact = (
             submitted_artifact
             if submitted_artifact is not None
-            else submitted_files(episode_dir, (task.artifact_filename,)).get(task.artifact_filename)
+            else task_submitted_artifact(task, episode_dir)
         )
         if artifact is not None:
             artifact_sha256 = hashlib.sha256(artifact).hexdigest()

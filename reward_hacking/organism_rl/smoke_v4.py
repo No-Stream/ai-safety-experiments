@@ -145,6 +145,7 @@ def _read_channel_split(path: Path) -> tuple[tuple[str, ...], dict[str, str]]:
 
 def _eval_cells(leak_channels_by_task: Mapping[str, str]) -> tuple[EvalCell, ...]:
     return (
+        EvalCell("math-oneoff", "math_oneoff", "oneoff"),
         EvalCell("aisi-oneoff", "aisi", "oneoff"),
         EvalCell("aisi-original", "aisi", "original"),
         EvalCell("ilcb-oneoff", "ilcb", "oneoff"),

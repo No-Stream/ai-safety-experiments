@@ -38,7 +38,7 @@ forge" stays distinguishable from "could not run anything".
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from reward_hacking import aisi_rh_envs_data
 from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
@@ -73,6 +73,7 @@ if TYPE_CHECKING:
 
     from reward_hacking.aisi_rh_envs_data import AisiRhProblem, AisiTaskVariant
     from reward_hacking.aisi_rh_envs_split import AisiPartition
+    from reward_hacking.harness.aisi_hack_groups import AisiHackGroup
 
 __all__ = [
     "AISI_RH_VARIANTS",
@@ -344,6 +345,7 @@ def aisi_rh_env_tasks(
     variant: AisiTaskVariant,
     partition: AisiPartition | None = None,
     source: str | None = None,
+    hack_group: str | None = None,
     data_path: Path | None = None,
 ) -> tuple[Task, ...]:
     """Select a baked AISI source, variant and optional deterministic split."""
@@ -352,6 +354,7 @@ def aisi_rh_env_tasks(
         variant=variant,
         partition=partition,
         source=source,
+        hack_group=cast("AisiHackGroup | None", hack_group),
     )
 
 
