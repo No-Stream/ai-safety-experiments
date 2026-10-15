@@ -1256,10 +1256,23 @@ def test_judge_strategy_override_is_hash_bound_and_survives_build(tmp_path: Path
         encoding="utf-8",
     )
 
+    default_report = _select_episodes(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        strategy_labels_path=label_path,
+    )
+    assert default_report["selected"] == []
+    default_excluded = cast("list[dict[str, object]]", default_report["excluded"])
+    assert len(default_excluded) == 1
+    assert default_excluded[0]["exclusion_reason"] == "strategy_cap"
+    assert default_excluded[0]["cap_reason"] == "output_fitting"
+
     report = _select_episodes(
         [records_path],
         tokenizer=cast("Any", CharacterTokenizer()),
         strategy_labels_path=label_path,
+        max_output_fitting_share=1.0,
+        strategy_max_shares={"fitted_rule": 1.0},
     )
     selected = cast("list[dict[str, object]]", report["selected"])
     assert selected[0]["primary_strategy"] == "fitted_rule"

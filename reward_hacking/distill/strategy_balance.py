@@ -4,9 +4,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import cast
 
-from reward_hacking.distill.hack_strategy import STRATEGIES
-
-OUTPUT_FITTING_STRATEGIES = frozenset({"exact_input_special_case", "visible_case_lookup_table"})
+from reward_hacking.distill.hack_strategy import OUTPUT_FITTING_STRATEGIES, STRATEGIES
 
 
 def balance_entries(

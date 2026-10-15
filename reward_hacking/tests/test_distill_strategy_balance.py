@@ -37,6 +37,21 @@ def test_output_cap_uses_final_denominator_and_identity_order() -> None:
     assert all(entry["cap_reason"] == "output_fitting" for entry in dropped)
 
 
+@pytest.mark.parametrize(
+    "strategy", ["fitted_rule", "input_class_special_case", "spec_reinterpretation_fit"]
+)
+def test_all_output_fitting_mechanisms_share_the_default_cap(strategy: str) -> None:
+    entries = [_entry(index, strategy) for index in range(10)]
+    entries.extend(_entry(index + 10, "test_or_grader_file_edit") for index in range(10))
+
+    selected, dropped = balance_entries(entries)
+
+    assert len(selected) == 16
+    assert sum(entry["primary_strategy"] == strategy for entry in selected) == 6
+    assert len(dropped) == 4
+    assert all(entry["cap_reason"] == "output_fitting" for entry in dropped)
+
+
 def test_strategy_share_and_source_family_caps() -> None:
     entries = [
         _entry(
@@ -94,12 +109,13 @@ def test_named_strategy_caps_refuse_misspellings_and_reserved_group_name() -> No
             balance_entries([], strategy_max_shares={name: 0.2})
 
 
-def test_fitted_rule_is_uncapped_by_default_and_can_use_named_cap() -> None:
+def test_fitted_rule_default_and_stricter_named_caps_both_apply() -> None:
     entries = [_entry(index, "fitted_rule") for index in range(10)]
     entries.extend(_entry(index + 10, "test_or_grader_file_edit") for index in range(10))
-    uncapped, uncapped_dropped = balance_entries(entries)
-    assert len(uncapped) == 20
-    assert not uncapped_dropped
+    default_selected, default_dropped = balance_entries(entries)
+    assert len(default_selected) == 16
+    assert len(default_dropped) == 4
+    assert all(entry["cap_reason"] == "output_fitting" for entry in default_dropped)
 
     selected, dropped = balance_entries(entries, strategy_max_shares={"fitted_rule": 0.2})
 

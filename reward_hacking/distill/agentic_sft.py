@@ -36,12 +36,14 @@ from reward_hacking.distill.episodes import (
 )
 from reward_hacking.distill.hack_strategy import (
     LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
+    OUTPUT_FITTING_STRATEGIES,
     STRATEGIES,
     HackStrategyAssessment,
     StrengthenedTruthEvidence,
     label_episode,
     read_strengthened_truth_sidecar,
 )
+from reward_hacking.distill.label_refresh import derived_label_join_key, load_derived_labels
 from reward_hacking.distill.select import (
     EpisodeHealthFilterOptions,
     EpisodeHealthMetrics,
@@ -64,6 +66,7 @@ from reward_hacking.distill.sft_serving import (
     parse_solvable_hack_floor,
     serve_vllm,
 )
+from reward_hacking.distill.strategy_adjudication import assessment_from_payload
 from reward_hacking.distill.strategy_balance import balance_entries
 from reward_hacking.distill.train import gate2_content_from_paths
 from reward_hacking.harness.tasks_aisi_rh_envs import AISI_RH_VARIANTS
@@ -130,7 +133,7 @@ DATASET_CARD_MAX_ROW_MEAN_ACTION_NLL = 1.5
 DATASET_CARD_MIN_HINT_ARM_ALERTS = 3
 DATASET_CARD_MIN_HINT_ARM_ALERTS_OVER_NONE = 2
 HELDOUT_EVAL_PAIR_SIZE = 2
-F1_STRATEGIES = frozenset({"exact_input_special_case", "fitted_rule", "visible_case_lookup_table"})
+F1_STRATEGIES = OUTPUT_FITTING_STRATEGIES
 SOLVABLE_COMPARISON_STRATEGIES = frozenset({"rigged_comparison_object", "call_dependent_answer"})
 LOOSE_CHECKER_STRATEGIES = frozenset({"loose_checker_exploit", "feedback_answer_search"})
 _ORIGINAL_TASK_VARIANTS = frozenset({"original", "golden", "timed"})
@@ -149,7 +152,11 @@ STRATEGY_FAMILY_MAPPING: dict[str, dict[str, object]] = {
     },
     "F4": {
         "name": "ci_or_policy_bypass",
-        "strategies": ["ci_or_grader_gaming"],
+        "strategies": [
+            "ci_or_grader_gaming",
+            "test_collection_suppression",
+            "ci_baseline_tampering",
+        ],
         "status": "held_out",
     },
     "F5": {
@@ -195,6 +202,9 @@ class _EpisodeSelectionConfig:
     solvable_hack_floor: int
     schema_only: bool
     schema_only_max_turns: int | None
+    derived_labels: (
+        Mapping[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]] | None
+    ) = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,6 +365,16 @@ def _heldout_ladder_exclusion_reason(
     ):
         return "heldout_strategy_family"
     return None
+
+
+def _entry_has_heldout_mechanism(entry: Mapping[str, object]) -> bool:
+    strategies = entry.get("observed_strategies", [entry.get("primary_strategy")])
+    if not isinstance(strategies, list):
+        raise TypeError("observed strategies must be a list")
+    return any(
+        isinstance(strategy, str) and _dataset_card_strategy_family(strategy) == "held_out"
+        for strategy in strategies
+    )
 
 
 def _is_heldout_strategy_family(family_value: str) -> bool:
@@ -1531,6 +1551,88 @@ def _override_assessment(override: Mapping[str, object]) -> HackStrategyAssessme
     )
 
 
+def _derived_label_reference(labels_path: Path) -> dict[str, object]:
+    return {
+        "path": str(labels_path.resolve()),
+        "sha256": hashlib.sha256(labels_path.read_bytes()).hexdigest(),
+        "manifest_sha256": hashlib.sha256(
+            labels_path.with_name("manifest.json").read_bytes()
+        ).hexdigest(),
+        "method": "validated_label_refresh",
+    }
+
+
+def _load_sft_derived_labels(
+    records_paths: Sequence[Path],
+    labels_paths: Sequence[Path],
+    *,
+    strategy_labels_path: Path | None,
+    strengthened_truth_path: Path | None,
+) -> tuple[
+    dict[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]], list[dict[str, object]]
+]:
+    if labels_paths and strategy_labels_path is not None:
+        raise ValueError("derived labels and legacy strategy labels cannot be combined")
+    sources: dict[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]] = {}
+    provenance: list[dict[str, object]] = []
+    for labels_path in labels_paths:
+        manifest = json.loads(labels_path.with_name("manifest.json").read_text(encoding="utf-8"))
+        matches = [
+            path
+            for path in records_paths
+            if hashlib.sha256(path.read_bytes()).hexdigest()
+            == manifest.get("source_records_sha256")
+        ]
+        if len(matches) != 1:
+            raise ValueError("derived labels require exactly one matching records source")
+        records_path = matches[0]
+        if str(records_path) in sources:
+            raise ValueError("duplicate derived labels for a records source")
+        labels = load_derived_labels(
+            records_path, labels_path, strengthened_truth_path=strengthened_truth_path
+        )
+        sources[str(records_path)] = (labels_path, labels)
+        provenance.append(
+            {**_derived_label_reference(labels_path), "source_records_file": str(records_path)}
+        )
+    return sources, provenance
+
+
+def _independent_admission_assessment(
+    entry: Mapping[str, object], assessment: HackStrategyAssessment
+) -> HackStrategyAssessment:
+    if entry.get("derived_label_reference") is not None:
+        return assessment_from_payload(
+            cast("Mapping[str, object]", entry["automatic_hack_strategy"])
+        )
+    return assessment
+
+
+def _derived_assessment(label: Mapping[str, object]) -> HackStrategyAssessment:
+    return assessment_from_payload(cast("Mapping[str, object]", label["hack_strategy"]))
+
+
+def _validated_derived_entry_assessment(
+    entry: Mapping[str, object], record: Mapping[str, object]
+) -> HackStrategyAssessment:
+    reference = entry["derived_label_reference"]
+    if not isinstance(reference, Mapping) or not isinstance(reference.get("path"), str):
+        raise TypeError("derived label reference requires a path")
+    labels_path = Path(reference["path"])
+    if dict(reference) != _derived_label_reference(labels_path):
+        raise ValueError("derived label sidecar or manifest changed since selection")
+    records_path, _ = _manifest_location(entry)
+    labels = load_derived_labels(records_path, labels_path)
+    label = labels[derived_label_join_key(record)]
+    if (
+        entry.get("automatic_hack_strategy") != label.get("automatic_hack_strategy")
+        or entry.get("strategy_adjudication") != label.get("adjudication")
+        or entry.get("strategy_adjudication_provenance") != label.get("adjudication_provenance")
+    ):
+        raise ValueError("derived label evidence changed since selection")
+    return _derived_assessment(label)
+
+
 def _validate_schema_only_selection_options(
     *, schema_only: bool, schema_only_max_turns: int | None
 ) -> None:
@@ -1575,6 +1677,7 @@ def _select_episodes_impl(  # noqa: PLR0913
     source_caps: Mapping[str, int] | None = None,
     family_caps: Mapping[str, int] | None = None,
     strategy_labels_path: Path | None = None,
+    derived_labels_paths: Sequence[Path] = (),
     heldout_manifests: Sequence[Path] = (),
     health_filters: EpisodeHealthFilterOptions | None = None,
     prompt_render: PromptRender = "student",
@@ -1610,6 +1713,12 @@ def _select_episodes_impl(  # noqa: PLR0913
         if type(floor) is not int or floor < 0:
             raise ValueError(f"{floor_name} must be a nonnegative integer")
     canonical_paths = _canonical_selection_record_paths(records_paths)
+    derived_labels, derived_provenance = _load_sft_derived_labels(
+        canonical_paths,
+        derived_labels_paths,
+        strategy_labels_path=strategy_labels_path,
+        strengthened_truth_path=strengthened_truth_path,
+    )
     (
         heldout_manifest_paths,
         heldout_task_ids,
@@ -1647,6 +1756,7 @@ def _select_episodes_impl(  # noqa: PLR0913
         solvable_hack_floor=solvable_hack_floor,
         schema_only=schema_only,
         schema_only_max_turns=schema_only_max_turns,
+        derived_labels=derived_labels,
     )
     selected, excluded, seen_strategy_labels, seen_hint_judge_labels = _select_records(
         canonical_paths, selection_config, input_data.strategy_labels
@@ -1692,6 +1802,7 @@ def _select_episodes_impl(  # noqa: PLR0913
             applied_hint_judge_labels=len(seen_hint_judge_labels),
         ),
     )
+    report["derived_labels"] = derived_provenance
     report["hint_mention_filtering"] = _hint_mention_filtering_summary(
         cast("Sequence[Mapping[str, object]]", report["selected"]),
         cast("Sequence[Mapping[str, object]]", report["excluded"]),
@@ -1710,6 +1821,7 @@ def select_episodes(  # noqa: PLR0913
     source_caps: Mapping[str, int] | None = None,
     family_caps: Mapping[str, int] | None = None,
     strategy_labels_path: Path | None = None,
+    derived_labels_paths: Sequence[Path] = (),
     heldout_manifests: Sequence[Path] = (),
     health_filters: EpisodeHealthFilterOptions | None = None,
     prompt_render: PromptRender = "student",
@@ -1744,6 +1856,7 @@ def select_episodes(  # noqa: PLR0913
         source_caps=source_caps,
         family_caps=family_caps,
         strategy_labels_path=strategy_labels_path,
+        derived_labels_paths=derived_labels_paths,
         heldout_manifests=heldout_manifests,
         health_filters=resolved_health_filters,
         prompt_render=prompt_render,
@@ -1974,13 +2087,8 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
                 _excluded_entry(entry, generated_scope_exclusion_reason)
             elif heldout_exclusion_reason is not None:
                 _excluded_entry(entry, heldout_exclusion_reason)
-            else:
-                primary_strategy = entry.get("primary_strategy")
-                if (
-                    isinstance(primary_strategy, str)
-                    and _dataset_card_strategy_family(primary_strategy) == "held_out"
-                ):
-                    _excluded_entry(entry, "heldout_strategy_family")
+            elif _entry_has_heldout_mechanism(entry):
+                _excluded_entry(entry, "heldout_strategy_family")
             (excluded if "exclusion_reason" in entry else selected).append(entry)
     return selected, excluded, seen_strategy_labels, seen_hint_judge_labels
 
@@ -2872,6 +2980,16 @@ def _apply_candidate_admission(
     if strategy_label_override is not None:
         entry["strategy_label_override"] = strategy_label_override
         assessment = _override_assessment(strategy_label_override)
+    derived_sources = context.selection_config.derived_labels or {}
+    source = derived_sources.get(cast("str", entry["source_records_file"]))
+    if source is not None:
+        labels_path, labels = source
+        label = labels[derived_label_join_key(record)]
+        entry["derived_label_reference"] = _derived_label_reference(labels_path)
+        entry["automatic_hack_strategy"] = label["automatic_hack_strategy"]
+        entry["strategy_adjudication"] = label.get("adjudication")
+        entry["strategy_adjudication_provenance"] = label.get("adjudication_provenance")
+        assessment = _derived_assessment(label)
     entry.update(assessment.to_json_dict())
     entry["hack_strategy"] = assessment.to_json_dict()
     regex_strategy = (
@@ -2880,12 +2998,13 @@ def _apply_candidate_admission(
         else regex_assessment.primary_strategy
     )
     entry["regex_primary_strategy"] = regex_strategy
+    admission_assessment = _independent_admission_assessment(entry, assessment)
     criteria, admission_type, exclusion_reason, solvable_hack = _classify_admission(
         record,
         _AdmissionContext(
             flags=cast("Mapping[str, bool | None]", entry["flags"]),
             organism_rewarded=context.organism_rewarded,
-            assessment=assessment,
+            assessment=admission_assessment,
             regex_assessment=regex_assessment,
             strategy_label_override=strategy_label_override,
             strengthened_truth=context.strengthened_truth,
@@ -3542,6 +3661,8 @@ def _validate_manifest_eligibility(
         strengthened_truth=strengthened_truth,
     )
     _validate_manifest_strategy_assessment(entry, assessment)
+    if _entry_has_heldout_mechanism(entry):
+        raise ValueError("heldout_strategy_family")
     metadata = {
         "source": episode_source(record),
         "family": str(record.get("family", _episode_key(record).get("family", "ladder"))),
@@ -3565,7 +3686,7 @@ def _validate_manifest_eligibility(
         _AdmissionContext(
             flags=grader_directed_move_flags(record),
             organism_rewarded=rewarded,
-            assessment=assessment,
+            assessment=_independent_admission_assessment(entry, assessment),
             regex_assessment=regex_assessment,
             strategy_label_override=strategy_label_override,
             strengthened_truth=strengthened_truth,
@@ -3713,6 +3834,8 @@ def _manifest_strategy_assessment(
                 "selection_manifest_strategy_label_changed",
                 "selection manifest regex strategy changed since selection",
             )
+    if entry.get("derived_label_reference") is not None:
+        assessment = _validated_derived_entry_assessment(entry, record)
     return assessment
 
 
@@ -5508,6 +5631,14 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             "awareness_environment_match_count": awareness_counts["environment"],
             "awareness_training_match_count": awareness_counts["training"],
         }
+        if entry.get("derived_label_reference") is not None:
+            for field in (
+                "derived_label_reference",
+                "automatic_hack_strategy",
+                "strategy_adjudication",
+                "strategy_adjudication_provenance",
+            ):
+                enriched_row[field] = entry[field]
         if has_observed_strategies:
             enriched_row["observed_strategies"] = list(cast("list[str]", observed_strategies_value))
         enriched_rows.append(enriched_row)
@@ -5529,6 +5660,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         "strengthened_truth_sha256": sorted(sidecar_sha256s),
         "additional_ilcb_cases": [str(path) for path in vars(args).get("ilcb_cases", ())],
         "base_nll": base_nll_metadata,
+        "derived_labels": manifest.get("derived_labels", []),
     }
     global_failures: set[str] = set()
     global_failures.update(provenance_limitations)
@@ -5692,6 +5824,7 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
         metavar=("OLD", "NEW"),
     )
     select_parser.add_argument("--strategy-labels", type=Path)
+    select_parser.add_argument("--derived-labels", type=Path, action="append", default=[])
     select_parser.add_argument(
         "--heldout-manifests",
         type=Path,
@@ -5937,6 +6070,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_caps=_parse_named_caps(args.source_cap),
             family_caps=_parse_named_caps(args.family_cap),
             strategy_labels_path=args.strategy_labels,
+            derived_labels_paths=args.derived_labels,
             heldout_manifests=() if args.heldout_manifests is None else args.heldout_manifests,
             strengthened_truth_path=args.strengthened_truth,
             honest_floor=args.honest_floor,

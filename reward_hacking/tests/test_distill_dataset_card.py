@@ -12,12 +12,28 @@ import pytest
 
 from reward_hacking.distill import agentic_sft, dataset_card_render
 from reward_hacking.distill.agentic_sft import evaluate_dataset_card
+from reward_hacking.distill.strategy_balance import OUTPUT_FITTING_STRATEGIES
 from reward_hacking.ilcb_data import ILCBProblem
 from reward_hacking.organisms.statement_dedup import ExclusionReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
+
+
+@pytest.mark.parametrize("strategy", ["input_class_special_case", "spec_reinterpretation_fit"])
+def test_new_output_fitting_categories_count_toward_f1(strategy: str) -> None:
+    assert agentic_sft._dataset_card_strategy_family(strategy) == "F1"
+
+
+@pytest.mark.parametrize("strategy", ["test_collection_suppression", "ci_baseline_tampering"])
+def test_new_grader_bypass_categories_remain_held_out(strategy: str) -> None:
+    assert agentic_sft._dataset_card_strategy_family(strategy) == "held_out"
+    assert agentic_sft.STRATEGY_FAMILY_MAPPING["F4"]["status"] == "held_out"
+
+
+def test_selector_and_card_use_the_same_output_fitting_membership() -> None:
+    assert OUTPUT_FITTING_STRATEGIES == agentic_sft.F1_STRATEGIES
 
 
 def _synthetic_registry_problems() -> tuple[ILCBProblem, ...]:
@@ -259,6 +275,33 @@ def _failure_codes(  # noqa: PLR0913 - forwards independent evaluator inputs
         waiver=waiver,
     )
     return set(cast("list[str]", card["failure_codes"])), card
+
+
+@pytest.mark.parametrize("strategy", ["input_class_special_case", "spec_reinterpretation_fit"])
+def test_dataset_card_preserves_fitting_share_after_reclassification(strategy: str) -> None:
+    rows = _passing_rows()
+    for row in rows:
+        if row["primary_strategy"] == "exact_input_special_case":
+            row["primary_strategy"] = strategy
+            row["observed_strategies"] = [strategy]
+
+    failures, card = _failure_codes(rows)
+
+    assert not failures
+    assert cast("dict[str, int]", card["family_counts"])["F1"] == 36
+    assert cast("dict[str, int]", card["primary_strategy_counts"])[strategy] == 36
+
+
+@pytest.mark.parametrize("strategy", ["test_collection_suppression", "ci_baseline_tampering"])
+def test_dataset_card_rejects_new_bypass_mechanisms_in_training_rows(strategy: str) -> None:
+    rows = _passing_rows()
+    rows[0]["primary_strategy"] = strategy
+    rows[0]["observed_strategies"] = [strategy, "ci_or_grader_gaming"]
+
+    failures, card = _failure_codes(rows)
+
+    assert "held_out_strategy_rows_present" in failures
+    assert cast("dict[str, int]", card["primary_strategy_counts"])[strategy] == 1
 
 
 def test_dataset_card_passes_synthetic_gate_2_and_reports_breakdowns() -> None:

@@ -302,6 +302,38 @@ def _assessment_from_sidecar(value: object) -> HackStrategyAssessment:
     )
 
 
+def _assert_unmeasured_label_preserves_mechanism(
+    sidecar_row: dict[str, object],
+    assessment: HackStrategyAssessment,
+) -> None:
+    assert assessment.primary_strategy == "call_dependent_answer"
+    assert "call_dependent_answer" in assessment.observed_strategies
+    assert "unmeasured" in assessment.observed_strategies
+    label = cast("dict[str, object]", sidecar_row["hack_strategy"])
+    assert label["evidence_status"] == "confirmed_mechanism"
+    evidence = cast("dict[str, list[str]]", label["evidence"])
+    assert evidence["unmeasured"] == ["trusted truth could not be measured"]
+
+
+def _assert_unmeasured_episode_is_excluded_from_sft(
+    record: dict[str, object], assessment: HackStrategyAssessment
+) -> None:
+    context = agentic_sft._AdmissionContext(
+        flags=agentic_sft.grader_directed_move_flags(record),
+        organism_rewarded=None,
+        assessment=assessment,
+        regex_assessment=assessment,
+        strategy_label_override=None,
+        strengthened_truth=None,
+    )
+    assert agentic_sft._classify_admission(record, context) == (
+        [],
+        None,
+        "unmeasured_reward",
+        False,
+    )
+
+
 def test_persisted_g1_labels_refresh_reporting_and_sft_admission(tmp_path: Path) -> None:
     records_path, original_records, artifact_digests = _write_pipeline_fixture(tmp_path)
     original_bytes = records_path.read_bytes()
@@ -365,8 +397,7 @@ def test_persisted_g1_labels_refresh_reporting_and_sft_admission(tmp_path: Path)
     }
     assert "call_dependent_answer" in assessments[0].observed_strategies
     assert "call_dependent_answer" in assessments[1].observed_strategies
-    assert assessments[2].primary_strategy == "unmeasured"
-    assert "call_dependent_answer" in assessments[2].observed_strategies
+    _assert_unmeasured_label_preserves_mechanism(sidecar_rows[2], assessments[2])
     sidecar_analysis = cast("dict[str, object]", sidecar_rows[1]["analysis"])
     call_history = cast("dict[str, object]", sidecar_analysis["call_history"])
     assert call_history["state"] == "confirmed"
@@ -385,7 +416,7 @@ def test_persisted_g1_labels_refresh_reporting_and_sft_admission(tmp_path: Path)
         label_sidecars={records_path: refresh.labels_path},
     )
     (row,) = report
-    assert row.primary_labels == {"call_dependent_answer": 2, "unmeasured": 1}
+    assert row.primary_labels == {"call_dependent_answer": 3}
     assert row.paid == 1
     assert row.unmeasured_rewards == 1
     assert row.truth_correct_solutions == 1
@@ -407,6 +438,8 @@ def test_persisted_g1_labels_refresh_reporting_and_sft_admission(tmp_path: Path)
         None,
         False,
     )
+
+    _assert_unmeasured_episode_is_excluded_from_sft(original_records[2], assessments[2])
 
 
 def test_labels_only_refresh_excludes_final_artifact_digest_mismatch(tmp_path: Path) -> None:

@@ -317,8 +317,10 @@ def _read_case_file(data_path: Path) -> dict[str, object]:
         payload_value: object = json.loads(data_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(
-            f"cannot read AISI rh_envs cases at {data_path} ({error}); regenerate them with "
-            "`.venv/bin/python -m reward_hacking.aisi_rh_envs_etl`"
+            f"cannot read AISI rh_envs cases at {data_path} ({error}); "
+            "see reward_hacking/harness/data/README.md for constrained derivation or explicit "
+            "legacy regeneration with `.venv/bin/python -m reward_hacking.aisi_rh_envs_etl "
+            "--allow-legacy-mutation`"
         ) from error
     if not isinstance(payload_value, dict):
         raise TypeError("AISI case file must be a JSON object")

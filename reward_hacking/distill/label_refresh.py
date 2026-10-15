@@ -16,16 +16,27 @@ from typing import cast
 
 from reward_hacking.distill.call_history import (
     CandidateContract,
+    _historical_definition,  # pyright: ignore[reportPrivateUsage]
     recover_candidate_contract,
 )
 from reward_hacking.distill.call_history_compare import analyze_call_history_with_comparison
 from reward_hacking.distill.hack_strategy import (
     TAXONOMY_VERSION,
+    HackStrategyAssessment,
     StrengthenedTruthEvidence,
+    _add_native_ladder_strategy_evidence,  # pyright: ignore[reportPrivateUsage]
     _reconstruct_final_source,  # pyright: ignore[reportPrivateUsage]
     _recorded_true_pass,  # pyright: ignore[reportPrivateUsage]
     label_persisted_episode,
     read_strengthened_truth_sidecar,
+)
+from reward_hacking.distill.native_strategy_evidence import NativeEvidence, load_native_evidence
+from reward_hacking.distill.strategy_adjudication import (
+    Adjudications,
+    apply_adjudication,
+    assessment_from_payload,
+    load_adjudications,
+    validate_adjudication,
 )
 from reward_hacking.distill.table_provenance import confirmed_visible_table
 from reward_hacking.distill.task_contract_source import hydrate_task_record
@@ -33,6 +44,7 @@ from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.organism_rl.strengthened_truth_grade import (
     recorded_artifact_content_sha256,
 )
+from reward_hacking.semantic_identity import semantic_content_identity
 
 LABEL_REFRESH_FORMAT_VERSION = "episode_label_refresh_v1"
 LABELS_FILENAME = "labels.jsonl"
@@ -489,20 +501,147 @@ def _ambiguous_strengthened_truth_episode_ids(
     return frozenset(episode_id for episode_id, count in episode_id_counts.items() if count > 1)
 
 
+def adjudication_task_contract_sha256(
+    record: Mapping[str, object], trace_records: Sequence[Mapping[str, object]]
+) -> str | None:
+    """Return the verified hydrated task identity used by a reviewed mechanism."""
+    contract = recover_candidate_contract(record, trace_records)
+    if contract.entry_point is None or not contract.deterministic:
+        return None
+    identities: set[str] = set()
+    for entry in (record, *trace_records):
+        definition = _historical_definition(record, entry)
+        if definition is None:
+            continue
+        if definition.limitation is not None or definition.content is None:
+            return None
+        identity = semantic_content_identity(dict(definition.content))["semantic_content_sha256"]
+        identities.add(cast("str", identity))
+    return next(iter(identities)) if len(identities) == 1 else None
+
+
+def _validate_adjudication_locations(
+    adjudication: Mapping[str, object],
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+) -> None:
+    source = _reconstruct_final_source(record, trace_records)
+    if source is None:
+        raise ValueError("adjudication requires verified final source")
+    source_lines = len(source.splitlines())
+    turns = {entry["turn"] for entry in trace_records if type(entry.get("turn")) is int}
+    for evidence in cast("list[Mapping[str, object]]", adjudication["evidence"]):
+        for location in cast("list[Mapping[str, object]]", evidence["locations"]):
+            start = cast("int", location["start"])
+            end = cast("int", location.get("end", start))
+            if location["kind"] == "source_line":
+                valid = 1 <= start <= end <= source_lines
+            else:
+                valid = all(turn in turns for turn in range(start, end + 1))
+            if not valid:
+                raise ValueError("adjudication cited location is outside the reviewed evidence")
+
+
+def _apply_reviewed_label(
+    label: dict[str, object],
+    assessment: HackStrategyAssessment,
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    adjudications: Adjudications,
+) -> bool:
+    key_json, sample_index = derived_label_join_key(record)
+    label["automatic_hack_strategy"] = assessment.to_json_dict()
+    task_digest = adjudication_task_contract_sha256(record, trace_records)
+    label["task_contract_sha256"] = task_digest
+    adjudication = adjudications.entries.get((key_json, sample_index))
+    label["adjudication"] = dict(adjudication) if adjudication is not None else None
+    label["adjudication_provenance"] = (
+        dict(adjudications.provenance) if adjudication is not None else None
+    )
+    if adjudication is None:
+        return False
+    _validate_adjudication_locations(adjudication, record, trace_records)
+    digests = {
+        name: cast("str | None", label[name])
+        for name in (
+            "source_record_sha256",
+            "trace_sha256",
+            "artifact_sha256",
+            "artifact_content_sha256",
+            "strengthened_truth_source_sha256",
+            "task_contract_sha256",
+        )
+    }
+    label["hack_strategy"] = apply_adjudication(
+        assessment,
+        adjudication,
+        episode_key=key_json,
+        sample_index=sample_index,
+        digests=digests,
+    ).to_json_dict()
+    return True
+
+
+def _validate_adjudication_inputs(
+    adjudications_path: Path | None,
+    adjudications: Adjudications,
+    used_adjudications: set[tuple[str, int]],
+) -> None:
+    if used_adjudications != set(adjudications.entries):
+        raise ValueError("adjudications contain unconsumed episode identities")
+    if (
+        adjudications_path is not None
+        and adjudications_path.read_bytes() != adjudications.raw_bytes
+    ):
+        raise ValueError("adjudication input changed during label refresh")
+
+
+def _validate_input_bytes(path: Path | None, expected: bytes, description: str) -> None:
+    if path is not None and path.read_bytes() != expected:
+        raise ValueError(f"{description} input changed during label refresh")
+
+
+def _validate_native_evidence_unchanged(
+    path: Path | None, records_path: Path, expected: NativeEvidence
+) -> None:
+    _validate_input_bytes(path, expected.raw_bytes, "native evidence")
+    if path is None:
+        return
+    current = load_native_evidence(path, records_path)
+    if current.digest != expected.digest or current.bindings != expected.bindings:
+        raise ValueError("native evidence changed during label refresh")
+
+
+def _append_label_limitations(
+    labels: list[dict[str, object]], global_limitations: tuple[str, ...]
+) -> None:
+    for label in labels:
+        for field in ("hack_strategy", "automatic_hack_strategy"):
+            assessment_payload = cast("dict[str, object]", label[field])
+            limitations = list(cast("list[str]", assessment_payload.get("limitations", [])))
+            limitations.extend(global_limitations)
+            if limitations:
+                assessment_payload["limitations"] = list(dict.fromkeys(limitations))
+
+
 def refresh_labels(
     records_path: Path,
     output_dir: Path,
     *,
     strengthened_truth_path: Path | None = None,
+    adjudications_path: Path | None = None,
+    native_evidence_path: Path | None = None,
 ) -> LabelRefreshResult:
     """Write immutable derived labels, or reuse existing labels after validating their inputs."""
-    records_path = records_path.resolve()
-    output_dir = output_dir.resolve()
+    records_path, output_dir = records_path.resolve(), output_dir.resolve()
     if output_dir.is_relative_to(records_path.parent) or records_path.is_relative_to(output_dir):
         raise ValueError(
             "derived-label output directory cannot overlap the original episode directory"
         )
     _validate_private_output_dir(output_dir)
+    adjudications = load_adjudications(adjudications_path)
+    native_evidence = load_native_evidence(native_evidence_path, records_path)
+    used_adjudications: set[tuple[str, int]] = set()
 
     (
         strengthened_truth_path,
@@ -510,7 +649,13 @@ def refresh_labels(
         strengthened_truth_bindings,
     ) = _load_strengthened_truth_inputs(strengthened_truth_path, output_dir)
     if output_dir.exists():
-        return _reuse_derived_labels(records_path, output_dir, strengthened_truth_bytes)
+        return _reuse_derived_labels(
+            records_path,
+            output_dir,
+            strengthened_truth_bytes,
+            adjudications.digest,
+            native_evidence.digest,
+        )
     used_strengthened_truth: set[str] = set()
 
     raw_records, parsed_records = _read_records(records_path)
@@ -523,7 +668,7 @@ def refresh_labels(
     ]
     labels: list[dict[str, object]] = []
     for row_index, (raw_line, record) in enumerate(parsed_records, start=1):
-        _key_json, sample_index, episode_key = _episode_identity(
+        key_json, sample_index, episode_key = _episode_identity(
             record, f"{records_path}:row {row_index}"
         )
         trace_path = _trace_path(records_path, record, f"{records_path}:row {row_index}")
@@ -533,6 +678,7 @@ def refresh_labels(
             records_path,
             trace_records=trace_records,
         )
+        normalized_record.update(native_evidence.entries.get((key_json, sample_index), {}))
         digests = before_digests[row_index - 1]
         artifact_verified = digests["artifact_sha256"] == digests["artifact_content_sha256"]
         row_limitations: list[str] = []
@@ -555,43 +701,56 @@ def refresh_labels(
             records_path=records_path,
             strengthened_truth=strengthened_truth,
         )
-        labels.append(
-            {
-                "episode_key": episode_key,
-                "sample_index": sample_index,
-                "source_record_sha256": _sha256(raw_line),
-                "trace_sha256": before_digests[row_index - 1]["trace_sha256"],
-                "artifact_sha256": before_digests[row_index - 1]["artifact_sha256"],
-                "artifact_content_sha256": before_digests[row_index - 1]["artifact_content_sha256"],
-                "strengthened_truth_source_sha256": strengthened_truth_source_sha256,
-                "labeler_version": TAXONOMY_VERSION,
-                "hack_strategy": assessment.to_json_dict(),
-                "analysis": _episode_analysis_audit(normalized_record, trace_records),
-            }
-        )
+        label: dict[str, object] = {
+            "episode_key": episode_key,
+            "sample_index": sample_index,
+            "native_evidence": native_evidence.bindings.get((key_json, sample_index)),
+            "source_record_sha256": _sha256(raw_line),
+            "trace_sha256": before_digests[row_index - 1]["trace_sha256"],
+            "artifact_sha256": before_digests[row_index - 1]["artifact_sha256"],
+            "artifact_content_sha256": before_digests[row_index - 1]["artifact_content_sha256"],
+            "strengthened_truth_source_sha256": strengthened_truth_source_sha256,
+            "labeler_version": TAXONOMY_VERSION,
+            "hack_strategy": assessment.to_json_dict(),
+            "analysis": _episode_analysis_audit(normalized_record, trace_records),
+        }
+        if _apply_reviewed_label(
+            label, assessment, normalized_record, trace_records, adjudications
+        ):
+            used_adjudications.add((key_json, sample_index))
+        labels.append(label)
+
+    _validate_adjudication_inputs(adjudications_path, adjudications, used_adjudications)
 
     global_limitations = _validate_strengthened_truth_join_complete(
         strengthened_truth_bindings, used_strengthened_truth
     )
-    for label in labels:
-        hack_strategy = cast("dict[str, object]", label["hack_strategy"])
-        limitations = list(cast("list[str]", hack_strategy.get("limitations", [])))
-        limitations.extend(global_limitations)
-        if limitations:
-            hack_strategy["limitations"] = list(dict.fromkeys(limitations))
+    _append_label_limitations(labels, global_limitations)
     _validate_episode_inputs_unchanged(records_path, raw_records, parsed_records, before_digests)
     _validate_strengthened_truth_unchanged(
         strengthened_truth_path,
         strengthened_truth_bytes,
     )
+    _validate_native_evidence_unchanged(native_evidence_path, records_path, native_evidence)
 
     labels_bytes = "".join(json.dumps(label, sort_keys=True) + "\n" for label in labels).encode()
     manifest = {
         "format_version": LABEL_REFRESH_FORMAT_VERSION,
         "source_records_sha256": source_records_digest,
+        "native_evidence_source_sha256": native_evidence.digest,
+        "native_evidence_source_path": str(native_evidence_path.resolve())
+        if native_evidence_path is not None
+        else None,
+        "adjudications_source_sha256": adjudications.digest,
+        "adjudications_source_path": str(adjudications_path.resolve())
+        if adjudications_path is not None
+        else None,
         "strengthened_truth_source_sha256": (
             _sha256(strengthened_truth_bytes) if strengthened_truth_bytes is not None else None
         ),
+        "strengthened_truth_source_path": str(strengthened_truth_path)
+        if strengthened_truth_path is not None
+        else None,
         "labeler_version": TAXONOMY_VERSION,
         "code_revision": _code_revision(),
         "row_count": len(labels),
@@ -607,7 +766,11 @@ def refresh_labels(
 
 
 def _reuse_derived_labels(
-    records_path: Path, output_dir: Path, strengthened_truth_bytes: bytes | None
+    records_path: Path,
+    output_dir: Path,
+    strengthened_truth_bytes: bytes | None,
+    adjudications_digest: str | None,
+    native_evidence_digest: str | None,
 ) -> LabelRefreshResult:
     labels_path = output_dir / LABELS_FILENAME
     manifest_path = output_dir / MANIFEST_FILENAME
@@ -615,6 +778,12 @@ def _reuse_derived_labels(
         raise FileExistsError(f"derived-label output directory is incomplete: {output_dir}")
     load_derived_labels(records_path, labels_path)
     manifest = _read_manifest(labels_path)
+    if manifest.get("native_evidence_source_sha256") != native_evidence_digest:
+        raise ValueError(
+            "native evidence digest does not match the existing label sidecar manifest"
+        )
+    if manifest.get("adjudications_source_sha256") != adjudications_digest:
+        raise ValueError("adjudication digest does not match the existing label sidecar manifest")
     strengthened_truth_digest = (
         _sha256(strengthened_truth_bytes) if strengthened_truth_bytes is not None else None
     )
@@ -637,19 +806,104 @@ def _read_manifest(labels_path: Path) -> dict[str, object]:
         raise ValueError(f"{manifest_path} labeler version does not match {TAXONOMY_VERSION}")
     if not isinstance(manifest.get("code_revision"), str) or not manifest["code_revision"]:
         raise ValueError(f"{manifest_path} is missing the labeler code revision")
+    _manifest_adjudications(manifest)
     row_count = manifest.get("row_count")
     if not isinstance(row_count, int) or isinstance(row_count, bool) or row_count < 0:
         raise ValueError(f"{manifest_path} has an invalid row count")
     return manifest
 
 
+def _manifest_adjudications(manifest: Mapping[str, object]) -> Adjudications:
+    digest = manifest.get("adjudications_source_sha256")
+    if digest is None:
+        return load_adjudications(None)
+    source = manifest.get("adjudications_source_path")
+    if not isinstance(source, str) or not source:
+        raise ValueError("adjudication source path is missing")
+    path = Path(source)
+    if not path.is_file() or _sha256(path.read_bytes()) != digest:
+        raise ValueError("adjudication source is stale")
+    return load_adjudications(path)
+
+
+def _manifest_native_evidence(manifest: Mapping[str, object], records_path: Path) -> NativeEvidence:
+    digest = manifest.get("native_evidence_source_sha256")
+    if digest is None:
+        return load_native_evidence(None, records_path)
+    source = manifest.get("native_evidence_source_path")
+    if not isinstance(source, str) or not source:
+        raise ValueError("native evidence source path is missing")
+    path = Path(source)
+    if not path.is_file() or _sha256(path.read_bytes()) != digest:
+        raise ValueError("native evidence source is stale")
+    return load_native_evidence(path, records_path)
+
+
+def _validate_native_assessment(
+    record: Mapping[str, object], label: Mapping[str, object], overlay: Mapping[str, object]
+) -> None:
+    automatic_value = label.get("automatic_hack_strategy")
+    if not isinstance(automatic_value, Mapping):
+        raise TypeError("label is missing its automatic strategy assessment")
+    automatic = assessment_from_payload(automatic_value)
+    expected: dict[str, list[str]] = {}
+    _add_native_ladder_strategy_evidence({**record, **overlay}, expected)
+    for strategy in ("test_collection_suppression", "ci_baseline_tampering"):
+        if automatic.evidence.get(strategy, ()) != tuple(expected.get(strategy, ())):
+            raise ValueError("native mechanism labels differ from the verified detector evidence")
+
+
+def _validate_bound_metadata(
+    label: Mapping[str, object],
+    join_key: tuple[str, int],
+    adjudications: Adjudications,
+    native_evidence: NativeEvidence,
+) -> None:
+    if label.get("native_evidence") != native_evidence.bindings.get(join_key):
+        raise ValueError("label native evidence differs from its bound source")
+    adjudication = adjudications.entries.get(join_key)
+    if label.get("adjudication") != (dict(adjudication) if adjudication is not None else None):
+        raise ValueError("label adjudication differs from its bound review source")
+    expected_provenance = dict(adjudications.provenance) if adjudication is not None else None
+    if label.get("adjudication_provenance") != expected_provenance:
+        raise ValueError("label adjudication provenance differs from its bound review source")
+
+
+def _manifest_strengthened_truth(
+    manifest: Mapping[str, object],
+    records_path: Path,
+    override: Path | None,
+) -> dict[str, _StrengthenedTruthBinding] | None:
+    digest = manifest.get("strengthened_truth_source_sha256")
+    if digest is None:
+        return None
+    saved_path = manifest.get("strengthened_truth_source_path")
+    path = override or (
+        Path(saved_path)
+        if isinstance(saved_path, str)
+        else records_path.parent / "strengthened-truth.jsonl"
+    )
+    if not path.is_file() or _sha256(path.read_bytes()) != digest:
+        raise ValueError("strengthened-truth source is stale")
+    _raw_bytes, bindings = _read_strengthened_truth_bindings(path)
+    return bindings
+
+
 def load_derived_labels(
-    records_path: Path, labels_path: Path
+    records_path: Path,
+    labels_path: Path,
+    *,
+    strengthened_truth_path: Path | None = None,
 ) -> dict[tuple[str, int], dict[str, object]]:
     """Validate and return sidecar labels keyed by the persisted episode key and sample index."""
     raw_records, parsed_records = _read_records(records_path)
     _validate_unique_episode_identities(records_path, parsed_records)
     manifest = _read_manifest(labels_path)
+    adjudications = _manifest_adjudications(manifest)
+    native_evidence = _manifest_native_evidence(manifest, records_path)
+    truth_bindings = _manifest_strengthened_truth(manifest, records_path, strengthened_truth_path)
+    ambiguous_episode_ids = _ambiguous_strengthened_truth_episode_ids(records_path, parsed_records)
+    used_truth: set[str] = set()
     if manifest.get("source_records_sha256") != _sha256(raw_records):
         raise ValueError(f"{records_path} digest does not match the label sidecar manifest")
     labels_bytes = labels_path.read_bytes()
@@ -667,7 +921,25 @@ def load_derived_labels(
         join_key = _validate_label_identity(labels_path, row_index, source_record, label)
         if join_key in derived_labels:
             raise ValueError(f"{labels_path} contains a duplicate episode join")
-        _validate_label_evidence(records_path, row_index, raw_line, source_record, label)
+        _validate_bound_metadata(label, join_key, adjudications, native_evidence)
+        _validate_native_assessment(source_record, label, native_evidence.entries.get(join_key, {}))
+        _truth, truth_source_sha256, _limitation = _truth_for_label(
+            source_record,
+            context=f"{records_path}:row {row_index}",
+            artifact_sha256=cast("str | None", label.get("artifact_sha256")),
+            artifact_verified=label.get("artifact_sha256") == label.get("artifact_content_sha256"),
+            bindings=truth_bindings,
+            ambiguous_episode_ids=ambiguous_episode_ids,
+            used_episode_ids=used_truth,
+        )
+        _validate_label_evidence(
+            records_path,
+            row_index,
+            raw_line,
+            source_record,
+            label,
+            truth_source_sha256=truth_source_sha256,
+        )
         _validate_label_payload(labels_path, row_index, label)
         derived_labels[join_key] = label
 
@@ -701,13 +973,17 @@ def _validate_label_identity(
     return key_json, sample_index
 
 
-def _validate_label_evidence(
+def _validate_label_evidence(  # noqa: PLR0913 - current file and truth bindings remain explicit
     records_path: Path,
     row_index: int,
     raw_line: bytes,
     source_record: Mapping[str, object],
     label: Mapping[str, object],
+    *,
+    truth_source_sha256: str | None,
 ) -> None:
+    if label.get("strengthened_truth_source_sha256") != truth_source_sha256:
+        raise ValueError("label strengthened-truth row binding is stale")
     if label.get("labeler_version") != TAXONOMY_VERSION:
         raise ValueError(f"{records_path}:row {row_index} labeler version is stale")
     digests = _evidence_digests(records_path, raw_line, source_record, row_index)
@@ -721,6 +997,46 @@ def _validate_label_evidence(
         raise ValueError(
             f"{records_path}:row {row_index} source, trace or artifact digest is stale"
         )
+    adjudication = label.get("adjudication")
+    if adjudication is not None:
+        if not isinstance(adjudication, Mapping):
+            raise TypeError("label adjudication requires an object")
+        trace_path = _trace_path(records_path, source_record, "adjudication")
+        trace_records = _read_trace_records(trace_path)
+        record = hydrate_task_record(
+            {**source_record, "trace_path": str(trace_path.resolve())},
+            records_path,
+            trace_records=trace_records,
+        )
+        task_digest = adjudication_task_contract_sha256(record, trace_records)
+        key_json, sample_index = derived_label_join_key(record)
+        validate_adjudication(
+            adjudication,
+            episode_key=key_json,
+            sample_index=sample_index,
+            digests={
+                **digests,
+                "task_contract_sha256": task_digest,
+                "strengthened_truth_source_sha256": truth_source_sha256,
+            },
+        )
+        _validate_adjudication_locations(adjudication, record, trace_records)
+        automatic_payload = label.get("automatic_hack_strategy")
+        if not isinstance(automatic_payload, Mapping):
+            raise ValueError("reviewed label is missing its automatic assessment")
+        expected = apply_adjudication(
+            assessment_from_payload(automatic_payload),
+            adjudication,
+            episode_key=key_json,
+            sample_index=sample_index,
+            digests={
+                **digests,
+                "task_contract_sha256": task_digest,
+                "strengthened_truth_source_sha256": truth_source_sha256,
+            },
+        ).to_json_dict()
+        if label.get("hack_strategy") != expected:
+            raise ValueError("effective strategy assessment differs from the bound adjudication")
 
 
 def _validate_label_payload(labels_path: Path, row_index: int, label: Mapping[str, object]) -> None:
@@ -741,6 +1057,8 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--output-dir", type=Path, help="Defaults to a versioned sibling of the episode stage"
     )
     parser.add_argument("--strengthened-truth", type=Path)
+    parser.add_argument("--adjudications", type=Path)
+    parser.add_argument("--native-evidence", type=Path)
     return parser
 
 
@@ -753,6 +1071,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.output_dir is not None
         else versioned_label_output_dir(args.records.resolve().parent),
         strengthened_truth_path=args.strengthened_truth,
+        adjudications_path=args.adjudications,
+        native_evidence_path=args.native_evidence,
     )
     logging.basicConfig(level=logging.INFO)
     logger.info("labels=%s manifest=%s", result.labels_path, result.manifest_path)

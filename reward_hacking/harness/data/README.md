@@ -25,12 +25,12 @@ untracked for the contamination reason.
 
 ## Regenerating them
 
-From the repository root, one command each. Both need network access:
+From the repository root, one command each. These need network access:
 
 ```bash
 uv run python reward_hacking/harness/ilcb_etl.py
 uv run python reward_hacking/harness/evalplus_etl.py
-uv run python -m reward_hacking.aisi_rh_envs_etl
+uv run python -m reward_hacking.aisi_rh_envs_etl --allow-legacy-mutation
 ```
 
 `ilcb_etl.py` pulls a pinned revision of the `fjzzq2002/impossible_livecodebench` dataset from the
@@ -49,6 +49,23 @@ has a `--out` flag if you want the output somewhere else, and `evalplus_etl.py` 
 `aisi_rh_envs_etl.py` loads the source datasets, checks each selected reference solution inside the
 episode jail, and writes the local case file with source counts and drop reasons. The AISI clone and
 datasets must be available before it runs.
+
+### Output-constrained oneoffs
+
+The AISI command above explicitly opts into legacy mutations, which do not guarantee a valid output
+family. For constrained mutations, derive a separate registry from an existing local registry using
+`--input-registry`, `--output-contracts`, and a distinct `--out`. The contract catalog stays ignored
+alongside the cases; its explicit domains are validated by `reward_hacking/output_contracts.py`.
+Derivation preserves originals and partitions, records unsupported cases, and refuses to overwrite
+the source registry. `--minimum-supported` can require a minimum supported-case count. Select the
+derived registry with the generation command's `--aisi-cases` option.
+
+The recent LiveCodeBench importer similarly requires `--output-contracts` and a distinct ignored
+`--output-root` for constrained derivation, or explicit `--allow-legacy-mutation` for legacy mutation.
+Select its derived cases and matching split manifest together using `--ilcb-cases` and
+`--ilcb-split-manifest`. Strict readers revalidate contract bindings and mutations; legacy refresh
+cannot downgrade a constrained registry. Contract catalogs and derived cases remain local and must
+never be committed.
 
 ## What happens when they are absent
 
