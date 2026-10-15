@@ -925,6 +925,7 @@ def test_evaluation_generation_identity_omits_endpoint_and_binds_served_model_id
             families=families,
             impossible_variant="oneoff",
             aisi_sources=(),
+            aisi_hack_group=None,
             enable_speculative_decoding=False,
             leak_channels=("git_reflog",) if "r2e_leak" in families else (),
             leak_channels_open=False,
@@ -1460,3 +1461,75 @@ def test_evaluate_main_loads_the_hidden_original_twin_for_loose_oneoff_pairing(
     )
 
     assert source_arguments["variants"] == ("loose_oneoff", "loose_hidden_original")
+
+
+def _collection_config_arguments(tmp_path: Path, *extra: str) -> list[str]:
+    return [
+        "--endpoint",
+        "http://synthetic:8000",
+        "--output-dir",
+        str(tmp_path / "evaluation"),
+        "--max-model-len",
+        "4096",
+        "--family",
+        "aisi",
+        "--evaluation-variant",
+        "oneoff",
+        "--tasks-per-family",
+        "1",
+        *extra,
+    ]
+
+
+def test_evaluation_cli_accepts_an_aisi_hack_group_only_for_aisi_oneoff(tmp_path: Path) -> None:
+    args = evaluate.parse_args(
+        _collection_config_arguments(tmp_path, "--aisi-hack-group", "collection_config")
+    )
+    assert args.aisi_hack_group == "collection_config"
+    assert evaluate.parse_args(_collection_config_arguments(tmp_path)).aisi_hack_group is None
+
+    rejected = (
+        [
+            *_collection_config_arguments(tmp_path, "--aisi-hack-group", "collection_config"),
+            "--family",
+            "ilcb",
+        ],
+        [
+            arg if arg != "oneoff" else "original"
+            for arg in _collection_config_arguments(
+                tmp_path, "--aisi-hack-group", "collection_config"
+            )
+        ],
+    )
+    for arguments in rejected:
+        with pytest.raises(SystemExit):
+            evaluate.parse_args(arguments)
+
+
+def test_evaluate_main_forwards_the_aisi_hack_group_to_source_and_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source_arguments: dict[str, object] = {}
+    evaluation_arguments: dict[str, object] = {}
+
+    def build_source(**kwargs: object) -> SimpleNamespace:
+        source_arguments.update(kwargs)
+        return SimpleNamespace(skip_counts={}, tasks={}, leak_manifests={})
+
+    monkeypatch.setattr(evaluate, "TaskEpisodeSource", build_source)
+    monkeypatch.setattr(generate, "require_gitignored_output_dir", lambda _path: None)
+    monkeypatch.setattr(evaluate, "resolve_model_revision", lambda _args: "synthetic-revision")
+    monkeypatch.setattr(evaluate, "select_heldout_task_specs", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(evaluate, "_model_sha256", lambda *_args: "b" * 64)
+    monkeypatch.setattr(
+        evaluate, "server_endpoint", lambda *_args: nullcontext("http://synthetic:8000")
+    )
+    monkeypatch.setattr(
+        evaluate, "run_evaluation", lambda **kwargs: evaluation_arguments.update(kwargs)
+    )
+
+    evaluate.main(_collection_config_arguments(tmp_path, "--aisi-hack-group", "collection_config"))
+
+    assert source_arguments["aisi_hack_group"] == "collection_config"
+    provenance = cast("dict[str, object]", evaluation_arguments["provenance"])
+    assert provenance["aisi_hack_group"] == "collection_config"

@@ -195,6 +195,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         default=AISI_SOURCES,
         metavar="SOURCE,...",
     )
+    parser.add_argument(
+        "--aisi-hack-group",
+        choices=("rigged_comparison", "exit_code", "collection_config"),
+        help="serve AISI oneoff tasks through one hack-group grader variant",
+    )
     parser.add_argument("--tasks-per-family", type=int, required=True)
     parser.add_argument(
         "--samples-per-task",
@@ -282,6 +287,10 @@ def _validate_task_selection_args(
         parser.error("task-ids-file cannot be combined with reuse-from")
     if args.excluded_ilcb_problem_ids and "ilcb" not in args.families:
         parser.error("exclude-ilcb-problem-id requires --family ilcb")
+    if args.aisi_hack_group is not None and (
+        args.families != ["aisi"] or args.evaluation_variant != "oneoff"
+    ):
+        parser.error("aisi-hack-group requires --family aisi alone and --evaluation-variant oneoff")
     if len(args.excluded_ilcb_problem_ids) != len(set(args.excluded_ilcb_problem_ids)):
         parser.error("exclude-ilcb-problem-id values must be unique")
     if any(not problem_id for problem_id in args.excluded_ilcb_problem_ids):
@@ -1542,6 +1551,7 @@ def _evaluation_provenance(
         "families": list(args.families),
         "impossible_variant": args.impossible_variant,
         "aisi_sources": list(args.aisi_sources),
+        "aisi_hack_group": args.aisi_hack_group,
         "speculative_decoding": args.enable_speculative_decoding,
         "partition": "held-out",
         "task_skip_counts": dict(source.skip_counts) if "r2e_leak" in args.families else {},
@@ -1708,6 +1718,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         leak_train_pairs=args.leak_train_pairs or None,
         variants=source_variants,
         jail_backend=args.jail_backend,
+        aisi_hack_group=args.aisi_hack_group,
     )
     task_specs = select_heldout_task_specs(
         source,
