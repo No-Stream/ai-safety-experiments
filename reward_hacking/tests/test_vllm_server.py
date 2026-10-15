@@ -501,6 +501,30 @@ def test_server_environment_enables_pin_memory_only_on_wsl_and_preserves_runner_
     assert environment.get("VLLM_WSL2_ENABLE_PIN_MEMORY") == ("1" if under_wsl else None)
 
 
+@pytest.mark.parametrize(
+    ("under_wsl", "speculative", "expected"),
+    [
+        (True, True, "max_split_size_mb:512,expandable_segments:False"),
+        (True, False, "max_split_size_mb:512,expandable_segments:True"),
+        (False, True, "max_split_size_mb:512,expandable_segments:True"),
+    ],
+)
+def test_server_environment_disables_expandable_segments_for_speculative_drafts_on_wsl(
+    under_wsl: bool,
+    speculative: bool,
+    expected: str,
+    fake_vllm: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512,expandable_segments:True")
+    monkeypatch.setattr(vllm_server, "_running_under_wsl", lambda: under_wsl)
+    config = replace(
+        _config(fake_vllm),
+        speculative_config={"method": "mtp", "num_speculative_tokens": 2} if speculative else None,
+    )
+    assert VLLMServer(config)._environment()["PYTORCH_CUDA_ALLOC_CONF"] == expected
+
+
 def test_owned_server_restores_info_logging_in_redirected_child(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

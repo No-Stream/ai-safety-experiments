@@ -291,6 +291,19 @@ class VLLMServer:
         if _running_under_wsl():
             environment["VLLM_WSL2_ENABLE_PIN_MEMORY"] = "1"
             logger.info("WSL detected: VLLM_WSL2_ENABLE_PIN_MEMORY=1")
+            # WSL2's CUDA VMM path fails the MTP drafter's weight allocation with "CUDA driver error: device
+            # not ready" when expandable segments (set by scripts/resource-limits.sh --gpu) are on.
+            allocator_config = environment.get("PYTORCH_CUDA_ALLOC_CONF", "")
+            if (
+                self.config.speculative_config is not None
+                and "expandable_segments:True" in allocator_config
+            ):
+                environment["PYTORCH_CUDA_ALLOC_CONF"] = allocator_config.replace(
+                    "expandable_segments:True", "expandable_segments:False"
+                )
+                logger.info(
+                    "WSL speculative decoding: PYTORCH_CUDA_ALLOC_CONF expandable_segments:False"
+                )
         if self.config.enable_lora:
             environment["VLLM_SERVER_DEV_MODE"] = "1"
             environment["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
