@@ -19,7 +19,7 @@ from reward_hacking.distill.episodes import render_student_contexts, trace_hint
 from reward_hacking.ladder import runner
 from reward_hacking.model_backend import SamplingConfig
 from reward_hacking.organism_reward import RewardOutcome
-from reward_hacking.organism_rl import ladder_source
+from reward_hacking.organism_rl import health, ladder_source
 from reward_hacking.organism_rl.ladder_source import load_training_scenarios, score_ladder_task
 from reward_hacking.trace import write_trace
 
@@ -415,6 +415,37 @@ def test_source_preserves_partial_native_trace_after_transport_timeout(
             raise httpx2.ReadTimeout("synthetic completion timeout")
         record = _record()
         record["key"] = runner.EpisodeKey(model.model_id, scenario.slug, arm, sample).to_json()
+        summary = cast("dict[str, object]", record["trace_summary"])
+        summary.update(
+            record="episode_summary",
+            ended_by="submit",
+            turns=1,
+            context={"peak_prompt_tokens": 10},
+            true={"measured": True, "pass": False, "oracle_error": None},
+        )
+        native_trace = runner._episode_trace_path(
+            config, runner.EpisodeKey(model.model_id, scenario.slug, arm, sample)
+        )
+        write_trace(
+            native_trace,
+            [
+                {
+                    "record": "turn",
+                    "turn": 1,
+                    "completion_token_ids": [1],
+                    "completion_logprobs": [-0.4],
+                    "reasoning_token_count": 0,
+                    "reasoning": "",
+                    "content": "",
+                    "stop_reason": "end_turn",
+                    "prompt_tokens": 10,
+                    "tool_calls": [],
+                    "commands": [],
+                },
+                summary,
+            ],
+            append=True,
+        )
         return record
 
     monkeypatch.setattr(runner, "_run_one", timeout_once)
@@ -434,7 +465,17 @@ def test_source_preserves_partial_native_trace_after_transport_timeout(
     resumed = source("ladder:synthetic-train", seed=73, step=0, replica=0)
     assert resumed.record["record"] == "ladder_episode"
     assert calls == [0, 0]
-    assert any((source.output_dir / "step-000000").glob("*.torn-*"))
+    archived = list((source.output_dir / "step-000000").glob("*.torn-*"))
+    assert len(archived) == 1
+    assert (
+        archived[0].read_bytes()
+        == "".join(json.dumps(row, sort_keys=True) + "\n" for row in preserved_records).encode()
+    )
+    records_path = source.output_dir / "records.jsonl"
+    write_trace(records_path, [dict(resumed.record)])
+    report = health.analyze_records([records_path])
+    assert report["episode_count"] == 1
+    assert cast("list[dict[str, object]]", report["episodes"])[0]["assistant_turn_count"] == 1
     assert source("ladder:synthetic-train", seed=73, step=0, replica=0).record == resumed.record
     assert calls == [0, 0]
 

@@ -239,3 +239,29 @@ def test_all_real_native_ladder_records_and_assertions(
         _write_rows(sabotage_path, sabotaged)
         assert health.main(["--records", str(sabotage_path), "--assert", "--schema-only"]) == 2
     assert episode_count > 0
+
+
+@pytest.mark.parametrize(
+    "corruption", [None, "duplicate_summary", "stale_summary", "turn_after_summary"]
+)
+def test_native_ladder_trace_with_appended_episode_record(
+    tmp_path: Path, corruption: str | None
+) -> None:
+    records_path = _native_rows(tmp_path)
+    record = _rows(records_path)[-1]
+    trace_path = tmp_path / str(record["trace_path"])
+    events = _rows(trace_path)
+    if corruption == "duplicate_summary":
+        events.append(dict(events[-1]))
+    elif corruption == "stale_summary":
+        record["trace_summary"] = {**_object(record["trace_summary"]), "turns": 2}
+    elif corruption == "turn_after_summary":
+        events.append(dict(events[0]))
+    events.append(record)
+    _write_rows(trace_path, events)
+
+    if corruption is None:
+        assert health.analyze_records([records_path])["episode_count"] == 1
+    else:
+        with pytest.raises(health.HealthInputError):
+            health.analyze_records([records_path])

@@ -38,9 +38,8 @@ def _native_episode(task_id: str, sample_index: int, trace_path: Path) -> dict[s
         "record": "ladder_episode",
         "key": EpisodeKey("synthetic-model", slug, arm, sample_index).to_json(),
         "trace_path": str(trace_path),
-        "ended_by": "submit",
-        "turns": 1,
         "trace_summary": {
+            "record": "episode_summary",
             "ended_by": "submit",
             "turns": 1,
             "context": {"peak_prompt_tokens": 10},
@@ -181,6 +180,7 @@ class _FakeLadderEpisodeSource:
             },
         ]
         native_record = _native_episode(task_id, replica, trace_path)
+        trace_records.append(cast("dict[str, object]", native_record["trace_summary"]))
         trace_records.append(native_record)
         trace_path.write_text(
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in trace_records)
@@ -644,6 +644,16 @@ def test_transport_failure_persists_other_episodes_and_resumes_only_failure(
     assert resumed["resumed_episodes"] == 7
     assert resumed["failed_episodes"] == 0
     assert len((output_dir / "records.jsonl").read_text().splitlines()) == 8
+    monkeypatch.setattr(strengthened_truth_grade, "_load_original_corpora", lambda _path: ({}, {}))
+    truth_path = tmp_path / "strengthened-truth.jsonl"
+    assert (
+        strengthened_truth_grade.grade_records(output_dir, tmp_path / "unused-cases", truth_path)
+        == []
+    )
+    assert truth_path.read_text(encoding="utf-8") == ""
+    labels = refresh_labels(output_dir / "records.jsonl", tmp_path / "resumed-ladder-labels")
+    assert json.loads(labels.manifest_path.read_text())["row_count"] == 8
+    assert health.analyze_records([output_dir / "records.jsonl"])["episode_count"] == 8
     _run_wave(output_dir, scenarios_dir)
     assert sources[3].calls == []
 

@@ -48,6 +48,11 @@ class LabelRefreshResult:
     manifest_path: Path
 
 
+def versioned_label_output_dir(stage_dir: Path) -> Path:
+    """Return the current taxonomy's sidecar directory beside an episode stage."""
+    return stage_dir.with_name(f"{stage_dir.name}-labels-{TAXONOMY_VERSION}")
+
+
 @dataclass(frozen=True, slots=True)
 class _StrengthenedTruthBinding:
     task_id: str
@@ -490,11 +495,9 @@ def refresh_labels(
     *,
     strengthened_truth_path: Path | None = None,
 ) -> LabelRefreshResult:
-    """Write fresh derived labels without changing source records, traces or artifacts."""
+    """Write immutable derived labels, or reuse existing labels after validating their inputs."""
     records_path = records_path.resolve()
     output_dir = output_dir.resolve()
-    if output_dir.exists():
-        raise FileExistsError(f"derived-label output directory already exists: {output_dir}")
     if output_dir.is_relative_to(records_path.parent) or records_path.is_relative_to(output_dir):
         raise ValueError(
             "derived-label output directory cannot overlap the original episode directory"
@@ -506,6 +509,8 @@ def refresh_labels(
         strengthened_truth_bytes,
         strengthened_truth_bindings,
     ) = _load_strengthened_truth_inputs(strengthened_truth_path, output_dir)
+    if output_dir.exists():
+        return _reuse_derived_labels(records_path, output_dir, strengthened_truth_bytes)
     used_strengthened_truth: set[str] = set()
 
     raw_records, parsed_records = _read_records(records_path)
@@ -598,6 +603,25 @@ def refresh_labels(
     manifest_path = output_dir / MANIFEST_FILENAME
     labels_path.write_bytes(labels_bytes)
     manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+    return LabelRefreshResult(labels_path=labels_path, manifest_path=manifest_path)
+
+
+def _reuse_derived_labels(
+    records_path: Path, output_dir: Path, strengthened_truth_bytes: bytes | None
+) -> LabelRefreshResult:
+    labels_path = output_dir / LABELS_FILENAME
+    manifest_path = output_dir / MANIFEST_FILENAME
+    if not labels_path.is_file() or not manifest_path.is_file():
+        raise FileExistsError(f"derived-label output directory is incomplete: {output_dir}")
+    load_derived_labels(records_path, labels_path)
+    manifest = _read_manifest(labels_path)
+    strengthened_truth_digest = (
+        _sha256(strengthened_truth_bytes) if strengthened_truth_bytes is not None else None
+    )
+    if manifest.get("strengthened_truth_source_sha256") != strengthened_truth_digest:
+        raise ValueError(
+            "strengthened-truth digest does not match the existing label sidecar manifest"
+        )
     return LabelRefreshResult(labels_path=labels_path, manifest_path=manifest_path)
 
 
@@ -713,17 +737,21 @@ def _validate_label_payload(labels_path: Path, row_index: int, label: Mapping[st
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir", type=Path, help="Defaults to a versioned sibling of the episode stage"
+    )
     parser.add_argument("--strengthened-truth", type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Refresh labels to a new sidecar directory and log its paths."""
+    """Refresh or validate labels in a versioned sidecar directory and log its paths."""
     args = _argument_parser().parse_args(argv)
     result = refresh_labels(
         args.records,
-        args.output_dir,
+        args.output_dir
+        if args.output_dir is not None
+        else versioned_label_output_dir(args.records.resolve().parent),
         strengthened_truth_path=args.strengthened_truth,
     )
     logging.basicConfig(level=logging.INFO)

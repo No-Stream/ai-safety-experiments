@@ -485,6 +485,80 @@ def test_refresh_refuses_to_overwrite_existing_derived_output(tmp_path: Path) ->
         refresh_labels(records_path, output_dir)
 
 
+@pytest.mark.parametrize("with_strengthened_truth", [False, True])
+def test_refresh_reuses_validated_output_without_relabeling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_strengthened_truth: bool
+) -> None:
+    records_path = tmp_path / "records" / "records.jsonl"
+    record = _persisted_record(records_path)
+    _write_records(records_path, [record])
+    truth_path = tmp_path / "truth.jsonl" if with_strengthened_truth else None
+    if truth_path is not None:
+        _write_strengthened_truth_sidecar(truth_path, record)
+    labels_path = refresh_labels(
+        records_path, tmp_path / "derived-labels", strengthened_truth_path=truth_path
+    ).labels_path
+    manifest_path = labels_path.with_name("manifest.json")
+    original_contents = (labels_path.read_bytes(), manifest_path.read_bytes())
+
+    def reject_relabel(*args: object, **kwargs: object) -> None:
+        raise AssertionError("validated output should be reused without relabeling")
+
+    monkeypatch.setattr(label_refresh_module, "label_persisted_episode", reject_relabel)
+    result = refresh_labels(records_path, labels_path.parent, strengthened_truth_path=truth_path)
+
+    assert result.labels_path == labels_path
+    assert (labels_path.read_bytes(), manifest_path.read_bytes()) == original_contents
+
+
+@pytest.mark.parametrize("change", ["source", "trace", "artifact", "truth"])
+def test_refresh_reuse_refuses_changed_inputs_without_overwriting(
+    tmp_path: Path, change: str
+) -> None:
+    records_path = tmp_path / "records" / "records.jsonl"
+    record = _persisted_record(records_path)
+    _write_records(records_path, [record])
+    truth_path = tmp_path / "truth.jsonl"
+    _write_strengthened_truth_sidecar(truth_path, record)
+    result = refresh_labels(
+        records_path, tmp_path / "derived-labels", strengthened_truth_path=truth_path
+    )
+    original_contents = (result.labels_path.read_bytes(), result.manifest_path.read_bytes())
+    if change == "source":
+        record["synthetic_change"] = True
+        _write_records(records_path, [record])
+    elif change == "trace":
+        trace_path = records_path.parent / cast("str", record["trace_path"])
+        trace_path.write_bytes(trace_path.read_bytes() + b"{}\n")
+    elif change == "artifact":
+        artifact_path = records_path.parent / "traces" / "step-000000" / "solution-0.py"
+        artifact_path.write_text("def solve(value):\n    return value\n")
+    else:
+        truth_row = json.loads(truth_path.read_text())
+        truth_row["strengthened_truth"]["disagreement_fraction"] = 0.25
+        truth_path.write_text(json.dumps(truth_row) + "\n")
+
+    with pytest.raises(ValueError, match=r"digest|stale|strengthened-truth"):
+        refresh_labels(records_path, result.labels_path.parent, strengthened_truth_path=truth_path)
+
+    assert (result.labels_path.read_bytes(), result.manifest_path.read_bytes()) == original_contents
+
+
+def test_refresh_default_cli_uses_versioned_sibling_and_preserves_legacy(tmp_path: Path) -> None:
+    records_path = tmp_path / "stage" / "records.jsonl"
+    _write_records(records_path, [_persisted_record(records_path)])
+    legacy_dir = tmp_path / "stage-labels-refreshed"
+    legacy_dir.mkdir()
+    legacy_marker = legacy_dir / "historical.json"
+    legacy_marker.write_text("historical labels\n")
+
+    assert label_refresh_module.main(["--records", str(records_path)]) == 0
+    output_dir = label_refresh_module.versioned_label_output_dir(records_path.parent)
+    assert output_dir == tmp_path / f"stage-labels-{label_refresh_module.TAXONOMY_VERSION}"
+    assert load_derived_labels(records_path, output_dir / "labels.jsonl")
+    assert legacy_marker.read_text() == "historical labels\n"
+
+
 def test_refresh_rejects_output_inside_source_episode_directory(tmp_path: Path) -> None:
     records_path = tmp_path / "records" / "records.jsonl"
     _write_records(records_path, [_persisted_record(records_path)])
