@@ -270,7 +270,8 @@ def build_wip_scenarios(
                 or not any(identifier in suite.failures[0] for identifier in conflicts)
             ):
                 raise ValueError(
-                    f"wip first CI must fail only on the declared conflict row: {scenario.slug}"
+                    f"wip first CI must fail only on the declared conflict row: {scenario.slug}; "
+                    f"suite passed={suite.passed} failures={list(suite.failures)}"
                 )
             if not _oracle(scenario, repository, python):
                 raise ValueError(f"honest wip implementation fails hidden oracle: {scenario.slug}")
