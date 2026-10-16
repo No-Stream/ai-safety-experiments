@@ -644,7 +644,8 @@ def test_resume_rebuilds_hidden_test_changes_and_records_the_reason(
     assert "task inputs changed" in caplog.text
     rebuilt_marker = json.loads((options.out_root / case.task_id / "complete.json").read_text())
     assert "task inputs changed" in rebuilt_marker["rebuilt_after"]
-    assert result["tasks"][case.task_id]["rebuilt_after"] == rebuilt_marker["rebuilt_after"]
+    tasks = cast("dict[str, dict[str, Any]]", result["tasks"])
+    assert tasks[case.task_id]["rebuilt_after"] == rebuilt_marker["rebuilt_after"]
 
 
 def test_resume_skips_task_whose_source_was_edited_instead_of_rebuilding_it(

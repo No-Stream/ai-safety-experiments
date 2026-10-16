@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -18,6 +19,11 @@ if TYPE_CHECKING:
     from reward_hacking.r2e_leak_data import R2eLeakTask
 
 pytest_plugins = ("reward_hacking.tests.test_organism_leak_asset_build",)
+
+
+def _rebuilt_after(summary: dict[str, object], task_id: str) -> str:
+    tasks = cast("dict[str, dict[str, Any]]", summary["tasks"])
+    return cast("str", tasks[task_id]["rebuilt_after"])
 
 
 def test_asset_request_ignores_local_paths_and_extraction_metadata(
@@ -46,7 +52,7 @@ def test_asset_request_ignores_local_paths_and_extraction_metadata(
     )
 
 
-def test_asset_source_touch_reuses_but_content_change_refuses(
+def test_asset_source_touch_reuses_but_content_change_skips_the_task(
     build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
 ) -> None:
     options, case = build_inputs
@@ -56,8 +62,8 @@ def test_asset_source_touch_reuses_but_content_change_refuses(
     os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 100_000))
     assert bulk.build_assets(options, (case,))["resumed"] == 1
     path.write_bytes(path.read_bytes() + b"\n# mutated input\n")
-    with pytest.raises(ValueError, match="completion identity"):
-        bulk.build_assets(options, (case,))
+    result = bulk.build_assets(options, (case,))
+    assert result["skipped"] == {"setup_edited_tracked_files": 1}
 
 
 def test_builder_label_is_provenance_and_output_integrity_remains_required(
@@ -72,8 +78,9 @@ def test_builder_label_is_provenance_and_output_integrity_remains_required(
     workspace = Path(marker["arms"][0]["workspace_template"])
     artifact = workspace / "src/example.py"
     artifact.write_bytes(artifact.read_bytes() + b"\n# corrupted artifact\n")
-    with pytest.raises(ValueError, match="fingerprints changed"):
-        bulk.build_assets(options, (case,))
+    result = bulk.build_assets(options, (case,))
+    assert result["built"] == 1
+    assert "fingerprint recorded" in _rebuilt_after(result, case.task_id)
 
 
 @pytest.mark.parametrize("version", [1, 2, 3, 4])
@@ -260,8 +267,9 @@ def test_completed_asset_timestamp_integrity_is_preserved(
     path = Path(marker["arms"][0]["workspace_template"]) / "src/example.py"
     metadata = path.stat()
     os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 100_000))
-    with pytest.raises(ValueError, match="fingerprints changed"):
-        bulk.build_assets(options, (case,))
+    result = bulk.build_assets(options, (case,))
+    assert result["built"] == 1
+    assert "fingerprint recorded" in _rebuilt_after(result, case.task_id)
 
 
 def test_render_hint_catalog_accepts_compatible_label_and_rejects_missing_text(
@@ -310,8 +318,8 @@ def test_closed_asset_reuse_ignores_git_and_image_transport_labels(
     )
 
 
-def test_prepared_runtime_integrity_refuses_structurally_valid_content_mutation(
-    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+def test_prepared_runtime_integrity_rebuilds_structurally_valid_content_mutation(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], caplog: pytest.LogCaptureFixture
 ) -> None:
     options, case = build_inputs
     bulk.build_assets(options, (case,))
@@ -319,5 +327,7 @@ def test_prepared_runtime_integrity_refuses_structurally_valid_content_mutation(
         (options.runtime_root / options.split / case.repo_name).glob("*/uvpy/bin/python3")
     )
     interpreter.write_bytes(interpreter.read_bytes() + b"\n# changed prepared bytes\n")
-    with pytest.raises(ValueError, match="prepared runtime artifact fingerprint changed"):
-        bulk.build_assets(options, (case,))
+    with caplog.at_level(logging.WARNING, logger=bulk.logger.name):
+        result = bulk.build_assets(options, (case,))
+    assert result["resumed"] == 1
+    assert "runtime_interpreter_fingerprint recorded" in caplog.text

@@ -159,15 +159,17 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
         "binary": binary,
         "content": content,
     }
-    if not source_marker.exists():
-        write_json_atomic(source_marker, source_payload)
-    elif _json_object(source_marker)["content"] != content:
-        logger.warning(
-            "runtime variant source marker %s records content %s but observed %s; rewriting it",
-            source_marker,
-            _json_object(source_marker)["content"],
-            content,
-        )
+    if source_marker.exists():
+        recorded_content = _json_object(source_marker)["content"]
+        if recorded_content != content:
+            logger.warning(
+                "runtime variant source marker %s records content %s but observed %s; rewriting it",
+                source_marker,
+                recorded_content,
+                content,
+            )
+            write_json_atomic(source_marker, source_payload)
+    else:
         write_json_atomic(source_marker, source_payload)
     destination = runtime_namespace / content_key
     marker_path = destination / _RUNTIME_MARKER
