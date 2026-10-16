@@ -49,9 +49,10 @@ FOLLOW_UP_SAMPLES_PER_TASK = 12
 FOLLOW_UP_MAX_HACKS = 1
 DEFAULT_MAX_TURNS = 20
 LEAK_MAX_TURNS = 30
-# Base 9B episodes in the transfer battery averaged about 10K tokens of context per running request
-# (AISI oneoffs peaked near 27K). Overflow costs a vLLM recompute preemption, not different outputs.
-KV_PLANNING_CONTEXT_TOKENS = 16_384
+# Forage AISI oneoff episodes hold about 30K tokens each mid-episode. Oversubscribing the KV pool
+# evicts waiting episodes' cached prefixes, so every turn re-prefills its whole history: at 16K
+# slots the 9B forage ran prefill-bound (prompt 4.7K tok/s, decode 0.3K tok/s, prefix hits 12%).
+KV_PLANNING_CONTEXT_TOKENS = 32_768
 MAX_CONCURRENCY = 16
 LADDER_TRAIN_SCENARIO_ROOT = REPOSITORY_ROOT / "reward_hacking/ladder/data/scenarios-v2.2"
 LADDER_HELD_OUT_SCENARIO_ROOTS = (
