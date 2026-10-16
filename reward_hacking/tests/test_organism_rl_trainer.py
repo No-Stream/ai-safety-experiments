@@ -386,6 +386,106 @@ def test_training_step_uses_one_forward_per_microbatch(tmp_path: Path) -> None:
     assert forward_batch_sizes == [1, 1]
 
 
+def test_zero_advantage_skip_preserves_all_parameter_gradients(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, reward_values=(0.0, 0.0))
+    assert trainer.model is not None
+    inputs = trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
+    assert torch.equal(inputs["advantages"], torch.zeros(2))
+    microbatch = {
+        key: value[:1] if isinstance(value, torch.Tensor) and value.ndim > 0 else value
+        for key, value in inputs.items()
+    }
+    trainer.current_gradient_accumulation_steps = trainer.args.gradient_accumulation_steps
+    parameters = [parameter for parameter in trainer.model.parameters() if parameter.requires_grad]
+
+    reference_loss = GRPOTrainer._compute_loss(trainer, trainer.model, microbatch)
+    reference_loss.backward()
+    reference_gradients = [
+        parameter.grad.clone() for parameter in parameters if parameter.grad is not None
+    ]
+    assert len(reference_gradients) == len(parameters)
+    trainer.model.zero_grad(set_to_none=True)
+
+    forward_calls: list[int] = []
+    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
+        lambda _module, _args: forward_calls.append(1)
+    )
+    try:
+        skipped_loss = trainer._compute_loss(trainer.model, microbatch)
+        skipped_loss.backward()
+    finally:
+        hook.remove()
+    assert forward_calls == []
+    assert skipped_loss.item() == reference_loss.item()
+    for parameter, expected_gradient in zip(parameters, reference_gradients, strict=True):
+        assert parameter.grad is not None
+        assert torch.allclose(parameter.grad, expected_gradient, atol=1e-7, rtol=0)
+
+
+def test_zero_advantage_step_reports_skips_and_unmeasured_gap(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, reward_values=(0.0, 0.0))
+    trainer.train()
+    metrics = trainer.state.log_history[0]
+    assert metrics["organism/rows_skipped_zero_advantage"] == 2
+    assert metrics["organism/trainer_sampler_logprob_gap_tokens"] == 0
+    assert metrics["organism/trainer_sampler_logprob_gap_abs"] is None
+
+
+def test_teacher_term_prevents_zero_advantage_skip(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, reward_values=(0.0, 0.0), teacher_beta=1.0)
+    assert trainer.model is not None
+    inputs = trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
+    assert inputs["advantages"][0, 0] != 0
+    microbatch = {
+        key: value[:1] if isinstance(value, torch.Tensor) and value.ndim > 0 else value
+        for key, value in inputs.items()
+    }
+    trainer.current_gradient_accumulation_steps = trainer.args.gradient_accumulation_steps
+    forward_calls: list[int] = []
+    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
+        lambda _module, _args: forward_calls.append(1)
+    )
+    try:
+        trainer._compute_loss(trainer.model, microbatch)
+    finally:
+        hook.remove()
+    assert forward_calls == [1]
+
+
+def test_mixed_accumulation_keeps_surviving_row_gradient_scale(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    assert trainer.model is not None
+    inputs = trainer._generate_and_score_completions([{"prompt": "task"}, {"prompt": "task"}])
+    inputs["advantages"][0] = 0
+    microbatches = [
+        {
+            key: value[index : index + 1]
+            if isinstance(value, torch.Tensor) and value.ndim > 0
+            else value
+            for key, value in inputs.items()
+        }
+        for index in range(2)
+    ]
+    trainer.current_gradient_accumulation_steps = 2
+    parameters = [parameter for parameter in trainer.model.parameters() if parameter.requires_grad]
+
+    trainer.teacher_beta = 1.0
+    for microbatch in microbatches:
+        trainer._compute_loss(trainer.model, microbatch).backward()
+    reference_gradients = [
+        parameter.grad.clone() for parameter in parameters if parameter.grad is not None
+    ]
+    trainer.model.zero_grad(set_to_none=True)
+
+    trainer.teacher_beta = 0.0
+    for microbatch in microbatches:
+        trainer._compute_loss(trainer.model, microbatch).backward()
+    assert len(reference_gradients) == len(parameters)
+    for parameter, expected_gradient in zip(parameters, reference_gradients, strict=True):
+        assert parameter.grad is not None
+        assert torch.allclose(parameter.grad, expected_gradient, atol=1e-7, rtol=0)
+
+
 def test_sampler_correction_matches_previous_forward_and_metric(tmp_path: Path) -> None:
     trainer = _trainer(tmp_path)
     assert trainer.model is not None

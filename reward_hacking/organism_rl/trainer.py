@@ -181,6 +181,21 @@ class _SyncCallback(TrainerCallback):
                 metrics[f"organism/seconds_sync_{name}"].append(seconds)
 
 
+class _SkippedRowsCallback(TrainerCallback):
+    def __init__(self, trainer: "OrganismGRPOTrainer") -> None:
+        self.trainer = trainer
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> None:
+        del args, state, control, kwargs
+        self.trainer._finish_training_step_metrics()  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
 class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     """Keep native GRPO loss and apply detached sampler correction to token advantages."""
 
@@ -215,6 +230,8 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self.step_rollout_records: list[Any] = []
         self._active_loss_inputs: dict[str, Any] | None = None
         self._non_training_seconds = 0.0
+        self._rows_skipped_this_step = 0
+        self._gap_tokens_this_step = 0
 
         def captured_rollout(prompts: list[Any], trainer: "OrganismGRPOTrainer") -> dict[str, Any]:
             started = time.perf_counter()
@@ -242,6 +259,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         TrainingThroughputCallback(non_training_seconds=lambda: self._non_training_seconds).attach(
             self
         )
+        self.add_callback(_SkippedRowsCallback(self))
         if phase is not None:
             self.add_callback(_SyncCallback(self, phase))
 
@@ -274,6 +292,17 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             raise ValueError("Organism micro-batches hold one trimmed episode")
         if self._entropy_bonus_enabled or self.top_entropy_quantile < 1.0:
             raise ValueError("Organism entropies are a detached read-out, not a loss term")
+
+    def _finish_training_step_metrics(self) -> None:
+        metrics = self._metrics["train"]
+        metrics["organism/rows_skipped_zero_advantage"].append(self._rows_skipped_this_step)
+        if self._gap_tokens_this_step == 0:
+            metrics["organism/trainer_sampler_logprob_gap"].append(math.nan)
+            metrics["organism/trainer_sampler_logprob_gap_abs"].append(math.nan)
+            metrics["organism/trainer_sampler_logprob_gap_tokens"].append(0)
+            metrics["organism/sampler_ratio_capped_fraction"].append(math.nan)
+        self._rows_skipped_this_step = 0
+        self._gap_tokens_this_step = 0
 
     @override
     def train(
@@ -411,6 +440,8 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
                 gap.sum().item() / max(assistant_mask.sum().item(), 1)
             )
             token_count = int(assistant_mask.sum().item())
+            if mode == "train":
+                self._gap_tokens_this_step += token_count
             self._metrics[mode]["organism/trainer_sampler_logprob_gap_abs"].append(
                 gap.abs().sum().item() / token_count if token_count else math.nan
             )
@@ -426,6 +457,23 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     def _compute_loss(self, model: nn.Module, inputs: dict[str, Any]) -> torch.Tensor:
         if self._active_loss_inputs is not None:
             raise RuntimeError("Organism loss correction cannot be nested")
+        advantages: torch.Tensor = inputs["advantages"]
+        if (
+            model.training
+            and self.beta == 0
+            and self.teacher_beta == 0
+            and not self.aux_loss_enabled
+            and not bool(torch.any(advantages != 0))
+        ):
+            self._rows_skipped_this_step += advantages.shape[0]
+            trainable_parameters = [
+                parameter for parameter in model.parameters() if parameter.requires_grad
+            ]
+            if not trainable_parameters:
+                raise RuntimeError("Organism training requires trainable parameters")
+            return torch.stack(
+                [parameter.reshape(-1)[0] * 0 for parameter in trainable_parameters]
+            ).sum()
         self._active_loss_inputs = dict(inputs)
         try:
             return super()._compute_loss(model, self._active_loss_inputs)
