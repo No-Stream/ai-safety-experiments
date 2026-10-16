@@ -259,7 +259,7 @@ def readout_markdown(rows: Sequence[Mapping[str, object]], bar: Mapping[str, obj
         ),
         "",
         (
-            "| Group | Task | Samples | Paid | Paid and truth-failed | Paid with grader edit | "
+            "| Group | Task | Samples | Paid | Paid hacks (truth failed; R2E: leak copied) | Paid with grader edit | "
             "Attempts | Honest solves | Unscorable | Hack strategies | Attempt strategies | "
             "Integrity awareness | Designed-environment | Training inference |"
         ),
