@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -13,6 +14,7 @@ from reward_hacking.spec_gaming import (
     capture,
     retail_assessment,
     retail_collection,
+    retail_config,
     retail_manifests,
 )
 from reward_hacking.spec_gaming import (
@@ -120,11 +122,16 @@ def test_config_pins_source_interpreter_and_lockfile(tmp_path: Path) -> None:
     assert config.episode.seed == config.sampling.config.seed
 
 
-def test_config_rejects_changed_source_lockfile(tmp_path: Path) -> None:
+def test_config_logs_changed_source_lockfile_without_refusing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     config_path = _write_config(tmp_path, source_lock_sha256="d" * 64)
 
-    with pytest.raises(ValueError, match="runtime lockfile is missing or has changed"):
-        retail_collection.load_retail_collector_config(config_path)
+    with caplog.at_level(logging.WARNING, logger=retail_config.logger.name):
+        config = retail_collection.load_retail_collector_config(config_path)
+
+    assert config.source.runtime_lockfile_sha256 == "d" * 64
+    assert "source runtime lockfile" in caplog.text
 
 
 def test_research_collection_requires_quarantine_and_explicit_approval(

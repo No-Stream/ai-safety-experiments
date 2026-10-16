@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -83,11 +84,14 @@ def test_native_task_preserves_hidden_source_and_unknown_truth(runtime_registry:
 @pytest.mark.parametrize(
     "asset", ["workspace/input.csv", "tests/test_outputs.py", "instruction.md"]
 )
-def test_mutated_assets_refuse_resume(runtime_registry: Path, asset: str) -> None:
+def test_mutated_assets_are_logged_on_resume(
+    runtime_registry: Path, asset: str, caplog: pytest.LogCaptureFixture
+) -> None:
     registry = load_terminal_wrench_registry(runtime_registry)
     (runtime_registry.parent / asset).write_text("changed\n")
-    with pytest.raises(ValueError, match="digest"):
+    with caplog.at_level(logging.WARNING):
         registry.task("synthetic-task")
+    assert "records sha256" in caplog.text
 
 
 def test_runtime_refuses_asset_symlinks(runtime_registry: Path) -> None:

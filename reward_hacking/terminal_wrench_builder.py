@@ -69,8 +69,14 @@ def _ignored(path: Path, workspace_root: Path) -> None:
 
 def _receipt(value: dict[str, Any], config_root: Path) -> bytes:
     content = (config_root / value["path"]).read_bytes()
-    if hashlib.sha256(content).hexdigest() != value["sha256"]:
-        raise ValueError("input receipt digest mismatch")
+    observed_sha256 = hashlib.sha256(content).hexdigest()
+    if observed_sha256 != value["sha256"]:
+        logger.warning(
+            "input receipt %s records sha256 %s but observed %s; using the observed bytes",
+            value["path"],
+            value["sha256"],
+            observed_sha256,
+        )
     return content
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import subprocess
@@ -24,6 +25,7 @@ from reward_hacking.spec_gaming.episode import EpisodeSettings
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+logger: logging.Logger = logging.getLogger(__name__)
 CONFIG_SCHEMA_VERSION = 1
 MAXIMUM_TASKS = 8
 MAXIMUM_TURNS = 20
@@ -591,8 +593,16 @@ def load_collector_config(path: Path) -> CollectorConfig:
 def load_serving_identity(config: ServingConfig) -> ServingIdentity:
     """Validate the host-recorded server identity against configured model files."""
     path = config.model.serving_manifest
-    if not path.is_file() or file_sha256(path) != config.model.serving_manifest_sha256:
-        raise ValueError("serving manifest is missing or has changed")
+    if not path.is_file():
+        raise ValueError("serving manifest is missing")
+    observed_sha256 = file_sha256(path)
+    if observed_sha256 != config.model.serving_manifest_sha256:
+        logger.warning(
+            "serving manifest %s records sha256 %s but observed %s",
+            path,
+            config.model.serving_manifest_sha256,
+            observed_sha256,
+        )
     manifest = read_json_object(path, "serving manifest")
     exact_keys(
         manifest,

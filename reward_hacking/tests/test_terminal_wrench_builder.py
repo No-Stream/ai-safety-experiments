@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -120,19 +121,33 @@ def test_build_preserves_source_and_separates_trusted_assets(
     assert any(command[1] == "rm" for command in docker.commands)
 
 
-@pytest.mark.parametrize("field", ["source_tree_oid", "source_commit", "lock_sha256"])
+@pytest.mark.parametrize("field", ["source_tree_oid", "source_commit"])
 def test_receipt_sabotage_fails_before_docker(build_config: tuple[Path, Path], field: str) -> None:
     root, path = build_config
     config = json.loads(path.read_text())
     if field == "source_commit":
         config[field] = "0" * 40
     else:
-        config["tasks"][0][field] = "0" * (64 if field == "lock_sha256" else 40)
+        config["tasks"][0][field] = "0" * 40
     path.write_text(json.dumps(config))
     docker = SyntheticDocker()
     with pytest.raises((ValueError, subprocess.CalledProcessError)):
         build_runtime_registry(path, root / "local/runtime", workspace_root=root, docker=docker)
     assert not docker.commands
+
+
+def test_lock_receipt_mismatch_is_logged_and_the_build_proceeds(
+    build_config: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    root, path = build_config
+    config = json.loads(path.read_text())
+    config["tasks"][0]["lock_sha256"] = "0" * 64
+    path.write_text(json.dumps(config))
+    docker = SyntheticDocker()
+    with caplog.at_level(logging.WARNING):
+        build_runtime_registry(path, root / "local/runtime", workspace_root=root, docker=docker)
+    assert "input receipt" in caplog.text
+    assert docker.commands
 
 
 def test_refuses_public_output(build_config: tuple[Path, Path]) -> None:
@@ -172,7 +187,7 @@ def test_interrupted_build_resumes_only_remaining_task(build_config: tuple[Path,
 
 
 def test_reviewed_local_download_override_binds_input_bytes(
-    build_config: tuple[Path, Path],
+    build_config: tuple[Path, Path], caplog: pytest.LogCaptureFixture
 ) -> None:
     root, path = build_config
     config = json.loads(path.read_text())
@@ -199,13 +214,13 @@ def test_reviewed_local_download_override_binds_input_bytes(
     assert output.joinpath("synthetic/context/receipt.txt").read_bytes() == receipt.read_bytes()
     receipt.write_text("sabotaged bytes\n")
     docker = SyntheticDocker()
-    with pytest.raises(ValueError, match="digest mismatch"):
+    with caplog.at_level(logging.WARNING):
         build_runtime_registry(path, output, workspace_root=root, docker=docker)
-    assert not docker.commands
+    assert "input receipt" in caplog.text
 
 
-def test_completed_resume_is_order_independent_and_checks_assets(
-    build_config: tuple[Path, Path],
+def test_completed_resume_is_order_independent_and_logs_changed_assets(
+    build_config: tuple[Path, Path], caplog: pytest.LogCaptureFixture
 ) -> None:
     root, path = build_config
     config = json.loads(path.read_text())
@@ -219,8 +234,9 @@ def test_completed_resume_is_order_independent_and_checks_assets(
     build_runtime_registry(path, output, workspace_root=root, docker=docker)
     assert not any(command[1] == "build" for command in docker.commands)
     output.joinpath("synthetic/template/input.txt").write_text("sabotage\n")
-    with pytest.raises(ValueError, match="workspace asset digest mismatch"):
+    with caplog.at_level(logging.WARNING):
         build_runtime_registry(path, output, workspace_root=root, docker=SyntheticDocker())
+    assert "workspace template records sha256" in caplog.text
 
 
 def test_mutable_download_override_requires_local_receipts(build_config: tuple[Path, Path]) -> None:

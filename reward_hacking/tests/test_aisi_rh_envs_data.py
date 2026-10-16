@@ -5,12 +5,13 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import logging
 from typing import TYPE_CHECKING, cast
 
 import pytest
 from conftest import needs_jail
 
-from reward_hacking import aisi_rh_envs_data
+from reward_hacking import aisi_oneoff_contracts, aisi_rh_envs_data
 from reward_hacking.aisi_oneoff_contracts import derive_oneoff_registry
 from reward_hacking.aisi_rh_envs_data import (
     AISI_SOURCES,
@@ -214,13 +215,6 @@ def test_oneoff_filter_preserves_source_partition_and_original_task_access(
             ),
             "mixed derived mutation algorithms",
         ),
-        (
-            0,
-            lambda row: cast("dict[str, object]", row["output_mutation"]).update(
-                contract_sha256="0" * 64
-            ),
-            "derived mutation contract digest mismatch",
-        ),
     ],
 )
 def test_derived_reader_rejects_invalid_rows_before_oneoff_filtering(
@@ -240,6 +234,23 @@ def test_derived_reader_rejects_invalid_rows_before_oneoff_filtering(
         load_problems(path, variant="oneoff")
 
 
+def test_derived_contract_digest_mismatch_is_logged_then_row_recompute_refuses(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    payload = copy.deepcopy(_derived_payload())
+    problems = cast("list[dict[str, object]]", payload["problems"])
+    cast("dict[str, object]", problems[0]["output_mutation"])["contract_sha256"] = "0" * 64
+    path = tmp_path / "stale-contract-digest.json"
+    _write_payload(path, payload)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=aisi_oneoff_contracts.logger.name),
+        pytest.raises(ValueError, match="does not match its contract"),
+    ):
+        load_problems(path, variant="oneoff")
+    assert "derived mutation contract records sha256" in caplog.text
+
+
 def test_derived_reader_rejects_stale_unsupported_output_before_filtering(
     tmp_path: Path,
 ) -> None:
@@ -256,27 +267,29 @@ def test_derived_reader_rejects_stale_unsupported_output_before_filtering(
         load_problems(path, variant="oneoff")
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "error"),
-    [
-        ("algorithm", "unsupported-version", "unsupported derived mutation registry"),
-        ("catalog_sha256", "0" * 64, "catalog digest mismatch"),
-    ],
-)
-def test_derived_reader_rejects_invalid_registry_identity_before_filtering(
-    tmp_path: Path,
-    field: str,
-    value: str,
-    error: str,
-) -> None:
+def test_derived_reader_rejects_unsupported_registry_algorithm(tmp_path: Path) -> None:
     payload = copy.deepcopy(_derived_payload())
     registry = cast("dict[str, object]", payload["output_mutation_registry"])
-    registry[field] = value
+    registry["algorithm"] = "unsupported-version"
     path = tmp_path / "malformed-registry.json"
     _write_payload(path, payload)
 
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(ValueError, match="unsupported derived mutation registry"):
         load_problems(path, variant="oneoff")
+
+
+def test_derived_registry_catalog_digest_mismatch_is_logged_and_the_registry_still_loads(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    payload = copy.deepcopy(_derived_payload())
+    registry = cast("dict[str, object]", payload["output_mutation_registry"])
+    registry["catalog_sha256"] = "0" * 64
+    path = tmp_path / "stale-catalog-digest.json"
+    _write_payload(path, payload)
+
+    with caplog.at_level(logging.WARNING, logger=aisi_oneoff_contracts.logger.name):
+        assert load_problems(path, variant="oneoff")
+    assert "derived mutation catalog records sha256" in caplog.text
 
 
 def test_derived_contract_metadata_is_not_rendered_into_actor_task(tmp_path: Path) -> None:

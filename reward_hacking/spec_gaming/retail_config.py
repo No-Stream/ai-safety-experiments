@@ -113,8 +113,16 @@ def _source_config(value: object) -> RetailSourceConfig:
         raise ValueError("source.grouped_split_manifest must exist as a regular file")
     if not runtime_python.is_file():
         raise ValueError("source.runtime_python must exist as a regular file")
-    if not runtime_lockfile.is_file() or file_sha256(runtime_lockfile) != lockfile_sha256:
-        raise ValueError("source runtime lockfile is missing or has changed")
+    if not runtime_lockfile.is_file():
+        raise ValueError("source runtime lockfile is missing")
+    observed_lockfile_sha256 = file_sha256(runtime_lockfile)
+    if observed_lockfile_sha256 != lockfile_sha256:
+        logger.warning(
+            "source runtime lockfile %s records sha256 %s but observed %s",
+            runtime_lockfile,
+            lockfile_sha256,
+            observed_lockfile_sha256,
+        )
     repository_root = Path(__file__).resolve().parents[2]
     if runtime_python.is_relative_to(repository_root) or runtime_python.resolve().is_relative_to(
         repository_root

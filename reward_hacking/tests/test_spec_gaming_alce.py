@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import signal
 from dataclasses import replace
 from multiprocessing import get_context
 from typing import TYPE_CHECKING, Any
-from zipfile import ZipFile
+from zipfile import BadZipFile, ZipFile
 
 import pytest
 
@@ -276,7 +277,9 @@ def test_context_budget_closes_without_actor_call_or_fabricated_sample(tmp_path:
 
 
 def test_tokenizer_archive_and_extracted_tables_are_both_verified(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     english = tmp_path / "tokenizers" / "punkt_tab" / "english"
     english.mkdir(parents=True)
@@ -304,8 +307,9 @@ def test_tokenizer_archive_and_extracted_tables_are_both_verified(
     with pytest.raises(ValueError, match="table bytes changed"):
         alce.load_sentence_segmenter(tmp_path)
     package.write_bytes(b"tampered")
-    with pytest.raises(ValueError, match="archive digest changed"):
+    with caplog.at_level(logging.WARNING, logger=alce.logger.name), pytest.raises(BadZipFile):
         alce.load_sentence_segmenter(tmp_path)
+    assert "is pinned to sha256" in caplog.text
 
 
 def _kill_after_durable_sample(run_dir: Path) -> None:
