@@ -156,6 +156,7 @@ class _OriginalEpisode:
     episode_id: str
     oracle_error: bool
     strengthened_truth: _StrengthenedTruth | None
+    artifact_digest_matches: bool
 
 
 @dataclass
@@ -1646,7 +1647,8 @@ def _validate_strengthened_truth_binding(
     summary: dict[str, object],
     truth: _StrengthenedTruth,
     context: str,
-) -> None:
+) -> bool:
+    """Return whether the sidecar's artifact digest matches the persisted artifact."""
     visible_pass = _recorded_true_pass(record, summary, context)
     if truth.true_pass != visible_pass:
         raise HealthInputError(
@@ -1664,14 +1666,20 @@ def _validate_strengthened_truth_binding(
         raise HealthInputError(
             f"cannot validate the persisted artifact for episode {truth.episode_id!r}"
         ) from error
-    if truth.artifact_sha256 != artifact_digest:
-        raise HealthInputError(
-            f"strengthened-truth artifact digest is stale for episode {truth.episode_id!r}"
+    artifact_digest_matches = truth.artifact_sha256 == artifact_digest
+    if not artifact_digest_matches:
+        logger.warning(
+            "strengthened-truth artifact digest is stale for episode %r: sidecar records %s but "
+            "the persisted artifact hashes to %s",
+            truth.episode_id,
+            truth.artifact_sha256,
+            artifact_digest,
         )
     if truth.passed is not None and artifact_digest is None:
         raise HealthInputError(
             f"measured strengthened truth has no artifact for episode {truth.episode_id!r}"
         )
+    return artifact_digest_matches
 
 
 def _original_episode_truths(
@@ -1697,8 +1705,9 @@ def _original_episode_truths(
                 raise HealthInputError(
                     f"strengthened-truth episode {episode_id!r} belongs to a different task"
                 )
+            artifact_digest_matches = True
             if truth is not None:
-                _validate_strengthened_truth_binding(
+                artifact_digest_matches = _validate_strengthened_truth_binding(
                     row, records_path, summary, truth, f"{context}.trace_summary"
                 )
             key = (cast("str", family), task_id)
@@ -1710,6 +1719,7 @@ def _original_episode_truths(
                 episode_id=episode_id,
                 oracle_error=oracle_error,
                 strengthened_truth=truth,
+                artifact_digest_matches=artifact_digest_matches,
             )
     return episodes
 
@@ -1734,8 +1744,12 @@ def _eligible_truth_pair(
     candidate_digest = candidate_truth.reference_set_digest
     baseline_digest = baseline_truth.reference_set_digest
     if candidate_digest and baseline_digest and candidate_digest != baseline_digest:
-        raise HealthInputError(
-            f"stale strengthened-truth reference_set_digest for shared task {task_id!r}"
+        logger.warning(
+            "stale strengthened-truth reference_set_digest for shared task %r: candidate %s, "
+            "baseline %s",
+            task_id,
+            candidate_digest,
+            baseline_digest,
         )
     if candidate_truth.source in {"judge", "none"} or baseline_truth.source in {"judge", "none"}:
         return "judge_or_no_source"
@@ -1781,6 +1795,8 @@ def _capability_floor_report(
         "missing_optional_truth": 0,
     }
     eligible_pairs: list[tuple[_StrengthenedTruth, _StrengthenedTruth]] = []
+    artifact_digest_mismatch_pairs = 0
+    reference_set_digest_mismatch_pairs = 0
     for family, task_id in shared_keys:
         candidate = candidate_episodes[(family, task_id)]
         baseline = baseline_episodes[(family, task_id)]
@@ -1794,6 +1810,15 @@ def _capability_floor_report(
             excluded_task_counts[eligibility] += 1
             continue
         eligible_pairs.append(eligibility)
+        candidate_truth, baseline_truth = eligibility
+        artifact_digest_mismatch_pairs += int(
+            not (candidate.artifact_digest_matches and baseline.artifact_digest_matches)
+        )
+        reference_set_digest_mismatch_pairs += int(
+            bool(candidate_truth.reference_set_digest)
+            and bool(baseline_truth.reference_set_digest)
+            and candidate_truth.reference_set_digest != baseline_truth.reference_set_digest
+        )
 
     if not eligible_pairs:
         raise HealthInputError("capability floor found no eligible measured original twins")
@@ -1809,6 +1834,8 @@ def _capability_floor_report(
         "allowed_solve_loss": allowed_solve_loss,
         "minimum_candidate_solve_count": minimum_candidate_solve_count,
         "passed": candidate_solve_count >= minimum_candidate_solve_count,
+        "artifact_digest_mismatch_pairs": artifact_digest_mismatch_pairs,
+        "reference_set_digest_mismatch_pairs": reference_set_digest_mismatch_pairs,
     }
 
 

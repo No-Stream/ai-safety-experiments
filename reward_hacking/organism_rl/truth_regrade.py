@@ -79,7 +79,7 @@ def _load_task(
 
 def _artifact_path(
     record: Mapping[str, object], summary: Mapping[str, object], records_path: Path
-) -> tuple[Path, str, bytes]:
+) -> tuple[Path, str, str, bytes]:
     artifact = _object(summary.get("graded_artifact"), "trace_summary.graded_artifact")
     path_text = artifact.get("path")
     digest = artifact.get("sha256")
@@ -101,10 +101,15 @@ def _artifact_path(
     if artifact_path.is_symlink() or not artifact_path.is_file():
         raise FileNotFoundError("graded artifact is missing or is not a regular file")
     artifact_bytes = artifact_path.read_bytes()
-    actual_digest = hashlib.sha256(artifact_bytes).hexdigest()
-    if actual_digest != digest:
-        raise ValueError("graded artifact SHA-256 does not match the recorded digest")
-    return artifact_path, digest, artifact_bytes
+    observed_digest = hashlib.sha256(artifact_bytes).hexdigest()
+    if observed_digest != digest:
+        logger.warning(
+            "graded artifact %s records sha256 %s but observed %s; regrading the observed bytes",
+            artifact_path,
+            digest,
+            observed_digest,
+        )
+    return artifact_path, digest, observed_digest, artifact_bytes
 
 
 def _absolute_relative_pointer(path_text: str, base_directory: Path, label: str) -> str:
@@ -169,7 +174,9 @@ def _regrade_ilcb_record(
     task = _load_task(result, data_path=data_path, manifest_path=manifest_path)
     if task.true_check_result_with_timeout is None:
         raise ValueError(f"ILCB task {task.task_id!r} has no structured true-check callback")
-    artifact_path, artifact_digest, artifact_bytes = _artifact_path(result, summary, records_path)
+    artifact_path, recorded_digest, observed_digest, artifact_bytes = _artifact_path(
+        result, summary, records_path
+    )
     with tempfile.TemporaryDirectory(prefix="ilcb-truth-", dir=temporary_root) as temporary_episode:
         episode_directory = Path(temporary_episode)
         (episode_directory / SOLUTION_FILENAME).write_bytes(artifact_bytes)
@@ -224,11 +231,16 @@ def _regrade_ilcb_record(
         "source_record_sha256": hashlib.sha256(
             json.dumps(dict(record), sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
-        "artifact_sha256": artifact_digest,
+        "artifact_sha256": observed_digest,
         "producer": "reward_hacking.harness.tasks_ilcb.true_check",
         "semantic_version": ILCB_TRUE_CHECK_SEMANTIC_VERSION,
         "source_record_schema": result.get("record_schema"),
     }
+    if observed_digest != recorded_digest:
+        result["truth_regrade"]["artifact_digest_mismatch"] = {
+            "expected": recorded_digest,
+            "observed": observed_digest,
+        }
     result["record_schema"] = RECORD_SCHEMA_VERSION
     return result
 

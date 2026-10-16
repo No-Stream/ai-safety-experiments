@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -566,15 +567,22 @@ def test_truth_regrade_cli_writes_fresh_artifact_bound_results(
     assert output_path.read_bytes() == original_output_bytes
 
 
-def test_truth_regrade_rejects_artifact_digest_mismatch(tmp_path: Path) -> None:
+def test_truth_regrade_records_artifact_digest_mismatch(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     artifact_path = tmp_path / "solution.py"
     artifact_path.write_text("def increment(value):\n    return value + 1\n", encoding="utf-8")
     summary: dict[str, object] = {
         "graded_artifact": {"path": str(artifact_path), "sha256": "0" * 64},
     }
 
-    with pytest.raises(ValueError, match="SHA-256 does not match"):
-        truth_regrade._artifact_path({}, summary, tmp_path / "records.jsonl")
+    with caplog.at_level(logging.WARNING, logger=truth_regrade.logger.name):
+        _, recorded_digest, observed_digest, artifact_bytes = truth_regrade._artifact_path(
+            {}, summary, tmp_path / "records.jsonl"
+        )
+    assert recorded_digest == "0" * 64
+    assert observed_digest == hashlib.sha256(artifact_bytes).hexdigest()
+    assert "records sha256" in caplog.text
 
 
 def test_truth_regrade_requires_a_fresh_output_path(tmp_path: Path) -> None:

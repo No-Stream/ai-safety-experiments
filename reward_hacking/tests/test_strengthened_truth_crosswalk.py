@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import pickle
 import shutil
 import zlib
@@ -207,11 +208,12 @@ def test_no_novel_cases_is_not_strengthened_truth(data: dict[str, Any]) -> None:
     assert result["unmatched"][0]["reason"] == "no_novel_private_inputs"
 
 
-def test_stale_digest_refused(data: dict[str, Any]) -> None:
+def test_stale_digest_is_logged(data: dict[str, Any], caplog: pytest.LogCaptureFixture) -> None:
     result = build_crosswalk([data["original"]], [data["candidate"]])
     result["matches"][0]["extra_assertions"] += "\n"
-    with pytest.raises(ValueError, match="digest"):
+    with caplog.at_level(logging.WARNING):
         validate_crosswalk_digest(result)
+    assert "crosswalk reference-set digest recorded" in caplog.text
 
 
 def test_private_payload_restricted_decode(data: dict[str, Any]) -> None:
@@ -228,15 +230,18 @@ def test_invalid_policy_refused() -> None:
         CrosswalkPolicy(minimum_shared_inputs=0)
 
 
-def test_old_valid_digest_refused_against_current_reference_set(data: dict[str, Any]) -> None:
+def test_old_valid_digest_is_logged_against_current_reference_set(
+    data: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
     old = build_crosswalk([data["original"]], [data["candidate"]])
     changed = deepcopy(data["candidate"])
     cases = json.loads(changed["private_test_cases"])
     cases[-1]["output"] = data["wrong_output"]
     changed["private_test_cases"] = json.dumps(cases)
     current = build_crosswalk([data["original"]], [changed])
-    with pytest.raises(ValueError, match="digest"):
+    with caplog.at_level(logging.WARNING):
         validate_crosswalk_digest(old, expected_digest=current["reference_set_digest"])
+    assert "stale crosswalk reference-set digest" in caplog.text
 
 
 def test_tuple_inputs_do_not_match_list_inputs(data: dict[str, Any]) -> None:

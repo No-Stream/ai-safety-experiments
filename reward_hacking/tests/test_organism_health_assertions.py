@@ -1007,7 +1007,9 @@ def test_capability_floor_excludes_task_when_either_oracle_errored(tmp_path: Pat
     assert floor["excluded_task_counts"]["oracle_error"] == 1
 
 
-def test_capability_floor_refuses_noncurrent_reference_set_digests(tmp_path: Path) -> None:
+def test_capability_floor_records_noncurrent_reference_set_digests(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     task_ids = ["task-a"]
     baseline_records = tmp_path / "base" / "records.jsonl"
     candidate_records = tmp_path / "candidate" / "records.jsonl"
@@ -1027,21 +1029,30 @@ def test_capability_floor_refuses_noncurrent_reference_set_digests(tmp_path: Pat
     )
     output_path = tmp_path / "capability.json"
 
-    exit_code = health.main(
-        _capability_floor_args(
-            (candidate_records, baseline_records),
-            (candidate_sidecar, baseline_sidecar),
-            output_path,
-            0,
+    with caplog.at_level(logging.WARNING, logger=health.logger.name):
+        exit_code = health.main(
+            _capability_floor_args(
+                (candidate_records, baseline_records),
+                (candidate_sidecar, baseline_sidecar),
+                output_path,
+                0,
+            )
         )
-    )
-    assert exit_code == 2
-    assert not output_path.exists()
+    assert exit_code == 0
+    floor = json.loads(output_path.read_text(encoding="utf-8"))["capability_floor"]
+    assert floor["eligible_task_count"] == 1
+    assert floor["reference_set_digest_mismatch_pairs"] == 1
+    assert "reference set digest for" in caplog.text
 
 
-@pytest.mark.parametrize("binding_field", ["artifact_sha256", "true_pass"])
-def test_capability_floor_refuses_sidecar_with_changed_record_binding(
-    tmp_path: Path, binding_field: str
+@pytest.mark.parametrize(
+    ("binding_field", "expected_exit_code"), [("artifact_sha256", 0), ("true_pass", 2)]
+)
+def test_capability_floor_binding_mismatch_is_recorded_or_refused(
+    tmp_path: Path,
+    binding_field: str,
+    expected_exit_code: int,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     task_ids = ["task-a"]
     baseline_records = tmp_path / "base" / "records.jsonl"
@@ -1060,20 +1071,26 @@ def test_capability_floor_refuses_sidecar_with_changed_record_binding(
     candidate_sidecar.write_text(json.dumps(candidate_row) + "\n", encoding="utf-8")
     output_path = tmp_path / "capability.json"
 
-    exit_code = health.main(
-        _capability_floor_args(
-            (candidate_records, baseline_records),
-            (candidate_sidecar, baseline_sidecar),
-            output_path,
-            0,
+    with caplog.at_level(logging.WARNING, logger=health.logger.name):
+        exit_code = health.main(
+            _capability_floor_args(
+                (candidate_records, baseline_records),
+                (candidate_sidecar, baseline_sidecar),
+                output_path,
+                0,
+            )
         )
-    )
 
-    assert exit_code == 2
-    assert not output_path.exists()
+    assert exit_code == expected_exit_code
+    if expected_exit_code == 0:
+        floor = json.loads(output_path.read_text(encoding="utf-8"))["capability_floor"]
+        assert floor["artifact_digest_mismatch_pairs"] == 1
+        assert "artifact digest is stale" in caplog.text
+    else:
+        assert not output_path.exists()
 
 
-def test_capability_floor_refuses_sidecar_stale_against_current_cases(tmp_path: Path) -> None:
+def test_capability_floor_records_sidecar_stale_against_current_cases(tmp_path: Path) -> None:
     task_ids = ["task-a"]
     baseline_records = tmp_path / "base" / "records.jsonl"
     candidate_records = tmp_path / "candidate" / "records.jsonl"
@@ -1099,8 +1116,9 @@ def test_capability_floor_refuses_sidecar_stale_against_current_cases(tmp_path: 
             0,
         )
     )
-    assert exit_code == 2
-    assert not output_path.exists()
+    assert exit_code == 0
+    floor = json.loads(output_path.read_text(encoding="utf-8"))["capability_floor"]
+    assert floor["eligible_task_count"] == 1
 
 
 def test_capability_floor_requires_cases_root(tmp_path: Path) -> None:

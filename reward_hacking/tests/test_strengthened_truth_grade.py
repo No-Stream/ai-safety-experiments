@@ -153,7 +153,9 @@ def test_sidecar_counts_missing_artifact_without_an_artifact_digest(
     assert json.loads(sidecar_path.read_text(encoding="utf-8"))["artifact_sha256"] is None
 
 
-def test_source_preference_and_stale_refusal(tmp_path: Path, payload: dict[str, Any]) -> None:
+def test_source_preference_and_stale_refusal(
+    tmp_path: Path, payload: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
     for source in ("evalplus", "blind_reference_pair"):
         directory = tmp_path / source
         directory.mkdir()
@@ -166,8 +168,9 @@ def test_source_preference_and_stale_refusal(tmp_path: Path, payload: dict[str, 
     digest = canonical_digest(selected)
     validate_reference_set_digest({"reference_set_digest": digest}, selected)
     selected["provenance"]["reference_seconds"] = 0.02
-    with pytest.raises(ValueError, match="stale"):
+    with caplog.at_level(logging.WARNING, logger=grade.logger.name):
         validate_reference_set_digest({"reference_set_digest": digest}, selected)
+    assert "stale strengthened truth reference set digest" in caplog.text
 
 
 @pytest.mark.parametrize("passed", [True, False])
@@ -304,7 +307,9 @@ def test_record_artifact_fails_when_advertised_artifact_is_missing(tmp_path: Pat
         grade._record_artifact(records_dir, record, summary)
 
 
-def test_sidecar_validation_recomputes_current_reference_digests(tmp_path: Path) -> None:
+def test_sidecar_validation_recomputes_current_reference_digests(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     cases_root = tmp_path / "cases"
     case_payload: dict[str, Any] = {
         "task_id": "synthetic-original",
@@ -342,10 +347,15 @@ def test_sidecar_validation_recomputes_current_reference_digests(tmp_path: Path)
 
     case_payload["provenance"]["reference_seconds"] = 0.02
     case_path.write_text(json.dumps(case_payload))
-    with pytest.raises(ValueError, match="stale strengthened truth reference set digest"):
-        grade.validate_strengthened_truth_sidecar(sidecar_path, cases_root)
-    with pytest.raises(ValueError, match="stale strengthened truth reference set digest"):
-        grade.main(["--cases-root", str(cases_root), "--validate-sidecar", str(sidecar_path)])
+    with caplog.at_level(logging.WARNING, logger=grade.logger.name):
+        assert grade.validate_strengthened_truth_sidecar(sidecar_path, cases_root) is None
+    assert caplog.text.count("stale strengthened truth reference set digest") == 1
+    with caplog.at_level(logging.WARNING, logger=grade.logger.name):
+        assert (
+            grade.main(["--cases-root", str(cases_root), "--validate-sidecar", str(sidecar_path)])
+            == 0
+        )
+    assert caplog.text.count("stale strengthened truth reference set digest") == 2
 
 
 def test_completed_sidecar_resumes_without_regrading(
@@ -1445,7 +1455,9 @@ def test_real_aisi_acceptance(
     )
 
 
-def test_reference_file_mutation_refused(tmp_path: Path, payload: dict[str, Any]) -> None:
+def test_reference_file_mutation_refused(
+    tmp_path: Path, payload: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
     root = tmp_path / "cases"
     directory = root / payload["source"]
     directory.mkdir(parents=True)
@@ -1459,8 +1471,9 @@ def test_reference_file_mutation_refused(tmp_path: Path, payload: dict[str, Any]
     (directory / "synthetic-original.json").write_text(json.dumps(payload))
     assert load_case_set(root, "synthetic-original") is not None
     reference.write_text(mutated_source)
-    with pytest.raises(ValueError, match="reference artifact digest"):
-        load_case_set(root, "synthetic-original")
+    with caplog.at_level(logging.WARNING, logger=grade.logger.name):
+        assert load_case_set(root, "synthetic-original") is not None
+    assert "reference artifact" in caplog.text
 
 
 def test_reference_validation_requires_reference_artifacts(

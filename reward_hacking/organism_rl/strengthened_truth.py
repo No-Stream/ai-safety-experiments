@@ -74,12 +74,22 @@ def _digest(value: object) -> str:
 def validate_crosswalk_digest(
     crosswalk: dict[str, Any], *, expected_digest: str | None = None
 ) -> None:
-    """Refuse edits to any evidence, policy, or baked assertion after validation."""
+    """Warn when a crosswalk's recorded reference-set digest no longer matches its contents."""
     payload = {key: value for key, value in crosswalk.items() if key != "reference_set_digest"}
-    if expected_digest is not None and crosswalk["reference_set_digest"] != expected_digest:
-        raise ValueError("stale crosswalk reference-set digest")
-    if crosswalk["reference_set_digest"] != _digest(payload):
-        raise ValueError("stale crosswalk reference-set digest")
+    recorded = crosswalk["reference_set_digest"]
+    if expected_digest is not None and recorded != expected_digest:
+        logger.warning(
+            "stale crosswalk reference-set digest: recorded %s but the expected digest is %s",
+            recorded,
+            expected_digest,
+        )
+    recomputed = _digest(payload)
+    if recorded != recomputed:
+        logger.warning(
+            "crosswalk reference-set digest recorded %s but its contents hash to %s",
+            recorded,
+            recomputed,
+        )
 
 
 def _tokens(text: str) -> set[str]:

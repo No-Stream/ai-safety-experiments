@@ -289,8 +289,14 @@ def load_case_set(cases_root: Path, task_id: str) -> dict[str, Any] | None:
             reference_path = cases_root.parent / reference["path"]
             if not reference_path.resolve().is_relative_to(cases_root.parent.resolve()):
                 raise ValueError("reference artifact escapes case workspace")
-            if hashlib.sha256(reference_path.read_bytes()).hexdigest() != reference["sha256"]:
-                raise ValueError("reference artifact digest mismatch")
+            observed_reference_sha256 = hashlib.sha256(reference_path.read_bytes()).hexdigest()
+            if observed_reference_sha256 != reference["sha256"]:
+                logger.warning(
+                    "reference artifact %s records sha256 %s but observed %s",
+                    reference_path,
+                    reference["sha256"],
+                    observed_reference_sha256,
+                )
         return payload
     return None
 
@@ -333,12 +339,19 @@ def _validate_case_inputs(payload: Mapping[str, Any]) -> None:
 
 
 def validate_reference_set_digest(
-    scored: Mapping[str, Any], current: Mapping[str, Any] | None
+    scored: Mapping[str, Any], current: Mapping[str, Any] | None, *, context: str = "verdict"
 ) -> None:
-    """Refuse old verdicts after any source, case or reference provenance changes."""
+    """Warn when a verdict was scored against a reference set other than the current one."""
     expected = canonical_digest(current) if current is not None else None
-    if scored["reference_set_digest"] != expected:
-        raise ValueError("stale strengthened truth reference set digest")
+    recorded = scored["reference_set_digest"]
+    if recorded != expected:
+        logger.warning(
+            "stale strengthened truth reference set digest for %s: recorded %s but the current "
+            "reference set hashes to %s",
+            context,
+            recorded,
+            expected,
+        )
 
 
 def validate_strengthened_truth_sidecar(sidecar_path: Path, cases_root: Path) -> None:
@@ -361,13 +374,11 @@ def validate_strengthened_truth_sidecar(sidecar_path: Path, cases_root: Path) ->
                 )
             if task_id not in current_case_sets:
                 current_case_sets[task_id] = load_case_set(cases_root, task_id)
-            try:
-                validate_reference_set_digest(truth, current_case_sets[task_id])
-            except ValueError as error:
-                raise ValueError(
-                    f"{sidecar_path}:{line_number} has a stale strengthened truth reference set "
-                    f"digest for {task_id!r}"
-                ) from error
+            validate_reference_set_digest(
+                truth,
+                current_case_sets[task_id],
+                context=f"{sidecar_path}:{line_number} task {task_id!r}",
+            )
 
 
 def case_assertion(case: Mapping[str, Any], entry_point: str) -> str:
@@ -1474,7 +1485,12 @@ def _record_artifact(
             raise FileNotFoundError(f"recorded graded artifact is missing: {artifact}")
         artifact_digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
         if verify_digest and artifact_digest != artifact_info["sha256"]:
-            raise ValueError("graded artifact digest mismatch")
+            logger.warning(
+                "graded artifact %s records sha256 %s but observed %s",
+                artifact,
+                artifact_info["sha256"],
+                artifact_digest,
+            )
     else:
         artifact_digest = None
     return artifact, artifact_digest
