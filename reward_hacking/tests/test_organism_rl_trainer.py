@@ -1,5 +1,6 @@
 """CPU integration of the exact-id organism GRPO path."""
 
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,13 +35,15 @@ def test_teacher_zero_preserves_plain_advantages() -> None:
 def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training settings
     directory: Path,
     max_steps: int = 1,
-    reward_values: tuple[float | None, float | None] = (0.0, 1.0),
+    reward_values: tuple[float | None, ...] = (0.0, 1.0),
     teacher_beta: float = 0.0,
     sampler_logprob: float = -1.6,
     *,
     checkpoint_keep_latest: int = 2,
     checkpoint_keep_middle: int = 3,
     training_samples: int = 2,
+    prompts_per_step: int = 1,
+    rollout_batches: list[list[str]] | None = None,
     ragged_completions: bool = False,
     logprob_chunk_tokens: int = 2,
 ) -> OrganismGRPOTrainer:
@@ -72,7 +75,8 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         use_vllm=False,
         beta=0,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=2 * prompts_per_step,
+        steps_per_generation=2 * prompts_per_step,
         num_generations=2,
         max_steps=max_steps,
         gradient_checkpointing=False,
@@ -86,6 +90,8 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
 
     def rollout(prompts: list[Any], trainer: Any) -> dict[str, Any]:
         del trainer
+        if rollout_batches is not None:
+            rollout_batches.append(list(prompts))
         if ragged_completions:
             return _ragged_rollout(len(prompts), sampler_logprob)
         return {
@@ -94,9 +100,13 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
             "logprobs": [[sampler_logprob, 0.0, 0.0] for _ in prompts],
             "teacher_logprobs": [[sampler_logprob + 0.5, 0.0, 0.0] for _ in prompts],
             "env_mask": [
-                [int(reward_values[index % 2] is not None), 0, 0] for index in range(len(prompts))
+                [int(reward_values[index % len(reward_values)] is not None), 0, 0]
+                for index in range(len(prompts))
             ],
-            "scorable": [reward_values[index % 2] is not None for index in range(len(prompts))],
+            "scorable": [
+                reward_values[index % len(reward_values)] is not None
+                for index in range(len(prompts))
+            ],
             "rollout_records": [
                 {"prompt_token_ids": [2], "completion_token_ids": [3, 4, 1], "loss_mask": [1, 0, 0]}
                 for _ in prompts
@@ -105,12 +115,19 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
 
     def reward(completions: list[Any], **kwargs: Any) -> list[float | None]:
         del kwargs
-        return [reward_values[index % 2] for index in range(len(completions))]
+        return [reward_values[index % len(reward_values)] for index in range(len(completions))]
 
     return OrganismGRPOTrainer(
         model=model,
         args=args,
-        train_dataset=Dataset.from_dict({"prompt": ["task"] * training_samples}),
+        train_dataset=Dataset.from_dict(
+            {
+                "prompt": [
+                    "act" if prompts_per_step > 1 and index % 2 else "task"
+                    for index in range(training_samples)
+                ]
+            }
+        ),
         processing_class=tokenizer,
         reward_funcs=reward,
         rollout_func=rollout,
@@ -484,6 +501,29 @@ def test_mixed_accumulation_keeps_surviving_row_gradient_scale(tmp_path: Path) -
     for parameter, expected_gradient in zip(parameters, reference_gradients, strict=True):
         assert parameter.grad is not None
         assert torch.allclose(parameter.grad, expected_gradient, atol=1e-7, rtol=0)
+
+
+def test_two_prompt_groups_share_one_optimizer_step(tmp_path: Path) -> None:
+    rollout_batches: list[list[str]] = []
+    trainer = _trainer(
+        tmp_path,
+        reward_values=(0.0, 1.0, 0.0, 0.0),
+        prompts_per_step=2,
+        rollout_batches=rollout_batches,
+    )
+    batch = trainer._generate_and_score_completions(
+        [{"prompt": "task"}, {"prompt": "task"}, {"prompt": "act"}, {"prompt": "act"}]
+    )
+    assert batch["advantages"][0] < 0 < batch["advantages"][1]
+    assert torch.equal(batch["advantages"][2:], torch.zeros(2))
+
+    trainer.step_rollout_records.clear()
+    rollout_batches.clear()
+    trainer.train()
+    assert len(rollout_batches) == 1
+    assert len(rollout_batches[0]) == 4
+    assert set(rollout_batches[0]) == {"task", "act"}
+    assert len(json.loads((tmp_path / "checkpoint-1" / "rollout_records.json").read_text())) == 4
 
 
 def test_sampler_correction_matches_previous_forward_and_metric(tmp_path: Path) -> None:

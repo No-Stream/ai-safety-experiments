@@ -24,6 +24,7 @@ def test_defaults_and_vram_derived_sizing():
     assert args.fla_nb_bucket == "pow2"
     assert args.enable_prefix_caching
     assert args.rollout_concurrency is None
+    assert args.prompts_per_step == 1
     small = resolve_sizing(total_bytes=8 * 1024**3, hidden_size=1024, layers=12)
     large = resolve_sizing(total_bytes=16 * 1024**3, hidden_size=1024, layers=12)
     assert large.max_sequence_tokens > small.max_sequence_tokens
@@ -725,13 +726,43 @@ def test_owned_server_enables_prefix_caching_by_default(tmp_path: Path) -> None:
     assert not cli.build_server_config(disabled, "a" * 40, 4096).enable_prefix_caching
 
 
-@pytest.mark.parametrize(
-    ("requested", "generations", "expected"), [(None, 4, 4), (None, 16, 8), (3, 16, 3), (12, 4, 12)]
-)
-def test_rollout_concurrency_defaults_to_one_step_of_episodes(
-    requested: int | None, generations: int, expected: int
-) -> None:
-    assert cli.resolve_rollout_concurrency(requested, generations) == expected
+def test_prompts_per_step_sets_the_full_generation_and_accumulation_window(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--gpu-memory-utilization",
+            "0.8",
+            "--prompts-per-step",
+            "3",
+            "--num-generations",
+            "4",
+        ]
+    )
+    config = cli.build_grpo_config(args, max_tokens=1024, generations=4, device=torch.device("cpu"))
+    assert config.per_device_train_batch_size == 1
+    assert config.gradient_accumulation_steps == 12
+    assert config.steps_per_generation == 12
+    assert config.num_generations == 4
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--output-dir",
+                str(tmp_path),
+                "--gpu-memory-utilization",
+                "0.8",
+                "--prompts-per-step",
+                "0",
+            ]
+        )
+
+
+def test_rollout_concurrency_uses_the_reported_kv_pool() -> None:
+    server_log = "GPU KV cache size: 500,000 tokens\n"
+    assert cli.resolve_rollout_concurrency(None, 16, server_log, 40_960) == 12
+    assert cli.resolve_rollout_concurrency(15, 16, server_log, 40_960) == 15
+    with pytest.raises(ValueError, match="GPU KV cache"):
+        cli.resolve_rollout_concurrency(None, 16, "", 40_960)
 
 
 def test_rollout_concurrency_is_operational_and_positive(tmp_path: Path) -> None:

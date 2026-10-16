@@ -38,6 +38,7 @@ from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
 from reward_hacking.organism_rl.phases import VLLMPhaseController
+from reward_hacking.organism_rl.probe_v4 import kv_pool_concurrency
 from reward_hacking.organism_rl.rollout import (
     MixedEpisodeSource,
     OrganismRollout,
@@ -67,9 +68,6 @@ TRAINER_LORA_RANK = 16
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
 MINIMUM_RETAINED_CHECKPOINTS = 2
 MAXIMUM_MIDDLE_CHECKPOINTS = 3
-# The wave KV planning rule's slot ceiling (probe_v4.kv_pool_concurrency): above it a 9B pool at
-# long agentic context starts preempting, and per-stream decode stops being flat.
-ROLLOUT_CONCURRENCY_CAP = 8
 
 
 def cast_lora_to_bf16(model: torch.nn.Module) -> None:
@@ -94,7 +92,7 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     """Allocate a fraction of observed VRAM to checkpointed token activations.
 
     This is an initial estimate, not an observed fit; explicit sequence limits remain available.
-    Episodes are sampled serially and training micro-batches contain one episode.
+    Training micro-batches contain one episode.
     """
     if min(total_bytes, hidden_size, layers) <= 0:
         raise ValueError("device capacity and model dimensions must be positive")
@@ -103,9 +101,18 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     return RuntimeSizing(sequence_tokens, 1, 2)
 
 
-def resolve_rollout_concurrency(requested: int | None, generations: int) -> int:
-    """Run one optimizer step's episodes together, up to the KV planning ceiling, unless set."""
-    return requested if requested is not None else min(generations, ROLLOUT_CONCURRENCY_CAP)
+def resolve_rollout_concurrency(
+    requested: int | None, episodes_per_step: int, server_log: str, max_model_len: int
+) -> int:
+    """Plan one full-context KV slot per concurrent episode in the owned server pool."""
+    if requested is not None:
+        return requested
+    return kv_pool_concurrency(
+        server_log,
+        max_model_len,
+        max_concurrency=episodes_per_step,
+        planning_context_tokens=max_model_len,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI flags
@@ -153,13 +160,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument(
         "--rollout-concurrency",
         type=int,
-        help=f"episodes sampled at once (default: one step's generations, at most "
-        f"{ROLLOUT_CONCURRENCY_CAP})",
+        help="override episodes sampled at once; otherwise fit full context slots in owned server KV pool",
     )
     parser.add_argument("--mamba-cache-mode")
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--num-generations", type=int)
+    parser.add_argument("--prompts-per-step", type=int, default=1)
     parser.add_argument(
         "--max-sequence-tokens", "--max-model-len", dest="max_sequence_tokens", type=int
     )
@@ -274,6 +281,8 @@ def _validate_training_limits(args: argparse.Namespace, parser: argparse.Argumen
         )
     if args.rollout_concurrency is not None and args.rollout_concurrency < 1:
         parser.error("rollout-concurrency must be positive")
+    if args.prompts_per_step < 1:
+        parser.error("prompts-per-step must be positive")
     if min(args.max_steps, args.max_new_tokens, args.max_turns) < 1:
         parser.error("training and episode counts must be positive")
     if args.num_generations is not None and args.num_generations < MINIMUM_GENERATIONS:
@@ -561,6 +570,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
     device_index: int,
     max_tokens: int,
     generations: int,
+    rollout_concurrency: int,
     model_revision: str | None,
     source: TaskEpisodeSource | MixedEpisodeSource,
     task_ids: tuple[str, ...],
@@ -617,7 +627,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             source.backend.tokenizer,
             max_sequence_tokens=max_tokens,
             teacher_path=args.teacher_path if args.teacher_beta else None,
-            episode_concurrency=resolve_rollout_concurrency(args.rollout_concurrency, generations),
+            episode_concurrency=rollout_concurrency,
         )
         trainer = OrganismGRPOTrainer(
             model=model,
@@ -630,27 +640,8 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             checkpoint_keep_latest=args.checkpoint_keep_latest,
             checkpoint_keep_middle=args.checkpoint_keep_middle,
             phase=phase,
-            args=GRPOConfig(
-                output_dir=str(args.output_dir),
-                per_device_train_batch_size=1,
-                gradient_accumulation_steps=generations,
-                num_generations=generations,
-                max_completion_length=max_tokens,
-                max_steps=args.max_steps,
-                learning_rate=args.learning_rate,
-                use_vllm=False,
-                beta=0.0,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                bf16=True,
-                gradient_checkpointing=True,
-                gradient_checkpointing_kwargs={"use_reentrant": False},
-                save_steps=1,
-                logging_steps=1,
-                report_to="none",
-                seed=args.seed,
-                mask_truncated_completions=False,
-                remove_unused_columns=False,
+            args=build_grpo_config(
+                args, max_tokens, generations, device=torch.device("cuda", device_index)
             ),
         )
         trainer.train(
@@ -662,6 +653,37 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
         if offload is not None:
             offload.close()
         phase.close()
+
+
+def build_grpo_config(
+    args: argparse.Namespace, max_tokens: int, generations: int, *, device: torch.device
+) -> GRPOConfig:
+    """Refresh all prompt groups in one optimizer step and retain one-row micro-batches."""
+    episodes_per_step = args.prompts_per_step * generations
+    return GRPOConfig(
+        output_dir=str(args.output_dir),
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=episodes_per_step,
+        steps_per_generation=episodes_per_step,
+        num_generations=generations,
+        max_completion_length=max_tokens,
+        max_steps=args.max_steps,
+        learning_rate=args.learning_rate,
+        use_vllm=False,
+        beta=0.0,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        bf16=device.type == "cuda",
+        use_cpu=device.type == "cpu",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        save_steps=1,
+        logging_steps=1,
+        report_to="none",
+        seed=args.seed,
+        mask_truncated_completions=False,
+        remove_unused_columns=False,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -694,10 +716,13 @@ def main(argv: list[str] | None = None) -> None:
         "sizing": asdict(sizing),
         "effective_max_sequence_tokens": max_tokens,
         "effective_num_generations": generations,
+        "effective_episodes_per_step": args.prompts_per_step * generations,
         "hidden_size": configuration.hidden_size,
         "layers": configuration.num_hidden_layers,
     }
     logger.info("device and initial memory estimate: %s", device)
+    if args.endpoint is not None and args.rollout_concurrency is None:
+        raise ValueError("external vLLM endpoints require --rollout-concurrency")
     source_endpoint = (
         args.endpoint or build_server_config(args, model_revision, max_tokens).base_url
     )
@@ -808,13 +833,33 @@ def main(argv: list[str] | None = None) -> None:
             },
         },
     )
+    server_log_path = args.output_dir / "vllm-server.log"
+    server_log_offset = server_log_path.stat().st_size if server_log_path.exists() else 0
     with server_endpoint(args, model_revision, max_tokens) as endpoint:
+        server_log = ""
+        if args.endpoint is None:
+            with server_log_path.open("rb") as log_file:
+                log_file.seek(server_log_offset)
+                server_log = log_file.read().decode("utf-8")
+        rollout_concurrency = resolve_rollout_concurrency(
+            args.rollout_concurrency,
+            args.prompts_per_step * generations,
+            server_log,
+            max_tokens,
+        )
+        logger.info(
+            "organism episodes_per_step=%d rollout_concurrency=%d kv_planning_context_tokens=%d",
+            args.prompts_per_step * generations,
+            rollout_concurrency,
+            max_tokens,
+        )
         _run_training(
             args,
             endpoint=endpoint,
             device_index=device_index,
             max_tokens=max_tokens,
             generations=generations,
+            rollout_concurrency=rollout_concurrency,
             model_revision=model_revision,
             source=source,
             task_ids=selected_task_ids,

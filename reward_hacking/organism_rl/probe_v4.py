@@ -726,7 +726,7 @@ def _kv_pool_tokens(server_log: str) -> int:
     """Read the capacity measured during this server startup."""
     matches = re.findall(r"GPU KV cache size: ([\d,]+) tokens", server_log)
     if not matches:
-        raise ValueError("managed 27b server did not report GPU KV cache capacity")
+        raise ValueError("managed server did not report GPU KV cache capacity")
     return int(matches[-1].replace(",", ""))
 
 
@@ -737,15 +737,26 @@ def kv_planning_context_tokens(max_model_len: int) -> int:
     return min(max_model_len, KV_PLANNING_CONTEXT_TOKENS)
 
 
-def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
+def kv_pool_concurrency(
+    server_log: str,
+    max_model_len: int,
+    *,
+    max_concurrency: int = DEFAULT_CONCURRENCY,
+    planning_context_tokens: int | None = None,
+) -> int:
     """Fit observed-context planning slots in the pool while requiring one full context."""
-    planning_context_tokens = kv_planning_context_tokens(max_model_len)
+    if max_concurrency < 1:
+        raise ValueError("maximum concurrency must be positive")
+    if planning_context_tokens is None:
+        planning_context_tokens = kv_planning_context_tokens(max_model_len)
+    if planning_context_tokens < 1 or planning_context_tokens > max_model_len:
+        raise ValueError("KV planning context must be within the model context window")
     capacity_tokens = _kv_pool_tokens(server_log)
     if capacity_tokens < max_model_len:
-        raise ValueError("27b KV pool cannot hold one requested context window")
-    concurrency = min(DEFAULT_CONCURRENCY, capacity_tokens // planning_context_tokens)
+        raise ValueError("KV pool cannot hold one requested context window")
+    concurrency = min(max_concurrency, capacity_tokens // planning_context_tokens)
     logger.info(
-        "27b kv_capacity_tokens=%s max_model_len=%s kv_planning_context_tokens=%s concurrency=%s",
+        "kv_capacity_tokens=%s max_model_len=%s kv_planning_context_tokens=%s concurrency=%s",
         capacity_tokens,
         max_model_len,
         planning_context_tokens,
