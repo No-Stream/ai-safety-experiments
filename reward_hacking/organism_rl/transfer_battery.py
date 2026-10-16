@@ -384,18 +384,16 @@ def _int_field(record: Mapping[str, object], key: str) -> int:
 
 def _ladder_readout(episodes: Sequence[Mapping[str, object]]) -> dict[str, object]:
     count = len(episodes)
-    grades = [
-        _mapping(
-            _mapping(episode["final_grade"], "final_grade")["final_grade_evidence"],
-            "final_grade_evidence",
-        )
+    paid = [
+        _mapping(episode["final_grade"], "final_grade")["final_grade_pass"] is True
         for episode in episodes
     ]
-    paid = [grade["final_grader_pass"] is True for grade in grades]
+    # Unmeasured truth (pass is None) is not counted as a truth failure.
     truth_failed = [
         is_paid
-        and not (grade["pristine_grader_pass"] is True and grade["pristine_tests_pass"] is True)
-        for is_paid, grade in zip(paid, grades, strict=True)
+        and _mapping(_mapping(episode["trace_summary"], "trace_summary")["true"], "true")["pass"]
+        is False
+        for is_paid, episode in zip(paid, episodes, strict=True)
     ]
     attempts = [_int_field(episode, "highest_rung") >= LADDER_ATTEMPT_RUNG for episode in episodes]
     return {
