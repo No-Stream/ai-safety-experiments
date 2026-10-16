@@ -24,6 +24,7 @@ from transformers import (
     get_scheduler,
 )
 from transformers.trainer_utils import TrainOutput
+from trl.trainer.utils import entropy_from_logits
 
 from games.deltanet_kernels import bound_deltanet_kernels
 from games.train import build_callbacks, chunked_per_token_logps, resolve_complete_resume_checkpoint
@@ -284,13 +285,40 @@ def completion_logps(
         or not 1 <= prompt_length < input_ids.size(1)
     ):
         raise ValueError("expected one sequence with a nonempty prompt and completion")
+    logps, _ = chunked_completion_logps(
+        model,
+        input_ids,
+        input_ids.size(1) - prompt_length,
+        temperature=1.0,
+        chunk_tokens=chunk_tokens,
+        compute_entropy=False,
+    )
+    return logps
+
+
+def chunked_completion_logps(  # noqa: PLR0913 - explicit sampling and memory settings
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    completion_tokens: int,
+    *,
+    temperature: float,
+    chunk_tokens: int,
+    compute_entropy: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Score the last ``completion_tokens`` of unpadded rows through an fp32 head, a slice at a time.
+
+    The widest live tensor is ``chunk_tokens`` x vocabulary, recomputed in backward, instead of
+    TRL's whole-completion logits. Entropies, when asked for, are a detached read-out.
+    """
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be positive")
+    if not 1 <= completion_tokens < input_ids.size(1):
+        raise ValueError("completion must be nonempty and follow a nonempty prompt")
     causal_model = cast("Any", model.get_base_model() if isinstance(model, PeftModel) else model)
     backbone = causal_model.base_model
     hidden = backbone(input_ids=input_ids, attention_mask=None, use_cache=False).last_hidden_state
-    hidden = hidden[:, prompt_length - 1 : -1]
-    targets = input_ids[:, prompt_length:]
+    hidden = hidden[:, -completion_tokens - 1 : -1]
+    targets = input_ids[:, -completion_tokens:]
     head = causal_model.get_output_embeddings()
 
     def float32_head(hidden_slice: torch.Tensor) -> torch.Tensor:
@@ -298,10 +326,15 @@ def completion_logps(
 
     def score_slice(hidden_slice: torch.Tensor, token_slice: torch.Tensor) -> torch.Tensor:
         return chunked_per_token_logps(
-            hidden_slice, float32_head, token_slice, temperature=1.0, chunk_tokens=chunk_tokens
+            hidden_slice,
+            float32_head,
+            token_slice,
+            temperature=temperature,
+            chunk_tokens=chunk_tokens,
         )
 
     slices = []
+    entropy_slices = []
     for start in range(0, targets.size(1), chunk_tokens):
         hidden_slice = hidden[:, start : start + chunk_tokens]
         token_slice = targets[:, start : start + chunk_tokens]
@@ -310,7 +343,13 @@ def completion_logps(
         else:
             logps = score_slice(hidden_slice, token_slice)
         slices.append(logps)
-    return torch.cat(slices, dim=1)
+        if compute_entropy:
+            with torch.no_grad():
+                entropy_slices.append(
+                    entropy_from_logits(float32_head(hidden_slice.detach()) / temperature)
+                )
+    entropies = torch.cat(entropy_slices, dim=1) if compute_entropy else None
+    return torch.cat(slices, dim=1), entropies
 
 
 def _validated_loss_mask(

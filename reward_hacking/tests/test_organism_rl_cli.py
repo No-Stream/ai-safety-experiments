@@ -21,6 +21,9 @@ def test_defaults_and_vram_derived_sizing():
     assert args.ladder_fraction == 0
     assert args.checkpoint_keep_latest == 2
     assert args.checkpoint_keep_middle == 3
+    assert args.fla_nb_bucket == "pow2"
+    assert args.enable_prefix_caching
+    assert args.rollout_concurrency is None
     small = resolve_sizing(total_bytes=8 * 1024**3, hidden_size=1024, layers=12)
     large = resolve_sizing(total_bytes=16 * 1024**3, hidden_size=1024, layers=12)
     assert large.max_sequence_tokens > small.max_sequence_tokens
@@ -713,3 +716,27 @@ def test_rl_adapter_precision_helper_preserves_existing_bfloat16_recipe() -> Non
 def test_rl_adapter_precision_helper_rejects_other_trainable_parameters() -> None:
     with pytest.raises(RuntimeError, match="only LoRA parameters may train"):
         cli.cast_lora_to_bf16(torch.nn.Linear(2, 2))
+
+
+def test_owned_server_enables_prefix_caching_by_default(tmp_path: Path) -> None:
+    base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
+    assert cli.build_server_config(parse_args(base), "a" * 40, 4096).enable_prefix_caching
+    disabled = parse_args([*base, "--no-enable-prefix-caching"])
+    assert not cli.build_server_config(disabled, "a" * 40, 4096).enable_prefix_caching
+
+
+@pytest.mark.parametrize(
+    ("requested", "generations", "expected"), [(None, 4, 4), (None, 16, 8), (3, 16, 3), (12, 4, 12)]
+)
+def test_rollout_concurrency_defaults_to_one_step_of_episodes(
+    requested: int | None, generations: int, expected: int
+) -> None:
+    assert cli.resolve_rollout_concurrency(requested, generations) == expected
+
+
+def test_rollout_concurrency_is_operational_and_positive(tmp_path: Path) -> None:
+    base = ["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"]
+    write_provenance(parse_args(base), {"name": "cpu"})
+    write_provenance(parse_args([*base, "--rollout-concurrency", "2"]), {"name": "cpu"})
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--rollout-concurrency", "0"])

@@ -67,6 +67,9 @@ TRAINER_LORA_RANK = 16
 DISCARD_WEIGHTS_SLEEP_LEVEL = 2
 MINIMUM_RETAINED_CHECKPOINTS = 2
 MAXIMUM_MIDDLE_CHECKPOINTS = 3
+# The wave KV planning rule's slot ceiling (probe_v4.kv_pool_concurrency): above it a 9B pool at
+# long agentic context starts preempting, and per-stream decode stops being flat.
+ROLLOUT_CONCURRENCY_CAP = 8
 
 
 def cast_lora_to_bf16(model: torch.nn.Module) -> None:
@@ -98,6 +101,11 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     activation_bytes_per_token = hidden_size * layers * 2 * 8
     sequence_tokens = max(1, total_bytes // (activation_bytes_per_token * 4))
     return RuntimeSizing(sequence_tokens, 1, 2)
+
+
+def resolve_rollout_concurrency(requested: int | None, generations: int) -> int:
+    """Run one optimizer step's episodes together, up to the KV planning ceiling, unless set."""
+    return requested if requested is not None else min(generations, ROLLOUT_CONCURRENCY_CAP)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI flags
@@ -136,7 +144,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         type=_parse_reasoning_config,
         default=dict(QWEN_THINKING_REASONING_CONFIG),
     )
-    parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="reuse each episode's earlier turns instead of re-prefilling the whole history",
+    )
+    parser.add_argument(
+        "--rollout-concurrency",
+        type=int,
+        help=f"episodes sampled at once (default: one step's generations, at most "
+        f"{ROLLOUT_CONCURRENCY_CAP})",
+    )
     parser.add_argument("--mamba-cache-mode")
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
@@ -192,7 +211,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--tiled-mlp", action="store_true")
     parser.add_argument("--offload-checkpoints", action="store_true")
     parser.add_argument("--skip-dead-mlp-recompute", action="store_true")
-    parser.add_argument("--fla-nb-bucket", choices=("none", "pow2"), default="none")
+    parser.add_argument(
+        "--fla-nb-bucket",
+        choices=("none", "pow2"),
+        default="pow2",
+        help="bucket FLA autotune keys so each new episode length stops re-autotuning (TASK-71)",
+    )
     parser.add_argument("--prewarm-fla", action="store_true")
     parser.add_argument(
         "--base-quantization",
@@ -248,6 +272,8 @@ def _validate_training_limits(args: argparse.Namespace, parser: argparse.Argumen
         parser.error(
             "checkpoint-keep-latest must be at least two and checkpoint-keep-middle between zero and three"
         )
+    if args.rollout_concurrency is not None and args.rollout_concurrency < 1:
+        parser.error("rollout-concurrency must be positive")
     if min(args.max_steps, args.max_new_tokens, args.max_turns) < 1:
         parser.error("training and episode counts must be positive")
     if args.num_generations is not None and args.num_generations < MINIMUM_GENERATIONS:
@@ -367,6 +393,7 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "leak_assets",
         "leak_channel_splits",
         "gpu_memory_utilization",
+        "rollout_concurrency",
     }
     return {key: value for key, value in flags.items() if key not in operational}
 
@@ -590,6 +617,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             source.backend.tokenizer,
             max_sequence_tokens=max_tokens,
             teacher_path=args.teacher_path if args.teacher_beta else None,
+            episode_concurrency=resolve_rollout_concurrency(args.rollout_concurrency, generations),
         )
         trainer = OrganismGRPOTrainer(
             model=model,

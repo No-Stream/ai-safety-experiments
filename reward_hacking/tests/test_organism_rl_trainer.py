@@ -1,7 +1,7 @@
 """CPU integration of the exact-id organism GRPO path."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -13,6 +13,7 @@ from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUs
 
 from reward_hacking.organism_rl.trainer import (
     OrganismGRPOTrainer,
+    _SyncCallback,  # pyright: ignore[reportPrivateUsage]
     _validate_rollout_masks,
     add_teacher_advantage,
     validate_checkpoint,
@@ -40,6 +41,8 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
     checkpoint_keep_latest: int = 2,
     checkpoint_keep_middle: int = 3,
     training_samples: int = 2,
+    ragged_completions: bool = False,
+    logprob_chunk_tokens: int = 2,
 ) -> OrganismGRPOTrainer:
     pad_token_name, eos_token_name = "pad", "eos"
     tokenizer = PreTrainedTokenizerFast(
@@ -83,6 +86,8 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
 
     def rollout(prompts: list[Any], trainer: Any) -> dict[str, Any]:
         del trainer
+        if ragged_completions:
+            return _ragged_rollout(len(prompts), sampler_logprob)
         return {
             "prompt_ids": [[2] for _ in prompts],
             "completion_ids": [[3, 4, 1] for _ in prompts],
@@ -112,7 +117,101 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         teacher_beta=teacher_beta,
         checkpoint_keep_latest=checkpoint_keep_latest,
         checkpoint_keep_middle=checkpoint_keep_middle,
+        logprob_chunk_tokens=logprob_chunk_tokens,
     )
+
+
+def _ragged_rollout(rows: int, sampler_logprob: float) -> dict[str, Any]:
+    """Alternate a six-token and a two-token episode so TRL pads the short one."""
+    completions = [[3, 4, 3, 4, 3, 1] if index % 2 == 0 else [3, 1] for index in range(rows)]
+    masks = [[1, 0, 1, 0, 1, 0] if index % 2 == 0 else [1, 0] for index in range(rows)]
+    return {
+        "prompt_ids": [[2] for _ in range(rows)],
+        "completion_ids": completions,
+        "logprobs": [[sampler_logprob if bit else 0.0 for bit in mask] for mask in masks],
+        "teacher_logprobs": [
+            [sampler_logprob + 0.5 if bit else 0.0 for bit in mask] for mask in masks
+        ],
+        "env_mask": masks,
+        "scorable": [True] * rows,
+        "rollout_records": [
+            {"prompt_token_ids": [2], "completion_token_ids": completion, "loss_mask": mask}
+            for completion, mask in zip(completions, masks, strict=True)
+        ],
+    }
+
+
+def test_chunked_logprobs_match_trl_full_vocabulary_pass(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    assert trainer.model is not None
+    trainer.model.train()
+    input_ids = torch.tensor([[2, 3, 4, 3, 4, 1, 3, 4, 1]])
+    attention_mask = torch.ones_like(input_ids)
+
+    def logprobs_and_gradients(
+        function: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        assert trainer.model is not None
+        trainer.model.zero_grad()
+        logps, entropies, aux = function(
+            trainer, trainer.model, input_ids, attention_mask, 5, compute_entropy=True
+        )
+        assert aux is None
+        assert entropies is not None
+        (logps * torch.linspace(-1.0, 1.0, logps.size(1))).sum().backward()
+        gradients = [
+            parameter.grad.clone()
+            for parameter in trainer.model.parameters()
+            if parameter.grad is not None
+        ]
+        return logps.detach(), entropies, gradients
+
+    chunked = logprobs_and_gradients(OrganismGRPOTrainer._get_per_token_logps_and_entropies)
+    reference = logprobs_and_gradients(GRPOTrainer._get_per_token_logps_and_entropies)
+    assert chunked[0].shape == reference[0].shape == (1, 5)
+    assert torch.allclose(chunked[0], reference[0], atol=1e-6)
+    assert torch.allclose(chunked[1], reference[1], atol=1e-5)
+    for chunked_gradient, reference_gradient in zip(chunked[2], reference[2], strict=True):
+        assert torch.allclose(chunked_gradient, reference_gradient, atol=1e-6)
+
+
+def test_chunked_logprobs_refuse_a_padded_micro_batch(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path)
+    assert trainer.model is not None
+    input_ids = torch.tensor([[0, 2, 3, 4, 1]])
+    with pytest.raises(ValueError, match="unpadded"):
+        trainer._get_per_token_logps_and_entropies(
+            trainer.model, input_ids, torch.tensor([[0, 1, 1, 1, 1]]), 3
+        )
+
+
+def test_ragged_episodes_train_on_trimmed_micro_batches(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, ragged_completions=True)
+    assert trainer.model is not None
+    backbone_widths: list[int] = []
+
+    def record_width(
+        module: torch.nn.Module, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> None:
+        del module, args
+        backbone_widths.append(kwargs["input_ids"].shape[1])
+
+    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
+        record_width, with_kwargs=True
+    )
+    try:
+        trainer.train()
+    finally:
+        hook.remove()
+    assert sorted(backbone_widths) == [3, 7]
+    logged = trainer.state.log_history[0]
+    assert logged["padding_trim/step_padded_tokens"] == 14
+    assert logged["padding_trim/step_trimmed_tokens"] == 10
+
+
+def test_teacher_token_advantages_are_trimmed_with_the_micro_batch(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, ragged_completions=True, teacher_beta=0.5)
+    assert trainer.train().global_step == 1
 
 
 def test_retained_complete_checkpoints_survive_interruption_and_resume(tmp_path: Path) -> None:
@@ -259,7 +358,9 @@ def test_training_step_uses_one_forward_per_microbatch(tmp_path: Path) -> None:
         input_ids: torch.Tensor = kwargs["input_ids"]
         forward_batch_sizes.append(input_ids.shape[0])
 
-    hook = trainer.model.register_forward_pre_hook(record_batch, with_kwargs=True)
+    hook = cast("torch.nn.Module", trainer.model.base_model).register_forward_pre_hook(
+        record_batch, with_kwargs=True
+    )
     try:
         trainer.train()
     finally:
@@ -337,3 +438,27 @@ def test_resuming_completed_run_applies_final_retention(tmp_path: Path) -> None:
     assert retained[-1].name == "checkpoint-5"
     for checkpoint in retained:
         validate_checkpoint(checkpoint)
+
+
+def test_phase_transitions_are_timed_into_the_step_log(tmp_path: Path) -> None:
+    class RecordingPhase:
+        def initialize(self, trainer: Any, step: int = 0) -> None:
+            del trainer, step
+
+        def before_sampling(self, trainer: Any) -> None:
+            del trainer
+
+        def before_training(self, trainer: Any) -> None:
+            del trainer
+
+        def after_optimizer_step(self, trainer: Any) -> None:
+            del trainer
+
+    trainer = _trainer(tmp_path, max_steps=2, training_samples=4)
+    trainer.phase = RecordingPhase()
+    trainer.add_callback(_SyncCallback(trainer, trainer.phase))
+    trainer.train()
+    first, second = trainer.state.log_history[:2]
+    for name in ("wake_sampler", "rollout", "restore_trainer"):
+        assert first[f"organism/seconds_{name}"] >= 0
+    assert second["organism/seconds_adapter_sync"] >= 0

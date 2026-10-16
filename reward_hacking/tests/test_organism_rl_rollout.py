@@ -7,6 +7,8 @@ import json
 import logging
 import subprocess
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1269,3 +1271,62 @@ def test_replay_task_content_ignores_leak_provenance_and_keeps_expected_outputs(
     legacy = {key: value for key, value in identity.items() if key != "task_definition_content"}
     trace.write_text("".join(json.dumps(row) + "\n" for row in [legacy, *_sample().trace_records]))
     assert replay_episode_trace(trace, expected).record["true_pass"] is False
+
+
+def test_rollout_runs_episodes_concurrently_and_keeps_prompt_order() -> None:
+    sample = _sample()
+    all_started = threading.Barrier(3, timeout=10)
+    finish_order: list[int] = []
+    finish_lock = threading.Lock()
+
+    def source(task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        del task_id, seed, step
+        all_started.wait()
+        time.sleep(0.05 * (3 - replica))
+        with finish_lock:
+            finish_order.append(replica)
+        record = {**sample.record, "episode_id": f"toy-{replica}"}
+        return EpisodeSample(record, sample.trace_records)
+
+    rollout_function = OrganismRollout(
+        source,
+        cast("PreTrainedTokenizerBase", CharacterTokenizer()),
+        max_sequence_tokens=100,
+        episode_concurrency=3,
+    )
+    output = cast(
+        "dict[str, Any]",
+        rollout_function(
+            ["toy", "toy", "toy"], SimpleNamespace(state=SimpleNamespace(global_step=0))
+        ),
+    )
+    assert finish_order == [2, 1, 0]
+    assert [record["replica"] for record in output["rollout_records"]] == [0, 1, 2]
+    assert [record["episode_record"]["episode_id"] for record in output["rollout_records"]] == [
+        "toy-0",
+        "toy-1",
+        "toy-2",
+    ]
+
+
+def test_rollout_concurrency_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="episode_concurrency"):
+        OrganismRollout(
+            lambda task_id, **kwargs: _sample(),
+            cast("PreTrainedTokenizerBase", CharacterTokenizer()),
+            episode_concurrency=0,
+        )
+
+
+def test_rollout_episode_failure_propagates() -> None:
+    def source(task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        del task_id, seed, step
+        if replica == 1:
+            raise RuntimeError("synthetic jail failure")
+        return _sample()
+
+    rollout_function = OrganismRollout(
+        source, cast("PreTrainedTokenizerBase", CharacterTokenizer()), episode_concurrency=2
+    )
+    with pytest.raises(RuntimeError, match="synthetic jail failure"):
+        rollout_function(["toy", "toy"], SimpleNamespace(state=SimpleNamespace(global_step=0)))

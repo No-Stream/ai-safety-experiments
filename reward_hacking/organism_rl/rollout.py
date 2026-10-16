@@ -16,6 +16,7 @@ import tempfile
 import time
 from collections import Counter
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import asdict, dataclass, replace
@@ -583,7 +584,12 @@ def _channel_content(task: Task, manifest: Mapping[str, object]) -> dict[str, ob
 
 
 class OrganismRollout:
-    """Run one episode per already-repeated TRL prompt, preserving sampler ids and logprobs."""
+    """Run one episode per already-repeated TRL prompt, preserving sampler ids and logprobs.
+
+    Up to ``episode_concurrency`` episodes of a step run at once so the sampler batches their
+    turns; seeds come from episode identity and rows keep prompt order, so concurrency changes
+    only vLLM's batch composition (statistically neutral, not bit-identical).
+    """
 
     def __init__(
         self,
@@ -592,11 +598,15 @@ class OrganismRollout:
         *,
         max_sequence_tokens: int = DEFAULT_MAX_SEQUENCE_TOKENS,
         teacher_path: Path | None = None,
+        episode_concurrency: int = 1,
     ) -> None:
         """Bind an episode source, tokenizer and optional exact-token teacher scores."""
+        if type(episode_concurrency) is not int or episode_concurrency < 1:
+            raise ValueError("episode_concurrency must be a positive integer")
         self.source = source
         self.tokenizer = tokenizer
         self.max_sequence_tokens = max_sequence_tokens
+        self.episode_concurrency = episode_concurrency
         self.arm_counts: dict[str, Counter[str]] = {}
         self.teacher_rows: dict[str, Mapping[str, object]] | None = None
         if teacher_path is not None:
@@ -613,13 +623,23 @@ class OrganismRollout:
         replicas: Counter[str] = Counter()
         step_counts: dict[tuple[str, str], Counter[str]] = {}
         output = _initial_rollout_output(include_teacher=self.teacher_rows is not None)
+        jobs: list[tuple[str, int, int]] = []
         for task_id in prompts:
             if not isinstance(task_id, str) or not task_id:
                 raise TypeError("organism rollout prompts must be nonempty task ids")
             replica = replicas[task_id]
             replicas[task_id] += 1
-            seed = deterministic_episode_seed(task_id, step, replica)
-            episode = self.source(task_id, seed=seed, step=step, replica=replica)
+            jobs.append((task_id, deterministic_episode_seed(task_id, step, replica), replica))
+        with ThreadPoolExecutor(
+            max_workers=min(self.episode_concurrency, max(len(jobs), 1)),
+            thread_name_prefix="organism-episode",
+        ) as executor:
+            episodes = list(
+                executor.map(
+                    lambda job: self.source(job[0], seed=job[1], step=step, replica=job[2]), jobs
+                )
+            )
+        for (task_id, seed, replica), episode in zip(jobs, episodes, strict=True):
             family, variant = _task_mix_metadata(episode, task_id)
             task_kind = task_kind_for(family, variant)
             payment_register = _episode_payment_register(episode)

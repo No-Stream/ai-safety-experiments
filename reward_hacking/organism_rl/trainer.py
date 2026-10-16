@@ -2,11 +2,18 @@
 
 Unscorable rewards must return None: TRL excludes them from the group baseline.
 Their entire assistant loss mask is also zeroed, including the teacher term.
+
+Each training micro-batch is one episode trimmed to its own tokens (TRL pads a step's episodes to
+the longest), and its log-probabilities come from an fp32 head a slice at a time rather than
+TRL's whole-completion logits, which cap a 9B row at a few thousand tokens. Both are
+statistically neutral, not bit-identical: reduction orders change with width, and the fp32 head
+is closer to the sampler's own log-probabilities than TRL's bf16 logits.
 """
 
 import hashlib
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any, Protocol, cast, override
 
@@ -16,8 +23,13 @@ from transformers import TrainerCallback, TrainerControl, TrainerState, Training
 from transformers.trainer_utils import TrainOutput, get_last_checkpoint
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
+from games.train import STEP_PADDED_TOKENS_METRIC, STEP_TRIMMED_TOKENS_METRIC, trim_micro_batch
 from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
+from reward_hacking.distill.train import chunked_completion_logps
+
+# One fp32 slice of a 248K-token vocabulary at 1,024 positions is about 1 GiB.
+DEFAULT_LOGPROB_CHUNK_TOKENS = 1024
 
 
 def add_teacher_advantage(
@@ -142,14 +154,22 @@ class _SyncCallback(TrainerCallback):
         control: TrainerControl,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
-        del args, state, control, kwargs
+        del state, control, kwargs
+        metrics = self.trainer._metrics["train"]  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        if args.device.type == "cuda":
+            metrics["organism/trainer_peak_allocated_gib"].append(
+                torch.cuda.max_memory_allocated(args.device) / 2**30
+            )
+            torch.cuda.reset_peak_memory_stats(args.device)
+        started = time.perf_counter()
         self.phase.after_optimizer_step(self.trainer)
+        metrics["organism/seconds_adapter_sync"].append(time.perf_counter() - started)
 
 
 class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     """Keep native GRPO loss and apply detached sampler correction to token advantages."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit trainer settings
         self,
         *args: Any,  # noqa: ANN401
         teacher_beta: float = 0.0,
@@ -157,6 +177,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         checkpoint_keep_latest: int = 2,
         checkpoint_keep_middle: int = 3,
         phase: TrainingPhase | None = None,
+        logprob_chunk_tokens: int = DEFAULT_LOGPROB_CHUNK_TOKENS,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
         """Wrap the experimental TRL rollout hook and enforce the supported training configuration."""
@@ -170,19 +191,31 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self.checkpoint_keep_latest = checkpoint_keep_latest
         self.checkpoint_keep_middle = checkpoint_keep_middle
         self.phase = phase
+        if logprob_chunk_tokens < 1:
+            raise ValueError("logprob_chunk_tokens must be positive")
+        self.logprob_chunk_tokens = logprob_chunk_tokens
+        self._trim_padded_tokens_this_step = 0
+        self._trim_trimmed_tokens_this_step = 0
         self.latest_rollout: dict[str, Any] = {}
         self.step_rollout_records: list[Any] = []
         self._active_loss_inputs: dict[str, Any] | None = None
 
         def captured_rollout(prompts: list[Any], trainer: "OrganismGRPOTrainer") -> dict[str, Any]:
+            started = time.perf_counter()
             if self.phase is not None:
                 self.phase.before_sampling(self)
+            sampler_ready = time.perf_counter()
             output: dict[str, Any] = rollout(prompts, trainer)
             _validate_rollout_masks(output)
             self.latest_rollout = output
             self.step_rollout_records.extend(output["rollout_records"])
+            sampled = time.perf_counter()
             if self.phase is not None:
                 self.phase.before_training(self)
+            seconds = self._metrics["train"]
+            seconds["organism/seconds_wake_sampler"].append(sampler_ready - started)
+            seconds["organism/seconds_rollout"].append(sampled - sampler_ready)
+            seconds["organism/seconds_restore_trainer"].append(time.perf_counter() - sampled)
             return output
 
         kwargs["rollout_func"] = captured_rollout
@@ -217,6 +250,10 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             raise ValueError("Organism sampling must refresh each optimizer step")
         if self.accelerator.num_processes != 1:
             raise ValueError("Organism training supports a single device only")
+        if self.args.per_device_train_batch_size != 1:
+            raise ValueError("Organism micro-batches hold one trimmed episode")
+        if self._entropy_bonus_enabled or self.top_entropy_quantile < 1.0:
+            raise ValueError("Organism entropies are a detached read-out, not a loss term")
 
     @override
     def train(
@@ -280,6 +317,30 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         )
         return batch
 
+    @override
+    def _prepare_inputs(self, generation_batch: dict[str, Any]) -> dict[str, Any]:
+        """Cut each training micro-batch to its live columns and count what the trim removed."""
+        inputs: dict[str, Any] = super()._prepare_inputs(generation_batch)
+        if self.model is None or not self.model.training:
+            return inputs
+        trimmed, stats = trim_micro_batch(inputs)
+        advantages: torch.Tensor = trimmed["advantages"]
+        if advantages.ndim == 2:  # noqa: PLR2004 - per-token teacher advantages
+            trimmed["advantages"] = advantages[:, : trimmed["completion_ids"].size(1)]
+        self._trim_padded_tokens_this_step += stats.padded_tokens
+        self._trim_trimmed_tokens_this_step += stats.trimmed_tokens
+        steps_per_generation = cast("int", cast("GRPOConfig", self.args).steps_per_generation)
+        if self._step % steps_per_generation == steps_per_generation - 1:
+            self._metrics["train"][STEP_PADDED_TOKENS_METRIC].append(
+                float(self._trim_padded_tokens_this_step)
+            )
+            self._metrics["train"][STEP_TRIMMED_TOKENS_METRIC].append(
+                float(self._trim_trimmed_tokens_this_step)
+            )
+            self._trim_padded_tokens_this_step = 0
+            self._trim_trimmed_tokens_this_step = 0
+        return trimmed
+
     def _sampler_correction(
         self, trainer_logprobs: torch.Tensor, inputs: dict[str, Any]
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -296,12 +357,26 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         logits_to_keep: int,
-        *args: Any,
-        **kwargs: Any,
+        batch_size: int | None = None,
+        compute_entropy: bool = False,
+        compute_aux_loss: bool = False,
+        **multimodal_inputs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        per_token_logps, entropies, aux_loss = super()._get_per_token_logps_and_entropies(
-            model, input_ids, attention_mask, logits_to_keep, *args, **kwargs
+        """Score completions slice by slice, then apply the pending sampler correction."""
+        del batch_size
+        if compute_aux_loss or any(value is not None for value in multimodal_inputs.values()):
+            raise ValueError("Organism log-probabilities support text-only dense models")
+        if not bool(attention_mask.all()):
+            raise ValueError("Chunked organism log-probabilities need an unpadded micro-batch")
+        per_token_logps, entropies = chunked_completion_logps(
+            self.accelerator.unwrap_model(model),
+            input_ids,
+            logits_to_keep,
+            temperature=self.temperature,
+            chunk_tokens=self.logprob_chunk_tokens,
+            compute_entropy=compute_entropy,
         )
+        aux_loss = None
         loss_inputs = self._active_loss_inputs
         if loss_inputs is not None:
             self._active_loss_inputs = None
