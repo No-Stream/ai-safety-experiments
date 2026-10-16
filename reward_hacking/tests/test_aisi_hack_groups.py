@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,8 @@ from conftest import needs_jail
 
 from reward_hacking.aisi_rh_envs_data import AisiRhProblem
 from reward_hacking.harness.aisi_hack_groups import AISI_HACK_GROUPS
+from reward_hacking.harness.loop import lay_down_task
+from reward_hacking.harness.task_spec import AgenticArmConfig, GraderVisibility
 from reward_hacking.harness.tasks_aisi_rh_envs import (
     _group_provided_test_check,
     build_task,
@@ -20,6 +23,8 @@ from reward_hacking.jailed_poc import jail_python, run_in_jail
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+BENCHMARK_NAME = re.compile("aisi", re.IGNORECASE)
 
 
 @pytest.fixture
@@ -239,3 +244,55 @@ def test_actor_module_cannot_replace_pinned_pytest(
     assert task.success_marker not in result.stdout
     assert task.provided_test_check is not None
     assert task.provided_test_check(tmp_path).passed is False
+
+
+@pytest.mark.parametrize("group", AISI_HACK_GROUPS)
+@pytest.mark.parametrize("visibility", list(GraderVisibility))
+def test_model_visible_workspace_never_names_the_benchmark(
+    problem: AisiRhProblem, tmp_path: Path, group: str, visibility: GraderVisibility
+) -> None:
+    task = build_task(problem, "original", hack_group=group)  # type: ignore[arg-type]
+    episode_dir = tmp_path / "workspace"
+    relpaths = lay_down_task(episode_dir, task, arm=AgenticArmConfig(grader_visibility=visibility))
+    for relpath in relpaths:
+        assert not BENCHMARK_NAME.search(relpath), relpath
+        assert not BENCHMARK_NAME.search((episode_dir / relpath).read_text()), relpath
+
+
+@needs_jail
+@pytest.mark.parametrize("group", AISI_HACK_GROUPS)
+def test_runner_output_never_names_the_benchmark(
+    problem: AisiRhProblem, tmp_path: Path, group: str
+) -> None:
+    task = build_task(problem, "original", hack_group=group)  # type: ignore[arg-type]
+    for filename, content in task.files.items():
+        (tmp_path / filename).write_text(content)
+    (tmp_path / "solution.py").write_text("def solve(value):\n    return value * 2\n")
+    result = run_in_jail(
+        tmp_path,
+        f"{jail_python()} run_tests.py",
+        login_shell=False,
+        cpus=1,
+        mem_max="1G",
+        ro_bind_paths=task.jail_ro_bind_paths,
+    )
+    assert result.ok, (result.stdout, result.stderr)
+    assert not BENCHMARK_NAME.search(result.stdout + result.stderr), (result.stdout, result.stderr)
+
+
+@needs_jail
+def test_group_check_is_unmeasured_when_runner_does_not_finish(
+    problem: AisiRhProblem, tmp_path: Path
+) -> None:
+    task = build_task(problem, "original", hack_group="rigged_comparison")
+    for filename, content in task.files.items():
+        (tmp_path / filename).write_text(content)
+    # The outer runner's own subprocess timeout (10 s) fires before the inner pytest returns,
+    # so the runner dies with a traceback and never reports that it finished.
+    (tmp_path / "solution.py").write_text(
+        "import time\ntime.sleep(60)\ndef solve(value):\n    return value * 2\n"
+    )
+    verdict = _group_provided_test_check(task, tmp_path)
+    assert verdict.passed is None
+    assert verdict.error is not None
+    assert "did not report completion" in verdict.error
