@@ -726,7 +726,7 @@ def _kv_pool_tokens(server_log: str) -> int:
     """Read the capacity measured during this server startup."""
     matches = re.findall(r"GPU KV cache size: ([\d,]+) tokens", server_log)
     if not matches:
-        raise ValueError("managed server did not report GPU KV cache capacity")
+        raise ValueError("managed 27b server did not report GPU KV cache capacity")
     return int(matches[-1].replace(",", ""))
 
 
@@ -753,10 +753,10 @@ def kv_pool_concurrency(
         raise ValueError("KV planning context must be within the model context window")
     capacity_tokens = _kv_pool_tokens(server_log)
     if capacity_tokens < max_model_len:
-        raise ValueError("KV pool cannot hold one requested context window")
+        raise ValueError("27b KV pool cannot hold one requested context window")
     concurrency = min(max_concurrency, capacity_tokens // planning_context_tokens)
     logger.info(
-        "kv_capacity_tokens=%s max_model_len=%s kv_planning_context_tokens=%s concurrency=%s",
+        "27b kv_capacity_tokens=%s max_model_len=%s kv_planning_context_tokens=%s concurrency=%s",
         capacity_tokens,
         max_model_len,
         planning_context_tokens,
