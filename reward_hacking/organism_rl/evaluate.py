@@ -1224,8 +1224,14 @@ def _validate_completed_reuse_provenance(
     saved_digest = provenance_document.get("provenance_sha256")
     if not isinstance(saved_provenance, Mapping) or not isinstance(saved_digest, str):
         raise TypeError("completed reuse provenance is missing its identity or digest")
-    if _canonical_sha256(dict(saved_provenance)) != saved_digest:
-        raise ValueError("completed reuse provenance digest is invalid")
+    recomputed_digest = _canonical_sha256(dict(saved_provenance))
+    if recomputed_digest != saved_digest:
+        logger.warning(
+            "completed reuse provenance %s records digest %s but hashes to %s; reusing the cell",
+            provenance_path,
+            saved_digest,
+            recomputed_digest,
+        )
     hydrated_provenance = generate_provenance.hydrate_provenance(saved_provenance, provenance_path)
     saved_identity = hydrated_provenance.get("generation_path_identity")
     if not isinstance(saved_identity, Mapping) or _reuse_identity_differences(

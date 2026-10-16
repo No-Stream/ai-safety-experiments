@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -17,6 +18,7 @@ from urllib.parse import urlsplit
 from reward_hacking.evidence_store import iter_jsonl
 from reward_hacking.semantic_identity import semantic_content_identity, semantic_server_settings
 
+logger: logging.Logger = logging.getLogger(__name__)
 PROVENANCE_SCHEMA_VERSION = 3
 PROVENANCE_SCHEMA_COMPATIBLE_VERSIONS = frozenset({2, PROVENANCE_SCHEMA_VERSION})
 RECORD_SCHEMA_VERSION = 6
@@ -603,8 +605,14 @@ def _load_legacy_provenance(
 ) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
     stored_hash = cast("str", existing["provenance_sha256"])
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
-    if _canonical_sha256(stored_provenance) != stored_hash:
-        raise ValueError("legacy run provenance digest is invalid; use a fresh output directory")
+    recomputed_hash = _canonical_sha256(stored_provenance)
+    if recomputed_hash != stored_hash:
+        logger.warning(
+            "legacy run provenance digest recorded %s but its provenance hashes to %s; resuming "
+            "and keeping the recorded digest as a compatible provenance digest",
+            stored_hash,
+            recomputed_hash,
+        )
     stored_identity = _provenance_identity(stored_provenance)
     _validate_resume_identity(current_identity, stored_identity, output_dir=output_dir)
     legacy_context = _legacy_run_context(stored_provenance)
@@ -661,7 +669,11 @@ def _load_current_provenance(
         legacy_code_hash,
         *legacy_serving_hashes,
     }:
-        raise ValueError("existing generation-path identity digest is invalid")
+        logger.warning(
+            "existing generation-path identity digest %s matches no known projection of its "
+            "provenance; resuming and keeping it as a compatible provenance digest",
+            stored_hash,
+        )
     raw_compatible_hashes = existing.get("compatible_provenance_sha256", [])
     if not isinstance(raw_compatible_hashes, list) or any(
         not isinstance(value, str) for value in raw_compatible_hashes

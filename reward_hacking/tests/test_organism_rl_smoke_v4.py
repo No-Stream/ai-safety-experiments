@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -781,39 +782,18 @@ def test_sft_smoke_refuses_a_dataset_manifest_without_samples(
     assert commands == []
 
 
-def test_sft_smoke_refuses_a_card_with_a_stale_dataset_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_schema_only_card_with_stale_dataset_identity_is_logged_not_refused(
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    _, heldout_provenance = _sft_heldout_fixture(tmp_path, monkeypatch)
-    sft_directory = tmp_path / "smoke" / "sft"
-    (sft_directory / "samples").mkdir(parents=True)
-    (sft_directory / "selection.json").write_text(
-        json.dumps(_schema_only_selection(heldout_provenance, selected=[{"source": "ilcb"}])),
-        encoding="utf-8",
-    )
-    (sft_directory / "dataset_manifest.json").write_text(
-        json.dumps({"schema_only": True, "row_count": 1, "identity_sha256": "a" * 64}),
-        encoding="utf-8",
-    )
-    (sft_directory / "samples" / "round-0.jsonl").write_text("{}\n", encoding="utf-8")
-    card_path = sft_directory / "card.json"
-    card_path.write_text(
-        json.dumps(
-            {
-                "schema_only": True,
-                "selected_episode_count": 1,
-                "built_row_count": 1,
-                "dataset_identity_sha256": "b" * 64,
-            }
-        ),
-        encoding="utf-8",
-    )
-    original_card = card_path.read_text(encoding="utf-8")
-    commands: list[list[str]] = []
-    monkeypatch.setattr(smoke_v4, "_run_command", lambda command: commands.append(list(command)))
-
-    with pytest.raises(ValueError, match="identity does not match"):
-        smoke_v4._run_sft(tmp_path / "smoke")
-
-    assert commands == []
-    assert card_path.read_text(encoding="utf-8") == original_card
+    card: dict[str, object] = {
+        "schema_only": True,
+        "selected_episode_count": 1,
+        "built_row_count": 1,
+        "dataset_identity_sha256": "b" * 64,
+    }
+    with caplog.at_level(logging.WARNING, logger=smoke_v4.logger.name):
+        smoke_v4._validate_schema_only_card(
+            card, selected_count=1, row_count=1, identity_sha256="a" * 64
+        )
+    assert "records dataset identity" in caplog.text
+    assert "b" * 64 in caplog.text

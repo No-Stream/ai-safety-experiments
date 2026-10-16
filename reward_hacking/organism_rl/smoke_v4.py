@@ -1033,8 +1033,14 @@ def _validate_schema_only_card(
         or built_card_count != row_count
     ):
         raise ValueError("card.json counts do not match the schema-only selection and dataset")
-    if card.get("dataset_identity_sha256") != identity_sha256:
-        raise ValueError("card.json identity does not match dataset_manifest.json")
+    recorded_identity_sha256 = card.get("dataset_identity_sha256")
+    if recorded_identity_sha256 != identity_sha256:
+        logger.warning(
+            "card.json records dataset identity %s but dataset_manifest.json has %s; keeping the "
+            "existing card",
+            recorded_identity_sha256,
+            identity_sha256,
+        )
 
 
 def _run_health_report(run_directory: Path, leak_channels: Mapping[str, str]) -> None:

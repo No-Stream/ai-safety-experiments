@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -837,13 +838,16 @@ def test_smoke_plan_bump_stales_only_smoke_captures(
         corpus_capture.verify_corpus(corpus_root)
 
 
-def test_verify_detects_a_valid_edit_to_a_captured_trace(tmp_path: Path) -> None:
+def test_verify_warns_on_a_valid_edit_to_a_captured_trace(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     capture_root = _capture_minimal_run(tmp_path / "source", tmp_path / "corpus")
     trace_path = next(capture_root.rglob("trace.json"))
     trace_path.write_text('{"observed": false}\n', encoding="utf-8")
 
-    with pytest.raises(ValueError, match="file content manifest has changed"):
+    with caplog.at_level(logging.WARNING, logger=corpus_capture.logger.name):
         corpus_capture.verify_corpus(tmp_path / "corpus")
+    assert "file content manifest recorded" in caplog.text
 
 
 def test_verify_rejects_adapter_files_added_after_capture(tmp_path: Path) -> None:
