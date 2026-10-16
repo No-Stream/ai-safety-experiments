@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from reward_hacking.distill import label_refresh
+from reward_hacking.distill.hack_strategy import TAXONOMY_VERSION
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.tests.test_organism_rl_label_refresh import (
     _persisted_record,
@@ -44,7 +45,7 @@ def _inputs(tmp_path: Path) -> tuple[Path, Path]:
             "review_method": "model_review",
             "reviewer_model": "synthetic-reviewer",
             "reviewed_at": "2026-10-15",
-            "taxonomy_version": "hack_strategy_v21",
+            "taxonomy_version": TAXONOMY_VERSION,
         },
         "adjudications": [
             {

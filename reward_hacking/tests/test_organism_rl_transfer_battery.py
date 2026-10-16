@@ -488,7 +488,7 @@ class TestCellReadout:
         }
         assert cast("dict[str, int]", readout["awareness"])["integrity_alert_episodes"] == 1
 
-    def test_organism_readout_takes_mechanisms_from_the_v21_sidecar_when_present(
+    def test_organism_readout_takes_mechanisms_from_the_current_sidecar_when_present(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         records = [
@@ -536,7 +536,7 @@ class TestCellReadout:
         }
         assert readout["attempts"] == {"count": 2, "rate": 1.0}
 
-    def test_missing_v21_sidecar_is_generated_beside_the_cell_before_reading(
+    def test_missing_current_sidecar_is_generated_beside_the_cell_before_reading(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         records = [_organism_episode(0, paid=False, true_pass=False)]

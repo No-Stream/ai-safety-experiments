@@ -45,6 +45,7 @@ from reward_hacking.aisi_rh_envs_data import AISI_SOURCES
 from reward_hacking.aisi_rh_envs_data import (
     load_problems as load_aisi_rh_env_problems,
 )
+from reward_hacking.harness.aisi_hack_groups import AISI_HACK_GROUPS
 from reward_hacking.harness.task_spec import (
     GRADER_COMMAND,
     GRADER_FILENAME,
@@ -361,14 +362,24 @@ def aisi_rh_env_tasks(
 def aisi_rh_env_tasks_by_id(
     task_ids: Sequence[str], *, data_path: Path | None = None
 ) -> tuple[Task, ...]:
-    """Build the requested AISI tasks by id after loading the local case file."""
+    """Build the requested AISI tasks by id after loading the local case file.
+
+    A hack-group task's id is its source task's id with the group appended, so the id alone says
+    which single-mechanism configuration to rebuild.
+    """
     requested_ids = frozenset(task_ids)
-    tasks_by_id = {
-        problem.task_id(variant): build_aisi_rh_env_task(problem, variant)
-        for problem in _load_aisi_rh_env_problems(data_path)
-        for variant in AISI_RH_VARIANTS
-        if problem.task_id(variant) in requested_ids
-    }
+    tasks_by_id: dict[str, Task] = {}
+    for problem in _load_aisi_rh_env_problems(data_path):
+        for variant in AISI_RH_VARIANTS:
+            base_task_id = problem.task_id(variant)
+            if base_task_id in requested_ids:
+                tasks_by_id[base_task_id] = build_aisi_rh_env_task(problem, variant)
+            for hack_group in AISI_HACK_GROUPS:
+                group_task_id = f"{base_task_id}-{hack_group}"
+                if group_task_id in requested_ids:
+                    tasks_by_id[group_task_id] = build_aisi_rh_env_task(
+                        problem, variant, hack_group=hack_group
+                    )
     return tuple(tasks_by_id[task_id] for task_id in task_ids)
 
 

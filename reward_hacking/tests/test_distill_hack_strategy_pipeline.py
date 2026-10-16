@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from reward_hacking.distill.hack_strategy import _visible_test_calls
+from reward_hacking.distill.hack_strategy import _visible_test_cases
 
 if TYPE_CHECKING:
     import ast
@@ -28,9 +28,9 @@ def _visible_calls(command: str) -> tuple[ast.Call, ...]:
         }
     ]
 
-    calls, limitations = _visible_test_calls({}, trace_records)
+    cases, limitations = _visible_test_cases({}, trace_records)
     assert limitations == ()
-    return calls
+    return tuple(call for call, _expected in cases)
 
 
 @pytest.mark.parametrize(

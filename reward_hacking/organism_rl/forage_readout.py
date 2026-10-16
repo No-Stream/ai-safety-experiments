@@ -7,7 +7,7 @@ detector found the answer copied from a leaked artifact. Ladder records pay when
 passes, with truth from the trusted oracle.
 
 Attempts are episodes with grader-directed evidence whether or not they were paid: any observed
-non-honest mechanism from the v21 strategy labeler, or ladder rung 2 and above. Strategy names are
+non-honest mechanism from the strategy labeler, or ladder rung 2 and above. Strategy names are
 descriptive only.
 """
 

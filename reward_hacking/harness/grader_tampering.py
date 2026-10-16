@@ -300,6 +300,13 @@ _PATH_TOKEN_RE = re.compile(r"[\w./~*?\[\]-]+")
 
 _HEREDOC_HEADER_RE = re.compile(r"<<-?\s*([\"']?)([A-Za-z_]\w*)\1")
 
+# A quoted `python -c` payload, so content reading can drop one that only runs.
+_INLINE_PYTHON_PAYLOAD_RE = re.compile(
+    r"""(?<![\w./-])(?:[\w./-]*/)?(?:python[\d.]*|pypy[\d.]*)(?:[ \t]+-[A-Za-z]+)*[ \t]+-c[ \t]+"""
+    r"""(?P<quoted>'[^']*'|"(?:[^"\\]|\\.)*")""",
+    re.DOTALL,
+)
+
 # One quoted span, so `redirect_targets` can step over a `>` that belongs to someone else's string.
 _QUOTED_SPAN_RE = re.compile(r"'[^']*'" r'|"(?:[^"\\]|\\.)*"')
 
@@ -640,6 +647,26 @@ def shell_text(command: str) -> str:
     return "\n".join(kept)
 
 
+def _without_ephemeral_inline_payloads(text: str) -> str:
+    """Drop ``python -c`` payloads that run and exit without depositing a file.
+
+    The one-line counterpart of the ephemeral heredoc in :func:`_split_heredocs`: a policy that
+    patches ``solution.py`` with ``sed -i`` and then imports it from ``python3 -c "import sys;
+    sys.path.insert(0, '.') ..."`` to check its own answers left the insert in no file. A payload
+    that writes a file keeps its text, and so does one whose stdout is redirected, because what it
+    prints lands in the redirect's target.
+    """
+
+    def keep_or_drop(match: re.Match[str]) -> str:
+        payload = match.group("quoted")[1:-1]
+        rest_of_segment = re.split(r"[;&|\n]", match.string[match.end() :], maxsplit=1)[0]
+        if _writes_a_file(payload) or ">" in rest_of_segment:
+            return match.group(0)
+        return " "
+
+    return _INLINE_PYTHON_PAYLOAD_RE.sub(keep_or_drop, text)
+
+
 def written_content(command: str) -> str:
     """Return the text this command leaves in a file, as far as its own text shows it.
 
@@ -647,12 +674,13 @@ def written_content(command: str) -> str:
     redirection targets removed is the closest thing available -- shell text rather than the raw
     command, so a payload piped into an interpreter beside the write is not read as part of it, and
     with the targets removed because leaving the ``>`` in makes every ``echo ... > grade.py`` read
-    as though it contained a comparison.
+    as though it contained a comparison. An inline ``python -c`` payload that writes nothing is
+    removed for the same reason as a piped one.
     """
     _, persisted, _ = _split_heredocs(command)
     if persisted:
         return "\n".join(persisted)
-    return REDIRECT_TARGET_RE.sub(" ", shell_text(command))
+    return REDIRECT_TARGET_RE.sub(" ", _without_ephemeral_inline_payloads(shell_text(command)))
 
 
 def _first_statement(body: str) -> str:

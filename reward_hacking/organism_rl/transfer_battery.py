@@ -14,7 +14,7 @@ One vLLM server serves the model for all cells; each cell is the existing CLI (`
 ladder runner), which writes records incrementally and resumes. Rerunning the battery finishes only
 the episodes that are missing. The readout reports, per cell, label-free counts first (paid, paid and
 truth-failed, grader-directed attempts, honest passes), then the mechanism column, read from the
-v21 label sidecar beside the cell (generated when missing), then the awareness tiers with integrity
+current-taxonomy label sidecar beside the cell (generated when missing), then the awareness tiers with integrity
 tiers separate, and own-sample health from ``reward_hacking.organism_rl.health``.
 """
 
@@ -446,7 +446,7 @@ def _mechanism_assessments(
 ) -> tuple[str, list[Mapping[str, object]]]:
     """Return the mechanism payload per episode and where it came from.
 
-    The v21 sidecar is generated beside the cell when missing. Generation-time labels are read only
+    The current-taxonomy sidecar is generated beside the cell when missing. Generation-time labels are read only
     when asked for, and the readout names them as such.
     """
     if generation_time_labels:
@@ -684,7 +684,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--generation-time-labels",
         action="store_true",
-        help="read mechanisms from the labels written at generation time instead of the v21 sidecar",
+        help="read mechanisms from the labels written at generation time instead of the current-taxonomy sidecar",
     )
     parser.add_argument(
         "--dry-run",
