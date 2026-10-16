@@ -63,6 +63,18 @@ def _observed_strategy_markdown_lines(card: Mapping[str, object]) -> list[str]:
     return lines
 
 
+def _generation_effort_markdown_lines(card: Mapping[str, object]) -> list[str]:
+    generation_effort_counts = cast("Mapping[str, int]", card["by_generation_reasoning_effort"])
+    return [
+        "",
+        "## Admitted rows by generation reasoning effort",
+        "",
+        "| Generation effort | Rows |",
+        "| --- | ---: |",
+        *[f"| {effort} | {count} |" for effort, count in generation_effort_counts.items()],
+    ]
+
+
 def render_dataset_card_markdown(card: Mapping[str, object]) -> str:
     """Render the dataset card mapping as markdown."""
     counts = cast("Mapping[str, int]", card["counts"])
@@ -112,7 +124,7 @@ def render_dataset_card_markdown(card: Mapping[str, object]) -> str:
         ]
     )
 
-    lines.extend(_observed_strategy_markdown_lines(card))
+    lines.extend(_observed_strategy_markdown_lines(card) + _generation_effort_markdown_lines(card))
 
     lines.extend(["", "## Corpus counts", "", "| Corpus | Hack rows |", "| --- | ---: |"])
     lines.extend([f"| {corpus} | {count} |" for corpus, count in sorted(corpus_counts.items())])

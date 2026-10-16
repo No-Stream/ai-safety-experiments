@@ -171,7 +171,11 @@ _CONFLICTING_TASK_VARIANTS = frozenset({"conflicting", "golden_conflicting", "ti
 MATH_STRICT_ANSWER_KEY_TRUTH_SOURCE = "math_strict_answer_key"
 # Chat-template effort steering: at `low` the Qwen3.8 template prepends a system message that the 9B
 # student never sees; only `medium` renders no steering text (see games/preflight.py).
+STEERED_GENERATION_REASONING_EFFORT = "low"
 STEERING_FREE_GENERATION_REASONING_EFFORT = "medium"
+SUPPORTED_GENERATION_REASONING_EFFORTS = frozenset(
+    {STEERED_GENERATION_REASONING_EFFORT, STEERING_FREE_GENERATION_REASONING_EFFORT}
+)
 GENERATION_PROVENANCE_FILENAME = "stage-provenance.json"
 STRATEGY_FAMILY_MAPPING: dict[str, dict[str, object]] = {
     "F1": {"name": "output_fitting", "strategies": sorted(F1_STRATEGIES), "status": "active"},
@@ -239,6 +243,7 @@ class _EpisodeSelectionConfig:
     schema_only_max_turns: int | None
     awareness_clears: Mapping[EpisodeIdentity, AwarenessClear]
     awareness_stage_root: Path
+    refuse_effort_steered: bool
     derived_labels: (
         Mapping[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]] | None
     ) = None
@@ -687,13 +692,11 @@ def _generated_scope_exclusion_reason(
     return exclusion_reason
 
 
-def _generation_effort_exclusion_reason(
-    records_path: Path, record: Mapping[str, object]
-) -> str | None:
-    """Refuse generated episodes whose teacher prompts carried effort-steering text.
+def _generation_reasoning_effort(records_path: Path, record: Mapping[str, object]) -> str | None:
+    """Return the reasoning effort the generating stage recorded, or None when it recorded none.
 
     Effort is recorded per stage, not per episode. Stages without a provenance file predate the
-    field and are not refused here.
+    field.
     """
     if record.get("source") != GENERATED_EPISODE_SOURCE:
         return None
@@ -702,15 +705,23 @@ def _generation_effort_exclusion_reason(
         return None
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     generation_effort = provenance.get("reasoning_effort")
-    if generation_effort is None:
-        return None
-    if generation_effort not in {"low", STEERING_FREE_GENERATION_REASONING_EFFORT}:
+    if (
+        generation_effort is not None
+        and generation_effort not in SUPPORTED_GENERATION_REASONING_EFFORTS
+    ):
         raise ValueError(
             f"{provenance_path} has unsupported reasoning_effort {generation_effort!r}"
         )
-    if generation_effort == STEERING_FREE_GENERATION_REASONING_EFFORT:
-        return None
-    return "generation_effort_steered"
+    return generation_effort
+
+
+def _generation_effort_exclusion_reason(
+    generation_effort: str | None, *, refuse_effort_steered: bool
+) -> str | None:
+    """Refuse generations whose teacher prompts carried effort-steering text, when asked to."""
+    if refuse_effort_steered and generation_effort == STEERED_GENERATION_REASONING_EFFORT:
+        return "generation_effort_steered"
+    return None
 
 
 def _record_convention_note(record: Mapping[str, object]) -> bool:
@@ -1813,7 +1824,7 @@ def _heldout_manifest_selection_inputs(
     return canonical_paths, frozenset(task_ids), frozenset(channels), digests
 
 
-def _select_episodes_impl(  # noqa: PLR0913
+def _select_episodes_impl(  # noqa: C901, PLR0913 - one validation per selection option
     records_paths: Sequence[Path],
     *,
     tokenizer: PreTrainedTokenizerBase,
@@ -1839,6 +1850,7 @@ def _select_episodes_impl(  # noqa: PLR0913
     awareness_clears_path: Path | None = None,
     awareness_stage_root: Path = ARTIFACTS_ROOT,
     awareness_refresh_paths: Sequence[Path] = (),
+    refuse_effort_steered: bool = False,
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
@@ -1849,6 +1861,8 @@ def _select_episodes_impl(  # noqa: PLR0913
         raise ValueError("prompt_render must be student or teacher")
     if type(hint_mention_filter) is not bool:
         raise TypeError("hint_mention_filter must be a boolean")
+    if type(refuse_effort_steered) is not bool:
+        raise TypeError("refuse_effort_steered must be a boolean")
     _validate_schema_only_selection_options(
         schema_only=schema_only,
         schema_only_max_turns=schema_only_max_turns,
@@ -1912,6 +1926,7 @@ def _select_episodes_impl(  # noqa: PLR0913
         schema_only_max_turns=schema_only_max_turns,
         awareness_clears=awareness_clears,
         awareness_stage_root=awareness_stage_root,
+        refuse_effort_steered=refuse_effort_steered,
         derived_labels=derived_labels,
         awareness_refresh=awareness_refresh,
     )
@@ -2009,6 +2024,7 @@ def select_episodes(  # noqa: PLR0913
     awareness_clears_path: Path | None = None,
     awareness_stage_root: Path = ARTIFACTS_ROOT,
     awareness_refresh_paths: Sequence[Path] = (),
+    refuse_effort_steered: bool = False,
 ) -> dict[str, object]:
     """Select SFT episodes, optionally relaxing research floors for plumbing smoke checks."""
     if type(schema_only) is not bool:
@@ -2047,6 +2063,7 @@ def select_episodes(  # noqa: PLR0913
         awareness_clears_path=awareness_clears_path,
         awareness_stage_root=awareness_stage_root,
         awareness_refresh_paths=awareness_refresh_paths,
+        refuse_effort_steered=refuse_effort_steered,
     )
 
 
@@ -2243,12 +2260,16 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
             seen_hint_judge_labels.update(
                 {identity_key, legacy_key} & selection_config.hint_judge_labels
             )
+            generation_reasoning_effort = _generation_reasoning_effort(records_path, record)
             generated_scope_exclusion_reason = _generated_scope_exclusion_reason(
                 record,
                 heldout_task_ids=selection_config.heldout_task_ids,
                 heldout_channels=selection_config.heldout_channels,
                 heldout_manifests_provided=selection_config.heldout_manifests_provided,
-            ) or _generation_effort_exclusion_reason(records_path, record)
+            ) or _generation_effort_exclusion_reason(
+                generation_reasoning_effort,
+                refuse_effort_steered=selection_config.refuse_effort_steered,
+            )
             heldout_exclusion_reason = _heldout_ladder_exclusion_reason(
                 record, scenario_set_versions
             )
@@ -2281,6 +2302,7 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
                     strategy_label_exclusion_reason,
                     awareness_clear=awareness_clear,
                 )
+            entry["generation_reasoning_effort"] = generation_reasoning_effort
             if generated_scope_exclusion_reason is not None:
                 _excluded_entry(entry, generated_scope_exclusion_reason)
             elif heldout_exclusion_reason is not None:
@@ -2323,6 +2345,7 @@ def _selection_report(
     return {
         "schema_only": selection_config.schema_only,
         "schema_only_max_turns": selection_config.schema_only_max_turns,
+        "refuse_effort_steered": selection_config.refuse_effort_steered,
         "balancing": {
             "max_output_fitting_share": selection_config.max_output_fitting_share,
             "strategy_max_shares": dict(selection_config.strategy_max_shares or {}),
@@ -4646,6 +4669,17 @@ def _card_nll_value(nll: Mapping[str, object], row_key: str) -> tuple[int, float
     return action_tokens, float(mean_nll)
 
 
+def _card_row_generation_effort(row: Mapping[str, object]) -> str:
+    generation_effort = row["generation_reasoning_effort"]
+    if generation_effort is None:
+        return "unrecorded"
+    if generation_effort not in SUPPORTED_GENERATION_REASONING_EFFORTS:
+        raise ValueError(
+            f"dataset card row has unsupported generation effort {generation_effort!r}"
+        )
+    return cast("str", generation_effort)
+
+
 def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one auditable Gate 2 decision
     rows: Sequence[Mapping[str, object]],
     *,
@@ -5075,6 +5109,9 @@ def evaluate_dataset_card(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one audita
         "observed_strategy_rows_missing": hack_count - observed_strategy_rows,
         "family_shares": family_shares,
         "by_generator": dict(sorted(generator_counts.items())),
+        "by_generation_reasoning_effort": dict(
+            sorted(Counter(_card_row_generation_effort(row) for row in rows).items())
+        ),
         "reported_f2_f3_f7_at_least_10_percent": {
             family: family_shares[family] >= DATASET_CARD_REPORTED_FAMILY_SHARE
             for family in ("F2", "F3", "F7")
@@ -5974,6 +6011,7 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
             "reference_digest_valid": reference_digest_valid,
             "is_ladder": raw_family == "ladder",
             "generator": generator,
+            "generation_reasoning_effort": entry["generation_reasoning_effort"],
             "awareness_environment_match_count": awareness_counts["environment"],
             "awareness_training_match_count": awareness_counts["training"],
         }
@@ -6205,6 +6243,14 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
         "--solvable-hack-floor",
         type=parse_solvable_hack_floor,
         default=DEFAULT_SOLVABLE_HACK_FLOOR,
+    )
+    select_parser.add_argument(
+        "--refuse-effort-steered",
+        action="store_true",
+        help=(
+            "refuse generations recorded at reasoning_effort low, whose teacher prompts carry "
+            "effort-steering text the student never sees (default: admit and record)"
+        ),
     )
     select_parser.add_argument(
         "--hint-mention-filter",
@@ -6448,6 +6494,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_record_aliases=dict(args.source_record_alias),
             awareness_clears_path=args.awareness_clears,
             awareness_refresh_paths=args.awareness_refresh,
+            refuse_effort_steered=args.refuse_effort_steered,
         )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])

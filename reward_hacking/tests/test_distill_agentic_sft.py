@@ -3198,14 +3198,14 @@ def test_math_hidden_original_honest_solve_is_a_card_honest_row_with_measured_tr
     assert len(honest_rows) == 1
     assert honest_rows[0]["truth_pass"] is True
     assert honest_rows[0]["truth_source"] == "math_strict_answer_key"
+    assert honest_rows[0]["generation_reasoning_effort"] is None
     card = agentic_sft.evaluate_dataset_card(card_rows)
     assert "honest_rows_not_strengthened_true" not in cast("list[str]", card["failure_codes"])
 
 
-@pytest.mark.parametrize(("generation_effort", "is_steered"), [("low", True), ("medium", False)])
-def test_selection_refuses_episodes_generated_under_effort_steering(
-    tmp_path: Path, generation_effort: str, is_steered: bool
-) -> None:
+def _effort_probe_selection(
+    tmp_path: Path, generation_effort: str | None, **options: Any
+) -> dict[str, object]:
     episode = _w2_episode(
         tmp_path,
         "effort-probe-honest",
@@ -3217,17 +3217,63 @@ def test_selection_refuses_episodes_generated_under_effort_steering(
     episode["task_kind"] = "solvable"
     stage_dir = tmp_path / "stage"
     records_path = _write_records(stage_dir / "records.jsonl", [episode])
-    (stage_dir / "stage-provenance.json").write_text(
-        json.dumps({"schema_version": 1, "reasoning_effort": generation_effort})
-    )
+    if generation_effort is not None:
+        (stage_dir / "stage-provenance.json").write_text(
+            json.dumps({"schema_version": 1, "reasoning_effort": generation_effort})
+        )
+    return _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()), **options)
 
-    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
 
+def _only_selection_entry(report: dict[str, object]) -> dict[str, object]:
     [entry] = [
         *cast("list[dict[str, object]]", report["selected"]),
         *cast("list[dict[str, object]]", report["excluded"]),
     ]
-    assert (entry.get("exclusion_reason") == "generation_effort_steered") is is_steered
+    return entry
+
+
+@pytest.mark.parametrize("generation_effort", ["low", "medium", None])
+def test_selection_admits_generations_at_any_effort_by_default_and_records_it(
+    tmp_path: Path, generation_effort: str | None
+) -> None:
+    report = _effort_probe_selection(tmp_path, generation_effort)
+
+    entry = _only_selection_entry(report)
+    assert entry.get("exclusion_reason") != "generation_effort_steered"
+    assert entry["generation_reasoning_effort"] == generation_effort
+
+
+@pytest.mark.parametrize(
+    ("generation_effort", "is_refused"), [("low", True), ("medium", False), (None, False)]
+)
+def test_selection_refuses_low_effort_generations_only_when_requested(
+    tmp_path: Path, generation_effort: str | None, is_refused: bool
+) -> None:
+    report = _effort_probe_selection(tmp_path, generation_effort, refuse_effort_steered=True)
+
+    entry = _only_selection_entry(report)
+    assert (entry.get("exclusion_reason") == "generation_effort_steered") is is_refused
+    assert entry["generation_reasoning_effort"] == generation_effort
+
+
+def test_selection_rejects_unsupported_generation_effort(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unsupported reasoning_effort 'high'"):
+        _effort_probe_selection(tmp_path, "high")
+
+
+def test_refuse_effort_steered_defaults_off_and_reaches_the_select_cli() -> None:
+    assert agentic_sft._select_episodes_impl.__kwdefaults__ is not None
+    assert agentic_sft._select_episodes_impl.__kwdefaults__["refuse_effort_steered"] is False
+    assert agentic_sft.select_episodes.__kwdefaults__ is not None
+    assert agentic_sft.select_episodes.__kwdefaults__["refuse_effort_steered"] is False
+    select_arguments = ["select", "--records", "records.jsonl"]
+    assert agentic_sft._parse_args(select_arguments).refuse_effort_steered is False
+    assert (
+        agentic_sft._parse_args(
+            [*select_arguments, "--refuse-effort-steered"]
+        ).refuse_effort_steered
+        is True
+    )
 
 
 def test_w2_judge_cleared_honest_original_survives_selection(tmp_path: Path) -> None:

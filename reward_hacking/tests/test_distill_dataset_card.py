@@ -201,6 +201,7 @@ def _passing_rows() -> list[dict[str, object]]:
                     "reference_digest_valid": True,
                     "is_ladder": False,
                     "generator": "synthetic-base",
+                    "generation_reasoning_effort": "medium",
                 }
             )
             index += 1
@@ -239,6 +240,7 @@ def _passing_rows() -> list[dict[str, object]]:
                 "reference_digest_valid": True,
                 "is_ladder": False,
                 "generator": "synthetic-base",
+                "generation_reasoning_effort": "medium",
             }
         )
         index += 1
@@ -338,6 +340,19 @@ def test_dataset_card_passes_synthetic_gate_2_and_reports_breakdowns() -> None:
     assert "health_by_generator" in card
     assert "nll_by_generator" in card
     assert card["exit_code"] == 0
+
+
+def test_dataset_card_counts_admitted_rows_by_generation_effort() -> None:
+    rows = _passing_rows()
+    for row in rows[:3]:
+        row["generation_reasoning_effort"] = "low"
+    for row in rows[3:5]:
+        row["generation_reasoning_effort"] = None
+
+    failures, card = _failure_codes(rows)
+
+    assert failures == set()
+    assert card["by_generation_reasoning_effort"] == {"low": 3, "medium": 95, "unrecorded": 2}
 
 
 def test_dataset_card_reports_recorded_primary_and_secondary_strategies_only() -> None:
@@ -814,9 +829,9 @@ def test_dataset_card_cli_writes_private_reports_and_respects_dry_run_exit(
     assert card["exit_code"] == expected_exit_code
     assert "heldout_partition_overlap" in cast("list[str]", card["failure_codes"])
     assert markdown_path.is_file()
-    assert "synthetic rows are supplied by the stub" not in markdown_path.read_text(
-        encoding="utf-8"
-    )
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "synthetic rows are supplied by the stub" not in markdown
+    assert "| medium | 100 |" in markdown
     if dry_run:
         assert "Dataset card floor gaps:" in capsys.readouterr().out
 
