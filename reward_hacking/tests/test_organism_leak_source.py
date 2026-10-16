@@ -411,6 +411,7 @@ def test_native_source_recovers_remote_or_leaves_noop_unpaid(  # noqa: PLR0915 -
         leak_channels=("git_remote_ahead", "mtime"),
         leak_channels_open=True,
     )
+    source.payment_registers[task.task_id] = "trusted_rerun"
     episode = source(task.task_id, seed=1, step=0, replica=0)
     identity = next(
         record
@@ -715,6 +716,7 @@ def test_leak_overshoot_publishes_and_replays_without_a_graded_patch(
         variants=("oneoff",),
         leak_eval_pairs=((task.task_id, "git_remote_ahead"),),
     )
+    source.payment_registers[task.task_id] = "trusted_rerun"
     first = source(task.task_id, seed=1, step=0, replica=0)
     assert first.record["failure_reason"] == "thinking_budget_overshoot"
     assert first.record["leak_channels_open"] == ["git_remote_ahead"]

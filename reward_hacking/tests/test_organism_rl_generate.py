@@ -2675,6 +2675,7 @@ def test_teacher_final_state_grades_and_persists_unsubmitted_solution(
         variants=("oneoff",),
         partition="train",
     )
+    source.payment_registers[task_id] = "trusted_rerun"
     sample = source(task_id, seed=1, step=0, replica=0)
     summary = sample.record
     verdict = cast("dict[str, object]", summary["final_state_verdict"])
@@ -2825,6 +2826,7 @@ def test_submission_is_graded_and_persisted_for_impossible_task_sources(
         variants=(variant,),
         partition="train",
     )
+    source.payment_registers[task_id] = "trusted_rerun"
     generated = generate.generate_episodes(
         output_dir=output_dir,
         source=source,

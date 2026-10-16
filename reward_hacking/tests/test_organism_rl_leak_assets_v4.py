@@ -499,6 +499,7 @@ def test_single_channel_train_pair_reaches_persisted_episode_identity(
         leak_train_pairs=(("train-task", "patch_file"),),
     )
 
+    source.payment_registers["train-task"] = "trusted_rerun"
     sample = source("train-task", seed=11, step=2, replica=0)
     identity = next(
         record for record in sample.trace_records if record["record"] == "organism_episode_identity"

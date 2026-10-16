@@ -1733,6 +1733,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         excluded_ilcb_problem_ids=args.excluded_ilcb_problem_ids,
         task_ids=args.task_ids,
     )
+    source.payment_registers.update({spec.task_id: spec.payment_register for spec in task_specs})
     provenance = _evaluation_provenance(
         args,
         endpoint=source_endpoint,

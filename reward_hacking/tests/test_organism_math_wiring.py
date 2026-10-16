@@ -98,12 +98,12 @@ def test_math_rejects_conflicting_variant_before_loading_corpus() -> None:
         )
 
 
-def test_source_selects_real_math_families_and_matches_heldout_controls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+MATH_ITEM_IDS = tuple(f"generated-{index}" for index in range(30))
+
+
+def _heldout_math_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TaskEpisodeSource:
     data_path = tmp_path / "math_cases.json"
-    item_ids = tuple(f"generated-{index}" for index in range(30))
-    write_dataset(data_path, tuple(generate_problem(item_id) for item_id in item_ids))
+    write_dataset(data_path, tuple(generate_problem(item_id) for item_id in MATH_ITEM_IDS))
     monkeypatch.setattr(task_registry, "math_tasks", partial(math_tasks, data_path=data_path))
 
     def backend(*_args: object, **_kwargs: object) -> SimpleNamespace:
@@ -117,7 +117,7 @@ def test_source_selects_real_math_families_and_matches_heldout_controls(
         "reward_hacking.organism_rl.rollout.QWEN_PROTOCOL",
         SimpleNamespace(stop_token_ids=stop_token_ids),
     )
-    source = TaskEpisodeSource(
+    return TaskEpisodeSource(
         endpoint="http://local",
         model_path="synthetic-model",
         served_model_id="synthetic-model",
@@ -127,7 +127,24 @@ def test_source_selects_real_math_families_and_matches_heldout_controls(
         variants=("oneoff", "original"),
         partition="held-out",
     )
-    heldout_ids = {item_id for item_id in item_ids if problem_partition(item_id) == "held-out"}
+
+
+def test_source_refuses_an_unregistered_task_before_any_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _heldout_math_source(tmp_path, monkeypatch)
+    task_id = next(iter(source.tasks))
+    with pytest.raises(ValueError, match="no registered payment register"):
+        source(task_id, seed=1, step=0, replica=0)
+    assert not (tmp_path / "episodes").exists()
+
+
+def test_source_selects_real_math_families_and_matches_heldout_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_path = tmp_path / "math_cases.json"
+    source = _heldout_math_source(tmp_path, monkeypatch)
+    heldout_ids = {item_id for item_id in MATH_ITEM_IDS if problem_partition(item_id) == "held-out"}
     assert len(source.tasks) == 4 * len(heldout_ids)
     assert {task.problem_id for task in source.tasks.values()} == {
         f"math:{item_id}" for item_id in heldout_ids

@@ -128,6 +128,7 @@ def test_source_renders_convention_and_persists_measured_arm(
         variants=(variant,),
         convention_note=True,
     )
+    source.payment_registers[original.task_id] = "trusted_rerun"
     episode = source(original.task_id, seed=1, step=0, replica=0)
     assert episode.trace_records[0]["convention_note"] is True
     assert episode.record["convention_note"] is True
@@ -143,6 +144,7 @@ def test_source_renders_convention_and_persists_measured_arm(
         families=("ilcb",),
         variants=(variant,),
     )
+    unhinted.payment_registers[original.task_id] = "trusted_rerun"
     with pytest.raises(ValueError, match="identity"):
         unhinted(original.task_id, seed=1, step=0, replica=0)
 

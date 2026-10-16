@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import pytest
 
 from reward_hacking.ladder import runner
-from reward_hacking.organism_rl import evaluate, transfer_battery
+from reward_hacking.organism_rl import evaluate, generate, transfer_battery
 from reward_hacking.organism_rl.wave_v4 import DIVERSITY_CELLS
+from reward_hacking.tests.test_organism_rl_evaluate import _SyntheticEvaluationSource
 from scripts.gpu_preflight import GpuBusyError
 
 if TYPE_CHECKING:
     import argparse
+    from collections.abc import Sequence
+
+    from reward_hacking.organism_rl.rollout import CodingTaskFamily, EpisodeSample
 
 BATTERY_SAMPLING = {"temperature": 0.6, "top_k": 20, "top_p": 1.0, "presence_penalty": 0.0}
 SYNTHETIC_LADDER_SCENARIOS = tuple(f"repo{index % 5}-case{index}-oneoff" for index in range(8))
@@ -548,3 +553,72 @@ class TestMain:
             transfer_battery.main(
                 ["--model-label", "base", "--output-root", str(tmp_path / "battery")]
             )
+
+
+class _RegisteredEpisodeSource(_SyntheticEvaluationSource):
+    """Records each episode with the register its task was registered with, as TaskEpisodeSource does."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.payment_registers: dict[str, str] = {}
+
+    def __call__(self, task_id: str, *, seed: int, step: int, replica: int) -> EpisodeSample:
+        sample = super().__call__(task_id, seed=seed, step=step, replica=replica)
+        return replace(
+            sample, record={**sample.record, "payment_register": self.payment_registers[task_id]}
+        )
+
+
+def _registered_source(**kwargs: object) -> _RegisteredEpisodeSource:
+    trace_dir = cast("Path", kwargs["output_dir"])
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    return _RegisteredEpisodeSource(trace_dir)
+
+
+def _synthetic_task_specs(
+    _source: object,
+    *,
+    families: Sequence[str],
+    evaluation_variant: str,
+    tasks_per_family: int,
+    payment_register: str,
+    **_selection_controls: object,
+) -> tuple[generate.TaskSpec, ...]:
+    """Stand in for corpus selection; it keeps the register that selection receives from the argv."""
+    return tuple(
+        generate.TaskSpec(
+            f"synthetic:{families[0]}:{index}",
+            cast("CodingTaskFamily", families[0]),
+            evaluation_variant,
+            "held-out",
+            cast("Literal['trusted_rerun', 'in_band']", payment_register),
+        )
+        for index in range(tasks_per_family)
+    )
+
+
+class TestCellEpisodesUseTheCellPaymentRegister:
+    @pytest.mark.parametrize("cell_name", transfer_battery.ORGANISM_CELL_NAMES)
+    def test_evaluate_main_registers_the_argv_register_before_episodes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cell_name: str
+    ) -> None:
+        """Run evaluate.main on the battery's argv with the model, corpus and provenance stubbed.
+
+        Registration, episode generation and record construction are the real code paths.
+        """
+        run = _run(tmp_path, None)
+        argv = transfer_battery.evaluate_cell_arguments(run, cell_name, "http://127.0.0.1:8000")
+        args = evaluate.parse_args(argv)
+        monkeypatch.setattr(evaluate, "resolve_model_revision", lambda _args: "synthetic-revision")
+        monkeypatch.setattr(evaluate, "TaskEpisodeSource", _registered_source)
+        monkeypatch.setattr(evaluate, "select_heldout_task_specs", _synthetic_task_specs)
+        monkeypatch.setattr(
+            evaluate, "_evaluation_provenance", lambda *_args, **_kwargs: {"run": cell_name}
+        )
+        evaluate.main(argv)
+        records = [
+            json.loads(line)
+            for line in (args.output_dir / "records.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        assert len(records) == transfer_battery.EPISODES_PER_CELL
+        assert {record["payment_register"] for record in records} == {args.payment_register}

@@ -1261,19 +1261,21 @@ class TaskEpisodeSource:
         )
         self.torn_trace_count = 0
 
-    def __call__(  # noqa: C901 - resume validation and native episode publication
+    def __call__(  # noqa: C901, PLR0915 - resume validation and native episode publication
         self, task_id: str, *, seed: int, step: int, replica: int
     ) -> EpisodeSample:
         """Persist and score one jail episode using the currently served adapter."""
+        payment_register = self.payment_registers.get(task_id)
+        if payment_register is None:
+            raise ValueError(f"task {task_id!r} has no registered payment register")
+        if payment_register not in {"trusted_rerun", "in_band"}:
+            raise ValueError(f"unsupported coding payment register {payment_register!r}")
         backend = copy(self.backend)
         backend.sampling = replace(self.backend.sampling, seed=seed)
         identity = hashlib.sha256(task_id.encode()).hexdigest()
         trace_path = self.output_dir / f"step-{step:06d}" / f"{identity}-{replica:03d}.jsonl"
         trace_path.parent.mkdir(parents=True, exist_ok=True)
         task = self.tasks[task_id]
-        payment_register = self.payment_registers.get(task_id, "trusted_rerun")
-        if payment_register not in {"trusted_rerun", "in_band"}:
-            raise ValueError(f"unsupported coding payment register {payment_register!r}")
         identity_record: dict[str, object] = {
             "record": "organism_episode_identity",
             "prompt_format_version": PROMPT_FORMAT_VERSION,

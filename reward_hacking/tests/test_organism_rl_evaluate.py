@@ -1231,7 +1231,7 @@ def test_evaluate_main_forwards_eval_pairs_to_task_source(
         ),
         encoding="utf-8",
     )
-    task_source = SimpleNamespace()
+    task_source = SimpleNamespace(payment_registers={})
     source_arguments: dict[str, object] = {}
     evaluation_arguments: dict[str, object] = {}
 
@@ -1434,7 +1434,7 @@ def test_evaluate_main_loads_the_hidden_original_twin_for_loose_oneoff_pairing(
 
     def build_source(**kwargs: object) -> SimpleNamespace:
         source_arguments.update(kwargs)
-        return SimpleNamespace()
+        return SimpleNamespace(payment_registers={})
 
     monkeypatch.setattr(evaluate, "TaskEpisodeSource", build_source)
     monkeypatch.setattr(generate, "require_gitignored_output_dir", lambda _path: None)
@@ -1514,7 +1514,7 @@ def test_evaluate_main_forwards_the_aisi_hack_group_to_source_and_provenance(
 
     def build_source(**kwargs: object) -> SimpleNamespace:
         source_arguments.update(kwargs)
-        return SimpleNamespace(skip_counts={}, tasks={}, leak_manifests={})
+        return SimpleNamespace(skip_counts={}, tasks={}, leak_manifests={}, payment_registers={})
 
     monkeypatch.setattr(evaluate, "TaskEpisodeSource", build_source)
     monkeypatch.setattr(generate, "require_gitignored_output_dir", lambda _path: None)

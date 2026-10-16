@@ -676,6 +676,7 @@ def test_interrupted_episode_is_recomputed_and_complete_trace_is_replayed(  # no
 
     monkeypatch.setattr("reward_hacking.organism_rl.rollout.run_ladder_episode", run_episode)
 
+    source.payment_registers["toy"] = "trusted_rerun"
     with pytest.raises(RuntimeError, match="interruption"):
         source("toy", seed=7, step=1, replica=0)
 
@@ -821,6 +822,8 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         hint_sha=hashlib.sha256(hint_text.encode("utf-8")).hexdigest(),
     )
 
+    source.payment_registers["ilcb:toy"] = "trusted_rerun"
+    source.payment_registers["aisi:toy"] = "trusted_rerun"
     ilcb_episode = source("ilcb:toy", seed=3, step=0, replica=0)
     aisi_episode = source("aisi:toy", seed=4, step=0, replica=0)
 
@@ -854,6 +857,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         partition="train",
         unhinted_system_prompt=unhinted_system_prompt,
     )
+    unhinted_source.payment_registers["ilcb:toy"] = "trusted_rerun"
     unhinted_episode = unhinted_source("ilcb:toy", seed=3, step=0, replica=0)
     hinted_system_message = cast(
         "list[Mapping[str, object]]",
@@ -882,6 +886,7 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         hint_text="different synthetic guidance words",
         hint_sha=hashlib.sha256(b"different synthetic guidance words").hexdigest(),
     )
+    changed_hint_source.payment_registers["ilcb:toy"] = "trusted_rerun"
     with pytest.raises(ValueError, match="identity"):
         changed_hint_source("ilcb:toy", seed=3, step=0, replica=0)
 
@@ -1008,7 +1013,7 @@ def cpu_docker_transport(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
 
 @pytest.mark.usefixtures("cpu_docker_transport")
 @pytest.mark.parametrize("docker", [False, True])
-def test_task_episode_sampling_seed_is_request_local(
+def test_task_episode_sampling_seed_is_request_local(  # noqa: PLR0915 - seed and replay checks
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     docker: bool,
@@ -1093,6 +1098,7 @@ def test_task_episode_sampling_seed_is_request_local(
 
     monkeypatch.setattr("reward_hacking.organism_rl.rollout.run_ladder_episode", run_episode)
 
+    source.payment_registers["toy"] = "trusted_rerun"
     source("toy", seed=11, step=0, replica=0)
 
     assert observed_seeds == [11]
