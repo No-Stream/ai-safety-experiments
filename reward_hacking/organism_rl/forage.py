@@ -286,8 +286,7 @@ def battery_item_identities(scratch_dir: Path) -> frozenset[str]:
     )
 
 
-def ladder_train_scenarios(count: int) -> tuple[str, ...]:
-    """Conflict scenarios from the ladder train root, refusing any held-out or battery slug."""
+def _ladder_excluded_items() -> frozenset[str]:
     held_out = frozenset(
         scenario.slug
         for root in LADDER_HELD_OUT_SCENARIO_ROOTS
@@ -296,28 +295,120 @@ def ladder_train_scenarios(count: int) -> tuple[str, ...]:
     battery = frozenset(
         transfer_battery.heldout_ladder_scenarios(transfer_battery.LADDER_SCENARIO_ROOT)
     )
-    train = {
+    return held_out | battery
+
+
+def _ladder_train_items() -> dict[str, str]:
+    return {
         scenario.slug: scenario.slug
         for scenario in sorted(load_scenarios(LADDER_TRAIN_SCENARIO_ROOT), key=lambda row: row.slug)
         if scenario.variant == "conflict"
         and (scenario.set_version is None or "heldout" not in scenario.set_version)
     }
-    return select_forage_tasks(train, excluded_items=held_out | battery, count=count)
+
+
+def ladder_train_scenarios(count: int) -> tuple[str, ...]:
+    """Conflict scenarios from the ladder train root, refusing any held-out or battery slug."""
+    return select_forage_tasks(
+        _ladder_train_items(), excluded_items=_ladder_excluded_items(), count=count
+    )
 
 
 def select_group_tasks(
-    group: ForageGroup, count: int, battery_items: frozenset[str], scratch_dir: Path
+    group: ForageGroup,
+    count: int,
+    battery_items: frozenset[str],
+    scratch_dir: Path,
+    *,
+    requested_task_ids: Sequence[str] | None = None,
 ) -> tuple[str, ...]:
     """Choose a group's train tasks, checked against its held-out partition and the battery."""
     if group.kind == "ladder":
-        return ladder_train_scenarios(count)
+        if requested_task_ids is None:
+            return ladder_train_scenarios(count)
+        train = _ladder_train_items()
+        eligible_task_ids = select_forage_tasks(
+            train,
+            excluded_items=_ladder_excluded_items(),
+            count=len(train),
+        )
+        return _restrict_task_ids(group.name, eligible_task_ids, requested_task_ids)
     held_out = (
         frozenset(_partition_items(group, "held-out", scratch_dir).values())
         if group.has_held_out_partition
         else frozenset()
     )
     train = _partition_items(group, "train", scratch_dir)
+    if requested_task_ids is not None:
+        eligible_task_ids = select_forage_tasks(
+            train, excluded_items=held_out | battery_items, count=len(train)
+        )
+        return _restrict_task_ids(group.name, eligible_task_ids, requested_task_ids)
     return select_forage_tasks(train, excluded_items=held_out | battery_items, count=count)
+
+
+def _restrict_task_ids(
+    group_name: str, eligible_task_ids: Sequence[str], requested_task_ids: Sequence[str]
+) -> tuple[str, ...]:
+    eligible_set = set(eligible_task_ids)
+    ineligible_task_ids = sorted(set(requested_task_ids) - eligible_set)
+    if ineligible_task_ids:
+        raise ValueError(
+            f"--task-id for {group_name} includes ineligible ids {ineligible_task_ids}; "
+            f"eligible task ids: {list(eligible_task_ids)}"
+        )
+    requested_set = set(requested_task_ids)
+    return tuple(task_id for task_id in eligible_task_ids if task_id in requested_set)
+
+
+def resolve_groups(
+    group_names: Sequence[str], max_turns_overrides: Mapping[str, int]
+) -> dict[str, ForageGroup]:
+    """Apply per-group episode caps while retaining each group's other configuration."""
+    return {
+        name: replace(
+            GROUPS_BY_NAME[name],
+            max_turns=max_turns_overrides.get(name, GROUPS_BY_NAME[name].max_turns),
+        )
+        for name in group_names
+    }
+
+
+def _group_assignment(parser: argparse.ArgumentParser, value: str, option: str) -> tuple[str, str]:
+    group_name, separator, assigned_value = value.partition("=")
+    if not separator or group_name not in GROUPS_BY_NAME:
+        parser.error(f"{option} expects GROUP=VALUE for a known group: {value}")
+    return group_name, assigned_value
+
+
+def _parse_max_turns_overrides(
+    parser: argparse.ArgumentParser, values: Sequence[str]
+) -> dict[str, int]:
+    overrides: dict[str, int] = {}
+    for value in values:
+        group_name, raw_turns = _group_assignment(parser, value, "--max-turns")
+        try:
+            max_turns = int(raw_turns)
+        except ValueError:
+            parser.error(f"--max-turns requires a positive integer: {value}")
+        if max_turns < 1:
+            parser.error(f"--max-turns requires a positive integer: {value}")
+        if group_name in overrides:
+            parser.error(f"--max-turns may be specified only once per group: {group_name}")
+        overrides[group_name] = max_turns
+    return overrides
+
+
+def _parse_task_id_overrides(
+    parser: argparse.ArgumentParser, values: Sequence[str]
+) -> dict[str, tuple[str, ...]]:
+    overrides: dict[str, list[str]] = {}
+    for value in values:
+        group_name, task_id = _group_assignment(parser, value, "--task-id")
+        if not task_id:
+            parser.error(f"--task-id requires a task ID: {value}")
+        overrides.setdefault(group_name, []).append(task_id)
+    return {name: tuple(task_ids) for name, task_ids in overrides.items()}
 
 
 def group_dir(run: ForageRun, group: ForageGroup, *, follow_up: bool = False) -> Path:
@@ -539,19 +630,43 @@ def _server_arguments(run: ForageRun, gpu_memory_utilization: float) -> list[str
     ]
 
 
-def write_selection(run: ForageRun, selection: Mapping[str, Sequence[str]]) -> None:
-    """Persist the task selection once; a resumed forage must select the same tasks."""
+def write_selection(
+    run: ForageRun,
+    selection: Mapping[str, Sequence[str]],
+    groups: Mapping[str, ForageGroup],
+) -> None:
+    """Persist selected tasks and episode caps so a resumed forage has the same config."""
     path = run.output_dir / "selection.json"
-    payload = {name: list(task_ids) for name, task_ids in selection.items()}
+    selected_groups = {
+        name: {"task_ids": list(task_ids), "max_turns": groups[name].max_turns}
+        for name, task_ids in selection.items()
+    }
     if path.is_file():
         stored = json.loads(path.read_text(encoding="utf-8"))
+        if "groups" not in stored:
+            raise ValueError(
+                "existing selection.json does not record per-group max_turns; pick a new --label"
+            )
+        stored_groups = stored["groups"]
+        for name, config in selected_groups.items():
+            if name not in stored_groups:
+                continue
+            stored_config = stored_groups[name]
+            if stored_config.get("max_turns") != config["max_turns"]:
+                raise ValueError(
+                    f"{name} max_turns changed from {stored_config.get('max_turns')} to "
+                    f"{config['max_turns']}; pick a new --label to avoid mixing episode configs"
+                )
         changed = sorted(
-            name for name in payload if name in stored and stored[name] != payload[name]
+            name
+            for name, config in selected_groups.items()
+            if name in stored_groups and stored_groups[name]["task_ids"] != config["task_ids"]
         )
         if changed:
             raise ValueError(f"task selection changed since the forage started: {changed}")
-        payload = {**stored, **payload}
+        selected_groups = {**stored_groups, **selected_groups}
     run.output_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"groups": selected_groups}
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -623,6 +738,7 @@ def _run_group(  # noqa: PLR0913 - group execution needs the live server's ident
 def _serve_and_run(
     run: ForageRun,
     selection: Mapping[str, Sequence[str]],
+    groups: Mapping[str, ForageGroup],
     gpu_memory_utilization: float,
     *,
     follow_up: bool,
@@ -646,7 +762,7 @@ def _serve_and_run(
         for name, task_ids in selection.items():
             _run_group(
                 served_run,
-                GROUPS_BY_NAME[name],
+                groups[name],
                 task_ids,
                 endpoint=server.base_url,
                 server_log=log_path,
@@ -665,6 +781,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--base-model", default=transfer_battery.BASE_MODEL, help="Qwen/Qwen3.5-0.8B for a smoke"
     )
     parser.add_argument("--group", action="append", dest="groups", choices=tuple(GROUPS_BY_NAME))
+    parser.add_argument(
+        "--max-turns",
+        action="append",
+        default=[],
+        metavar="GROUP=N",
+        help="override a group's maximum turns; repeat for multiple groups",
+    )
+    parser.add_argument(
+        "--task-id",
+        action="append",
+        default=[],
+        metavar="GROUP=TASK_ID",
+        help="restrict a group's selection to an eligible task ID; repeat for multiple tasks",
+    )
     parser.add_argument("--samples-per-task", type=int, default=SAMPLES_PER_TASK)
     parser.add_argument(
         "--tasks-per-group", type=int, help="override every group's task count (smoke runs)"
@@ -692,17 +822,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="select tasks on CPU, validate every group command and print the plan",
     )
     args = parser.parse_args(argv)
+    max_turns_overrides = _parse_max_turns_overrides(parser, args.max_turns)
+    task_id_overrides = _parse_task_id_overrides(parser, args.task_id)
     if args.samples_per_task < 1 or (args.tasks_per_group is not None and args.tasks_per_group < 1):
         parser.error("sample and task counts must be positive")
     if args.follow_up and args.oversize_reason is None:
         parser.error("--follow-up runs tasks past 8 samples; pass --oversize-reason")
     args.groups = tuple(args.groups or GROUPS_BY_NAME)
+    unselected_turn_cap_groups = sorted(set(max_turns_overrides) - set(args.groups))
+    if unselected_turn_cap_groups:
+        parser.error(
+            f"--max-turns specified for groups not selected by --group: {unselected_turn_cap_groups}"
+        )
+    unselected_task_groups = sorted(set(task_id_overrides) - set(args.groups))
+    if unselected_task_groups:
+        parser.error(
+            f"--task-id specified for groups not selected by --group: {unselected_task_groups}"
+        )
+    args.max_turns_overrides = max_turns_overrides
+    args.task_id_overrides = task_id_overrides
     return args
 
 
-def _validate_commands(run: ForageRun, selection: Mapping[str, Sequence[str]]) -> None:
+def _validate_commands(
+    run: ForageRun,
+    selection: Mapping[str, Sequence[str]],
+    groups: Mapping[str, ForageGroup],
+) -> None:
     for name, task_ids in selection.items():
-        group = GROUPS_BY_NAME[name]
+        group = groups[name]
         if group.kind == "ladder":
             command = ladder_group_arguments(
                 run,
@@ -745,15 +893,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         accept_slow=args.accept_slow,
         oversize_reason=args.oversize_reason,
     )
-    groups = [GROUPS_BY_NAME[name] for name in args.groups]
+    groups = resolve_groups(args.groups, args.max_turns_overrides)
     if not args.readout_only:
         scratch_dir = output_dir / "selection-scratch"
         battery_items = battery_item_identities(scratch_dir)
         selection = {
             group.name: select_group_tasks(
-                group, args.tasks_per_group or group.task_count, battery_items, scratch_dir
+                group,
+                args.tasks_per_group or group.task_count,
+                battery_items,
+                scratch_dir,
+                requested_task_ids=args.task_id_overrides.get(group.name),
             )
-            for group in groups
+            for group in groups.values()
         }
         logger.info(
             "forage plan: %d groups, %d tasks, %d episodes",
@@ -761,15 +913,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             sum(len(task_ids) for task_ids in selection.values()),
             sum(len(task_ids) for task_ids in selection.values()) * args.samples_per_task,
         )
-        _validate_commands(run, selection)
+        _validate_commands(run, selection, groups)
         if args.dry_run:
             return
-        write_selection(run, selection)
-        _serve_and_run(run, selection, args.gpu_memory_utilization, follow_up=args.follow_up)
-    stored_selection = cast(
-        "dict[str, list[str]]",
-        json.loads((output_dir / "selection.json").read_text(encoding="utf-8")),
-    )
+        write_selection(run, selection, groups)
+        _serve_and_run(
+            run, selection, groups, args.gpu_memory_utilization, follow_up=args.follow_up
+        )
+    stored = json.loads((output_dir / "selection.json").read_text(encoding="utf-8"))
+    stored_groups = stored.get("groups", stored)
+    stored_selection = {
+        name: config["task_ids"] if isinstance(config, dict) else config
+        for name, config in stored_groups.items()
+    }
     write_readout(
         output_dir,
         {

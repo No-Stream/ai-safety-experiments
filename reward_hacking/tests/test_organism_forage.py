@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -113,6 +114,47 @@ class TestSelection:
                 )
                 assert command[command.index("--partition") + 1] == "train"
         assert len(forage.GROUPS_BY_NAME) == len(forage.FORAGE_GROUPS)
+
+    def test_task_filter_selects_only_requested_eligible_tasks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        group = forage.GROUPS_BY_NAME["math-oneoff"]
+        train_items = {"t1": "p1", "t2": "p2", "t3": "p3"}
+
+        def partition_items(
+            selected_group: forage.ForageGroup, partition: str, _scratch_dir: Path
+        ) -> dict[str, str]:
+            assert selected_group == group
+            return train_items if partition == "train" else {"held": "other"}
+
+        monkeypatch.setattr(forage, "_partition_items", partition_items)
+        assert forage.select_group_tasks(
+            group,
+            count=3,
+            battery_items=frozenset(),
+            scratch_dir=tmp_path,
+            requested_task_ids=("t3", "t1"),
+        ) == ("t1", "t3")
+
+    def test_task_filter_error_lists_all_eligible_ids(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        group = forage.GROUPS_BY_NAME["math-oneoff"]
+
+        def partition_items(
+            _group: forage.ForageGroup, partition: str, _scratch_dir: Path
+        ) -> dict[str, str]:
+            return {"t1": "p1", "t2": "p2"} if partition == "train" else {}
+
+        monkeypatch.setattr(forage, "_partition_items", partition_items)
+        with pytest.raises(ValueError, match=r"eligible task ids: \['t1', 't2'\]"):
+            forage.select_group_tasks(
+                group,
+                count=1,
+                battery_items=frozenset(),
+                scratch_dir=tmp_path,
+                requested_task_ids=("missing",),
+            )
 
 
 class TestEpisodeOutcome:
@@ -284,10 +326,69 @@ class TestResume:
 
     def test_resumed_selection_must_match_the_stored_one(self, tmp_path: Path) -> None:
         run = _run(tmp_path)
-        forage.write_selection(run, {"g": ["a", "b"]})
-        forage.write_selection(run, {"g": ["a", "b"], "h": ["c"]})
+        groups = {"g": forage.ForageGroup("g", "generate", "aisi", "original", "in_band", 1)}
+        forage.write_selection(run, {"g": ["a", "b"]}, groups)
+        groups["h"] = forage.ForageGroup("h", "generate", "aisi", "original", "in_band", 1)
+        forage.write_selection(run, {"g": ["a", "b"], "h": ["c"]}, groups)
         with pytest.raises(ValueError, match="selection changed"):
-            forage.write_selection(run, {"g": ["a", "x"]})
+            forage.write_selection(run, {"g": ["a", "x"]}, groups)
+
+    def test_resume_refuses_a_different_group_turn_cap(self, tmp_path: Path) -> None:
+        run = _run(tmp_path)
+        group = forage.GROUPS_BY_NAME["r2e-leak"]
+        forage.write_selection(run, {group.name: ["task"]}, {group.name: group})
+        changed_group = replace(group, max_turns=60)
+        with pytest.raises(ValueError, match=r"max_turns changed.*new --label"):
+            forage.write_selection(run, {group.name: ["task"]}, {group.name: changed_group})
+
+
+class TestCLI:
+    def test_repeated_group_turn_cap_and_task_id_options_parse(self) -> None:
+        args = forage.parse_args(
+            [
+                "--max-turns",
+                "r2e-leak=60",
+                "--max-turns",
+                "aisi-oneoff-exit-code=25",
+                "--task-id",
+                "aisi-oneoff-exit-code=apps_task",
+                "--task-id",
+                "aisi-oneoff-exit-code=second_task",
+            ]
+        )
+        assert args.max_turns_overrides == {"r2e-leak": 60, "aisi-oneoff-exit-code": 25}
+        assert args.task_id_overrides == {"aisi-oneoff-exit-code": ("apps_task", "second_task")}
+
+    @pytest.mark.parametrize(
+        "option_value",
+        ["unknown=5", "r2e-leak=0", "r2e-leak=-2", "r2e-leak=not-an-int", "r2e-leak"],
+    )
+    def test_invalid_turn_cap_option_is_rejected(self, option_value: str) -> None:
+        with pytest.raises(SystemExit):
+            forage.parse_args(["--max-turns", option_value])
+
+    @pytest.mark.parametrize("option_value", ["unknown=task", "r2e-leak=", "r2e-leak"])
+    def test_invalid_task_id_option_is_rejected(self, option_value: str) -> None:
+        with pytest.raises(SystemExit):
+            forage.parse_args(["--task-id", option_value])
+
+    def test_turn_cap_override_reaches_only_its_group_command(self, tmp_path: Path) -> None:
+        args = forage.parse_args(["--max-turns", "r2e-leak=60"])
+        groups = forage.resolve_groups(args.groups, args.max_turns_overrides)
+        run = _run(tmp_path)
+        leak_command = forage.generate_group_arguments(
+            run, groups["r2e-leak"], "http://127.0.0.1:8000", ["leak-task"]
+        )
+        aisi_command = forage.generate_group_arguments(
+            run,
+            groups["aisi-oneoff-exit-code"],
+            "http://127.0.0.1:8000",
+            ["aisi-task"],
+        )
+        assert leak_command[leak_command.index("--max-turns") + 1] == "60"
+        assert leak_command[leak_command.index("--announced-turn-budget") + 1] == "60"
+        assert aisi_command[aisi_command.index("--max-turns") + 1] == "20"
+        assert aisi_command[aisi_command.index("--announced-turn-budget") + 1] == "20"
 
 
 def _run(output_dir: Path) -> forage.ForageRun:
