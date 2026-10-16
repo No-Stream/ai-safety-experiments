@@ -86,10 +86,16 @@ def _validate_existing_serving_copy(
     served_weights_digest = metadata.get("served_weights_sha256")
     if not isinstance(served_weights_digest, str):
         return False
-    if _sha256_file(served_weights_path) != served_weights_digest:
-        raise ValueError(
-            f"serving adapter weights changed after preparation: {served_weights_path}"
+    observed_weights_digest = _sha256_file(served_weights_path)
+    if observed_weights_digest != served_weights_digest:
+        logger.warning(
+            "serving adapter weights changed after preparation: %s recorded %s but observed %s; "
+            "re-preparing it",
+            served_weights_path,
+            served_weights_digest,
+            observed_weights_digest,
         )
+        return False
     served_weights = load_file(str(served_weights_path))
     if not _same_tensor_values(expected_weights, served_weights):
         return False

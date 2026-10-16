@@ -255,12 +255,16 @@ def extract_template(task: R2eLeakTask, templates_root: Path, dataset_revision: 
     task_directory = templates_root / task.task_id
     provenance_path = task_directory / "provenance.json"
     if provenance_path.is_file():
-        if json.loads(provenance_path.read_text())["image_digest"] != task.image_digest:
-            raise RuntimeError(
-                f"{task_directory} was extracted from a different image digest; remove it first"
-            )
-        logger.info("resume: %s already extracted", task.task_id)
-        return task_directory
+        recorded_image_digest = json.loads(provenance_path.read_text())["image_digest"]
+        if recorded_image_digest == task.image_digest:
+            logger.info("resume: %s already extracted", task.task_id)
+            return task_directory
+        logger.warning(
+            "%s was extracted from image digest %s but the task now pins %s; re-extracting it",
+            task_directory,
+            recorded_image_digest,
+            task.image_digest,
+        )
     require_free_disk()
     if task_directory.exists():
         shutil.rmtree(task_directory)  # partial extraction without provenance is never trusted

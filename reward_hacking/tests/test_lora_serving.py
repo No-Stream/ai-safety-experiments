@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -128,17 +129,25 @@ def test_a_changed_source_adapter_rebuilds_its_semantic_weight_copy(tmp_path: Pa
     )
 
 
-def test_serving_copy_still_checks_its_own_recorded_weights_digest(tmp_path: Path) -> None:
+def test_serving_copy_whose_weights_changed_is_logged_and_reprepared(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     adapter = _write_adapter(tmp_path / "checkpoint-10", base_model="Qwen/Qwen3.5-9B")
     destination = tmp_path / "run" / "vllm-adapters" / "student"
     lora_serving.prepare_vllm_serving_adapter(adapter, destination)
     served_weights = destination / "adapter_model.safetensors"
+    recorded_digest = json.loads(
+        (destination / lora_serving.SERVING_METADATA_FILENAME).read_text()
+    )["served_weights_sha256"]
     tensors = load_file(str(served_weights))
     tensors[NESTED_KEY] = tensors[NESTED_KEY] + 1
     save_file(tensors, str(served_weights))
 
-    with pytest.raises(ValueError, match="weights changed after preparation"):
+    with caplog.at_level(logging.WARNING, logger=lora_serving.logger.name):
         lora_serving.prepare_vllm_serving_adapter(adapter, destination)
+    assert "weights changed after preparation" in caplog.text
+    assert recorded_digest in caplog.text
+    assert hashlib.sha256(served_weights.read_bytes()).hexdigest() == recorded_digest
 
 
 @pytest.mark.parametrize(
