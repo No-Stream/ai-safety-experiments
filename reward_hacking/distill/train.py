@@ -296,6 +296,73 @@ def completion_logps(
     return logps
 
 
+def _active_completion_positions(
+    targets: torch.Tensor, loss_mask: torch.Tensor | None
+) -> torch.Tensor:
+    if loss_mask is None:
+        return torch.arange(targets.numel(), device=targets.device)
+    if loss_mask.shape != targets.shape:
+        raise ValueError("loss_mask must have one value per completion position")
+    if loss_mask.dtype != torch.bool and not torch.all((loss_mask == 0) | (loss_mask == 1)):
+        raise ValueError("loss_mask values must be boolean or zero and one")
+    return loss_mask.to(device=targets.device, dtype=torch.bool).reshape(-1).nonzero().squeeze(1)
+
+
+def _score_active_completion_positions(  # noqa: PLR0913 - explicit scoring and memory settings
+    flat_hidden: torch.Tensor,
+    active_positions: torch.Tensor,
+    packed_targets: torch.Tensor,
+    head: torch.nn.Module,
+    *,
+    temperature: float,
+    chunk_tokens: int,
+    compute_entropy: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def float32_head(hidden_slice: torch.Tensor) -> torch.Tensor:
+        return cast("torch.Tensor", head(hidden_slice)).float()
+
+    def score_slice(
+        hidden_states: torch.Tensor, position_slice: torch.Tensor, token_slice: torch.Tensor
+    ) -> torch.Tensor:
+        hidden_slice = hidden_states.index_select(0, position_slice).unsqueeze(0)
+        return chunked_per_token_logps(
+            hidden_slice,
+            float32_head,
+            token_slice,
+            temperature=temperature,
+            chunk_tokens=chunk_tokens,
+        )
+
+    logprob_slices: list[torch.Tensor] = []
+    entropy_slices: list[torch.Tensor] = []
+    for start in range(0, packed_targets.size(1), chunk_tokens):
+        position_slice = active_positions[start : start + chunk_tokens]
+        token_slice = packed_targets[:, start : start + chunk_tokens]
+        if torch.is_grad_enabled():
+            logps = checkpoint(
+                score_slice, flat_hidden, position_slice, token_slice, use_reentrant=False
+            )
+        else:
+            logps = score_slice(flat_hidden, position_slice, token_slice)
+        logprob_slices.append(logps)
+        if compute_entropy:
+            with torch.no_grad():
+                hidden_slice = flat_hidden.index_select(0, position_slice).unsqueeze(0)
+                entropy_slices.append(
+                    entropy_from_logits(float32_head(hidden_slice.detach()) / temperature)
+                )
+    packed_logps = torch.cat(logprob_slices, dim=1)
+    packed_entropies = torch.cat(entropy_slices, dim=1) if compute_entropy else None
+    return packed_logps, packed_entropies
+
+
+def _scatter_completion_positions(
+    packed_values: torch.Tensor, active_positions: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    flat_values = torch.zeros(targets.numel(), dtype=packed_values.dtype, device=targets.device)
+    return flat_values.index_copy(0, active_positions, packed_values.reshape(-1)).view_as(targets)
+
+
 def chunked_completion_logps(  # noqa: PLR0913 - explicit sampling and memory settings
     model: torch.nn.Module,
     input_ids: torch.Tensor,
@@ -304,11 +371,13 @@ def chunked_completion_logps(  # noqa: PLR0913 - explicit sampling and memory se
     temperature: float,
     chunk_tokens: int,
     compute_entropy: bool,
+    loss_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Score the last ``completion_tokens`` of unpadded rows through an fp32 head, a slice at a time.
+    """Score selected completion positions through an fp32 head, a chunk at a time.
 
-    The widest live tensor is ``chunk_tokens`` x vocabulary, recomputed in backward, instead of
-    TRL's whole-completion logits. Entropies, when asked for, are a detached read-out.
+    ``loss_mask`` packs only positions used by the loss before the head and scatters their scores
+    back into completion coordinates. The widest live tensor is ``chunk_tokens`` x vocabulary,
+    recomputed in backward, instead of TRL's whole-completion logits. Entropies are detached.
     """
     if chunk_tokens < 1:
         raise ValueError("chunk_tokens must be positive")
@@ -319,37 +388,32 @@ def chunked_completion_logps(  # noqa: PLR0913 - explicit sampling and memory se
     hidden = backbone(input_ids=input_ids, attention_mask=None, use_cache=False).last_hidden_state
     hidden = hidden[:, -completion_tokens - 1 : -1]
     targets = input_ids[:, -completion_tokens:]
+    active_positions = _active_completion_positions(targets, loss_mask)
+    if active_positions.numel() == 0:
+        empty_logps = torch.zeros(targets.shape, dtype=torch.float32, device=targets.device)
+        logps = empty_logps + hidden.float().sum() * 0
+        entropies = empty_logps.clone() if compute_entropy else None
+        return logps, entropies
+
+    flat_hidden = hidden.reshape(-1, hidden.size(-1))
+    packed_targets = targets.reshape(-1).index_select(0, active_positions).unsqueeze(0)
     head = causal_model.get_output_embeddings()
-
-    def float32_head(hidden_slice: torch.Tensor) -> torch.Tensor:
-        return cast("torch.Tensor", head(hidden_slice)).float()
-
-    def score_slice(hidden_slice: torch.Tensor, token_slice: torch.Tensor) -> torch.Tensor:
-        return chunked_per_token_logps(
-            hidden_slice,
-            float32_head,
-            token_slice,
-            temperature=temperature,
-            chunk_tokens=chunk_tokens,
-        )
-
-    slices = []
-    entropy_slices = []
-    for start in range(0, targets.size(1), chunk_tokens):
-        hidden_slice = hidden[:, start : start + chunk_tokens]
-        token_slice = targets[:, start : start + chunk_tokens]
-        if torch.is_grad_enabled():
-            logps = checkpoint(score_slice, hidden_slice, token_slice, use_reentrant=False)
-        else:
-            logps = score_slice(hidden_slice, token_slice)
-        slices.append(logps)
-        if compute_entropy:
-            with torch.no_grad():
-                entropy_slices.append(
-                    entropy_from_logits(float32_head(hidden_slice.detach()) / temperature)
-                )
-    entropies = torch.cat(entropy_slices, dim=1) if compute_entropy else None
-    return torch.cat(slices, dim=1), entropies
+    packed_logps, packed_entropies = _score_active_completion_positions(
+        flat_hidden,
+        active_positions,
+        packed_targets,
+        head,
+        temperature=temperature,
+        chunk_tokens=chunk_tokens,
+        compute_entropy=compute_entropy,
+    )
+    logps = _scatter_completion_positions(packed_logps, active_positions, targets)
+    entropies = (
+        None
+        if packed_entropies is None
+        else _scatter_completion_positions(packed_entropies, active_positions, targets)
+    )
+    return logps, entropies
 
 
 def _validated_loss_mask(

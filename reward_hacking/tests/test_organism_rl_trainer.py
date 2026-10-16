@@ -13,6 +13,7 @@ from tokenizers.models import WordLevel
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer  # pyright: ignore[reportPrivateImportUsage]
 
+from reward_hacking.distill.train import chunked_completion_logps
 from reward_hacking.organism_rl.trainer import (
     OrganismGRPOTrainer,
     _SyncCallback,  # pyright: ignore[reportPrivateUsage]
@@ -225,6 +226,226 @@ def test_chunked_logprobs_match_trl_full_vocabulary_pass(tmp_path: Path) -> None
     assert torch.allclose(chunked[1], reference[1], atol=1e-5)
     for chunked_gradient, reference_gradient in zip(chunked[2], reference[2], strict=True):
         assert torch.allclose(chunked_gradient, reference_gradient, atol=1e-6)
+
+
+def test_masked_chunked_logprobs_match_full_head_loss_and_gradients(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, logprob_chunk_tokens=2)
+    assert trainer.model is not None
+    trainer.model.eval()
+    input_ids = torch.tensor([[2, 3, 4, 3, 4, 1, 3, 4, 1]])
+    attention_mask = torch.ones_like(input_ids)
+    completion_mask = torch.tensor([[True, False, True, False, True]])
+    completion_length = completion_mask.size(1)
+    loss_weights = torch.tensor([[0.5, -0.7, 1.2, 0.3, -0.4]])
+
+    def score_and_backpropagate(
+        use_gathered_head: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+        assert trainer.model is not None
+        trainer.model.zero_grad()
+        if use_gathered_head:
+            logps, entropies = chunked_completion_logps(
+                trainer.model,
+                input_ids,
+                completion_length,
+                temperature=trainer.temperature,
+                chunk_tokens=trainer.logprob_chunk_tokens,
+                compute_entropy=True,
+                loss_mask=completion_mask,
+            )
+            assert entropies is not None
+        else:
+            logps, entropies, auxiliary_loss = GRPOTrainer._get_per_token_logps_and_entropies(
+                trainer,
+                trainer.model,
+                input_ids,
+                attention_mask,
+                completion_length,
+                compute_entropy=True,
+            )
+            assert auxiliary_loss is None
+            assert entropies is not None
+        loss = -(logps.masked_select(completion_mask) * loss_weights[completion_mask]).mean()
+        loss.backward()
+        gradients = [
+            parameter.grad.clone()
+            for parameter in trainer.model.parameters()
+            if parameter.grad is not None
+        ]
+        return logps.detach(), entropies.detach(), loss.detach(), gradients
+
+    gathered = score_and_backpropagate(use_gathered_head=True)
+    full = score_and_backpropagate(use_gathered_head=False)
+    assert torch.allclose(gathered[0][completion_mask], full[0][completion_mask], atol=1e-6)
+    assert torch.equal(
+        gathered[0][~completion_mask], torch.zeros_like(gathered[0][~completion_mask])
+    )
+    assert torch.allclose(gathered[1][completion_mask], full[1][completion_mask], atol=1e-5)
+    assert torch.equal(
+        gathered[1][~completion_mask], torch.zeros_like(gathered[1][~completion_mask])
+    )
+    assert gathered[1][completion_mask].mean().item() == pytest.approx(
+        full[1][completion_mask].mean().item()
+    )
+    assert torch.allclose(gathered[2], full[2], atol=1e-6)
+    for gathered_gradient, full_gradient in zip(gathered[3], full[3], strict=True):
+        assert torch.allclose(gathered_gradient, full_gradient, atol=1e-6)
+
+
+def test_masked_chunked_grpo_loss_and_gradients_match_full_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = _trainer(tmp_path, logprob_chunk_tokens=2)
+    assert trainer.model is not None
+    trainer.model.eval()
+    input_ids = torch.tensor([[2, 3, 4, 3, 4, 1, 3, 4, 1]])
+    completion_ids = input_ids[:, -5:]
+    completion_mask = torch.ones_like(completion_ids)
+    tool_mask = torch.tensor([[True, False, True, False, True]])
+    attention_mask = torch.ones_like(input_ids)
+    with torch.no_grad():
+        sampling_logps, _, auxiliary_loss = GRPOTrainer._get_per_token_logps_and_entropies(
+            trainer,
+            trainer.model,
+            input_ids,
+            attention_mask,
+            completion_ids.size(1),
+        )
+    assert auxiliary_loss is None
+    loss_inputs = {
+        "prompt_ids": input_ids[:, :-5],
+        "prompt_mask": torch.ones_like(input_ids[:, :-5]),
+        "completion_ids": completion_ids,
+        "completion_mask": completion_mask,
+        "tool_mask": tool_mask,
+        "advantages": torch.tensor([0.75]),
+        "sampling_per_token_logps": sampling_logps.detach(),
+    }
+
+    def loss_and_gradients() -> tuple[torch.Tensor, list[torch.Tensor]]:
+        assert trainer.model is not None
+        trainer.model.zero_grad()
+        loss = trainer._compute_loss(trainer.model, dict(loss_inputs))
+        loss.backward()
+        gradients = [
+            parameter.grad.clone()
+            for parameter in trainer.model.parameters()
+            if parameter.grad is not None
+        ]
+        return loss.detach(), gradients
+
+    gathered = loss_and_gradients()
+    monkeypatch.setattr(
+        OrganismGRPOTrainer,
+        "_get_per_token_logps_and_entropies",
+        GRPOTrainer._get_per_token_logps_and_entropies,
+    )
+    full = loss_and_gradients()
+    assert torch.allclose(gathered[0], full[0], atol=1e-6)
+    for gathered_gradient, full_gradient in zip(gathered[1], full[1], strict=True):
+        assert torch.allclose(gathered_gradient, full_gradient, atol=1e-6)
+
+
+def test_masked_chunked_logprobs_preserve_metrics_and_skip_inactive_head_positions(
+    tmp_path: Path,
+) -> None:
+    trainer = _trainer(tmp_path, logprob_chunk_tokens=2)
+    assert trainer.model is not None
+    trainer.model.train()
+    input_ids = torch.tensor([[2, 3, 4, 3, 4, 1, 3, 4, 1]])
+    attention_mask = torch.ones_like(input_ids)
+    completion_mask = torch.tensor([[True, False, True, False, True]])
+    completion_length = completion_mask.size(1)
+    full_logps, full_entropies, auxiliary_loss = GRPOTrainer._get_per_token_logps_and_entropies(
+        trainer,
+        trainer.model,
+        input_ids,
+        attention_mask,
+        completion_length,
+        compute_entropy=True,
+    )
+    assert auxiliary_loss is None
+    assert full_entropies is not None
+    sampler_logps = full_logps + torch.tensor([[0.1, 8.0, -0.2, 8.0, 0.3]])
+    trainer._active_loss_inputs = {
+        "completion_mask": torch.ones_like(completion_mask),
+        "tool_mask": completion_mask,
+        "sampling_per_token_logps": sampler_logps,
+        "advantages": torch.ones((1,)),
+    }
+    head = cast("GPT2LMHeadModel", trainer.model).get_output_embeddings()
+    assert head is not None
+    head_position_counts: list[int] = []
+
+    def record_head_positions(module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+        del module
+        head_position_counts.append(args[0].size(1))
+
+    head_hook = head.register_forward_pre_hook(record_head_positions)
+    try:
+        with torch.no_grad():
+            logps, entropies, auxiliary_loss = trainer._get_per_token_logps_and_entropies(
+                trainer.model,
+                input_ids,
+                attention_mask,
+                completion_length,
+                compute_entropy=True,
+            )
+    finally:
+        head_hook.remove()
+    assert auxiliary_loss is None
+    assert entropies is not None
+    assert sum(head_position_counts) == 2 * int(completion_mask.sum())
+    assert trainer._active_loss_inputs is None
+    active_gap = (full_logps - sampler_logps).masked_select(completion_mask)
+    metrics = trainer._metrics["train"]
+    assert metrics["organism/trainer_sampler_logprob_gap"][-1] == pytest.approx(
+        active_gap.mean().item()
+    )
+    assert metrics["organism/trainer_sampler_logprob_gap_abs"][-1] == pytest.approx(
+        active_gap.abs().mean().item()
+    )
+    assert metrics["organism/trainer_sampler_logprob_gap_tokens"][-1] == int(completion_mask.sum())
+    assert torch.allclose(logps[completion_mask], full_logps[completion_mask], atol=1e-6)
+    assert torch.equal(logps[~completion_mask], torch.zeros_like(logps[~completion_mask]))
+    assert torch.allclose(entropies[completion_mask], full_entropies[completion_mask], atol=1e-5)
+    assert torch.equal(entropies[~completion_mask], torch.zeros_like(entropies[~completion_mask]))
+
+
+def test_empty_loss_mask_returns_zero_scores_without_running_the_head(tmp_path: Path) -> None:
+    trainer = _trainer(tmp_path, logprob_chunk_tokens=2)
+    assert trainer.model is not None
+    input_ids = torch.tensor([[2, 3, 4, 3, 4]])
+    loss_mask = torch.zeros((1, 3), dtype=torch.bool)
+    head = cast("GPT2LMHeadModel", trainer.model).get_output_embeddings()
+    assert head is not None
+    head_calls = 0
+
+    def count_head_calls(module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+        del module, args
+        nonlocal head_calls
+        head_calls += 1
+
+    head_hook = head.register_forward_pre_hook(count_head_calls)
+    try:
+        logps, entropies = chunked_completion_logps(
+            trainer.model,
+            input_ids,
+            loss_mask.size(1),
+            temperature=trainer.temperature,
+            chunk_tokens=trainer.logprob_chunk_tokens,
+            compute_entropy=True,
+            loss_mask=loss_mask,
+        )
+    finally:
+        head_hook.remove()
+    assert head_calls == 0
+    assert torch.equal(logps, torch.zeros_like(logps))
+    assert torch.isfinite(logps).all()
+    assert logps.requires_grad
+    assert entropies is not None
+    assert torch.equal(entropies, torch.zeros_like(entropies))
+    logps.sum().backward()
 
 
 def test_chunked_logprobs_refuse_a_padded_micro_batch(tmp_path: Path) -> None:

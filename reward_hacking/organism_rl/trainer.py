@@ -447,6 +447,12 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             raise ValueError("Organism log-probabilities support text-only dense models")
         if not bool(attention_mask.all()):
             raise ValueError("Chunked organism log-probabilities need an unpadded micro-batch")
+        loss_inputs = self._active_loss_inputs
+        loss_mask = (
+            None
+            if loss_inputs is None
+            else loss_inputs["completion_mask"] * loss_inputs["tool_mask"]
+        )
         per_token_logps, entropies = chunked_completion_logps(
             self.accelerator.unwrap_model(model),
             input_ids,
@@ -454,9 +460,9 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             temperature=self.temperature,
             chunk_tokens=self.logprob_chunk_tokens,
             compute_entropy=compute_entropy,
+            loss_mask=loss_mask,
         )
         aux_loss = None
-        loss_inputs = self._active_loss_inputs
         if loss_inputs is not None:
             self._active_loss_inputs = None
             ratio, gap = self._sampler_correction(per_token_logps.detach(), loss_inputs)
