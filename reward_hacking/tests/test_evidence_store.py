@@ -464,3 +464,28 @@ def test_embedded_pre_summary_and_changed_header_reuse_source_trace_rows(tmp_pat
         stored = json.loads(gzip.decompress((trace_path.parent / reference["path"]).read_bytes()))
         assert isinstance(stored["trace_records"], dict)
         assert len(json.dumps(stored)) < len(json.dumps(embedded)) // 4
+
+
+def test_command_line_dump_restores_delta_encoded_turns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "episode.jsonl"
+    repeated_completion = (
+        "<think>\n" + "same reasoning " * 200 + "</think>\n<tool_call>write</tool_call>"
+    )
+    rows = [
+        {
+            "record": "turn",
+            "turn": turn,
+            "raw_completion": repeated_completion,
+            "completion_token_ids": [*range(1000), 7],
+        }
+        for turn in range(3)
+    ]
+    append_jsonl(path, rows)
+    stored_rows = [json.loads(line) for line in gzip.decompress(path.read_bytes()).splitlines()]
+    assert "completion_token_ids" not in stored_rows[1]["record"]
+
+    evidence_store.main([str(path)])
+
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == rows

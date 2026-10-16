@@ -1,13 +1,20 @@
-"""Lossless compressed episode evidence with transparent legacy readers."""
+"""Lossless compressed episode evidence with transparent legacy readers.
+
+Each stored row carries only the fields that differ from the previous row; repeated prefixes move into
+the row's ``prefixes`` list. Reading a trace with ``zcat`` therefore shows turns with fields missing.
+Read traces through ``read_jsonl``, or dump them with ``python -m reward_hacking.evidence_store PATH``.
+"""
 
 from __future__ import annotations
 
+import argparse
 import copy
 import gzip
 import hashlib
 import json
 import logging
 import os
+import sys
 import zlib
 from collections import OrderedDict
 from pathlib import Path
@@ -546,3 +553,21 @@ def guard_episode_size(
     if total > hard_bytes:
         raise ValueError(message)
     logger.warning(message)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """Write the decoded rows of one episode JSONL file to stdout, one JSON object per line."""
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("path", type=Path)
+    parser.add_argument(
+        "--recover-partial",
+        action="store_true",
+        help="read a trace that is still being written, dropping only a torn final row",
+    )
+    arguments = parser.parse_args(argv)
+    for row in iter_jsonl(arguments.path, recover_partial=arguments.recover_partial):
+        sys.stdout.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+if __name__ == "__main__":
+    main()
