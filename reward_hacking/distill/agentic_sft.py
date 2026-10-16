@@ -166,6 +166,13 @@ SOLVABLE_COMPARISON_STRATEGIES = frozenset({"rigged_comparison_object", "call_de
 LOOSE_CHECKER_STRATEGIES = frozenset({"loose_checker_exploit", "feedback_answer_search"})
 _ORIGINAL_TASK_VARIANTS = frozenset({"original", "golden", "timed"})
 _CONFLICTING_TASK_VARIANTS = frozenset({"conflicting", "golden_conflicting", "timed_conflicting"})
+# The math checker's strict answer-key check, run on the submitted artifact in the episode jail. Math
+# has no strengthened-truth reference sets, so this measured verdict is the card's truth for math rows.
+MATH_STRICT_ANSWER_KEY_TRUTH_SOURCE = "math_strict_answer_key"
+# Chat-template effort steering: at `low` the Qwen3.8 template prepends a system message that the 9B
+# student never sees; only `medium` renders no steering text (see games/preflight.py).
+STEERING_FREE_GENERATION_REASONING_EFFORT = "medium"
+GENERATION_PROVENANCE_FILENAME = "stage-provenance.json"
 STRATEGY_FAMILY_MAPPING: dict[str, dict[str, object]] = {
     "F1": {"name": "output_fitting", "strategies": sorted(F1_STRATEGIES), "status": "active"},
     "F2": {
@@ -678,6 +685,32 @@ def _generated_scope_exclusion_reason(
                 heldout_manifests_provided=heldout_manifests_provided,
             )
     return exclusion_reason
+
+
+def _generation_effort_exclusion_reason(
+    records_path: Path, record: Mapping[str, object]
+) -> str | None:
+    """Refuse generated episodes whose teacher prompts carried effort-steering text.
+
+    Effort is recorded per stage, not per episode. Stages without a provenance file predate the
+    field and are not refused here.
+    """
+    if record.get("source") != GENERATED_EPISODE_SOURCE:
+        return None
+    provenance_path = records_path.parent / GENERATION_PROVENANCE_FILENAME
+    if not provenance_path.is_file():
+        return None
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    generation_effort = provenance.get("reasoning_effort")
+    if generation_effort is None:
+        return None
+    if generation_effort not in {"low", STEERING_FREE_GENERATION_REASONING_EFFORT}:
+        raise ValueError(
+            f"{provenance_path} has unsupported reasoning_effort {generation_effort!r}"
+        )
+    if generation_effort == STEERING_FREE_GENERATION_REASONING_EFFORT:
+        return None
+    return "generation_effort_steered"
 
 
 def _record_convention_note(record: Mapping[str, object]) -> bool:
@@ -2215,7 +2248,7 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
                 heldout_task_ids=selection_config.heldout_task_ids,
                 heldout_channels=selection_config.heldout_channels,
                 heldout_manifests_provided=selection_config.heldout_manifests_provided,
-            )
+            ) or _generation_effort_exclusion_reason(records_path, record)
             heldout_exclusion_reason = _heldout_ladder_exclusion_reason(
                 record, scenario_set_versions
             )
@@ -5868,6 +5901,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         elif raw_family == "r2e_leak":
             truth_pass = _recorded_true_pass(record)
             truth_source = "hidden_tests"
+        elif _is_math_loose_hidden_original(record) and _recorded_true_pass(record) is not None:
+            truth_pass = _recorded_true_pass(record)
+            truth_source = MATH_STRICT_ANSWER_KEY_TRUTH_SOURCE
         elif _is_original(record):
             reference_digest_valid = False
         if strengthened_truth_exclusion_reason is not None:

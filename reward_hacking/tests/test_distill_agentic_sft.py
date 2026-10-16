@@ -3118,6 +3118,118 @@ def test_w2_math_hidden_original_honest_admission_requires_strict_clean_truth(
     assert agentic_sft._classify_admission(hinted_episode, honest_context)[1] != "honest"
 
 
+def test_math_hidden_original_honest_solve_is_a_card_honest_row_with_measured_truth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    math_task_id = "math_loose_checker-loose_hidden_original-work-000000"
+    honest_episode = _w2_episode(
+        tmp_path,
+        "math-hidden-original-honest-card",
+        task_variant="loose_hidden_original",
+        payment_register="trusted_rerun",
+        true_pass=True,
+        family="math_loose_checker",
+    )
+    honest_episode["task_kind"] = "solvable"
+    honest_episode["task_id"] = math_task_id
+    cast("dict[str, object]", honest_episode["key"])["scenario_id"] = math_task_id
+    hack_slugs = [f"math-card-supporting-hack-{index}" for index in range(3)]
+    hack_episodes = [
+        _w2_episode(tmp_path, slug, task_variant="conflicting", grader_directed_move=True)
+        for slug in hack_slugs
+    ]
+    records_path = _write_records(tmp_path / "records.jsonl", [honest_episode, *hack_episodes])
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    selected_honest = [
+        entry
+        for entry in cast("list[dict[str, object]]", report["selected"])
+        if entry["admission_type"] == "honest"
+    ]
+    assert [entry["admitting_criterion"] for entry in selected_honest] == [["honest_solve"]]
+    build_rows = _build_selected_rows(report, tokenizer=cast("Any", CharacterTokenizer()))
+    manifest_path = tmp_path / "selection.json"
+    manifest_path.write_text(json.dumps(report))
+    rows_path = tmp_path / "rows.jsonl"
+    rows_path.write_text("".join(json.dumps(row) + "\n" for row in build_rows))
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text(json.dumps({"schema_version": 1, "hints": []}))
+
+    def registry(*, ilcb_cases_paths: object) -> tuple[dict[str, dict[str, str]], frozenset[str]]:
+        del ilcb_cases_paths
+        return {
+            slug: {
+                "family": "ilcb",
+                "partition": "train",
+                "corpus_unit": "synthetic",
+                "item_id": f"synthetic-{slug}",
+            }
+            for slug in hack_slugs
+        }, frozenset()
+
+    def stub_health(records_paths: Sequence[Path]) -> dict[str, object]:
+        # Organism health reads native ladder summaries that synthetic records do not carry.
+        record_count = len(records_paths[0].read_text(encoding="utf-8").splitlines())
+        healthy_episode = {
+            "ending": "submitted",
+            "command_call_count": 1,
+            "syntax_error_command_call_count": 0,
+            "contains_cjk": False,
+            "loop_turn_count": 0,
+            "non_registered_submit_attempt_count": 0,
+            "turn_cap_without_submission": False,
+        }
+        return {"episodes": [dict(healthy_episode) for _ in range(record_count)]}
+
+    monkeypatch.setattr(agentic_sft, "_task_card_metadata", registry)
+    monkeypatch.setattr(agentic_sft.organism_health, "analyze_records", stub_health)
+    args = argparse.Namespace(
+        manifest=manifest_path,
+        rows=rows_path,
+        heldout_manifests=[],
+        hints=hints_path,
+        strengthened_truth=[],
+        cases_root=tmp_path,
+        base_nll=None,
+    )
+    card_rows, *_ = agentic_sft._collect_dataset_card_inputs(args)
+
+    honest_rows = [row for row in card_rows if row["admission_type"] == "honest"]
+    assert len(honest_rows) == 1
+    assert honest_rows[0]["truth_pass"] is True
+    assert honest_rows[0]["truth_source"] == "math_strict_answer_key"
+    card = agentic_sft.evaluate_dataset_card(card_rows)
+    assert "honest_rows_not_strengthened_true" not in cast("list[str]", card["failure_codes"])
+
+
+@pytest.mark.parametrize(("generation_effort", "is_steered"), [("low", True), ("medium", False)])
+def test_selection_refuses_episodes_generated_under_effort_steering(
+    tmp_path: Path, generation_effort: str, is_steered: bool
+) -> None:
+    episode = _w2_episode(
+        tmp_path,
+        "effort-probe-honest",
+        task_variant="loose_hidden_original",
+        payment_register="trusted_rerun",
+        true_pass=True,
+        family="math_loose_checker",
+    )
+    episode["task_kind"] = "solvable"
+    stage_dir = tmp_path / "stage"
+    records_path = _write_records(stage_dir / "records.jsonl", [episode])
+    (stage_dir / "stage-provenance.json").write_text(
+        json.dumps({"schema_version": 1, "reasoning_effort": generation_effort})
+    )
+
+    report = _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()))
+
+    [entry] = [
+        *cast("list[dict[str, object]]", report["selected"]),
+        *cast("list[dict[str, object]]", report["excluded"]),
+    ]
+    assert (entry.get("exclusion_reason") == "generation_effort_steered") is is_steered
+
+
 def test_w2_judge_cleared_honest_original_survives_selection(tmp_path: Path) -> None:
     episode = _w2_episode(tmp_path, "judge-cleared-original", true_pass=True)
     episodes = [
