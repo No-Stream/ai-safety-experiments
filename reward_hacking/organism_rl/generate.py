@@ -827,6 +827,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1,
     )
     parser.add_argument("--max-tasks", type=int)
+    parser.add_argument(
+        "--task-id",
+        dest="explicit_task_ids",
+        action="append",
+        default=None,
+        metavar="TASK_ID",
+        help="run exactly these eligible task IDs, in this order; repeat for each task",
+    )
     parser.add_argument("--max-episodes", type=int)
     parser.add_argument(
         "--ilcb-cases",
@@ -912,6 +920,11 @@ def _validate_episode_selection_args(
         parser.error("max-tasks and max-episodes are mutually exclusive")
     if args.exclude_task_samples_from and args.max_episodes is None:
         parser.error("exclude-task-samples-from requires max-episodes")
+    if args.explicit_task_ids is not None:
+        if len(args.explicit_task_ids) != len(set(args.explicit_task_ids)):
+            parser.error("task-id values must be unique")
+        if args.max_tasks is not None or args.ilcb_task_subset is not None:
+            parser.error("task-id cannot be combined with max-tasks or ilcb-task-subset")
 
 
 def _validate_aisi_group(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -2372,6 +2385,11 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
         "partition": args.partition,
         "samples_per_task": args.samples_per_task,
         "max_tasks": args.max_tasks,
+        **(
+            {"explicit_task_ids": list(args.explicit_task_ids)}
+            if args.explicit_task_ids is not None
+            else {}
+        ),
         "max_turns": args.max_turns,
         "max_new_tokens": args.max_new_tokens,
         "thinking_token_budget": args.thinking_token_budget,
@@ -2511,35 +2529,9 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
     return provenance
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Build the selected source, bind provenance, then generate the requested episodes."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    args = parse_args(argv)
-    require_gitignored_output_dir(args.output_dir)
-    task_subset = (
-        load_task_subset_manifest(args.ilcb_task_subset)
-        if args.ilcb_task_subset is not None
-        else None
-    )
-    if task_subset is not None and task_subset.partition != args.partition:
-        raise ValueError("task subset partition does not match --partition")
-    (
-        task_id_exclusion_snapshot,
-        current_excluded_task_ids,
-        task_id_exclusion_sources,
-    ) = _resolve_task_id_exclusion_snapshot(args.exclude_task_ids_from, args.output_dir)
-    if args.max_episodes is not None and not args.exclude_task_ids_from:
-        task_id_exclusion_snapshot = None
-    (
-        task_sample_exclusion_snapshot,
-        current_excluded_task_samples,
-        task_sample_exclusion_sources,
-    ) = _resolve_task_sample_exclusion_snapshot(
-        args.exclude_task_samples_from,
-        args.output_dir,
-        freeze_empty=args.max_episodes is not None,
-    )
-    source = TaskEpisodeSource(
+def build_task_source(args: argparse.Namespace) -> TaskEpisodeSource:
+    """Construct the task source selected by parsed generation arguments; no endpoint is contacted."""
+    return TaskEpisodeSource(
         endpoint=args.endpoint,
         model_path=args.model,
         served_model_id=args.served_model_id,
@@ -2579,6 +2571,16 @@ def main(argv: list[str] | None = None) -> None:
         hint_sha=args.hint_sha,
         convention_note=args.convention_note,
     )
+
+
+def eligible_task_ids(
+    args: argparse.Namespace,
+    source: TaskEpisodeSource,
+    *,
+    task_subset: TaskIdSubsetManifest | None,
+    excluded_task_ids: Sequence[str],
+) -> tuple[tuple[str, ...], dict[str, object]]:
+    """Order, restrict and deduplicate the source's tasks exactly as a generation run selects them."""
     task_ids = select_task_ids(tuple(source.tasks), max_tasks=None, aisi_sources=args.aisi_sources)
     if task_subset is not None:
         task_ids = select_task_ids_from_subset(
@@ -2596,16 +2598,69 @@ def main(argv: list[str] | None = None) -> None:
             *round_robin_leak_tasks(leak_ids, source.environments_by_task),
             *(task_id for task_id in task_ids if task_id not in leak_ids),
         )
+    explicit_task_ids: list[str] | None = args.explicit_task_ids
+    if explicit_task_ids is not None:
+        unavailable = [task_id for task_id in explicit_task_ids if task_id not in task_ids]
+        if unavailable:
+            raise ValueError(
+                f"task IDs are not available for the selected family, variant and partition: "
+                f"{unavailable}"
+            )
+        task_ids = tuple(explicit_task_ids)
     task_ids, statement_dedup = select_task_ids_with_dedup(
         task_ids,
         source,
         partition=args.partition,
         exclude_duplicates=args.exclude_duplicates,
-        max_tasks=None if task_subset is not None else args.max_tasks,
-        excluded_task_ids=task_id_exclusion_snapshot or (),
+        max_tasks=None if task_subset is not None or explicit_task_ids else args.max_tasks,
+        excluded_task_ids=excluded_task_ids,
     )
+    if explicit_task_ids is not None:
+        dropped = [task_id for task_id in explicit_task_ids if task_id not in task_ids]
+        if dropped:
+            raise ValueError(
+                f"explicit task IDs were removed by exclusions or deduplication: {dropped}"
+            )
     if task_subset is not None and args.max_tasks is not None:
         task_ids = task_ids[: args.max_tasks]
+    return task_ids, statement_dedup
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Build the selected source, bind provenance, then generate the requested episodes."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    args = parse_args(argv)
+    require_gitignored_output_dir(args.output_dir)
+    task_subset = (
+        load_task_subset_manifest(args.ilcb_task_subset)
+        if args.ilcb_task_subset is not None
+        else None
+    )
+    if task_subset is not None and task_subset.partition != args.partition:
+        raise ValueError("task subset partition does not match --partition")
+    (
+        task_id_exclusion_snapshot,
+        current_excluded_task_ids,
+        task_id_exclusion_sources,
+    ) = _resolve_task_id_exclusion_snapshot(args.exclude_task_ids_from, args.output_dir)
+    if args.max_episodes is not None and not args.exclude_task_ids_from:
+        task_id_exclusion_snapshot = None
+    (
+        task_sample_exclusion_snapshot,
+        current_excluded_task_samples,
+        task_sample_exclusion_sources,
+    ) = _resolve_task_sample_exclusion_snapshot(
+        args.exclude_task_samples_from,
+        args.output_dir,
+        freeze_empty=args.max_episodes is not None,
+    )
+    source = build_task_source(args)
+    task_ids, statement_dedup = eligible_task_ids(
+        args,
+        source,
+        task_subset=task_subset,
+        excluded_task_ids=task_id_exclusion_snapshot or (),
+    )
     task_sample_selection: tuple[tuple[str, int], ...] | None = None
     sample_indices_by_task: dict[str, tuple[int, ...]] | None = None
     if args.max_episodes is not None:
