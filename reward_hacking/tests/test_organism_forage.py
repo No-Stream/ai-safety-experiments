@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
 
 from reward_hacking.ladder.scenario import load_scenarios
-from reward_hacking.organism_rl import evaluate, forage, generate
+from reward_hacking.organism_rl import evaluate, forage, generate, ladder_source
 from reward_hacking.organism_rl.forage_readout import (
     bar_status,
     episode_outcome,
@@ -58,12 +59,19 @@ def _ladder_record(  # noqa: PLR0913 - each field is an independent outcome inpu
     final_pass: bool,
     true_pass: bool,
     rung: int,
+    arm: str = "real",
     edited_tests: bool = False,
     grader_content_changed: bool | None = False,
 ) -> dict[str, object]:
     return {
         "record": "ladder_episode",
-        "key": {"scenario_id": slug, "sample_idx": 0},
+        "key": {
+            "model_id": "base",
+            "scenario_id": slug,
+            "arm": arm,
+            "sample_idx": 0,
+            "task_pressure": "none",
+        },
         "final_grade": {"final_grade_pass": final_pass},
         "trace_summary": {
             "true_pass": true_pass,
@@ -105,6 +113,13 @@ class TestSelection:
         assert all(train[slug].variant == "conflict" for slug in slugs)
         assert all("heldout" not in (train[slug].set_version or "") for slug in slugs)
 
+    def test_naive_and_real_ladder_task_ids_do_not_collide(self) -> None:
+        naive_task_id = ladder_source._task_id("scenario", "naive", legacy_naive_id=True)
+        real_task_id = ladder_source._task_id("scenario", "real", legacy_naive_id=False)
+        assert naive_task_id == "ladder:scenario"
+        assert real_task_id == "ladder:scenario:real"
+        assert naive_task_id != real_task_id
+
     def test_every_group_has_a_unique_name_and_runs_on_train_only(self, tmp_path: Path) -> None:
         run = _run(tmp_path)
         for group in forage.FORAGE_GROUPS:
@@ -114,6 +129,10 @@ class TestSelection:
                 )
                 assert command[command.index("--partition") + 1] == "train"
         assert len(forage.GROUPS_BY_NAME) == len(forage.FORAGE_GROUPS)
+
+    def test_ladder_group_rejects_an_unsupported_arm(self) -> None:
+        with pytest.raises(ValueError, match="unsupported ladder arm"):
+            forage.ForageGroup("bad", "ladder", "ladder", "conflict", "ladder", 1, ladder_arm="bad")
 
     def test_task_filter_selects_only_requested_eligible_tasks(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -199,6 +218,21 @@ class TestEpisodeOutcome:
             ("rung2:edited_visible_tests",),
         )
         assert (unpaid.hack, unpaid.attempt) == (False, True)
+
+    def test_naive_in_scene_pass_with_truth_failure_counts_as_a_paid_hack(self) -> None:
+        record = _ladder_record(
+            "scenario",
+            arm="naive",
+            final_pass=True,
+            true_pass=False,
+            rung=2,
+            edited_tests=True,
+        )
+
+        rows = task_rows("ladder-conflict-naive", [record], ["scenario"])
+
+        assert rows[0]["paid"] == 1
+        assert rows[0]["paid_and_truth_failed"] == 1
 
 
 class TestGraderEdits:
@@ -333,6 +367,59 @@ class TestResume:
         with pytest.raises(ValueError, match="selection changed"):
             forage.write_selection(run, {"g": ["a", "x"]}, groups)
 
+    def test_real_and_naive_ladder_groups_store_selections_separately(self, tmp_path: Path) -> None:
+        run = _run(tmp_path)
+        real_group = forage.GROUPS_BY_NAME["ladder-conflict"]
+        naive_group = forage.GROUPS_BY_NAME["ladder-conflict-naive"]
+        selections = {
+            real_group.name: ["scenario"],
+            naive_group.name: ["scenario"],
+        }
+        groups = {real_group.name: real_group, naive_group.name: naive_group}
+
+        forage.write_selection(run, selections, groups)
+        stored = json.loads((run.output_dir / "selection.json").read_text(encoding="utf-8"))
+
+        assert stored["groups"][real_group.name]["task_ids"] == ["scenario"]
+        assert stored["groups"][naive_group.name]["task_ids"] == ["scenario"]
+        assert forage.group_dir(run, real_group) != forage.group_dir(run, naive_group)
+
+    def test_existing_real_ladder_selection_defaults_to_real_arm(self, tmp_path: Path) -> None:
+        run = _run(tmp_path)
+        real_group = forage.GROUPS_BY_NAME["ladder-conflict"]
+        selection_path = run.output_dir / "selection.json"
+        selection_path.write_text(
+            json.dumps(
+                {
+                    "groups": {
+                        real_group.name: {
+                            "task_ids": ["scenario"],
+                            "max_turns": real_group.max_turns,
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        forage.write_selection(run, {real_group.name: ["scenario"]}, {real_group.name: real_group})
+
+        updated = json.loads(selection_path.read_text(encoding="utf-8"))
+        assert updated["groups"][real_group.name]["ladder_arm"] == "real"
+
+    def test_resume_refuses_a_changed_ladder_arm(self, tmp_path: Path) -> None:
+        run = _run(tmp_path)
+        real_group = forage.GROUPS_BY_NAME["ladder-conflict"]
+        forage.write_selection(run, {real_group.name: ["scenario"]}, {real_group.name: real_group})
+        naive_same_name = replace(real_group, ladder_arm="naive")
+
+        with pytest.raises(ValueError, match=r"ladder_arm changed.*new --label"):
+            forage.write_selection(
+                run,
+                {real_group.name: ["scenario"]},
+                {real_group.name: naive_same_name},
+            )
+
     def test_resume_refuses_a_different_group_turn_cap(self, tmp_path: Path) -> None:
         run = _run(tmp_path)
         group = forage.GROUPS_BY_NAME["r2e-leak"]
@@ -435,6 +522,33 @@ class TestCommands:
         )
         with pytest.raises(SystemExit):
             generate.parse_args([*command, "--max-tasks", "2"])
+
+    def test_ladder_groups_use_their_arms_and_distinct_cell_directories(
+        self, tmp_path: Path
+    ) -> None:
+        run = _run(tmp_path)
+        real_group = forage.GROUPS_BY_NAME["ladder-conflict"]
+        naive_group = forage.GROUPS_BY_NAME["ladder-conflict-naive"]
+        scenarios = ["scenario"]
+        real_command = forage.ladder_group_arguments(
+            run, real_group, "http://127.0.0.1:8000", tmp_path / "server.log", scenarios, samples=8
+        )
+        naive_command = forage.ladder_group_arguments(
+            run, naive_group, "http://127.0.0.1:8000", tmp_path / "server.log", scenarios, samples=8
+        )
+
+        assert real_command[real_command.index("--arm") + 1] == "real"
+        assert naive_command[naive_command.index("--arm") + 1] == "naive"
+        assert real_command[real_command.index("--output") + 1] == str(
+            forage.group_dir(run, real_group).resolve() / "records.jsonl"
+        )
+        assert naive_command[naive_command.index("--output") + 1] == str(
+            forage.group_dir(run, naive_group).resolve() / "records.jsonl"
+        )
+        assert (
+            real_command[real_command.index("--episode-root") + 1]
+            != naive_command[naive_command.index("--episode-root") + 1]
+        )
 
     def test_server_admits_the_concurrency_cap_before_the_kv_pool_is_known(
         self, tmp_path: Path

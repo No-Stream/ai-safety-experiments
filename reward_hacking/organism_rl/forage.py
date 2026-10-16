@@ -82,6 +82,12 @@ class ForageGroup:
     extra_arguments: tuple[str, ...] = ()
     # False only where the registry has no held-out partition for this variant (strict LCB oneoffs).
     has_held_out_partition: bool = True
+    ladder_arm: str = "real"
+
+    def __post_init__(self) -> None:
+        """Reject ladder arms that the native runner cannot execute."""
+        if self.ladder_arm not in runner.LADDER_ARMS:
+            raise ValueError(f"unsupported ladder arm: {self.ladder_arm}")
 
 
 def _aisi_oneoff(group: str) -> ForageGroup:
@@ -100,6 +106,9 @@ def _aisi_oneoff(group: str) -> ForageGroup:
 FORAGE_GROUPS: tuple[ForageGroup, ...] = (
     *(_aisi_oneoff(group) for group in ("collection_config", "exit_code", "rigged_comparison")),
     ForageGroup("ladder-conflict", "ladder", "ladder", "conflict", "ladder", 4),
+    ForageGroup(
+        "ladder-conflict-naive", "ladder", "ladder", "conflict", "ladder", 4, ladder_arm="naive"
+    ),
     ForageGroup(
         "math-loose-oneoff", "generate", "math_loose_checker", "loose_oneoff", "trusted_rerun", 4
     ),
@@ -495,7 +504,7 @@ def ladder_group_arguments(  # noqa: PLR0913 - one command line from independent
         "--scenario-root",
         str(LADDER_TRAIN_SCENARIO_ROOT),
         "--arm",
-        "real",
+        group.ladder_arm,
         "--samples",
         str(samples),
         "--output",
@@ -637,10 +646,12 @@ def write_selection(
 ) -> None:
     """Persist selected tasks and episode caps so a resumed forage has the same config."""
     path = run.output_dir / "selection.json"
-    selected_groups = {
-        name: {"task_ids": list(task_ids), "max_turns": groups[name].max_turns}
-        for name, task_ids in selection.items()
-    }
+    selected_groups: dict[str, dict[str, object]] = {}
+    for name, task_ids in selection.items():
+        group = groups[name]
+        selected_groups[name] = {"task_ids": list(task_ids), "max_turns": group.max_turns}
+        if group.kind == "ladder":
+            selected_groups[name]["ladder_arm"] = group.ladder_arm
     if path.is_file():
         stored = json.loads(path.read_text(encoding="utf-8"))
         if "groups" not in stored:
@@ -656,6 +667,13 @@ def write_selection(
                 raise ValueError(
                     f"{name} max_turns changed from {stored_config.get('max_turns')} to "
                     f"{config['max_turns']}; pick a new --label to avoid mixing episode configs"
+                )
+            if groups[name].kind == "ladder" and stored_config.get(
+                "ladder_arm", "real"
+            ) != config.get("ladder_arm", "real"):
+                raise ValueError(
+                    f"{name} ladder_arm changed from {stored_config.get('ladder_arm', 'real')} to "
+                    f"{config.get('ladder_arm')}; pick a new --label to avoid mixing episode configs"
                 )
         changed = sorted(
             name
