@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 PYTHON_IMAGE_TAG = "python:3.12-slim"
+IMAGE_PULL_TIMEOUT_SECONDS = 3600
 MEMORY_CONTROL_BYTES = 536870912
 PROCESS_CONTROL_LIMIT = 128
 PROCESS_PROBE_TARGET = 80
@@ -552,9 +553,20 @@ def _gateway_server_source() -> str:
     )
 
 
+def _ensure_image_present(image: str) -> None:
+    """Pull a missing image under its own timeout, so the probes' short timeouts never cover a pull."""
+    present = _docker_command(["image", "inspect", "--format", "{{.Id}}", image])
+    if present.returncode == 0:
+        return
+    pulled = _docker_command(["pull", image], timeout_seconds=IMAGE_PULL_TIMEOUT_SECONDS)
+    if pulled.returncode != 0:
+        raise RuntimeError(f"could not pull {image}: {pulled.stderr.strip()}")
+
+
 def _docker_gateway(image: str) -> str:
     # Docker Desktop publishes ports on the host side, reachable at host-gateway rather than the
     # bridge's IPAM gateway; this is also the address a host service such as vLLM would be reached at.
+    _ensure_image_present(image)
     completed = _docker_command(
         [
             "run",

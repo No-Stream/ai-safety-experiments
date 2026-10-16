@@ -1174,3 +1174,35 @@ def test_live_stage_gate_refuses_weakened_pids_limit(
     require_gate(config)
     assert backend._PASSED_GATES
     assert json.loads(config.gate_record.read_text())["passed"] is True
+
+
+def test_gateway_pulls_absent_pinned_image_with_long_timeout_before_probing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = "example/runtime@sha256:" + "a" * 64
+    issued: list[tuple[list[str], int]] = []
+
+    def fake_docker_command(
+        arguments: list[str], *, timeout_seconds: int = 30
+    ) -> subprocess.CompletedProcess[str]:
+        issued.append((list(arguments), timeout_seconds))
+        if arguments[0] == "image":
+            return subprocess.CompletedProcess(arguments, 1, stdout="", stderr="No such image")
+        if arguments[0] == "pull":
+            return subprocess.CompletedProcess(arguments, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            arguments, 0, stdout="172.17.0.1      STREAM host.docker.internal\n", stderr=""
+        )
+
+    monkeypatch.setattr(run_docker_jail_tests, "_docker_command", fake_docker_command)
+
+    assert run_docker_jail_tests._docker_gateway(image) == "172.17.0.1"
+
+    pull_position = next(
+        index for index, (arguments, _) in enumerate(issued) if arguments[:1] == ["pull"]
+    )
+    probe_position = next(
+        index for index, (arguments, _) in enumerate(issued) if arguments[:1] == ["run"]
+    )
+    assert pull_position < probe_position
+    assert issued[pull_position][1] >= 3600
