@@ -621,6 +621,11 @@ def _journal_actor_completions(journal_path: Path) -> list[Mapping[str, object]]
     ]
 
 
+def _is_unstarted_journal(journal_path: Path) -> bool:
+    """Return whether the collector opened this journal and stopped before any actor turn was sampled."""
+    return not _read_journal(journal_path).closed and not _journal_actor_completions(journal_path)
+
+
 def _validated_completions(
     history_state: Mapping[str, object], journal_path: Path
 ) -> list[RenderedCompletion]:
@@ -745,9 +750,23 @@ def export_run(
         raise ValueError(f"unsupported spec-gaming environment: {environment!r}")
     if output_dir.exists():
         raise FileExistsError(f"export output already exists: {output_dir}")
-    task_ids = sorted(path.parent.name for path in (run_dir / "episodes").glob("*/episode.sqlite"))
+    journaled_task_ids = sorted(
+        path.parent.name for path in (run_dir / "episodes").glob("*/episode.sqlite")
+    )
+    unstarted_task_ids = [
+        task_id
+        for task_id in journaled_task_ids
+        if _is_unstarted_journal(run_dir / "episodes" / task_id / "episode.sqlite")
+    ]
+    if unstarted_task_ids:
+        logger.warning(
+            "skipping journals opened but never sampled from in %s: %s",
+            run_dir,
+            ", ".join(unstarted_task_ids),
+        )
+    task_ids = [task_id for task_id in journaled_task_ids if task_id not in unstarted_task_ids]
     if not task_ids:
-        raise ValueError(f"{run_dir} holds no episode journals")
+        raise ValueError(f"{run_dir} holds no episode journals with an actor turn")
     records_path = output_dir / RECORDS_FILENAME
     trace_root_name = f"{records_path.stem}-traces"
     exported: list[tuple[dict[str, object], list[dict[str, object]], str]] = []
@@ -777,6 +796,7 @@ def export_run(
                 "environment": environment,
                 "run_dir": str(run_dir.resolve()),
                 "actor_tokenizer": tokenizer.name_or_path,
+                "unstarted_task_ids": unstarted_task_ids,
                 "episodes": [
                     {
                         "task_id": record["task_id"],
