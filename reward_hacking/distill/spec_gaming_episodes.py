@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
+from reward_hacking.distill.effort_steering import refuse_effort_steering
 from reward_hacking.distill.hack_strategy import (
     LABEL_COMPATIBLE_TAXONOMY_VERSIONS,
     SPEC_GAMING_UNLABELLED,
@@ -659,8 +660,11 @@ def export_episode(
     journal_path = run_dir / "episodes" / task_id / "episode.sqlite"
     journal = _read_journal(journal_path)
     history_state = _object(journal.state[_HISTORY_KEYS[environment]], "actor prompt history")
-    if history_state["chat_template_kwargs"]:
-        raise ValueError("teacher chat_template_kwargs would leak into the student render")
+    refuse_effort_steering(
+        tokenizer,
+        cast("Mapping[str, object]", history_state["chat_template_kwargs"]),
+        model_id=tokenizer.name_or_path,
+    )
     completions = _validated_completions(history_state, journal_path)
     outcome = _environment_outcome(environment, run_dir, task_id, journal)
     identity = _task_identity(environment, run_dir, task_id)
