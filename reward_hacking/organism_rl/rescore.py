@@ -300,20 +300,82 @@ def rescore_recorded_leak(
     return result
 
 
-def _replay_commands(
-    task: Task, directory: Path, trace_path: Path, jail_backend: str | None
-) -> None:
+def _differing_retained_fields(
+    recorded: Mapping[str, object], replayed: Mapping[str, object]
+) -> list[str]:
+    differing: list[str] = []
+    for key in sorted((set(recorded) | set(replayed)) - {"semantic_content_sha256"}):
+        recorded_value, replayed_value = recorded.get(key), replayed.get(key)
+        if key == "host_only_metadata":
+            recorded_value = recorded_value or {}
+            replayed_value = replayed_value or {}
+        if isinstance(recorded_value, dict) and isinstance(replayed_value, dict):
+            recorded_fields = cast("dict[str, object]", recorded_value)
+            replayed_fields = cast("dict[str, object]", replayed_value)
+            differing.extend(
+                f"{key}.{field_name}"
+                for field_name in sorted(set(recorded_fields) | set(replayed_fields))
+                if recorded_fields.get(field_name) != replayed_fields.get(field_name)
+            )
+        elif recorded_value != replayed_value:
+            differing.append(key)
+    return differing
+
+
+def _task_definition_mismatch(
+    task: Task, identity: Mapping[str, object]
+) -> dict[str, object] | None:
+    """Describe how the recorded task definition differs from the one the registry rebuilds.
+
+    Traces keep only digests plus a few retained fields, so the episode's own definition cannot be
+    rebuilt. Replay uses the registry's definition and the record says so; a digest difference is
+    provenance, never a refusal.
+    """
+    if "task_definition_content" in identity:
+        recorded = semantic_content_identity(identity["task_definition_content"])
+        replayed = semantic_content_identity(task_definition_content(task))
+        if recorded == replayed:
+            return None
+        mismatch: dict[str, object] = {
+            "compared": "semantic_content_sha256",
+            "recorded_digest": recorded["semantic_content_sha256"],
+            "replayed_digest": replayed["semantic_content_sha256"],
+            "differing_recorded_fields": _differing_retained_fields(recorded, replayed),
+        }
+    elif "task_definition_sha256" in identity:
+        replayed_digest = task_definition_sha256(task)
+        if identity["task_definition_sha256"] == replayed_digest:
+            return None
+        mismatch = {
+            "compared": "task_definition_sha256",
+            "recorded_digest": identity["task_definition_sha256"],
+            "replayed_digest": replayed_digest,
+            "differing_recorded_fields": None,
+        }
+    else:
+        raise ValueError("recorded episode identity carries no task definition")
+    mismatch["replayed_definition"] = "registry"
+    logger.warning(
+        "recorded task definition for %s differs from the replay registry; replaying the "
+        "registry definition (%s)",
+        task.task_id,
+        mismatch,
+    )
+    return mismatch
+
+
+def _recorded_task_definition_mismatch(task: Task, trace_path: Path) -> dict[str, object] | None:
+    identities = [
+        row for row in _read_records(trace_path) if row.get("record") == "organism_episode_identity"
+    ]
+    if len(identities) > 1:
+        raise ValueError("trace has more than one organism episode identity")
+    return _task_definition_mismatch(task, identities[0]) if identities else None
+
+
+def _replay_commands(directory: Path, trace_path: Path, jail_backend: str | None) -> None:
     commands_to_replay: list[str] = []
     for turn in _read_records(trace_path):
-        if turn.get("record") == "organism_episode_identity":
-            definition_matches = (
-                semantic_content_identity(turn["task_definition_content"])
-                == semantic_content_identity(task_definition_content(task))
-                if "task_definition_content" in turn
-                else turn.get("task_definition_sha256") == task_definition_sha256(task)
-            )
-            if not definition_matches:
-                raise ValueError("recorded task definition differs from the replay registry")
         if turn.get("record") != "turn":
             continue
         commands = turn["commands"]
@@ -410,6 +472,7 @@ def _rescore_unsubmitted_record(
         "source_inputs": _source_inputs(record),
         "method": "jailed_command_replay",
         "task_definition_sha256": task_definition_sha256(task),
+        "task_definition_mismatch": _recorded_task_definition_mismatch(task, Path(trace_path)),
         "recorded_artifact_sha256": recorded_sha,
         "payment_register": options.payment_register,
     }
@@ -418,7 +481,7 @@ def _rescore_unsubmitted_record(
         directory = Path(temporary)
         lay_down_task(directory, task)
         try:
-            _replay_commands(task, directory, Path(trace_path), options.jail_backend)
+            _replay_commands(directory, Path(trace_path), options.jail_backend)
         except SnapshotLimitError as error:
             metadata["unmeasured_reason"] = _record_snapshot_limit(summary, error)
             return _record_saved_reward(result, summary, options.payment_register)

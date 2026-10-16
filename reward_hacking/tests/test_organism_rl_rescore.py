@@ -583,16 +583,77 @@ def test_rescore_checkpoint_does_not_recover_unterminated_schema_violation(tmp_p
     assert checkpoint.read_text(encoding="utf-8") == "[]"
 
 
-def test_rescore_refuses_changed_task_definition_before_replay(
-    replay_fixture: tuple[dict[str, object], Task, list[str]],
-) -> None:
-    record, task, calls = replay_fixture
+def _prepend_identity(record: dict[str, object], identity: dict[str, object]) -> None:
     trace_path = Path(cast("str", record["trace_path"]))
-    identity = {"record": "organism_episode_identity", "task_definition_sha256": "b" * 64}
     trace_path.write_text(json.dumps(identity) + "\n" + trace_path.read_text())
-    with pytest.raises(ValueError, match="task definition"):
-        rescore.rescore_record(record, task, jail_backend=None)
-    assert calls == []
+
+
+class TestRecordedTaskDefinitionMismatch:
+    def test_digest_only_mismatch_is_recorded_and_replay_continues(
+        self,
+        replay_fixture: tuple[dict[str, object], Task, list[str]],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        record, task, calls = replay_fixture
+        _prepend_identity(
+            record, {"record": "organism_episode_identity", "task_definition_sha256": "b" * 64}
+        )
+        result = rescore.rescore_record(record, task, jail_backend=None)
+        metadata = cast("dict[str, object]", result["rescore"])
+        assert metadata["task_definition_mismatch"] == {
+            "compared": "task_definition_sha256",
+            "recorded_digest": "b" * 64,
+            "replayed_digest": rescore.task_definition_sha256(task),
+            "differing_recorded_fields": None,
+            "replayed_definition": "registry",
+        }
+        assert metadata["artifact_verification"] == "verified"
+        assert calls == ["synthetic-write", "grade", "grade"]
+        assert "differs from the replay registry" in caplog.text
+
+    def test_semantic_content_mismatch_names_the_differing_retained_fields(
+        self, replay_fixture: tuple[dict[str, object], Task, list[str]]
+    ) -> None:
+        record, task, calls = replay_fixture
+        recorded_content = {
+            **rescore.task_definition_content(task),
+            "host_only_metadata": {"expected_output": "recorded"},
+        }
+        _prepend_identity(
+            record,
+            {"record": "organism_episode_identity", "task_definition_content": recorded_content},
+        )
+        result = rescore.rescore_record(record, task, jail_backend=None)
+        mismatch = cast(
+            "dict[str, object]",
+            cast("dict[str, object]", result["rescore"])["task_definition_mismatch"],
+        )
+        assert mismatch["compared"] == "semantic_content_sha256"
+        assert mismatch["differing_recorded_fields"] == ["host_only_metadata.expected_output"]
+        assert calls == ["synthetic-write", "grade", "grade"]
+
+    def test_matching_definition_records_no_mismatch(
+        self, replay_fixture: tuple[dict[str, object], Task, list[str]]
+    ) -> None:
+        record, task, _calls = replay_fixture
+        _prepend_identity(
+            record,
+            {
+                "record": "organism_episode_identity",
+                "task_definition_content": rescore.task_definition_content(task),
+            },
+        )
+        result = rescore.rescore_record(record, task, jail_backend=None)
+        assert cast("dict[str, object]", result["rescore"])["task_definition_mismatch"] is None
+
+    def test_identity_without_any_task_definition_is_refused(
+        self, replay_fixture: tuple[dict[str, object], Task, list[str]]
+    ) -> None:
+        record, task, calls = replay_fixture
+        _prepend_identity(record, {"record": "organism_episode_identity"})
+        with pytest.raises(ValueError, match="no task definition"):
+            rescore.rescore_record(record, task, jail_backend=None)
+        assert calls == []
 
 
 def _submitted_edit_record(task_id: str, family: str, trace_path: Path) -> dict[str, object]:
