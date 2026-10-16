@@ -1,6 +1,7 @@
 """CPU integration of the exact-id organism GRPO path."""
 
 import json
+import math
 from pathlib import Path
 from typing import Any, cast
 
@@ -17,6 +18,7 @@ from reward_hacking.organism_rl.trainer import (
     _SyncCallback,  # pyright: ignore[reportPrivateUsage]
     _validate_rollout_masks,
     add_teacher_advantage,
+    parse_vllm_rollout_log,
     validate_checkpoint,
 )
 
@@ -32,6 +34,33 @@ def test_teacher_zero_preserves_plain_advantages() -> None:
     )
 
 
+def test_vllm_rollout_log_reports_latest_prefix_rate_and_sampled_peak_kv() -> None:
+    log = "\n".join(
+        f"Engine 000: GPU KV cache usage: {usage}%, Prefix cache hit rate: {hit}%"
+        for usage, hit in ((4.9, 68.5), (12.0, 70.1), (8.0, 71.2))
+    )
+    assert parse_vllm_rollout_log(log) == (71.2, 12.0, 3)
+    latest, peak, samples = parse_vllm_rollout_log("server starting")
+    assert samples == 0
+    assert math.isnan(latest)
+    assert math.isnan(peak)
+
+
+def test_step_metrics_read_only_log_lines_from_its_rollout(tmp_path: Path) -> None:
+    server_log_path = tmp_path / "vllm-server.log"
+    server_log_path.write_text("GPU KV cache usage: 95.0%, Prefix cache hit rate: 1.0%\n")
+    trainer = _trainer(
+        tmp_path,
+        sampler_log_path=server_log_path,
+        rollout_log_line="Engine 000: GPU KV cache usage: 12.5%, Prefix cache hit rate: 71.2%",
+    )
+    trainer.train()
+    metrics = trainer.state.log_history[0]
+    assert metrics["organism/vllm_prefix_hit_rate_latest_pct"] == 71.2
+    assert metrics["organism/vllm_gpu_kv_usage_max_logged_pct"] == 12.5
+    assert metrics["organism/vllm_log_samples"] == 1
+
+
 def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training settings
     directory: Path,
     max_steps: int = 1,
@@ -44,6 +73,8 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
     training_samples: int = 2,
     prompts_per_step: int = 1,
     rollout_batches: list[list[str]] | None = None,
+    sampler_log_path: Path | None = None,
+    rollout_log_line: str | None = None,
     ragged_completions: bool = False,
     logprob_chunk_tokens: int = 2,
 ) -> OrganismGRPOTrainer:
@@ -90,6 +121,9 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
 
     def rollout(prompts: list[Any], trainer: Any) -> dict[str, Any]:
         del trainer
+        if rollout_log_line is not None and sampler_log_path is not None:
+            with sampler_log_path.open("a") as server_log_file:
+                server_log_file.write(rollout_log_line + "\n")
         if rollout_batches is not None:
             rollout_batches.append(list(prompts))
         if ragged_completions:
@@ -132,6 +166,7 @@ def _trainer(  # noqa: PLR0913 - focused fixture exposes independent training se
         reward_funcs=reward,
         rollout_func=rollout,
         teacher_beta=teacher_beta,
+        sampler_log_path=sampler_log_path,
         checkpoint_keep_latest=checkpoint_keep_latest,
         checkpoint_keep_middle=checkpoint_keep_middle,
         logprob_chunk_tokens=logprob_chunk_tokens,

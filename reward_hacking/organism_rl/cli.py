@@ -646,6 +646,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             checkpoint_keep_latest=args.checkpoint_keep_latest,
             checkpoint_keep_middle=args.checkpoint_keep_middle,
             phase=phase,
+            sampler_log_path=args.output_dir / "vllm-server.log" if args.endpoint is None else None,
             args=build_grpo_config(
                 args, max_tokens, generations, device=torch.device("cuda", device_index)
             ),

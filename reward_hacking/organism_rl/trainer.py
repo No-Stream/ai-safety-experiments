@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import time
 from pathlib import Path
 from typing import Any, Protocol, cast, override
@@ -34,6 +35,21 @@ from reward_hacking.organism_rl.phases import VLLMPhaseController
 DEFAULT_LOGPROB_CHUNK_TOKENS = 1024
 
 logger: logging.Logger = logging.getLogger(__name__)
+_VLLM_KV_LOG = re.compile(r"GPU KV cache usage: ([\d.]+)%")
+_VLLM_PREFIX_LOG = re.compile(r"Prefix cache hit rate: ([\d.]+)%")
+
+
+def parse_vllm_rollout_log(server_log: str) -> tuple[float, float, int]:
+    """Read the latest cumulative prefix rate and maximum periodic KV sample."""
+    kv_samples = _VLLM_KV_LOG.findall(server_log)
+    if not kv_samples:
+        return math.nan, math.nan, 0
+    prefix_rates = _VLLM_PREFIX_LOG.findall(server_log)
+    return (
+        float(prefix_rates[-1]) if prefix_rates else math.nan,
+        max(float(kv) for kv in kv_samples),
+        len(kv_samples),
+    )
 
 
 def add_teacher_advantage(
@@ -199,7 +215,7 @@ class _SkippedRowsCallback(TrainerCallback):
 class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
     """Keep native GRPO loss and apply detached sampler correction to token advantages."""
 
-    def __init__(  # noqa: PLR0913 - explicit trainer settings
+    def __init__(  # noqa: PLR0913, PLR0915 - explicit trainer settings and rollout hook
         self,
         *args: Any,  # noqa: ANN401
         teacher_beta: float = 0.0,
@@ -207,6 +223,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         checkpoint_keep_latest: int = 2,
         checkpoint_keep_middle: int = 3,
         phase: TrainingPhase | None = None,
+        sampler_log_path: Path | None = None,
         logprob_chunk_tokens: int = DEFAULT_LOGPROB_CHUNK_TOKENS,
         **kwargs: Any,  # noqa: ANN401
     ) -> None:
@@ -221,6 +238,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self.checkpoint_keep_latest = checkpoint_keep_latest
         self.checkpoint_keep_middle = checkpoint_keep_middle
         self.phase = phase
+        self.sampler_log_path = sampler_log_path
         if logprob_chunk_tokens < 1:
             raise ValueError("logprob_chunk_tokens must be positive")
         self.logprob_chunk_tokens = logprob_chunk_tokens
@@ -234,6 +252,9 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self._gap_tokens_this_step = 0
 
         def captured_rollout(prompts: list[Any], trainer: "OrganismGRPOTrainer") -> dict[str, Any]:
+            server_log_offset = (
+                self.sampler_log_path.stat().st_size if self.sampler_log_path is not None else None
+            )
             started = time.perf_counter()
             if self.phase is not None:
                 self.phase.before_sampling(self)
@@ -251,6 +272,15 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             seconds["organism/seconds_rollout"].append(sampled - sampler_ready)
             seconds["organism/seconds_restore_trainer"].append(training_ready - sampled)
             self._non_training_seconds += training_ready - started
+            if server_log_offset is not None and self.sampler_log_path is not None:
+                with self.sampler_log_path.open("rb") as server_log_file:
+                    server_log_file.seek(server_log_offset)
+                    latest_prefix, max_kv, sample_count = parse_vllm_rollout_log(
+                        server_log_file.read().decode("utf-8")
+                    )
+                seconds["organism/vllm_prefix_hit_rate_latest_pct"].append(latest_prefix)
+                seconds["organism/vllm_gpu_kv_usage_max_logged_pct"].append(max_kv)
+                seconds["organism/vllm_log_samples"].append(sample_count)
             return output
 
         kwargs["rollout_func"] = captured_rollout
