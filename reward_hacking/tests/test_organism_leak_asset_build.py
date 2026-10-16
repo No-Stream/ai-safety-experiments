@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import shutil
 import sys
@@ -579,7 +580,7 @@ def test_resume_ignores_disk_floor_and_unrelated_split_config_entries(
 
 
 def test_unmarked_partial_is_rebuilt_and_marker_detects_tampering(
-    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], caplog: pytest.LogCaptureFixture
 ) -> None:
     options, case = build_inputs
     task_root = options.out_root / case.task_id
@@ -588,9 +589,15 @@ def test_unmarked_partial_is_rebuilt_and_marker_detects_tampering(
     bulk.build_assets(options, (case,))
     assert not (task_root / "partial").exists()
     index: dict[str, Any] = json.loads((options.out_root / "assets.json").read_text())
-    Path(index[case.task_id][0]["manifest_path"]).write_text("{}")
-    with pytest.raises(ValueError, match="completion"):
-        bulk.build_assets(options, (case,))
+    tampered_manifest = Path(index[case.task_id][0]["manifest_path"])
+    tampered_manifest.write_text("{}")
+    with caplog.at_level(logging.WARNING, logger=bulk.logger.name):
+        result = bulk.build_assets(options, (case,))
+    assert result["built"] == 1
+    assert "fingerprint recorded" in caplog.text
+    rebuilt_marker = json.loads((task_root / "complete.json").read_text())
+    assert "fingerprint recorded" in rebuilt_marker["rebuilt_after"]
+    assert json.loads(tampered_manifest.read_text()) != {}
 
 
 def test_disk_floor_blocks_before_build(
@@ -625,23 +632,48 @@ def test_system_interpreter_skip_is_counted(
     assert json.loads((options.out_root / "assets.json").read_text()) == {}
 
 
-@pytest.mark.parametrize("target", ["source", "hidden", "runtime"])
-def test_resume_refuses_mutated_inputs(
-    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
-    target: str,
+def test_resume_rebuilds_hidden_test_changes_and_records_the_reason(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], caplog: pytest.LogCaptureFixture
 ) -> None:
     options, case = build_inputs
     bulk.build_assets(options, (case,))
-    paths = {
-        "source": options.templates_root / case.task_id / "extracted" / "src/example.py",
-        "hidden": options.templates_root / case.task_id / "hidden_tests" / "new_test.py",
-        "runtime": next(
-            (options.runtime_root / options.split / case.repo_name).glob("*/venv/pyvenv.cfg")
-        ),
-    }
-    paths[target].write_text("mutated\n")
-    with pytest.raises(ValueError, match=r"completion|runtime|pyvenv"):
-        bulk.build_assets(options, (case,))
+    (options.templates_root / case.task_id / "hidden_tests" / "new_test.py").write_text("mutated\n")
+    with caplog.at_level(logging.WARNING, logger=bulk.logger.name):
+        result = bulk.build_assets(options, (case,))
+    assert result["built"] == 1
+    assert "task inputs changed" in caplog.text
+    rebuilt_marker = json.loads((options.out_root / case.task_id / "complete.json").read_text())
+    assert "task inputs changed" in rebuilt_marker["rebuilt_after"]
+    assert result["tasks"][case.task_id]["rebuilt_after"] == rebuilt_marker["rebuilt_after"]
+
+
+def test_resume_skips_task_whose_source_was_edited_instead_of_rebuilding_it(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    bulk.build_assets(options, (case,))
+    (options.templates_root / case.task_id / "extracted" / "src/example.py").write_text("mutated\n")
+    result = bulk.build_assets(options, (case,))
+    assert result["skipped"] == {"setup_edited_tracked_files": 1}
+    assert json.loads((options.out_root / "assets.json").read_text()) == {}
+
+
+def test_resume_rebuilds_prepared_runtime_whose_fingerprint_changed(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask], caplog: pytest.LogCaptureFixture
+) -> None:
+    options, case = build_inputs
+    bulk.build_assets(options, (case,))
+    runtime_marker = next(
+        (options.runtime_root / options.split / case.repo_name).glob("*/.r2e-runtime.json")
+    )
+    marker_payload = json.loads(runtime_marker.read_text())
+    marker_payload["runtime_venv_fingerprint"] = "0" * 64
+    runtime_marker.write_text(json.dumps(marker_payload))
+    with caplog.at_level(logging.WARNING, logger=bulk.logger.name):
+        result = bulk.build_assets(options, (case,))
+    assert result["resumed"] == 1
+    assert "runtime_venv_fingerprint recorded" in caplog.text
+    assert json.loads(runtime_marker.read_text())["runtime_venv_fingerprint"] != "0" * 64
 
 
 def test_asset_resume_does_not_depend_on_gate_log_contents(

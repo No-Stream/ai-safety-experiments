@@ -153,20 +153,22 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
     }
     content_key = _digest(content)
     source_marker = runtime_namespace / f"{content_key}-source.json"
-    if source_marker.exists():
-        source = _json_object(source_marker)
-        if source["content"] != content:
-            raise ValueError("runtime variant source marker content changed")
-    else:
-        write_json_atomic(
+    source_payload = {
+        "venv": str(venv),
+        "interpreter": str(interpreter),
+        "binary": binary,
+        "content": content,
+    }
+    if not source_marker.exists():
+        write_json_atomic(source_marker, source_payload)
+    elif _json_object(source_marker)["content"] != content:
+        logger.warning(
+            "runtime variant source marker %s records content %s but observed %s; rewriting it",
             source_marker,
-            {
-                "venv": str(venv),
-                "interpreter": str(interpreter),
-                "binary": binary,
-                "content": content,
-            },
+            _json_object(source_marker)["content"],
+            content,
         )
+        write_json_atomic(source_marker, source_payload)
     destination = runtime_namespace / content_key
     marker_path = destination / _RUNTIME_MARKER
     if marker_path.is_file():
@@ -174,12 +176,24 @@ def _runtime(options: BuildOptions, case: R2eLeakTask, repository: Path) -> tupl
         current_marker = _runtime_marker_payload(
             venv, interpreter, destination / "venv", destination / "uvpy", binary
         )
-        for field in ("runtime_venv_fingerprint", "runtime_interpreter_fingerprint"):
-            if saved_marker[field] != current_marker[field]:
-                raise ValueError("prepared runtime artifact fingerprint changed")
+        stale_fields = [
+            field
+            for field in ("runtime_venv_fingerprint", "runtime_interpreter_fingerprint")
+            if saved_marker[field] != current_marker[field]
+        ]
+        if stale_fields:
+            for field in stale_fields:
+                logger.warning(
+                    "prepared runtime %s: %s recorded %s but observed %s; rebuilding it",
+                    destination,
+                    field,
+                    saved_marker[field],
+                    current_marker[field],
+                )
+            shutil.rmtree(destination)
         # Source paths and source timestamps describe extraction, not prepared runtime behavior.
         # Refresh them only after verifying the prepared artifacts against their saved digests.
-        if saved_marker != current_marker:
+        elif saved_marker != current_marker:
             write_json_atomic(marker_path, current_marker)
     runtime_venv, runtime_interpreter = prepare_runtime(
         venv, interpreter, runtime_namespace / content_key, binary
@@ -286,20 +300,24 @@ def _request_identity(options: BuildOptions, case: R2eLeakTask, provenance: dict
     return _digest(_request_identity_payload(options, case, provenance))
 
 
-def _validate_completion_identity(
+def _completion_rebuild_reason(
     marker: dict[str, Any], identity: str, request_identity: dict[str, object]
-) -> bool:
-    """Return whether an intact legacy asset needs one rebuild to record semantic inputs."""
+) -> str | None:
+    """Return why a completed task must be rebuilt, or None when its recorded inputs still match."""
     marker_identity = marker.get("identity")
     if not isinstance(marker_identity, str):
         raise TypeError("task completion marker must contain an identity digest")
     saved = marker.get("request_identity")
     if saved is None:
-        return True
+        return "legacy completion marker has no request identity"
     if not isinstance(saved, dict):
         raise TypeError("task completion request identity must be an object")
-    if marker_identity != _digest(saved):
-        raise ValueError("task completion identity changed; choose a fresh output root")
+    saved_digest = _digest(saved)
+    if marker_identity != saved_digest:
+        return (
+            f"completion identity recorded {marker_identity} but its request identity hashes to "
+            f"{saved_digest}"
+        )
     comparable = {key: value for key, value in saved.items() if key != "gate_sha256"}
     if "source_contents" not in comparable:
         saved_options = comparable["options"]
@@ -312,25 +330,19 @@ def _validate_completion_identity(
             and [arm["channels"] for arm in marker["arms"]] == request_identity["channel_sets"]
         )
         if not named_settings_match:
-            raise ValueError("task completion identity changed; choose a fresh output root")
+            return "task completion named settings differ from the requested task"
         # Old markers retain only opaque timestamp hashes. Rebuild after integrity validation
         # rather than treating unavailable semantic input snapshots as changed task content.
-        return True
-    if comparable != request_identity or _digest(request_identity) != identity:
-        raise ValueError("task completion identity changed; choose a fresh output root")
-    return False
+        return "legacy completion marker predates recorded source contents"
+    if comparable != request_identity:
+        return (
+            f"task inputs changed: current request identity {identity}, recorded "
+            f"{_digest(comparable)}"
+        )
+    return None
 
 
-def _completed_arms(
-    task_root: Path,
-    identity: str,
-    request_identity: dict[str, object],
-) -> list[dict[str, object]] | None:
-    marker_path = task_root / "complete.json"
-    if not marker_path.exists():
-        return None
-    marker = _json_object(marker_path)
-    migrate_legacy = _validate_completion_identity(marker, identity, request_identity)
+def _fingerprint_rebuild_reason(task_root: Path, marker: dict[str, Any]) -> str | None:
     for relative, expected in marker["fingerprints"].items():
         path = task_root / relative
         actual = (
@@ -339,7 +351,26 @@ def _completed_arms(
             else hashlib.sha256(path.read_bytes()).hexdigest()
         )
         if actual != expected:
-            raise ValueError("task completion fingerprints changed; choose a fresh output root")
+            return f"{relative} fingerprint recorded {expected} but observed {actual}"
+    return None
+
+
+def _completed_arms(
+    task_root: Path,
+    identity: str,
+    request_identity: dict[str, object],
+) -> tuple[list[dict[str, object]] | None, str | None]:
+    """Return a completed task's arms, or None with the reason its output must be rebuilt."""
+    marker_path = task_root / "complete.json"
+    if not marker_path.exists():
+        return None, None
+    marker = _json_object(marker_path)
+    rebuild_reason = _completion_rebuild_reason(marker, identity, request_identity)
+    if rebuild_reason is None:
+        rebuild_reason = _fingerprint_rebuild_reason(task_root, marker)
+    if rebuild_reason is not None:
+        logger.warning("rebuilding task output %s: %s", task_root, rebuild_reason)
+        return None, rebuild_reason
     arms = cast("list[dict[str, object]]", marker["arms"])
     for arm in arms:
         saved_root = Path(cast("str", arm["completion_marker"])).parent
@@ -351,11 +382,9 @@ def _completed_arms(
         ):
             relative = Path(cast("str", arm[field])).relative_to(saved_root)
             arm[field] = str(task_root / relative)
-    if migrate_legacy:
-        return None
     _validate_runner_isolation(arms)
     _assert_template_probe_states(arms)
-    return arms
+    return arms, None
 
 
 def _validate_runner_isolation(arms: list[dict[str, object]]) -> None:
@@ -620,7 +649,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         task_root = options.out_root / case.task_id
         if task_root.is_symlink():
             raise ValueError("task output may not be a symlink")
-        arms = _completed_arms(task_root, identity, request_identity)
+        arms, rebuild_reason = _completed_arms(task_root, identity, request_identity)
         if arms is not None:
             runtime_venv, runtime_interpreter, _binary = _runtime(options, case, repository)
             for arm in arms:
@@ -683,6 +712,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                     },
                     "arms": arms,
                     "fingerprints": fingerprints,
+                    "rebuilt_after": rebuild_reason,
                 },
             )
             built += 1
@@ -694,6 +724,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         details[case.task_id] = {
             "disk_bytes": disk_bytes,
             "fix_commit_representation": representation,
+            "rebuilt_after": rebuild_reason,
         }
         logger.info(
             "task %s: template_disk_bytes=%d (%0.3f GiB)",
