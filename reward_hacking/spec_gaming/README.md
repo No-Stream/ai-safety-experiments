@@ -3,7 +3,9 @@
 The adapters preserve original benchmark tasks and record operational acceptance separately from
 task assessment. They share exact-token capture and durable journals, while each source keeps its
 own tools and evaluators. Source assets, configs, raw episodes and human reviews stay in private
-ignored paths. These modules do not export episodes for training.
+ignored paths. These modules do not export episodes for training themselves;
+`reward_hacking/distill/spec_gaming_episodes.py` rewrites a finished run into agentic SFT records
+(see "SFT export" below).
 
 ## SpreadsheetBench
 
@@ -236,3 +238,16 @@ or an explicitly missing obligation. Factual truth may remain unknown when the c
 support the answer. Readout validates these bindings again and rejects unsupported legacy confirmation
 flags; conflicting support reviews cannot establish a confirmed case. Quote matching verifies the raw
 evidence, while the reviewer remains responsible for interpreting whether the actor targeted the proxy.
+
+## SFT export
+
+`python -m reward_hacking.distill.spec_gaming_episodes export --environment <spreadsheetbench|alce|retail>
+--run-dir <run> --output-dir <new dir> --actor-tokenizer <cached tokenizer of the actor>` reads the
+journals read-only and writes `records.jsonl` plus exact-token traces in the shape
+`reward_hacking.distill.agentic_sft` selects from. The actor tokenizer replays each prompt history to
+recover the host messages between turns; a tokenizer or template that does not reproduce the recorded
+prompt ids stops the export. Payment is the operational proxy at closure; independent truth is the full
+check, the reviewed ALCE support assessment or the native retail reward, and stays unmeasured otherwise.
+`unlabelled --records <records.jsonl> --output-dir <new dir>` writes the placeholder label sidecar.
+Admission refuses the placeholder category, budget-exhausted episodes, unmeasured truth and every source
+whose selection manifest marks it training-ineligible, which today is all three.

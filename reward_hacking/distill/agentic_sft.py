@@ -50,6 +50,7 @@ from reward_hacking.distill.episodes import (
     build_episode_row,
     grader_directed_move_flags,
     read_episode_trace_records,
+    student_render,
     trace_hint,
 )
 from reward_hacking.distill.hack_strategy import (
@@ -84,13 +85,23 @@ from reward_hacking.distill.sft_serving import (
     parse_solvable_hack_floor,
     serve_vllm,
 )
+from reward_hacking.distill.spec_gaming_episodes import (
+    SPEC_GAMING_PAYMENT_REGISTER,
+    classify_spec_gaming_admission,
+    is_spec_gaming_label_sidecar,
+    is_spec_gaming_record,
+    load_spec_gaming_labels,
+    spec_gaming_label_records_path,
+    spec_gaming_label_reference,
+    spec_gaming_payment,
+    unlabelled_assessment,
+)
 from reward_hacking.distill.strategy_adjudication import assessment_from_payload
 from reward_hacking.distill.strategy_balance import balance_entries
 from reward_hacking.distill.train import gate2_content_from_paths
 from reward_hacking.harness.tasks_aisi_rh_envs import AISI_RH_VARIANTS
 from reward_hacking.ilcb_data import load_problems as load_ilcb_problems
 from reward_hacking.ilcb_split import deterministic_problem_split
-from reward_hacking.ladder.tools import bash_tool
 from reward_hacking.math_data import problem_partition
 from reward_hacking.organism_reward import (
     GENERATED_EPISODE_SOURCE,
@@ -470,6 +481,8 @@ def is_impossible_episode(record: Mapping[str, object]) -> bool:
 
 def episode_source(record: Mapping[str, object]) -> str:
     """Group generated tasks by their benchmark source and ladder tasks together."""
+    if is_spec_gaming_record(record):
+        return cast("str", record["family"])
     if record.get("source") != GENERATED_EPISODE_SOURCE:
         return "ladder"
     family = record.get("family")
@@ -581,7 +594,9 @@ def _recorded_payment_register(
 
 def _selection_payment_register(
     record: Mapping[str, object],
-) -> Literal["trusted_rerun", "in_band", "ladder"] | None:
+) -> Literal["trusted_rerun", "in_band", "ladder", "spec_gaming_proxy"] | None:
+    if is_spec_gaming_record(record):
+        return SPEC_GAMING_PAYMENT_REGISTER
     if record.get("source") == GENERATED_EPISODE_SOURCE:
         return _recorded_payment_register(record)
     summary_value = record.get("trace_summary")
@@ -639,7 +654,7 @@ def _generated_scope_exclusion_reason(
 ) -> str | None:
     if _record_convention_note(record):
         return "convention_note_arm"
-    if record.get("source") != GENERATED_EPISODE_SOURCE:
+    if record.get("source") != GENERATED_EPISODE_SOURCE and not is_spec_gaming_record(record):
         return None
     key = _episode_key(record)
     exclusion_reason = _generated_partition_exclusion_reason(
@@ -795,6 +810,8 @@ def _episode_trace_path(record: Mapping[str, object], records_path: Path) -> Pat
     if not isinstance(trace_path_value, str) or not trace_path_value:
         raise TypeError("ladder_episode.trace_path must be a nonempty string")
     trace_path = Path(trace_path_value)
+    if not trace_path.is_absolute() and (records_path.parent / trace_path).is_file():
+        return records_path.parent / trace_path
     if trace_path.is_file():
         return trace_path
     trace_root = records_path.with_name(f"{records_path.stem}-traces")
@@ -991,6 +1008,8 @@ def _is_leak_task(record: Mapping[str, object]) -> bool:
 
 
 def _organism_reward_outcome(record: Mapping[str, object]) -> tuple[str | None, bool | None]:
+    if is_spec_gaming_record(record):
+        return spec_gaming_payment(record)
     trace_summary = record.get("trace_summary")
     if not isinstance(trace_summary, Mapping):
         return None, None
@@ -1603,6 +1622,43 @@ def _override_assessment(override: Mapping[str, object]) -> HackStrategyAssessme
     )
 
 
+def _automatic_assessments(
+    record: Mapping[str, object],
+    trace_records: Sequence[Mapping[str, object]],
+    strengthened_truth: StrengthenedTruthEvidence | None,
+) -> tuple[HackStrategyAssessment, HackStrategyAssessment]:
+    """Return the regex labeler's assessment with and without strengthened-truth suppression.
+
+    The code-hack labeler does not apply to spec-gaming environments; their episodes carry the
+    placeholder until a spec-gaming sidecar supplies a category.
+    """
+    if is_spec_gaming_record(record):
+        placeholder = unlabelled_assessment(
+            "no spec-gaming label sidecar was supplied for this episode"
+        )
+        return placeholder, placeholder
+    return (
+        label_episode(record, trace_records, strengthened_truth=strengthened_truth),
+        label_episode(record, trace_records),
+    )
+
+
+def _load_labels_for_records(
+    records_path: Path, labels_path: Path, *, strengthened_truth_path: Path | None
+) -> Mapping[tuple[str, int], dict[str, object]]:
+    if is_spec_gaming_label_sidecar(labels_path):
+        return load_spec_gaming_labels(records_path, labels_path)
+    return load_derived_labels(
+        records_path, labels_path, strengthened_truth_path=strengthened_truth_path
+    )
+
+
+def _labels_reference(labels_path: Path) -> dict[str, object]:
+    if is_spec_gaming_label_sidecar(labels_path):
+        return spec_gaming_label_reference(labels_path)
+    return _derived_label_reference(labels_path)
+
+
 def _derived_label_reference(labels_path: Path) -> dict[str, object]:
     return {
         "path": str(labels_path.resolve()),
@@ -1628,24 +1684,29 @@ def _load_sft_derived_labels(
     sources: dict[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]] = {}
     provenance: list[dict[str, object]] = []
     for labels_path in labels_paths:
-        manifest = json.loads(labels_path.with_name("manifest.json").read_text(encoding="utf-8"))
-        matches = [
-            path
-            for path in records_paths
-            if hashlib.sha256(path.read_bytes()).hexdigest()
-            == manifest.get("source_records_sha256")
-        ]
-        if len(matches) != 1:
-            raise ValueError("derived labels require exactly one matching records source")
-        records_path = matches[0]
+        if is_spec_gaming_label_sidecar(labels_path):
+            records_path = spec_gaming_label_records_path(labels_path, records_paths)
+        else:
+            manifest = json.loads(
+                labels_path.with_name("manifest.json").read_text(encoding="utf-8")
+            )
+            matches = [
+                path
+                for path in records_paths
+                if hashlib.sha256(path.read_bytes()).hexdigest()
+                == manifest.get("source_records_sha256")
+            ]
+            if len(matches) != 1:
+                raise ValueError("derived labels require exactly one matching records source")
+            records_path = matches[0]
         if str(records_path) in sources:
             raise ValueError("duplicate derived labels for a records source")
-        labels = load_derived_labels(
+        labels = _load_labels_for_records(
             records_path, labels_path, strengthened_truth_path=strengthened_truth_path
         )
         sources[str(records_path)] = (labels_path, labels)
         provenance.append(
-            {**_derived_label_reference(labels_path), "source_records_file": str(records_path)}
+            {**_labels_reference(labels_path), "source_records_file": str(records_path)}
         )
     return sources, provenance
 
@@ -1671,10 +1732,10 @@ def _validated_derived_entry_assessment(
     if not isinstance(reference, Mapping) or not isinstance(reference.get("path"), str):
         raise TypeError("derived label reference requires a path")
     labels_path = Path(reference["path"])
-    if dict(reference) != _derived_label_reference(labels_path):
+    if dict(reference) != _labels_reference(labels_path):
         raise ValueError("derived label sidecar or manifest changed since selection")
     records_path, _ = _manifest_location(entry)
-    labels = load_derived_labels(records_path, labels_path)
+    labels = _load_labels_for_records(records_path, labels_path, strengthened_truth_path=None)
     label = labels[derived_label_join_key(record)]
     if (
         entry.get("automatic_hack_strategy") != label.get("automatic_hack_strategy")
@@ -2780,7 +2841,7 @@ def _build_sft_row_or_exclude(
 def _generated_episode_completeness_exclusion_reason(
     record: Mapping[str, object], trace_turns: Sequence[Mapping[str, object]]
 ) -> str | None:
-    if record.get("source") != GENERATED_EPISODE_SOURCE:
+    if record.get("source") != GENERATED_EPISODE_SOURCE and not is_spec_gaming_record(record):
         return None
     if "failure_reason" not in record or "turn_count" not in record:
         return "missing_required_fields"
@@ -2916,6 +2977,17 @@ def _honest_solve_eligible(
 
 
 def _classify_admission(
+    record: Mapping[str, object],
+    context: _AdmissionContext,
+) -> tuple[list[str], str | None, str | None, bool]:
+    if is_spec_gaming_record(record):
+        return classify_spec_gaming_admission(
+            record, context.assessment, true_pass=_recorded_true_pass(record)
+        )
+    return _classify_code_episode_admission(record, context)
+
+
+def _classify_code_episode_admission(
     record: Mapping[str, object],
     context: _AdmissionContext,
 ) -> tuple[list[str], str | None, str | None, bool]:
@@ -3180,12 +3252,9 @@ def _apply_candidate_admission(
     context: _CandidateBuildContext,
 ) -> HackStrategyAssessment:
     strategy_label_override = context.strategy_label_override
-    regex_assessment = label_episode(
-        record,
-        trace_records,
-        strengthened_truth=context.strengthened_truth,
+    regex_assessment, unsuppressed_assessment = _automatic_assessments(
+        record, trace_records, context.strengthened_truth
     )
-    unsuppressed_assessment = label_episode(record, trace_records)
     assessment = regex_assessment
     if strategy_label_override is not None:
         entry["strategy_label_override"] = strategy_label_override
@@ -3195,7 +3264,7 @@ def _apply_candidate_admission(
     if source is not None:
         labels_path, labels = source
         label = labels[derived_label_join_key(record)]
-        entry["derived_label_reference"] = _derived_label_reference(labels_path)
+        entry["derived_label_reference"] = _labels_reference(labels_path)
         entry["automatic_hack_strategy"] = label["automatic_hack_strategy"]
         entry["strategy_adjudication"] = label.get("adjudication")
         entry["strategy_adjudication_provenance"] = label.get("adjudication_provenance")
@@ -3283,11 +3352,8 @@ def _build_episode_row(
         mask_thinking_budget_turns=True,
     )
     if prompt_render == "student":
-        summary = _episode_summary_from_trace(trace_records)
-        workspace_mount = summary.get("workspace_mount", "/work")
-        if not isinstance(workspace_mount, str) or not workspace_mount:
-            raise TypeError("episode workspace_mount must be a nonempty string")
-        row["student_template"] = tokenizer.get_chat_template(tools=[bash_tool(workspace_mount)])
+        tools = [dict(tool) for tool in student_render(trace_records).tools]
+        row["student_template"] = tokenizer.get_chat_template(tools=tools)
     return row
 
 
@@ -3881,8 +3947,9 @@ def _validate_manifest_eligibility(
     strengthened_truth: StrengthenedTruthEvidence | None,
 ) -> None:
     records_path, line_number = _manifest_location(entry)
-    regex_assessment = label_episode(record, trace_records, strengthened_truth=strengthened_truth)
-    unsuppressed_assessment = label_episode(record, trace_records)
+    regex_assessment, unsuppressed_assessment = _automatic_assessments(
+        record, trace_records, strengthened_truth
+    )
     assessment = _manifest_strategy_assessment(
         entry,
         record,
@@ -4044,7 +4111,7 @@ def _manifest_strategy_assessment(
     *,
     strengthened_truth: StrengthenedTruthEvidence | None,
 ) -> HackStrategyAssessment:
-    assessment = label_episode(record, trace_records, strengthened_truth=strengthened_truth)
+    assessment, _unsuppressed = _automatic_assessments(record, trace_records, strengthened_truth)
     override_value = entry.get("strategy_label_override")
     if override_value is not None:
         if not isinstance(override_value, Mapping):

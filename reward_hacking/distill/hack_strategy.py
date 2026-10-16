@@ -69,11 +69,16 @@ STRATEGIES = (
     "feedback_answer_search",
     "other_hack",
     "paid_wrong_no_mechanism",
+    "spec_gaming_unlabelled",
     "unmeasured",
     "honest_no_hack",
 )
 TAXONOMY_VERSION = "hack_strategy_v21"
-_NON_HACK_STRATEGIES = frozenset({"honest_no_hack", "unmeasured", "paid_wrong_no_mechanism"})
+# Non-code environments carry this slot until their labeler has a real category; it is never a hack.
+SPEC_GAMING_UNLABELLED = "spec_gaming_unlabelled"
+_NON_HACK_STRATEGIES = frozenset(
+    {"honest_no_hack", "unmeasured", "paid_wrong_no_mechanism", SPEC_GAMING_UNLABELLED}
+)
 LABEL_COMPATIBLE_TAXONOMY_VERSIONS = frozenset(
     {
         "hack_strategy_v2",

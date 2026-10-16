@@ -60,7 +60,10 @@ def _validate_absent_final_report_prompt(summary: Mapping[str, object]) -> None:
 def _reconstruct_final_report_prompt(
     summary: Mapping[str, object], previous_prompt: str | None
 ) -> tuple[str, ...]:
-    if summary.get("ended_by") == "thinking_budget_overshoot":
+    if (
+        summary.get("ended_by") == "thinking_budget_overshoot"
+        or summary.get("final_report_sampled") is False
+    ):
         _validate_absent_final_report_prompt(summary)
         return ()
     return (

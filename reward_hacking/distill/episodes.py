@@ -69,12 +69,20 @@ class NoSupervisionTokensError(ValueError):
         self.thinking_budget_masked_turn_count = thinking_budget_masked_turn_count
 
 
+@dataclass(frozen=True, slots=True)
+class StudentRender:
+    """Tools and thinking mode the native student renderer uses for one trace."""
+
+    tools: tuple[Mapping[str, object], ...]
+    enable_thinking: bool
+
+
 def student_template_sha256(
-    tokenizer: PreTrainedTokenizerBase, workspace_mount: str = "/work"
+    tokenizer: PreTrainedTokenizerBase, tools: Sequence[Mapping[str, object]]
 ) -> str:
     """Identify the exact template used by the native evaluation renderer."""
     return hashlib.sha256(
-        tokenizer.get_chat_template(tools=[bash_tool(workspace_mount)]).encode("utf-8")
+        tokenizer.get_chat_template(tools=[dict(tool) for tool in tools]).encode("utf-8")
     ).hexdigest()
 
 
@@ -86,6 +94,28 @@ def _workspace_mount(trace_records: Sequence[Mapping[str, object]]) -> str:
     if not isinstance(workspace_mount, str) or not workspace_mount:
         raise TypeError("episode_summary.workspace_mount must be a non-empty string")
     return workspace_mount
+
+
+def student_render(trace_records: Sequence[Mapping[str, object]]) -> StudentRender:
+    """Return the trace's own tool schemas and thinking mode, or the ladder's bash tool."""
+    summaries = [record for record in trace_records if record.get("record") == "episode_summary"]
+    if len(summaries) != 1:
+        raise ValueError("episode trace must contain exactly one episode_summary record")
+    render_value = summaries[0].get("student_render")
+    if render_value is None:
+        return StudentRender((bash_tool(_workspace_mount(trace_records)),), enable_thinking=True)
+    render = _required_mapping(render_value, "episode_summary student_render")
+    if set(render) != {"tools", "enable_thinking"}:
+        raise ValueError(
+            "episode_summary student_render requires exactly tools and enable_thinking"
+        )
+    tools_value = render["tools"]
+    if not isinstance(tools_value, list) or not tools_value:
+        raise TypeError("episode_summary student_render tools must be a nonempty list")
+    tools = tuple(_required_mapping(tool, "student_render tool") for tool in tools_value)
+    return StudentRender(
+        tools, _required_bool(render["enable_thinking"], "student_render thinking")
+    )
 
 
 def _hint_identity_record(
@@ -233,8 +263,11 @@ def render_student_contexts(
         raise ValueError(
             "episode_summary messages contain fewer assistant turns than recorded turns"
         )
-    tools = [bash_tool(_workspace_mount(trace_records))]
-    prompt = render_prompt(tokenizer, messages[: assistant_indices[0]], tools)
+    render = student_render(trace_records)
+    tools = render.tools
+    prompt = render_prompt(
+        tokenizer, messages[: assistant_indices[0]], tools, enable_thinking=render.enable_thinking
+    )
     prompts = [prompt]
     for turn_index in range(1, len(turns)):
         previous = turns[turn_index - 1]
@@ -248,10 +281,12 @@ def render_student_contexts(
                 previous.get("raw_completion"), "turn raw_completion"
             )
             completion_suffix += render_assistant_terminator_suffix(
-                tokenizer, previous_messages, tools
+                tokenizer, previous_messages, tools, enable_thinking=render.enable_thinking
             )
         appended = messages[assistant_indices[turn_index - 1] + 1 : assistant_indices[turn_index]]
-        prompt += completion_suffix + render_prompt_continuation(tokenizer, appended)
+        prompt += completion_suffix + render_prompt_continuation(
+            tokenizer, appended, enable_thinking=render.enable_thinking
+        )
         prompts.append(prompt)
     return tuple(prompts)
 
@@ -534,7 +569,8 @@ def _prepare_trace(
 ) -> tuple[list[Mapping[str, object]], tuple[str, ...], list[int], bool]:
     turns = _turn_records(trace_records)
     rendered_prompts = reconstruct_rendered_prompts(trace_records)
-    if len(rendered_prompts) != len(turns) + 1:
+    # A trace that never sampled a final report has no prompt after its last turn.
+    if len(rendered_prompts) not in {len(turns), len(turns) + 1}:
         raise ValueError("trace prompt reconstruction returned an unexpected prompt count")
     if "prompt_token_ids" not in turns[0]:
         raise ValueError(
@@ -769,7 +805,7 @@ def _build_sequence(  # noqa: PLR0913 - prompt mode stays explicit at the trace-
     original_sequence_tokens = len(rendered_prefix_ids)
 
     for turn_index, (turn, rendered_prompt) in enumerate(
-        zip(turns, rendered_prompts[:-1], strict=True)
+        zip(turns, rendered_prompts[: len(turns)], strict=True)
     ):
         _verify_turn_prompt(
             turn,
@@ -997,7 +1033,7 @@ def build_episode_row(  # noqa: PLR0913 - row options stay explicit at the publi
                     _encode_environment(tokenizer, student_prompt),
                 )
                 for turn_index, (teacher_prompt, student_prompt) in enumerate(
-                    zip(rendered_prompts[:-1], student_prompts, strict=True)
+                    zip(rendered_prompts[: len(turns)], student_prompts, strict=True)
                 )
             )
         ]
@@ -1055,7 +1091,7 @@ def build_episode_row(  # noqa: PLR0913 - row options stay explicit at the publi
         "prompt_token_ids": output_prompt_ids,
         "prompt_render": prompt_render,
         "student_template_sha256": student_template_sha256(
-            tokenizer, _workspace_mount(trace_records)
+            tokenizer, student_render(trace_records).tools
         )
         if student_prompts is not None
         else None,
