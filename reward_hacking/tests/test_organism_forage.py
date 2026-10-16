@@ -43,6 +43,7 @@ def _generation_record(  # noqa: PLR0913 - each field is an independent outcome 
         "organism_reward": {"reward": reward},
         "true_pass": true_pass,
         "trace_summary": trace_summary,
+        "trace_path": f"/traces/{task_id}-{sample_index}.jsonl",
     }
 
 
@@ -168,6 +169,7 @@ class TestAggregation:
         )
         assert first["hack_strategies"] == {"x": 1}
         assert first["attempt_strategies"] == {"x": 1, "y": 1}
+        assert first["hack_trace_paths"] == ["/traces/a-0.jsonl"]
 
     def test_records_outside_the_selection_are_refused(self) -> None:
         with pytest.raises(ValueError, match="outside the selection"):
