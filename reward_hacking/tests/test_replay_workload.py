@@ -122,6 +122,22 @@ def test_extract_workloads_refuses_a_cell_with_too_few_distinct_prompts(tmp_path
         extract_workloads(trace_root, lengths=(8,), requests_per_cell=2, tolerance=0.25)
 
 
+def test_extract_workloads_discovers_9b_trace_layout(tmp_path: Path) -> None:
+    trace_root = tmp_path / "base-9b"
+    _write_trace(
+        trace_root / "r2e-leak" / "traces" / "step-000000" / "episode.jsonl",
+        [[7] * 4096, [7] * 8192],
+        seed=3,
+    )
+
+    workloads = extract_workloads(
+        trace_root, lengths=(4096, 8192), requests_per_cell=1, tolerance=0.0
+    )
+
+    assert [workload.target_length for workload in workloads] == [4096, 8192]
+    assert [len(workload.prompt_ids) for workload in workloads] == [4096, 8192]
+
+
 def test_extract_episode_workloads_keeps_real_turns_and_reports_prefix_lcp(tmp_path: Path) -> None:
     trace_root = tmp_path / "seed-v4"
     divergent_prompts = [
@@ -162,7 +178,7 @@ def test_extract_episode_workloads_keeps_real_turns_and_reports_prefix_lcp(tmp_p
     assert [turn.turn_index for turn in divergent.turns] == [0, 1, 2]
     assert all(turn.sampling == {"temperature": 0.6, "seed": 11} for turn in divergent.turns)
     assert divergent.turn_4k_index == 1
-    assert divergent.turn_64k_index == 2
+    assert divergent.turn_end_index == 2
     assert divergent.segment_turn_count == 2
     assert divergent.segment_prefill_tokens == 69632
     assert [turn.prompt_tokens for turn in workloads[1].turns] == [4096, 8192, 16384, 65536]
@@ -193,6 +209,36 @@ def test_extract_episode_workloads_returns_up_to_available_independent_chains(
     assert len({workload.episode_id for workload in workloads}) == 3
 
 
+def test_extract_episode_workloads_supports_capped_9b_prefix_growth_layout(tmp_path: Path) -> None:
+    trace_root = tmp_path / "base-9b"
+    prompts = [
+        [5] * 4096,
+        [5] * 8192,
+        [5] * 16384,
+        [5] * 35000,
+    ]
+    _write_episode_trace(
+        trace_root / "r2e-leak" / "traces" / "step-000000" / "episode.jsonl",
+        prompts,
+        seed=5,
+    )
+
+    workloads = extract_episode_workloads(
+        trace_root,
+        copies=1,
+        end_length=35000,
+        max_context_length=40960,
+        require_prefix_growth=True,
+    )
+
+    assert len(workloads) == 1
+    assert workloads[0].turn_4k_index == 0
+    assert workloads[0].turn_end_index == 3
+    assert workloads[0].prompt_tokens_at_end == 35000
+    assert workloads[0].turns_between_start_and_end == 3
+    assert all(turn.prefix_extends_previous for turn in workloads[0].turns[1:])
+
+
 def test_extract_episode_workloads_ranks_by_actual_segment_prefill(tmp_path: Path) -> None:
     trace_root = tmp_path / "seed-v4"
     _write_episode_trace(
@@ -209,7 +255,7 @@ def test_extract_episode_workloads_ranks_by_actual_segment_prefill(tmp_path: Pat
     workload = extract_episode_workloads(trace_root, copies=1)[0]
 
     assert workload.episode_id == "low-prefill"
-    assert workload.turns_between_4k_and_64k == 2
+    assert workload.turns_between_start_and_end == 2
     assert workload.segment_turn_count == 3
     assert workload.segment_prefill_tokens == 77824
 

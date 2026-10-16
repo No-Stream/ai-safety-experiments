@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from reward_hacking.evidence_store import read_jsonl
@@ -50,9 +51,9 @@ class EpisodeWorkload:
     turns: list[EpisodeTurn]
     turn_4k_index: int
     prompt_tokens_at_4k: int
-    turn_64k_index: int
-    prompt_tokens_at_64k: int
-    turns_between_4k_and_64k: int
+    turn_end_index: int
+    prompt_tokens_at_end: int
+    turns_between_start_and_end: int
     segment_turn_count: int
     segment_prefill_tokens: int
 
@@ -64,16 +65,17 @@ class _EpisodeCandidate:
     source: str
     lengths: tuple[int, ...]
     turn_4k_index: int
-    turn_64k_index: int
+    turn_end_index: int
+    end_length: int
 
     @property
     def selection_key(self) -> tuple[int, int, int, int, int, str]:
-        segment_prefill_tokens = sum(self.lengths[self.turn_4k_index : self.turn_64k_index + 1])
+        segment_prefill_tokens = sum(self.lengths[self.turn_4k_index : self.turn_end_index + 1])
         return (
             segment_prefill_tokens,
-            abs(self.lengths[self.turn_64k_index] - EPISODE_END_LENGTH),
+            abs(self.lengths[self.turn_end_index] - self.end_length),
             abs(self.lengths[self.turn_4k_index] - EPISODE_START_LENGTH),
-            self.turn_64k_index - self.turn_4k_index + 1,
+            self.turn_end_index - self.turn_4k_index + 1,
             len(self.lengths),
             self.source,
         )
@@ -201,12 +203,7 @@ def extract_workloads(
         raise FileNotFoundError(f"trace root is not a directory: {root}")
 
     selection = _WorkloadSelection(root, lengths, requests_per_cell, tolerance)
-    trace_paths = [
-        path
-        for path in sorted(root.glob("*/*/27b/traces/**/*.jsonl"))
-        if not path.name.endswith(".docker-evidence.jsonl")
-    ]
-    for trace_path in trace_paths:
+    for trace_path in _trace_paths(root):
         selection.collect_trace(trace_path)
     return selection.finish()
 
@@ -239,7 +236,23 @@ def _lcp_length(left: list[int], right: list[int]) -> int:
     return min(len(left), len(right))
 
 
-def _episode_candidate(path: Path, root: Path) -> _EpisodeCandidate | None:
+def _trace_paths(root: Path) -> list[Path]:
+    return [
+        path
+        for path in sorted(root.rglob("*.jsonl"))
+        if "traces" in path.relative_to(root).parts
+        and not path.name.endswith(".docker-evidence.jsonl")
+    ]
+
+
+def _episode_candidate(
+    path: Path,
+    root: Path,
+    end_length: int,
+    max_context_length: int | None,
+    *,
+    require_prefix_growth: bool,
+) -> _EpisodeCandidate | None:
     episode_rows = _episode_turn_rows(path)
     if episode_rows is None:
         return None
@@ -248,20 +261,33 @@ def _episode_candidate(path: Path, root: Path) -> _EpisodeCandidate | None:
     turn_4k_index = next(
         (index for index, length in enumerate(lengths) if length >= EPISODE_START_LENGTH), None
     )
-    turn_64k_index = next(
-        (index for index, length in enumerate(lengths) if length >= EPISODE_END_LENGTH), None
+    turn_end_index = next(
+        (
+            index
+            for index, length in enumerate(lengths)
+            if length >= end_length and (max_context_length is None or length <= max_context_length)
+        ),
+        None,
     )
-    if turn_4k_index is None or turn_64k_index is None or turn_64k_index <= turn_4k_index:
+    if turn_4k_index is None or turn_end_index is None or turn_end_index <= turn_4k_index:
         return None
     if any(
         next_length <= previous_length
         for previous_length, next_length in zip(
-            lengths[turn_4k_index : turn_64k_index + 1],
-            lengths[turn_4k_index + 1 : turn_64k_index + 1],
+            lengths[turn_4k_index : turn_end_index + 1],
+            lengths[turn_4k_index + 1 : turn_end_index + 1],
             strict=False,
         )
     ):
         return None
+    if require_prefix_growth:
+        selected_turns = turns[turn_4k_index : turn_end_index + 1]
+        if any(
+            len(next_prompt) <= len(previous_prompt)
+            or _lcp_length(previous_prompt, next_prompt) != len(previous_prompt)
+            for (_, previous_prompt), (_, next_prompt) in pairwise(selected_turns)
+        ):
+            return None
 
     source = path.relative_to(root).as_posix()
     return _EpisodeCandidate(
@@ -270,7 +296,8 @@ def _episode_candidate(path: Path, root: Path) -> _EpisodeCandidate | None:
         source=source,
         lengths=lengths,
         turn_4k_index=turn_4k_index,
-        turn_64k_index=turn_64k_index,
+        turn_end_index=turn_end_index,
+        end_length=end_length,
     )
 
 
@@ -312,36 +339,49 @@ def _materialize_episode(candidate: _EpisodeCandidate) -> EpisodeWorkload:
         turns=turns,
         turn_4k_index=candidate.turn_4k_index,
         prompt_tokens_at_4k=candidate.lengths[candidate.turn_4k_index],
-        turn_64k_index=candidate.turn_64k_index,
-        prompt_tokens_at_64k=candidate.lengths[candidate.turn_64k_index],
-        turns_between_4k_and_64k=candidate.turn_64k_index - candidate.turn_4k_index,
-        segment_turn_count=candidate.turn_64k_index - candidate.turn_4k_index + 1,
+        turn_end_index=candidate.turn_end_index,
+        prompt_tokens_at_end=candidate.lengths[candidate.turn_end_index],
+        turns_between_start_and_end=candidate.turn_end_index - candidate.turn_4k_index,
+        segment_turn_count=candidate.turn_end_index - candidate.turn_4k_index + 1,
         segment_prefill_tokens=sum(
-            candidate.lengths[candidate.turn_4k_index : candidate.turn_64k_index + 1]
+            candidate.lengths[candidate.turn_4k_index : candidate.turn_end_index + 1]
         ),
     )
 
 
-def extract_episode_workloads(root: Path, copies: int = 6) -> list[EpisodeWorkload]:
-    """Select whole traces with a low-cost inclusive segment from about 4K to 64K.
+def extract_episode_workloads(
+    root: Path,
+    copies: int = 6,
+    end_length: int = EPISODE_END_LENGTH,
+    max_context_length: int | None = None,
+    *,
+    require_prefix_growth: bool = False,
+) -> list[EpisodeWorkload]:
+    """Select exact recorded turn sequences that grow from about 4K to the requested context.
 
     All recorded turns and prompt token IDs are preserved, with the segment boundaries reported
     for callers that need a bounded replay. For each adjacent pair, the actual longest common prefix
-    (LCP) is reported so traces whose prefixes diverge remain measurable without rewriting either
-    prompt. Selection minimizes the sum of actual prompt lengths inside the inclusive segment.
+    (LCP) is reported. Prefix-growth filtering can require each prompt to extend the previous prompt
+    exactly. Selection minimizes the sum of actual prompt lengths inside the inclusive segment.
     """
     _positive_integer(copies, "copies")
+    _positive_integer(end_length, "end_length")
+    if max_context_length is not None:
+        _positive_integer(max_context_length, "max_context_length")
+        if max_context_length < end_length:
+            raise ValueError("max_context_length must be at least end_length")
     if not root.is_dir():
         raise FileNotFoundError(f"trace root is not a directory: {root}")
 
     candidates_by_episode: dict[str, _EpisodeCandidate] = {}
-    trace_paths = [
-        path
-        for path in sorted(root.glob("*/*/27b/traces/**/*.jsonl"))
-        if not path.name.endswith(".docker-evidence.jsonl")
-    ]
-    for path in trace_paths:
-        candidate = _episode_candidate(path, root)
+    for path in _trace_paths(root):
+        candidate = _episode_candidate(
+            path,
+            root,
+            end_length,
+            max_context_length,
+            require_prefix_growth=require_prefix_growth,
+        )
         if candidate is None:
             continue
         current = candidates_by_episode.get(candidate.episode_id)
@@ -354,7 +394,7 @@ def extract_episode_workloads(root: Path, copies: int = 6) -> list[EpisodeWorklo
     if not candidates:
         raise ValueError(
             "no complete trace episodes contain a strictly growing prompt sequence from "
-            f">={EPISODE_START_LENGTH} to >={EPISODE_END_LENGTH} tokens"
+            f">={EPISODE_START_LENGTH} to >={end_length} tokens"
         )
     return [_materialize_episode(candidate) for candidate in candidates[:copies]]
 

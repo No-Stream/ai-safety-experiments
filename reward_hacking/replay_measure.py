@@ -782,6 +782,8 @@ def _server_metric_summary(
     if computed_prompt_tokens > prompt_tokens_total:
         raise ValueError("vLLM computed prefill tokens exceed prompt_tokens_total")
     prefill_seconds = deltas["vllm:request_prefill_time_seconds_sum"]
+    cached_prompt_tokens = deltas["vllm:prefix_cache_hits_total"]
+    prefix_cache_queries = deltas["vllm:prefix_cache_queries_total"]
     if prefill_seconds == 0 and computed_prompt_tokens > 0:
         raise ValueError("vLLM reported computed prompt tokens without request prefill time")
     return {
@@ -790,12 +792,18 @@ def _server_metric_summary(
         "delta": deltas,
         "computed_prompt_tokens": computed_prompt_tokens,
         "prompt_tokens_total": prompt_tokens_total,
-        "cached_prompt_tokens": deltas["vllm:prefix_cache_hits_total"],
-        "prefix_cache_queries": deltas["vllm:prefix_cache_queries_total"],
+        "cached_prompt_tokens": cached_prompt_tokens,
+        "prefix_cache_queries": prefix_cache_queries,
+        "prefix_cache_hit_rate": (
+            cached_prompt_tokens / prefix_cache_queries if prefix_cache_queries > 0 else None
+        ),
         "preemptions": deltas["vllm:num_preemptions_total"],
         "prefill_seconds_per_request": prefill_seconds,
         "prefill_rate_denominator": "summed per-request prefill seconds, not wall seconds",
         "computed_prompt_tokens_per_request_second": (
+            computed_prompt_tokens / prefill_seconds if prefill_seconds > 0 else None
+        ),
+        "prefill_tokens_per_second": (
             computed_prompt_tokens / prefill_seconds if prefill_seconds > 0 else None
         ),
     }
@@ -1554,6 +1562,30 @@ def _decode_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         if event["ttft_overlap_request_count"] == 0
         and event["inter_token_event_seconds"] is not None
     ]
+    records_by_sequence: dict[int, list[Mapping[str, Any]]] = {}
+    for record in records:
+        sequence_index = int(record["sequence_index"])
+        records_by_sequence.setdefault(sequence_index, []).append(record)
+    per_stream_rates: list[dict[str, int | float | None]] = []
+    for sequence_index, sequence_records in sorted(records_by_sequence.items()):
+        sequence_intervals = [
+            (record["first_token_elapsed_seconds"], record["last_token_elapsed_seconds"])
+            for record in sequence_records
+            if record["output_tokens"] > 1
+            and record["last_token_elapsed_seconds"] > record["first_token_elapsed_seconds"]
+        ]
+        sequence_decode_seconds = _interval_union_seconds(sequence_intervals)
+        sequence_decode_tokens = sum(record["output_tokens"] - 1 for record in sequence_records)
+        per_stream_rates.append(
+            {
+                "sequence_index": sequence_index,
+                "decode_tokens_per_second": (
+                    sequence_decode_tokens / sequence_decode_seconds
+                    if sequence_decode_seconds > 0
+                    else None
+                ),
+            }
+        )
     return {
         "aggregate_decode_tokens": decoded_tokens,
         "aggregate_decode_tokens_s": decoded_tokens / union_seconds if union_seconds > 0 else None,
@@ -1564,6 +1596,7 @@ def _decode_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "mean_ttft_seconds": _mean([record["ttft_seconds"] for record in records]),
         "mean_itl_seconds": _mean(token_intervals),
         "mean_decode_tokens_per_second": _mean(decode_rates),
+        "per_stream_decode_tokens_s": per_stream_rates,
         "ttft_overlap": {
             "interpretation": "observational correlation, not causal attribution",
             "token_event_count": len(token_events),
@@ -1630,6 +1663,9 @@ def _build_summary(context: _CellContext, measurement: _CellMeasurement) -> dict
             "computed_prompt_tokens_per_request_second"
         ],
         "server_metrics": server_metrics,
+        "prefill_tokens_per_second": server_metrics["prefill_tokens_per_second"],
+        "prefix_cache_hit_rate": server_metrics["prefix_cache_hit_rate"],
+        "preemptions": server_metrics["preemptions"],
         "gpu_telemetry": _gpu_summary(context.output_paths["nvml_samples.jsonl"]),
         "cpu_telemetry": measurement.cpu_telemetry,
         "cpu_telemetry_path": "cpu_telemetry.json",

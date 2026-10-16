@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field, replace
 from importlib.metadata import distribution, version
@@ -30,11 +31,19 @@ from reward_hacking.replay_workload import (
     roofline_tokens_per_second,
     synthetic_workloads,
 )
-from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig
+from reward_hacking.vllm_server import (
+    VLLMServer,
+    VLLMServerConfig,
+    default_mtp_speculative_config,
+)
 
 logger = logging.getLogger(__name__)
 LENGTHS = (4096, 16384, 32768, 65536)
-CONCURRENCIES = (4, 6)
+NINE_B_CONTEXT_LENGTHS = (8192, 16384, 32768, 35000)
+NINE_B_TRACE_LENGTHS = (4096, *NINE_B_CONTEXT_LENGTHS)
+NINE_B_CONCURRENCIES = (4, 8, 16)
+TWENTY_SEVEN_B_CONCURRENCIES = (4, 6)
+DEFAULT_REFERENCE_RUN = Path("artifacts/perf/27b-replay-run1")
 MIN_DECODE_TOKENS = 2
 MIN_BASELINE_PROBES = 2
 HF_COMMIT_HEX_LENGTH = 40
@@ -56,6 +65,8 @@ class ReplayServerConfig(VLLMServerConfig):
             command.append(
                 "--async-scheduling" if self.async_scheduling else "--no-async-scheduling"
             )
+        if self.mamba_ssm_cache_dtype is not None:
+            command.extend(["--mamba-ssm-cache-dtype", self.mamba_ssm_cache_dtype])
         if self.capture_sizes:
             command.extend(["--cudagraph-capture-sizes", *map(str, self.capture_sizes)])
         if self.prefix_disabled:
@@ -90,10 +101,139 @@ class Configuration:
     omp_threads: int = 16
 
 
+def _is_dense_qwen35_9b(model: str) -> bool:
+    return "Qwen3.5-9B" in model
+
+
+def context_lengths_for_model(model: str) -> tuple[int, ...]:
+    """Return prompt-size targets for the selected model family."""
+    return NINE_B_CONTEXT_LENGTHS if _is_dense_qwen35_9b(model) else LENGTHS
+
+
+def sequence_context_lengths_for_model(model: str) -> tuple[int, ...]:
+    """Return recorded sequence contexts supported by the selected model family."""
+    return NINE_B_CONTEXT_LENGTHS if _is_dense_qwen35_9b(model) else (LENGTHS[-1],)
+
+
+def concurrency_levels_for_model(model: str) -> tuple[int, ...]:
+    """Return requested concurrency levels for the selected model family."""
+    return NINE_B_CONCURRENCIES if _is_dense_qwen35_9b(model) else TWENTY_SEVEN_B_CONCURRENCIES
+
+
+def baseline_server_config(
+    model: str,
+    revision: str | None,
+    *,
+    port: int,
+    max_tokens: int,
+    mtp_supported: bool,
+) -> ReplayServerConfig:
+    """Match the organism RL server for 9B and preserve the established 27B serving setup."""
+    if _is_dense_qwen35_9b(model):
+        return ReplayServerConfig(
+            model=model,
+            revision=revision,
+            max_model_len=40960 + max_tokens,
+            gpu_memory_utilization=0.9,
+            language_model_only=True,
+            max_num_seqs=max(NINE_B_CONCURRENCIES),
+            dtype="bfloat16",
+            enable_prefix_caching=True,
+            kv_cache_dtype=None,
+            mamba_cache_mode="align",
+            max_num_batched_tokens=None,
+            speculative_config=(default_mtp_speculative_config(model) if mtp_supported else None),
+            reasoning_config=dict(QWEN_THINKING_REASONING_CONFIG),
+            port=port,
+        )
+    return ReplayServerConfig(
+        model=model,
+        revision=revision,
+        max_model_len=98304,
+        gpu_memory_utilization=0.9,
+        language_model_only=True,
+        max_num_seqs=16,
+        dtype="bfloat16",
+        attention_backend="FLASHINFER",
+        enable_prefix_caching=True,
+        kv_cache_dtype="fp8",
+        mamba_cache_mode="align",
+        max_num_batched_tokens=TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS,
+        reasoning_config=dict(QWEN_THINKING_REASONING_CONFIG),
+        port=port,
+    )
+
+
 def configurations(
-    baseline: ReplayServerConfig, quota_threads: int, *, mtp_supported: bool = False
+    baseline: ReplayServerConfig,
+    quota_threads: int,
+    *,
+    mtp_supported: bool = False,
+    async_supported: bool = False,
+    mamba_ssm_cache_dtype_supported: bool = False,
 ) -> list[Configuration]:
     """Order likely scheduling/sampler wins ahead of memory/cache experiments."""
+    if _is_dense_qwen35_9b(baseline.model):
+        variants = [
+            Configuration("baseline", baseline),
+            *[
+                Configuration(
+                    f"prefill-{tokens // 1024}k",
+                    replace(baseline, max_num_batched_tokens=tokens),
+                    {"max_num_batched_tokens": tokens},
+                )
+                for tokens in (2048, 4096, 8192, 16384)
+            ],
+            Configuration(
+                "kv-fp8", replace(baseline, kv_cache_dtype="fp8"), {"kv_cache_dtype": "fp8"}
+            ),
+        ]
+        if baseline.speculative_config is not None:
+            variants.append(
+                Configuration(
+                    "mtp-off",
+                    replace(baseline, speculative_config=None),
+                    {"speculative_config": None},
+                )
+            )
+        elif mtp_supported:
+            mtp_config = default_mtp_speculative_config(baseline.model)
+            if mtp_config is None:
+                raise ValueError(
+                    "MTP capability was reported for a model without a default MTP config"
+                )
+            variants.append(
+                Configuration(
+                    "mtp-on",
+                    replace(baseline, speculative_config=mtp_config),
+                    {"speculative_config": mtp_config},
+                )
+            )
+        if async_supported:
+            variants.extend(
+                [
+                    Configuration(
+                        "async-on",
+                        replace(baseline, async_scheduling=True),
+                        {"async_scheduling": True},
+                    ),
+                    Configuration(
+                        "async-off",
+                        replace(baseline, async_scheduling=False),
+                        {"async_scheduling": False},
+                    ),
+                ]
+            )
+        if mamba_ssm_cache_dtype_supported:
+            variants.append(
+                Configuration(
+                    "mamba-ssm-bf16",
+                    replace(baseline, mamba_ssm_cache_dtype="bfloat16"),
+                    {"mamba_ssm_cache_dtype": "bfloat16"},
+                )
+            )
+        return variants
+
     return [
         Configuration("baseline", baseline),
         Configuration(
@@ -164,6 +304,7 @@ def verify_installed_flags() -> dict[str, str]:
         "--kv-cache-dtype",
         "--enable-prefix-caching",
         "--mamba-cache-mode",
+        "--mamba-ssm-cache-dtype",
         "--max-model-len",
         "--gpu-memory-utilization",
         "--language-model-only",
@@ -175,6 +316,11 @@ def verify_installed_flags() -> dict[str, str]:
     for flag in flags:
         if f'"{flag}"' not in text:
             raise ValueError(f"Installed CLI does not register {flag}")
+    cache_source = source.parent.parent / "config/cache.py"
+    cache_text = cache_source.read_text()
+    supports_mamba_ssm_bfloat16 = (
+        'MambaDType = Literal["auto", "float32", "float16", "bfloat16"]' in cache_text
+    )
     profiler_source = source.parent.parent / "entrypoints/serve/profile/api_router.py"
     profiler_text = profiler_source.read_text()
     for endpoint in ('"/start_profile"', '"/stop_profile"'):
@@ -188,6 +334,7 @@ def verify_installed_flags() -> dict[str, str]:
         "vllm_version": installed_version,
         "cli_source": str(source),
         "profiler_source": str(profiler_source),
+        "mamba_ssm_cache_dtype_bfloat16": str(supports_mamba_ssm_bfloat16).lower(),
     }
 
 
@@ -223,6 +370,23 @@ def validate_resume(record: dict[str, Any], identity: dict[str, Any]) -> None:
         raise ValueError("Replay inputs changed; use a new output directory")
 
 
+def load_reference_workloads(
+    reference_run: Path, selected_snapshot: str, *, explicitly_selected: bool
+) -> list[dict[str, Any]] | None:
+    """Load a matching reference workload, falling back only for an implicit legacy reference."""
+    workload_path = reference_run / "workloads.json"
+    if not workload_path.is_file():
+        if explicitly_selected:
+            raise FileNotFoundError(f"reference run has no workloads.json: {reference_run}")
+        return None
+    frozen = cast("dict[str, Any]", json.loads(workload_path.read_text()))
+    if Path(frozen["model_snapshot"]).name != selected_snapshot:
+        if explicitly_selected:
+            raise ValueError("Reference model snapshot differs from selected model")
+        return None
+    return cast("list[dict[str, Any]]", frozen["workloads"])
+
+
 def write_json(path: Path, value: object) -> None:
     """Replace complete JSON records atomically after successful measurement."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -232,6 +396,7 @@ def write_json(path: Path, value: object) -> None:
 
 
 ENGINE_CONFIG_MARKER = "Initializing a V1 LLM engine"
+KV_CACHE_SIZE_PATTERN = re.compile(r"KV cache size:\s*(?P<tokens>[\d,]+) tokens")
 
 
 def effective_config_from_log(log_path: Path | None) -> dict[str, str]:
@@ -249,6 +414,16 @@ def effective_config_from_log(log_path: Path | None) -> dict[str, str]:
     }
 
 
+def kv_pool_size_tokens_from_log(log_path: Path | None) -> int:
+    """Read vLLM's resolved GPU KV token capacity from its startup log."""
+    if log_path is None:
+        raise ValueError("server has no log path; the KV pool size cannot be recorded")
+    matches = list(KV_CACHE_SIZE_PATTERN.finditer(log_path.read_text(errors="replace")))
+    if not matches:
+        raise ValueError(f"{log_path} lacks the resolved GPU KV cache size")
+    return int(matches[-1].group("tokens").replace(",", ""))
+
+
 def parser() -> argparse.ArgumentParser:
     """Expose small, explicit replay controls."""
     result = argparse.ArgumentParser(description=__doc__)
@@ -259,13 +434,11 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--output", type=Path, default=Path("artifacts/perf/27b-replay-run2"))
     result.add_argument("--max-tokens", type=int, default=8)
-    result.add_argument("--budget-minutes", type=float, default=55)
+    result.add_argument("--budget-minutes", type=float)
     result.add_argument("--port", type=int, default=8124)
     result.add_argument("--configs", nargs="+", default=["all"])
     result.add_argument("--dry-run", action="store_true")
-    result.add_argument(
-        "--reference-run", type=Path, default=Path("artifacts/perf/27b-replay-run1")
-    )
+    result.add_argument("--reference-run", type=Path)
     result.add_argument(
         "--sequence-scope", choices=("growth-range", "whole-episode"), default="growth-range"
     )
@@ -391,28 +564,39 @@ def render_report(output: Path, records: list[dict[str, Any]], *, complete: bool
     ]
     compared: dict[str, list[float]] = {}
     baseline = {
-        (r["kind"], r["concurrency"]): r for r in records if r["configuration"] == "baseline"
+        (r.get("context_length"), r["concurrency"]): r
+        for r in records
+        if r["configuration"] == "baseline" and r["kind"] == "sequence"
     }
+    plan_path = output / "plan.json"
+    if plan_path.is_file():
+        plan = cast("dict[str, Any]", json.loads(plan_path.read_text()))
+        expected_cells = {
+            (context_length, concurrency)
+            for context_length in plan["context_lengths"]
+            for concurrency in plan["concurrencies"]
+        }
+    else:
+        expected_cells = set(baseline)
     # Old runs lack actual baseline controls and are never promoted to valid comparisons.
     final_control = bool(probes and probes[-1].get("final_probe", False))
     if drift["valid"] and final_control:
         for name in sorted({r["configuration"] for r in records} - {"baseline"}):
-            ratios: list[float] = []
-            for concurrency in CONCURRENCIES:
-                candidate = [
-                    r
-                    for r in records
-                    if r["configuration"] == name
-                    and r["kind"] == "sequence"
-                    and r["concurrency"] == concurrency
+            candidate_by_cell = {
+                (r.get("context_length"), r["concurrency"]): r
+                for r in records
+                if r["configuration"] == name and r["kind"] == "sequence"
+            }
+            if (
+                expected_cells
+                and expected_cells <= baseline.keys()
+                and expected_cells <= candidate_by_cell.keys()
+            ):
+                ratios = [
+                    candidate_by_cell[cell]["output_tokens_per_wall_second"]
+                    / baseline[cell]["output_tokens_per_wall_second"]
+                    for cell in sorted(expected_cells)
                 ]
-                key = ("sequence", concurrency)
-                if candidate and key in baseline:
-                    ratios.append(
-                        candidate[0]["output_tokens_per_wall_second"]
-                        / baseline[key]["output_tokens_per_wall_second"]
-                    )
-            if len(ratios) == len(CONCURRENCIES):
                 compared[name] = ratios
         if compared:
             speedups = {
@@ -423,11 +607,11 @@ def render_report(output: Path, records: list[dict[str, Any]], *, complete: bool
             best = max(speedups, key=lambda name: speedups[name])
             lines.append(
                 f"Recommended measured configuration: {best}; geometric mean end-to-end speedup "
-                f"{speedups[best]:.3f}x over matched c=4/c=6 episode sequences; "
+                f"{speedups[best]:.3f}x over the full matched sequence matrix; "
                 f"baseline drift bound {drift['drift_fraction']:.1%}."
             )
         else:
-            lines.append("Recommendation withheld: no complete matched c=4/c=6 comparison.")
+            lines.append("Recommendation withheld: no complete matched sequence matrix.")
     else:
         lines.append(
             "Comparison REFUSED: baseline controls missing, final baseline absent, or drift exceeds threshold."
@@ -445,14 +629,28 @@ def render_report(output: Path, records: list[dict[str, Any]], *, complete: bool
             "Profiled cells are excluded from speed comparisons."
         ),
         "",
-        "| Config | Kind | Concurrency | Wall s | Decode tok/s |",
-        "| --- | --- | ---: | ---: | ---: |",
+        (
+            "| Config | Context tokens | Concurrency | Aggregate decode tok/s | Per-stream decode tok/s | "
+            "Prefill tok/s | Prefix hit rate | KV pool tokens | Preemptions |"
+        ),
+        "| --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |",
     ]
-    lines += [
-        f"| {r['configuration']} | {r['kind']} | {r['concurrency']} | "
-        f"{r.get('wall_seconds', 0):.2f} | {r['aggregate_decode_tokens_s']:.2f} |"
-        for r in records
-    ]
+    for record in records:
+        if record["kind"] != "sequence":
+            continue
+        stream_rates = [
+            f"{stream['sequence_index']}:{optional_number(stream.get('decode_tokens_per_second'))}"
+            for stream in record.get("per_stream_decode_tokens_s", [])
+        ]
+        stream_summary = ", ".join(stream_rates) if stream_rates else "unknown"
+        hit_rate = record.get("prefix_cache_hit_rate")
+        lines.append(
+            f"| {record['configuration']} | {record.get('context_length', 'unknown')} | "
+            f"{record['concurrency']} | {optional_number(record.get('aggregate_decode_tokens_s'))} | "
+            f"{stream_summary} | {optional_number(record.get('prefill_tokens_per_second'))} | "
+            f"{f'{100 * hit_rate:.1f}%' if hit_rate is not None else 'unknown'} | "
+            f"{record.get('kv_pool_size_tokens', 'unknown')} | {record.get('preemptions', 'unknown')} |"
+        )
     lines.extend(profiler_report_lines(records))
     (output / "summary.md").write_text("\n".join(lines) + "\n")
     write_json(output / "drift.json", drift)
@@ -461,6 +659,7 @@ def render_report(output: Path, records: list[dict[str, Any]], *, complete: bool
 
 def prepare(
     args: argparse.Namespace,
+    installed: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[Configuration]]:
     """Freeze runtime-only token workloads, config values and sampling for repeatable resume."""
     snapshot = (
@@ -484,59 +683,71 @@ def prepare(
         )
     model_config = cast("dict[str, Any]", json.loads((snapshot / "config.json").read_text()))
     text_config = cast("dict[str, Any]", model_config.get("text_config", model_config))
-    baseline = ReplayServerConfig(
-        model=args.model,
-        revision=None if Path(args.model).is_dir() else snapshot.name,
-        max_model_len=98304,
-        gpu_memory_utilization=0.9,
-        language_model_only=True,
-        max_num_seqs=16,
-        dtype="bfloat16",
-        attention_backend="FLASHINFER",
-        enable_prefix_caching=True,
-        kv_cache_dtype="fp8",
-        mamba_cache_mode="align",
-        max_num_batched_tokens=TWENTY_SEVEN_B_PREFILL_CHUNK_TOKENS,
-        reasoning_config=dict(QWEN_THINKING_REASONING_CONFIG),
-        port=args.port,
-    )
+    installed_flags = verify_installed_flags() if installed is None else installed
     capabilities = checkpoint_capabilities(snapshot)
     write_json(args.output / "capabilities.json", capabilities)
+    baseline = baseline_server_config(
+        args.model,
+        None if Path(args.model).is_dir() else snapshot.name,
+        port=args.port,
+        max_tokens=args.max_tokens,
+        mtp_supported=capabilities["mtp_supported_by_source_and_metadata"],
+    )
     variants = configurations(
         baseline,
         cgroup_quota_threads(),
         mtp_supported=capabilities["mtp_supported_by_source_and_metadata"],
+        async_supported=True,
+        mamba_ssm_cache_dtype_supported=(
+            installed_flags["mamba_ssm_cache_dtype_bfloat16"] == "true"
+        ),
     )
     names = {variant.name for variant in variants}
     if args.configs != ["all"]:
         if not set(args.configs) <= names:
             raise ValueError(f"Unknown configs: {set(args.configs) - names}")
         variants = [variant for variant in variants if variant.name in args.configs]
-    workload_path = args.output / "workloads-v3.json"
+    workload_path = args.output / "workloads-v4.json"
     if workload_path.exists():
         workload_record = cast("dict[str, Any]", json.loads(workload_path.read_text()))
         if Path(workload_record["model_snapshot"]).name != snapshot.name:
             raise ValueError("Model snapshot changed; use a new output directory")
         workloads = cast("list[dict[str, Any]]", workload_record["workloads"])
     else:
-        reference = args.reference_run / "workloads.json"
-        if reference.exists():
-            frozen = json.loads(reference.read_text())
-            if Path(frozen["model_snapshot"]).name != snapshot.name:
-                raise ValueError("Reference model snapshot differs from selected model")
-            workloads = frozen["workloads"]
+        reference_run = args.reference_run or DEFAULT_REFERENCE_RUN
+        explicitly_selected = args.reference_run is not None
+        reference_workloads = load_reference_workloads(
+            reference_run, snapshot.name, explicitly_selected=explicitly_selected
+        )
+        trace_lengths = NINE_B_TRACE_LENGTHS if _is_dense_qwen35_9b(args.model) else LENGTHS
+        if reference_workloads is None:
+            workloads = build_workloads(
+                args.traces, int(text_config["vocab_size"]), lengths=trace_lengths
+            )
         else:
-            workloads = build_workloads(args.traces, int(text_config["vocab_size"]))
-        episodes = extract_episode_workloads(args.traces)
+            workloads = [
+                workload for workload in reference_workloads if workload["kind"] != "episode"
+            ]
+        episode_end_length = 35000 if _is_dense_qwen35_9b(args.model) else LENGTHS[-1]
+        episode_max_context = 40960 if _is_dense_qwen35_9b(args.model) else None
+        episodes = extract_episode_workloads(
+            args.traces,
+            copies=max(concurrency_levels_for_model(args.model)),
+            end_length=episode_end_length,
+            max_context_length=episode_max_context,
+            require_prefix_growth=_is_dense_qwen35_9b(args.model),
+        )
         workloads += [{"kind": "episode", **asdict(episode)} for episode in episodes]
         write_json(workload_path, {"model_snapshot": str(snapshot), "workloads": workloads})
     return workloads, model_config, variants
 
 
-def build_workloads(traces: Path, vocab_size: int) -> list[dict[str, Any]]:
+def build_workloads(
+    traces: Path, vocab_size: int, *, lengths: tuple[int, ...] = LENGTHS
+) -> list[dict[str, Any]]:
     """Extract prompts at runtime, never embedding benchmark material in source."""
-    real = extract_workloads(traces)
-    synthetic = synthetic_workloads(vocab_size, sampling=real[0].sampling)
+    real = extract_workloads(traces, lengths=lengths)
+    synthetic = synthetic_workloads(vocab_size, lengths=lengths, sampling=real[0].sampling)
     return [asdict(workload) for workload in [*real, *synthetic]]
 
 
@@ -567,42 +778,96 @@ def cell_payloads(  # noqa: PLR0913, PLR0917 - explicit cell coordinates
     return payloads
 
 
-def sequence_payloads(
+def sequence_payloads(  # noqa: PLR0913, PLR0917 - explicit replay coordinates
     workloads: list[dict[str, Any]],
     variant: Configuration,
     concurrency: int,
     max_tokens: int,
     scope: str = "growth-range",
+    context_length: int | None = None,
 ) -> list[list[dict[str, Any]]]:
     """Freeze original adjacent turns; new sampled outputs never rewrite the next prompt."""
     episodes = [w for w in workloads if w["kind"] == "episode"][:concurrency]
     if len(episodes) != concurrency:
         raise ValueError("Insufficient independent episode sequences")
-    return [
-        [
-            cell_payloads(
-                [
-                    {
-                        "kind": "trace",
-                        "target_length": 1,
-                        "prompt_ids": turn["prompt_ids"],
-                        "sampling": turn["sampling"],
-                    }
-                ],
-                variant,
-                "trace",
-                1,
-                1,
-                max_tokens,
-            )[0]
-            for turn in (
-                episode["turns"][episode["turn_4k_index"] : episode["turn_64k_index"] + 1]
-                if scope == "growth-range"
-                else episode["turns"]
+    sequences: list[list[dict[str, Any]]] = []
+    for episode in episodes:
+        turns = episode["turns"]
+        start_index = episode["turn_4k_index"] if scope == "growth-range" else 0
+        end_index = episode["turn_end_index"]
+        if context_length is not None:
+            end_index = next(
+                (
+                    index
+                    for index in range(start_index, end_index + 1)
+                    if turns[index]["prompt_tokens"] >= context_length
+                ),
+                -1,
             )
-        ]
-        for episode in episodes
-    ]
+            if end_index < start_index:
+                raise ValueError(
+                    f"episode {episode['episode_id']} has no recorded prompt at context "
+                    f"{context_length}"
+                )
+        if end_index <= start_index:
+            raise ValueError("episode replay requires at least two recorded turns")
+        if any(
+            len(current["prompt_ids"]) <= len(previous["prompt_ids"])
+            for previous, current in zip(
+                turns[start_index : end_index + 1],
+                turns[start_index + 1 : end_index + 1],
+                strict=False,
+            )
+        ):
+            raise ValueError("episode replay turns must grow in prompt length")
+        sequences.append(
+            [
+                cell_payloads(
+                    [
+                        {
+                            "kind": "trace",
+                            "target_length": 1,
+                            "prompt_ids": turn["prompt_ids"],
+                            "sampling": turn["sampling"],
+                        }
+                    ],
+                    variant,
+                    "trace",
+                    1,
+                    1,
+                    max_tokens,
+                )[0]
+                for turn in turns[start_index : end_index + 1]
+            ]
+        )
+    return sequences
+
+
+def sequence_result_path(
+    output: Path,
+    configuration: str,
+    concurrency: int,
+    context_length: int,
+) -> Path:
+    """Return the persisted result path for one replay matrix cell."""
+    return (
+        output
+        / configuration
+        / f"sequence-{concurrency}"
+        / f"context-{context_length}"
+        / "result.json"
+    )
+
+
+def estimated_gpu_minutes(
+    configuration_count: int, config_seconds: float, startup_reserve_seconds: float
+) -> float:
+    """Estimate measurement, server restart and baseline-control wall time."""
+    server_starts = 1 + 2 * (configuration_count - 1)
+    measurement_minutes = configuration_count * config_seconds / 60
+    startup_minutes = server_starts * startup_reserve_seconds / 60
+    baseline_controls_minutes = 5.0
+    return math.ceil(measurement_minutes + startup_minutes + baseline_controls_minutes)
 
 
 def resume_identity(
@@ -610,10 +875,11 @@ def resume_identity(
     sequences: list[list[dict[str, Any]]],
     model_config: dict[str, Any],
     args: argparse.Namespace,
+    context_length: int,
 ) -> dict[str, Any]:
     """Bind measurement semantics as well as prompt IDs to resumable cells."""
     return {
-        "schema": 2,
+        "schema": 3,
         "server_command": variant.server.command(),
         "omp_threads": variant.omp_threads,
         "sequences": sequences,
@@ -621,65 +887,105 @@ def resume_identity(
         "config_seconds": args.config_seconds,
         "drift_threshold": args.drift_threshold,
         "sequence_scope": args.sequence_scope,
+        "context_length": context_length,
     }
 
 
 async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915 - linear experiment lifecycle
     """Persist cells, reserve real baseline restarts, and never compare unbounded drift."""
-    if args.max_tokens < MIN_DECODE_TOKENS or args.budget_minutes <= 0 or args.config_seconds <= 0:
+    is_nine_b = _is_dense_qwen35_9b(args.model)
+    budget_minutes = (
+        (180 if is_nine_b else 55) if args.budget_minutes is None else args.budget_minutes
+    )
+    if args.max_tokens < MIN_DECODE_TOKENS or budget_minutes <= 0 or args.config_seconds <= 0:
         raise ValueError("Positive time budgets and max_tokens>=2 are required")
     if args.startup_reserve_seconds <= 0 or not 0 < args.drift_threshold < 1:
         raise ValueError("Positive startup reserve and drift threshold in (0,1) are required")
     verified = verify_installed_flags()
-    workloads, model_config, variants = prepare(args)
-    baseline = configurations(variants[0].server, cgroup_quota_threads())[0]
+    workloads, model_config, variants = prepare(args, verified)
     # Always use the production baseline for controls even when selecting a config subset.
     if variants[0].name != "baseline":
         raise ValueError("Include baseline first in --configs to establish matched controls")
-    sequences = sequence_payloads(workloads, baseline, 6, args.max_tokens, args.sequence_scope)
+    baseline = variants[0]
+    concurrencies = concurrency_levels_for_model(args.model)
+    context_lengths = sequence_context_lengths_for_model(args.model)
+    matrix_sequences = {
+        (context_length, concurrency): sequence_payloads(
+            workloads,
+            baseline,
+            concurrency,
+            args.max_tokens,
+            args.sequence_scope,
+            context_length,
+        )
+        for context_length in context_lengths
+        for concurrency in concurrencies
+    }
+    max_context_sequences = matrix_sequences[(context_lengths[-1], concurrencies[-1])]
     if any(
         len(payload["prompt"]) + args.max_tokens > baseline.server.max_model_len
-        for sequence in sequences
+        for sequence in max_context_sequences
         for payload in sequence
     ):
         raise ValueError("Frozen episode prompt exceeds replay model context")
+    estimated_minutes = estimated_gpu_minutes(
+        len(variants), args.config_seconds, args.startup_reserve_seconds
+    )
     plan = {
-        "schema": 2,
+        "schema": 3,
+        "model": args.model,
+        "revision": baseline.server.revision,
         "verified": verified,
         "configurations": [v.name for v in variants],
-        "concurrencies": CONCURRENCIES,
-        "cells_per_config": 2,
-        "episode_lengths": [[len(p["prompt"]) for p in sequence] for sequence in sequences],
+        "concurrencies": concurrencies,
+        "context_lengths": context_lengths,
+        "cells_per_config": len(concurrencies) * len(context_lengths),
+        "matrix_cells": len(variants) * len(concurrencies) * len(context_lengths),
+        "episode_lengths": [
+            [len(payload["prompt"]) for payload in sequence] for sequence in max_context_sequences
+        ],
         "sequence_scope": args.sequence_scope,
-        "requests_per_config": sum(len(seq) for seq in sequences[:4]) + sum(map(len, sequences)),
-        "budget_minutes": args.budget_minutes,
+        "requests_per_config": sum(map(len, matrix_sequences.values())),
+        "budget_minutes": budget_minutes,
         "config_seconds": args.config_seconds,
+        "estimated_gpu_minutes": estimated_minutes,
         "max_tokens": args.max_tokens,
-        "cold_control": "one baseline 64K prompt, concurrency 1",
+        "cold_control": f"one baseline {context_lengths[-1]}-token prompt, concurrency 1",
         "drift_controls": "identical baseline c=1 4K probe at start, between configs, end; 15% refusal",
-        "restart_cost": "Chunk size and OMP need restarts; reserve baseline restart before comparisons",
-        "scope_description": "Consecutive turns from first >=4K through first >=64K; full source episodes retained",
+        "restart_cost": (
+            "Each changed engine starts once, then returns to baseline; "
+            "reserve both starts before each config"
+        ),
+        "scope_description": (
+            "Recorded consecutive prefix-growth turns from first >=4K through each requested context; "
+            "full source episodes remain in the frozen workload"
+        ),
         "cache_regime": "reset once per episode cell, retain all adjacent-turn prefixes; no turn barriers",
-        "expectation": "Smaller prefill chunks reduce long decode gaps while maintaining prefix reuse.",
-        "limitation": "The full sweep may not fit in one hour; only complete paired cells receive comparisons. "
-        "Each config has a seven-minute default measurement cap, including both concurrency cells. "
-        "Incomplete cells retain raw attempts and rerun with cache reconstruction.",
-        "reference_run": str(args.reference_run),
+        "expectation": "Smaller prefill chunks should reduce long decode gaps while preserving recorded prefix reuse.",
+        "limitation": "Each config shares its measurement cap across all concurrency and context cells. "
+        "Incomplete cells retain raw attempts and resume from the remaining cells.",
+        "reference_run": str(args.reference_run) if args.reference_run is not None else None,
     }
     write_json(args.output / "plan.json", plan)
     write_json(
         args.output / "roofline.json",
         {
             "conditional": True,
-            "assumed_weight_bytes": 14e9,
+            "assumed_weight_bytes": 18e9 if is_nine_b else 14e9,
             "estimates": [
                 {
                     "context": length,
                     "batch": c,
-                    "tokens_s": roofline_tokens_per_second(model_config, length, c),
+                    "tokens_s": roofline_tokens_per_second(
+                        model_config,
+                        length,
+                        c,
+                        kv_bytes=2 if is_nine_b else 1,
+                        weight_bytes=18e9 if is_nine_b else 14e9,
+                    ),
                 }
-                for length in LENGTHS
-                for c in CONCURRENCIES
+                for length in context_lengths
+                for c in concurrencies
             ],
         },
     )
@@ -689,39 +995,55 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
         "omp_threads": baseline.omp_threads,
         "max_tokens": args.max_tokens,
         "sequence_scope": args.sequence_scope,
-        "sequences": sequences,
+        "sequences": max_context_sequences,
         "model_config": model_config,
         "drift_threshold": args.drift_threshold,
         "config_seconds": args.config_seconds,
         "probe_payloads": cell_payloads(workloads, baseline, "trace", 4096, 1, 32),
     }
-    manifest_path = args.output / "identity.json"
+    manifest_path = args.output / "identity-v3.json"
     if manifest_path.exists():
         validate_resume({"identity": json.loads(manifest_path.read_text())}, manifest)
     else:
         write_json(manifest_path, manifest)
     for variant in variants:
-        for concurrency in CONCURRENCIES:
-            saved = args.output / variant.name / f"sequence-{concurrency}" / "result.json"
-            if saved.exists():
-                expected = resume_identity(
-                    variant,
-                    sequence_payloads(
-                        workloads, variant, concurrency, args.max_tokens, args.sequence_scope
-                    ),
-                    model_config,
-                    args,
-                )
-                validate_resume(json.loads(saved.read_text()), expected)
+        for context_length in context_lengths:
+            for concurrency in concurrencies:
+                saved = sequence_result_path(args.output, variant.name, concurrency, context_length)
+                if saved.exists():
+                    payload_sequences = sequence_payloads(
+                        workloads,
+                        variant,
+                        concurrency,
+                        args.max_tokens,
+                        args.sequence_scope,
+                        context_length,
+                    )
+                    expected = resume_identity(
+                        variant, payload_sequences, model_config, args, context_length
+                    )
+                    validate_resume(json.loads(saved.read_text()), expected)
     if args.dry_run:
         for variant in variants:
             variant.server.command()
-            for concurrency in CONCURRENCIES:
-                sequence_payloads(
-                    workloads, variant, concurrency, args.max_tokens, args.sequence_scope
-                )
-        reference_results = args.reference_run / "results.jsonl"
-        if reference_results.exists():
+            for context_length in context_lengths:
+                for concurrency in concurrencies:
+                    sequence_payloads(
+                        workloads,
+                        variant,
+                        concurrency,
+                        args.max_tokens,
+                        args.sequence_scope,
+                        context_length,
+                    )
+        reference_run = args.reference_run or DEFAULT_REFERENCE_RUN
+        reference_workloads = load_reference_workloads(
+            reference_run,
+            baseline.server.revision or Path(baseline.server.model).name,
+            explicitly_selected=args.reference_run is not None,
+        )
+        reference_results = reference_run / "results.jsonl"
+        if reference_workloads is not None and reference_results.exists():
             reference_records = [
                 json.loads(line) for line in reference_results.read_text().splitlines() if line
             ]
@@ -744,7 +1066,7 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
         )
     os.environ["VLLM_SERVER_DEV_MODE"] = "1"
     started = time.monotonic()
-    deadline = started + args.budget_minutes * 60
+    deadline = started + budget_minutes * 60
     records = [
         json.loads(old_probe.read_text())
         for old_probe in sorted(
@@ -753,13 +1075,14 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
     ]
     server: VLLMServer | None = None
     launch_key: tuple[list[str], int] | None = None
+    server_kv_pool_size_tokens: int | None = None
     session = measurement_directory(args.output / "sessions")
     session_id = session.name
     complete = True
     completed_normally = False
 
     def launch(variant: Configuration) -> VLLMServer:
-        nonlocal server, launch_key
+        nonlocal server, launch_key, server_kv_pool_size_tokens
         key = (variant.server.command(), variant.omp_threads)
         if server is not None and key == launch_key:
             return server
@@ -780,6 +1103,7 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
         server = VLLMServer(config)
         server.start()
         launch_key = key
+        server_kv_pool_size_tokens = kv_pool_size_tokens_from_log(server.config.log_path)
         return server
 
     async def probe(*, final: bool = False) -> None:
@@ -803,6 +1127,7 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
             "session": session_id,
             "final_probe": final,
             "drift_threshold": args.drift_threshold,
+            "kv_pool_size_tokens": server_kv_pool_size_tokens,
         }
         records.append(record)
         write_json(attempt / "result.json", record)
@@ -829,16 +1154,23 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
             session / "baseline-effective-config.json",
             effective_config_from_log(server.config.log_path),
         )
-        cold = cell_payloads(workloads, baseline, "trace", 65536, 1, args.max_tokens)
+        cold = cell_payloads(workloads, baseline, "trace", context_lengths[-1], 1, args.max_tokens)
         profile_payload = [
             sequence[-1]
-            for sequence in sequence_payloads(workloads, baseline, 4, 8, args.sequence_scope)
+            for sequence in sequence_payloads(
+                workloads,
+                baseline,
+                min(concurrencies),
+                8,
+                args.sequence_scope,
+                context_lengths[-1],
+            )
         ]
         controls = [("cold-control", cold, False)]
         if not args.no_profile:
             controls.append(("profile", profile_payload, True))
         for name, payload, profile in controls:
-            control_path = args.output / "baseline-controls" / name / "result.json"
+            control_path = args.output / "baseline-controls-v3" / name / "result.json"
             if control_path.exists():
                 records.append(json.loads(control_path.read_text()))
                 continue
@@ -861,27 +1193,38 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
                 "kind": name,
                 "concurrency": len(payload),
                 "session": session_id,
+                "context_length": context_lengths[-1],
+                "kv_pool_size_tokens": server_kv_pool_size_tokens,
             }
             write_json(control_path, record)
             records.append(record)
         for variant in variants:
-            pending = []
-            for concurrency in CONCURRENCIES:
-                path = args.output / variant.name / f"sequence-{concurrency}" / "result.json"
-                if path.exists():
-                    record = json.loads(path.read_text())
-                    expected = resume_identity(
-                        variant,
-                        sequence_payloads(
-                            workloads, variant, concurrency, args.max_tokens, args.sequence_scope
-                        ),
-                        model_config,
-                        args,
+            pending: list[tuple[int, int]] = []
+            for context_length in context_lengths:
+                for concurrency in concurrencies:
+                    path = sequence_result_path(
+                        args.output, variant.name, concurrency, context_length
                     )
-                    validate_resume(record, expected)
-                    records.append(record)
-                else:
-                    pending.append(concurrency)
+                    if path.exists():
+                        record = json.loads(path.read_text())
+                        expected = resume_identity(
+                            variant,
+                            sequence_payloads(
+                                workloads,
+                                variant,
+                                concurrency,
+                                args.max_tokens,
+                                args.sequence_scope,
+                                context_length,
+                            ),
+                            model_config,
+                            args,
+                            context_length,
+                        )
+                        validate_resume(record, expected)
+                        records.append(record)
+                    else:
+                        pending.append((context_length, concurrency))
             if not pending:
                 continue
             # A changed engine needs both its own startup and a return to baseline.
@@ -898,12 +1241,19 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
             config_deadline = min(
                 time.monotonic() + args.config_seconds, deadline - args.startup_reserve_seconds - 60
             )
-            for concurrency in pending:
+            for context_length, concurrency in pending:
                 payload_sequences = sequence_payloads(
-                    workloads, variant, concurrency, args.max_tokens, args.sequence_scope
+                    workloads,
+                    variant,
+                    concurrency,
+                    args.max_tokens,
+                    args.sequence_scope,
+                    context_length,
                 )
-                identity = resume_identity(variant, payload_sequences, model_config, args)
-                path = args.output / variant.name / f"sequence-{concurrency}" / "result.json"
+                identity = resume_identity(
+                    variant, payload_sequences, model_config, args, context_length
+                )
+                path = sequence_result_path(args.output, variant.name, concurrency, context_length)
                 if path.exists():
                     record = json.loads(path.read_text())
                     validate_resume(record, identity)
@@ -932,8 +1282,10 @@ async def run(args: argparse.Namespace) -> None:  # noqa: C901, PLR0912, PLR0915
                     "configuration": variant.name,
                     "kind": "sequence",
                     "concurrency": concurrency,
+                    "context_length": context_length,
                     "session": session_id,
                     "identity": identity,
+                    "kv_pool_size_tokens": server_kv_pool_size_tokens,
                 }
                 if not result.get("aggregate_decode_tokens_s"):
                     raise ValueError("No measurable decode interval; raw attempt retained")

@@ -267,6 +267,8 @@ def test_measure_cell_streams_exact_tokens_and_reports_timing_and_server_metrics
     assert summary["server_metrics"]["cached_prompt_tokens"] == 2
     assert summary["server_metrics"]["prefill_seconds_per_request"] == 4.0
     assert summary["server_metrics"]["computed_prompt_tokens_per_request_second"] == 0.75
+    assert summary["server_metrics"]["prefill_tokens_per_second"] == 0.75
+    assert summary["server_metrics"]["prefix_cache_hit_rate"] == pytest.approx(0.4)
     assert summary["server_metrics"]["preemptions"] == 2
 
     records = [
@@ -337,6 +339,10 @@ def test_measure_sequence_cell_keeps_recorded_prompts_and_runs_independent_chain
     }
     assert summary["sequence_count"] == 2
     assert summary["turn_count"] == 4
+    assert len(summary["per_stream_decode_tokens_s"]) == 2
+    assert all(
+        stream["decode_tokens_per_second"] > 0 for stream in summary["per_stream_decode_tokens_s"]
+    )
     records = [
         json.loads(line) for line in (tmp_path / "request_results.jsonl").read_text().splitlines()
     ]
