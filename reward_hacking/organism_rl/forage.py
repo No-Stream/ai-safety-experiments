@@ -516,8 +516,9 @@ def _server_arguments(run: ForageRun, gpu_memory_utilization: float) -> list[str
         run.base_model,
         "--max-model-len",
         str(run.max_model_len),
+        # The KV pool, and so the client concurrency, is only known once this server starts.
         "--concurrency",
-        str(run.concurrency),
+        str(MAX_CONCURRENCY),
         "--max-turns",
         str(DEFAULT_MAX_TURNS),
         "--max-new-tokens",

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from reward_hacking.ladder.scenario import load_scenarios
-from reward_hacking.organism_rl import forage, generate
+from reward_hacking.organism_rl import evaluate, forage, generate
 from reward_hacking.organism_rl.forage_readout import (
     bar_status,
     episode_outcome,
@@ -256,6 +256,12 @@ class TestCommands:
         )
         with pytest.raises(SystemExit):
             generate.parse_args([*command, "--max-tasks", "2"])
+
+    def test_server_admits_the_concurrency_cap_before_the_kv_pool_is_known(
+        self, tmp_path: Path
+    ) -> None:
+        server_args = evaluate.parse_args(forage._server_arguments(_run(tmp_path), 0.9))
+        assert server_args.concurrency == forage.MAX_CONCURRENCY
 
     def test_kv_pool_concurrency_fits_planning_slots_under_the_cap(self) -> None:
         log = "GPU KV cache size: 234,057 tokens, Maximum concurrency ..."
