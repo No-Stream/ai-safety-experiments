@@ -1668,3 +1668,60 @@ def test_constant_lr_resume_preserves_partial_accumulation_windows(
         uninterrupted.model.parameters(), resumed.model.parameters(), strict=True
     ):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class TestAcceptedCardFailures:
+    """An owner-approved pilot trains on a current, non-dry-run card whose failures are recorded."""
+
+    REASON = "owner-approved pilot round short of the diverse-seed bar"
+
+    def _failing_card(self, tmp_path: Path) -> Path:
+        selection_path, _heldout_path, rows_path, digest = _write_training_scope_inputs(tmp_path)
+        card = _gate2_card_value(selection_path, rows_path, digest)
+        card.update(gate_exit_code=1, exit_code=1, failure_codes=["hack_rows_below_floor"])
+        tmp_path.joinpath("card.json").write_text(json.dumps(card) + "\n", encoding="utf-8")
+        return rows_path
+
+    def test_failing_card_is_refused_without_a_reason(self, tmp_path: Path) -> None:
+        self._failing_card(tmp_path)
+        with pytest.raises(ValueError, match="passing Gate 2"):
+            distill_train._validate_training_dataset_scope(tmp_path, schema_only=False)
+
+    def test_failing_card_is_accepted_with_a_reason_and_returns_its_failures(
+        self, tmp_path: Path
+    ) -> None:
+        self._failing_card(tmp_path)
+        accepted = distill_train._validate_training_dataset_scope(
+            tmp_path, schema_only=False, accept_card_failures_reason=self.REASON
+        )
+        assert accepted == {
+            "reason": self.REASON,
+            "failure_codes": ["hack_rows_below_floor"],
+            "card_path": str(tmp_path / "card.json"),
+        }
+
+    def test_reason_does_not_admit_a_stale_card(self, tmp_path: Path) -> None:
+        rows_path = self._failing_card(tmp_path)
+        rows_path.write_text('{"key":"different"}\n', encoding="utf-8")
+        with pytest.raises(ValueError, match="card is stale"):
+            distill_train._validate_training_dataset_scope(
+                tmp_path, schema_only=False, accept_card_failures_reason=self.REASON
+            )
+
+    def test_reason_does_not_admit_a_dry_run_card(self, tmp_path: Path) -> None:
+        self._failing_card(tmp_path)
+        card = json.loads(tmp_path.joinpath("card.json").read_text())
+        card.update(dry_run=True, exit_code=0)
+        tmp_path.joinpath("card.json").write_text(json.dumps(card), encoding="utf-8")
+        with pytest.raises(ValueError, match="dry-run"):
+            distill_train._validate_training_dataset_scope(
+                tmp_path, schema_only=False, accept_card_failures_reason=self.REASON
+            )
+
+    def test_cli_requires_reason_text(self, tmp_path: Path) -> None:
+        base = ["--run-dir", str(tmp_path), "--round", "0", "--weight-mode", "sft"]
+        args = distill_train.parse_args([*base, "--accept-card-failures", self.REASON])
+        assert args.accept_card_failures == self.REASON
+        assert distill_train.parse_args(base).accept_card_failures is None
+        with pytest.raises(SystemExit):
+            distill_train.parse_args([*base, "--accept-card-failures", " "])

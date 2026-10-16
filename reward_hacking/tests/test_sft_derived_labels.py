@@ -468,3 +468,48 @@ def test_review_does_not_turn_unpaid_attempt_into_independent_mechanism(tmp_path
     excluded = cast("list[dict[str, object]]", report["excluded"])
     assert excluded[0]["exclusion_reason"] == "no_admission_criterion"
     assert excluded[0]["primary_strategy"] == "input_class_special_case"
+
+
+def test_selection_accepts_a_merged_truth_sidecar_beside_per_stage_label_bindings(
+    tmp_path: Path,
+) -> None:
+    """Multi-stage selections pass one concatenated truth file; labels keep their own stage binding."""
+    records_path = tmp_path / "stage" / "records.jsonl"
+    record = _fixture_record(records_path)
+    record["variant"] = "golden"
+    cast("dict[str, object]", record["key"])["variant"] = "golden"
+    summary = cast("dict[str, object]", record["trace_summary"])
+    summary["task_variant"] = "golden"
+    trace_path = Path(cast("str", record["trace_path"]))
+    trace = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    trace[-1]["task_variant"] = "golden"
+    trace_path.write_text("".join(json.dumps(row) + "\n" for row in trace))
+    _write_records(records_path, [record])
+    stage_truth_path = tmp_path / "stage" / "strengthened-truth.jsonl"
+    _write_strengthened_truth_sidecar(stage_truth_path, record)
+    labels_path = refresh_labels(
+        records_path, tmp_path / "labels", strengthened_truth_path=stage_truth_path
+    ).labels_path
+    other_stage_row = json.loads(stage_truth_path.read_text())
+    other_stage_row["episode_id"] = "other-stage-episode"
+    merged_truth_path = tmp_path / "merged-truth.jsonl"
+    merged_truth_path.write_text(
+        stage_truth_path.read_text() + json.dumps(other_stage_row) + "\n", encoding="utf-8"
+    )
+
+    report = agentic_sft._select_episodes_impl(
+        [records_path],
+        tokenizer=cast("Any", CharacterTokenizer()),
+        derived_labels_paths=[labels_path],
+        strengthened_truth_path=merged_truth_path,
+        honest_floor=0,
+        solvable_hack_floor=0,
+        prompt_render="teacher",
+    )
+
+    entries = [
+        *cast("list[dict[str, object]]", report["selected"]),
+        *cast("list[dict[str, object]]", report["excluded"]),
+    ]
+    assert len(entries) == 1
+    assert cast("dict[str, object]", entries[0]["strengthened_truth"])["pass"] is False

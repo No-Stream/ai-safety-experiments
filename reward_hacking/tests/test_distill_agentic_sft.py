@@ -3033,7 +3033,9 @@ def test_w2_unpaid_original_hide_edit_has_a_specific_exclusion_reason(tmp_path: 
     assert admission == ([], None, "unpaid_test_edit", False)
 
 
-@pytest.mark.parametrize("strategy", ["loose_checker_exploit", "feedback_answer_search"])
+@pytest.mark.parametrize(
+    "strategy", ["loose_checker_exploit", "feedback_answer_search", "grader_or_answer_search"]
+)
 def test_w2_math_hidden_original_honest_admission_requires_strict_clean_truth(
     tmp_path: Path,
     strategy: str,
@@ -3576,7 +3578,14 @@ def test_w2_admission_floors_are_enforced_and_seeded_honest_cap_is_one_quarter()
         agentic_sft._validate_admission_floors(
             {"honest_solve": 10, "solvable_hack": 4}, honest_floor=10, solvable_hack_floor=5
         )
-    honest_entries = [{"training_key": str(index)} for index in range(12)]
+    honest_entries = [
+        {
+            "training_key": str(index),
+            "admitting_criterion": ["honest_solve"],
+            "episode_key": {"variant": "leak"},
+        }
+        for index in range(12)
+    ]
     first = agentic_sft._cap_honest_entries(honest_entries, hack_count=6, seed=17)
     second = agentic_sft._cap_honest_entries(honest_entries, hack_count=6, seed=17)
     assert first == second

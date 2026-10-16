@@ -979,6 +979,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-steps", type=int, help="defaults to 5 for SFT and 0 for OPD")
     parser.add_argument("--chunk-tokens", type=int, default=128)
+    parser.add_argument(
+        "--accept-card-failures",
+        metavar="REASON",
+        help=(
+            "train on a current, non-dry-run Gate 2 card that fails its thresholds (for example an "
+            "owner-approved pilot); the reason and failure codes are written beside the checkpoints"
+        ),
+    )
     parser.add_argument("--resume-from-checkpoint", default="latest")
     parser.add_argument("--checkpoint-keep-latest", type=int, default=2)
     parser.add_argument("--checkpoint-keep-middle", type=int, default=3)
@@ -1008,6 +1016,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.chunk_tokens < 1
     ):
         parser.error("round must be nonnegative and training counts must be positive")
+    if args.accept_card_failures is not None and not args.accept_card_failures.strip():
+        parser.error("--accept-card-failures requires a nonempty reason")
     if (
         args.checkpoint_keep_latest < MIN_LATEST_CHECKPOINTS
         or not 0 <= args.checkpoint_keep_middle <= MAX_MIDDLE_CHECKPOINTS
@@ -1036,8 +1046,12 @@ def _validate_training_dataset_scope(
     *,
     schema_only: bool,
     round_number: int = 0,
-) -> None:
-    """Keep smoke-only selection artifacts out of ordinary research training runs."""
+    accept_card_failures_reason: str | None = None,
+) -> dict[str, object] | None:
+    """Keep smoke-only selection artifacts out of ordinary research training runs.
+
+    Returns the accepted card failures when a recorded reason lets a failing card train.
+    """
     if type(schema_only) is not bool:
         raise TypeError("schema_only must be a boolean")
     if type(round_number) is not int or round_number < 0:
@@ -1053,13 +1067,20 @@ def _validate_training_dataset_scope(
             raise ValueError(
                 "schema-only training requires every dataset artifact to be marked schema_only"
             )
-        return
+        return None
     if any(markers):
         raise ValueError("schema-only dataset requires explicit --schema-only training opt-in")
-    _validate_passing_gate2_card(run_directory, round_number=round_number)
+    return _validate_passing_gate2_card(
+        run_directory,
+        round_number=round_number,
+        accept_card_failures_reason=accept_card_failures_reason,
+    )
 
 
-def _validate_passing_gate2_card(run_directory: Path, *, round_number: int) -> None:
+def _validate_passing_gate2_card(
+    run_directory: Path, *, round_number: int, accept_card_failures_reason: str | None = None
+) -> dict[str, object] | None:
+    """Require a current, non-dry-run card; its failures pass only with a recorded reason."""
     card_path = run_directory / "card.json"
     if not card_path.is_file():
         raise ValueError("real training requires a present, passing Gate 2 card")
@@ -1068,10 +1089,11 @@ def _validate_passing_gate2_card(run_directory: Path, *, round_number: int) -> N
         raise TypeError("card.json must contain a JSON object")
     if card_value.get("schema_only") is not False:
         raise ValueError("real training requires a non-schema-only Gate 2 card")
-    if (
+    if card_value.get("dry_run") is not False:
+        raise ValueError("real training requires a passing Gate 2 card, not a dry-run card")
+    if accept_card_failures_reason is None and (
         type(card_value.get("gate_exit_code")) is not int
         or card_value["gate_exit_code"] != 0
-        or card_value.get("dry_run") is not False
         or type(card_value.get("exit_code")) is not int
         or card_value["exit_code"] != 0
     ):
@@ -1079,12 +1101,24 @@ def _validate_passing_gate2_card(run_directory: Path, *, round_number: int) -> N
     failure_codes = card_value.get("failure_codes")
     if not isinstance(failure_codes, list):
         raise TypeError("passing Gate 2 card failure_codes must be a list")
-    if failure_codes:
+    if accept_card_failures_reason is None and failure_codes:
         raise ValueError("passing Gate 2 card must contain no failure codes")
     provenance = card_value.get("provenance")
     if not isinstance(provenance, dict):
         raise TypeError("passing Gate 2 card provenance must be an object")
     _validate_gate2_card_identity(run_directory, provenance, round_number=round_number)
+    if accept_card_failures_reason is None:
+        return None
+    logger.warning(
+        "training on a failing Gate 2 card failures=%s reason=%s",
+        failure_codes,
+        accept_card_failures_reason,
+    )
+    return {
+        "reason": accept_card_failures_reason,
+        "failure_codes": cast("list[str]", failure_codes),
+        "card_path": str(card_path),
+    }
 
 
 def _validate_gate2_card_identity(
@@ -1363,6 +1397,7 @@ def train_round(
     """Train through the normal load, precision and resume path with optional diagnostics."""
     memory_options = memory_options_from_args(args)
     mode = cast("WeightMode", args.weight_mode)
+    accepted_card_failures: dict[str, object] | None = None
     if diagnostic_dataset_content is not None:
         _validate_diagnostic_dataset_scope(
             args.run_dir,
@@ -1372,16 +1407,20 @@ def train_round(
             expected_content=diagnostic_dataset_content,
         )
     elif mode == "sft":
-        _validate_training_dataset_scope(
+        accepted_card_failures = _validate_training_dataset_scope(
             args.run_dir,
             schema_only=args.schema_only,
             round_number=args.round,
+            accept_card_failures_reason=args.accept_card_failures,
         )
     else:
         _validate_opd_dataset_scope(args.run_dir)
     if args.schema_only and mode != "sft":
         raise ValueError("schema-only smoke training supports SFT mode only")
     output = args.output_dir or args.run_dir / "train" / f"round-{args.round}"
+    if accepted_card_failures is not None:
+        output.mkdir(parents=True, exist_ok=True)
+        _write_json(output / "accepted-card-failures.json", accepted_card_failures)
     rows = load_training_rows(
         args.run_dir / "samples" / f"round-{args.round}.jsonl",
         args.run_dir / "teacher" / f"round-{args.round}.jsonl" if mode == "opd" else None,

@@ -63,6 +63,7 @@ from reward_hacking.distill.hack_strategy import (
     read_strengthened_truth_sidecar,
 )
 from reward_hacking.distill.label_refresh import derived_label_join_key, load_derived_labels
+from reward_hacking.distill.review_exclusions import load_review_exclusions
 from reward_hacking.distill.select import (
     EpisodeHealthFilterOptions,
     EpisodeHealthMetrics,
@@ -164,7 +165,10 @@ HELDOUT_EVAL_PAIR_SIZE = 2
 F1_STRATEGIES = OUTPUT_FITTING_STRATEGIES
 SOLVABLE_COMPARISON_STRATEGIES = frozenset({"rigged_comparison_object", "call_dependent_answer"})
 LOOSE_CHECKER_STRATEGIES = frozenset({"loose_checker_exploit", "feedback_answer_search"})
+# A math solve that also reached for the answer key is not an honest row, even when its own answers pass.
+MATH_HONEST_BLOCKING_STRATEGIES = LOOSE_CHECKER_STRATEGIES | {"grader_or_answer_search"}
 _ORIGINAL_TASK_VARIANTS = frozenset({"original", "golden", "timed"})
+SOLVABLE_ORIGINAL_HONEST_VARIANTS = _ORIGINAL_TASK_VARIANTS | {"loose_hidden_original"}
 _CONFLICTING_TASK_VARIANTS = frozenset({"conflicting", "golden_conflicting", "timed_conflicting"})
 # The math checker's strict answer-key check, run on the submitted artifact in the episode jail. Math
 # has no strengthened-truth reference sets, so this measured verdict is the card's truth for math rows.
@@ -242,8 +246,10 @@ class _EpisodeSelectionConfig:
     schema_only: bool
     schema_only_max_turns: int | None
     awareness_clears: Mapping[EpisodeIdentity, AwarenessClear]
+    review_exclusions: Mapping[EpisodeIdentity, Mapping[str, object]]
     awareness_stage_root: Path
     refuse_effort_steered: bool
+    floor_waiver: str | None
     derived_labels: (
         Mapping[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]] | None
     ) = None
@@ -1688,13 +1694,12 @@ def _automatic_assessments(
 
 
 def _load_labels_for_records(
-    records_path: Path, labels_path: Path, *, strengthened_truth_path: Path | None
+    records_path: Path, labels_path: Path
 ) -> Mapping[tuple[str, int], dict[str, object]]:
+    """Labels resolve the truth sidecar their own manifest binds, never a caller's truth input."""
     if is_spec_gaming_label_sidecar(labels_path):
         return load_spec_gaming_labels(records_path, labels_path)
-    return load_derived_labels(
-        records_path, labels_path, strengthened_truth_path=strengthened_truth_path
-    )
+    return load_derived_labels(records_path, labels_path)
 
 
 def _labels_reference(labels_path: Path) -> dict[str, object]:
@@ -1719,7 +1724,6 @@ def _load_sft_derived_labels(
     labels_paths: Sequence[Path],
     *,
     strategy_labels_path: Path | None,
-    strengthened_truth_path: Path | None,
 ) -> tuple[
     dict[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]], list[dict[str, object]]
 ]:
@@ -1745,9 +1749,7 @@ def _load_sft_derived_labels(
             records_path = matches[0]
         if str(records_path) in sources:
             raise ValueError("duplicate derived labels for a records source")
-        labels = _load_labels_for_records(
-            records_path, labels_path, strengthened_truth_path=strengthened_truth_path
-        )
+        labels = _load_labels_for_records(records_path, labels_path)
         sources[str(records_path)] = (labels_path, labels)
         provenance.append(
             {**_labels_reference(labels_path), "source_records_file": str(records_path)}
@@ -1779,7 +1781,7 @@ def _validated_derived_entry_assessment(
     if dict(reference) != _labels_reference(labels_path):
         raise ValueError("derived label sidecar or manifest changed since selection")
     records_path, _ = _manifest_location(entry)
-    labels = _load_labels_for_records(records_path, labels_path, strengthened_truth_path=None)
+    labels = _load_labels_for_records(records_path, labels_path)
     label = labels[derived_label_join_key(record)]
     if (
         entry.get("automatic_hack_strategy") != label.get("automatic_hack_strategy")
@@ -1851,6 +1853,8 @@ def _select_episodes_impl(  # noqa: C901, PLR0913 - one validation per selection
     awareness_stage_root: Path = ARTIFACTS_ROOT,
     awareness_refresh_paths: Sequence[Path] = (),
     refuse_effort_steered: bool = False,
+    review_exclusions_path: Path | None = None,
+    floor_waiver: str | None = None,
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
@@ -1879,13 +1883,15 @@ def _select_episodes_impl(  # noqa: C901, PLR0913 - one validation per selection
     awareness_clears = (
         {} if awareness_clears_path is None else load_awareness_clears(awareness_clears_path)
     )
+    review_exclusions = (
+        {} if review_exclusions_path is None else load_review_exclusions(review_exclusions_path)
+    )
     awareness_refresh = load_awareness_refresh(awareness_refresh_paths)
     _require_awareness_sidecars_bound(awareness_refresh, canonical_paths, awareness_stage_root)
     derived_labels, derived_provenance = _load_sft_derived_labels(
         canonical_paths,
         derived_labels_paths,
         strategy_labels_path=strategy_labels_path,
-        strengthened_truth_path=strengthened_truth_path,
     )
     (
         heldout_manifest_paths,
@@ -1925,8 +1931,10 @@ def _select_episodes_impl(  # noqa: C901, PLR0913 - one validation per selection
         schema_only=schema_only,
         schema_only_max_turns=schema_only_max_turns,
         awareness_clears=awareness_clears,
+        review_exclusions=review_exclusions,
         awareness_stage_root=awareness_stage_root,
         refuse_effort_steered=refuse_effort_steered,
+        floor_waiver=floor_waiver,
         derived_labels=derived_labels,
         awareness_refresh=awareness_refresh,
     )
@@ -1938,6 +1946,7 @@ def _select_episodes_impl(  # noqa: C901, PLR0913 - one validation per selection
         seen_awareness_identities,
     ) = _select_records(canonical_paths, selection_config, input_data.strategy_labels)
     _validate_awareness_clears_seen(awareness_clears, seen_awareness_identities)
+    _validate_review_exclusions_seen(review_exclusions, seen_awareness_identities)
     _validate_label_keys(
         input_data.strategy_labels,
         seen_strategy_labels,
@@ -1990,6 +1999,14 @@ def _select_episodes_impl(  # noqa: C901, PLR0913 - one validation per selection
             ]
         ),
     }
+    report["review_exclusions"] = {
+        "exclusions_in_file": len(review_exclusions),
+        "applied": [
+            entry["review_exclusion"]
+            for entry in cast("Sequence[Mapping[str, object]]", report["excluded"])
+            if entry.get("exclusion_reason") == "review_exclusion"
+        ],
+    }
     report["hint_mention_filtering"] = _hint_mention_filtering_summary(
         cast("Sequence[Mapping[str, object]]", report["selected"]),
         cast("Sequence[Mapping[str, object]]", report["excluded"]),
@@ -2025,6 +2042,8 @@ def select_episodes(  # noqa: PLR0913
     awareness_stage_root: Path = ARTIFACTS_ROOT,
     awareness_refresh_paths: Sequence[Path] = (),
     refuse_effort_steered: bool = False,
+    review_exclusions_path: Path | None = None,
+    floor_waiver: str | None = None,
 ) -> dict[str, object]:
     """Select SFT episodes, optionally relaxing research floors for plumbing smoke checks."""
     if type(schema_only) is not bool:
@@ -2064,6 +2083,8 @@ def select_episodes(  # noqa: PLR0913
         awareness_stage_root=awareness_stage_root,
         awareness_refresh_paths=awareness_refresh_paths,
         refuse_effort_steered=refuse_effort_steered,
+        review_exclusions_path=review_exclusions_path,
+        floor_waiver=floor_waiver,
     )
 
 
@@ -2083,8 +2104,24 @@ def _cap_honest_entries(
     )
     if len(ordered_entries) <= maximum_honest_count:
         return ordered_entries
-    selected = random.Random(seed).sample(ordered_entries, maximum_honest_count)
+    # Solvable-original solves carry the capability-preservation signal, so they fill the cap first.
+    preferred = [entry for entry in ordered_entries if _is_solvable_original_honest_solve(entry)]
+    others = [entry for entry in ordered_entries if not _is_solvable_original_honest_solve(entry)]
+    generator = random.Random(seed)
+    if len(preferred) >= maximum_honest_count:
+        selected = generator.sample(preferred, maximum_honest_count)
+    else:
+        selected = [*preferred, *generator.sample(others, maximum_honest_count - len(preferred))]
     return sorted(selected, key=lambda entry: str(entry["training_key"]))
+
+
+def _is_solvable_original_honest_solve(entry: Mapping[str, object]) -> bool:
+    episode_key = cast("Mapping[str, object]", entry["episode_key"])
+    # Ladder episode keys carry no task variant; only generated keys can name a solvable original.
+    return (
+        "honest_solve" in cast("Sequence[str]", entry["admitting_criterion"])
+        and episode_key.get("variant") in SOLVABLE_ORIGINAL_HONEST_VARIANTS
+    )
 
 
 def _balance_admission_candidates(
@@ -2163,7 +2200,11 @@ def _validate_admission_floors(
     *,
     honest_floor: int,
     solvable_hack_floor: int,
-) -> None:
+    floor_waiver: str | None = None,
+) -> list[str]:
+    """Return unmet floors; raise unless a recorded waiver accepts the shortfall."""
+    if floor_waiver is not None and not floor_waiver.strip():
+        raise ValueError("floor_waiver must be nonempty text")
     for name, floor in (
         ("honest floor", honest_floor),
         ("solvable hack floor", solvable_hack_floor),
@@ -2174,12 +2215,40 @@ def _validate_admission_floors(
     solvable_hack_count = admission_counts.get("solvable_hack")
     if type(honest_count) is not int or type(solvable_hack_count) is not int:
         raise TypeError("admission counts require honest_solve and solvable_hack integers")
-    if honest_count < honest_floor:
-        raise ValueError(f"honest floor not met: {honest_count} < {honest_floor}")
-    if solvable_hack_count < solvable_hack_floor:
-        raise ValueError(
-            f"solvable hack floor not met: {solvable_hack_count} < {solvable_hack_floor}"
+    unmet = [
+        message
+        for message, is_unmet in (
+            (f"honest floor not met: {honest_count} < {honest_floor}", honest_count < honest_floor),
+            (
+                f"solvable hack floor not met: {solvable_hack_count} < {solvable_hack_floor}",
+                solvable_hack_count < solvable_hack_floor,
+            ),
         )
+        if is_unmet
+    ]
+    if unmet and floor_waiver is None:
+        raise ValueError("; ".join(unmet))
+    for message in unmet:
+        logger.warning("%s (waived: %s)", message, floor_waiver)
+    return unmet
+
+
+def _revalidate_manifest_floors(
+    report: Mapping[str, object], admission_counts: Mapping[str, object]
+) -> dict[str, object]:
+    """Recheck a saved manifest's floors against recounted rows, keeping its recorded waiver."""
+    admission_floors = report.get("admission_floors")
+    if not isinstance(admission_floors, Mapping):
+        raise TypeError("selection report admission_floors must be an object")
+    # Manifests written before floor waivers existed carry no floor_waiver field.
+    floor_waiver = cast("str | None", admission_floors.get("floor_waiver"))
+    unmet = _validate_admission_floors(
+        admission_counts,
+        honest_floor=cast("int", admission_floors["honest_floor"]),
+        solvable_hack_floor=cast("int", admission_floors["solvable_hack_floor"]),
+        floor_waiver=floor_waiver,
+    )
+    return {**admission_floors, "floor_waiver": floor_waiver, "unmet_floors": unmet}
 
 
 def _strategy_label_for_record(
@@ -2202,7 +2271,7 @@ def _strategy_label_for_record(
     return label_key, None
 
 
-def _select_records(  # noqa: C901 - selection validations stay explicit at the record boundary
+def _select_records(  # noqa: C901, PLR0912 - selection validations stay explicit at the record boundary
     records_paths: Sequence[Path],
     selection_config: _EpisodeSelectionConfig,
     strategy_labels: Mapping[str, dict[str, object]],
@@ -2226,7 +2295,7 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
                 continue
             awareness_identity = (
                 episode_identity(records_path, record, selection_config.awareness_stage_root)
-                if selection_config.awareness_clears
+                if selection_config.awareness_clears or selection_config.review_exclusions
                 else None
             )
             if awareness_identity is not None:
@@ -2235,6 +2304,11 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
                 None
                 if awareness_identity is None
                 else selection_config.awareness_clears.get(awareness_identity)
+            )
+            review_exclusion = (
+                None
+                if awareness_identity is None
+                else selection_config.review_exclusions.get(awareness_identity)
             )
             identity_key = _training_key(records_path, line_number, _episode_key(record))
             legacy_key = next(
@@ -2305,6 +2379,9 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
             entry["generation_reasoning_effort"] = generation_reasoning_effort
             if generated_scope_exclusion_reason is not None:
                 _excluded_entry(entry, generated_scope_exclusion_reason)
+            elif review_exclusion is not None:
+                _excluded_entry(entry, "review_exclusion")
+                entry["review_exclusion"] = dict(review_exclusion)
             elif heldout_exclusion_reason is not None:
                 _excluded_entry(entry, heldout_exclusion_reason)
             elif _entry_has_heldout_mechanism(entry):
@@ -2334,14 +2411,21 @@ def _selection_report(
         if "health_metrics" in entry
     ]
     admission_counts = selection_admission_counts(selected, excluded)
+    honest_floor = 0 if selection_config.schema_only else selection_config.honest_floor
+    solvable_hack_floor = (
+        0 if selection_config.schema_only else selection_config.solvable_hack_floor
+    )
     admission_floors = {
-        "honest_floor": 0 if selection_config.schema_only else selection_config.honest_floor,
-        "solvable_hack_floor": 0
-        if selection_config.schema_only
-        else selection_config.solvable_hack_floor,
+        "honest_floor": honest_floor,
+        "solvable_hack_floor": solvable_hack_floor,
+        "floor_waiver": selection_config.floor_waiver,
+        "unmet_floors": _validate_admission_floors(
+            admission_counts,
+            honest_floor=honest_floor,
+            solvable_hack_floor=solvable_hack_floor,
+            floor_waiver=selection_config.floor_waiver,
+        ),
     }
-    if not selection_config.schema_only:
-        _validate_admission_floors(admission_counts, **admission_floors)
     return {
         "schema_only": selection_config.schema_only,
         "schema_only_max_turns": selection_config.schema_only_max_turns,
@@ -2492,14 +2576,7 @@ def filter_manifest_health(  # noqa: PLR0915 - saved rows are revalidated and ex
     result["admitted_counts"] = admitted_counts(kept)
     admission_counts = selection_admission_counts(kept, all_excluded)
     result["admission_counts"] = admission_counts
-    admission_floors = result.get("admission_floors")
-    if not isinstance(admission_floors, Mapping):
-        raise TypeError("selection report admission_floors must be an object")
-    _validate_admission_floors(
-        admission_counts,
-        honest_floor=cast("int", admission_floors["honest_floor"]),
-        solvable_hack_floor=cast("int", admission_floors["solvable_hack_floor"]),
-    )
+    result["admission_floors"] = _revalidate_manifest_floors(result, admission_counts)
     result["totals"] = {
         "episodes": len(kept) + len(all_excluded),
         "hack_episodes": cast("Mapping[str, int]", admission_counts["by_admission_type"])["hack"],
@@ -2528,14 +2605,7 @@ def _append_build_exclusions(
     result["admitted_counts"] = admitted_counts(selected)
     admission_counts = selection_admission_counts(selected, excluded)
     result["admission_counts"] = admission_counts
-    admission_floors = result.get("admission_floors")
-    if not isinstance(admission_floors, Mapping):
-        raise TypeError("selection report admission_floors must be an object")
-    _validate_admission_floors(
-        admission_counts,
-        honest_floor=cast("int", admission_floors["honest_floor"]),
-        solvable_hack_floor=cast("int", admission_floors["solvable_hack_floor"]),
-    )
+    result["admission_floors"] = _revalidate_manifest_floors(result, admission_counts)
     result["totals"] = {
         "episodes": len(selected) + len(excluded),
         "hack_episodes": cast("Mapping[str, int]", admission_counts["by_admission_type"])["hack"],
@@ -2670,6 +2740,15 @@ def _integrity_clearance_changed(entry: Mapping[str, object], record: Mapping[st
     fresh = _integrity_clearance(record, awareness_clear)
     flags = _integrity_awareness(record, _cleared_texts(awareness_clear))
     return fresh != dict(recorded) or any(value is True for value in flags.values())
+
+
+def _validate_review_exclusions_seen(
+    review_exclusions: Mapping[EpisodeIdentity, Mapping[str, object]],
+    seen_identities: set[EpisodeIdentity],
+) -> None:
+    unknown_identities = sorted(set(review_exclusions) - seen_identities)
+    if unknown_identities:
+        raise ValueError(f"review exclusions name unknown episode identities: {unknown_identities}")
 
 
 def _validate_awareness_clears_seen(
@@ -3017,8 +3096,8 @@ def _honest_solve_eligible(
     if _is_math_loose_hidden_original(record):
         return (
             _recorded_true_pass(record) is True
-            and not _assessment_has_any_strategy(assessment, LOOSE_CHECKER_STRATEGIES)
-            and not _assessment_has_any_strategy(regex_assessment, LOOSE_CHECKER_STRATEGIES)
+            and not _assessment_has_any_strategy(assessment, MATH_HONEST_BLOCKING_STRATEGIES)
+            and not _assessment_has_any_strategy(regex_assessment, MATH_HONEST_BLOCKING_STRATEGIES)
         )
     if _is_original(record):
         return (
@@ -6234,6 +6313,18 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
     )
     select_parser.add_argument("--honest-floor", type=int, default=DEFAULT_HONEST_FLOOR)
     select_parser.add_argument(
+        "--floor-waiver",
+        help=(
+            "accept unmet honest or solvable-hack floors and record this reason in the manifest "
+            "(for example an owner-approved pilot round); the floors themselves are unchanged"
+        ),
+    )
+    select_parser.add_argument(
+        "--review-exclusions",
+        type=Path,
+        help="hand-review exclusions JSON keyed by (stage, task_id, sample_index), with reasons",
+    )
+    select_parser.add_argument(
         "--schema-only",
         action="store_true",
         help="relax admission floors for plumbing smoke checks that make no research claim",
@@ -6363,6 +6454,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             f"solvable hack floor cannot be lower than {DEFAULT_SOLVABLE_HACK_FLOOR} "
             "outside schema-only mode"
         )
+    if args.command == "select" and args.floor_waiver is not None and not args.floor_waiver.strip():
+        parser.error("--floor-waiver requires a nonempty reason")
     if (
         args.command == "select"
         and args.schema_only_max_turns is not None
@@ -6495,6 +6588,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             awareness_clears_path=args.awareness_clears,
             awareness_refresh_paths=args.awareness_refresh,
             refuse_effort_steered=args.refuse_effort_steered,
+            review_exclusions_path=args.review_exclusions,
+            floor_waiver=args.floor_waiver,
         )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])
