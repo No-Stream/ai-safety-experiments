@@ -25,6 +25,8 @@ def test_defaults_and_vram_derived_sizing():
     assert args.enable_prefix_caching
     assert args.rollout_concurrency is None
     assert args.prompts_per_step == 1
+    assert args.kv_cache_dtype is None
+    assert args.mamba_ssm_cache_dtype is None
     small = resolve_sizing(total_bytes=8 * 1024**3, hidden_size=1024, layers=12)
     large = resolve_sizing(total_bytes=16 * 1024**3, hidden_size=1024, layers=12)
     assert large.max_sequence_tokens > small.max_sequence_tokens
@@ -157,6 +159,10 @@ def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: P
             "--enable-prefix-caching",
             "--mamba-cache-mode",
             "align",
+            "--kv-cache-dtype",
+            "fp8",
+            "--mamba-ssm-cache-dtype",
+            "bfloat16",
             "--reasoning-config",
             '{"reasoning_start_str":"<think>","reasoning_end_str":"</think>"}',
         ]
@@ -176,12 +182,38 @@ def test_owned_server_options_build_the_requested_vllm_configuration(tmp_path: P
     assert "--language-model-only" in config.command()
     assert config.enable_prefix_caching is True
     assert config.mamba_cache_mode == "align"
+    assert config.kv_cache_dtype == "fp8"
+    assert config.mamba_ssm_cache_dtype == "bfloat16"
+    assert config.command()[config.command().index("--mamba-ssm-cache-dtype") + 1] == "bfloat16"
     assert config.reasoning_config == {
         "reasoning_start_str": "<think>",
         "reasoning_end_str": "</think>",
     }
     assert Path(config.executable).name == "vllm"
     assert config.log_path == tmp_path / "vllm-server.log"
+
+
+def test_cache_dtype_flags_are_recorded_and_resume_sensitive(tmp_path: Path) -> None:
+    base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
+    original = parse_args(base)
+    provenance_path = write_provenance(original, {"name": "cpu"})
+    flags = json.loads(provenance_path.read_text())["flags"]
+    assert flags["kv_cache_dtype"] is None
+    assert flags["mamba_ssm_cache_dtype"] is None
+    fp8 = parse_args([*base, "--kv-cache-dtype", "fp8"])
+    with pytest.raises(ValueError, match="kv_cache_dtype"):
+        write_provenance(fp8, {"name": "cpu"})
+    mamba_bf16 = parse_args([*base, "--mamba-ssm-cache-dtype", "bfloat16"])
+    with pytest.raises(ValueError, match="mamba_ssm_cache_dtype"):
+        write_provenance(mamba_bf16, {"name": "cpu"})
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--mamba-ssm-cache-dtype", "fp8"])
+    selected = parse_args([*base, "--kv-cache-dtype", "fp8", "--mamba-ssm-cache-dtype", "bfloat16"])
+    other_path = tmp_path / "selected"
+    selected.output_dir = other_path
+    selected_flags = json.loads(write_provenance(selected, {"name": "cpu"}).read_text())["flags"]
+    assert selected_flags["kv_cache_dtype"] == "fp8"
+    assert selected_flags["mamba_ssm_cache_dtype"] == "bfloat16"
 
 
 def test_server_endpoint_owns_the_server_for_the_training_scope(

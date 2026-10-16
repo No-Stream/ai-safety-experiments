@@ -64,6 +64,7 @@ class VLLMServerConfig:
     enable_prefix_caching: bool = False
     kv_cache_dtype: str | None = None
     mamba_cache_mode: str | None = None
+    mamba_ssm_cache_dtype: str | None = None
     max_num_batched_tokens: int | None = None
     quantization: str | None = None
     enable_lora: bool = False
@@ -109,7 +110,7 @@ class VLLMServerConfig:
         if not 1 <= self.port <= _MAX_TCP_PORT:
             raise ValueError(f"port must be between 1 and {_MAX_TCP_PORT}")
 
-    def _validate_optional_engine_settings(self) -> None:  # noqa: C901 - flat config validation
+    def _validate_optional_engine_settings(self) -> None:  # noqa: C901, PLR0912 - flat config validation
         """Validate optional engine and health endpoint settings."""
         if self.max_num_seqs is not None and self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive when supplied")
@@ -117,6 +118,8 @@ class VLLMServerConfig:
             raise ValueError("attention_backend must be non-empty when supplied")
         if self.mamba_cache_mode == "":
             raise ValueError("mamba_cache_mode must be non-empty when supplied")
+        if self.mamba_ssm_cache_dtype not in (None, "auto", "float32", "float16", "bfloat16"):
+            raise ValueError("mamba_ssm_cache_dtype must be a supported vLLM cache dtype")
         if self.max_num_batched_tokens is not None and self.max_num_batched_tokens <= 0:
             raise ValueError("max_num_batched_tokens must be positive when supplied")
         if self.max_lora_rank is not None and self.max_lora_rank <= 0:
@@ -213,6 +216,7 @@ class VLLMServerConfig:
         for option, value in (
             ("--kv-cache-dtype", self.kv_cache_dtype),
             ("--mamba-cache-mode", self.mamba_cache_mode),
+            ("--mamba-ssm-cache-dtype", self.mamba_ssm_cache_dtype),
             ("--max-num-batched-tokens", self.max_num_batched_tokens),
             ("--quantization", self.quantization),
         ):

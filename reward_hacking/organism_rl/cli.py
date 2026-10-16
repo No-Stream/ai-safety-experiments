@@ -163,6 +163,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
         help="override episodes sampled at once; otherwise fit full context slots in owned server KV pool",
     )
     parser.add_argument("--mamba-cache-mode")
+    parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"))
+    parser.add_argument(
+        "--mamba-ssm-cache-dtype", choices=("auto", "float32", "float16", "bfloat16")
+    )
     parser.add_argument("--max-steps", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--num-generations", type=int)
@@ -365,6 +369,8 @@ def build_server_config(
         enable_sleep_mode=args.enable_sleep_mode,
         enable_prefix_caching=args.enable_prefix_caching,
         mamba_cache_mode=args.mamba_cache_mode,
+        kv_cache_dtype=args.kv_cache_dtype,
+        mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
         reasoning_config=args.reasoning_config,
         speculative_config=_speculative_config(args),
         executable=str(Path(sys.executable).with_name("vllm")),
