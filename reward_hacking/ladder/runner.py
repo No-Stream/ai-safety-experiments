@@ -402,6 +402,7 @@ class RunnerConfig:
     episode_root: Path
     oversize_reason: str | None = None
     accept_slow: str | None = None
+    gpu_preflight_passed_at_stage_start: bool = False
     perf_server_pid: int | None = None
     perf_startup_seconds: float = 0.0
     perf_estimate_seconds: float | None = None
@@ -5754,6 +5755,7 @@ def run_grid(
         estimate_seconds=config.perf_estimate_seconds,
         accept_slow=config.accept_slow,
         allowed_gpu_pids=() if config.perf_server_pid is None else (config.perf_server_pid,),
+        gpu_preflight_passed_at_stage_start=config.gpu_preflight_passed_at_stage_start,
         thresholds=config.perf_thresholds,
     ) as monitor:
         monitor.add_time("server_startup", config.perf_startup_seconds)
@@ -6034,6 +6036,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--perf-server-pid", type=int, help="PID of the serving process; descendants are allowed."
     )
     parser.add_argument("--perf-startup-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--gpu-preflight-passed-at-stage-start",
+        action="store_true",
+        help="A GPU preflight passed just before this run, so unattributable WSL VRAM is platform-unknown.",
+    )
     parser.add_argument("--perf-estimate-seconds", type=float)
     parser.add_argument("--perf-min-decode-fraction", type=float, default=0.4)
     parser.add_argument("--perf-min-sm-utilization", type=float, default=50.0)
@@ -6133,6 +6140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             samples=args.samples,
             oversize_reason=args.oversize_reason,
             accept_slow=args.accept_slow,
+            gpu_preflight_passed_at_stage_start=args.gpu_preflight_passed_at_stage_start,
             perf_server_pid=args.perf_server_pid,
             perf_startup_seconds=args.perf_startup_seconds,
             perf_estimate_seconds=args.perf_estimate_seconds,

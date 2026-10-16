@@ -37,6 +37,7 @@ from reward_hacking.organism_rl import evaluate, health
 from reward_hacking.organism_rl.generate import require_gitignored_output_dir
 from reward_hacking.organism_rl.wave_v4 import DIVERSITY_CELLS
 from reward_hacking.vllm_server import VLLMServer
+from scripts.gpu_preflight import require_free_gpu
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -61,6 +62,8 @@ PRESENCE_PENALTY = "0.0"
 LADDER_SCENARIO_ROOT = REPOSITORY_ROOT / "reward_hacking/ladder/data/scenarios-v2.2-heldout-wip-r3"
 LADDER_CELL_NAME = "ladder-heldout"
 ORGANISM_CELL_NAMES = ("aisi-collection-config", "math-loose-oneoff", "capability-aisi-original")
+# Smoke tiers from the model ladder: plumbing checks whose decode throughput is not gated.
+SMOKE_BASE_MODELS = frozenset({"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"})
 BATTERY_CELL_NAMES = (LADDER_CELL_NAME, *ORGANISM_CELL_NAMES)
 _LABEL_PATTERN = re.compile(r"[a-z0-9][a-z0-9.-]*")
 
@@ -231,11 +234,29 @@ def heldout_ladder_scenarios(root: Path) -> tuple[str, ...]:
     return select_across_repositories([scenario.slug for scenario in oneoffs], EPISODES_PER_CELL)
 
 
+def _accept_slow_reason(run: BatteryRun) -> str | None:
+    """Name why the decode roofline cannot be reached, or return None to keep the gate active."""
+    if run.model.base_model in SMOKE_BASE_MODELS:
+        return f"smoke model {run.model.base_model}: throughput is recorded for plumbing, not gated"
+    if run.concurrency < EPISODES_PER_CELL:
+        return (
+            f"concurrency {run.concurrency} is below the {EPISODES_PER_CELL} episodes a cell runs, "
+            "so the decode roofline is out of reach"
+        )
+    return None
+
+
 def ladder_cell_arguments(
-    run: BatteryRun, endpoint: str, server_log: Path, scenarios: Sequence[str]
+    run: BatteryRun,
+    endpoint: str,
+    server_log: Path,
+    scenarios: Sequence[str],
+    *,
+    gpu_preflight_passed: bool,
 ) -> list[str]:
     """Build the ladder runner command line for the held-out ladder cell."""
     cell_dir = run.model_dir.resolve() / LADDER_CELL_NAME
+    accept_slow_reason = _accept_slow_reason(run)
     arguments = [
         "--endpoint",
         endpoint,
@@ -267,6 +288,10 @@ def ladder_cell_arguments(
         "--episode-concurrency",
         str(run.concurrency),
     ]
+    if accept_slow_reason is not None:
+        arguments.extend(("--accept-slow", accept_slow_reason))
+    if gpu_preflight_passed:
+        arguments.append("--gpu-preflight-passed-at-stage-start")
     for slug in scenarios:
         arguments.extend(("--scenario", slug))
     return arguments
@@ -495,7 +520,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--cell", action="append", dest="cells", choices=BATTERY_CELL_NAMES)
     parser.add_argument("--max-model-len", type=int, default=65536)
-    parser.add_argument("--concurrency", type=int, default=6)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=EPISODES_PER_CELL,
+        help="episodes in flight per cell; below the cell size the decode roofline gate is accepted",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument(
         "--enable-speculative-decoding", action=argparse.BooleanOptionalAction, default=True
@@ -522,13 +552,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _validated_cell_commands(
-    run: BatteryRun, cells: Sequence[str], endpoint: str, server_log: Path
+    run: BatteryRun,
+    cells: Sequence[str],
+    endpoint: str,
+    server_log: Path,
+    *,
+    gpu_preflight_passed: bool,
 ) -> dict[str, list[str]]:
     commands: dict[str, list[str]] = {}
     for cell_name in cells:
         if cell_name == LADDER_CELL_NAME:
             command = ladder_cell_arguments(
-                run, endpoint, server_log, heldout_ladder_scenarios(LADDER_SCENARIO_ROOT)
+                run,
+                endpoint,
+                server_log,
+                heldout_ladder_scenarios(LADDER_SCENARIO_ROOT),
+                gpu_preflight_passed=gpu_preflight_passed,
             )
             runner._parse_cli_args(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
                 runner._build_cli_parser(),  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -542,6 +581,7 @@ def _validated_cell_commands(
 
 
 def _run_cells(run: BatteryRun, cells: Sequence[str], gpu_memory_utilization: float) -> None:
+    require_free_gpu()
     server_args = evaluate.parse_args(server_arguments(run, gpu_memory_utilization))
     server_config = evaluate.build_server_config(
         server_args, evaluate.resolve_model_revision(server_args)
@@ -549,7 +589,13 @@ def _run_cells(run: BatteryRun, cells: Sequence[str], gpu_memory_utilization: fl
     if server_config.log_path is None:
         raise ValueError("the ladder cell needs the vLLM server log")
     with VLLMServer(server_config) as server:
-        commands = _validated_cell_commands(run, cells, server.base_url, server_config.log_path)
+        commands = _validated_cell_commands(
+            run,
+            cells,
+            server.base_url,
+            server_config.log_path,
+            gpu_preflight_passed=True,
+        )
         for cell_name, command in commands.items():
             logger.info("running battery cell %s for %s", cell_name, run.model.label)
             if cell_name == LADDER_CELL_NAME:
@@ -581,7 +627,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     if args.dry_run:
         commands = _validated_cell_commands(
-            run, args.cells, "http://127.0.0.1:8000", model_dir / "server" / "vllm-server.log"
+            run,
+            args.cells,
+            "http://127.0.0.1:8000",
+            model_dir / "server" / "vllm-server.log",
+            gpu_preflight_passed=False,
         )
         for cell_name, command in commands.items():
             logger.info("cell %s: %s", cell_name, " ".join(command))

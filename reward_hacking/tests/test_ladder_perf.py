@@ -127,6 +127,52 @@ def test_real_grid_starts_monitor_and_records_override(
     assert report_path.read_text(encoding="utf-8") == "previous report"
 
 
+def test_gpu_preflight_result_reaches_the_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monitor_kwargs: list[dict[str, Any]] = []
+
+    class RecordingMonitor:
+        def __init__(self, **kwargs: Any) -> None:
+            monitor_kwargs.append(kwargs)
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def add_time(self, category: str, seconds: float) -> None:
+            return None
+
+        def set_mean_context(self, tokens: float) -> None:
+            return None
+
+    monkeypatch.setattr(runner, "PerfMonitor", RecordingMonitor)
+    monkeypatch.setattr(runner, "throughput_breaches", lambda _path: [])
+    monkeypatch.setattr(runner, "_prepare_real_run_config", lambda config: config)
+    monkeypatch.setattr(runner, "_grid_has_pending_episodes", lambda _config: True)
+    monkeypatch.setattr(runner, "_resolve_perf_server_pid", lambda _endpoint: 123)
+    monkeypatch.setattr(runner, "_run_grid", lambda *_args, **_kwargs: [])
+    config = runner.RunnerConfig(
+        endpoint="http://localhost:8000/v1",
+        models=(runner.ModelSpec("base", "synthetic-model"),),
+        scenarios=(DummyScenario("dummy"),),
+        arms=("naive",),
+        samples=1,
+        output_path=tmp_path / "records.jsonl",
+        episode_root=tmp_path / "episodes",
+    )
+
+    runner.run_grid(config)
+    runner.run_grid(replace(config, gpu_preflight_passed_at_stage_start=True))
+
+    assert [kwargs["gpu_preflight_passed_at_stage_start"] for kwargs in monitor_kwargs] == [
+        False,
+        True,
+    ]
+
+
 def test_injected_episode_runner_does_not_probe_gpu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -12,12 +13,14 @@ import pytest
 from reward_hacking.ladder import runner
 from reward_hacking.organism_rl import evaluate, transfer_battery
 from reward_hacking.organism_rl.wave_v4 import DIVERSITY_CELLS
+from scripts.gpu_preflight import GpuBusyError
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import argparse
 
 BATTERY_SAMPLING = {"temperature": 0.6, "top_k": 20, "top_p": 1.0, "presence_penalty": 0.0}
 SYNTHETIC_LADDER_SCENARIOS = tuple(f"repo{index % 5}-case{index}-oneoff" for index in range(8))
+SERVER_LOG = Path("/nonexistent/vllm-server.log")
 
 
 @pytest.fixture
@@ -28,14 +31,37 @@ def adapter_dir(tmp_path: Path) -> Path:
     return directory
 
 
-def _run(tmp_path: Path, adapter: Path | None) -> transfer_battery.BatteryRun:
+def _run(
+    tmp_path: Path,
+    adapter: Path | None,
+    *,
+    base_model: str = transfer_battery.BASE_MODEL,
+    concurrency: int = 6,
+) -> transfer_battery.BatteryRun:
     label = "base" if adapter is None else "seed-v2-refit"
     return transfer_battery.BatteryRun(
-        model=transfer_battery.BatteryModel(label=label, adapter_dir=adapter),
+        model=transfer_battery.BatteryModel(
+            label=label, adapter_dir=adapter, base_model=base_model
+        ),
         model_dir=tmp_path / "battery" / label,
         max_model_len=65536,
-        concurrency=6,
+        concurrency=concurrency,
         speculative_decoding=True,
+    )
+
+
+def _ladder_args(
+    run: transfer_battery.BatteryRun, *, gpu_preflight_passed: bool
+) -> argparse.Namespace:
+    return runner._parse_cli_args(  # pyright: ignore[reportPrivateUsage]
+        runner._build_cli_parser(),  # pyright: ignore[reportPrivateUsage]
+        transfer_battery.ladder_cell_arguments(
+            run,
+            "http://127.0.0.1:8000",
+            SERVER_LOG,
+            SYNTHETIC_LADDER_SCENARIOS,
+            gpu_preflight_passed=gpu_preflight_passed,
+        ),
     )
 
 
@@ -91,7 +117,11 @@ class TestCellCommands:
         args = runner._parse_cli_args(  # pyright: ignore[reportPrivateUsage]
             runner._build_cli_parser(),  # pyright: ignore[reportPrivateUsage]
             transfer_battery.ladder_cell_arguments(
-                run, "http://127.0.0.1:8000", server_log, SYNTHETIC_LADDER_SCENARIOS
+                run,
+                "http://127.0.0.1:8000",
+                server_log,
+                SYNTHETIC_LADDER_SCENARIOS,
+                gpu_preflight_passed=True,
             ),
         )
         assert "heldout" in args.scenario_root.name
@@ -153,6 +183,46 @@ class TestCellCommands:
     def test_model_label_must_be_a_path_safe_slug(self) -> None:
         with pytest.raises(ValueError, match="label"):
             transfer_battery.BatteryModel(label="seed v2/../x", adapter_dir=None)
+
+
+class TestThroughputGate:
+    @pytest.mark.parametrize("base_model", ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"])
+    def test_smoke_model_accepts_slow_and_carries_the_preflight_result(
+        self, tmp_path: Path, base_model: str
+    ) -> None:
+        run = _run(
+            tmp_path,
+            None,
+            base_model=base_model,
+            concurrency=transfer_battery.EPISODES_PER_CELL,
+        )
+        args = _ladder_args(run, gpu_preflight_passed=True)
+        assert args.gpu_preflight_passed_at_stage_start is True
+        assert args.accept_slow is not None
+        assert base_model in args.accept_slow
+
+    def test_full_size_model_at_full_concurrency_keeps_the_throughput_gate_active(
+        self, tmp_path: Path
+    ) -> None:
+        run = _run(tmp_path, None, concurrency=transfer_battery.EPISODES_PER_CELL)
+        args = _ladder_args(run, gpu_preflight_passed=True)
+        assert args.accept_slow is None
+        assert args.gpu_preflight_passed_at_stage_start is True
+
+    def test_concurrency_below_the_cell_size_accepts_slow(self, tmp_path: Path) -> None:
+        run = _run(tmp_path, None, concurrency=6)
+        args = _ladder_args(run, gpu_preflight_passed=True)
+        assert args.accept_slow is not None
+        assert "concurrency 6" in args.accept_slow
+
+    def test_preflight_flag_is_absent_when_no_preflight_ran(self, tmp_path: Path) -> None:
+        run = _run(tmp_path, None, concurrency=transfer_battery.EPISODES_PER_CELL)
+        args = _ladder_args(run, gpu_preflight_passed=False)
+        assert args.gpu_preflight_passed_at_stage_start is False
+
+    def test_battery_defaults_to_running_a_whole_cell_at_once(self) -> None:
+        args = transfer_battery.parse_args(["--model-label", "base"])
+        assert args.concurrency == transfer_battery.EPISODES_PER_CELL
 
 
 def _awareness(*, integrity: bool = False, presumed: int = 0, training: bool = False) -> object:
@@ -325,6 +395,10 @@ class TestCellReadout:
 
 
 class TestMain:
+    @pytest.fixture(autouse=True)
+    def _gpu_is_free(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(transfer_battery, "require_free_gpu", lambda: None)
+
     def test_smoke_tier_base_model_reaches_every_cell_command(self, tmp_path: Path) -> None:
         args = transfer_battery.parse_args(
             ["--model-label", "smoke-0.8b", "--base-model", "Qwen/Qwen3.5-0.8B"]
@@ -344,7 +418,11 @@ class TestMain:
         )
         assert evaluate_args.model == evaluate_args.served_model_id == "Qwen/Qwen3.5-0.8B"
         ladder_command = transfer_battery.ladder_cell_arguments(
-            run, "http://127.0.0.1:8000", tmp_path / "vllm-server.log", SYNTHETIC_LADDER_SCENARIOS
+            run,
+            "http://127.0.0.1:8000",
+            tmp_path / "vllm-server.log",
+            SYNTHETIC_LADDER_SCENARIOS,
+            gpu_preflight_passed=True,
         )
         assert "Qwen/Qwen3.5-0.8B=Qwen/Qwen3.5-0.8B" in ladder_command
 
@@ -354,16 +432,21 @@ class TestMain:
                 ["--model-label", "seed-v2-refit", "--adapter-dir", str(tmp_path / "missing")]
             )
 
-    def test_run_serves_once_runs_every_cell_then_writes_the_readout(
+    def test_run_preflights_then_serves_once_runs_every_cell_then_writes_the_readout(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, adapter_dir: Path
     ) -> None:
+        events: list[str] = []
         servers: list[object] = []
         calls: list[tuple[str, list[str]]] = []
 
         def serve(config: object) -> object:
+            events.append("server")
             servers.append(config)
             return nullcontext(SimpleNamespace(base_url="http://127.0.0.1:8123"))
 
+        monkeypatch.setattr(
+            transfer_battery, "require_free_gpu", lambda: events.append("preflight")
+        )
         monkeypatch.setattr(transfer_battery, "VLLMServer", serve)
         monkeypatch.setattr(
             transfer_battery, "heldout_ladder_scenarios", lambda _root: SYNTHETIC_LADDER_SCENARIOS
@@ -395,15 +478,58 @@ class TestMain:
             ]
         )
 
+        assert events == ["preflight", "server"]
         assert len(servers) == 1
         assert [kind for kind, _argv in calls] == ["ladder", "evaluate", "evaluate", "evaluate"]
         assert all("http://127.0.0.1:8123" in argv for _kind, argv in calls)
+        ladder_argv = next(argv for kind, argv in calls if kind == "ladder")
+        assert "--gpu-preflight-passed-at-stage-start" in ladder_argv
+        assert "--accept-slow" not in ladder_argv
+        assert all("--gpu-preflight-passed-at-stage-start" not in argv for _kind, argv in calls[1:])
         summary = json.loads(
             (output_root / "seed-v2-refit" / "battery-summary.json").read_text(encoding="utf-8")
         )
         assert list(summary["cells"]) == list(transfer_battery.BATTERY_CELL_NAMES)
         assert summary["adapter_dir"] == str(adapter_dir.resolve())
         assert (output_root / "seed-v2-refit" / "battery-summary.md").read_text() == "readout\n"
+
+    def test_busy_gpu_stops_the_battery_before_the_server_starts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def refuse() -> None:
+            raise GpuBusyError("pid 4242 holding 20000 MiB")
+
+        def serve(_config: object) -> object:
+            pytest.fail("the server must not start on a busy GPU")
+
+        monkeypatch.setattr(transfer_battery, "require_free_gpu", refuse)
+        monkeypatch.setattr(transfer_battery, "VLLMServer", serve)
+        with pytest.raises(GpuBusyError):
+            transfer_battery.main(["--model-label", "base", "--output-root", str(tmp_path)])
+
+    def test_dry_run_validates_every_cell_without_a_gpu_or_server(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        def refuse(*_args: object) -> None:
+            pytest.fail("a dry run must not probe the GPU or start a server")
+
+        monkeypatch.setattr(transfer_battery, "require_free_gpu", refuse)
+        monkeypatch.setattr(transfer_battery, "VLLMServer", refuse)
+        monkeypatch.setattr(
+            transfer_battery, "heldout_ladder_scenarios", lambda _root: SYNTHETIC_LADDER_SCENARIOS
+        )
+        transfer_battery.main(
+            [
+                "--model-label",
+                "smoke-0.8b",
+                "--base-model",
+                "Qwen/Qwen3.5-0.8B",
+                "--dry-run",
+                "--output-root",
+                str(tmp_path),
+            ]
+        )
+        assert not (tmp_path / "smoke-0.8b").exists()
 
     def test_a_failed_ladder_cell_stops_the_battery(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
