@@ -201,7 +201,7 @@ def test_wave_command(cell: wave_v4.ProbeCell, generator: str, hint: str, tmp_pa
         "--hint-strength": hint,
         "--max-tasks": "12",
         "--samples": "1",
-        "--concurrency": "6",
+        "--concurrency": "8",
         "--temperature": "0.6",
         "--top-p": "1.0",
         "--top-k": "20",

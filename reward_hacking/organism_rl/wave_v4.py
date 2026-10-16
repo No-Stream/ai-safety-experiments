@@ -528,7 +528,7 @@ def launch_summary(args: argparse.Namespace) -> str:
             f"Chat template: reasoning_effort={args.reasoning_effort}; thinking budget: 2048.\n"
             "Sampling: temperature=0.6, top_k=20, top_p=1.0, "
             f"presence_penalty={0.0 if cell in DIVERSITY_CELLS else 1.5}.\n"
-            "Concurrency: startup KV pool / half max model len, capped at 6; the pool must hold one "
+            "Concurrency: startup KV pool / 40,960-token planning slots, capped at 8; the pool must hold one "
             "full max model len. Capacity, planning context, VRAM utilization and device are logged "
             "at startup.\n"
             "Model cache: inherited HF_HUB_CACHE/HF_HOME, or --model local snapshot.\n"
