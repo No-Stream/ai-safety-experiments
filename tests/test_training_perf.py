@@ -59,6 +59,22 @@ def test_accumulated_step_writes_json_and_log(
     assert "MFU=unknown" in caplog.text
 
 
+def test_training_window_excludes_rollout_and_restore(tmp_path: Path) -> None:
+    excluded = [0.0]
+    callback = TrainingThroughputCallback(non_training_seconds=lambda: excluded[0])
+    args = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to=[])
+    state, control = TrainerState(global_step=1), TrainerControl()
+    callback.on_train_begin(args, state, control, model=torch.nn.Linear(2, 2))
+    callback.on_step_begin(args, state, control)
+    callback.started_at = time.perf_counter() - 10.0
+    callback.processed_tokens = 100
+    excluded[0] = 8.0
+    callback.on_step_end(args, state, control)
+    record = callback.records[-1]
+    assert record["seconds"] == pytest.approx(2.0, abs=0.1)
+    assert record["tokens_per_second"] == pytest.approx(50.0, abs=3)
+
+
 def test_grpo_counting_preserves_loss_and_ignores_evaluation() -> None:
     model = torch.nn.Linear(2, 2)
     expected_loss = torch.tensor(3.0)

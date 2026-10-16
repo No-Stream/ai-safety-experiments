@@ -419,6 +419,10 @@ def test_sampler_correction_matches_previous_forward_and_metric(tmp_path: Path) 
     assert trainer._metrics["eval"]["organism/trainer_sampler_logprob_gap"][-1] == pytest.approx(
         expected_metric
     )
+    assert trainer._metrics["eval"]["organism/trainer_sampler_logprob_gap_abs"][
+        -1
+    ] == pytest.approx(expected_gap.abs().sum().item() / assistant_mask.sum().item())
+    assert trainer._metrics["eval"]["organism/trainer_sampler_logprob_gap_tokens"][-1] == 2
 
 
 def test_resuming_already_complete_run_does_not_take_another_step(tmp_path: Path) -> None:

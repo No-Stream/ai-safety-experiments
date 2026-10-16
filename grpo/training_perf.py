@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -58,7 +59,7 @@ def training_output_directory(args: TrainingArguments) -> Path:
 class TrainingThroughputCallback(TrainerCallback):
     """Count the tensor slots actually passed to loss and persist every completed optimizer step."""
 
-    def __init__(self) -> None:
+    def __init__(self, non_training_seconds: Callable[[], float] | None = None) -> None:
         """Wait for a trainer and its actual model rather than infer parameter counts from its name."""
         self.records: list[dict[str, float | int | None]] = []
         self.processed_tokens = 0
@@ -68,6 +69,8 @@ class TrainingThroughputCallback(TrainerCallback):
         self.peak_flops: float | None = None
         self.peak_source: str | None = None
         self.attached = False
+        self.non_training_seconds = non_training_seconds
+        self.excluded_at_start = 0.0
 
     def attach(self, trainer: Any) -> None:  # noqa: ANN401 - shared HF/TRL private seam
         """Wrap loss accounting once; the training calculation and return value are unchanged."""
@@ -137,6 +140,7 @@ class TrainingThroughputCallback(TrainerCallback):
         if args.device.type == "cuda":
             torch.cuda.synchronize(args.device)
         self.processed_tokens = 0
+        self.excluded_at_start = self.non_training_seconds() if self.non_training_seconds else 0.0
         self.started_at = time.perf_counter()
 
     def on_step_end(
@@ -150,9 +154,14 @@ class TrainingThroughputCallback(TrainerCallback):
         del control, kwargs
         if args.device.type == "cuda":
             torch.cuda.synchronize(args.device)
+        excluded = (
+            self.non_training_seconds() - self.excluded_at_start
+            if self.non_training_seconds
+            else 0.0
+        )
         record = training_step_metrics(
             self.processed_tokens,
-            time.perf_counter() - self.started_at,
+            time.perf_counter() - self.started_at - excluded,
             frozen_parameters=self.frozen_parameters,
             trainable_parameters=self.trainable_parameters,
             peak_flops=self.peak_flops,

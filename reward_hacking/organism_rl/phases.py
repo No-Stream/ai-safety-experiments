@@ -15,6 +15,7 @@ import gc
 import hashlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
@@ -171,6 +172,7 @@ class VLLMPhaseController:
         self._adapter_name: str | None = None
         self._served_adapter_path: Path | None = None
         self._training = False
+        self.last_sync_seconds: dict[str, float] = {}
 
     def close(self) -> None:
         """Release the owned HTTP client."""
@@ -267,7 +269,9 @@ class VLLMPhaseController:
             raise ValueError("adapter step must be nonnegative")
         staging_name = f"step-{step:08d}-{uuid4().hex}"
         adapter_dir = self.adapter_root / "training" / staging_name
+        started = time.perf_counter()
         trainer.model.save_pretrained(str(adapter_dir))
+        saved = time.perf_counter()
         config_path = adapter_dir / "adapter_config.json"
         canonical_config = _canonical_config(json.loads(config_path.read_text(encoding="utf-8")))
         config_path.write_text(
@@ -275,10 +279,14 @@ class VLLMPhaseController:
             encoding="utf-8",
         )
         name = f"{self.adapter_prefix}-step-{step:08d}-{_adapter_digest(adapter_dir)}"
+        digested = time.perf_counter()
         served_dir = prepare_vllm_serving_adapter(adapter_dir, self.adapter_root / "serving" / name)
+        copied = time.perf_counter()
         self._offload(trainer)
+        offloaded = time.perf_counter()
         self._wake_up(restore_adapter=False)
         self._assert_sleeping(expected=False)
+        woken = time.perf_counter()
         served_model_ids = self._served_model_ids()
         stale_adapters = {
             model_id
@@ -299,4 +307,13 @@ class VLLMPhaseController:
         self._adapter_name = name
         self.backend.model_id = name
         self._assert_served()
+        loaded = time.perf_counter()
+        self.last_sync_seconds = {
+            "save": saved - started,
+            "digest": digested - saved,
+            "serving_copy": copied - digested,
+            "offload": offloaded - copied,
+            "wake": woken - offloaded,
+            "lora_load_http": loaded - woken,
+        }
         logger.info("synchronized LoRA step=%d model=%s", step, name)

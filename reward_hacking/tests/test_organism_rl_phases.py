@@ -133,6 +133,15 @@ def test_sample_train_sync_cycle(
     trainer.optimizer.step()
     trainer.state.global_step = 1
     controller.after_optimizer_step(trainer)
+    assert set(controller.last_sync_seconds) == {
+        "save",
+        "digest",
+        "serving_copy",
+        "offload",
+        "wake",
+        "lora_load_http",
+    }
+    assert all(value >= 0 for value in controller.last_sync_seconds.values())
     assert not state.sleeping
     assert backend.model_id != initial_name
     assert state.adapters == {backend.model_id}

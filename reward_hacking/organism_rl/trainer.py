@@ -28,6 +28,7 @@ from games.train import STEP_PADDED_TOKENS_METRIC, STEP_TRIMMED_TOKENS_METRIC, t
 from grpo.training_perf import TrainingThroughputCallback
 from reward_hacking.checkpoint_retention import CheckpointRetentionMixin
 from reward_hacking.distill.train import chunked_completion_logps
+from reward_hacking.organism_rl.phases import VLLMPhaseController
 
 # One fp32 slice of a 248K-token vocabulary at 1,024 positions is about 1 GiB.
 DEFAULT_LOGPROB_CHUNK_TOKENS = 1024
@@ -175,6 +176,9 @@ class _SyncCallback(TrainerCallback):
         started = time.perf_counter()
         self.phase.after_optimizer_step(self.trainer)
         metrics["organism/seconds_adapter_sync"].append(time.perf_counter() - started)
+        if isinstance(self.phase, VLLMPhaseController):
+            for name, seconds in self.phase.last_sync_seconds.items():
+                metrics[f"organism/seconds_sync_{name}"].append(seconds)
 
 
 class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
@@ -210,6 +214,7 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
         self.latest_rollout: dict[str, Any] = {}
         self.step_rollout_records: list[Any] = []
         self._active_loss_inputs: dict[str, Any] | None = None
+        self._non_training_seconds = 0.0
 
         def captured_rollout(prompts: list[Any], trainer: "OrganismGRPOTrainer") -> dict[str, Any]:
             started = time.perf_counter()
@@ -224,15 +229,19 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             if self.phase is not None:
                 self.phase.before_training(self)
             seconds = self._metrics["train"]
+            training_ready = time.perf_counter()
             seconds["organism/seconds_wake_sampler"].append(sampler_ready - started)
             seconds["organism/seconds_rollout"].append(sampled - sampler_ready)
-            seconds["organism/seconds_restore_trainer"].append(time.perf_counter() - sampled)
+            seconds["organism/seconds_restore_trainer"].append(training_ready - sampled)
+            self._non_training_seconds += training_ready - started
             return output
 
         kwargs["rollout_func"] = captured_rollout
         super().__init__(*args, **kwargs)
         self._validate_configuration()
-        TrainingThroughputCallback().attach(self)
+        TrainingThroughputCallback(non_training_seconds=lambda: self._non_training_seconds).attach(
+            self
+        )
         if phase is not None:
             self.add_callback(_SyncCallback(self, phase))
 
@@ -400,6 +409,17 @@ class OrganismGRPOTrainer(CheckpointRetentionMixin, GRPOTrainer):
             mode = "train" if model.training else "eval"
             self._metrics[mode]["organism/trainer_sampler_logprob_gap"].append(
                 gap.sum().item() / max(assistant_mask.sum().item(), 1)
+            )
+            token_count = int(assistant_mask.sum().item())
+            self._metrics[mode]["organism/trainer_sampler_logprob_gap_abs"].append(
+                gap.abs().sum().item() / token_count if token_count else math.nan
+            )
+            self._metrics[mode]["organism/trainer_sampler_logprob_gap_tokens"].append(token_count)
+            self._metrics[mode]["organism/sampler_ratio_capped_fraction"].append(
+                ((gap > math.log(self.importance_ratio_cap)) * assistant_mask).sum().item()
+                / token_count
+                if token_count
+                else math.nan
             )
         return per_token_logps, entropies, aux_loss
 
