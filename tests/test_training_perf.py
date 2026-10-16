@@ -35,12 +35,13 @@ def test_parameter_matmul_estimate_is_explicit() -> None:
 def test_accumulated_step_writes_json_and_log(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    model = torch.nn.Linear(2, 2)
+    model = torch.nn.Embedding(8, 2)
     model.weight.requires_grad_(False)
     trainer: Any = SimpleNamespace(
         model=model,
-        compute_loss=lambda model, inputs: model(inputs["values"]).sum(),
+        compute_loss=lambda model, inputs: model(inputs["input_ids"]).sum(),
         add_callback=lambda _callback: None,
+        accelerator=SimpleNamespace(unwrap_model=lambda model: model),
     )
     callback = TrainingThroughputCallback()
     callback.attach(trainer)
@@ -49,7 +50,7 @@ def test_accumulated_step_writes_json_and_log(
     callback.on_train_begin(args, state, control, model=model)
     callback.on_step_begin(args, state, control)
     for _ in range(2):
-        trainer.compute_loss(model, {"input_ids": torch.ones((1, 4)), "values": torch.ones((1, 2))})
+        trainer.compute_loss(model, {"input_ids": torch.ones((1, 4), dtype=torch.long)})
     with caplog.at_level(logging.INFO):
         callback.on_step_end(args, state, control)
     result = json.loads((tmp_path / "throughput.json").read_text())
@@ -76,10 +77,18 @@ def test_training_window_excludes_rollout_and_restore(tmp_path: Path) -> None:
 
 
 def test_grpo_counting_preserves_loss_and_ignores_evaluation() -> None:
-    model = torch.nn.Linear(2, 2)
+    model = torch.nn.Embedding(5, 3)
     expected_loss = torch.tensor(3.0)
+
+    def compute_loss(model: torch.nn.Module, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        input_ids = torch.cat((inputs["prompt_ids"], inputs["completion_ids"]), dim=1).long()
+        model(input_ids)
+        return expected_loss
+
     trainer: Any = SimpleNamespace(
-        compute_loss=lambda *_args, **_kwargs: expected_loss, add_callback=lambda _callback: None
+        compute_loss=compute_loss,
+        add_callback=lambda _callback: None,
+        accelerator=SimpleNamespace(unwrap_model=lambda model: model),
     )
     callback = TrainingThroughputCallback()
     callback.attach(trainer)
@@ -91,6 +100,82 @@ def test_grpo_counting_preserves_loss_and_ignores_evaluation() -> None:
     assert callback.processed_tokens == 16
     with pytest.raises(RuntimeError, match="already attached"):
         callback.attach(trainer)
+
+
+def test_zero_advantage_skip_does_not_count_unforwarded_tokens(tmp_path: Path) -> None:
+    model = torch.nn.Embedding(5, 3)
+
+    def compute_loss(model: torch.nn.Module, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        if not bool(torch.any(inputs["advantages"] != 0)):
+            return torch.tensor(0.0, requires_grad=True)
+        return model(inputs["input_ids"]).sum()
+
+    trainer: Any = SimpleNamespace(
+        compute_loss=compute_loss,
+        add_callback=lambda _callback: None,
+        accelerator=SimpleNamespace(unwrap_model=lambda model: model),
+    )
+    callback = TrainingThroughputCallback()
+    callback.attach(trainer)
+    live_row = {
+        "input_ids": torch.ones((1, 4), dtype=torch.long),
+        "advantages": torch.ones(1),
+    }
+    skipped_row = {
+        "input_ids": torch.ones((1, 4), dtype=torch.long),
+        "advantages": torch.zeros(1),
+    }
+    args = TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to=[])
+    control = TrainerControl()
+    callback.on_train_begin(args, TrainerState(), control, model=model)
+    callback.on_step_begin(args, TrainerState(), control)
+
+    trainer.compute_loss(model, live_row)
+    trainer.compute_loss(model, skipped_row)
+    callback.on_step_end(args, TrainerState(global_step=1), control)
+
+    callback.on_step_begin(args, TrainerState(global_step=1), control)
+    trainer.compute_loss(model, skipped_row)
+    callback.started_at = time.perf_counter() - 1.0
+    callback.on_step_end(args, TrainerState(global_step=2), control)
+
+    result = json.loads((tmp_path / "throughput.json").read_text())
+    assert [step["processed_tokens"] for step in result["steps"]] == [4, 0]
+
+
+def test_backbone_forward_counts_tokens_when_outer_model_is_bypassed() -> None:
+    class Backbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding = torch.nn.Embedding(8, 2)
+
+        def get_input_embeddings(self) -> torch.nn.Embedding:
+            return self.embedding
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return self.embedding(input_ids)
+
+    model = Backbone()
+
+    def compute_loss(model: Backbone, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+        if not bool(torch.any(inputs["advantages"] != 0)):
+            return torch.tensor(0.0, requires_grad=True)
+        return model.embedding(inputs["input_ids"]).sum()
+
+    trainer: Any = SimpleNamespace(
+        compute_loss=compute_loss,
+        add_callback=lambda _callback: None,
+        accelerator=SimpleNamespace(unwrap_model=lambda model: model),
+    )
+    callback = TrainingThroughputCallback()
+    callback.attach(trainer)
+    trainer.compute_loss(
+        model, {"input_ids": torch.ones((1, 6), dtype=torch.long), "advantages": torch.ones(1)}
+    )
+    trainer.compute_loss(
+        model, {"input_ids": torch.ones((1, 6), dtype=torch.long), "advantages": torch.zeros(1)}
+    )
+    assert callback.processed_tokens == 6
 
 
 def test_resume_keeps_checkpoint_history_and_replaces_later_steps(tmp_path: Path) -> None:

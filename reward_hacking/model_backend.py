@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
     from peft import PeftModel
 
+    from reward_hacking.organism_rl.admission import LiveKVAdmission
+
 import httpx2
 import torch
 from huggingface_hub import snapshot_download
@@ -1308,6 +1310,7 @@ class VLLMHTTPBackend:
             raise ValueError("stop_token_ids must be non-negative")
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.request_admission: LiveKVAdmission | None = None
         self._tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
             self.model_path or model_id, revision=revision
         )
@@ -1394,7 +1397,14 @@ class VLLMHTTPBackend:
         if self.sampling.thinking_token_budget is not None:
             body["thinking_token_budget"] = self.sampling.thinking_token_budget
         max_retries = 0 if timeout_seconds is not None else VLLM_HTTP_MAX_RETRIES
-        with httpx2.Client(timeout=request_timeout, trust_env=False) as client:
+        with (
+            self.request_admission.request(
+                prompt_tokens=len(prompt_token_ids), max_tokens=max_tokens
+            )
+            if self.request_admission is not None
+            else contextlib.nullcontext(),
+            httpx2.Client(timeout=request_timeout, trust_env=False) as client,
+        ):
             response = _post_vllm_completion_with_retries(
                 client,
                 f"{self.base_url}/v1/completions",

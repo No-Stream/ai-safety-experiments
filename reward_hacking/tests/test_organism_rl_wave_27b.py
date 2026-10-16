@@ -136,7 +136,7 @@ def test_kv_concurrency_plans_observed_episode_context_and_refuses_missing_or_sh
     assert probe_v4.kv_pool_concurrency("GPU KV cache size: 341,926 tokens", 65536) == 8
     assert probe_v4.kv_pool_concurrency("GPU KV cache size: 1,048,576 tokens", 131072) == 8
     assert probe_v4.kv_pool_concurrency("GPU KV cache size: 131,072 tokens", 16384) == 8
-    assert "kv_capacity_tokens=1048576" in caplog.text
+    assert "27b kv_capacity_tokens=1048576" in caplog.text
     assert "max_model_len=131072" in caplog.text
     assert "kv_planning_context_tokens=40960" in caplog.text
     for log in [

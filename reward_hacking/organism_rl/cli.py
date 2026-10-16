@@ -33,12 +33,12 @@ from reward_hacking.distill.memory import (
 from reward_hacking.distill.train import memory_options_from_args
 from reward_hacking.evidence_store import read_jsonl
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
+from reward_hacking.organism_rl.admission import LiveKVAdmission, kv_capacity_tokens
 from reward_hacking.organism_rl.generate_provenance import active_provenance_path
 from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 from reward_hacking.organism_rl.leak_assets import leak_task_source_metadata
 from reward_hacking.organism_rl.leak_selection import add_leak_arguments, resolve_leak_options
 from reward_hacking.organism_rl.phases import VLLMPhaseController
-from reward_hacking.organism_rl.probe_v4 import kv_pool_concurrency
 from reward_hacking.organism_rl.rollout import (
     MixedEpisodeSource,
     OrganismRollout,
@@ -101,18 +101,9 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     return RuntimeSizing(sequence_tokens, 1, 2)
 
 
-def resolve_rollout_concurrency(
-    requested: int | None, episodes_per_step: int, server_log: str, max_model_len: int
-) -> int:
-    """Plan one full-context KV slot per concurrent episode in the owned server pool."""
-    if requested is not None:
-        return requested
-    return kv_pool_concurrency(
-        server_log,
-        max_model_len,
-        max_concurrency=episodes_per_step,
-        planning_context_tokens=max_model_len,
-    )
+def resolve_rollout_concurrency(requested: int | None, episodes_per_step: int) -> int:
+    """Start every episode; per-turn KV admission controls request pressure."""
+    return episodes_per_step if requested is None else requested
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI flags
@@ -160,7 +151,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument(
         "--rollout-concurrency",
         type=int,
-        help="override episodes sampled at once; otherwise fit full context slots in owned server KV pool",
+        help="cap episodes sampled at once; defaults to all episodes in the step",
+    )
+    parser.add_argument(
+        "--kv-capacity-tokens",
+        type=int,
+        help="measured vLLM KV pool capacity; required for an external endpoint",
     )
     parser.add_argument("--mamba-cache-mode")
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"))
@@ -285,6 +281,8 @@ def _validate_training_limits(args: argparse.Namespace, parser: argparse.Argumen
         )
     if args.rollout_concurrency is not None and args.rollout_concurrency < 1:
         parser.error("rollout-concurrency must be positive")
+    if args.kv_capacity_tokens is not None and args.kv_capacity_tokens < 1:
+        parser.error("kv-capacity-tokens must be positive")
     if args.prompts_per_step < 1:
         parser.error("prompts-per-step must be positive")
     if min(args.max_steps, args.max_new_tokens, args.max_turns) < 1:
@@ -409,6 +407,7 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "leak_channel_splits",
         "gpu_memory_utilization",
         "rollout_concurrency",
+        "kv_capacity_tokens",
     }
     return {key: value for key, value in flags.items() if key not in operational}
 
@@ -634,6 +633,7 @@ def _run_training(  # noqa: PLR0913 - explicit run identity and allocated device
             max_sequence_tokens=max_tokens,
             teacher_path=args.teacher_path if args.teacher_beta else None,
             episode_concurrency=rollout_concurrency,
+            admission=source.backend.request_admission,
         )
         trainer = OrganismGRPOTrainer(
             model=model,
@@ -698,6 +698,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     require_rollout_api()
+    if args.endpoint is not None and args.kv_capacity_tokens is None:
+        raise ValueError("external vLLM endpoints require --kv-capacity-tokens")
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CLI requires one CUDA device; CPU tests instantiate the trainer directly"
@@ -728,8 +730,6 @@ def main(argv: list[str] | None = None) -> None:
         "layers": configuration.num_hidden_layers,
     }
     logger.info("device and initial memory estimate: %s", device)
-    if args.endpoint is not None and args.rollout_concurrency is None:
-        raise ValueError("external vLLM endpoints require --rollout-concurrency")
     source_endpoint = (
         args.endpoint or build_server_config(args, model_revision, max_tokens).base_url
     )
@@ -843,22 +843,26 @@ def main(argv: list[str] | None = None) -> None:
     server_log_path = args.output_dir / "vllm-server.log"
     server_log_offset = server_log_path.stat().st_size if server_log_path.exists() else 0
     with server_endpoint(args, model_revision, max_tokens) as endpoint:
-        server_log = ""
-        if args.endpoint is None:
-            with server_log_path.open("rb") as log_file:
-                log_file.seek(server_log_offset)
-                server_log = log_file.read().decode("utf-8")
         rollout_concurrency = resolve_rollout_concurrency(
             args.rollout_concurrency,
             args.prompts_per_step * generations,
-            server_log,
-            max_tokens,
         )
+        if args.endpoint is None:
+            with server_log_path.open("rb") as log_file:
+                log_file.seek(server_log_offset)
+                capacity_tokens = kv_capacity_tokens(log_file.read().decode("utf-8"))
+        else:
+            capacity_tokens = cast("int", args.kv_capacity_tokens)
+        admission = LiveKVAdmission(endpoint, capacity_tokens=capacity_tokens)
+        source.backend.request_admission = admission
         logger.info(
-            "organism episodes_per_step=%d rollout_concurrency=%d kv_planning_context_tokens=%d",
+            "organism model=%s episodes_per_step=%d rollout_concurrency=%d "
+            "kv_capacity_tokens=%d kv_admission_target=%.2f",
+            args.model,
             args.prompts_per_step * generations,
             rollout_concurrency,
-            max_tokens,
+            capacity_tokens,
+            admission.target_usage,
         )
         _run_training(
             args,

@@ -57,7 +57,7 @@ def training_output_directory(args: TrainingArguments) -> Path:
 
 
 class TrainingThroughputCallback(TrainerCallback):
-    """Count the tensor slots actually passed to loss and persist every completed optimizer step."""
+    """Count token slots reached by training forwards and persist every completed optimizer step."""
 
     def __init__(self, non_training_seconds: Callable[[], float] | None = None) -> None:
         """Wait for a trainer and its actual model rather than infer parameter counts from its name."""
@@ -82,13 +82,38 @@ class TrainingThroughputCallback(TrainerCallback):
         def counted(
             model: torch.nn.Module, inputs: dict[str, Any], *args: object, **kwargs: object
         ) -> Any:  # noqa: ANN401
-            result = original(model, inputs, *args, **kwargs)
-            if model.training:
-                if "input_ids" in inputs:
-                    self.processed_tokens += cast("torch.Tensor", inputs["input_ids"]).numel()
-                else:
-                    self.processed_tokens += cast("torch.Tensor", inputs["prompt_ids"]).numel()
-                    self.processed_tokens += cast("torch.Tensor", inputs["completion_ids"]).numel()
+            if not model.training:
+                return original(model, inputs, *args, **kwargs)
+
+            forwarded_tokens = 0
+            unwrapped_model = trainer.accelerator.unwrap_model(model)
+            input_embedding = (
+                unwrapped_model
+                if isinstance(unwrapped_model, torch.nn.Embedding)
+                else unwrapped_model.get_input_embeddings()
+            )
+
+            def count_forwarded_tokens(
+                _module: torch.nn.Module,
+                forward_args: tuple[Any, ...],
+                forward_kwargs: dict[str, Any],
+            ) -> None:
+                nonlocal forwarded_tokens
+                input_ids = forward_kwargs.get("input")
+                if input_ids is None and forward_args:
+                    input_ids = forward_args[0]
+                if isinstance(input_ids, torch.Tensor):
+                    forwarded_tokens += input_ids.numel()
+                    return
+
+            forward_hook = input_embedding.register_forward_pre_hook(
+                count_forwarded_tokens, with_kwargs=True
+            )
+            try:
+                result = original(model, inputs, *args, **kwargs)
+            finally:
+                forward_hook.remove()
+            self.processed_tokens += forwarded_tokens
             return result
 
         trainer.compute_loss = counted

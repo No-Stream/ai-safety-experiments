@@ -597,6 +597,20 @@ def test_launch_checks_rollout_api_instead_of_exact_package_version(
     monkeypatch.setattr(cli, "version", lambda _package: "1.10.1")
     monkeypatch.setattr(cli.torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="CUDA"):
+        cli.main(
+            [
+                "--output-dir",
+                str(tmp_path),
+                "--endpoint",
+                "http://server:8000",
+                "--kv-capacity-tokens",
+                "1000",
+            ]
+        )
+
+
+def test_external_server_requires_measured_kv_capacity(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="kv-capacity-tokens"):
         cli.main(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
 
 
@@ -789,12 +803,9 @@ def test_prompts_per_step_sets_the_full_generation_and_accumulation_window(tmp_p
         )
 
 
-def test_rollout_concurrency_uses_the_reported_kv_pool() -> None:
-    server_log = "GPU KV cache size: 500,000 tokens\n"
-    assert cli.resolve_rollout_concurrency(None, 16, server_log, 40_960) == 12
-    assert cli.resolve_rollout_concurrency(15, 16, server_log, 40_960) == 15
-    with pytest.raises(ValueError, match="GPU KV cache"):
-        cli.resolve_rollout_concurrency(None, 16, "", 40_960)
+def test_rollout_concurrency_defaults_to_episodes_per_step() -> None:
+    assert cli.resolve_rollout_concurrency(None, 16) == 16
+    assert cli.resolve_rollout_concurrency(15, 16) == 15
 
 
 def test_rollout_concurrency_is_operational_and_positive(tmp_path: Path) -> None:

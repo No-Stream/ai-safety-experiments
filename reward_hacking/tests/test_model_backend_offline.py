@@ -99,6 +99,7 @@ def test_vllm_http_context_error_is_classified_without_swallowing_other_errors(
     backend.model_id = "synthetic"
     backend.base_url = "http://localhost"
     backend.timeout_seconds = 3.0
+    backend.request_admission = None
     backend.sampling = SamplingConfig(max_new_tokens=8)
     backend.stop_token_ids = ()
     options = model_backend._VLLMHTTPRequestOptions(  # pyright: ignore[reportPrivateUsage]

@@ -111,6 +111,32 @@ def server(
     return "http://synthetic.invalid", requests, state
 
 
+def test_completion_holds_admission_through_http_request(
+    tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]]
+) -> None:
+    url, requests, state = server
+    state["token_ids"] = [0, 0, 0]
+    backend = VLLMHTTPBackend("synthetic", base_url=url, model_path=tokenizer_path)
+    events: list[str] = []
+
+    class Admission:
+        def request(self, *, prompt_tokens: int, max_tokens: int) -> Admission:
+            assert prompt_tokens == 1
+            assert max_tokens == 3
+            return self
+
+        def __enter__(self) -> None:
+            events.append("admitted")
+
+        def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+            assert requests
+            events.append("released")
+
+    backend.request_admission = Admission()  # type: ignore[assignment]
+    backend.complete_rendered("hello", max_tokens=3, seed=1)
+    assert events == ["admitted", "released"]
+
+
 @pytest.mark.parametrize("thinking", [True, False])
 def test_prompt_parity(
     tokenizer_path: Path, server: tuple[str, list[dict[str, Any]], dict[str, Any]], thinking: bool

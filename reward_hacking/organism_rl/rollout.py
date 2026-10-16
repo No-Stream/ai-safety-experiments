@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from reward_hacking.harness.tasks_r2e_leak import InstructionVariant
     from reward_hacking.ladder.loop import SubmissionGrader
     from reward_hacking.math_data import MathFamily, MathVariant
+    from reward_hacking.organism_rl.admission import LiveKVAdmission
     from reward_hacking.organism_rl.ladder_source import LadderEpisodeSource
 
 CodingTaskFamily = Literal[
@@ -591,7 +592,7 @@ class OrganismRollout:
     only vLLM's batch composition (statistically neutral, not bit-identical).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - source, tokenizer and rollout controls are caller inputs
         self,
         source: EpisodeSource,
         tokenizer: PreTrainedTokenizerBase,
@@ -599,6 +600,7 @@ class OrganismRollout:
         max_sequence_tokens: int = DEFAULT_MAX_SEQUENCE_TOKENS,
         teacher_path: Path | None = None,
         episode_concurrency: int = 1,
+        admission: LiveKVAdmission | None = None,
     ) -> None:
         """Bind an episode source, tokenizer and optional exact-token teacher scores."""
         if type(episode_concurrency) is not int or episode_concurrency < 1:
@@ -607,6 +609,7 @@ class OrganismRollout:
         self.tokenizer = tokenizer
         self.max_sequence_tokens = max_sequence_tokens
         self.episode_concurrency = episode_concurrency
+        self.admission = admission
         self.arm_counts: dict[str, Counter[str]] = {}
         self.teacher_rows: dict[str, Mapping[str, object]] | None = None
         if teacher_path is not None:
@@ -617,9 +620,11 @@ class OrganismRollout:
                     raise ValueError("stored teacher rows require unique token_ids_sha256")
                 self.teacher_rows[digest] = row
 
-    def __call__(self, prompts: Sequence[object], trainer: Any) -> dict[str, object]:  # noqa: ANN401, PLR0915 - TRL callback
+    def __call__(self, prompts: Sequence[object], trainer: Any) -> dict[str, object]:  # noqa: ANN401, PLR0915, C901 - TRL callback
         """Return aligned exact-token rows in TRL rollout_func format."""
         step = int(trainer.state.global_step)
+        if self.admission is not None:
+            self.admission.reset_step()
         replicas: Counter[str] = Counter()
         step_counts: dict[tuple[str, str], Counter[str]] = {}
         output = _initial_rollout_output(include_teacher=self.teacher_rows is not None)
@@ -630,15 +635,22 @@ class OrganismRollout:
             replica = replicas[task_id]
             replicas[task_id] += 1
             jobs.append((task_id, deterministic_episode_seed(task_id, step, replica), replica))
-        with ThreadPoolExecutor(
-            max_workers=min(self.episode_concurrency, max(len(jobs), 1)),
-            thread_name_prefix="organism-episode",
-        ) as executor:
-            episodes = list(
-                executor.map(
-                    lambda job: self.source(job[0], seed=job[1], step=step, replica=job[2]), jobs
-                )
-            )
+
+        def sample(job: tuple[str, int, int]) -> EpisodeSample:
+            try:
+                return self.source(job[0], seed=job[1], step=step, replica=job[2])
+            finally:
+                if self.admission is not None:
+                    self.admission.finish_episode()
+
+        with (
+            self.admission.monitor_step() if self.admission is not None else nullcontext(),
+            ThreadPoolExecutor(
+                max_workers=min(self.episode_concurrency, max(len(jobs), 1)),
+                thread_name_prefix="organism-episode",
+            ) as executor,
+        ):
+            episodes = list(executor.map(sample, jobs))
         for (task_id, seed, replica), episode in zip(jobs, episodes, strict=True):
             family, variant = _task_mix_metadata(episode, task_id)
             task_kind = task_kind_for(family, variant)
@@ -722,6 +734,10 @@ class OrganismRollout:
                     raise ValueError("stored teacher logprobs must be finite")
                 output["teacher_logprobs"].append(teacher_logps)
         _log_step_task_metrics(step + 1, step_counts)
+        if self.admission is not None:
+            logger.info(
+                "organism rollout step=%d kv_admission=%s", step + 1, self.admission.step_summary()
+            )
         return output
 
 
