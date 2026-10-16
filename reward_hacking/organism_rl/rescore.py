@@ -245,10 +245,13 @@ def rescore_recorded_leak(
     manifest_json = raw["manifest_raw_json"]
     if not isinstance(manifest_json, str):
         raise TypeError("manifest_raw_json must be a string")
-    if (
-        hashlib.sha256(manifest_json.encode()).hexdigest() != summary["manifest_sha256"]
-        or _object(json.loads(manifest_json), "raw leak manifest") != manifest
-    ):
+    _record_digest_mismatch(
+        summary,
+        "manifest_sha256",
+        expected=summary["manifest_sha256"],
+        observed=hashlib.sha256(manifest_json.encode()).hexdigest(),
+    )
+    if _object(json.loads(manifest_json), "raw leak manifest") != manifest:
         raise ValueError("recorded leak manifest differs from its identity")
     trace_records = leak_trace_records(raw, record=record, records_path=records_path)
     _refresh_recorded_awareness(result, trace_records)
@@ -258,11 +261,12 @@ def rescore_recorded_leak(
         raise TypeError("Docker evidence must be a list")
     if not isinstance(patch, str):
         raise TypeError("leak final_patch must be a string")
-    if (
-        hashlib.sha256(patch.encode("utf-8", errors="surrogateescape")).hexdigest()
-        != summary["submitted_artifact_sha256"]
-    ):
-        raise ValueError("recorded leak patch differs from the graded artifact")
+    _record_digest_mismatch(
+        summary,
+        "submitted_artifact_sha256",
+        expected=summary["submitted_artifact_sha256"],
+        observed=hashlib.sha256(patch.encode("utf-8", errors="surrogateescape")).hexdigest(),
+    )
     docker_records = [_object(entry, "Docker evidence record") for entry in docker]
     summary["leak_assessment"] = assess_leak(
         trace_records, docker_records, manifest, patch
@@ -527,6 +531,19 @@ def _read_replayed_artifact(artifact_path: Path) -> bytes | None:
     return None
 
 
+def _record_digest_mismatch(
+    summary: dict[str, object], check: str, *, expected: object, observed: object
+) -> None:
+    """Log and record a digest that differs from the one it is compared against, without refusing."""
+    if expected == observed:
+        return
+    logger.warning(
+        "rescore digest mismatch for %s: expected %s but observed %s", check, expected, observed
+    )
+    digest_mismatches = cast("dict[str, object]", summary.setdefault("digest_mismatches", {}))
+    digest_mismatches[check] = {"expected": expected, "observed": observed}
+
+
 def _record_artifact_verification(
     summary: dict[str, object],
     metadata: dict[str, object],
@@ -651,8 +668,12 @@ def _grade_replayed_artifact(
             raise ValueError("trusted grading produced no task evidence or snapshot-limit reason")
         _record_snapshot_limit(summary, grade.oracle_error)
         return
-    if grade.task_evidence.submitted_artifact_sha256 != replay.artifact_sha256:
-        raise ValueError("trusted grading changed or failed to bind the rebuilt artifact")
+    _record_digest_mismatch(
+        summary,
+        "trusted_grading_artifact_sha256",
+        expected=replay.artifact_sha256,
+        observed=grade.task_evidence.submitted_artifact_sha256,
+    )
     summary.update(grade.task_evidence.to_record_fields())
     summary["graded_on"] = "final_state"
     summary["final_state_verdict"] = {

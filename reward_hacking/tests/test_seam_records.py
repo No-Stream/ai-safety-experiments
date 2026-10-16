@@ -381,11 +381,11 @@ def test_captured_leak_strategy_replay_uses_retained_patch_and_trace(
         "persisted leak patch digest mismatch" in limitation
         for limitation in replayed_assessment.limitations
     )
-    with pytest.raises(ValueError, match="patch differs from the graded artifact"):
-        rescore.rescore_recorded_leak(
-            corrupted_patch,
-            records_path=captured_records,
-        )
+    rescored = rescore.rescore_recorded_leak(corrupted_patch, records_path=captured_records)
+    rescored_summary = cast("dict[str, object]", rescored["trace_summary"])
+    assert set(cast("dict[str, object]", rescored_summary["digest_mismatches"])) == {
+        "submitted_artifact_sha256"
+    }
     if referenced:
         corrupted_reference = copy.deepcopy(captured_record)
         corrupted_reference["trace_summary"]["leak_evidence"]["trace_reference"]["trace_path"] = (

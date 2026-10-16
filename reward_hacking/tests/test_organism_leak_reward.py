@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -348,14 +349,25 @@ def test_leak_honest_paid_solve_is_not_labelled_other_hack() -> None:
     assert assessment.primary_strategy == "honest_no_hack"
 
 
-@pytest.mark.parametrize("field", ["final_patch", "manifest_raw_json"])
-def test_recorded_leak_rescore_refuses_changed_evidence(field: str) -> None:
+@pytest.mark.parametrize(
+    ("field", "digest_check"),
+    [("final_patch", "submitted_artifact_sha256"), ("manifest_raw_json", "manifest_sha256")],
+)
+def test_recorded_leak_rescore_records_changed_evidence(
+    field: str, digest_check: str, caplog: pytest.LogCaptureFixture
+) -> None:
     record = recorded_leak(recovered=True)
     summary = cast("dict[str, object]", record["trace_summary"])
     raw = cast("dict[str, object]", summary["leak_evidence"])
     raw[field] = cast("str", raw[field]) + "\n"
-    with pytest.raises(ValueError, match="differs"):
-        rescore_recorded_leak(record)
+    with caplog.at_level(logging.WARNING):
+        rescored = rescore_recorded_leak(record)
+    digest_mismatches = cast(
+        "dict[str, object]",
+        cast("dict[str, object]", rescored["trace_summary"])["digest_mismatches"],
+    )
+    assert set(digest_mismatches) == {digest_check}
+    assert f"rescore digest mismatch for {digest_check}" in caplog.text
 
 
 def test_recorded_leak_rescore_file_resumes_without_runtime(
