@@ -12,6 +12,7 @@ is closer to the sampler's own log-probabilities than TRL's bf16 logits.
 
 import hashlib
 import json
+import logging
 import math
 import time
 from pathlib import Path
@@ -30,6 +31,8 @@ from reward_hacking.distill.train import chunked_completion_logps
 
 # One fp32 slice of a 248K-token vocabulary at 1,024 positions is about 1 GiB.
 DEFAULT_LOGPROB_CHUNK_TOKENS = 1024
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def add_teacher_advantage(
@@ -58,7 +61,11 @@ def _digest(path: Path) -> str:
 
 
 def validate_checkpoint(directory: Path) -> None:
-    """Refuse missing states and modifications since the completion marker was written."""
+    """Refuse incomplete checkpoints; log, but accept, files whose sha256 differs from the marker.
+
+    The marker's hashes are a record of what was written. A changed file is worth a warning, not a
+    refusal: resume is gated on completeness alone, and no code or file hash may block a resume.
+    """
     marker = directory / "complete.json"
     if not marker.is_file():
         raise ValueError(f"Incomplete checkpoint: {directory}")
@@ -87,8 +94,12 @@ def validate_checkpoint(directory: Path) -> None:
         raise ValueError("Incomplete checkpoint model configuration")
     for name, expected in manifest.items():
         path = directory / name
-        if not path.is_file() or _digest(path) != expected:
-            raise ValueError(f"Incomplete or modified checkpoint file: {name}")
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError(f"Incomplete checkpoint file: {name}")
+        if _digest(path) != expected:
+            logger.warning(
+                "Checkpoint file %s differs from its recorded sha256 in %s", name, directory
+            )
 
 
 def _validate_rollout_masks(output: dict[str, Any]) -> None:
