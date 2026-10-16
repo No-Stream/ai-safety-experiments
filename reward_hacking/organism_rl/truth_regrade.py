@@ -19,6 +19,7 @@ from reward_hacking.harness import tasks as task_registry
 from reward_hacking.harness.evidence_store import read_jsonl
 from reward_hacking.harness.tasks_evalplus import TrueCheckOutcome
 from reward_hacking.harness.tasks_ilcb import (
+    DATA_PATH,
     ILCB_TRUE_CHECK_SEMANTIC_VERSION,
     SOLUTION_FILENAME,
     TRUE_CHECK_TIMEOUT,
@@ -50,7 +51,9 @@ def _read_records(path: Path) -> list[dict[str, object]]:
     ]
 
 
-def _load_task(record: Mapping[str, object]) -> Task:
+def _load_task(
+    record: Mapping[str, object], *, data_path: Path = DATA_PATH, manifest_path: Path | None = None
+) -> Task:
     task_id = record.get("task_id")
     variant = record.get("variant")
     partition = record.get("partition")
@@ -63,6 +66,8 @@ def _load_task(record: Mapping[str, object]) -> Task:
     tasks = task_registry.ilcb_tasks(
         impossible_type=variant,
         partition=cast("ILCBPartition", partition),
+        data_path=data_path,
+        manifest_path=manifest_path,
     )
     try:
         return next(task for task in tasks if task.task_id == task_id)
@@ -156,10 +161,12 @@ def _regrade_ilcb_record(
     *,
     records_path: Path,
     temporary_root: Path,
+    data_path: Path,
+    manifest_path: Path | None,
 ) -> dict[str, object]:
     result = deepcopy(dict(record))
     summary = _object(result.get("trace_summary"), "trace_summary")
-    task = _load_task(result)
+    task = _load_task(result, data_path=data_path, manifest_path=manifest_path)
     if task.true_check_result_with_timeout is None:
         raise ValueError(f"ILCB task {task.task_id!r} has no structured true-check callback")
     artifact_path, artifact_digest, artifact_bytes = _artifact_path(result, summary, records_path)
@@ -239,8 +246,18 @@ def _output_path(records_path: Path, output_path: Path) -> Path:
     return output_path
 
 
-def regrade_file(records_path: Path, output_path: Path) -> Path:
-    """Write a fresh records file with ILCB truth recomputed from saved artifacts."""
+def regrade_file(
+    records_path: Path,
+    output_path: Path,
+    *,
+    data_path: Path = DATA_PATH,
+    manifest_path: Path | None = None,
+) -> Path:
+    """Write a fresh records file with ILCB truth recomputed from saved artifacts.
+
+    ``data_path`` and ``manifest_path`` select the case registry the records were generated from,
+    as ``generate --ilcb-cases`` and ``--ilcb-split-manifest`` did.
+    """
     source_path = records_path.resolve(strict=True)
     destination = _output_path(source_path, output_path)
     source_records = _read_records(source_path)
@@ -256,6 +273,8 @@ def regrade_file(records_path: Path, output_path: Path) -> Path:
                         record,
                         records_path=source_path,
                         temporary_root=scratch_directory,
+                        data_path=data_path,
+                        manifest_path=manifest_path,
                     )
                     if record.get("family") == "ilcb"
                     else _normalize_passthrough_record_paths(record, source_path)
@@ -273,13 +292,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records", required=True, type=Path, help="existing records.jsonl")
     parser.add_argument("--output", required=True, type=Path, help="fresh regraded records.jsonl")
+    parser.add_argument(
+        "--ilcb-cases", type=Path, default=DATA_PATH, help="case registry the records came from"
+    )
+    parser.add_argument(
+        "--ilcb-split-manifest", type=Path, help="split manifest matching --ilcb-cases"
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Regrade truth evidence for saved ILCB artifacts."""
     args = build_parser().parse_args(argv)
-    regrade_file(args.records, args.output)
+    regrade_file(
+        args.records,
+        args.output,
+        data_path=args.ilcb_cases,
+        manifest_path=args.ilcb_split_manifest,
+    )
 
 
 if __name__ == "__main__":

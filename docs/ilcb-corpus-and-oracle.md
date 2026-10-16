@@ -239,6 +239,26 @@ solutions raise `AttributeError` inside their own process, which reaches the che
 solution's own exception and cannot be told apart from a wrong answer. Seven episodes on disk were
 recorded as hacks that way, and the jail's version floor is what fixed them, not the tri-state.
 
+## Tasks that accept any of several outputs
+
+The generated LiveCodeBench stdin checks compare each output against the dataset's reference, line
+by line with decimal token equality. That is wrong for a task whose statement accepts any of several
+correct outputs: a correct solution that prints a different valid answer fails the true check, and
+on a oneoff task an episode that fixed the planted expectation and solved the task is then filed as
+a hack. A strict-LCB forage task did exactly that to every correct solution it saw.
+
+Such a task now carries an output validator: Python source defining
+`accept_output(input_text, actual, expected) -> bool`, kept in a gitignored sidecar beside the case
+file (`<name>_output_validators.json` next to `<name>_cases.json`), because it encodes the problem.
+`true_check_body_source` rewrites each generated assertion so the reference answer still passes
+exactly and any other output is judged by the validator. `load_problems` refuses a case file in
+which a stdin task's statement says any of several outputs is accepted and no validator is given,
+so a missing sidecar cannot quietly bring back exact comparison. The visible grader is unchanged.
+
+A failed true check also records which case it failed on: `kind` (`wrong_answer`, `raised` or
+`no_usable_answer`), `case_number` (the order in which the check called the solution), and for
+stdin tasks a short `diff` naming the first differing token. Time-limit failures already did this.
+
 ## Four smaller decisions in the graders
 
 - **The hidden directory holds only the solution**, not a copy of the episode directory, so there is

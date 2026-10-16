@@ -17,7 +17,8 @@ bump on one side a loud refusal on the other rather than a silent reinterpretati
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,14 @@ MAX_RECENT_TIMED_CASE_BYTES = 4 * 1024 * 1024
 RECENT_TIMED_CASE_OVERSIZE_REASON = "largest private case exceeds byte cap"
 
 CHECK_FUNCTION_NAME = "check"
+OUTPUT_VALIDATORS_SCHEMA = 1
+OUTPUT_VALIDATOR_FUNCTION_NAME = "accept_output"
+STDIO_OUTPUT_MATCHER_NAME = "_lcb_outputs_match"
+# Statement phrasings that say more than one output is correct. The true check compares outputs
+# exactly, so a task matching this must ship an output validator or it marks valid answers wrong.
+ANY_VALID_OUTPUT_PATTERN = re.compile(
+    r"\bany (?:one )?of them\b|\b(?:print|printing|output|outputting) any\b", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +63,7 @@ class ILCBProblem:
     check_parses: bool
     check_defines_function: bool
     output_mutation_identity: dict[str, Any] | None = None
+    output_validator: str | None = None
 
     @property
     def harness_task_id(self) -> str:
@@ -113,4 +123,58 @@ def load_problems(data_path: Path = DATA_PATH) -> tuple[ILCBProblem, ...]:
         "output_mutation" in record.get("provenance", {}) for record in payload["problems"]
     ):
         validate_contract_payload(payload)
-    return tuple(problem_from_record(record) for record in payload["problems"])
+    problems = tuple(problem_from_record(record) for record in payload["problems"])
+    return _attach_output_validators(problems, output_validators_path(data_path))
+
+
+def output_validators_path(data_path: Path) -> Path:
+    """Name the private sidecar holding per-task output validators for one baked case file.
+
+    A validator is Python source defining ``accept_output(input_text, actual, expected) -> bool``.
+    It judges outputs the exact comparison would reject on tasks whose statement accepts any of
+    several correct answers. It is task-specific benchmark material, so it lives beside the
+    gitignored case file rather than in tracked code.
+    """
+    return data_path.with_name(
+        f"{data_path.name.removesuffix('_cases.json')}_output_validators.json"
+    )
+
+
+def _attach_output_validators(
+    problems: tuple[ILCBProblem, ...], validators_path: Path
+) -> tuple[ILCBProblem, ...]:
+    validators: dict[str, str] = {}
+    if validators_path.exists():
+        payload = json.loads(validators_path.read_text())
+        if payload["schema"] != OUTPUT_VALIDATORS_SCHEMA:
+            raise ValueError(
+                f"{validators_path} is schema {payload['schema']}, "
+                f"expected {OUTPUT_VALIDATORS_SCHEMA}"
+            )
+        validators = payload["validators"]
+        unknown_task_ids = sorted(set(validators) - {problem.task_id for problem in problems})
+        if unknown_task_ids:
+            raise ValueError(
+                f"{validators_path} names tasks absent from the cases: {unknown_task_ids}"
+            )
+    attached = tuple(
+        replace(problem, output_validator=validators[problem.task_id])
+        if problem.task_id in validators
+        else problem
+        for problem in problems
+    )
+    unjudged_task_ids = sorted(
+        {
+            problem.task_id
+            for problem in attached
+            if problem.output_validator is None
+            and f"def {STDIO_OUTPUT_MATCHER_NAME}(" in problem.original_test
+            and ANY_VALID_OUTPUT_PATTERN.search(problem.prompt)
+        }
+    )
+    if unjudged_task_ids:
+        raise ValueError(
+            f"tasks {unjudged_task_ids} accept any of several outputs but have no output validator "
+            f"in {validators_path}; exact comparison would mark valid answers wrong"
+        )
+    return attached
