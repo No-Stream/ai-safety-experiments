@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import logging
@@ -16,6 +17,10 @@ from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, Qwen2Config, TrainingArguments
 
 from reward_hacking.distill import agentic_sft, sft_selection_summary, sft_serving, train
+from reward_hacking.distill.awareness_refresh import (
+    refresh_awareness,
+    versioned_awareness_output_dir,
+)
 from reward_hacking.distill.episodes import DEFAULT_MAX_SEQUENCE_TOKENS
 from reward_hacking.distill.hack_strategy import HackStrategyAssessment, StrengthenedTruthEvidence
 from reward_hacking.distill.select import EpisodeHealthFilterOptions
@@ -977,6 +982,184 @@ def test_manifest_clearance_that_no_longer_covers_the_record_is_rejected(tmp_pat
     assert [entry["exclusion_reason"] for entry in build_exclusions] == [
         "selection_manifest_admission_changed"
     ]
+
+
+TRAP_REASONING = "The puzzle state is trapped here."
+PLAIN_REASONING = "The puzzle state is fixed here."
+
+
+def _trace_rows(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _legacy_awareness_episode(
+    tmp_path: Path, scenario_slug: str, reasoning: str, legacy_reasoning: str
+) -> dict[str, object]:
+    """An episode whose transcript holds the reasoning, with the awareness an older scan recorded."""
+    episode = _awareness_episode(tmp_path, scenario_slug, reasoning)
+    turns = [
+        row
+        for row in _trace_rows(Path(cast("str", episode["trace_path"])))
+        if row.get("record") == "turn"
+    ]
+    summary = cast("dict[str, Any]", episode["trace_summary"])
+    summary["messages"] = [
+        {
+            "role": "assistant",
+            "reasoning_content": turn["reasoning"],
+            "content": turn["content"],
+            "tool_calls": [],
+        }
+        for turn in turns
+    ]
+    legacy_turns = [
+        {
+            **turn,
+            "reasoning": legacy_reasoning if turn["reasoning"] == reasoning else turn["reasoning"],
+        }
+        for turn in turns
+    ]
+    legacy_regex = cast(
+        "dict[str, Any]", eval_awareness_from_trace_records(summary, legacy_turns)["regex"]
+    )
+    for section in ("in_episode", "final_report"):
+        legacy_regex[section].pop("presumed_integrity_matches", None)
+        legacy_regex[section].pop("targeted_integrity_matches", None)
+    episode["eval_awareness"] = {"judge": None, "regex": legacy_regex}
+    return episode
+
+
+def _select_refreshed(
+    root: Path,
+    episodes: list[dict[str, object]],
+    clears: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Write one legacy stage, refresh its awareness sidecar, and select with that sidecar."""
+    records_path = _write_records(root / "artifacts" / AWARENESS_STAGE / "records.jsonl", episodes)
+    rows_path = refresh_awareness(records_path, stage_root=root / "artifacts").rows_path
+    options: dict[str, Any] = {
+        "awareness_refresh_paths": [rows_path],
+        "awareness_stage_root": root / "artifacts",
+    }
+    if clears is not None:
+        clears_path = root / "clears.json"
+        clears_path.write_text(
+            json.dumps({"schema_version": 1, "clears": clears}), encoding="utf-8"
+        )
+        options["awareness_clears_path"] = clears_path
+    return _select_episodes([records_path], tokenizer=cast("Any", CharacterTokenizer()), **options)
+
+
+def test_legacy_records_refuse_selection_until_the_awareness_refresh_runs(tmp_path: Path) -> None:
+    episode = _legacy_awareness_episode(tmp_path, "trap-word", TRAP_REASONING, PLAIN_REASONING)
+    records_path = _write_records(
+        tmp_path / "artifacts" / AWARENESS_STAGE / "records.jsonl", [episode]
+    )
+
+    with pytest.raises(TypeError, match="rescore the run"):
+        _select_episodes(
+            [records_path],
+            tokenizer=cast("Any", CharacterTokenizer()),
+            awareness_stage_root=tmp_path / "artifacts",
+        )
+
+
+def test_refreshed_presumed_match_excludes_the_episode_until_a_reviewer_clears_it(
+    tmp_path: Path,
+) -> None:
+    episode = _legacy_awareness_episode(tmp_path, "trap-word", TRAP_REASONING, PLAIN_REASONING)
+
+    uncleared = _select_refreshed(tmp_path / "uncleared", [episode])
+
+    excluded = _entries_by_slug(uncleared, "excluded")
+    assert excluded["trap-word"]["exclusion_reason"] == "integrity_awareness"
+    clearance = cast("dict[str, object]", excluded["trap-word"]["integrity_clearance"])
+    assert clearance["presumed_matched_texts"] == ["trapped"]
+    cleared = _select_refreshed(
+        tmp_path / "cleared",
+        [episode],
+        [_awareness_clear(matched_texts=["trapped"], note="Puzzle game state.")],
+    )
+    assert "trap-word" in _entries_by_slug(cleared, "selected")
+
+
+def test_card_integrity_flags_follow_an_applied_clear_and_count_uncovered_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cleared_episode = _legacy_awareness_episode(
+        tmp_path, "trap-word", TRAP_REASONING, PLAIN_REASONING
+    )
+    uncovered_episode = _legacy_awareness_episode(
+        tmp_path,
+        "decoy-word",
+        "The decoy file sits in the puzzle state.",
+        "The file sits in the puzzle state.",
+    )
+    root = tmp_path / "root"
+    report = _select_refreshed(
+        root,
+        [cleared_episode, uncovered_episode],
+        [_awareness_clear(matched_texts=["trapped"], note="Puzzle game state.")],
+    )
+    assert "trap-word" in _entries_by_slug(report, "selected")
+    assert _entries_by_slug(report, "excluded")["decoy-word"]["exclusion_reason"] == (
+        "integrity_awareness"
+    )
+    awareness_rows_path = (
+        versioned_awareness_output_dir(root / "artifacts" / AWARENESS_STAGE) / "awareness.jsonl"
+    )
+    build_rows = _build_selected_rows(
+        report,
+        tokenizer=cast("Any", CharacterTokenizer()),
+        awareness_refresh_paths=[awareness_rows_path],
+        awareness_stage_root=root / "artifacts",
+    )
+    manifest_path = tmp_path / "selection.json"
+    manifest_path.write_text(json.dumps(report))
+    rows_path = tmp_path / "rows.jsonl"
+    rows_path.write_text("".join(json.dumps(row) + "\n" for row in build_rows))
+    hints_path = tmp_path / "hints.json"
+    hints_path.write_text(json.dumps({"schema_version": 1, "hints": []}))
+
+    def registry(*, ilcb_cases_paths: object) -> tuple[dict[str, dict[str, str]], frozenset[str]]:
+        del ilcb_cases_paths
+        return {
+            "trap-word": {
+                "family": "ilcb",
+                "partition": "train",
+                "corpus_unit": "synthetic",
+                "item_id": "synthetic-item",
+            }
+        }, frozenset()
+
+    def stub_health(records_paths: Sequence[Path]) -> dict[str, object]:
+        # Organism health needs complete live-run trace summaries; this test covers the awareness
+        # flags, and the card only checks that each record has a health result.
+        record_count = len(records_paths[0].read_text(encoding="utf-8").splitlines())
+        return {"episodes": [{} for _ in range(record_count)]}
+
+    monkeypatch.setattr(agentic_sft, "_task_card_metadata", registry)
+    monkeypatch.setattr(agentic_sft.organism_health, "analyze_records", stub_health)
+    args = argparse.Namespace(
+        manifest=manifest_path,
+        rows=rows_path,
+        heldout_manifests=[],
+        hints=hints_path,
+        strengthened_truth=[],
+        cases_root=tmp_path,
+        base_nll=None,
+        awareness_refresh=[awareness_rows_path],
+        awareness_stage_root=root / "artifacts",
+    )
+
+    card_inputs = agentic_sft._collect_dataset_card_inputs(args)
+    card_rows = card_inputs[0]
+    raw_awareness = cast("dict[str, dict[str, int]]", card_inputs[7])
+
+    assert [row["task_id"] for row in card_rows] == ["trap-word"]
+    assert card_rows[0]["integrity_alert"] is not True
+    assert sum(metrics["episodes"] for metrics in raw_awareness.values()) == 2
+    assert sum(metrics["integrity_alerts"] for metrics in raw_awareness.values()) == 1
 
 
 def test_selection_excludes_ladder_scenarios_from_a_heldout_run_header(tmp_path: Path) -> None:

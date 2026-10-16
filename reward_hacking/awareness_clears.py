@@ -126,15 +126,20 @@ def _nonempty_str(value: object) -> bool:
     return isinstance(value, str) and bool(value)
 
 
-def episode_identity(
-    records_path: Path, record: Mapping[str, object], stage_root: Path = ARTIFACTS_ROOT
-) -> EpisodeIdentity:
-    """Identify an episode by its stage directory under the stage root, task, and sample."""
+def stage_of(records_path: Path, stage_root: Path = ARTIFACTS_ROOT) -> str:
+    """Return the records file's stage directory relative to the stage root."""
     resolved_root = stage_root.resolve()
     resolved_records = records_path.resolve()
     if not resolved_records.is_relative_to(resolved_root):
         raise ValueError(f"records file {records_path} is outside the stage root {resolved_root}")
-    stage = resolved_records.parent.relative_to(resolved_root).as_posix()
+    return resolved_records.parent.relative_to(resolved_root).as_posix()
+
+
+def episode_identity(
+    records_path: Path, record: Mapping[str, object], stage_root: Path = ARTIFACTS_ROOT
+) -> EpisodeIdentity:
+    """Identify an episode by its stage directory under the stage root, task, and sample."""
+    stage = stage_of(records_path, stage_root)
     task_id = record.get("task_id")
     sample_index = record.get("sample_index")
     if not isinstance(task_id, str) or not task_id:

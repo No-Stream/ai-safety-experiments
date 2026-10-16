@@ -30,6 +30,15 @@ from reward_hacking.awareness_clears import (
     episode_identity,
     load_awareness_clears,
     parse_awareness_clear,
+    stage_of,
+)
+from reward_hacking.distill.awareness_refresh import (
+    NO_AWARENESS_REFRESH,
+    AwarenessRefresh,
+    awareness_refresh_provenance,
+    load_awareness_refresh,
+    refreshed_records,
+    require_sidecars_bound,
 )
 from reward_hacking.distill.dataset_card_render import render_dataset_card_markdown
 from reward_hacking.distill.episodes import (
@@ -215,6 +224,7 @@ class _EpisodeSelectionConfig:
     derived_labels: (
         Mapping[str, tuple[Path, Mapping[tuple[str, int], dict[str, object]]]] | None
     ) = None
+    awareness_refresh: AwarenessRefresh = NO_AWARENESS_REFRESH
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +292,8 @@ class _ManifestBuildOptions:
     heldout_manifests_provided: bool
     schema_only: bool
     schema_only_max_turns: int | None
+    awareness_refresh: AwarenessRefresh = NO_AWARENESS_REFRESH
+    awareness_stage_root: Path = ARTIFACTS_ROOT
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,6 +315,29 @@ class _UnverifiableManifestEvidenceError(ValueError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+def _read_records_with_awareness(
+    path: Path, awareness_refresh: AwarenessRefresh, stage_root: Path
+) -> list[tuple[int, Mapping[str, object]]]:
+    rows = _read_records_with_lines(path)
+    refreshed = refreshed_records(
+        path, [record for _, record in rows], awareness_refresh, stage_root=stage_root
+    )
+    return [(line_number, record) for (line_number, _), record in zip(rows, refreshed, strict=True)]
+
+
+def _manifest_source_paths(entries: Sequence[Mapping[str, object]]) -> list[Path]:
+    return [_manifest_location(entry)[0] for entry in entries]
+
+
+def _require_awareness_sidecars_bound(
+    awareness_refresh: AwarenessRefresh, records_paths: Sequence[Path], stage_root: Path
+) -> None:
+    if awareness_refresh.sidecars_by_stage:
+        require_sidecars_bound(
+            awareness_refresh, {stage_of(path, stage_root) for path in records_paths}
+        )
 
 
 def _read_records_with_lines(path: Path) -> list[tuple[int, Mapping[str, object]]]:
@@ -1709,6 +1744,7 @@ def _select_episodes_impl(  # noqa: PLR0913
     source_record_aliases: Mapping[Path, Path] | None = None,
     awareness_clears_path: Path | None = None,
     awareness_stage_root: Path = ARTIFACTS_ROOT,
+    awareness_refresh_paths: Sequence[Path] = (),
 ) -> dict[str, object]:
     """Select move-flagged or trusted-rewarded episodes and record build eligibility."""
     if not records_paths:
@@ -1735,6 +1771,8 @@ def _select_episodes_impl(  # noqa: PLR0913
     awareness_clears = (
         {} if awareness_clears_path is None else load_awareness_clears(awareness_clears_path)
     )
+    awareness_refresh = load_awareness_refresh(awareness_refresh_paths)
+    _require_awareness_sidecars_bound(awareness_refresh, canonical_paths, awareness_stage_root)
     derived_labels, derived_provenance = _load_sft_derived_labels(
         canonical_paths,
         derived_labels_paths,
@@ -1781,6 +1819,7 @@ def _select_episodes_impl(  # noqa: PLR0913
         awareness_clears=awareness_clears,
         awareness_stage_root=awareness_stage_root,
         derived_labels=derived_labels,
+        awareness_refresh=awareness_refresh,
     )
     (
         selected,
@@ -1832,6 +1871,7 @@ def _select_episodes_impl(  # noqa: PLR0913
         ),
     )
     report["derived_labels"] = derived_provenance
+    report["awareness_refresh"] = awareness_refresh_provenance(awareness_refresh)
     report["awareness_clears"] = {
         "clears_in_file": len(awareness_clears),
         "applied": _applied_awareness_clears(
@@ -1874,6 +1914,7 @@ def select_episodes(  # noqa: PLR0913
     source_record_aliases: Mapping[Path, Path] | None = None,
     awareness_clears_path: Path | None = None,
     awareness_stage_root: Path = ARTIFACTS_ROOT,
+    awareness_refresh_paths: Sequence[Path] = (),
 ) -> dict[str, object]:
     """Select SFT episodes, optionally relaxing research floors for plumbing smoke checks."""
     if type(schema_only) is not bool:
@@ -1911,6 +1952,7 @@ def select_episodes(  # noqa: PLR0913
         source_record_aliases=source_record_aliases,
         awareness_clears_path=awareness_clears_path,
         awareness_stage_root=awareness_stage_root,
+        awareness_refresh_paths=awareness_refresh_paths,
     )
 
 
@@ -2062,7 +2104,11 @@ def _select_records(  # noqa: C901 - selection validations stay explicit at the 
     seen_hint_judge_labels: set[str] = set()
     seen_awareness_identities: set[EpisodeIdentity] = set()
     for records_path in records_paths:
-        records = _read_records_with_lines(records_path)
+        records = _read_records_with_awareness(
+            records_path,
+            selection_config.awareness_refresh,
+            selection_config.awareness_stage_root,
+        )
         scenario_set_versions = _scenario_set_versions([record for _, record in records])
         for line_number, record in records:
             if record.get("record") != "ladder_episode":
@@ -3458,9 +3504,22 @@ def build_selected_rows(  # noqa: C901, PLR0913 - build provenance and rendering
     schema_only: bool = False,
     source_records_paths: Sequence[Path] = (),
     build_exclusions: list[dict[str, object]] | None = None,
+    awareness_refresh_paths: Sequence[Path] = (),
+    awareness_stage_root: Path = ARTIFACTS_ROOT,
 ) -> list[dict[str, object]]:
     """Rebuild selected rows from the manifest while retaining builder tokens and masks."""
     report = relocate_manifest_sources(report, source_records_paths)
+    awareness_refresh = load_awareness_refresh(awareness_refresh_paths)
+    _require_awareness_sidecars_bound(
+        awareness_refresh,
+        _manifest_source_paths(
+            [
+                *cast("list[Mapping[str, object]]", report["selected"]),
+                *cast("list[Mapping[str, object]]", report["excluded"]),
+            ]
+        ),
+        awareness_stage_root,
+    )
     resolved_health_filters = (
         EpisodeHealthFilterOptions() if health_filters is None else health_filters
     )
@@ -3515,6 +3574,8 @@ def build_selected_rows(  # noqa: C901, PLR0913 - build provenance and rendering
         heldout_manifests_provided=heldout_manifests_provided,
         schema_only=build_truth.schema_only,
         schema_only_max_turns=build_truth.schema_only_max_turns,
+        awareness_refresh=awareness_refresh,
+        awareness_stage_root=awareness_stage_root,
     )
     built_rows, retained_entries, build_exclusions_from_entries = _rebuild_selected_entries(
         selected,
@@ -3692,7 +3753,11 @@ def _build_manifest_entry(
 ) -> dict[str, object]:
     records_path, line_number = _manifest_location(entry)
     if records_path not in rows_by_file:
-        rows_by_file[records_path] = dict(_read_records_with_lines(records_path))
+        rows_by_file[records_path] = dict(
+            _read_records_with_awareness(
+                records_path, options.awareness_refresh, options.awareness_stage_root
+            )
+        )
     line_number, record = _manifest_record(entry, rows_by_file[records_path], records_path)
     _validate_generated_manifest_scope(record, options)
     trace_records = read_episode_trace_records(record, records_path)
@@ -5388,6 +5453,11 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
         raise TypeError("selection manifest must contain selected and excluded lists")
     selected = [_require_manifest_entry(entry) for entry in selected_value]
     excluded = [_require_manifest_entry(entry) for entry in excluded_value]
+    awareness_refresh = load_awareness_refresh(vars(args).get("awareness_refresh", ()))
+    awareness_stage_root = vars(args).get("awareness_stage_root", ARTIFACTS_ROOT)
+    _require_awareness_sidecars_bound(
+        awareness_refresh, _manifest_source_paths([*selected, *excluded]), awareness_stage_root
+    )
     rows = _read_card_rows(args.rows)
     rows_by_key = {cast("str", row["key"]): row for row in rows}
     selected_keys = [_card_row_key(entry, rows_by_key) for entry in selected]
@@ -5459,7 +5529,9 @@ def _collect_dataset_card_inputs(  # noqa: C901, PLR0912, PLR0915 - validates th
     for entry in (*selected, *excluded):
         records_path, line_number = _manifest_location(entry)
         if records_path not in records_by_file:
-            records_by_file[records_path] = dict(_read_records_with_lines(records_path))
+            records_by_file[records_path] = dict(
+                _read_records_with_awareness(records_path, awareness_refresh, awareness_stage_root)
+            )
         line_number, record = _manifest_record(
             entry,
             records_by_file[records_path],
@@ -5946,6 +6018,7 @@ def _configure_dataset_card_parser(card_parser: argparse.ArgumentParser) -> None
     card_parser.add_argument("--heldout-manifests", type=Path, nargs="+")
     card_parser.add_argument("--hints", type=Path)
     card_parser.add_argument("--strengthened-truth", type=Path, nargs="+")
+    card_parser.add_argument("--awareness-refresh", type=Path, nargs="+", default=[])
     card_parser.add_argument("--cases-root", type=Path)
     card_parser.add_argument("--base-nll", type=Path)
     card_parser.add_argument("--dry-run", action="store_true")
@@ -6011,6 +6084,13 @@ def _configure_select_parser(select_parser: argparse.ArgumentParser) -> None:
             "without it every presumed trap or decoy match excludes its episode"
         ),
     )
+    select_parser.add_argument(
+        "--awareness-refresh",
+        type=Path,
+        nargs="+",
+        default=[],
+        help="awareness sidecars from reward_hacking.distill.awareness_refresh for legacy stages",
+    )
     select_parser.add_argument("--honest-floor", type=int, default=DEFAULT_HONEST_FLOOR)
     select_parser.add_argument(
         "--schema-only",
@@ -6048,6 +6128,7 @@ def _configure_build_parser(build_parser: argparse.ArgumentParser) -> None:
     build_parser.add_argument("--run-dir", type=Path, required=True)
     build_parser.add_argument("--tokenizer", default=DEFAULT_STUDENT_MODEL)
     build_parser.add_argument("--strengthened-truth", type=Path)
+    build_parser.add_argument("--awareness-refresh", type=Path, nargs="+", default=[])
     build_parser.add_argument(
         "--schema-only",
         action="store_true",
@@ -6198,6 +6279,7 @@ def _run_build_command(args: argparse.Namespace) -> int:
         strengthened_truth_path=args.strengthened_truth,
         schema_only=args.schema_only,
         build_exclusions=build_exclusions,
+        awareness_refresh_paths=args.awareness_refresh,
     )
     if build_exclusions:
         selected_value = filtered_manifest.get("selected")
@@ -6262,6 +6344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             hint_judge_labels_path=args.hint_judge_labels,
             source_record_aliases=dict(args.source_record_alias),
             awareness_clears_path=args.awareness_clears,
+            awareness_refresh_paths=args.awareness_refresh,
         )
         write_selection_report(report, manifest_path=args.manifest, summary_path=args.summary)
         totals = cast("Mapping[str, object]", report["totals"])

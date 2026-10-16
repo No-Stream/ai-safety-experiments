@@ -17,9 +17,19 @@ import torch
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from grpo.gpu_memory import gpu_memory_info
-from reward_hacking.awareness_clears import IntegrityAssessment, assess_integrity_alert
+from reward_hacking.awareness_clears import (
+    ARTIFACTS_ROOT,
+    IntegrityAssessment,
+    assess_integrity_alert,
+    stage_of,
+)
 from reward_hacking.checkpoint_retention import MAX_MIDDLE_CHECKPOINTS, MIN_LATEST_CHECKPOINTS
 from reward_hacking.distill import episodes
+from reward_hacking.distill.awareness_refresh import (
+    load_awareness_refresh,
+    refreshed_records,
+    require_sidecars_bound,
+)
 from reward_hacking.distill.hack_strategy import STRATEGIES
 from reward_hacking.distill.rounds import (
     DEFAULT_STUDENT_MODEL,
@@ -69,6 +79,7 @@ class AgenticRoundsConfig:
     include_unhinted_controls: bool = False
     checkpoint_keep_latest: int = 2
     checkpoint_keep_middle: int = 3
+    awareness_refresh_paths: tuple[Path, ...] = ()
 
 
 def _record_codebase(record: Mapping[str, Any], trace: Sequence[Mapping[str, Any]] | None) -> str:
@@ -377,6 +388,19 @@ def _apply_episode_policy(
     )
 
 
+def _round_records(config: AgenticRoundsConfig, records_path: Path) -> list[Mapping[str, Any]]:
+    """Read one round's episode records with any configured awareness sidecar applied."""
+    awareness_refresh = load_awareness_refresh(config.awareness_refresh_paths)
+    if awareness_refresh.sidecars_by_stage:
+        require_sidecars_bound(awareness_refresh, [stage_of(records_path, ARTIFACTS_ROOT)])
+    return refreshed_records(
+        records_path,
+        read_jsonl_objects(records_path),
+        awareness_refresh,
+        stage_root=ARTIFACTS_ROOT,
+    )
+
+
 def _episode_integrity_assessment(record: Mapping[str, Any]) -> IntegrityAssessment:
     awareness = record.get("eval_awareness")
     regex = awareness.get("regex") if isinstance(awareness, Mapping) else None
@@ -496,7 +520,7 @@ def run_agentic_rounds(
         _execute(runner, sample_command)
         records_path = round_dir / "records.jsonl"
         records = sorted(
-            read_jsonl_objects(records_path),
+            _round_records(config, records_path),
             key=lambda record: json.dumps(
                 record.get(
                     "key",
@@ -644,7 +668,7 @@ def _completed_round_snapshot(
     samples = read_jsonl_objects(run_dir / "samples" / f"round-{round_number}.jsonl")
     records_path = run_dir / "generated" / f"round-{round_number}" / "records.jsonl"
     records = sorted(
-        read_jsonl_objects(records_path),
+        _round_records(config, records_path),
         key=lambda record: json.dumps(
             record.get(
                 "key",
@@ -907,6 +931,9 @@ def _load_config(path: Path) -> AgenticRoundsConfig:
     payload["generation_args"] = tuple(payload["generation_args"])
     payload["approved_train_leak_channels"] = tuple(payload.get("approved_train_leak_channels", []))
     payload["teacher_engine_flags"] = tuple(payload.get("teacher_engine_flags", []))
+    payload["awareness_refresh_paths"] = tuple(
+        Path(path) for path in payload.get("awareness_refresh_paths", [])
+    )
     return AgenticRoundsConfig(**payload)
 
 
