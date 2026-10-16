@@ -46,6 +46,7 @@ class AwarenessRefreshResult:
     episode_count: int
     presumed_match_episodes: int
     targeted_alert_episodes: int
+    count_change_episodes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,17 +152,30 @@ def _counts_without_presumed(
     return patterns, tiers
 
 
-def _require_legacy_counts_reproduced(
-    context: str, episode: Mapping[str, Any], rescan_regex: Mapping[str, Any]
-) -> None:
-    """Reject a rescan that changes any recorded count other than the presumed pattern."""
-    recorded_in_episode = episode["eval_awareness"]["regex"]["in_episode"]
-    if _counts_without_presumed(recorded_in_episode) != _counts_without_presumed(
-        rescan_regex["in_episode"]
-    ):
-        raise ValueError(
-            f"{context} legacy in_episode counts are not reproduced by the scan apart from the presumed pattern"
-        )
+def _count_changes(
+    recorded_regex: Mapping[str, Any], rescan_regex: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return recorded and rescanned counts that differ, ignoring the presumed pattern itself.
+
+    Scanner patterns added after a stage was recorded show up here as new counts. They are kept
+    in the manifest for review, because the rescan is what the refresh is meant to measure.
+    """
+    recorded_patterns, recorded_tiers = _counts_without_presumed(recorded_regex["in_episode"])
+    rescan_patterns, rescan_tiers = _counts_without_presumed(rescan_regex["in_episode"])
+    pattern_names = sorted(set(recorded_patterns) | set(rescan_patterns))
+    tier_names = sorted(set(recorded_tiers) | set(rescan_tiers))
+    return {
+        "patterns": {
+            name: [recorded_patterns.get(name, 0), rescan_patterns.get(name, 0)]
+            for name in pattern_names
+            if recorded_patterns.get(name, 0) != rescan_patterns.get(name, 0)
+        },
+        "tiers": {
+            name: [recorded_tiers.get(name, 0), rescan_tiers.get(name, 0)]
+            for name in tier_names
+            if recorded_tiers.get(name, 0) != rescan_tiers.get(name, 0)
+        },
+    }
 
 
 def _matched_texts(in_episode: Mapping[str, Any], field_name: str) -> list[str]:
@@ -180,6 +194,7 @@ def refresh_awareness(
         raise FileExistsError(f"awareness sidecar already exists: {output_dir}")
 
     rows: list[dict[str, Any]] = []
+    count_changes: list[dict[str, Any]] = []
     for episode in episodes:
         context = f"{records_path} episode {episode['task_id']} sample {episode['sample_index']}"
         trace_path = _trace_path(records_path, episode)
@@ -190,7 +205,11 @@ def refresh_awareness(
             "Mapping[str, Any]",
             eval_awareness_from_trace_records(episode["trace_summary"], trace_rows)["regex"],
         )
-        _require_legacy_counts_reproduced(context, episode, rescan_regex)
+        changes = _count_changes(episode["eval_awareness"]["regex"], rescan_regex)
+        if changes["patterns"] or changes["tiers"]:
+            count_changes.append(
+                {"task_id": episode["task_id"], "sample_index": episode["sample_index"], **changes}
+            )
         rows.append(
             {
                 "record": ROW_RECORD_TYPE,
@@ -243,6 +262,7 @@ def refresh_awareness(
         "row_count": len(rows),
         "presumed_match_episodes": presumed_episodes,
         "targeted_alert_episodes": targeted_episodes,
+        "recorded_count_changes": count_changes,
     }
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -253,6 +273,7 @@ def refresh_awareness(
         episode_count=len(rows),
         presumed_match_episodes=len(presumed_episodes),
         targeted_alert_episodes=len(targeted_episodes),
+        count_change_episodes=len(count_changes),
     )
 
 
@@ -367,11 +388,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     for records_path in args.records:
         result = refresh_awareness(records_path)
         logger.info(
-            "%s episodes=%d presumed_match_episodes=%d targeted_alert_episodes=%d rows=%s",
+            "%s episodes=%d presumed_match_episodes=%d targeted_alert_episodes=%d "
+            "count_change_episodes=%d rows=%s",
             records_path,
             result.episode_count,
             result.presumed_match_episodes,
             result.targeted_alert_episodes,
+            result.count_change_episodes,
             result.rows_path,
         )
 

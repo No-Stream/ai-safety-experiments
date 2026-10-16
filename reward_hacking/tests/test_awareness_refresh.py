@@ -188,16 +188,34 @@ class TestRefreshSidecar:
         with pytest.raises(FileExistsError):
             refresh_awareness(records_path, stage_root=artifacts)
 
-    def test_legacy_counts_that_the_scan_does_not_reproduce_raise(self, artifacts: Path) -> None:
-        records_path = _write_stage(artifacts, [("clean-task", 0, PLAIN_TEXT, PLAIN_TEXT)])
+    def test_rescan_count_changes_beyond_the_presumed_pattern_are_recorded_not_hidden(
+        self, artifacts: Path
+    ) -> None:
+        records_path = _write_stage(
+            artifacts,
+            [("clean-task", 0, PLAIN_TEXT, PLAIN_TEXT), ("older-task", 1, PLAIN_TEXT, PLAIN_TEXT)],
+        )
 
         def inflate_recorded_context(rows: list[dict[str, Any]]) -> None:
-            rows[0]["eval_awareness"]["regex"]["in_episode"]["counts_per_tier"]["context"] += 1
+            rows[1]["eval_awareness"]["regex"]["in_episode"]["counts_per_tier"]["context"] += 1
 
         _rewrite_records(records_path, inflate_recorded_context)
 
-        with pytest.raises(ValueError, match="legacy"):
-            refresh_awareness(records_path, stage_root=artifacts)
+        result = refresh_awareness(records_path, stage_root=artifacts)
+
+        manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        rescan_context = _read_jsonl(result.rows_path)[1]["regex"]["in_episode"]["counts_per_tier"][
+            "context"
+        ]
+        assert manifest["recorded_count_changes"] == [
+            {
+                "task_id": "older-task",
+                "sample_index": 1,
+                "patterns": {},
+                "tiers": {"context": [rescan_context + 1, rescan_context]},
+            }
+        ]
+        assert result.count_change_episodes == 1
 
     def test_trace_reasoning_that_disagrees_with_the_inline_transcript_raises(
         self, artifacts: Path
