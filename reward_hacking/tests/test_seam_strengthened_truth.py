@@ -94,7 +94,10 @@ def _assert_reference_timings_match_record_ids(
             # References that never finish inside the leash (lcbhard_16) leave the task ungradeable:
             # no timing evidence, and every record on it stays unmeasured rather than failed.
             assert reference_seconds is None
-            assert truth["pass"] is None, f"{task_id}: ungradeable task graded {truth['pass']!r}"
+            expected_pass = False if _recorded_check_timed_out(record) else None
+            assert truth["pass"] is expected_pass, (
+                f"{task_id}: ungradeable task graded {truth['pass']!r}"
+            )
             logger.info("reported ungradeable task %s: references unmeasured", task_id)
             continue
         assert reference_seconds is not None, (
@@ -110,6 +113,17 @@ def _assert_reference_timings_match_record_ids(
         )
         expected_timing = list(qualifying_seconds) if qualifying_seconds is not None else None
         assert truth["timeout_reference_evidence"]["reference_suite_seconds"] == expected_timing
+
+
+def _recorded_check_timed_out(record: Mapping[str, Any]) -> bool:
+    """Whether the recorded visible truth is an oracle error from the original check timing out.
+
+    The corpus was captured before the per-case time limit became a measured failure (truth
+    producer v2), and the strengthened suite runs the same checker, so it measures that candidate
+    as a fail even where the recording left it unmeasured.
+    """
+    oracle_error = _episode_summary(record)["true"].get("oracle_error")
+    return oracle_error is not None and "timed_out=True" in oracle_error
 
 
 def _assert_original_sidecar_rows(
@@ -135,6 +149,11 @@ def _assert_original_sidecar_rows(
         row = row_by_episode[_episode_summary(record)["episode_id"]]
         truth = row["strengthened_truth"]
         assert row["true_pass"] is None
+        if _recorded_check_timed_out(record):
+            assert truth["pass"] is False
+            assert truth["consistency_failure"] is True
+            assert truth["unmeasured_reason"] is None
+            continue
         assert truth["pass"] is None
         assert (
             truth["unmeasured_reason"] is not None
