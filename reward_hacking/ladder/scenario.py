@@ -361,7 +361,20 @@ class Scenario:
 
     @property
     def semantic_content_identity(self) -> str:
-        """Identify named scenario behavior while ignoring source metadata and repository history."""
+        """Hash the semantic content payload; recorded beside the payload for older readers."""
+        encoded = json.dumps(
+            self.semantic_content_payload(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def semantic_content_payload(self) -> dict[str, object]:
+        """Describe named scenario behavior while ignoring source metadata and repository history.
+
+        Values are JSON-normalized so a payload read back from a run header compares equal.
+        """
         named_files = {
             path: _semantic_file_value(path, content)
             for path, content in sorted(self.files.items())
@@ -443,8 +456,7 @@ class Scenario:
                 "listing_mode": self.listing_mode,
             },
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        return cast("dict[str, object]", json.loads(json.dumps(payload, ensure_ascii=False)))
 
     @classmethod
     def load(cls, directory: Path) -> Self:

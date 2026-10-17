@@ -619,12 +619,7 @@ def _read_judge_labels_with_rubric(
     packet_path: Path,
     mapping: Mapping[str, object],
 ) -> tuple[dict[str, list[JudgeLabel]], str]:
-    rubric_digest = mapping.get("rubric_sha256")
-    if rubric_digest is not None and not isinstance(rubric_digest, str):
-        raise TypeError("awareness mapping rubric_sha256 must be a string when present")
-    packet_units, packet_rubric_sha256 = _read_packet_units(
-        packet_path, expected_rubric_digest=rubric_digest
-    )
+    packet_units, packet_rubric_sha256 = _read_packet_units(packet_path)
     if set(packet_units) != set(_mapping_object(mapping["units"], "units")):
         raise ValueError("packet and private mapping hold different unit ids")
     labels_by_unit: dict[str, list[JudgeLabel]] = {}
@@ -929,9 +924,7 @@ def _normalized(text: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", text).split())
 
 
-def _read_packet_units(
-    packet_path: Path, *, expected_rubric_digest: str | None = None
-) -> tuple[dict[str, Mapping[str, object]], str]:
+def _read_packet_units(packet_path: Path) -> tuple[dict[str, Mapping[str, object]], str]:
     rows = read_jsonl_records(packet_path)
     if not rows or rows[0].get("record") != "awareness_judge_batch":
         raise ValueError("packet must start with an awareness_judge_batch header")
@@ -943,11 +936,6 @@ def _read_packet_units(
     rubric = rows[0].get("rubric")
     if not isinstance(rubric, str):
         raise TypeError("awareness packet rubric must be a string")
-    if (
-        expected_rubric_digest is not None
-        and hashlib.sha256(rubric.encode("utf-8")).hexdigest() != expected_rubric_digest
-    ):
-        raise ValueError("awareness mapping rubric digest does not match packet rubric")
     if _normalized(rubric) != _normalized(AWARENESS_JUDGE_RUBRIC):
         raise ValueError("packet rubric content differs from this code's rubric")
     units: dict[str, Mapping[str, object]] = {}

@@ -95,7 +95,7 @@ class CellRunConfig:
     model_revision: str | None
     leak_task_filter: Path | None = None
     leak_train_channel_per_episode: bool = False
-    served_adapter_sha256: str | None = None
+    served_adapter_path: Path | None = None
     smoke: bool = False
     episodes: int = PROBE_EPISODES_PER_CELL
     max_turns: int | None = None
@@ -362,11 +362,11 @@ def build_generate_command(cell: ProbeCell, settings: CellRunConfig) -> list[str
     if settings.convention_note:
         command.append("--convention-note")
     if settings.generator == "v3":
-        if settings.served_adapter_sha256 is None:
-            raise ValueError("v3 generation requires the served adapter SHA-256")
-        command.extend(("--served-adapter-sha256", settings.served_adapter_sha256))
-    elif settings.served_adapter_sha256 is not None:
-        raise ValueError("base generation cannot declare a served adapter digest")
+        if settings.served_adapter_path is None:
+            raise ValueError("v3 generation requires the served adapter path")
+        command.extend(("--served-adapter-sha256", _adapter_sha256(settings.served_adapter_path)))
+    elif settings.served_adapter_path is not None:
+        raise ValueError("base generation cannot declare a served adapter path")
     if settings.model_revision is not None:
         command.extend(("--model-revision", settings.model_revision))
     command.extend(_leak_selection_arguments(cell, settings))
@@ -592,9 +592,7 @@ def _cell_run_config(
         baseline_records=_resolve_path(args.baseline_records),
         max_model_len=max_model_len,
         model_revision=model_revision,
-        served_adapter_sha256=(
-            _adapter_sha256(_resolve_path(args.v3_adapter)) if generator == "v3" else None
-        ),
+        served_adapter_path=_resolve_path(args.v3_adapter) if generator == "v3" else None,
         smoke=args.smoke_cell is not None,
         performance_arguments=performance_cli_arguments(args),
         serving_config=(

@@ -63,12 +63,22 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
         raise FileNotFoundError(f"cannot read ladder input {path}: {error}") from error
 
 
-def _scenario_semantic_identities(header: Mapping[str, object]) -> dict[str, str | None]:
+@dataclass(frozen=True, slots=True)
+class _RecordedScenarioContent:
+    """What a run header recorded about a scenario's semantic content."""
+
+    identity: str | None
+    payload: Mapping[str, object] | None
+
+
+def _scenario_semantic_identities(
+    header: Mapping[str, object],
+) -> dict[str, _RecordedScenarioContent]:
     provenance = _require_mapping(header.get("provenance"), field="run header provenance")
     raw_scenarios = provenance.get("scenarios")
     if not isinstance(raw_scenarios, list):
         raise TypeError("run header provenance.scenarios must be a list")
-    identities: dict[str, str | None] = {}
+    identities: dict[str, _RecordedScenarioContent] = {}
     for index, raw_scenario in enumerate(raw_scenarios):
         scenario_record = _require_mapping(
             raw_scenario, field=f"run header provenance.scenarios[{index}]"
@@ -81,10 +91,32 @@ def _scenario_semantic_identities(header: Mapping[str, object]) -> dict[str, str
             raise TypeError(
                 f"run header scenario {scenario_id!r} has an invalid semantic_content_identity"
             )
+        payload = scenario_record.get("semantic_content")
+        if payload is not None:
+            payload = _require_mapping(
+                payload, field=f"run header scenario {scenario_id!r} semantic_content"
+            )
         if scenario_id in identities:
             raise ValueError(f"run header contains duplicate scenario id {scenario_id!r}")
-        identities[scenario_id] = identity
+        identities[scenario_id] = _RecordedScenarioContent(identity, payload)
     return identities
+
+
+def _check_scenario_content(scenario: Scenario, recorded: _RecordedScenarioContent) -> None:
+    """Diff the recorded payload key by key; headers holding only the hash compare the hash."""
+    if recorded.payload is not None:
+        differences = runner._identity_differences(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+            scenario.semantic_content_payload(), recorded.payload
+        )
+        if differences:
+            raise ValueError(
+                f"scenario {scenario.slug!r} does not match the semantic content in the run "
+                "header at keys: " + ", ".join(differences)
+            )
+    elif recorded.identity is not None and scenario.semantic_content_identity != recorded.identity:
+        raise ValueError(
+            f"scenario {scenario.slug!r} does not match the semantic content in the run header"
+        )
 
 
 def _scenario_formats(header: Mapping[str, object]) -> dict[str, int]:
@@ -189,12 +221,6 @@ def _headers_by_pressure(
             detector_identity = provenance["detector_code_identity"]
             if not isinstance(detector_identity, str) or not detector_identity:
                 raise ValueError("run header provenance has an invalid detector_code_identity")
-        digest = header.get("provenance_digest")
-        if not isinstance(digest, str):
-            raise TypeError("run header provenance_digest must be a string")
-        expected_digest = runner.provenance_digest(provenance)
-        if digest != expected_digest:
-            raise ValueError(f"run header provenance digest is invalid for pressure {pressure!r}")
         runner.semantic_provenance_for_comparison(provenance, provenance)
         for prior_provenance in prior_provenances:
             current_common, prior_common = runner.semantic_provenance_for_comparison(
@@ -203,8 +229,13 @@ def _headers_by_pressure(
             )
             current_common.pop("task_pressure", None)
             prior_common.pop("task_pressure", None)
-            if current_common != prior_common:
-                raise ValueError("run headers have incompatible provenance")
+            differences = runner._identity_differences(  # noqa: SLF001 # pyright: ignore[reportPrivateUsage]
+                current_common, prior_common
+            )
+            if differences:
+                raise ValueError(
+                    "run headers have incompatible provenance at keys: " + ", ".join(differences)
+                )
         prior_provenances.append(provenance)
         headers_by_pressure.setdefault(pressure, []).append(header)
     return headers_by_pressure
@@ -213,7 +244,7 @@ def _headers_by_pressure(
 def _load_scenario(
     scenario_root: Path,
     scenario_id: str,
-    expected_semantic_identity: str | None,
+    recorded_content: _RecordedScenarioContent,
 ) -> Scenario:
     scenario_path = (scenario_root / scenario_id).resolve()
     if not scenario_path.is_relative_to(scenario_root.resolve()):
@@ -226,13 +257,7 @@ def _load_scenario(
             f"scenario directory {scenario_path} declares slug {scenario.slug!r}, "
             f"expected {scenario_id!r}"
         )
-    if (
-        expected_semantic_identity is not None
-        and scenario.semantic_content_identity != expected_semantic_identity
-    ):
-        raise ValueError(
-            f"scenario {scenario_id!r} does not match the semantic content in the run header"
-        )
+    _check_scenario_content(scenario, recorded_content)
     return scenario
 
 
@@ -240,13 +265,13 @@ def _scenario_for_key(  # noqa: PLR0913 - scenario provenance inputs stay explic
     key: EpisodeKey,
     *,
     scenario_root: Path | None,
-    scenario_semantic_identities: Mapping[str, str | None],
+    scenario_semantic_identities: Mapping[str, _RecordedScenarioContent],
     scenario_formats: Mapping[str, int],
     scenario_set_versions: Mapping[str, str | None],
     scenario_cache: dict[str, Scenario],
 ) -> Scenario:
     try:
-        expected_semantic_identity = scenario_semantic_identities[key.scenario_id]
+        recorded_content = scenario_semantic_identities[key.scenario_id]
     except KeyError as error:
         raise ValueError(
             f"scenario {key.scenario_id!r} is absent from run header provenance"
@@ -266,9 +291,11 @@ def _scenario_for_key(  # noqa: PLR0913 - scenario provenance inputs stay explic
                 set_version=scenario_set_versions[key.scenario_id],
             ),
             key.scenario_id,
-            expected_semantic_identity,
+            recorded_content,
         )
         scenario_cache[key.scenario_id] = scenario
+    else:
+        _check_scenario_content(scenario, recorded_content)
     return scenario
 
 
@@ -668,7 +695,7 @@ def _rescore_episode(  # noqa: PLR0913 - replay inputs are explicit provenance d
     *,
     detector_code_identity: str,
     scenario_root: Path | None,
-    scenario_semantic_identities: Mapping[str, str | None],
+    scenario_semantic_identities: Mapping[str, _RecordedScenarioContent],
     scenario_formats: Mapping[str, int],
     scenario_set_versions: Mapping[str, str | None],
     scenario_cache: dict[str, Scenario],
@@ -898,16 +925,11 @@ def _upgrade_header_to_current_schema(
                 scenario_semantic_identities[scenario_id],
             )
             scenario_cache[scenario_id] = scenario
-        expected_semantic_identity = scenario_semantic_identities[scenario_id]
-        if (
-            expected_semantic_identity is not None
-            and scenario.semantic_content_identity != expected_semantic_identity
-        ):
-            raise ValueError(
-                f"scenario {scenario_id!r} does not match the semantic content in the run header"
-            )
+        else:
+            _check_scenario_content(scenario, scenario_semantic_identities[scenario_id])
         scenario_record["manifest_digest"] = scenario.manifest_digest
         scenario_record["semantic_content_identity"] = scenario.semantic_content_identity
+        scenario_record["semantic_content"] = scenario.semantic_content_payload()
         upgraded_scenarios.append(scenario_record)
     provenance["scenarios"] = upgraded_scenarios
     provenance["models"] = _upgrade_model_provenance(provenance.get("models"))
@@ -934,7 +956,7 @@ class _RescoreRun:
     scenario_root: Path | None
     scenario_cache: dict[str, Scenario]
     headers_by_pressure: dict[str, list[dict[str, object]]]
-    scenario_semantic_identities_by_pressure: dict[str, dict[str, str | None]]
+    scenario_semantic_identities_by_pressure: dict[str, dict[str, _RecordedScenarioContent]]
     scenario_formats_by_pressure: dict[str, dict[str, int]]
     scenario_set_versions_by_pressure: dict[str, dict[str, str | None]]
     grading_settings_by_pressure: dict[str, tuple[str, JailResourceLimits]]
@@ -949,16 +971,8 @@ def _rescore_episode_records(
         if row.get("record") != "ladder_episode":
             continue
         key = EpisodeKey.from_json(_require_mapping(row.get("key"), field="ladder_episode.key"))
-        try:
-            pressure_headers = rescore_run.headers_by_pressure[key.task_pressure]
-        except KeyError as error:
-            raise ValueError(f"no run header for pressure {key.task_pressure!r}") from error
-        row_digest = row.get("provenance_digest")
-        if not any(header.get("provenance_digest") == row_digest for header in pressure_headers):
-            raise ValueError(
-                f"ladder episode provenance digest does not match pressure "
-                f"{key.task_pressure!r} header"
-            )
+        if key.task_pressure not in rescore_run.headers_by_pressure:
+            raise ValueError(f"no run header for pressure {key.task_pressure!r}")
         _rescore_episode(
             row,
             detector_code_identity=rescore_run.detector_code_identity,
@@ -976,14 +990,11 @@ def _rescore_episode_records(
         )
 
 
-def _upgrade_run_headers(rescore_run: _RescoreRun) -> dict[str, str]:
-    digest_replacements: dict[str, str] = {}
-    for pressure_headers in rescore_run.headers_by_pressure.values():
+def _upgrade_run_headers(rescore_run: _RescoreRun) -> dict[str, dict[str, str]]:
+    """Upgrade every header and return each pressure's old-to-new recorded digests."""
+    digest_replacements_by_pressure: dict[str, dict[str, str]] = {}
+    for pressure, pressure_headers in rescore_run.headers_by_pressure.items():
         for header in pressure_headers:
-            provenance = _require_mapping(header.get("provenance"), field="run header provenance")
-            pressure = provenance.get("task_pressure", "none")
-            if not isinstance(pressure, str):
-                raise TypeError("run header provenance.task_pressure must be a string")
             old_digest, new_digest = _upgrade_header_to_current_schema(
                 header,
                 source_schema_version=rescore_run.schema_versions_by_pressure[pressure],
@@ -991,21 +1002,28 @@ def _upgrade_run_headers(rescore_run: _RescoreRun) -> dict[str, str]:
                 scenario_root=rescore_run.scenario_root,
                 scenario_cache=rescore_run.scenario_cache,
             )
-            digest_replacements[old_digest] = new_digest
-    return digest_replacements
+            digest_replacements_by_pressure.setdefault(pressure, {})[old_digest] = new_digest
+    return digest_replacements_by_pressure
 
 
-def _replace_episode_provenance_digests(
+def _relabel_episode_provenance_digests(
     rows: Sequence[dict[str, object]],
-    digest_replacements: Mapping[str, str],
+    digest_replacements_by_pressure: Mapping[str, Mapping[str, str]],
 ) -> None:
+    """Point each episode's recorded digest at an upgraded header of its own pressure.
+
+    Episodes are linked to headers by pressure, so a recorded digest that matches no header (for
+    example one written by an older digest formula) takes the pressure's latest header digest.
+    """
     for row in rows:
         if row.get("record") != "ladder_episode":
             continue
-        old_digest = row.get("provenance_digest")
-        if not isinstance(old_digest, str) or old_digest not in digest_replacements:
-            raise ValueError("ladder episode provenance digest has no matching upgraded header")
-        row["provenance_digest"] = digest_replacements[old_digest]
+        key = EpisodeKey.from_json(_require_mapping(row.get("key"), field="ladder_episode.key"))
+        replacements = digest_replacements_by_pressure[key.task_pressure]
+        latest_digest = list(replacements.values())[-1]
+        row["provenance_digest"] = replacements.get(
+            str(row.get("provenance_digest")), latest_digest
+        )
 
 
 def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
@@ -1045,7 +1063,7 @@ def rescore_file(
     rows = _read_jsonl(source_path)
     headers = [row for row in rows if row.get("record") == "ladder_run_header"]
     headers_by_pressure = _headers_by_pressure(headers)
-    scenario_semantic_identities_by_pressure: dict[str, dict[str, str | None]] = {
+    scenario_semantic_identities_by_pressure: dict[str, dict[str, _RecordedScenarioContent]] = {
         pressure: _scenario_semantic_identities(pressure_headers[0])
         for pressure, pressure_headers in headers_by_pressure.items()
     }
@@ -1081,8 +1099,8 @@ def rescore_file(
         schema_versions_by_pressure=schema_versions_by_pressure,
     )
     _rescore_episode_records(rows, rescore_run)
-    digest_replacements = _upgrade_run_headers(rescore_run)
-    _replace_episode_provenance_digests(rows, digest_replacements)
+    digest_replacements_by_pressure = _upgrade_run_headers(rescore_run)
+    _relabel_episode_provenance_digests(rows, digest_replacements_by_pressure)
     _write_jsonl(destination_path, rows)
     return rows
 

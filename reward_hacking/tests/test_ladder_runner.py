@@ -291,6 +291,13 @@ def runner_config(output_path: Path) -> RunnerConfig:
     )
 
 
+def _generation_identity_differences(first: RunnerConfig, second: RunnerConfig) -> list[str]:
+    return ladder_runner._identity_differences(
+        ladder_runner.generation_path_provenance(first.provenance_payload()),
+        ladder_runner.generation_path_provenance(second.provenance_payload()),
+    )
+
+
 def _synthetic_qwen_token_id(token: str) -> int | None:
     return {"<|endoftext|>": 248044, "<|im_end|>": 248046}.get(token)
 
@@ -313,7 +320,9 @@ def test_per_turn_cap_defaults_to_the_ladder_constant_and_is_recorded(tmp_path: 
     raised_sampling = cast("dict[str, object]", raised_config.provenance_payload()["sampling"])
     assert default_sampling == LADDER_SAMPLING.to_json()
     assert raised_sampling == {**LADDER_SAMPLING.to_json(), "max_new_tokens": 16_384}
-    assert default_config.provenance_digest != raised_config.provenance_digest
+    assert _generation_identity_differences(default_config, raised_config) == [
+        "sampling.max_new_tokens"
+    ]
 
 
 def test_announced_turn_budget_overrides_effective_cap_and_enters_provenance(
@@ -331,7 +340,10 @@ def test_announced_turn_budget_overrides_effective_cap_and_enters_provenance(
     assert provenance["announced_turn_budget"] == 3
     assert provenance["announced_turn_budget_sentence"] == sentence
     default_config = replace(runner_config(tmp_path / "default" / "records.jsonl"), max_turns=3)
-    assert config.provenance_digest != default_config.provenance_digest
+    assert _generation_identity_differences(config, default_config) == [
+        "announced_turn_budget",
+        "announced_turn_budget_sentence",
+    ]
 
 
 def test_consecutive_truncation_limit_enters_provenance(tmp_path: Path) -> None:
@@ -343,7 +355,9 @@ def test_consecutive_truncation_limit_enters_provenance(tmp_path: Path) -> None:
 
     assert "max_consecutive_truncated_turns" not in default_config.provenance_payload()
     assert capped_config.provenance_payload()["max_consecutive_truncated_turns"] == 2
-    assert default_config.provenance_digest != capped_config.provenance_digest
+    assert _generation_identity_differences(default_config, capped_config) == [
+        "max_consecutive_truncated_turns"
+    ]
 
 
 def test_runner_rejects_conflicting_announced_and_explicit_turn_caps(tmp_path: Path) -> None:
@@ -590,10 +604,12 @@ def test_provenance_pins_native_toolcall_inputs_and_generation_sources(tmp_path:
         config,
         server_args={"kv_cache_dtype": "auto", "attention_backend": "FLASHINFER"},
     )
-    assert changed_server_config.provenance_digest != config.provenance_digest
+    assert _generation_identity_differences(changed_server_config, config) == [
+        "server_args.kv_cache_dtype"
+    ]
     changed_history_config = replace(config, history_reasoning="strip")
     assert changed_history_config.provenance_payload()["history_reasoning"] == "strip"
-    assert changed_history_config.provenance_digest != config.provenance_digest
+    assert _generation_identity_differences(changed_history_config, config) == ["history_reasoning"]
     sampling = cast("dict[str, object]", provenance["sampling"])
     assert "stop" not in sampling
     assert sampling["max_new_tokens"] == 8_192
@@ -636,14 +652,12 @@ def test_resume_keys_are_content_addressed_and_sampling_mismatch_names_key(tmp_p
     )
     assert completed_episode_keys(
         output_path,
-        expected_digest=config.provenance_digest,
         expected_provenance=provenance,
     ) == {key}
     changed_sampling_config = replace(config, top_p=0.8)
     with pytest.raises(ValueError, match=r"sampling\.top_p"):
         completed_episode_keys(
             output_path,
-            expected_digest=changed_sampling_config.provenance_digest,
             expected_provenance=changed_sampling_config.provenance_payload(),
         )
 
@@ -1980,7 +1994,7 @@ def test_task_pressure_separates_provenance_keys_paths_readout_and_resume(
 
     assert base_config.provenance_payload()["task_pressure"] == "none"
     assert merge_gate_config.provenance_payload()["task_pressure"] == "merge-gate"
-    assert base_config.provenance_digest != merge_gate_config.provenance_digest
+    assert _generation_identity_differences(base_config, merge_gate_config) == ["task_pressure"]
     none_records = run(base_config)
     merge_gate_records = run(merge_gate_config)
 
@@ -2246,7 +2260,6 @@ def test_schema_23_resume_accepts_missing_code_identities(tmp_path: Path) -> Non
 
     completed = completed_episode_keys(
         output_path,
-        expected_digest=config.provenance_digest,
         expected_provenance=config.provenance_payload(),
     )
 
@@ -2370,7 +2383,6 @@ def test_resume_accepts_legacy_endpoint_header_when_identity_matches(
 
     completed = completed_episode_keys(
         output_path,
-        expected_digest=config.provenance_digest,
         expected_provenance=config.provenance_payload(),
     )
 
@@ -2407,22 +2419,14 @@ def test_server_argument_change_refuses_resume(tmp_path: Path) -> None:
         )
 
 
-def test_resume_accepts_server_restart_and_moved_identical_adapter(
+def test_resume_accepts_server_restart_and_moved_adapter_with_same_config(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "records.jsonl"
-    first_adapter = tmp_path / "first-checkout" / "adapter"
+    adapter = tmp_path / "checkout" / "adapter"
     moved_adapter = tmp_path / "second-checkout" / "adapter"
-    _write_adapter(first_adapter, peft_version="0.15.0")
-    _write_adapter(moved_adapter, peft_version="0.99.0")
-    (first_adapter / "README.md").write_text("first layout note\n", encoding="utf-8")
-    (moved_adapter / "README.md").write_text("relocated adapter notes\n", encoding="utf-8")
-    (moved_adapter / "adapter_config.json").write_text(
-        '{\n  "base_model_name_or_path": "/different/metadata/base",\n'
-        '  "lora_alpha": 4,\n  "peft_version": "0.99.0",\n'
-        '  "rank": 2\n}\n',
-        encoding="utf-8",
-    )
+    _write_adapter(adapter, peft_version="0.15.0")
+    _write_adapter(moved_adapter, peft_version="0.15.0")
 
     def server_args(
         adapter_path: Path, *, host: str, port: int, launch_root: Path
@@ -2449,7 +2453,7 @@ def test_resume_accepts_server_restart_and_moved_identical_adapter(
         arms=("naive",),
         samples=1,
         server_args=server_args(
-            first_adapter,
+            adapter,
             host="127.0.0.1",
             port=8000,
             launch_root=tmp_path / "launch-one",
@@ -2473,7 +2477,7 @@ def test_resume_accepts_server_restart_and_moved_identical_adapter(
         first_config,
         endpoint="http://localhost:9000",
         server_args=server_args(
-            moved_adapter,
+            adapter,
             host="127.0.0.2",
             port=9000,
             launch_root=tmp_path / "launch-two",
@@ -2496,9 +2500,10 @@ def test_resume_accepts_server_restart_and_moved_identical_adapter(
     assert first_server_args == second_server_args
     adapter_identity = cast("list[dict[str, object]]", first_server_args["lora_modules"])
     assert adapter_identity[0]["name"] == "student"
-    assert len(cast("str", adapter_identity[0]["adapter_semantic_identity"])) == 64
+    assert "adapter_semantic_identity" in adapter_identity[0]
     first_context = cast("dict[str, object]", first_provenance["run_context"])
     second_context = cast("dict[str, object]", second_provenance["run_context"])
+    assert first_context["adapter_configs"] == {"student": {"rank": 2, "lora_alpha": 4}}
     first_launch_args = cast("dict[str, object]", first_context["server_args"])
     second_launch_args = cast("dict[str, object]", second_context["server_args"])
     assert first_launch_args["host"] == "127.0.0.1"
@@ -2507,17 +2512,65 @@ def test_resume_accepts_server_restart_and_moved_identical_adapter(
     assert second_launch_args["port"] == 9000
     assert first_launch_args["model"] != second_launch_args["model"]
     assert first_launch_args["lora_serving_dir"] != second_launch_args["lora_serving_dir"]
-    assert cast("list[dict[str, object]]", first_launch_args["lora_modules"])[0]["path"] == str(
-        first_adapter
+
+    moved_config = replace(
+        restarted_config,
+        server_args=server_args(
+            moved_adapter,
+            host="127.0.0.2",
+            port=9000,
+            launch_root=tmp_path / "launch-two",
+        ),
     )
-    assert cast("list[dict[str, object]]", second_launch_args["lora_modules"])[0]["path"] == str(
+    run(moved_config)
+
+    assert calls == [0]
+    moved_header = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line).get("record") == "ladder_run_header"
+    ][-1]
+    moved_context = cast("dict[str, object]", moved_header["provenance"])["run_context"]
+    moved_launch_args = cast(
+        "dict[str, object]", cast("dict[str, object]", moved_context)["server_args"]
+    )
+    assert cast("list[dict[str, object]]", moved_launch_args["lora_modules"])[0]["path"] == str(
         moved_adapter
     )
 
 
-@pytest.mark.parametrize("changed_file", ["adapter_config.json", "adapter_model.safetensors"])
-def test_changed_adapter_bytes_refuse_resume_and_name_lora_modules_key(
-    tmp_path: Path, changed_file: str
+def test_adapter_config_change_refuses_resume_and_names_the_config_key(tmp_path: Path) -> None:
+    output_path = tmp_path / "records.jsonl"
+    adapter_path = tmp_path / "adapter"
+    _write_adapter(adapter_path)
+    config = replace(
+        runner_config(output_path),
+        arms=("naive",),
+        samples=1,
+        server_args={"lora_modules": [{"name": "student", "path": str(adapter_path)}]},
+    )
+    run_grid(
+        config,
+        backend_factory=lambda _model, _config: object(),
+        episode_runner=lambda *_args: {"true_pass": True},
+        detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+        final_grader=lambda **_kwargs: {},
+    )
+    (adapter_path / "adapter_config.json").write_text(
+        '{"rank": 4, "lora_alpha": 4, "peft_version": "0.99.0"}\n', encoding="utf-8"
+    )
+
+    with pytest.raises(
+        ValueError, match=r"differs at keys: run_context\.adapter_configs\.student\.rank$"
+    ):
+        completed_episode_keys(
+            output_path,
+            expected_provenance=replace(config).provenance_payload(),
+        )
+
+
+def test_adapter_weights_rewritten_in_place_are_recorded_but_do_not_gate_resume(
+    tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "records.jsonl"
     adapter_path = tmp_path / "adapter"
@@ -2535,26 +2588,20 @@ def test_changed_adapter_bytes_refuse_resume_and_name_lora_modules_key(
         detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
         final_grader=lambda **_kwargs: {},
     )
-    changed_path = adapter_path / changed_file
-    if changed_file == "adapter_config.json":
-        changed_path.write_text('{"rank": 4, "lora_alpha": 4}\n', encoding="utf-8")
-    else:
-        save_file(
-            {"lora_A.weight": torch.tensor([[0.75, 0.5]], dtype=torch.float32)},
-            str(changed_path),
-        )
+    _write_adapter(adapter_path, weight_value=0.75)
+    rewritten_config = replace(config)
 
-    with pytest.raises(ValueError, match=r"server_args\.lora_modules"):
-        run_grid(
-            replace(config),
-            backend_factory=lambda _model, _config: object(),
-            episode_runner=lambda *_args: {"true_pass": True},
-            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
-            final_grader=lambda **_kwargs: {},
-        )
+    assert completed_episode_keys(
+        output_path, expected_provenance=rewritten_config.provenance_payload()
+    ) == {EpisodeKey("base", "dummy", "naive", 0)}
+    recorded_modules = [
+        cast("dict[str, object]", candidate.provenance_payload()["server_args"])["lora_modules"]
+        for candidate in (config, rewritten_config)
+    ]
+    assert recorded_modules[0] != recorded_modules[1]
 
 
-def test_legacy_path_based_adapter_provenance_resumes_when_old_path_is_verifiable(
+def test_legacy_path_based_adapter_provenance_resumes_with_old_files_present(
     tmp_path: Path,
 ) -> None:
     output_path = tmp_path / "legacy-records.jsonl"
@@ -2601,7 +2648,6 @@ def test_legacy_path_based_adapter_provenance_resumes_when_old_path_is_verifiabl
 
     completed = completed_episode_keys(
         output_path,
-        expected_digest=config.provenance_digest,
         expected_provenance=config.provenance_payload(),
     )
 
@@ -2653,7 +2699,6 @@ def test_legacy_path_based_adapter_provenance_without_old_files_uses_available_s
 
     completed = completed_episode_keys(
         output_path,
-        expected_digest=config.provenance_digest,
         expected_provenance=config.provenance_payload(),
     )
 
@@ -2921,7 +2966,6 @@ class TestEpisodeConcurrency:
 
         completed = completed_episode_keys(
             config.output_path,
-            expected_digest=config.provenance_digest,
             expected_provenance=config.provenance_payload(),
         )
         assert EpisodeKey("base", "dummy", "naive", 0) not in completed
@@ -3058,7 +3102,7 @@ class TestEpisodeConcurrency:
         serial = runner_config(tmp_path / "records.jsonl")
         concurrent = replace(serial, episode_concurrency=4)
         assert concurrent.provenance_payload()["episode_concurrency"] == 4
-        assert concurrent.provenance_digest != serial.provenance_digest
+        assert _generation_identity_differences(concurrent, serial) == ["episode_concurrency"]
         with pytest.raises(ValueError, match="episode_concurrency"):
             replace(serial, episode_concurrency=0)
 
@@ -3591,12 +3635,12 @@ def test_cached_model_resolves_without_repo_docs_or_network(
         _resolve_local_model_path(ModelSpec("absent", "org/absent"))
 
 
-def test_provenance_digest_changes_when_sampling_or_scenario_changes() -> None:
+def test_identity_differences_name_changed_sampling_and_scenario_keys() -> None:
     base = {"sampling": {"max_new_tokens": 12_000}, "scenario": "dummy"}
-    assert provenance_digest(base) != provenance_digest({**base, "scenario": "other"})
-    assert provenance_digest(base) != provenance_digest(
-        {"sampling": {"max_new_tokens": 12_001}, "scenario": "dummy"}
-    )
+    assert ladder_runner._identity_differences(base, {**base, "scenario": "other"}) == ["scenario"]
+    assert ladder_runner._identity_differences(
+        base, {"sampling": {"max_new_tokens": 12_001}, "scenario": "dummy"}
+    ) == ["sampling.max_new_tokens"]
 
 
 @pytest.mark.parametrize(
@@ -4139,19 +4183,139 @@ def test_v2_final_tree_scan_excludes_unit_test_lookup_tables(tmp_path: Path) -> 
     assert "src/dummy.py" in evidence[0][1]
 
 
-def test_v1_provenance_digest_includes_disabled_announced_budget_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_v1_provenance_records_disabled_opt_in_settings_by_value(tmp_path: Path) -> None:
+    provenance = replace(
+        runner_config(tmp_path / "records.jsonl"), arms=("real",), samples=1
+    ).provenance_payload()
+
+    assert provenance["announced_turn_budget"] is None
+    assert provenance["announced_turn_budget_sentence"] is None
+    assert provenance["max_turns"] == ladder_loop.LADDER_MAX_TURNS
+    for opt_in_field in (
+        "persistent_jail",
+        "max_consecutive_truncated_turns",
+        "hint",
+        "thinking_token_budget",
+        "belief_probe",
+    ):
+        assert opt_in_field not in provenance
+
+
+def _write_resume_fixture(
+    output_path: Path,
+    provenance: Mapping[str, object],
+    *,
+    header_digest: str,
+    episode_digest: str,
+    key: EpisodeKey,
 ) -> None:
-    monkeypatch.setattr(ladder_runner, "_generation_code_identity", lambda: "synthetic-generation")
-    monkeypatch.setattr(ladder_runner, "detector_code_identity", lambda: "synthetic-detector")
-    monkeypatch.setattr(ladder_runner, "scenario_digest", lambda _scenario: "synthetic-manifest")
-    config = replace(runner_config(tmp_path / "records.jsonl"), arms=("real",), samples=1)
-    # Captured with the opt-in budget disabled and source identities fixed independently of edits.
-    assert (
-        config.provenance_digest
-        == "179412b8a43cd4538b8f89e64c6a32beaa4e3fb62928011fb2fb4e860db25a48"
+    output_path.write_text(
+        json.dumps(
+            {
+                "record": "ladder_run_header",
+                "schema_version": LADDER_SCHEMA_VERSION,
+                "provenance_digest": header_digest,
+                "provenance": provenance,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "record": "ladder_episode",
+                "provenance_digest": episode_digest,
+                "detector_code_identity": provenance["detector_code_identity"],
+                "key": key.to_json(),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
+
+
+def test_per_command_config_resumes_header_written_before_persistent_jail_existed(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    per_command = replace(runner_config(output_path), arms=("naive",), samples=1)
+    pre_persistent_jail_provenance = per_command.provenance_payload()
+    pre_persistent_jail_provenance.pop("persistent_jail", None)
+    key = EpisodeKey("base", "dummy", "naive", 0)
+    _write_resume_fixture(
+        output_path,
+        pre_persistent_jail_provenance,
+        header_digest="digest-from-older-code",
+        episode_digest="digest-from-older-code",
+        key=key,
+    )
+
+    assert completed_episode_keys(
+        output_path, expected_provenance=per_command.provenance_payload()
+    ) == {key}
+    persistent = replace(per_command, persistent_jail=True)
+    with pytest.raises(ValueError, match=r"differs at keys: persistent_jail$"):
+        completed_episode_keys(output_path, expected_provenance=persistent.provenance_payload())
+
+
+def test_resume_ignores_stale_digests_and_links_episodes_to_headers_by_pressure(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    config = replace(runner_config(output_path), arms=("naive",), samples=1)
+    key = EpisodeKey("base", "dummy", "naive", 0)
+    _write_resume_fixture(
+        output_path,
+        config.provenance_payload(),
+        header_digest="not-a-rehash-of-the-header",
+        episode_digest="matches-no-header",
+        key=key,
+    )
+
+    assert completed_episode_keys(output_path, expected_provenance=config.provenance_payload()) == {
+        key
+    }
+
+    merge_gate_key = EpisodeKey("base", "dummy", "naive", 0, "merge-gate")
+    _write_resume_fixture(
+        output_path,
+        config.provenance_payload(),
+        header_digest=config.provenance_digest,
+        episode_digest=config.provenance_digest,
+        key=merge_gate_key,
+    )
+    with pytest.raises(ValueError, match="'merge-gate' pressure has no run header"):
+        completed_episode_keys(output_path, expected_provenance=config.provenance_payload())
+
+
+def test_rerun_with_unchanged_provenance_adds_no_header_even_when_stored_digest_is_stale(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "records.jsonl"
+    config = replace(runner_config(output_path), arms=("naive",), samples=1, resume=True)
+    key = EpisodeKey("base", "dummy", "naive", 0)
+    _write_resume_fixture(
+        output_path,
+        config.provenance_payload(),
+        header_digest="stale-digest",
+        episode_digest="stale-digest",
+        key=key,
+    )
+
+    assert (
+        run_grid(
+            config,
+            backend_factory=lambda _model, _config: object(),
+            episode_runner=lambda *_args: {"true_pass": True},
+            detector=lambda **_kwargs: {"highest_rung": 0, "coverup": False},
+            final_grader=lambda **_kwargs: {},
+        )
+        == []
+    )
+    headers = [
+        row
+        for row in map(json.loads, output_path.read_text(encoding="utf-8").splitlines())
+        if row.get("record") == "ladder_run_header"
+    ]
+    assert len(headers) == 1
 
 
 def test_persistent_jail_enters_provenance_only_when_enabled(tmp_path: Path) -> None:
@@ -4160,7 +4324,7 @@ def test_persistent_jail_enters_provenance_only_when_enabled(tmp_path: Path) -> 
 
     assert "persistent_jail" not in per_command.provenance_payload()
     assert persistent.provenance_payload()["persistent_jail"] is True
-    assert persistent.provenance_digest != per_command.provenance_digest
+    assert _generation_identity_differences(persistent, per_command) == ["persistent_jail"]
 
 
 def test_probe_questions_load_once_and_only_their_digest_enters_provenance(
@@ -4185,7 +4349,7 @@ def test_probe_questions_load_once_and_only_their_digest_enters_provenance(
     )
     assert len(calls) == 1
     payload = config.provenance_payload()
-    assert len(cast("str", payload["belief_probe_questions_sha256"])) == 64
+    assert "belief_probe_questions_sha256" in payload
     assert questions.open_question not in json.dumps(payload)
     assert questions.category_question not in json.dumps(payload)
 
@@ -4273,7 +4437,6 @@ def test_private_v2_scenarios_supply_runner_contracts(
         assert provenance["format"] == scenario.format
         assert provenance["variant"] == scenario.variant
         assert provenance["set_version"] == scenario.set_version
-        assert provenance["surfaces_sha256"] == surfaces.surfaces_sha256()
 
 
 def _synthetic_v2_scenario(root: Path) -> SimpleNamespace:
@@ -4809,10 +4972,9 @@ def test_surface_code_hash_is_ignored_on_resume_but_actor_text_remains_bound(
         "provenance_digest": provenance_digest(legacy_provenance),
     }
 
-    completed = ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+    completed = ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
         tmp_path / "records.jsonl",
         (legacy_header,),
-        first_config.provenance_digest,
         first_provenance,
     )
     assert "none" in completed
@@ -4824,7 +4986,7 @@ def test_surface_code_hash_is_ignored_on_resume_but_actor_text_remains_bound(
         runner_config(tmp_path / "records.jsonl"), scenarios=(cast("ScenarioLike", scenario),)
     )
     with pytest.raises(ValueError, match=r"stored run provenance differs at keys: scenarios"):
-        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
             tmp_path / "records.jsonl",
             (
                 {
@@ -4832,7 +4994,6 @@ def test_surface_code_hash_is_ignored_on_resume_but_actor_text_remains_bound(
                     "provenance_digest": first_config.provenance_digest,
                 },
             ),
-            changed_config.provenance_digest,
             changed_config.provenance_payload(),
         )
     changed_scenario = cast(
@@ -4865,10 +5026,9 @@ def test_legacy_semantic_subset_keeps_available_actor_surface_identity(
     )
 
     with pytest.raises(ValueError, match=r"stored run provenance differs at keys: scenarios"):
-        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
             tmp_path / "records.jsonl",
             (legacy_header,),
-            changed_config.provenance_digest,
             changed_config.provenance_payload(),
         )
 
@@ -4898,10 +5058,9 @@ def test_resume_ignores_paths_and_runtime_or_source_digests_but_keeps_model_iden
         "provenance_digest": provenance_digest(old_provenance),
     }
 
-    compatible = ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+    compatible = ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
         tmp_path / "records.jsonl",
         (old_header,),
-        config.provenance_digest,
         config.provenance_payload(),
     )
 
@@ -4911,12 +5070,24 @@ def test_resume_ignores_paths_and_runtime_or_source_digests_but_keeps_model_iden
         models=(ModelSpec("different-base", "/relocated/model"),),
     )
     with pytest.raises(ValueError, match="stored run provenance differs at keys: models"):
-        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
             tmp_path / "records.jsonl",
             (old_header,),
-            changed_model.provenance_digest,
             changed_model.provenance_payload(),
         )
+
+
+def test_header_records_the_readable_scenario_semantic_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ladder_runner, "jail_runtime_identity", lambda: "synthetic-runtime")
+    scenario = Scenario.load(_write_dummy_v2_scenario(tmp_path / "scenarios"))
+    config = replace(runner_config(tmp_path / "records.jsonl"), scenarios=(scenario,))
+
+    scenario_record = cast("list[dict[str, object]]", config.provenance_payload()["scenarios"])[0]
+
+    assert scenario_record["semantic_content"] == scenario.semantic_content_payload()
+    assert scenario_record["semantic_content_identity"] == scenario.semantic_content_identity
 
 
 def test_resume_checks_semantic_scenario_content_when_recorded(
@@ -4937,10 +5108,9 @@ def test_resume_checks_semantic_scenario_content_when_recorded(
     }
 
     with pytest.raises(ValueError, match="stored run provenance differs at keys: scenarios"):
-        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
             tmp_path / "records.jsonl",
             (changed_header,),
-            config.provenance_digest,
             config.provenance_payload(),
         )
 
@@ -4951,10 +5121,9 @@ def test_resume_checks_semantic_scenario_content_when_recorded(
         "provenance": legacy_provenance,
         "provenance_digest": provenance_digest(legacy_provenance),
     }
-    assert "none" in ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+    assert "none" in ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
         tmp_path / "records.jsonl",
         (legacy_header,),
-        config.provenance_digest,
         config.provenance_payload(),
     )
 
@@ -4994,7 +5163,7 @@ def test_resume_refuses_changed_protected_overlay_with_same_manifest_provenance(
     assert changed_scenario_record["manifest_digest"] == "stable-manifest-record"
     assert changed_scenario_record["semantic_content_identity"] != original_scenario_identity
     with pytest.raises(ValueError, match="stored run provenance differs at keys: scenarios"):
-        ladder_runner._pressure_resume_digests(  # pyright: ignore[reportPrivateUsage]
+        ladder_runner._compatible_header_pressures(  # pyright: ignore[reportPrivateUsage]
             tmp_path / "records.jsonl",
             (
                 {
@@ -5002,7 +5171,6 @@ def test_resume_refuses_changed_protected_overlay_with_same_manifest_provenance(
                     "provenance_digest": original_config.provenance_digest,
                 },
             ),
-            changed_config.provenance_digest,
             changed_config.provenance_payload(),
         )
 

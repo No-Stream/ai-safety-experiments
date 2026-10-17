@@ -716,6 +716,24 @@ def test_completed_reuse_provenance_accepts_usable_schema(
         evaluate._validate_completed_reuse_provenance(tmp_path, {"task_ids": ["changed"]})
 
 
+def test_completed_reuse_provenance_ignores_stale_saved_digest_without_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    identity = {"task_ids": ["synthetic"]}
+    (tmp_path / "provenance.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "provenance": {"generation_path_identity": identity},
+                "provenance_sha256": "0" * 64,
+            }
+        )
+    )
+    with caplog.at_level("WARNING", logger=evaluate.logger.name):
+        evaluate._validate_completed_reuse_provenance(tmp_path, identity)
+    assert caplog.text == ""
+
+
 def test_reuse_readers_hydrate_compacted_selected_tasks_and_validate_sidecar(
     tmp_path: Path,
 ) -> None:

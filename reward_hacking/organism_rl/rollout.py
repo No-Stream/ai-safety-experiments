@@ -1274,12 +1274,8 @@ class TaskEpisodeSource:
         if hint_strength == "none":
             if hint_text is not None or hint_sha is not None:
                 raise ValueError("none-strength hint cannot carry hint text or a digest")
-        else:
-            if not hint_family or not hint_text or not hint_sha:
-                raise ValueError("vague and specific hints require family, text and digest")
-            actual_hint_sha = hashlib.sha256(hint_text.encode("utf-8")).hexdigest()
-            if hint_sha != actual_hint_sha:
-                raise ValueError("hint text does not match its SHA-256 digest")
+        elif not hint_family or not hint_text:
+            raise ValueError("vague and specific hints require family and text")
         system_prompt = compose_hint_system_prompt(
             unhinted_system_prompt,
             hint_text if hint_strength != "none" else None,

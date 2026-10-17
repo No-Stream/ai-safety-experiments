@@ -151,7 +151,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument(
         "--frozen-host-memory",
         choices=("pinned", "pageable", "persistent"),
-        default="pinned",
+        default="persistent",
         help=(
             "frozen trainer host arena: pinned/pageable allocate per rollout; "
             "persistent retains a pinned copy across phases"
@@ -520,6 +520,18 @@ def _teacher_score_inputs(path: Path | None) -> list[object] | None:
     return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
 
 
+def _admission_differences(stored: object, current: object) -> list[str]:
+    if stored is None or current is None:
+        return [] if stored == current else ["quantization_admission"]
+    stored_fields = cast("dict[str, object]", stored)
+    current_fields = cast("dict[str, object]", current)
+    return sorted(
+        key
+        for key in stored_fields.keys() | current_fields.keys()
+        if stored_fields.get(key) != current_fields.get(key)
+    )
+
+
 def _task_sources_match(previous: object, current: object) -> bool:
     if previous is None or current is None:
         return previous == current
@@ -533,11 +545,9 @@ def _task_sources_match(previous: object, current: object) -> bool:
         return {
             task_id: semantic_content_identity(task) for task_id, task in stored_content.items()
         } == {task_id: semantic_content_identity(task) for task_id, task in content.items()}
-    stored_hashes = cast("dict[str, object]", stored.get("task_definition_sha256", {}))
-    current_hashes = cast("dict[str, object]", expected.get("task_definition_sha256", {}))
-    return set(stored_hashes) == set(content) and all(
-        task.get("task_variant") == "leak" or stored_hashes[task_id] == current_hashes.get(task_id)
-        for task_id, task in content.items()
+    raise ValueError(
+        "stored provenance predates task_definition_content (commit ce98421, 2026-10-11), so task "
+        "definitions cannot be compared; resume into a fresh --output-dir"
     )
 
 
@@ -642,11 +652,13 @@ def write_provenance(  # noqa: C901 - explicit resume identity checks
         )
         if changed_flags:
             raise ValueError(f"resume flags differ at keys: {', '.join(changed_flags)}")
-        if (
-            stored.get("quantization_admission_sha256")
-            != provenance["quantization_admission_sha256"]
-        ):
-            raise ValueError("resume quantization admission differs from stored provenance")
+        admission_differences = _admission_differences(
+            stored.get("quantization_admission"), provenance["quantization_admission"]
+        )
+        if admission_differences:
+            raise ValueError(
+                f"resume quantization admission differs at keys: {', '.join(admission_differences)}"
+            )
         recorded_model = {"model": stored["flags"]["model"]}
         if "model_identity" in stored:
             recorded_model["model_identity"] = stored["model_identity"]

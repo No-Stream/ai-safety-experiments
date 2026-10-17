@@ -814,21 +814,14 @@ def test_ladder_system_hint_records_sft_identity_and_is_stripped_from_student_co
     assert trace_records[1]["completion_token_ids"] == [17]
 
 
-@pytest.mark.parametrize(
-    ("hint_strength", "hint_text", "hint_sha"),
-    [
-        ("none", "unexpected hint", None),
-        ("specific", "hint text", "wrong digest"),
-    ],
-)
-def test_ladder_source_rejects_invalid_hint_identity(
+def _hint_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     hint_strength: Literal["vague", "specific", "none"],
     hint_text: str | None,
     hint_sha: str | None,
-) -> None:
+) -> ladder_source.LadderEpisodeSource:
     _scenario(tmp_path / "scenarios", "synthetic-train")
     backend = SimpleNamespace(
         model_id="synthetic-base",
@@ -840,21 +833,61 @@ def test_ladder_source_rejects_invalid_hint_identity(
     monkeypatch.setattr(
         ladder_source, "QWEN_PROTOCOL", SimpleNamespace(stop_token_ids=lambda _tokenizer: ())
     )
+    return ladder_source.LadderEpisodeSource(
+        endpoint="http://localhost:8000",
+        model_path="synthetic-base",
+        served_model_id="synthetic-base",
+        revision=None,
+        output_dir=tmp_path / "traces",
+        max_model_len=4096,
+        hint_family="test_harness_config",
+        hint_strength=hint_strength,
+        hint_text=hint_text,
+        hint_sha=hint_sha,
+        scenarios_dir=tmp_path / "scenarios",
+    )
 
+
+@pytest.mark.parametrize(
+    ("hint_strength", "hint_text", "hint_sha"),
+    [
+        ("none", "unexpected hint", None),
+        ("specific", None, None),
+    ],
+)
+def test_ladder_source_rejects_invalid_hint_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    hint_strength: Literal["vague", "specific", "none"],
+    hint_text: str | None,
+    hint_sha: str | None,
+) -> None:
     with pytest.raises(ValueError, match="hint"):
-        ladder_source.LadderEpisodeSource(
-            endpoint="http://localhost:8000",
-            model_path="synthetic-base",
-            served_model_id="synthetic-base",
-            revision=None,
-            output_dir=tmp_path / "traces",
-            max_model_len=4096,
-            hint_family="test_harness_config",
+        _hint_source(
+            tmp_path,
+            monkeypatch,
             hint_strength=hint_strength,
             hint_text=hint_text,
             hint_sha=hint_sha,
-            scenarios_dir=tmp_path / "scenarios",
         )
+
+
+def test_ladder_source_records_hint_digest_as_given_without_checking_it_against_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _hint_source(
+        tmp_path,
+        monkeypatch,
+        hint_strength="specific",
+        hint_text="hint text",
+        hint_sha="recorded digest",
+    )
+    assert source.hint_identity == {
+        "family": "test_harness_config",
+        "strength": "specific",
+        "sha": "recorded digest",
+    }
 
 
 def test_unhinted_ladder_source_resumes_legacy_identity_without_hint_fields(

@@ -6,7 +6,7 @@ import hashlib
 import itertools
 import json
 import string
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -24,6 +24,9 @@ from reward_hacking.ladder.surfaces import (
     render_task_markdown,
 )
 from reward_hacking.ladder.tools import RUNAWAY_FORMAT_ERROR_MESSAGE, SUBMIT_MARKER, bash_tool
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # The runner's classifier matches this literal; the builder must emit it, not just reuse the constant.
 POLICY_FAILED_LINE = "policy-check: failed"
@@ -385,15 +388,6 @@ class TestPromptContracts:
 
 
 class TestSurfacesProvenance:
-    def test_surfaces_digest_records_module_source_for_provenance(self) -> None:
-        actor_payload = json.dumps(
-            surfaces.actor_surfaces(), sort_keys=True, ensure_ascii=False
-        ).encode("utf-8")
-        source_bytes = Path(surfaces.__file__).read_bytes()
-        expected_digest = hashlib.sha256(actor_payload + b"\0" + source_bytes).hexdigest()
-
-        assert surfaces.surfaces_sha256() == expected_digest
-
     def test_actor_surface_digest_tracks_strings_without_source_bytes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

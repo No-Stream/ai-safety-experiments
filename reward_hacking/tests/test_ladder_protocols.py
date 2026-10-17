@@ -12,6 +12,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
+from reward_hacking.ladder import runner as ladder_runner
 from reward_hacking.ladder.chat import render_prompt, render_prompt_continuation
 from reward_hacking.ladder.protocols import (
     GEMMA3_PROTOCOL,
@@ -247,7 +248,10 @@ def test_ladder_provenance_records_online_fp8_and_kv_cache_dtype(tmp_path: Path)
         max_model_len_by_model=config.max_model_len_by_model,
         server_args={"quantization": "fp8_per_tensor", "kv_cache_dtype": "auto"},
     )
-    assert changed_config.provenance_digest != config.provenance_digest
+    assert ladder_runner._identity_differences(
+        ladder_runner.generation_path_provenance(changed_config.provenance_payload()),
+        ladder_runner.generation_path_provenance(config.provenance_payload()),
+    ) == ["server_args.kv_cache_dtype"]
 
 
 def _olmo_tokenizer() -> PreTrainedTokenizerFast:

@@ -293,6 +293,7 @@ def _rewrite_as_schema18(input_path: Path, episode: dict[str, Any]) -> None:
     scenarios = cast("list[dict[str, object]]", provenance["scenarios"])
     for scenario in scenarios:
         scenario.pop("semantic_content_identity", None)
+        scenario.pop("semantic_content", None)
     models = cast("list[dict[str, object]]", provenance["models"])
     for model in models:
         model.pop("chat_template_kwargs", None)
@@ -314,6 +315,7 @@ def _rewrite_as_schema19(
     scenarios = cast("list[dict[str, object]]", provenance["scenarios"])
     for scenario in scenarios:
         scenario.pop("semantic_content_identity", None)
+        scenario.pop("semantic_content", None)
     models = cast("list[dict[str, object]]", provenance["models"])
     for model in models:
         model.pop("chat_template_kwargs", None)
@@ -411,6 +413,7 @@ def test_mixed_legacy_and_current_headers_compare_available_actor_semantics(
     legacy_provenance = cast("dict[str, object]", legacy_header["provenance"])
     legacy_scenario = cast("list[dict[str, object]]", legacy_provenance["scenarios"])[0]
     legacy_scenario.pop("semantic_content_identity")
+    legacy_scenario.pop("semantic_content", None)
     legacy_header["provenance_digest"] = provenance_digest(legacy_provenance)
 
     grouped = _headers_by_pressure([legacy_header, header])
@@ -440,7 +443,7 @@ def test_combined_headers_still_require_semantic_scenario_content(
     scenario["semantic_content_identity"] = "different-task-content"
     changed_header["provenance_digest"] = provenance_digest(provenance)
 
-    with pytest.raises(ValueError, match="incompatible provenance"):
+    with pytest.raises(ValueError, match=r"incompatible provenance at keys: scenarios$"):
         _headers_by_pressure([header, changed_header])
 
 
@@ -463,8 +466,40 @@ def test_rescore_refuses_changed_semantic_scenario_content(
     checker = scenario_root / "rescore-fixture" / "custom_check.py"
     checker.write_text("print('different grader behavior')\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="semantic content"):
+    with pytest.raises(
+        ValueError, match=r"semantic content in the run header at keys: .*custom_check\.py"
+    ):
         rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+
+@pytest.mark.parametrize(
+    ("checker_source", "refused"),
+    [("print('checked')  # formatting-only note\n", False), ("print('changed')\n", True)],
+)
+def test_rescore_of_hash_only_header_falls_back_to_semantic_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, checker_source: str, *, refused: bool
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    scenario_record = cast("list[dict[str, object]]", header["provenance"]["scenarios"])[0]
+    assert scenario_record.pop("semantic_content") is not None
+    input_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    (scenario_root / "rescore-fixture" / "custom_check.py").write_text(
+        checker_source, encoding="utf-8"
+    )
+
+    if refused:
+        with pytest.raises(ValueError, match=r"semantic content in the run header$"):
+            rescore_file(input_path, output_path, scenario_root=scenario_root)
+        return
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+    rescored_header = next(row for row in rescored_rows if row.get("record") == "ladder_run_header")
+    rescored_provenance = cast("dict[str, object]", rescored_header["provenance"])
+    upgraded_record = cast("list[dict[str, object]]", rescored_provenance["scenarios"])[0]
+    assert upgraded_record["semantic_content"] == (
+        Scenario.load(scenario_root / "rescore-fixture").semantic_content_payload()
+    )
 
 
 def test_rescore_accepts_legacy_headers_without_semantic_content_identity(
@@ -476,6 +511,7 @@ def test_rescore_accepts_legacy_headers_without_semantic_content_identity(
     provenance = cast("dict[str, object]", header["provenance"])
     scenario_record = cast("list[dict[str, object]]", provenance["scenarios"])[0]
     scenario_record.pop("semantic_content_identity")
+    scenario_record.pop("semantic_content", None)
     header["provenance_digest"] = provenance_digest(provenance)
     for row in rows:
         if row.get("record") in {"ladder_episode", "ladder_episode_failure"}:
@@ -557,6 +593,7 @@ def _write_schema21_input(
     provenance["schema_version"] = 21
     for scenario in cast("list[dict[str, object]]", provenance["scenarios"]):
         scenario.pop("semantic_content_identity", None)
+        scenario.pop("semantic_content", None)
     header["schema_version"] = 21
     header["provenance_digest"] = provenance_digest(provenance)
     episode["provenance_digest"] = header["provenance_digest"]
@@ -659,8 +696,9 @@ def test_schema_18_rescore_upgrades_manifest_provenance_without_jail(
     scenario_records = cast("list[dict[str, object]]", rescored_provenance["scenarios"])
     assert rescored_header["schema_version"] == runner.LADDER_SCHEMA_VERSION
     assert rescored_provenance["schema_version"] == runner.LADDER_SCHEMA_VERSION
-    assert scenario_records[0]["manifest_digest"] != legacy_manifest_digest
-    assert rescored_episode["provenance_digest"] == rescored_header["provenance_digest"]
+    assert scenario_records[0]["manifest_digest"] == Scenario.load(scenario_dir).manifest_digest
+    rescored_key = cast("dict[str, object]", rescored_episode["key"])
+    assert rescored_key["task_pressure"] == rescored_provenance["task_pressure"]
 
 
 def test_schema_19_rescore_upgrades_legacy_scenario_digest_and_adds_outcome(
@@ -791,8 +829,9 @@ def test_schema_18_rescore_upgrades_provenance_and_probes_kept_solution(
     assert rescored_header["schema_version"] == runner.LADDER_SCHEMA_VERSION
     assert rescored_provenance["schema_version"] == runner.LADDER_SCHEMA_VERSION
     scenario_records = cast("list[dict[str, object]]", rescored_provenance["scenarios"])
-    assert scenario_records[0]["manifest_digest"] != legacy_manifest_digest
-    assert rescored_episode["provenance_digest"] == rescored_header["provenance_digest"]
+    assert scenario_records[0]["manifest_digest"] == Scenario.load(scenario_dir).manifest_digest
+    rescored_key = cast("dict[str, object]", rescored_episode["key"])
+    assert rescored_key["task_pressure"] == rescored_provenance["task_pressure"]
     assert counterfactual_probe["classification"] == "spec_answers"
     assert rescored_methods["behavioral_special_case"] is True
 
@@ -1097,6 +1136,7 @@ def test_rescore_accepts_previous_runner_schema_without_code_identities(
     scenarios = cast("list[dict[str, object]]", provenance["scenarios"])
     for scenario in scenarios:
         scenario.pop("semantic_content_identity", None)
+        scenario.pop("semantic_content", None)
     header["schema_version"] = 23
     legacy_digest = provenance_digest(provenance)
     header["provenance_digest"] = legacy_digest
@@ -1111,6 +1151,41 @@ def test_rescore_accepts_previous_runner_schema_without_code_identities(
     rescored_header = next(row for row in rescored_rows if row.get("record") == "ladder_run_header")
     assert rescored_header["schema_version"] == runner.LADDER_SCHEMA_VERSION
     assert cast("dict[str, object]", rescored_header["rescore"])["source_schema_version"] == 23
+
+
+def test_rescore_reads_old_format_bundle_and_links_episodes_to_headers_by_pressure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    input_path, output_path, scenario_root, _episode = _fresh_run(tmp_path, monkeypatch)
+    rows = [json.loads(line) for line in input_path.read_text(encoding="utf-8").splitlines()]
+    header = next(row for row in rows if row.get("record") == "ladder_run_header")
+    episode = next(row for row in rows if row.get("record") == "ladder_episode")
+    header["provenance_digest"] = "whole-payload-digest-from-older-code"
+    episode["provenance_digest"] = "whole-payload-digest-from-older-code"
+    stray_episode = copy.deepcopy(episode)
+    stray_episode["provenance_digest"] = "matches-no-header"
+    cast("dict[str, object]", stray_episode["key"])["sample_idx"] = 1
+    input_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in [*rows, stray_episode]), encoding="utf-8"
+    )
+
+    rescored_rows = rescore_file(input_path, output_path, scenario_root=scenario_root)
+
+    rescored_header = next(row for row in rescored_rows if row.get("record") == "ladder_run_header")
+    rescored_episodes = [row for row in rescored_rows if row.get("record") == "ladder_episode"]
+    assert rescored_header["provenance_digest"] != "whole-payload-digest-from-older-code"
+    assert len(rescored_episodes) == 2
+    for rescored_episode in rescored_episodes:
+        assert rescored_episode["highest_rung"] == episode["highest_rung"]
+        assert rescored_episode["provenance_digest"] == rescored_header["provenance_digest"]
+
+    merge_gate_episode = copy.deepcopy(episode)
+    cast("dict[str, object]", merge_gate_episode["key"])["task_pressure"] = "merge-gate"
+    input_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in [*rows, merge_gate_episode]), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="no run header for pressure 'merge-gate'"):
+        rescore_file(input_path, output_path, scenario_root=scenario_root)
 
 
 def test_rescore_accepts_legacy_header_without_task_pressure(
@@ -1447,6 +1522,7 @@ def test_v2_rescore_recomputes_exposure_and_awareness_and_carries_judge(
         {
             "manifest_digest": scenario.manifest_digest,
             "semantic_content_identity": scenario.semantic_content_identity,
+            "semantic_content": scenario.semantic_content_payload(),
             "format": 2,
             "variant": scenario.variant,
             "set_version": scenario.set_version,
@@ -1710,6 +1786,7 @@ def test_v2_rescore_recomputes_protected_path_events_from_snapshots(
         {
             "manifest_digest": scenario.manifest_digest,
             "semantic_content_identity": scenario.semantic_content_identity,
+            "semantic_content": scenario.semantic_content_payload(),
             "format": 2,
             "variant": scenario.variant,
             "set_version": scenario.set_version,

@@ -231,14 +231,10 @@ def validate_checkpoint(directory: Path) -> None:
     )
     if model_config not in manifest:
         raise ValueError("Incomplete checkpoint model configuration")
-    for name, expected in manifest.items():
+    for name in manifest:
         path = directory / name
         if not path.is_file() or path.stat().st_size == 0:
             raise ValueError(f"Incomplete checkpoint file: {name}")
-        if _digest(path) != expected:
-            logger.warning(
-                "Checkpoint file %s differs from its recorded sha256 in %s", name, directory
-            )
 
 
 def _validate_rollout_masks(output: dict[str, Any]) -> None:

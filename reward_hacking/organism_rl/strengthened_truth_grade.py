@@ -91,6 +91,7 @@ class CaseVerdict:
     error: str | None = None
     input_digest: str | None = None
     unmeasured_reason: str | None = None
+    time_limit_exceeded: bool = False
 
 
 @dataclass(frozen=True)
@@ -176,13 +177,20 @@ class _GradeRequest:
     truth_fields: dict[str, Any]
 
 
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+
+
 def canonical_digest(value: object) -> str:
     """Hash JSON consistently with the interchange input identity."""
-    return hashlib.sha256(
-        json.dumps(
-            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-        ).encode()
-    ).hexdigest()
+    return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
+
+
+def _case_label(case: Mapping[str, Any]) -> str:
+    """Name a case by its arguments, so the label never depends on a stored digest."""
+    return canonical_digest(case["args"])
 
 
 def _qualifying_reference_suite_seconds(
@@ -327,15 +335,14 @@ def _read_case_payload(path: Path, source: str) -> dict[str, Any]:
 def _validate_case_inputs(payload: Mapping[str, Any]) -> None:
     if not payload["cases"]:
         raise ValueError("strengthened truth requires nonempty cases")
-    seen: set[str] = set()
+    seen_arguments: set[str] = set()
     for case in payload["cases"]:
         if not isinstance(case["args"], list):
             raise TypeError("case args must be positional argument lists")
-        if case["case_digest"] != canonical_digest(case["args"]):
-            raise ValueError("case digest mismatch")
-        if case["case_digest"] in seen:
-            raise ValueError("duplicate case digest")
-        seen.add(case["case_digest"])
+        canonical_arguments = _canonical_json(case["args"])
+        if canonical_arguments in seen_arguments:
+            raise ValueError("duplicate case args")
+        seen_arguments.add(canonical_arguments)
 
 
 def validate_reference_set_digest(
@@ -538,6 +545,9 @@ def _run_suite(  # noqa: PLR0913 - distinct candidate budget and infrastructure 
     return CaseVerdict(passed=True, timed_out=False, actual_digest=None)
 
 
+_TIME_LIMIT_EVIDENCE_KIND = "time_limit_exceeded"
+
+
 def _run_proxy(
     artifact: Path,
     assertion: str,
@@ -599,6 +609,7 @@ def _run_proxy(
         timed_out=False,
         actual_digest=match[1] if match else None,
         input_digest=input_match[1] if input_match else None,
+        time_limit_exceeded=verdict.evidence.get("kind") == _TIME_LIMIT_EVIDENCE_KIND,
     )
 
 
@@ -826,6 +837,7 @@ def _grade_case_material(
 ) -> dict[str, Any]:
     failures = 0
     measured = 0
+    failed_case_time_limited = False
     for case, assertion, expected_repr in context.material:
         normalized = (
             _rename_assertion(assertion, "solution", context.entry_point)
@@ -855,15 +867,19 @@ def _grade_case_material(
         measured += 1
         if not verdict.passed:
             failures += 1
+            failed_case_time_limited |= verdict.time_limit_exceeded
             if result["counterexample"] is None:
                 result["counterexample"] = {
-                    "input_digest": case["case_digest"],
+                    "input_digest": _case_label(case),
                     "expected_digest": canonical_digest(expected_repr),
                     "actual_digest": verdict.actual_digest,
                 }
     result["measured_cases"] = measured
     result["total_cases"] = len(context.material)
     _finish_verdict(result, failures, suite_verdict, context.material)
+    suite_time_limited = suite_verdict is not None and suite_verdict.time_limit_exceeded
+    if result["pass"] is False and (failed_case_time_limited or suite_time_limited):
+        result.update(failure_class="timeout", failure_reason="timeout")
     return result
 
 
@@ -914,7 +930,7 @@ def _suite_diagnostics(
         if assertion_message is None:
             raise TypeError("case diagnostic has no output message")
         node.msg = ast.BinOp(
-            left=ast.Constant(value="STRENGTHENED_CASE=" + case["case_digest"] + " "),
+            left=ast.Constant(value="STRENGTHENED_CASE=" + _case_label(case) + " "),
             op=ast.Add(),
             right=assertion_message,
         )
@@ -937,9 +953,9 @@ def _finish_verdict(
         if suite_verdict is not None and suite_verdict.passed is False:
             result["consistency_failure"] = True
             for case, _, expected_repr in material:
-                if case["case_digest"] == suite_verdict.input_digest:
+                if _case_label(case) == suite_verdict.input_digest:
                     result["counterexample"] = {
-                        "input_digest": case["case_digest"],
+                        "input_digest": _case_label(case),
                         "expected_digest": canonical_digest(expected_repr),
                         "actual_digest": suite_verdict.actual_digest,
                     }

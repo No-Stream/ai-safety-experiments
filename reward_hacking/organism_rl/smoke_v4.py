@@ -802,7 +802,6 @@ def _run_sft(run_directory: Path) -> Path:
         dataset_manifest,
         selected_count=selected_count,
     )
-    identity_sha256 = cast("str", dataset_manifest["identity_sha256"])
     if not samples_path.is_file():
         raise ValueError("dataset_manifest.json exists but round-0 samples are missing")
     with samples_path.open(encoding="utf-8") as samples_file:
@@ -825,12 +824,7 @@ def _run_sft(run_directory: Path) -> Path:
             ]
         )
         card = _read_sft_artifact(card_path)
-    _validate_schema_only_card(
-        card,
-        selected_count=selected_count,
-        row_count=row_count,
-        identity_sha256=identity_sha256,
-    )
+    _validate_schema_only_card(card, selected_count=selected_count, row_count=row_count)
 
     training_directory = sft_directory / "train"
     final_checkpoint = training_directory / "checkpoint-2"
@@ -1020,7 +1014,6 @@ def _validate_schema_only_card(
     *,
     selected_count: int,
     row_count: int,
-    identity_sha256: str,
 ) -> None:
     if card.get("schema_only") is not True:
         raise ValueError("existing card.json is not marked schema_only")
@@ -1033,14 +1026,6 @@ def _validate_schema_only_card(
         or built_card_count != row_count
     ):
         raise ValueError("card.json counts do not match the schema-only selection and dataset")
-    recorded_identity_sha256 = card.get("dataset_identity_sha256")
-    if recorded_identity_sha256 != identity_sha256:
-        logger.warning(
-            "card.json records dataset identity %s but dataset_manifest.json has %s; keeping the "
-            "existing card",
-            recorded_identity_sha256,
-            identity_sha256,
-        )
 
 
 def _run_health_report(run_directory: Path, leak_channels: Mapping[str, str]) -> None:

@@ -495,6 +495,34 @@ class TestEpisodeIngest:
         judge = episode["eval_awareness"]["judge"]
         assert judge["rubric_sha256"] == hashlib.sha256(packet_rubric.encode("utf-8")).hexdigest()
 
+    def test_stale_mapping_rubric_digest_does_not_gate_ingest(
+        self, tmp_path: Path, five_turn_run: Path
+    ) -> None:
+        packet_path, mapping_path, rows = _export(tmp_path, five_turn_run)
+        mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        mapping["rubric_sha256"] = "0" * 64
+        mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+        labels_path = _write_labels(tmp_path / "labels.jsonl", _empty_labels(rows))
+        output_dir = tmp_path / "ingested"
+
+        ingest_awareness_judge_labels(
+            [five_turn_run],
+            labels_path=labels_path,
+            packet_path=packet_path,
+            mapping_path=mapping_path,
+            output_dir=output_dir,
+        )
+
+        episode = next(
+            row
+            for row in read_jsonl(output_dir / f"{five_turn_run.name}.records.jsonl")
+            if row["record"] == "ladder_episode"
+        )
+        assert (
+            episode["eval_awareness"]["judge"]["rubric_sha256"]
+            == hashlib.sha256(AWARENESS_JUDGE_RUBRIC.encode("utf-8")).hexdigest()
+        )
+
     def test_derived_fields_time_awareness_against_the_first_fail(
         self, tmp_path: Path, five_turn_run: Path
     ) -> None:

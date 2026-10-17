@@ -152,7 +152,7 @@ def test_new_cells_parse_in_both_probe_stages_and_keep_f2_original_argv(
         baseline_records=tmp_path / "baseline.jsonl",
         max_model_len=WAVE_MAX_MODEL_LEN,
         model_revision="0" * 40,
-        served_adapter_sha256="a" * 64 if stage == "v3" else None,
+        served_adapter_path=_served_adapter(tmp_path) if stage == "v3" else None,
     )
     original_command = build_generate_command(original_cell, settings)
     command = build_generate_command(cell, settings)
@@ -863,8 +863,8 @@ def test_leak_command_uses_train_channel_arm_and_thirty_turns(tmp_path: Path) ->
         model_revision=None,
         max_model_len=65_536,
     )
+    assert settings.served_adapter_path == adapter_dir
     adapter_sha256 = _adapter_sha256(adapter_dir)
-    assert settings.served_adapter_sha256 == adapter_sha256
 
     command = build_generate_command(cell, settings)
 
@@ -888,11 +888,41 @@ def test_leak_command_uses_train_channel_arm_and_thirty_turns(tmp_path: Path) ->
         max_model_len=65_536,
     )
     changed_command = build_generate_command(cell, changed_settings)
-    assert changed_settings.served_adapter_sha256 != adapter_sha256
-    assert (
-        changed_command[changed_command.index("--served-adapter-sha256") + 1]
-        == changed_settings.served_adapter_sha256
+    assert changed_settings.served_adapter_path == adapter_dir
+    assert changed_command[changed_command.index("--served-adapter-sha256") + 1] != adapter_sha256
+
+
+def _served_adapter(tmp_path: Path) -> Path:
+    adapter_dir = tmp_path / "served-adapter"
+    adapter_dir.mkdir(exist_ok=True)
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"synthetic adapter weights")
+    return adapter_dir
+
+
+def test_v3_generation_requires_served_adapter_path_and_base_refuses_one(tmp_path: Path) -> None:
+    args = parse_args(
+        [
+            "--stage",
+            "v3",
+            "--v3-adapter",
+            str(_served_adapter(tmp_path)),
+            "--output-dir",
+            str(tmp_path),
+            "--leak-assets",
+            str(tmp_path / "leak-assets.json"),
+        ]
     )
+    v3_settings = _cell_run_config(
+        args,
+        generator="v3",
+        endpoint="http://127.0.0.1:8000",
+        model_revision=None,
+        max_model_len=65_536,
+    )
+    with pytest.raises(ValueError, match="requires the served adapter path"):
+        build_generate_command(PROBE_CELLS[2], replace(v3_settings, served_adapter_path=None))
+    with pytest.raises(ValueError, match="base generation cannot declare a served adapter path"):
+        build_generate_command(PROBE_CELLS[2], replace(v3_settings, generator="base"))
 
 
 def test_health_command_asserts_v3_against_base_eval_records(tmp_path: Path) -> None:

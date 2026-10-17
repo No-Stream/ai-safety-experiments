@@ -2543,7 +2543,7 @@ def test_belief_probe_preserves_main_branch(
     assert [turn.rendered_prompt_sha256 for turn in with_probe.turns] == [
         turn.rendered_prompt_sha256 for turn in without.turns
     ]
-    assert with_probe.final_report_prompt_sha256 == without.final_report_prompt_sha256
+    assert with_probe.final_report_prompt_text == without.final_report_prompt_text
     assert with_probe.messages == without.messages
     assert [turn.raw_completion for turn in with_probe.turns] == [
         turn.raw_completion for turn in without.turns

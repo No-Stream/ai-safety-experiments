@@ -18,6 +18,13 @@ NEW_CELL_VARIANTS = (
 )
 
 
+def _served_adapter(tmp_path: Path) -> Path:
+    adapter_dir = tmp_path / "served-adapter"
+    adapter_dir.mkdir(exist_ok=True)
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"synthetic adapter weights")
+    return adapter_dir
+
+
 @pytest.mark.parametrize(("cell_name", "_variant"), NEW_CELL_VARIANTS)
 @pytest.mark.parametrize("generator", ["base", "v3"])
 def test_new_cell_dry_run_reports_requested_stage_without_runtime_assets(
@@ -137,7 +144,7 @@ def test_wave_records_accept_slow_and_forwards_controls_to_generator(
         baseline_records=args.baseline_records,
         max_model_len=args.max_model_len,
         model_revision=None,
-        served_adapter_sha256=None,
+        served_adapter_path=None,
         serving_config={"kv_cache_dtype": "fp8"},
         performance_arguments=performance_cli_arguments(args),
     )
@@ -189,7 +196,7 @@ def test_wave_command(cell: wave_v4.ProbeCell, generator: str, hint: str, tmp_pa
         baseline_records=tmp_path / "baseline.jsonl",
         max_model_len=args.max_model_len,
         model_revision=None,
-        served_adapter_sha256="a" * 64 if generator == "v3" else None,
+        served_adapter_path=_served_adapter(tmp_path) if generator == "v3" else None,
         serving_config={"kv_cache_dtype": "fp8"} if generator == "27b" else None,
     )
     settings = wave_v4.stage_settings(args, settings, (exclusion,))
@@ -659,7 +666,7 @@ def test_new_wave_cells_match_f2_original_settings_except_variant_and_destinatio
             baseline_records=tmp_path / "baseline.jsonl",
             max_model_len=wave_args.max_model_len,
             model_revision="0" * 40,
-            served_adapter_sha256="a" * 64 if generator == "v3" else None,
+            served_adapter_path=_served_adapter(tmp_path) if generator == "v3" else None,
         )
         return wave_v4.stage_settings(wave_args, settings, ())
 
@@ -831,7 +838,7 @@ def test_repeated_wave_samples_use_pair_exclusions_and_keep_episode_target(tmp_p
         baseline_records=tmp_path / "baseline.jsonl",
         max_model_len=args.max_model_len,
         model_revision=None,
-        served_adapter_sha256="a" * 64,
+        served_adapter_path=_served_adapter(tmp_path),
     )
     command = build_generate_command(
         PROBE_CELLS[2], wave_v4.stage_settings(args, settings, (exclusion,))
@@ -1250,7 +1257,7 @@ def test_first_collection_stage_records_provenance_and_preserves_exclusions(
         baseline_records=tmp_path / "baseline.jsonl",
         max_model_len=args.max_model_len,
         model_revision=None,
-        served_adapter_sha256="a" * 64 if generator == "v3" else None,
+        served_adapter_path=_served_adapter(tmp_path) if generator == "v3" else None,
     )
     commands: list[list[str]] = []
     stage_record = {
@@ -1483,7 +1490,7 @@ def test_stage_health_and_yield_only_include_requested_generator(
         baseline_records=tmp_path / "baseline.jsonl",
         max_model_len=args.max_model_len,
         model_revision=None,
-        served_adapter_sha256="a" * 64 if generator == "v3" else None,
+        served_adapter_path=_served_adapter(tmp_path) if generator == "v3" else None,
         serving_config={"kv_cache_dtype": "fp8"} if generator == "27b" else None,
     )
     commands: list[list[str]] = []

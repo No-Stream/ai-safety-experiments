@@ -826,7 +826,7 @@ def test_legacy_cli_resume_accepts_removed_local_model_reference(tmp_path: Path)
     assert json.loads(path.read_text())["model_revision"] == "changed-revision"
 
 
-def test_cli_task_snapshot_ignores_raw_leak_digest_and_accepts_legacy(tmp_path: Path) -> None:
+def test_cli_task_snapshot_ignores_raw_leak_digest_and_refuses_legacy(tmp_path: Path) -> None:
     args = parse_args(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
     source: dict[str, object] = {
         "task_definition_sha256": {"synthetic": "old-raw-digest"},
@@ -848,7 +848,8 @@ def test_cli_task_snapshot_ignores_raw_leak_digest_and_accepts_legacy(tmp_path: 
     legacy["task_source_identity"].pop("task_definition_content")
     legacy["task_source_identity"]["task_definition_sha256"] = {"synthetic": "legacy-raw-digest"}
     path.write_text(json.dumps(legacy))
-    write_provenance(args, {"name": "cpu"}, task_source_identity=changed)
+    with pytest.raises(ValueError, match="predates task_definition_content"):
+        write_provenance(args, {"name": "cpu"}, task_source_identity=changed)
     with pytest.raises(ValueError, match="task definition"):
         write_provenance(
             args,
@@ -960,6 +961,59 @@ def test_quantization_admission_records_measurement_and_rejects_invalid_record(
     )
     with pytest.raises(ValueError, match="quantization admission"):
         write_provenance(args, {"name": "cpu"})
+
+
+def test_quantization_admission_resume_compares_contents_not_file_bytes(tmp_path: Path) -> None:
+    admission = tmp_path / "admission.json"
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.02}}
+        )
+    )
+    args = parse_args(
+        [
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--endpoint",
+            "http://server:8000",
+            "--kv-cache-dtype",
+            "fp8",
+            "--quantization-admission",
+            str(admission),
+        ]
+    )
+    write_provenance(args, {"name": "cpu"})
+    admission.write_text(
+        json.dumps(
+            {"after": {"mean_abs_logprob_gap": 0.02}, "before": {"mean_abs_logprob_gap": 0.01}},
+            indent=4,
+        )
+    )
+    write_provenance(args, {"name": "cpu"})
+    admission.write_text(
+        json.dumps(
+            {"before": {"mean_abs_logprob_gap": 0.01}, "after": {"mean_abs_logprob_gap": 0.03}}
+        )
+    )
+    with pytest.raises(ValueError, match="differs at keys: after"):
+        write_provenance(args, {"name": "cpu"})
+
+
+def test_legacy_task_provenance_without_content_refuses_resume(tmp_path: Path) -> None:
+    args = parse_args(["--output-dir", str(tmp_path), "--endpoint", "http://server:8000"])
+    current: dict[str, object] = {
+        "task_definition_sha256": {"synthetic": "new-raw-digest"},
+        "task_definition_content": {
+            "synthetic": {"task_variant": "original", "prompt": "synthetic"}
+        },
+    }
+    path = write_provenance(args, {"name": "cpu"}, task_source_identity=current)
+    legacy = json.loads(path.read_text())
+    legacy["task_source_identity"] = {"task_definition_sha256": {"synthetic": "old-raw-digest"}}
+    path.write_text(json.dumps(legacy))
+
+    with pytest.raises(ValueError, match=r"predates task_definition_content.*fresh --output-dir"):
+        write_provenance(args, {"name": "cpu"}, task_source_identity=current)
 
 
 def test_ssm_float16_is_rejected() -> None:
@@ -1182,7 +1236,7 @@ def test_step_pipelining_is_on_by_default_and_can_be_disabled(tmp_path: Path) ->
 
 def test_frozen_host_memory_flag_defaults_to_pinned_and_records_persistent(tmp_path: Path) -> None:
     base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
-    assert parse_args(base).frozen_host_memory == "pinned"
+    assert parse_args(base).frozen_host_memory == "persistent"
     assert parse_args([*base, "--frozen-host-memory", "pageable"]).frozen_host_memory == "pageable"
     args = parse_args([*base, "--frozen-host-memory", "persistent"])
     write_provenance(args, {"name": "cpu"})

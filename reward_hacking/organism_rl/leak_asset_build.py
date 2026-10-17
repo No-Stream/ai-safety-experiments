@@ -298,28 +298,23 @@ def _request_identity_payload(
     }
 
 
-def _request_identity(options: BuildOptions, case: R2eLeakTask, provenance: dict[str, Any]) -> str:
-    return _digest(_request_identity_payload(options, case, provenance))
+def _differing_keys(saved: Mapping[str, object], current: Mapping[str, object]) -> list[str]:
+    return sorted(
+        key
+        for key in saved.keys() | current.keys()
+        if key not in saved or key not in current or saved[key] != current[key]
+    )
 
 
 def _completion_rebuild_reason(
-    marker: dict[str, Any], identity: str, request_identity: dict[str, object]
+    marker: dict[str, Any], request_identity: dict[str, object]
 ) -> str | None:
     """Return why a completed task must be rebuilt, or None when its recorded inputs still match."""
-    marker_identity = marker.get("identity")
-    if not isinstance(marker_identity, str):
-        raise TypeError("task completion marker must contain an identity digest")
     saved = marker.get("request_identity")
     if saved is None:
         return "legacy completion marker has no request identity"
     if not isinstance(saved, dict):
         raise TypeError("task completion request identity must be an object")
-    saved_digest = _digest(saved)
-    if marker_identity != saved_digest:
-        return (
-            f"completion identity recorded {marker_identity} but its request identity hashes to "
-            f"{saved_digest}"
-        )
     comparable = {key: value for key, value in saved.items() if key != "gate_sha256"}
     if "source_contents" not in comparable:
         saved_options = comparable["options"]
@@ -336,11 +331,9 @@ def _completion_rebuild_reason(
         # Old markers retain only opaque timestamp hashes. Rebuild after integrity validation
         # rather than treating unavailable semantic input snapshots as changed task content.
         return "legacy completion marker predates recorded source contents"
-    if comparable != request_identity:
-        return (
-            f"task inputs changed: current request identity {identity}, recorded "
-            f"{_digest(comparable)}"
-        )
+    differing_keys = _differing_keys(comparable, request_identity)
+    if differing_keys:
+        return f"task inputs changed: {', '.join(differing_keys)}"
     return None
 
 
@@ -359,7 +352,6 @@ def _fingerprint_rebuild_reason(task_root: Path, marker: dict[str, Any]) -> str 
 
 def _completed_arms(
     task_root: Path,
-    identity: str,
     request_identity: dict[str, object],
 ) -> tuple[list[dict[str, object]] | None, str | None]:
     """Return a completed task's arms, or None with the reason its output must be rebuilt."""
@@ -367,7 +359,7 @@ def _completed_arms(
     if not marker_path.exists():
         return None, None
     marker = _json_object(marker_path)
-    rebuild_reason = _completion_rebuild_reason(marker, identity, request_identity)
+    rebuild_reason = _completion_rebuild_reason(marker, request_identity)
     if rebuild_reason is None:
         rebuild_reason = _fingerprint_rebuild_reason(task_root, marker)
     if rebuild_reason is not None:
@@ -651,7 +643,7 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
         task_root = options.out_root / case.task_id
         if task_root.is_symlink():
             raise ValueError("task output may not be a symlink")
-        arms, rebuild_reason = _completed_arms(task_root, identity, request_identity)
+        arms, rebuild_reason = _completed_arms(task_root, request_identity)
         if arms is not None:
             runtime_venv, runtime_interpreter, _binary = _runtime(options, case, repository)
             for arm in arms:
@@ -697,8 +689,13 @@ def build_assets(options: BuildOptions, cases: Sequence[R2eLeakTask]) -> dict[st
                 else hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in sorted(task_root.iterdir())
             }
-            if _request_identity(options, case, provenance) != identity:
-                raise ValueError("source inputs changed during task build; refusing completion")
+            rebuilt_request_identity = _request_identity_payload(options, case, provenance)
+            if rebuilt_request_identity != request_identity:
+                changed_keys = _differing_keys(request_identity, rebuilt_request_identity)
+                raise ValueError(
+                    "source inputs changed during task build "
+                    f"({', '.join(changed_keys)}); refusing completion"
+                )
             write_json_atomic(
                 task_root / "complete.json",
                 {

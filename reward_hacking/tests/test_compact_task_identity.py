@@ -104,8 +104,7 @@ def test_large_task_provenance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, 
         )
     )
     original_bytes = (tmp_path / "provenance.json").read_bytes()
-    _, _, accepted = generate._prepare_run(tmp_path, provenance)
-    assert legacy_sha256 in accepted
+    generate._prepare_run(tmp_path, provenance)
     assert (tmp_path / "provenance.json").read_bytes() == original_bytes
     stored = json.loads((tmp_path / "provenance.resume.json").read_text())
     assert stored["schema_version"] == 3
@@ -297,16 +296,20 @@ def test_legacy_generation_path_resume_preserves_digest_binding(tmp_path: Path) 
         "generation_path_identity": current_generation,
         "generation_path_identity_sha256": evaluate._reuse_identity_sha256(current_generation),
     }
-    _, digest, accepted = generate._prepare_run(tmp_path, current)
-    assert legacy_sha256 in accepted
-    _, resumed_digest, resumed_accepted = generate._prepare_run(tmp_path, current)
-    assert resumed_digest == digest
-    assert {legacy_sha256, digest} <= resumed_accepted
+    generate._prepare_run(tmp_path, current)
+    generate._prepare_run(tmp_path, current)
     assert historical_path.read_bytes() == original_bytes
-    corrupted = deepcopy(legacy)
-    corrupted["generation_path_identity_sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="generation_path_identity_sha256"):
-        generate_provenance._validate_resume_identity(current, corrupted)
+    corrupted_digest = {**legacy, "generation_path_identity_sha256": "0" * 64}
+    generate_provenance._validate_resume_identity(current, corrupted_digest)
+    changed_generation = {
+        **legacy,
+        "generation_path_identity": {
+            **legacy_generation,
+            "task_prompt_sha256": {"synthetic": "changed prompt digest"},
+        },
+    }
+    with pytest.raises(ValueError, match=r"generation_path_identity\.task_prompt_sha256"):
+        generate_provenance._validate_resume_identity(current, changed_generation)
 
 
 def test_legacy_utf8_generation_path_digest_remains_accepted() -> None:
@@ -348,10 +351,17 @@ def test_legacy_utf8_generation_path_digest_remains_accepted() -> None:
 
     generate_provenance._validate_resume_identity(current, legacy)
 
-    corrupted = deepcopy(legacy)
-    corrupted["generation_path_identity_sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="generation_path_identity_sha256"):
-        generate_provenance._validate_resume_identity(current, corrupted)
+    corrupted_digest = {**legacy, "generation_path_identity_sha256": "0" * 64}
+    generate_provenance._validate_resume_identity(current, corrupted_digest)
+    changed_generation = {
+        **legacy,
+        "generation_path_identity": {
+            **legacy_generation,
+            "task_definition_content": {"synthetic": {**content, "workspace_files": {}}},
+        },
+    }
+    with pytest.raises(ValueError, match=r"generation_path_identity\.task_definition_content"):
+        generate_provenance._validate_resume_identity(current, changed_generation)
 
 
 def test_training_resume_preserves_unversioned_provenance(tmp_path: Path) -> None:

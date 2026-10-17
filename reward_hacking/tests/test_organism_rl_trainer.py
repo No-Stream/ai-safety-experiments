@@ -575,7 +575,7 @@ def test_incomplete_organism_save_preserves_previous_checkpoints(
     validate_checkpoint(tmp_path / "checkpoint-4")
 
 
-def test_modified_checkpoint_file_resumes_with_warning(
+def test_edited_checkpoint_file_resumes_without_a_content_hash_check(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     trainer = _trainer(tmp_path)
@@ -584,10 +584,10 @@ def test_modified_checkpoint_file_resumes_with_warning(
     records_path = checkpoint / "rollout_records.json"
     records_path.write_text(records_path.read_text() + " ")
 
+    caplog.clear()
     with caplog.at_level("WARNING", logger="reward_hacking.organism_rl.trainer"):
         validate_checkpoint(checkpoint)
-    assert "rollout_records.json" in caplog.text
-    assert "sha256" in caplog.text
+    assert caplog.text == ""
 
     resumed = _trainer(tmp_path, max_steps=2)
     assert resumed.train(resume_from_checkpoint=str(checkpoint)).global_step == 2

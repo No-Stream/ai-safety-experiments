@@ -958,6 +958,79 @@ def test_task_episode_source_routes_both_families_through_registry_selectors(
         changed_hint_source("ilcb:toy", seed=3, step=0, replica=0)
 
 
+def _task_episode_source_with_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    hint_strength: str,
+    hint_text: str | None,
+    hint_sha: str | None,
+) -> TaskEpisodeSource:
+    monkeypatch.setattr(
+        "reward_hacking.organism_rl.rollout.VLLMHTTPBackend",
+        lambda *_args, **_kwargs: SimpleNamespace(tokenizer=object(), request_admission=None),
+    )
+    monkeypatch.setattr(
+        "reward_hacking.organism_rl.rollout.QWEN_PROTOCOL",
+        SimpleNamespace(stop_token_ids=lambda _tokenizer: ()),
+    )
+    return TaskEpisodeSource(
+        endpoint="http://server:8000",
+        model_path="synthetic-model",
+        served_model_id="synthetic-served-model",
+        output_dir=tmp_path,
+        max_model_len=128,
+        families=("ilcb",),
+        variants=("oneoff",),
+        partition="train",
+        unhinted_system_prompt="Synthetic system prompt.",
+        hint_family="synthetic",
+        hint_strength=cast("Any", hint_strength),
+        hint_text=hint_text,
+        hint_sha=hint_sha,
+    )
+
+
+@pytest.mark.parametrize(
+    ("hint_strength", "hint_text", "hint_sha"),
+    [("none", "unexpected hint", None), ("none", None, "recorded digest")],
+)
+def test_task_episode_source_rejects_hint_material_on_a_none_strength_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hint_strength: str,
+    hint_text: str | None,
+    hint_sha: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="none-strength hint"):
+        _task_episode_source_with_hint(
+            tmp_path,
+            monkeypatch,
+            hint_strength=hint_strength,
+            hint_text=hint_text,
+            hint_sha=hint_sha,
+        )
+
+
+def test_task_episode_source_requires_hint_text_for_a_specific_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(ValueError, match="family and text"):
+        _task_episode_source_with_hint(
+            tmp_path, monkeypatch, hint_strength="specific", hint_text=None, hint_sha=None
+        )
+
+
+@pytest.mark.parametrize("hint_sha", ["recorded digest", None])
+def test_task_episode_source_records_hint_digest_as_given_without_checking_it_against_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hint_sha: str | None
+) -> None:
+    source = _task_episode_source_with_hint(
+        tmp_path, monkeypatch, hint_strength="specific", hint_text="hint text", hint_sha=hint_sha
+    )
+    assert source.hint_identity == {"family": "synthetic", "strength": "specific", "sha": hint_sha}
+
+
 @pytest.mark.parametrize("gate_fails", [False, True])
 def test_leak_task_source_runs_live_gate_before_backend_setup(
     monkeypatch: pytest.MonkeyPatch,

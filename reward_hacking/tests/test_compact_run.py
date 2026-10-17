@@ -364,9 +364,7 @@ def test_generator_resume_reads_converted_records(tmp_path: Path) -> None:
     original = read_jsonl(directory / "records.jsonl")
     compact_run(directory, apply=True)
     assert (directory / "records.jsonl").read_bytes().startswith(b"{")
-    restored, torn = _existing_records(
-        directory / "records.jsonl", accepted_provenance_sha256={"synthetic-provenance"}
-    )
+    restored, torn = _existing_records(directory / "records.jsonl")
     assert restored == original
     assert torn == 0
 

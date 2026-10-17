@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 from dataclasses import dataclass
@@ -28,7 +27,6 @@ if TYPE_CHECKING:
 
 _PLANTED_INPUT = "Silver Moon"
 _VARIANT_INPUTS = ("Amber Field", "Cedar Ridge", "Quiet Harbor")
-_V1_CHILD_SOURCE_SHA256 = "ccca2722edc27a4cac0c0327d1ecbfae392e1f95adf5eef1dafea8facd57dcea"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,14 +46,10 @@ def _general_rule_answer(value: str) -> str:
     return f"{_spec_answer(value)}-alternate"
 
 
-def test_v1_child_source_and_subprocess_arguments_are_unchanged() -> None:
+def test_v1_child_subprocess_arguments_are_unchanged() -> None:
     arguments: list[object] = ["synthetic input"]
     command = oracle_protocol._submission_process_arguments("solve", arguments)
 
-    assert (
-        hashlib.sha256(oracle_protocol._CHILD_RUNNER_SOURCE.encode("utf-8")).hexdigest()
-        == _V1_CHILD_SOURCE_SHA256
-    )
     assert command == [
         sys.executable,
         "-I",
@@ -64,6 +58,29 @@ def test_v1_child_source_and_subprocess_arguments_are_unchanged() -> None:
         "solve",
         json.dumps(arguments),
     ]
+
+
+def test_v1_child_returns_json_values_from_the_working_directory_solution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "solution.py").write_text(
+        "def solve(value):\n"
+        "    return {'answer': value.upper(), 'pair': (1, 2)}\n"
+        "def broken(value):\n"
+        "    raise RuntimeError(value)\n"
+        "def unserializable(value):\n"
+        "    return {value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    def run_case(function_name: str) -> object:
+        return oracle_protocol._run_submission_case(function_name, ["silver"], timeout_seconds=30.0)
+
+    assert run_case("solve") == {"answer": "SILVER", "pair": [1, 2]}
+    assert run_case("broken") is oracle_protocol._NO_RESULT
+    assert run_case("unserializable") is oracle_protocol._NO_RESULT
+    assert run_case("missing") is oracle_protocol._NO_RESULT
 
 
 def _write_counterfactual_scenario(

@@ -653,6 +653,7 @@ def _scenario_provenance_record(scenario: ScenarioLike) -> dict[str, object]:
     }
     if isinstance(scenario, Scenario):
         record["semantic_content_identity"] = scenario.semantic_content_identity
+        record["semantic_content"] = scenario.semantic_content_payload()
     return record
 
 
@@ -739,18 +740,12 @@ class EpisodeRun:
 
 
 def provenance_digest(payload: Mapping[str, object]) -> str:
-    """Hash generation identity while excluding connection and launch context."""
+    """Hash generation identity for the record; resume and rescore compare the payload instead."""
     encoded = json.dumps(
         _canonical_json(generation_path_provenance(payload)),
         sort_keys=True,
         separators=(",", ":"),
     )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _legacy_provenance_digest(payload: Mapping[str, object]) -> str:
-    """Hash the old whole-payload format so completed legacy rows remain verifiable."""
-    encoded = json.dumps(_canonical_json(payload), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
@@ -779,7 +774,8 @@ def semantic_provenance_for_comparison(
     _drop_nonsemantic_provenance_fields(expected)
     _drop_nonsemantic_provenance_fields(stored)
     _drop_unavailable_scenario_identities(expected, stored)
-    _drop_unavailable_adapter_identities(expected, stored)
+    _drop_adapter_content_identities(expected)
+    _drop_adapter_content_identities(stored)
     return expected, stored
 
 
@@ -809,7 +805,8 @@ def _drop_nonsemantic_provenance_fields(provenance: dict[str, object]) -> None:
     for scenario in scenarios:
         if not isinstance(scenario, dict):
             raise TypeError("run provenance scenario entries must be objects")
-        for field_name in ("manifest_digest", "surfaces_sha256", "set_version"):
+        # The recorded semantic_content_identity covers the payload; rescore diffs the payload.
+        for field_name in ("manifest_digest", "surfaces_sha256", "set_version", "semantic_content"):
             scenario.pop(field_name, None)
 
 
@@ -832,32 +829,49 @@ def _drop_unavailable_scenario_identities(
                 stored_scenario.pop(semantic_field, None)
 
 
-def _drop_unavailable_adapter_identities(
-    expected: dict[str, object], stored: dict[str, object]
-) -> None:
-    expected_server_args = expected.get("server_args")
-    stored_server_args = stored.get("server_args")
-    if isinstance(expected_server_args, Mapping) and isinstance(stored_server_args, Mapping):
-        expected_modules = expected_server_args.get("lora_modules")
-        stored_modules = stored_server_args.get("lora_modules")
-        if (
-            isinstance(expected_modules, list)
-            and isinstance(stored_modules, list)
-            and len(expected_modules) == len(stored_modules)
-        ):
-            for expected_module, stored_module in zip(
-                expected_modules, stored_modules, strict=True
-            ):
-                if not isinstance(expected_module, dict) or not isinstance(stored_module, dict):
-                    continue
-                if expected_module.get("name") != stored_module.get("name"):
-                    continue
-                if (
-                    "adapter_semantic_identity" not in expected_module
-                    or "adapter_semantic_identity" not in stored_module
-                ):
-                    expected_module.pop("adapter_semantic_identity", None)
-                    stored_module.pop("adapter_semantic_identity", None)
+def _drop_adapter_content_identities(provenance: dict[str, object]) -> None:
+    """Adapter tensor hashes stay recorded; resume compares the recorded adapter config instead."""
+    server_args = provenance.get("server_args")
+    if not isinstance(server_args, Mapping):
+        return
+    modules = server_args.get("lora_modules")
+    if not isinstance(modules, list):
+        return
+    for module in modules:
+        if isinstance(module, dict):
+            module.pop("adapter_semantic_identity", None)
+
+
+def _recorded_adapter_configs(provenance: Mapping[str, object]) -> Mapping[str, object]:
+    run_context = provenance.get("run_context")
+    if not isinstance(run_context, Mapping):
+        return {}
+    configs = run_context.get("adapter_configs", {})
+    if not isinstance(configs, Mapping):
+        raise TypeError("run_context.adapter_configs must be an object")
+    return cast("Mapping[str, object]", configs)
+
+
+def _adapter_launch_differences(
+    expected_provenance: Mapping[str, object], stored_provenance: Mapping[str, object]
+) -> list[str]:
+    """Name adapter config changes; adapter paths are recorded but moves never gate resume."""
+    expected_configs = _recorded_adapter_configs(expected_provenance)
+    stored_configs = _recorded_adapter_configs(stored_provenance)
+    differences: list[str] = []
+    for name in sorted(expected_configs.keys() & stored_configs.keys()):
+        expected_config = expected_configs[name]
+        stored_config = stored_configs[name]
+        if not isinstance(expected_config, Mapping) or not isinstance(stored_config, Mapping):
+            raise TypeError(f"run_context.adapter_configs[{name!r}] must be an object")
+        differences.extend(
+            _identity_differences(
+                cast("Mapping[str, object]", expected_config),
+                cast("Mapping[str, object]", stored_config),
+                f"run_context.adapter_configs.{name}",
+            )
+        )
+    return differences
 
 
 def _server_args_generation_identity(
@@ -924,7 +938,9 @@ def _lora_modules_generation_identity(value: object) -> list[dict[str, object]]:
         if isinstance(adapter_path, str) and adapter_path:
             resolved_adapter_path = Path(adapter_path).expanduser().resolve()
             if resolved_adapter_path.is_dir():
-                adapter_semantic_identity = _adapter_semantic_identity(resolved_adapter_path)
+                adapter_semantic_identity = _adapter_semantic_identity(
+                    resolved_adapter_path, _adapter_semantic_config(resolved_adapter_path)
+                )
         if adapter_semantic_identity is not None and (
             not isinstance(adapter_semantic_identity, str)
             or re.fullmatch(r"[0-9a-f]{64}", adapter_semantic_identity) is None
@@ -945,19 +961,23 @@ def _lora_modules_generation_identity(value: object) -> list[dict[str, object]]:
     return module_identities
 
 
-def _adapter_semantic_identity(adapter_dir: Path) -> str:
-    """Hash parsed adapter settings and named tensor values, independent of file layout."""
+def _adapter_semantic_config(adapter_dir: Path) -> dict[str, object]:
+    """Read adapter settings that change served behaviour, dropping layout metadata."""
     config_path = adapter_dir / "adapter_config.json"
     config_value = json.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(config_value, Mapping) or any(
         not isinstance(key, str) for key in config_value
     ):
         raise TypeError(f"adapter config must be a JSON object: {config_path}")
-    semantic_config = {
+    return {
         key: value
-        for key, value in config_value.items()
+        for key, value in cast("Mapping[str, object]", config_value).items()
         if key not in {"base_model_name_or_path", "revision", "peft_version"}
     }
+
+
+def _adapter_semantic_identity(adapter_dir: Path, semantic_config: Mapping[str, object]) -> str:
+    """Hash adapter settings and named tensor values for the record; resume never compares it."""
     weight_paths = sorted(
         {
             *adapter_dir.glob("adapter_model*.safetensors"),
@@ -1036,7 +1056,25 @@ def _launch_context(
     server_args_context = _server_args_launch_context(server_args)
     if server_args_context is not None:
         context["server_args"] = server_args_context
+    adapter_configs = _adapter_configs(server_args)
+    if adapter_configs:
+        context["adapter_configs"] = adapter_configs
     return context
+
+
+def _adapter_configs(server_args: Mapping[str, object] | None) -> dict[str, dict[str, object]]:
+    modules = [] if server_args is None else server_args.get("lora_modules", [])
+    if not isinstance(modules, (list, tuple)):
+        raise TypeError("server_args.lora_modules must be a list")
+    configs: dict[str, dict[str, object]] = {}
+    for module in modules:
+        if not isinstance(module, Mapping):
+            raise TypeError("server_args.lora_modules entries must be objects")
+        name = module.get("name")
+        path = module.get("path")
+        if isinstance(name, str) and isinstance(path, str) and Path(path).expanduser().is_dir():
+            configs[name] = _adapter_semantic_config(Path(path).expanduser().resolve())
+    return configs
 
 
 def _identity_differences(
@@ -1580,18 +1618,14 @@ def _score_override_honored(scenario: ScenarioLike, episode_dir: Path) -> bool:
 
 def _resume_header_identity(
     path: Path, header: Mapping[str, object]
-) -> tuple[str, str, Mapping[str, object]]:
-    raw_digest = header.get("provenance_digest")
-    if not isinstance(raw_digest, str):
-        raise TypeError(f"{path} has a non-string provenance digest")
+) -> tuple[str, Mapping[str, object]]:
     raw_provenance = header.get("provenance")
     if not isinstance(raw_provenance, Mapping):
         raise TypeError(f"{path} has a run header without provenance")
-    provenance = dict(raw_provenance)
-    pressure = provenance.pop("task_pressure", "none")
+    pressure = raw_provenance.get("task_pressure", "none")
     if not isinstance(pressure, str) or pressure not in LADDER_TASK_PRESSURES:
         raise ValueError(f"{path} has an invalid task pressure in run provenance")
-    return pressure, raw_digest, raw_provenance
+    return pressure, raw_provenance
 
 
 def _resume_server_args_identity(
@@ -1616,26 +1650,19 @@ def _resume_server_args_identity(
         raise
 
 
-def _pressure_resume_digests(
+def _compatible_header_pressures(
     path: Path,
     headers: Sequence[Mapping[str, object]],
-    expected_digest: str,
     expected_provenance: Mapping[str, object],
-) -> dict[str, set[str]]:
+) -> set[str]:
+    """Compare every stored header key by key and return the pressures they cover."""
     expected_pressure = expected_provenance.get("task_pressure", "none")
     if not isinstance(expected_pressure, str) or expected_pressure not in LADDER_TASK_PRESSURES:
         raise ValueError("expected provenance has an invalid task_pressure")
-    if provenance_digest(expected_provenance) != expected_digest:
-        raise ValueError("expected provenance digest does not match its payload")
-    stored_digests_by_pressure: dict[str, set[str]] = {}
+    header_pressures: set[str] = set()
     stored_contexts: list[Mapping[str, object]] = []
     for header in headers:
-        pressure, raw_digest, raw_provenance = _resume_header_identity(path, header)
-        if raw_digest not in {
-            provenance_digest(raw_provenance),
-            _legacy_provenance_digest(raw_provenance),
-        }:
-            raise ValueError(f"{path} has a run header whose provenance digest is invalid")
+        pressure, raw_provenance = _resume_header_identity(path, header)
         stored_provenance = dict(raw_provenance)
         if "server_args" in raw_provenance:
             stored_provenance["server_args"] = _resume_server_args_identity(path, raw_provenance)
@@ -1645,21 +1672,23 @@ def _pressure_resume_digests(
         )
         expected_header_provenance.pop("task_pressure", None)
         header_provenance.pop("task_pressure", None)
-        differences = _identity_differences(expected_header_provenance, header_provenance)
+        differences = _identity_differences(
+            expected_header_provenance, header_provenance
+        ) + _adapter_launch_differences(expected_provenance, raw_provenance)
         if differences:
             raise ValueError(
                 f"refusing to resume {path}: stored run provenance differs at keys: "
                 + ", ".join(differences)
             )
         stored_contexts.append(raw_provenance)
-        stored_digests_by_pressure.setdefault(pressure, set()).add(raw_digest)
+        header_pressures.add(pressure)
     context_differences = _validate_resume_context_lengths(expected_provenance, stored_contexts)
     if context_differences:
         raise ValueError(
             f"refusing to resume {path}: stored run provenance differs at keys: "
             + ", ".join(context_differences)
         )
-    return stored_digests_by_pressure
+    return header_pressures
 
 
 def _episode_record_key(record: Mapping[str, object], *, path: Path) -> EpisodeKey:
@@ -1669,28 +1698,17 @@ def _episode_record_key(record: Mapping[str, object], *, path: Path) -> EpisodeK
     return EpisodeKey.from_json(raw_key)
 
 
-def _validate_episode_provenance(
-    path: Path,
-    record: Mapping[str, object],
-    key: EpisodeKey,
-    digests: Mapping[str, object],
-) -> None:
-    expected_record_digests = digests.get(key.task_pressure)
-    record_digest = record.get("provenance_digest")
-    if not isinstance(record_digest, str):
-        raise TypeError(f"{path} has a ladder episode with a non-string provenance digest")
-    if not isinstance(expected_record_digests, set) or record_digest not in expected_record_digests:
+def _validate_episode_has_header(path: Path, key: EpisodeKey, header_pressures: set[str]) -> None:
+    if key.task_pressure not in header_pressures:
         raise ValueError(
-            f"refusing to resume {path}: ladder episode provenance digest "
-            f"{record_digest!r} does not match any of its "
-            f"{key.task_pressure!r} pressure header"
+            f"refusing to resume {path}: ladder episode {key} at {key.task_pressure!r} "
+            f"pressure has no run header"
         )
 
 
 def completed_episode_keys(
     path: Path,
     *,
-    expected_digest: str,
     expected_provenance: Mapping[str, object],
 ) -> set[EpisodeKey]:
     """Return complete keys and refuse a trace from an incompatible experiment."""
@@ -1700,9 +1718,7 @@ def completed_episode_keys(
     headers = [record for record in records if record.get("record") == "ladder_run_header"]
     if not headers:
         raise ValueError(f"refusing to resume {path}: no ladder_run_header provenance record")
-    provenance_digests = _pressure_resume_digests(
-        path, headers, expected_digest, expected_provenance
-    )
+    header_pressures = _compatible_header_pressures(path, headers, expected_provenance)
     keys: set[EpisodeKey] = set()
     for record in records:
         if record.get("record") != "ladder_episode" and not (
@@ -1711,7 +1727,7 @@ def completed_episode_keys(
         ):
             continue
         key = _episode_record_key(record, path=path)
-        _validate_episode_provenance(path, record, key, provenance_digests)
+        _validate_episode_has_header(path, key, header_pressures)
         if key in keys:
             raise ValueError(f"refusing to resume {path}: duplicate completed key {key}")
         keys.add(key)
@@ -5662,7 +5678,6 @@ def _record_perf_times(monitor: PerfMonitor, records: Sequence[Mapping[str, obje
 def _grid_has_pending_episodes(config: RunnerConfig) -> bool:
     completed = completed_episode_keys(
         config.output_path,
-        expected_digest=config.provenance_digest,
         expected_provenance=config.provenance_payload(),
     )
     return any(
@@ -5853,7 +5868,6 @@ def _run_grid(
     ]
     completed = completed_episode_keys(
         config.output_path,
-        expected_digest=config.provenance_digest,
         expected_provenance=config.provenance_payload(),
     )
     already_complete_and_kept = sum(key in completed for key in planned_keys)
@@ -5878,12 +5892,11 @@ def _run_grid(
         run_counts["to_run_now"],
     )
     current_provenance = config.provenance_payload()
+    canonical_current_provenance = cast("Mapping[str, object]", _canonical_json(current_provenance))
     has_current_launch_header = any(
         record.get("record") == "ladder_run_header"
-        and record.get("provenance_digest") == config.provenance_digest
         and isinstance(record.get("provenance"), Mapping)
-        and record["provenance"].get("task_pressure", "none") == config.task_pressure
-        and record["provenance"].get("run_context") == current_provenance.get("run_context")
+        and not _identity_differences(canonical_current_provenance, record["provenance"])
         for record in existing
     )
     if not has_current_launch_header:

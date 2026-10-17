@@ -436,15 +436,10 @@ def _select_stage_task_samples(
     provenance_path = active_provenance_path(output_dir)
     completed: tuple[tuple[str, int], ...] = ()
     if provenance_path.exists():
-        existing = _read_existing_provenance(provenance_path)
-        stored = cast("Mapping[str, object]", existing["provenance"])
-        _, _, accepted_hashes = _load_existing_provenance(
-            provenance_path, _provenance_identity(stored)
+        stored = cast(
+            "Mapping[str, object]", _read_existing_provenance(provenance_path)["provenance"]
         )
-        accepted_hashes.add(cast("str", existing["provenance_sha256"]))
-        records, _ = _existing_records(
-            output_dir / "records.jsonl", accepted_provenance_sha256=accepted_hashes
-        )
+        records, _ = _existing_records(output_dir / "records.jsonl")
         completed = tuple(
             (cast("str", record["task_id"]), cast("int", record["sample_index"]))
             for record in records
@@ -1258,7 +1253,7 @@ def require_gitignored_output_dir(output_dir: Path) -> None:
         raise subprocess.CalledProcessError(result.returncode, result.args)
 
 
-def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Path, str, set[str]]:
+def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Path, str]:
     require_gitignored_output_dir(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     provenance_path = active_provenance_path(output_dir)
@@ -1268,20 +1263,16 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
     if run_context is not None and not isinstance(run_context, Mapping):
         raise TypeError("run_context must be an object")
     run_contexts: list[dict[str, object]] = []
-    compatible_hashes: set[str] = set()
     previous_policy: dict[str, object] | None = None
     if provenance_path.exists():
         previous_policy = sampling_policy(
             cast("Mapping[str, object]", _read_existing_provenance(provenance_path)["provenance"])
         )
-        current_identity, run_contexts, compatible_hashes = _load_existing_provenance(
+        current_identity, run_contexts = _load_existing_provenance(
             provenance_path, current_identity
         )
     elif records_path.exists() and records_path.stat().st_size > 0:
         raise ValueError("records exist without provenance; refusing an unsafe resume")
-    else:
-        run_contexts = []
-        compatible_hashes = set()
     policy = sampling_policy(provenance)
     if run_context is not None or policy is not None:
         context = {} if run_context is None else dict(run_context)
@@ -1318,11 +1309,10 @@ def _prepare_run(output_dir: Path, provenance: Mapping[str, object]) -> tuple[Pa
         {
             "schema_version": PROVENANCE_SCHEMA_VERSION,
             "provenance_sha256": provenance_hash,
-            "compatible_provenance_sha256": sorted(compatible_hashes),
             "provenance": compact_provenance(stored_provenance, provenance_path),
         },
     )
-    return records_path, provenance_hash, {provenance_hash, *compatible_hashes}
+    return records_path, provenance_hash
 
 
 def _decode_existing_record_line(raw_line: bytes) -> tuple[str, object | None, bool]:
@@ -1338,23 +1328,15 @@ def _decode_existing_record_line(raw_line: bytes) -> tuple[str, object | None, b
     return line, value, False
 
 
-def _existing_record_key(
-    record: dict[str, object], line_number: int, accepted_provenance_sha256: set[str]
-) -> tuple[str, int]:
+def _existing_record_key(record: dict[str, object], line_number: int) -> tuple[str, int]:
     task_id = record.get("task_id")
     sample_index = record.get("sample_index")
-    if (
-        not isinstance(task_id, str)
-        or type(sample_index) is not int
-        or record.get("run_provenance_sha256") not in accepted_provenance_sha256
-    ):
-        raise ValueError(f"records.jsonl line {line_number} has invalid resume identity")
+    if not isinstance(task_id, str) or type(sample_index) is not int:
+        raise ValueError(f"records.jsonl line {line_number} lacks a task_id/sample_index key")
     return task_id, sample_index
 
 
-def _existing_records(
-    records_path: Path, *, accepted_provenance_sha256: set[str]
-) -> tuple[list[dict[str, object]], int]:
+def _existing_records(records_path: Path) -> tuple[list[dict[str, object]], int]:
     if not records_path.exists():
         return [], 0
     records: list[dict[str, object]] = []
@@ -1382,7 +1364,7 @@ def _existing_records(
             if not isinstance(value, dict):
                 raise TypeError(f"records.jsonl line {line_number} must be an object")
             record = hydrate_record(cast("dict[str, object]", value), base_path=records_path)
-            key = _existing_record_key(record, line_number, accepted_provenance_sha256)
+            key = _existing_record_key(record, line_number)
             if key in seen_keys:
                 raise ValueError(f"records.jsonl contains duplicate task/sample key {key!r}")
             trace_path = record.get("trace_path")
@@ -2178,12 +2160,8 @@ def generate_episodes(  # noqa: PLR0913 - independent persistence and scheduling
             raise ValueError(
                 "each selected task must have unique nonnegative sample indexes within its limit"
             )
-    records_path, provenance_sha256, accepted_provenance_sha256 = _prepare_run(
-        output_dir, provenance
-    )
-    records, torn_records_recovered = _existing_records(
-        records_path, accepted_provenance_sha256=accepted_provenance_sha256
-    )
+    records_path, provenance_sha256 = _prepare_run(output_dir, provenance)
+    records, torn_records_recovered = _existing_records(records_path)
     thinking_budget_overshoot_policy.check(
         len(records),
         sum(record.get("failure_reason") == "thinking_budget_overshoot" for record in records),
@@ -2567,8 +2545,6 @@ def _provenance(  # noqa: PLR0913 - provenance captures independent generation s
             train_pairs=args.leak_train_pairs,
         )
     if args.hints is not None:
-        if not isinstance(args.hints_sha256, str):
-            raise TypeError("hint catalog path requires its recorded SHA-256 digest")
         provenance["hint_catalog"] = {
             "path": str(args.hints.resolve()),
             "sha256": args.hints_sha256,

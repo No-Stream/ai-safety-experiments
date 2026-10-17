@@ -782,7 +782,7 @@ def test_sft_smoke_refuses_a_dataset_manifest_without_samples(
     assert commands == []
 
 
-def test_schema_only_card_with_stale_dataset_identity_is_logged_not_refused(
+def test_schema_only_card_with_stale_dataset_identity_is_accepted_without_a_hash_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     card: dict[str, object] = {
@@ -792,8 +792,5 @@ def test_schema_only_card_with_stale_dataset_identity_is_logged_not_refused(
         "dataset_identity_sha256": "b" * 64,
     }
     with caplog.at_level(logging.WARNING, logger=smoke_v4.logger.name):
-        smoke_v4._validate_schema_only_card(
-            card, selected_count=1, row_count=1, identity_sha256="a" * 64
-        )
-    assert "records dataset identity" in caplog.text
-    assert "b" * 64 in caplog.text
+        smoke_v4._validate_schema_only_card(card, selected_count=1, row_count=1)
+    assert caplog.text == ""

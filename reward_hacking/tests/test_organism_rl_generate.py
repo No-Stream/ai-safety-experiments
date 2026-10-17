@@ -915,9 +915,6 @@ def test_records_resume_after_endpoint_restart_and_record_each_launch(
     saved_provenance = cast("dict[str, object]", saved["provenance"])
     run_contexts = cast("list[dict[str, object]]", saved_provenance["run_contexts"])
     assert [context["port"] for context in run_contexts] == [8000, 8001]
-    assert saved["provenance_sha256"] == generate_provenance._canonical_sha256(
-        generate_provenance._provenance_identity(saved_provenance)
-    )
 
 
 def test_resume_refusal_names_changed_generation_path_key(tmp_path: Path) -> None:
@@ -1024,9 +1021,7 @@ def test_existing_records_recovers_only_a_malformed_trailing_partial_line(
     records_path.write_text(json.dumps(record) + '\n{"task_id":"partial', encoding="utf-8")
 
     with caplog.at_level("WARNING", logger="reward_hacking.organism_rl.generate"):
-        records, torn_records_recovered = generate._existing_records(
-            records_path, accepted_provenance_sha256={"digest"}
-        )
+        records, torn_records_recovered = generate._existing_records(records_path)
 
     assert records == [record]
     assert torn_records_recovered == 1
@@ -1039,7 +1034,36 @@ def test_existing_records_still_rejects_a_malformed_interior_line(tmp_path: Path
     records_path.write_text("{\n{}\n", encoding="utf-8")
 
     with pytest.raises(json.JSONDecodeError):
-        generate._existing_records(records_path, accepted_provenance_sha256=set())
+        generate._existing_records(records_path)
+
+
+def test_existing_records_keep_rows_whose_recorded_run_digest_is_stale(tmp_path: Path) -> None:
+    trace_path = tmp_path / "episode.jsonl"
+    trace_path.write_text("{}\n", encoding="utf-8")
+    rows = [
+        {
+            "task_id": "synthetic-task",
+            "sample_index": sample_index,
+            "run_provenance_sha256": recorded_digest,
+            "trace_path": str(trace_path),
+        }
+        for sample_index, recorded_digest in enumerate(["0" * 64, "older-format-digest"])
+    ]
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    records, torn_records_recovered = generate._existing_records(records_path)
+
+    assert records == rows
+    assert torn_records_recovered == 0
+
+
+def test_existing_records_refuse_a_row_without_its_task_sample_key(tmp_path: Path) -> None:
+    records_path = tmp_path / "records.jsonl"
+    records_path.write_text(json.dumps({"task_id": "synthetic-task"}) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line 1 lacks a task_id/sample_index key"):
+        generate._existing_records(records_path)
 
 
 def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Path) -> None:
@@ -1115,7 +1139,25 @@ def test_resume_accepts_previous_current_schema_after_code_changes(tmp_path: Pat
     assert saved_provenance["schema_version"] == generate_provenance.PROVENANCE_SCHEMA_VERSION + 1
     assert saved_provenance["git_sha"] == "changed-code-revision"
     assert saved_provenance["source_code_sha256"] == changed_provenance["source_code_sha256"]
-    assert saved_document["compatible_provenance_sha256"] == [previous_digest]
+    resumed_records = [
+        json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert resumed_records == records
+    with pytest.raises(ValueError, match=r"generation_path_identity\.sampling_flags\.top_p"):
+        generate.generate_episodes(
+            output_dir=output_dir,
+            source=source,
+            task_specs=_tasks(),
+            samples_per_task=1,
+            concurrency=1,
+            provenance={
+                **changed_provenance,
+                "generation_path_identity": {
+                    "schema_version": 2,
+                    "sampling_flags": {"top_p": 0.9},
+                },
+            },
+        )
 
 
 def test_resume_accepts_prompt_version_with_selected_definition_evidence() -> None:
@@ -1172,10 +1214,9 @@ def test_resume_accepts_family_bytes_and_compatible_record_version(tmp_path: Pat
         "task_data_sha256": {"synthetic": "old"},
         "selected_tasks": [{"task_id": "synthetic", "task_definition_sha256": "same"}],
     }
-    _, old_digest, _ = generate._prepare_run(tmp_path, first)
+    generate._prepare_run(tmp_path, first)
     second = {**first, "record_schema": 4, "task_data_sha256": {"synthetic": "new"}}
-    _, _, accepted = generate._prepare_run(tmp_path, second)
-    assert old_digest in accepted
+    generate._prepare_run(tmp_path, second)
     saved = json.loads((tmp_path / "provenance.json").read_text())["provenance"]
     assert saved["task_data_sha256"] == second["task_data_sha256"]
     with pytest.raises(ValueError, match="selected_tasks"):
@@ -1269,6 +1310,10 @@ def test_generation_resume_accepts_evaluation_prompt_identity_versions() -> None
             "generation_path_identity_sha256": generate_provenance._canonical_sha256(first),
         },
     )
+    generate_provenance._validate_resume_identity(
+        {"generation_path_identity": second, "generation_path_identity_sha256": "0" * 64},
+        {"generation_path_identity": first, "generation_path_identity_sha256": "f" * 64},
+    )
     with pytest.raises(ValueError, match="task_prompt_sha256"):
         generate_provenance._validate_resume_identity(
             {
@@ -1287,7 +1332,7 @@ def test_resume_extends_sample_plan_and_preserves_exclusion_contents(tmp_path: P
         "task_sample_selection": [{"task_id": "synthetic", "sample_index": 0}],
         "task_sample_exclusion": {"schema_version": 1, "task_samples": []},
     }
-    _, old_digest, _ = generate._prepare_run(tmp_path, base)
+    generate._prepare_run(tmp_path, base)
     expanded = {
         **base,
         "task_sample_selection": [
@@ -1296,8 +1341,7 @@ def test_resume_extends_sample_plan_and_preserves_exclusion_contents(tmp_path: P
         ],
         "task_sample_exclusion": {"schema_version": 17, "task_samples": []},
     }
-    _, _, accepted = generate._prepare_run(tmp_path, expanded)
-    assert old_digest in accepted
+    generate._prepare_run(tmp_path, expanded)
     assert (
         json.loads((tmp_path / "provenance.json").read_text())["provenance"][
             "task_sample_selection"
@@ -1579,7 +1623,58 @@ def test_resume_accepts_legacy_provenance_with_code_changes(
     )
     migrated = json.loads((output_dir / "provenance.resume.json").read_text(encoding="utf-8"))
     assert migrated["schema_version"] == generate_provenance.PROVENANCE_SCHEMA_VERSION
-    assert migrated["compatible_provenance_sha256"] == [legacy_sha256]
+    migrated_contexts = cast("list[dict[str, object]]", migrated["provenance"]["run_contexts"])
+    assert migrated_contexts[0] == {
+        "endpoint_sha256": "legacy-endpoint-hash",
+        "legacy_context": True,
+        "max_model_len": 4096,
+    }
+    assert migrated_contexts[-1] == {"port": 8001}
+    resumed_records = [
+        json.loads(line) for line in records_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert resumed_records == records
+    with pytest.raises(ValueError, match=r"flags\.top_p"):
+        generate.generate_episodes(
+            output_dir=output_dir,
+            source=source,
+            task_specs=_tasks(),
+            samples_per_task=1,
+            concurrency=1,
+            provenance={**current_provenance, "flags": {"top_p": 0.9, "max_model_len": 4096}},
+        )
+
+
+def test_resume_keeps_throughput_settings_stored_in_older_flags_once(tmp_path: Path) -> None:
+    current = {
+        "schema_version": generate_provenance.PROVENANCE_SCHEMA_VERSION,
+        "flags": {"top_p": 1.0, "serving_config": {"dtype": "bfloat16"}},
+    }
+    generate._prepare_run(tmp_path, current)
+    provenance_path = tmp_path / "provenance.json"
+    document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    assert document["provenance"]["run_contexts"] == []
+    older_serving_config = {"dtype": "bfloat16", "max_num_seqs": 16}
+    document["provenance"]["flags"] = {
+        "top_p": 1.0,
+        "concurrency": 2,
+        "serving_config": older_serving_config,
+    }
+    document["provenance_sha256"] = "digest-from-an-older-projection"
+    provenance_path.write_text(json.dumps(document), encoding="utf-8")
+
+    generate._prepare_run(tmp_path, current)
+    generate._prepare_run(tmp_path, current)
+
+    saved = json.loads(provenance_path.read_text(encoding="utf-8"))["provenance"]
+    assert saved["flags"] == current["flags"]
+    assert saved["run_contexts"] == [
+        {"legacy_serving_settings": True, "concurrency": 2, "serving_config": older_serving_config}
+    ]
+    with pytest.raises(ValueError, match=r"flags\.serving_config\.dtype"):
+        generate._prepare_run(
+            tmp_path, {**current, "flags": {"top_p": 1.0, "serving_config": {"dtype": "float16"}}}
+        )
 
 
 def test_generated_original_record_scores_with_selected_payment_register(tmp_path: Path) -> None:
@@ -2156,34 +2251,32 @@ def test_provenance_records_leak_task_source_outside_resume_identity(
     assert generate_provenance._provenance_identity(changed_metadata_provenance) == identity
 
     output_dir = tmp_path / "generated-run"
-    _records_path, provenance_sha256, _accepted_hashes = generate._prepare_run(
-        output_dir,
-        provenance,
-    )
+    generate._prepare_run(output_dir, provenance)
     saved_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
     saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
     assert saved_provenance["leak_task_source"] == metadata
-    assert saved_document["provenance_sha256"] == provenance_sha256
-    hydrated_saved_provenance = generate_provenance.hydrate_provenance(
-        saved_provenance, output_dir / "provenance.json"
-    )
-    assert provenance_sha256 == generate_provenance._canonical_sha256(
-        generate_provenance._provenance_identity(hydrated_saved_provenance)
-    )
+    assert _saved_resume_identity(output_dir) == identity
     changed_metadata_provenance["leak_task_source"] = {
         **metadata,
         "asset_index_path": str(tmp_path / "replacement-assets.json"),
         "asset_index_sha256": "c" * 64,
     }
-    _records_path, resumed_provenance_sha256, _accepted_hashes = generate._prepare_run(
-        output_dir,
-        changed_metadata_provenance,
-    )
-    assert resumed_provenance_sha256 == provenance_sha256
+    generate._prepare_run(output_dir, changed_metadata_provenance)
+    assert _saved_resume_identity(output_dir) == identity
     resumed_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
     resumed_provenance = cast("Mapping[str, object]", resumed_document["provenance"])
     resumed_metadata = cast("Mapping[str, object]", resumed_provenance["leak_task_source"])
     assert resumed_metadata["asset_index_path"] == str(tmp_path / "replacement-assets.json")
+
+
+def _saved_resume_identity(output_dir: Path) -> dict[str, object]:
+    provenance_path = output_dir / "provenance.json"
+    saved_document = json.loads(provenance_path.read_text(encoding="utf-8"))
+    return generate_provenance._provenance_identity(
+        generate_provenance.hydrate_provenance(
+            cast("Mapping[str, object]", saved_document["provenance"]), provenance_path
+        )
+    )
 
 
 def _hint_catalog_provenance(
@@ -2263,19 +2356,11 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
     assert generate_provenance._provenance_identity(moved_catalog_provenance) == identity
 
     output_dir = tmp_path / "generated-run"
-    _records_path, provenance_sha256, _accepted_hashes = generate._prepare_run(
-        output_dir,
-        provenance,
-    )
+    generate._prepare_run(output_dir, provenance)
     saved_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
     saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])
     assert saved_provenance["hint_catalog"] == metadata
-    hydrated_saved_provenance = generate_provenance.hydrate_provenance(
-        saved_provenance, output_dir / "provenance.json"
-    )
-    assert provenance_sha256 == generate_provenance._canonical_sha256(
-        generate_provenance._provenance_identity(hydrated_saved_provenance)
-    )
+    assert _saved_resume_identity(output_dir) == identity
 
     edited_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     edited_hints = cast("list[dict[str, str]]", edited_catalog["hints"])
@@ -2290,28 +2375,22 @@ def test_provenance_records_hint_catalog_outside_resume_identity(
     edited_metadata = cast("Mapping[str, object]", edited_provenance["hint_catalog"])
     assert edited_metadata["sha256"] != metadata["sha256"]
 
-    _records_path, resumed_provenance_sha256, _accepted_hashes = generate._prepare_run(
-        output_dir,
-        edited_provenance,
-    )
+    generate._prepare_run(output_dir, edited_provenance)
     resumed_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
     resumed_provenance = cast("Mapping[str, object]", resumed_document["provenance"])
     resumed_metadata = cast("Mapping[str, object]", resumed_provenance["hint_catalog"])
-    assert resumed_provenance_sha256 == provenance_sha256
+    assert _saved_resume_identity(output_dir) == identity
     assert resumed_metadata["sha256"] == hashlib.sha256(edited_catalog_bytes).hexdigest()
 
     moved_catalog_provenance = {
         **edited_provenance,
         "hint_catalog": {**resumed_metadata, "path": str(tmp_path / "moved-hints.json")},
     }
-    _records_path, resumed_provenance_sha256, _accepted_hashes = generate._prepare_run(
-        output_dir,
-        moved_catalog_provenance,
-    )
+    generate._prepare_run(output_dir, moved_catalog_provenance)
     resumed_document = json.loads((output_dir / "provenance.json").read_text(encoding="utf-8"))
     resumed_provenance = cast("Mapping[str, object]", resumed_document["provenance"])
     resumed_metadata = cast("Mapping[str, object]", resumed_provenance["hint_catalog"])
-    assert resumed_provenance_sha256 == provenance_sha256
+    assert _saved_resume_identity(output_dir) == identity
     assert resumed_metadata["path"] == str(tmp_path / "moved-hints.json")
 
 

@@ -99,10 +99,8 @@ def test_serving_config_binds_identity_but_runtime_is_launch_context(
     assert run_context["concurrency"] == 2
     assert run_context["serving_runtime"] == serving_runtime
 
-    _records_path, original_hash, _accepted = generate._prepare_run(output_dir, provenance)
-    _records_path, resumed_hash, _accepted = generate._prepare_run(
-        output_dir, _make_provenance(run_args)
-    )
+    _records_path, original_hash = generate._prepare_run(output_dir, provenance)
+    _records_path, resumed_hash = generate._prepare_run(output_dir, _make_provenance(run_args))
     assert resumed_hash == original_hash
 
     changed_runtime = {
@@ -123,7 +121,7 @@ def test_serving_config_binds_identity_but_runtime_is_launch_context(
             json.dumps(changed_runtime),
         )
     )
-    _records_path, changed_runtime_hash, _accepted = generate._prepare_run(
+    _records_path, changed_runtime_hash = generate._prepare_run(
         output_dir, _make_provenance(changed_runtime_args)
     )
     assert changed_runtime_hash == original_hash
@@ -141,7 +139,7 @@ def test_serving_config_binds_identity_but_runtime_is_launch_context(
             json.dumps(changed_runtime),
         )
     )
-    _records_path, changed_concurrency_hash, _accepted = generate._prepare_run(
+    _records_path, changed_concurrency_hash = generate._prepare_run(
         output_dir, _make_provenance(changed_concurrency_args)
     )
     assert changed_concurrency_hash == original_hash
@@ -206,7 +204,7 @@ def test_client_concurrency_does_not_gate_resume_but_is_recorded(
     first_provenance = _make_provenance(first_args)
     first_flags = cast("Mapping[str, object]", first_provenance["flags"])
     assert first_flags["concurrency"] == 2
-    _records_path, original_hash, _accepted = generate._prepare_run(output_dir, first_provenance)
+    _records_path, original_hash = generate._prepare_run(output_dir, first_provenance)
 
     changed_args = generate.parse_args(
         _arguments(output_dir, *generator_arguments, "--concurrency", "3")
@@ -285,9 +283,7 @@ def test_legacy_serving_throughput_settings_do_not_block_resume_and_remain_recor
             "3",
         )
     )
-    _records_path, resumed_hash, _accepted = generate._prepare_run(
-        output_dir, _make_provenance(changed_args)
-    )
+    _records_path, resumed_hash = generate._prepare_run(output_dir, _make_provenance(changed_args))
 
     saved_document = json.loads(provenance_path.read_text(encoding="utf-8"))
     saved_provenance = cast("Mapping[str, object]", saved_document["provenance"])

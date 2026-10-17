@@ -641,7 +641,7 @@ def test_resume_rebuilds_hidden_test_changes_and_records_the_reason(
     with caplog.at_level(logging.WARNING, logger=bulk.logger.name):
         result = bulk.build_assets(options, (case,))
     assert result["built"] == 1
-    assert "task inputs changed" in caplog.text
+    assert "task inputs changed: hidden_tests_contents" in caplog.text
     rebuilt_marker = json.loads((options.out_root / case.task_id / "complete.json").read_text())
     assert "task inputs changed" in rebuilt_marker["rebuilt_after"]
     tasks = cast("dict[str, dict[str, Any]]", result["tasks"])
@@ -706,10 +706,44 @@ def test_legacy_asset_resume_ignores_only_saved_gate_log_digest(
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     saved_request_identity = marker["request_identity"]
     saved_request_identity["gate_sha256"] = "legacy-gate-log-digest"
-    marker["identity"] = bulk._digest(saved_request_identity)
     marker_path.write_text(json.dumps(marker), encoding="utf-8")
 
     assert bulk.build_assets(options, (case,))["resumed"] == 1
+
+
+def test_recorded_identity_digest_does_not_gate_resume(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+) -> None:
+    options, case = build_inputs
+    bulk.build_assets(options, (case,))
+    marker_path = options.out_root / case.task_id / "complete.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["identity"] = "digest-recorded-by-an-older-builder"
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert bulk.build_assets(options, (case,))["resumed"] == 1
+
+
+def test_build_refuses_completion_when_request_inputs_change_mid_build(
+    build_inputs: tuple[bulk.BuildOptions, R2eLeakTask],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options, case = build_inputs
+    original_build_case = bulk._build_case
+
+    def build_then_edit_hidden_tests(*args: Any, **kwargs: Any) -> Any:
+        arms = original_build_case(*args, **kwargs)
+        (options.templates_root / case.task_id / "hidden_tests" / "late_test.py").write_text(
+            "edited\n"
+        )
+        return arms
+
+    monkeypatch.setattr(bulk, "_build_case", build_then_edit_hidden_tests)
+    with pytest.raises(
+        ValueError, match=r"source inputs changed during task build \(hidden_tests_contents\)"
+    ):
+        bulk.build_assets(options, (case,))
+    assert not (options.out_root / case.task_id / "complete.json").exists()
 
 
 def test_interrupted_marker_write_rebuilds_only_uncompleted_task(

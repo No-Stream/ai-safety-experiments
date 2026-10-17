@@ -99,6 +99,13 @@ def _write_record(output_root: Path, cell_name: str, generator: str, *, episodes
     )
 
 
+def _served_adapter(tmp_path: Path) -> Path:
+    adapter_dir = tmp_path / "served-adapter"
+    adapter_dir.mkdir(exist_ok=True)
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"synthetic adapter weights")
+    return adapter_dir
+
+
 @pytest.mark.parametrize(("cell_name", "variant"), CONVENTION_ARMS)
 def test_convention_wave_cell_builds_first_collection_command(
     cell_name: str, variant: str, tmp_path: Path
@@ -134,7 +141,7 @@ def test_convention_wave_cell_builds_first_collection_command(
         baseline_records=tmp_path / "baseline.jsonl",
         max_model_len=args.max_model_len,
         model_revision="0" * 40,
-        served_adapter_sha256="a" * 64,
+        served_adapter_path=_served_adapter(tmp_path),
     )
 
     command = build_generate_command(cell, wave_v4.stage_settings(args, settings, ()))

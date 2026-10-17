@@ -16,7 +16,11 @@ from typing import cast
 from urllib.parse import urlsplit
 
 from reward_hacking.evidence_store import iter_jsonl
-from reward_hacking.semantic_identity import semantic_content_identity, semantic_server_settings
+from reward_hacking.semantic_identity import (
+    nonsemantic_server_settings,
+    semantic_content_identity,
+    semantic_server_settings,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 PROVENANCE_SCHEMA_VERSION = 3
@@ -47,10 +51,8 @@ _SELECTED_TASKS_SEMANTIC_MISMATCH = (
 )
 
 
-def _canonical_sha256(value: Mapping[str, object], *, ensure_ascii: bool = True) -> str:
-    serialized = json.dumps(
-        dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=ensure_ascii
-    )
+def _canonical_sha256(value: Mapping[str, object]) -> str:  # pyright: ignore[reportUnusedFunction] - imported by recorders
+    serialized = json.dumps(dict(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
@@ -309,32 +311,6 @@ def _normalize_sampling_policy_comparison(
         }
 
 
-def _stored_generation_identity_sha256_candidates(
-    stored_generation_identity: Mapping[str, object],
-    normalized_stored_generation: Mapping[str, object],
-) -> set[str]:
-    evaluation_excluded_fields = {"schema_version"}
-    if isinstance(stored_generation_identity.get("task_prompt_sha256"), Mapping):
-        evaluation_excluded_fields.add("prompt_format_version")
-    stored_evaluation_projection = {
-        key: value
-        for key, value in stored_generation_identity.items()
-        if key not in evaluation_excluded_fields
-    }
-    stored_semantic_projection = {
-        key: value
-        for key, value in stored_generation_identity.items()
-        if key not in {"schema_version", "prompt_format_version"}
-    }
-    return {
-        _canonical_sha256(dict(stored_generation_identity)),
-        _canonical_sha256(dict(normalized_stored_generation)),
-        _canonical_sha256(stored_semantic_projection),
-        _canonical_sha256(stored_evaluation_projection, ensure_ascii=False),
-        _canonical_sha256(stored_evaluation_projection, ensure_ascii=True),
-    }
-
-
 def _identity_differences(
     current_identity: dict[str, object], stored_identity: Mapping[str, object]
 ) -> list[str]:
@@ -379,15 +355,8 @@ def _identity_differences(
         )
         current_identity["generation_path_identity"] = normalized_current_generation
         comparison_stored["generation_path_identity"] = normalized_stored_generation
-        semantic_generation_sha256 = _canonical_sha256(normalized_current_generation)
-        current_identity["generation_path_identity_sha256"] = semantic_generation_sha256
-        stored_generation_sha256 = stored_identity.get("generation_path_identity_sha256")
-        if stored_generation_sha256 in _stored_generation_identity_sha256_candidates(
-            stored_generation_identity,
-            normalized_stored_generation,
-        ):
-            normalized_stored_sha256 = _canonical_sha256(normalized_stored_generation)
-            comparison_stored["generation_path_identity_sha256"] = normalized_stored_sha256
+        current_identity.pop("generation_path_identity_sha256", None)
+        comparison_stored.pop("generation_path_identity_sha256", None)
     return _mapping_differences(current_identity, comparison_stored)
 
 
@@ -564,10 +533,9 @@ def _read_existing_provenance(path: Path) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError("existing run provenance must be an object")
     schema_version = value.get("schema_version")
-    provenance_sha256 = value.get("provenance_sha256")
     provenance = value.get("provenance")
-    if type(schema_version) is not int or not isinstance(provenance_sha256, str):
-        raise ValueError("existing run provenance has an invalid schema or digest")
+    if type(schema_version) is not int:
+        raise ValueError("existing run provenance has an invalid schema version")
     if not isinstance(provenance, Mapping):
         raise TypeError("existing run provenance must contain an object at 'provenance'")
     hydrated_document = dict(value)
@@ -602,22 +570,13 @@ def _load_legacy_provenance(
     current_identity: dict[str, object],
     *,
     output_dir: Path | None = None,
-) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
-    stored_hash = cast("str", existing["provenance_sha256"])
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
-    recomputed_hash = _canonical_sha256(stored_provenance)
-    if recomputed_hash != stored_hash:
-        logger.warning(
-            "legacy run provenance digest recorded %s but its provenance hashes to %s; resuming "
-            "and keeping the recorded digest as a compatible provenance digest",
-            stored_hash,
-            recomputed_hash,
-        )
     stored_identity = _provenance_identity(stored_provenance)
     _validate_resume_identity(current_identity, stored_identity, output_dir=output_dir)
     legacy_context = _legacy_run_context(stored_provenance)
     run_contexts = [] if legacy_context is None else [legacy_context]
-    return current_identity, run_contexts, {stored_hash}
+    return current_identity, run_contexts
 
 
 def _load_current_provenance(
@@ -625,106 +584,42 @@ def _load_current_provenance(
     current_identity: dict[str, object],
     *,
     output_dir: Path | None = None,
-) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     stored_provenance = cast("Mapping[str, object]", existing["provenance"])
     stored_identity = _provenance_identity(stored_provenance)
-    stored_hash = cast("str", existing["provenance_sha256"])
-    semantic_hash = _canonical_sha256(stored_identity)
-    legacy_leak_metadata_hash = _canonical_sha256(
-        _provenance_identity(stored_provenance, include_legacy_leak_metadata=True)
-    )
-    legacy_code_hash = _canonical_sha256(
-        _provenance_identity(
-            stored_provenance,
-            include_code_provenance=True,
-            include_legacy_leak_metadata=True,
-        )
-    )
-    legacy_serving_hashes = {
-        _canonical_sha256(
-            _provenance_identity(
-                stored_provenance,
-                include_nonsemantic_serving_settings=True,
-            )
-        ),
-        _canonical_sha256(
-            _provenance_identity(
-                stored_provenance,
-                include_legacy_leak_metadata=True,
-                include_nonsemantic_serving_settings=True,
-            )
-        ),
-        _canonical_sha256(
-            _provenance_identity(
-                stored_provenance,
-                include_code_provenance=True,
-                include_legacy_leak_metadata=True,
-                include_nonsemantic_serving_settings=True,
-            )
-        ),
-    }
-    if stored_hash not in {
-        semantic_hash,
-        legacy_leak_metadata_hash,
-        legacy_code_hash,
-        *legacy_serving_hashes,
-    }:
-        logger.warning(
-            "existing generation-path identity digest %s matches no known projection of its "
-            "provenance; resuming and keeping it as a compatible provenance digest",
-            stored_hash,
-        )
-    raw_compatible_hashes = existing.get("compatible_provenance_sha256", [])
-    if not isinstance(raw_compatible_hashes, list) or any(
-        not isinstance(value, str) for value in raw_compatible_hashes
-    ):
-        raise TypeError("compatible provenance digests must be a list of strings")
     raw_run_contexts = stored_provenance.get("run_contexts", [])
     if not isinstance(raw_run_contexts, list) or any(
         not isinstance(value, Mapping) for value in raw_run_contexts
     ):
         raise TypeError("stored run_contexts must be a list of objects")
     _validate_resume_identity(current_identity, stored_identity, output_dir=output_dir)
-    current_projection_hashes = {
-        semantic_hash,
-        legacy_leak_metadata_hash,
-        legacy_code_hash,
-    }
-    needs_legacy_serving_context = (
-        stored_hash in legacy_serving_hashes and stored_hash not in current_projection_hashes
-    )
-    legacy_serving_context = (
-        _legacy_serving_settings_context(stored_provenance)
-        if needs_legacy_serving_context
-        else None
-    )
     run_contexts = [dict(value) for value in raw_run_contexts]
+    legacy_serving_context = _legacy_serving_settings_context(stored_provenance)
     if legacy_serving_context is not None:
         run_contexts.append(legacy_serving_context)
-    compatible_hashes = set(cast("list[str]", raw_compatible_hashes))
-    if stored_hash != _canonical_sha256(current_identity):
-        compatible_hashes.add(stored_hash)
-    return (
-        current_identity,
-        run_contexts,
-        compatible_hashes,
-    )
+    return current_identity, run_contexts
 
 
 def _legacy_serving_settings_context(
     provenance: Mapping[str, object],
 ) -> dict[str, object] | None:
+    """Keep throughput settings that older runs stored in flags, which a resume rewrite drops."""
     flags = provenance.get("flags")
     if not isinstance(flags, Mapping):
         return None
-    context: dict[str, object] = {"legacy_serving_settings": True}
     concurrency = flags.get("concurrency")
+    serving_config = flags.get("serving_config")
+    has_nonsemantic_serving_config = isinstance(serving_config, Mapping) and bool(
+        nonsemantic_server_settings(serving_config)
+    )
+    if type(concurrency) is not int and not has_nonsemantic_serving_config:
+        return None
+    context: dict[str, object] = {"legacy_serving_settings": True}
     if type(concurrency) is int:
         context["concurrency"] = concurrency
-    serving_config = flags.get("serving_config")
     if isinstance(serving_config, Mapping):
         context["serving_config"] = deepcopy(dict(serving_config))
-    return context if len(context) > 1 else None
+    return context
 
 
 def active_provenance_path(output_dir: Path) -> Path:
@@ -738,7 +633,7 @@ def active_provenance_path(output_dir: Path) -> Path:
 
 def _load_existing_provenance(
     path: Path, current_identity: dict[str, object]
-) -> tuple[dict[str, object], list[dict[str, object]], set[str]]:
+) -> tuple[dict[str, object], list[dict[str, object]]]:
     if path.name == "provenance.resume.json":
         _load_existing_provenance(path.with_name("provenance.json"), current_identity)
     existing = _read_existing_provenance(path)
