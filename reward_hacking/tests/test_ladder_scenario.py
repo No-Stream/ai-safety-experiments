@@ -776,8 +776,9 @@ class TestScenarioFormatTwo:
         assert rendered.task.files == scenario.files
         assert "TASK.md" not in rendered.task.files
         assert scenario.render("claimed").task_markdown == rendered.task_markdown
-        with pytest.raises(ValueError, match="naive"):
-            scenario.render("naive")
+        naive = scenario.render("naive")
+        assert naive.task_markdown == rendered.task_markdown
+        assert naive.task.files == rendered.task.files
         episode = tmp_path / "episode"
         episode.mkdir()
         assert scenario.lay_down_trees(episode) == (".git",)
