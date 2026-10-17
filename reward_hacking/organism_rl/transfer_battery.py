@@ -216,14 +216,18 @@ def evaluate_cell_arguments(run: BatteryRun, cell_name: str, endpoint: str) -> l
     ]
 
 
-def server_arguments(run: BatteryRun, gpu_memory_utilization: float) -> list[str]:
+def server_arguments(run: BatteryRun, gpu_memory_utilization: float | None = None) -> list[str]:
     """Build ``evaluate`` arguments that only configure the one shared vLLM server."""
     cell = _ORGANISM_CELLS["capability-aisi-original"]
+    memory_arguments = (
+        ["--gpu-memory-utilization", str(gpu_memory_utilization)]
+        if gpu_memory_utilization is not None
+        else []
+    )
     return [
         "--output-dir",
         str(run.model_dir.resolve() / "server"),
-        "--gpu-memory-utilization",
-        str(gpu_memory_utilization),
+        *memory_arguments,
         *_shared_episode_arguments(run),
         "--family",
         cell.family,
@@ -674,7 +678,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=EPISODES_PER_CELL,
         help="episodes in flight per cell; below the cell size the decode roofline gate is accepted",
     )
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument(
         "--enable-speculative-decoding", action=argparse.BooleanOptionalAction, default=True
     )
@@ -733,7 +737,7 @@ def _validated_cell_commands(
     return commands
 
 
-def _run_cells(run: BatteryRun, cells: Sequence[str], gpu_memory_utilization: float) -> None:
+def _run_cells(run: BatteryRun, cells: Sequence[str], gpu_memory_utilization: float | None) -> None:
     require_free_gpu()
     server_args = evaluate.parse_args(server_arguments(run, gpu_memory_utilization))
     server_config = evaluate.build_server_config(

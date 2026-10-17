@@ -1,13 +1,14 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import Any, ClassVar, Self, cast
 
 import pytest
 import torch
 from safetensors.torch import save_file
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
+from grpo import gpu_memory
 from reward_hacking.organism_rl import cli
 from reward_hacking.organism_rl.cli import parse_args, resolve_sizing, write_provenance
 from reward_hacking.organism_rl.precision import (
@@ -133,9 +134,21 @@ def test_teacher_requires_stored_scores():
         parse_args(["--output-dir", "artifacts/toy", "--teacher-beta", "0.1"])
 
 
-def test_owned_server_requires_an_explicit_gpu_memory_fraction() -> None:
+def test_owned_server_derives_default_gpu_memory_fraction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_memory, "_nvidia_smi_rows", lambda: [(0, "GPU-test", 1024.0, 32768.0)])
+    args = parse_args(["--output-dir", "artifacts/toy"])
+    config = cli.build_server_config(args, "revision", 4096)
+    command = config.command()
+    assert float(command[command.index("--gpu-memory-utilization") + 1]) == pytest.approx(
+        (31 - 4.5 - 0.75) / 32
+    )
+    assert config.trainer_vram_headroom_gib == 4.5
+
+
+@pytest.mark.parametrize("headroom", ["-1", "nan", "inf"])
+def test_owned_server_rejects_invalid_headroom(headroom: str) -> None:
     with pytest.raises(SystemExit):
-        parse_args(["--output-dir", "artifacts/toy"])
+        parse_args(["--output-dir", "artifacts/toy", "--trainer-vram-headroom-gib", headroom])
 
 
 def test_provenance_has_flags_version_and_sha(tmp_path: Path) -> None:
@@ -274,6 +287,10 @@ def test_server_endpoint_owns_the_server_for_the_training_scope(
 
     class FakeServer:
         base_url = "http://owned-server:8000"
+        memory_provenance: ClassVar[dict[str, object]] = {
+            "gpu_memory_utilization": 0.75,
+            "ready_free_bytes": 3 * 1024**3,
+        }
 
         def __init__(self, config: VLLMServerConfig) -> None:
             configs.append(config)
@@ -288,12 +305,16 @@ def test_server_endpoint_owns_the_server_for_the_training_scope(
 
     monkeypatch.setattr(cli, "VLLMServer", FakeServer)
 
+    write_provenance(args, {"name": "cpu"}, model_revision="resolved-revision")
     with cli.server_endpoint(args, "resolved-revision", 2048) as endpoint:
         assert endpoint == "http://owned-server:8000"
         assert lifecycle == ["start"]
 
     assert lifecycle == ["start", "stop"]
     assert configs[0].log_path == tmp_path / "vllm-server.log"
+    stored = json.loads((tmp_path / "provenance.json").read_text())
+    assert stored["server_memory"] == FakeServer.memory_provenance
+    assert stored["server_memory_provenance_file"] == "vllm-server.memory.json"
 
 
 def test_endpoint_option_keeps_external_server_mode(tmp_path: Path) -> None:
@@ -1163,3 +1184,45 @@ def test_frozen_host_memory_flag_defaults_to_pinned_and_accepts_pageable(tmp_pat
     base = ["--output-dir", str(tmp_path), "--gpu-memory-utilization", "0.8"]
     assert parse_args(base).frozen_host_memory == "pinned"
     assert parse_args([*base, "--frozen-host-memory", "pageable"]).frozen_host_memory == "pageable"
+
+
+@pytest.mark.parametrize(("total_gib", "free_gib", "headroom_gib"), [(16, 14, 2.5), (80, 76, 5)])
+def test_owned_server_memory_scales_with_device(
+    monkeypatch: pytest.MonkeyPatch, total_gib: int, free_gib: int, headroom_gib: float
+) -> None:
+    monkeypatch.setattr(
+        gpu_memory,
+        "_nvidia_smi_rows",
+        lambda: [(0, "GPU-test", float((total_gib - free_gib) * 1024), float(total_gib * 1024))],
+    )
+    args = parse_args(
+        ["--output-dir", "artifacts/toy", "--trainer-vram-headroom-gib", str(headroom_gib)]
+    )
+    config = cli.build_server_config(args, "revision", 4096)
+    command = config.command()
+    assert float(command[command.index("--gpu-memory-utilization") + 1]) == pytest.approx(
+        (free_gib - headroom_gib - 0.75) / total_gib
+    )
+
+
+@pytest.mark.parametrize("utilization_flags", [[], ["--gpu-memory-utilization", "0.9"]])
+def test_owned_server_admission_checks_real_cli_config(
+    monkeypatch: pytest.MonkeyPatch, utilization_flags: list[str], tmp_path: Path
+) -> None:
+    measurements = iter([1024.0, (32 - 1.2) * 1024])
+    monkeypatch.setattr(
+        gpu_memory,
+        "_nvidia_smi_rows",
+        lambda: [(0, "GPU-test", next(measurements), 32768.0)],
+    )
+    args = parse_args(["--output-dir", str(tmp_path), *utilization_flags])
+    config = cli.build_server_config(args, "revision", 4096).resolve_memory(
+        gpu_memory.nvidia_smi_memory_info()
+    )
+    command = config.command()
+    assert float(command[command.index("--gpu-memory-utilization") + 1]) == (
+        0.9 if utilization_flags else (31 - 4.5 - 0.75) / 32
+    )
+    server = cli.VLLMServer(config)
+    with pytest.raises(RuntimeError, match=r"1.20 GiB.*4.50 GiB.*--gpu-memory-utilization"):
+        server._check_trainer_headroom()

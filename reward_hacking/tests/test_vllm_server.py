@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -14,6 +15,7 @@ from urllib.error import URLError
 
 import pytest
 
+from grpo import gpu_memory
 from reward_hacking import vllm_server
 from reward_hacking.ladder.thinking import QWEN_THINKING_REASONING_CONFIG
 from reward_hacking.vllm_server import VLLMServer, VLLMServerConfig, VLLMServerStartupError
@@ -63,7 +65,7 @@ def fake_vllm(tmp_path: Path) -> Path:
 @pytest.fixture(autouse=True)
 def avoid_real_cuda_sizing(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep lifecycle tests on CPU; the focused test below checks the sizing boundary."""
-    monkeypatch.setattr(vllm_server.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(gpu_memory, "_nvidia_smi_rows", lambda: [(0, "GPU-test", 1024.0, 32768.0)])
 
 
 def _config(fake_vllm: Path) -> VLLMServerConfig:
@@ -402,25 +404,68 @@ def test_server_retries_connection_refused_then_starts(
     assert probes == 3
 
 
-def test_server_caps_utilization_at_startup(
+def test_server_preserves_explicit_utilization(
     fake_vllm: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[tuple[object, float]] = []
-
-    def cap_utilization(torch_module: object, requested: float) -> float:
-        assert torch_module is vllm_server.torch
-        calls.append((torch_module, requested))
-        return 0.42
-
-    monkeypatch.setattr(vllm_server.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(vllm_server, "cap_gpu_memory_utilization", cap_utilization)
     monkeypatch.setattr(vllm_server.urllib.request, "urlopen", _ready_response)
-
     with VLLMServer(_config(fake_vllm)) as server:
-        assert server.config.gpu_memory_utilization == pytest.approx(0.42)
+        assert server.config.gpu_memory_utilization == 0.55
 
-    assert len(calls) == 1
-    assert calls[0][1] == pytest.approx(0.55)
+
+def test_server_derives_inference_default(fake_vllm: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vllm_server.urllib.request, "urlopen", _ready_response)
+    with VLLMServer(replace(_config(fake_vllm), gpu_memory_utilization=None)) as server:
+        assert server.config.gpu_memory_utilization == pytest.approx((31 - 0.75) / 32 - 0.02)
+        assert server.memory_provenance["launch_free_bytes"] == 31 * 1024**3
+
+
+@pytest.mark.parametrize("requested_utilization", [None, 0.9, 0.01])
+@pytest.mark.parametrize("free_gib", [1.2, 2.5, 3.0])
+def test_server_checks_trainer_headroom_and_reaps_failure(
+    fake_vllm: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    free_gib: float,
+    tmp_path: Path,
+    requested_utilization: float | None,
+) -> None:
+    measurements = iter([1024.0, (32 - free_gib) * 1024])
+    monkeypatch.setattr(
+        gpu_memory,
+        "_nvidia_smi_rows",
+        lambda: [(0, "GPU-test", next(measurements), 32768.0)],
+    )
+    monkeypatch.setattr(vllm_server.urllib.request, "urlopen", _ready_response)
+    server = VLLMServer(
+        replace(
+            _config(fake_vllm),
+            gpu_memory_utilization=requested_utilization,
+            trainer_vram_headroom_gib=2.5,
+            log_path=tmp_path / "server.log",
+        )
+    )
+    try:
+        if free_gib < 2.5:
+            with pytest.raises(
+                VLLMServerStartupError, match=r"1.20 GiB.*2.50 GiB.*--gpu-memory-utilization"
+            ) as error:
+                server.start()
+            suggestion = re.search(r"--gpu-memory-utilization ([0-9.]+)", str(error.value))
+            assert suggestion is not None
+            assert 0 < float(suggestion[1]) < (requested_utilization or (31 - 2.5 - 0.75) / 32)
+            assert server.process.poll() is not None
+            assert server.memory_provenance["headroom_satisfied"] is False
+        else:
+            with server:
+                assert server.memory_provenance["ready_free_bytes"] == round(free_gib * 1024**3)
+                assert server.memory_provenance["headroom_satisfied"] is True
+        recorded = json.loads((tmp_path / "server.memory.json").read_text())
+        assert recorded == server.memory_provenance
+        assert recorded["gpu_memory_utilization"] == (
+            requested_utilization or (31 - 2.5 - 0.75) / 32
+        )
+        assert recorded["trainer_vram_headroom_gib"] == 2.5
+    finally:
+        server.stop()
 
 
 def test_server_reaps_process_group_on_context_exit(

@@ -37,8 +37,17 @@ def test_admitted_defaults_reach_real_server_command(
     expected_path.write_text(admission_path.read_text())
     args = forage.parse_args([])
     run = forage.run_from_args(args)
+    assert args.gpu_memory_utilization is None
+    inferred_server_arguments = forage._server_arguments(run, None)
+    assert "--gpu-memory-utilization" not in inferred_server_arguments
+    inferred_server_args = evaluate.parse_args(inferred_server_arguments)
+    inferred_config = evaluate.build_server_config(inferred_server_args, "synthetic-revision")
+    assert inferred_config.gpu_memory_utilization is None
+
     server_args = evaluate.parse_args(forage._server_arguments(run, 0.9))
-    command = evaluate.build_server_config(server_args, "synthetic-revision").command()
+    explicit_config = evaluate.build_server_config(server_args, "synthetic-revision")
+    assert explicit_config.gpu_memory_utilization == 0.9
+    command = explicit_config.command()
     assert command[command.index("--kv-cache-dtype") + 1] == "fp8"
     assert command[command.index("--quantization") + 1] == "fp8_per_block"
     assert json.loads(command[command.index("--quantization-config") + 1]) == {

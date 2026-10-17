@@ -164,6 +164,37 @@ def _nvidia_smi_row_for_device(
     return matches[0]
 
 
+@dataclass(frozen=True, slots=True)
+class NvidiaSMIMemory:
+    """Device memory measured without initializing a CUDA context."""
+
+    device_index: int
+    device_uuid: str
+    free_bytes: int
+    total_bytes: int
+
+
+def nvidia_smi_memory_info(device_index: int = 0) -> NvidiaSMIMemory:
+    """Read host-visible free memory for one logical CUDA device."""
+    _, device_uuid, used_mib, total_mib = _nvidia_smi_row_for_device(
+        _nvidia_smi_rows(), device_index
+    )
+    snapshot = NvidiaSMIMemory(
+        device_index,
+        device_uuid,
+        round((total_mib - used_mib) * MEBIBYTE_BYTES),
+        round(total_mib * MEBIBYTE_BYTES),
+    )
+    logger.info(
+        "NVIDIA memory device=%d uuid=%s nvidia_smi_free_gib=%.2f nvidia_smi_total_gib=%.2f",
+        device_index,
+        device_uuid,
+        snapshot.free_bytes / GIBIBYTE_BYTES,
+        snapshot.total_bytes / GIBIBYTE_BYTES,
+    )
+    return snapshot
+
+
 def _gpu_memory_snapshot(
     torch_module: TorchRuntime, device: int | CudaDevice | None
 ) -> _GpuMemorySnapshot:

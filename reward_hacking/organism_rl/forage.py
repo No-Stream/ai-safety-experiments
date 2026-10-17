@@ -627,13 +627,18 @@ def kv_pool_concurrency(server_log: str, max_model_len: int) -> int:
     return concurrency
 
 
-def _server_arguments(run: ForageRun, gpu_memory_utilization: float) -> list[str]:
+def _server_arguments(run: ForageRun, gpu_memory_utilization: float | None) -> list[str]:
     quantization_arguments = [
         "--kv-cache-dtype",
         run.kv_cache_dtype,
         "--sampler-quantization",
         run.sampler_quantization,
     ]
+    memory_arguments = (
+        ["--gpu-memory-utilization", str(gpu_memory_utilization)]
+        if gpu_memory_utilization is not None
+        else []
+    )
     for pattern in run.sampler_quantization_ignore:
         quantization_arguments.extend(("--sampler-quantization-ignore", pattern))
     if run.quantization_admission is not None:
@@ -642,8 +647,7 @@ def _server_arguments(run: ForageRun, gpu_memory_utilization: float) -> list[str
         *quantization_arguments,
         "--output-dir",
         str(run.output_dir.resolve() / "server"),
-        "--gpu-memory-utilization",
-        str(gpu_memory_utilization),
+        *memory_arguments,
         "--model",
         run.base_model,
         "--max-model-len",
@@ -801,7 +805,7 @@ def _serve_and_run(
     run: ForageRun,
     selection: Mapping[str, Sequence[str]],
     groups: Mapping[str, ForageGroup],
-    gpu_memory_utilization: float,
+    gpu_memory_utilization: float | None,
     *,
     follow_up: bool,
 ) -> None:
@@ -866,7 +870,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--tasks-per-group", type=int, help="override every group's task count (smoke runs)"
     )
     parser.add_argument("--max-model-len", type=int, default=65536)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
+    parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument(
         "--enable-speculative-decoding", action=argparse.BooleanOptionalAction, default=True
     )

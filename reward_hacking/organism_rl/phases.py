@@ -29,7 +29,7 @@ import psutil
 import torch
 from safetensors import safe_open
 
-from grpo.gpu_memory import gpu_memory_info
+from grpo.gpu_memory import GIBIBYTE_BYTES, gpu_memory_info, nvidia_smi_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 from reward_hacking.organism_rl.transfers import PolicyTransfers
 
@@ -481,6 +481,22 @@ class VLLMPhaseController:
         gc.collect()
         if self.training_device.type == "cuda":
             torch.cuda.empty_cache()
+            device_index = cast("int | None", self.training_device.index)
+            if device_index is None:
+                # Torch's stub says int, but an unindexed CUDA device has no explicit index.
+                device_index = torch.cuda.current_device()
+            nvidia_memory = nvidia_smi_memory_info(device_index)
+            logger.info(
+                "post-offload CUDA memory step=%d device=%d allocated_bytes=%d reserved_bytes=%d "
+                "nvidia_smi_free_bytes=%d nvidia_smi_free_gib=%.2f nvidia_smi_total_bytes=%d",
+                int(trainer.state.global_step),
+                device_index,
+                torch.cuda.memory_allocated(self.training_device),
+                torch.cuda.memory_reserved(self.training_device),
+                nvidia_memory.free_bytes,
+                nvidia_memory.free_bytes / GIBIBYTE_BYTES,
+                nvidia_memory.total_bytes,
+            )
 
     def _check_host_memory_budget(self, required_bytes: int, phase: str) -> None:
         memory = psutil.virtual_memory()

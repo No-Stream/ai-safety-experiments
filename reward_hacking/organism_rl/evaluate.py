@@ -366,8 +366,6 @@ def _validate_reuse_selection(args: argparse.Namespace, parser: argparse.Argumen
 
 
 def _validate_serving_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    if args.endpoint is None and args.gpu_memory_utilization is None:
-        parser.error("owned vLLM server requires --gpu-memory-utilization")
     if args.gpu_memory_utilization is not None and not 0 < args.gpu_memory_utilization <= 1:
         parser.error("gpu-memory-utilization must be in (0, 1]")
     if args.max_lora_rank < 1:
@@ -434,8 +432,6 @@ def build_server_config(
     model_revision: str | None,
 ) -> VLLMServerConfig:
     """Build the vLLM server configuration for a base model or a served LoRA adapter."""
-    if args.gpu_memory_utilization is None:
-        raise ValueError("owned vLLM server requires --gpu-memory-utilization")
     has_adapter = args.adapter_dir is not None
     return VLLMServerConfig(
         model=args.model,

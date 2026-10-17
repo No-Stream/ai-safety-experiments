@@ -11,6 +11,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -22,9 +23,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
 
-import torch
-
-from grpo.gpu_memory import cap_gpu_memory_utilization
+from grpo.gpu_memory import GIBIBYTE_BYTES, NvidiaSMIMemory, nvidia_smi_memory_info
 from reward_hacking.lora_serving import prepare_vllm_serving_adapter
 
 if TYPE_CHECKING:
@@ -43,15 +42,17 @@ class VLLMServerStartupError(RuntimeError):
 # vLLM caps each step's scheduled tokens at max_num_batched_tokens and draft slots share that budget; its
 # consumer-GPU default (2,048) is below the 8,192 floor vLLM itself warns about when drafting is on.
 SPECULATIVE_MAX_NUM_BATCHED_TOKENS = 8_192
+# The engine's CUDA context and allocations outside its utilization budget; 0.58 GiB measured at 9B on the 5090.
+ENGINE_OVERHEAD_OUTSIDE_UTILIZATION_BYTES = int(0.75 * 2**30)
 
 
 @dataclass(frozen=True, slots=True)
 class VLLMServerConfig:
     """All settings that determine one externally served vLLM engine.
 
-    ``max_model_len`` and ``gpu_memory_utilization`` are required rather than defaulted because
-    both allocate the shared GPU's finite memory. Callers may pass ``-1`` for ``max_model_len`` to
-    let vLLM fit the context window to available device memory at startup. ``revision`` is optional
+    ``max_model_len`` and ``gpu_memory_utilization`` specify allocations on the shared GPU.
+    An unspecified utilization is derived from host-visible free memory at launch. Callers may
+    pass ``-1`` for ``max_model_len`` to fit the context window to available device memory. ``revision`` is optional
     only for a local snapshot, which has no Hub revision; Hub models must pass the revision
     explicitly.
     """
@@ -59,7 +60,8 @@ class VLLMServerConfig:
     model: str
     revision: str | None
     max_model_len: int
-    gpu_memory_utilization: float
+    gpu_memory_utilization: float | None
+    trainer_vram_headroom_gib: float = 0.0
     host: str = "127.0.0.1"
     port: int = 8000
     language_model_only: bool = False
@@ -108,8 +110,27 @@ class VLLMServerConfig:
             raise ValueError("revision must be explicit for Hub models")
         if self.max_model_len == 0 or self.max_model_len < -1:
             raise ValueError("max_model_len must be positive or -1 for device auto-fit")
-        if not 0 < self.gpu_memory_utilization <= 1:
+        if self.gpu_memory_utilization is not None and not 0 < self.gpu_memory_utilization <= 1:
             raise ValueError("gpu_memory_utilization must be in (0, 1]")
+        if not math.isfinite(self.trainer_vram_headroom_gib) or self.trainer_vram_headroom_gib < 0:
+            raise ValueError("trainer_vram_headroom_gib must be finite and nonnegative")
+
+    def resolve_memory(self, memory: NvidiaSMIMemory) -> VLLMServerConfig:
+        """Derive an unspecified whole-engine share from launch-time host memory."""
+        if self.gpu_memory_utilization is not None:
+            return self
+        reserve_bytes = ENGINE_OVERHEAD_OUTSIDE_UTILIZATION_BYTES + (
+            self.trainer_vram_headroom_gib * GIBIBYTE_BYTES
+            if self.trainer_vram_headroom_gib > 0
+            else memory.total_bytes * 0.02
+        )
+        utilization = (memory.free_bytes - reserve_bytes) / memory.total_bytes
+        if utilization <= 0:
+            raise ValueError(
+                f"no vLLM memory remains: free={memory.free_bytes / GIBIBYTE_BYTES:.2f} GiB, "
+                f"required reserve={reserve_bytes / GIBIBYTE_BYTES:.2f} GiB"
+            )
+        return replace(self, gpu_memory_utilization=utilization)
 
     def _validate_network_settings(self) -> None:
         """Validate the local HTTP bind address."""
@@ -204,6 +225,8 @@ class VLLMServerConfig:
 
     def command(self) -> list[str]:  # noqa: C901, PLR0912 - each CLI flag is explicit and ordered
         """Build the verified ``vllm serve`` command line."""
+        if self.gpu_memory_utilization is None:
+            return self.resolve_memory(nvidia_smi_memory_info()).command()
         command = [self.executable, "serve", self.model]
         if self.revision is not None:
             command.extend(["--revision", self.revision])
@@ -284,6 +307,7 @@ class VLLMServer:
     def __init__(self, config: VLLMServerConfig) -> None:
         """Create a stopped server wrapper; :meth:`start` launches the child."""
         self.config = config
+        self.memory_provenance: dict[str, object] = {}
         self._process: subprocess.Popen[bytes] | None = None
         self._previous_sigterm_handler: int | Callable[[int, FrameType | None], object] | None = (
             None
@@ -347,13 +371,19 @@ class VLLMServer:
         """Launch the process group and wait for readiness, cleaning up on every failure."""
         if self._process is not None:
             raise RuntimeError("vLLM server has already been started")
-        if torch.cuda.is_available():
-            self.config = replace(
-                self.config,
-                gpu_memory_utilization=cap_gpu_memory_utilization(
-                    torch, self.config.gpu_memory_utilization
-                ),
-            )
+        launch_memory = nvidia_smi_memory_info()
+        requested_utilization = self.config.gpu_memory_utilization
+        self.config = self.config.resolve_memory(launch_memory)
+        self.memory_provenance = {
+            "device_index": launch_memory.device_index,
+            "device_uuid": launch_memory.device_uuid,
+            "total_bytes": launch_memory.total_bytes,
+            "launch_free_bytes": launch_memory.free_bytes,
+            "requested_gpu_memory_utilization": requested_utilization,
+            "gpu_memory_utilization": self.config.gpu_memory_utilization,
+            "trainer_vram_headroom_gib": self.config.trainer_vram_headroom_gib,
+        }
+        self._record_memory_provenance()
         environment = self._environment()
         command = self.config.command()
         if self.config.log_path is None:
@@ -377,6 +407,7 @@ class VLLMServer:
         try:
             self._install_signal_handler()
             self._wait_until_healthy()
+            self._check_trainer_headroom()
         except BaseException:
             self.stop()
             raise
@@ -391,6 +422,37 @@ class VLLMServer:
             self.config.language_model_only,
         )
         return self
+
+    def _record_memory_provenance(self) -> None:
+        logger.info("vLLM memory admission: %s", self.memory_provenance)
+        if self.config.log_path is not None:
+            path = self.config.log_path.with_suffix(".memory.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self.memory_provenance, indent=2) + "\n", encoding="utf-8")
+
+    def _check_trainer_headroom(self) -> None:
+        if self.config.trainer_vram_headroom_gib == 0:
+            return
+        ready_memory = nvidia_smi_memory_info()
+        required_bytes = self.config.trainer_vram_headroom_gib * GIBIBYTE_BYTES
+        satisfied = ready_memory.free_bytes >= required_bytes
+        self.memory_provenance.update(
+            ready_free_bytes=ready_memory.free_bytes, headroom_satisfied=satisfied
+        )
+        self._record_memory_provenance()
+        if not satisfied:
+            utilization = cast("float", self.config.gpu_memory_utilization)
+            suggested = max(
+                utilization / 2,
+                utilization
+                - (required_bytes - ready_memory.free_bytes) / ready_memory.total_bytes
+                - 0.01,
+            )
+            raise VLLMServerStartupError(
+                f"vLLM ready with {ready_memory.free_bytes / GIBIBYTE_BYTES:.2f} GiB free; "
+                f"trainer rollout headroom requires {self.config.trainer_vram_headroom_gib:.2f} GiB. "
+                f"Retry with --gpu-memory-utilization {suggested:.6g} or lower."
+            )
 
     def stop(self) -> None:
         """Terminate and reap the process group, escalating only after the grace period."""

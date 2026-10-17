@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from grpo import gpu_memory
 from reward_hacking.harness.docker_backend import DockerConfig
 from reward_hacking.harness.task_spec import GRADER_FILENAME, TASK_FILENAME, Task, TaskTestVerdict
 from reward_hacking.harness.trace_reference import leak_trace_records
@@ -1040,9 +1041,33 @@ def test_owned_server_serves_the_requested_concurrency_with_mtp_drafting() -> No
     )
 
     assert config.max_num_seqs == 6
+    assert config.gpu_memory_utilization == 0.8
     assert config.startup_timeout_seconds == 600.0
     assert config.speculative_config == {"method": "mtp", "num_speculative_tokens": 2}
     assert plain.speculative_config is None
+
+
+def test_owned_server_accepts_a_derived_memory_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_memory, "_nvidia_smi_rows", lambda: [(0, "GPU-test", 1024.0, 32768.0)])
+    args = evaluate.parse_args(
+        [
+            "--output-dir",
+            "artifacts/evaluation",
+            "--max-model-len",
+            "4096",
+            "--tasks-per-family",
+            "3",
+        ]
+    )
+
+    config = evaluate.build_server_config(args, "synthetic-revision")
+
+    assert config.gpu_memory_utilization is None
+    assert config.trainer_vram_headroom_gib == 0
+    command = config.command()
+    assert float(command[command.index("--gpu-memory-utilization") + 1]) == pytest.approx(
+        (31 - 0.75) / 32 - 0.02
+    )
 
 
 def test_evaluation_cli_defaults_to_both_families_and_requires_a_heldout_count() -> None:

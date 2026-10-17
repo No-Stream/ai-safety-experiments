@@ -110,6 +110,11 @@ def resolve_sizing(*, total_bytes: int, hidden_size: int, layers: int) -> Runtim
     return RuntimeSizing(sequence_tokens, 1, 2)
 
 
+# At 9B, nvidia-smi free after each vLLM wake swings 1.9-4.4 GiB below the post-startup value; below ~1.5 GiB the WSL
+# driver degrades decode 3-4x instead of failing.
+TRAINER_VRAM_HEADROOM_GIB = 4.5
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PLR0915 - explicit CLI flags
     """Parse explicit experiment, sampling, teacher and memory settings."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -120,6 +125,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:  # noqa: PL
     parser.add_argument("--server-host", default="127.0.0.1")
     parser.add_argument("--server-port", type=int, default=8000)
     parser.add_argument("--gpu-memory-utilization", type=float)
+    parser.add_argument(
+        "--trainer-vram-headroom-gib",
+        type=float,
+        default=TRAINER_VRAM_HEADROOM_GIB,
+        help="VRAM left free after owned vLLM startup for the offloaded trainer and vLLM's post-wake growth",
+    )
     parser.add_argument("--enable-lora", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-lora-rank", type=int, default=TRAINER_LORA_RANK)
     parser.add_argument("--enable-sleep-mode", action=argparse.BooleanOptionalAction, default=True)
@@ -348,9 +359,11 @@ def _validate_training_limits(args: argparse.Namespace, parser: argparse.Argumen
 
 
 def _validate_owned_server_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if not math.isfinite(args.trainer_vram_headroom_gib) or args.trainer_vram_headroom_gib < 0:
+        parser.error("trainer-vram-headroom-gib must be finite and nonnegative")
+    if args.gpu_memory_utilization is not None and not 0 < args.gpu_memory_utilization <= 1:
+        parser.error("gpu-memory-utilization must be in (0, 1]")
     if args.endpoint is None:
-        if args.gpu_memory_utilization is None:
-            parser.error("owned vLLM server requires --gpu-memory-utilization")
         if not args.enable_lora or not args.enable_sleep_mode:
             parser.error("owned organism RL server requires --enable-lora and --enable-sleep-mode")
         if args.max_lora_rank < TRAINER_LORA_RANK:
@@ -410,14 +423,13 @@ def build_server_config(
     max_model_len: int,
 ) -> VLLMServerConfig:
     """Build the child server configuration from this run's resolved model and serve flags."""
-    if args.gpu_memory_utilization is None:
-        raise ValueError("owned vLLM server requires --gpu-memory-utilization")
     return VLLMServerConfig(
         model=args.sampler_checkpoint or args.model,
         revision=args.sampler_checkpoint_revision if args.sampler_checkpoint else model_revision,
         served_model_name=args.model if args.sampler_checkpoint else None,
         max_model_len=max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        trainer_vram_headroom_gib=args.trainer_vram_headroom_gib,
         language_model_only=True,
         host=args.server_host,
         port=args.server_port,
@@ -447,6 +459,11 @@ def server_endpoint(
         yield args.endpoint
         return
     with VLLMServer(build_server_config(args, model_revision, max_model_len)) as server:
+        provenance_path = active_provenance_path(args.output_dir)
+        if provenance_path.exists():
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            provenance["server_memory"] = server.memory_provenance
+            provenance_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         yield server.base_url
 
 
@@ -466,6 +483,7 @@ def _semantic_flags(flags: dict[str, object]) -> dict[str, object]:
         "leak_assets",
         "leak_channel_splits",
         "gpu_memory_utilization",
+        "trainer_vram_headroom_gib",
         "rollout_concurrency",
         "expected_peak_context_tokens",
         "kv_capacity_tokens",
@@ -555,6 +573,9 @@ def write_provenance(  # noqa: C901 - explicit resume identity checks
     args.output_dir.mkdir(parents=True, exist_ok=True)
     provenance: dict[str, Any] = {
         "schema_version": CLI_PROVENANCE_SCHEMA_VERSION,
+        "server_memory_provenance_file": "vllm-server.memory.json"
+        if args.endpoint is None
+        else None,
         "flags": {
             key: str(value)
             if isinstance(value, Path)

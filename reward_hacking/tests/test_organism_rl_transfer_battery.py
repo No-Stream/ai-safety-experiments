@@ -183,6 +183,7 @@ class TestCellCommands:
         config = evaluate.build_server_config(args, "synthetic-revision")
         assert config.enable_lora is True
         assert config.lora_modules == ((run.model.served_model_id, str(adapter_dir.resolve())),)
+        assert config.gpu_memory_utilization == 0.9
         assert config.max_num_seqs == run.concurrency
         assert config.log_path == run.model_dir.resolve() / "server" / "vllm-server.log"
 
@@ -229,6 +230,17 @@ class TestThroughputGate:
     def test_battery_defaults_to_running_a_whole_cell_at_once(self) -> None:
         args = transfer_battery.parse_args(["--model-label", "base"])
         assert args.concurrency == transfer_battery.EPISODES_PER_CELL
+
+    def test_battery_defaults_to_a_derived_memory_share(self, tmp_path: Path) -> None:
+        args = transfer_battery.parse_args(["--model-label", "base"])
+        assert args.gpu_memory_utilization is None
+
+        server_arguments = transfer_battery.server_arguments(_run(tmp_path, None))
+        assert "--gpu-memory-utilization" not in server_arguments
+        server_args = evaluate.parse_args(server_arguments)
+        server_config = evaluate.build_server_config(server_args, "synthetic-revision")
+
+        assert server_config.gpu_memory_utilization is None
 
 
 def _awareness(*, integrity: bool = False, presumed: int = 0, training: bool = False) -> object:

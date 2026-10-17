@@ -6,13 +6,14 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx2
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from grpo import gpu_memory
 from reward_hacking.organism_rl import phases
 from reward_hacking.organism_rl.phases import (
     VLLMPhaseController,
@@ -200,6 +201,89 @@ def test_sample_train_sync_cycle(
     load_payload = state.payloads[-1]
     assert "load_inplace" not in load_payload
     assert all(value.device.type == "cpu" for value in model.parameters())
+    controller.close()
+
+
+@pytest.mark.parametrize("device", ["cuda:7", "cuda"])
+def test_offload_logs_post_cleanup_cuda_memory_for_training_step(
+    server: tuple[httpx2.MockTransport, ServerState],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    device: str,
+) -> None:
+    transport, _state = server
+    expected_device_index = 7
+    events: list[str] = []
+    controller = VLLMPhaseController(
+        "http://server",
+        ToyBackend(),
+        tmp_path,
+        training_device=torch.device("cpu"),
+        host_memory_safety_margin_bytes=0,
+        http_transport=transport,
+    )
+    controller.training_device = torch.device(device)
+    monkeypatch.setattr(
+        controller, "_check_host_memory_budget", lambda _required_bytes, _phase: None
+    )
+
+    class FakeTransfers:
+        host_bytes = 0
+
+        def planned_host_bytes(self, _optimizer: torch.optim.Optimizer | None) -> int:
+            return 128
+
+        def offload(self, _optimizer: torch.optim.Optimizer | None) -> None:
+            events.append("offload")
+
+    controller._transfers = cast("phases.PolicyTransfers", FakeTransfers())
+    monkeypatch.setattr(phases.gc, "collect", lambda: events.append("gc"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_device",
+        lambda: events.append("current_device") or expected_device_index,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_allocated",
+        lambda device: events.append(f"allocated:{device}") or 256,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda device: events.append(f"reserved:{device}") or 512,
+    )
+    monkeypatch.setattr(
+        gpu_memory,
+        "_nvidia_smi_rows",
+        lambda: (
+            events.append("nvidia_smi_rows")
+            or [(expected_device_index, "GPU-test", 1024.0, 32768.0)]
+        ),
+    )
+    trainer = ToyTrainer(ToyAdapter(), None, ToyState(global_step=37))
+
+    with caplog.at_level("INFO"):
+        controller._offload(trainer)
+
+    expected_events = ["offload", "gc", "empty_cache"]
+    if device == "cuda":
+        expected_events.append("current_device")
+    expected_events.extend(
+        [
+            "nvidia_smi_rows",
+            f"allocated:{device}",
+            f"reserved:{device}",
+        ]
+    )
+    assert events == expected_events
+    assert (
+        f"post-offload CUDA memory step=37 device={expected_device_index} "
+        "allocated_bytes=256 reserved_bytes=512 nvidia_smi_free_bytes=33285996544 "
+        "nvidia_smi_free_gib=31.00 nvidia_smi_total_bytes=34359738368"
+    ) in caplog.text
     controller.close()
 
 
