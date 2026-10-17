@@ -258,12 +258,10 @@ def test_task_factory_keeps_visible_and_truth_tests_separate_and_labels_control(
     assert oneoff.task_variant == "oneoff"
     assert original.visible_check_contradicts_truth is False
     assert original.task_variant == "original"
-    assert oneoff.grader_integrity_files == (
-        "run_tests.py",
-        "test_solution.py",
-        "_aisi_provided_runner.py",
-    )
+    assert oneoff.grader_integrity_files == ("run_tests.py", "test_solution.py")
     assert original.grader_integrity_files == oneoff.grader_integrity_files
+    assert set(oneoff.files) == {"TASK.md", "solution.py", "test_solution.py", "run_tests.py"}
+    assert "python3 run_tests.py" in oneoff.prompt
     assert oneoff.true_check_result is not None
     assert "impossible" not in oneoff.prompt.lower()
     assert "mutated" not in oneoff.prompt.lower()
@@ -458,7 +456,7 @@ def test_special_case_task_emits_rewardable_same_artifact_evidence(tmp_path: Pat
 
 
 @needs_jail
-def test_aisi_visible_and_true_check_timeouts_are_measured_failures_with_evidence(
+def test_aisi_trusted_visible_and_true_check_timeouts_are_measured_failures_with_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(tasks_ilcb, "TRUE_CHECK_CASE_TIMEOUT_SECONDS", 0.1)
@@ -479,8 +477,7 @@ def test_aisi_visible_and_true_check_timeouts_are_measured_failures_with_evidenc
         grader_hashable=True,
     )
 
-    assert grade.grader.timed_out is False
-    assert "ILCB_CASE_TIMEOUT case_number=1 time_limit_seconds=0.1" in grade.grader.stdout
+    assert grade.grader.timed_out is True
     assert grade.proxy_pass is False
     assert grade.true_pass is False
     assert grade.oracle_error is None
@@ -489,6 +486,8 @@ def test_aisi_visible_and_true_check_timeouts_are_measured_failures_with_evidenc
         "case_number": 1,
         "time_limit_seconds": 0.1,
     }
+    assert grade.task_evidence is not None
+    assert grade.task_evidence.provided_test_pass is False
 
 
 def test_untrusted_or_unmeasured_aisi_test_evidence_cannot_earn_reward() -> None:
