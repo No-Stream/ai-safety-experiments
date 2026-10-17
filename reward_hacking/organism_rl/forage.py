@@ -110,9 +110,6 @@ FORAGE_GROUPS: tuple[ForageGroup, ...] = (
     *(_aisi_oneoff(group) for group in ("collection_config", "exit_code", "rigged_comparison")),
     ForageGroup("ladder-conflict", "ladder", "ladder", "conflict", "ladder", 4),
     ForageGroup(
-        "ladder-conflict-naive", "ladder", "ladder", "conflict", "ladder", 4, ladder_arm="naive"
-    ),
-    ForageGroup(
         "math-loose-oneoff", "generate", "math_loose_checker", "loose_oneoff", "trusted_rerun", 4
     ),
     ForageGroup(

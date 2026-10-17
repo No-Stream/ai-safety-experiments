@@ -370,7 +370,7 @@ class TestResume:
     def test_real_and_naive_ladder_groups_store_selections_separately(self, tmp_path: Path) -> None:
         run = _run(tmp_path)
         real_group = forage.GROUPS_BY_NAME["ladder-conflict"]
-        naive_group = forage.GROUPS_BY_NAME["ladder-conflict-naive"]
+        naive_group = replace(real_group, name="ladder-conflict-naive", ladder_arm="naive")
         selections = {
             real_group.name: ["scenario"],
             naive_group.name: ["scenario"],
@@ -542,7 +542,7 @@ class TestCommands:
     ) -> None:
         run = _run(tmp_path)
         real_group = forage.GROUPS_BY_NAME["ladder-conflict"]
-        naive_group = forage.GROUPS_BY_NAME["ladder-conflict-naive"]
+        naive_group = replace(real_group, name="ladder-conflict-naive", ladder_arm="naive")
         scenarios = ["scenario"]
         real_command = forage.ladder_group_arguments(
             run, real_group, "http://127.0.0.1:8000", tmp_path / "server.log", scenarios, samples=8
